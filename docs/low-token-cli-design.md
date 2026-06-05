@@ -1,13 +1,13 @@
-# Agent Runtime 设计与低 Token 架构建议
+# Agent Runtime Operating System 完整架构设计
 
 ## 文档定位
 
 这份文档回答一个问题：
 
 ```text
-Agent CLI 应该怎么设计，
-才能在保证可用性、可恢复性和可扩展性的前提下，
-把 token 消耗控制在合理范围内。
+一个完善的 Agent Runtime Operating System 应该怎么设计，
+才能同时具备低 token、可恢复、可治理、可审计、
+可回放、可评估、可演化和可编排能力。
 ```
 
 这里的“低 token”不是单纯换便宜模型，也不是要求模型少输出几句。真正决定成本的是系统架构：
@@ -20,7 +20,7 @@ Agent CLI 应该怎么设计，
 - policy、state、evidence 怎么建模
 - harness 修改怎么验证
 
-因此本文档的重点不是“命令行参数怎么写”，而是 agent runtime 应该承担哪些能力。CLI 只是入口，runtime 才是低 token、可恢复、可治理和可演化的核心。
+因此本文档的重点不是“命令行参数怎么写”，而是完整 agent runtime 应该承担哪些系统能力。CLI 只是入口，runtime 才是低 token、可恢复、可治理、可审计和可演化的核心。
 
 本文只去除重复结论和重复清单，保留原有资料中的核心论证、设计细节和外部项目启发。
 
@@ -559,9 +559,9 @@ Evolution 负责根据证据改进 harness。
 | wire/state/artifact 三层存储 | `wire` 保存事件事实，`state` 保存当前快照，`artifact` 保存大输出和原始证据 |
 | trace issue detector | 从 event log 自动检测 orphan tool call、缺失 result、未闭合 step、未完成 compaction 等协议问题 |
 
-### 推荐的最小字段
+### 推荐的通用字段
 
-如果现在就要落表，最少建议每类对象保留这些公共字段：
+每类对象建议保留这些公共字段，保证跨模块查询、回放、迁移和审计稳定：
 
 ```text
 id
@@ -576,25 +576,33 @@ trace_id
 parent_id
 ```
 
-### 可选实施方案
+### 完整架构形态
 
-可以按 4 个层次推进：
+完善架构不是在几个实施方案中择一，而是把这些能力域统一纳入目标形态。
 
-| 方案 | 结构 | 适合程度 |
+| 能力域 | 目标形态 | 关键要求 |
 | --- | --- | --- |
-| 方案 1 | 单体分层：`CLI/TUI -> Runtime -> Store/Policy/Tools/Verify` | 最快落地，适合先做 MVP |
-| 方案 2 | 核心 runtime + 适配器：`Runtime Core` 独立，入口都做薄 | 当前最推荐，兼顾维护和扩展 |
-| 方案 3 | 事件溯源 + 可回放：所有决策链路对象事件化、可查询、可重放 | 适合你要的完整观测体系 |
-| 方案 4 | 平台化 + 插件/多 agent：runtime + plugin + worker + verifier + harness | 后期演进，别一开始就上 |
+| Runtime Kernel | `Host Runtime + Stateless Loop` | 主状态机统一，loop 无状态，入口不持有核心状态 |
+| Event Sourcing | `recorded events + live events + diagnostics` | 可恢复事实和 UI 流式事件分离 |
+| Decision System | `Data -> Observation -> Evidence -> State -> Policy -> Decision -> Evaluation` | 决策必须结构化、可查询、可审计 |
+| Execution System | `ToolAccesses + Permission + Sandbox + ToolResultEnvelope` | 所有副作用都可授权、可调度、可追踪 |
+| Storage System | `wire + state + artifact + index + migration` | 事实、快照、大数据和查询索引分层 |
+| Observability System | `trace + replay + issue detector + metrics + OTel adapter` | 不只记录日志，还要自动发现协议和决策问题 |
+| Evolution System | `HARNESS + ChangeManifest + regression evaluation` | prompt/tool/skill/memory/policy 修改必须有证据和验证 |
+| Orchestration System | `subagent + background task + queue + lease + idempotency + DLQ` | 多 agent 编排不能污染单 agent loop |
 
-### 推荐组合
+### 完善架构约束
 
-主线建议是：
+完整架构应满足这些不可变约束：
 
-- 结构上按 **方案 2**
-- 观测上按 **方案 3**
-- 实施节奏按 **方案 1**
-- 平台化能力放到后期，按 **方案 4** 扩展
+- 所有入口都通过统一 protocol 调 runtime。
+- 所有可恢复事实都以 recorded event 落盘。
+- 所有 UI streaming 都不能影响 runtime 状态收敛。
+- 所有工具副作用都必须经过权限、策略、资源访问声明和 sandbox。
+- 所有长输出和原始证据都必须落 artifact，模型只看摘要和引用。
+- 所有关键决策都必须生成 evidence refs、candidate actions、decision summary 和 rejected reasons。
+- 所有 session、turn、tool、task、verification 都必须有显式状态机。
+- 所有 harness 修改都必须生成 ChangeManifest 并进入评估闭环。
 
 ## 决策审计与演化链路
 
@@ -676,7 +684,7 @@ parent_id
 
 完整观测必须有失败分类，否则 trace 很多但归因仍然模糊。
 
-建议先采用下面这组最小分类：
+建议采用下面这组基础分类：
 
 | 类型 | 含义 | 典型信号 |
 | --- | --- | --- |
@@ -697,7 +705,7 @@ parent_id
 
 很多 agent 决策失败不是模型本身的问题，而是环境变化导致的。因此 `EnvironmentSnapshot` 必须成为 trajectory 的组成部分。
 
-建议最小字段：
+建议字段：
 
 ```text
 snapshot_id
@@ -720,7 +728,7 @@ env_whitelist
 created_at
 ```
 
-实现上不用首版就记录全量环境，但至少要记录会影响复盘的内容：
+实现上不必记录全量环境，但至少要记录会影响复盘的内容：
 
 - 当前工作目录和 workspace root。
 - 关键文件 hash 或版本引用。
@@ -751,7 +759,7 @@ created_at
 这样可以同时满足两点：
 
 - 内部仍按 agent runtime 语义建模，不被 vendor schema 绑死。
-- 后期可以接 Phoenix、Langfuse、OpenTelemetry GenAI、OpenInference 等生态，降低自研观测面板成本。
+- 可以接 Phoenix、Langfuse、OpenTelemetry GenAI、OpenInference 等生态，降低自研观测面板成本。
 
 ### Memory / Skill / Policy 分层
 
@@ -996,7 +1004,7 @@ compact boundary 的价值：
 - 大型 JSON
 - trace 明细
 
-应该先做：
+处理流程：
 
 - 提取关键信息
 - 去重
@@ -1427,42 +1435,337 @@ CLI 命令应该围绕 runtime 能力设计。
 - risk
 - verification plan
 
-## MVP 顺序
+## 完整目标架构
 
-推荐按这个顺序落地：
+完整目标不是一个命令行工具，而是一个 Agent Runtime Operating System。它应由 13 个长期稳定的系统组成。
 
-1. 定义 message model 和 transcript 存储。
-2. 实现最小 query loop。
-3. 接入 basic tools。
-4. 增加 ToolResultEnvelope。
-5. 增加 transcript / resume。
-6. 增加 permission engine。
-7. 增加 working summary。
-8. 增加 compact boundary。
-9. 增加 memory 检索式注入。
-10. 增加 token budget tracker。
-11. 增加 verification runner。
-12. 增加 task model。
-13. 增加 workspace isolation。
-14. 增加 hooks。
-15. 增加最小 skills / plugin / MCP。
-16. 增加 Change Manifest 和 trace analysis。
-17. 增加 Trajectory / Replay，把历史失败任务沉淀成可回放样本。
-18. 增加 Failure Taxonomy 和 DecisionEvaluation，支持稳定归因。
-19. 增加 Evaluation Harness，把 verification evidence 转成回归评测集。
-20. 增加 EnvironmentSnapshot，支撑真实复盘和跨版本对比。
-21. 增加 OpenTelemetry / OpenInference 映射层，后期对接外部观测生态。
+```text
+Entry Layer
+  CLI / TUI / IDE / SDK / App Server / API
 
-不建议首版优先做：
+Protocol Layer
+  Command Protocol / Event Stream / Approval RPC / Session API / Export API
 
-- 复杂 UI
-- 大量 agent 类型
-- 大而全插件系统
-- 没有 transcript/resume 的 background task
-- 没有权限系统的 bash 开放
-- 没有 compact 的长期会话
+Host Runtime
+  Session / Agent / Turn / Goal / Task / Background / Plugin / MCP / Skill
 
-这个顺序的重点是先把单 agent 闭环做稳，再扩展多入口、多 agent 和插件生态。
+Stateless Loop
+  Message Build / Provider Step / Tool Call Lifecycle / Loop Events
+
+Decision System
+  Data / Observation / Evidence / State / Policy / CandidateAction / Decision / Evaluation
+
+Context System
+  Working Summary / Compact Boundary / Hot-Warm-Cold History / Memory Retrieval / Token Budget
+
+Tool Execution System
+  Tool Registry / Schema / Validation / ToolAccesses / Scheduler / Sandbox / ToolResultEnvelope
+
+Policy & Security System
+  Permission Rules / Workspace Isolation / Secrets Redaction / Network Policy / Destructive Guard
+
+Storage System
+  Wire Event Log / State Snapshot / Artifact Store / Index / Migration / Export
+
+Observability System
+  Trace / Replay / Issue Detector / Metrics / OpenTelemetry Adapter / Decision Audit
+
+Evaluation System
+  Verification / Regression Tasks / Trajectory Replay / Failure Taxonomy / Provider Comparison
+
+Evolution System
+  ChangeManifest / Skill Evolution / Memory Update / Policy Proposal / Harness Versioning
+
+Orchestration System
+  Subagent / Background Task / Queue / Lease / Idempotency / DLQ
+
+Provider & Environment System
+  Model Provider Abstraction / Local Shell / SSH / Container / Sandbox / Remote Executor
+```
+
+### 1. Entry Layer
+
+Entry Layer 只负责用户体验和入口适配：
+
+- CLI 接收命令和展示流式状态。
+- TUI 展示会话、工具、权限、任务和 trace。
+- IDE 接入文件上下文、diff、诊断和快捷操作。
+- SDK / API 给外部系统调用 runtime。
+
+入口层不能拼 prompt、不能裁剪历史、不能直接执行工具、不能持有长期状态。
+
+### 2. Protocol Layer
+
+Protocol Layer 是入口和 runtime 之间的唯一通信边界。
+
+核心协议：
+
+- command protocol：创建 session、发送消息、取消 turn、压缩上下文、导出 trace。
+- event stream：token delta、tool started、permission request、verification result、turn completed。
+- approval RPC：工具授权、计划确认、敏感动作确认。
+- session API：resume、fork、rename、list、export、import。
+
+所有入口都必须通过协议层进入 runtime，避免 CLI/TUI/IDE 各自实现一套状态逻辑。
+
+### 3. Host Runtime
+
+Host Runtime 管理外部世界和长期状态：
+
+- Session：会话元数据、恢复、导出、fork、索引。
+- Agent：主 agent、子 agent、独立 agent、profile、system context。
+- Turn：用户输入、steer、cancel、continuation、goal 驱动。
+- Goal：目标状态、预算、完成/阻塞判断。
+- Task：后台任务、验证任务、长运行工具、子 agent 任务。
+- Plugin / MCP / Skill：扩展能力加载、隔离、生命周期和权限。
+
+Host Runtime 可以有状态，Stateless Loop 不应该有 host 依赖。
+
+### 4. Stateless Loop
+
+Stateless Loop 只负责一轮模型执行的纯核心：
+
+- 构造模型可见消息。
+- 调 provider。
+- 接收 stream。
+- 归一化 finish reason、usage、tool calls。
+- 调用工具生命周期。
+- 写出 loop recorded events。
+
+它不拥有 session、不写 UI、不直接做 compaction、不弹权限框、不加载插件。所有这些都由 host runtime 通过 hook 和 dispatcher 接入。
+
+### 5. Decision System
+
+Decision System 是 Golutra 区别于普通 agent CLI 的核心。
+
+每次关键动作都要经过：
+
+```text
+Data -> Observation -> Evidence -> State -> Policy -> CandidateAction -> Decision -> Execution -> Evaluation
+```
+
+完善架构中，`DecisionRecord` 必须包含：
+
+- 当前状态摘要。
+- 相关 evidence refs。
+- 候选动作列表。
+- 被拒绝候选动作和原因。
+- 最终动作。
+- 风险判断。
+- 成本判断。
+- 策略检查结果。
+- 预期验证方式。
+
+没有 `DecisionRecord` 的工具执行只能算自动化动作，不能算可审计决策。
+
+### 6. Context System
+
+Context System 负责把大量事实压成模型当前真正需要看的内容。
+
+它维护：
+
+- working summary
+- compact boundary
+- hot / warm / cold history
+- evidence refs
+- memory hits
+- active plan
+- token budget
+
+它的目标不是“保留更多上下文”，而是确保进入模型的上下文精简、相关、可追溯。
+
+### 7. Tool Execution System
+
+工具系统是副作用边界。
+
+完整工具执行对象应包含：
+
+- tool name
+- input schema
+- validation result
+- approval rule
+- ToolAccesses
+- sandbox policy
+- execution metadata
+- stdout/stderr artifact refs
+- summary
+- model-visible output
+- telemetry
+- post hook result
+
+工具调度器应基于资源冲突决定并发或串行，而不是简单按模型输出直接并发。
+
+### 8. Policy & Security System
+
+Policy & Security System 负责所有不可违反约束。
+
+至少包含：
+
+- permission policy
+- workspace isolation
+- sensitive file policy
+- git control path policy
+- network allow/deny policy
+- secrets redaction
+- destructive command guard
+- project policy
+- user policy
+- system policy
+
+策略必须有来源、版本、优先级和命中记录。权限判断必须可审计。
+
+### 9. Storage System
+
+完整存储系统应分层：
+
+| 存储 | 保存内容 | 特性 |
+| --- | --- | --- |
+| wire event log | 可恢复事实事件 | append-only，容忍尾部截断 |
+| state snapshot | 当前 session/agent/task 状态 | 可覆盖，可快速恢复 |
+| artifact store | 原始输出、大文件、trace、验证结果 | content-addressed 或稳定路径引用 |
+| index | 查询索引、统计、trace 搜索 | 可重建，不作为唯一事实源 |
+| migration | schema 演进记录 | 旧 session 可恢复 |
+| export package | session、wire、state、artifact、manifest | 可复盘、可迁移 |
+
+不能只靠 transcript，也不能只靠数据库快照。事实链和快照要同时存在。
+
+### 10. Observability System
+
+Observability 不是普通日志系统，而是决策审计系统。
+
+它应支持：
+
+- trace timeline
+- context projection
+- tool/result pairing
+- permission audit
+- token timeline
+- compaction timeline
+- issue detector
+- decision graph
+- evidence graph
+- replay view
+- OTel/OpenInference export
+
+issue detector 应自动发现：
+
+- orphan tool call
+- missing tool result
+- incomplete step
+- incomplete compaction
+- active plan 未关闭
+- permission ask 无结果
+- artifact ref 丢失
+- DecisionRecord 无 evidence
+- claimed verification 无真实命令
+
+### 11. Evaluation System
+
+Evaluation System 负责回答架构是否真的更可靠。
+
+它不等同于单次 verification。
+
+完整评估对象包括：
+
+- regression task set
+- historical failure trajectory
+- expected tool behavior
+- forbidden tool behavior
+- required evidence
+- required verification
+- token/cost budget
+- pass/fail/partial verdict
+- failure taxonomy
+- model/provider comparison
+
+每次 runtime、prompt、tool、skill、policy、memory 修改，都应该能用 evaluation system 做回归比较。
+
+### 12. Evolution System
+
+Evolution System 管理 agent 自身能力演化。
+
+可演化对象：
+
+- system rules
+- tool descriptions
+- tool implementations
+- middleware
+- skills
+- sub-agents
+- long-term memory
+- policy proposals
+
+每次演化必须写 ChangeManifest：
+
+- 失败证据
+- 根因
+- 修改对象
+- 修改内容
+- 预期收益
+- 风险任务
+- 验证计划
+- 回归结果
+
+没有 ChangeManifest 的 harness 修改不可接受。
+
+### 13. Orchestration System
+
+多 agent、后台任务和队列编排属于 orchestration system，不属于单个 loop。
+
+它应包含：
+
+- subagent spawn/resume/cancel
+- background task lifecycle
+- task queue
+- lease / claim
+- idempotency key
+- causal order
+- DLQ
+- team budget
+- cross-agent trace
+
+这样可以让单 agent loop 保持简单，同时保留完整团队化扩展能力。
+
+### 14. Provider & Environment System
+
+Provider 和 Environment 都应抽象出来。
+
+Provider 负责：
+
+- model catalog
+- capability
+- streaming
+- tool call normalize
+- usage normalize
+- finish reason normalize
+- retry/fallback
+
+Environment 负责：
+
+- local shell
+- SSH
+- container
+- sandbox
+- remote executor
+- path normalization
+- process lifecycle
+- file read/write/search
+
+agent loop 不应直接依赖某个模型 SDK，也不应直接依赖本地文件系统和进程 API。
+
+### 完整架构判断标准
+
+一套完善架构至少要满足：
+
+1. 任意入口都能复用同一 runtime。
+2. 任意 turn 都能恢复、审计和 replay。
+3. 任意工具副作用都有权限、策略、资源访问和 artifact 记录。
+4. 任意关键决策都有 evidence、candidate actions、rejected reasons 和 evaluation。
+5. 任意长上下文都有 compact boundary 和 raw artifact。
+6. 任意 session 崩溃后都能通过 wire + state 恢复。
+7. 任意 trace 都能被 issue detector 自动检查。
+8. 任意 harness 修改都有 ChangeManifest 和回归评估。
+9. 任意多 agent 编排都有 idempotency、lease、DLQ 和 cross-agent trace。
+10. 任意外部 provider 或执行环境都能通过抽象层替换。
 
 ## 外部项目启发
 
@@ -1496,7 +1799,7 @@ CLI 命令应该围绕 runtime 能力设计。
 - 运行时内核要明确：轻量场景可用回合制，长期演进更需要事件流和队列协议。
 - 会话恢复不能靠临时拼接，必须有 transcript、状态对象和恢复链。
 - 工具协议和权限模型要早定，否则后续安全、摘要和成本控制都会变得困难。
-- 多 agent 之前先把单 agent 做稳。
+- 多 agent 能力必须建立在稳定单 agent runtime 之上。
 - 成本控制不是附属能力，token 计数、prompt 压缩、历史裁剪、预算提醒、模型路由和输出长度控制都应内建。
 
 ### `ai-agent-deep-dive` 源码分析报告
@@ -1515,7 +1818,7 @@ CLI 命令应该围绕 runtime 能力设计。
 - TaskRecord 是后台任务和子 agent 的前提。
 - Workspace Isolation 应按角色和风险分配。
 
-这些内容已经分别落到本文的 prompt/context、message/state、tool/permission、verification 和 MVP 顺序中。
+这些内容已经分别落到本文的 prompt/context、message/state、tool/permission、verification 和完整目标架构中。
 
 ### Agentic Harness Engineering
 
@@ -1552,7 +1855,7 @@ Trace 分析建议分层：
 - 长工具输出截断并落文件
 - 旧上下文自动 compaction
 - 用评测和 trace 驱动下一轮修改
-- 从最小 agent 闭环开始演化
+- 从稳定 agent 闭环持续演化
 
 ### Kimi Code
 
@@ -1610,7 +1913,7 @@ Kimi Code 的核心价值不是提出新算法，而是把 coding agent runtime 
 13. 用 trace overview/detail 和 metrics 评估演化效果。
 14. 用 Trajectory / Replay、Failure Taxonomy 和 Evaluation Harness 把 trace 升级成决策审计能力。
 15. 用 EnvironmentSnapshot 和 ObservabilityAdapter 支撑真实复盘与外部观测生态。
-16. 先把单 agent 闭环做稳，再扩展多入口、多 agent、插件和 MCP。
+16. 单 agent、多入口、多 agent、插件和 MCP 都通过统一 runtime 与 orchestration system 组织，不让入口或协作能力污染核心 loop。
 
 如果只保留一个工程判断：
 
