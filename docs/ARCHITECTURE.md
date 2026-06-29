@@ -17,16 +17,14 @@ Golutra 的核心系统是什么，
 
 Golutra 不是普通 CLI agent，也不是 prompt + tools 的包装层。它应设计为 Rust-first Agent Runtime OS。
 
-核心主线是：
+第一阶段核心链路是：
 
 ```text
 User Input
 -> Session Command Protocol
--> Goal Ledger
 -> Runtime Event
 -> State Projection
 -> Context Projection
--> Runtime Governor
 -> Provider / Tool Loop
 -> LoopDecision
 -> Verification
@@ -63,6 +61,21 @@ GoalLedger
 
 这些能力属于后续治理增强，不是第一阶段同步链路的必做项。第一阶段只保留扩展位，避免过早引入额外判断、索引和模型评估成本。
 
+## 情报吸收后的硬架构启示
+
+`file/` 情报只作为架构输入，不直接覆盖本文档的主规格。真正吸收到 Golutra 架构里的启示是以下硬约束：
+
+- Agent 核心是 runtime，不是 prompt 包装器。CLI、TUI、API、SDK 都必须进入同一套 runtime loop。
+- 关键边界必须是硬契约，包括 `SessionCommand`、`RuntimeEvent`、`ProviderContract`、`ToolContract`、`ToolResultEnvelope`、`LoopDecision`、`VerificationRecord`。
+- 任务完成不能由模型自然语言决定，必须由 `VerificationRecord` 结合 evidence、artifact、tool result 和用户目标判断。
+- Artifact / Evidence 是系统事实层，大输出、diff、日志、网页、下载文件和执行结果都通过 artifact 保存，通过 evidence 引用。
+- Provider adapter 是反腐层，负责把不同 provider 的 stream、tool call、usage、finish_reason、error、rate limit 和 cost 映射成统一 contract。
+- 多入口共享同一套 session protocol，入口层只能提交命令和读取投影，不能各自实现状态机。
+- Policy / Sandbox 必须在执行层生效，文件、进程、网络、secret 和外部副作用都要经过 policy gate。
+- Memory 是受治理的 durable state，不是塞更多上下文；长期 memory 必须有 evidence、scope、confidence、expiry、contradiction 和 rollback。
+
+这些约束属于第一阶段架构边界。复杂 multi-agent、自动 self-improvement、dynamic benchmark 和开放式演进仍然属于后续能力。
+
 ## 四个核心系统
 
 ### Runtime Loop
@@ -74,16 +87,21 @@ GoalLedger
 ```text
 Session
 Turn
-GoalRecord
 GoalState
 LoopGuard
 LoopDecision
-GoalAlignmentCheck
-GovernanceDecision
 ProviderResult
 ToolResultEnvelope
 VerificationRecord
 PostTaskReview
+```
+
+后续治理对象：
+
+```text
+GoalRecord
+GoalAlignmentCheck
+GovernanceDecision
 ```
 
 关键要求：
@@ -219,16 +237,16 @@ deep PostTaskReview
 
 | 模块 | 职责 |
 | --- | --- |
-| `golutra-core` | 核心类型：Message、SessionState、GoalState、LoopDecision、ToolResultEnvelope、Policy |
+| `golutra-core` | 核心类型：SessionCommand、Message、SessionState、GoalState、LoopDecision、ToolResultEnvelope、Policy |
 | `golutra-runtime` | turn 状态机、loop 执行、LoopDecision、resume、compact、fallback、post review |
 | `golutra-event` | ProviderRawEvent、RuntimeEvent、UiSdkEvent、durable/live-only 事件协议 |
 | `golutra-context` | ContextBuilder、TokenBudgetTracker、WorkingSummary、CompactManager、context projection |
 | `golutra-memory` | MemoryRetriever、MemoryGovernance、memory promotion/rollback、项目索引 |
-| `golutra-store` | SQLite、event log、artifact store、FTS5、migration、snapshot |
-| `golutra-llm` | ProviderConfig、ModelCatalog、CapabilityMatrix、adapter、routing、usage |
-| `golutra-tools` | ToolSchema、ToolAccesses、tool registry、tool execution、ToolResultEnvelope |
+| `golutra-store` | SQLite、event log、ArtifactRecord、artifact store、FTS5、migration、snapshot |
+| `golutra-llm` | ProviderConfig、ProviderContract、ModelCatalog、CapabilityMatrix、adapter、routing、usage |
+| `golutra-tools` | ToolContract、ToolSchema、ToolAccesses、tool registry、tool execution、ToolResultEnvelope |
 | `golutra-governor` | 后续治理增强：GoalLedger、RuntimeGovernor、GoalAlignmentCheck、GovernanceDecision、cost/risk/approval gate |
-| `golutra-policy` | PermissionPolicy、workspace isolation、路径/网络/命令策略 |
+| `golutra-policy` | PermissionPolicy、PolicyEvaluation、workspace isolation、路径/网络/命令策略 |
 | `golutra-verify` | verification runner、PASS/FAIL/PARTIAL、证据记录；后续扩展 VerificationTier |
 | `golutra-eval` | eval runner、trajectory recorder、vcr/golden fixture、post-task review |
 | `golutra-tui` | ratatui/crossterm TUI，只展示 runtime projection |
@@ -275,9 +293,12 @@ Evaluation / Improvement 模式使用 `Evaluation / Improvement Projection`：
 
 必须核心：
 
+- Session Protocol
 - Runtime Loop
 - Durable State
 - Context Projection
+- Artifact / Evidence
+- Tool Contract
 - Tool Permission / Sandbox
 - Provider Contract / CapabilityMatrix
 - Verification

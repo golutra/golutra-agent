@@ -4,7 +4,7 @@
 
 1. `ARCHITECTURE.md`：主架构规格，作为实现时的架构真相。
 2. `implementation-blueprint.md`：第一阶段实现蓝图、最小 schema、同步/后台/离线边界。
-3. `file文件夹汇总.md`：基于 `file/` 情报沉淀的架构缺口、修改建议和新增文档建议。
+3. `file文件夹汇总.md`：基于 `file/` 情报沉淀的架构输入；核心启示已吸收到主架构和实现蓝图，本文不作为更高优先级规格。
 4. `agent-runtime-technology-selection.md`：语言、crate、workspace 和库选型。
 5. `context-memory.md`：context、token、compaction、memory governance。
 6. `evaluation-observability.md`：观测、验证、复盘、benchmark。
@@ -18,7 +18,7 @@
 | --- | --- |
 | `ARCHITECTURE.md` | 主架构真相 |
 | `implementation-blueprint.md` | 第一阶段实现蓝图 |
-| `file文件夹汇总.md` | `file/` 情报汇总与架构修改建议 |
+| `file文件夹汇总.md` | `file/` 情报汇总与架构输入，不替代主架构规格 |
 | `agent-runtime-technology-selection.md` | 技术栈和模块选型 |
 | `context-memory.md` | 上下文、压缩、记忆 |
 | `evaluation-observability.md` | 观测、验证、复盘、评估 |

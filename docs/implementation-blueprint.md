@@ -23,7 +23,10 @@ RuntimeEvent
 StateProjection
 ContextProjection
 ProviderContract
+ToolContract
 ToolResultEnvelope
+ArtifactRecord / EvidenceRecord
+PolicyEvaluation
 LoopDecision
 VerificationRecord
 UserProjection
@@ -47,6 +50,20 @@ Plugin Marketplace
 ```
 
 第一阶段只生成 `ImprovementCandidate`，不自动应用改动。
+
+## 第一阶段吸收的架构启示
+
+第一阶段不新增复杂治理层，但必须吸收以下 runtime 硬边界：
+
+- `SessionCommand` 是 CLI / TUI / API / SDK 的唯一入口协议，入口层不能绕过 runtime 自建状态机。
+- `ProviderContract` 是 provider 反腐层，统一 stream event、tool call、usage、finish_reason、error、rate limit 和 cost。
+- `ToolContract` 先于工具实现定义，明确 schema、错误、取消、重试、幂等、副作用和 artifact 策略。
+- `ArtifactRecord` / `EvidenceRecord` 是事实层，raw output 默认进 artifact，模型只读取受控摘要和 evidence refs。
+- `VerificationRecord` 决定任务是否完成，模型自然语言不能直接触发成功终止。
+- `PolicyEvaluation` 必须在执行层阻断高风险文件、进程、网络、secret 和外部副作用。
+- `MemoryCandidate` 只作为候选，长期 memory 不能从 transcript 自动晋升。
+
+这些是第一阶段的架构约束，不等于要实现完整 benchmark hardening、复杂 multi-agent、自改进或动态评测系统。
 
 ## 后续治理增强
 
@@ -81,6 +98,19 @@ ContextProjectionCache
 
 ## 最小核心 Schema
 
+### SessionCommand
+
+```text
+SessionCommand
+  command_id
+  session_id
+  kind: create | prompt | approve | deny | pause | resume | abort | compact | verify | replay | export
+  idempotency_key
+  actor: user | api | tui | cli | sdk
+  payload
+  timestamp
+```
+
 ### RuntimeEvent
 
 ```text
@@ -95,6 +125,23 @@ RuntimeEvent
   source: runtime | provider | tool | policy | verifier | user
   payload_ref
   durable: true | false
+```
+
+### ProviderContract
+
+```text
+ProviderContract
+  provider_id
+  model_id
+  native_protocol
+  stream_event_mapping
+  tool_call_mapping
+  usage_mapping
+  finish_reason_mapping
+  error_mapping
+  rate_limit_mapping
+  cost_model
+  capability_matrix_ref
 ```
 
 ### LoopDecision
@@ -114,6 +161,23 @@ LoopDecision
   next_step
 ```
 
+### ToolContract
+
+```text
+ToolContract
+  tool_name
+  input_schema
+  output_schema
+  error_schema
+  side_effect_type: none | file | process | network | external_system
+  idempotency_key_policy
+  timeout_policy
+  cancellation_policy
+  retry_policy
+  artifact_policy
+  permission_policy_ref
+```
+
 ### ToolResultEnvelope
 
 ```text
@@ -128,6 +192,49 @@ ToolResultEnvelope
   evidence_refs
   risk
   verification_hint
+```
+
+### ArtifactRecord
+
+```text
+ArtifactRecord
+  artifact_id
+  session_id
+  turn_id
+  tool_call_id
+  artifact_type
+  uri
+  checksum
+  size_bytes
+  producer
+  redaction_status
+  retention_policy
+```
+
+### EvidenceRecord
+
+```text
+EvidenceRecord
+  evidence_id
+  claim
+  artifact_refs
+  source_event_refs
+  evidence_strength
+  verifier
+  limitations
+```
+
+### PolicyEvaluation
+
+```text
+PolicyEvaluation
+  policy_ref
+  subject
+  action
+  resource
+  decision: allow | ask | deny | block
+  reason
+  evidence_refs
 ```
 
 ### VerificationRecord
@@ -237,10 +344,14 @@ PromotionDecision
 
 这些能力参与当前任务正确性，必须在用户任务链路中同步运行：
 
+- SessionCommand 归一化。
 - RuntimeEvent 写入。
 - StateProjection 更新。
 - ContextProjection 构造。
+- ProviderContract 映射。
+- ToolContract 校验。
 - ToolResultEnvelope 生成。
+- ArtifactRecord / EvidenceRecord 最小记录。
 - PolicyEvaluation。
 - VerificationRecord 基础验证。
 - LoopDecision。
@@ -321,6 +432,23 @@ DebugProjection
 
 Debug Projection 只在 debug/audit/replay 模式启用。
 
+## P0 验收矩阵
+
+第一阶段完成时至少覆盖这些硬边界，不用等后续治理增强：
+
+| 场景 | 必须验证 |
+| --- | --- |
+| 多入口请求 | CLI / TUI / API / SDK 都转成 `SessionCommand`，没有入口私有状态机 |
+| provider 正常流 | stream event、usage、finish_reason、tool call 映射进 `ProviderContract` |
+| provider 异常流 | truncated stream、malformed event、rate limit、network error 都有结构化错误 |
+| tool 成功 | `ToolContract` 校验通过，生成 `ToolResultEnvelope`、artifact refs 和 evidence refs |
+| tool 失败 | error、timeout、cancelled、blocked 都有明确状态，不把 raw stderr 直接塞进模型 |
+| abort / pause | abort 后不能继续产生外部副作用，pause/resume 不破坏 event 顺序 |
+| retry | 有副作用的 tool retry 必须依赖 idempotency 或显式阻断 |
+| artifact | raw output 可通过 checksum 校验，模型只读取摘要或受控 excerpt |
+| verification | 没有足够 evidence 时不能 `stop_success`，只能 `stop_partial`、`stop_failed` 或 `blocked` |
+| memory | `MemoryCandidate` 不自动晋升长期 memory，必须保留 evidence、scope 和 rollback 信息 |
+
 ## 第一阶段落地顺序
 
 1. `golutra-core`：核心 schema。
@@ -341,7 +469,10 @@ Debug Projection 只在 debug/audit/replay 模式启用。
 
 - 单个任务能从 CLI/TUI/API 进入同一 runtime。
 - 每个 turn 有 durable event。
+- 每个 provider 响应都通过 ProviderContract 归一化。
+- 每个工具执行前有 ToolContract 和 PolicyEvaluation。
 - 每个工具结果有 ToolResultEnvelope。
+- raw output、日志和大内容有 ArtifactRecord，关键结论有 EvidenceRecord。
 - 每个任务结束有 VerificationRecord。
 - 每次循环结束有 LoopDecision。
 - 普通用户只看到 UserProjection。
