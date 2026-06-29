@@ -26,9 +26,8 @@ User Input
 -> State Projection
 -> Context Projection
 -> Provider / Tool Loop
--> LoopDecision
 -> Verification
--> PostTaskReview
+-> LoopDecision
 -> Projection
    -> User Result
    -> Debug / Audit
@@ -42,7 +41,7 @@ User Input
 所有能力都必须围绕 Runtime Event、State Projection、Context Projection、LoopDecision 和多投影观测展开。
 ```
 
-如果一个能力无法说明它产生什么 runtime fact、改变什么 state projection、是否影响 context projection、是否参与 RuntimeGovernor / LoopDecision / PromotionGate，它就不进入核心，只作为插件或实验能力。
+如果一个能力无法说明它产生什么 runtime fact、改变什么 state projection、是否影响 context projection、是否参与 Verification / LoopDecision / PromotionGate，它就不进入核心，只作为插件或实验能力。
 
 后续治理增强对 Golutra 有两个直接提醒：
 
@@ -57,24 +56,18 @@ GoalLedger
 -> LoopDecision
 ```
 
-`GoalLedger` 负责保存原始目标、约束和成功标准；`RuntimeGovernor` 负责在每轮动作前后统一判断 goal drift、policy、risk、cost、verification tier 和 approval escalation；`LoopDecision` 负责把判断结果落实为继续、重试、压缩、询问用户、阻塞或结束。
-
 这些能力属于后续治理增强，不是第一阶段同步链路的必做项。第一阶段只保留扩展位，避免过早引入额外判断、索引和模型评估成本。
 
-## 情报吸收后的硬架构启示
+## 主架构边界
 
-`file/` 情报只作为架构输入，不直接覆盖本文档的主规格。真正吸收到 Golutra 架构里的启示是以下硬约束：
+主架构只保留最稳定的骨架与边界，支持层和未来治理细节分别下沉到专题文档：
 
-- Agent 核心是 runtime，不是 prompt 包装器。CLI、TUI、API、SDK 都必须进入同一套 runtime loop。
-- 关键边界必须是硬契约，包括 `SessionCommand`、`RuntimeEvent`、`ProviderContract`、`ToolContract`、`ToolResultEnvelope`、`LoopDecision`、`VerificationRecord`。
-- 任务完成不能由模型自然语言决定，必须由 `VerificationRecord` 结合 evidence、artifact、tool result 和用户目标判断。
-- Artifact / Evidence 是系统事实层，大输出、diff、日志、网页、下载文件和执行结果都通过 artifact 保存，通过 evidence 引用。
-- Provider adapter 是反腐层，负责把不同 provider 的 stream、tool call、usage、finish_reason、error、rate limit 和 cost 映射成统一 contract。
-- 多入口共享同一套 session protocol，入口层只能提交命令和读取投影，不能各自实现状态机。
-- Policy / Sandbox 必须在执行层生效，文件、进程、网络、secret 和外部副作用都要经过 policy gate。
-- Memory 是受治理的 durable state，不是塞更多上下文；长期 memory 必须有 evidence、scope、confidence、expiry、contradiction 和 rollback。
-
-这些约束属于第一阶段架构边界。复杂 multi-agent、自动 self-improvement、dynamic benchmark 和开放式演进仍然属于后续能力。
+- Agent 核心是 runtime，不是 prompt 包装器。CLI、TUI、API、SDK 都要进入同一套 runtime loop。
+- 任务完成必须由 `VerificationRecord` 判定，不能只看模型自然语言。
+- `ProviderContract`、`ToolContract`、`PolicyEvaluation`、`ArtifactRecord`、`EvidenceRecord` 属于支持层，细节见 `implementation-blueprint.md` 和观测/记忆专题文档。
+- `GoalLedger`、`RuntimeGovernor`、`VerificationTier`、`EventSamplingPolicy`、`ContextProjectionCache` 只作为后续治理增强入口，不进入第一阶段主链路。
+- 多入口只共享同一套 session protocol，入口层不能各自实现状态机。
+- 长期 memory 是受治理的 durable state，不是直接回灌完整历史。
 
 ## 四个核心系统
 
@@ -82,35 +75,13 @@ GoalLedger
 
 负责一轮任务如何运行、是否继续、是否压缩、是否重试、是否 fallback、是否验证、是否结束。
 
-核心对象：
-
-```text
-Session
-Turn
-GoalState
-LoopGuard
-LoopDecision
-ProviderResult
-ToolResultEnvelope
-VerificationRecord
-PostTaskReview
-```
-
-后续治理对象：
-
-```text
-GoalRecord
-GoalAlignmentCheck
-GovernanceDecision
-```
-
 关键要求：
 
 - 模型不能单独决定任务完成。
+- `VerificationRecord` 先于最终 `LoopDecision`，任务完成必须先被证据证明。
 - provider fallback 必须发生在 loop 层，不能藏在 provider adapter。
-- 第一阶段由 `LoopDecision` 记录继续、压缩、重试、fallback、询问用户和结束原因；后续再接入 `RuntimeGovernor`。
-- 每轮结束必须生成 `LoopDecision`。
-- 任务终止必须有 `VerificationRecord` 或明确的失败/阻塞原因。
+- `LoopDecision` 只记录继续、压缩、重试、fallback、询问用户和结束原因。
+- 任务终止必须有 `VerificationRecord` 或明确的失败 / 阻塞原因。
 
 ### Durable State
 
@@ -161,58 +132,13 @@ MemoryGovernance
 
 ### Governance
 
-负责权限、安全、证据、验证、复盘和能力晋升。
+负责权限、安全、证据、验证、复盘和能力晋升，但不作为第一阶段主链路展开。
 
-核心对象：
+专题文档分工：
 
-```text
-GoalLedger
-RuntimeGovernor
-GoalAlignmentCheck
-GovernanceDecision
-PermissionPolicy
-PolicyEvaluation
-CostBudgetState
-VerificationTier
-EventSamplingPolicy
-EvidenceRecord
-VerificationRecord
-PostTaskReview
-FailureTaxonomy
-PromotionGate
-ChangeManifest
-ImprovementCandidate
-RegressionResult
-PromotionDecision
-```
-
-关键要求：
-
-- 工具副作用必须有权限、sandbox、artifact 和 evidence。
-- 任务完成必须可验证，不能只看模型自然语言。
-- 第一阶段只做基础验证和 debug/audit 扩展位；后续再加入 `VerificationTier`。
-- 第一阶段完整保存轻量 runtime event；后续再加入 `EventSamplingPolicy` 控制索引和离线评估成本。
-- 后续治理增强可加入 `GoalLedger`、`GoalAlignmentCheck` 和 `RuntimeGovernor`，用于长任务目标漂移控制。
-- 复盘结果可以产生 memory、benchmark、policy、skill 候选，但不能直接晋升。
-- agent 改进必须经过 ImprovementCandidate、RegressionResult 和 PromotionDecision。
-- Open-Endedness 必须经过 sandbox、verification、regression 和 human gate。
-
-详细规则见 `evaluation-observability.md`、`agent-improvement-loop.md` 与 `agent-open-endedness-design.md`。
-
-`PostTaskReview` 分为两层：
-
-- minimal review：同步生成，只记录任务 outcome、关键失败类型、证据质量和必要风险。
-- deep review：后台或离线生成，用于 benchmark、memory、policy、skill 候选和 agent 改进。
-
-改进闭环固定为：
-
-```text
-deep PostTaskReview
--> FailureTaxonomy
--> ImprovementCandidate
--> RegressionResult
--> PromotionDecision
-```
+- `evaluation-observability.md`：观测、验证、复盘、benchmark。
+- `agent-improvement-loop.md`：失败轨迹如何变成可验证、可回滚的 agent 改进。
+- `agent-open-endedness-design.md`：开放式能力、技能晋升和 Promotion Gate。
 
 ## 完整链路
 
@@ -228,7 +154,7 @@ deep PostTaskReview
 9. ToolResultEnvelope 写入 summary、structured facts、artifact ref、evidence refs
 10. Verification 判断任务是否达成、证据是否可靠、是否违反 policy
 11. LoopGuard 与 LoopDecision 判断 continue / compact / retry / fallback / ask_user / stop
-12. 任务结束后生成 PostTaskReview 和可选 ImprovementCandidate
+12. 任务结束后按需生成 PostTaskReview 和可选 ImprovementCandidate
 13. Projection Layer 按用途生成 User / Runtime Control / Debug / Evaluation 四类投影
 14. 后续治理增强可在第 4、5、8、10、11 步之间接入 GoalLedger、RuntimeGovernor、VerificationTier、EventSamplingPolicy 和 ContextProjectionCache
 ```
@@ -237,19 +163,19 @@ deep PostTaskReview
 
 | 模块 | 职责 |
 | --- | --- |
-| `golutra-core` | 核心类型：SessionCommand、Message、SessionState、GoalState、LoopDecision、ToolResultEnvelope、Policy |
-| `golutra-runtime` | turn 状态机、loop 执行、LoopDecision、resume、compact、fallback、post review |
-| `golutra-event` | ProviderRawEvent、RuntimeEvent、UiSdkEvent、durable/live-only 事件协议 |
-| `golutra-context` | ContextBuilder、TokenBudgetTracker、WorkingSummary、CompactManager、context projection |
-| `golutra-memory` | MemoryRetriever、MemoryGovernance、memory promotion/rollback、项目索引 |
-| `golutra-store` | SQLite、event log、ArtifactRecord、artifact store、FTS5、migration、snapshot |
-| `golutra-llm` | ProviderConfig、ProviderContract、ModelCatalog、CapabilityMatrix、adapter、routing、usage |
-| `golutra-tools` | ToolContract、ToolSchema、ToolAccesses、tool registry、tool execution、ToolResultEnvelope |
-| `golutra-governor` | 后续治理增强：GoalLedger、RuntimeGovernor、GoalAlignmentCheck、GovernanceDecision、cost/risk/approval gate |
-| `golutra-policy` | PermissionPolicy、PolicyEvaluation、workspace isolation、路径/网络/命令策略 |
-| `golutra-verify` | verification runner、PASS/FAIL/PARTIAL、证据记录；后续扩展 VerificationTier |
-| `golutra-eval` | eval runner、trajectory recorder、vcr/golden fixture、post-task review |
-| `golutra-tui` | ratatui/crossterm TUI，只展示 runtime projection |
+| `golutra-core` | 核心协议与状态类型 |
+| `golutra-runtime` | turn 状态机、loop 执行、resume、compact、fallback |
+| `golutra-event` | Durable / live-only 事件协议 |
+| `golutra-context` | ContextBuilder、TokenBudgetTracker、WorkingSummary、context projection |
+| `golutra-memory` | MemoryRetriever、MemoryGovernance、memory promotion/rollback |
+| `golutra-store` | SQLite、event log、artifact store、snapshot |
+| `golutra-llm` | Provider adapter、CapabilityMatrix、routing、usage |
+| `golutra-tools` | ToolContract、tool registry、tool execution、ToolResultEnvelope |
+| `golutra-governor` | 后续治理增强：GoalLedger、RuntimeGovernor、GovernanceDecision |
+| `golutra-policy` | PermissionPolicy、PolicyEvaluation、workspace isolation |
+| `golutra-verify` | verification runner、PASS/FAIL/PARTIAL、证据记录 |
+| `golutra-eval` | eval runner、replay、benchmark、post-task review |
+| `golutra-tui` | 只展示 runtime projection 的 TUI |
 | `golutra-cli` | 薄 CLI 入口 |
 | `golutra-app-server` | HTTP/WebSocket/SSE 入口 |
 | `golutra-vis` | replay、trace、context、artifact 审计视图 |
@@ -261,7 +187,6 @@ Golutra 的观测不是一条全部展示给用户的链路，而是同一批 ru
 ```text
 Runtime Control Projection
   给 runtime 自己使用，用于 LoopDecision、context、verification、retry、fallback、compact。
-  每次任务都必须生成最小必要数据。
 
 User Projection
   给普通 CLI / TUI / API 用户使用，只展示进度、权限请求、最终结果和必要风险。

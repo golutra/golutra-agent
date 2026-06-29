@@ -27,8 +27,8 @@ ToolContract
 ToolResultEnvelope
 ArtifactRecord / EvidenceRecord
 PolicyEvaluation
-LoopDecision
 VerificationRecord
+LoopDecision
 UserProjection
 DebugProjection
 ```
@@ -161,6 +161,20 @@ LoopDecision
   next_step
 ```
 
+### VerificationRecord
+
+```text
+VerificationRecord
+  task_id
+  objective
+  completion_criteria
+  checks
+  evidence_refs
+  result: pass | fail | partial | unknown
+  policy_status
+  residual_risks
+```
+
 ### ToolContract
 
 ```text
@@ -235,20 +249,6 @@ PolicyEvaluation
   decision: allow | ask | deny | block
   reason
   evidence_refs
-```
-
-### VerificationRecord
-
-```text
-VerificationRecord
-  task_id
-  objective
-  completion_criteria
-  checks
-  evidence_refs
-  result: pass | fail | partial | unknown
-  policy_status
-  residual_risks
 ```
 
 ### PostTaskReview
