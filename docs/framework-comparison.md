@@ -29,6 +29,26 @@ Rust Runtime Kernel
 + Verification / Replay / PostTaskReview
 ```
 
+## 评测平台借鉴
+
+LangSmith、Braintrust、Promptfoo 不是这里六个框架的一部分，但它们代表了另一类更成熟的工程能力：观测、评估、红队和 CI 检查。
+
+它们值得借鉴的点是：
+
+| 平台 | 可借鉴能力 | 在 Golutra 里的对应 |
+| --- | --- | --- |
+| LangSmith | trace、span、debug view、run 回看 | `RuntimeEvent`、`DebugProjection`、`replay` |
+| Braintrust | dataset、experiment、scorer、对比实验 | `EvaluationProjection`、`RegressionResult` |
+| Promptfoo | 配置式 eval、red team、CI 检查、安全测试 | `PolicyEvaluation`、`VerificationRecord`、`golutra-eval` |
+
+这些能力的价值不在于“架构更先进”，而在于它们已经证明：
+
+1. 任务轨迹需要结构化，不只是聊天记录。
+2. 评估需要可重复，不只是一次性总结。
+3. 安全和越权要能自动化测试，不只是人工审核。
+
+Golutra 应该吸收这些方法，但仍然保持自己的 runtime 定位，不把自己改造成评测平台。
+
 ## TUI 选型
 
 推荐：

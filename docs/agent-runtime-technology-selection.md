@@ -342,6 +342,29 @@ PASS / FAIL / PARTIAL
 verdict
 ```
 
+建议在 `RuntimeEvent` 上预留与外部观测平台兼容的字段，但仅作为 runtime 自己的投影输入，不作为产品核心：
+
+```text
+trace_id
+span_id
+parent_span_id
+latency
+token_usage
+cost
+provider
+model
+tool
+```
+
+这样可以把 LangSmith / Braintrust / Promptfoo 的一些工程能力吸收到 Golutra 里：
+
+- trace view 变成 `DebugProjection`
+- dataset / scorer 变成 `EvaluationProjection`
+- red team case 变成 `PolicyEvaluation` 和 `VerificationRecord`
+- regression 对比变成 `golutra-eval`
+
+但不要把外部平台的 UI 或实验管理逻辑直接搬进 runtime core。
+
 ## 完整目标技术栈
 
 推荐基础栈：

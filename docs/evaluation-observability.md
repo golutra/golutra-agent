@@ -32,6 +32,63 @@ Evaluation / Improvement Projection
 
 因此，运行时最小观测是执行链路的一部分；完整审计、复盘和改进分析是按需或后台链路。
 
+## 前沿观点的客观采纳
+
+近一年 Agent 研究和工程实践对 Golutra 最有价值的提醒，不是“让模型更会规划”，而是“让运行时更可控”。这些方向对后续大版本有价值，但不应全部塞进第一阶段同步链路。
+
+| 方向 | 对 Golutra 的价值 | 采纳方式 | 局限 |
+| --- | --- | --- | --- |
+| Goal Drift / Planning Drift | 防止长任务逐步偏离用户原始目标 | 加入 `GoalLedger` 和 `GoalAlignmentCheck` | 对齐分数本身仍可能误判，必须保留 evidence 和人可接管 |
+| Runtime Governance | 把目标、策略、风险、预算、审批统一成运行时决策 | 加入 `RuntimeGovernor` / `GovernanceDecision` | 不应把所有判断都同步大模型化，否则成本过高 |
+| Runtime Verification | 任务完成和高风险动作必须有证据 | 加入 `VerificationTier` | 低风险动作不应完整验证，高风险动作不能省略验证 |
+| Event Sampling | 避免完整观测导致存储、索引、评估成本爆炸 | 加入 `EventSamplingPolicy` | raw event 仍需轻量保存，否则恢复和 replay 会断链 |
+| Context Projection Cache | 降低 token，并减少长上下文造成的漂移 | 加入 `ContextProjectionCache` | cache 失效规则必须严格，否则会引用过期状态 |
+
+这些补充有借鉴意义，但不能直接照搬成“每一步都评估、每个事件都索引、每个任务都深度审计”。第一阶段只保留基础 event、LoopDecision、VerificationRecord、DebugProjection 和 PostTaskReview；后续在真实失败数据足够后再逐步加入。Golutra 的设计原则是：
+
+```text
+运行时自用判断必须轻量同步；
+普通用户展示必须克制；
+debug/audit 必须按需展开；
+离线评估必须分层采样。
+```
+
+## 可借鉴的外部平台能力
+
+LangSmith、Braintrust、Promptfoo 这类工具不是 Golutra 的架构模板，但它们在工程上证明了几件事值得吸收：
+
+- `trace / span` 结构：把一次任务拆成可定位的阶段，而不是只有一条聊天记录。
+- `dataset / experiment / scorer`：把失败样本、回归和对比做成可重复实验，而不是只写复盘文字。
+- `red team / safety case`：把 prompt injection、越权调用、敏感信息泄漏和 policy bypass 变成可自动化检查项。
+- `CI` 集成：让评估进入持续集成，而不是只靠人工抽查。
+
+Golutra 只吸收这些方法，不吸收它们的产品定位。对应映射为：
+
+```text
+RuntimeEvent / trace_id / span_id
+DebugProjection / replay trace view
+EvaluationProjection / dataset / scorer
+VerificationRecord / assertion / evidence
+RegressionResult / experiment comparison
+PolicyEvaluation / red team case
+```
+
+推荐保留的最小字段：
+
+```text
+trace_id
+span_id
+parent_span_id
+latency
+token_usage
+cost
+provider
+model
+tool
+```
+
+这些字段的价值主要体现在 DebugProjection、Evaluation Harness 和 regression 对比里，不应把 Golutra 改造成一个纯评测平台。
+
 ## 观测对象
 
 每个任务至少观测九类数据：
@@ -49,6 +106,46 @@ DecisionEvaluation
 ```
 
 这些数据来自 runtime、provider、tool、policy、verification、user approval 和 post-task review，而不是事后从聊天文本里猜。
+
+## Planning Drift 观测链路
+
+Planning Drift 的核心问题是：任务在执行过程中看起来每一步都合理，但整体逐渐偏离原始目标。这是后续治理增强要重点解决的问题，不是第一阶段的强制同步能力。
+
+Golutra 用三层数据控制它：
+
+```text
+GoalRecord
+  记录原始目标、约束、成功标准和禁止偏移项
+
+GoalAlignmentCheck
+  检查 plan / tool_call / tool_result / completion_claim 是否仍服务原始目标
+
+GovernanceDecision
+  决定 allow / warn / ask_user / replan / block / terminate
+```
+
+典型触发点：
+
+- 生成新计划时。
+- 准备执行高风险工具前。
+- 多轮任务超过固定 step 或 token 阈值时。
+- compact 前后。
+- 声称任务完成前。
+- 用户目标、工具结果和当前计划出现语义冲突时。
+
+示例：
+
+```text
+用户目标：找最便宜的东京机票。
+当前计划：研究航空公司商业模式。
+
+GoalAlignmentCheck:
+  alignment_score: 0.12
+  drift_type: wrong_objective
+  action: replan
+```
+
+这类检查的作用不是保证模型永远正确，而是让偏移有记录、有阈值、有恢复动作。
 
 ## RuntimeEvent
 
@@ -121,6 +218,19 @@ residual_risks
 - artifact 证据。
 - policy evaluation。
 - benchmark / golden fixture。
+
+### Verification Tier
+
+为控制成本，后续应把验证做成分级：
+
+| Tier | 适用动作 | 同步成本 | 处理方式 |
+| --- | --- | --- | --- |
+| Tier0 | 低风险读取、普通列表、无副作用查询 | 极低 | 记录 event 和摘要，不额外验证 |
+| Tier1 | 非破坏性工具调用、普通文件读取 | 低 | exit code、schema、文件存在性、摘要一致性 |
+| Tier2 | 代码修改、配置修改、网络请求、策略边界动作 | 中 | diff、测试、lint、artifact、policy/evidence |
+| Tier3 | 删除、覆盖、权限升级、生产环境、改进晋升 | 高 | 强验证 + approval gate，必要时人工确认 |
+
+这样做解决的是 Cost Explosion：不是所有步骤都值得完整验证，但高风险动作必须强验证。第一阶段可以先用任务类型基础验证，等验证成本成为明确问题后再引入完整 `VerificationTier`。
 
 ## PostTaskReview
 
@@ -211,6 +321,59 @@ UI 只展示 runtime projection，不维护自己的任务真相。
 | User | 是 | 普通用户 | 展示进度、权限、结果、必要风险 |
 | Debug / Audit | 按需 | 开发者、人类审计者、其他 agent | 展开链路、定位错误、解释行为 |
 | Evaluation / Improvement | 后台或离线 | eval 系统、改进 agent | replay、benchmark、regression、改 prompt/tool/schema/policy/runtime |
+
+## Event Sampling
+
+完整保存和完整分析是两回事。第一阶段先轻量保存 runtime event，保证恢复、debug 和基本 replay。后续当 debug/audit/eval 数据变多后，Golutra 应采用三层事件策略：
+
+```text
+Raw Event
+  轻量完整保存，保证恢复和基本 replay。
+
+Indexed Event
+  只索引关键决策、高风险动作、异常、失败、人工修正和小比例随机样本。
+
+Evaluation Event
+  只进入离线评估、benchmark、regression 和改进候选生成。
+```
+
+推荐保留规则：
+
+- risk >= high：必须进入 indexed event 和 evaluation event。
+- policy violation：必须进入 evaluation event。
+- verification fail / partial / unknown：必须进入 evaluation event。
+- goal alignment 低于阈值：必须进入 evaluation event。
+- 用户人工纠正：必须进入 evaluation event。
+- 普通低风险事件：raw 保存，按比例抽样进入 indexed event。
+
+这样可以保留可回放性，同时避免每个工具流、每段输出、每个 token 都进入高成本分析。
+
+## Context Projection Cache
+
+长上下文会增加成本，也会提高目标漂移风险。第一阶段先做 `WorkingSummary` 和基础 `ContextProjection`；后续当 context 构造成为明确瓶颈时，再引入 `ContextProjectionCache`：
+
+```text
+RuntimeEvent
+-> StateProjection
+-> FactGraph / WorkingSummary
+-> ContextProjectionCache
+-> Prompt
+```
+
+`ContextProjectionCache` 的作用：
+
+- 避免相同 state 重复构造 prompt。
+- 让模型读取“当前状态”，而不是滚动历史全文。
+- compact 前后保持可校验的状态转移。
+- 让 debug/audit 能看到“模型当时到底看到了什么”。
+
+失效条件：
+
+- 新 evidence 改变任务事实。
+- GoalRecord 或 success criteria 改变。
+- ToolResultEnvelope 产生新的 structured facts。
+- MemoryCandidate 被晋升或回滚。
+- PolicyEvaluation 改变允许范围。
 
 ## Evaluation Harness
 
@@ -327,6 +490,10 @@ cost
 
 - 能解释每个关键决策为什么发生。
 - 能证明任务是否达成。
+- 能持续检查计划和动作是否偏离原始目标。
+- 能按风险分级验证，避免每个动作都付出完整审计成本。
+- 能区分 raw event、indexed event 和 evaluation event，避免观测成本失控。
+- 能证明模型当时看到的 context projection 是什么。
 - 能区分失败归因。
 - 能 replay 任意关键 turn。
 - 能把失败转成 benchmark。

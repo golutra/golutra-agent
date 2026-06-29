@@ -36,12 +36,48 @@ DebugProjection
 Open-Endedness
 Dynamic Benchmark
 Skill Promotion
+GoalLedger / RuntimeGovernor
+GoalAlignmentCheck
+VerificationTier
+EventSamplingPolicy
+ContextProjectionCache
 Plugin Marketplace
 复杂 Multi-Agent Orchestration
 自动修改 runtime 代码
 ```
 
 第一阶段只生成 `ImprovementCandidate`，不自动应用改动。
+
+## 后续治理增强
+
+以下能力有架构价值，但不适合放进第一阶段同步链路。原因是它们会增加 schema、判断逻辑、索引策略和额外模型调用，前期容易把 runtime 做复杂，也会浪费 token。
+
+```text
+GoalLedger
+RuntimeGovernor
+GoalAlignmentCheck
+GovernanceDecision
+VerificationTier
+EventSamplingPolicy
+ContextProjectionCache
+```
+
+建议放到后续大版本，触发条件是：基础 runtime 已经稳定，真实失败轨迹足够多，且确实观察到目标漂移、验证成本过高或上下文构造成本过高。
+
+推荐落地顺序：
+
+1. `VerificationTier`：先把验证分级做起来，收益最大，成本最低。
+2. `EventSamplingPolicy`：再控制 debug/audit/eval 的索引和分析成本。
+3. `ContextProjectionCache`：当 context 构造成为明确瓶颈时再做。
+4. `GoalLedger + GoalAlignmentCheck`：长任务和多步骤任务稳定后再加。
+5. `RuntimeGovernor + GovernanceDecision`：最后统一治理层，避免前期过早抽象。
+
+前期只保留这些能力的扩展位：
+
+- `LoopDecision.reason` 能记录目标偏移、预算超限、权限阻塞等原因。
+- `VerificationRecord` 能记录检查来源和残余风险。
+- `DebugProjection` 能展示 event、context、policy、verification。
+- `PostTaskReview` 能把疑似 drift / cost / context 问题归入失败分类。
 
 ## 最小核心 Schema
 
@@ -206,7 +242,7 @@ PromotionDecision
 - ContextProjection 构造。
 - ToolResultEnvelope 生成。
 - PolicyEvaluation。
-- VerificationRecord。
+- VerificationRecord 基础验证。
 - LoopDecision。
 - UserProjection。
 - minimal PostTaskReview。
@@ -294,7 +330,7 @@ Debug Projection 只在 debug/audit/replay 模式启用。
 5. `golutra-tools`：tool schema、permission、ToolResultEnvelope。
 6. `golutra-context`：ContextBuilder、TokenBudgetTracker、WorkingSummary。
 7. `golutra-runtime`：turn loop、LoopDecision、verification 调度。
-8. `golutra-verify`：任务类型验证策略。
+8. `golutra-verify`：任务类型基础验证策略。
 9. `golutra-cli` / `golutra-tui`：UserProjection 展示。
 10. `golutra-vis`：DebugProjection 和 replay 查询。
 11. `golutra-eval`：ImprovementCandidate、RegressionResult、PromotionDecision 的离线链路。

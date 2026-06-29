@@ -22,9 +22,11 @@ Golutra 不是普通 CLI agent，也不是 prompt + tools 的包装层。它应�
 ```text
 User Input
 -> Session Command Protocol
+-> Goal Ledger
 -> Runtime Event
 -> State Projection
 -> Context Projection
+-> Runtime Governor
 -> Provider / Tool Loop
 -> LoopDecision
 -> Verification
@@ -42,7 +44,24 @@ User Input
 所有能力都必须围绕 Runtime Event、State Projection、Context Projection、LoopDecision 和多投影观测展开。
 ```
 
-如果一个能力无法说明它产生什么 runtime fact、改变什么 state projection、是否影响 context projection、是否参与 LoopDecision 或 PromotionGate，它就不进入核心，只作为插件或实验能力。
+如果一个能力无法说明它产生什么 runtime fact、改变什么 state projection、是否影响 context projection、是否参与 RuntimeGovernor / LoopDecision / PromotionGate，它就不进入核心，只作为插件或实验能力。
+
+后续治理增强对 Golutra 有两个直接提醒：
+
+- Planning Drift 不能只靠任务结束时检查。必须在运行中持续检查当前计划、工具动作和原始目标是否仍然一致。
+- Cost Explosion 不能只靠全局 token 上限。必须对验证、审计、索引、上下文构造和离线评估分级，否则完整观测会拖垮普通任务。
+
+当基础 runtime 稳定后，Golutra 的治理控制层可以从“事件 + 循环判断”升级为：
+
+```text
+GoalLedger
+-> RuntimeGovernor
+-> LoopDecision
+```
+
+`GoalLedger` 负责保存原始目标、约束和成功标准；`RuntimeGovernor` 负责在每轮动作前后统一判断 goal drift、policy、risk、cost、verification tier 和 approval escalation；`LoopDecision` 负责把判断结果落实为继续、重试、压缩、询问用户、阻塞或结束。
+
+这些能力属于后续治理增强，不是第一阶段同步链路的必做项。第一阶段只保留扩展位，避免过早引入额外判断、索引和模型评估成本。
 
 ## 四个核心系统
 
@@ -55,9 +74,12 @@ User Input
 ```text
 Session
 Turn
+GoalRecord
 GoalState
 LoopGuard
 LoopDecision
+GoalAlignmentCheck
+GovernanceDecision
 ProviderResult
 ToolResultEnvelope
 VerificationRecord
@@ -68,6 +90,7 @@ PostTaskReview
 
 - 模型不能单独决定任务完成。
 - provider fallback 必须发生在 loop 层，不能藏在 provider adapter。
+- 第一阶段由 `LoopDecision` 记录继续、压缩、重试、fallback、询问用户和结束原因；后续再接入 `RuntimeGovernor`。
 - 每轮结束必须生成 `LoopDecision`。
 - 任务终止必须有 `VerificationRecord` 或明确的失败/阻塞原因。
 
@@ -125,8 +148,15 @@ MemoryGovernance
 核心对象：
 
 ```text
+GoalLedger
+RuntimeGovernor
+GoalAlignmentCheck
+GovernanceDecision
 PermissionPolicy
 PolicyEvaluation
+CostBudgetState
+VerificationTier
+EventSamplingPolicy
 EvidenceRecord
 VerificationRecord
 PostTaskReview
@@ -142,6 +172,9 @@ PromotionDecision
 
 - 工具副作用必须有权限、sandbox、artifact 和 evidence。
 - 任务完成必须可验证，不能只看模型自然语言。
+- 第一阶段只做基础验证和 debug/audit 扩展位；后续再加入 `VerificationTier`。
+- 第一阶段完整保存轻量 runtime event；后续再加入 `EventSamplingPolicy` 控制索引和离线评估成本。
+- 后续治理增强可加入 `GoalLedger`、`GoalAlignmentCheck` 和 `RuntimeGovernor`，用于长任务目标漂移控制。
 - 复盘结果可以产生 memory、benchmark、policy、skill 候选，但不能直接晋升。
 - agent 改进必须经过 ImprovementCandidate、RegressionResult 和 PromotionDecision。
 - Open-Endedness 必须经过 sandbox、verification、regression 和 human gate。
@@ -177,8 +210,9 @@ deep PostTaskReview
 9. ToolResultEnvelope 写入 summary、structured facts、artifact ref、evidence refs
 10. Verification 判断任务是否达成、证据是否可靠、是否违反 policy
 11. LoopGuard 与 LoopDecision 判断 continue / compact / retry / fallback / ask_user / stop
-12. 任务结束后生成 PostTaskReview 和可选 PromotionCandidate
+12. 任务结束后生成 PostTaskReview 和可选 ImprovementCandidate
 13. Projection Layer 按用途生成 User / Runtime Control / Debug / Evaluation 四类投影
+14. 后续治理增强可在第 4、5、8、10、11 步之间接入 GoalLedger、RuntimeGovernor、VerificationTier、EventSamplingPolicy 和 ContextProjectionCache
 ```
 
 ## 模块划分
@@ -193,8 +227,9 @@ deep PostTaskReview
 | `golutra-store` | SQLite、event log、artifact store、FTS5、migration、snapshot |
 | `golutra-llm` | ProviderConfig、ModelCatalog、CapabilityMatrix、adapter、routing、usage |
 | `golutra-tools` | ToolSchema、ToolAccesses、tool registry、tool execution、ToolResultEnvelope |
+| `golutra-governor` | 后续治理增强：GoalLedger、RuntimeGovernor、GoalAlignmentCheck、GovernanceDecision、cost/risk/approval gate |
 | `golutra-policy` | PermissionPolicy、workspace isolation、路径/网络/命令策略 |
-| `golutra-verify` | verification runner、PASS/FAIL/PARTIAL、证据记录 |
+| `golutra-verify` | verification runner、PASS/FAIL/PARTIAL、证据记录；后续扩展 VerificationTier |
 | `golutra-eval` | eval runner、trajectory recorder、vcr/golden fixture、post-task review |
 | `golutra-tui` | ratatui/crossterm TUI，只展示 runtime projection |
 | `golutra-cli` | 薄 CLI 入口 |
@@ -257,6 +292,8 @@ Evaluation / Improvement 模式使用 `Evaluation / Improvement Projection`：
 
 高级演进：
 
+- GoalLedger / RuntimeGovernor
+- VerificationTier / EventSamplingPolicy / ContextProjectionCache
 - Open-Endedness
 - Dynamic Benchmark
 - Skill Promotion
