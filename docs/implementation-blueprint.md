@@ -66,6 +66,7 @@ Plugin Marketplace
 
 - `SessionCommand` 是 CLI / TUI / API / SDK 的唯一入口协议，入口层不能绕过 runtime 自建状态机。
 - `RuntimeQuery` 是查询当前 session / task 状态的统一接口；不同前端不能各自维护私有状态快照作为真相。
+- 协议类型必须有统一 schema 产物；Rust、TypeScript、Python 侧不能各自手写一套含义接近但字段漂移的契约。
 - `ProviderContract` 是 provider 反腐层，统一 stream event、tool call、usage、finish_reason、error、rate limit 和 cost。
 - `ToolContract` 先于工具实现定义，明确 schema、错误、取消、重试、幂等、副作用和 artifact 策略。
 - `ArtifactRecord` / `EvidenceRecord` 是事实层，raw output 默认进 artifact，模型只读取受控摘要和 evidence refs。
@@ -420,6 +421,26 @@ PromotionDecision
 4. 三端查询到同一个 task status、visible steps、approval state
 5. 三端订阅到同一条流式输出和工具进度
 ```
+
+### 协议与 SDK 约束
+
+第一阶段需要把“runtime 协议”当成独立资产，而不只是 Rust 内部类型：
+
+- `SessionCommand`、`RuntimeQuery`、`RuntimeEvent` 要有稳定 schema 产物。
+- TypeScript SDK 应尽量从协议产物生成类型，避免手写接口漂移。
+- Python SDK 第一阶段可以后置，但其 transport 语义必须与 TypeScript SDK 和 app-server 一致。
+- 本地 SDK 允许两种运行方式：
+  - 连接已运行的 `app-server`
+  - 按配置拉起本地 runtime host
+- 无论哪种运行方式，`task_id`、event 顺序、approval、resume、replay 语义必须一致。
+
+### 协议测试与 smoke 约束
+
+第一阶段除业务测试外，至少还要有三类契约测试：
+
+- schema / fixture 测试：保证协议产物稳定可消费。
+- app-server test client：对 `query`、`subscribe`、`approve`、`abort`、`resume` 做 transport 对拍。
+- SDK 集成 smoke：保证 SDK 与 runtime 不会在字段和事件顺序上漂移。
 
 ### Coding Agent 验证默认值
 

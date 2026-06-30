@@ -39,7 +39,7 @@ Rust Runtime Kernel
   + crossterm / ratatui TUI
   + SQLite + event log
   + structured tool result
-  + tracing / OpenTelemetry / replay / evaluation
+  + tracing / replay / evaluation
   + provider contract + capability matrix
   + sandbox / permission / policy / workspace isolation
 ```
@@ -95,6 +95,8 @@ Python 和 TypeScript 的优势主要在生态和开发速度，但它们更适�
 golutra-core
 golutra-runtime
 golutra-event
+golutra-protocol
+golutra-protocol-fixtures
 golutra-context
 golutra-tools
 golutra-policy
@@ -104,6 +106,7 @@ golutra-llm
 golutra-verify
 golutra-eval
 golutra-otel
+golutra-test-client
 golutra-cli
 golutra-tui
 golutra-vis
@@ -119,6 +122,8 @@ sdk/python
 | `golutra-core` | Message、SessionState、GoalState、LoopGuard、LoopDecision、ToolResultEnvelope、TaskRecord、Policy 等核心类型 |
 | `golutra-runtime` | query loop、turn 状态机、LoopDecision 生成、tool/model 回流、resume/compact 调度 |
 | `golutra-event` | ProviderRawEvent、RuntimeEvent、UiSdkEvent、durable/live-only 事件协议 |
+| `golutra-protocol` | `SessionCommand`、`RuntimeQuery`、`RuntimeEvent`、app-server transport contract、SDK 共享类型 |
+| `golutra-protocol-fixtures` | schema 产物、协议 fixture、跨语言契约测试输入 |
 | `golutra-context` | ContextBuilder、TokenBudgetTracker、WorkingSummary、CompactManager、history 分层、context projection |
 | `golutra-tools` | ToolSchema、ToolAccesses、tool registry、schema validation、tool execution、ToolResultEnvelope |
 | `golutra-policy` | PermissionPolicy、`allow/ask/deny`、workspace isolation、路径/网络/命令策略 |
@@ -128,6 +133,7 @@ sdk/python
 | `golutra-verify` | verification runner、PASS/FAIL/PARTIAL、证据记录 |
 | `golutra-eval` | eval_runner、trajectory_recorder、post_task_reviewer、vcr/golden fixture |
 | `golutra-otel` | tracing、metrics、event export/import |
+| `golutra-test-client` | app-server 协议 smoke、transport 对拍、fixture replay、SDK 集成验证 |
 | `golutra-client` | `RuntimeClient`、`RuntimeQuery`、event subscription、transport abstraction |
 | `golutra-cli` | 薄 CLI 入口 |
 | `golutra-tui` | TUI 入口，只展示 runtime projection，支持 normal/debug panel |
@@ -155,6 +161,8 @@ Governance
 - `golutra-store` 保存 raw event、artifact 和 projection，避免 UI、provider adapter 或 tool 层维护自己的任务真相。
 - `golutra-eval` 和 `golutra-verify` 基于 durable event/replay 做验证，不另建一套不可回放的评估输入。
 - `golutra-client` 只暴露统一 runtime 语义，不携带前端私有状态机。
+- `golutra-protocol` 负责跨 crate、跨 transport、跨语言的契约定义；协议升级必须先过 fixture 和 SDK 契约测试。
+- `golutra-test-client` 不承载业务逻辑，只用于 app-server、SDK、transport 和 schema 对拍。
 
 判断一个新能力是否进入主架构时，必须回答：它产生什么 runtime fact、改变什么 state projection、是否影响 context projection、是否参与 LoopDecision 或 PromotionGate。如果回答不清楚，就先作为插件或实验能力，不进入核心。
 
@@ -204,7 +212,7 @@ trait RuntimeClient {
 | --- | --- | --- |
 | CLI 参数 | `clap` | `chat/resume/summary/usage/compact/trace/manifest` 命令 |
 | TUI | `ratatui` + `crossterm` | 交互式终端、状态卡片、工具进度、历史渲染 |
-| 错误展示 | `miette` 或 `color-eyre` | 面向 CLI/TUI 的可读错误 |
+| 错误展示 | `miette` | 面向 CLI/TUI 的可读错误 |
 
 CLI 层要保持薄，不要在命令 handler 里拼 prompt 或裁剪历史。
 
@@ -247,11 +255,17 @@ schema validation -> pre hook -> permission -> sandbox -> execute -> post hook -
 | --- | --- | --- |
 | 序列化 | `serde`、`serde_json` | 所有 message/state/tool result 均结构化 |
 | Schema 生成 | `schemars` | 从 Rust 类型生成 JSON Schema |
+| TypeScript 类型产物 | `ts-rs` | 从 Rust 协议类型生成 TS 类型，减少 SDK 与 runtime 漂移 |
 | Schema 校验 | `jsonschema` | tool input/output、配置、插件声明校验 |
 | 类型错误 | `thiserror` | library 层错误类型 |
-| 应用错误 | `anyhow` / `miette` | binary 层聚合错误 |
+| 应用错误 | `miette` | binary 层聚合错误与用户可读诊断 |
 
 建议所有对外协议都 schema-first，避免 SDK 和 runtime 类型漂移。
+
+协议层再补两条：
+
+- app-server contract 要有 fixture 产物，供 Rust、TypeScript、Python SDK 共用。
+- 协议升级要先跑 `golutra-test-client` 和 SDK 契约测试，避免 runtime 与 SDK 版本语义偏移。
 
 ### LLM Provider
 
@@ -260,7 +274,7 @@ schema validation -> pre hook -> permission -> sandbox -> execute -> post hook -
 | HTTP client | `reqwest` | OpenAI/Anthropic/OpenAI-compatible provider 调用 |
 | Streaming | `tokio` + `reqwest` stream | token 流、tool call 流、usage 事件 |
 | Provider abstraction | 自研 trait | 不把 runtime 绑死到某个 vendor SDK |
-| 多 provider 加速接入 | `genai` / `rust-genai` | 作为 `GenaiProviderAdapter` 使用，不进入核心协议 |
+| 多 provider 加速接入 | `genai` | 作为 `GenaiProviderAdapter` 使用，不进入核心协议 |
 
 建议核心用 provider abstraction：
 
@@ -284,7 +298,7 @@ Provider 层不直接照搬某个项目：
 - 吸收 Hermes Agent 的 plugin discovery，但插件必须经过 capability matrix 和 policy gate。
 - 吸收 Claude Code Best 对 Anthropic 能力的深集成经验，但不能让 runtime 绑定单一 provider。
 
-`rust-genai` 的定位是接入加速器，不是 Golutra 的核心 Provider 协议。推荐采用一层反腐适配：
+`genai` 的定位是接入加速器，不是 Golutra 的核心 Provider 协议。推荐采用一层反腐适配：
 
 ```text
 Golutra ProviderContract
@@ -292,15 +306,15 @@ Golutra ProviderContract
        -> genai::Client
 ```
 
-这样可以先获得 `rust-genai` 对 OpenAI、OpenAI Responses、Anthropic、Gemini、Ollama、OpenRouter、Groq、DeepSeek、xAI、Bedrock、Vertex、Moonshot、Aliyun 等 provider 的覆盖，同时保留 Golutra 自己的 request、stream event、tool call、usage、error、capability 和 telemetry 标准。
+这样可以先获得 `genai` 对 OpenAI、OpenAI Responses、Anthropic、Gemini、Ollama、OpenRouter、Groq、DeepSeek、xAI、Bedrock、Vertex、Moonshot、Aliyun 等 provider 的覆盖，同时保留 Golutra 自己的 request、stream event、tool call、usage、error、capability 和 telemetry 标准。
 
-不建议让 runtime core 直接使用 `genai::ChatRequest`、`genai::ChatResponse` 或其内部事件作为核心数据模型。`GenaiProviderAdapter` 必须完成：
+不建议让 runtime core 直接使用 `genai` 的请求/响应或其内部事件作为核心数据模型。`GenaiProviderAdapter` 必须完成：
 
 - `LlmRequest -> genai request` 的转换。
 - `genai stream/event -> Golutra LlmStreamEvent` 的归一化。
 - tool call id、tool arguments、finish reason、usage、reasoning、error 的标准化。
 - provider 原始字段写入 `provider_metadata` 和 artifact ref，供 debug/replay 使用。
-- 根据 `rust-genai` 支持范围补全 Capability Matrix，并对不确定能力标记为 unknown。
+- 根据 `genai` 支持范围补全 Capability Matrix，并对不确定能力标记为 unknown。
 - 对关键 provider 建 recorded/golden tests，避免升级 `genai` 后破坏回放和评估。
 
 完整 ProviderContract 至少要记录：
@@ -329,7 +343,7 @@ provider_quirks
 
 | 能力 | 推荐库 | 建议 |
 | --- | --- | --- |
-| 主存储 | SQLite + `sqlx` 或 `rusqlite` | 用于 session/thread metadata、message index、tool call index、permission、verification、artifact index |
+| 主存储 | SQLite + `sqlx` | 用于 session/thread metadata、message index、tool call index、permission、verification、artifact index |
 | 事件轨迹 | append-only event log / JSONL | 用于 raw turn event、model envelope、tool summary、replay timeline、benchmark fixture |
 | 全文检索 | SQLite FTS5 | 用于跨会话搜索、历史浏览、证据和 artifact 检索 |
 | 轻量 KV | `redb` | 可选，用于 cache 或小型本地索引 |
@@ -350,13 +364,18 @@ provider_quirks
 - `replay(task_id)` 优先于 session 级模糊恢复。
 - artifact 应重点保存 `diff`、测试结果、命令输出、诊断日志和关键工具原始输出。
 
+额外建议增加两个持久化边界：
+
+- `thread/session metadata` 与 `runtime state/event index` 可以共库，但逻辑上要分表和访问层，避免 thread 浏览与 runtime 真相耦合。
+- `artifact blob` 默认走文件系统或对象目录；SQLite 只保留索引、checksum、大小和类型，不直接吞大对象正文。
+
 ### Memory 与代码理解
 
 | 能力 | 推荐库 | 用法 |
 | --- | --- | --- |
-| 全文检索 | `tantivy` | 本地 docs/code/memory 搜索 |
+| 全文检索 | SQLite FTS5 | 本地 docs/code/memory 搜索 |
 | 代码解析 | `tree-sitter` | 代码符号、函数范围、片段召回 |
-| 文件遍历 | `ignore`、`walkdir` | 遵守 `.gitignore`，避免扫无关目录 |
+| 文件遍历 | `ignore` | 遵守 `.gitignore`，避免扫无关目录 |
 | glob 匹配 | `globset` | workspace policy、工具路径匹配 |
 | 路径处理 | `camino` | UTF-8 path，减少跨平台坑 |
 
@@ -379,6 +398,11 @@ Memory 优先使用可解释、可回放的检索链路：
 | 插件 sandbox | `wasmtime` | 用于高风险插件隔离和可分发插件运行时 |
 | MCP | 官方 Rust SDK `rmcp` | 放在 adapter 层，不进入 core |
 
+平台边界建议明确：
+
+- Linux / macOS / Windows 的 sandbox 与 exec policy 允许分别实现，不强求第一阶段抽成一个完全对称的实现。
+- 第一阶段优先保证主平台路径稳定，跨平台差异通过 `golutra-policy` / `golutra-sandbox-*` 分层吸收。
+
 Sandbox 和权限至少要覆盖：
 
 - read-only / shared / temp / worktree workspace 类型
@@ -392,7 +416,7 @@ Sandbox 和权限至少要覆盖：
 | --- | --- | --- |
 | 结构化日志 | `tracing` | runtime event、tool event、decision event |
 | 日志订阅 | `tracing-subscriber` | CLI/TUI/App Server 不同输出 |
-| 指标导出 | OpenTelemetry | 外部 trace/log/metrics 映射 |
+| 指标导出 | 后续按需接 OpenTelemetry | 第一阶段不作为默认实现 |
 | Snapshot/Golden test | `insta` | message、tool envelope、trace 输出测试 |
 | 临时目录 | `tempfile` | tool/sandbox/store 测试 |
 | Mock HTTP | `wiremock` 或 `httpmock` | LLM provider 测试 |
@@ -432,6 +456,25 @@ tool
 
 但不要把外部平台的 UI 或实验管理逻辑直接搬进 runtime core。
 
+### 构建、分发与安装
+
+除了 runtime 本身，Golutra 还需要明确工程与分发层选型：
+
+| 能力 | 推荐方案 | 说明 |
+| --- | --- | --- |
+| Rust workspace 构建 | `cargo` | 第一阶段主构建入口 |
+| 开发任务编排 | `just` | 统一 `fmt`、`test`、`run`、`replay`、`schema`、`sdk` 等命令 |
+| Node/TS 包管理 | `pnpm` | 管 SDK/Web 依赖，不进入 runtime core |
+| Python SDK 构建 | `uv` 或标准 `pyproject` | 仅用于 SDK/脚本，不进入核心运行时 |
+
+第一阶段不建议引入 Bazel/Nix 这类更重工程体系。等 monorepo、跨平台构建矩阵和远程构建需求明确后，再评估。
+
+分发层建议：
+
+- 主分发物是 Rust 原生二进制。
+- npm / Python 包如果需要存在，应作为启动器、SDK 或安装壳，不承载 runtime 实现本体。
+- SDK 可以支持“连接已运行 app-server”和“按配置拉起本地 runtime host”两种模式，但协议语义必须一致。
+
 ## 完整目标技术栈
 
 推荐基础栈：
@@ -443,18 +486,17 @@ clap
 serde / serde_json
 schemars / jsonschema
 reqwest
-rusqlite
+sqlx
 tracing / tracing-subscriber
-thiserror / anyhow
-ignore / walkdir / globset / camino
+thiserror / miette
+ignore / globset / camino
 ratatui / crossterm
 axum
-SQLx or rusqlite
-OpenTelemetry
-tantivy or SQLite FTS5
+SQLite
+SQLite FTS5
 tree-sitter
 rmcp
-wasmtime
+genai
 TypeScript SDK
 ```
 
@@ -490,10 +532,10 @@ Tools
   schema validation + permission + sandbox + execution + ToolResultEnvelope
 
 Observability
-  tracing + OpenTelemetry + replay + verification + evaluation harness
+  tracing + replay + verification + evaluation harness
 
 Extension
-  MCP adapter + plugin contract + optional Wasm sandbox + TypeScript/Python SDK
+  MCP adapter + plugin contract + TypeScript/Python SDK
 ```
 
 ## 不推荐的选型
@@ -545,14 +587,16 @@ Extension
 7. 建 `golutra-runtime`：turn flow、LoopGuard、LoopDecision 生成、recorded events、resume、compact、replay、tool/model 回流。
 8. 建 `golutra-context`：working summary、history 分层、compact boundary、token budget。
 9. 建 `golutra-verify`：验证结果结构化。
-10. 建 `golutra-client`：`RuntimeClient`、`InProcessTransport`、query / subscribe 语义。
-11. 建 `golutra-cli`：薄 CLI 命令面。
-12. 建 `golutra-tui`：`crossterm + ratatui + Golutra 业务组件`，通过 `InProcessTransport` 访问 runtime。
-13. 建 `golutra-app-server`：HTTP/WebSocket/SSE 入口，先实现 `HttpSseTransport`，复用同一 runtime facts。
-14. 建 `golutra-otel`：tracing、OTel adapter、debug/replay/audit 查询。
-15. 建 `golutra-vis`：离线 replay、event/wire/context/artifact 检查。
-16. 建 `golutra-eval`：eval_runner、trajectory_recorder、deep post_task_reviewer、vcr/golden fixture。
-17. 建 memory index、MCP ToolEntry bridge、plugin capability package、TypeScript/Python SDK 和 Web/IDE 集成。
+10. 建 `golutra-protocol`：协议类型、schema、TS 类型生成。
+11. 建 `golutra-client`：`RuntimeClient`、`InProcessTransport`、query / subscribe 语义。
+12. 建 `golutra-cli`：薄 CLI 命令面。
+13. 建 `golutra-tui`：`crossterm + ratatui + Golutra 业务组件`，通过 `InProcessTransport` 访问 runtime。
+14. 建 `golutra-app-server`：HTTP/WebSocket/SSE 入口，先实现 `HttpSseTransport`，复用同一 runtime facts。
+15. 建 `golutra-test-client`：协议 fixture、transport 对拍、app-server smoke。
+16. 建 `golutra-otel`：先承载 `tracing` 查询和调试出口，OpenTelemetry 导出后续按需补充。
+17. 建 `golutra-vis`：离线 replay、event/wire/context/artifact 检查。
+18. 建 `golutra-eval`：eval_runner、trajectory_recorder、deep post_task_reviewer、vcr/golden fixture。
+19. 建 memory index、MCP ToolEntry bridge、plugin capability package、TypeScript/Python SDK 和 Web/IDE 集成。
 
 ## 参考链接
 
@@ -564,9 +608,6 @@ Extension
 - tower: https://tower-rs.github.io/tower/
 - Ratatui: https://ratatui.rs/
 - crossterm: https://docs.rs/crossterm/
-- rusqlite: https://docs.rs/rusqlite/
 - SQLx: https://sqlx.dev/
 - tree-sitter: https://tree-sitter.github.io/tree-sitter/
-- Tantivy: https://tantivy-search.github.io/
-- Wasmtime: https://docs.wasmtime.dev/
 - Model Context Protocol: https://modelcontextprotocol.io/
