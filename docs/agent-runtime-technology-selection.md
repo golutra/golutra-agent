@@ -11,7 +11,7 @@
 - 工具、权限、状态、恢复、预算、trace 和 verification 应集中在 runtime。
 - 选型优先满足可恢复、可治理、可验证、可演化，而不是短期拼装速度。
 - 主线采用 `cg` 式 Rust native runtime：核心执行、TUI、状态、沙箱、观测和 provider adapter 统一在 Rust 内治理。
-- 其他项目只吸收能力，不改变 Rust-first 主线：Kimi Code 的 wire/state/vis、OpenCode 的事件化 session/API、多端共享核心、Pi 的 harness/provider 分层、Claude Code Best 的终端体验、Hermes Agent 的 SQLite/FTS5 和插件 provider。
+- 其他项目只吸收能力，不改变 Rust-first 主线：Kimi Code 的 wire/state/vis、OpenCode 的事件化 session/API、多端共享核心、Pi 的 harness/provider 分层、Claude Code Best 的终端体验、Hermes Agent 的 SQLite 和插件 provider。
 - 第一阶段按 coding agent 收敛，不按通用 agent 平台做全入口同优先级铺开。
 
 ## 总体推荐
@@ -127,7 +127,7 @@ sdk/python
 | `golutra-context` | ContextBuilder、TokenBudgetTracker、WorkingSummary、CompactManager、history 分层、context projection |
 | `golutra-tools` | ToolSchema、ToolAccesses、tool registry、schema validation、tool execution、ToolResultEnvelope |
 | `golutra-policy` | PermissionPolicy、`allow/ask/deny`、workspace isolation、路径/网络/命令策略 |
-| `golutra-store` | SQLite state、durable event log、artifact store、FTS5、migration |
+| `golutra-store` | SQLite state、durable event log、artifact store、migration |
 | `golutra-memory` | MemoryRetriever、MemoryGovernance、项目索引、代码片段召回、memory promotion/rollback |
 | `golutra-llm` | ProviderConfig、ModelCatalog、CapabilityMatrix、ModelRouteDecision、adapter、usage 解析 |
 | `golutra-verify` | verification runner、PASS/FAIL/PARTIAL、证据记录 |
@@ -271,10 +271,10 @@ schema validation -> pre hook -> permission -> sandbox -> execute -> post hook -
 
 | 能力 | 推荐库 | 用法 |
 | --- | --- | --- |
-| HTTP client | `reqwest` | OpenAI/Anthropic/OpenAI-compatible provider 调用 |
-| Streaming | `tokio` + `reqwest` stream | token 流、tool call 流、usage 事件 |
+| HTTP client | `reqwest` | runtime 自有 HTTP 能力、测试和非 provider 网络调用 |
+| Streaming | `tokio` | LLM stream、tool task、background task |
 | Provider abstraction | 自研 trait | 不把 runtime 绑死到某个 vendor SDK |
-| 多 provider 加速接入 | `genai` | 作为 `GenaiProviderAdapter` 使用，不进入核心协议 |
+| LLM provider 调用 | `genai` | 长期唯一默认 provider adapter，底层协议差异交给 `genai` |
 
 建议核心用 provider abstraction：
 
@@ -286,27 +286,31 @@ trait LlmProvider {
 
 原因：
 
-- OpenAI-compatible provider 很多，字段和错误形态不完全一致。
-- 不同模型对 tool call、usage、reasoning token 的返回差异很大。
-- provider SDK 可以做 adapter，但不要进入 runtime core。
+- provider 调用需要方便接入多家模型，第一阶段不维护多套 provider 协议实现。
+- 不同模型对 tool call、usage、reasoning token 的返回差异很大，必须在 Golutra contract 层归一化。
+- `genai` 可以作为 provider 调用层，但不要让它的类型进入 runtime core。
 
 Provider 层不直接照搬某个项目：
 
-- 采用 `cg` 的 Responses-first / OpenAI-compatible 统一性，保证主链路简单。
-- 吸收 Pi 的 provider registry，保证 adapter 可插拔。
-- 吸收 OpenCode 的 provider 覆盖意识，但不把 AI SDK 作为 Rust core 依赖。
+- 吸收 Maka 的分层方式：底层用统一 provider runtime，上层用自己的 contract 反腐归一化。
+- 吸收 OpenCode 的 provider 覆盖意识，但不把 AI SDK 或第三方 SDK 类型作为 Rust core 依赖。
+- 吸收 Pi 的 provider contract 思路，但不采用 Pi 式多协议自研矩阵。
 - 吸收 Hermes Agent 的 plugin discovery，但插件必须经过 capability matrix 和 policy gate。
-- 吸收 Claude Code Best 对 Anthropic 能力的深集成经验，但不能让 runtime 绑定单一 provider。
+- 吸收 Claude Code Best 对 provider 深能力的经验，但第一阶段不为单一 provider 单独维护 native adapter。
 
-`genai` 的定位是接入加速器，不是 Golutra 的核心 Provider 协议。推荐采用一层反腐适配：
+`genai` 的定位是 Golutra 长期默认 LLM provider adapter，不是 Golutra 的核心 Provider 协议。推荐采用一层反腐适配：
 
 ```text
 Golutra ProviderContract
-  -> GenaiProviderAdapter
+ -> GenaiProviderAdapter
        -> genai::Client
 ```
 
-这样可以先获得 `genai` 对 OpenAI、OpenAI Responses、Anthropic、Gemini、Ollama、OpenRouter、Groq、DeepSeek、xAI、Bedrock、Vertex、Moonshot、Aliyun 等 provider 的覆盖，同时保留 Golutra 自己的 request、stream event、tool call、usage、error、capability 和 telemetry 标准。
+这样可以获得 `genai` 对 OpenAI、OpenAI Responses、Anthropic、Gemini、Ollama、OpenRouter、Groq、DeepSeek、xAI、Bedrock、Vertex、Moonshot、Aliyun 等 provider 的覆盖，同时保留 Golutra 自己的 request、stream event、tool call、usage、error、capability 和 telemetry 标准。
+
+Golutra 不规划并行维护 `OpenAICompatibleAdapter`、`AnthropicNativeAdapter`、`AisdkProviderAdapter` 或其他 provider native adapter。各家模型协议差异统一交给 `genai` 处理；如果某个 provider 暂时不满足需求，优先通过 `genai` 支持的配置、OpenAI-compatible endpoint、上游 issue 或 PR 解决，而不是在 Golutra 内新增协议分叉。
+
+`genai` 只对应 Maka / Vercel AI SDK 的 provider client 层，不承担完整 `streamText` / tool loop / UI stream / agent framework 职责。Golutra 的 agent loop、tool execution、permission、verification、fallback、replay 和 UI projection 仍由 runtime 自己掌控。
 
 不建议让 runtime core 直接使用 `genai` 的请求/响应或其内部事件作为核心数据模型。`GenaiProviderAdapter` 必须完成：
 
@@ -345,7 +349,7 @@ provider_quirks
 | --- | --- | --- |
 | 主存储 | SQLite + `sqlx` | 用于 session/thread metadata、message index、tool call index、permission、verification、artifact index |
 | 事件轨迹 | append-only event log / JSONL | 用于 raw turn event、model envelope、tool summary、replay timeline、benchmark fixture |
-| 全文检索 | SQLite FTS5 | 用于跨会话搜索、历史浏览、证据和 artifact 检索 |
+| 全文检索 | `rg` | 用于跨会话文件内容搜索、历史浏览、证据和 artifact 定位 |
 | 轻量 KV | `redb` | 可选，用于 cache 或小型本地索引 |
 | migration | `refinery` 或自研 SQL migration | 保持 store 可升级 |
 
@@ -355,7 +359,7 @@ provider_quirks
 
 - SQLite 适合查询、索引、跨会话检索、权限审计和 UI 列表。
 - append-only event log 适合 replay、benchmark、trace diff 和失败复现。
-- FTS5 可以吸收 Hermes Agent 的跨会话搜索优势，但不需要把核心 runtime 改成 Python 平台。
+- 可吸收 Hermes Agent 的跨会话搜索目标，但第一阶段不引入额外全文索引层。
 - Kimi Code 的 `wire/state` 分离说明，运行轨迹和当前状态必须分开保存。
 
 对于 coding agent，建议 task 级查询和回放优先：
@@ -373,7 +377,7 @@ provider_quirks
 
 | 能力 | 推荐库 | 用法 |
 | --- | --- | --- |
-| 全文检索 | SQLite FTS5 | 本地 docs/code/memory 搜索 |
+| 全文检索 | `rg` | 本地 docs/code/memory 搜索 |
 | 代码解析 | `tree-sitter` | 代码符号、函数范围、片段召回 |
 | 文件遍历 | `ignore` | 遵守 `.gitignore`，避免扫无关目录 |
 | glob 匹配 | `globset` | workspace policy、工具路径匹配 |
@@ -493,7 +497,7 @@ ignore / globset / camino
 ratatui / crossterm
 axum
 SQLite
-SQLite FTS5
+rg
 tree-sitter
 rmcp
 genai
@@ -523,7 +527,7 @@ Entry
   clap CLI / ratatui TUI / axum App Server / SDK
 
 Storage
-  SQLite metadata + FTS5 + event log + artifact store + migration
+  SQLite metadata + rg + event log + artifact store + migration
 
 Provider
   ProviderContract + Capability Matrix + Routing Policy + adapters
@@ -579,7 +583,7 @@ Extension
 工程落地以 `implementation-blueprint.md` 的第一阶段为准。下面是技术模块顺序：
 
 1. 建 `golutra-core`：定义 Message、SessionState、GoalState、LoopGuard、LoopDecision、TaskRecord、ArtifactRef、DecisionRecord、EvidenceRecord。
-2. 建 `golutra-store`：SQLite metadata、event log、artifact store、migration、FTS5。
+2. 建 `golutra-store`：SQLite metadata、event log、artifact store、migration。
 3. 建 `golutra-event`：ProviderRawEvent、RuntimeEvent、UiSdkEvent，明确 durable 与 live-only。
 4. 建 `golutra-llm`：ProviderConfig、ModelCatalog、CapabilityMatrix、GenaiProviderAdapter、ModelRouteDecision、FallbackPolicy。
 5. 建 `golutra-tools`：ToolSchema、ToolAccesses、ToolResultEnvelope、tool registry。
@@ -597,6 +601,58 @@ Extension
 17. 建 `golutra-vis`：离线 replay、event/wire/context/artifact 检查。
 18. 建 `golutra-eval`：eval_runner、trajectory_recorder、deep post_task_reviewer、vcr/golden fixture。
 19. 建 memory index、MCP ToolEntry bridge、plugin capability package、TypeScript/Python SDK 和 Web/IDE 集成。
+
+## 结合 Codex 的实施加权
+
+在上面的顺序基础上，再加一个现实优先级判断。Codex 的工程经验说明，下面这些模块不是“可有可无的补充”，而是 runtime-first 多前端系统真正落地的骨架：
+
+### 第一优先级
+
+1. `golutra-protocol`
+2. `golutra-client`
+3. `golutra-app-server`
+4. `golutra-test-client`
+
+原因：
+
+- 没有协议、client、app-server、test-client，多前端一致性就只是文档承诺。
+- 这四层是 `RuntimeCore` 向外提供统一能力的基础设施。
+
+### 第二优先级
+
+1. `golutra-store`
+2. `golutra-event`
+3. `golutra-file-search`
+4. `golutra-policy`
+
+原因：
+
+- store/event/search/policy 决定 coding agent 能否长期运行、恢复、定位和受控执行。
+- 搜索应独立成模块，不要散在 TUI、CLI 或 memory 里。
+
+### 第三优先级
+
+1. `golutra-otel`
+2. `golutra-vis`
+3. `golutra-eval`
+
+原因：
+
+- 这三层决定系统是否真正可调试、可回放、可评估。
+- 没有它们，观测体系很容易停留在字段定义层。
+
+## 需要显式新增的模块
+
+结合 Codex 的实际工程结构，建议把下列模块从“隐含能力”升级为文档中的显式模块：
+
+- `golutra-file-search`：独立承载 rg 搜索、ignore/glob 规则、snippet 和 tree-sitter 结构切片。
+- `golutra-daemon`：作为 `RuntimeHost` 的一种承载方式，不新增语义，只提供远程 attach / query / subscribe。
+- `golutra-sandbox-*`：按平台分层实现 Linux / macOS / Windows 的实际 sandbox 边界。
+
+约束：
+
+- 这些模块增加的是工程承载能力，不增加新的 runtime 语义模型。
+- 不允许因为模块变多而重新长出第二套任务状态机或第二套事件协议。
 
 ## 参考链接
 

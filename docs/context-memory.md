@@ -178,7 +178,7 @@ confidence
 reason
 ```
 
-优先使用 SQLite FTS5、tantivy、tree-sitter 和结构化索引。向量检索可以作为增强，但不能成为恢复、审计、replay 和 benchmark 的基础依赖。
+第一阶段优先使用 SQLite、rg、tree-sitter 和结构化索引。向量检索可以作为增强，但不能成为恢复、审计、replay 和 benchmark 的基础依赖。
 
 ### MemoryGovernance
 

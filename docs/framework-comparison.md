@@ -15,7 +15,8 @@
 | Pi | harness/provider 分层、compaction、session tree | 吸收 loop hook、compact boundary、provider registry |
 | Kimi Code | wire/state 分离、context projection、vis/replay | 吸收 durable event、context projector、issue detector |
 | Claude Code Best | 终端交互、权限体验、fallback、auto compact | 吸收交互密度、阈值熔断、fallback 一致性 |
-| Hermes Agent | SQLite/FTS5、memory provider、多入口、插件 provider | 吸收 memory governance 和长期运行经验 |
+| Hermes Agent | SQLite、memory provider、多入口、插件 provider | 吸收 memory governance 和长期运行经验 |
+| Codex | protocol/app-server/client/daemon/test-client、state/thread-store/rollout、sandbox/otel/file-search | 吸收协议工程化、多入口访问层、状态分层、搜索模块和安全边界 |
 
 Golutra 的最佳路线不是照搬任一项目，而是：
 
@@ -28,6 +29,109 @@ Rust Runtime Kernel
 + ContextBuilder / CompactManager / MemoryGovernance
 + Verification / Replay / PostTaskReview
 ```
+
+## Codex 的工程骨架影响
+
+Codex 最值得吸收的不是某个单库，而是一组已经被工程化验证过的骨架：
+
+### 1. 协议独立化
+
+吸收点：
+
+- 独立 `golutra-protocol`
+- 独立 schema 产物
+- TypeScript 类型生成
+- 协议 fixture
+
+影响：
+
+- runtime、app-server、SDK、TUI 不再各自解释事件语义
+- 多前端一致性从设计原则变成可测试契约
+
+### 2. app-server 全家桶
+
+吸收点：
+
+- `golutra-app-server`
+- `golutra-client`
+- daemon 形态
+- transport 层和 test client
+
+影响：
+
+- “一个 runtime，多入口访问”能真正落地
+- CLI / TUI / Web / SDK 不再演变成多套接口
+
+### 3. 状态分层
+
+吸收点：
+
+- `state`
+- `thread-store`
+- `rollout`
+
+影响：
+
+- SQLite 负责状态和元数据
+- event / rollout 负责可回放轨迹
+- thread/session 视图不再和底层存储耦死在一起
+
+### 4. 搜索独立模块
+
+吸收点：
+
+- 独立 `golutra-file-search`
+- SQLite 元数据检索
+- rg 文件内容搜索
+- tree-sitter 结构切片
+
+影响：
+
+- 搜索能力不再散落在 TUI、CLI 或 memory 模块里
+- 第一阶段就能形成稳定的本地检索骨架
+
+### 5. 安全边界模块化
+
+吸收点：
+
+- sandbox
+- execpolicy
+- process hardening
+
+影响：
+
+- coding agent 的工具执行、命令权限和进程边界更容易单独演进
+- 这部分不再只是 policy 文档，而是具体模块责任
+
+### 6. 观测导出层
+
+吸收点：
+
+- `golutra-otel`
+- tracing 查询出口
+- debug context / replay 访问层
+
+影响：
+
+- 观测链路不会只停留在 schema 定义
+- 后续接 OpenTelemetry 或外部评测平台时更自然
+
+## Codex 吸收优先级
+
+优先吸收：
+
+1. protocol / schema / TS type generation
+2. app-server / client / daemon / test-client
+3. state / thread-store / rollout
+4. file-search
+5. sandbox / execpolicy / process hardening
+6. otel / replay export
+
+不建议照搬：
+
+- 重 TUI 依赖面
+- 让 CLI 变成系统总调度中心
+- 一开始复制 Codex 那种大规模 provider 自研矩阵
 
 ## 评测平台借鉴
 
@@ -78,12 +182,11 @@ RuntimeEvent -> UiState projection
 
 ```text
 Golutra ProviderContract
-  -> NativeAdapter
   -> GenaiProviderAdapter
-  -> OpenAICompatibleAdapter
+       -> genai::Client
 ```
 
-`rust-genai` 可作为 adapter 加速覆盖多 provider，但不进入核心数据模型。
+`rust-genai` 是 Golutra 长期唯一默认 LLM provider adapter，用来覆盖多 provider，但不进入核心数据模型。
 
 必须保留：
 
@@ -95,8 +198,8 @@ Golutra ProviderContract
 
 原因：
 
-- native adapter 承载 OpenAI Responses、Anthropic thinking/cache、Gemini multimodal 等深能力。
-- genai adapter 负责快速接入常见 provider。
+- genai adapter 负责接入 OpenAI、Anthropic、Gemini、Ollama、OpenRouter、DeepSeek 等常见 provider。
+- Golutra 不规划 OpenAI / Anthropic / Gemini 等 provider native adapter，避免第一阶段和长期架构变成多协议维护矩阵。
 - fallback 需要 loop 层掌握上下文一致性，不能由 adapter 私自处理。
 
 ## Storage 选型
@@ -107,7 +210,7 @@ Golutra ProviderContract
 SQLite state
 Durable event log
 Artifact store
-FTS5 / tantivy
+rg-backed content search
 State snapshot
 Replay timeline
 ```
@@ -117,7 +220,7 @@ Replay timeline
 - SQLite 适合本地状态、索引、权限审计、session 列表。
 - event log 适合 replay、benchmark、trace diff 和失败复现。
 - artifact store 适合保存大工具输出、diff、raw logs。
-- FTS5/tantivy 适合可解释检索，优先级高于外部向量数据库。
+- 第一阶段优先采用 SQLite 元数据检索 + rg 文件内容搜索，优先级高于外部向量数据库。
 
 ## Context / Memory 选型
 

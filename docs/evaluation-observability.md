@@ -107,6 +107,193 @@ DecisionEvaluation
 
 这些数据来自 runtime、provider、tool、policy、verification、user approval 和 post-task review，而不是事后从聊天文本里猜。
 
+## Evaluation 分层模型
+
+Evaluation 不能只理解成“任务结束后打分”。在 Golutra 里，它分成五层，分别服务不同时间点和不同成本等级：
+
+| 层级 | 运行时机 | 解决的问题 | 默认成本 |
+| --- | --- | --- | --- |
+| Runtime Verification | 同步运行 | 当前任务能否声明完成 | 低 |
+| Trajectory Evaluation | 后台或按需 | 执行过程是否有效、是否漂移、是否浪费 | 中 |
+| Evaluation Case / Dataset | 离线沉淀 | 哪些真实任务可以复现、回归和比较 | 中 |
+| Regression / Benchmark | 离线运行 | 某个改动是否真的变好、是否引入回归 | 中到高 |
+| Meta Evaluation | 离线审计 | 评估器、judge、benchmark 是否可靠 | 中到高 |
+
+分层原则：
+
+- 普通任务只同步执行 `Runtime Verification` 和 minimal `PostTaskReview`。
+- `Trajectory Evaluation` 默认不阻塞用户返回，只在失败、高风险、用户纠正或 debug/audit 模式下展开。
+- `Evaluation Case` 从真实 trajectory、benchmark 样本和人工构造用例中沉淀。
+- `Regression / Benchmark` 只用于比较版本、provider、prompt、tool schema、policy 和 context 规则。
+- `Meta Evaluation` 用于防止过拟合、答案泄漏、judge 偏置和 harness 变厚造成的虚假提升。
+
+这套分层的核心目标是：
+
+```text
+让 evaluation 成为改进 agent 的事实系统，
+而不是把每个用户任务都变成昂贵评测。
+```
+
+## Evaluation Core Model
+
+Golutra 的评估系统应围绕以下对象收敛：
+
+```text
+RuntimeEvent / ArtifactRecord / EvidenceRecord / VerificationRecord
+-> TrajectoryReplay
+-> EvaluationCase
+-> EvaluationRun
+-> Scorer
+-> EvaluationResult
+-> RegressionResult
+-> PromotionDecision
+```
+
+### TrajectoryReplay
+
+用于复现一次历史任务，不重新从聊天文本猜测输入。
+
+```text
+TrajectoryReplay
+  replay_id
+  source_task_id
+  event_refs
+  artifact_refs
+  context_projection_refs
+  provider_fixture_refs
+  tool_fixture_refs
+  replay_mode: exact | simulated_provider | live_provider
+  determinism_level
+  limitations
+```
+
+要求：
+
+- 能定位当时的 event、artifact、context projection 和 verification。
+- provider 和 tool 可以用 fixture 回放，也可以在隔离环境中 live replay。
+- replay 结果必须声明确定性边界，不能把不可复现结果当稳定证据。
+
+### EvaluationCase
+
+用于把真实任务、失败轨迹或 benchmark 样本变成可重复评估的 case。
+
+```text
+EvaluationCase
+  case_id
+  source: live_task | benchmark | regression | adversarial | manual
+  task_type
+  input_refs
+  expected_outcome
+  success_criteria
+  required_evidence
+  policy_constraints
+  fixture_refs
+  leakage_risk
+  tags
+```
+
+要求：
+
+- 每个 case 必须有成功标准和所需证据，不能只有自然语言描述。
+- 从真实任务晋升为 case 时，要保留来源 task、失败分类和 artifact/evidence 引用。
+- 高风险 case 要标记数据泄漏、隐私、外部副作用和 judge 风险。
+
+### EvaluationRun
+
+用于记录某个系统版本、provider 路由、prompt/context/tool/policy 组合在一批 case 上的结果。
+
+```text
+EvaluationRun
+  run_id
+  dataset_id
+  case_ids
+  system_version
+  candidate_ref
+  provider_config_ref
+  runtime_config_ref
+  started_at
+  completed_at
+  cost
+  latency
+  artifact_refs
+  result_refs
+```
+
+要求：
+
+- 必须能对比 baseline 和 candidate。
+- 必须记录 system version、provider config、runtime config、tool budget、attempt count、cost 和 latency。
+- run 的输入来自 `EvaluationCase`，输出进入 `EvaluationResult`，不能直接用一段总结替代。
+
+### Scorer
+
+Scorer 是可替换的评分器，不等于 LLM judge。
+
+```text
+Scorer
+  scorer_id
+  kind: command | rule | unit_test | snapshot | human | llm_judge | composite
+  input_contract
+  output_contract
+  evidence_requirements
+  confidence_policy
+  known_biases
+```
+
+推荐优先级：
+
+1. 客观命令：test、lint、typecheck、build、exit code。
+2. 规则检查：diff、文件存在、schema、artifact checksum、policy。
+3. snapshot / golden：协议、工具输出、projection、trace。
+4. 人审：高风险、开放性强或 judge 不稳定的 case。
+5. LLM judge：只作为辅助，不能成为高风险结论的唯一来源。
+
+### EvaluationResult
+
+```text
+EvaluationResult
+  run_id
+  case_id
+  scorer_results
+  verdict: pass | fail | partial | unknown
+  quality_score
+  cost
+  latency
+  failure_taxonomy
+  evidence_refs
+  judge_reliability
+  residual_risks
+```
+
+要求：
+
+- 结论必须绑定 evidence。
+- `unknown` 是合法结果，不能强行归为 pass/fail。
+- 需要同时记录质量、成本、延迟和失败分类，避免只优化单一分数。
+
+### MetaEvaluation
+
+用于评估 evaluation 本身是否可靠。
+
+```text
+MetaEvaluation
+  target_run_id
+  leakage_checks
+  judge_checks
+  harness_checks
+  scorer_disagreement
+  overfitting_signals
+  verdict: reliable | risky | invalid
+```
+
+检查重点：
+
+- benchmark 答案是否泄漏到 prompt、artifact、memory 或检索层。
+- LLM judge 是否被格式诱导，是否缺少 evidence。
+- harness / scaffold 是否变厚，导致分数提升不可比较。
+- scorer 之间是否严重分歧。
+- candidate 是否只对公开 benchmark 变好，对 shadow / regression set 退化。
+
 ## Planning Drift 观测链路
 
 Planning Drift 的核心问题是：任务在执行过程中看起来每一步都合理，但整体逐渐偏离原始目标。这是后续治理增强要重点解决的问题，不是第一阶段的强制同步能力。

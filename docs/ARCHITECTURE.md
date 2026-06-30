@@ -145,7 +145,7 @@ Golutra 当前主场景是 coding agent，不按通用 agent 平台做第一阶�
 SQLite state
 Durable event log
 Artifact store
-FTS5 / tantivy index
+rg-backed content search
 State snapshot
 Replay timeline
 ```
@@ -188,9 +188,12 @@ MemoryGovernance
 
 专题文档分工：
 
-- `evaluation-observability.md`：观测、验证、复盘、benchmark。
+- `evaluation-observability.md`：观测、验证、复盘、EvaluationCase / EvaluationRun / Scorer / benchmark。
 - `agent-improvement-loop.md`：失败轨迹如何变成可验证、可回滚的 agent 改进。
 - `agent-open-endedness-design.md`：开放式能力、技能晋升和 Promotion Gate。
+- `runtime-contracts.md`：tool/provider/terminal/cancel/retry/fallback 的硬契约。
+- `artifact-evidence-ledger.md`：artifact 与 evidence 的事实层。
+- `benchmark-hardening.md`：benchmark 元数据、judge 风险和防跑分规则。
 
 ## 完整链路
 
@@ -226,7 +229,7 @@ MemoryGovernance
 | `golutra-governor` | 后续治理增强：GoalLedger、RuntimeGovernor、GovernanceDecision |
 | `golutra-policy` | PermissionPolicy、PolicyEvaluation、workspace isolation |
 | `golutra-verify` | verification runner、PASS/FAIL/PARTIAL、证据记录 |
-| `golutra-eval` | eval runner、replay、benchmark、post-task review |
+| `golutra-eval` | EvaluationCase、EvaluationRun、Scorer、TrajectoryReplay、benchmark、regression |
 | `golutra-tui` | 只展示 runtime projection 的 TUI |
 | `golutra-cli` | 薄 CLI 入口 |
 | `golutra-app-server` | HTTP/WebSocket/SSE 入口 |
@@ -315,7 +318,7 @@ Evaluation / Improvement 模式使用 `Evaluation / Improvement Projection`：
 - Replay
 - Debug Mode
 - MemoryGovernance
-- Evaluation Harness
+- Evaluation Harness / EvaluationCase / Regression
 
 高级演进：
 
@@ -341,6 +344,9 @@ Evaluation / Improvement 模式使用 `Evaluation / Improvement Projection`：
 ## 关联文档
 
 - `agent-runtime-technology-selection.md`：语言、crate、workspace 和库选型。
+- `runtime-contracts.md`：runtime 硬契约。
+- `artifact-evidence-ledger.md`：artifact / evidence 事实层规格。
+- `benchmark-hardening.md`：benchmark 防污染与元数据规范。
 - `context-memory.md`：token、context、compact、memory 规格。
 - `evaluation-observability.md`：观测、验证、复盘、benchmark 规格。
 - `agent-improvement-loop.md`：失败轨迹如何变成可验证、可回滚的 agent 改进。

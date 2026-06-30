@@ -40,6 +40,9 @@ VerificationRecord
 LoopDecision
 UserProjection
 DebugProjection
+EvaluationCase
+EvaluationRun
+EvaluationResult
 ```
 
 暂不作为第一阶段核心：
@@ -59,6 +62,7 @@ Plugin Marketplace
 ```
 
 第一阶段只生成 `ImprovementCandidate`，不自动应用改动。
+`EvaluationCase`、`EvaluationRun` 和 `EvaluationResult` 第一阶段只作为离线评估的最小数据模型，不进入普通用户任务同步链路。
 
 ## 第一阶段吸收的架构启示
 
@@ -306,6 +310,56 @@ PostTaskReview
   promotion_candidates
 ```
 
+### EvaluationCase
+
+```text
+EvaluationCase
+  case_id
+  source: live_task | benchmark | regression | adversarial | manual
+  task_type
+  input_refs
+  expected_outcome
+  success_criteria
+  required_evidence
+  policy_constraints
+  fixture_refs
+  leakage_risk
+  tags
+```
+
+### EvaluationRun
+
+```text
+EvaluationRun
+  run_id
+  dataset_id
+  case_ids
+  system_version
+  candidate_ref
+  provider_config_ref
+  runtime_config_ref
+  cost
+  latency
+  artifact_refs
+  result_refs
+```
+
+### EvaluationResult
+
+```text
+EvaluationResult
+  run_id
+  case_id
+  scorer_results
+  verdict: pass | fail | partial | unknown
+  quality_score
+  cost
+  latency
+  failure_taxonomy
+  evidence_refs
+  residual_risks
+```
+
 ### CompactionRecord
 
 ```text
@@ -477,6 +531,7 @@ coding agent 第一阶段默认采用强客观验证：
 - memory / policy / skill / benchmark 候选生成。
 - provider routing 质量分析。
 - ImprovementCandidate 生成。
+- 从失败或高价值 trajectory 生成 EvaluationCase 候选。
 
 ### 离线运行
 
@@ -484,6 +539,7 @@ coding agent 第一阶段默认采用强客观验证：
 
 - replay_runner。
 - vcr / golden fixture。
+- EvaluationCase / EvaluationRun / EvaluationResult。
 - regression suite。
 - dynamic benchmark promotion。
 - open-ended task generation。
