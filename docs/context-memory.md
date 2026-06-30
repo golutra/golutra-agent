@@ -4,6 +4,12 @@
 
 本文档定义 Golutra 的上下文、token 压缩和长期记忆治理。主架构见 `ARCHITECTURE.md`。
 
+阶段边界说明：
+
+- 本文档描述的是目标态的 Context & Memory 设计。
+- 第一阶段以 [implementation-blueprint.md](/Users/skyseek/Desktop/project/open/golutra-agent/golutra-agent/docs/implementation-blueprint.md) 为准，只默认实现 `WorkingSummary`、`CompactionRecord`、`MemoryCandidate` 和 `project-scoped retrieval`。
+- `user/global` 长期 memory 晋升、复杂 memory promotion 和重型检索策略属于后续增强，不是第一阶段必做。
+
 核心原则：
 
 ```text

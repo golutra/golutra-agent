@@ -4,6 +4,13 @@
 
 本文档定义 Golutra 如何从一次任务失败或低质量轨迹中产生可验证的 agent 改进。
 
+阶段边界说明：
+
+- 本文档描述的是完整改进闭环的目标态。
+- 第一阶段默认只做到 `deep PostTaskReview -> ImprovementCandidate -> 人工查看`。
+- `replay / regression / PromotionDecision` 是后续阶段重点。
+- “可自动晋升”是长期能力预留，不代表当前默认实现会自动 redeploy 或自动替换线上执行版本。
+
 核心原则：
 
 ```text

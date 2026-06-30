@@ -12,6 +12,7 @@
 - 选型优先满足可恢复、可治理、可验证、可演化，而不是短期拼装速度。
 - 主线采用 `cg` 式 Rust native runtime：核心执行、TUI、状态、沙箱、观测和 provider adapter 统一在 Rust 内治理。
 - 其他项目只吸收能力，不改变 Rust-first 主线：Kimi Code 的 wire/state/vis、OpenCode 的事件化 session/API、多端共享核心、Pi 的 harness/provider 分层、Claude Code Best 的终端体验、Hermes Agent 的 SQLite/FTS5 和插件 provider。
+- 第一阶段按 coding agent 收敛，不按通用 agent 平台做全入口同优先级铺开。
 
 ## 总体推荐
 
@@ -42,6 +43,26 @@ Rust Runtime Kernel
   + provider contract + capability matrix
   + sandbox / permission / policy / workspace isolation
 ```
+
+推荐补充一个稳定的访问层收敛模型：
+
+```text
+Frontend
+  -> Frontend SDK
+  -> RuntimeClient
+  -> Transport Adapter
+  -> RuntimeHost
+  -> RuntimeCore
+```
+
+这里的关键不是多做几套 API，而是把不同入口都压到同一套 runtime 语义上。
+
+第一阶段推荐优先级：
+
+- `CLI + TUI + InProcessTransport`
+- `app-server + HttpSseTransport`
+- `SDK / Web attach`
+- `IDE attach`
 
 不建议：
 
@@ -107,6 +128,7 @@ sdk/python
 | `golutra-verify` | verification runner、PASS/FAIL/PARTIAL、证据记录 |
 | `golutra-eval` | eval_runner、trajectory_recorder、post_task_reviewer、vcr/golden fixture |
 | `golutra-otel` | tracing、metrics、event export/import |
+| `golutra-client` | `RuntimeClient`、`RuntimeQuery`、event subscription、transport abstraction |
 | `golutra-cli` | 薄 CLI 入口 |
 | `golutra-tui` | TUI 入口，只展示 runtime projection，支持 normal/debug panel |
 | `golutra-vis` | 离线 replay、wire/event/context/blob 检查和审计视图 |
@@ -132,8 +154,47 @@ Governance
 - `golutra-memory` 只负责可解释召回和长期 memory 晋升治理，不直接改写当前任务状态。
 - `golutra-store` 保存 raw event、artifact 和 projection，避免 UI、provider adapter 或 tool 层维护自己的任务真相。
 - `golutra-eval` 和 `golutra-verify` 基于 durable event/replay 做验证，不另建一套不可回放的评估输入。
+- `golutra-client` 只暴露统一 runtime 语义，不携带前端私有状态机。
 
 判断一个新能力是否进入主架构时，必须回答：它产生什么 runtime fact、改变什么 state projection、是否影响 context projection、是否参与 LoopDecision 或 PromotionGate。如果回答不清楚，就先作为插件或实验能力，不进入核心。
+
+## RuntimeClient 与 Transport
+
+Golutra 不应为 TUI、Web、IDE、SDK、API 各做一套独立接口。更合理的是保留一套统一客户端语义：
+
+```text
+RuntimeCommand
+RuntimeQuery
+RuntimeEvent Subscription
+```
+
+Rust 内部可以收敛成类似下面的接口：
+
+```rust
+trait RuntimeClient {
+    async fn send_command(&self, command: SessionCommand) -> Result<CommandAck>;
+    async fn query(&self, query: RuntimeQuery) -> Result<QueryResult>;
+    async fn subscribe(&self, filter: EventFilter) -> Result<EventStream>;
+}
+```
+
+推荐 transport 分层：
+
+- `InProcessTransport`：TUI / CLI 第一阶段首选。和 `RuntimeCore` 同进程，最简单、最省资源。
+- `HttpSseTransport`：Web / SDK / daemon 模式第一阶段首选。HTTP 发 command 和 query，SSE 接 event stream。
+- `WebSocketTransport`：后续用于高频双向同步或远程协作，不作为第一阶段必做。
+- `IpcTransport`：后续用于 IDE companion、本地桌面端或侧车进程。
+
+关键判断：
+
+- transport 可以不同，但 `SessionCommand`、`RuntimeQuery`、`RuntimeEvent` 语义必须完全一致。
+- 一个 task 在 SDK 中运行时，TUI / Web attach 后应通过同一 client 语义查询到相同状态，并订阅到同一条流式输出。
+- daemon 只是 `RuntimeHost + HttpSseTransport` 的组合，不是新的任务接口体系。
+
+对于 coding agent，推荐再加两条默认约束：
+
+- 一个 `session` 同时只允许一个 `active task`，避免工具副作用和工作区状态冲突。
+- 多前端 attach 时默认采用 `one active controller + many observers`，而不是多 controller 并发写入。
 
 ## 核心库推荐
 
@@ -282,6 +343,12 @@ provider_quirks
 - append-only event log 适合 replay、benchmark、trace diff 和失败复现。
 - FTS5 可以吸收 Hermes Agent 的跨会话搜索优势，但不需要把核心 runtime 改成 Python 平台。
 - Kimi Code 的 `wire/state` 分离说明，运行轨迹和当前状态必须分开保存。
+
+对于 coding agent，建议 task 级查询和回放优先：
+
+- `query(task_id)` 优先于全文 transcript 重放。
+- `replay(task_id)` 优先于 session 级模糊恢复。
+- artifact 应重点保存 `diff`、测试结果、命令输出、诊断日志和关键工具原始输出。
 
 ### Memory 与代码理解
 
@@ -477,14 +544,15 @@ Extension
 6. 建 `golutra-policy`：PermissionPolicy、permission `allow/ask/deny`、workspace isolation、sandbox policy。
 7. 建 `golutra-runtime`：turn flow、LoopGuard、LoopDecision 生成、recorded events、resume、compact、replay、tool/model 回流。
 8. 建 `golutra-context`：working summary、history 分层、compact boundary、token budget。
-9. 建 `golutra-cli`：薄 CLI 命令面。
-10. 建 `golutra-verify`：验证结果结构化。
-11. 建 `golutra-tui`：`crossterm + ratatui + Golutra 业务组件`，支持 normal/debug panel。
-12. 建 `golutra-otel`：tracing、OTel adapter、debug/replay/audit 查询。
-13. 建 `golutra-vis`：离线 replay、event/wire/context/artifact 检查。
-14. 建 `golutra-eval`：eval_runner、trajectory_recorder、deep post_task_reviewer、vcr/golden fixture。
-15. 建 `golutra-app-server`：HTTP/WebSocket/SSE 入口，复用同一 runtime facts。
-16. 建 memory index、MCP ToolEntry bridge、plugin capability package、TypeScript/Python SDK 和 Web/IDE 集成。
+9. 建 `golutra-verify`：验证结果结构化。
+10. 建 `golutra-client`：`RuntimeClient`、`InProcessTransport`、query / subscribe 语义。
+11. 建 `golutra-cli`：薄 CLI 命令面。
+12. 建 `golutra-tui`：`crossterm + ratatui + Golutra 业务组件`，通过 `InProcessTransport` 访问 runtime。
+13. 建 `golutra-app-server`：HTTP/WebSocket/SSE 入口，先实现 `HttpSseTransport`，复用同一 runtime facts。
+14. 建 `golutra-otel`：tracing、OTel adapter、debug/replay/audit 查询。
+15. 建 `golutra-vis`：离线 replay、event/wire/context/artifact 检查。
+16. 建 `golutra-eval`：eval_runner、trajectory_recorder、deep post_task_reviewer、vcr/golden fixture。
+17. 建 memory index、MCP ToolEntry bridge、plugin capability package、TypeScript/Python SDK 和 Web/IDE 集成。
 
 ## 参考链接
 

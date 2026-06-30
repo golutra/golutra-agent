@@ -15,6 +15,14 @@
 
 第一阶段不追求完整开放式演进，也不追求复杂多 agent。目标是跑通单 agent、多入口、可恢复、可验证、可 debug 的核心 runtime。
 
+主场景默认按 coding agent 收敛：
+
+- `workspace -> session -> task -> turn`
+- 一个 `session` 同时只有一个 `active task`
+- 多前端可 attach 同一 `session/task`
+- 同时只有一个 `active controller`
+- 其他端默认 observer
+
 必须完成：
 
 ```text
@@ -22,6 +30,7 @@ SessionCommand
 RuntimeEvent
 StateProjection
 ContextProjection
+RuntimeQuery
 ProviderContract
 ToolContract
 ToolResultEnvelope
@@ -56,6 +65,7 @@ Plugin Marketplace
 第一阶段不新增复杂治理层，但必须吸收以下 runtime 硬边界：
 
 - `SessionCommand` 是 CLI / TUI / API / SDK 的唯一入口协议，入口层不能绕过 runtime 自建状态机。
+- `RuntimeQuery` 是查询当前 session / task 状态的统一接口；不同前端不能各自维护私有状态快照作为真相。
 - `ProviderContract` 是 provider 反腐层，统一 stream event、tool call、usage、finish_reason、error、rate limit 和 cost。
 - `ToolContract` 先于工具实现定义，明确 schema、错误、取消、重试、幂等、副作用和 artifact 策略。
 - `ArtifactRecord` / `EvidenceRecord` 是事实层，raw output 默认进 artifact，模型只读取受控摘要和 evidence refs。
@@ -96,6 +106,24 @@ ContextProjectionCache
 - `DebugProjection` 能展示 event、context、policy、verification。
 - `PostTaskReview` 能把疑似 drift / cost / context 问题归入失败分类。
 
+## Coding Agent 生命周期默认值
+
+如果用户没有额外指定，第一阶段按以下语义实现：
+
+- `workspace`：一个代码仓库或工作目录。
+- `session`：绑定某个 workspace 的长期上下文容器，允许累积多个历史 task。
+- `task`：一次明确用户请求，对应一次可 replay、可 verification、可 improvement 的执行轨迹。
+- `turn`：task 内的一步推进，例如一次模型调用、一次用户补充或一次恢复动作。
+- `resume` 默认恢复 `session`，并定位最近的 `active task` 或 latest task。
+- `replay`、`debug`、`evaluation` 以 `task_id` 为主，不以原始 transcript 为主。
+
+并发默认值：
+
+- 一个 `session` 同时只允许一个 `active task`。
+- 同一 workspace 可以存在多个 session，但第一阶段不鼓励共享同一个可写 working tree 并发执行。
+- 多前端 attach 到同一 task 时，共享同一 `StateProjection` 和 `RuntimeEvent` 流。
+- 新 prompt 只接受来自 `active controller`；其他前端默认只能观察，除非显式执行 `takeover`。
+
 ## 最小核心 Schema
 
 ### SessionCommand
@@ -125,6 +153,19 @@ RuntimeEvent
   source: runtime | provider | tool | policy | verifier | user
   payload_ref
   durable: true | false
+```
+
+### RuntimeQuery
+
+```text
+RuntimeQuery
+  query_id
+  session_id
+  task_id
+  kind: session_state | task_state | user_projection | debug_projection | replay_cursor
+  requester: user | api | tui | cli | sdk | web | ide
+  cursor
+  timestamp
 ```
 
 ### ProviderContract
@@ -358,6 +399,53 @@ PromotionDecision
 - UserProjection。
 - minimal PostTaskReview。
 
+### 多前端一致性边界
+
+第一阶段就要保证同一 workspace/session/task 在多个入口下看到的是同一份状态真相，而不是“看起来差不多”的近似结果。
+
+必须成立的规则：
+
+- `StateProjection` 是当前任务状态的唯一投影结果。
+- `RuntimeEvent` 是流式输出、工具进度、权限请求、完成状态的唯一事实来源。
+- TUI、Web、IDE、SDK 对同一 task 的实时展示，必须来自同一条 event stream 或同一份 projection 查询结果。
+- 一个前端发起 `approve`、`deny`、`abort`、`resume` 后，其他前端应通过后续 event 看到同一状态变化。
+- 前端本地缓存只能用于渲染加速，断线重连后必须能通过 `RuntimeQuery + RuntimeEvent` 恢复一致状态。
+
+第一阶段重点支持的场景：
+
+```text
+1. SDK 创建或驱动一个 task
+2. TUI attach 到同一个 session / task
+3. Web attach 到同一个 session / task
+4. 三端查询到同一个 task status、visible steps、approval state
+5. 三端订阅到同一条流式输出和工具进度
+```
+
+### Coding Agent 验证默认值
+
+coding agent 第一阶段默认采用强客观验证：
+
+- 代码修改任务至少需要 `diff` 和一类客观验证证据。
+- 客观验证证据优先来自 `test`、`lint`、`typecheck`、`build`、`command exit code`。
+- 如果没有足够 evidence，任务不能 `stop_success`。
+- 无法完成强验证时，只能输出 `stop_partial`、`blocked` 或 `stop_failed`。
+- 文档/调研型 task 可以允许较弱验证，但 coding task 不应退化为模型自述完成。
+
+### Coding Agent 记忆默认值
+
+第一阶段不做重型长期记忆，默认只做：
+
+- `WorkingSummary`
+- `CompactionRecord`
+- `MemoryCandidate`
+- `project-scoped retrieval`
+
+第一阶段不默认实现：
+
+- 自动晋升长期 memory
+- `user/global` 长期记忆写入
+- 向量记忆作为基础依赖
+
 ### 后台可跑
 
 这些能力可以在任务完成后后台运行，不应阻塞普通用户返回：
@@ -439,6 +527,7 @@ Debug Projection 只在 debug/audit/replay 模式启用。
 | 场景 | 必须验证 |
 | --- | --- |
 | 多入口请求 | CLI / TUI / API / SDK 都转成 `SessionCommand`，没有入口私有状态机 |
+| 多前端一致性 | 同一 `workspace/session/task` 在 SDK / TUI / Web 查询到相同状态，并能看到同一条运行中事件流 |
 | provider 正常流 | stream event、usage、finish_reason、tool call 映射进 `ProviderContract` |
 | provider 异常流 | truncated stream、malformed event、rate limit、network error 都有结构化错误 |
 | tool 成功 | `ToolContract` 校验通过，生成 `ToolResultEnvelope`、artifact refs 和 evidence refs |
@@ -454,14 +543,23 @@ Debug Projection 只在 debug/audit/replay 模式启用。
 1. `golutra-core`：核心 schema。
 2. `golutra-store`：SQLite、event log、artifact store。
 3. `golutra-event`：durable/live-only event。
-4. `golutra-llm`：provider contract、capability matrix、routing。
-5. `golutra-tools`：tool schema、permission、ToolResultEnvelope。
-6. `golutra-context`：ContextBuilder、TokenBudgetTracker、WorkingSummary。
-7. `golutra-runtime`：turn loop、LoopDecision、verification 调度。
+4. `golutra-runtime`：turn loop、LoopDecision、verification 调度。
+5. `golutra-context`：ContextBuilder、TokenBudgetTracker、WorkingSummary。
+6. `golutra-llm`：provider contract、capability matrix、routing。
+7. `golutra-tools`：tool schema、permission、ToolResultEnvelope。
 8. `golutra-verify`：任务类型基础验证策略。
-9. `golutra-cli` / `golutra-tui`：UserProjection 展示。
-10. `golutra-vis`：DebugProjection 和 replay 查询。
-11. `golutra-eval`：ImprovementCandidate、RegressionResult、PromotionDecision 的离线链路。
+9. `golutra-client`：统一 `RuntimeClient`、`RuntimeQuery` 和 event subscription 接口。
+10. `golutra-cli` / `golutra-tui`：先用 `InProcessTransport` 消费同一 runtime。
+11. `golutra-app-server`：暴露 `HttpSseTransport`，支持 Web / SDK attach、query、stream。
+12. `golutra-vis`：DebugProjection 和 replay 查询。
+13. `golutra-eval`：ImprovementCandidate、RegressionResult、PromotionDecision 的离线链路。
+
+入口优先级默认值：
+
+1. `CLI + TUI + InProcessTransport`
+2. `app-server + HttpSseTransport`
+3. `SDK + Web attach`
+4. `IDE attach`
 
 ## 通过标准
 

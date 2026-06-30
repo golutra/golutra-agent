@@ -58,6 +58,22 @@ GoalLedger
 
 这些能力属于后续治理增强，不是第一阶段同步链路的必做项。第一阶段只保留扩展位，避免过早引入额外判断、索引和模型评估成本。
 
+## 阶段分层
+
+为避免把目标态误读成第一阶段必做，Golutra 按三层理解：
+
+| 层级 | 说明 | 当前状态 |
+| --- | --- | --- |
+| 目标态 | 完整 Runtime OS，包含多投影、多入口、改进闭环、回放与治理增强 | 架构方向 |
+| 第一阶段 | coding agent 主场景下的单 agent、单 active task、强 verification、可 replay 核心 runtime | 当前实现目标 |
+| 后续增强 | GoalLedger、RuntimeGovernor、VerificationTier、EventSamplingPolicy、ContextProjectionCache、自动晋升等 | 后续演进 |
+
+阅读原则：
+
+- `ARCHITECTURE.md` 描述目标态与稳定边界。
+- `implementation-blueprint.md` 决定第一阶段真正要做什么。
+- 其他专题文档默认写目标态，但如果与第一阶段范围冲突，以 `implementation-blueprint.md` 为准。
+
 ## 主架构边界
 
 主架构只保留最稳定的骨架与边界，支持层和未来治理细节分别下沉到专题文档：
@@ -68,6 +84,42 @@ GoalLedger
 - `GoalLedger`、`RuntimeGovernor`、`VerificationTier`、`EventSamplingPolicy`、`ContextProjectionCache` 只作为后续治理增强入口，不进入第一阶段主链路。
 - 多入口只共享同一套 session protocol，入口层不能各自实现状态机。
 - 长期 memory 是受治理的 durable state，不是直接回灌完整历史。
+
+## Runtime-First 多前端边界
+
+Golutra 要支持的不是“多个前端各跑一套 agent”，而是“一个 runtime 被多个前端同时观察和驱动”。
+
+统一边界如下：
+
+- 同一 `workspace_id + session_id + task_id` 只能有一份 runtime 真相，来源是 `RuntimeEventLog + StateProjection`。
+- SDK、TUI、Web、IDE、API 只能通过统一协议访问 runtime，不能各自维护私有任务状态。
+- 一个前端提交 `SessionCommand` 后，其他已附着到同一 session/task 的前端应该看到同样的运行状态变化。
+- 流式输出也属于共享 runtime 事件；差异只允许出现在 projection 和渲染层，不允许出现在任务事实层。
+- daemon 不是额外的一套业务接口，只是 `RuntimeCore` 的一种 host / transport 承载方式。
+
+这意味着下面这种场景必须成立：
+
+```text
+SDK 正在执行某个 workspace 里的 task
+-> TUI attach 到同一个 session / task
+-> Web 也 attach 到同一个 session / task
+-> 三端看到同一个 running 状态、同一组工具进度、同一条流式输出
+-> 如果其中一端发起 approve / abort，其他端也能看到同一条状态变化
+```
+
+## Coding Agent 默认约束
+
+Golutra 当前主场景是 coding agent，不按通用 agent 平台做第一阶段收敛。默认约束如下：
+
+- 资源层级采用 `workspace -> session -> task -> turn`。
+- `workspace` 表示一个代码仓库或工作目录。
+- `session` 表示绑定某个 workspace 的长期工作会话，可承载多个历史 task。
+- `task` 表示一次明确的编码目标，例如修 bug、加功能、做重构。
+- `turn` 表示 task 执行过程中的单步交互或单次模型推进。
+- 一个 `session` 同时只允许一个 `active task`，避免文件、命令、测试和 git 状态互相污染。
+- 多前端可以 attach 到同一个 `session/task`，但同一时刻只允许一个 `active controller` 发起新的 prompt。
+- 其他已 attach 前端默认为 observer，只共享状态、流式输出和工具进度。
+- `approve`、`deny`、`abort`、`takeover` 这类控制动作必须写入 runtime event，不能走前端私有逻辑。
 
 ## 四个核心系统
 
@@ -179,6 +231,35 @@ MemoryGovernance
 | `golutra-cli` | 薄 CLI 入口 |
 | `golutra-app-server` | HTTP/WebSocket/SSE 入口 |
 | `golutra-vis` | replay、trace、context、artifact 审计视图 |
+
+## Host / Transport / Projection
+
+Golutra 的多前端支持要按三层收敛，而不是为每个入口各造一套接口：
+
+```text
+Frontend
+  -> Frontend SDK
+  -> RuntimeClient
+  -> Transport Adapter
+  -> RuntimeHost
+  -> RuntimeCore
+  -> RuntimeEvent / RuntimeQuery
+  -> Projection
+```
+
+各层职责：
+
+- `RuntimeCore`：唯一执行核心，负责 loop、provider、tool、policy、verification。
+- `RuntimeHost`：承载 `RuntimeCore`，管理 session 生命周期，对外暴露本地或远程访问方式。
+- `Transport Adapter`：把统一协议映射到进程内调用、HTTP + SSE、WebSocket 或 IPC。
+- `RuntimeClient`：前端统一客户端接口，屏蔽不同 transport。
+- `Projection`：把同一批 runtime facts 渲染成 User / Debug / Evaluation 等不同视图。
+
+核心约束：
+
+- 语义接口只有一套：`SessionCommand`、`RuntimeEvent`、`RuntimeQuery`。
+- transport 可以有多种，但不能改变任务语义。
+- 任意前端都只能消费统一 projection 或原始 runtime event，不能直接读取内部可变状态。
 
 ## 用户模式
 
