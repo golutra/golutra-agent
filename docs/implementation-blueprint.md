@@ -43,6 +43,12 @@ DebugProjection
 EvaluationCase
 EvaluationRun
 EvaluationResult
+TokenBudgetSnapshot
+TokenUsageRecord
+TokenAttribution
+CounterfactualReplay
+CausalComparison
+SecurityUtilityResult
 ```
 
 暂不作为第一阶段核心：
@@ -63,6 +69,7 @@ Plugin Marketplace
 
 第一阶段只生成 `ImprovementCandidate`，不自动应用改动。
 `EvaluationCase`、`EvaluationRun` 和 `EvaluationResult` 第一阶段只作为离线评估的最小数据模型，不进入普通用户任务同步链路。
+`CounterfactualReplay`、`CausalComparison` 和 `SecurityUtilityResult` 属于后续离线评估增强，第一阶段只保留 schema 方向，不阻塞 P0 runtime。
 
 ## 第一阶段吸收的架构启示
 
@@ -188,6 +195,68 @@ ProviderContract
   rate_limit_mapping
   cost_model
   capability_matrix_ref
+```
+
+### TokenBudgetSnapshot
+
+```text
+TokenBudgetSnapshot
+  task_id
+  turn_id
+  context_window
+  max_output
+  reserved_output_tokens
+  planned_input_tokens
+  planned_tool_tokens
+  planned_summary_tokens
+  budget_limit
+  budget_policy
+  action_if_exceeded: trim | compact | ask_user | block
+```
+
+### TokenUsageRecord
+
+```text
+TokenUsageRecord
+  task_id
+  turn_id
+  provider_id
+  model_id
+  request_event_id
+  response_event_id
+  input_tokens
+  output_tokens
+  reasoning_tokens
+  cached_input_tokens
+  tool_result_tokens
+  total_tokens
+  estimated_cost
+  budget_snapshot_ref
+  attribution_ref
+  usage_source: provider | estimated | unknown
+```
+
+`input_tokens` 包含 system prompt、developer/runtime instructions、policy constraints、user / assistant recent messages、context projection、working summary、memory、evidence summary、tool instructions 和 tool result excerpts 等所有进入 provider request 的模型可见内容。
+
+### TokenAttribution
+
+```text
+TokenAttribution
+  system_prompt_tokens
+  developer_instruction_tokens
+  runtime_context_tokens
+  policy_tokens
+  user_message_tokens
+  assistant_recent_tokens
+  working_summary_tokens
+  memory_tokens
+  evidence_tokens
+  tool_instruction_tokens
+  tool_result_excerpt_tokens
+  output_tokens
+  reasoning_tokens
+  cached_input_tokens
+  source: tokenizer | provider | mixed | unknown
 ```
 
 ### LoopDecision
@@ -360,6 +429,57 @@ EvaluationResult
   residual_risks
 ```
 
+### CounterfactualReplay
+
+```text
+CounterfactualReplay
+  replay_id
+  source_task_id
+  baseline_config_ref
+  variant_config_ref
+  changed_layer: context | memory | tool_policy | provider_route | prompt | verification | token_policy | security_policy
+  controlled_variables
+  replay_mode: fixture | sandbox_live
+  result_refs
+  limitations
+```
+
+### CausalComparison
+
+```text
+CausalComparison
+  comparison_id
+  baseline_run_id
+  variant_run_id
+  changed_layer
+  controlled_variables
+  delta_quality
+  delta_cost
+  delta_latency
+  delta_token_usage
+  delta_tool_calls
+  delta_security
+  regressions
+  confidence
+  verdict: improved | regressed | mixed | inconclusive
+```
+
+### SecurityUtilityResult
+
+```text
+SecurityUtilityResult
+  run_id
+  case_id
+  utility_score
+  security_score
+  policy_violations
+  data_exfiltration_risk
+  prompt_injection_signal
+  unsafe_tool_use
+  evidence_refs
+  verdict: pass | fail | needs_review
+```
+
 ### CompactionRecord
 
 ```text
@@ -444,7 +564,9 @@ PromotionDecision
 - RuntimeEvent 写入。
 - StateProjection 更新。
 - ContextProjection 构造。
+- TokenBudgetSnapshot 生成。
 - ProviderContract 映射。
+- TokenUsageRecord 写入。
 - ToolContract 校验。
 - ToolResultEnvelope 生成。
 - ArtifactRecord / EvidenceRecord 最小记录。
@@ -540,6 +662,7 @@ coding agent 第一阶段默认采用强客观验证：
 - replay_runner。
 - vcr / golden fixture。
 - EvaluationCase / EvaluationRun / EvaluationResult。
+- CounterfactualReplay / CausalComparison / SecurityUtilityResult。
 - regression suite。
 - dynamic benchmark promotion。
 - open-ended task generation。
@@ -607,6 +730,7 @@ Debug Projection 只在 debug/audit/replay 模式启用。
 | 多前端一致性 | 同一 `workspace/session/task` 在 SDK / TUI / Web 查询到相同状态，并能看到同一条运行中事件流 |
 | provider 正常流 | stream event、usage、finish_reason、tool call 映射进 `ProviderContract` |
 | provider 异常流 | truncated stream、malformed event、rate limit、network error 都有结构化错误 |
+| token 观测 | 每次 provider request 前有 `TokenBudgetSnapshot`，response 后有 `TokenUsageRecord`；usage 缺失时记录 unknown 或估算来源 |
 | tool 成功 | `ToolContract` 校验通过，生成 `ToolResultEnvelope`、artifact refs 和 evidence refs |
 | tool 失败 | error、timeout、cancelled、blocked 都有明确状态，不把 raw stderr 直接塞进模型 |
 | abort / pause | abort 后不能继续产生外部副作用，pause/resume 不破坏 event 顺序 |
@@ -622,7 +746,7 @@ Debug Projection 只在 debug/audit/replay 模式启用。
 3. `golutra-event`：durable/live-only event。
 4. `golutra-runtime`：turn loop、LoopDecision、verification 调度。
 5. `golutra-context`：ContextBuilder、TokenBudgetTracker、WorkingSummary。
-6. `golutra-llm`：provider contract、capability matrix、routing。
+6. `golutra-llm`：provider contract、capability matrix、routing、usage normalization。
 7. `golutra-tools`：tool schema、permission、ToolResultEnvelope。
 8. `golutra-verify`：任务类型基础验证策略。
 9. `golutra-client`：统一 `RuntimeClient`、`RuntimeQuery` 和 event subscription 接口。

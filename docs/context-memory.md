@@ -85,6 +85,147 @@ reserve for tool calls / summary
 5. 触发 compact。
 6. 必要时要求用户缩小目标。
 
+Token 预算不是只在 provider 返回 usage 后才统计。Golutra 要把 token 分成三类观测：
+
+```text
+planned_tokens
+  ContextBuilder 构造 prompt 前的预算与预估。
+
+actual_tokens
+  provider 返回的 input / output / reasoning / cached / total usage。
+
+wasted_tokens
+  后台或 debug 归因出的无效上下文、重复工具输出、失败 retry、无贡献模型输出。
+```
+
+`input_tokens` 必须被理解为完整 provider request 的模型可见输入，不只是用户消息。它至少包含：
+
+```text
+system prompt
+developer / runtime instructions
+policy constraints
+user messages
+assistant recent messages
+context projection
+working summary
+memory snippets
+evidence summary
+tool instructions
+tool result excerpts
+```
+
+`output_tokens` 是 provider 生成的可见 assistant 输出和 tool call 参数。`reasoning_tokens` 是 provider 暴露的隐藏推理消耗。`cached_input_tokens` 是 provider 侧命中的输入缓存部分。`tool_result_tokens` 只统计进入模型输入的工具结果片段，不统计保存在 artifact 中但没有进入 provider request 的 raw output。
+
+### Token 消耗观测链路
+
+第一阶段必须建立轻量同步链路：
+
+```text
+ContextBuilder
+-> TokenBudgetSnapshot
+-> ProviderRequest
+-> ProviderUsage
+-> TokenUsageRecord
+-> LoopDecision.budget_state
+-> DebugProjection / EvaluationProjection
+```
+
+每次模型调用至少记录：
+
+```text
+TokenBudgetSnapshot
+  task_id
+  turn_id
+  context_window
+  max_output
+  reserved_output_tokens
+  planned_input_tokens
+  planned_tool_tokens
+  planned_summary_tokens
+  budget_limit
+  budget_policy
+  action_if_exceeded: trim | compact | ask_user | block
+```
+
+provider 返回后记录：
+
+```text
+TokenUsageRecord
+  task_id
+  turn_id
+  provider_id
+  model_id
+  request_event_id
+  response_event_id
+  input_tokens
+  output_tokens
+  reasoning_tokens
+  cached_input_tokens
+  tool_result_tokens
+  total_tokens
+  estimated_cost
+  budget_snapshot_ref
+```
+
+为了定位 token 消耗来源，`TokenUsageRecord` 应关联一份可选的 `TokenAttribution`：
+
+```text
+TokenAttribution
+  system_prompt_tokens
+  developer_instruction_tokens
+  runtime_context_tokens
+  policy_tokens
+  user_message_tokens
+  assistant_recent_tokens
+  working_summary_tokens
+  memory_tokens
+  evidence_tokens
+  tool_instruction_tokens
+  tool_result_excerpt_tokens
+  output_tokens
+  reasoning_tokens
+  cached_input_tokens
+```
+
+其中 attribution 可以来自 tokenizer 预估、provider usage、或二者结合。字段不完整时必须标记为 unknown，不能用 0 伪装成没有消耗。
+
+如果 provider 不能返回完整 usage，`TokenUsageRecord` 也必须存在，但把缺失字段标为 unknown，并记录估算来源。不能因为 usage 不完整就断掉成本链路。
+
+Token 消耗归因按来源分组：
+
+| 来源 | 说明 | 处理方式 |
+| --- | --- | --- |
+| system / policy | 稳定系统规则、权限约束 | 保持短且可缓存 |
+| runtime context | 当前任务状态、LoopDecision、约束 | 必须进入预算 |
+| working summary | 当前任务摘要 | compact 后替代旧历史 |
+| memory | 检索出的长期/项目记忆 | 低相关先剔除 |
+| evidence | 关键证据摘要和引用 | 大内容只放 artifact ref |
+| tool excerpt | 工具输出给模型看的片段 | 默认截断和摘要 |
+| user / assistant recent | 近期必要交互 | 超预算时压缩旧消息 |
+| output reserve | 给模型输出和 tool call 预留 | 不足时先缩输入 |
+
+预算状态进入 `LoopDecision.budget_state`：
+
+```text
+budget_state
+  planned_input_tokens
+  actual_input_tokens
+  output_tokens
+  total_tokens
+  estimated_cost
+  budget_remaining
+  compact_recommended
+  cost_risk: low | medium | high | exceeded
+```
+
+触发动作：
+
+- planned input 超过阈值：先 trim 低相关 memory 和 tool excerpt。
+- 多轮 token 增长过快：触发 compact。
+- tool output token 占比过高：要求工具改为 summary + artifact ref。
+- retry / fallback 成本过高：LoopDecision 可转为 ask_user 或 blocked。
+- evaluation / debug 需要深度分析时，只读 `TokenUsageRecord` 和 artifact，不重新把完整上下文塞回模型。
+
 ### ContextBuilder
 
 `ContextBuilder` 从结构化状态投影模型输入：

@@ -141,10 +141,12 @@ Golutra 的评估系统应围绕以下对象收敛：
 ```text
 RuntimeEvent / ArtifactRecord / EvidenceRecord / VerificationRecord
 -> TrajectoryReplay
+-> CounterfactualReplay
 -> EvaluationCase
 -> EvaluationRun
 -> Scorer
 -> EvaluationResult
+-> CausalComparison
 -> RegressionResult
 -> PromotionDecision
 ```
@@ -172,6 +174,38 @@ TrajectoryReplay
 - 能定位当时的 event、artifact、context projection 和 verification。
 - provider 和 tool 可以用 fixture 回放，也可以在隔离环境中 live replay。
 - replay 结果必须声明确定性边界，不能把不可复现结果当稳定证据。
+
+### CounterfactualReplay
+
+用于在同一个任务或同一批 case 上替换某一层策略，比较“到底是哪一层导致变好或变坏”。它属于离线 evaluation，不进入普通任务同步链路。
+
+```text
+CounterfactualReplay
+  replay_id
+  source_task_id
+  baseline_config_ref
+  variant_config_ref
+  changed_layer: context | memory | tool_policy | provider_route | prompt | verification | token_policy | security_policy
+  controlled_variables
+  replay_mode: fixture | sandbox_live
+  result_refs
+  limitations
+```
+
+典型对照：
+
+- 有 memory vs 无 memory。
+- 长上下文 vs compact 后上下文。
+- 工具输出全文 vs summary + artifact ref。
+- provider A vs provider B。
+- 宽松 policy vs 严格 policy。
+- 不同 token budget / truncation 策略。
+
+要求：
+
+- 每次只改变一个主要层，其他变量尽量固定。
+- 无法固定的变量必须写入 `controlled_variables` 或 `limitations`。
+- 结果必须同时比较质量、成本、延迟、工具次数和安全风险。
 
 ### EvaluationCase
 
@@ -270,6 +304,54 @@ EvaluationResult
 - 结论必须绑定 evidence。
 - `unknown` 是合法结果，不能强行归为 pass/fail。
 - 需要同时记录质量、成本、延迟和失败分类，避免只优化单一分数。
+
+### CausalComparison
+
+用于比较 baseline 和 variant 的差异，给 ImprovementCandidate 提供更强证据。
+
+```text
+CausalComparison
+  comparison_id
+  baseline_run_id
+  variant_run_id
+  changed_layer
+  controlled_variables
+  delta_quality
+  delta_cost
+  delta_latency
+  delta_token_usage
+  delta_tool_calls
+  delta_security
+  regressions
+  confidence
+  verdict: improved | regressed | mixed | inconclusive
+```
+
+判断原则：
+
+- 质量提升但成本、延迟或安全风险不可接受时，不能直接判定为 improved。
+- 成本下降但通过率、证据质量或安全性下降时，不能直接晋升。
+- `inconclusive` 是合法结果，尤其适用于不可复现或变量无法控制的 replay。
+
+### SecurityUtilityResult
+
+用于同时评估任务效用和安全性，避免 agent 只追求完成任务而牺牲 policy。
+
+```text
+SecurityUtilityResult
+  run_id
+  case_id
+  utility_score
+  security_score
+  policy_violations
+  data_exfiltration_risk
+  prompt_injection_signal
+  unsafe_tool_use
+  evidence_refs
+  verdict: pass | fail | needs_review
+```
+
+它特别适合 coding agent，因为代码仓库、README、issue、网页内容、测试输出和 package script 都可能包含恶意指令。高风险 case 不应只看任务是否完成，还必须看是否存在越权读取、数据外泄、恶意命令执行或 prompt injection 成功。
 
 ### MetaEvaluation
 
@@ -474,6 +556,74 @@ PostTaskReview
 | StateFailure | session、branch、resume、artifact 或 event 状态漂移 |
 | CostFailure | token、时间、工具次数或预算超限 |
 | HumanInteractionFailure | 需要用户确认但没有拿到明确输入 |
+
+## Token / Cost 观测链路
+
+Token 消耗是 CostFailure、ContextFailure 和 ProviderFailure 的共同输入，不能只作为 provider usage 的附属字段。Golutra 应把 token 观测拆成同步记录和离线归因两层：
+
+详细预算、上下文分层和超预算处理归属 `context-memory.md`；本文只定义 token / cost 如何进入 debug、evaluation、regression 和失败归因。
+
+```text
+同步记录
+  ContextBuilder 生成 TokenBudgetSnapshot
+  ProviderContract 归一化 ProviderUsage
+  Runtime 写入 TokenUsageRecord
+  LoopDecision 读取 budget_state
+
+离线归因
+  Debug / Evaluation Projection 聚合 token timeline
+  PostTaskReview 识别 token waste 和 cost risk
+  EvaluationRun / RegressionResult 对比成本变化
+```
+
+### 必须观测的 token 数据
+
+```text
+TokenBudgetSnapshot
+  预算、阈值、预估输入、预留输出、超限动作
+
+TokenUsageRecord
+  provider 返回或估算的 input / output / reasoning / cached / total tokens
+
+TokenAttribution
+  system_prompt / developer_instruction / runtime_context / policy / user_message / assistant_recent / working_summary / memory / evidence / tool_instruction / tool_result_excerpt / output / reasoning / cached_input 的占比
+
+CostRecord
+  provider、model、unit price、estimated cost、cost source、confidence
+```
+
+第一阶段要求：
+
+- 每次 provider request 前都有 `TokenBudgetSnapshot`。
+- 每次 provider response 后都有 `TokenUsageRecord`，usage 缺失时记录 unknown 和估算来源。
+- `input_tokens` 必须覆盖所有进入 provider request 的模型可见内容，包括提示词、运行时上下文、历史摘要、memory、evidence、工具说明和工具结果片段。
+- `TokenAttribution` 要能区分提示词、上下文、memory、工具结果片段、输出、reasoning 和 cached input，字段不完整时标记 unknown。
+- DebugProjection 能看到每个 turn 的 token timeline。
+- EvaluationRun / RegressionResult 必须记录 cost 和 latency，不允许只比较质量分。
+- PostTaskReview 可以把 token 相关问题归入 `CostFailure` 或 `ContextFailure`。
+
+### Token Waste 归因
+
+Token waste 不在同步链路里做重分析，默认后台或 debug 模式归因。
+
+常见类型：
+
+| 类型 | 含义 | 可能改进 |
+| --- | --- | --- |
+| stale_context | 旧上下文仍反复进入 prompt | compact 或 ContextProjectionCache |
+| low_relevance_memory | 低相关 memory 占用 prompt | 调整 MemoryRetriever 阈值 |
+| oversized_tool_output | 工具输出片段过长 | 工具改 summary + artifact ref |
+| repeated_retry | retry/fallback 消耗过多 | 调整 RetryPolicy 或 ask_user |
+| judge_overuse | 过多 LLM judge / deep review | 降级为 rule / command scorer |
+| missing_cache | 稳定前缀或 projection 重复构造 | 后续引入 cache |
+
+Token 观测的目的不是让普通用户看到所有成本细节，而是让 runtime 和后续评估能回答：
+
+```text
+这次任务为什么贵？
+贵在 context、工具输出、模型输出、retry，还是 evaluation？
+改动后质量是否提升，成本是否也可接受？
+```
 
 ## Debug / Audit / Replay
 

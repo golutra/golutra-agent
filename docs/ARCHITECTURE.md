@@ -202,9 +202,9 @@ MemoryGovernance
 2. Entry Layer 转成 SessionCommand
 3. Host Runtime 创建 Session / Turn / GoalState
 4. Runtime 写入 input event 和 turn snapshot
-5. ContextBuilder 根据 state、summary、memory、evidence 构造模型输入
+5. ContextBuilder 根据 state、summary、memory、evidence 构造模型输入，并生成 TokenBudgetSnapshot
 6. Provider Router 根据 CapabilityMatrix 和预算选择模型
-7. Provider 返回 assistant message / tool calls / usage / raw events
+7. Provider 返回 assistant message / tool calls / usage / raw events，ProviderContract 归一化为 TokenUsageRecord
 8. Tool System 校验 schema、权限、sandbox 和资源访问
 9. ToolResultEnvelope 写入 summary、structured facts、artifact ref、evidence refs
 10. Verification 判断任务是否达成、证据是否可靠、是否违反 policy
@@ -221,15 +221,15 @@ MemoryGovernance
 | `golutra-core` | 核心协议与状态类型 |
 | `golutra-runtime` | turn 状态机、loop 执行、resume、compact、fallback |
 | `golutra-event` | Durable / live-only 事件协议 |
-| `golutra-context` | ContextBuilder、TokenBudgetTracker、WorkingSummary、context projection |
+| `golutra-context` | ContextBuilder、TokenBudgetTracker、TokenBudgetSnapshot、WorkingSummary、context projection |
 | `golutra-memory` | MemoryRetriever、MemoryGovernance、memory promotion/rollback |
 | `golutra-store` | SQLite、event log、artifact store、snapshot |
-| `golutra-llm` | Provider adapter、CapabilityMatrix、routing、usage |
+| `golutra-llm` | Provider adapter、CapabilityMatrix、routing、usage normalization、TokenUsageRecord |
 | `golutra-tools` | ToolContract、tool registry、tool execution、ToolResultEnvelope |
 | `golutra-governor` | 后续治理增强：GoalLedger、RuntimeGovernor、GovernanceDecision |
 | `golutra-policy` | PermissionPolicy、PolicyEvaluation、workspace isolation |
 | `golutra-verify` | verification runner、PASS/FAIL/PARTIAL、证据记录 |
-| `golutra-eval` | EvaluationCase、EvaluationRun、Scorer、TrajectoryReplay、benchmark、regression |
+| `golutra-eval` | EvaluationCase、EvaluationRun、Scorer、TrajectoryReplay、CounterfactualReplay、CausalComparison、benchmark、regression |
 | `golutra-tui` | 只展示 runtime projection 的 TUI |
 | `golutra-cli` | 薄 CLI 入口 |
 | `golutra-app-server` | HTTP/WebSocket/SSE 入口 |
@@ -318,7 +318,7 @@ Evaluation / Improvement 模式使用 `Evaluation / Improvement Projection`：
 - Replay
 - Debug Mode
 - MemoryGovernance
-- Evaluation Harness / EvaluationCase / Regression
+- Evaluation Harness / EvaluationCase / Regression / CounterfactualReplay
 
 高级演进：
 

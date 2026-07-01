@@ -52,6 +52,8 @@ ImprovementCandidate
   expected_effect
   risk_level: low | medium | high | critical
   evidence_refs
+  causal_evidence_refs
+  counterfactual_result_refs
   benchmark_refs
   rollback_plan
   status: proposed | testing | rejected | promoted
@@ -64,8 +66,27 @@ source_failure: search tool 返回过长导致 context 污染
 target_type: tool_schema
 proposed_change: search 默认只返回 top 5、summary、artifact_ref
 expected_effect: 降低 token、减少无关上下文
+counterfactual_result: 同一批 case 下 token 下降，质量和安全结果无明显回归
 rollback_plan: 恢复旧 search result policy
 ```
+
+## Causal Evidence
+
+高价值候选不应只来自复盘文字，还应尽量绑定反事实证据：
+
+```text
+CounterfactualReplay
+-> CausalComparison
+-> ImprovementCandidate.causal_evidence_refs
+```
+
+示例：
+
+- 修改 memory 检索阈值前后，对同一批 case 比较成功率、token、误召回和安全风险。
+- 修改工具输出策略前后，对同一批 case 比较 token、证据质量和任务通过率。
+- 修改 provider route 前后，对同一批 case 比较质量、延迟、成本和 tool calling 稳定性。
+
+第一阶段不要求自动生成 causal evidence，但文档和 schema 要保留引用位置。后续只有通过反事实对照或回归验证的 candidate，才适合进入 PromotionDecision。
 
 ## RegressionResult
 
@@ -83,6 +104,8 @@ RegressionResult
   cost_delta
   latency_delta
   quality_delta
+  security_delta
+  causal_comparison_refs
   verdict: pass | fail | needs_review
 ```
 
@@ -91,6 +114,7 @@ RegressionResult
 - 至少跑来源失败轨迹。
 - 高风险候选必须跑相关历史 benchmark。
 - 改 prompt、tool schema、policy、provider routing 时必须记录成本和失败回归。
+- 涉及 context、memory、tool policy、provider route、prompt 或 security policy 的候选，优先使用 CounterfactualReplay 做对照。
 - 不能用同一个模型 judge 的一句话作为唯一判断。
 
 ## PromotionDecision
