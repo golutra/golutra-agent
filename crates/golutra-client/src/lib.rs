@@ -12,7 +12,7 @@ use golutra_context::{ContextBuilder, ContextContributor};
 use golutra_core::{
     BusyPolicy, EventId, LoopAction, SessionId, TaskId, TaskStatus, TurnId, WorkspaceId,
 };
-use golutra_llm::{ConfiguredProvider, MockProvider, ProviderRole};
+use golutra_llm::{ConfiguredProvider, MockProvider, ProviderError, ProviderRole};
 use golutra_policy::WorkspacePolicy;
 use golutra_protocol::{
     CommandAck, EventFilter, RuntimeEvent, RuntimeEventSource, RuntimeEventType, RuntimeQuery,
@@ -464,7 +464,8 @@ impl RuntimeHost {
             .into_iter()
             .map(|contract| contract.tool_name.clone())
             .collect::<Vec<_>>();
-        let provider_plan = mock_provider_plan(&task.payload, &objective);
+        let provider_plan = mock_provider_plan(&task.payload, &objective)
+            .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
         let agent_loop = AgentLoop::new(
             provider_plan.provider,
             ContextBuilder::default(),
@@ -487,7 +488,7 @@ impl RuntimeHost {
                         ContextContributor {
                             name: "system".to_owned(),
                             role: ProviderRole::System,
-                            content: "You are Golutra, a workspace coding agent.".to_owned(),
+                            content: system_prompt(),
                             token_budget_hint: 64,
                         },
                         ContextContributor {
@@ -724,57 +725,67 @@ struct MockProviderPlan {
     touched_code: bool,
 }
 
-fn mock_provider_plan(payload: &Value, objective: &str) -> MockProviderPlan {
+fn mock_provider_plan(payload: &Value, objective: &str) -> Result<MockProviderPlan, ProviderError> {
     let lower = objective.to_ascii_lowercase();
     if lower.contains("write") || lower.contains("create") || payload.get("content").is_some() {
-        return MockProviderPlan {
-            provider: ConfiguredProvider::from_env_or_mock(MockProvider::tool_call(
+        return Ok(MockProviderPlan {
+            provider: ConfiguredProvider::resolve_from_env(MockProvider::tool_call(
                 "write_file",
                 json!({
                     "path": string_payload(payload, "path", "golutra-agent-output.txt"),
                     "content": string_payload(payload, "content", "done\n"),
                 }),
-            )),
+            ))?,
             touched_code: true,
-        };
+        });
     }
 
     if lower.contains("read") {
-        return MockProviderPlan {
-            provider: ConfiguredProvider::from_env_or_mock(MockProvider::tool_call(
+        return Ok(MockProviderPlan {
+            provider: ConfiguredProvider::resolve_from_env(MockProvider::tool_call(
                 "read_file",
                 json!({"path": string_payload(payload, "path", "README.md")}),
-            )),
+            ))?,
             touched_code: false,
-        };
+        });
     }
 
     if lower.contains("sleep") {
-        return MockProviderPlan {
-            provider: ConfiguredProvider::from_env_or_mock(MockProvider::tool_call(
+        return Ok(MockProviderPlan {
+            provider: ConfiguredProvider::resolve_from_env(MockProvider::tool_call(
                 "shell",
                 json!({"command": "sleep 5"}),
-            )),
+            ))?,
             touched_code: false,
-        };
+        });
     }
 
     if lower.contains("list") || lower.contains("ls") {
-        return MockProviderPlan {
-            provider: ConfiguredProvider::from_env_or_mock(MockProvider::tool_call(
+        return Ok(MockProviderPlan {
+            provider: ConfiguredProvider::resolve_from_env(MockProvider::tool_call(
                 "list_dir",
                 json!({"path": string_payload(payload, "path", ".")}),
-            )),
+            ))?,
             touched_code: false,
-        };
+        });
     }
 
-    MockProviderPlan {
-        provider: ConfiguredProvider::from_env_or_mock(MockProvider::text_response(
+    Ok(MockProviderPlan {
+        provider: ConfiguredProvider::resolve_from_env(MockProvider::text_response(
             "mock provider completed without tool calls",
-        )),
+        ))?,
         touched_code: false,
-    }
+    })
+}
+
+fn system_prompt() -> String {
+    [
+        "You are Golutra, a workspace coding agent.",
+        "Use the provided tools whenever the task requires reading files, listing directories, searching, writing files, or running validation commands.",
+        "Use workspace-relative paths. Do not invent file contents when a read or search tool can inspect them.",
+        "For write tasks, call write_file or edit_file with complete arguments instead of only explaining the change.",
+    ]
+    .join(" ")
 }
 
 fn prompt_from_payload(payload: &Value) -> String {

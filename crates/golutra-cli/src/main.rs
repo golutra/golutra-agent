@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use golutra_client::{InProcessTransport, RuntimeClient};
 use golutra_core::{Actor, ActorKind, CommandId, SessionId, TaskStatus};
+use golutra_llm::ConfiguredProvider;
 use golutra_protocol::{RuntimeQuery, RuntimeQueryKind, SessionCommand, SessionCommandKind};
 use tokio::time::{Duration, sleep};
 use uuid::Uuid;
@@ -28,6 +29,16 @@ enum Command {
     Abort,
     Trace,
     Export,
+    Provider {
+        #[command(subcommand)]
+        command: ProviderCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProviderCommand {
+    Current,
+    Probe,
 }
 
 #[tokio::main]
@@ -139,6 +150,25 @@ async fn main() -> miette::Result<()> {
                 serde_json::to_string_pretty(&artifacts).unwrap_or_default()
             );
         }
+        Command::Provider { command } => match command {
+            ProviderCommand::Current => {
+                let config = ConfiguredProvider::redacted_from_env()
+                    .map_err(|error| miette::miette!("{error}"))?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&config).unwrap_or_default()
+                );
+            }
+            ProviderCommand::Probe => {
+                let result = ConfiguredProvider::probe_from_env()
+                    .await
+                    .map_err(|error| miette::miette!("{error}"))?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).unwrap_or_default()
+                );
+            }
+        },
     }
     Ok(())
 }

@@ -22,7 +22,7 @@
 - `RuntimeHost` 已接管 `InProcessTransport` 后端，统一持有 `RuntimeStore`、`RuntimeLaneManager`、EventBus、sequence 分配和 session 生命周期；`send_command` 不再直接写入口层假事件。
 - app-server `/events` 已改为 cursor 历史 replay + 长连接轮询 live stream，TUI 可 attach 到 CLI 已创建的同一 running task。
 - `RuntimeHost` 已接入后台 `AgentLoop` 执行器，P0 可通过 mock provider 触发本地工具、写入 artifact/evidence、checkpoint、verification/loop decision，并把终态投影给 CLI/TUI/app-server。
-- `golutra-llm` 已提供 OpenAI-compatible live provider adapter；默认仍走 deterministic mock provider，只有显式设置 `GOLUTRA_PROVIDER_MODE=live`、`GOLUTRA_PROVIDER_API_KEY` 和 `GOLUTRA_PROVIDER_MODEL` 时才联网。
+- `golutra-llm` 已提供可用的 OpenAI-compatible live provider adapter；默认仍走 deterministic mock provider，只有显式设置 `GOLUTRA_PROVIDER_MODE=live` 和 key/model 时才联网。live 配置缺失会显式失败，支持 `GOLUTRA_PROVIDER_*` 与 `OPENAI_*` env，并提供 CLI `provider current/probe` 脱敏检查入口。
 - P1/P2 先落稳定 schema、guardrail、SDK 和最小页面，复杂自动化和外部凭据相关能力仍通过 TODO 决策位收敛。
 - 第一阶段范围已在 `implementation-blueprint.md` 中明确，不能继续扩张到复杂 multi-agent 或不可审计的自动自我改进。
 

@@ -38,7 +38,11 @@ Golutra 不直接复制 qwen-code 的配置文件形状。Golutra 的核心仍�
   - `GOLUTRA_PROVIDER_API_KEY`
   - `GOLUTRA_PROVIDER_MODEL`
   - 可选 `GOLUTRA_PROVIDER_BASE_URL`
-- 这套 env 入口保留为 P0 兼容路径，后续 provider 配置系统必须能包住它，而不是破坏现有 smoke 和 CLI 行为。
+- OpenAI-compatible adapter 已支持 `OPENAI_API_KEY`、`OPENAI_MODEL`、`OPENAI_BASE_URL` 作为兼容 fallback。
+- base URL 会做 P0 规范化：例如 `api.golutra.cn` 会解析成 `https://api.golutra.cn/v1`。
+- CLI 已提供 `golutra provider current` 和 `golutra provider probe`，输出只包含脱敏配置与 probe 结果，不输出 API key。
+- live 模式下配置缺失会显式失败，不再静默回退到 mock。
+- 这套 env 入口保留为 P0 兼容路径，后续 provider catalog / secretRef / OAuth 配置系统必须能包住它，而不是破坏现有 smoke 和 CLI 行为。
 
 ## 目标架构
 
@@ -323,8 +327,9 @@ probe 结果进入 capability matrix，但不能把一次 probe 成功当作永�
 
 ### P0 兼容层
 
-- 保留 `GOLUTRA_PROVIDER_MODE=live` 快捷入口。
-- 将 env 读取集中到 `ProviderResolver`，避免散落在 adapter 内。
+- 已保留 `GOLUTRA_PROVIDER_MODE=live` 快捷入口。
+- 已将 env 读取集中到 OpenAI-compatible 配置解析入口，避免运行时散落读取 key/model/baseUrl。
+- 已支持 `golutra provider current` 和 `golutra provider probe` 作为 P0 脱敏检查入口。
 - 增加 provider config schema 草案和脱敏 snapshot。
 - provider 错误统一写入 runtime event，避免只在 stderr 出现。
 
@@ -361,4 +366,3 @@ probe 结果进入 capability matrix，但不能把一次 probe 成功当作永�
 - TUI/Web 看到同一个 `ProviderAuthRequired`，任一端提交或取消后，其他端看到同一状态。
 - runtime event、artifact、projection、debug export 中没有明文 key。
 - 重启后 provider selection 可恢复，但 secret 仍从 env/keychain/secretRef 解析。
-

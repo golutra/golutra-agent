@@ -11,8 +11,8 @@ use golutra_context::{
 use golutra_core::{
     Actor, BudgetState, BusyPolicy, BusyPolicyDecision, CheckpointId, CheckpointType, CommandId,
     DecisionId, EventId, LaneId, LoopAction, LoopDecision, LoopDecisionId, PolicyId, RuntimeLane,
-    SessionId, TaskId, TaskStatus, TurnId, VerificationRecord, VerificationResult,
-    WorkspaceCheckpoint, WorkspaceId,
+    SessionId, TaskId, TaskStatus, ToolResultStatus, TurnId, VerificationCheck, VerificationRecord,
+    VerificationResult, WorkspaceCheckpoint, WorkspaceId,
 };
 use golutra_llm::{LlmProvider, ProviderError, ProviderFinishReason};
 use golutra_protocol::{RuntimeEvent, RuntimeEventSource, RuntimeEventType};
@@ -324,12 +324,22 @@ where
             .iter()
             .flat_map(|report| report.evidence.iter().map(|evidence| evidence.evidence_id))
             .collect::<Vec<_>>();
+        let command_checks = tool_reports
+            .iter()
+            .map(|report| VerificationCheck {
+                name: format!("tool:{}", report.envelope.tool_name),
+                command: None,
+                passed: report.envelope.status == ToolResultStatus::Ok,
+                evidence_refs: report.envelope.evidence_refs.clone(),
+                message: report.envelope.summary.clone(),
+            })
+            .collect::<Vec<_>>();
         let verification = self.verifier.verify(VerificationInput {
             task_id: request.task_id,
             objective: request.objective.clone(),
             completion_criteria: request.completion_criteria.clone(),
             evidence_refs,
-            command_checks: Vec::new(),
+            command_checks,
             touched_code: request.touched_code,
         });
         let loop_decision = loop_decision_from_verification(
@@ -766,6 +776,32 @@ mod tests {
             .expect("loop runs");
 
         assert_eq!(outcome.loop_decision.action, LoopAction::StopFailed);
+    }
+
+    #[tokio::test]
+    async fn agent_loop_does_not_stop_success_when_tool_fails() {
+        let workspace = tempdir().expect("workspace");
+        let provider = MockProvider::tool_call("read_file", json!({"path": "missing.md"}));
+        let executor =
+            BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+        let agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor);
+
+        let outcome = agent_loop
+            .run(AgentTaskRequest {
+                session_id: SessionId::new(),
+                task_id: TaskId::new(),
+                turn_id: TurnId::new(),
+                objective: "read missing file".to_owned(),
+                completion_criteria: vec!["file read evidence".to_owned()],
+                touched_code: false,
+                contributors: Vec::new(),
+                tools: vec!["read_file".to_owned()],
+            })
+            .await
+            .expect("loop runs");
+
+        assert_eq!(outcome.loop_decision.action, LoopAction::StopPartial);
+        assert_eq!(outcome.verification.result, VerificationResult::Partial);
     }
 
     #[test]

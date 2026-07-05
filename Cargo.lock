@@ -792,6 +792,7 @@ dependencies = [
  "clap",
  "golutra-client",
  "golutra-core",
+ "golutra-llm",
  "golutra-protocol",
  "miette",
  "serde_json",
