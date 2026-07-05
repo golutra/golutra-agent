@@ -101,7 +101,7 @@ struct SlashCommandHint {
 const TOP_LEVEL_SLASH_HINTS: &[SlashCommandHint] = &[
     SlashCommandHint {
         command: "/resume",
-        description: "resume a thread",
+        description: "open sessions",
     },
     SlashCommandHint {
         command: "/threads",
@@ -435,14 +435,14 @@ mod tests {
         assert_eq!(
             slash_command_suggestions("/"),
             vec![
-                "/resume - resume a thread".to_owned(),
+                "/resume - open sessions".to_owned(),
                 "/threads - list threads".to_owned(),
                 "/fork - fork a thread".to_owned(),
             ]
         );
         assert_eq!(
             slash_command_suggestions("/r"),
-            vec!["/resume - resume a thread".to_owned()]
+            vec!["/resume - open sessions".to_owned()]
         );
     }
 

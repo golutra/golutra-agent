@@ -57,6 +57,7 @@ struct TuiApp {
     projection: Option<UserProjection>,
     events: Vec<Value>,
     command_messages: Vec<TranscriptItem>,
+    resume_picker: Option<ResumePickerState>,
     input: String,
     status_message: String,
     provider_message: String,
@@ -95,6 +96,7 @@ impl TuiApp {
             projection: None,
             events: Vec::new(),
             command_messages: Vec::new(),
+            resume_picker: None,
             input: String::new(),
             status_message: "attached to workspace runtime".to_owned(),
             provider_message,
@@ -138,6 +140,12 @@ impl TuiApp {
     }
 
     async fn send_prompt(&mut self, transport: &InProcessTransport) -> miette::Result<()> {
+        if self.resume_picker.is_some() {
+            self.status_message = "select a session with arrow keys or Esc".to_owned();
+            self.input.clear();
+            return Ok(());
+        }
+
         let input = self.input.trim().to_owned();
         match parse_slash_input(&input) {
             SlashInput::Prompt(prompt) => self.send_runtime_prompt(transport, prompt).await,
@@ -195,27 +203,12 @@ impl TuiApp {
                 self.execute_auth_command(transport, command).await?;
             }
             SlashCommand::Resume { thread_id } => {
-                let thread_id = parse_optional_thread_id(thread_id.as_deref(), self.thread_id)?;
-                let thread = transport
-                    .resume_thread(thread_id)
-                    .await
-                    .map_err(|error| miette::miette!("{error}"))?;
-                self.thread_id = thread.thread_id;
-                self.session_id = thread.session_id;
-                self.task_id = None;
-                self.events.clear();
-                self.cursor = None;
-                self.status_message =
-                    format!("resumed thread {}", short_id(&thread.thread_id.to_string()));
-                self.push_system_message(
-                    "Thread resumed",
-                    vec![
-                        format!("thread {}", thread.thread_id),
-                        format!("session {}", thread.session_id),
-                        format!("title {}", thread.title),
-                    ],
-                );
-                self.refresh(transport).await?;
+                if let Some(thread_id) = thread_id {
+                    self.resume_thread(transport, parse_thread_id(&thread_id)?)
+                        .await?;
+                } else {
+                    self.open_resume_picker(transport).await?;
+                }
             }
             SlashCommand::Threads { limit } => {
                 let threads = transport
@@ -311,6 +304,86 @@ impl TuiApp {
         Ok(())
     }
 
+    async fn open_resume_picker(&mut self, transport: &InProcessTransport) -> miette::Result<()> {
+        let threads = transport
+            .list_threads(50)
+            .await
+            .map_err(|error| miette::miette!("{error}"))?;
+        let items = threads
+            .into_iter()
+            .map(|thread| ResumeThreadItem {
+                thread_id: thread.thread_id,
+                session_id: thread.session_id,
+                title: thread.title,
+                preview: thread.preview,
+            })
+            .collect::<Vec<_>>();
+
+        if items.is_empty() {
+            self.push_system_message(
+                "Resume",
+                vec!["no sessions in this workspace yet".to_owned()],
+            );
+            return Ok(());
+        }
+
+        self.input.clear();
+        self.resume_picker = Some(ResumePickerState { items, selected: 0 });
+        self.status_message = "select a session to resume".to_owned();
+        Ok(())
+    }
+
+    async fn resume_thread(
+        &mut self,
+        transport: &InProcessTransport,
+        thread_id: ThreadId,
+    ) -> miette::Result<()> {
+        let thread = transport
+            .resume_thread(thread_id)
+            .await
+            .map_err(|error| miette::miette!("{error}"))?;
+        self.thread_id = thread.thread_id;
+        self.session_id = thread.session_id;
+        self.task_id = None;
+        self.events.clear();
+        self.cursor = None;
+        self.resume_picker = None;
+        self.status_message = format!("resumed {}", short_id(&thread.thread_id.to_string()));
+        self.push_system_message(
+            "Resumed",
+            vec![
+                thread.title,
+                format!("session {}", short_id(&thread.session_id.to_string())),
+            ],
+        );
+        self.refresh(transport).await
+    }
+
+    async fn resume_selected_thread(
+        &mut self,
+        transport: &InProcessTransport,
+    ) -> miette::Result<()> {
+        let Some(thread_id) = self
+            .resume_picker
+            .as_ref()
+            .and_then(ResumePickerState::selected_thread_id)
+        else {
+            return Ok(());
+        };
+        self.resume_thread(transport, thread_id).await
+    }
+
+    fn move_resume_selection(&mut self, direction: ResumeSelectionDirection) {
+        if let Some(picker) = &mut self.resume_picker {
+            picker.move_selection(direction);
+        }
+    }
+
+    fn close_resume_picker(&mut self) {
+        self.resume_picker = None;
+        self.status_message = "resume cancelled".to_owned();
+    }
+
     async fn execute_auth_command(
         &mut self,
         transport: &InProcessTransport,
@@ -398,6 +471,14 @@ impl TuiApp {
         self.refresh(transport).await
     }
 
+    async fn interrupt_or_quit(&mut self, transport: &InProcessTransport) -> miette::Result<()> {
+        if has_active_task(self) {
+            self.abort(transport).await?;
+        }
+        self.should_quit = true;
+        Ok(())
+    }
+
     fn push_system_message(&mut self, title: impl Into<String>, body: Vec<String>) {
         self.status_message = title.into();
         self.command_messages.push(TranscriptItem {
@@ -409,6 +490,45 @@ impl TuiApp {
             self.command_messages
                 .drain(0..self.command_messages.len().saturating_sub(12));
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResumePickerState {
+    items: Vec<ResumeThreadItem>,
+    selected: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ResumeThreadItem {
+    thread_id: ThreadId,
+    session_id: SessionId,
+    title: String,
+    preview: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ResumeSelectionDirection {
+    Previous,
+    Next,
+}
+
+impl ResumePickerState {
+    fn selected_thread_id(&self) -> Option<ThreadId> {
+        self.items.get(self.selected).map(|item| item.thread_id)
+    }
+
+    fn move_selection(&mut self, direction: ResumeSelectionDirection) {
+        if self.items.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        self.selected = match direction {
+            ResumeSelectionDirection::Previous => self.selected.saturating_sub(1),
+            ResumeSelectionDirection::Next => {
+                (self.selected + 1).min(self.items.len().saturating_sub(1))
+            }
+        };
     }
 }
 
@@ -476,6 +596,13 @@ async fn handle_key(
     app: &mut TuiApp,
     transport: &InProcessTransport,
 ) -> miette::Result<()> {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return app.interrupt_or_quit(transport).await;
+    }
+    if app.resume_picker.is_some() {
+        return handle_resume_picker_key(key, app, transport).await;
+    }
+
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
         KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -502,17 +629,50 @@ async fn handle_key(
     Ok(())
 }
 
+async fn handle_resume_picker_key(
+    key: KeyEvent,
+    app: &mut TuiApp,
+    transport: &InProcessTransport,
+) -> miette::Result<()> {
+    match key.code {
+        KeyCode::Esc => app.close_resume_picker(),
+        KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.move_resume_selection(ResumeSelectionDirection::Previous);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.move_resume_selection(ResumeSelectionDirection::Next);
+        }
+        KeyCode::Enter => {
+            app.resume_selected_thread(transport).await?;
+        }
+        KeyCode::Char(character) if character.is_ascii_digit() => {
+            if let Some(index) = character
+                .to_digit(10)
+                .and_then(|digit| digit.checked_sub(1))
+                && let Some(picker) = &mut app.resume_picker
+                && (index as usize) < picker.items.len()
+            {
+                picker.selected = index as usize;
+                app.resume_selected_thread(transport).await?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn draw_ui(frame: &mut Frame<'_>, app: &TuiApp) {
     let constraints = if app.debug_mode {
         vec![
-            Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Min(8),
             Constraint::Length(8),
             Constraint::Length(5),
         ]
     } else {
         vec![
-            Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Min(8),
             Constraint::Length(5),
         ]
@@ -533,52 +693,40 @@ fn draw_ui(frame: &mut Frame<'_>, app: &TuiApp) {
 }
 
 fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let task_text = app
-        .task_id
-        .map(|task_id| task_id.to_string())
-        .unwrap_or_else(|| "auto".to_owned());
     let status = app
         .projection
         .as_ref()
         .map(|projection| format!("{:?}", projection.status))
         .unwrap_or_else(|| "loading".to_owned());
-    let event_count = app.events.len();
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(
-                "Golutra",
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(status, Style::default().fg(status_color(app))),
-            Span::raw("  "),
-            Span::styled(
-                if app.debug_mode { "debug" } else { "chat" },
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("session ", Style::default().fg(Color::DarkGray)),
-            Span::raw(short_id(&app.session_id.to_string())),
-            Span::styled("  thread ", Style::default().fg(Color::DarkGray)),
-            Span::raw(short_id(&app.thread_id.to_string())),
-            Span::styled("  task ", Style::default().fg(Color::DarkGray)),
-            Span::raw(short_id(&task_text)),
-            Span::styled("  events ", Style::default().fg(Color::DarkGray)),
-            Span::raw(event_count.to_string()),
-        ]),
-        Line::from(vec![
-            Span::styled("provider ", Style::default().fg(Color::DarkGray)),
-            Span::raw(app.provider_message.clone()),
-        ]),
-    ];
+    let mode = if app.resume_picker.is_some() {
+        "resume"
+    } else if app.debug_mode {
+        "debug"
+    } else {
+        "chat"
+    };
+    let lines = vec![Line::from(vec![
+        Span::styled(
+            "Golutra",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(status, Style::default().fg(status_color(app))),
+        Span::raw("  "),
+        Span::styled(mode, Style::default().fg(Color::DarkGray)),
+    ])];
     let paragraph = Paragraph::new(lines).alignment(Alignment::Left);
     frame.render_widget(paragraph, area);
 }
 
 fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    if let Some(picker) = &app.resume_picker {
+        draw_resume_picker(frame, area, picker, app.thread_id);
+        return;
+    }
+
     let mut items = transcript_items(app)
         .into_iter()
         .flat_map(transcript_list_items)
@@ -588,6 +736,70 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         items.drain(0..items.len() - visible_rows);
     }
     let list = List::new(items).block(Block::default().borders(Borders::TOP));
+    frame.render_widget(list, area);
+}
+
+fn draw_resume_picker(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    picker: &ResumePickerState,
+    current_thread_id: ThreadId,
+) {
+    let visible_rows = area.height.saturating_sub(1) as usize;
+    let items = picker
+        .items
+        .iter()
+        .enumerate()
+        .take(visible_rows.max(1))
+        .map(|(index, item)| {
+            let selected = index == picker.selected;
+            let current = item.thread_id == current_thread_id;
+            let marker = if selected { "> " } else { "  " };
+            let current_marker = if current { "current" } else { "" };
+            ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled(
+                        marker,
+                        Style::default().fg(if selected {
+                            Color::Cyan
+                        } else {
+                            Color::DarkGray
+                        }),
+                    ),
+                    Span::styled(
+                        format!("{} ", index + 1),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        item.title.clone(),
+                        Style::default()
+                            .fg(if selected { Color::White } else { Color::Gray })
+                            .add_modifier(if selected {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(current_marker, Style::default().fg(Color::Green)),
+                ]),
+                Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(
+                        short_id(&item.session_id.to_string()),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(item.preview.clone(), Style::default().fg(Color::DarkGray)),
+                ]),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let list = List::new(items).block(
+        Block::default()
+            .title("Resume session")
+            .borders(Borders::TOP),
+    );
     frame.render_widget(list, area);
 }
 
@@ -626,14 +838,20 @@ fn draw_debug_timeline(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 }
 
 fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let help = "Enter send   /help commands   Ctrl+A abort   Tab debug   q/Esc quit";
+    let help = if app.resume_picker.is_some() {
+        "Enter resume   Up/Down select   Esc cancel   Ctrl+C quit"
+    } else {
+        "Enter send   /resume sessions   Ctrl+C quit   Tab debug"
+    };
     let command_hint = slash_command_suggestions(&app.input);
     let help_line = if command_hint.is_empty() {
         help.to_owned()
     } else {
         format!("Commands: {}", command_hint.join("   "))
     };
-    let input_line = if app.input.is_empty() {
+    let input_line = if app.resume_picker.is_some() {
+        "Select a session to resume".to_owned()
+    } else if app.input.is_empty() {
         "Ask Golutra to change code or inspect the workspace".to_owned()
     } else {
         app.input.clone()
@@ -838,6 +1056,17 @@ fn provider_color(app: &TuiApp) -> Color {
     }
 }
 
+fn has_active_task(app: &TuiApp) -> bool {
+    matches!(
+        app.projection.as_ref().map(|projection| projection.status),
+        Some(golutra_core::TaskStatus::Running)
+            | Some(golutra_core::TaskStatus::WaitingApproval)
+            | Some(golutra_core::TaskStatus::Aborting)
+            | Some(golutra_core::TaskStatus::Pausing)
+            | Some(golutra_core::TaskStatus::Paused)
+    )
+}
+
 fn composer_style(app: &TuiApp) -> Style {
     if app.input.is_empty() {
         Style::default().fg(Color::DarkGray)
@@ -913,13 +1142,6 @@ fn parse_task_id(value: Option<&str>) -> miette::Result<Option<TaskId>> {
         .transpose()
 }
 
-fn parse_optional_thread_id(value: Option<&str>, fallback: ThreadId) -> miette::Result<ThreadId> {
-    value
-        .map(parse_thread_id)
-        .transpose()
-        .map(|thread_id| thread_id.unwrap_or(fallback))
-}
-
 fn parse_thread_id(value: &str) -> miette::Result<ThreadId> {
     value
         .parse()
@@ -964,7 +1186,8 @@ fn apply_auth_login(
 
 fn slash_help_lines() -> Vec<String> {
     vec![
-        "/resume [thread-id]  resume default or specific thread".to_owned(),
+        "/resume  open current workspace session list".to_owned(),
+        "/resume <thread-id>  resume a specific current-workspace thread".to_owned(),
         "/threads [limit]  list recent workspace threads".to_owned(),
         "/fork <thread-id>  fork a thread and switch to it".to_owned(),
         "/auth status  show provider onboarding state".to_owned(),
