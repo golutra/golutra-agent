@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use golutra_core::{ProviderContract, ProviderRequestId, ProviderResponseId, TaskId, TurnId};
 pub use golutra_core::{ProviderUsage, UsageSource};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use thiserror::Error;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -177,6 +177,147 @@ impl LlmProvider for GenaiProviderAdapter {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct OpenAiCompatibleProvider {
+    api_key: String,
+    base_url: String,
+    model_id: String,
+    client: reqwest::Client,
+}
+
+impl OpenAiCompatibleProvider {
+    #[must_use]
+    pub fn new(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+        model_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            api_key: api_key.into(),
+            base_url: base_url.into(),
+            model_id: model_id.into(),
+            client: reqwest::Client::new(),
+        }
+    }
+
+    pub fn from_env() -> Result<Self, ProviderError> {
+        let api_key = std::env::var("GOLUTRA_PROVIDER_API_KEY").map_err(|_| {
+            ProviderError::NotConfigured {
+                message: "GOLUTRA_PROVIDER_API_KEY is not set".to_owned(),
+            }
+        })?;
+        let model_id =
+            std::env::var("GOLUTRA_PROVIDER_MODEL").map_err(|_| ProviderError::NotConfigured {
+                message: "GOLUTRA_PROVIDER_MODEL is not set".to_owned(),
+            })?;
+        let base_url = std::env::var("GOLUTRA_PROVIDER_BASE_URL")
+            .unwrap_or_else(|_| "https://api.openai.com/v1".to_owned());
+        Ok(Self::new(api_key, base_url, model_id))
+    }
+}
+
+#[async_trait]
+impl LlmProvider for OpenAiCompatibleProvider {
+    async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let mut body = json!({
+            "model": self.model_id,
+            "messages": request.messages.iter().map(openai_message).collect::<Vec<_>>(),
+        });
+        if !request.tools.is_empty() {
+            body["tools"] = Value::Array(request.tools.iter().map(openai_tool_schema).collect());
+            body["tool_choice"] = Value::String("auto".to_owned());
+        }
+
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| ProviderError::Failed {
+                message: error.to_string(),
+            })?;
+        let status = response.status();
+        let value = response
+            .json::<Value>()
+            .await
+            .map_err(|error| ProviderError::Failed {
+                message: error.to_string(),
+            })?;
+        if status.as_u16() == 429 {
+            return Err(ProviderError::RateLimited {
+                message: provider_error_message(&value),
+            });
+        }
+        if !status.is_success() {
+            return Err(ProviderError::Failed {
+                message: provider_error_message(&value),
+            });
+        }
+
+        Ok(provider_response_from_openai(
+            value,
+            request.task_id,
+            request.turn_id,
+        ))
+    }
+
+    fn contract(&self) -> ProviderContract {
+        ProviderContract {
+            provider_id: "openai_compatible".to_owned(),
+            model_id: self.model_id.clone(),
+            native_protocol: "openai_chat_completions".to_owned(),
+            stream_event_mapping: "non_streaming_p0".to_owned(),
+            tool_call_mapping: "function_tool_calls".to_owned(),
+            usage_mapping: "chat_completion_usage".to_owned(),
+            reasoning_mapping: "not_exposed".to_owned(),
+            finish_reason_mapping: "chat_completion_finish_reason".to_owned(),
+            error_mapping: "http_status_and_error_body".to_owned(),
+            rate_limit_mapping: "http_429".to_owned(),
+            cost_model: "external".to_owned(),
+            capability_matrix_ref: None,
+            golden_fixture_refs: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ConfiguredProvider {
+    Mock(Box<MockProvider>),
+    OpenAiCompatible(OpenAiCompatibleProvider),
+}
+
+impl ConfiguredProvider {
+    #[must_use]
+    pub fn from_env_or_mock(mock: MockProvider) -> Self {
+        if std::env::var("GOLUTRA_PROVIDER_MODE").as_deref() != Ok("live") {
+            return Self::Mock(Box::new(mock));
+        }
+        OpenAiCompatibleProvider::from_env()
+            .map(Self::OpenAiCompatible)
+            .unwrap_or_else(|_| Self::Mock(Box::new(mock)))
+    }
+}
+
+#[async_trait]
+impl LlmProvider for ConfiguredProvider {
+    async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        match self {
+            Self::Mock(provider) => provider.complete(request).await,
+            Self::OpenAiCompatible(provider) => provider.complete(request).await,
+        }
+    }
+
+    fn contract(&self) -> ProviderContract {
+        match self {
+            Self::Mock(provider) => provider.contract(),
+            Self::OpenAiCompatible(provider) => provider.contract(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelRouteDecision {
     pub provider_id: String,
@@ -283,6 +424,121 @@ fn mock_contract() -> ProviderContract {
         capability_matrix_ref: None,
         golden_fixture_refs: Vec::new(),
     }
+}
+
+fn openai_message(message: &ProviderMessage) -> Value {
+    json!({
+        "role": match message.role {
+            ProviderRole::System => "system",
+            ProviderRole::User => "user",
+            ProviderRole::Assistant => "assistant",
+            ProviderRole::Tool => "tool",
+        },
+        "content": message.content,
+    })
+}
+
+fn openai_tool_schema(tool_name: &String) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": tool_name,
+            "description": format!("Golutra workspace tool: {tool_name}"),
+            "parameters": {
+                "type": "object",
+                "additionalProperties": true
+            }
+        }
+    })
+}
+
+fn provider_response_from_openai(
+    value: Value,
+    _task_id: TaskId,
+    _turn_id: TurnId,
+) -> ProviderResponse {
+    let choice = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let message = choice.get("message").cloned().unwrap_or_else(|| json!({}));
+    let content = message
+        .get("content")
+        .and_then(Value::as_str)
+        .filter(|content| !content.is_empty())
+        .map(|content| ProviderMessage {
+            role: ProviderRole::Assistant,
+            content: content.to_owned(),
+        });
+    let tool_calls = message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(provider_tool_call_from_openai)
+        .collect::<Vec<_>>();
+    let usage_value = value.get("usage").cloned().unwrap_or_else(|| json!({}));
+
+    ProviderResponse {
+        response_id: ProviderResponseId::new(),
+        message: content,
+        tool_calls,
+        usage: ProviderUsage {
+            input_tokens: usage_value.get("prompt_tokens").and_then(Value::as_u64),
+            output_tokens: usage_value.get("completion_tokens").and_then(Value::as_u64),
+            reasoning_tokens: None,
+            cached_input_tokens: None,
+            total_tokens: usage_value.get("total_tokens").and_then(Value::as_u64),
+            usage_source: UsageSource::Provider,
+            raw: usage_value,
+        },
+        finish_reason: finish_reason_from_openai(
+            choice
+                .get("finish_reason")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        ),
+        raw_metadata: value,
+    }
+}
+
+fn provider_tool_call_from_openai(value: &Value) -> Option<ProviderToolCall> {
+    let function = value.get("function")?;
+    let arguments = function
+        .get("arguments")
+        .and_then(Value::as_str)
+        .and_then(|arguments| serde_json::from_str(arguments).ok())
+        .unwrap_or_else(|| json!({}));
+    Some(ProviderToolCall {
+        tool_call_id: value
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("provider-tool-call")
+            .to_owned(),
+        tool_name: function.get("name")?.as_str()?.to_owned(),
+        arguments,
+    })
+}
+
+fn finish_reason_from_openai(value: &str) -> ProviderFinishReason {
+    match value {
+        "stop" => ProviderFinishReason::Stop,
+        "tool_calls" | "function_call" => ProviderFinishReason::ToolCalls,
+        "length" => ProviderFinishReason::Length,
+        "content_filter" => ProviderFinishReason::ContentFilter,
+        _ => ProviderFinishReason::Unknown,
+    }
+}
+
+fn provider_error_message(value: &Value) -> String {
+    value
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("provider request failed")
+        .to_owned()
 }
 
 fn usage(input_tokens: u64, output_tokens: u64) -> ProviderUsage {

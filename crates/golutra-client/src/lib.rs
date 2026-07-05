@@ -12,7 +12,7 @@ use golutra_context::{ContextBuilder, ContextContributor};
 use golutra_core::{
     BusyPolicy, EventId, LoopAction, SessionId, TaskId, TaskStatus, TurnId, WorkspaceId,
 };
-use golutra_llm::{MockProvider, ProviderRole};
+use golutra_llm::{ConfiguredProvider, MockProvider, ProviderRole};
 use golutra_policy::WorkspacePolicy;
 use golutra_protocol::{
     CommandAck, EventFilter, RuntimeEvent, RuntimeEventSource, RuntimeEventType, RuntimeQuery,
@@ -20,7 +20,7 @@ use golutra_protocol::{
 };
 use golutra_runtime::{
     AgentLoop, AgentLoopTraceEvent, AgentTaskRequest, RuntimeLaneError, RuntimeLaneManager,
-    is_active_status,
+    WorkspaceCheckpointManager, is_active_status,
 };
 use golutra_store::{RuntimeStore, StoreError};
 use golutra_tools::BasicToolExecutor;
@@ -455,7 +455,7 @@ impl RuntimeHost {
     async fn run_agent_task(self: Arc<Self>, task: HostedAgentTask) -> Result<(), ClientError> {
         let objective = prompt_from_payload(&task.payload);
         let workspace_root = self.execution_workspace_root()?;
-        let policy = WorkspacePolicy::new(workspace_root)
+        let policy = WorkspacePolicy::new(workspace_root.clone())
             .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
         let tool_executor = BasicToolExecutor::new(policy);
         let tool_names = tool_executor
@@ -507,14 +507,17 @@ impl RuntimeHost {
         for trace_event in trace_events {
             self.record_trace_event(&task, trace_event).await?;
         }
+        let mut changed_files = Vec::new();
+        let mut last_tool_event_id = EventId::new();
         for report in &outcome.tool_reports {
+            changed_files.extend(report.changed_files.clone());
             for artifact in &report.artifacts {
                 self.store.store_artifact(artifact).await?;
             }
             for evidence in &report.evidence {
                 self.store.store_evidence(evidence).await?;
             }
-            self.record_event(agent_event(
+            let event = agent_event(
                 self.next_sequence_no(),
                 &task,
                 RuntimeEventType::ToolCompleted,
@@ -523,6 +526,32 @@ impl RuntimeHost {
                     "summary": report.envelope.summary,
                     "envelope": report.envelope,
                     "changed_files": report.changed_files,
+                }),
+            );
+            last_tool_event_id = event.id;
+            self.record_event(event).await?;
+        }
+        if !changed_files.is_empty() {
+            let checkpoint = WorkspaceCheckpointManager::new(
+                workspace_root.clone(),
+                workspace_root.join(".golutra/checkpoints"),
+            )
+            .create_checkpoint(
+                self.workspace_id,
+                task.task_id,
+                task.turn_id,
+                &changed_files,
+                last_tool_event_id,
+            )
+            .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
+            self.record_event(agent_event(
+                self.next_sequence_no(),
+                &task,
+                RuntimeEventType::CheckpointCreated,
+                RuntimeEventSource::Runtime,
+                json!({
+                    "summary": "workspace checkpoint created",
+                    "checkpoint": checkpoint,
                 }),
             ))
             .await?;
@@ -691,7 +720,7 @@ pub fn event_sequence_no(value: &Value) -> Option<u64> {
 
 #[derive(Debug, Clone)]
 struct MockProviderPlan {
-    provider: MockProvider,
+    provider: ConfiguredProvider,
     touched_code: bool,
 }
 
@@ -699,46 +728,51 @@ fn mock_provider_plan(payload: &Value, objective: &str) -> MockProviderPlan {
     let lower = objective.to_ascii_lowercase();
     if lower.contains("write") || lower.contains("create") || payload.get("content").is_some() {
         return MockProviderPlan {
-            provider: MockProvider::tool_call(
+            provider: ConfiguredProvider::from_env_or_mock(MockProvider::tool_call(
                 "write_file",
                 json!({
                     "path": string_payload(payload, "path", "golutra-agent-output.txt"),
                     "content": string_payload(payload, "content", "done\n"),
                 }),
-            ),
+            )),
             touched_code: true,
         };
     }
 
     if lower.contains("read") {
         return MockProviderPlan {
-            provider: MockProvider::tool_call(
+            provider: ConfiguredProvider::from_env_or_mock(MockProvider::tool_call(
                 "read_file",
                 json!({"path": string_payload(payload, "path", "README.md")}),
-            ),
+            )),
             touched_code: false,
         };
     }
 
     if lower.contains("sleep") {
         return MockProviderPlan {
-            provider: MockProvider::tool_call("shell", json!({"command": "sleep 5"})),
+            provider: ConfiguredProvider::from_env_or_mock(MockProvider::tool_call(
+                "shell",
+                json!({"command": "sleep 5"}),
+            )),
             touched_code: false,
         };
     }
 
     if lower.contains("list") || lower.contains("ls") {
         return MockProviderPlan {
-            provider: MockProvider::tool_call(
+            provider: ConfiguredProvider::from_env_or_mock(MockProvider::tool_call(
                 "list_dir",
                 json!({"path": string_payload(payload, "path", ".")}),
-            ),
+            )),
             touched_code: false,
         };
     }
 
     MockProviderPlan {
-        provider: MockProvider::text_response("mock provider completed without tool calls"),
+        provider: ConfiguredProvider::from_env_or_mock(MockProvider::text_response(
+            "mock provider completed without tool calls",
+        )),
         touched_code: false,
     }
 }
@@ -998,6 +1032,7 @@ mod tests {
             fs::read_to_string(workspace.path().join("result.txt")).expect("file"),
             "done"
         );
+        assert!(workspace.path().join(".golutra/checkpoints").exists());
         assert!(
             debug["tool_results"]
                 .as_array()
