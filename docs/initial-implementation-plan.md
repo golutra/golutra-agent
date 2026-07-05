@@ -22,7 +22,8 @@
 - `RuntimeHost` 已接管 `InProcessTransport` 后端，统一持有 `RuntimeStore`、`RuntimeLaneManager`、EventBus、sequence 分配和 session 生命周期；`send_command` 不再直接写入口层假事件。
 - app-server `/events` 已改为 cursor 历史 replay + 长连接轮询 live stream，TUI 可 attach 到 CLI 已创建的同一 running task。
 - `RuntimeHost` 已接入后台 `AgentLoop` 执行器，P0 可通过 mock provider 触发本地工具、写入 artifact/evidence、checkpoint、verification/loop decision，并把终态投影给 CLI/TUI/app-server。
-- `golutra-llm` 已提供可用的 OpenAI-compatible live provider adapter；默认仍走 deterministic mock provider，只有显式设置 `GOLUTRA_PROVIDER_MODE=live` 和 key/model 时才联网。live 配置缺失会显式失败，支持 `GOLUTRA_PROVIDER_*` 与 `OPENAI_*` env，并提供 CLI `provider current/probe` 脱敏检查入口。
+- `golutra-llm` 已提供可用的 OpenAI-compatible live provider adapter；默认仍走 deterministic mock provider，只有显式设置 `GOLUTRA_PROVIDER_PROTOCOL=openai-compatible` 或兼容的 `GOLUTRA_PROVIDER_MODE=live` 且配置 key/model 时才联网。live 配置缺失会显式失败，支持 `GOLUTRA_PROVIDER_*` 与 `OPENAI_*` env，并提供 CLI `provider protocols/current/probe` 脱敏检查入口。
+- LLM 协议 catalog 已注册 `mock`、`openai-compatible`、`anthropic`、`gemini`、`vertex-ai`、`genai`；除 `mock` 与 `openai-compatible` 外，其它协议当前处于 catalog/diagnostic ready 状态，选择后会返回 `adapter_not_implemented` 而不是静默 fallback。
 - P1/P2 先落稳定 schema、guardrail、SDK 和最小页面，复杂自动化和外部凭据相关能力仍通过 TODO 决策位收敛。
 - 第一阶段范围已在 `implementation-blueprint.md` 中明确，不能继续扩张到复杂 multi-agent 或不可审计的自动自我改进。
 
@@ -136,7 +137,7 @@ P0 可以先创建全部 crate 空壳，但只实现 P0 必需模块：
 
 TODO 决策占位：
 
-- TODO(provider-config)：确定 P0 默认模型、环境变量命名、配置文件路径和本地 mock provider 优先级。
+- TODO(provider-config)：P0 env 入口已确定为 `GOLUTRA_PROVIDER_PROTOCOL`、`GOLUTRA_PROVIDER_*`、`OPENAI_*` 兼容 fallback 和默认 mock；仍需确定 user/workspace provider config 文件路径与 secretRef/OAuth 存储策略。
 - TODO(sqlite-path)：确定默认数据目录，建议遵守 XDG / macOS app support，并支持 `GOLUTRA_HOME` 覆盖。
 - TODO(event-log-layout)：决定 P0 event log 只用 SQLite，还是 SQLite + JSONL 双写。
 - TODO(runtime-host)：补齐 `RuntimeHost`，让 `InProcessTransport` 和 `HttpSseTransport` 都连接同一 host，而不是各自包一份 store。
@@ -407,7 +408,7 @@ Provider 内部模型：
 TODO 配置占位：
 
 - TODO(genai-version)：确定 `genai` crate 版本和最小 provider 覆盖。
-- TODO(model-catalog)：确定 P0 模型能力矩阵字段和默认 fallback 列表。
+- TODO(model-catalog)：P0 已有内置 protocol catalog 与最小模型能力字段；P1 仍需补 provider 品牌目录、可安装模型列表、streaming/vision/json/schema/reasoning 等能力矩阵。
 - TODO(tokenizer)：确定 P0 token 估算方式，允许先用粗略估算但必须标记来源。
 
 ## P0.6 最小 ReAct Loop 与 Verification

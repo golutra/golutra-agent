@@ -16,6 +16,7 @@
 | Time | Problem | Action | Verification |
 | --- | --- | --- | --- |
 | 2026-07-05 23:52 | live provider smoke 读取不存在的 `README.md` 时，工具返回失败但 verifier 只检查 evidence_refs 非空，导致弱错误 evidence 被误判为 Pass。 | 将 AgentLoop 中每个 tool report 转成 `VerificationCheck`，只有 `ToolResultStatus::Ok` 才通过；失败工具现在生成 Partial/Failed 而不是 StopSuccess。 | `cargo test -p golutra-runtime` 通过；新增 `agent_loop_does_not_stop_success_when_tool_fails` 测试。 |
+| 2026-07-06 00:06 | `ProviderProtocol::OpenAiCompatible` 使用 serde `kebab-case` 自动序列化成 `open-ai-compatible`，与配置和文档约定的 `openai-compatible` 不一致。 | 为该枚举变体增加显式 serde rename，并新增 wire id 序列化单元测试。 | `cargo test -p golutra-llm` 通过；`cargo run -p golutra-cli -- provider protocols` 输出 `openai-compatible`。 |
 | 2026-07-05 22:35 | 后台 AgentLoop 接入后，client 测试继续依赖 `sleep` 任务的调度时间来验证 persisted active task，导致任务完成时序不稳定并触发断言失败。 | 将该测试改为直接写入持久 `TaskCreated` 事件来构造 active task 状态，避免依赖后台任务执行时长。 | `cargo test -p golutra-client` 通过。 |
 | 2026-07-05 22:15 | 检查 TUI 文件非 ASCII 时误把 NUL 范围写进 shell 命令，导致 `exec_command` 拒绝执行。 | 改用 `rg -nP '[^\\x00-\\x7F]' crates/golutra-tui/src/main.rs` 检查非 ASCII 内容。 | 命令返回退出码 1 且无输出，确认目标文件无非 ASCII 字符。 |
 | 2026-07-05 21:21 | TUI 单元测试把 `RuntimeEventSource` / `RuntimeEventType` 误从 `golutra-core` 导入，实际这两个协议枚举定义在 `golutra-protocol`，导致 `cargo test -p golutra-tui` 编译失败。 | 调整测试导入为 `golutra_protocol::{RuntimeEventSource, RuntimeEventType}`，保持 core 只承载基础 ID 和领域类型。 | `cargo test -p golutra-tui`、`cargo clippy --workspace --all-targets -- -D warnings` 和 `cargo test --workspace` 通过。 |

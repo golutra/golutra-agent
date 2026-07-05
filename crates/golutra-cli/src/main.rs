@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use golutra_client::{InProcessTransport, RuntimeClient};
 use golutra_core::{Actor, ActorKind, CommandId, SessionId, TaskStatus};
-use golutra_llm::ConfiguredProvider;
+use golutra_llm::{ConfiguredProvider, provider_protocol_catalog};
 use golutra_protocol::{RuntimeQuery, RuntimeQueryKind, SessionCommand, SessionCommandKind};
 use tokio::time::{Duration, sleep};
 use uuid::Uuid;
@@ -39,6 +39,7 @@ enum Command {
 enum ProviderCommand {
     Current,
     Probe,
+    Protocols,
 }
 
 #[tokio::main]
@@ -166,6 +167,13 @@ async fn main() -> miette::Result<()> {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&result).unwrap_or_default()
+                );
+            }
+            ProviderCommand::Protocols => {
+                let protocols = provider_protocol_catalog();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&protocols).unwrap_or_default()
                 );
             }
         },

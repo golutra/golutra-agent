@@ -33,14 +33,21 @@ Golutra 不直接复制 qwen-code 的配置文件形状。Golutra 的核心仍�
 
 - `golutra-llm` 已有 `MockProvider` 和 OpenAI-compatible live adapter。
 - 默认 provider 是 mock。
-- 真实联网调用必须显式设置：
+- 真实联网调用必须显式选择协议并配置凭据。推荐设置：
+  - `GOLUTRA_PROVIDER_PROTOCOL=openai-compatible`
+  - `GOLUTRA_PROVIDER_API_KEY`
+  - `GOLUTRA_PROVIDER_MODEL`
+  - 可选 `GOLUTRA_PROVIDER_BASE_URL`
+- 兼容入口仍支持：
   - `GOLUTRA_PROVIDER_MODE=live`
   - `GOLUTRA_PROVIDER_API_KEY`
   - `GOLUTRA_PROVIDER_MODEL`
   - 可选 `GOLUTRA_PROVIDER_BASE_URL`
 - OpenAI-compatible adapter 已支持 `OPENAI_API_KEY`、`OPENAI_MODEL`、`OPENAI_BASE_URL` 作为兼容 fallback。
+- provider protocol catalog 已注册 `mock`、`openai-compatible`、`anthropic`、`gemini`、`vertex-ai` 和 `genai`。
+- 当前只有 `mock` 与 `openai-compatible` 可执行；`anthropic`、`gemini`、`vertex-ai`、`genai` 已具备协议选择、env 映射和脱敏诊断，live adapter 待接。
 - base URL 会做 P0 规范化：例如 `api.golutra.cn` 会解析成 `https://api.golutra.cn/v1`。
-- CLI 已提供 `golutra provider current` 和 `golutra provider probe`，输出只包含脱敏配置与 probe 结果，不输出 API key。
+- CLI 已提供 `golutra provider protocols`、`golutra provider current` 和 `golutra provider probe`，输出只包含协议目录、脱敏配置与 probe 结果，不输出 API key。
 - live 模式下配置缺失会显式失败，不再静默回退到 mock。
 - 这套 env 入口保留为 P0 兼容路径，后续 provider catalog / secretRef / OAuth 配置系统必须能包住它，而不是破坏现有 smoke 和 CLI 行为。
 
@@ -84,11 +91,21 @@ Golutra 第一阶段按协议能力分类，不按品牌分叉 runtime：
 | --- | --- | --- |
 | `mock` | deterministic provider，用于本地 smoke、replay、测试 | 默认启用 |
 | `openai-compatible` | OpenAI Chat Completions 兼容 endpoint，包括 OpenAI、OpenRouter、DashScope compatible、Ollama/vLLM/LM Studio | P0 已有最小 adapter，P1 扩展配置 |
-| `genai` | `rust-genai` 聚合 adapter，覆盖 Anthropic、Gemini、Ollama、OpenRouter、DeepSeek 等 | P1/P2 推荐默认多 provider 接入层 |
-| `dashscope` | 阿里 DashScope / Qwen 原生或兼容 endpoint | 优先走 OpenAI-compatible；需要原生能力时再加 adapter |
-| `anthropic-native` | Anthropic native Messages API | 只有 `genai` 无法满足关键能力时再直接实现 |
-| `gemini-native` | Google GenAI / Vertex | 同上 |
-| `local-openai` | 本地推理服务的 OpenAI-compatible endpoint | 作为 `openai-compatible` 的 baseUrl 变体 |
+| `anthropic` | Anthropic native Messages API | 目录、env 映射和诊断已就绪，adapter 待接 |
+| `gemini` | Google Gemini API | 目录、env 映射和诊断已就绪，adapter 待接 |
+| `vertex-ai` | Google Vertex AI | 目录、env 映射和诊断已就绪，adapter 待接 |
+| `genai` | `rust-genai` 聚合 adapter，覆盖 Anthropic、Gemini、Ollama、OpenRouter、DeepSeek 等 | P1/P2 推荐默认多 provider 接入层，adapter 待接 |
+
+常见 provider 可以先按协议接入：
+
+| provider | 推荐协议 | 备注 |
+| --- | --- | --- |
+| OpenAI | `openai-compatible` | `OPENAI_*` env 可作为 fallback |
+| OpenRouter | `openai-compatible` | 设置自定义 baseUrl 和 model |
+| DashScope / Qwen compatible | `openai-compatible` | 优先走兼容 endpoint |
+| Ollama / vLLM / LM Studio | `openai-compatible` | 作为本地或私有 baseUrl 变体 |
+| Anthropic | `anthropic` 或未来 `genai` | 当前只做配置诊断，不执行 live 请求 |
+| Gemini / Vertex AI | `gemini` / `vertex-ai` 或未来 `genai` | 当前只做配置诊断，不执行 live 请求 |
 
 新增 provider 时先问两个问题：
 
@@ -227,7 +244,7 @@ fingerprint 只用于判断“是否换了凭据”，不能用于认证。
 建议命令：
 
 ```bash
-golutra provider list
+golutra provider protocols
 golutra provider current
 golutra provider probe
 golutra provider login <provider-id>
@@ -241,6 +258,7 @@ golutra provider add-custom --protocol openai-compatible --base-url http://local
 
 - `provider login` 负责交互式 OAuth 或 guided API key setup。
 - `provider set-key` 不把 key 写入 runtime event；只写 envKey/secretRef，或交给 keychain。
+- `provider protocols` 输出内置协议、env key、baseUrl key、model key、probe 能力和 adapter 状态。
 - `provider probe` 执行最小健康检查并写脱敏 event。
 - 非交互环境下，如果缺凭据，返回可执行错误：缺哪个 envKey、当前 provider/model 是什么、如何设置。
 
@@ -328,8 +346,10 @@ probe 结果进入 capability matrix，但不能把一次 probe 成功当作永�
 ### P0 兼容层
 
 - 已保留 `GOLUTRA_PROVIDER_MODE=live` 快捷入口。
+- 已新增 `GOLUTRA_PROVIDER_PROTOCOL`，协议选择优先于旧 mode 快捷入口。
 - 已将 env 读取集中到 OpenAI-compatible 配置解析入口，避免运行时散落读取 key/model/baseUrl。
-- 已支持 `golutra provider current` 和 `golutra provider probe` 作为 P0 脱敏检查入口。
+- 已支持 `golutra provider protocols`、`golutra provider current` 和 `golutra provider probe` 作为 P0 脱敏检查入口。
+- 已注册 `mock`、`openai-compatible`、`anthropic`、`gemini`、`vertex-ai`、`genai` protocol catalog；未实现 adapter 的协议会返回 `adapter_not_implemented` 诊断，不会静默 fallback。
 - 增加 provider config schema 草案和脱敏 snapshot。
 - provider 错误统一写入 runtime event，避免只在 stderr 出现。
 
