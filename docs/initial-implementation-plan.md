@@ -24,6 +24,7 @@
 - `RuntimeHost` 已接入后台 `AgentLoop` 执行器，P0 可通过 mock provider 触发本地工具、写入 artifact/evidence、checkpoint、verification/loop decision，并把终态投影给 CLI/TUI/app-server。
 - `golutra-llm` 已提供可用的 OpenAI-compatible live provider adapter；默认仍走 deterministic mock provider，只有显式设置 `GOLUTRA_PROVIDER_PROTOCOL=openai-compatible` 或兼容的 `GOLUTRA_PROVIDER_MODE=live` 且配置 key/model 时才联网。live 配置缺失会显式失败，支持 `GOLUTRA_PROVIDER_*` 与 `OPENAI_*` env，并提供 CLI `provider protocols/current/probe` 脱敏检查入口。
 - LLM 协议 catalog 已注册 `mock`、`openai-compatible`、`anthropic`、`gemini`、`vertex-ai`、`genai`；除 `mock` 与 `openai-compatible` 外，其它协议当前处于 catalog/diagnostic ready 状态，选择后会返回 `adapter_not_implemented` 而不是静默 fallback。
+- 当前首次进入不会要求登录或输入 key；下一步首次 provider onboarding、凭据持久化、resume、多 session、多工作区设计已收敛到 `onboarding-session-workspace-design.md`。
 - P1/P2 先落稳定 schema、guardrail、SDK 和最小页面，复杂自动化和外部凭据相关能力仍通过 TODO 决策位收敛。
 - 第一阶段范围已在 `implementation-blueprint.md` 中明确，不能继续扩张到复杂 multi-agent 或不可审计的自动自我改进。
 
@@ -77,7 +78,7 @@ CLI 创建 coding task
 | P0.8 | app-server、RuntimeClient、多入口一致性 | 中 | 多端看到同一 task 状态和 event stream；支持 cursor replay + live stream |
 | P0.9 | checkpoint、debug、replay、改进候选 | 中 | 文件副作用有恢复点，失败任务可复盘 |
 
-P1 才做：真实 provider 覆盖增强、TypeScript SDK、基础 Web attach、评估回归套件。
+P1 才做：provider onboarding、真实 provider 覆盖增强、thread list/resume/fork、TypeScript SDK、基础 Web attach、评估回归套件。
 P2 才做：长期 memory 晋升、PromotionDecision、Open-Endedness、复杂 benchmark hardening。
 
 ## 推荐 Workspace 结构
@@ -589,6 +590,9 @@ P1 在 P0 稳定后推进，不反向污染 P0：
 - [x] TypeScript SDK 从 schema/type 产物消费协议。
 - [x] Web attach 页面，只展示 projection 和 event stream。
 - [ ] 真实 provider golden tests。TODO(provider-golden)：需要确定真实 provider、模型、密钥环境变量和可提交的脱敏 golden fixture。
+- [ ] Provider onboarding：实现 `ProviderInstallPlan`、`provider login/set-key/use`、TUI/Web 首次 connect provider flow，并确保配置/probe 失败 rollback。
+- [ ] Thread/session 体验：引入用户可见 `ThreadId`、`threads` 表、`default-thread`、`thread list/resume/fork` 和 TUI resume picker。
+- [ ] 多工作区索引：增加 `$GOLUTRA_HOME/index.sqlite`，跨 workspace 列出最近 thread，同时保持 workspace SQLite 为事实来源。
 - [x] 更完整的 config loader 和 model catalog。
 - [x] file-search 独立模块，加入 SQLite metadata + rg。
 - [x] evaluation runner 最小可用：

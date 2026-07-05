@@ -11,6 +11,8 @@
 - 默认仍使用 deterministic mock provider；真实 provider 必须显式启用。
 - secret 不进入 runtime event、artifact 摘要、projection、SQLite payload 或日志。
 
+首次 provider onboarding、resume、多 session 和多工作区的完整 UX 见 `onboarding-session-workspace-design.md`。
+
 ## qwen-code 调研结论
 
 参考路径：`/Users/skyseek/Desktop/project/open/golutra-agent/project/qwen-code`。
@@ -33,6 +35,7 @@ Golutra 不直接复制 qwen-code 的配置文件形状。Golutra 的核心仍�
 
 - `golutra-llm` 已有 `MockProvider` 和 OpenAI-compatible live adapter。
 - 默认 provider 是 mock。
+- 首次进入当前不会要求登录或输入 key；CLI/TUI 会继续使用 mock，除非显式选择 live protocol。
 - 真实联网调用必须显式选择协议并配置凭据。推荐设置：
   - `GOLUTRA_PROVIDER_PROTOCOL=openai-compatible`
   - `GOLUTRA_PROVIDER_API_KEY`
@@ -50,6 +53,7 @@ Golutra 不直接复制 qwen-code 的配置文件形状。Golutra 的核心仍�
 - CLI 已提供 `golutra provider protocols`、`golutra provider current` 和 `golutra provider probe`，输出只包含协议目录、脱敏配置与 probe 结果，不输出 API key。
 - live 模式下配置缺失会显式失败，不再静默回退到 mock。
 - 这套 env 入口保留为 P0 兼容路径，后续 provider catalog / secretRef / OAuth 配置系统必须能包住它，而不是破坏现有 smoke 和 CLI 行为。
+- P1 需要补 provider onboarding gate：TUI/Web 首次进入时展示 connect provider flow，CLI 非交互场景保持结构化诊断。
 
 ## 目标架构
 
@@ -262,6 +266,13 @@ golutra provider add-custom --protocol openai-compatible --base-url http://local
 - `provider probe` 执行最小健康检查并写脱敏 event。
 - 非交互环境下，如果缺凭据，返回可执行错误：缺哪个 envKey、当前 provider/model 是什么、如何设置。
 
+首次进入策略：
+
+- `golutra tui` / Web：如果没有 ready live provider，打开 provider setup，并提供 Continue with mock。
+- `golutra chat`：默认 mock；如果用户显式设置 live protocol 但缺 key/model，返回 missing env 错误。
+- `golutra provider login`：强制进入 provider setup。
+- CI / 非 TTY：永远不弹交互 UI，只输出结构化错误。
+
 ### TUI
 
 TUI provider connect modal 按三组展示：
@@ -356,8 +367,10 @@ probe 结果进入 capability matrix，但不能把一次 probe 成功当作永�
 ### P1 provider catalog
 
 - 新增 user/workspace provider config 文件。
-- 实现 `provider list/current/use/probe`。
+- 实现 `provider list/current/use/probe/login/set-key`。
 - 引入 `ProviderCatalog`、`ProviderSelection`、`ResolvedProviderConfig`。
+- 引入 `ProviderInstallPlan`，确保 settings/env/runtime reload/probe 失败时可 rollback。
+- TUI/Web 接入首次 provider setup，不再让真实用户面对空白 mock 前端。
 - 支持 OpenAI-compatible 自定义 endpoint。
 - 给 OpenAI-compatible adapter 增加 streaming/tool calling/capability probe 测试。
 
