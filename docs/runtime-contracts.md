@@ -25,6 +25,9 @@
 - `RetryContract`
 - `FallbackContract`
 - `SideEffectPolicy`
+- `RuntimeLaneContract`
+- `LoopGuardContract`
+- `WorkspaceCheckpointContract`
 
 第一阶段不要求把所有策略自动化做满，但必须有一致字段和明确语义。
 
@@ -118,6 +121,26 @@ CancellationContract
 - `pause` / `resume` 不能破坏 event 顺序。
 - 工具取消必须有明确 `cancelled` 状态，而不是模糊错误。
 
+## RuntimeLaneContract
+
+运行中输入必须由 runtime 统一裁决：
+
+```text
+RuntimeLaneContract
+  lane_scope: workspace_id + session_id + task_id
+  busy_policy: append | inject | interrupt | reject
+  active_controller_required
+  safe_injection_points
+  event_ordering_policy
+```
+
+要求：
+
+- 同一 task 的 turn 默认串行，不能由多个入口并发推进。
+- `append`、`inject`、`interrupt`、`reject` 都必须产生 runtime event。
+- `inject` 只能发生在 provider call 前或工具安全间隙，不能中断副作用。
+- 非 active controller 的控制动作必须走 `takeover` 或被拒绝。
+
 ## RetryContract
 
 重试不能默认发生在隐式层：
@@ -155,6 +178,28 @@ FallbackContract
 - fallback 由 `LoopDecision` 记录。
 - 不能因为 provider 适配细节不同而默默改变能力边界。
 
+## LoopGuardContract
+
+LoopGuard 是防止 agent 无界循环、无意义烧 token 和污染上下文的硬边界：
+
+```text
+LoopGuardContract
+  repeated_tool_failure
+  empty_response_recovery
+  context_overflow_recovery
+  max_iteration_policy
+  retry_cost_policy
+  oversized_tool_output_policy
+```
+
+要求：
+
+- 同一工具连续确定性失败达到阈值后，必须改变策略、询问用户或 blocked。
+- provider 空回复只能有限恢复，恢复用的 synthetic message 不能进入长期历史。
+- context overflow 优先裁剪旧工具输出和低价值上下文；裁剪失败进入 `LoopDecision`。
+- max iteration 后必须产生 `stop_partial`、`stop_failed` 或 `blocked`，不能无声结束。
+- retry / fallback 的 token 和成本必须进入预算判断。
+
 ## SideEffectPolicy
 
 副作用不是工具实现细节，而是核心治理对象：
@@ -174,6 +219,27 @@ SideEffectPolicy
 - 高风险动作要能触发 approval gate。
 - side effect 失败后是否中止任务，必须提前定义。
 
+## WorkspaceCheckpointContract
+
+coding agent 只要会改文件，就必须有工作区恢复边界：
+
+```text
+WorkspaceCheckpointContract
+  checkpoint_type: shadow_git | snapshot | external
+  changed_files
+  ignored_patterns
+  secret_exclusion_policy
+  restore_hint
+  retention_policy
+```
+
+要求：
+
+- checkpoint 只能作为 Golutra 恢复网，不能修改用户自己的 `.git` 历史。
+- 默认遵守 `.gitignore` 和 policy 排除规则，避免保存依赖目录、构建产物和敏感文件。
+- checkpoint 失败不能让任务成功假象化；必须写入 event，并在必要时降级为 residual risk。
+- 非文件副作用不能伪装成可回滚，必须单独记录补偿或不可回滚风险。
+
 ## P0 验收口径
 
 第一阶段至少要验证这些契约没有漂：
@@ -184,3 +250,6 @@ SideEffectPolicy
 - retry 不会重复制造副作用。
 - fallback 不会绕过 `LoopDecision`。
 - stop_success 不会绕过 `VerificationRecord`。
+- running task 中的新输入不会绕过 `RuntimeLaneContract`。
+- loop guard 不允许重复工具失败、空回复、context overflow 或 max iteration 形成无界循环。
+- workspace checkpoint 不污染用户 `.git`，且敏感文件排除策略可验证。

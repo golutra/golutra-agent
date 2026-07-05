@@ -119,15 +119,15 @@ sdk/python
 
 | 模块 | 职责 |
 | --- | --- |
-| `golutra-core` | Message、SessionState、GoalState、LoopGuard、LoopDecision、ToolResultEnvelope、TaskRecord、Policy 等核心类型 |
-| `golutra-runtime` | query loop、turn 状态机、LoopDecision 生成、tool/model 回流、resume/compact 调度 |
+| `golutra-core` | Message、SessionState、GoalState、RuntimeLane、BusyPolicyDecision、LoopGuard、LoopDecision、ToolResultEnvelope、TaskRecord、Policy 等核心类型 |
+| `golutra-runtime` | query loop、RuntimeLane、turn 状态机、LoopGuard、LoopDecision 生成、tool/model 回流、resume/compact 调度 |
 | `golutra-event` | ProviderRawEvent、RuntimeEvent、UiSdkEvent、durable/live-only 事件协议 |
 | `golutra-protocol` | `SessionCommand`、`RuntimeQuery`、`RuntimeEvent`、app-server transport contract、SDK 共享类型 |
 | `golutra-protocol-fixtures` | schema 产物、协议 fixture、跨语言契约测试输入 |
 | `golutra-context` | ContextBuilder、TokenBudgetTracker、WorkingSummary、CompactManager、history 分层、context projection |
 | `golutra-tools` | ToolSchema、ToolAccesses、tool registry、schema validation、tool execution、ToolResultEnvelope |
 | `golutra-policy` | PermissionPolicy、`allow/ask/deny`、workspace isolation、路径/网络/命令策略 |
-| `golutra-store` | SQLite state、durable event log、artifact store、migration |
+| `golutra-store` | SQLite state、durable event log、artifact store、workspace checkpoint ref、migration |
 | `golutra-memory` | MemoryRetriever、MemoryGovernance、项目索引、代码片段召回、memory promotion/rollback |
 | `golutra-llm` | ProviderConfig、ModelCatalog、CapabilityMatrix、ModelRouteDecision、adapter、usage 解析 |
 | `golutra-verify` | verification runner、PASS/FAIL/PARTIAL、证据记录 |
@@ -156,6 +156,7 @@ Governance
 模块落地时遵守以下边界：
 
 - `golutra-runtime` 只产生 loop 状态和 `LoopDecision`，不直接拥有长期 memory。
+- `golutra-runtime` 负责 `RuntimeLane` 和 busy policy；CLI/TUI/SDK 不能各自实现排队、注入或中断。
 - `golutra-context` 只负责模型可见输入投影、token 预算和 compaction，不把完整 transcript 当 prompt 回灌。
 - `golutra-memory` 只负责可解释召回和长期 memory 晋升治理，不直接改写当前任务状态。
 - `golutra-store` 保存 raw event、artifact 和 projection，避免 UI、provider adapter 或 tool 层维护自己的任务真相。
@@ -203,6 +204,8 @@ trait RuntimeClient {
 
 - 一个 `session` 同时只允许一个 `active task`，避免工具副作用和工作区状态冲突。
 - 多前端 attach 时默认采用 `one active controller + many observers`，而不是多 controller 并发写入。
+- active task 运行中收到新输入时，必须通过 `RuntimeLane` 统一裁决为 `append`、`inject`、`interrupt` 或 `reject`。
+- `inject` 只能在 provider call 前或工具安全间隙发生，不能打断正在执行的副作用。
 
 ## 核心库推荐
 

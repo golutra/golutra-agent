@@ -121,6 +121,24 @@ Golutra 当前主场景是 coding agent，不按通用 agent 平台做第一阶�
 - 其他已 attach 前端默认为 observer，只共享状态、流式输出和工具进度。
 - `approve`、`deny`、`abort`、`takeover` 这类控制动作必须写入 runtime event，不能走前端私有逻辑。
 
+## RuntimeLane 与运行中输入
+
+同一 `session/task` 必须有一个串行执行域，称为 `RuntimeLane`。它解决的是：任务执行中用户又输入、取消、接管或补充约束时，runtime 应该如何处理，而不是让入口层各自猜。
+
+第一阶段默认策略：
+
+- `append`：当前 task 正在运行时，把新输入排到后续 turn。
+- `inject`：当前 loop 尚未进入不可中断工具副作用时，把用户补充合并到下一次 provider call 前。
+- `interrupt`：取消当前 turn，写入 cancellation event，再由新输入接管执行。
+- `reject`：非 active controller 或不满足安全边界的新输入直接拒绝，但要返回可解释原因。
+
+约束：
+
+- `RuntimeLane` 是 runtime 状态，不是 TUI / SDK 私有队列。
+- `inject` 只能在安全边界处发生，不能打断正在执行的文件写入、shell、网络或外部系统副作用。
+- 所有 busy policy 决策都必须写入 `RuntimeEvent`，并进入 `StateProjection`。
+- `interrupt` 与 `abort` 都必须走 `CancellationContract`，不能只停止 UI stream。
+
 ## 四个核心系统
 
 ### Runtime Loop
@@ -201,17 +219,19 @@ MemoryGovernance
 1. 用户从 CLI / TUI / API / SDK 输入请求
 2. Entry Layer 转成 SessionCommand
 3. Host Runtime 创建 Session / Turn / GoalState
-4. Runtime 写入 input event 和 turn snapshot
-5. ContextBuilder 根据 state、summary、memory、evidence 构造模型输入，并生成 TokenBudgetSnapshot
-6. Provider Router 根据 CapabilityMatrix 和预算选择模型
-7. Provider 返回 assistant message / tool calls / usage / raw events，ProviderContract 归一化为 TokenUsageRecord
-8. Tool System 校验 schema、权限、sandbox 和资源访问
-9. ToolResultEnvelope 写入 summary、structured facts、artifact ref、evidence refs
-10. Verification 判断任务是否达成、证据是否可靠、是否违反 policy
-11. LoopGuard 与 LoopDecision 判断 continue / compact / retry / fallback / ask_user / stop
-12. 任务结束后按需生成 PostTaskReview 和可选 ImprovementCandidate
-13. Projection Layer 按用途生成 User / Runtime Control / Debug / Evaluation 四类投影
-14. 后续治理增强可在第 4、5、8、10、11 步之间接入 GoalLedger、RuntimeGovernor、VerificationTier、EventSamplingPolicy 和 ContextProjectionCache
+4. RuntimeLane 根据 busy policy 判断 append / inject / interrupt / reject
+5. Runtime 写入 input event 和 turn snapshot
+6. ContextBuilder 根据 state、summary、memory、evidence 构造模型输入，并生成 TokenBudgetSnapshot
+7. Provider Router 根据 CapabilityMatrix 和预算选择模型
+8. Provider 返回 assistant message / tool calls / usage / raw events，ProviderContract 归一化为 TokenUsageRecord
+9. Tool System 校验 schema、权限、sandbox 和资源访问
+10. ToolResultEnvelope 写入 summary、structured facts、artifact ref、evidence refs
+11. Verification 判断任务是否达成、证据是否可靠、是否违反 policy
+12. LoopGuard 与 LoopDecision 判断 continue / compact / retry / fallback / ask_user / stop
+13. WorkspaceCheckpoint 在文件副作用后生成可恢复快照
+14. 任务结束后按需生成 PostTaskReview 和可选 ImprovementCandidate
+15. Projection Layer 按用途生成 User / Runtime Control / Debug / Evaluation 四类投影
+16. 后续治理增强可在第 5、6、9、11、12 步之间接入 GoalLedger、RuntimeGovernor、VerificationTier、EventSamplingPolicy 和 ContextProjectionCache
 ```
 
 ## 模块划分
@@ -219,11 +239,11 @@ MemoryGovernance
 | 模块 | 职责 |
 | --- | --- |
 | `golutra-core` | 核心协议与状态类型 |
-| `golutra-runtime` | turn 状态机、loop 执行、resume、compact、fallback |
+| `golutra-runtime` | RuntimeLane、turn 状态机、loop 执行、LoopGuard、resume、compact、fallback |
 | `golutra-event` | Durable / live-only 事件协议 |
 | `golutra-context` | ContextBuilder、TokenBudgetTracker、TokenBudgetSnapshot、WorkingSummary、context projection |
 | `golutra-memory` | MemoryRetriever、MemoryGovernance、memory promotion/rollback |
-| `golutra-store` | SQLite、event log、artifact store、snapshot |
+| `golutra-store` | SQLite、event log、artifact store、state snapshot、workspace checkpoint refs |
 | `golutra-llm` | Provider adapter、CapabilityMatrix、routing、usage normalization、TokenUsageRecord |
 | `golutra-tools` | ToolContract、tool registry、tool execution、ToolResultEnvelope |
 | `golutra-governor` | 后续治理增强：GoalLedger、RuntimeGovernor、GovernanceDecision |

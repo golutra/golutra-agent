@@ -243,6 +243,23 @@ ToolInstructions
 
 它不直接拥有 session，不写 UI，不做权限弹窗，不调用 provider。
 
+第一阶段可以把输入来源实现为 `ContextContributor` 列表，而不是在一个巨型函数里拼 prompt：
+
+```text
+ContextContributor
+  name
+  order
+  source: state | summary | memory | evidence | policy | tool | recent_interaction
+  token_budget_hint
+  build()
+```
+
+要求：
+
+- stable 信息、volatile 信息和 history 信息分开预算。
+- contributor 只能贡献模型可见片段和 metadata，不能执行工具或改变 runtime state。
+- 每个 contributor 的 token 占比要能进入 `TokenAttribution`，便于定位浪费上下文。
+
 ### WorkingSummary
 
 保存当前任务活状态：
@@ -320,6 +337,19 @@ reason
 ```
 
 第一阶段优先使用 SQLite、rg、tree-sitter 和结构化索引。向量检索可以作为增强，但不能成为恢复、审计、replay 和 benchmark 的基础依赖。
+
+长期记忆后端如果要扩展，核心只依赖窄契约：
+
+```text
+MemoryBackend
+  recall(query, scope, top_k)
+  store(session_id, messages)
+  feedback(signals)
+  start()
+  stop()
+```
+
+第一阶段不必做完整插件生态，但文档和接口要避免把 memory backend 设计成拥有 context、runtime、tool 和 policy 的大对象。
 
 ### MemoryGovernance
 

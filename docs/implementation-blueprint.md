@@ -31,6 +31,8 @@ RuntimeEvent
 StateProjection
 ContextProjection
 RuntimeQuery
+RuntimeLane
+BusyPolicyDecision
 ProviderContract
 ToolContract
 ToolResultEnvelope
@@ -38,6 +40,8 @@ ArtifactRecord / EvidenceRecord
 PolicyEvaluation
 VerificationRecord
 LoopDecision
+LoopGuardRule
+WorkspaceCheckpoint
 UserProjection
 DebugProjection
 EvaluationCase
@@ -84,6 +88,9 @@ Plugin Marketplace
 - `VerificationRecord` 决定任务是否完成，模型自然语言不能直接触发成功终止。
 - `PolicyEvaluation` 必须在执行层阻断高风险文件、进程、网络、secret 和外部副作用。
 - `MemoryCandidate` 只作为候选，长期 memory 不能从 transcript 自动晋升。
+- `RuntimeLane` 负责同一 task 的串行执行和运行中输入处理，入口层不能私自排队、注入或中断。
+- `LoopGuardRule` 把重复工具失败、空回复、context overflow、max iteration 等循环异常变成显式规则。
+- `WorkspaceCheckpoint` 负责 coding agent 文件副作用后的恢复点，不能污染用户自己的 `.git`。
 
 这些是第一阶段的架构约束，不等于要实现完整 benchmark hardening、复杂 multi-agent、自改进或动态评测系统。
 
@@ -135,6 +142,8 @@ ContextProjectionCache
 - 同一 workspace 可以存在多个 session，但第一阶段不鼓励共享同一个可写 working tree 并发执行。
 - 多前端 attach 到同一 task 时，共享同一 `StateProjection` 和 `RuntimeEvent` 流。
 - 新 prompt 只接受来自 `active controller`；其他前端默认只能观察，除非显式执行 `takeover`。
+- active task 正在运行时，新输入必须通过 `RuntimeLane` 选择 `append`、`inject`、`interrupt` 或 `reject`，不能由 CLI/TUI/SDK 各自处理。
+- `inject` 只允许在 provider call 前或工具安全间隙合并，不允许打断正在执行的副作用。
 
 ## 最小核心 Schema
 
@@ -178,6 +187,37 @@ RuntimeQuery
   requester: user | api | tui | cli | sdk | web | ide
   cursor
   timestamp
+```
+
+### RuntimeLane
+
+```text
+RuntimeLane
+  lane_id
+  workspace_id
+  session_id
+  task_id
+  active_turn_id
+  active_controller
+  status: idle | running | draining | cancelled
+  pending_turns
+  injected_inputs
+  busy_policy_default: append | inject | interrupt | reject
+```
+
+### BusyPolicyDecision
+
+```text
+BusyPolicyDecision
+  decision_id
+  lane_id
+  command_id
+  requested_policy: append | inject | interrupt | reject
+  applied_policy: append | inject | interrupt | reject
+  reason
+  safe_to_inject: true | false
+  affected_turn_id
+  event_ref
 ```
 
 ### ProviderContract
@@ -276,6 +316,25 @@ LoopDecision
   next_step
 ```
 
+### LoopGuardRule
+
+```text
+LoopGuardRule
+  rule_id
+  trigger: repeated_tool_failure | empty_response | context_overflow | max_iteration | retry_cost_exceeded | oversized_tool_output
+  threshold
+  action: nudge | compact | retry | fallback | ask_user | synthesize_final | blocked
+  reason
+```
+
+第一阶段内置规则：
+
+- 同一工具连续确定性失败时，不能无限重复同一调用；应要求换方法、询问用户或 blocked。
+- provider 空回复时最多做有限恢复，恢复失败后不能写入污染历史。
+- context overflow 优先裁剪旧工具输出和低价值上下文，裁剪失败进入 `LoopDecision`。
+- max iteration 不应静默失败，必须生成可解释的 partial / failed / blocked 结果。
+- retry 或 fallback 成本超过预算时，必须转为 ask_user 或 blocked。
+
 ### VerificationRecord
 
 ```text
@@ -322,6 +381,24 @@ ToolResultEnvelope
   risk
   verification_hint
 ```
+
+### WorkspaceCheckpoint
+
+```text
+WorkspaceCheckpoint
+  checkpoint_id
+  workspace_id
+  task_id
+  turn_id
+  checkpoint_type: shadow_git | snapshot | external
+  changed_files
+  artifact_refs
+  created_after_event_id
+  restore_hint
+  retention_policy
+```
+
+第一阶段推荐使用 shadow-git 或等价独立快照机制。它只能作为 Golutra 的恢复网，不能修改用户自己的 `.git` 历史，也不能把被 `.gitignore` 或 policy 排除的敏感文件写入快照。
 
 ### ArtifactRecord
 
@@ -563,6 +640,7 @@ PromotionDecision
 - SessionCommand 归一化。
 - RuntimeEvent 写入。
 - StateProjection 更新。
+- RuntimeLane / BusyPolicyDecision。
 - ContextProjection 构造。
 - TokenBudgetSnapshot 生成。
 - ProviderContract 映射。
@@ -573,6 +651,7 @@ PromotionDecision
 - PolicyEvaluation。
 - VerificationRecord 基础验证。
 - LoopDecision。
+- WorkspaceCheckpoint。
 - UserProjection。
 - minimal PostTaskReview。
 
@@ -728,6 +807,7 @@ Debug Projection 只在 debug/audit/replay 模式启用。
 | --- | --- |
 | 多入口请求 | CLI / TUI / API / SDK 都转成 `SessionCommand`，没有入口私有状态机 |
 | 多前端一致性 | 同一 `workspace/session/task` 在 SDK / TUI / Web 查询到相同状态，并能看到同一条运行中事件流 |
+| 运行中输入 | active task 运行时，新输入必须被记录为 append / inject / interrupt / reject 之一，且其他前端看到同一状态 |
 | provider 正常流 | stream event、usage、finish_reason、tool call 映射进 `ProviderContract` |
 | provider 异常流 | truncated stream、malformed event、rate limit、network error 都有结构化错误 |
 | token 观测 | 每次 provider request 前有 `TokenBudgetSnapshot`，response 后有 `TokenUsageRecord`；usage 缺失时记录 unknown 或估算来源 |
@@ -735,7 +815,9 @@ Debug Projection 只在 debug/audit/replay 模式启用。
 | tool 失败 | error、timeout、cancelled、blocked 都有明确状态，不把 raw stderr 直接塞进模型 |
 | abort / pause | abort 后不能继续产生外部副作用，pause/resume 不破坏 event 顺序 |
 | retry | 有副作用的 tool retry 必须依赖 idempotency 或显式阻断 |
+| loop guard | 重复工具失败、空回复、context overflow、max iteration 都有明确 `LoopDecision`，不能无界循环 |
 | artifact | raw output 可通过 checksum 校验，模型只读取摘要或受控 excerpt |
+| workspace checkpoint | 文件副作用后有可恢复引用，且不修改用户 `.git` |
 | verification | 没有足够 evidence 时不能 `stop_success`，只能 `stop_partial`、`stop_failed` 或 `blocked` |
 | memory | `MemoryCandidate` 不自动晋升长期 memory，必须保留 evidence、scope 和 rollback 信息 |
 
@@ -744,16 +826,17 @@ Debug Projection 只在 debug/audit/replay 模式启用。
 1. `golutra-core`：核心 schema。
 2. `golutra-store`：SQLite、event log、artifact store。
 3. `golutra-event`：durable/live-only event。
-4. `golutra-runtime`：turn loop、LoopDecision、verification 调度。
+4. `golutra-runtime`：RuntimeLane、turn loop、LoopGuard、LoopDecision、verification 调度。
 5. `golutra-context`：ContextBuilder、TokenBudgetTracker、WorkingSummary。
 6. `golutra-llm`：provider contract、capability matrix、routing、usage normalization。
 7. `golutra-tools`：tool schema、permission、ToolResultEnvelope。
-8. `golutra-verify`：任务类型基础验证策略。
-9. `golutra-client`：统一 `RuntimeClient`、`RuntimeQuery` 和 event subscription 接口。
-10. `golutra-cli` / `golutra-tui`：先用 `InProcessTransport` 消费同一 runtime。
-11. `golutra-app-server`：暴露 `HttpSseTransport`，支持 Web / SDK attach、query、stream。
-12. `golutra-vis`：DebugProjection 和 replay 查询。
-13. `golutra-eval`：ImprovementCandidate、RegressionResult、PromotionDecision 的离线链路。
+8. `golutra-store` checkpoint 子模块：workspace checkpoint。
+9. `golutra-verify`：任务类型基础验证策略。
+10. `golutra-client`：统一 `RuntimeClient`、`RuntimeQuery` 和 event subscription 接口。
+11. `golutra-cli` / `golutra-tui`：先用 `InProcessTransport` 消费同一 runtime。
+12. `golutra-app-server`：暴露 `HttpSseTransport`，支持 Web / SDK attach、query、stream。
+13. `golutra-vis`：DebugProjection 和 replay 查询。
+14. `golutra-eval`：ImprovementCandidate、RegressionResult、PromotionDecision 的离线链路。
 
 入口优先级默认值：
 
@@ -771,7 +854,9 @@ Debug Projection 只在 debug/audit/replay 模式启用。
 - 每个 provider 响应都通过 ProviderContract 归一化。
 - 每个工具执行前有 ToolContract 和 PolicyEvaluation。
 - 每个工具结果有 ToolResultEnvelope。
+- 运行中用户输入经过 RuntimeLane 和 BusyPolicyDecision。
 - raw output、日志和大内容有 ArtifactRecord，关键结论有 EvidenceRecord。
+- 文件副作用后能生成 WorkspaceCheckpoint 或明确说明不可快照原因。
 - 每个任务结束有 VerificationRecord。
 - 每次循环结束有 LoopDecision。
 - 普通用户只看到 UserProjection。
