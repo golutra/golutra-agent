@@ -746,11 +746,14 @@ fn draw_resume_picker(
     current_thread_id: ThreadId,
 ) {
     let visible_rows = area.height.saturating_sub(1) as usize;
+    let visible_count = visible_rows.max(1);
+    let offset = resume_picker_offset(picker.selected, visible_count, picker.items.len());
     let items = picker
         .items
         .iter()
         .enumerate()
-        .take(visible_rows.max(1))
+        .skip(offset)
+        .take(visible_count)
         .map(|(index, item)| {
             let selected = index == picker.selected;
             let current = item.thread_id == current_thread_id;
@@ -801,6 +804,17 @@ fn draw_resume_picker(
             .borders(Borders::TOP),
     );
     frame.render_widget(list, area);
+}
+
+fn resume_picker_offset(selected: usize, visible_count: usize, item_count: usize) -> usize {
+    if visible_count == 0 || item_count <= visible_count || selected < visible_count {
+        return 0;
+    }
+    let last_window_start = item_count.saturating_sub(visible_count);
+    selected
+        .saturating_add(1)
+        .saturating_sub(visible_count)
+        .min(last_window_start)
 }
 
 fn draw_debug_timeline(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
@@ -1226,5 +1240,19 @@ fn provider_status_message(transport: &InProcessTransport) -> String {
             )
         }
         Err(error) => format!("provider config error: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resume_picker_offset_keeps_selected_item_visible() {
+        assert_eq!(resume_picker_offset(0, 5, 20), 0);
+        assert_eq!(resume_picker_offset(4, 5, 20), 0);
+        assert_eq!(resume_picker_offset(5, 5, 20), 1);
+        assert_eq!(resume_picker_offset(19, 5, 20), 15);
+        assert_eq!(resume_picker_offset(3, 5, 4), 0);
     }
 }

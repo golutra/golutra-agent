@@ -987,14 +987,15 @@ fn mock_provider_plan(
     let provider_env = workspace_root.and_then(|root| load_provider_runtime_env(root).ok());
     let lower = objective.to_ascii_lowercase();
     if lower.contains("write") || lower.contains("create") || payload.get("content").is_some() {
+        let write_args = mock_write_file_args(payload, objective);
         return Ok(MockProviderPlan {
             provider: resolve_configured_provider(
                 provider_env.as_ref(),
                 MockProvider::tool_call(
                     "write_file",
                     json!({
-                        "path": string_payload(payload, "path", "golutra-agent-output.txt"),
-                        "content": string_payload(payload, "content", "done\n"),
+                        "path": write_args.path,
+                        "content": write_args.content,
                     }),
                 ),
             )?,
@@ -1047,6 +1048,62 @@ fn mock_provider_plan(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MockWriteFileArgs {
+    path: String,
+    content: String,
+}
+
+fn mock_write_file_args(payload: &Value, objective: &str) -> MockWriteFileArgs {
+    let parsed = parse_mock_write_file_prompt(objective);
+    MockWriteFileArgs {
+        path: non_empty_string_payload(payload, "path")
+            .or_else(|| parsed.as_ref().map(|parsed| parsed.path.clone()))
+            .unwrap_or_else(|| "golutra-agent-output.txt".to_owned()),
+        content: non_empty_string_payload(payload, "content")
+            .or_else(|| parsed.map(|parsed| parsed.content))
+            .unwrap_or_else(|| "done\n".to_owned()),
+    }
+}
+
+fn parse_mock_write_file_prompt(objective: &str) -> Option<MockWriteFileArgs> {
+    let objective = objective.trim();
+    let lower = objective.to_ascii_lowercase();
+    let marker = " with content ";
+    let marker_index = lower.find(marker)?;
+    let (path_part, content_part_with_marker) = objective.split_at(marker_index);
+    let content = clean_mock_prompt_segment(&content_part_with_marker[marker.len()..]);
+    let path = parse_mock_write_path(path_part)?;
+    if content.is_empty() {
+        return None;
+    }
+    Some(MockWriteFileArgs { path, content })
+}
+
+fn parse_mock_write_path(path_part: &str) -> Option<String> {
+    let tokens = path_part.split_whitespace().collect::<Vec<_>>();
+    let command_index = tokens
+        .iter()
+        .position(|token| matches!(token.to_ascii_lowercase().as_str(), "write" | "create"))?;
+    let candidate = match tokens
+        .get(command_index + 1)
+        .map(|token| token.to_ascii_lowercase())
+    {
+        Some(value) if value == "file" => tokens.get(command_index + 2),
+        Some(_) => tokens.get(command_index + 1),
+        None => None,
+    }?;
+    let path = clean_mock_prompt_segment(candidate);
+    if path.is_empty() { None } else { Some(path) }
+}
+
+fn clean_mock_prompt_segment(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches(|character| matches!(character, '"' | '\'' | '`' | ',' | ';' | ':'))
+        .to_owned()
+}
+
 fn resolve_configured_provider(
     provider_env: Option<&golutra_config::ProviderRuntimeEnv>,
     mock: MockProvider,
@@ -1077,12 +1134,15 @@ fn prompt_from_payload(payload: &Value) -> String {
 }
 
 fn string_payload(payload: &Value, key: &str, fallback: &str) -> String {
+    non_empty_string_payload(payload, key).unwrap_or_else(|| fallback.to_owned())
+}
+
+fn non_empty_string_payload(payload: &Value, key: &str) -> Option<String> {
     payload
         .get(key)
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or(fallback)
-        .to_owned()
+        .map(ToOwned::to_owned)
 }
 
 fn title_from_payload(payload: &Value) -> String {
@@ -1525,6 +1585,48 @@ mod tests {
             debug["artifacts"]
                 .as_array()
                 .is_some_and(|items| !items.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_write_file_natural_language_uses_requested_path_and_content() {
+        let workspace = tempdir().expect("workspace");
+        let transport = InProcessTransport::for_workspace(workspace.path())
+            .await
+            .expect("transport");
+        let session_id = transport.default_session_id();
+
+        let ack = transport
+            .send_command(command(session_id, "write file smoke.txt with content ok"))
+            .await
+            .expect("command");
+        let state = wait_for_status(&transport, session_id, TaskStatus::Completed).await;
+
+        assert!(ack.accepted);
+        assert_eq!(projection_status(&state), Some(TaskStatus::Completed));
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("smoke.txt")).expect("file"),
+            "ok"
+        );
+        assert!(!workspace.path().join("golutra-agent-output.txt").exists());
+    }
+
+    #[test]
+    fn mock_write_file_args_prefers_payload_over_prompt() {
+        let args = mock_write_file_args(
+            &json!({
+                "path": "explicit.txt",
+                "content": "explicit",
+            }),
+            "write file prompt.txt with content prompt",
+        );
+
+        assert_eq!(
+            args,
+            MockWriteFileArgs {
+                path: "explicit.txt".to_owned(),
+                content: "explicit".to_owned(),
+            }
         );
     }
 

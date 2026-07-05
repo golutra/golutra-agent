@@ -328,16 +328,23 @@ pub fn provider_onboarding_state(
         "none"
     }
     .to_owned();
-    let active_profile = merged.active_profile().map(ProviderProfile::redacted);
+    let active_profile = merged
+        .active_profile()
+        .map(ProviderProfile::redacted)
+        .or_else(|| Some(ProviderProfile::mock()));
     let missing_fields = active_profile
         .as_ref()
         .map(missing_fields)
-        .unwrap_or_else(|| vec!["active_profile".to_owned()]);
+        .unwrap_or_default();
     Ok(ProviderOnboardingState {
         configured: missing_fields.is_empty(),
         active_profile,
         missing_fields,
-        source,
+        source: if source == "none" {
+            "default".to_owned()
+        } else {
+            source
+        },
     })
 }
 
@@ -606,6 +613,20 @@ mod tests {
             plan.apply(&paths),
             Err(ConfigError::Validation(_))
         ));
+    }
+
+    #[test]
+    fn onboarding_defaults_to_ready_mock_provider() {
+        let dir = tempdir().expect("dir");
+        let state = provider_onboarding_state(dir.path()).expect("onboarding");
+
+        assert!(state.configured);
+        assert_eq!(state.source, "default");
+        assert!(state.missing_fields.is_empty());
+        assert_eq!(
+            state.active_profile.expect("profile").protocol,
+            ProviderProtocol::Mock
+        );
     }
 
     #[test]
