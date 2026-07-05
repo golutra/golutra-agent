@@ -677,6 +677,22 @@ PromotionDecision
 5. 三端订阅到同一条流式输出和工具进度
 ```
 
+### RuntimeHost 与事件流边界
+
+多前端一致性的前提是存在一个中心 `RuntimeHost`。如果 CLI、TUI、app-server 各自创建本地内存 store，即使协议类型一致，也只是三个互不相干的演示 runtime。
+
+第一阶段需要明确以下实现边界：
+
+- `RuntimeHost` 是执行与状态所有权边界，负责接收 `SessionCommand`、驱动 `RuntimeLane / AgentLoop`、写入 event、更新 projection、广播 live event。
+- `RuntimeStore` 是 durable facts，不直接等于 runtime host；store 可以恢复状态，但不能替代任务调度、运行中取消、订阅和 provider/tool loop。
+- `EventBus` 负责把 durable event 与 live event 统一起来：先 append 到 store，再发布给订阅者；断线重连时按 cursor replay，再接 live stream。
+- `InProcessTransport` 第一阶段可以用于 CLI/TUI，但它必须持有或连接 `Arc<RuntimeHost>`，不能只包 `RuntimeStore`。
+- `HttpSseTransport` 用于 Web / SDK / daemon 模式，语义必须与 `InProcessTransport` 对拍一致。
+- `RuntimeClient::subscribe` 的目标语义是 event stream；如果短期保留 snapshot API，也必须新增 live watch 能力，不能让 TUI 长期轮询历史事件。
+- `SessionResolver` 必须稳定解析 workspace 当前 session / task，不能每次入口启动都生成新的默认 session。
+
+这条边界决定了 TUI 的实施顺序：先让多个入口看到同一 task，再完善终端布局和组件。否则 TUI 会被迫维护自己的状态机，最终和 runtime 脱节。
+
 ### 协议与 SDK 约束
 
 第一阶段需要把“runtime 协议”当成独立资产，而不只是 Rust 内部类型：
@@ -832,11 +848,12 @@ Debug Projection 只在 debug/audit/replay 模式启用。
 7. `golutra-tools`：tool schema、permission、ToolResultEnvelope。
 8. `golutra-store` checkpoint 子模块：workspace checkpoint。
 9. `golutra-verify`：任务类型基础验证策略。
-10. `golutra-client`：统一 `RuntimeClient`、`RuntimeQuery` 和 event subscription 接口。
-11. `golutra-cli` / `golutra-tui`：先用 `InProcessTransport` 消费同一 runtime。
-12. `golutra-app-server`：暴露 `HttpSseTransport`，支持 Web / SDK attach、query、stream。
-13. `golutra-vis`：DebugProjection 和 replay 查询。
-14. `golutra-eval`：ImprovementCandidate、RegressionResult、PromotionDecision 的离线链路。
+10. `golutra-runtime` host 子模块：`RuntimeHost`、`SessionResolver`、`EventBus`、workspace 默认 SQLite 路径。
+11. `golutra-client`：统一 `RuntimeClient`、`RuntimeQuery`、event replay 和 live subscription 接口。
+12. `golutra-cli` / `golutra-tui`：通过 `InProcessTransport` 连接同一 `RuntimeHost`，只消费 command/query/event。
+13. `golutra-app-server`：暴露 `HttpSseTransport`，支持 Web / SDK attach、query、stream。
+14. `golutra-vis`：DebugProjection 和 replay 查询。
+15. `golutra-eval`：ImprovementCandidate、RegressionResult、PromotionDecision 的离线链路。
 
 入口优先级默认值：
 

@@ -1,0 +1,24 @@
+[package]
+name = "golutra-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+golutra-context = { path = "../golutra-context" }
+golutra-core.workspace = true
+golutra-llm = { path = "../golutra-llm" }
+golutra-protocol.workspace = true
+golutra-tools = { path = "../golutra-tools" }
+golutra-verify = { path = "../golutra-verify" }
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+golutra-policy = { path = "../golutra-policy" }
+tempfile.workspace = true
+tokio.workspace = true

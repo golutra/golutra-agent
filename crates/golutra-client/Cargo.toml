@@ -1,0 +1,22 @@
+[package]
+name = "golutra-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+golutra-core.workspace = true
+golutra-protocol.workspace = true
+golutra-runtime = { path = "../golutra-runtime" }
+golutra-store = { path = "../golutra-store" }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

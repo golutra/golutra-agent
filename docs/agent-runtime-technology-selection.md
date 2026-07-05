@@ -189,7 +189,7 @@ trait RuntimeClient {
 
 推荐 transport 分层：
 
-- `InProcessTransport`：TUI / CLI 第一阶段首选。和 `RuntimeCore` 同进程，最简单、最省资源。
+- `InProcessTransport`：TUI / CLI 第一阶段首选。和 `RuntimeHost / RuntimeCore` 同进程，最简单、最省资源。
 - `HttpSseTransport`：Web / SDK / daemon 模式第一阶段首选。HTTP 发 command 和 query，SSE 接 event stream。
 - `WebSocketTransport`：后续用于高频双向同步或远程协作，不作为第一阶段必做。
 - `IpcTransport`：后续用于 IDE companion、本地桌面端或侧车进程。
@@ -199,6 +199,9 @@ trait RuntimeClient {
 - transport 可以不同，但 `SessionCommand`、`RuntimeQuery`、`RuntimeEvent` 语义必须完全一致。
 - 一个 task 在 SDK 中运行时，TUI / Web attach 后应通过同一 client 语义查询到相同状态，并订阅到同一条流式输出。
 - daemon 只是 `RuntimeHost + HttpSseTransport` 的组合，不是新的任务接口体系。
+- `InProcessTransport` 不能退化成“每个入口各自创建一份 `sqlite::memory:` store”。它必须连接同一 `RuntimeHost`，否则 CLI、TUI、app-server 看到的 task 天然不一致。
+- `subscribe` 的目标形态是 `cursor replay + live stream`。一次性返回历史事件只适合 smoke，不足以支撑 TUI、Web 或 SDK 观察运行中任务。
+- TUI 的复杂度应限制在输入、布局、渲染和 debug panel；任务排队、运行中输入、abort、approval、provider/tool loop 都归 `RuntimeHost`。
 
 对于 coding agent，推荐再加两条默认约束：
 

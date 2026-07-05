@@ -1,0 +1,223 @@
+use chrono::Utc;
+use golutra_core::{
+    Actor, ActorKind, BudgetState, EvidenceId, LoopAction, LoopDecision, LoopDecisionId, SessionId,
+    TaskId, TaskStatus, TurnId, VerificationId,
+};
+use golutra_protocol::{
+    RuntimeEvent, RuntimeEventSource, RuntimeEventType, SessionCommand, SessionCommandKind,
+    StateProjection, UserProjection, VisibleStep,
+};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ScenarioFixture {
+    pub name: String,
+    pub commands: Vec<SessionCommand>,
+    pub events: Vec<RuntimeEvent>,
+    pub state_projection: StateProjection,
+    pub user_projection: UserProjection,
+}
+
+#[must_use]
+pub fn read_only_task() -> ScenarioFixture {
+    fixture_with_status(
+        "read_only_task",
+        TaskStatus::Completed,
+        LoopAction::StopSuccess,
+    )
+}
+
+#[must_use]
+pub fn tool_failure_task() -> ScenarioFixture {
+    fixture_with_status(
+        "tool_failure_task",
+        TaskStatus::Blocked,
+        LoopAction::Blocked,
+    )
+}
+
+#[must_use]
+pub fn abort_task() -> ScenarioFixture {
+    fixture_with_status("abort_task", TaskStatus::Aborting, LoopAction::StopPartial)
+}
+
+#[must_use]
+pub fn verification_failed_task() -> ScenarioFixture {
+    fixture_with_status(
+        "verification_failed_task",
+        TaskStatus::Failed,
+        LoopAction::StopFailed,
+    )
+}
+
+#[must_use]
+pub fn multi_frontend_attach_task() -> ScenarioFixture {
+    fixture_with_status(
+        "multi_frontend_attach_task",
+        TaskStatus::Running,
+        LoopAction::Continue,
+    )
+}
+
+#[must_use]
+pub fn all_scenarios() -> Vec<ScenarioFixture> {
+    vec![
+        read_only_task(),
+        tool_failure_task(),
+        abort_task(),
+        verification_failed_task(),
+        multi_frontend_attach_task(),
+    ]
+}
+
+fn fixture_with_status(name: &str, status: TaskStatus, action: LoopAction) -> ScenarioFixture {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let turn_id = TurnId::new();
+    let actor = Actor {
+        kind: ActorKind::Cli,
+        id: "fixture-cli".to_owned(),
+    };
+    let command = SessionCommand {
+        command_id: golutra_core::CommandId::new(),
+        session_id: Some(session_id),
+        kind: SessionCommandKind::Prompt,
+        idempotency_key: format!("{name}-prompt"),
+        actor,
+        payload: json!({
+            "objective": format!("fixture objective: {name}")
+        }),
+        timestamp: Utc::now(),
+    };
+    let event = RuntimeEvent {
+        id: golutra_core::EventId::new(),
+        sequence_no: 1,
+        session_id,
+        turn_id: Some(turn_id),
+        task_id: Some(task_id),
+        parent_event_id: None,
+        event_type: RuntimeEventType::TaskCreated,
+        timestamp: Utc::now(),
+        source: RuntimeEventSource::Runtime,
+        payload: json!({
+            "name": name,
+            "status": status
+        }),
+        payload_ref: None,
+        durable: true,
+    };
+    let visible_step = VisibleStep {
+        label: "runtime".to_owned(),
+        status: format!("{status:?}"),
+        summary: format!("scenario {name} reached {status:?}"),
+    };
+    let loop_decision = LoopDecision {
+        decision_id: LoopDecisionId::new(),
+        task_id,
+        turn_id,
+        action,
+        reason: format!("fixture loop decision for {name}"),
+        evidence_refs: vec![EvidenceId::new()],
+        verification_ref: Some(VerificationId::new()),
+        policy_ref: None,
+        budget_state: BudgetState {
+            planned_input_tokens: Some(128),
+            actual_input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            estimated_cost: None,
+            budget_remaining: Some(2048),
+            compact_recommended: false,
+            cost_risk: "low".to_owned(),
+        },
+        tool_state: "fixture".to_owned(),
+        model_state: "fixture".to_owned(),
+        next_step: None,
+    };
+    ScenarioFixture {
+        name: name.to_owned(),
+        commands: vec![command],
+        events: vec![event],
+        state_projection: StateProjection {
+            session_id,
+            active_task_id: Some(task_id),
+            task_status: status,
+            runtime_lane: None,
+            last_sequence_no: 1,
+            visible_steps: vec![visible_step.clone()],
+            pending_approval: None,
+            last_loop_decision: Some(loop_decision),
+            last_verification: None,
+        },
+        user_projection: UserProjection {
+            session_id,
+            task_id: Some(task_id),
+            status,
+            visible_steps: vec![visible_step],
+            pending_approval: None,
+            final_message: terminal_message(status),
+            residual_risks: residual_risks(status),
+        },
+    }
+}
+
+fn terminal_message(status: TaskStatus) -> Option<String> {
+    match status {
+        TaskStatus::Completed => Some("fixture completed".to_owned()),
+        TaskStatus::Partial | TaskStatus::Failed | TaskStatus::Blocked => {
+            Some(format!("fixture ended with {status:?}"))
+        }
+        _ => None,
+    }
+}
+
+fn residual_risks(status: TaskStatus) -> Vec<String> {
+    match status {
+        TaskStatus::Completed => Vec::new(),
+        _ => vec![format!("fixture residual risk for {status:?}")],
+    }
+}
+
+pub fn protocol_schema_names() -> Vec<&'static str> {
+    vec![
+        "ScenarioFixture",
+        "SessionCommand",
+        "RuntimeEvent",
+        "StateProjection",
+        "UserProjection",
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use schemars::schema_for;
+
+    #[test]
+    fn fixtures_roundtrip() {
+        for fixture in all_scenarios() {
+            let encoded = serde_json::to_string_pretty(&fixture).expect("fixture serializes");
+            let decoded: ScenarioFixture =
+                serde_json::from_str(&encoded).expect("fixture deserializes");
+            assert_eq!(fixture, decoded);
+        }
+    }
+
+    #[test]
+    fn schema_smoke() {
+        let scenario_schema = schema_for!(ScenarioFixture);
+        let command_schema = schema_for!(SessionCommand);
+        let event_schema = schema_for!(RuntimeEvent);
+
+        let scenario_json = serde_json::to_value(&scenario_schema).expect("schema serializes");
+        let command_json = serde_json::to_value(&command_schema).expect("schema serializes");
+        let event_json = serde_json::to_value(&event_schema).expect("schema serializes");
+
+        assert!(scenario_json.is_object());
+        assert!(command_json.is_object());
+        assert!(event_json.is_object());
+        assert_eq!(protocol_schema_names().len(), 5);
+    }
+}

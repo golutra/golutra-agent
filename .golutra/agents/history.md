@@ -1,0 +1,25 @@
+# History
+
+## Description
+- Record each Git change or local file change summary.
+- Each entry includes reason, impact scope, and related links (put links in Notes when applicable).
+- If owner is not specified, default to `<project-name>-agent-1`.
+- Use datetime format `YYYY-MM-DD HH:MM` (24h).
+
+## Mandatory Action
+- MUST: When this table reaches 50 entries, compress the records into shorter and more general summaries, keeping stable and reusable change points.
+
+## Record Template
+| Date Time | Type | Summary | Reason | Impact Scope | Owner Id | Notes |
+| ---- | ---- | ---- | ---- | ---- | ---- | ---- |
+| 2026-07-05 22:15 | feat | 将 TUI 默认布局改为聊天式 transcript | 参考 Codex TUI 的单列转录和底部输入区结构，移除默认左右 projection/event demo 观感，将 debug timeline 改为按 Tab 切换显示 | crates/golutra-tui/src/main.rs | 01KWRWH7SC4Z2A0NAV6X84FCYX | 验证：cargo fmt --all -- --check；cargo check -p golutra-tui；cargo clippy --workspace --all-targets -- -D warnings；cargo test --workspace；cargo run -p golutra-tui -- --help；伪终端启动 `cargo run -p golutra-tui` 后发送 q 正常退出 |
+| 2026-07-05 22:05 | feat | 打通 workspace 级共享 runtime 主干 | 根据 TUI 难点复盘，将 CLI/TUI/app-server 从各自内存 store 收敛到 RuntimeHost、workspace SQLite、默认 session、持久 active task 防重入和 SSE replay/live stream | Cargo.toml, crates/golutra-store, crates/golutra-client, crates/golutra-cli, crates/golutra-tui, crates/golutra-app-server, crates/golutra-test-client, docs/initial-implementation-plan.md | 01KWRWH7SC4Z2A0NAV6X84FCYX | 验证：cargo fmt --all -- --check；cargo clippy --workspace --all-targets -- -D warnings；cargo test --workspace；just schema；just fixture；just smoke；just replay-smoke；just transport-smoke；just ts-check；CLI 跨进程 workspace smoke；TUI attach CLI-created task smoke |
+| 2026-07-05 21:21 | feat | 实现可启动 TUI 界面 | 按架构文档补齐 `ratatui` + `crossterm` TUI 二进制入口，支持 attach 展示、prompt composer、abort command、debug event timeline 和 projection/event 渲染 | Cargo.toml, crates/golutra-tui, docs/initial-implementation-plan.md | 01KWRWH7SC4Z2A0NAV6X84FCYX | 验证：cargo fmt --all -- --check；cargo clippy --workspace --all-targets -- -D warnings；cargo test --workspace；cargo run -p golutra-tui -- --help；伪终端启动 `cargo run -p golutra-tui` 后发送 q 正常退出 |
+| 2026-07-05 19:59 | feat | 补齐 P1/P2 最小实现并完成全量检查 | 按计划继续实施，增加 Web attach、file-search SQLite 元数据索引、eval 回归/晋升/Open-Endedness schema，并同步计划状态和 Node 忽略规则 | .gitignore, crates/golutra-app-server, crates/golutra-eval, crates/golutra-file-search, docs/initial-implementation-plan.md | 01KWRWH7SC4Z2A0NAV6X84FCYX | 验证：cargo fmt --all -- --check；cargo clippy --workspace --all-targets -- -D warnings；cargo test --workspace；just schema；just fixture；just smoke；just replay-smoke；just transport-smoke；just ts-check |
+| 2026-07-05 18:54 | feat | 完成 P0.4-P0.9 runtime 闭环 | 实现 policy/tool pipeline、provider/context、AgentLoop/Verification、CLI/TUI in-process 入口、app-server/SSE/test-client、checkpoint/debug/replay/improvement candidate | crates/golutra-policy, crates/golutra-tools, crates/golutra-llm, crates/golutra-context, crates/golutra-verify, crates/golutra-runtime, crates/golutra-client, crates/golutra-cli, crates/golutra-tui, crates/golutra-app-server, crates/golutra-test-client, crates/golutra-eval, docs/initial-implementation-plan.md | 01KWRWH7SC4Z2A0NAV6X84FCYX | 验证：cargo clippy --workspace --all-targets -- -D warnings；cargo test --workspace |
+| 2026-07-05 18:39 | feat | 实现 P0.3 RuntimeLane 状态语义 | 增加 active task 防重入、active controller busy policy、abort/pause/resume 状态转换和 runtime lane 单元测试 | crates/golutra-runtime, docs/initial-implementation-plan.md | 01KWRWH7SC4Z2A0NAV6X84FCYX | 验证：cargo clippy --workspace --all-targets -- -D warnings；cargo test --workspace |
+| 2026-07-05 18:37 | feat | 实现 P0.2 store 地基 | 增加 SQLite migration、runtime event append/load、StateProjection reducer、artifact/evidence metadata API 和 store 单元测试 | crates/golutra-store, Cargo.toml, docs/initial-implementation-plan.md | 01KWRWH7SC4Z2A0NAV6X84FCYX | 验证：cargo clippy --workspace --all-targets -- -D warnings；cargo test --workspace |
+| 2026-07-05 18:34 | feat | 初始化 Rust workspace 与核心协议 schema | 开始实施初始计划，完成 P0.0/P0.1 的 crate 骨架、质量门禁、核心类型、协议类型和 fixtures 测试 | Cargo.toml, crates/*, justfile, .github/workflows/ci.yml, docs/initial-implementation-plan.md | 01KWRWH7SC4Z2A0NAV6X84FCYX | 验证：cargo fmt --all -- --check；cargo clippy --workspace --all-targets -- -D warnings；cargo test --workspace |
+| 2026-07-05 18:22 | docs | 重写初始实施计划 | 将现有架构文档收敛为可直接开工的 P0/P1/P2 任务计划、验收门槛和 TODO 决策位 | docs/initial-implementation-plan.md | 01KWRWH7SC4Z2A0NAV6X84FCYX |  |
+| 2026-07-05 18:19 | docs | 更新智能体角色长期协作规则 | 记录用户补充的 ID、工作路径、中文回复、技能加载和 AGENTS 执行要求 | .golutra/members/01KWRWH7SC4Z2A0NAV6X84FCYX/solo.md | 01KWRWH7SC4Z2A0NAV6X84FCYX |  |
+|  |  |  |  |  |  |  |

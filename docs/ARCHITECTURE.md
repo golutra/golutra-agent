@@ -284,6 +284,40 @@ Frontend
 - transport 可以有多种，但不能改变任务语义。
 - 任意前端都只能消费统一 projection 或原始 runtime event，不能直接读取内部可变状态。
 
+### TUI 可用性的真实边界
+
+TUI 的难点不在终端绘制，而在是否存在一个可共享、可恢复、可订阅的 runtime truth。`ratatui` / `crossterm` 只能解决输入和渲染，不能解决 session、task、event stream 和执行状态一致性。
+
+因此第一阶段不能把 TUI 当成独立 agent 前端实现，而要把它定义为薄 attach client：
+
+```text
+golutra-tui
+  -> RuntimeClient
+  -> InProcessTransport 或 HttpSseTransport
+  -> RuntimeHost
+  -> RuntimeCore / RuntimeLane / AgentLoop
+  -> RuntimeStore + EventBus
+```
+
+硬性边界：
+
+- `RuntimeHost` 必须拥有 `RuntimeStore`、`RuntimeLaneManager`、`AgentLoop`、`EventBus` 和 session/task 生命周期。
+- `InProcessTransport` 不能只是包一层临时 `RuntimeStore`，必须路由到 `RuntimeHost`。
+- CLI、TUI、app-server、SDK 不能各自创建 `sqlite::memory:` 作为主路径，否则它们看到的是不同任务世界。
+- `subscribe` 不能只是一次性返回历史 `Vec<Event>`，必须支持 `cursor replay + live event stream`。
+- TUI 的本地状态只能用于渲染，例如输入框、选中项、滚动位置，不能成为任务状态真相。
+- TUI 复杂组件应在 `RuntimeHost + EventBus + stable session resolver` 打通后再做；否则 UI 越复杂，越容易复制 runtime 状态机。
+
+最低可用目标不是“界面完整”，而是：
+
+```text
+CLI 创建或驱动 task
+-> TUI attach 同一个 workspace/session/task
+-> app-server 或 Web attach 同一个 task
+-> 三端看到同一 running 状态、同一工具进度、同一流式输出
+-> 任意一端 abort / approve 后，其他端通过同一事件流看到变化
+```
+
 ## 用户模式
 
 Golutra 的观测不是一条全部展示给用户的链路，而是同一批 runtime facts 的多种投影。

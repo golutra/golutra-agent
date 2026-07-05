@@ -1,0 +1,15 @@
+[package]
+name = "golutra-protocol-fixtures"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+golutra-core.workspace = true
+golutra-protocol.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
