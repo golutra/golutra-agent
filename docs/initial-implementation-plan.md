@@ -21,8 +21,8 @@
 - 当前代码已经具备 workspace 级共享 runtime 主干：CLI、TUI 和 app-server 主路径默认连接 `.golutra/runtime.sqlite`，并通过 `.golutra/default-session` 复用同一 workspace 默认 session。
 - `RuntimeHost` 已接管 `InProcessTransport` 后端，统一持有 `RuntimeStore`、`RuntimeLaneManager`、EventBus、sequence 分配和 session 生命周期；`send_command` 不再直接写入口层假事件。
 - app-server `/events` 已改为 cursor 历史 replay + 长连接轮询 live stream，TUI 可 attach 到 CLI 已创建的同一 running task。
-- 剩余关键缺口是把真实 provider/tool `AgentLoop` 作为 RuntimeHost 后台执行器接入，当前 host 只创建 lane、写入 runtime facts、处理 busy/abort 和共享 projection。
-- P1/P2 先落稳定 schema、guardrail、SDK 和最小页面，真实 provider 配置、复杂自动化和外部凭据相关能力仍通过 TODO 决策位收敛。
+- `RuntimeHost` 已接入后台 `AgentLoop` 执行器，P0 可通过 mock provider 触发本地工具、写入 artifact/evidence、完成 verification/loop decision，并把终态投影给 CLI/TUI/app-server。
+- P1/P2 先落稳定 schema、guardrail、SDK 和最小页面，真实 provider 配置、复杂自动化和外部凭据相关能力仍通过 TODO 决策位收敛；当前 P0 真实执行闭环先以 deterministic mock provider 验证。
 - 第一阶段范围已在 `implementation-blueprint.md` 中明确，不能继续扩张到复杂 multi-agent 或不可审计的自动自我改进。
 
 ## 实施原则
@@ -765,6 +765,6 @@ P0 不做：
 - [x] P0.8-1 实现 app-server command/query/SSE 演示入口。
 - [x] P0.8-2 实现 `cursor replay + live stream` SSE。
 - [x] P0.8-3 实现 test client 多入口一致性 smoke。
-- [ ] P0.8-4 接入 RuntimeHost 后台 AgentLoop 执行器。
+- [x] P0.8-4 接入 RuntimeHost 后台 AgentLoop 执行器。
 - [x] P0.9-1 实现 WorkspaceCheckpoint。
 - [x] P0.9-2 实现 DebugProjection、replay 和 ImprovementCandidate。

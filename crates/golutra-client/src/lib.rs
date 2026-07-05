@@ -8,13 +8,22 @@ use std::{
 };
 
 use async_trait::async_trait;
-use golutra_core::{BusyPolicy, EventId, SessionId, TaskId, TaskStatus, TurnId, WorkspaceId};
+use golutra_context::{ContextBuilder, ContextContributor};
+use golutra_core::{
+    BusyPolicy, EventId, LoopAction, SessionId, TaskId, TaskStatus, TurnId, WorkspaceId,
+};
+use golutra_llm::{MockProvider, ProviderRole};
+use golutra_policy::WorkspacePolicy;
 use golutra_protocol::{
     CommandAck, EventFilter, RuntimeEvent, RuntimeEventSource, RuntimeEventType, RuntimeQuery,
     RuntimeQueryKind, SessionCommand, SessionCommandKind,
 };
-use golutra_runtime::{RuntimeLaneError, RuntimeLaneManager, is_active_status};
+use golutra_runtime::{
+    AgentLoop, AgentLoopTraceEvent, AgentTaskRequest, RuntimeLaneError, RuntimeLaneManager,
+    is_active_status,
+};
 use golutra_store::{RuntimeStore, StoreError};
+use golutra_tools::BasicToolExecutor;
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast};
@@ -32,6 +41,8 @@ pub enum ClientError {
     Io(String),
     #[error("runtime session id is invalid: {0}")]
     InvalidSession(String),
+    #[error("runtime task execution failed: {0}")]
+    TaskExecution(String),
 }
 
 #[async_trait]
@@ -89,7 +100,7 @@ impl InProcessTransport {
 #[async_trait]
 impl RuntimeClient for InProcessTransport {
     async fn send_command(&self, command: SessionCommand) -> Result<CommandAck, ClientError> {
-        self.host.handle_command(command).await
+        self.host.clone().handle_command(command).await
     }
 
     async fn query(&self, query: RuntimeQuery) -> Result<Value, ClientError> {
@@ -110,6 +121,14 @@ pub struct RuntimeHost {
     workspace_id: WorkspaceId,
     workspace_root: Option<PathBuf>,
     default_session_id: SessionId,
+}
+
+#[derive(Debug, Clone)]
+struct HostedAgentTask {
+    session_id: SessionId,
+    task_id: TaskId,
+    turn_id: TurnId,
+    payload: Value,
 }
 
 impl RuntimeHost {
@@ -158,7 +177,10 @@ impl RuntimeHost {
         self.event_bus.subscribe()
     }
 
-    pub async fn handle_command(&self, command: SessionCommand) -> Result<CommandAck, ClientError> {
+    pub async fn handle_command(
+        self: Arc<Self>,
+        command: SessionCommand,
+    ) -> Result<CommandAck, ClientError> {
         let session_id = command.session_id.unwrap_or(self.default_session_id);
         let command_id = command.command_id;
         let result = match command.kind {
@@ -219,12 +241,13 @@ impl RuntimeHost {
     }
 
     async fn handle_prompt(
-        &self,
+        self: Arc<Self>,
         session_id: SessionId,
         command: SessionCommand,
     ) -> Result<CommandAck, ClientError> {
         let task_id = TaskId::new();
         let turn_id = TurnId::new();
+        let payload = command.payload.clone();
         let lane_manager = self.lane_manager.lock().await;
         if lane_manager.lane(session_id).is_some() {
             let decision = lane_manager.decide_busy_policy(
@@ -297,9 +320,15 @@ impl RuntimeHost {
         self.record_event(with_command_payload(
             transition.event,
             command.command_id,
-            command.payload,
+            payload.clone(),
         ))
         .await?;
+        self.clone().spawn_agent_task(HostedAgentTask {
+            session_id,
+            task_id,
+            turn_id,
+            payload,
+        });
 
         Ok(CommandAck {
             command_id: command.command_id,
@@ -414,6 +443,191 @@ impl RuntimeHost {
     fn next_sequence_no(&self) -> u64 {
         self.next_sequence_no.fetch_add(1, Ordering::SeqCst)
     }
+
+    fn spawn_agent_task(self: Arc<Self>, task: HostedAgentTask) {
+        tokio::spawn(async move {
+            if let Err(error) = self.clone().run_agent_task(task.clone()).await {
+                let _ = self.record_task_execution_failure(&task, error).await;
+            }
+        });
+    }
+
+    async fn run_agent_task(self: Arc<Self>, task: HostedAgentTask) -> Result<(), ClientError> {
+        let objective = prompt_from_payload(&task.payload);
+        let workspace_root = self.execution_workspace_root()?;
+        let policy = WorkspacePolicy::new(workspace_root)
+            .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
+        let tool_executor = BasicToolExecutor::new(policy);
+        let tool_names = tool_executor
+            .registry()
+            .contracts()
+            .into_iter()
+            .map(|contract| contract.tool_name.clone())
+            .collect::<Vec<_>>();
+        let provider_plan = mock_provider_plan(&task.payload, &objective);
+        let agent_loop = AgentLoop::new(
+            provider_plan.provider,
+            ContextBuilder::default(),
+            tool_executor,
+        );
+        let mut trace_events = Vec::new();
+        let outcome = agent_loop
+            .run_with_trace(
+                AgentTaskRequest {
+                    session_id: task.session_id,
+                    task_id: task.task_id,
+                    turn_id: task.turn_id,
+                    objective: objective.clone(),
+                    completion_criteria: vec![
+                        "runtime task produces durable evidence or terminal verification"
+                            .to_owned(),
+                    ],
+                    touched_code: provider_plan.touched_code,
+                    contributors: vec![
+                        ContextContributor {
+                            name: "system".to_owned(),
+                            role: ProviderRole::System,
+                            content: "You are Golutra, a workspace coding agent.".to_owned(),
+                            token_budget_hint: 64,
+                        },
+                        ContextContributor {
+                            name: "objective".to_owned(),
+                            role: ProviderRole::User,
+                            content: objective,
+                            token_budget_hint: 512,
+                        },
+                    ],
+                    tools: tool_names,
+                },
+                |event| trace_events.push(event),
+            )
+            .await
+            .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
+
+        for trace_event in trace_events {
+            self.record_trace_event(&task, trace_event).await?;
+        }
+        for report in &outcome.tool_reports {
+            for artifact in &report.artifacts {
+                self.store.store_artifact(artifact).await?;
+            }
+            for evidence in &report.evidence {
+                self.store.store_evidence(evidence).await?;
+            }
+            self.record_event(agent_event(
+                self.next_sequence_no(),
+                &task,
+                RuntimeEventType::ToolCompleted,
+                RuntimeEventSource::Tool,
+                json!({
+                    "summary": report.envelope.summary,
+                    "envelope": report.envelope,
+                    "changed_files": report.changed_files,
+                }),
+            ))
+            .await?;
+        }
+        self.record_event(agent_event(
+            self.next_sequence_no(),
+            &task,
+            RuntimeEventType::VerificationCompleted,
+            RuntimeEventSource::Verifier,
+            json!({
+                "summary": format!("verification result: {:?}", outcome.verification.result),
+                "record": outcome.verification,
+            }),
+        ))
+        .await?;
+        let terminal_status = task_status_from_loop_action(outcome.loop_decision.action);
+        self.record_event(agent_event(
+            self.next_sequence_no(),
+            &task,
+            RuntimeEventType::LoopDecided,
+            RuntimeEventSource::Runtime,
+            json!({
+                "summary": outcome.loop_decision.reason,
+                "record": outcome.loop_decision,
+            }),
+        ))
+        .await?;
+        self.finish_lane(&task, terminal_status).await
+    }
+
+    async fn record_trace_event(
+        &self,
+        task: &HostedAgentTask,
+        trace_event: AgentLoopTraceEvent,
+    ) -> Result<(), ClientError> {
+        if let Some((event_type, source, payload)) = trace_event_payload(trace_event) {
+            self.record_event(agent_event(
+                self.next_sequence_no(),
+                task,
+                event_type,
+                source,
+                payload,
+            ))
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn finish_lane(
+        &self,
+        task: &HostedAgentTask,
+        status: TaskStatus,
+    ) -> Result<(), ClientError> {
+        let mut lane_manager = self.lane_manager.lock().await;
+        let transition = lane_manager.finish_task(task.session_id, status, self.next_sequence_no());
+        drop(lane_manager);
+        match transition {
+            Ok(mut transition) => {
+                transition.event.payload = json!({
+                    "summary": format!("runtime task finished with {status:?}"),
+                    "status": status,
+                });
+                self.record_event(transition.event).await
+            }
+            Err(RuntimeLaneError::LaneNotFound) => {
+                self.record_event(agent_event(
+                    self.next_sequence_no(),
+                    task,
+                    RuntimeEventType::TaskCompleted,
+                    RuntimeEventSource::Runtime,
+                    json!({
+                        "summary": format!("persisted runtime task finished with {status:?}"),
+                        "status": status,
+                    }),
+                ))
+                .await
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn record_task_execution_failure(
+        &self,
+        task: &HostedAgentTask,
+        error: ClientError,
+    ) -> Result<(), ClientError> {
+        self.record_event(agent_event(
+            self.next_sequence_no(),
+            task,
+            RuntimeEventType::LoopDecided,
+            RuntimeEventSource::Runtime,
+            json!({
+                "summary": "runtime task execution failed",
+                "error": error.to_string(),
+            }),
+        ))
+        .await?;
+        self.finish_lane(task, TaskStatus::Failed).await
+    }
+
+    fn execution_workspace_root(&self) -> Result<PathBuf, ClientError> {
+        self.workspace_root.clone().map(Ok).unwrap_or_else(|| {
+            std::env::current_dir().map_err(|error| ClientError::Io(error.to_string()))
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -475,6 +689,148 @@ pub fn event_sequence_no(value: &Value) -> Option<u64> {
     value.get("sequence_no").and_then(Value::as_u64)
 }
 
+#[derive(Debug, Clone)]
+struct MockProviderPlan {
+    provider: MockProvider,
+    touched_code: bool,
+}
+
+fn mock_provider_plan(payload: &Value, objective: &str) -> MockProviderPlan {
+    let lower = objective.to_ascii_lowercase();
+    if lower.contains("write") || lower.contains("create") || payload.get("content").is_some() {
+        return MockProviderPlan {
+            provider: MockProvider::tool_call(
+                "write_file",
+                json!({
+                    "path": string_payload(payload, "path", "golutra-agent-output.txt"),
+                    "content": string_payload(payload, "content", "done\n"),
+                }),
+            ),
+            touched_code: true,
+        };
+    }
+
+    if lower.contains("read") {
+        return MockProviderPlan {
+            provider: MockProvider::tool_call(
+                "read_file",
+                json!({"path": string_payload(payload, "path", "README.md")}),
+            ),
+            touched_code: false,
+        };
+    }
+
+    if lower.contains("sleep") {
+        return MockProviderPlan {
+            provider: MockProvider::tool_call("shell", json!({"command": "sleep 5"})),
+            touched_code: false,
+        };
+    }
+
+    if lower.contains("list") || lower.contains("ls") {
+        return MockProviderPlan {
+            provider: MockProvider::tool_call(
+                "list_dir",
+                json!({"path": string_payload(payload, "path", ".")}),
+            ),
+            touched_code: false,
+        };
+    }
+
+    MockProviderPlan {
+        provider: MockProvider::text_response("mock provider completed without tool calls"),
+        touched_code: false,
+    }
+}
+
+fn prompt_from_payload(payload: &Value) -> String {
+    payload
+        .get("prompt")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn string_payload(payload: &Value, key: &str, fallback: &str) -> String {
+    payload
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(fallback)
+        .to_owned()
+}
+
+fn task_status_from_loop_action(action: LoopAction) -> TaskStatus {
+    match action {
+        LoopAction::StopSuccess => TaskStatus::Completed,
+        LoopAction::StopPartial => TaskStatus::Partial,
+        LoopAction::StopFailed => TaskStatus::Failed,
+        LoopAction::Blocked => TaskStatus::Blocked,
+        LoopAction::Continue
+        | LoopAction::Compact
+        | LoopAction::Retry
+        | LoopAction::Fallback
+        | LoopAction::AskUser
+        | LoopAction::Verify => TaskStatus::Partial,
+    }
+}
+
+fn trace_event_payload(
+    trace_event: AgentLoopTraceEvent,
+) -> Option<(RuntimeEventType, RuntimeEventSource, Value)> {
+    match trace_event {
+        AgentLoopTraceEvent::ContextBuilt {
+            contributors,
+            planned_input_tokens,
+        } => Some((
+            RuntimeEventType::ContextBuilt,
+            RuntimeEventSource::Runtime,
+            json!({
+                "summary": "context built for provider request",
+                "contributors": contributors,
+                "planned_input_tokens": planned_input_tokens,
+            }),
+        )),
+        AgentLoopTraceEvent::ProviderStarted {
+            provider_id,
+            model_id,
+        } => Some((
+            RuntimeEventType::ProviderStarted,
+            RuntimeEventSource::Provider,
+            json!({
+                "summary": "provider request started",
+                "provider_id": provider_id,
+                "model_id": model_id,
+            }),
+        )),
+        AgentLoopTraceEvent::ProviderCompleted {
+            provider_id,
+            model_id,
+            finish_reason,
+            tool_call_count,
+        } => Some((
+            RuntimeEventType::ProviderCompleted,
+            RuntimeEventSource::Provider,
+            json!({
+                "summary": "provider request completed",
+                "provider_id": provider_id,
+                "model_id": model_id,
+                "finish_reason": finish_reason,
+                "tool_call_count": tool_call_count,
+            }),
+        )),
+        AgentLoopTraceEvent::ToolStarted { tool_name } => Some((
+            RuntimeEventType::ToolStarted,
+            RuntimeEventSource::Tool,
+            json!({
+                "summary": format!("tool {tool_name} started"),
+                "tool_name": tool_name,
+            }),
+        )),
+        AgentLoopTraceEvent::ToolCompleted { .. } => None,
+    }
+}
+
 fn host_event(
     sequence_no: u64,
     session_id: SessionId,
@@ -489,6 +845,29 @@ fn host_event(
         session_id,
         turn_id: Some(TurnId::new()),
         task_id,
+        parent_event_id: None,
+        event_type,
+        timestamp: chrono::Utc::now(),
+        source,
+        payload,
+        payload_ref: None,
+        durable: true,
+    }
+}
+
+fn agent_event(
+    sequence_no: u64,
+    task: &HostedAgentTask,
+    event_type: RuntimeEventType,
+    source: RuntimeEventSource,
+    payload: Value,
+) -> RuntimeEvent {
+    RuntimeEvent {
+        id: EventId::new(),
+        sequence_no,
+        session_id: task.session_id,
+        turn_id: Some(task.turn_id),
+        task_id: Some(task.task_id),
         parent_event_id: None,
         event_type,
         timestamp: chrono::Utc::now(),
@@ -519,9 +898,12 @@ fn with_command_payload(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use golutra_core::{Actor, ActorKind, CommandId, QueryId};
     use golutra_protocol::RuntimeQueryKind;
     use tempfile::tempdir;
+    use tokio::time::{Duration, sleep};
 
     use super::*;
 
@@ -529,21 +911,10 @@ mod tests {
     async fn command_query_and_subscribe_share_state() {
         let transport = InProcessTransport::in_memory().await.expect("transport");
         let session_id = SessionId::new();
-        let command = command(session_id, "test");
+        let command = command(session_id, "list workspace");
 
         let ack = transport.send_command(command).await.expect("accepted");
-        let state = transport
-            .query(RuntimeQuery {
-                query_id: QueryId::new(),
-                session_id,
-                task_id: None,
-                kind: RuntimeQueryKind::SessionState,
-                requester: ActorKind::Cli,
-                cursor: None,
-                timestamp: chrono::Utc::now(),
-            })
-            .await
-            .expect("state");
+        let state = wait_for_status(&transport, session_id, TaskStatus::Completed).await;
         let events = transport
             .replay_events(EventFilter {
                 session_id,
@@ -554,8 +925,8 @@ mod tests {
             .expect("events");
 
         assert!(ack.accepted);
-        assert_eq!(projection_status(&state), Some(TaskStatus::Running));
-        assert_eq!(events.len(), 1);
+        assert_eq!(projection_status(&state), Some(TaskStatus::Completed));
+        assert!(events.len() >= 7);
     }
 
     #[tokio::test]
@@ -566,9 +937,10 @@ mod tests {
             .expect("first transport");
         let session_id = first.default_session_id();
         first
-            .send_command(command(session_id, "persisted"))
+            .send_command(command(session_id, "list workspace"))
             .await
             .expect("command");
+        wait_for_status(&first, session_id, TaskStatus::Completed).await;
 
         let second = InProcessTransport::for_workspace(workspace.path())
             .await
@@ -583,21 +955,78 @@ mod tests {
             .expect("events");
 
         assert_eq!(second.default_session_id(), session_id);
-        assert_eq!(events.len(), 1);
+        assert!(events.len() >= 7);
         assert!(workspace.path().join(".golutra/runtime.sqlite").exists());
+    }
+
+    #[tokio::test]
+    async fn prompt_runs_mock_agent_loop_and_writes_file() {
+        let workspace = tempdir().expect("workspace");
+        let transport = InProcessTransport::for_workspace(workspace.path())
+            .await
+            .expect("transport");
+        let session_id = transport.default_session_id();
+
+        let ack = transport
+            .send_command(command_with_payload(
+                session_id,
+                json!({
+                    "prompt": "write file",
+                    "path": "result.txt",
+                    "content": "done",
+                }),
+            ))
+            .await
+            .expect("command");
+        let state = wait_for_status(&transport, session_id, TaskStatus::Completed).await;
+        let debug = transport
+            .query(RuntimeQuery {
+                query_id: QueryId::new(),
+                session_id,
+                task_id: None,
+                kind: RuntimeQueryKind::DebugProjection,
+                requester: ActorKind::Cli,
+                cursor: None,
+                timestamp: chrono::Utc::now(),
+            })
+            .await
+            .expect("debug projection");
+
+        assert!(ack.accepted);
+        assert_eq!(projection_status(&state), Some(TaskStatus::Completed));
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("result.txt")).expect("file"),
+            "done"
+        );
+        assert!(
+            debug["tool_results"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        );
+        assert!(
+            debug["artifacts"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        );
     }
 
     #[tokio::test]
     async fn persisted_active_task_rejects_new_prompt_and_accepts_abort() {
         let workspace = tempdir().expect("workspace");
-        let first = InProcessTransport::for_workspace(workspace.path())
+        let host = RuntimeHost::for_workspace(workspace.path())
             .await
-            .expect("first transport");
-        let session_id = first.default_session_id();
-        first
-            .send_command(command(session_id, "first"))
-            .await
-            .expect("first command");
+            .expect("host");
+        let session_id = host.default_session_id();
+        host.record_event(host_event(
+            host.next_sequence_no(),
+            session_id,
+            Some(TaskId::new()),
+            RuntimeEventType::TaskCreated,
+            RuntimeEventSource::Runtime,
+            json!({"summary": "persisted active task"}),
+        ))
+        .await
+        .expect("event");
 
         let second = InProcessTransport::for_workspace(workspace.path())
             .await
@@ -640,6 +1069,10 @@ mod tests {
     }
 
     fn command(session_id: SessionId, prompt: &str) -> SessionCommand {
+        command_with_payload(session_id, json!({"prompt": prompt}))
+    }
+
+    fn command_with_payload(session_id: SessionId, payload: Value) -> SessionCommand {
         SessionCommand {
             command_id: CommandId::new(),
             session_id: Some(session_id),
@@ -649,8 +1082,34 @@ mod tests {
                 kind: ActorKind::Cli,
                 id: "test".to_owned(),
             },
-            payload: json!({"prompt": prompt}),
+            payload,
             timestamp: chrono::Utc::now(),
         }
+    }
+
+    async fn wait_for_status(
+        transport: &InProcessTransport,
+        session_id: SessionId,
+        expected: TaskStatus,
+    ) -> Value {
+        for _ in 0..40 {
+            let state = transport
+                .query(RuntimeQuery {
+                    query_id: QueryId::new(),
+                    session_id,
+                    task_id: None,
+                    kind: RuntimeQueryKind::SessionState,
+                    requester: ActorKind::Cli,
+                    cursor: None,
+                    timestamp: chrono::Utc::now(),
+                })
+                .await
+                .expect("state");
+            if projection_status(&state) == Some(expected) {
+                return state;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        panic!("timed out waiting for status {expected:?}");
     }
 }

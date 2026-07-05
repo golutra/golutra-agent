@@ -10,9 +10,13 @@ rust-version.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 golutra-core.workspace = true
+golutra-context = { path = "../golutra-context" }
+golutra-llm = { path = "../golutra-llm" }
+golutra-policy = { path = "../golutra-policy" }
 golutra-protocol.workspace = true
 golutra-runtime = { path = "../golutra-runtime" }
 golutra-store = { path = "../golutra-store" }
+golutra-tools = { path = "../golutra-tools" }
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

@@ -1,4 +1,7 @@
-use golutra_core::{ArtifactId, ArtifactRecord, EvidenceRecord, SessionId, TaskId, TaskStatus};
+use golutra_core::{
+    ArtifactId, ArtifactRecord, EvidenceRecord, LoopDecision, SessionId, TaskId, TaskStatus,
+    ToolResultEnvelope, VerificationRecord,
+};
 use golutra_protocol::{
     DebugProjection, RuntimeEvent, RuntimeEventType, StateProjection, UserProjection, VisibleStep,
 };
@@ -176,16 +179,37 @@ impl RuntimeStore {
         let events = self.load_events(session_id, task_id, None).await?;
         let artifacts = self.load_artifacts_for_session(session_id).await?;
         let evidence = self.load_evidence_records().await?;
+        let tool_results = events
+            .iter()
+            .filter(|event| event.event_type == RuntimeEventType::ToolCompleted)
+            .filter_map(|event| {
+                event
+                    .payload
+                    .get("envelope")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<ToolResultEnvelope>(value).ok())
+            })
+            .collect::<Vec<_>>();
+        let verification = events
+            .iter()
+            .rev()
+            .find(|event| event.event_type == RuntimeEventType::VerificationCompleted)
+            .and_then(verification_from_event);
+        let loop_decisions = events
+            .iter()
+            .filter(|event| event.event_type == RuntimeEventType::LoopDecided)
+            .filter_map(loop_decision_from_event)
+            .collect::<Vec<_>>();
         Ok(DebugProjection {
             session_id,
             task_id,
             events,
             busy_policy_decisions: Vec::new(),
-            tool_results: Vec::new(),
+            tool_results,
             artifacts,
             evidence,
-            verification: None,
-            loop_decisions: Vec::new(),
+            verification,
+            loop_decisions,
         })
     }
 
@@ -293,16 +317,21 @@ fn apply_event_to_projection(projection: &mut StateProjection, event: &RuntimeEv
             projection.task_status = TaskStatus::Running;
         }
         RuntimeEventType::TaskCompleted => {
-            projection.task_status = TaskStatus::Completed;
+            projection.task_status = event
+                .payload
+                .get("status")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or(TaskStatus::Completed);
         }
         RuntimeEventType::TaskAborted => {
             projection.task_status = TaskStatus::Aborting;
         }
         RuntimeEventType::VerificationCompleted => {
-            projection.last_verification = serde_json::from_value(event.payload.clone()).ok();
+            projection.last_verification = verification_from_event(event);
         }
         RuntimeEventType::LoopDecided => {
-            projection.last_loop_decision = serde_json::from_value(event.payload.clone()).ok();
+            projection.last_loop_decision = loop_decision_from_event(event);
         }
         _ => {}
     }
@@ -317,6 +346,24 @@ fn apply_event_to_projection(projection: &mut StateProjection, event: &RuntimeEv
             .unwrap_or("runtime event recorded")
             .to_owned(),
     });
+}
+
+fn verification_from_event(event: &RuntimeEvent) -> Option<VerificationRecord> {
+    event
+        .payload
+        .get("record")
+        .cloned()
+        .or_else(|| Some(event.payload.clone()))
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+fn loop_decision_from_event(event: &RuntimeEvent) -> Option<LoopDecision> {
+    event
+        .payload
+        .get("record")
+        .cloned()
+        .or_else(|| Some(event.payload.clone()))
+        .and_then(|value| serde_json::from_value(value).ok())
 }
 
 const MIGRATIONS: &[&str] = &[

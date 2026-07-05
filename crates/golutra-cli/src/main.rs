@@ -1,7 +1,8 @@
 use clap::{Parser, Subcommand};
 use golutra_client::{InProcessTransport, RuntimeClient};
-use golutra_core::{Actor, ActorKind, CommandId, SessionId};
+use golutra_core::{Actor, ActorKind, CommandId, SessionId, TaskStatus};
 use golutra_protocol::{RuntimeQuery, RuntimeQueryKind, SessionCommand, SessionCommandKind};
+use tokio::time::{Duration, sleep};
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
@@ -50,6 +51,13 @@ async fn main() -> miette::Result<()> {
                 .await
                 .map_err(|error| miette::miette!("{error}"))?;
             println!("{}", serde_json::to_string_pretty(&ack).unwrap_or_default());
+            if ack.accepted {
+                let state = wait_for_terminal_state(&transport, session_id).await?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&state).unwrap_or_default()
+                );
+            }
         }
         Command::Status => {
             let state = transport
@@ -69,9 +77,17 @@ async fn main() -> miette::Result<()> {
                 serde_json::to_string_pretty(&state).unwrap_or_default()
             );
         }
-        Command::Resume => println!(
-            "resume command will use SessionCommand::Resume after persistent sessions land"
-        ),
+        Command::Resume => {
+            let ack = transport
+                .send_command(command(
+                    session_id,
+                    SessionCommandKind::Resume,
+                    serde_json::json!({}),
+                ))
+                .await
+                .map_err(|error| miette::miette!("{error}"))?;
+            println!("{}", serde_json::to_string_pretty(&ack).unwrap_or_default());
+        }
         Command::Abort => {
             let ack = transport
                 .send_command(command(
@@ -84,10 +100,44 @@ async fn main() -> miette::Result<()> {
             println!("{}", serde_json::to_string_pretty(&ack).unwrap_or_default());
         }
         Command::Trace => {
-            println!("trace command will query DebugProjection after persistent sessions land")
+            let trace = transport
+                .query(RuntimeQuery {
+                    query_id: golutra_core::QueryId::new(),
+                    session_id,
+                    task_id: None,
+                    kind: RuntimeQueryKind::DebugProjection,
+                    requester: ActorKind::Cli,
+                    cursor: None,
+                    timestamp: chrono::Utc::now(),
+                })
+                .await
+                .map_err(|error| miette::miette!("{error}"))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&trace).unwrap_or_default()
+            );
         }
         Command::Export => {
-            println!("export command will query runtime artifacts after artifact export lands")
+            let debug = transport
+                .query(RuntimeQuery {
+                    query_id: golutra_core::QueryId::new(),
+                    session_id,
+                    task_id: None,
+                    kind: RuntimeQueryKind::DebugProjection,
+                    requester: ActorKind::Cli,
+                    cursor: None,
+                    timestamp: chrono::Utc::now(),
+                })
+                .await
+                .map_err(|error| miette::miette!("{error}"))?;
+            let artifacts = debug
+                .get("artifacts")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([]));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&artifacts).unwrap_or_default()
+            );
         }
     }
     Ok(())
@@ -124,4 +174,42 @@ fn command(
         payload,
         timestamp: chrono::Utc::now(),
     }
+}
+
+async fn wait_for_terminal_state(
+    transport: &InProcessTransport,
+    session_id: SessionId,
+) -> miette::Result<serde_json::Value> {
+    let mut last_state = serde_json::Value::Null;
+    for _ in 0..200 {
+        let state = transport
+            .query(RuntimeQuery {
+                query_id: golutra_core::QueryId::new(),
+                session_id,
+                task_id: None,
+                kind: RuntimeQueryKind::SessionState,
+                requester: ActorKind::Cli,
+                cursor: None,
+                timestamp: chrono::Utc::now(),
+            })
+            .await
+            .map_err(|error| miette::miette!("{error}"))?;
+        if state
+            .get("task_status")
+            .and_then(|value| serde_json::from_value::<TaskStatus>(value.clone()).ok())
+            .is_some_and(is_terminal_status)
+        {
+            return Ok(state);
+        }
+        last_state = state;
+        sleep(Duration::from_millis(50)).await;
+    }
+    Ok(last_state)
+}
+
+fn is_terminal_status(status: TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Completed | TaskStatus::Partial | TaskStatus::Failed | TaskStatus::Blocked
+    )
 }

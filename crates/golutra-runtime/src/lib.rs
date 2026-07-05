@@ -14,7 +14,7 @@ use golutra_core::{
     SessionId, TaskId, TaskStatus, TurnId, VerificationRecord, VerificationResult,
     WorkspaceCheckpoint, WorkspaceId,
 };
-use golutra_llm::{LlmProvider, ProviderError};
+use golutra_llm::{LlmProvider, ProviderError, ProviderFinishReason};
 use golutra_protocol::{RuntimeEvent, RuntimeEventSource, RuntimeEventType};
 use golutra_tools::{BasicToolExecutor, ToolError, ToolExecutionReport, ToolRequest};
 use golutra_verify::{VerificationInput, VerificationRunner};
@@ -67,6 +67,7 @@ pub struct RuntimeLaneManager {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentTaskRequest {
+    pub session_id: SessionId,
     pub task_id: TaskId,
     pub turn_id: TurnId,
     pub objective: String,
@@ -81,6 +82,31 @@ pub struct AgentLoopOutcome {
     pub verification: VerificationRecord,
     pub loop_decision: LoopDecision,
     pub tool_reports: Vec<ToolExecutionReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentLoopTraceEvent {
+    ContextBuilt {
+        contributors: Vec<String>,
+        planned_input_tokens: u64,
+    },
+    ProviderStarted {
+        provider_id: String,
+        model_id: String,
+    },
+    ProviderCompleted {
+        provider_id: String,
+        model_id: String,
+        finish_reason: ProviderFinishReason,
+        tool_call_count: usize,
+    },
+    ToolStarted {
+        tool_name: String,
+    },
+    ToolCompleted {
+        tool_name: String,
+        summary: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,6 +220,17 @@ where
     }
 
     pub async fn run(&self, request: AgentTaskRequest) -> Result<AgentLoopOutcome, AgentLoopError> {
+        self.run_with_trace(request, |_| {}).await
+    }
+
+    pub async fn run_with_trace<F>(
+        &self,
+        request: AgentTaskRequest,
+        mut trace: F,
+    ) -> Result<AgentLoopOutcome, AgentLoopError>
+    where
+        F: FnMut(AgentLoopTraceEvent),
+    {
         let mut tool_reports = Vec::new();
         let mut last_budget_state = BudgetState {
             planned_input_tokens: None,
@@ -216,15 +253,30 @@ where
                 request.turn_id,
                 request.contributors.clone(),
             )?;
+            trace(AgentLoopTraceEvent::ContextBuilt {
+                contributors: plan.contributors.clone(),
+                planned_input_tokens: plan.budget_snapshot.planned_input_tokens,
+            });
+            let provider_contract = self.provider.contract();
             let provider_request = provider_request_from_plan(
                 &plan,
                 request.task_id,
                 request.turn_id,
-                self.provider.contract().provider_id,
-                self.provider.contract().model_id,
+                provider_contract.provider_id.clone(),
+                provider_contract.model_id.clone(),
                 request.tools.clone(),
             );
+            trace(AgentLoopTraceEvent::ProviderStarted {
+                provider_id: provider_request.provider_id.clone(),
+                model_id: provider_request.model_id.clone(),
+            });
             let provider_response = self.provider.complete(provider_request.clone()).await?;
+            trace(AgentLoopTraceEvent::ProviderCompleted {
+                provider_id: provider_request.provider_id.clone(),
+                model_id: provider_request.model_id.clone(),
+                finish_reason: provider_response.finish_reason,
+                tool_call_count: provider_response.tool_calls.len(),
+            });
             let usage_record = token_usage_record(
                 &provider_request,
                 provider_response.response_id,
@@ -250,13 +302,20 @@ where
             }
 
             for tool_call in provider_response.tool_calls {
+                trace(AgentLoopTraceEvent::ToolStarted {
+                    tool_name: tool_call.tool_name.clone(),
+                });
                 let report = self.tool_executor.execute(ToolRequest {
                     tool_call_id: golutra_core::ToolCallId::new(),
-                    session_id: SessionId::new(),
+                    session_id: request.session_id,
                     turn_id: Some(request.turn_id),
                     tool_name: tool_call.tool_name,
                     arguments: tool_call.arguments,
                 })?;
+                trace(AgentLoopTraceEvent::ToolCompleted {
+                    tool_name: report.envelope.tool_name.clone(),
+                    summary: report.envelope.summary.clone(),
+                });
                 tool_reports.push(report);
             }
         }
@@ -410,6 +469,20 @@ impl RuntimeLaneManager {
             TaskStatus::Running,
             sequence_no,
             RuntimeEventType::TurnStarted,
+        )
+    }
+
+    pub fn finish_task(
+        &mut self,
+        session_id: SessionId,
+        status: TaskStatus,
+        sequence_no: u64,
+    ) -> Result<RuntimeTransition, RuntimeLaneError> {
+        self.set_status(
+            session_id,
+            status,
+            sequence_no,
+            RuntimeEventType::TaskCompleted,
         )
     }
 
@@ -647,9 +720,11 @@ mod tests {
         let agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor);
         let task_id = TaskId::new();
         let turn_id = TurnId::new();
+        let session_id = SessionId::new();
 
         let outcome = agent_loop
             .run(AgentTaskRequest {
+                session_id,
                 task_id,
                 turn_id,
                 objective: "write result".to_owned(),
@@ -678,6 +753,7 @@ mod tests {
 
         let outcome = agent_loop
             .run(AgentTaskRequest {
+                session_id: SessionId::new(),
                 task_id: TaskId::new(),
                 turn_id: TurnId::new(),
                 objective: "claim done".to_owned(),
