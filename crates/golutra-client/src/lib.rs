@@ -153,7 +153,10 @@ struct HostedAgentTask {
 impl RuntimeHost {
     pub async fn in_memory() -> Result<Arc<Self>, ClientError> {
         let store = RuntimeStore::in_memory().await?;
-        Self::from_store(store, None, SessionId::new(), ThreadId::new()).await
+        let default_session_id = SessionId::new();
+        let default_thread_id = ThreadId::new();
+        ensure_thread_record(&store, None, default_thread_id, default_session_id).await?;
+        Self::from_store(store, None, default_session_id, default_thread_id).await
     }
 
     pub async fn for_workspace(workspace_root: impl AsRef<Path>) -> Result<Arc<Self>, ClientError> {
@@ -161,11 +164,14 @@ impl RuntimeHost {
         let store = RuntimeStore::connect(&resolver.sqlite_url()).await?;
         let default_session_id = resolver.resolve_default_session()?;
         let default_thread_id = resolver.resolve_default_thread()?;
+        let default_thread = resolver
+            .repair_default_thread(&store, default_thread_id, default_session_id)
+            .await?;
         Self::from_store(
             store,
             Some(resolver.workspace_root),
-            default_session_id,
-            default_thread_id,
+            default_thread.session_id,
+            default_thread.thread_id,
         )
         .await
     }
@@ -500,9 +506,16 @@ impl RuntimeHost {
         payload: &Value,
     ) -> Result<(), ClientError> {
         let now = chrono::Utc::now();
-        let existing = self.store.thread_by_id(self.default_thread_id).await?;
+        let existing = self
+            .store
+            .thread_by_session(session_id)
+            .await?
+            .or(self.store.thread_by_id(self.default_thread_id).await?);
         let thread = ThreadRecord {
-            thread_id: self.default_thread_id,
+            thread_id: existing
+                .as_ref()
+                .map(|thread| thread.thread_id)
+                .unwrap_or(self.default_thread_id),
             session_id,
             parent_thread_id: existing.as_ref().and_then(|thread| thread.parent_thread_id),
             workspace_root: self.workspace_root_string(),
@@ -843,6 +856,82 @@ impl SessionResolver {
             .map_err(|error| ClientError::Io(error.to_string()))?;
         Ok(thread_id)
     }
+
+    async fn repair_default_thread(
+        &self,
+        store: &RuntimeStore,
+        default_thread_id: ThreadId,
+        default_session_id: SessionId,
+    ) -> Result<ThreadRecord, ClientError> {
+        if let Some(thread) = store.thread_by_id(default_thread_id).await? {
+            self.write_default_ids(thread.thread_id, thread.session_id)?;
+            return Ok(thread);
+        }
+
+        let workspace_root = self.workspace_root.to_string_lossy().to_string();
+        if let Some(thread) = store
+            .list_threads(Some(&workspace_root), 1)
+            .await?
+            .into_iter()
+            .next()
+        {
+            self.write_default_ids(thread.thread_id, thread.session_id)?;
+            return Ok(thread);
+        }
+
+        if let Some(thread) = store.list_threads(None, 1).await?.into_iter().next() {
+            self.write_default_ids(thread.thread_id, thread.session_id)?;
+            return Ok(thread);
+        }
+
+        let thread = ensure_thread_record(
+            store,
+            Some(workspace_root),
+            default_thread_id,
+            default_session_id,
+        )
+        .await?;
+        self.write_default_ids(thread.thread_id, thread.session_id)?;
+        Ok(thread)
+    }
+
+    fn write_default_ids(
+        &self,
+        thread_id: ThreadId,
+        session_id: SessionId,
+    ) -> Result<(), ClientError> {
+        fs::write(&self.default_thread_file, thread_id.to_string())
+            .map_err(|error| ClientError::Io(error.to_string()))?;
+        fs::write(&self.default_session_file, session_id.to_string())
+            .map_err(|error| ClientError::Io(error.to_string()))?;
+        Ok(())
+    }
+}
+
+async fn ensure_thread_record(
+    store: &RuntimeStore,
+    workspace_root: Option<String>,
+    thread_id: ThreadId,
+    session_id: SessionId,
+) -> Result<ThreadRecord, ClientError> {
+    if let Some(thread) = store.thread_by_id(thread_id).await? {
+        return Ok(thread);
+    }
+    let now = chrono::Utc::now();
+    let thread = ThreadRecord {
+        thread_id,
+        session_id,
+        parent_thread_id: None,
+        workspace_root,
+        title: "New thread".to_owned(),
+        preview: "Ready to start a task".to_owned(),
+        created_at: now,
+        updated_at: now,
+        recency_at: now,
+        archived: false,
+    };
+    store.upsert_thread(&thread).await?;
+    Ok(thread)
 }
 
 #[must_use]
@@ -1192,6 +1281,105 @@ mod tests {
         assert_eq!(second.default_session_id(), session_id);
         assert!(events.len() >= 7);
         assert!(workspace.path().join(".golutra/runtime.sqlite").exists());
+    }
+
+    #[tokio::test]
+    async fn workspace_transport_repairs_missing_default_thread_record() {
+        let workspace = tempdir().expect("workspace");
+        let golutra_dir = workspace.path().join(".golutra");
+        fs::create_dir_all(&golutra_dir).expect("golutra dir");
+        let stale_thread_id = ThreadId::new();
+        let session_id = SessionId::new();
+        fs::write(
+            golutra_dir.join("default-thread"),
+            stale_thread_id.to_string(),
+        )
+        .expect("default thread");
+        fs::write(golutra_dir.join("default-session"), session_id.to_string())
+            .expect("default session");
+
+        let transport = InProcessTransport::for_workspace(workspace.path())
+            .await
+            .expect("transport repairs thread index");
+        let thread = transport
+            .resume_thread(transport.default_thread_id())
+            .await
+            .expect("default thread can resume after repair");
+
+        assert_eq!(transport.default_thread_id(), stale_thread_id);
+        assert_eq!(thread.session_id, session_id);
+    }
+
+    #[tokio::test]
+    async fn workspace_transport_falls_back_to_latest_thread_when_pointer_is_stale() {
+        let workspace = tempdir().expect("workspace");
+        let first = InProcessTransport::for_workspace(workspace.path())
+            .await
+            .expect("first transport");
+        let session_id = first.default_session_id();
+        first
+            .send_command(command(session_id, "list workspace"))
+            .await
+            .expect("command");
+        wait_for_status(&first, session_id, TaskStatus::Completed).await;
+        let original_thread_id = first.default_thread_id();
+        fs::write(
+            workspace.path().join(".golutra/default-thread"),
+            ThreadId::new().to_string(),
+        )
+        .expect("stale default thread pointer");
+
+        let repaired = InProcessTransport::for_workspace(workspace.path())
+            .await
+            .expect("transport repairs stale pointer");
+
+        assert_eq!(repaired.default_thread_id(), original_thread_id);
+        assert_eq!(repaired.default_session_id(), session_id);
+        assert_eq!(
+            fs::read_to_string(workspace.path().join(".golutra/default-thread"))
+                .expect("default thread")
+                .trim(),
+            original_thread_id.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_updates_resumed_thread_metadata_by_session() {
+        let workspace = tempdir().expect("workspace");
+        let transport = InProcessTransport::for_workspace(workspace.path())
+            .await
+            .expect("transport");
+        let parent_thread_id = transport.default_thread_id();
+        let child = transport
+            .fork_thread(parent_thread_id)
+            .await
+            .expect("fork thread");
+
+        transport
+            .send_command(command_with_payload(
+                child.session_id,
+                json!({
+                    "prompt": "write child output",
+                    "path": "child.txt",
+                    "content": "child",
+                }),
+            ))
+            .await
+            .expect("command");
+        wait_for_status(&transport, child.session_id, TaskStatus::Completed).await;
+
+        let threads = transport.list_threads(10).await.expect("threads");
+        let child_after = threads
+            .iter()
+            .find(|thread| thread.thread_id == child.thread_id)
+            .expect("child thread remains indexed");
+        let parent_after = threads
+            .iter()
+            .find(|thread| thread.thread_id == parent_thread_id)
+            .expect("parent thread remains indexed");
+
+        assert_eq!(child_after.preview, "write child output");
+        assert_ne!(parent_after.session_id, child.session_id);
     }
 
     #[tokio::test]

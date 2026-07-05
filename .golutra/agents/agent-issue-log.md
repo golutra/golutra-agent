@@ -15,6 +15,7 @@
 ## Registration Table
 | Time | Problem | Action | Verification |
 | --- | --- | --- | --- |
+| 2026-07-06 01:32 | `.golutra/default-thread` 指向 SQLite `threads` 表中不存在的 thread，导致 TUI 启动和 `/resume` 报 `thread ... not found`。 | 在 workspace RuntimeHost 启动时 repair default thread：优先使用有效指针，其次 fallback 当前 workspace 最近 thread，再 fallback 全局最近 thread，最后 bootstrap 新 thread；同时让 prompt 按 session 更新 resumed/forked thread 元数据，并给 TUI 增加 slash command 提示。 | `cargo test -p golutra-client`、`cargo test -p golutra-tui`、`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace` 通过；TUI 伪终端 `/resume`、`/help`、`/quit` smoke 通过；密钥扫描无匹配。 |
 | 2026-07-05 23:52 | live provider smoke 读取不存在的 `README.md` 时，工具返回失败但 verifier 只检查 evidence_refs 非空，导致弱错误 evidence 被误判为 Pass。 | 将 AgentLoop 中每个 tool report 转成 `VerificationCheck`，只有 `ToolResultStatus::Ok` 才通过；失败工具现在生成 Partial/Failed 而不是 StopSuccess。 | `cargo test -p golutra-runtime` 通过；新增 `agent_loop_does_not_stop_success_when_tool_fails` 测试。 |
 | 2026-07-06 00:06 | `ProviderProtocol::OpenAiCompatible` 使用 serde `kebab-case` 自动序列化成 `open-ai-compatible`，与配置和文档约定的 `openai-compatible` 不一致。 | 为该枚举变体增加显式 serde rename，并新增 wire id 序列化单元测试。 | `cargo test -p golutra-llm` 通过；`cargo run -p golutra-cli -- provider protocols` 输出 `openai-compatible`。 |
 | 2026-07-05 22:35 | 后台 AgentLoop 接入后，client 测试继续依赖 `sleep` 任务的调度时间来验证 persisted active task，导致任务完成时序不稳定并触发断言失败。 | 将该测试改为直接写入持久 `TaskCreated` 事件来构造 active task 状态，避免依赖后台任务执行时长。 | `cargo test -p golutra-client` 通过。 |

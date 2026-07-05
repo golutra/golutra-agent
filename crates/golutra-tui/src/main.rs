@@ -22,7 +22,7 @@ use golutra_protocol::{
 };
 use golutra_tui::{
     AuthConfigScope, OpenAiCompatibleLogin, SlashAuthCommand, SlashCommand, SlashInput,
-    event_timeline_lines, parse_slash_input,
+    event_timeline_lines, parse_slash_input, slash_command_suggestions,
 };
 use ratatui::{
     Frame, Terminal,
@@ -627,6 +627,12 @@ fn draw_debug_timeline(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
 fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let help = "Enter send   /help commands   Ctrl+A abort   Tab debug   q/Esc quit";
+    let command_hint = slash_command_suggestions(&app.input);
+    let help_line = if command_hint.is_empty() {
+        help.to_owned()
+    } else {
+        format!("Commands: {}", command_hint.join("   "))
+    };
     let input_line = if app.input.is_empty() {
         "Ask Golutra to change code or inspect the workspace".to_owned()
     } else {
@@ -646,7 +652,10 @@ fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             &app.provider_message,
             Style::default().fg(provider_color(app)),
         )),
-        Line::from(Span::styled(help, Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(
+            help_line,
+            Style::default().fg(Color::DarkGray),
+        )),
     ])
     .block(Block::default().borders(Borders::TOP))
     .wrap(Wrap { trim: false });

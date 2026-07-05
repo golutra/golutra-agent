@@ -92,6 +92,116 @@ pub enum SlashInput {
     Error(String),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SlashCommandHint {
+    command: &'static str,
+    description: &'static str,
+}
+
+const TOP_LEVEL_SLASH_HINTS: &[SlashCommandHint] = &[
+    SlashCommandHint {
+        command: "/resume",
+        description: "resume a thread",
+    },
+    SlashCommandHint {
+        command: "/threads",
+        description: "list threads",
+    },
+    SlashCommandHint {
+        command: "/fork",
+        description: "fork a thread",
+    },
+    SlashCommandHint {
+        command: "/auth",
+        description: "provider setup",
+    },
+    SlashCommandHint {
+        command: "/status",
+        description: "show runtime status",
+    },
+    SlashCommandHint {
+        command: "/debug",
+        description: "toggle timeline",
+    },
+    SlashCommandHint {
+        command: "/abort",
+        description: "abort active task",
+    },
+    SlashCommandHint {
+        command: "/clear",
+        description: "clear local messages",
+    },
+    SlashCommandHint {
+        command: "/quit",
+        description: "leave TUI",
+    },
+];
+
+const AUTH_SLASH_HINTS: &[SlashCommandHint] = &[
+    SlashCommandHint {
+        command: "/auth status",
+        description: "show provider state",
+    },
+    SlashCommandHint {
+        command: "/auth protocols",
+        description: "list protocols",
+    },
+    SlashCommandHint {
+        command: "/auth mock",
+        description: "use mock provider",
+    },
+    SlashCommandHint {
+        command: "/auth login",
+        description: "save OpenAI-compatible profile",
+    },
+    SlashCommandHint {
+        command: "/auth use",
+        description: "activate profile",
+    },
+];
+
+#[must_use]
+pub fn slash_command_suggestions(input: &str) -> Vec<String> {
+    let input = input.trim_start();
+    if !input.starts_with('/') {
+        return Vec::new();
+    }
+
+    let tokens = input.split_whitespace().collect::<Vec<_>>();
+    let first_token = tokens.first().copied().unwrap_or("/");
+    let suggestions =
+        if first_token == "/auth" && (input.ends_with(char::is_whitespace) || tokens.len() > 1) {
+            let action_prefix = if input.ends_with(char::is_whitespace) && tokens.len() == 1 {
+                ""
+            } else {
+                tokens.get(1).copied().unwrap_or("")
+            };
+            matching_hints(AUTH_SLASH_HINTS, action_prefix, "/auth ")
+        } else {
+            matching_hints(TOP_LEVEL_SLASH_HINTS, first_token, "")
+        };
+
+    suggestions.into_iter().take(3).collect()
+}
+
+fn matching_hints(
+    hints: &[SlashCommandHint],
+    prefix: &str,
+    auth_prefix_to_strip: &str,
+) -> Vec<String> {
+    hints
+        .iter()
+        .filter(|hint| {
+            let command = hint
+                .command
+                .strip_prefix(auth_prefix_to_strip)
+                .unwrap_or(hint.command);
+            command.starts_with(prefix)
+        })
+        .map(|hint| format!("{} - {}", hint.command, hint.description))
+        .collect()
+}
+
 #[must_use]
 pub fn parse_slash_input(input: &str) -> SlashInput {
     let trimmed = input.trim();
@@ -317,5 +427,38 @@ mod tests {
             parse_slash_input("/auth login --model qwen"),
             SlashInput::Error(_)
         ));
+    }
+
+    #[test]
+    fn slash_suggestions_follow_top_level_prefix() {
+        assert!(slash_command_suggestions("read README.md").is_empty());
+        assert_eq!(
+            slash_command_suggestions("/"),
+            vec![
+                "/resume - resume a thread".to_owned(),
+                "/threads - list threads".to_owned(),
+                "/fork - fork a thread".to_owned(),
+            ]
+        );
+        assert_eq!(
+            slash_command_suggestions("/r"),
+            vec!["/resume - resume a thread".to_owned()]
+        );
+    }
+
+    #[test]
+    fn slash_suggestions_follow_auth_subcommand_prefix() {
+        assert_eq!(
+            slash_command_suggestions("/auth "),
+            vec![
+                "/auth status - show provider state".to_owned(),
+                "/auth protocols - list protocols".to_owned(),
+                "/auth mock - use mock provider".to_owned(),
+            ]
+        );
+        assert_eq!(
+            slash_command_suggestions("/auth l"),
+            vec!["/auth login - save OpenAI-compatible profile".to_owned()]
+        );
     }
 }
