@@ -1018,6 +1018,7 @@ dependencies = [
  "golutra-client",
  "golutra-config",
  "golutra-core",
+ "golutra-llm",
  "golutra-protocol",
  "miette",
  "ratatui",

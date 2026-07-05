@@ -10,13 +10,20 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use golutra_client::{InProcessTransport, RuntimeClient};
-use golutra_config::provider_onboarding_state;
-use golutra_core::{Actor, ActorKind, CommandId, QueryId, SessionId, TaskId};
+use golutra_config::{
+    ProviderConfigPaths, ProviderConfigScope, ProviderInstallPlan, ProviderProfile,
+    ProviderSettings, provider_onboarding_state,
+};
+use golutra_core::{Actor, ActorKind, CommandId, QueryId, SessionId, TaskId, ThreadId};
+use golutra_llm::provider_protocol_catalog;
 use golutra_protocol::{
     EventFilter, RuntimeEvent, RuntimeEventType, RuntimeQuery, RuntimeQueryKind, SessionCommand,
     SessionCommandKind, UserProjection, VisibleStep,
 };
-use golutra_tui::event_timeline_lines;
+use golutra_tui::{
+    AuthConfigScope, OpenAiCompatibleLogin, SlashAuthCommand, SlashCommand, SlashInput,
+    event_timeline_lines, parse_slash_input,
+};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -44,10 +51,12 @@ struct Args {
 
 #[derive(Debug)]
 struct TuiApp {
+    thread_id: ThreadId,
     session_id: SessionId,
     task_id: Option<TaskId>,
     projection: Option<UserProjection>,
     events: Vec<Value>,
+    command_messages: Vec<TranscriptItem>,
     input: String,
     status_message: String,
     provider_message: String,
@@ -73,16 +82,19 @@ struct TranscriptItem {
 
 impl TuiApp {
     fn new(
+        thread_id: ThreadId,
         session_id: SessionId,
         task_id: Option<TaskId>,
         debug_mode: bool,
         provider_message: String,
     ) -> Self {
         Self {
+            thread_id,
             session_id,
             task_id,
             projection: None,
             events: Vec::new(),
+            command_messages: Vec::new(),
             input: String::new(),
             status_message: "attached to workspace runtime".to_owned(),
             provider_message,
@@ -126,8 +138,31 @@ impl TuiApp {
     }
 
     async fn send_prompt(&mut self, transport: &InProcessTransport) -> miette::Result<()> {
-        let prompt = self.input.trim().to_owned();
-        if prompt.is_empty() {
+        let input = self.input.trim().to_owned();
+        match parse_slash_input(&input) {
+            SlashInput::Prompt(prompt) => self.send_runtime_prompt(transport, prompt).await,
+            SlashInput::Command(command) => {
+                self.input.clear();
+                self.execute_slash_command(transport, command).await
+            }
+            SlashInput::Empty => {
+                self.status_message = "prompt is empty".to_owned();
+                Ok(())
+            }
+            SlashInput::Error(error) => {
+                self.input.clear();
+                self.push_system_message("Command error", vec![error]);
+                Ok(())
+            }
+        }
+    }
+
+    async fn send_runtime_prompt(
+        &mut self,
+        transport: &InProcessTransport,
+        prompt: String,
+    ) -> miette::Result<()> {
+        if prompt.trim().is_empty() {
             self.status_message = "prompt is empty".to_owned();
             return Ok(());
         }
@@ -147,6 +182,209 @@ impl TuiApp {
         self.refresh(transport).await
     }
 
+    async fn execute_slash_command(
+        &mut self,
+        transport: &InProcessTransport,
+        command: SlashCommand,
+    ) -> miette::Result<()> {
+        match command {
+            SlashCommand::Help => {
+                self.push_system_message("Slash commands", slash_help_lines());
+            }
+            SlashCommand::Auth(command) => {
+                self.execute_auth_command(transport, command).await?;
+            }
+            SlashCommand::Resume { thread_id } => {
+                let thread_id = parse_optional_thread_id(thread_id.as_deref(), self.thread_id)?;
+                let thread = transport
+                    .resume_thread(thread_id)
+                    .await
+                    .map_err(|error| miette::miette!("{error}"))?;
+                self.thread_id = thread.thread_id;
+                self.session_id = thread.session_id;
+                self.task_id = None;
+                self.events.clear();
+                self.cursor = None;
+                self.status_message =
+                    format!("resumed thread {}", short_id(&thread.thread_id.to_string()));
+                self.push_system_message(
+                    "Thread resumed",
+                    vec![
+                        format!("thread {}", thread.thread_id),
+                        format!("session {}", thread.session_id),
+                        format!("title {}", thread.title),
+                    ],
+                );
+                self.refresh(transport).await?;
+            }
+            SlashCommand::Threads { limit } => {
+                let threads = transport
+                    .list_threads(limit)
+                    .await
+                    .map_err(|error| miette::miette!("{error}"))?;
+                let lines = if threads.is_empty() {
+                    vec!["no threads in this workspace yet".to_owned()]
+                } else {
+                    threads
+                        .into_iter()
+                        .map(|thread| {
+                            format!(
+                                "{}  {}",
+                                short_id(&thread.thread_id.to_string()),
+                                thread.title
+                            )
+                        })
+                        .collect()
+                };
+                self.push_system_message("Threads", lines);
+            }
+            SlashCommand::Fork { thread_id } => {
+                let thread = transport
+                    .fork_thread(parse_thread_id(&thread_id)?)
+                    .await
+                    .map_err(|error| miette::miette!("{error}"))?;
+                self.thread_id = thread.thread_id;
+                self.session_id = thread.session_id;
+                self.task_id = None;
+                self.events.clear();
+                self.cursor = None;
+                self.status_message =
+                    format!("forked thread {}", short_id(&thread.thread_id.to_string()));
+                self.push_system_message(
+                    "Thread forked",
+                    vec![
+                        format!("thread {}", thread.thread_id),
+                        format!(
+                            "parent {}",
+                            thread
+                                .parent_thread_id
+                                .map(|id| id.to_string())
+                                .unwrap_or_else(|| "none".to_owned())
+                        ),
+                        format!("session {}", thread.session_id),
+                    ],
+                );
+                self.refresh(transport).await?;
+            }
+            SlashCommand::Status => {
+                self.refresh(transport).await?;
+                let status = self
+                    .projection
+                    .as_ref()
+                    .map(|projection| format!("{:?}", projection.status))
+                    .unwrap_or_else(|| "loading".to_owned());
+                self.push_system_message(
+                    "Status",
+                    vec![
+                        format!("thread {}", self.thread_id),
+                        format!("session {}", self.session_id),
+                        format!(
+                            "task {}",
+                            self.task_id
+                                .map(|id| id.to_string())
+                                .unwrap_or_else(|| "auto".to_owned())
+                        ),
+                        format!("status {status}"),
+                        format!("events {}", self.events.len()),
+                    ],
+                );
+            }
+            SlashCommand::Debug => {
+                self.debug_mode = !self.debug_mode;
+                self.status_message = if self.debug_mode {
+                    "debug timeline visible".to_owned()
+                } else {
+                    "debug timeline hidden".to_owned()
+                };
+            }
+            SlashCommand::Abort => {
+                self.abort(transport).await?;
+            }
+            SlashCommand::Clear => {
+                self.command_messages.clear();
+                self.status_message = "local command messages cleared".to_owned();
+            }
+            SlashCommand::Quit => {
+                self.should_quit = true;
+            }
+        }
+        Ok(())
+    }
+
+    async fn execute_auth_command(
+        &mut self,
+        transport: &InProcessTransport,
+        command: SlashAuthCommand,
+    ) -> miette::Result<()> {
+        match command {
+            SlashAuthCommand::Status => {
+                self.provider_message = provider_status_message(transport);
+                self.push_system_message("Auth status", vec![self.provider_message.clone()]);
+            }
+            SlashAuthCommand::Protocols => {
+                let lines = provider_protocol_catalog()
+                    .into_iter()
+                    .map(|protocol| {
+                        format!(
+                            "{}  {}  {}",
+                            protocol.protocol.id(),
+                            protocol.status,
+                            protocol.notes
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                self.push_system_message("Auth protocols", lines);
+            }
+            SlashAuthCommand::Mock => {
+                let paths = provider_paths_for_tui(transport)?;
+                ProviderInstallPlan {
+                    scope: ProviderConfigScope::Workspace,
+                    profile: ProviderProfile::mock(),
+                    activate: true,
+                }
+                .apply(&paths)
+                .map_err(|error| miette::miette!("{error}"))?;
+                self.provider_message = provider_status_message(transport);
+                self.push_system_message(
+                    "Auth updated",
+                    vec!["workspace provider switched to mock".to_owned()],
+                );
+            }
+            SlashAuthCommand::Use { profile, scope } => {
+                let paths = provider_paths_for_tui(transport)?;
+                let path = match provider_scope(scope) {
+                    ProviderConfigScope::User => &paths.user_config,
+                    ProviderConfigScope::Workspace => &paths.workspace_config,
+                };
+                let mut settings =
+                    ProviderSettings::load(path).map_err(|error| miette::miette!("{error}"))?;
+                settings
+                    .set_active_profile(profile.clone())
+                    .map_err(|error| miette::miette!("{error}"))?;
+                settings
+                    .save(path)
+                    .map_err(|error| miette::miette!("{error}"))?;
+                self.provider_message = provider_status_message(transport);
+                self.push_system_message(
+                    "Auth updated",
+                    vec![format!("active provider profile set to {profile}")],
+                );
+            }
+            SlashAuthCommand::Login(login) => {
+                apply_auth_login(transport, login)?;
+                self.provider_message = provider_status_message(transport);
+                self.push_system_message(
+                    "Auth updated",
+                    vec![
+                        "OpenAI-compatible provider saved".to_owned(),
+                        self.provider_message.clone(),
+                    ],
+                );
+            }
+        }
+        Ok(())
+    }
+
     async fn abort(&mut self, transport: &InProcessTransport) -> miette::Result<()> {
         let ack = transport
             .send_command(session_command(
@@ -158,6 +396,19 @@ impl TuiApp {
             .map_err(|error| miette::miette!("{error}"))?;
         self.status_message = ack.reason.unwrap_or_else(|| "abort accepted".to_owned());
         self.refresh(transport).await
+    }
+
+    fn push_system_message(&mut self, title: impl Into<String>, body: Vec<String>) {
+        self.status_message = title.into();
+        self.command_messages.push(TranscriptItem {
+            role: TranscriptRole::System,
+            title: self.status_message.clone(),
+            body,
+        });
+        if self.command_messages.len() > 12 {
+            self.command_messages
+                .drain(0..self.command_messages.len().saturating_sub(12));
+        }
     }
 }
 
@@ -175,7 +426,13 @@ async fn main() -> miette::Result<()> {
     let mut terminal = setup_terminal()?;
     let result = run_app(
         &mut terminal,
-        TuiApp::new(session_id, task_id, args.debug, provider_message),
+        TuiApp::new(
+            transport.default_thread_id(),
+            session_id,
+            task_id,
+            args.debug,
+            provider_message,
+        ),
         transport,
     )
     .await;
@@ -305,6 +562,8 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         Line::from(vec![
             Span::styled("session ", Style::default().fg(Color::DarkGray)),
             Span::raw(short_id(&app.session_id.to_string())),
+            Span::styled("  thread ", Style::default().fg(Color::DarkGray)),
+            Span::raw(short_id(&app.thread_id.to_string())),
             Span::styled("  task ", Style::default().fg(Color::DarkGray)),
             Span::raw(short_id(&task_text)),
             Span::styled("  events ", Style::default().fg(Color::DarkGray)),
@@ -367,7 +626,7 @@ fn draw_debug_timeline(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 }
 
 fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let help = "Enter send   Ctrl+A abort   Tab debug   Ctrl+U clear   q/Esc quit";
+    let help = "Enter send   /help commands   Ctrl+A abort   Tab debug   q/Esc quit";
     let input_line = if app.input.is_empty() {
         "Ask Golutra to change code or inspect the workspace".to_owned()
     } else {
@@ -396,6 +655,7 @@ fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
 fn transcript_items(app: &TuiApp) -> Vec<TranscriptItem> {
     let mut items = Vec::new();
+    items.extend(app.command_messages.clone());
     items.extend(user_prompt_items(&app.events));
     if let Some(projection) = &app.projection {
         items.extend(projection_items(projection));
@@ -642,6 +902,73 @@ fn parse_task_id(value: Option<&str>) -> miette::Result<Option<TaskId>> {
                 .map_err(|error| miette::miette!("invalid task id: {error}"))
         })
         .transpose()
+}
+
+fn parse_optional_thread_id(value: Option<&str>, fallback: ThreadId) -> miette::Result<ThreadId> {
+    value
+        .map(parse_thread_id)
+        .transpose()
+        .map(|thread_id| thread_id.unwrap_or(fallback))
+}
+
+fn parse_thread_id(value: &str) -> miette::Result<ThreadId> {
+    value
+        .parse()
+        .map_err(|error: uuid::Error| miette::miette!("invalid thread id: {error}"))
+}
+
+fn provider_paths_for_tui(transport: &InProcessTransport) -> miette::Result<ProviderConfigPaths> {
+    let workspace = transport
+        .workspace_root()
+        .ok_or_else(|| miette::miette!("provider config requires a workspace"))?;
+    ProviderConfigPaths::for_workspace(workspace).map_err(|error| miette::miette!("{error}"))
+}
+
+fn provider_scope(scope: AuthConfigScope) -> ProviderConfigScope {
+    match scope {
+        AuthConfigScope::User => ProviderConfigScope::User,
+        AuthConfigScope::Workspace => ProviderConfigScope::Workspace,
+    }
+}
+
+fn apply_auth_login(
+    transport: &InProcessTransport,
+    login: OpenAiCompatibleLogin,
+) -> miette::Result<()> {
+    let paths = provider_paths_for_tui(transport)?;
+    let scope = provider_scope(login.scope);
+    let profile = ProviderProfile::openai_compatible(
+        login.profile,
+        login.base_url,
+        login.model,
+        login.api_key_env,
+    )
+    .map_err(|error| miette::miette!("{error}"))?;
+    ProviderInstallPlan {
+        scope,
+        profile,
+        activate: true,
+    }
+    .apply(&paths)
+    .map_err(|error| miette::miette!("{error}"))
+}
+
+fn slash_help_lines() -> Vec<String> {
+    vec![
+        "/resume [thread-id]  resume default or specific thread".to_owned(),
+        "/threads [limit]  list recent workspace threads".to_owned(),
+        "/fork <thread-id>  fork a thread and switch to it".to_owned(),
+        "/auth status  show provider onboarding state".to_owned(),
+        "/auth protocols  list registered provider protocols".to_owned(),
+        "/auth mock  switch this workspace to mock provider".to_owned(),
+        "/auth login --base-url <url> --model <model> [--api-key-env <env>] [--scope user|workspace]".to_owned(),
+        "/auth use <profile> [user|workspace]  activate saved provider profile".to_owned(),
+        "/status  show current session/task status".to_owned(),
+        "/debug  toggle debug timeline".to_owned(),
+        "/abort  abort active task".to_owned(),
+        "/clear  clear local command messages".to_owned(),
+        "/quit  leave TUI".to_owned(),
+    ]
 }
 
 fn provider_status_message(transport: &InProcessTransport) -> String {

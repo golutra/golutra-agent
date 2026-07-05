@@ -254,14 +254,30 @@ $GOLUTRA_HOME/index.sqlite
 6. 增加 `$GOLUTRA_HOME/index.sqlite`，支持跨 workspace 最近 thread 列表。
 7. 将 app-server 协议扩展为 `thread/start`、`thread/list`、`thread/resume`、`thread/fork`，CLI/TUI/Web 统一消费。
 
+### TUI slash command 层
+
+TUI 输入框现在先经过 slash command parser：
+
+| 命令 | 行为 |
+| --- | --- |
+| `/help` | 在 transcript 中展示可用 slash commands |
+| `/resume [thread-id]` | 恢复默认 thread 或指定 thread，并切换当前 session |
+| `/threads [limit]` | 列出当前 workspace 最近 threads |
+| `/fork <thread-id>` | fork 指定 thread，创建新 thread/session 并切换 |
+| `/auth status` | 展示 provider onboarding 状态 |
+| `/auth protocols` | 展示注册 provider protocols |
+| `/auth mock` | 将 workspace provider 切换为 mock |
+| `/auth login --base-url <url> --model <model> [--api-key-env <env>] [--scope user|workspace]` | 保存 OpenAI-compatible provider 配置；不在 TUI 输入中采集明文 key |
+| `/auth use <profile> [user|workspace]` | 激活已保存 provider profile |
+| `/status`、`/debug`、`/abort`、`/clear`、`/quit` | 本地状态、debug、abort 和退出控制 |
+
 ## 当前差距
 
 - 当前 TUI 首屏会显示 provider onboarding 状态，但还没有 qwen-code 风格的多步骤交互式 AuthDialog。
 - 当前 provider 配置已支持 `$GOLUTRA_HOME/provider.json` 和 `<workspace>/.golutra/provider.json`，workspace 配置禁止保存明文 key；但 OS keychain、OAuth 和 secret-ref 还未实现。
 - 当前 `threads` 表、`.golutra/default-thread`、`golutra thread list`、`golutra resume [THREAD_ID]` 和 `golutra fork THREAD_ID` 已可用；fork 当前复制元数据并创建新 session，还未复制/截断 rollout JSONL 历史。
 - 当前多工作区仍以 workspace SQLite 为事实来源；`$GOLUTRA_HOME/index.sqlite` 的跨 workspace 全局索引还未实现。
-- 当前 TUI 没有 provider setup modal。
-- 当前只有 workspace 默认 session，缺少用户可见 thread list/resume/fork。
+- 当前 TUI 没有 provider setup modal，但已提供 `/auth` slash command 作为非 modal 操作入口。
 - 当前 session 事实在 workspace SQLite，缺少 rollout JSONL 和跨 workspace index。
 
 这些差距不影响当前 P0 mock/live OpenAI-compatible smoke，但会影响真实用户首次使用、恢复历史任务和多项目日常使用。
