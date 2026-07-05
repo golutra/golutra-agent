@@ -474,6 +474,7 @@ impl RuntimeHost {
         let thread = self.store.thread_by_id(thread_id).await?.ok_or_else(|| {
             ClientError::InvalidSession(format!("thread `{thread_id}` not found"))
         })?;
+        self.ensure_thread_in_workspace(&thread)?;
         self.write_default_thread_files(thread.thread_id, thread.session_id)?;
         Ok(thread)
     }
@@ -482,6 +483,7 @@ impl RuntimeHost {
         let parent = self.store.thread_by_id(thread_id).await?.ok_or_else(|| {
             ClientError::InvalidSession(format!("thread `{thread_id}` not found"))
         })?;
+        self.ensure_thread_in_workspace(&parent)?;
         let now = chrono::Utc::now();
         let child = ThreadRecord {
             thread_id: ThreadId::new(),
@@ -781,6 +783,19 @@ impl RuntimeHost {
             .map(|path| path.to_string_lossy().to_string())
     }
 
+    fn ensure_thread_in_workspace(&self, thread: &ThreadRecord) -> Result<(), ClientError> {
+        let Some(workspace_root) = self.workspace_root_string() else {
+            return Ok(());
+        };
+        if thread.workspace_root.as_deref() == Some(workspace_root.as_str()) {
+            return Ok(());
+        }
+        Err(ClientError::InvalidSession(format!(
+            "thread `{}` does not belong to workspace `{workspace_root}`",
+            thread.thread_id
+        )))
+    }
+
     fn write_default_thread_files(
         &self,
         thread_id: ThreadId,
@@ -863,12 +878,18 @@ impl SessionResolver {
         default_thread_id: ThreadId,
         default_session_id: SessionId,
     ) -> Result<ThreadRecord, ClientError> {
-        if let Some(thread) = store.thread_by_id(default_thread_id).await? {
-            self.write_default_ids(thread.thread_id, thread.session_id)?;
-            return Ok(thread);
-        }
-
         let workspace_root = self.workspace_root.to_string_lossy().to_string();
+        let default_thread_exists =
+            if let Some(thread) = store.thread_by_id(default_thread_id).await? {
+                if thread.workspace_root.as_deref() == Some(workspace_root.as_str()) {
+                    self.write_default_ids(thread.thread_id, thread.session_id)?;
+                    return Ok(thread);
+                }
+                true
+            } else {
+                false
+            };
+
         if let Some(thread) = store
             .list_threads(Some(&workspace_root), 1)
             .await?
@@ -879,15 +900,15 @@ impl SessionResolver {
             return Ok(thread);
         }
 
-        if let Some(thread) = store.list_threads(None, 1).await?.into_iter().next() {
-            self.write_default_ids(thread.thread_id, thread.session_id)?;
-            return Ok(thread);
-        }
-
+        let bootstrap_thread_id = if default_thread_exists {
+            ThreadId::new()
+        } else {
+            default_thread_id
+        };
         let thread = ensure_thread_record(
             store,
             Some(workspace_root),
-            default_thread_id,
+            bootstrap_thread_id,
             default_session_id,
         )
         .await?;
@@ -1340,6 +1361,79 @@ mod tests {
                 .expect("default thread")
                 .trim(),
             original_thread_id.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_transport_does_not_repair_to_other_workspace_thread() {
+        let workspace = tempdir().expect("workspace");
+        let workspace_root = workspace
+            .path()
+            .canonicalize()
+            .expect("workspace canonicalizes")
+            .to_string_lossy()
+            .to_string();
+        let golutra_dir = workspace.path().join(".golutra");
+        fs::create_dir_all(&golutra_dir).expect("golutra dir");
+        let default_session_id = SessionId::new();
+        let other_workspace_thread = ThreadRecord {
+            thread_id: ThreadId::new(),
+            session_id: SessionId::new(),
+            parent_thread_id: None,
+            workspace_root: Some("/tmp/other-golutra-workspace".to_owned()),
+            title: "Other workspace".to_owned(),
+            preview: "Do not resume from here".to_owned(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            recency_at: chrono::Utc::now(),
+            archived: false,
+        };
+        fs::write(
+            golutra_dir.join("default-thread"),
+            other_workspace_thread.thread_id.to_string(),
+        )
+        .expect("default thread");
+        fs::write(
+            golutra_dir.join("default-session"),
+            default_session_id.to_string(),
+        )
+        .expect("default session");
+        let store = RuntimeStore::connect(&format!(
+            "sqlite://{}",
+            golutra_dir.join("runtime.sqlite").display()
+        ))
+        .await
+        .expect("store");
+        store
+            .upsert_thread(&other_workspace_thread)
+            .await
+            .expect("other workspace thread");
+
+        let transport = InProcessTransport::for_workspace(workspace.path())
+            .await
+            .expect("transport repairs current workspace only");
+        let current_thread = transport
+            .resume_thread(transport.default_thread_id())
+            .await
+            .expect("current workspace default thread resumes");
+        let other_error = transport
+            .resume_thread(other_workspace_thread.thread_id)
+            .await
+            .expect_err("other workspace thread is rejected");
+
+        assert_ne!(
+            transport.default_thread_id(),
+            other_workspace_thread.thread_id
+        );
+        assert_eq!(
+            current_thread.workspace_root.as_deref(),
+            Some(workspace_root.as_str())
+        );
+        assert_eq!(current_thread.session_id, default_session_id);
+        assert!(
+            other_error
+                .to_string()
+                .contains("does not belong to workspace")
         );
     }
 
