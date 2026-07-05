@@ -10,6 +10,7 @@ rust-version.workspace = true
 chrono.workspace = true
 clap.workspace = true
 golutra-client = { path = "../golutra-client" }
+golutra-config = { path = "../golutra-config" }
 golutra-core.workspace = true
 golutra-llm = { path = "../golutra-llm" }
 golutra-protocol.workspace = true

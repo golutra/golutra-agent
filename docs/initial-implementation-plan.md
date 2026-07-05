@@ -24,7 +24,7 @@
 - `RuntimeHost` 已接入后台 `AgentLoop` 执行器，P0 可通过 mock provider 触发本地工具、写入 artifact/evidence、checkpoint、verification/loop decision，并把终态投影给 CLI/TUI/app-server。
 - `golutra-llm` 已提供可用的 OpenAI-compatible live provider adapter；默认仍走 deterministic mock provider，只有显式设置 `GOLUTRA_PROVIDER_PROTOCOL=openai-compatible` 或兼容的 `GOLUTRA_PROVIDER_MODE=live` 且配置 key/model 时才联网。live 配置缺失会显式失败，支持 `GOLUTRA_PROVIDER_*` 与 `OPENAI_*` env，并提供 CLI `provider protocols/current/probe` 脱敏检查入口。
 - LLM 协议 catalog 已注册 `mock`、`openai-compatible`、`anthropic`、`gemini`、`vertex-ai`、`genai`；除 `mock` 与 `openai-compatible` 外，其它协议当前处于 catalog/diagnostic ready 状态，选择后会返回 `adapter_not_implemented` 而不是静默 fallback。
-- 当前首次进入不会要求登录或输入 key；下一步首次 provider onboarding、凭据持久化、resume、多 session、多工作区设计已收敛到 `onboarding-session-workspace-design.md`。
+- provider onboarding、凭据持久化和 thread resume/fork 已完成最小闭环：`golutra-config` 支持 `$GOLUTRA_HOME/provider.json` 与 `<workspace>/.golutra/provider.json`，CLI 支持 `provider login/set-key/use/current/probe`，TUI 首屏展示 provider 状态，store/client/CLI 支持 `ThreadId`、`threads` 表、`.golutra/default-thread`、`thread list/resume/fork`。
 - P1/P2 先落稳定 schema、guardrail、SDK 和最小页面，复杂自动化和外部凭据相关能力仍通过 TODO 决策位收敛。
 - 第一阶段范围已在 `implementation-blueprint.md` 中明确，不能继续扩张到复杂 multi-agent 或不可审计的自动自我改进。
 
@@ -78,7 +78,7 @@ CLI 创建 coding task
 | P0.8 | app-server、RuntimeClient、多入口一致性 | 中 | 多端看到同一 task 状态和 event stream；支持 cursor replay + live stream |
 | P0.9 | checkpoint、debug、replay、改进候选 | 中 | 文件副作用有恢复点，失败任务可复盘 |
 
-P1 才做：provider onboarding、真实 provider 覆盖增强、thread list/resume/fork、TypeScript SDK、基础 Web attach、评估回归套件。
+P1 继续做：provider onboarding 交互式 TUI/AuthDialog、真实 provider 覆盖增强、thread rollout JSONL、resume picker、TypeScript SDK、基础 Web attach、评估回归套件。
 P2 才做：长期 memory 晋升、PromotionDecision、Open-Endedness、复杂 benchmark hardening。
 
 ## 推荐 Workspace 结构
@@ -138,12 +138,12 @@ P0 可以先创建全部 crate 空壳，但只实现 P0 必需模块：
 
 TODO 决策占位：
 
-- TODO(provider-config)：P0 env 入口已确定为 `GOLUTRA_PROVIDER_PROTOCOL`、`GOLUTRA_PROVIDER_*`、`OPENAI_*` 兼容 fallback 和默认 mock；仍需确定 user/workspace provider config 文件路径与 secretRef/OAuth 存储策略。
+- TODO(provider-config)：P0 env 入口已确定为 `GOLUTRA_PROVIDER_PROTOCOL`、`GOLUTRA_PROVIDER_*`、`OPENAI_*` 兼容 fallback 和默认 mock；user/workspace provider config 文件路径已落地，secretRef/OAuth 存储策略仍待确定。
 - TODO(sqlite-path)：确定默认数据目录，建议遵守 XDG / macOS app support，并支持 `GOLUTRA_HOME` 覆盖。
 - TODO(event-log-layout)：决定 P0 event log 只用 SQLite，还是 SQLite + JSONL 双写。
 - TODO(runtime-host)：补齐 `RuntimeHost`，让 `InProcessTransport` 和 `HttpSseTransport` 都连接同一 host，而不是各自包一份 store。
 - TODO(event-bus)：实现 `cursor replay + live stream`，替换一次性 `Vec<Event>` 订阅语义。
-- TODO(session-resolver)：确定 workspace 默认 session/task 解析规则，避免每个入口启动时生成新 session。
+- TODO(session-resolver)：workspace 默认 session 与 default-thread 已落地；后续补 rollout JSONL 重建和跨 workspace index。
 - TODO(checkpoint-strategy)：在 `shadow_git` 与独立 snapshot 之间做 P0 选择。
 - TODO(sandbox-profile)：明确默认 shell 允许命令、网络策略、敏感路径和 secret 排除规则。
 - TODO(protocol-version)：确定 schema version 初始值和兼容策略。

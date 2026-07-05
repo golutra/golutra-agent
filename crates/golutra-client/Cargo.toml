@@ -10,6 +10,7 @@ rust-version.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 golutra-core.workspace = true
+golutra-config = { path = "../golutra-config" }
 golutra-context = { path = "../golutra-context" }
 golutra-llm = { path = "../golutra-llm" }
 golutra-policy = { path = "../golutra-policy" }

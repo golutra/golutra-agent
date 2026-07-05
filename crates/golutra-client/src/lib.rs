@@ -8,9 +8,10 @@ use std::{
 };
 
 use async_trait::async_trait;
+use golutra_config::load_provider_runtime_env;
 use golutra_context::{ContextBuilder, ContextContributor};
 use golutra_core::{
-    BusyPolicy, EventId, LoopAction, SessionId, TaskId, TaskStatus, TurnId, WorkspaceId,
+    BusyPolicy, EventId, LoopAction, SessionId, TaskId, TaskStatus, ThreadId, TurnId, WorkspaceId,
 };
 use golutra_llm::{ConfiguredProvider, MockProvider, ProviderError, ProviderRole};
 use golutra_policy::WorkspacePolicy;
@@ -22,7 +23,7 @@ use golutra_runtime::{
     AgentLoop, AgentLoopTraceEvent, AgentTaskRequest, RuntimeLaneError, RuntimeLaneManager,
     WorkspaceCheckpointManager, is_active_status,
 };
-use golutra_store::{RuntimeStore, StoreError};
+use golutra_store::{RuntimeStore, StoreError, ThreadRecord};
 use golutra_tools::BasicToolExecutor;
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -87,6 +88,11 @@ impl InProcessTransport {
     }
 
     #[must_use]
+    pub fn default_thread_id(&self) -> ThreadId {
+        self.host.default_thread_id()
+    }
+
+    #[must_use]
     pub fn workspace_root(&self) -> Option<&Path> {
         self.host.workspace_root()
     }
@@ -94,6 +100,18 @@ impl InProcessTransport {
     #[must_use]
     pub fn subscribe_live(&self, filter: EventFilter) -> broadcast::Receiver<RuntimeEvent> {
         self.host.subscribe_live(filter)
+    }
+
+    pub async fn list_threads(&self, limit: u32) -> Result<Vec<ThreadRecord>, ClientError> {
+        self.host.list_threads(limit).await
+    }
+
+    pub async fn resume_thread(&self, thread_id: ThreadId) -> Result<ThreadRecord, ClientError> {
+        self.host.resume_thread(thread_id).await
+    }
+
+    pub async fn fork_thread(&self, thread_id: ThreadId) -> Result<ThreadRecord, ClientError> {
+        self.host.fork_thread(thread_id).await
     }
 }
 
@@ -121,6 +139,7 @@ pub struct RuntimeHost {
     workspace_id: WorkspaceId,
     workspace_root: Option<PathBuf>,
     default_session_id: SessionId,
+    default_thread_id: ThreadId,
 }
 
 #[derive(Debug, Clone)]
@@ -134,20 +153,28 @@ struct HostedAgentTask {
 impl RuntimeHost {
     pub async fn in_memory() -> Result<Arc<Self>, ClientError> {
         let store = RuntimeStore::in_memory().await?;
-        Self::from_store(store, None, SessionId::new()).await
+        Self::from_store(store, None, SessionId::new(), ThreadId::new()).await
     }
 
     pub async fn for_workspace(workspace_root: impl AsRef<Path>) -> Result<Arc<Self>, ClientError> {
         let resolver = SessionResolver::new(workspace_root.as_ref())?;
         let store = RuntimeStore::connect(&resolver.sqlite_url()).await?;
         let default_session_id = resolver.resolve_default_session()?;
-        Self::from_store(store, Some(resolver.workspace_root), default_session_id).await
+        let default_thread_id = resolver.resolve_default_thread()?;
+        Self::from_store(
+            store,
+            Some(resolver.workspace_root),
+            default_session_id,
+            default_thread_id,
+        )
+        .await
     }
 
     async fn from_store(
         store: RuntimeStore,
         workspace_root: Option<PathBuf>,
         default_session_id: SessionId,
+        default_thread_id: ThreadId,
     ) -> Result<Arc<Self>, ClientError> {
         let (event_bus, _) = broadcast::channel(512);
         let next_sequence_no = store.max_sequence_no().await?.saturating_add(1);
@@ -159,12 +186,18 @@ impl RuntimeHost {
             workspace_id: WorkspaceId::new(),
             workspace_root,
             default_session_id,
+            default_thread_id,
         }))
     }
 
     #[must_use]
     pub fn default_session_id(&self) -> SessionId {
         self.default_session_id
+    }
+
+    #[must_use]
+    pub fn default_thread_id(&self) -> ThreadId {
+        self.default_thread_id
     }
 
     #[must_use]
@@ -248,6 +281,7 @@ impl RuntimeHost {
         let task_id = TaskId::new();
         let turn_id = TurnId::new();
         let payload = command.payload.clone();
+        self.upsert_current_thread(session_id, &payload).await?;
         let lane_manager = self.lane_manager.lock().await;
         if lane_manager.lane(session_id).is_some() {
             let decision = lane_manager.decide_busy_policy(
@@ -422,6 +456,74 @@ impl RuntimeHost {
             .map_err(ClientError::Serialization)
     }
 
+    pub async fn list_threads(&self, limit: u32) -> Result<Vec<ThreadRecord>, ClientError> {
+        let workspace_root = self.workspace_root_string();
+        self.store
+            .list_threads(workspace_root.as_deref(), limit)
+            .await
+            .map_err(ClientError::Store)
+    }
+
+    pub async fn resume_thread(&self, thread_id: ThreadId) -> Result<ThreadRecord, ClientError> {
+        let thread = self.store.thread_by_id(thread_id).await?.ok_or_else(|| {
+            ClientError::InvalidSession(format!("thread `{thread_id}` not found"))
+        })?;
+        self.write_default_thread_files(thread.thread_id, thread.session_id)?;
+        Ok(thread)
+    }
+
+    pub async fn fork_thread(&self, thread_id: ThreadId) -> Result<ThreadRecord, ClientError> {
+        let parent = self.store.thread_by_id(thread_id).await?.ok_or_else(|| {
+            ClientError::InvalidSession(format!("thread `{thread_id}` not found"))
+        })?;
+        let now = chrono::Utc::now();
+        let child = ThreadRecord {
+            thread_id: ThreadId::new(),
+            session_id: SessionId::new(),
+            parent_thread_id: Some(parent.thread_id),
+            workspace_root: parent.workspace_root.clone(),
+            title: format!("Fork of {}", parent.title),
+            preview: parent.preview.clone(),
+            created_at: now,
+            updated_at: now,
+            recency_at: now,
+            archived: false,
+        };
+        self.store.upsert_thread(&child).await?;
+        self.write_default_thread_files(child.thread_id, child.session_id)?;
+        Ok(child)
+    }
+
+    async fn upsert_current_thread(
+        &self,
+        session_id: SessionId,
+        payload: &Value,
+    ) -> Result<(), ClientError> {
+        let now = chrono::Utc::now();
+        let existing = self.store.thread_by_id(self.default_thread_id).await?;
+        let thread = ThreadRecord {
+            thread_id: self.default_thread_id,
+            session_id,
+            parent_thread_id: existing.as_ref().and_then(|thread| thread.parent_thread_id),
+            workspace_root: self.workspace_root_string(),
+            title: existing
+                .as_ref()
+                .map(|thread| thread.title.clone())
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or_else(|| title_from_payload(payload)),
+            preview: preview_from_payload(payload),
+            created_at: existing
+                .as_ref()
+                .map(|thread| thread.created_at)
+                .unwrap_or(now),
+            updated_at: now,
+            recency_at: now,
+            archived: false,
+        };
+        self.store.upsert_thread(&thread).await?;
+        Ok(())
+    }
+
     async fn record_event(&self, event: RuntimeEvent) -> Result<(), ClientError> {
         self.store.append_event(&event).await?;
         let _ = self.event_bus.send(event);
@@ -464,8 +566,9 @@ impl RuntimeHost {
             .into_iter()
             .map(|contract| contract.tool_name.clone())
             .collect::<Vec<_>>();
-        let provider_plan = mock_provider_plan(&task.payload, &objective)
-            .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
+        let provider_plan =
+            mock_provider_plan(self.workspace_root.as_deref(), &task.payload, &objective)
+                .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
         let agent_loop = AgentLoop::new(
             provider_plan.provider,
             ContextBuilder::default(),
@@ -658,6 +761,29 @@ impl RuntimeHost {
             std::env::current_dir().map_err(|error| ClientError::Io(error.to_string()))
         })
     }
+
+    fn workspace_root_string(&self) -> Option<String> {
+        self.workspace_root
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string())
+    }
+
+    fn write_default_thread_files(
+        &self,
+        thread_id: ThreadId,
+        session_id: SessionId,
+    ) -> Result<(), ClientError> {
+        let Some(workspace_root) = &self.workspace_root else {
+            return Ok(());
+        };
+        let golutra_dir = workspace_root.join(".golutra");
+        fs::create_dir_all(&golutra_dir).map_err(|error| ClientError::Io(error.to_string()))?;
+        fs::write(golutra_dir.join("default-thread"), thread_id.to_string())
+            .map_err(|error| ClientError::Io(error.to_string()))?;
+        fs::write(golutra_dir.join("default-session"), session_id.to_string())
+            .map_err(|error| ClientError::Io(error.to_string()))?;
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -665,6 +791,7 @@ struct SessionResolver {
     workspace_root: PathBuf,
     runtime_db: PathBuf,
     default_session_file: PathBuf,
+    default_thread_file: PathBuf,
 }
 
 impl SessionResolver {
@@ -677,6 +804,7 @@ impl SessionResolver {
         Ok(Self {
             runtime_db: golutra_dir.join("runtime.sqlite"),
             default_session_file: golutra_dir.join("default-session"),
+            default_thread_file: golutra_dir.join("default-thread"),
             workspace_root,
         })
     }
@@ -698,6 +826,22 @@ impl SessionResolver {
         fs::write(&self.default_session_file, session_id.to_string())
             .map_err(|error| ClientError::Io(error.to_string()))?;
         Ok(session_id)
+    }
+
+    fn resolve_default_thread(&self) -> Result<ThreadId, ClientError> {
+        if self.default_thread_file.exists() {
+            let value = fs::read_to_string(&self.default_thread_file)
+                .map_err(|error| ClientError::Io(error.to_string()))?;
+            return value
+                .trim()
+                .parse()
+                .map_err(|error: uuid::Error| ClientError::InvalidSession(error.to_string()));
+        }
+
+        let thread_id = ThreadId::new();
+        fs::write(&self.default_thread_file, thread_id.to_string())
+            .map_err(|error| ClientError::Io(error.to_string()))?;
+        Ok(thread_id)
     }
 }
 
@@ -725,57 +869,83 @@ struct MockProviderPlan {
     touched_code: bool,
 }
 
-fn mock_provider_plan(payload: &Value, objective: &str) -> Result<MockProviderPlan, ProviderError> {
+fn mock_provider_plan(
+    workspace_root: Option<&Path>,
+    payload: &Value,
+    objective: &str,
+) -> Result<MockProviderPlan, ProviderError> {
+    let provider_env = workspace_root.and_then(|root| load_provider_runtime_env(root).ok());
     let lower = objective.to_ascii_lowercase();
     if lower.contains("write") || lower.contains("create") || payload.get("content").is_some() {
         return Ok(MockProviderPlan {
-            provider: ConfiguredProvider::resolve_from_env(MockProvider::tool_call(
-                "write_file",
-                json!({
-                    "path": string_payload(payload, "path", "golutra-agent-output.txt"),
-                    "content": string_payload(payload, "content", "done\n"),
-                }),
-            ))?,
+            provider: resolve_configured_provider(
+                provider_env.as_ref(),
+                MockProvider::tool_call(
+                    "write_file",
+                    json!({
+                        "path": string_payload(payload, "path", "golutra-agent-output.txt"),
+                        "content": string_payload(payload, "content", "done\n"),
+                    }),
+                ),
+            )?,
             touched_code: true,
         });
     }
 
     if lower.contains("read") {
         return Ok(MockProviderPlan {
-            provider: ConfiguredProvider::resolve_from_env(MockProvider::tool_call(
-                "read_file",
-                json!({"path": string_payload(payload, "path", "README.md")}),
-            ))?,
+            provider: resolve_configured_provider(
+                provider_env.as_ref(),
+                MockProvider::tool_call(
+                    "read_file",
+                    json!({"path": string_payload(payload, "path", "README.md")}),
+                ),
+            )?,
             touched_code: false,
         });
     }
 
     if lower.contains("sleep") {
         return Ok(MockProviderPlan {
-            provider: ConfiguredProvider::resolve_from_env(MockProvider::tool_call(
-                "shell",
-                json!({"command": "sleep 5"}),
-            ))?,
+            provider: resolve_configured_provider(
+                provider_env.as_ref(),
+                MockProvider::tool_call("shell", json!({"command": "sleep 5"})),
+            )?,
             touched_code: false,
         });
     }
 
     if lower.contains("list") || lower.contains("ls") {
         return Ok(MockProviderPlan {
-            provider: ConfiguredProvider::resolve_from_env(MockProvider::tool_call(
-                "list_dir",
-                json!({"path": string_payload(payload, "path", ".")}),
-            ))?,
+            provider: resolve_configured_provider(
+                provider_env.as_ref(),
+                MockProvider::tool_call(
+                    "list_dir",
+                    json!({"path": string_payload(payload, "path", ".")}),
+                ),
+            )?,
             touched_code: false,
         });
     }
 
     Ok(MockProviderPlan {
-        provider: ConfiguredProvider::resolve_from_env(MockProvider::text_response(
-            "mock provider completed without tool calls",
-        ))?,
+        provider: resolve_configured_provider(
+            provider_env.as_ref(),
+            MockProvider::text_response("mock provider completed without tool calls"),
+        )?,
         touched_code: false,
     })
+}
+
+fn resolve_configured_provider(
+    provider_env: Option<&golutra_config::ProviderRuntimeEnv>,
+    mock: MockProvider,
+) -> Result<ConfiguredProvider, ProviderError> {
+    if let Some(provider_env) = provider_env {
+        ConfiguredProvider::resolve_from_reader(mock, |key| provider_env.get(key))
+    } else {
+        ConfiguredProvider::resolve_from_env(mock)
+    }
 }
 
 fn system_prompt() -> String {
@@ -803,6 +973,26 @@ fn string_payload(payload: &Value, key: &str, fallback: &str) -> String {
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(fallback)
         .to_owned()
+}
+
+fn title_from_payload(payload: &Value) -> String {
+    let compact = compact_prompt(payload);
+    if compact.is_empty() {
+        "Untitled thread".to_owned()
+    } else {
+        compact.chars().take(80).collect()
+    }
+}
+
+fn preview_from_payload(payload: &Value) -> String {
+    compact_prompt(payload).chars().take(240).collect()
+}
+
+fn compact_prompt(payload: &Value) -> String {
+    prompt_from_payload(payload)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn task_status_from_loop_action(action: LoopAction) -> TaskStatus {

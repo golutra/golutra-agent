@@ -31,11 +31,12 @@ Golutra 不直接复制 qwen-code 的配置文件形状。Golutra 的核心仍�
 
 ## 当前状态
 
-截至 2026-07-05：
+截至 2026-07-06：
 
 - `golutra-llm` 已有 `MockProvider` 和 OpenAI-compatible live adapter。
 - 默认 provider 是 mock。
-- 首次进入当前不会要求登录或输入 key；CLI/TUI 会继续使用 mock，除非显式选择 live protocol。
+- CLI 已支持 `golutra provider login`、`golutra provider set-key` 和 `golutra provider use`；TUI 首屏会显示 provider onboarding 状态和缺失字段。
+- 首次进入当前不会弹出完整交互式登录表单；CLI/TUI 会继续使用 mock，除非显式选择 live protocol 或 provider config 指向 live provider。
 - 真实联网调用必须显式选择协议并配置凭据。推荐设置：
   - `GOLUTRA_PROVIDER_PROTOCOL=openai-compatible`
   - `GOLUTRA_PROVIDER_API_KEY`
@@ -51,9 +52,10 @@ Golutra 不直接复制 qwen-code 的配置文件形状。Golutra 的核心仍�
 - 当前只有 `mock` 与 `openai-compatible` 可执行；`anthropic`、`gemini`、`vertex-ai`、`genai` 已具备协议选择、env 映射和脱敏诊断，live adapter 待接。
 - base URL 会做 P0 规范化：例如 `api.golutra.cn` 会解析成 `https://api.golutra.cn/v1`。
 - CLI 已提供 `golutra provider protocols`、`golutra provider current` 和 `golutra provider probe`，输出只包含协议目录、脱敏配置与 probe 结果，不输出 API key。
+- provider 配置已可持久化到 `$GOLUTRA_HOME/provider.json` 或 `<workspace>/.golutra/provider.json`；workspace 配置禁止保存明文 key，用户级配置使用原子写和 owner-only 权限。
 - live 模式下配置缺失会显式失败，不再静默回退到 mock。
 - 这套 env 入口保留为 P0 兼容路径，后续 provider catalog / secretRef / OAuth 配置系统必须能包住它，而不是破坏现有 smoke 和 CLI 行为。
-- P1 需要补 provider onboarding gate：TUI/Web 首次进入时展示 connect provider flow，CLI 非交互场景保持结构化诊断。
+- P1 需要补完整 provider onboarding gate：TUI/Web 首次进入时展示多步骤 connect provider flow，CLI 非交互场景保持结构化诊断。
 
 ## 目标架构
 

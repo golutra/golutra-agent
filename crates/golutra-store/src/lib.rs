@@ -1,6 +1,6 @@
 use golutra_core::{
     ArtifactId, ArtifactRecord, EvidenceRecord, LoopDecision, SessionId, TaskId, TaskStatus,
-    ToolResultEnvelope, VerificationRecord,
+    ThreadId, Timestamp, ToolResultEnvelope, VerificationRecord,
 };
 use golutra_protocol::{
     DebugProjection, RuntimeEvent, RuntimeEventType, StateProjection, UserProjection, VisibleStep,
@@ -18,9 +18,25 @@ pub enum StoreError {
     Sqlx(#[from] sqlx::Error),
     #[error("json serialization failed")]
     Json(#[from] serde_json::Error),
+    #[error("stored id is invalid: {0}")]
+    InvalidId(String),
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ThreadRecord {
+    pub thread_id: ThreadId,
+    pub session_id: SessionId,
+    pub parent_thread_id: Option<ThreadId>,
+    pub workspace_root: Option<String>,
+    pub title: String,
+    pub preview: String,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    pub recency_at: Timestamp,
+    pub archived: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct RuntimeStore {
@@ -267,6 +283,102 @@ impl RuntimeStore {
         Ok(())
     }
 
+    pub async fn upsert_thread(&self, thread: &ThreadRecord) -> StoreResult<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO threads (
+                thread_id, session_id, parent_thread_id, workspace_root, title, preview,
+                created_at, updated_at, recency_at, archived
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(thread_id) DO UPDATE SET
+                session_id = excluded.session_id,
+                parent_thread_id = excluded.parent_thread_id,
+                workspace_root = excluded.workspace_root,
+                title = excluded.title,
+                preview = excluded.preview,
+                updated_at = excluded.updated_at,
+                recency_at = excluded.recency_at,
+                archived = excluded.archived
+            "#,
+        )
+        .bind(thread.thread_id.to_string())
+        .bind(thread.session_id.to_string())
+        .bind(thread.parent_thread_id.map(|id| id.to_string()))
+        .bind(&thread.workspace_root)
+        .bind(&thread.title)
+        .bind(&thread.preview)
+        .bind(thread.created_at)
+        .bind(thread.updated_at)
+        .bind(thread.recency_at)
+        .bind(thread.archived)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn thread_by_id(&self, thread_id: ThreadId) -> StoreResult<Option<ThreadRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT thread_id, session_id, parent_thread_id, workspace_root, title, preview,
+                   created_at, updated_at, recency_at, archived
+            FROM threads
+            WHERE thread_id = ?
+            "#,
+        )
+        .bind(thread_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(thread_from_row).transpose()
+    }
+
+    pub async fn thread_by_session(
+        &self,
+        session_id: SessionId,
+    ) -> StoreResult<Option<ThreadRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT thread_id, session_id, parent_thread_id, workspace_root, title, preview,
+                   created_at, updated_at, recency_at, archived
+            FROM threads
+            WHERE session_id = ?
+            ORDER BY recency_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(session_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(thread_from_row).transpose()
+    }
+
+    pub async fn list_threads(
+        &self,
+        workspace_root: Option<&str>,
+        limit: u32,
+    ) -> StoreResult<Vec<ThreadRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT thread_id, session_id, parent_thread_id, workspace_root, title, preview,
+                   created_at, updated_at, recency_at, archived
+            FROM threads
+            WHERE archived = 0
+              AND (? IS NULL OR workspace_root = ?)
+            ORDER BY recency_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(workspace_root)
+        .bind(workspace_root)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(thread_from_row).collect()
+    }
+
     async fn load_artifacts_for_session(
         &self,
         session_id: SessionId,
@@ -405,7 +517,53 @@ const MIGRATIONS: &[&str] = &[
         evidence_json TEXT NOT NULL
     )
     "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS threads (
+        thread_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        parent_thread_id TEXT,
+        workspace_root TEXT,
+        title TEXT NOT NULL,
+        preview TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        recency_at TEXT NOT NULL,
+        archived INTEGER NOT NULL DEFAULT 0
+    )
+    "#,
+    r#"
+    CREATE INDEX IF NOT EXISTS idx_threads_workspace_recency
+    ON threads (workspace_root, recency_at DESC)
+    "#,
+    r#"
+    CREATE INDEX IF NOT EXISTS idx_threads_session
+    ON threads (session_id)
+    "#,
 ];
+
+fn thread_from_row(row: sqlx::sqlite::SqliteRow) -> StoreResult<ThreadRecord> {
+    let thread_id: String = row.try_get("thread_id")?;
+    let session_id: String = row.try_get("session_id")?;
+    let parent_thread_id: Option<String> = row.try_get("parent_thread_id")?;
+    Ok(ThreadRecord {
+        thread_id: ThreadId::from_str(&thread_id)
+            .map_err(|error| StoreError::InvalidId(error.to_string()))?,
+        session_id: SessionId::from_str(&session_id)
+            .map_err(|error| StoreError::InvalidId(error.to_string()))?,
+        parent_thread_id: parent_thread_id
+            .map(|value| {
+                ThreadId::from_str(&value).map_err(|error| StoreError::InvalidId(error.to_string()))
+            })
+            .transpose()?,
+        workspace_root: row.try_get("workspace_root")?,
+        title: row.try_get("title")?,
+        preview: row.try_get("preview")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+        recency_at: row.try_get("recency_at")?,
+        archived: row.try_get("archived")?,
+    })
+}
 
 #[cfg(test)]
 mod tests {
@@ -524,5 +682,38 @@ mod tests {
 
         assert_eq!(projection.events.len(), 1);
         assert_eq!(projection.artifacts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stores_and_lists_thread_metadata() {
+        let store = RuntimeStore::in_memory().await.expect("store opens");
+        let now = Utc::now();
+        let thread = ThreadRecord {
+            thread_id: ThreadId::new(),
+            session_id: SessionId::new(),
+            parent_thread_id: None,
+            workspace_root: Some("/workspace".to_owned()),
+            title: "Implement provider setup".to_owned(),
+            preview: "Implement provider setup and persistence".to_owned(),
+            created_at: now,
+            updated_at: now,
+            recency_at: now,
+            archived: false,
+        };
+
+        store.upsert_thread(&thread).await.expect("thread stored");
+        let loaded = store
+            .thread_by_id(thread.thread_id)
+            .await
+            .expect("thread loads")
+            .expect("thread exists");
+        let listed = store
+            .list_threads(Some("/workspace"), 10)
+            .await
+            .expect("threads list");
+
+        assert_eq!(loaded.thread_id, thread.thread_id);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, thread.session_id);
     }
 }

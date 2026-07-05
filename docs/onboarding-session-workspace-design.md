@@ -8,7 +8,7 @@
 - LLM provider 凭据、配置和运行时状态应该持久化在哪里。
 - resume、多 session、多工作区应该如何设计，避免 CLI/TUI/Web 各自维护状态。
 
-结论：当前 Golutra 不会在首次进入时要求登录或输入 key。它默认使用 `mock` provider；只有显式设置 `GOLUTRA_PROVIDER_PROTOCOL=openai-compatible` 或旧入口 `GOLUTRA_PROVIDER_MODE=live` 时才尝试真实 provider。下一步应补一个 qwen-code 风格的 provider onboarding gate：首次交互入口如果没有可执行 live provider，先打开 provider setup；非交互命令保留 mock 或返回结构化诊断。
+结论：Golutra 已具备 provider onboarding 与 thread resume/fork 的最小闭环。默认仍可使用 `mock` provider；真实 provider 可通过 `golutra provider login` 写入用户级或 workspace 级 `provider.json`，运行时会把该配置与进程环境变量合并后解析。TUI 首屏会展示 provider 状态和缺失字段，但完整交互式 provider setup 表单仍是后续增强。
 
 ## qwen-code 参考结论
 
@@ -256,8 +256,10 @@ $GOLUTRA_HOME/index.sqlite
 
 ## 当前差距
 
-- 当前首次进入不会要求登录或输入 key。
-- 当前 provider 配置只从 env 读取，没有 user/workspace provider config 写入能力。
+- 当前 TUI 首屏会显示 provider onboarding 状态，但还没有 qwen-code 风格的多步骤交互式 AuthDialog。
+- 当前 provider 配置已支持 `$GOLUTRA_HOME/provider.json` 和 `<workspace>/.golutra/provider.json`，workspace 配置禁止保存明文 key；但 OS keychain、OAuth 和 secret-ref 还未实现。
+- 当前 `threads` 表、`.golutra/default-thread`、`golutra thread list`、`golutra resume [THREAD_ID]` 和 `golutra fork THREAD_ID` 已可用；fork 当前复制元数据并创建新 session，还未复制/截断 rollout JSONL 历史。
+- 当前多工作区仍以 workspace SQLite 为事实来源；`$GOLUTRA_HOME/index.sqlite` 的跨 workspace 全局索引还未实现。
 - 当前 TUI 没有 provider setup modal。
 - 当前只有 workspace 默认 session，缺少用户可见 thread list/resume/fork。
 - 当前 session 事实在 workspace SQLite，缺少 rollout JSONL 和跨 workspace index。

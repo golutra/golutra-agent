@@ -10,6 +10,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use golutra_client::{InProcessTransport, RuntimeClient};
+use golutra_config::provider_onboarding_state;
 use golutra_core::{Actor, ActorKind, CommandId, QueryId, SessionId, TaskId};
 use golutra_protocol::{
     EventFilter, RuntimeEvent, RuntimeEventType, RuntimeQuery, RuntimeQueryKind, SessionCommand,
@@ -49,6 +50,7 @@ struct TuiApp {
     events: Vec<Value>,
     input: String,
     status_message: String,
+    provider_message: String,
     debug_mode: bool,
     cursor: Option<u64>,
     should_quit: bool,
@@ -70,7 +72,12 @@ struct TranscriptItem {
 }
 
 impl TuiApp {
-    fn new(session_id: SessionId, task_id: Option<TaskId>, debug_mode: bool) -> Self {
+    fn new(
+        session_id: SessionId,
+        task_id: Option<TaskId>,
+        debug_mode: bool,
+        provider_message: String,
+    ) -> Self {
         Self {
             session_id,
             task_id,
@@ -78,6 +85,7 @@ impl TuiApp {
             events: Vec::new(),
             input: String::new(),
             status_message: "attached to workspace runtime".to_owned(),
+            provider_message,
             debug_mode,
             cursor: None,
             should_quit: false,
@@ -163,10 +171,11 @@ async fn main() -> miette::Result<()> {
     }
     .map_err(|error| miette::miette!("{error}"))?;
     let session_id = parse_session_id(args.session_id.as_deref(), &transport)?;
+    let provider_message = provider_status_message(&transport);
     let mut terminal = setup_terminal()?;
     let result = run_app(
         &mut terminal,
-        TuiApp::new(session_id, task_id, args.debug),
+        TuiApp::new(session_id, task_id, args.debug, provider_message),
         transport,
     )
     .await;
@@ -301,6 +310,10 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             Span::styled("  events ", Style::default().fg(Color::DarkGray)),
             Span::raw(event_count.to_string()),
         ]),
+        Line::from(vec![
+            Span::styled("provider ", Style::default().fg(Color::DarkGray)),
+            Span::raw(app.provider_message.clone()),
+        ]),
     ];
     let paragraph = Paragraph::new(lines).alignment(Alignment::Left);
     frame.render_widget(paragraph, area);
@@ -370,6 +383,10 @@ fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             Span::styled("  ", Style::default()),
             Span::styled(&app.status_message, Style::default().fg(Color::DarkGray)),
         ]),
+        Line::from(Span::styled(
+            &app.provider_message,
+            Style::default().fg(provider_color(app)),
+        )),
         Line::from(Span::styled(help, Style::default().fg(Color::DarkGray))),
     ])
     .block(Block::default().borders(Borders::TOP))
@@ -542,6 +559,16 @@ fn status_color(app: &TuiApp) -> Color {
     }
 }
 
+fn provider_color(app: &TuiApp) -> Color {
+    if app.provider_message.contains("ready") {
+        Color::Green
+    } else if app.provider_message.contains("missing") || app.provider_message.contains("setup") {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    }
+}
+
 fn composer_style(app: &TuiApp) -> Style {
     if app.input.is_empty() {
         Style::default().fg(Color::DarkGray)
@@ -615,4 +642,30 @@ fn parse_task_id(value: Option<&str>) -> miette::Result<Option<TaskId>> {
                 .map_err(|error| miette::miette!("invalid task id: {error}"))
         })
         .transpose()
+}
+
+fn provider_status_message(transport: &InProcessTransport) -> String {
+    let Some(workspace_root) = transport.workspace_root() else {
+        return "workspace config unavailable".to_owned();
+    };
+    match provider_onboarding_state(workspace_root) {
+        Ok(state) if state.configured => {
+            let profile = state
+                .active_profile
+                .map(|profile| profile.name)
+                .unwrap_or_else(|| "default".to_owned());
+            format!("ready ({profile})")
+        }
+        Ok(state) => {
+            let missing = if state.missing_fields.is_empty() {
+                "provider setup".to_owned()
+            } else {
+                state.missing_fields.join(", ")
+            };
+            format!(
+                "missing {missing}; run `golutra provider login --base-url <url> --model <model>`"
+            )
+        }
+        Err(error) => format!("provider config error: {error}"),
+    }
 }

@@ -1,7 +1,11 @@
 use clap::{Parser, Subcommand};
 use golutra_client::{InProcessTransport, RuntimeClient};
-use golutra_core::{Actor, ActorKind, CommandId, SessionId, TaskStatus};
-use golutra_llm::{ConfiguredProvider, provider_protocol_catalog};
+use golutra_config::{
+    ProviderConfigPaths, ProviderConfigScope, ProviderInstallPlan, ProviderProfile,
+    load_provider_runtime_env, provider_onboarding_state,
+};
+use golutra_core::{Actor, ActorKind, CommandId, SessionId, TaskStatus, ThreadId};
+use golutra_llm::{ConfiguredProvider, ProviderProtocol, provider_protocol_catalog};
 use golutra_protocol::{RuntimeQuery, RuntimeQueryKind, SessionCommand, SessionCommandKind};
 use tokio::time::{Duration, sleep};
 use uuid::Uuid;
@@ -25,13 +29,36 @@ enum Command {
         prompt: String,
     },
     Status,
-    Resume,
+    Resume {
+        thread_id: Option<String>,
+    },
+    Fork {
+        thread_id: String,
+    },
     Abort,
     Trace,
     Export,
+    Thread {
+        #[command(subcommand)]
+        command: ThreadCommand,
+    },
     Provider {
         #[command(subcommand)]
         command: ProviderCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ThreadCommand {
+    List {
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    Resume {
+        thread_id: String,
+    },
+    Fork {
+        thread_id: String,
     },
 }
 
@@ -40,6 +67,35 @@ enum ProviderCommand {
     Current,
     Probe,
     Protocols,
+    Login {
+        #[arg(long, default_value = "openai-compatible")]
+        protocol: String,
+        #[arg(long, default_value = "default")]
+        profile: String,
+        #[arg(long)]
+        base_url: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, default_value = "GOLUTRA_PROVIDER_API_KEY")]
+        api_key_env: String,
+        #[arg(long)]
+        api_key: Option<String>,
+        #[arg(long, default_value = "user")]
+        scope: String,
+        #[arg(long, default_value_t = true)]
+        activate: bool,
+    },
+    SetKey {
+        #[arg(long, default_value = "default")]
+        profile: String,
+        #[arg(long)]
+        api_key: String,
+    },
+    Use {
+        profile: String,
+        #[arg(long, default_value = "workspace")]
+        scope: String,
+    },
 }
 
 #[tokio::main]
@@ -89,16 +145,46 @@ async fn main() -> miette::Result<()> {
                 serde_json::to_string_pretty(&state).unwrap_or_default()
             );
         }
-        Command::Resume => {
-            let ack = transport
-                .send_command(command(
-                    session_id,
-                    SessionCommandKind::Resume,
-                    serde_json::json!({}),
-                ))
+        Command::Resume { thread_id } => {
+            let parsed_thread_id = parse_optional_thread_id(thread_id.as_deref(), &transport)?;
+            match transport.resume_thread(parsed_thread_id).await {
+                Ok(thread) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&thread).unwrap_or_default()
+                    );
+                }
+                Err(error) if thread_id.is_none() => {
+                    let ack = transport
+                        .send_command(command(
+                            session_id,
+                            SessionCommandKind::Resume,
+                            serde_json::json!({}),
+                        ))
+                        .await
+                        .map_err(|error| miette::miette!("{error}"))?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "fallback": "lane-resume",
+                            "reason": error.to_string(),
+                            "ack": ack,
+                        }))
+                        .unwrap_or_default()
+                    );
+                }
+                Err(error) => return Err(miette::miette!("{error}")),
+            }
+        }
+        Command::Fork { thread_id } => {
+            let thread = transport
+                .fork_thread(parse_thread_id(&thread_id)?)
                 .await
                 .map_err(|error| miette::miette!("{error}"))?;
-            println!("{}", serde_json::to_string_pretty(&ack).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&thread).unwrap_or_default()
+            );
         }
         Command::Abort => {
             let ack = transport
@@ -151,17 +237,63 @@ async fn main() -> miette::Result<()> {
                 serde_json::to_string_pretty(&artifacts).unwrap_or_default()
             );
         }
-        Command::Provider { command } => match command {
-            ProviderCommand::Current => {
-                let config = ConfiguredProvider::redacted_from_env()
+        Command::Thread { command } => match command {
+            ThreadCommand::List { limit } => {
+                let threads = transport
+                    .list_threads(limit)
+                    .await
                     .map_err(|error| miette::miette!("{error}"))?;
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&config).unwrap_or_default()
+                    serde_json::to_string_pretty(&threads).unwrap_or_default()
+                );
+            }
+            ThreadCommand::Resume { thread_id } => {
+                let thread = transport
+                    .resume_thread(parse_thread_id(&thread_id)?)
+                    .await
+                    .map_err(|error| miette::miette!("{error}"))?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&thread).unwrap_or_default()
+                );
+            }
+            ThreadCommand::Fork { thread_id } => {
+                let thread = transport
+                    .fork_thread(parse_thread_id(&thread_id)?)
+                    .await
+                    .map_err(|error| miette::miette!("{error}"))?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&thread).unwrap_or_default()
+                );
+            }
+        },
+        Command::Provider { command } => match command {
+            ProviderCommand::Current => {
+                let config = provider_env_for_cli(&transport)
+                    .ok()
+                    .map(|env| ConfiguredProvider::redacted_from_reader(|key| env.get(key)))
+                    .transpose()
+                    .map_err(|error| miette::miette!("{error}"))?
+                    .unwrap_or_else(|| {
+                        ConfiguredProvider::redacted_from_env()
+                            .unwrap_or_else(|error| provider_error_config(error.to_string()))
+                    });
+                let onboarding = provider_onboarding_for_cli(&transport)?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "provider": config,
+                        "onboarding": onboarding,
+                    }))
+                    .unwrap_or_default()
                 );
             }
             ProviderCommand::Probe => {
-                let result = ConfiguredProvider::probe_from_env()
+                let env =
+                    provider_env_for_cli(&transport).map_err(|error| miette::miette!("{error}"))?;
+                let result = ConfiguredProvider::probe_from_reader(|key| env.get(key))
                     .await
                     .map_err(|error| miette::miette!("{error}"))?;
                 println!(
@@ -176,9 +308,186 @@ async fn main() -> miette::Result<()> {
                     serde_json::to_string_pretty(&protocols).unwrap_or_default()
                 );
             }
+            ProviderCommand::Login {
+                protocol,
+                profile,
+                base_url,
+                model,
+                api_key_env,
+                api_key,
+                scope,
+                activate,
+            } => {
+                let protocol = parse_provider_protocol(&protocol)?;
+                let scope = parse_provider_scope(&scope)?;
+                let paths = provider_paths_for_cli(&transport)?;
+                let mut provider_profile = match protocol {
+                    ProviderProtocol::Mock => ProviderProfile::mock(),
+                    ProviderProtocol::OpenAiCompatible => ProviderProfile::openai_compatible(
+                        profile,
+                        base_url.ok_or_else(|| {
+                            miette::miette!("--base-url is required for openai-compatible login")
+                        })?,
+                        model.ok_or_else(|| {
+                            miette::miette!("--model is required for openai-compatible login")
+                        })?,
+                        api_key_env,
+                    )
+                    .map_err(|error| miette::miette!("{error}"))?,
+                    _ => {
+                        return Err(miette::miette!(
+                            "provider protocol `{}` is catalog-only and has no live adapter yet",
+                            protocol.id()
+                        ));
+                    }
+                };
+                provider_profile.api_key = api_key;
+                let plan = ProviderInstallPlan {
+                    scope,
+                    profile: provider_profile.redacted(),
+                    activate,
+                };
+                let mut persisted_profile = provider_profile;
+                if scope == ProviderConfigScope::Workspace {
+                    persisted_profile.api_key = None;
+                }
+                ProviderInstallPlan {
+                    scope,
+                    profile: persisted_profile,
+                    activate,
+                }
+                .apply(&paths)
+                .map_err(|error| miette::miette!("{error}"))?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "installed": true,
+                        "plan": plan,
+                        "paths": {
+                            "user": paths.user_config,
+                            "workspace": paths.workspace_config,
+                        }
+                    }))
+                    .unwrap_or_default()
+                );
+            }
+            ProviderCommand::SetKey { profile, api_key } => {
+                let paths = provider_paths_for_cli(&transport)?;
+                let mut settings = golutra_config::ProviderSettings::load(&paths.user_config)
+                    .map_err(|error| miette::miette!("{error}"))?;
+                let target = settings
+                    .profiles
+                    .iter_mut()
+                    .find(|item| item.name == profile)
+                    .ok_or_else(|| {
+                        miette::miette!(
+                            "provider profile `{profile}` does not exist in user config"
+                        )
+                    })?;
+                target.api_key = Some(api_key);
+                settings
+                    .save(&paths.user_config)
+                    .map_err(|error| miette::miette!("{error}"))?;
+                println!(
+                    "{}",
+                    serde_json::json!({"updated": true, "profile": profile})
+                );
+            }
+            ProviderCommand::Use { profile, scope } => {
+                let scope = parse_provider_scope(&scope)?;
+                let paths = provider_paths_for_cli(&transport)?;
+                let path = match scope {
+                    ProviderConfigScope::User => &paths.user_config,
+                    ProviderConfigScope::Workspace => &paths.workspace_config,
+                };
+                let mut settings = golutra_config::ProviderSettings::load(path)
+                    .map_err(|error| miette::miette!("{error}"))?;
+                settings
+                    .set_active_profile(profile.clone())
+                    .map_err(|error| miette::miette!("{error}"))?;
+                settings
+                    .save(path)
+                    .map_err(|error| miette::miette!("{error}"))?;
+                println!(
+                    "{}",
+                    serde_json::json!({"updated": true, "active_profile": profile, "scope": scope})
+                );
+            }
         },
     }
     Ok(())
+}
+
+fn provider_paths_for_cli(transport: &InProcessTransport) -> miette::Result<ProviderConfigPaths> {
+    let workspace = transport
+        .workspace_root()
+        .ok_or_else(|| miette::miette!("provider config requires a workspace"))?;
+    ProviderConfigPaths::for_workspace(workspace).map_err(|error| miette::miette!("{error}"))
+}
+
+fn provider_env_for_cli(
+    transport: &InProcessTransport,
+) -> miette::Result<golutra_config::ProviderRuntimeEnv> {
+    let workspace = transport
+        .workspace_root()
+        .ok_or_else(|| miette::miette!("provider config requires a workspace"))?;
+    load_provider_runtime_env(workspace).map_err(|error| miette::miette!("{error}"))
+}
+
+fn provider_onboarding_for_cli(
+    transport: &InProcessTransport,
+) -> miette::Result<golutra_config::ProviderOnboardingState> {
+    let workspace = transport
+        .workspace_root()
+        .ok_or_else(|| miette::miette!("provider config requires a workspace"))?;
+    provider_onboarding_state(workspace).map_err(|error| miette::miette!("{error}"))
+}
+
+fn parse_provider_protocol(value: &str) -> miette::Result<ProviderProtocol> {
+    ProviderProtocol::from_config_value(value)
+        .ok_or_else(|| miette::miette!("unsupported provider protocol `{value}`"))
+}
+
+fn parse_provider_scope(value: &str) -> miette::Result<ProviderConfigScope> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "user" => Ok(ProviderConfigScope::User),
+        "workspace" => Ok(ProviderConfigScope::Workspace),
+        _ => Err(miette::miette!(
+            "provider scope must be `user` or `workspace`"
+        )),
+    }
+}
+
+fn provider_error_config(error: String) -> golutra_llm::RedactedProviderConfig {
+    golutra_llm::RedactedProviderConfig {
+        mode: "unknown".to_owned(),
+        provider_id: "unknown".to_owned(),
+        protocol: ProviderProtocol::Mock,
+        native_protocol: "unknown".to_owned(),
+        base_url: None,
+        model_id: None,
+        api_key_env: None,
+        api_key_configured: false,
+        missing_env: Vec::new(),
+        supported: false,
+        status: error,
+    }
+}
+
+fn parse_optional_thread_id(
+    value: Option<&str>,
+    transport: &InProcessTransport,
+) -> miette::Result<ThreadId> {
+    value
+        .map(parse_thread_id)
+        .transpose()
+        .map(|thread_id| thread_id.unwrap_or_else(|| transport.default_thread_id()))
+}
+
+fn parse_thread_id(value: &str) -> miette::Result<ThreadId> {
+    value
+        .parse()
+        .map_err(|error: uuid::Error| miette::miette!("invalid thread id: {error}"))
 }
 
 fn resolve_session_id(

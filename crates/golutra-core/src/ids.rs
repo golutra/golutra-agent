@@ -40,10 +40,19 @@ macro_rules! define_id {
                 write!(formatter, "{}", self.0)
             }
         }
+
+        impl std::str::FromStr for $name {
+            type Err = uuid::Error;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                uuid::Uuid::parse_str(value).map(Self)
+            }
+        }
     };
 }
 
 define_id!(WorkspaceId);
+define_id!(ThreadId);
 define_id!(SessionId);
 define_id!(TaskId);
 define_id!(TurnId);

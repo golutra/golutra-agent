@@ -501,7 +501,14 @@ pub enum ConfiguredProvider {
 
 impl ConfiguredProvider {
     pub fn resolve_from_env(mock: MockProvider) -> Result<Self, ProviderError> {
-        let protocol = selected_protocol_from_env();
+        Self::resolve_from_reader(mock, |key| std::env::var(key).ok())
+    }
+
+    pub fn resolve_from_reader<F>(mock: MockProvider, reader: F) -> Result<Self, ProviderError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let protocol = selected_protocol_from_reader(&reader);
         if protocol.is_none_or(|protocol| protocol == ProviderProtocol::Mock) {
             return Ok(Self::Mock(Box::new(mock)));
         }
@@ -509,7 +516,9 @@ impl ConfiguredProvider {
         if protocol != ProviderProtocol::OpenAiCompatible {
             return Err(unsupported_protocol_error(protocol));
         }
-        OpenAiCompatibleProvider::from_env().map(Self::OpenAiCompatible)
+        OpenAiCompatibleProvider::config_from_env_reader(reader)
+            .map(OpenAiCompatibleProvider::from_config)
+            .map(Self::OpenAiCompatible)
     }
 
     #[must_use]
@@ -523,7 +532,14 @@ impl ConfiguredProvider {
     }
 
     pub fn redacted_from_env() -> Result<RedactedProviderConfig, ProviderError> {
-        let protocol = selected_protocol_from_env().unwrap_or(ProviderProtocol::Mock);
+        Self::redacted_from_reader(|key| std::env::var(key).ok())
+    }
+
+    pub fn redacted_from_reader<F>(reader: F) -> Result<RedactedProviderConfig, ProviderError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let protocol = selected_protocol_from_reader(&reader).unwrap_or(ProviderProtocol::Mock);
         if protocol == ProviderProtocol::Mock {
             return Ok(RedactedProviderConfig {
                 mode: "mock".to_owned(),
@@ -540,17 +556,28 @@ impl ConfiguredProvider {
             });
         }
         if protocol == ProviderProtocol::OpenAiCompatible {
-            return Ok(redacted_openai_from_env());
+            return Ok(redacted_openai_from_reader(&reader));
         }
-        Ok(redacted_unsupported_from_env(protocol))
+        Ok(redacted_unsupported_from_reader(protocol, &reader))
     }
 
     pub async fn probe_from_env() -> Result<ProviderProbeResult, ProviderError> {
-        let protocol = selected_protocol_from_env().unwrap_or(ProviderProtocol::OpenAiCompatible);
+        Self::probe_from_reader(|key| std::env::var(key).ok()).await
+    }
+
+    pub async fn probe_from_reader<F>(reader: F) -> Result<ProviderProbeResult, ProviderError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let protocol =
+            selected_protocol_from_reader(&reader).unwrap_or(ProviderProtocol::OpenAiCompatible);
         if protocol != ProviderProtocol::OpenAiCompatible {
             return Err(unsupported_protocol_error(protocol));
         }
-        OpenAiCompatibleProvider::from_env()?.probe().await
+        OpenAiCompatibleProvider::config_from_env_reader(reader)
+            .map(OpenAiCompatibleProvider::from_config)?
+            .probe()
+            .await
     }
 }
 
@@ -1029,12 +1056,14 @@ fn unsupported_protocol_error(protocol: ProviderProtocol) -> ProviderError {
     }
 }
 
-fn redacted_openai_from_env() -> RedactedProviderConfig {
-    let reader = |key: &str| std::env::var(key).ok();
+fn redacted_openai_from_reader<F>(reader: &F) -> RedactedProviderConfig
+where
+    F: Fn(&str) -> Option<String>,
+{
     let mapping = env_mapping(ProviderProtocol::OpenAiCompatible);
-    let api_key = first_env(&reader, mapping.api_key);
-    let model = first_env(&reader, mapping.model);
-    let base_url = first_env(&reader, mapping.base_url)
+    let api_key = first_env(reader, mapping.api_key);
+    let model = first_env(reader, mapping.model);
+    let base_url = first_env(reader, mapping.base_url)
         .map(|(_, value)| value)
         .or_else(|| mapping.default_base_url.map(ToOwned::to_owned));
     let mut missing_env = Vec::new();
@@ -1059,11 +1088,6 @@ fn redacted_openai_from_env() -> RedactedProviderConfig {
         supported: true,
         status: if ready { "ready" } else { "missing_env" }.to_owned(),
     }
-}
-
-fn redacted_unsupported_from_env(protocol: ProviderProtocol) -> RedactedProviderConfig {
-    let reader = |key: &str| std::env::var(key).ok();
-    redacted_unsupported_from_reader(protocol, &reader)
 }
 
 fn redacted_unsupported_from_reader<F>(
