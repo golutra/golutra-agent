@@ -524,6 +524,7 @@ impl RuntimeHost {
         } else {
             None
         };
+        let source_thread = existing.as_ref().or(default_thread.as_ref());
         let thread = ThreadRecord {
             thread_id: existing
                 .as_ref()
@@ -537,12 +538,7 @@ impl RuntimeHost {
                 .or(default_thread.as_ref())
                 .and_then(|thread| thread.parent_thread_id),
             workspace_root: self.workspace_root_string(),
-            title: existing
-                .as_ref()
-                .or(default_thread.as_ref())
-                .map(|thread| thread.title.clone())
-                .filter(|title| !title.trim().is_empty())
-                .unwrap_or_else(|| title_from_payload(payload)),
+            title: thread_title_for_prompt(source_thread, payload),
             preview: preview_from_payload(payload),
             created_at: existing
                 .as_ref()
@@ -575,6 +571,63 @@ impl RuntimeHost {
         }
     }
 
+    async fn context_contributors_for_task(
+        &self,
+        session_id: SessionId,
+        current_task_id: TaskId,
+        objective: String,
+    ) -> Result<Vec<ContextContributor>, ClientError> {
+        let mut contributors = vec![ContextContributor {
+            name: "system".to_owned(),
+            role: ProviderRole::System,
+            content: system_prompt(),
+            token_budget_hint: 64,
+        }];
+
+        if let Some(history) = self
+            .conversation_history_summary(session_id, current_task_id)
+            .await?
+        {
+            contributors.push(ContextContributor {
+                name: "conversation_history".to_owned(),
+                role: ProviderRole::System,
+                content: history,
+                token_budget_hint: 1024,
+            });
+        }
+
+        contributors.push(ContextContributor {
+            name: "objective".to_owned(),
+            role: ProviderRole::User,
+            content: objective,
+            token_budget_hint: 512,
+        });
+
+        Ok(contributors)
+    }
+
+    async fn conversation_history_summary(
+        &self,
+        session_id: SessionId,
+        current_task_id: TaskId,
+    ) -> Result<Option<String>, ClientError> {
+        let events = self.store.load_events(session_id, None, None).await?;
+        let lines = events
+            .iter()
+            .filter(|event| event.task_id != Some(current_task_id))
+            .filter_map(conversation_history_line)
+            .collect::<Vec<_>>();
+
+        if lines.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(format!(
+            "Previous conversation in this workspace session:\n{}",
+            compact_history_lines(lines)
+        )))
+    }
+
     fn next_sequence_no(&self) -> u64 {
         self.next_sequence_no.fetch_add(1, Ordering::SeqCst)
     }
@@ -593,7 +646,7 @@ impl RuntimeHost {
         let policy = WorkspacePolicy::new(workspace_root.clone())
             .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
         let tool_executor = BasicToolExecutor::new(policy);
-        let tool_names = tool_executor
+        let workspace_tool_names = tool_executor
             .registry()
             .contracts()
             .into_iter()
@@ -607,6 +660,9 @@ impl RuntimeHost {
             ContextBuilder::default(),
             tool_executor,
         );
+        let contributors = self
+            .context_contributors_for_task(task.session_id, task.task_id, objective.clone())
+            .await?;
         let mut trace_events = Vec::new();
         let outcome = agent_loop
             .run_with_trace(
@@ -620,21 +676,12 @@ impl RuntimeHost {
                             .to_owned(),
                     ],
                     touched_code: provider_plan.touched_code,
-                    contributors: vec![
-                        ContextContributor {
-                            name: "system".to_owned(),
-                            role: ProviderRole::System,
-                            content: system_prompt(),
-                            token_budget_hint: 64,
-                        },
-                        ContextContributor {
-                            name: "objective".to_owned(),
-                            role: ProviderRole::User,
-                            content: objective,
-                            token_budget_hint: 512,
-                        },
-                    ],
-                    tools: tool_names,
+                    contributors,
+                    tools: if provider_plan.workspace_tools_enabled {
+                        workspace_tool_names
+                    } else {
+                        Vec::new()
+                    },
                 },
                 |event| trace_events.push(event),
             )
@@ -689,6 +736,23 @@ impl RuntimeHost {
                 json!({
                     "summary": "workspace checkpoint created",
                     "checkpoint": checkpoint,
+                }),
+            ))
+            .await?;
+        }
+        if let Some(final_message) = outcome
+            .final_message
+            .as_ref()
+            .filter(|message| !message.trim().is_empty())
+        {
+            self.record_event(agent_event(
+                self.next_sequence_no(),
+                &task,
+                RuntimeEventType::AssistantMessage,
+                RuntimeEventSource::Runtime,
+                json!({
+                    "summary": compact_event_summary(final_message),
+                    "content": final_message,
                 }),
             ))
             .await?;
@@ -775,13 +839,14 @@ impl RuntimeHost {
         task: &HostedAgentTask,
         error: ClientError,
     ) -> Result<(), ClientError> {
+        let error_summary = compact_event_summary(&error.to_string());
         self.record_event(agent_event(
             self.next_sequence_no(),
             task,
             RuntimeEventType::LoopDecided,
             RuntimeEventSource::Runtime,
             json!({
-                "summary": "runtime task execution failed",
+                "summary": format!("runtime task execution failed: {error_summary}"),
                 "error": error.to_string(),
             }),
         ))
@@ -986,6 +1051,22 @@ fn is_placeholder_thread(thread: &ThreadRecord) -> bool {
         && thread.preview == "Ready to start a task"
 }
 
+fn thread_title_for_prompt(source_thread: Option<&ThreadRecord>, payload: &Value) -> String {
+    let current_title = source_thread
+        .map(|thread| thread.title.trim())
+        .unwrap_or_default();
+    let should_refresh_title = current_title.is_empty()
+        || source_thread.is_some_and(is_placeholder_thread)
+        || current_title == "Untitled thread"
+        || current_title == "Fork of New thread";
+
+    if should_refresh_title {
+        title_from_payload(payload)
+    } else {
+        current_title.to_owned()
+    }
+}
+
 #[must_use]
 pub fn projection_status(value: &Value) -> Option<TaskStatus> {
     value
@@ -1008,6 +1089,7 @@ pub fn event_sequence_no(value: &Value) -> Option<u64> {
 struct MockProviderPlan {
     provider: ConfiguredProvider,
     touched_code: bool,
+    workspace_tools_enabled: bool,
 }
 
 fn mock_provider_plan(
@@ -1031,6 +1113,7 @@ fn mock_provider_plan(
                 ),
             )?,
             touched_code: true,
+            workspace_tools_enabled: true,
         });
     }
 
@@ -1044,6 +1127,7 @@ fn mock_provider_plan(
                 ),
             )?,
             touched_code: false,
+            workspace_tools_enabled: true,
         });
     }
 
@@ -1054,6 +1138,7 @@ fn mock_provider_plan(
                 MockProvider::tool_call("shell", json!({"command": "sleep 5"})),
             )?,
             touched_code: false,
+            workspace_tools_enabled: true,
         });
     }
 
@@ -1067,6 +1152,7 @@ fn mock_provider_plan(
                 ),
             )?,
             touched_code: false,
+            workspace_tools_enabled: true,
         });
     }
 
@@ -1076,7 +1162,69 @@ fn mock_provider_plan(
             MockProvider::text_response("mock provider completed without tool calls"),
         )?,
         touched_code: false,
+        workspace_tools_enabled: prompt_requests_workspace_tools(payload, objective),
     })
+}
+
+fn prompt_requests_workspace_tools(payload: &Value, objective: &str) -> bool {
+    if payload.get("path").is_some()
+        || payload.get("content").is_some()
+        || payload.get("command").is_some()
+    {
+        return true;
+    }
+
+    let lower = objective.to_ascii_lowercase();
+    const ENGLISH_MARKERS: &[&str] = &[
+        "write",
+        "create",
+        "edit",
+        "modify",
+        "update",
+        "delete",
+        "read",
+        "list",
+        "search",
+        "find",
+        "inspect",
+        "run",
+        "test",
+        "build",
+        "fix",
+        "debug",
+        "refactor",
+        "file",
+        "code",
+        "workspace",
+        "diff",
+        "commit",
+        "shell",
+    ];
+    const CJK_MARKERS: &[&str] = &[
+        "写",
+        "创建",
+        "修改",
+        "更新",
+        "删除",
+        "读取",
+        "读",
+        "列出",
+        "搜索",
+        "查找",
+        "检查",
+        "运行",
+        "测试",
+        "构建",
+        "修复",
+        "重构",
+        "文件",
+        "代码",
+        "工作区",
+        "提交",
+    ];
+
+    ENGLISH_MARKERS.iter().any(|marker| lower.contains(marker))
+        || CJK_MARKERS.iter().any(|marker| objective.contains(marker))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1135,6 +1283,51 @@ fn clean_mock_prompt_segment(value: &str) -> String {
         .to_owned()
 }
 
+fn conversation_history_line(event: &RuntimeEvent) -> Option<String> {
+    match event.event_type {
+        RuntimeEventType::TaskCreated => event
+            .payload
+            .get("payload")
+            .and_then(|payload| payload.get("prompt"))
+            .and_then(Value::as_str)
+            .filter(|prompt| !prompt.trim().is_empty())
+            .map(|prompt| format!("User: {}", compact_history_text(prompt, 240))),
+        RuntimeEventType::AssistantMessage => event
+            .payload
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|message| !message.trim().is_empty())
+            .map(|message| format!("Golutra: {}", compact_history_text(message, 360))),
+        RuntimeEventType::ToolCompleted => event
+            .payload
+            .get("summary")
+            .and_then(Value::as_str)
+            .filter(|summary| !summary.trim().is_empty())
+            .map(|summary| format!("Tool: {}", compact_history_text(summary, 180))),
+        RuntimeEventType::TaskCompleted => event
+            .payload
+            .get("status")
+            .and_then(Value::as_str)
+            .map(|status| format!("Task: {status}")),
+        _ => None,
+    }
+}
+
+fn compact_history_lines(lines: Vec<String>) -> String {
+    const MAX_HISTORY_LINES: usize = 24;
+    let start = lines.len().saturating_sub(MAX_HISTORY_LINES);
+    lines[start..].join("\n")
+}
+
+fn compact_history_text(value: &str, max_chars: usize) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        compact
+    } else {
+        compact.chars().take(max_chars).collect::<String>()
+    }
+}
+
 fn resolve_configured_provider(
     provider_env: Option<&golutra_config::ProviderRuntimeEnv>,
     mock: MockProvider,
@@ -1187,6 +1380,10 @@ fn title_from_payload(payload: &Value) -> String {
 
 fn preview_from_payload(payload: &Value) -> String {
     compact_prompt(payload).chars().take(240).collect()
+}
+
+fn compact_event_summary(value: &str) -> String {
+    compact_history_text(value, 160)
 }
 
 fn compact_prompt(payload: &Value) -> String {
@@ -1582,6 +1779,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prompt_updates_placeholder_thread_title_from_prompt() {
+        let workspace = tempdir().expect("workspace");
+        install_workspace_mock_provider(workspace.path());
+        let transport = InProcessTransport::for_workspace(workspace.path())
+            .await
+            .expect("transport");
+        let default_thread_id = transport.default_thread_id();
+
+        transport
+            .send_command(command_with_payload(
+                transport.default_session_id(),
+                json!({
+                    "prompt": "write file chain.txt with content ok",
+                }),
+            ))
+            .await
+            .expect("command");
+        wait_for_status(
+            &transport,
+            transport.default_session_id(),
+            TaskStatus::Completed,
+        )
+        .await;
+
+        let thread = transport
+            .resume_thread(default_thread_id)
+            .await
+            .expect("default thread remains resumable");
+
+        assert_eq!(thread.title, "write file chain.txt with content ok");
+        assert_eq!(thread.preview, "write file chain.txt with content ok");
+    }
+
+    #[tokio::test]
+    async fn resumed_session_context_includes_previous_conversation_summary() {
+        let workspace = tempdir().expect("workspace");
+        install_workspace_mock_provider(workspace.path());
+        let transport = InProcessTransport::for_workspace(workspace.path())
+            .await
+            .expect("transport");
+
+        transport
+            .send_command(command_with_payload(
+                transport.default_session_id(),
+                json!({
+                    "prompt": "write file first.txt with content done",
+                }),
+            ))
+            .await
+            .expect("command");
+        wait_for_status(
+            &transport,
+            transport.default_session_id(),
+            TaskStatus::Completed,
+        )
+        .await;
+
+        let contributors = transport
+            .host
+            .context_contributors_for_task(
+                transport.default_session_id(),
+                TaskId::new(),
+                "continue from previous task".to_owned(),
+            )
+            .await
+            .expect("contributors");
+        let history = contributors
+            .iter()
+            .find(|contributor| contributor.name == "conversation_history")
+            .expect("history contributor");
+
+        assert!(
+            history
+                .content
+                .contains("User: write file first.txt with content done")
+        );
+        assert!(history.content.contains("Golutra: Completed: file written"));
+        assert!(history.content.contains("Tool: file written"));
+    }
+
+    #[tokio::test]
     async fn prompt_with_explicit_thread_id_starts_new_thread_without_overwriting_default() {
         let workspace = tempdir().expect("workspace");
         install_workspace_mock_provider(workspace.path());
@@ -1670,6 +1948,69 @@ mod tests {
                 .as_array()
                 .is_some_and(|items| !items.is_empty())
         );
+    }
+
+    #[tokio::test]
+    async fn prompt_plain_conversation_completes_without_tool_evidence() {
+        let workspace = tempdir().expect("workspace");
+        install_workspace_mock_provider(workspace.path());
+        let transport = InProcessTransport::for_workspace(workspace.path())
+            .await
+            .expect("transport");
+        let session_id = transport.default_session_id();
+
+        let ack = transport
+            .send_command(command(session_id, "你好"))
+            .await
+            .expect("command");
+        let state = wait_for_status(&transport, session_id, TaskStatus::Completed).await;
+        let projection = transport
+            .query(RuntimeQuery {
+                query_id: QueryId::new(),
+                session_id,
+                task_id: None,
+                kind: RuntimeQueryKind::UserProjection,
+                requester: ActorKind::Cli,
+                cursor: None,
+                timestamp: chrono::Utc::now(),
+            })
+            .await
+            .expect("projection");
+
+        assert!(ack.accepted);
+        assert_eq!(projection_status(&state), Some(TaskStatus::Completed));
+        assert_eq!(
+            projection.get("final_message").and_then(Value::as_str),
+            Some("mock provider completed without tool calls")
+        );
+    }
+
+    #[test]
+    fn plain_conversation_plan_does_not_send_workspace_tools() {
+        let workspace = tempdir().expect("workspace");
+        install_workspace_mock_provider(workspace.path());
+
+        let plan = mock_provider_plan(Some(workspace.path()), &json!({"prompt": "你好"}), "你好")
+            .expect("provider plan");
+
+        assert!(!plan.touched_code);
+        assert!(!plan.workspace_tools_enabled);
+    }
+
+    #[test]
+    fn workspace_objective_plan_still_sends_workspace_tools() {
+        let workspace = tempdir().expect("workspace");
+        install_workspace_mock_provider(workspace.path());
+
+        let plan = mock_provider_plan(
+            Some(workspace.path()),
+            &json!({"prompt": "读取 README.md"}),
+            "读取 README.md",
+        )
+        .expect("provider plan");
+
+        assert!(!plan.touched_code);
+        assert!(plan.workspace_tools_enabled);
     }
 
     #[tokio::test]

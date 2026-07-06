@@ -6,9 +6,13 @@ use std::{
 
 use clap::Parser;
 use crossterm::{
-    event::{self, Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
+    },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
+    },
 };
 use golutra_client::{InProcessTransport, RuntimeClient};
 use golutra_config::{
@@ -22,8 +26,8 @@ use golutra_protocol::{
     SessionCommandKind, UserProjection, VisibleStep,
 };
 use golutra_tui::{
-    AuthConfigScope, OpenAiCompatibleLogin, SlashAuthCommand, SlashCommand, SlashInput,
-    event_timeline_lines, parse_slash_input, slash_command_suggestions,
+    AuthConfigScope, OpenAiCompatibleLogin, SlashAuthCommand, SlashCommand, SlashCommandCandidate,
+    SlashInput, event_timeline_lines, parse_slash_input, slash_command_candidates,
 };
 use ratatui::{
     Frame, Terminal,
@@ -61,10 +65,14 @@ struct TuiApp {
     resume_picker: Option<ResumePickerState>,
     auth_dialog: Option<AuthDialogState>,
     input: String,
+    slash_selected: usize,
     status_message: String,
     provider_message: String,
     debug_mode: bool,
     cursor: Option<u64>,
+    transcript_scroll_offset: usize,
+    transcript_row_count: usize,
+    quit_shortcut_expires_at: Option<Instant>,
     should_quit: bool,
 }
 
@@ -102,15 +110,20 @@ impl TuiApp {
             resume_picker: None,
             auth_dialog,
             input: String::new(),
+            slash_selected: 0,
             status_message: String::new(),
             provider_message,
             debug_mode,
             cursor: None,
+            transcript_scroll_offset: 0,
+            transcript_row_count: 0,
+            quit_shortcut_expires_at: None,
             should_quit: false,
         }
     }
 
     async fn refresh(&mut self, transport: &InProcessTransport) -> miette::Result<()> {
+        let previous_row_count = self.transcript_row_count;
         let projection = transport
             .query(RuntimeQuery {
                 query_id: QueryId::new(),
@@ -140,6 +153,7 @@ impl TuiApp {
             .into_iter()
             .map(|line| line.sequence_no)
             .max();
+        self.sync_transcript_row_count(previous_row_count);
         Ok(())
     }
 
@@ -174,6 +188,121 @@ impl TuiApp {
         }
     }
 
+    async fn accept_slash_candidate(
+        &mut self,
+        transport: &InProcessTransport,
+    ) -> miette::Result<bool> {
+        let candidates = self.slash_candidates();
+        let Some(candidate) = candidates
+            .get(self.slash_selected.min(candidates.len().saturating_sub(1)))
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        let trimmed_input = self.input.trim();
+        if trimmed_input.starts_with(&format!("{} ", candidate.command)) {
+            return Ok(false);
+        }
+        if candidate.execute_on_select {
+            self.input = candidate.command;
+            self.send_prompt(transport).await?;
+        } else {
+            self.input = format!("{} ", candidate.command);
+            self.slash_selected = 0;
+            self.status_message = "complete slash command arguments".to_owned();
+        }
+        Ok(true)
+    }
+
+    fn slash_candidates(&self) -> Vec<SlashCommandCandidate> {
+        if self.auth_dialog.is_some() || self.resume_picker.is_some() {
+            return Vec::new();
+        }
+        slash_command_candidates(&self.input)
+    }
+
+    fn move_slash_selection(&mut self, direction: ResumeSelectionDirection) -> bool {
+        let candidates = self.slash_candidates();
+        if candidates.is_empty() {
+            self.slash_selected = 0;
+            return false;
+        }
+        self.slash_selected = self.slash_selected.min(candidates.len().saturating_sub(1));
+        self.slash_selected = match direction {
+            ResumeSelectionDirection::Previous => self.slash_selected.saturating_sub(1),
+            ResumeSelectionDirection::Next => {
+                (self.slash_selected + 1).min(candidates.len().saturating_sub(1))
+            }
+        };
+        true
+    }
+
+    fn reset_slash_selection(&mut self) {
+        self.slash_selected = 0;
+    }
+
+    fn reset_transcript_view(&mut self) {
+        self.transcript_scroll_offset = 0;
+        self.transcript_row_count = transcript_rows(self).len();
+    }
+
+    fn sync_transcript_row_count(&mut self, previous_row_count: usize) {
+        let current_row_count = transcript_rows(self).len();
+        if self.transcript_scroll_offset > 0 && current_row_count > previous_row_count {
+            self.transcript_scroll_offset = self
+                .transcript_scroll_offset
+                .saturating_add(current_row_count - previous_row_count);
+        }
+        self.transcript_row_count = current_row_count;
+        self.clamp_transcript_scroll();
+    }
+
+    fn scroll_transcript(&mut self, action: TranscriptScrollAction, visible_rows: usize) {
+        if self.auth_dialog.is_some() || self.resume_picker.is_some() || self.debug_mode {
+            return;
+        }
+        let page = visible_rows.max(1);
+        match action {
+            TranscriptScrollAction::LineUp => {
+                self.transcript_scroll_offset = self.transcript_scroll_offset.saturating_add(1);
+            }
+            TranscriptScrollAction::LineDown => {
+                self.transcript_scroll_offset = self.transcript_scroll_offset.saturating_sub(1);
+            }
+            TranscriptScrollAction::PageUp => {
+                self.transcript_scroll_offset = self.transcript_scroll_offset.saturating_add(page);
+            }
+            TranscriptScrollAction::PageDown => {
+                self.transcript_scroll_offset = self.transcript_scroll_offset.saturating_sub(page);
+            }
+            TranscriptScrollAction::Top => {
+                self.transcript_scroll_offset = self.max_transcript_scroll_offset(visible_rows);
+            }
+            TranscriptScrollAction::Bottom => {
+                self.transcript_scroll_offset = 0;
+            }
+        }
+        self.clamp_transcript_scroll_for_rows(visible_rows);
+        self.status_message = transcript_scroll_status(self.transcript_scroll_offset);
+    }
+
+    fn clamp_transcript_scroll(&mut self) {
+        self.transcript_scroll_offset = self
+            .transcript_scroll_offset
+            .min(self.transcript_row_count.saturating_sub(1));
+    }
+
+    fn clamp_transcript_scroll_for_rows(&mut self, visible_rows: usize) {
+        self.transcript_scroll_offset = self
+            .transcript_scroll_offset
+            .min(self.max_transcript_scroll_offset(visible_rows));
+    }
+
+    fn max_transcript_scroll_offset(&self, visible_rows: usize) -> usize {
+        self.transcript_row_count
+            .saturating_sub(visible_rows.max(1))
+    }
+
     async fn send_runtime_prompt(
         &mut self,
         transport: &InProcessTransport,
@@ -197,6 +326,7 @@ impl TuiApp {
             .map_err(|error| miette::miette!("{error}"))?;
         self.input.clear();
         self.status_message = compact_ack_reason(&ack.reason);
+        self.reset_transcript_view();
         self.refresh(transport).await
     }
 
@@ -211,6 +341,9 @@ impl TuiApp {
             }
             SlashCommand::Help => {
                 self.push_system_message("Slash commands", slash_help_lines());
+            }
+            SlashCommand::New => {
+                self.start_new_session();
             }
             SlashCommand::Auth(command) => {
                 self.execute_auth_command(transport, command).await?;
@@ -252,8 +385,13 @@ impl TuiApp {
                 self.thread_id = thread.thread_id;
                 self.session_id = thread.session_id;
                 self.task_id = None;
+                self.projection = None;
                 self.events.clear();
+                self.command_messages.clear();
+                self.input.clear();
+                self.reset_slash_selection();
                 self.cursor = None;
+                self.reset_transcript_view();
                 self.status_message =
                     format!("forked thread {}", short_id(&thread.thread_id.to_string()));
                 self.push_system_message(
@@ -308,6 +446,7 @@ impl TuiApp {
             }
             SlashCommand::Clear => {
                 self.command_messages.clear();
+                self.reset_transcript_view();
                 self.status_message = "local command messages cleared".to_owned();
             }
             SlashCommand::Quit => {
@@ -346,6 +485,22 @@ impl TuiApp {
         Ok(())
     }
 
+    fn start_new_session(&mut self) {
+        self.thread_id = ThreadId::new();
+        self.session_id = SessionId::new();
+        self.task_id = None;
+        self.projection = None;
+        self.events.clear();
+        self.command_messages.clear();
+        self.input.clear();
+        self.reset_slash_selection();
+        self.cursor = None;
+        self.resume_picker = None;
+        self.debug_mode = false;
+        self.status_message = "new session".to_owned();
+        self.reset_transcript_view();
+    }
+
     async fn resume_thread(
         &mut self,
         transport: &InProcessTransport,
@@ -358,17 +513,15 @@ impl TuiApp {
         self.thread_id = thread.thread_id;
         self.session_id = thread.session_id;
         self.task_id = None;
+        self.projection = None;
         self.events.clear();
+        self.command_messages.clear();
+        self.input.clear();
+        self.reset_slash_selection();
         self.cursor = None;
         self.resume_picker = None;
         self.status_message = format!("resumed {}", short_id(&thread.thread_id.to_string()));
-        self.push_system_message(
-            "Resumed",
-            vec![
-                thread.title,
-                format!("session {}", short_id(&thread.session_id.to_string())),
-            ],
-        );
+        self.reset_transcript_view();
         self.refresh(transport).await
     }
 
@@ -490,11 +643,27 @@ impl TuiApp {
     }
 
     async fn interrupt_or_quit(&mut self, transport: &InProcessTransport) -> miette::Result<()> {
+        if self.quit_shortcut_is_active() {
+            self.should_quit = true;
+            return Ok(());
+        }
+        self.arm_quit_shortcut();
         if has_active_task(self) {
             self.abort(transport).await?;
+            self.status_message = "interrupt requested; press Ctrl+C again to quit".to_owned();
+        } else {
+            self.status_message = "press Ctrl+C again to quit".to_owned();
         }
-        self.should_quit = true;
         Ok(())
+    }
+
+    fn arm_quit_shortcut(&mut self) {
+        self.quit_shortcut_expires_at = Instant::now().checked_add(Duration::from_secs(2));
+    }
+
+    fn quit_shortcut_is_active(&self) -> bool {
+        self.quit_shortcut_expires_at
+            .is_some_and(|expires_at| Instant::now() < expires_at)
     }
 
     fn push_system_message(&mut self, title: impl Into<String>, body: Vec<String>) {
@@ -508,6 +677,8 @@ impl TuiApp {
             self.command_messages
                 .drain(0..self.command_messages.len().saturating_sub(12));
         }
+        self.transcript_row_count = transcript_rows(self).len();
+        self.clamp_transcript_scroll();
     }
 }
 
@@ -683,7 +854,19 @@ impl AuthDialogState {
     }
 
     fn prepare_custom_model_input(&mut self) -> &mut String {
+        let was_custom_model_selected = self.is_custom_model_selected();
+        let model_matches_preset = self
+            .model_options()
+            .iter()
+            .any(|model| *model == self.model)
+            || self
+                .provider
+                .and_then(|provider| provider.model)
+                .is_some_and(|model| model == self.model);
         self.selected = self.custom_model_index();
+        if !was_custom_model_selected || model_matches_preset {
+            self.model.clear();
+        }
         self.error = None;
         &mut self.model
     }
@@ -805,6 +988,16 @@ enum ResumeSelectionDirection {
     Next,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptScrollAction {
+    LineUp,
+    LineDown,
+    PageUp,
+    PageDown,
+    Top,
+    Bottom,
+}
+
 impl ResumePickerState {
     fn selected_thread_id(&self) -> Option<ThreadId> {
         self.items.get(self.selected).map(|item| item.thread_id)
@@ -871,8 +1064,14 @@ async fn run_app(
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
         if event::poll(timeout).map_err(|error| miette::miette!("{error}"))? {
             let event = event::read().map_err(|error| miette::miette!("{error}"))?;
-            if let CrosstermEvent::Key(key) = event {
-                handle_key(key, &mut app, &transport).await?;
+            match event {
+                CrosstermEvent::Key(key) => {
+                    handle_key(key, &mut app, &transport).await?;
+                }
+                CrosstermEvent::Mouse(mouse) => {
+                    handle_mouse(mouse, &mut app);
+                }
+                _ => {}
             }
         }
 
@@ -901,29 +1100,80 @@ async fn handle_key(
     }
 
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+        KeyCode::Esc => {
+            if !app.input.is_empty() {
+                app.input.clear();
+                app.reset_slash_selection();
+                app.status_message = "input cleared".to_owned();
+            } else {
+                app.status_message = "press Ctrl+C twice to quit".to_owned();
+            }
+        }
         KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.abort(transport).await?;
         }
-        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => app.input.clear(),
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.input.clear();
+            app.reset_slash_selection();
+        }
         KeyCode::Tab => {
-            app.debug_mode = !app.debug_mode;
-            app.status_message = if app.debug_mode {
-                "debug timeline visible".to_owned()
+            if app.move_slash_selection(ResumeSelectionDirection::Next) {
+                app.status_message = "slash command selected".to_owned();
             } else {
-                "debug timeline hidden".to_owned()
-            };
+                app.debug_mode = !app.debug_mode;
+                app.status_message = if app.debug_mode {
+                    "debug timeline visible".to_owned()
+                } else {
+                    "debug timeline hidden".to_owned()
+                };
+            }
+        }
+        KeyCode::Up => {
+            app.move_slash_selection(ResumeSelectionDirection::Previous);
+        }
+        KeyCode::Down => {
+            app.move_slash_selection(ResumeSelectionDirection::Next);
+        }
+        KeyCode::PageUp => {
+            app.scroll_transcript(TranscriptScrollAction::PageUp, transcript_page_rows(app));
+        }
+        KeyCode::PageDown => {
+            app.scroll_transcript(TranscriptScrollAction::PageDown, transcript_page_rows(app));
+        }
+        KeyCode::Home => {
+            app.scroll_transcript(TranscriptScrollAction::Top, transcript_page_rows(app));
+        }
+        KeyCode::End => {
+            app.scroll_transcript(TranscriptScrollAction::Bottom, transcript_page_rows(app));
         }
         KeyCode::Enter => {
-            app.send_prompt(transport).await?;
+            if !app.accept_slash_candidate(transport).await? {
+                app.send_prompt(transport).await?;
+            }
         }
         KeyCode::Backspace => {
             app.input.pop();
+            app.reset_slash_selection();
         }
-        KeyCode::Char(character) => app.input.push(character),
+        KeyCode::Char(character) => {
+            app.input.push(character);
+            app.reset_slash_selection();
+        }
         _ => {}
     }
     Ok(())
+}
+
+fn handle_mouse(mouse: MouseEvent, app: &mut TuiApp) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            app.scroll_transcript(TranscriptScrollAction::LineUp, transcript_page_rows(app));
+        }
+        MouseEventKind::ScrollDown => {
+            app.scroll_transcript(TranscriptScrollAction::LineDown, transcript_page_rows(app));
+        }
+        _ => {}
+    }
 }
 
 async fn handle_auth_dialog_key(
@@ -932,7 +1182,6 @@ async fn handle_auth_dialog_key(
     transport: &InProcessTransport,
 ) -> miette::Result<()> {
     match key.code {
-        KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Esc => {
             if let Some(dialog) = &mut app.auth_dialog {
                 dialog.go_back();
@@ -1124,7 +1373,6 @@ async fn handle_resume_picker_key(
 ) -> miette::Result<()> {
     match key.code {
         KeyCode::Esc => app.close_resume_picker(),
-        KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Up | KeyCode::Char('k') => {
             app.move_resume_selection(ResumeSelectionDirection::Previous);
         }
@@ -1182,13 +1430,14 @@ fn draw_ui(frame: &mut Frame<'_>, app: &TuiApp) {
 }
 
 fn bottom_pane_height(app: &TuiApp) -> u16 {
+    let slash_rows = app.slash_candidates().len() as u16;
     if app.auth_dialog.is_some()
         || app.resume_picker.is_some()
         || provider_footer_line(app).is_some()
     {
-        4
+        4 + slash_rows
     } else {
-        3
+        3 + slash_rows
     }
 }
 
@@ -1237,16 +1486,17 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         return;
     }
 
-    let mut items = transcript_items(app)
-        .into_iter()
-        .flat_map(transcript_list_items)
-        .collect::<Vec<_>>();
+    let mut items = transcript_rows(app);
     if items.is_empty() {
         return;
     }
     let visible_rows = area.height.saturating_sub(1) as usize;
-    if visible_rows > 0 && items.len() > visible_rows {
-        items.drain(0..items.len() - visible_rows);
+    let window = transcript_visible_window(items.len(), visible_rows, app.transcript_scroll_offset);
+    if window.end < items.len() {
+        items.drain(window.end..);
+    }
+    if window.start > 0 {
+        items.drain(..window.start);
     }
     let list = List::new(items).block(Block::default().borders(Borders::TOP));
     frame.render_widget(list, area);
@@ -1431,7 +1681,7 @@ fn auth_review_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
     }));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Enter save   Esc back   Ctrl+C quit",
+        "Enter save   Esc back   Ctrl+C twice quit",
         Style::default().fg(Color::DarkGray),
     )));
     push_auth_error(&mut lines, dialog.error.as_deref());
@@ -1537,7 +1787,7 @@ fn auth_input_lines(
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            "Enter continue   Esc back   Ctrl+C quit",
+            "Enter continue   Esc back   Ctrl+C twice quit",
             Style::default().fg(Color::DarkGray),
         )),
     ];
@@ -1665,18 +1915,14 @@ fn draw_debug_timeline(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
 fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let help = if app.auth_dialog.is_some() {
-        "Provider setup   Enter continue   Esc back   Ctrl+C quit"
+        "Provider setup   Enter continue   Esc back   Ctrl+C twice quit"
     } else if app.resume_picker.is_some() {
-        "Enter resume   Up/Down select   Esc cancel   Ctrl+C quit"
+        "Enter resume   Up/Down select   Esc cancel   Ctrl+C twice quit"
     } else {
-        "Enter send   /resume sessions   Ctrl+C quit"
+        "Enter send   PgUp/PgDn history   Home/End jump   Ctrl+C interrupt"
     };
-    let command_hint = slash_command_suggestions(&app.input);
-    let help_line = if command_hint.is_empty() {
-        help.to_owned()
-    } else {
-        format!("Commands: {}", command_hint.join("   "))
-    };
+    let candidates = app.slash_candidates();
+    let help_line = help.to_owned();
     let input_line = if let Some(dialog) = &app.auth_dialog {
         auth_composer_line(dialog)
     } else if app.resume_picker.is_some() {
@@ -1686,13 +1932,12 @@ fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     } else {
         app.input.clone()
     };
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("> ", Style::default().fg(Color::Cyan)),
-            Span::styled(input_line, composer_style(app)),
-        ]),
-        footer_status_line(app),
-    ];
+    let mut lines = vec![Line::from(vec![
+        Span::styled("> ", Style::default().fg(Color::Cyan)),
+        Span::styled(input_line, composer_style(app)),
+    ])];
+    lines.extend(slash_candidate_lines(app, &candidates));
+    lines.push(footer_status_line(app));
     if let Some(provider_line) = provider_footer_line(app) {
         lines.push(Line::from(Span::styled(
             provider_line,
@@ -1707,6 +1952,42 @@ fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .block(Block::default().borders(Borders::TOP))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+fn slash_candidate_lines(app: &TuiApp, candidates: &[SlashCommandCandidate]) -> Vec<Line<'static>> {
+    candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            let selected = index == app.slash_selected.min(candidates.len().saturating_sub(1));
+            let marker = if selected { "> " } else { "  " };
+            Line::from(vec![
+                Span::styled(
+                    marker,
+                    Style::default().fg(if selected {
+                        Color::Cyan
+                    } else {
+                        Color::DarkGray
+                    }),
+                ),
+                Span::styled(
+                    candidate.command.clone(),
+                    Style::default()
+                        .fg(if selected { Color::White } else { Color::Gray })
+                        .add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    candidate.description.clone(),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
+        })
+        .collect()
 }
 
 fn auth_composer_line(dialog: &AuthDialogState) -> String {
@@ -1797,6 +2078,47 @@ fn transcript_items(app: &TuiApp) -> Vec<TranscriptItem> {
     items
 }
 
+fn transcript_rows(app: &TuiApp) -> Vec<ListItem<'static>> {
+    transcript_items(app)
+        .into_iter()
+        .flat_map(transcript_list_items)
+        .collect()
+}
+
+fn transcript_visible_window(
+    total_rows: usize,
+    visible_rows: usize,
+    scroll_offset: usize,
+) -> std::ops::Range<usize> {
+    if total_rows == 0 || visible_rows == 0 {
+        return 0..0;
+    }
+    let visible_rows = visible_rows.min(total_rows);
+    let max_offset = total_rows.saturating_sub(visible_rows);
+    let offset = scroll_offset.min(max_offset);
+    let end = total_rows.saturating_sub(offset);
+    end.saturating_sub(visible_rows)..end
+}
+
+fn transcript_page_rows(app: &TuiApp) -> usize {
+    let terminal_height = size().map(|(_, height)| height).unwrap_or(24);
+    usize::from(
+        terminal_height
+            .saturating_sub(1)
+            .saturating_sub(bottom_pane_height(app))
+            .saturating_sub(1)
+            .max(1),
+    )
+}
+
+fn transcript_scroll_status(scroll_offset: usize) -> String {
+    if scroll_offset == 0 {
+        "history at latest".to_owned()
+    } else {
+        format!("history offset {scroll_offset} rows from latest")
+    }
+}
+
 fn user_prompt_items(events: &[Value]) -> Vec<TranscriptItem> {
     events
         .iter()
@@ -1855,7 +2177,8 @@ fn significant_step(step: &VisibleStep) -> bool {
     matches!(
         step.label.as_str(),
         "ToolCompleted" | "TaskCompleted" | "CommandRejected" | "BusyPolicyDecided"
-    )
+    ) || (step.label == "LoopDecided"
+        && (step.summary.contains("failed") || step.summary.contains("error")))
 }
 
 fn step_item(step: &VisibleStep) -> TranscriptItem {
@@ -2239,6 +2562,7 @@ fn apply_auth_mock(transport: &InProcessTransport) -> miette::Result<()> {
 
 fn slash_help_lines() -> Vec<String> {
     vec![
+        "/new  start a new session".to_owned(),
         "/resume  open current workspace session list".to_owned(),
         "/resume <thread-id>  resume a specific current-workspace thread".to_owned(),
         "/threads [limit]  list recent workspace threads".to_owned(),
@@ -2311,11 +2635,25 @@ mod tests {
     #[tokio::test]
     async fn initial_auth_dialog_opens_without_provider_config() {
         let dir = tempfile::tempdir().expect("dir");
+        let home = tempfile::tempdir().expect("home");
         let transport = InProcessTransport::for_workspace(dir.path())
             .await
             .expect("transport");
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let previous_home = std::env::var("GOLUTRA_HOME").ok();
+        unsafe {
+            std::env::set_var("GOLUTRA_HOME", home.path());
+        }
 
         assert!(initial_auth_dialog(&transport).is_some());
+        match previous_home {
+            Some(value) => unsafe {
+                std::env::set_var("GOLUTRA_HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("GOLUTRA_HOME");
+            },
+        }
     }
 
     #[tokio::test]
@@ -2432,6 +2770,80 @@ mod tests {
             dialog.error.as_deref(),
             Some("Base URL must start with http:// or https://")
         );
+    }
+
+    #[tokio::test]
+    async fn q_key_does_not_exit_tui() {
+        let transport = InProcessTransport::in_memory().await.expect("transport");
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            SessionId::new(),
+            None,
+            false,
+            "ready (mock)".to_owned(),
+            None,
+        );
+
+        handle_key(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            &mut app,
+            &transport,
+        )
+        .await
+        .expect("handle key");
+
+        assert!(!app.should_quit);
+        assert_eq!(app.input, "q");
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_requires_second_press_to_exit() {
+        let transport = InProcessTransport::in_memory().await.expect("transport");
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            SessionId::new(),
+            None,
+            false,
+            "ready (mock)".to_owned(),
+            None,
+        );
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        handle_key(ctrl_c, &mut app, &transport)
+            .await
+            .expect("first ctrl-c");
+        assert!(!app.should_quit);
+        assert_eq!(app.status_message, "press Ctrl+C again to quit");
+
+        handle_key(ctrl_c, &mut app, &transport)
+            .await
+            .expect("second ctrl-c");
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn slash_candidates_render_below_composer_with_selection() {
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            SessionId::new(),
+            None,
+            false,
+            "ready (mock)".to_owned(),
+            None,
+        );
+        app.input = "/".to_owned();
+        app.slash_selected = 2;
+        let candidates = app.slash_candidates();
+        let lines = slash_candidate_lines(&app, &candidates)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(lines.contains("/new"));
+        assert!(lines.contains("/resume"));
+        assert!(lines.contains("> /threads"));
+        assert_eq!(bottom_pane_height(&app), 8);
     }
 
     #[tokio::test]
@@ -2593,6 +3005,227 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].title, "Tool Completed");
         assert_eq!(items[1].title, "Task Completed");
+    }
+
+    #[test]
+    fn failed_loop_decision_is_visible_in_transcript() {
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            SessionId::new(),
+            None,
+            false,
+            "ready (mock)".to_owned(),
+            None,
+        );
+        app.projection = Some(UserProjection {
+            session_id: app.session_id,
+            task_id: Some(TaskId::new()),
+            status: golutra_core::TaskStatus::Failed,
+            visible_steps: vec![VisibleStep {
+                label: "LoopDecided".to_owned(),
+                status: "Running".to_owned(),
+                summary: "runtime task execution failed: provider failed: model not found"
+                    .to_owned(),
+            }],
+            pending_approval: None,
+            final_message: None,
+            residual_risks: Vec::new(),
+        });
+
+        let items = transcript_items(&app);
+
+        assert_eq!(items[0].title, "Loop Decided");
+        assert!(items[0].body[0].contains("model not found"));
+    }
+
+    #[test]
+    fn resumed_completed_history_renders_user_prompt_and_terminal_steps() {
+        let session_id = SessionId::new();
+        let task_id = TaskId::new();
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            session_id,
+            None,
+            false,
+            "ready (mock)".to_owned(),
+            None,
+        );
+        app.events = vec![
+            serde_json::to_value(RuntimeEvent {
+                id: golutra_core::EventId::new(),
+                sequence_no: 1,
+                session_id,
+                turn_id: None,
+                task_id: Some(task_id),
+                parent_event_id: None,
+                event_type: RuntimeEventType::TaskCreated,
+                timestamp: chrono::Utc::now(),
+                source: golutra_protocol::RuntimeEventSource::Runtime,
+                payload: json!({
+                    "payload": {
+                        "prompt": "write file chain.txt with content ok"
+                    },
+                    "summary": "runtime lane started task",
+                }),
+                payload_ref: None,
+                durable: true,
+            })
+            .expect("event serializes"),
+        ];
+        app.projection = Some(UserProjection {
+            session_id,
+            task_id: Some(task_id),
+            status: golutra_core::TaskStatus::Completed,
+            visible_steps: vec![
+                VisibleStep {
+                    label: "ToolCompleted".to_owned(),
+                    status: "Running".to_owned(),
+                    summary: "file written".to_owned(),
+                },
+                VisibleStep {
+                    label: "TaskCompleted".to_owned(),
+                    status: "Completed".to_owned(),
+                    summary: "runtime task finished with Completed".to_owned(),
+                },
+            ],
+            pending_approval: None,
+            final_message: Some("Completed: file written".to_owned()),
+            residual_risks: Vec::new(),
+        });
+
+        let items = transcript_items(&app);
+        let titles = items
+            .iter()
+            .map(|item| item.title.as_str())
+            .collect::<Vec<_>>();
+        let body = items
+            .iter()
+            .flat_map(|item| item.body.iter())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            titles,
+            vec!["You", "Tool Completed", "Task Completed", "Golutra"]
+        );
+        assert!(body.contains("write file chain.txt with content ok"));
+        assert!(body.contains("file written"));
+        assert!(body.contains("runtime task finished with Completed"));
+        assert!(body.contains("Completed: file written"));
+    }
+
+    #[test]
+    fn transcript_visible_window_pages_from_bottom_and_round_trips() {
+        assert_eq!(transcript_visible_window(50, 10, 0), 40..50);
+        assert_eq!(transcript_visible_window(50, 10, 10), 30..40);
+        assert_eq!(transcript_visible_window(50, 10, 1_000), 0..10);
+
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            SessionId::new(),
+            None,
+            false,
+            "ready (mock)".to_owned(),
+            None,
+        );
+        app.transcript_row_count = 50;
+
+        app.scroll_transcript(TranscriptScrollAction::PageUp, 10);
+        assert_eq!(app.transcript_scroll_offset, 10);
+        app.scroll_transcript(TranscriptScrollAction::PageDown, 10);
+        assert_eq!(app.transcript_scroll_offset, 0);
+        app.scroll_transcript(TranscriptScrollAction::Top, 10);
+        assert_eq!(app.transcript_scroll_offset, 40);
+        app.scroll_transcript(TranscriptScrollAction::Bottom, 10);
+        assert_eq!(app.transcript_scroll_offset, 0);
+    }
+
+    #[tokio::test]
+    async fn resume_thread_clears_previous_visible_transcript_state() {
+        let transport = InProcessTransport::in_memory().await.expect("transport");
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            SessionId::new(),
+            None,
+            false,
+            "ready (mock)".to_owned(),
+            None,
+        );
+        app.command_messages.push(TranscriptItem {
+            role: TranscriptRole::System,
+            title: "Old".to_owned(),
+            body: vec!["old session only".to_owned()],
+        });
+        app.events.push(json!({"old": true}));
+        app.input = "/resume".to_owned();
+        app.slash_selected = 2;
+        app.transcript_scroll_offset = 12;
+        app.transcript_row_count = 30;
+
+        app.resume_thread(&transport, transport.default_thread_id())
+            .await
+            .expect("resume");
+
+        assert!(app.command_messages.is_empty());
+        assert!(app.events.is_empty());
+        assert!(app.input.is_empty());
+        assert_eq!(app.slash_selected, 0);
+        assert_eq!(app.transcript_scroll_offset, 0);
+    }
+
+    #[test]
+    fn start_new_session_resets_visible_tui_state() {
+        let original_thread_id = ThreadId::new();
+        let original_session_id = SessionId::new();
+        let mut app = TuiApp::new(
+            original_thread_id,
+            original_session_id,
+            Some(TaskId::new()),
+            true,
+            "ready (mock)".to_owned(),
+            None,
+        );
+        app.projection = Some(UserProjection {
+            session_id: original_session_id,
+            task_id: Some(TaskId::new()),
+            status: golutra_core::TaskStatus::Completed,
+            visible_steps: Vec::new(),
+            pending_approval: None,
+            final_message: Some("old answer".to_owned()),
+            residual_risks: Vec::new(),
+        });
+        app.command_messages.push(TranscriptItem {
+            role: TranscriptRole::System,
+            title: "Old".to_owned(),
+            body: vec!["old session only".to_owned()],
+        });
+        app.events.push(json!({"old": true}));
+        app.input = "/new".to_owned();
+        app.slash_selected = 2;
+        app.cursor = Some(9);
+        app.resume_picker = Some(ResumePickerState {
+            items: Vec::new(),
+            selected: 0,
+        });
+        app.transcript_scroll_offset = 7;
+        app.transcript_row_count = 20;
+
+        app.start_new_session();
+
+        assert_ne!(app.thread_id, original_thread_id);
+        assert_ne!(app.session_id, original_session_id);
+        assert!(app.task_id.is_none());
+        assert!(app.projection.is_none());
+        assert!(app.command_messages.is_empty());
+        assert!(app.events.is_empty());
+        assert!(app.input.is_empty());
+        assert_eq!(app.slash_selected, 0);
+        assert!(app.cursor.is_none());
+        assert!(app.resume_picker.is_none());
+        assert!(!app.debug_mode);
+        assert_eq!(app.transcript_scroll_offset, 0);
+        assert_eq!(app.status_message, "new session");
     }
 
     #[test]

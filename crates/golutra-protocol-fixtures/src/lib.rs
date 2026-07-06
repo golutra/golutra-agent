@@ -136,6 +136,7 @@ fn fixture_with_status(name: &str, status: TaskStatus, action: LoopAction) -> Sc
         model_state: "fixture".to_owned(),
         next_step: None,
     };
+    let final_message = terminal_message(status);
     ScenarioFixture {
         name: name.to_owned(),
         commands: vec![command],
@@ -148,6 +149,7 @@ fn fixture_with_status(name: &str, status: TaskStatus, action: LoopAction) -> Sc
             last_sequence_no: 1,
             visible_steps: vec![visible_step.clone()],
             pending_approval: None,
+            final_message: final_message.clone(),
             last_loop_decision: Some(loop_decision),
             last_verification: None,
         },
@@ -157,7 +159,7 @@ fn fixture_with_status(name: &str, status: TaskStatus, action: LoopAction) -> Sc
             status,
             visible_steps: vec![visible_step],
             pending_approval: None,
-            final_message: terminal_message(status),
+            final_message,
             residual_risks: residual_risks(status),
         },
     }

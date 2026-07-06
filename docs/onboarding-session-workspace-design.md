@@ -167,6 +167,16 @@ WorkspaceId
 | `.golutra/default-thread` | 当前 workspace 最近活跃 thread，替代单一 default-session 心智 |
 | `.golutra/default-session` | 兼容旧入口，后续由 default-thread 派生 |
 
+当前实现采用轻量 conversation 层作为 rollout JSONL 前置方案：
+
+- `runtime_events` 仍是事实来源，不新增旁路状态。
+- `TaskCreated` 中的 `payload.prompt` 作为用户消息。
+- `ToolCompleted` 的 `summary` 和 `changed_files` 作为用户可见工具结果摘要。
+- `AssistantMessage` 持久化最终回复，`UserProjection.final_message` 从该事件 reducer 得到，TUI resume 后可恢复显示。
+- 下一轮 prompt 构造 provider context 时，会从当前 session 历史事件提取用户输入、工具摘要、最终回复和任务终态，压缩成 `conversation_history` system contributor。这样 resume 后继续任务能看到前文关键上下文，但不会把完整 debug trace 塞回模型。
+
+这个方案不替代 Codex 风格 rollout JSONL。后续需要完整 transcript 导出、fork 到指定 turn、跨 workspace 全文搜索或 compaction 时，再将 `runtime_events` 双写到 append-only rollout。
+
 `threads` 最小字段：
 
 ```text
@@ -262,7 +272,8 @@ TUI 输入框现在先经过 slash command parser：
 | 命令 | 行为 |
 | --- | --- |
 | `/help` | 在 transcript 中展示可用 slash commands |
-| `/resume [thread-id]` | 恢复默认 thread 或指定 thread，并切换当前 session |
+| `/new` | 创建新的本地 thread/session，清空当前 TUI 可见状态，首个 prompt 时再持久化 |
+| `/resume [thread-id]` | 无参数时打开当前 workspace session 列表；带 thread id 时恢复指定 thread 并切换当前 session |
 | `/threads [limit]` | 列出当前 workspace 最近 threads |
 | `/fork <thread-id>` | fork 指定 thread，创建新 thread/session 并切换 |
 | `/auth`、`/auth setup` | 打开 provider setup |
@@ -273,11 +284,22 @@ TUI 输入框现在先经过 slash command parser：
 | `/auth use <profile> [user|workspace]` | 激活已保存 provider profile |
 | `/status`、`/debug`、`/abort`、`/clear`、`/quit` | 本地状态、debug、abort 和退出控制 |
 
+输入体验对齐 Codex：
+
+- 输入 `/` 或 `/auth ` 时，底部输入框下方显示候选命令列表，而不是只显示一行 help 文案。
+- Up/Down 或 Tab 可移动候选，Enter 会启动可直接执行的命令；需要参数的命令会先补全命令文本并等待用户继续输入。
+- `/resume` 选择 session 后会清空当前 TUI 的本地 command messages、event cursor、输入框和 transcript scroll 状态，再 replay 目标 session 的历史；这样不会把旧 session 的提示或历史混到新 session。
+- 普通 transcript 默认跟随最新内容；PageUp/PageDown 按页翻历史，Home/End 跳到最旧/最新。TUI 默认不捕获鼠标，优先保留终端选择复制能力。
+- 普通 `q` 是文本输入，不作为全局退出键。
+- Ctrl+C 第一按用于中断当前运行任务并展示退出提示；在短时间内第二次按 Ctrl+C 才退出 TUI。
+- Esc 用于关闭局部 picker/dialog 或清空当前输入，不作为常规退出路径。
+
 ## 当前差距
 
 - 当前 TUI 已有 qwen-code 风格 provider setup：Golutra API、Third-party Providers、Custom Provider、mock 分组选择；第三方内置 OpenAI、OpenRouter、DeepSeek、Qwen/DashScope compatible 和本地 OpenAI-compatible preset；OpenAI-compatible setup 已按 baseUrl -> API key -> model -> review -> install 顺序执行，review 会展示脱敏 `ProviderInstallPlan`、保存路径和同名 profile 覆盖提示；还没有 advanced config、secretRef/envKey 选择和 probe rollback。
 - 当前 provider 配置已支持 `$GOLUTRA_HOME/provider.json` 和 `<workspace>/.golutra/provider.json`，workspace 配置禁止保存明文 key；但 OS keychain、OAuth 和 secret-ref 还未实现。
 - 当前 `threads` 表、`.golutra/default-thread`、`golutra thread list`、`golutra resume [THREAD_ID]` 和 `golutra fork THREAD_ID` 已可用；fork 当前复制元数据并创建新 session，还未复制/截断 rollout JSONL 历史。
+- 当前完成任务会写入 `AssistantMessage`，`UserProjection.final_message` 和 TUI transcript 可在 resume 后恢复最终回复；下一轮 prompt 会携带当前 session 的压缩历史摘要。
 - 当前多工作区仍以 workspace SQLite 为事实来源；`$GOLUTRA_HOME/index.sqlite` 的跨 workspace 全局索引还未实现。
 - 当前 TUI provider setup 直接写本地 provider config；后续应改为通过 RuntimeHost/config service 返回 `ProviderConfigured`、`ProviderProbeCompleted` 或 `ProviderAuthFailed`。
 - 当前 session 事实在 workspace SQLite，缺少 rollout JSONL 和跨 workspace index。

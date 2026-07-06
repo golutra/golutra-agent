@@ -16,6 +16,7 @@ pub struct StateProjection {
     pub last_sequence_no: u64,
     pub visible_steps: Vec<VisibleStep>,
     pub pending_approval: Option<String>,
+    pub final_message: Option<String>,
     pub last_loop_decision: Option<LoopDecision>,
     pub last_verification: Option<VerificationRecord>,
 }

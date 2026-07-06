@@ -25,6 +25,7 @@
 - `golutra-llm` 已提供可用的 OpenAI-compatible live provider adapter；默认仍走 deterministic mock provider，只有显式设置 `GOLUTRA_PROVIDER_PROTOCOL=openai-compatible` 或兼容的 `GOLUTRA_PROVIDER_MODE=live` 且配置 key/model 时才联网。live 配置缺失会显式失败，支持 `GOLUTRA_PROVIDER_*` 与 `OPENAI_*` env，并提供 CLI `provider protocols/current/probe` 脱敏检查入口。
 - LLM 协议 catalog 已注册 `mock`、`openai-compatible`、`anthropic`、`gemini`、`vertex-ai`、`genai`；除 `mock` 与 `openai-compatible` 外，其它协议当前处于 catalog/diagnostic ready 状态，选择后会返回 `adapter_not_implemented` 而不是静默 fallback。
 - provider onboarding、凭据持久化和 thread resume/fork 已完成最小闭环：`golutra-config` 支持 `$GOLUTRA_HOME/provider.json` 与 `<workspace>/.golutra/provider.json`，CLI 支持 `provider login/set-key/use/current/probe`，TUI 首屏展示 provider 状态，store/client/CLI 支持 `ThreadId`、`threads` 表、`.golutra/default-thread`、`thread list/resume/fork`。
+- 用户可见 conversation 层已完成轻量闭环：`TaskCreated` 记录用户输入，`AssistantMessage` 记录最终回复，`UserProjection.final_message` 可从历史事件恢复；resume 后继续任务时，RuntimeHost 会把同一 session 的压缩历史摘要加入 provider context。
 - P1 provider onboarding 已补齐 TUI `/auth` qwen-code 风格主流程：provider 分组、第三方 preset、baseUrl/API key/model、保存前 review 和同名 profile 覆盖提示。复杂自动化、Web connect modal、probe rollback、OAuth/secretRef 和高级模型配置仍通过 TODO 决策位收敛。
 - 第一阶段范围已在 `implementation-blueprint.md` 中明确，不能继续扩张到复杂 multi-agent 或不可审计的自动自我改进。
 

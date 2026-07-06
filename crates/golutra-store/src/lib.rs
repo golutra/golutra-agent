@@ -142,6 +142,7 @@ impl RuntimeStore {
             last_sequence_no: 0,
             visible_steps: Vec::new(),
             pending_approval: None,
+            final_message: None,
             last_loop_decision: None,
             last_verification: None,
         };
@@ -179,7 +180,7 @@ impl RuntimeStore {
             status: state.task_status,
             visible_steps: state.visible_steps,
             pending_approval: state.pending_approval,
-            final_message: None,
+            final_message: state.final_message,
             residual_risks: state
                 .last_verification
                 .map(|record| record.residual_risks)
@@ -445,6 +446,13 @@ fn apply_event_to_projection(projection: &mut StateProjection, event: &RuntimeEv
         RuntimeEventType::LoopDecided => {
             projection.last_loop_decision = loop_decision_from_event(event);
         }
+        RuntimeEventType::AssistantMessage => {
+            projection.final_message = event
+                .payload
+                .get("content")
+                .and_then(|content| content.as_str())
+                .map(ToOwned::to_owned);
+        }
         _ => {}
     }
 
@@ -605,6 +613,42 @@ mod tests {
         assert_eq!(projection.active_task_id, Some(task_id));
         assert_eq!(projection.task_status, TaskStatus::Running);
         assert_eq!(projection.last_sequence_no, 1);
+    }
+
+    #[tokio::test]
+    async fn assistant_message_becomes_user_projection_final_message() {
+        let store = RuntimeStore::in_memory().await.expect("store opens");
+        let session_id = SessionId::new();
+        let task_id = TaskId::new();
+        let event = RuntimeEvent {
+            id: golutra_core::EventId::new(),
+            sequence_no: 1,
+            session_id,
+            turn_id: Some(TurnId::new()),
+            task_id: Some(task_id),
+            parent_event_id: None,
+            event_type: RuntimeEventType::AssistantMessage,
+            timestamp: Utc::now(),
+            source: RuntimeEventSource::Runtime,
+            payload: json!({
+                "summary": "Completed: file written",
+                "content": "Completed: file written",
+            }),
+            payload_ref: None,
+            durable: true,
+        };
+
+        store.append_event(&event).await.expect("event appended");
+
+        let projection = store
+            .user_projection(session_id, None)
+            .await
+            .expect("projection loads");
+
+        assert_eq!(
+            projection.final_message,
+            Some("Completed: file written".to_owned())
+        );
     }
 
     #[tokio::test]

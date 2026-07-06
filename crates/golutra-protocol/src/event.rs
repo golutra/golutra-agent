@@ -27,6 +27,7 @@ pub enum RuntimeEventType {
     ProviderStarted,
     ProviderStreamed,
     ProviderCompleted,
+    AssistantMessage,
     ToolStarted,
     ToolCompleted,
     PolicyEvaluated,

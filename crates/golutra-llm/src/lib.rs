@@ -939,13 +939,27 @@ fn finish_reason_from_openai(value: &str) -> ProviderFinishReason {
 }
 
 fn provider_error_message(value: &Value) -> String {
-    sanitize_provider_error(
-        value
-            .get("error")
-            .and_then(|error| error.get("message"))
-            .and_then(Value::as_str)
-            .unwrap_or("provider request failed"),
-    )
+    let message = value
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| value.get("message").and_then(Value::as_str))
+        .or_else(|| value.get("detail").and_then(Value::as_str))
+        .or_else(|| value.get("error").and_then(Value::as_str))
+        .unwrap_or("provider request failed");
+    let message = sanitize_provider_error(message);
+    let code = value
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+        .or_else(|| value.get("code").and_then(Value::as_str))
+        .map(sanitize_provider_error)
+        .filter(|code| !code.is_empty());
+
+    match code {
+        Some(code) if message != "provider request failed" => format!("{code}: {message}"),
+        _ => message,
+    }
 }
 
 async fn response_json_or_error(response: reqwest::Response) -> Result<Value, ProviderError> {
@@ -1237,10 +1251,10 @@ pub fn normalize_openai_base_url(value: &str) -> String {
 fn sanitize_provider_error(message: &str) -> String {
     let single_line = message.replace(['\n', '\r'], " ");
     let trimmed = single_line.trim();
-    if trimmed.len() <= 512 {
+    if trimmed.chars().count() <= 512 {
         trimmed.to_owned()
     } else {
-        format!("{}...", &trimmed[..512])
+        format!("{}...", trimmed.chars().take(512).collect::<String>())
     }
 }
 
@@ -1486,6 +1500,31 @@ mod tests {
 
         assert!(!message.contains('\n'));
         assert!(message.len() <= 515);
+    }
+
+    #[test]
+    fn provider_error_message_reads_top_level_code_and_message() {
+        let value = json!({
+            "code": "INVALID_API_KEY",
+            "message": "Invalid API key"
+        });
+
+        assert_eq!(
+            provider_error_message(&value),
+            "INVALID_API_KEY: Invalid API key"
+        );
+    }
+
+    #[test]
+    fn provider_error_message_reads_string_error() {
+        let value = json!({
+            "error": "model does not support tools"
+        });
+
+        assert_eq!(
+            provider_error_message(&value),
+            "model does not support tools"
+        );
     }
 
     fn request() -> ProviderRequest {

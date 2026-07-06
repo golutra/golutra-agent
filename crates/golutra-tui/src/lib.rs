@@ -46,6 +46,7 @@ pub fn event_timeline_lines(events: &[Value]) -> Vec<EventTimelineLine> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommand {
     Help,
+    New,
     Auth(SlashAuthCommand),
     Resume { thread_id: Option<String> },
     Threads { limit: u32 },
@@ -98,44 +99,72 @@ pub enum SlashInput {
 struct SlashCommandHint {
     command: &'static str,
     description: &'static str,
+    selection: SlashCommandSelection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlashCommandSelection {
+    Execute,
+    Fill,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlashCommandCandidate {
+    pub command: String,
+    pub description: String,
+    pub execute_on_select: bool,
 }
 
 const TOP_LEVEL_SLASH_HINTS: &[SlashCommandHint] = &[
     SlashCommandHint {
+        command: "/new",
+        description: "start a new session",
+        selection: SlashCommandSelection::Execute,
+    },
+    SlashCommandHint {
         command: "/resume",
         description: "open sessions",
+        selection: SlashCommandSelection::Execute,
     },
     SlashCommandHint {
         command: "/threads",
         description: "list threads",
+        selection: SlashCommandSelection::Execute,
     },
     SlashCommandHint {
         command: "/fork",
         description: "fork a thread",
+        selection: SlashCommandSelection::Fill,
     },
     SlashCommandHint {
         command: "/auth",
         description: "provider setup",
+        selection: SlashCommandSelection::Execute,
     },
     SlashCommandHint {
         command: "/status",
         description: "show runtime status",
+        selection: SlashCommandSelection::Execute,
     },
     SlashCommandHint {
         command: "/debug",
         description: "toggle timeline",
+        selection: SlashCommandSelection::Execute,
     },
     SlashCommandHint {
         command: "/abort",
         description: "abort active task",
+        selection: SlashCommandSelection::Execute,
     },
     SlashCommandHint {
         command: "/clear",
         description: "clear local messages",
+        selection: SlashCommandSelection::Execute,
     },
     SlashCommandHint {
         command: "/quit",
         description: "leave TUI",
+        selection: SlashCommandSelection::Execute,
     },
 ];
 
@@ -143,31 +172,45 @@ const AUTH_SLASH_HINTS: &[SlashCommandHint] = &[
     SlashCommandHint {
         command: "/auth setup",
         description: "connect provider",
+        selection: SlashCommandSelection::Execute,
     },
     SlashCommandHint {
         command: "/auth status",
         description: "show provider state",
+        selection: SlashCommandSelection::Execute,
     },
     SlashCommandHint {
         command: "/auth protocols",
         description: "list protocols",
+        selection: SlashCommandSelection::Execute,
     },
     SlashCommandHint {
         command: "/auth mock",
         description: "use mock provider",
+        selection: SlashCommandSelection::Execute,
     },
     SlashCommandHint {
         command: "/auth login",
         description: "save OpenAI-compatible profile",
+        selection: SlashCommandSelection::Fill,
     },
     SlashCommandHint {
         command: "/auth use",
         description: "activate profile",
+        selection: SlashCommandSelection::Fill,
     },
 ];
 
 #[must_use]
 pub fn slash_command_suggestions(input: &str) -> Vec<String> {
+    slash_command_candidates(input)
+        .into_iter()
+        .map(|candidate| format!("{} - {}", candidate.command, candidate.description))
+        .collect()
+}
+
+#[must_use]
+pub fn slash_command_candidates(input: &str) -> Vec<SlashCommandCandidate> {
     let input = input.trim_start();
     if !input.starts_with('/') {
         return Vec::new();
@@ -187,14 +230,14 @@ pub fn slash_command_suggestions(input: &str) -> Vec<String> {
             matching_hints(TOP_LEVEL_SLASH_HINTS, first_token, "")
         };
 
-    suggestions.into_iter().take(3).collect()
+    suggestions.into_iter().take(5).collect()
 }
 
 fn matching_hints(
     hints: &[SlashCommandHint],
     prefix: &str,
     auth_prefix_to_strip: &str,
-) -> Vec<String> {
+) -> Vec<SlashCommandCandidate> {
     hints
         .iter()
         .filter(|hint| {
@@ -204,7 +247,11 @@ fn matching_hints(
                 .unwrap_or(hint.command);
             command.starts_with(prefix)
         })
-        .map(|hint| format!("{} - {}", hint.command, hint.description))
+        .map(|hint| SlashCommandCandidate {
+            command: hint.command.to_owned(),
+            description: hint.description.to_owned(),
+            execute_on_select: hint.selection == SlashCommandSelection::Execute,
+        })
         .collect()
 }
 
@@ -226,6 +273,7 @@ pub fn parse_slash_input(input: &str) -> SlashInput {
     };
     match command {
         "/help" | "/?" => SlashInput::Command(SlashCommand::Help),
+        "/new" => SlashInput::Command(SlashCommand::New),
         "/resume" => SlashInput::Command(SlashCommand::Resume {
             thread_id: tokens.get(1).cloned(),
         }),
@@ -411,6 +459,10 @@ mod tests {
     #[test]
     fn slash_parser_accepts_resume_and_auth_login() {
         assert_eq!(
+            parse_slash_input("/new"),
+            SlashInput::Command(SlashCommand::New)
+        );
+        assert_eq!(
             parse_slash_input("/resume 019f"),
             SlashInput::Command(SlashCommand::Resume {
                 thread_id: Some("019f".to_owned())
@@ -448,10 +500,16 @@ mod tests {
         assert_eq!(
             slash_command_suggestions("/"),
             vec![
+                "/new - start a new session".to_owned(),
                 "/resume - open sessions".to_owned(),
                 "/threads - list threads".to_owned(),
                 "/fork - fork a thread".to_owned(),
+                "/auth - provider setup".to_owned(),
             ]
+        );
+        assert_eq!(
+            slash_command_suggestions("/n"),
+            vec!["/new - start a new session".to_owned()]
         );
         assert_eq!(
             slash_command_suggestions("/r"),
@@ -467,11 +525,28 @@ mod tests {
                 "/auth setup - connect provider".to_owned(),
                 "/auth status - show provider state".to_owned(),
                 "/auth protocols - list protocols".to_owned(),
+                "/auth mock - use mock provider".to_owned(),
+                "/auth login - save OpenAI-compatible profile".to_owned(),
             ]
         );
         assert_eq!(
             slash_command_suggestions("/auth l"),
             vec!["/auth login - save OpenAI-compatible profile".to_owned()]
         );
+    }
+
+    #[test]
+    fn slash_candidates_mark_fill_only_commands() {
+        let fork = slash_command_candidates("/f")
+            .into_iter()
+            .find(|candidate| candidate.command == "/fork")
+            .expect("fork candidate");
+        let resume = slash_command_candidates("/r")
+            .into_iter()
+            .find(|candidate| candidate.command == "/resume")
+            .expect("resume candidate");
+
+        assert!(!fork.execute_on_select);
+        assert!(resume.execute_on_select);
     }
 }

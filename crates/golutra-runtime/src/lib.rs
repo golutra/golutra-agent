@@ -11,8 +11,8 @@ use golutra_context::{
 use golutra_core::{
     Actor, BudgetState, BusyPolicy, BusyPolicyDecision, CheckpointId, CheckpointType, CommandId,
     DecisionId, EventId, LaneId, LoopAction, LoopDecision, LoopDecisionId, PolicyId, RuntimeLane,
-    SessionId, TaskId, TaskStatus, ToolResultStatus, TurnId, VerificationCheck, VerificationRecord,
-    VerificationResult, WorkspaceCheckpoint, WorkspaceId,
+    SessionId, TaskId, TaskStatus, ToolResultStatus, TurnId, VerificationCheck, VerificationId,
+    VerificationRecord, VerificationResult, WorkspaceCheckpoint, WorkspaceId,
 };
 use golutra_llm::{LlmProvider, ProviderError, ProviderFinishReason};
 use golutra_protocol::{RuntimeEvent, RuntimeEventSource, RuntimeEventType};
@@ -38,7 +38,7 @@ pub enum RuntimeLaneError {
 pub enum AgentLoopError {
     #[error("context build failed")]
     Context(#[from] ContextError),
-    #[error("provider call failed")]
+    #[error("provider call failed: {0}")]
     Provider(#[from] ProviderError),
     #[error("tool execution failed")]
     Tool(#[from] ToolError),
@@ -82,6 +82,7 @@ pub struct AgentLoopOutcome {
     pub verification: VerificationRecord,
     pub loop_decision: LoopDecision,
     pub tool_reports: Vec<ToolExecutionReport>,
+    pub final_message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,6 +233,7 @@ where
         F: FnMut(AgentLoopTraceEvent),
     {
         let mut tool_reports = Vec::new();
+        let mut last_assistant_message = None;
         let mut last_budget_state = BudgetState {
             planned_input_tokens: None,
             actual_input_tokens: None,
@@ -271,6 +273,13 @@ where
                 model_id: provider_request.model_id.clone(),
             });
             let provider_response = self.provider.complete(provider_request.clone()).await?;
+            if let Some(message) = provider_response
+                .message
+                .as_ref()
+                .filter(|message| !message.content.trim().is_empty())
+            {
+                last_assistant_message = Some(message.content.trim().to_owned());
+            }
             trace(AgentLoopTraceEvent::ProviderCompleted {
                 provider_id: provider_request.provider_id.clone(),
                 model_id: provider_request.model_id.clone(),
@@ -334,14 +343,22 @@ where
                 message: report.envelope.summary.clone(),
             })
             .collect::<Vec<_>>();
-        let verification = self.verifier.verify(VerificationInput {
-            task_id: request.task_id,
-            objective: request.objective.clone(),
-            completion_criteria: request.completion_criteria.clone(),
-            evidence_refs,
-            command_checks,
-            touched_code: request.touched_code,
-        });
+        let verification = if accepts_text_response_without_evidence(
+            &request,
+            last_assistant_message.as_deref(),
+            &tool_reports,
+        ) {
+            text_response_verification(&request)
+        } else {
+            self.verifier.verify(VerificationInput {
+                task_id: request.task_id,
+                objective: request.objective.clone(),
+                completion_criteria: request.completion_criteria.clone(),
+                evidence_refs,
+                command_checks,
+                touched_code: request.touched_code,
+            })
+        };
         let loop_decision = loop_decision_from_verification(
             request.task_id,
             request.turn_id,
@@ -350,6 +367,11 @@ where
         );
 
         Ok(AgentLoopOutcome {
+            final_message: final_message_from_outcome(
+                last_assistant_message,
+                &tool_reports,
+                &verification,
+            ),
             verification,
             loop_decision,
             tool_reports,
@@ -561,6 +583,132 @@ fn loop_decision_from_verification(
     }
 }
 
+fn final_message_from_outcome(
+    assistant_message: Option<String>,
+    tool_reports: &[ToolExecutionReport],
+    verification: &VerificationRecord,
+) -> Option<String> {
+    let summaries = tool_reports
+        .iter()
+        .map(|report| report.envelope.summary.trim())
+        .filter(|summary| !summary.is_empty())
+        .collect::<Vec<_>>();
+
+    if verification.result == VerificationResult::Pass
+        && assistant_message
+            .as_ref()
+            .is_some_and(|message| !message.trim().is_empty())
+    {
+        return assistant_message;
+    }
+
+    if summaries.is_empty() {
+        return match verification.result {
+            VerificationResult::Pass => Some("Completed.".to_owned()),
+            VerificationResult::Partial
+            | VerificationResult::Fail
+            | VerificationResult::Unknown => {
+                Some("Task finished without enough evidence to verify completion.".to_owned())
+            }
+        };
+    }
+
+    match verification.result {
+        VerificationResult::Pass => Some(format!("Completed: {}", summaries.join("; "))),
+        VerificationResult::Partial | VerificationResult::Fail | VerificationResult::Unknown => {
+            Some(format!(
+                "Could not fully complete: {}",
+                summaries.join("; ")
+            ))
+        }
+    }
+}
+
+fn accepts_text_response_without_evidence(
+    request: &AgentTaskRequest,
+    assistant_message: Option<&str>,
+    tool_reports: &[ToolExecutionReport],
+) -> bool {
+    !request.touched_code
+        && tool_reports.is_empty()
+        && assistant_message.is_some_and(|message| !message.trim().is_empty())
+        && !objective_requires_workspace_evidence(&request.objective)
+}
+
+fn text_response_verification(request: &AgentTaskRequest) -> VerificationRecord {
+    VerificationRecord {
+        verification_id: VerificationId::new(),
+        task_id: request.task_id,
+        objective: request.objective.clone(),
+        completion_criteria: request.completion_criteria.clone(),
+        checks: vec![VerificationCheck {
+            name: "assistant_response".to_owned(),
+            command: None,
+            passed: true,
+            evidence_refs: Vec::new(),
+            message: "assistant response produced".to_owned(),
+        }],
+        evidence_refs: Vec::new(),
+        result: VerificationResult::Pass,
+        policy_status: "conversation_response".to_owned(),
+        residual_risks: Vec::new(),
+    }
+}
+
+fn objective_requires_workspace_evidence(objective: &str) -> bool {
+    let lower = objective.to_ascii_lowercase();
+    const ENGLISH_MARKERS: &[&str] = &[
+        "write",
+        "create",
+        "edit",
+        "modify",
+        "update",
+        "delete",
+        "read",
+        "list",
+        "search",
+        "find",
+        "inspect",
+        "run",
+        "test",
+        "build",
+        "fix",
+        "debug",
+        "refactor",
+        "file",
+        "code",
+        "workspace",
+        "diff",
+        "commit",
+    ];
+    const CJK_MARKERS: &[&str] = &[
+        "写",
+        "创建",
+        "修改",
+        "更新",
+        "删除",
+        "读取",
+        "查看",
+        "列出",
+        "搜索",
+        "查找",
+        "检查",
+        "运行",
+        "测试",
+        "构建",
+        "修复",
+        "重构",
+        "文件",
+        "代码",
+        "项目",
+        "工作区",
+        "提交",
+    ];
+
+    ENGLISH_MARKERS.iter().any(|marker| lower.contains(marker))
+        || CJK_MARKERS.iter().any(|marker| objective.contains(marker))
+}
+
 #[must_use]
 pub fn is_active_status(status: TaskStatus) -> bool {
     matches!(
@@ -719,6 +867,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_loop_provider_error_includes_detail() {
+        let workspace = tempdir().expect("workspace");
+        let provider = golutra_llm::GenaiProviderAdapter::unconfigured();
+        let executor =
+            BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+        let agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor);
+
+        let error = agent_loop
+            .run(AgentTaskRequest {
+                session_id: SessionId::new(),
+                task_id: TaskId::new(),
+                turn_id: TurnId::new(),
+                objective: "你好".to_owned(),
+                completion_criteria: vec!["assistant response".to_owned()],
+                touched_code: false,
+                contributors: Vec::new(),
+                tools: Vec::new(),
+            })
+            .await
+            .expect_err("provider error");
+
+        assert!(error.to_string().contains("provider call failed"));
+        assert!(error.to_string().contains("provider is not configured"));
+    }
+
+    #[tokio::test]
     async fn agent_loop_stops_success_when_tool_evidence_exists() {
         let workspace = tempdir().expect("workspace");
         let provider = MockProvider::tool_call(
@@ -748,6 +922,10 @@ mod tests {
 
         assert_eq!(outcome.loop_decision.action, LoopAction::StopSuccess);
         assert_eq!(
+            outcome.final_message,
+            Some("Completed: file written".to_owned())
+        );
+        assert_eq!(
             fs::read_to_string(workspace.path().join("result.txt")).unwrap(),
             "done"
         );
@@ -776,6 +954,63 @@ mod tests {
             .expect("loop runs");
 
         assert_eq!(outcome.loop_decision.action, LoopAction::StopFailed);
+        assert_eq!(
+            outcome.final_message,
+            Some("Task finished without enough evidence to verify completion.".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_loop_accepts_plain_conversation_response_without_tool_evidence() {
+        let workspace = tempdir().expect("workspace");
+        let provider = MockProvider::text_response("你好，我在。");
+        let executor =
+            BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+        let agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor);
+
+        let outcome = agent_loop
+            .run(AgentTaskRequest {
+                session_id: SessionId::new(),
+                task_id: TaskId::new(),
+                turn_id: TurnId::new(),
+                objective: "你好".to_owned(),
+                completion_criteria: vec!["assistant response".to_owned()],
+                touched_code: false,
+                contributors: Vec::new(),
+                tools: Vec::new(),
+            })
+            .await
+            .expect("loop runs");
+
+        assert_eq!(outcome.loop_decision.action, LoopAction::StopSuccess);
+        assert_eq!(outcome.verification.result, VerificationResult::Pass);
+        assert_eq!(outcome.final_message, Some("你好，我在。".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn agent_loop_still_requires_evidence_for_workspace_objectives() {
+        let workspace = tempdir().expect("workspace");
+        let provider = MockProvider::text_response("README looks fine.");
+        let executor =
+            BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+        let agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor);
+
+        let outcome = agent_loop
+            .run(AgentTaskRequest {
+                session_id: SessionId::new(),
+                task_id: TaskId::new(),
+                turn_id: TurnId::new(),
+                objective: "read README.md".to_owned(),
+                completion_criteria: vec!["file read evidence".to_owned()],
+                touched_code: false,
+                contributors: Vec::new(),
+                tools: vec!["read_file".to_owned()],
+            })
+            .await
+            .expect("loop runs");
+
+        assert_eq!(outcome.loop_decision.action, LoopAction::Blocked);
+        assert_eq!(outcome.verification.result, VerificationResult::Unknown);
     }
 
     #[tokio::test]
