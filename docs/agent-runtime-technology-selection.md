@@ -327,6 +327,32 @@ Golutra 不规划并行维护 `OpenAICompatibleAdapter`、`AnthropicNativeAdapte
 - 根据 `genai` 支持范围补全 Capability Matrix，并对不确定能力标记为 unknown。
 - 对关键 provider 建 recorded/golden tests，避免升级 `genai` 后破坏回放和评估。
 
+### Custom Provider 设置与验证
+
+Custom Provider 的交互流程要对齐 qwen-code 的协议优先设计，不能只做一个 OpenAI-compatible 表单。推荐流程：
+
+```text
+Step 1/6 Protocol
+  OpenAI-compatible
+  Anthropic-compatible
+  Gemini-compatible
+Step 2/6 Base URL
+Step 3/6 API Key
+Step 4/6 Model IDs
+Step 5/6 Advanced Config
+Step 6/6 Review
+```
+
+验证边界：
+
+- Step 1 必须先确定协议，因为 base URL 默认值、env key、模型格式、tool call 映射和后续连通性 probe 都依赖协议。
+- OpenAI-compatible 默认走 Chat Completions 兼容路径，base URL 可规范化到 `/v1`。
+- Anthropic-compatible 和 Gemini-compatible 可以进入 UI 协议选择，但在 live adapter 未接通前不能假装连接成功。
+- 当前实现阶段只能保存并启用 OpenAI-compatible live provider；Anthropic/Gemini 应返回明确错误，提示协议已识别但 live runtime 只支持 OpenAI-compatible。
+- Review 阶段必须展示 protocol、base URL、model、API key 掩码、scope 和 config path。
+- provider 配置校验必须按 protocol 检查必填字段，不能只校验 OpenAI-compatible。
+- 后续接入 `genai` 后，放开 Anthropic/Gemini 的保存和 probe，但仍要通过 Golutra 的 `ProviderContract` 归一化 request、stream、usage、tool call 和 error。
+
 完整 ProviderContract 至少要记录：
 
 ```text

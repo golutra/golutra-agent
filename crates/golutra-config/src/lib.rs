@@ -204,11 +204,28 @@ impl ProviderProfile {
         model_id: impl Into<String>,
         api_key_env: impl Into<String>,
     ) -> Result<Self, ConfigError> {
+        Self::live_profile(
+            name,
+            ProviderProtocol::OpenAiCompatible,
+            base_url,
+            model_id,
+            api_key_env,
+        )
+    }
+
+    pub fn live_profile(
+        name: impl Into<String>,
+        protocol: ProviderProtocol,
+        base_url: impl Into<String>,
+        model_id: impl Into<String>,
+        api_key_env: impl Into<String>,
+    ) -> Result<Self, ConfigError> {
+        let base_url = normalize_provider_base_url(protocol, &base_url.into());
         let profile = Self {
             name: name.into(),
-            protocol: ProviderProtocol::OpenAiCompatible,
+            protocol,
             model_id: Some(model_id.into()),
-            base_url: Some(normalize_openai_base_url(&base_url.into())),
+            base_url: Some(base_url),
             api_key_env: Some(api_key_env.into()),
             api_key: None,
             enabled: true,
@@ -222,7 +239,7 @@ impl ProviderProfile {
         if let Some(api_key_env) = &self.api_key_env {
             validate_env_key(api_key_env)?;
         }
-        if self.protocol == ProviderProtocol::OpenAiCompatible && self.enabled {
+        if live_profile_requires_connection_fields(self.protocol) && self.enabled {
             require_non_empty(self.model_id.as_deref(), "model_id")?;
             require_non_empty(self.base_url.as_deref(), "base_url")?;
             if self.api_key.is_none() {
@@ -509,9 +526,24 @@ fn require_non_empty(value: Option<&str>, field: &str) -> Result<(), ConfigError
     }
 }
 
+fn live_profile_requires_connection_fields(protocol: ProviderProtocol) -> bool {
+    matches!(
+        protocol,
+        ProviderProtocol::OpenAiCompatible | ProviderProtocol::Anthropic | ProviderProtocol::Gemini
+    )
+}
+
+fn normalize_provider_base_url(protocol: ProviderProtocol, value: &str) -> String {
+    if protocol == ProviderProtocol::OpenAiCompatible {
+        normalize_openai_base_url(value)
+    } else {
+        value.trim().trim_end_matches('/').to_owned()
+    }
+}
+
 fn missing_fields(profile: &ProviderProfile) -> Vec<String> {
     let mut fields = Vec::new();
-    if profile.protocol == ProviderProtocol::OpenAiCompatible {
+    if live_profile_requires_connection_fields(profile.protocol) {
         if profile.model_id.as_deref().is_none_or(str::is_empty) {
             fields.push("model_id".to_owned());
         }

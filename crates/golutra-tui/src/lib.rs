@@ -1,3 +1,4 @@
+use golutra_llm::ProviderProtocol;
 use serde_json::Value;
 
 pub use golutra_protocol::{DebugProjection, RuntimeEvent, UserProjection};
@@ -80,6 +81,7 @@ pub enum AuthConfigScope {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenAiCompatibleLogin {
     pub profile: String,
+    pub protocol: ProviderProtocol,
     pub base_url: String,
     pub model: String,
     pub api_key_env: String,
@@ -330,6 +332,7 @@ fn parse_auth_use(tokens: &[String]) -> SlashInput {
 
 fn parse_auth_login(tokens: &[String]) -> SlashInput {
     let mut profile = "default".to_owned();
+    let mut protocol = ProviderProtocol::OpenAiCompatible;
     let mut base_url = None;
     let mut model = None;
     let mut api_key_env = "GOLUTRA_PROVIDER_API_KEY".to_owned();
@@ -344,6 +347,30 @@ fn parse_auth_login(tokens: &[String]) -> SlashInput {
                     return SlashInput::Error("--profile requires a value".to_owned());
                 };
                 profile = value.clone();
+            }
+            "--protocol" => {
+                index += 1;
+                let Some(value) = tokens.get(index) else {
+                    return SlashInput::Error("--protocol requires a value".to_owned());
+                };
+                protocol = match ProviderProtocol::from_config_value(value) {
+                    Some(
+                        protocol @ (ProviderProtocol::OpenAiCompatible
+                        | ProviderProtocol::Anthropic
+                        | ProviderProtocol::Gemini),
+                    ) => protocol,
+                    Some(other) => {
+                        return SlashInput::Error(format!(
+                            "custom provider protocol `{}` is not supported by setup",
+                            other.id()
+                        ));
+                    }
+                    None => {
+                        return SlashInput::Error(
+                            "--protocol must be openai-compatible, anthropic, or gemini".to_owned(),
+                        );
+                    }
+                };
             }
             "--base-url" => {
                 index += 1;
@@ -398,6 +425,7 @@ fn parse_auth_login(tokens: &[String]) -> SlashInput {
     SlashInput::Command(SlashCommand::Auth(SlashAuthCommand::Login(
         OpenAiCompatibleLogin {
             profile,
+            protocol,
             base_url,
             model,
             api_key_env,
@@ -475,6 +503,7 @@ mod tests {
             SlashInput::Command(SlashCommand::Auth(SlashAuthCommand::Login(
                 OpenAiCompatibleLogin {
                     profile: "default".to_owned(),
+                    protocol: ProviderProtocol::OpenAiCompatible,
                     base_url: "api.golutra.cn".to_owned(),
                     model: "qwen".to_owned(),
                     api_key_env: "GOLUTRA_KEY".to_owned(),

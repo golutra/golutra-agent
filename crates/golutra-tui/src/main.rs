@@ -20,7 +20,7 @@ use golutra_config::{
     ProviderSettings, provider_onboarding_state,
 };
 use golutra_core::{Actor, ActorKind, CommandId, QueryId, SessionId, TaskId, ThreadId};
-use golutra_llm::provider_protocol_catalog;
+use golutra_llm::{ProviderProtocol, provider_protocol_catalog};
 use golutra_protocol::{
     EventFilter, RuntimeEvent, RuntimeEventType, RuntimeQuery, RuntimeQueryKind, SessionCommand,
     SessionCommandKind, UserProjection, VisibleStep,
@@ -701,6 +701,7 @@ struct AuthDialogState {
     step: AuthDialogStep,
     selected: usize,
     provider: Option<AuthProviderPreset>,
+    protocol: ProviderProtocol,
     base_url: String,
     model: String,
     api_key: String,
@@ -712,9 +713,11 @@ struct AuthDialogState {
 enum AuthDialogStep {
     GroupChoice,
     ThirdPartyChoice,
+    Protocol,
     BaseUrl,
     ApiKey,
     Model,
+    AdvancedConfig,
     Review,
 }
 
@@ -740,6 +743,7 @@ struct AuthProviderPreset {
     title: &'static str,
     detail: &'static str,
     source: AuthProviderSource,
+    protocol_options: &'static [ProviderProtocol],
     base_url: Option<&'static str>,
     model: Option<&'static str>,
     recommended_models: &'static [&'static str],
@@ -749,6 +753,7 @@ struct AuthProviderPreset {
 struct AuthReview {
     provider_title: &'static str,
     profile: String,
+    protocol: String,
     base_url: String,
     model: String,
     api_key: String,
@@ -772,6 +777,7 @@ impl AuthDialogState {
             step: AuthDialogStep::GroupChoice,
             selected: 0,
             provider: None,
+            protocol: ProviderProtocol::OpenAiCompatible,
             base_url: String::new(),
             model: String::new(),
             api_key: String::new(),
@@ -798,13 +804,44 @@ impl AuthDialogState {
 
     fn select_provider(&mut self, provider: AuthProviderPreset) {
         self.provider = Some(provider);
+        self.protocol = provider
+            .protocol_options
+            .first()
+            .copied()
+            .unwrap_or(ProviderProtocol::OpenAiCompatible);
         self.base_url = provider.base_url.unwrap_or_default().to_owned();
         self.model = provider.model.unwrap_or_default().to_owned();
         self.api_key.clear();
         self.review = None;
         self.error = None;
-        self.step = AuthDialogStep::BaseUrl;
+        self.step = if provider.protocol_options.len() > 1 {
+            AuthDialogStep::Protocol
+        } else {
+            AuthDialogStep::BaseUrl
+        };
         self.selected = 0;
+    }
+
+    fn protocol_options(&self) -> &'static [ProviderProtocol] {
+        self.provider
+            .map(|provider| provider.protocol_options)
+            .unwrap_or(&[])
+    }
+
+    fn selected_protocol(&self) -> ProviderProtocol {
+        self.protocol_options()
+            .get(self.selected)
+            .copied()
+            .unwrap_or(self.protocol)
+    }
+
+    fn default_base_url_for_protocol(protocol: ProviderProtocol) -> &'static str {
+        match protocol {
+            ProviderProtocol::OpenAiCompatible => "https://api.openai.com/v1",
+            ProviderProtocol::Anthropic => "https://api.anthropic.com/v1",
+            ProviderProtocol::Gemini => "https://generativelanguage.googleapis.com",
+            _ => "",
+        }
     }
 
     fn model_options(&self) -> &'static [&'static str] {
@@ -831,8 +868,12 @@ impl AuthDialogState {
             AuthDialogStep::ThirdPartyChoice => {
                 THIRD_PARTY_PROVIDER_PRESETS.len().saturating_sub(1)
             }
+            AuthDialogStep::Protocol => self.protocol_options().len().saturating_sub(1),
             AuthDialogStep::Model => self.custom_model_index(),
-            AuthDialogStep::BaseUrl | AuthDialogStep::ApiKey | AuthDialogStep::Review => 0,
+            AuthDialogStep::BaseUrl
+            | AuthDialogStep::ApiKey
+            | AuthDialogStep::AdvancedConfig
+            | AuthDialogStep::Review => 0,
         };
         self.selected = match direction {
             ResumeSelectionDirection::Previous => self.selected.saturating_sub(1),
@@ -848,7 +889,9 @@ impl AuthDialogState {
             AuthDialogStep::Model if self.is_custom_model_selected() => Some(&mut self.model),
             AuthDialogStep::GroupChoice
             | AuthDialogStep::ThirdPartyChoice
+            | AuthDialogStep::Protocol
             | AuthDialogStep::Model
+            | AuthDialogStep::AdvancedConfig
             | AuthDialogStep::Review => None,
         }
     }
@@ -878,16 +921,27 @@ impl AuthDialogState {
             AuthDialogStep::GroupChoice => AuthDialogStep::GroupChoice,
             AuthDialogStep::ThirdPartyChoice => AuthDialogStep::GroupChoice,
             AuthDialogStep::BaseUrl => match self.provider.map(|provider| provider.source) {
+                Some(AuthProviderSource::Custom) if self.protocol_options().len() > 1 => {
+                    AuthDialogStep::Protocol
+                }
                 Some(AuthProviderSource::ThirdParty) => AuthDialogStep::ThirdPartyChoice,
                 _ => AuthDialogStep::GroupChoice,
             },
             AuthDialogStep::ApiKey => AuthDialogStep::BaseUrl,
             AuthDialogStep::Model => AuthDialogStep::ApiKey,
-            AuthDialogStep::Review => AuthDialogStep::Model,
+            AuthDialogStep::AdvancedConfig => AuthDialogStep::Model,
+            AuthDialogStep::Review => AuthDialogStep::AdvancedConfig,
+            AuthDialogStep::Protocol => AuthDialogStep::GroupChoice,
         };
     }
 }
 
+const OPENAI_PROTOCOL_ONLY: &[ProviderProtocol] = &[ProviderProtocol::OpenAiCompatible];
+const CUSTOM_PROTOCOL_OPTIONS: &[ProviderProtocol] = &[
+    ProviderProtocol::OpenAiCompatible,
+    ProviderProtocol::Anthropic,
+    ProviderProtocol::Gemini,
+];
 const OFFICIAL_MODELS: &[&str] = &["gpt-test", "gpt-4.1", "qwen-coder-plus"];
 const OPENAI_MODELS: &[&str] = &["gpt-4.1", "gpt-4.1-mini", "o4-mini"];
 const OPENROUTER_MODELS: &[&str] = &[
@@ -905,6 +959,7 @@ const OFFICIAL_PROVIDER_PRESET: AuthProviderPreset = AuthProviderPreset {
     title: "Golutra API",
     detail: "Official OpenAI-compatible endpoint",
     source: AuthProviderSource::Official,
+    protocol_options: OPENAI_PROTOCOL_ONLY,
     base_url: Some("https://api.golutra.cn/v1"),
     model: Some("gpt-test"),
     recommended_models: OFFICIAL_MODELS,
@@ -913,8 +968,9 @@ const OFFICIAL_PROVIDER_PRESET: AuthProviderPreset = AuthProviderPreset {
 const CUSTOM_PROVIDER_PRESET: AuthProviderPreset = AuthProviderPreset {
     profile: "custom",
     title: "Custom Provider",
-    detail: "Manually connect any OpenAI-compatible endpoint",
+    detail: "Manually connect a local server, proxy, or unsupported provider",
     source: AuthProviderSource::Custom,
+    protocol_options: CUSTOM_PROTOCOL_OPTIONS,
     base_url: None,
     model: None,
     recommended_models: CUSTOM_MODELS,
@@ -926,6 +982,7 @@ const THIRD_PARTY_PROVIDER_PRESETS: &[AuthProviderPreset] = &[
         title: "OpenAI",
         detail: "https://api.openai.com/v1",
         source: AuthProviderSource::ThirdParty,
+        protocol_options: OPENAI_PROTOCOL_ONLY,
         base_url: Some("https://api.openai.com/v1"),
         model: Some("gpt-4.1"),
         recommended_models: OPENAI_MODELS,
@@ -935,6 +992,7 @@ const THIRD_PARTY_PROVIDER_PRESETS: &[AuthProviderPreset] = &[
         title: "OpenRouter",
         detail: "https://openrouter.ai/api/v1",
         source: AuthProviderSource::ThirdParty,
+        protocol_options: OPENAI_PROTOCOL_ONLY,
         base_url: Some("https://openrouter.ai/api/v1"),
         model: Some("openai/gpt-4.1"),
         recommended_models: OPENROUTER_MODELS,
@@ -944,6 +1002,7 @@ const THIRD_PARTY_PROVIDER_PRESETS: &[AuthProviderPreset] = &[
         title: "DeepSeek",
         detail: "https://api.deepseek.com/v1",
         source: AuthProviderSource::ThirdParty,
+        protocol_options: OPENAI_PROTOCOL_ONLY,
         base_url: Some("https://api.deepseek.com/v1"),
         model: Some("deepseek-chat"),
         recommended_models: DEEPSEEK_MODELS,
@@ -953,6 +1012,7 @@ const THIRD_PARTY_PROVIDER_PRESETS: &[AuthProviderPreset] = &[
         title: "Qwen / DashScope compatible",
         detail: "https://dashscope.aliyuncs.com/compatible-mode/v1",
         source: AuthProviderSource::ThirdParty,
+        protocol_options: OPENAI_PROTOCOL_ONLY,
         base_url: Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
         model: Some("qwen-coder-plus"),
         recommended_models: QWEN_MODELS,
@@ -962,6 +1022,7 @@ const THIRD_PARTY_PROVIDER_PRESETS: &[AuthProviderPreset] = &[
         title: "Local OpenAI-compatible",
         detail: "Ollama, LM Studio, vLLM or a local proxy",
         source: AuthProviderSource::ThirdParty,
+        protocol_options: OPENAI_PROTOCOL_ONLY,
         base_url: Some("http://localhost:11434/v1"),
         model: Some("qwen2.5-coder"),
         recommended_models: LOCAL_MODELS,
@@ -1193,6 +1254,7 @@ async fn handle_auth_dialog_key(
                     dialog.step,
                     AuthDialogStep::GroupChoice
                         | AuthDialogStep::ThirdPartyChoice
+                        | AuthDialogStep::Protocol
                         | AuthDialogStep::Model
                 )
             {
@@ -1205,6 +1267,7 @@ async fn handle_auth_dialog_key(
                     dialog.step,
                     AuthDialogStep::GroupChoice
                         | AuthDialogStep::ThirdPartyChoice
+                        | AuthDialogStep::Protocol
                         | AuthDialogStep::Model
                 )
             {
@@ -1229,7 +1292,7 @@ async fn handle_auth_dialog_key(
                     dialog.step,
                     AuthDialogStep::GroupChoice
                         | AuthDialogStep::ThirdPartyChoice
-                        | AuthDialogStep::Model
+                        | AuthDialogStep::Protocol
                 )
                 && let Some(index) = character
                     .to_digit(10)
@@ -1240,8 +1303,12 @@ async fn handle_auth_dialog_key(
                     AuthDialogStep::ThirdPartyChoice => {
                         THIRD_PARTY_PROVIDER_PRESETS.len().saturating_sub(1)
                     }
-                    AuthDialogStep::Model => dialog.custom_model_index(),
-                    AuthDialogStep::BaseUrl | AuthDialogStep::ApiKey | AuthDialogStep::Review => 0,
+                    AuthDialogStep::Protocol => dialog.protocol_options().len().saturating_sub(1),
+                    AuthDialogStep::BaseUrl
+                    | AuthDialogStep::ApiKey
+                    | AuthDialogStep::Model
+                    | AuthDialogStep::AdvancedConfig
+                    | AuthDialogStep::Review => 0,
                 };
                 if (index as usize) <= last_index {
                     dialog.selected = index as usize;
@@ -1298,6 +1365,17 @@ fn advance_auth_dialog(app: &mut TuiApp, transport: &InProcessTransport) -> miet
                 dialog.select_provider(provider);
                 AuthAdvanceAction::None
             }
+            AuthDialogStep::Protocol => {
+                dialog.protocol = dialog.selected_protocol();
+                if dialog.base_url.is_empty() {
+                    dialog.base_url =
+                        AuthDialogState::default_base_url_for_protocol(dialog.protocol).to_owned();
+                }
+                dialog.step = AuthDialogStep::BaseUrl;
+                dialog.selected = 0;
+                dialog.error = None;
+                AuthAdvanceAction::None
+            }
             AuthDialogStep::BaseUrl => {
                 match validate_auth_base_url(&dialog.base_url) {
                     Ok(base_url) => {
@@ -1330,19 +1408,30 @@ fn advance_auth_dialog(app: &mut TuiApp, transport: &InProcessTransport) -> miet
                 if dialog.model.is_empty() {
                     dialog.error = Some("Model cannot be empty".to_owned());
                     AuthAdvanceAction::None
+                } else if !custom_provider_protocol_is_runtime_supported(dialog.protocol) {
+                    dialog.error = Some(format!(
+                        "{} setup is recognized, but Golutra live runtime currently only supports OpenAI-compatible providers",
+                        protocol_option_text(dialog.protocol).0
+                    ));
+                    AuthAdvanceAction::None
                 } else {
-                    match build_auth_review(dialog, transport) {
-                        Ok(review) => {
-                            dialog.review = Some(review);
-                            dialog.step = AuthDialogStep::Review;
-                            dialog.error = None;
-                        }
-                        Err(error) => {
-                            dialog.error = Some(error);
-                        }
-                    }
+                    dialog.step = AuthDialogStep::AdvancedConfig;
+                    dialog.error = None;
                     AuthAdvanceAction::None
                 }
+            }
+            AuthDialogStep::AdvancedConfig => {
+                match build_auth_review(dialog, transport) {
+                    Ok(review) => {
+                        dialog.review = Some(review);
+                        dialog.step = AuthDialogStep::Review;
+                        dialog.error = None;
+                    }
+                    Err(error) => {
+                        dialog.error = Some(error);
+                    }
+                }
+                AuthAdvanceAction::None
             }
             AuthDialogStep::Review => AuthAdvanceAction::SaveOpenAiCompatible(auth_login(dialog)),
         }
@@ -1364,6 +1453,10 @@ fn advance_auth_dialog(app: &mut TuiApp, transport: &InProcessTransport) -> miet
         AuthAdvanceAction::Quit => app.should_quit = true,
     }
     Ok(())
+}
+
+fn custom_provider_protocol_is_runtime_supported(protocol: ProviderProtocol) -> bool {
+    protocol == ProviderProtocol::OpenAiCompatible
 }
 
 async fn handle_resume_picker_key(
@@ -1506,16 +1599,17 @@ fn draw_auth_dialog(frame: &mut Frame<'_>, area: Rect, dialog: &AuthDialogState)
     let lines = match dialog.step {
         AuthDialogStep::GroupChoice => auth_group_lines(dialog),
         AuthDialogStep::ThirdPartyChoice => auth_third_party_lines(dialog),
+        AuthDialogStep::Protocol => auth_protocol_lines(dialog),
         AuthDialogStep::BaseUrl => auth_input_lines(
-            auth_setup_title(dialog),
+            &auth_step_title(dialog),
             "Base URL",
-            "https://api.golutra.cn/v1 or https://api.openai.com/v1",
+            "endpoint URL for the selected protocol",
             &dialog.base_url,
             dialog.error.as_deref(),
             false,
         ),
         AuthDialogStep::ApiKey => auth_input_lines(
-            auth_setup_title(dialog),
+            &auth_step_title(dialog),
             "API key",
             "stored in user provider config",
             &dialog.api_key,
@@ -1523,6 +1617,7 @@ fn draw_auth_dialog(frame: &mut Frame<'_>, area: Rect, dialog: &AuthDialogState)
             true,
         ),
         AuthDialogStep::Model => auth_model_lines(dialog),
+        AuthDialogStep::AdvancedConfig => auth_advanced_config_lines(dialog),
         AuthDialogStep::Review => auth_review_lines(dialog),
     };
     let paragraph = Paragraph::new(lines)
@@ -1575,9 +1670,48 @@ fn auth_third_party_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
     lines
 }
 
+fn auth_protocol_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(vec![Span::styled(
+        auth_step_title(dialog),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )])];
+    lines.push(Line::from(""));
+    lines.extend(
+        dialog
+            .protocol_options()
+            .iter()
+            .enumerate()
+            .map(|(index, protocol)| {
+                let (title, detail) = protocol_option_text(*protocol);
+                auth_option_line(index, title, detail, index == dialog.selected)
+            }),
+    );
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Enter to select, ↑↓ to navigate, Esc to go back",
+        Style::default().fg(Color::DarkGray),
+    )));
+    push_auth_error(&mut lines, dialog.error.as_deref());
+    lines
+}
+
+fn protocol_option_text(protocol: ProviderProtocol) -> (&'static str, &'static str) {
+    match protocol {
+        ProviderProtocol::OpenAiCompatible => (
+            "OpenAI-compatible",
+            "Standard OpenAI API format (most common)",
+        ),
+        ProviderProtocol::Anthropic => ("Anthropic-compatible", "Anthropic Messages API format"),
+        ProviderProtocol::Gemini => ("Gemini-compatible", "Google Gemini API format"),
+        _ => ("Unsupported", "Not available for custom provider setup"),
+    }
+}
+
 fn auth_model_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(vec![Span::styled(
-        auth_setup_title(dialog),
+        auth_step_title(dialog),
         Style::default()
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
@@ -1639,6 +1773,33 @@ fn auth_model_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
     lines
 }
 
+fn auth_advanced_config_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(vec![Span::styled(
+            auth_step_title(dialog),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "No advanced generation overrides are saved in this runtime stage.",
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(Span::styled(
+            "Provider protocol, base URL, API key, and model will be validated in the review step.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Enter continue   Esc back   Ctrl+C twice quit",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    push_auth_error(&mut lines, dialog.error.as_deref());
+    lines
+}
+
 fn auth_review_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
     let Some(review) = &dialog.review else {
         return vec![Line::from(Span::styled(
@@ -1661,6 +1822,7 @@ fn auth_review_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
         Line::from(""),
         auth_kv_line("Provider", review.provider_title),
         auth_kv_line("Profile", &review.profile),
+        auth_kv_line("Protocol", &review.protocol),
         auth_kv_line("Base URL", &review.base_url),
         auth_kv_line("Model", &review.model),
         auth_kv_line("API key", &review.api_key),
@@ -1741,15 +1903,36 @@ fn push_auth_error(lines: &mut Vec<Line<'static>>, error: Option<&str>) {
     }
 }
 
-fn auth_setup_title(dialog: &AuthDialogState) -> &'static str {
-    dialog
+fn auth_step_title(dialog: &AuthDialogState) -> String {
+    let provider_title = dialog
         .provider
         .map(|provider| provider.title)
-        .unwrap_or("Connect provider")
+        .unwrap_or("Connect provider");
+    if matches!(
+        dialog.provider.map(|provider| provider.source),
+        Some(AuthProviderSource::Custom)
+    ) {
+        let step = match dialog.step {
+            AuthDialogStep::Protocol => "Step 1/6 · Protocol",
+            AuthDialogStep::BaseUrl => "Step 2/6 · Base URL",
+            AuthDialogStep::ApiKey => "Step 3/6 · API Key",
+            AuthDialogStep::Model => "Step 4/6 · Model IDs",
+            AuthDialogStep::AdvancedConfig => "Step 5/6 · Advanced Config",
+            AuthDialogStep::Review => "Step 6/6 · Review",
+            AuthDialogStep::GroupChoice | AuthDialogStep::ThirdPartyChoice => "",
+        };
+        if step.is_empty() {
+            provider_title.to_owned()
+        } else {
+            format!("{provider_title} · {step}")
+        }
+    } else {
+        provider_title.to_owned()
+    }
 }
 
 fn auth_input_lines(
-    title: &'static str,
+    title: &str,
     label: &'static str,
     hint: &'static str,
     value: &str,
@@ -1768,7 +1951,7 @@ fn auth_input_lines(
     };
     let mut lines = vec![
         Line::from(vec![Span::styled(
-            title,
+            title.to_owned(),
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
@@ -1994,6 +2177,7 @@ fn auth_composer_line(dialog: &AuthDialogState) -> String {
     match dialog.step {
         AuthDialogStep::GroupChoice => "Select provider group".to_owned(),
         AuthDialogStep::ThirdPartyChoice => "Select provider".to_owned(),
+        AuthDialogStep::Protocol => "Select protocol".to_owned(),
         AuthDialogStep::BaseUrl if dialog.base_url.is_empty() => "Base URL".to_owned(),
         AuthDialogStep::BaseUrl => dialog.base_url.clone(),
         AuthDialogStep::ApiKey if dialog.api_key.is_empty() => "API key".to_owned(),
@@ -2005,6 +2189,7 @@ fn auth_composer_line(dialog: &AuthDialogState) -> String {
             .selected_recommended_model()
             .unwrap_or("Custom model")
             .to_owned(),
+        AuthDialogStep::AdvancedConfig => "Advanced config".to_owned(),
         AuthDialogStep::Review => "Review install plan".to_owned(),
     }
 }
@@ -2300,10 +2485,13 @@ fn has_active_task(app: &TuiApp) -> bool {
 fn composer_style(app: &TuiApp) -> Style {
     if let Some(dialog) = &app.auth_dialog {
         let empty = match dialog.step {
-            AuthDialogStep::GroupChoice | AuthDialogStep::ThirdPartyChoice => true,
+            AuthDialogStep::GroupChoice
+            | AuthDialogStep::ThirdPartyChoice
+            | AuthDialogStep::Protocol => true,
             AuthDialogStep::BaseUrl => dialog.base_url.is_empty(),
             AuthDialogStep::ApiKey => dialog.api_key.is_empty(),
             AuthDialogStep::Model => dialog.is_custom_model_selected() && dialog.model.is_empty(),
+            AuthDialogStep::AdvancedConfig => false,
             AuthDialogStep::Review => false,
         };
         return if empty {
@@ -2428,6 +2616,7 @@ fn auth_login(dialog: &AuthDialogState) -> OpenAiCompatibleLogin {
     let provider = dialog.provider.unwrap_or(CUSTOM_PROVIDER_PRESET);
     OpenAiCompatibleLogin {
         profile: provider.profile.to_owned(),
+        protocol: dialog.protocol,
         base_url: dialog.base_url.trim().to_owned(),
         model: dialog.model.trim().to_owned(),
         api_key_env: "GOLUTRA_PROVIDER_API_KEY".to_owned(),
@@ -2454,8 +2643,9 @@ fn build_auth_review(
         .iter()
         .any(|profile| profile.name == login.profile);
 
-    let mut preview_profile = ProviderProfile::openai_compatible(
+    let mut preview_profile = ProviderProfile::live_profile(
         login.profile.clone(),
+        login.protocol,
         login.base_url.clone(),
         login.model.clone(),
         login.api_key_env,
@@ -2473,6 +2663,7 @@ fn build_auth_review(
     Ok(AuthReview {
         provider_title: provider.title,
         profile: login.profile,
+        protocol: login.protocol.id().to_owned(),
         base_url: login.base_url,
         model: login.model,
         api_key: mask_api_key(login.api_key.as_deref().unwrap_or_default()),
@@ -2532,8 +2723,9 @@ fn apply_auth_login(
 ) -> miette::Result<()> {
     let paths = provider_paths_for_tui(transport)?;
     let scope = provider_scope(login.scope);
-    let mut profile = ProviderProfile::openai_compatible(
+    let mut profile = ProviderProfile::live_profile(
         login.profile,
+        login.protocol,
         login.base_url,
         login.model,
         login.api_key_env,
@@ -2716,6 +2908,11 @@ mod tests {
             dialog.selected = dialog.custom_model_index();
         }
         advance_auth_dialog(&mut app, &transport).expect("model");
+        assert_eq!(
+            app.auth_dialog.as_ref().map(|dialog| dialog.step),
+            Some(AuthDialogStep::AdvancedConfig)
+        );
+        advance_auth_dialog(&mut app, &transport).expect("advanced config");
         assert_eq!(
             app.auth_dialog.as_ref().map(|dialog| dialog.step),
             Some(AuthDialogStep::Review)
@@ -2925,6 +3122,60 @@ mod tests {
     }
 
     #[test]
+    fn auth_dialog_custom_provider_exposes_protocol_step() {
+        let mut dialog = AuthDialogState::new();
+        dialog.select_provider(CUSTOM_PROVIDER_PRESET);
+        assert_eq!(dialog.step, AuthDialogStep::Protocol);
+
+        let lines = auth_protocol_lines(&dialog)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(lines.contains("Custom Provider · Step 1/6 · Protocol"));
+        assert!(lines.contains("OpenAI-compatible"));
+        assert!(lines.contains("Anthropic-compatible"));
+        assert!(lines.contains("Gemini-compatible"));
+    }
+
+    #[tokio::test]
+    async fn auth_dialog_blocks_custom_protocols_without_live_adapter() {
+        let dir = tempfile::tempdir().expect("dir");
+        let transport = InProcessTransport::for_workspace(dir.path())
+            .await
+            .expect("transport");
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            SessionId::new(),
+            None,
+            false,
+            provider_status_message(&transport),
+            Some(AuthDialogState::new()),
+        );
+        {
+            let dialog = app.auth_dialog.as_mut().expect("dialog");
+            dialog.select_provider(CUSTOM_PROVIDER_PRESET);
+            dialog.protocol = ProviderProtocol::Anthropic;
+            dialog.step = AuthDialogStep::Model;
+            dialog.model = "claude-sonnet-4".to_owned();
+            dialog.base_url = "https://api.anthropic.com/v1".to_owned();
+            dialog.api_key = "test-key".to_owned();
+        }
+
+        advance_auth_dialog(&mut app, &transport).expect("advance");
+
+        let dialog = app.auth_dialog.as_ref().expect("dialog");
+        assert_eq!(dialog.step, AuthDialogStep::Model);
+        assert!(
+            dialog
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("only supports OpenAI-compatible"))
+        );
+    }
+
+    #[test]
     fn auth_dialog_exposes_recommended_models_and_custom_input() {
         let mut dialog = AuthDialogState::new();
         dialog.select_provider(OFFICIAL_PROVIDER_PRESET);
@@ -2937,6 +3188,43 @@ mod tests {
 
         assert!(lines.contains("gpt-test"));
         assert!(lines.contains("Custom model"));
+    }
+
+    #[tokio::test]
+    async fn auth_model_input_accepts_numeric_custom_model_ids() {
+        let dir = tempfile::tempdir().expect("dir");
+        let transport = InProcessTransport::for_workspace(dir.path())
+            .await
+            .expect("transport");
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            SessionId::new(),
+            None,
+            false,
+            provider_status_message(&transport),
+            Some(AuthDialogState::new()),
+        );
+        {
+            let dialog = app.auth_dialog.as_mut().expect("dialog");
+            dialog.select_provider(OFFICIAL_PROVIDER_PRESET);
+            dialog.step = AuthDialogStep::Model;
+            dialog.api_key = "test-key".to_owned();
+        }
+
+        for character in "gpt-5.5".chars() {
+            handle_auth_dialog_key(
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                &mut app,
+                &transport,
+            )
+            .await
+            .expect("type model character");
+        }
+
+        let dialog = app.auth_dialog.as_ref().expect("dialog");
+        assert_eq!(dialog.step, AuthDialogStep::Model);
+        assert!(dialog.is_custom_model_selected());
+        assert_eq!(dialog.model, "gpt-5.5");
     }
 
     #[test]
