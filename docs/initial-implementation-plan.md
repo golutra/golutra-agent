@@ -15,7 +15,7 @@
 
 ## 当前状态
 
-截至 2026-07-05：
+截至 2026-07-06：
 
 - 仓库已初始化 Rust workspace，并具备 core、protocol、store、runtime、tools、policy、llm、context、verify、client、CLI、TUI、app-server、test-client、eval、config、governor、memory 和 file-search crate。
 - 当前代码已经具备 workspace 级共享 runtime 主干：CLI、TUI 和 app-server 主路径默认连接 `.golutra/runtime.sqlite`，并通过 `.golutra/default-session` 复用同一 workspace 默认 session。
@@ -25,7 +25,7 @@
 - `golutra-llm` 已提供可用的 OpenAI-compatible live provider adapter；默认仍走 deterministic mock provider，只有显式设置 `GOLUTRA_PROVIDER_PROTOCOL=openai-compatible` 或兼容的 `GOLUTRA_PROVIDER_MODE=live` 且配置 key/model 时才联网。live 配置缺失会显式失败，支持 `GOLUTRA_PROVIDER_*` 与 `OPENAI_*` env，并提供 CLI `provider protocols/current/probe` 脱敏检查入口。
 - LLM 协议 catalog 已注册 `mock`、`openai-compatible`、`anthropic`、`gemini`、`vertex-ai`、`genai`；除 `mock` 与 `openai-compatible` 外，其它协议当前处于 catalog/diagnostic ready 状态，选择后会返回 `adapter_not_implemented` 而不是静默 fallback。
 - provider onboarding、凭据持久化和 thread resume/fork 已完成最小闭环：`golutra-config` 支持 `$GOLUTRA_HOME/provider.json` 与 `<workspace>/.golutra/provider.json`，CLI 支持 `provider login/set-key/use/current/probe`，TUI 首屏展示 provider 状态，store/client/CLI 支持 `ThreadId`、`threads` 表、`.golutra/default-thread`、`thread list/resume/fork`。
-- P1/P2 先落稳定 schema、guardrail、SDK 和最小页面，复杂自动化和外部凭据相关能力仍通过 TODO 决策位收敛。
+- P1 provider onboarding 已补齐 TUI `/auth` qwen-code 风格主流程：provider 分组、第三方 preset、baseUrl/API key/model、保存前 review 和同名 profile 覆盖提示。复杂自动化、Web connect modal、probe rollback、OAuth/secretRef 和高级模型配置仍通过 TODO 决策位收敛。
 - 第一阶段范围已在 `implementation-blueprint.md` 中明确，不能继续扩张到复杂 multi-agent 或不可审计的自动自我改进。
 
 ## 实施原则
@@ -78,7 +78,7 @@ CLI 创建 coding task
 | P0.8 | app-server、RuntimeClient、多入口一致性 | 中 | 多端看到同一 task 状态和 event stream；支持 cursor replay + live stream |
 | P0.9 | checkpoint、debug、replay、改进候选 | 中 | 文件副作用有恢复点，失败任务可复盘 |
 
-P1 继续做：provider onboarding 交互式 TUI/AuthDialog、真实 provider 覆盖增强、thread rollout JSONL、resume picker、TypeScript SDK、基础 Web attach、评估回归套件。
+P1 继续做：真实 provider 覆盖增强、Web provider onboarding、provider probe rollback、thread rollout JSONL、跨 workspace index、评估回归套件。
 P2 才做：长期 memory 晋升、PromotionDecision、Open-Endedness、复杂 benchmark hardening。
 
 ## 推荐 Workspace 结构
@@ -592,7 +592,7 @@ P1 在 P0 稳定后推进，不反向污染 P0：
 - [ ] 真实 provider golden tests。TODO(provider-golden)：需要确定真实 provider、模型、密钥环境变量和可提交的脱敏 golden fixture。
 - [x] Provider onboarding 基础层：实现 `ProviderInstallPlan`、`provider login/set-key/use`、TUI provider 状态提示和 `/auth` slash command。
 - [x] Thread/session 基础层：引入用户可见 `ThreadId`、`threads` 表、`default-thread`、`thread list/resume/fork` 和 TUI `/resume`、`/threads`、`/fork` slash command。
-- [x] TUI 首次 connect provider flow：补最小 qwen-code 风格 provider setup，支持 OpenAI-compatible base URL/model/API key 和 Continue with mock。
+- [x] TUI 首次 connect provider flow：补 qwen-code 风格 provider setup，支持 Golutra API / Third-party Providers / Custom Provider / mock 分组，第三方 provider preset，OpenAI-compatible base URL/API key/model，以及保存前 review、脱敏 install plan 和同名 profile 覆盖提示。
 - [ ] Web 首次 connect provider flow 与 provider probe rollback。TODO(provider-web-onboarding)：Web 需要复用 RuntimeHost/config service 的 provider command，配置失败时回滚 active selection。
 - [ ] TUI resume picker：当前 workspace / all workspaces、resume / fork、预览 transcript。
 - [ ] 多工作区索引：增加 `$GOLUTRA_HOME/index.sqlite`，跨 workspace 列出最近 thread，同时保持 workspace SQLite 为事实来源。

@@ -1,5 +1,6 @@
 use std::{
     io::{self, Stdout},
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -528,25 +529,62 @@ struct ResumeThreadItem {
 struct AuthDialogState {
     step: AuthDialogStep,
     selected: usize,
+    provider: Option<AuthProviderPreset>,
     base_url: String,
     model: String,
     api_key: String,
+    review: Option<AuthReview>,
     error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthDialogStep {
-    ProviderChoice,
+    GroupChoice,
+    ThirdPartyChoice,
     BaseUrl,
-    Model,
     ApiKey,
+    Model,
+    Review,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuthDialogAction {
-    OpenAiCompatible,
+enum AuthGroupAction {
+    Official,
+    ThirdParty,
+    Custom,
     Mock,
     Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthProviderSource {
+    Official,
+    ThirdParty,
+    Custom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AuthProviderPreset {
+    profile: &'static str,
+    title: &'static str,
+    detail: &'static str,
+    source: AuthProviderSource,
+    base_url: Option<&'static str>,
+    model: Option<&'static str>,
+    recommended_models: &'static [&'static str],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthReview {
+    provider_title: &'static str,
+    profile: String,
+    base_url: String,
+    model: String,
+    api_key: String,
+    scope: ProviderConfigScope,
+    config_path: PathBuf,
+    updates_existing_profile: bool,
+    preview_json: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -560,27 +598,74 @@ enum AuthAdvanceAction {
 impl AuthDialogState {
     fn new() -> Self {
         Self {
-            step: AuthDialogStep::ProviderChoice,
+            step: AuthDialogStep::GroupChoice,
             selected: 0,
+            provider: None,
             base_url: String::new(),
             model: String::new(),
             api_key: String::new(),
+            review: None,
             error: None,
         }
     }
 
-    fn selected_action(&self) -> AuthDialogAction {
+    fn selected_group_action(&self) -> AuthGroupAction {
         match self.selected {
-            1 => AuthDialogAction::Mock,
-            2 => AuthDialogAction::Quit,
-            _ => AuthDialogAction::OpenAiCompatible,
+            1 => AuthGroupAction::ThirdParty,
+            2 => AuthGroupAction::Custom,
+            3 => AuthGroupAction::Mock,
+            4 => AuthGroupAction::Quit,
+            _ => AuthGroupAction::Official,
         }
     }
 
+    fn selected_third_party_provider(&self) -> AuthProviderPreset {
+        THIRD_PARTY_PROVIDER_PRESETS[self
+            .selected
+            .min(THIRD_PARTY_PROVIDER_PRESETS.len().saturating_sub(1))]
+    }
+
+    fn select_provider(&mut self, provider: AuthProviderPreset) {
+        self.provider = Some(provider);
+        self.base_url = provider.base_url.unwrap_or_default().to_owned();
+        self.model = provider.model.unwrap_or_default().to_owned();
+        self.api_key.clear();
+        self.review = None;
+        self.error = None;
+        self.step = AuthDialogStep::BaseUrl;
+        self.selected = 0;
+    }
+
+    fn model_options(&self) -> &'static [&'static str] {
+        self.provider
+            .map(|provider| provider.recommended_models)
+            .unwrap_or(&[])
+    }
+
+    fn custom_model_index(&self) -> usize {
+        self.model_options().len()
+    }
+
+    fn selected_recommended_model(&self) -> Option<&'static str> {
+        self.model_options().get(self.selected).copied()
+    }
+
+    fn is_custom_model_selected(&self) -> bool {
+        self.selected >= self.custom_model_index()
+    }
+
     fn move_selection(&mut self, direction: ResumeSelectionDirection) {
+        let last_index = match self.step {
+            AuthDialogStep::GroupChoice => AUTH_GROUP_ITEMS.len().saturating_sub(1),
+            AuthDialogStep::ThirdPartyChoice => {
+                THIRD_PARTY_PROVIDER_PRESETS.len().saturating_sub(1)
+            }
+            AuthDialogStep::Model => self.custom_model_index(),
+            AuthDialogStep::BaseUrl | AuthDialogStep::ApiKey | AuthDialogStep::Review => 0,
+        };
         self.selected = match direction {
             ResumeSelectionDirection::Previous => self.selected.saturating_sub(1),
-            ResumeSelectionDirection::Next => (self.selected + 1).min(2),
+            ResumeSelectionDirection::Next => (self.selected + 1).min(last_index),
         };
         self.error = None;
     }
@@ -588,22 +673,131 @@ impl AuthDialogState {
     fn current_input_mut(&mut self) -> Option<&mut String> {
         match self.step {
             AuthDialogStep::BaseUrl => Some(&mut self.base_url),
-            AuthDialogStep::Model => Some(&mut self.model),
             AuthDialogStep::ApiKey => Some(&mut self.api_key),
-            AuthDialogStep::ProviderChoice => None,
+            AuthDialogStep::Model if self.is_custom_model_selected() => Some(&mut self.model),
+            AuthDialogStep::GroupChoice
+            | AuthDialogStep::ThirdPartyChoice
+            | AuthDialogStep::Model
+            | AuthDialogStep::Review => None,
         }
+    }
+
+    fn prepare_custom_model_input(&mut self) -> &mut String {
+        self.selected = self.custom_model_index();
+        self.error = None;
+        &mut self.model
     }
 
     fn go_back(&mut self) {
         self.error = None;
+        self.review = None;
         self.step = match self.step {
-            AuthDialogStep::ProviderChoice => AuthDialogStep::ProviderChoice,
-            AuthDialogStep::BaseUrl => AuthDialogStep::ProviderChoice,
-            AuthDialogStep::Model => AuthDialogStep::BaseUrl,
-            AuthDialogStep::ApiKey => AuthDialogStep::Model,
+            AuthDialogStep::GroupChoice => AuthDialogStep::GroupChoice,
+            AuthDialogStep::ThirdPartyChoice => AuthDialogStep::GroupChoice,
+            AuthDialogStep::BaseUrl => match self.provider.map(|provider| provider.source) {
+                Some(AuthProviderSource::ThirdParty) => AuthDialogStep::ThirdPartyChoice,
+                _ => AuthDialogStep::GroupChoice,
+            },
+            AuthDialogStep::ApiKey => AuthDialogStep::BaseUrl,
+            AuthDialogStep::Model => AuthDialogStep::ApiKey,
+            AuthDialogStep::Review => AuthDialogStep::Model,
         };
     }
 }
+
+const OFFICIAL_MODELS: &[&str] = &["gpt-test", "gpt-4.1", "qwen-coder-plus"];
+const OPENAI_MODELS: &[&str] = &["gpt-4.1", "gpt-4.1-mini", "o4-mini"];
+const OPENROUTER_MODELS: &[&str] = &[
+    "openai/gpt-4.1",
+    "anthropic/claude-sonnet-4",
+    "qwen/qwen3-coder",
+];
+const DEEPSEEK_MODELS: &[&str] = &["deepseek-chat", "deepseek-reasoner"];
+const QWEN_MODELS: &[&str] = &["qwen-coder-plus", "qwen-plus", "qwen-max"];
+const LOCAL_MODELS: &[&str] = &["qwen2.5-coder", "llama3.1", "deepseek-coder"];
+const CUSTOM_MODELS: &[&str] = &[];
+
+const OFFICIAL_PROVIDER_PRESET: AuthProviderPreset = AuthProviderPreset {
+    profile: "golutra",
+    title: "Golutra API",
+    detail: "Official OpenAI-compatible endpoint",
+    source: AuthProviderSource::Official,
+    base_url: Some("https://api.golutra.cn/v1"),
+    model: Some("gpt-test"),
+    recommended_models: OFFICIAL_MODELS,
+};
+
+const CUSTOM_PROVIDER_PRESET: AuthProviderPreset = AuthProviderPreset {
+    profile: "custom",
+    title: "Custom Provider",
+    detail: "Manually connect any OpenAI-compatible endpoint",
+    source: AuthProviderSource::Custom,
+    base_url: None,
+    model: None,
+    recommended_models: CUSTOM_MODELS,
+};
+
+const THIRD_PARTY_PROVIDER_PRESETS: &[AuthProviderPreset] = &[
+    AuthProviderPreset {
+        profile: "openai",
+        title: "OpenAI",
+        detail: "https://api.openai.com/v1",
+        source: AuthProviderSource::ThirdParty,
+        base_url: Some("https://api.openai.com/v1"),
+        model: Some("gpt-4.1"),
+        recommended_models: OPENAI_MODELS,
+    },
+    AuthProviderPreset {
+        profile: "openrouter",
+        title: "OpenRouter",
+        detail: "https://openrouter.ai/api/v1",
+        source: AuthProviderSource::ThirdParty,
+        base_url: Some("https://openrouter.ai/api/v1"),
+        model: Some("openai/gpt-4.1"),
+        recommended_models: OPENROUTER_MODELS,
+    },
+    AuthProviderPreset {
+        profile: "deepseek",
+        title: "DeepSeek",
+        detail: "https://api.deepseek.com/v1",
+        source: AuthProviderSource::ThirdParty,
+        base_url: Some("https://api.deepseek.com/v1"),
+        model: Some("deepseek-chat"),
+        recommended_models: DEEPSEEK_MODELS,
+    },
+    AuthProviderPreset {
+        profile: "qwen",
+        title: "Qwen / DashScope compatible",
+        detail: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        source: AuthProviderSource::ThirdParty,
+        base_url: Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        model: Some("qwen-coder-plus"),
+        recommended_models: QWEN_MODELS,
+    },
+    AuthProviderPreset {
+        profile: "local",
+        title: "Local OpenAI-compatible",
+        detail: "Ollama, LM Studio, vLLM or a local proxy",
+        source: AuthProviderSource::ThirdParty,
+        base_url: Some("http://localhost:11434/v1"),
+        model: Some("qwen2.5-coder"),
+        recommended_models: LOCAL_MODELS,
+    },
+];
+
+const AUTH_GROUP_ITEMS: &[(&str, &str)] = &[
+    ("Golutra API", "Official recommended setup with an API key"),
+    (
+        "Third-party Providers",
+        "Choose a known OpenAI-compatible provider",
+    ),
+    (
+        "Custom Provider",
+        "Manually connect a local server, proxy, or unsupported provider",
+    ),
+    ("Continue with mock", "Use local deterministic provider"),
+    ("Quit", "Leave without changing provider settings"),
+];
 
 #[derive(Debug, Clone, Copy)]
 enum ResumeSelectionDirection {
@@ -746,14 +940,24 @@ async fn handle_auth_dialog_key(
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if let Some(dialog) = &mut app.auth_dialog
-                && dialog.step == AuthDialogStep::ProviderChoice
+                && matches!(
+                    dialog.step,
+                    AuthDialogStep::GroupChoice
+                        | AuthDialogStep::ThirdPartyChoice
+                        | AuthDialogStep::Model
+                )
             {
                 dialog.move_selection(ResumeSelectionDirection::Previous);
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
             if let Some(dialog) = &mut app.auth_dialog
-                && dialog.step == AuthDialogStep::ProviderChoice
+                && matches!(
+                    dialog.step,
+                    AuthDialogStep::GroupChoice
+                        | AuthDialogStep::ThirdPartyChoice
+                        | AuthDialogStep::Model
+                )
             {
                 dialog.move_selection(ResumeSelectionDirection::Next);
             }
@@ -772,29 +976,43 @@ async fn handle_auth_dialog_key(
         }
         KeyCode::Char(character) if character.is_ascii_digit() => {
             if let Some(dialog) = &mut app.auth_dialog
-                && dialog.step == AuthDialogStep::ProviderChoice
+                && matches!(
+                    dialog.step,
+                    AuthDialogStep::GroupChoice
+                        | AuthDialogStep::ThirdPartyChoice
+                        | AuthDialogStep::Model
+                )
                 && let Some(index) = character
                     .to_digit(10)
                     .and_then(|digit| digit.checked_sub(1))
-                && index < 3
             {
-                dialog.selected = index as usize;
-                advance_auth_dialog(app, transport)?;
-            } else if let Some(input) = app
-                .auth_dialog
-                .as_mut()
-                .and_then(AuthDialogState::current_input_mut)
-            {
-                input.push(character);
+                let last_index = match dialog.step {
+                    AuthDialogStep::GroupChoice => AUTH_GROUP_ITEMS.len().saturating_sub(1),
+                    AuthDialogStep::ThirdPartyChoice => {
+                        THIRD_PARTY_PROVIDER_PRESETS.len().saturating_sub(1)
+                    }
+                    AuthDialogStep::Model => dialog.custom_model_index(),
+                    AuthDialogStep::BaseUrl | AuthDialogStep::ApiKey | AuthDialogStep::Review => 0,
+                };
+                if (index as usize) <= last_index {
+                    dialog.selected = index as usize;
+                    advance_auth_dialog(app, transport)?;
+                }
+            } else if let Some(dialog) = &mut app.auth_dialog {
+                if dialog.step == AuthDialogStep::Model {
+                    dialog.prepare_custom_model_input().push(character);
+                } else if let Some(input) = dialog.current_input_mut() {
+                    input.push(character);
+                }
             }
         }
         KeyCode::Char(character) => {
-            if let Some(input) = app
-                .auth_dialog
-                .as_mut()
-                .and_then(AuthDialogState::current_input_mut)
-            {
-                input.push(character);
+            if let Some(dialog) = &mut app.auth_dialog {
+                if dialog.step == AuthDialogStep::Model {
+                    dialog.prepare_custom_model_input().push(character);
+                } else if let Some(input) = dialog.current_input_mut() {
+                    input.push(character);
+                }
             }
         }
         _ => {}
@@ -808,48 +1026,76 @@ fn advance_auth_dialog(app: &mut TuiApp, transport: &InProcessTransport) -> miet
             return Ok(());
         };
         match dialog.step {
-            AuthDialogStep::ProviderChoice => match dialog.selected_action() {
-                AuthDialogAction::OpenAiCompatible => {
-                    dialog.step = AuthDialogStep::BaseUrl;
+            AuthDialogStep::GroupChoice => match dialog.selected_group_action() {
+                AuthGroupAction::Official => {
+                    dialog.select_provider(OFFICIAL_PROVIDER_PRESET);
+                    AuthAdvanceAction::None
+                }
+                AuthGroupAction::ThirdParty => {
+                    dialog.step = AuthDialogStep::ThirdPartyChoice;
+                    dialog.selected = 0;
                     dialog.error = None;
                     AuthAdvanceAction::None
                 }
-                AuthDialogAction::Mock => AuthAdvanceAction::SaveMock,
-                AuthDialogAction::Quit => AuthAdvanceAction::Quit,
-            },
-            AuthDialogStep::BaseUrl => {
-                if dialog.base_url.trim().is_empty() {
-                    dialog.error = Some("Base URL cannot be empty".to_owned());
-                } else {
-                    dialog.step = AuthDialogStep::Model;
-                    dialog.error = None;
+                AuthGroupAction::Custom => {
+                    dialog.select_provider(CUSTOM_PROVIDER_PRESET);
+                    AuthAdvanceAction::None
                 }
+                AuthGroupAction::Mock => AuthAdvanceAction::SaveMock,
+                AuthGroupAction::Quit => AuthAdvanceAction::Quit,
+            },
+            AuthDialogStep::ThirdPartyChoice => {
+                let provider = dialog.selected_third_party_provider();
+                dialog.select_provider(provider);
                 AuthAdvanceAction::None
             }
-            AuthDialogStep::Model => {
-                if dialog.model.trim().is_empty() {
-                    dialog.error = Some("Model cannot be empty".to_owned());
-                } else {
-                    dialog.step = AuthDialogStep::ApiKey;
-                    dialog.error = None;
+            AuthDialogStep::BaseUrl => {
+                match validate_auth_base_url(&dialog.base_url) {
+                    Ok(base_url) => {
+                        dialog.base_url = base_url;
+                        dialog.step = AuthDialogStep::ApiKey;
+                        dialog.error = None;
+                    }
+                    Err(error) => {
+                        dialog.error = Some(error);
+                    }
                 }
                 AuthAdvanceAction::None
             }
             AuthDialogStep::ApiKey => {
                 if dialog.api_key.trim().is_empty() {
                     dialog.error = Some("API key cannot be empty".to_owned());
+                } else {
+                    dialog.api_key = dialog.api_key.trim().to_owned();
+                    dialog.step = AuthDialogStep::Model;
+                    dialog.selected = 0;
+                    dialog.error = None;
+                }
+                AuthAdvanceAction::None
+            }
+            AuthDialogStep::Model => {
+                if let Some(model) = dialog.selected_recommended_model() {
+                    dialog.model = model.to_owned();
+                }
+                dialog.model = normalize_model_id(&dialog.model);
+                if dialog.model.is_empty() {
+                    dialog.error = Some("Model cannot be empty".to_owned());
                     AuthAdvanceAction::None
                 } else {
-                    AuthAdvanceAction::SaveOpenAiCompatible(OpenAiCompatibleLogin {
-                        profile: "default".to_owned(),
-                        base_url: dialog.base_url.trim().to_owned(),
-                        model: dialog.model.trim().to_owned(),
-                        api_key_env: "GOLUTRA_PROVIDER_API_KEY".to_owned(),
-                        api_key: Some(dialog.api_key.trim().to_owned()),
-                        scope: AuthConfigScope::User,
-                    })
+                    match build_auth_review(dialog, transport) {
+                        Ok(review) => {
+                            dialog.review = Some(review);
+                            dialog.step = AuthDialogStep::Review;
+                            dialog.error = None;
+                        }
+                        Err(error) => {
+                            dialog.error = Some(error);
+                        }
+                    }
+                    AuthAdvanceAction::None
                 }
             }
+            AuthDialogStep::Review => AuthAdvanceAction::SaveOpenAiCompatible(auth_login(dialog)),
         }
     };
     match action {
@@ -1008,31 +1254,26 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
 fn draw_auth_dialog(frame: &mut Frame<'_>, area: Rect, dialog: &AuthDialogState) {
     let lines = match dialog.step {
-        AuthDialogStep::ProviderChoice => auth_choice_lines(dialog),
+        AuthDialogStep::GroupChoice => auth_group_lines(dialog),
+        AuthDialogStep::ThirdPartyChoice => auth_third_party_lines(dialog),
         AuthDialogStep::BaseUrl => auth_input_lines(
-            "Connect provider",
+            auth_setup_title(dialog),
             "Base URL",
-            "api.golutra.cn or https://api.openai.com/v1",
+            "https://api.golutra.cn/v1 or https://api.openai.com/v1",
             &dialog.base_url,
             dialog.error.as_deref(),
             false,
         ),
-        AuthDialogStep::Model => auth_input_lines(
-            "Connect provider",
-            "Model",
-            "model id, for example gpt-4.1 or qwen-coder",
-            &dialog.model,
-            dialog.error.as_deref(),
-            false,
-        ),
         AuthDialogStep::ApiKey => auth_input_lines(
-            "Connect provider",
+            auth_setup_title(dialog),
             "API key",
             "stored in user provider config",
             &dialog.api_key,
             dialog.error.as_deref(),
             true,
         ),
+        AuthDialogStep::Model => auth_model_lines(dialog),
+        AuthDialogStep::Review => auth_review_lines(dialog),
     };
     let paragraph = Paragraph::new(lines)
         .block(
@@ -1044,64 +1285,217 @@ fn draw_auth_dialog(frame: &mut Frame<'_>, area: Rect, dialog: &AuthDialogState)
     frame.render_widget(paragraph, area);
 }
 
-fn auth_choice_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
-    let options = [
-        (
-            "OpenAI-compatible",
-            "Use an OpenAI-compatible endpoint and API key",
-        ),
-        ("Continue with mock", "Use local deterministic provider"),
-        ("Quit", "Leave without changing provider settings"),
-    ];
+fn auth_group_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(vec![Span::styled(
-        "Connect a provider to start this workspace",
+        "Connect a Provider",
         Style::default()
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
     )])];
     lines.push(Line::from(""));
     lines.extend(
-        options
-            .into_iter()
+        AUTH_GROUP_ITEMS
+            .iter()
             .enumerate()
             .map(|(index, (title, detail))| {
-                let selected = index == dialog.selected;
-                Line::from(vec![
-                    Span::styled(
-                        if selected { "> " } else { "  " },
-                        Style::default().fg(if selected {
-                            Color::Cyan
-                        } else {
-                            Color::DarkGray
-                        }),
-                    ),
-                    Span::styled(
-                        format!("{} ", index + 1),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::styled(
-                        title,
-                        Style::default()
-                            .fg(if selected { Color::White } else { Color::Gray })
-                            .add_modifier(if selected {
-                                Modifier::BOLD
-                            } else {
-                                Modifier::empty()
-                            }),
-                    ),
-                    Span::raw("  "),
-                    Span::styled(detail, Style::default().fg(Color::DarkGray)),
-                ])
+                auth_option_line(index, title, detail, index == dialog.selected)
             }),
     );
-    if let Some(error) = &dialog.error {
+    push_auth_error(&mut lines, dialog.error.as_deref());
+    lines
+}
+
+fn auth_third_party_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(vec![Span::styled(
+        "Third-party Providers",
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )])];
+    lines.push(Line::from(""));
+    lines.extend(
+        THIRD_PARTY_PROVIDER_PRESETS
+            .iter()
+            .enumerate()
+            .map(|(index, preset)| {
+                auth_option_line(index, preset.title, preset.detail, index == dialog.selected)
+            }),
+    );
+    push_auth_error(&mut lines, dialog.error.as_deref());
+    lines
+}
+
+fn auth_model_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(vec![Span::styled(
+        auth_setup_title(dialog),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )])];
+    lines.push(Line::from(""));
+    if dialog.model_options().is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("Model: ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                if dialog.model.is_empty() {
+                    "model id, for example gpt-4.1 or qwen-coder".to_owned()
+                } else {
+                    dialog.model.clone()
+                },
+                Style::default().fg(if dialog.model.is_empty() {
+                    Color::DarkGray
+                } else {
+                    Color::White
+                }),
+            ),
+        ]));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Recommended models",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.extend(
+            dialog
+                .model_options()
+                .iter()
+                .enumerate()
+                .map(|(index, model)| {
+                    auth_option_line(
+                        index,
+                        model,
+                        "built-in recommendation",
+                        index == dialog.selected,
+                    )
+                }),
+        );
+        let custom_value = if dialog.model.is_empty() {
+            "type a custom model id"
+        } else {
+            dialog.model.as_str()
+        };
+        lines.push(auth_option_line(
+            dialog.custom_model_index(),
+            "Custom model",
+            custom_value,
+            dialog.is_custom_model_selected(),
+        ));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Enter continue   Type to use custom model   Esc back",
+        Style::default().fg(Color::DarkGray),
+    )));
+    push_auth_error(&mut lines, dialog.error.as_deref());
+    lines
+}
+
+fn auth_review_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
+    let Some(review) = &dialog.review else {
+        return vec![Line::from(Span::styled(
+            "Review is not ready",
+            Style::default().fg(Color::Red),
+        ))];
+    };
+    let update_line = if review.updates_existing_profile {
+        "will update existing profile"
+    } else {
+        "will create new profile"
+    };
+    let mut lines = vec![
+        Line::from(vec![Span::styled(
+            "Review provider setup",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(""),
+        auth_kv_line("Provider", review.provider_title),
+        auth_kv_line("Profile", &review.profile),
+        auth_kv_line("Base URL", &review.base_url),
+        auth_kv_line("Model", &review.model),
+        auth_kv_line("API key", &review.api_key),
+        auth_kv_line("Scope", provider_scope_label(review.scope)),
+        auth_kv_line("Config", &review.config_path.display().to_string()),
+        auth_kv_line("Plan", update_line),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Install plan preview",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    lines.extend(review.preview_json.lines().take(8).map(|line| {
+        Line::from(Span::styled(
+            line.to_owned(),
+            Style::default().fg(Color::Gray),
+        ))
+    }));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Enter save   Esc back   Ctrl+C quit",
+        Style::default().fg(Color::DarkGray),
+    )));
+    push_auth_error(&mut lines, dialog.error.as_deref());
+    lines
+}
+
+fn auth_kv_line(label: &'static str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label}: "), Style::default().fg(Color::Cyan)),
+        Span::styled(value.to_owned(), Style::default().fg(Color::White)),
+    ])
+}
+
+fn provider_scope_label(scope: ProviderConfigScope) -> &'static str {
+    match scope {
+        ProviderConfigScope::User => "user",
+        ProviderConfigScope::Workspace => "workspace",
+    }
+}
+
+fn auth_option_line(index: usize, title: &str, detail: &str, selected: bool) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            if selected { "> " } else { "  " },
+            Style::default().fg(if selected {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            }),
+        ),
+        Span::styled(
+            format!("{} ", index + 1),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            title.to_owned(),
+            Style::default()
+                .fg(if selected { Color::White } else { Color::Gray })
+                .add_modifier(if selected {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ),
+        Span::raw("  "),
+        Span::styled(detail.to_owned(), Style::default().fg(Color::DarkGray)),
+    ])
+}
+
+fn push_auth_error(lines: &mut Vec<Line<'static>>, error: Option<&str>) {
+    if let Some(error) = error {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            error.clone(),
+            error.to_owned(),
             Style::default().fg(Color::Red),
         )));
     }
-    lines
+}
+
+fn auth_setup_title(dialog: &AuthDialogState) -> &'static str {
+    dialog
+        .provider
+        .map(|provider| provider.title)
+        .unwrap_or("Connect provider")
 }
 
 fn auth_input_lines(
@@ -1317,13 +1711,20 @@ fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
 fn auth_composer_line(dialog: &AuthDialogState) -> String {
     match dialog.step {
-        AuthDialogStep::ProviderChoice => "Select provider".to_owned(),
+        AuthDialogStep::GroupChoice => "Select provider group".to_owned(),
+        AuthDialogStep::ThirdPartyChoice => "Select provider".to_owned(),
         AuthDialogStep::BaseUrl if dialog.base_url.is_empty() => "Base URL".to_owned(),
         AuthDialogStep::BaseUrl => dialog.base_url.clone(),
-        AuthDialogStep::Model if dialog.model.is_empty() => "Model".to_owned(),
-        AuthDialogStep::Model => dialog.model.clone(),
         AuthDialogStep::ApiKey if dialog.api_key.is_empty() => "API key".to_owned(),
         AuthDialogStep::ApiKey => "*".repeat(dialog.api_key.chars().count()),
+        AuthDialogStep::Model if dialog.is_custom_model_selected() && !dialog.model.is_empty() => {
+            dialog.model.clone()
+        }
+        AuthDialogStep::Model => dialog
+            .selected_recommended_model()
+            .unwrap_or("Custom model")
+            .to_owned(),
+        AuthDialogStep::Review => "Review install plan".to_owned(),
     }
 }
 
@@ -1576,10 +1977,11 @@ fn has_active_task(app: &TuiApp) -> bool {
 fn composer_style(app: &TuiApp) -> Style {
     if let Some(dialog) = &app.auth_dialog {
         let empty = match dialog.step {
-            AuthDialogStep::ProviderChoice => true,
+            AuthDialogStep::GroupChoice | AuthDialogStep::ThirdPartyChoice => true,
             AuthDialogStep::BaseUrl => dialog.base_url.is_empty(),
-            AuthDialogStep::Model => dialog.model.is_empty(),
             AuthDialogStep::ApiKey => dialog.api_key.is_empty(),
+            AuthDialogStep::Model => dialog.is_custom_model_selected() && dialog.model.is_empty(),
+            AuthDialogStep::Review => false,
         };
         return if empty {
             Style::default().fg(Color::DarkGray)
@@ -1699,6 +2101,108 @@ fn provider_scope(scope: AuthConfigScope) -> ProviderConfigScope {
     }
 }
 
+fn auth_login(dialog: &AuthDialogState) -> OpenAiCompatibleLogin {
+    let provider = dialog.provider.unwrap_or(CUSTOM_PROVIDER_PRESET);
+    OpenAiCompatibleLogin {
+        profile: provider.profile.to_owned(),
+        base_url: dialog.base_url.trim().to_owned(),
+        model: dialog.model.trim().to_owned(),
+        api_key_env: "GOLUTRA_PROVIDER_API_KEY".to_owned(),
+        api_key: Some(dialog.api_key.trim().to_owned()),
+        scope: AuthConfigScope::User,
+    }
+}
+
+fn build_auth_review(
+    dialog: &AuthDialogState,
+    transport: &InProcessTransport,
+) -> Result<AuthReview, String> {
+    let provider = dialog.provider.unwrap_or(CUSTOM_PROVIDER_PRESET);
+    let login = auth_login(dialog);
+    let paths = provider_paths_for_tui(transport).map_err(|error| error.to_string())?;
+    let scope = provider_scope(login.scope);
+    let config_path = match scope {
+        ProviderConfigScope::User => paths.user_config.clone(),
+        ProviderConfigScope::Workspace => paths.workspace_config.clone(),
+    };
+    let settings = ProviderSettings::load(&config_path).map_err(|error| error.to_string())?;
+    let updates_existing_profile = settings
+        .profiles
+        .iter()
+        .any(|profile| profile.name == login.profile);
+
+    let mut preview_profile = ProviderProfile::openai_compatible(
+        login.profile.clone(),
+        login.base_url.clone(),
+        login.model.clone(),
+        login.api_key_env,
+    )
+    .map_err(|error| error.to_string())?;
+    preview_profile.api_key = Some(mask_api_key(login.api_key.as_deref().unwrap_or_default()));
+    let preview_plan = ProviderInstallPlan {
+        scope,
+        profile: preview_profile,
+        activate: true,
+    };
+    let preview_json =
+        serde_json::to_string_pretty(&preview_plan).map_err(|error| error.to_string())?;
+
+    Ok(AuthReview {
+        provider_title: provider.title,
+        profile: login.profile,
+        base_url: login.base_url,
+        model: login.model,
+        api_key: mask_api_key(login.api_key.as_deref().unwrap_or_default()),
+        scope,
+        config_path,
+        updates_existing_profile,
+        preview_json,
+    })
+}
+
+fn validate_auth_base_url(value: &str) -> Result<String, String> {
+    let trimmed = value.trim().trim_end_matches('/').to_owned();
+    if trimmed.is_empty() {
+        return Err("Base URL cannot be empty".to_owned());
+    }
+    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+        return Err("Base URL must start with http:// or https://".to_owned());
+    }
+    let Some((_, rest)) = trimmed.split_once("://") else {
+        return Err("Base URL must start with http:// or https://".to_owned());
+    };
+    if rest.split('/').next().unwrap_or_default().trim().is_empty() {
+        return Err("Base URL host cannot be empty".to_owned());
+    }
+    Ok(trimmed)
+}
+
+fn normalize_model_id(value: &str) -> String {
+    value
+        .split(',')
+        .map(str::trim)
+        .find(|model| !model.is_empty())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn mask_api_key(value: &str) -> String {
+    let length = value.chars().count();
+    if length <= 8 {
+        return "***".to_owned();
+    }
+    let prefix = value.chars().take(4).collect::<String>();
+    let suffix = value
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{prefix}...{suffix}")
+}
+
 fn apply_auth_login(
     transport: &InProcessTransport,
     login: OpenAiCompatibleLogin,
@@ -1781,6 +2285,8 @@ fn provider_status_message(transport: &InProcessTransport) -> String {
 mod tests {
     use super::*;
 
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[tokio::test]
     async fn initial_session_without_argument_starts_new_thread_and_session() {
         let transport = InProcessTransport::in_memory().await.expect("transport");
@@ -1827,7 +2333,7 @@ mod tests {
             Some(AuthDialogState::new()),
         );
         let dialog = app.auth_dialog.as_mut().expect("dialog");
-        dialog.selected = 1;
+        dialog.selected = 3;
 
         advance_auth_dialog(&mut app, &transport).expect("advance");
 
@@ -1840,13 +2346,14 @@ mod tests {
     async fn auth_dialog_openai_flow_persists_user_key() {
         let dir = tempfile::tempdir().expect("dir");
         let home = tempfile::tempdir().expect("home");
+        let transport = InProcessTransport::for_workspace(dir.path())
+            .await
+            .expect("transport");
+        let _guard = ENV_LOCK.lock().expect("env lock");
         let previous_home = std::env::var("GOLUTRA_HOME").ok();
         unsafe {
             std::env::set_var("GOLUTRA_HOME", home.path());
         }
-        let transport = InProcessTransport::for_workspace(dir.path())
-            .await
-            .expect("transport");
         let mut app = TuiApp::new(
             ThreadId::new(),
             SessionId::new(),
@@ -1857,11 +2364,24 @@ mod tests {
         );
         {
             let dialog = app.auth_dialog.as_mut().expect("dialog");
-            dialog.step = AuthDialogStep::ApiKey;
-            dialog.base_url = "api.golutra.cn".to_owned();
+            dialog.provider = Some(OFFICIAL_PROVIDER_PRESET);
+            dialog.step = AuthDialogStep::BaseUrl;
+            dialog.base_url = "https://api.golutra.cn/v1".to_owned();
             dialog.model = "qwen-coder".to_owned();
             dialog.api_key = "test-key".to_owned();
         }
+
+        advance_auth_dialog(&mut app, &transport).expect("base url");
+        advance_auth_dialog(&mut app, &transport).expect("api key");
+        {
+            let dialog = app.auth_dialog.as_mut().expect("dialog");
+            dialog.selected = dialog.custom_model_index();
+        }
+        advance_auth_dialog(&mut app, &transport).expect("model");
+        assert_eq!(
+            app.auth_dialog.as_ref().map(|dialog| dialog.step),
+            Some(AuthDialogStep::Review)
+        );
 
         let result = advance_auth_dialog(&mut app, &transport);
         match previous_home {
@@ -1875,11 +2395,136 @@ mod tests {
         result.expect("advance");
 
         assert!(app.auth_dialog.is_none());
-        assert_eq!(app.provider_message, "ready (default)");
+        assert_eq!(app.provider_message, "ready (golutra)");
         let settings = ProviderSettings::load(home.path().join("provider.json")).expect("settings");
         let profile = settings.active_profile().expect("profile");
+        assert_eq!(profile.name, "golutra");
         assert_eq!(profile.model_id.as_deref(), Some("qwen-coder"));
         assert_eq!(profile.api_key.as_deref(), Some("test-key"));
+    }
+
+    #[tokio::test]
+    async fn auth_dialog_base_url_requires_http_scheme() {
+        let dir = tempfile::tempdir().expect("dir");
+        let transport = InProcessTransport::for_workspace(dir.path())
+            .await
+            .expect("transport");
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            SessionId::new(),
+            None,
+            false,
+            provider_status_message(&transport),
+            Some(AuthDialogState::new()),
+        );
+        {
+            let dialog = app.auth_dialog.as_mut().expect("dialog");
+            dialog.provider = Some(OFFICIAL_PROVIDER_PRESET);
+            dialog.step = AuthDialogStep::BaseUrl;
+            dialog.base_url = "api.golutra.cn".to_owned();
+        }
+
+        advance_auth_dialog(&mut app, &transport).expect("advance");
+
+        let dialog = app.auth_dialog.as_ref().expect("dialog");
+        assert_eq!(dialog.step, AuthDialogStep::BaseUrl);
+        assert_eq!(
+            dialog.error.as_deref(),
+            Some("Base URL must start with http:// or https://")
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_review_marks_existing_profile_updates() {
+        let dir = tempfile::tempdir().expect("dir");
+        let home = tempfile::tempdir().expect("home");
+        let transport = InProcessTransport::for_workspace(dir.path())
+            .await
+            .expect("transport");
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let previous_home = std::env::var("GOLUTRA_HOME").ok();
+        unsafe {
+            std::env::set_var("GOLUTRA_HOME", home.path());
+        }
+        let paths = provider_paths_for_tui(&transport).expect("paths");
+        ProviderInstallPlan {
+            scope: ProviderConfigScope::User,
+            profile: ProviderProfile::openai_compatible(
+                "golutra",
+                "https://api.golutra.cn/v1",
+                "gpt-test",
+                "GOLUTRA_PROVIDER_API_KEY",
+            )
+            .expect("profile"),
+            activate: true,
+        }
+        .apply(&paths)
+        .expect("install");
+        let mut dialog = AuthDialogState::new();
+        dialog.provider = Some(OFFICIAL_PROVIDER_PRESET);
+        dialog.base_url = "https://api.golutra.cn/v1".to_owned();
+        dialog.model = "qwen-coder".to_owned();
+        dialog.api_key = "test-key".to_owned();
+
+        let review = build_auth_review(&dialog, &transport).expect("review");
+        match previous_home {
+            Some(value) => unsafe {
+                std::env::set_var("GOLUTRA_HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("GOLUTRA_HOME");
+            },
+        }
+
+        assert!(review.updates_existing_profile);
+        assert!(review.preview_json.contains("\"api_key\": \"***\""));
+        assert!(!review.preview_json.contains("test-key"));
+    }
+
+    #[test]
+    fn auth_dialog_exposes_qwen_style_provider_groups() {
+        let dialog = AuthDialogState::new();
+        let group_lines = auth_group_lines(&dialog)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(group_lines.contains("Connect a Provider"));
+        assert!(group_lines.contains("Golutra API"));
+        assert!(group_lines.contains("Third-party Providers"));
+        assert!(group_lines.contains("Custom Provider"));
+    }
+
+    #[test]
+    fn auth_dialog_exposes_third_party_provider_choices() {
+        let mut dialog = AuthDialogState::new();
+        dialog.step = AuthDialogStep::ThirdPartyChoice;
+        let lines = auth_third_party_lines(&dialog)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(lines.contains("OpenAI"));
+        assert!(lines.contains("OpenRouter"));
+        assert!(lines.contains("DeepSeek"));
+        assert!(lines.contains("Qwen / DashScope compatible"));
+    }
+
+    #[test]
+    fn auth_dialog_exposes_recommended_models_and_custom_input() {
+        let mut dialog = AuthDialogState::new();
+        dialog.select_provider(OFFICIAL_PROVIDER_PRESET);
+        dialog.step = AuthDialogStep::Model;
+        let lines = auth_model_lines(&dialog)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(lines.contains("gpt-test"));
+        assert!(lines.contains("Custom model"));
     }
 
     #[test]

@@ -36,7 +36,7 @@ Golutra 不直接复制 qwen-code 的配置文件形状。Golutra 的核心仍�
 - `golutra-llm` 已有 `MockProvider` 和 OpenAI-compatible live adapter。
 - 默认 provider 是 mock。
 - CLI 已支持 `golutra provider login`、`golutra provider set-key` 和 `golutra provider use`；TUI 首次进入会检查 provider onboarding 状态。
-- 如果当前用户和 workspace 都没有 active provider profile，TUI 会打开 provider setup；用户可以填写 OpenAI-compatible base URL、model、API key，或显式选择 mock provider。
+- 如果当前用户和 workspace 都没有 active provider profile，TUI 会打开 provider setup；用户可以先选 Golutra API、Third-party Providers、Custom Provider 或 mock，再按 qwen-code 风格填写 OpenAI-compatible base URL、API key、推荐或自定义 model，最后在 review 页确认脱敏 install plan 后保存。
 - 真实联网调用必须显式选择协议并配置凭据。推荐设置：
   - `GOLUTRA_PROVIDER_PROTOCOL=openai-compatible`
   - `GOLUTRA_PROVIDER_API_KEY`
@@ -50,12 +50,12 @@ Golutra 不直接复制 qwen-code 的配置文件形状。Golutra 的核心仍�
 - OpenAI-compatible adapter 已支持 `OPENAI_API_KEY`、`OPENAI_MODEL`、`OPENAI_BASE_URL` 作为兼容 fallback。
 - provider protocol catalog 已注册 `mock`、`openai-compatible`、`anthropic`、`gemini`、`vertex-ai` 和 `genai`。
 - 当前只有 `mock` 与 `openai-compatible` 可执行；`anthropic`、`gemini`、`vertex-ai`、`genai` 已具备协议选择、env 映射和脱敏诊断，live adapter 待接。
-- base URL 会做 P0 规范化：例如 `api.golutra.cn` 会解析成 `https://api.golutra.cn/v1`。
+- CLI/env base URL 会做 P0 规范化：例如 `api.golutra.cn` 会解析成 `https://api.golutra.cn/v1`。TUI provider setup 为了对齐 qwen-code 的交互校验，要求用户输入 `http://` 或 `https://` 开头的 endpoint；Golutra 官方 preset 默认填入 `https://api.golutra.cn/v1`。
 - CLI 已提供 `golutra provider protocols`、`golutra provider current` 和 `golutra provider probe`，输出只包含协议目录、脱敏配置与 probe 结果，不输出 API key。
 - provider 配置已可持久化到 `$GOLUTRA_HOME/provider.json` 或 `<workspace>/.golutra/provider.json`；workspace 配置禁止保存明文 key，用户级配置使用原子写和 owner-only 权限。
 - live 模式下配置缺失会显式失败，不再静默回退到 mock。
 - 这套 env 入口保留为 P0 兼容路径，后续 provider catalog / secretRef / OAuth 配置系统必须能包住它，而不是破坏现有 smoke 和 CLI 行为。
-- TUI 已有最小 provider onboarding gate；Web 首次 connect provider flow 仍待补齐，CLI 非交互场景保持结构化诊断。
+- TUI 已有 provider onboarding gate 和 `/auth` setup；已有 active provider 时不会首屏打断，但输入 `/auth` 可随时重新打开同一套选型并覆盖同名 profile。Web 首次 connect provider flow 仍待补齐，CLI 非交互场景保持结构化诊断。
 
 ## 目标架构
 
@@ -271,7 +271,7 @@ golutra provider add-custom --protocol openai-compatible --base-url http://local
 首次进入策略：
 
 - `golutra tui` / Web：如果没有 ready live provider，打开 provider setup，并提供 Continue with mock。
-- `golutra tui` 当前已实现最小 OpenAI-compatible API key setup；API key 默认保存到用户级 provider config，workspace config 仍禁止保存明文 key。
+- `golutra tui` 当前已实现 qwen-code 风格 provider 分组和 OpenAI-compatible API key setup；流程为 group -> provider preset -> baseUrl -> apiKey -> model -> review -> install。API key 默认保存到用户级 provider config，workspace config 仍禁止保存明文 key。
 - `golutra chat`：默认 mock；如果用户显式设置 live protocol 但缺 key/model，返回 missing env 错误。
 - `golutra provider login`：强制进入 provider setup。
 - CI / 非 TTY：永远不弹交互 UI，只输出结构化错误。
@@ -280,19 +280,27 @@ golutra provider add-custom --protocol openai-compatible --base-url http://local
 
 TUI provider connect modal 按三组展示：
 
-- 内置常用 provider
+- Golutra API / 内置常用 provider
 - OpenAI-compatible 聚合/第三方 provider
-- Custom endpoint
+- Custom endpoint / mock fallback
 
-表单字段：
+当前已实现字段：
 
-- protocol selector
-- baseUrl selector/input
-- API key / secretRef / envKey
-- model IDs
+- provider group：Golutra API、Third-party Providers、Custom Provider、mock fallback
+- provider preset：OpenAI、OpenRouter、DeepSeek、Qwen/DashScope compatible、本地 OpenAI-compatible
+- baseUrl input：必须以 `http://` 或 `https://` 开头
+- API key input：脱敏显示，保存到 user provider config
+- model：内置推荐模型选择，或输入自定义 model id
+- review：展示 profile、baseUrl、model、scope、保存路径、是否覆盖同名 profile，以及脱敏后的 `ProviderInstallPlan`
+
+尚未实现字段：
+
+- protocol selector：当前 TUI setup 只落 OpenAI-compatible 和 mock
+- secretRef / envKey 选择：当前 TUI 明文 key 只写用户级 provider config
 - advanced config：context window、tool calling、streaming、reasoning、custom headers
+- probe rollback：当前保存前不默认联网 probe
 
-TUI 不直接写 runtime 状态。它发送 provider command，由 RuntimeHost / config service 返回 `ProviderConfigured`、`ProviderProbeCompleted` 或 `ProviderAuthFailed`。
+目标架构中，TUI 不直接写 runtime 状态，而是发送 provider command，由 RuntimeHost / config service 返回 `ProviderConfigured`、`ProviderProbeCompleted` 或 `ProviderAuthFailed`。当前 TUI setup 为了先闭环本地体验，会直接应用 `ProviderInstallPlan` 写入 provider config；这条路径必须继续保持脱敏 review 和 workspace 禁止保存明文 key 的约束。
 
 ### app-server / Web / SDK
 

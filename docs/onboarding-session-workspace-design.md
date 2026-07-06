@@ -8,7 +8,7 @@
 - LLM provider 凭据、配置和运行时状态应该持久化在哪里。
 - resume、多 session、多工作区应该如何设计，避免 CLI/TUI/Web 各自维护状态。
 
-结论：Golutra 已具备 provider onboarding 与 thread resume/fork 的最小闭环。默认仍可使用 `mock` provider；真实 provider 可通过 `golutra provider login` 写入用户级或 workspace 级 `provider.json`，运行时会把该配置与进程环境变量合并后解析。TUI 首次进入会检查 active provider profile；没有显式配置时打开 provider setup，支持填写 OpenAI-compatible base URL、model、API key，或选择 mock provider。
+结论：Golutra 已具备 provider onboarding 与 thread resume/fork 的最小闭环。默认仍可使用 `mock` provider；真实 provider 可通过 `golutra provider login` 写入用户级或 workspace 级 `provider.json`，运行时会把该配置与进程环境变量合并后解析。TUI 首次进入会检查 active provider profile；没有显式配置时打开 provider setup，支持 qwen-code 风格的 provider 分组、第三方 provider 选型、OpenAI-compatible base URL/API key/model 填写、保存前 review，或选择 mock provider。已有 provider 时首屏不打断，输入 `/auth` 或 `/auth setup` 可随时重新打开并覆盖同名 profile。
 
 ## qwen-code 参考结论
 
@@ -110,14 +110,15 @@ ProviderOnboardingState
 | `golutra chat` | 默认继续 mock；如果设置了 live protocol 但缺 key，返回结构化错误 |
 | CI / 非 TTY | 不弹窗，返回 missing env 或 adapter_not_implemented |
 
-Provider setup 步骤：
+目标 Provider setup 步骤：
 
-1. 选择 provider 分组：OpenAI-compatible、Anthropic、Gemini/Vertex、Custom endpoint。
-2. 选择协议：`openai-compatible`、`anthropic`、`gemini`、`vertex-ai`、`genai`。
-3. 输入或选择 baseUrl。
+1. 选择 provider 分组：Golutra API、Third-party Providers、Custom Provider、mock fallback。
+2. 选择 provider preset 或协议：当前 TUI 已覆盖 OpenAI-compatible preset，后续扩展 `anthropic`、`gemini`、`vertex-ai`、`genai`。
+3. 输入或选择 baseUrl；TUI 交互要求 `http://` 或 `https://` 开头。
 4. 输入 API key，或选择 envKey / secretRef。
-5. 输入 model id 列表，默认选第一个。
-6. probe；成功后应用配置，失败则保留表单但不污染 active selection。
+5. 选择推荐 model，或输入自定义 model id。
+6. review：展示脱敏 install plan、保存路径、scope、是否覆盖同名 profile。
+7. probe；成功后应用配置，失败则保留表单但不污染 active selection。
 
 应用配置必须走 `ProviderInstallPlan` 等价结构：
 
@@ -274,7 +275,7 @@ TUI 输入框现在先经过 slash command parser：
 
 ## 当前差距
 
-- 当前 TUI 已有最小多步骤 provider setup：provider 选择、base URL、model、API key；还没有 qwen-code 的完整 provider catalog 分组、advanced config、review 和 probe rollback。
+- 当前 TUI 已有 qwen-code 风格 provider setup：Golutra API、Third-party Providers、Custom Provider、mock 分组选择；第三方内置 OpenAI、OpenRouter、DeepSeek、Qwen/DashScope compatible 和本地 OpenAI-compatible preset；OpenAI-compatible setup 已按 baseUrl -> API key -> model -> review -> install 顺序执行，review 会展示脱敏 `ProviderInstallPlan`、保存路径和同名 profile 覆盖提示；还没有 advanced config、secretRef/envKey 选择和 probe rollback。
 - 当前 provider 配置已支持 `$GOLUTRA_HOME/provider.json` 和 `<workspace>/.golutra/provider.json`，workspace 配置禁止保存明文 key；但 OS keychain、OAuth 和 secret-ref 还未实现。
 - 当前 `threads` 表、`.golutra/default-thread`、`golutra thread list`、`golutra resume [THREAD_ID]` 和 `golutra fork THREAD_ID` 已可用；fork 当前复制元数据并创建新 session，还未复制/截断 rollout JSONL 历史。
 - 当前多工作区仍以 workspace SQLite 为事实来源；`$GOLUTRA_HOME/index.sqlite` 的跨 workspace 全局索引还未实现。
