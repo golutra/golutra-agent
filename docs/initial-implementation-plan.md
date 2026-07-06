@@ -592,7 +592,8 @@ P1 在 P0 稳定后推进，不反向污染 P0：
 - [ ] 真实 provider golden tests。TODO(provider-golden)：需要确定真实 provider、模型、密钥环境变量和可提交的脱敏 golden fixture。
 - [x] Provider onboarding 基础层：实现 `ProviderInstallPlan`、`provider login/set-key/use`、TUI provider 状态提示和 `/auth` slash command。
 - [x] Thread/session 基础层：引入用户可见 `ThreadId`、`threads` 表、`default-thread`、`thread list/resume/fork` 和 TUI `/resume`、`/threads`、`/fork` slash command。
-- [ ] TUI/Web 首次 connect provider flow：补 qwen-code 风格多步骤 AuthDialog，并确保配置/probe 失败 rollback。
+- [x] TUI 首次 connect provider flow：补最小 qwen-code 风格 provider setup，支持 OpenAI-compatible base URL/model/API key 和 Continue with mock。
+- [ ] Web 首次 connect provider flow 与 provider probe rollback。TODO(provider-web-onboarding)：Web 需要复用 RuntimeHost/config service 的 provider command，配置失败时回滚 active selection。
 - [ ] TUI resume picker：当前 workspace / all workspaces、resume / fork、预览 transcript。
 - [ ] 多工作区索引：增加 `$GOLUTRA_HOME/index.sqlite`，跨 workspace 列出最近 thread，同时保持 workspace SQLite 为事实来源。
 - [x] 更完整的 config loader 和 model catalog。

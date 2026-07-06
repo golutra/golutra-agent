@@ -1023,6 +1023,7 @@ dependencies = [
  "miette",
  "ratatui",
  "serde_json",
+ "tempfile",
  "tokio",
  "uuid",
 ]

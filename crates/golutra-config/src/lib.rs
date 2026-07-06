@@ -328,23 +328,16 @@ pub fn provider_onboarding_state(
         "none"
     }
     .to_owned();
-    let active_profile = merged
-        .active_profile()
-        .map(ProviderProfile::redacted)
-        .or_else(|| Some(ProviderProfile::mock()));
+    let active_profile = merged.active_profile().map(ProviderProfile::redacted);
     let missing_fields = active_profile
         .as_ref()
         .map(missing_fields)
-        .unwrap_or_default();
+        .unwrap_or_else(|| vec!["active_profile".to_owned()]);
     Ok(ProviderOnboardingState {
         configured: missing_fields.is_empty(),
         active_profile,
         missing_fields,
-        source: if source == "none" {
-            "default".to_owned()
-        } else {
-            source
-        },
+        source,
     })
 }
 
@@ -543,9 +536,51 @@ fn missing_fields(profile: &ProviderProfile) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use tempfile::tempdir;
+    use std::{
+        ffi::OsString,
+        sync::{Mutex, MutexGuard},
+    };
+
+    use tempfile::{TempDir, tempdir};
 
     use super::*;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct IsolatedGolutraHome {
+        previous: Option<OsString>,
+        _dir: TempDir,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl IsolatedGolutraHome {
+        fn new() -> Self {
+            let guard = ENV_LOCK.lock().expect("env lock");
+            let dir = tempdir().expect("home");
+            let previous = std::env::var_os(GOLUTRA_HOME);
+            unsafe {
+                std::env::set_var(GOLUTRA_HOME, dir.path());
+            }
+            Self {
+                previous,
+                _dir: dir,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for IsolatedGolutraHome {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => unsafe {
+                    std::env::set_var(GOLUTRA_HOME, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(GOLUTRA_HOME);
+                },
+            }
+        }
+    }
 
     #[test]
     fn runtime_config_roundtrips() {
@@ -593,6 +628,7 @@ mod tests {
 
     #[test]
     fn workspace_config_rejects_stored_api_key() {
+        let _home = IsolatedGolutraHome::new();
         let dir = tempdir().expect("dir");
         let paths = ProviderConfigPaths::for_workspace(dir.path()).expect("paths");
         let mut profile = ProviderProfile::openai_compatible(
@@ -616,16 +652,70 @@ mod tests {
     }
 
     #[test]
-    fn onboarding_defaults_to_ready_mock_provider() {
+    fn onboarding_requires_explicit_provider_profile() {
+        let _home = IsolatedGolutraHome::new();
         let dir = tempdir().expect("dir");
         let state = provider_onboarding_state(dir.path()).expect("onboarding");
 
+        assert!(!state.configured);
+        assert_eq!(state.source, "none");
+        assert_eq!(state.missing_fields, vec!["active_profile"]);
+        assert!(state.active_profile.is_none());
+    }
+
+    #[test]
+    fn onboarding_accepts_explicit_mock_provider() {
+        let _home = IsolatedGolutraHome::new();
+        let dir = tempdir().expect("dir");
+        let paths = ProviderConfigPaths::for_workspace(dir.path()).expect("paths");
+        ProviderInstallPlan {
+            scope: ProviderConfigScope::Workspace,
+            profile: ProviderProfile::mock(),
+            activate: true,
+        }
+        .apply(&paths)
+        .expect("install mock");
+
+        let state = provider_onboarding_state(dir.path()).expect("onboarding");
+
         assert!(state.configured);
-        assert_eq!(state.source, "default");
+        assert_eq!(state.source, "workspace");
         assert!(state.missing_fields.is_empty());
         assert_eq!(
             state.active_profile.expect("profile").protocol,
             ProviderProtocol::Mock
+        );
+    }
+
+    #[test]
+    fn onboarding_accepts_user_openai_key() {
+        let _home = IsolatedGolutraHome::new();
+        let dir = tempdir().expect("dir");
+        let paths = ProviderConfigPaths::for_workspace(dir.path()).expect("paths");
+        let mut profile = ProviderProfile::openai_compatible(
+            "golutra",
+            "api.golutra.cn",
+            "gpt-test",
+            "GOLUTRA_PROVIDER_API_KEY",
+        )
+        .expect("profile");
+        profile.api_key = Some("secret".to_owned());
+        ProviderInstallPlan {
+            scope: ProviderConfigScope::User,
+            profile,
+            activate: true,
+        }
+        .apply(&paths)
+        .expect("install provider");
+
+        let state = provider_onboarding_state(dir.path()).expect("onboarding");
+
+        assert!(state.configured);
+        assert_eq!(state.source, "user");
+        assert!(state.missing_fields.is_empty());
+        assert_eq!(
+            state.active_profile.expect("profile").api_key,
+            Some(USER_KEY_SENTINEL.to_owned())
         );
     }
 

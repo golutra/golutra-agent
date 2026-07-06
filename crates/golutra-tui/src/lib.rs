@@ -59,6 +59,7 @@ pub enum SlashCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashAuthCommand {
+    Setup,
     Status,
     Protocols,
     Mock,
@@ -81,6 +82,7 @@ pub struct OpenAiCompatibleLogin {
     pub base_url: String,
     pub model: String,
     pub api_key_env: String,
+    pub api_key: Option<String>,
     pub scope: AuthConfigScope,
 }
 
@@ -138,6 +140,10 @@ const TOP_LEVEL_SLASH_HINTS: &[SlashCommandHint] = &[
 ];
 
 const AUTH_SLASH_HINTS: &[SlashCommandHint] = &[
+    SlashCommandHint {
+        command: "/auth setup",
+        description: "connect provider",
+    },
     SlashCommandHint {
         command: "/auth status",
         description: "show provider state",
@@ -250,18 +256,15 @@ fn parse_threads_command(tokens: &[String]) -> SlashInput {
 }
 
 fn parse_auth_command(tokens: &[String]) -> SlashInput {
-    match tokens
-        .get(1)
-        .map(|value| value.as_str())
-        .unwrap_or("status")
-    {
+    match tokens.get(1).map(|value| value.as_str()).unwrap_or("setup") {
+        "setup" => SlashInput::Command(SlashCommand::Auth(SlashAuthCommand::Setup)),
         "status" => SlashInput::Command(SlashCommand::Auth(SlashAuthCommand::Status)),
         "protocols" => SlashInput::Command(SlashCommand::Auth(SlashAuthCommand::Protocols)),
         "mock" => SlashInput::Command(SlashCommand::Auth(SlashAuthCommand::Mock)),
         "use" => parse_auth_use(tokens),
         "login" => parse_auth_login(tokens),
         other => SlashInput::Error(format!(
-            "unknown /auth action `{other}`; use status, protocols, mock, use or login"
+            "unknown /auth action `{other}`; use setup, status, protocols, mock, use or login"
         )),
     }
 }
@@ -282,6 +285,7 @@ fn parse_auth_login(tokens: &[String]) -> SlashInput {
     let mut base_url = None;
     let mut model = None;
     let mut api_key_env = "GOLUTRA_PROVIDER_API_KEY".to_owned();
+    let mut api_key = None;
     let mut scope = AuthConfigScope::User;
     let mut index = 2;
     while index < tokens.len() {
@@ -314,6 +318,13 @@ fn parse_auth_login(tokens: &[String]) -> SlashInput {
                 };
                 api_key_env = value.clone();
             }
+            "--api-key" => {
+                index += 1;
+                let Some(value) = tokens.get(index) else {
+                    return SlashInput::Error("--api-key requires a value".to_owned());
+                };
+                api_key = Some(value.clone());
+            }
             "--scope" => {
                 index += 1;
                 let Some(value) = tokens.get(index) else {
@@ -342,6 +353,7 @@ fn parse_auth_login(tokens: &[String]) -> SlashInput {
             base_url,
             model,
             api_key_env,
+            api_key,
             scope,
         },
     )))
@@ -414,6 +426,7 @@ mod tests {
                     base_url: "api.golutra.cn".to_owned(),
                     model: "qwen".to_owned(),
                     api_key_env: "GOLUTRA_KEY".to_owned(),
+                    api_key: None,
                     scope: AuthConfigScope::Workspace,
                 }
             )))
@@ -451,9 +464,9 @@ mod tests {
         assert_eq!(
             slash_command_suggestions("/auth "),
             vec![
+                "/auth setup - connect provider".to_owned(),
                 "/auth status - show provider state".to_owned(),
                 "/auth protocols - list protocols".to_owned(),
-                "/auth mock - use mock provider".to_owned(),
             ]
         );
         assert_eq!(

@@ -58,6 +58,7 @@ struct TuiApp {
     events: Vec<Value>,
     command_messages: Vec<TranscriptItem>,
     resume_picker: Option<ResumePickerState>,
+    auth_dialog: Option<AuthDialogState>,
     input: String,
     status_message: String,
     provider_message: String,
@@ -88,6 +89,7 @@ impl TuiApp {
         task_id: Option<TaskId>,
         debug_mode: bool,
         provider_message: String,
+        auth_dialog: Option<AuthDialogState>,
     ) -> Self {
         Self {
             thread_id,
@@ -97,6 +99,7 @@ impl TuiApp {
             events: Vec::new(),
             command_messages: Vec::new(),
             resume_picker: None,
+            auth_dialog,
             input: String::new(),
             status_message: String::new(),
             provider_message,
@@ -140,6 +143,11 @@ impl TuiApp {
     }
 
     async fn send_prompt(&mut self, transport: &InProcessTransport) -> miette::Result<()> {
+        if self.auth_dialog.is_some() {
+            self.status_message = "finish provider setup first".to_owned();
+            self.input.clear();
+            return Ok(());
+        }
         if self.resume_picker.is_some() {
             self.status_message = "select a session with arrow keys or Esc".to_owned();
             self.input.clear();
@@ -197,6 +205,9 @@ impl TuiApp {
         command: SlashCommand,
     ) -> miette::Result<()> {
         match command {
+            SlashCommand::Auth(SlashAuthCommand::Setup) => {
+                self.open_auth_dialog();
+            }
             SlashCommand::Help => {
                 self.push_system_message("Slash commands", slash_help_lines());
             }
@@ -385,12 +396,22 @@ impl TuiApp {
         self.status_message = "resume cancelled".to_owned();
     }
 
+    fn open_auth_dialog(&mut self) {
+        self.resume_picker = None;
+        self.input.clear();
+        self.auth_dialog = Some(AuthDialogState::new());
+        self.status_message = "connect a provider".to_owned();
+    }
+
     async fn execute_auth_command(
         &mut self,
         transport: &InProcessTransport,
         command: SlashAuthCommand,
     ) -> miette::Result<()> {
         match command {
+            SlashAuthCommand::Setup => {
+                self.open_auth_dialog();
+            }
             SlashAuthCommand::Status => {
                 self.provider_message = provider_status_message(transport);
                 self.push_system_message("Auth status", vec![self.provider_message.clone()]);
@@ -410,15 +431,9 @@ impl TuiApp {
                 self.push_system_message("Auth protocols", lines);
             }
             SlashAuthCommand::Mock => {
-                let paths = provider_paths_for_tui(transport)?;
-                ProviderInstallPlan {
-                    scope: ProviderConfigScope::Workspace,
-                    profile: ProviderProfile::mock(),
-                    activate: true,
-                }
-                .apply(&paths)
-                .map_err(|error| miette::miette!("{error}"))?;
+                apply_auth_mock(transport)?;
                 self.provider_message = provider_status_message(transport);
+                self.auth_dialog = None;
                 self.push_system_message(
                     "Auth updated",
                     vec!["workspace provider switched to mock".to_owned()],
@@ -447,6 +462,7 @@ impl TuiApp {
             SlashAuthCommand::Login(login) => {
                 apply_auth_login(transport, login)?;
                 self.provider_message = provider_status_message(transport);
+                self.auth_dialog = None;
                 self.push_system_message(
                     "Auth updated",
                     vec![
@@ -508,6 +524,87 @@ struct ResumeThreadItem {
     preview: String,
 }
 
+#[derive(Debug, Clone)]
+struct AuthDialogState {
+    step: AuthDialogStep,
+    selected: usize,
+    base_url: String,
+    model: String,
+    api_key: String,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthDialogStep {
+    ProviderChoice,
+    BaseUrl,
+    Model,
+    ApiKey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthDialogAction {
+    OpenAiCompatible,
+    Mock,
+    Quit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuthAdvanceAction {
+    None,
+    SaveMock,
+    SaveOpenAiCompatible(OpenAiCompatibleLogin),
+    Quit,
+}
+
+impl AuthDialogState {
+    fn new() -> Self {
+        Self {
+            step: AuthDialogStep::ProviderChoice,
+            selected: 0,
+            base_url: String::new(),
+            model: String::new(),
+            api_key: String::new(),
+            error: None,
+        }
+    }
+
+    fn selected_action(&self) -> AuthDialogAction {
+        match self.selected {
+            1 => AuthDialogAction::Mock,
+            2 => AuthDialogAction::Quit,
+            _ => AuthDialogAction::OpenAiCompatible,
+        }
+    }
+
+    fn move_selection(&mut self, direction: ResumeSelectionDirection) {
+        self.selected = match direction {
+            ResumeSelectionDirection::Previous => self.selected.saturating_sub(1),
+            ResumeSelectionDirection::Next => (self.selected + 1).min(2),
+        };
+        self.error = None;
+    }
+
+    fn current_input_mut(&mut self) -> Option<&mut String> {
+        match self.step {
+            AuthDialogStep::BaseUrl => Some(&mut self.base_url),
+            AuthDialogStep::Model => Some(&mut self.model),
+            AuthDialogStep::ApiKey => Some(&mut self.api_key),
+            AuthDialogStep::ProviderChoice => None,
+        }
+    }
+
+    fn go_back(&mut self) {
+        self.error = None;
+        self.step = match self.step {
+            AuthDialogStep::ProviderChoice => AuthDialogStep::ProviderChoice,
+            AuthDialogStep::BaseUrl => AuthDialogStep::ProviderChoice,
+            AuthDialogStep::Model => AuthDialogStep::BaseUrl,
+            AuthDialogStep::ApiKey => AuthDialogStep::Model,
+        };
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum ResumeSelectionDirection {
     Previous,
@@ -544,10 +641,18 @@ async fn main() -> miette::Result<()> {
     .map_err(|error| miette::miette!("{error}"))?;
     let (thread_id, session_id) = initial_session(args.session_id.as_deref(), &transport)?;
     let provider_message = provider_status_message(&transport);
+    let auth_dialog = initial_auth_dialog(&transport);
     let mut terminal = setup_terminal()?;
     let result = run_app(
         &mut terminal,
-        TuiApp::new(thread_id, session_id, task_id, args.debug, provider_message),
+        TuiApp::new(
+            thread_id,
+            session_id,
+            task_id,
+            args.debug,
+            provider_message,
+            auth_dialog,
+        ),
         transport,
     )
     .await;
@@ -597,6 +702,9 @@ async fn handle_key(
     if app.resume_picker.is_some() {
         return handle_resume_picker_key(key, app, transport).await;
     }
+    if app.auth_dialog.is_some() {
+        return handle_auth_dialog_key(key, app, transport).await;
+    }
 
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
@@ -620,6 +728,145 @@ async fn handle_key(
         }
         KeyCode::Char(character) => app.input.push(character),
         _ => {}
+    }
+    Ok(())
+}
+
+async fn handle_auth_dialog_key(
+    key: KeyEvent,
+    app: &mut TuiApp,
+    transport: &InProcessTransport,
+) -> miette::Result<()> {
+    match key.code {
+        KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Esc => {
+            if let Some(dialog) = &mut app.auth_dialog {
+                dialog.go_back();
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(dialog) = &mut app.auth_dialog
+                && dialog.step == AuthDialogStep::ProviderChoice
+            {
+                dialog.move_selection(ResumeSelectionDirection::Previous);
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(dialog) = &mut app.auth_dialog
+                && dialog.step == AuthDialogStep::ProviderChoice
+            {
+                dialog.move_selection(ResumeSelectionDirection::Next);
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(input) = app
+                .auth_dialog
+                .as_mut()
+                .and_then(AuthDialogState::current_input_mut)
+            {
+                input.pop();
+            }
+        }
+        KeyCode::Enter => {
+            advance_auth_dialog(app, transport)?;
+        }
+        KeyCode::Char(character) if character.is_ascii_digit() => {
+            if let Some(dialog) = &mut app.auth_dialog
+                && dialog.step == AuthDialogStep::ProviderChoice
+                && let Some(index) = character
+                    .to_digit(10)
+                    .and_then(|digit| digit.checked_sub(1))
+                && index < 3
+            {
+                dialog.selected = index as usize;
+                advance_auth_dialog(app, transport)?;
+            } else if let Some(input) = app
+                .auth_dialog
+                .as_mut()
+                .and_then(AuthDialogState::current_input_mut)
+            {
+                input.push(character);
+            }
+        }
+        KeyCode::Char(character) => {
+            if let Some(input) = app
+                .auth_dialog
+                .as_mut()
+                .and_then(AuthDialogState::current_input_mut)
+            {
+                input.push(character);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn advance_auth_dialog(app: &mut TuiApp, transport: &InProcessTransport) -> miette::Result<()> {
+    let action = {
+        let Some(dialog) = &mut app.auth_dialog else {
+            return Ok(());
+        };
+        match dialog.step {
+            AuthDialogStep::ProviderChoice => match dialog.selected_action() {
+                AuthDialogAction::OpenAiCompatible => {
+                    dialog.step = AuthDialogStep::BaseUrl;
+                    dialog.error = None;
+                    AuthAdvanceAction::None
+                }
+                AuthDialogAction::Mock => AuthAdvanceAction::SaveMock,
+                AuthDialogAction::Quit => AuthAdvanceAction::Quit,
+            },
+            AuthDialogStep::BaseUrl => {
+                if dialog.base_url.trim().is_empty() {
+                    dialog.error = Some("Base URL cannot be empty".to_owned());
+                } else {
+                    dialog.step = AuthDialogStep::Model;
+                    dialog.error = None;
+                }
+                AuthAdvanceAction::None
+            }
+            AuthDialogStep::Model => {
+                if dialog.model.trim().is_empty() {
+                    dialog.error = Some("Model cannot be empty".to_owned());
+                } else {
+                    dialog.step = AuthDialogStep::ApiKey;
+                    dialog.error = None;
+                }
+                AuthAdvanceAction::None
+            }
+            AuthDialogStep::ApiKey => {
+                if dialog.api_key.trim().is_empty() {
+                    dialog.error = Some("API key cannot be empty".to_owned());
+                    AuthAdvanceAction::None
+                } else {
+                    AuthAdvanceAction::SaveOpenAiCompatible(OpenAiCompatibleLogin {
+                        profile: "default".to_owned(),
+                        base_url: dialog.base_url.trim().to_owned(),
+                        model: dialog.model.trim().to_owned(),
+                        api_key_env: "GOLUTRA_PROVIDER_API_KEY".to_owned(),
+                        api_key: Some(dialog.api_key.trim().to_owned()),
+                        scope: AuthConfigScope::User,
+                    })
+                }
+            }
+        }
+    };
+    match action {
+        AuthAdvanceAction::None => {}
+        AuthAdvanceAction::SaveMock => {
+            apply_auth_mock(transport)?;
+            app.provider_message = provider_status_message(transport);
+            app.auth_dialog = None;
+            app.status_message = "using mock provider".to_owned();
+        }
+        AuthAdvanceAction::SaveOpenAiCompatible(login) => {
+            apply_auth_login(transport, login)?;
+            app.provider_message = provider_status_message(transport);
+            app.auth_dialog = None;
+            app.status_message = "provider connected".to_owned();
+        }
+        AuthAdvanceAction::Quit => app.should_quit = true,
     }
     Ok(())
 }
@@ -689,7 +936,10 @@ fn draw_ui(frame: &mut Frame<'_>, app: &TuiApp) {
 }
 
 fn bottom_pane_height(app: &TuiApp) -> u16 {
-    if app.resume_picker.is_some() || provider_footer_line(app).is_some() {
+    if app.auth_dialog.is_some()
+        || app.resume_picker.is_some()
+        || provider_footer_line(app).is_some()
+    {
         4
     } else {
         3
@@ -712,6 +962,9 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 }
 
 fn header_mode(app: &TuiApp) -> String {
+    if app.auth_dialog.is_some() {
+        return "  auth".to_owned();
+    }
     if app.resume_picker.is_some() {
         return "  resume".to_owned();
     }
@@ -729,6 +982,10 @@ fn header_mode(app: &TuiApp) -> String {
 }
 
 fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    if let Some(dialog) = &app.auth_dialog {
+        draw_auth_dialog(frame, area, dialog);
+        return;
+    }
     if let Some(picker) = &app.resume_picker {
         draw_resume_picker(frame, area, picker, app.thread_id);
         return;
@@ -747,6 +1004,157 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     }
     let list = List::new(items).block(Block::default().borders(Borders::TOP));
     frame.render_widget(list, area);
+}
+
+fn draw_auth_dialog(frame: &mut Frame<'_>, area: Rect, dialog: &AuthDialogState) {
+    let lines = match dialog.step {
+        AuthDialogStep::ProviderChoice => auth_choice_lines(dialog),
+        AuthDialogStep::BaseUrl => auth_input_lines(
+            "Connect provider",
+            "Base URL",
+            "api.golutra.cn or https://api.openai.com/v1",
+            &dialog.base_url,
+            dialog.error.as_deref(),
+            false,
+        ),
+        AuthDialogStep::Model => auth_input_lines(
+            "Connect provider",
+            "Model",
+            "model id, for example gpt-4.1 or qwen-coder",
+            &dialog.model,
+            dialog.error.as_deref(),
+            false,
+        ),
+        AuthDialogStep::ApiKey => auth_input_lines(
+            "Connect provider",
+            "API key",
+            "stored in user provider config",
+            &dialog.api_key,
+            dialog.error.as_deref(),
+            true,
+        ),
+    };
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title("Provider setup")
+                .borders(Borders::TOP),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
+
+fn auth_choice_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
+    let options = [
+        (
+            "OpenAI-compatible",
+            "Use an OpenAI-compatible endpoint and API key",
+        ),
+        ("Continue with mock", "Use local deterministic provider"),
+        ("Quit", "Leave without changing provider settings"),
+    ];
+    let mut lines = vec![Line::from(vec![Span::styled(
+        "Connect a provider to start this workspace",
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )])];
+    lines.push(Line::from(""));
+    lines.extend(
+        options
+            .into_iter()
+            .enumerate()
+            .map(|(index, (title, detail))| {
+                let selected = index == dialog.selected;
+                Line::from(vec![
+                    Span::styled(
+                        if selected { "> " } else { "  " },
+                        Style::default().fg(if selected {
+                            Color::Cyan
+                        } else {
+                            Color::DarkGray
+                        }),
+                    ),
+                    Span::styled(
+                        format!("{} ", index + 1),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        title,
+                        Style::default()
+                            .fg(if selected { Color::White } else { Color::Gray })
+                            .add_modifier(if selected {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(detail, Style::default().fg(Color::DarkGray)),
+                ])
+            }),
+    );
+    if let Some(error) = &dialog.error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            error.clone(),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    lines
+}
+
+fn auth_input_lines(
+    title: &'static str,
+    label: &'static str,
+    hint: &'static str,
+    value: &str,
+    error: Option<&str>,
+    secret: bool,
+) -> Vec<Line<'static>> {
+    let visible_value = if secret && !value.is_empty() {
+        "*".repeat(value.chars().count())
+    } else {
+        value.to_owned()
+    };
+    let input = if visible_value.is_empty() {
+        hint.to_owned()
+    } else {
+        visible_value
+    };
+    let mut lines = vec![
+        Line::from(vec![Span::styled(
+            title,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(format!("{label}: "), Style::default().fg(Color::Cyan)),
+            Span::styled(
+                input,
+                Style::default().fg(if value.is_empty() {
+                    Color::DarkGray
+                } else {
+                    Color::White
+                }),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Enter continue   Esc back   Ctrl+C quit",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    if let Some(error) = error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            error.to_owned(),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    lines
 }
 
 fn draw_resume_picker(
@@ -862,7 +1270,9 @@ fn draw_debug_timeline(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 }
 
 fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let help = if app.resume_picker.is_some() {
+    let help = if app.auth_dialog.is_some() {
+        "Provider setup   Enter continue   Esc back   Ctrl+C quit"
+    } else if app.resume_picker.is_some() {
         "Enter resume   Up/Down select   Esc cancel   Ctrl+C quit"
     } else {
         "Enter send   /resume sessions   Ctrl+C quit"
@@ -873,7 +1283,9 @@ fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     } else {
         format!("Commands: {}", command_hint.join("   "))
     };
-    let input_line = if app.resume_picker.is_some() {
+    let input_line = if let Some(dialog) = &app.auth_dialog {
+        auth_composer_line(dialog)
+    } else if app.resume_picker.is_some() {
         "Select a session to resume".to_owned()
     } else if app.input.is_empty() {
         "Ask Golutra to change code or inspect the workspace".to_owned()
@@ -903,6 +1315,18 @@ fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     frame.render_widget(paragraph, area);
 }
 
+fn auth_composer_line(dialog: &AuthDialogState) -> String {
+    match dialog.step {
+        AuthDialogStep::ProviderChoice => "Select provider".to_owned(),
+        AuthDialogStep::BaseUrl if dialog.base_url.is_empty() => "Base URL".to_owned(),
+        AuthDialogStep::BaseUrl => dialog.base_url.clone(),
+        AuthDialogStep::Model if dialog.model.is_empty() => "Model".to_owned(),
+        AuthDialogStep::Model => dialog.model.clone(),
+        AuthDialogStep::ApiKey if dialog.api_key.is_empty() => "API key".to_owned(),
+        AuthDialogStep::ApiKey => "*".repeat(dialog.api_key.chars().count()),
+    }
+}
+
 fn footer_status_line(app: &TuiApp) -> Line<'static> {
     let detail = footer_status_detail(app);
     let spans = if detail.is_empty() {
@@ -921,6 +1345,9 @@ fn footer_status_line(app: &TuiApp) -> Line<'static> {
 }
 
 fn footer_status_detail(app: &TuiApp) -> String {
+    if app.auth_dialog.is_some() {
+        return "connect provider".to_owned();
+    }
     if app.status_message.trim().is_empty() {
         return match app.projection.as_ref().map(|projection| projection.status) {
             Some(golutra_core::TaskStatus::Idle) | None => "new session".to_owned(),
@@ -939,6 +1366,9 @@ fn footer_status_detail(app: &TuiApp) -> String {
 }
 
 fn provider_footer_line(app: &TuiApp) -> Option<String> {
+    if app.auth_dialog.is_some() {
+        return None;
+    }
     if app.provider_message == "ready (mock)" || app.provider_message.starts_with("ready (") {
         None
     } else {
@@ -947,6 +1377,9 @@ fn provider_footer_line(app: &TuiApp) -> Option<String> {
 }
 
 fn transcript_items(app: &TuiApp) -> Vec<TranscriptItem> {
+    if app.auth_dialog.is_some() {
+        return Vec::new();
+    }
     let mut items = Vec::new();
     items.extend(app.command_messages.clone());
     items.extend(user_prompt_items(&app.events));
@@ -1083,6 +1516,9 @@ fn role_color(role: &TranscriptRole) -> Color {
 }
 
 fn status_chip(app: &TuiApp) -> &'static str {
+    if app.auth_dialog.is_some() {
+        return "auth";
+    }
     match app.projection.as_ref().map(|projection| projection.status) {
         Some(golutra_core::TaskStatus::Running) => "running",
         Some(golutra_core::TaskStatus::WaitingApproval) => "waiting approval",
@@ -1098,6 +1534,9 @@ fn status_chip(app: &TuiApp) -> &'static str {
 }
 
 fn status_color(app: &TuiApp) -> Color {
+    if app.auth_dialog.is_some() {
+        return Color::Cyan;
+    }
     match app.projection.as_ref().map(|projection| projection.status) {
         Some(golutra_core::TaskStatus::Running) => Color::Cyan,
         Some(golutra_core::TaskStatus::Completed) => Color::Green,
@@ -1135,6 +1574,19 @@ fn has_active_task(app: &TuiApp) -> bool {
 }
 
 fn composer_style(app: &TuiApp) -> Style {
+    if let Some(dialog) = &app.auth_dialog {
+        let empty = match dialog.step {
+            AuthDialogStep::ProviderChoice => true,
+            AuthDialogStep::BaseUrl => dialog.base_url.is_empty(),
+            AuthDialogStep::Model => dialog.model.is_empty(),
+            AuthDialogStep::ApiKey => dialog.api_key.is_empty(),
+        };
+        return if empty {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        };
+    }
     if app.input.is_empty() {
         Style::default().fg(Color::DarkGray)
     } else {
@@ -1209,6 +1661,14 @@ fn initial_session(
     Ok((ThreadId::new(), SessionId::new()))
 }
 
+fn initial_auth_dialog(transport: &InProcessTransport) -> Option<AuthDialogState> {
+    let workspace_root = transport.workspace_root()?;
+    match provider_onboarding_state(workspace_root) {
+        Ok(state) if state.configured => None,
+        Ok(_) | Err(_) => Some(AuthDialogState::new()),
+    }
+}
+
 fn parse_task_id(value: Option<&str>) -> miette::Result<Option<TaskId>> {
     value
         .map(|value| {
@@ -1245,16 +1705,28 @@ fn apply_auth_login(
 ) -> miette::Result<()> {
     let paths = provider_paths_for_tui(transport)?;
     let scope = provider_scope(login.scope);
-    let profile = ProviderProfile::openai_compatible(
+    let mut profile = ProviderProfile::openai_compatible(
         login.profile,
         login.base_url,
         login.model,
         login.api_key_env,
     )
     .map_err(|error| miette::miette!("{error}"))?;
+    profile.api_key = login.api_key;
     ProviderInstallPlan {
         scope,
         profile,
+        activate: true,
+    }
+    .apply(&paths)
+    .map_err(|error| miette::miette!("{error}"))
+}
+
+fn apply_auth_mock(transport: &InProcessTransport) -> miette::Result<()> {
+    let paths = provider_paths_for_tui(transport)?;
+    ProviderInstallPlan {
+        scope: ProviderConfigScope::Workspace,
+        profile: ProviderProfile::mock(),
         activate: true,
     }
     .apply(&paths)
@@ -1268,9 +1740,10 @@ fn slash_help_lines() -> Vec<String> {
         "/threads [limit]  list recent workspace threads".to_owned(),
         "/fork <thread-id>  fork a thread and switch to it".to_owned(),
         "/auth status  show provider onboarding state".to_owned(),
+        "/auth setup  open provider setup".to_owned(),
         "/auth protocols  list registered provider protocols".to_owned(),
         "/auth mock  switch this workspace to mock provider".to_owned(),
-        "/auth login --base-url <url> --model <model> [--api-key-env <env>] [--scope user|workspace]".to_owned(),
+        "/auth login --base-url <url> --model <model> [--api-key <key>|--api-key-env <env>] [--scope user|workspace]".to_owned(),
         "/auth use <profile> [user|workspace]  activate saved provider profile".to_owned(),
         "/status  show current session/task status".to_owned(),
         "/debug  toggle debug timeline".to_owned(),
@@ -1298,9 +1771,7 @@ fn provider_status_message(transport: &InProcessTransport) -> String {
             } else {
                 state.missing_fields.join(", ")
             };
-            format!(
-                "missing {missing}; run `golutra provider login --base-url <url> --model <model>`"
-            )
+            format!("missing {missing}; use /auth setup")
         }
         Err(error) => format!("provider config error: {error}"),
     }
@@ -1331,6 +1802,86 @@ mod tests {
         assert_eq!(session_id, explicit_session_id);
     }
 
+    #[tokio::test]
+    async fn initial_auth_dialog_opens_without_provider_config() {
+        let dir = tempfile::tempdir().expect("dir");
+        let transport = InProcessTransport::for_workspace(dir.path())
+            .await
+            .expect("transport");
+
+        assert!(initial_auth_dialog(&transport).is_some());
+    }
+
+    #[tokio::test]
+    async fn auth_dialog_mock_choice_persists_workspace_provider() {
+        let dir = tempfile::tempdir().expect("dir");
+        let transport = InProcessTransport::for_workspace(dir.path())
+            .await
+            .expect("transport");
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            SessionId::new(),
+            None,
+            false,
+            provider_status_message(&transport),
+            Some(AuthDialogState::new()),
+        );
+        let dialog = app.auth_dialog.as_mut().expect("dialog");
+        dialog.selected = 1;
+
+        advance_auth_dialog(&mut app, &transport).expect("advance");
+
+        assert!(app.auth_dialog.is_none());
+        assert_eq!(app.provider_message, "ready (mock)");
+        assert!(initial_auth_dialog(&transport).is_none());
+    }
+
+    #[tokio::test]
+    async fn auth_dialog_openai_flow_persists_user_key() {
+        let dir = tempfile::tempdir().expect("dir");
+        let home = tempfile::tempdir().expect("home");
+        let previous_home = std::env::var("GOLUTRA_HOME").ok();
+        unsafe {
+            std::env::set_var("GOLUTRA_HOME", home.path());
+        }
+        let transport = InProcessTransport::for_workspace(dir.path())
+            .await
+            .expect("transport");
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            SessionId::new(),
+            None,
+            false,
+            provider_status_message(&transport),
+            Some(AuthDialogState::new()),
+        );
+        {
+            let dialog = app.auth_dialog.as_mut().expect("dialog");
+            dialog.step = AuthDialogStep::ApiKey;
+            dialog.base_url = "api.golutra.cn".to_owned();
+            dialog.model = "qwen-coder".to_owned();
+            dialog.api_key = "test-key".to_owned();
+        }
+
+        let result = advance_auth_dialog(&mut app, &transport);
+        match previous_home {
+            Some(value) => unsafe {
+                std::env::set_var("GOLUTRA_HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("GOLUTRA_HOME");
+            },
+        }
+        result.expect("advance");
+
+        assert!(app.auth_dialog.is_none());
+        assert_eq!(app.provider_message, "ready (default)");
+        let settings = ProviderSettings::load(home.path().join("provider.json")).expect("settings");
+        let profile = settings.active_profile().expect("profile");
+        assert_eq!(profile.model_id.as_deref(), Some("qwen-coder"));
+        assert_eq!(profile.api_key.as_deref(), Some("test-key"));
+    }
+
     #[test]
     fn new_idle_session_has_empty_transcript() {
         let mut app = TuiApp::new(
@@ -1339,6 +1890,7 @@ mod tests {
             None,
             false,
             "ready (mock)".to_owned(),
+            None,
         );
         app.projection = Some(UserProjection {
             session_id: app.session_id,
@@ -1363,6 +1915,7 @@ mod tests {
             None,
             false,
             "ready (mock)".to_owned(),
+            None,
         );
         app.projection = Some(UserProjection {
             session_id: app.session_id,

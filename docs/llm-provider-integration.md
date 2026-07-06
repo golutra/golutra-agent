@@ -35,8 +35,8 @@ Golutra 不直接复制 qwen-code 的配置文件形状。Golutra 的核心仍�
 
 - `golutra-llm` 已有 `MockProvider` 和 OpenAI-compatible live adapter。
 - 默认 provider 是 mock。
-- CLI 已支持 `golutra provider login`、`golutra provider set-key` 和 `golutra provider use`；TUI 首屏会显示 provider onboarding 状态和缺失字段。
-- 首次进入当前不会弹出完整交互式登录表单；CLI/TUI 会继续使用 mock，除非显式选择 live protocol 或 provider config 指向 live provider。
+- CLI 已支持 `golutra provider login`、`golutra provider set-key` 和 `golutra provider use`；TUI 首次进入会检查 provider onboarding 状态。
+- 如果当前用户和 workspace 都没有 active provider profile，TUI 会打开 provider setup；用户可以填写 OpenAI-compatible base URL、model、API key，或显式选择 mock provider。
 - 真实联网调用必须显式选择协议并配置凭据。推荐设置：
   - `GOLUTRA_PROVIDER_PROTOCOL=openai-compatible`
   - `GOLUTRA_PROVIDER_API_KEY`
@@ -55,7 +55,7 @@ Golutra 不直接复制 qwen-code 的配置文件形状。Golutra 的核心仍�
 - provider 配置已可持久化到 `$GOLUTRA_HOME/provider.json` 或 `<workspace>/.golutra/provider.json`；workspace 配置禁止保存明文 key，用户级配置使用原子写和 owner-only 权限。
 - live 模式下配置缺失会显式失败，不再静默回退到 mock。
 - 这套 env 入口保留为 P0 兼容路径，后续 provider catalog / secretRef / OAuth 配置系统必须能包住它，而不是破坏现有 smoke 和 CLI 行为。
-- P1 需要补完整 provider onboarding gate：TUI/Web 首次进入时展示多步骤 connect provider flow，CLI 非交互场景保持结构化诊断。
+- TUI 已有最小 provider onboarding gate；Web 首次 connect provider flow 仍待补齐，CLI 非交互场景保持结构化诊断。
 
 ## 目标架构
 
@@ -271,6 +271,7 @@ golutra provider add-custom --protocol openai-compatible --base-url http://local
 首次进入策略：
 
 - `golutra tui` / Web：如果没有 ready live provider，打开 provider setup，并提供 Continue with mock。
+- `golutra tui` 当前已实现最小 OpenAI-compatible API key setup；API key 默认保存到用户级 provider config，workspace config 仍禁止保存明文 key。
 - `golutra chat`：默认 mock；如果用户显式设置 live protocol 但缺 key/model，返回 missing env 错误。
 - `golutra provider login`：强制进入 provider setup。
 - CI / 非 TTY：永远不弹交互 UI，只输出结构化错误。

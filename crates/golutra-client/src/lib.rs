@@ -1334,8 +1334,11 @@ fn with_command_payload(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, path::Path};
 
+    use golutra_config::{
+        ProviderConfigPaths, ProviderConfigScope, ProviderInstallPlan, ProviderProfile,
+    };
     use golutra_core::{Actor, ActorKind, CommandId, QueryId};
     use golutra_protocol::RuntimeQueryKind;
     use tempfile::tempdir;
@@ -1368,6 +1371,7 @@ mod tests {
     #[tokio::test]
     async fn workspace_transport_reuses_default_session_and_sqlite_events() {
         let workspace = tempdir().expect("workspace");
+        install_workspace_mock_provider(workspace.path());
         let first = InProcessTransport::for_workspace(workspace.path())
             .await
             .expect("first transport");
@@ -1437,6 +1441,7 @@ mod tests {
     #[tokio::test]
     async fn workspace_transport_falls_back_to_latest_thread_when_pointer_is_stale() {
         let workspace = tempdir().expect("workspace");
+        install_workspace_mock_provider(workspace.path());
         let first = InProcessTransport::for_workspace(workspace.path())
             .await
             .expect("first transport");
@@ -1543,6 +1548,7 @@ mod tests {
     #[tokio::test]
     async fn prompt_updates_resumed_thread_metadata_by_session() {
         let workspace = tempdir().expect("workspace");
+        install_workspace_mock_provider(workspace.path());
         let transport = InProcessTransport::for_workspace(workspace.path())
             .await
             .expect("transport");
@@ -1578,6 +1584,7 @@ mod tests {
     #[tokio::test]
     async fn prompt_with_explicit_thread_id_starts_new_thread_without_overwriting_default() {
         let workspace = tempdir().expect("workspace");
+        install_workspace_mock_provider(workspace.path());
         let transport = InProcessTransport::for_workspace(workspace.path())
             .await
             .expect("transport");
@@ -1615,6 +1622,7 @@ mod tests {
     #[tokio::test]
     async fn prompt_runs_mock_agent_loop_and_writes_file() {
         let workspace = tempdir().expect("workspace");
+        install_workspace_mock_provider(workspace.path());
         let transport = InProcessTransport::for_workspace(workspace.path())
             .await
             .expect("transport");
@@ -1667,6 +1675,7 @@ mod tests {
     #[tokio::test]
     async fn prompt_write_file_natural_language_uses_requested_path_and_content() {
         let workspace = tempdir().expect("workspace");
+        install_workspace_mock_provider(workspace.path());
         let transport = InProcessTransport::for_workspace(workspace.path())
             .await
             .expect("transport");
@@ -1766,6 +1775,17 @@ mod tests {
 
     fn command(session_id: SessionId, prompt: &str) -> SessionCommand {
         command_with_payload(session_id, json!({"prompt": prompt}))
+    }
+
+    fn install_workspace_mock_provider(workspace_root: &Path) {
+        let paths = ProviderConfigPaths::for_workspace(workspace_root).expect("provider paths");
+        ProviderInstallPlan {
+            scope: ProviderConfigScope::Workspace,
+            profile: ProviderProfile::mock(),
+            activate: true,
+        }
+        .apply(&paths)
+        .expect("workspace mock provider");
     }
 
     fn command_with_payload(session_id: SessionId, payload: Value) -> SessionCommand {
