@@ -463,11 +463,20 @@ impl RuntimeHost {
     }
 
     pub async fn list_threads(&self, limit: u32) -> Result<Vec<ThreadRecord>, ClientError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let workspace_root = self.workspace_root_string();
-        self.store
-            .list_threads(workspace_root.as_deref(), limit)
-            .await
-            .map_err(ClientError::Store)
+        let fetch_limit = limit.saturating_add(20);
+        let threads = self
+            .store
+            .list_threads(workspace_root.as_deref(), fetch_limit)
+            .await?
+            .into_iter()
+            .filter(|thread| !is_placeholder_thread(thread))
+            .take(limit as usize)
+            .collect();
+        Ok(threads)
     }
 
     pub async fn resume_thread(&self, thread_id: ThreadId) -> Result<ThreadRecord, ClientError> {
@@ -508,27 +517,36 @@ impl RuntimeHost {
         payload: &Value,
     ) -> Result<(), ClientError> {
         let now = chrono::Utc::now();
-        let existing = self
-            .store
-            .thread_by_session(session_id)
-            .await?
-            .or(self.store.thread_by_id(self.default_thread_id).await?);
+        let existing = self.store.thread_by_session(session_id).await?;
+        let payload_thread_id = thread_id_from_payload(payload);
+        let default_thread = if existing.is_none() && payload_thread_id.is_none() {
+            self.store.thread_by_id(self.default_thread_id).await?
+        } else {
+            None
+        };
         let thread = ThreadRecord {
             thread_id: existing
                 .as_ref()
                 .map(|thread| thread.thread_id)
+                .or(payload_thread_id)
+                .or(default_thread.as_ref().map(|thread| thread.thread_id))
                 .unwrap_or(self.default_thread_id),
             session_id,
-            parent_thread_id: existing.as_ref().and_then(|thread| thread.parent_thread_id),
+            parent_thread_id: existing
+                .as_ref()
+                .or(default_thread.as_ref())
+                .and_then(|thread| thread.parent_thread_id),
             workspace_root: self.workspace_root_string(),
             title: existing
                 .as_ref()
+                .or(default_thread.as_ref())
                 .map(|thread| thread.title.clone())
                 .filter(|title| !title.trim().is_empty())
                 .unwrap_or_else(|| title_from_payload(payload)),
             preview: preview_from_payload(payload),
             created_at: existing
                 .as_ref()
+                .or(default_thread.as_ref())
                 .map(|thread| thread.created_at)
                 .unwrap_or(now),
             updated_at: now,
@@ -955,6 +973,19 @@ async fn ensure_thread_record(
     Ok(thread)
 }
 
+fn thread_id_from_payload(payload: &Value) -> Option<ThreadId> {
+    payload
+        .get("_thread_id")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse().ok())
+}
+
+fn is_placeholder_thread(thread: &ThreadRecord) -> bool {
+    thread.parent_thread_id.is_none()
+        && thread.title == "New thread"
+        && thread.preview == "Ready to start a task"
+}
+
 #[must_use]
 pub fn projection_status(value: &Value) -> Option<TaskStatus> {
     value
@@ -1365,6 +1396,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_threads_hides_bootstrap_placeholder_thread() {
+        let workspace = tempdir().expect("workspace");
+        let transport = InProcessTransport::for_workspace(workspace.path())
+            .await
+            .expect("transport");
+
+        let threads = transport.list_threads(10).await.expect("threads");
+
+        assert!(threads.is_empty());
+    }
+
+    #[tokio::test]
     async fn workspace_transport_repairs_missing_default_thread_record() {
         let workspace = tempdir().expect("workspace");
         let golutra_dir = workspace.path().join(".golutra");
@@ -1527,13 +1570,46 @@ mod tests {
             .iter()
             .find(|thread| thread.thread_id == child.thread_id)
             .expect("child thread remains indexed");
-        let parent_after = threads
-            .iter()
-            .find(|thread| thread.thread_id == parent_thread_id)
-            .expect("parent thread remains indexed");
 
         assert_eq!(child_after.preview, "write child output");
-        assert_ne!(parent_after.session_id, child.session_id);
+        assert_eq!(child_after.parent_thread_id, Some(parent_thread_id));
+    }
+
+    #[tokio::test]
+    async fn prompt_with_explicit_thread_id_starts_new_thread_without_overwriting_default() {
+        let workspace = tempdir().expect("workspace");
+        let transport = InProcessTransport::for_workspace(workspace.path())
+            .await
+            .expect("transport");
+        let default_thread_id = transport.default_thread_id();
+        let default_session_id = transport.default_session_id();
+        let tui_thread_id = ThreadId::new();
+        let tui_session_id = SessionId::new();
+
+        transport
+            .send_command(command_with_payload(
+                tui_session_id,
+                json!({
+                    "prompt": "write file tui.txt with content ok",
+                    "_thread_id": tui_thread_id.to_string(),
+                }),
+            ))
+            .await
+            .expect("command");
+        wait_for_status(&transport, tui_session_id, TaskStatus::Completed).await;
+        let threads = transport.list_threads(10).await.expect("threads");
+        let tui_thread = threads
+            .iter()
+            .find(|thread| thread.thread_id == tui_thread_id)
+            .expect("tui thread indexed");
+        let default_thread = transport
+            .resume_thread(default_thread_id)
+            .await
+            .expect("default thread remains resumable");
+
+        assert_eq!(tui_thread.session_id, tui_session_id);
+        assert_eq!(tui_thread.preview, "write file tui.txt with content ok");
+        assert_eq!(default_thread.session_id, default_session_id);
     }
 
     #[tokio::test]

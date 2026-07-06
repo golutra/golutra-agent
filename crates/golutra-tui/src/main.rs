@@ -98,7 +98,7 @@ impl TuiApp {
             command_messages: Vec::new(),
             resume_picker: None,
             input: String::new(),
-            status_message: "attached to workspace runtime".to_owned(),
+            status_message: String::new(),
             provider_message,
             debug_mode,
             cursor: None,
@@ -179,14 +179,15 @@ impl TuiApp {
             .send_command(session_command(
                 self.session_id,
                 SessionCommandKind::Prompt,
-                json!({ "prompt": prompt }),
+                json!({
+                    "prompt": prompt,
+                    "_thread_id": self.thread_id.to_string(),
+                }),
             ))
             .await
             .map_err(|error| miette::miette!("{error}"))?;
         self.input.clear();
-        self.status_message = ack
-            .reason
-            .unwrap_or_else(|| "prompt accepted by runtime".to_owned());
+        self.status_message = compact_ack_reason(&ack.reason);
         self.refresh(transport).await
     }
 
@@ -541,18 +542,12 @@ async fn main() -> miette::Result<()> {
         None => InProcessTransport::for_current_workspace().await,
     }
     .map_err(|error| miette::miette!("{error}"))?;
-    let session_id = parse_session_id(args.session_id.as_deref(), &transport)?;
+    let (thread_id, session_id) = initial_session(args.session_id.as_deref(), &transport)?;
     let provider_message = provider_status_message(&transport);
     let mut terminal = setup_terminal()?;
     let result = run_app(
         &mut terminal,
-        TuiApp::new(
-            transport.default_thread_id(),
-            session_id,
-            task_id,
-            args.debug,
-            provider_message,
-        ),
+        TuiApp::new(thread_id, session_id, task_id, args.debug, provider_message),
         transport,
     )
     .await;
@@ -663,18 +658,19 @@ async fn handle_resume_picker_key(
 }
 
 fn draw_ui(frame: &mut Frame<'_>, app: &TuiApp) {
+    let bottom_height = bottom_pane_height(app);
     let constraints = if app.debug_mode {
         vec![
             Constraint::Length(1),
             Constraint::Min(8),
             Constraint::Length(8),
-            Constraint::Length(5),
+            Constraint::Length(bottom_height),
         ]
     } else {
         vec![
             Constraint::Length(1),
             Constraint::Min(8),
-            Constraint::Length(5),
+            Constraint::Length(bottom_height),
         ]
     };
     let chunks = Layout::default()
@@ -692,19 +688,16 @@ fn draw_ui(frame: &mut Frame<'_>, app: &TuiApp) {
     }
 }
 
-fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let status = app
-        .projection
-        .as_ref()
-        .map(|projection| format!("{:?}", projection.status))
-        .unwrap_or_else(|| "loading".to_owned());
-    let mode = if app.resume_picker.is_some() {
-        "resume"
-    } else if app.debug_mode {
-        "debug"
+fn bottom_pane_height(app: &TuiApp) -> u16 {
+    if app.resume_picker.is_some() || provider_footer_line(app).is_some() {
+        4
     } else {
-        "chat"
-    };
+        3
+    }
+}
+
+fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let mode = header_mode(app);
     let lines = vec![Line::from(vec![
         Span::styled(
             "Golutra",
@@ -712,13 +705,27 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  "),
-        Span::styled(status, Style::default().fg(status_color(app))),
-        Span::raw("  "),
         Span::styled(mode, Style::default().fg(Color::DarkGray)),
     ])];
     let paragraph = Paragraph::new(lines).alignment(Alignment::Left);
     frame.render_widget(paragraph, area);
+}
+
+fn header_mode(app: &TuiApp) -> String {
+    if app.resume_picker.is_some() {
+        return "  resume".to_owned();
+    }
+    if app.debug_mode {
+        return "  debug".to_owned();
+    }
+    match app.projection.as_ref().map(|projection| projection.status) {
+        Some(golutra_core::TaskStatus::Running) => "  running".to_owned(),
+        Some(golutra_core::TaskStatus::WaitingApproval) => "  waiting".to_owned(),
+        Some(golutra_core::TaskStatus::Failed) => "  failed".to_owned(),
+        Some(golutra_core::TaskStatus::Blocked) => "  blocked".to_owned(),
+        Some(golutra_core::TaskStatus::Completed) => "  complete".to_owned(),
+        _ => String::new(),
+    }
 }
 
 fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
@@ -731,6 +738,9 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .into_iter()
         .flat_map(transcript_list_items)
         .collect::<Vec<_>>();
+    if items.is_empty() {
+        return;
+    }
     let visible_rows = area.height.saturating_sub(1) as usize;
     if visible_rows > 0 && items.len() > visible_rows {
         items.drain(0..items.len() - visible_rows);
@@ -855,7 +865,7 @@ fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let help = if app.resume_picker.is_some() {
         "Enter resume   Up/Down select   Esc cancel   Ctrl+C quit"
     } else {
-        "Enter send   /resume sessions   Ctrl+C quit   Tab debug"
+        "Enter send   /resume sessions   Ctrl+C quit"
     };
     let command_hint = slash_command_suggestions(&app.input);
     let help_line = if command_hint.is_empty() {
@@ -870,28 +880,70 @@ fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     } else {
         app.input.clone()
     };
-    let paragraph = Paragraph::new(vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled("> ", Style::default().fg(Color::Cyan)),
             Span::styled(input_line, composer_style(app)),
         ]),
-        Line::from(vec![
-            Span::styled(status_chip(app), Style::default().fg(status_color(app))),
-            Span::styled("  ", Style::default()),
-            Span::styled(&app.status_message, Style::default().fg(Color::DarkGray)),
-        ]),
-        Line::from(Span::styled(
-            &app.provider_message,
+        footer_status_line(app),
+    ];
+    if let Some(provider_line) = provider_footer_line(app) {
+        lines.push(Line::from(Span::styled(
+            provider_line,
             Style::default().fg(provider_color(app)),
-        )),
-        Line::from(Span::styled(
-            help_line,
-            Style::default().fg(Color::DarkGray),
-        )),
-    ])
-    .block(Block::default().borders(Borders::TOP))
-    .wrap(Wrap { trim: false });
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        help_line,
+        Style::default().fg(Color::DarkGray),
+    )));
+    let paragraph = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::TOP))
+        .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+fn footer_status_line(app: &TuiApp) -> Line<'static> {
+    let detail = footer_status_detail(app);
+    let spans = if detail.is_empty() {
+        vec![Span::styled(
+            status_chip(app),
+            Style::default().fg(status_color(app)),
+        )]
+    } else {
+        vec![
+            Span::styled(status_chip(app), Style::default().fg(status_color(app))),
+            Span::raw("  "),
+            Span::styled(detail, Style::default().fg(Color::DarkGray)),
+        ]
+    };
+    Line::from(spans)
+}
+
+fn footer_status_detail(app: &TuiApp) -> String {
+    if app.status_message.trim().is_empty() {
+        return match app.projection.as_ref().map(|projection| projection.status) {
+            Some(golutra_core::TaskStatus::Idle) | None => "new session".to_owned(),
+            _ => String::new(),
+        };
+    }
+    if matches!(
+        app.projection.as_ref().map(|projection| projection.status),
+        Some(golutra_core::TaskStatus::Running) | Some(golutra_core::TaskStatus::Completed)
+    ) && app.status_message == "task started"
+    {
+        String::new()
+    } else {
+        app.status_message.clone()
+    }
+}
+
+fn provider_footer_line(app: &TuiApp) -> Option<String> {
+    if app.provider_message == "ready (mock)" || app.provider_message.starts_with("ready (") {
+        None
+    } else {
+        Some(app.provider_message.clone())
+    }
 }
 
 fn transcript_items(app: &TuiApp) -> Vec<TranscriptItem> {
@@ -908,13 +960,6 @@ fn transcript_items(app: &TuiApp) -> Vec<TranscriptItem> {
         });
     }
 
-    if items.is_empty() {
-        items.push(TranscriptItem {
-            role: TranscriptRole::System,
-            title: "Ready".to_owned(),
-            body: vec!["Type a prompt below to start a task in this workspace.".to_owned()],
-        });
-    }
     items
 }
 
@@ -942,6 +987,7 @@ fn projection_items(projection: &UserProjection) -> Vec<TranscriptItem> {
     let mut items = projection
         .visible_steps
         .iter()
+        .filter(|step| significant_step(step))
         .map(step_item)
         .collect::<Vec<_>>();
 
@@ -969,6 +1015,13 @@ fn projection_items(projection: &UserProjection) -> Vec<TranscriptItem> {
         });
     }
     items
+}
+
+fn significant_step(step: &VisibleStep) -> bool {
+    matches!(
+        step.label.as_str(),
+        "ToolCompleted" | "TaskCompleted" | "CommandRejected" | "BusyPolicyDecided"
+    )
 }
 
 fn step_item(step: &VisibleStep) -> TranscriptItem {
@@ -1097,6 +1150,17 @@ fn short_id(value: &str) -> String {
     }
 }
 
+fn compact_ack_reason(reason: &Option<String>) -> String {
+    match reason.as_deref() {
+        Some(value) if value.starts_with("started task ") => "task started".to_owned(),
+        Some(value) if value.starts_with("session already has an active") => {
+            "session already has an active task".to_owned()
+        }
+        Some(value) => value.to_owned(),
+        None => "prompt accepted".to_owned(),
+    }
+}
+
 fn setup_terminal() -> miette::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode().map_err(|error| miette::miette!("{error}"))?;
     let mut stdout = io::stdout();
@@ -1132,18 +1196,17 @@ fn session_command(
     }
 }
 
-fn parse_session_id(
+fn initial_session(
     value: Option<&str>,
     transport: &InProcessTransport,
-) -> miette::Result<SessionId> {
-    value
-        .map(|value| {
-            Uuid::parse_str(value)
-                .map(SessionId)
-                .map_err(|error| miette::miette!("invalid session id: {error}"))
-        })
-        .transpose()
-        .map(|session_id| session_id.unwrap_or_else(|| transport.default_session_id()))
+) -> miette::Result<(ThreadId, SessionId)> {
+    if let Some(value) = value {
+        let session_id = Uuid::parse_str(value)
+            .map(SessionId)
+            .map_err(|error| miette::miette!("invalid session id: {error}"))?;
+        return Ok((transport.default_thread_id(), session_id));
+    }
+    Ok((ThreadId::new(), SessionId::new()))
 }
 
 fn parse_task_id(value: Option<&str>) -> miette::Result<Option<TaskId>> {
@@ -1246,6 +1309,104 @@ fn provider_status_message(transport: &InProcessTransport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn initial_session_without_argument_starts_new_thread_and_session() {
+        let transport = InProcessTransport::in_memory().await.expect("transport");
+        let (thread_id, session_id) = initial_session(None, &transport).expect("initial session");
+
+        assert_ne!(thread_id, transport.default_thread_id());
+        assert_ne!(session_id, transport.default_session_id());
+    }
+
+    #[tokio::test]
+    async fn initial_session_with_argument_keeps_explicit_session() {
+        let transport = InProcessTransport::in_memory().await.expect("transport");
+        let explicit_session_id = SessionId::new();
+        let (thread_id, session_id) =
+            initial_session(Some(&explicit_session_id.to_string()), &transport)
+                .expect("initial session");
+
+        assert_eq!(thread_id, transport.default_thread_id());
+        assert_eq!(session_id, explicit_session_id);
+    }
+
+    #[test]
+    fn new_idle_session_has_empty_transcript() {
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            SessionId::new(),
+            None,
+            false,
+            "ready (mock)".to_owned(),
+        );
+        app.projection = Some(UserProjection {
+            session_id: app.session_id,
+            task_id: None,
+            status: golutra_core::TaskStatus::Idle,
+            visible_steps: Vec::new(),
+            pending_approval: None,
+            final_message: None,
+            residual_risks: Vec::new(),
+        });
+
+        assert!(transcript_items(&app).is_empty());
+        assert_eq!(bottom_pane_height(&app), 3);
+        assert!(provider_footer_line(&app).is_none());
+    }
+
+    #[test]
+    fn normal_transcript_keeps_only_user_visible_runtime_milestones() {
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            SessionId::new(),
+            None,
+            false,
+            "ready (mock)".to_owned(),
+        );
+        app.projection = Some(UserProjection {
+            session_id: app.session_id,
+            task_id: None,
+            status: golutra_core::TaskStatus::Completed,
+            visible_steps: vec![
+                VisibleStep {
+                    label: "ProviderStarted".to_owned(),
+                    status: "Running".to_owned(),
+                    summary: "provider request started".to_owned(),
+                },
+                VisibleStep {
+                    label: "ToolCompleted".to_owned(),
+                    status: "Running".to_owned(),
+                    summary: "file written".to_owned(),
+                },
+                VisibleStep {
+                    label: "TaskCompleted".to_owned(),
+                    status: "Completed".to_owned(),
+                    summary: "runtime task finished".to_owned(),
+                },
+            ],
+            pending_approval: None,
+            final_message: None,
+            residual_risks: Vec::new(),
+        });
+
+        let items = transcript_items(&app);
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].title, "Tool Completed");
+        assert_eq!(items[1].title, "Task Completed");
+    }
+
+    #[test]
+    fn compact_ack_reason_hides_runtime_ids() {
+        assert_eq!(
+            compact_ack_reason(&Some(
+                "started task 00000000 in session 11111111".to_owned()
+            )),
+            "task started"
+        );
+        assert_eq!(compact_ack_reason(&None), "prompt accepted");
+    }
 
     #[test]
     fn resume_picker_offset_keeps_selected_item_visible() {
