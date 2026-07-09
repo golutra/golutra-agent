@@ -2933,16 +2933,12 @@ async fn apply_auth_login(
     .map_err(|error| miette::miette!("{error}"))?;
     profile.api_key = login.api_key;
     profile.generation_config = login.generation_config;
-    let mut persisted_profile = profile;
-    if scope == ProviderConfigScope::Workspace {
-        persisted_profile.api_key = None;
-    }
     apply_provider_install_plan_verified(
         &paths,
         workspace_root,
         &ProviderInstallPlan {
             scope,
-            profile: persisted_profile,
+            profile,
             activate: true,
         },
     )

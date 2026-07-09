@@ -367,16 +367,12 @@ async fn main() -> miette::Result<()> {
                     profile: provider_profile.redacted(),
                     activate,
                 };
-                let mut persisted_profile = provider_profile;
-                if scope == ProviderConfigScope::Workspace {
-                    persisted_profile.api_key = None;
-                }
-                let persisted_plan = ProviderInstallPlan {
+                let install_plan = ProviderInstallPlan {
                     scope,
-                    profile: persisted_profile,
+                    profile: provider_profile,
                     activate,
                 };
-                apply_provider_install_plan_verified(&paths, workspace_root, &persisted_plan)
+                apply_provider_install_plan_verified(&paths, workspace_root, &install_plan)
                     .await
                     .map_err(|error| miette::miette!("{error}"))?;
                 println!(

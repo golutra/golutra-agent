@@ -811,6 +811,39 @@ mod tests {
     }
 
     #[test]
+    fn completed_lane_allows_next_task_in_same_session() {
+        let mut manager = RuntimeLaneManager::new();
+        let session_id = SessionId::new();
+        let actor = actor("cli");
+
+        manager
+            .start_task(
+                WorkspaceId::new(),
+                session_id,
+                TaskId::new(),
+                TurnId::new(),
+                actor.clone(),
+                1,
+            )
+            .expect("first task starts");
+        manager
+            .finish_task(session_id, TaskStatus::Completed, 2)
+            .expect("first task finishes");
+        let next = manager
+            .start_task(
+                WorkspaceId::new(),
+                session_id,
+                TaskId::new(),
+                TurnId::new(),
+                actor,
+                3,
+            )
+            .expect("next task starts");
+
+        assert_eq!(next.lane.status, TaskStatus::Running);
+    }
+
+    #[test]
     fn rejects_non_active_controller_input() {
         let mut manager = RuntimeLaneManager::new();
         let session_id = SessionId::new();

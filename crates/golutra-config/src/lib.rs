@@ -516,11 +516,6 @@ pub async fn apply_provider_install_plan_verified(
                 persist_profile_in_settings(user, plan.profile.clone(), plan.activate)?;
             }
             ProviderConfigScope::Workspace => {
-                if plan.profile.api_key.is_some() {
-                    return Err(ConfigError::Validation(
-                        "workspace provider config must not store api_key".to_owned(),
-                    ));
-                }
                 persist_profile_in_settings(workspace, plan.profile.clone(), plan.activate)?;
             }
         }
@@ -1444,6 +1439,46 @@ mod tests {
         let active = settings.active_profile().expect("active");
         assert_eq!(active.name, "custom");
         assert_eq!(active.model_id.as_deref(), Some("gpt-5.5"));
+    }
+
+    #[tokio::test]
+    async fn verified_workspace_provider_install_persists_env_map_without_inline_key() {
+        let _home = IsolatedGolutraHome::new();
+        let dir = tempdir().expect("dir");
+        let paths = ProviderConfigPaths::for_workspace(dir.path()).expect("paths");
+        let base_url = spawn_probe_server(r#"{"data":[{"id":"gpt-5.5"}]}"#).await;
+        let mut profile = ProviderProfile::openai_compatible(
+            "custom",
+            base_url,
+            "gpt-5.5",
+            "GOLUTRA_CUSTOM_PROVIDER_API_KEY_TEST",
+        )
+        .expect("profile");
+        profile.api_key = Some("good-key".to_owned());
+
+        apply_provider_install_plan_verified(
+            &paths,
+            dir.path(),
+            &ProviderInstallPlan {
+                scope: ProviderConfigScope::Workspace,
+                profile,
+                activate: true,
+            },
+        )
+        .await
+        .expect("probe should pass");
+
+        let settings = ProviderSettings::load(&paths.workspace_config).expect("settings");
+        let active = settings.active_profile().expect("active");
+        assert_eq!(active.name, "custom");
+        assert_eq!(active.api_key, None);
+        assert_eq!(
+            settings
+                .env
+                .get("GOLUTRA_CUSTOM_PROVIDER_API_KEY_TEST")
+                .map(String::as_str),
+            Some("good-key")
+        );
     }
 
     #[test]

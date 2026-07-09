@@ -289,7 +289,10 @@ impl RuntimeHost {
         let payload = command.payload.clone();
         self.upsert_current_thread(session_id, &payload).await?;
         let lane_manager = self.lane_manager.lock().await;
-        if lane_manager.lane(session_id).is_some() {
+        if lane_manager
+            .lane(session_id)
+            .is_some_and(|lane| is_active_status(lane.status))
+        {
             let decision = lane_manager.decide_busy_policy(
                 session_id,
                 command.command_id,
@@ -1566,6 +1569,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_task_allows_next_prompt_in_same_session() {
+        let transport = InProcessTransport::in_memory().await.expect("transport");
+        let session_id = SessionId::new();
+
+        let first = transport
+            .send_command(command(session_id, "hi"))
+            .await
+            .expect("first prompt");
+        wait_for_task_completed_count(&transport, session_id, 1).await;
+        let second = transport
+            .send_command(command(session_id, "what next"))
+            .await
+            .expect("second prompt");
+        let events = wait_for_task_completed_count(&transport, session_id, 2).await;
+
+        assert!(first.accepted);
+        assert!(second.accepted);
+        assert!(
+            second
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("started task"))
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == RuntimeEventType::TaskCreated)
+                .count(),
+            2
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.event_type != RuntimeEventType::BusyPolicyDecided)
+        );
+    }
+
+    #[tokio::test]
     async fn workspace_transport_reuses_default_session_and_sqlite_events() {
         let workspace = tempdir().expect("workspace");
         install_workspace_mock_provider(workspace.path());
@@ -2168,5 +2209,36 @@ mod tests {
             sleep(Duration::from_millis(50)).await;
         }
         panic!("timed out waiting for status {expected:?}");
+    }
+
+    async fn wait_for_task_completed_count(
+        transport: &InProcessTransport,
+        session_id: SessionId,
+        expected_count: usize,
+    ) -> Vec<RuntimeEvent> {
+        for _ in 0..40 {
+            let event_values = transport
+                .replay_events(EventFilter {
+                    session_id,
+                    task_id: None,
+                    after_sequence_no: None,
+                })
+                .await
+                .expect("events");
+            let events = event_values
+                .into_iter()
+                .map(serde_json::from_value::<RuntimeEvent>)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("typed events");
+            let completed_count = events
+                .iter()
+                .filter(|event| event.event_type == RuntimeEventType::TaskCompleted)
+                .count();
+            if completed_count >= expected_count {
+                return events;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        panic!("session did not record {expected_count} completed tasks");
     }
 }
