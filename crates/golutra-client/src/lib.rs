@@ -580,12 +580,19 @@ impl RuntimeHost {
         current_task_id: TaskId,
         objective: String,
     ) -> Result<Vec<ContextContributor>, ClientError> {
+        let workspace_root = self.execution_workspace_root()?;
         let mut contributors = vec![ContextContributor {
             name: "system".to_owned(),
             role: ProviderRole::System,
             content: system_prompt(),
             token_budget_hint: 64,
         }];
+        contributors.push(ContextContributor {
+            name: "environment_context".to_owned(),
+            role: ProviderRole::User,
+            content: environment_context_prompt(&workspace_root),
+            token_budget_hint: 128,
+        });
 
         if let Some(history) = self
             .conversation_history_summary(session_id, current_task_id)
@@ -1352,6 +1359,20 @@ fn system_prompt() -> String {
     .join(" ")
 }
 
+fn environment_context_prompt(workspace_root: &Path) -> String {
+    format!(
+        "<environment_context>\n  <cwd>{}</cwd>\n</environment_context>",
+        xml_escape(&workspace_root.to_string_lossy())
+    )
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 fn prompt_from_payload(payload: &Value) -> String {
     payload
         .get("prompt")
@@ -1534,17 +1555,73 @@ fn with_command_payload(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{ffi::OsString, fs};
 
     use golutra_config::{
         ProviderConfigPaths, ProviderConfigScope, ProviderInstallPlan, ProviderProfile,
     };
     use golutra_core::{Actor, ActorKind, CommandId, QueryId};
     use golutra_protocol::RuntimeQueryKind;
-    use tempfile::tempdir;
-    use tokio::time::{Duration, sleep};
+    use tempfile::{TempDir, tempdir};
+    use tokio::{
+        sync::{Mutex, MutexGuard},
+        time::{Duration, sleep},
+    };
 
     use super::*;
+
+    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    struct IsolatedGlobalMockProvider {
+        previous_home: Option<OsString>,
+        _home: TempDir,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl IsolatedGlobalMockProvider {
+        async fn install_for_workspace(workspace_root: impl AsRef<std::path::Path>) -> Self {
+            let guard = ENV_LOCK.lock().await;
+            let home = tempdir().expect("golutra home");
+            let previous_home = std::env::var_os("GOLUTRA_HOME");
+            unsafe {
+                std::env::set_var("GOLUTRA_HOME", home.path());
+            }
+            install_user_mock_provider(workspace_root);
+            Self {
+                previous_home,
+                _home: home,
+                _guard: guard,
+            }
+        }
+
+        fn install_for_workspace_blocking(workspace_root: impl AsRef<std::path::Path>) -> Self {
+            let guard = ENV_LOCK.blocking_lock();
+            let home = tempdir().expect("golutra home");
+            let previous_home = std::env::var_os("GOLUTRA_HOME");
+            unsafe {
+                std::env::set_var("GOLUTRA_HOME", home.path());
+            }
+            install_user_mock_provider(workspace_root);
+            Self {
+                previous_home,
+                _home: home,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for IsolatedGlobalMockProvider {
+        fn drop(&mut self) {
+            match &self.previous_home {
+                Some(value) => unsafe {
+                    std::env::set_var("GOLUTRA_HOME", value);
+                },
+                None => unsafe {
+                    std::env::remove_var("GOLUTRA_HOME");
+                },
+            }
+        }
+    }
 
     #[tokio::test]
     async fn command_query_and_subscribe_share_state() {
@@ -1609,7 +1686,7 @@ mod tests {
     #[tokio::test]
     async fn workspace_transport_reuses_default_session_and_sqlite_events() {
         let workspace = tempdir().expect("workspace");
-        install_workspace_mock_provider(workspace.path());
+        let _provider = IsolatedGlobalMockProvider::install_for_workspace(workspace.path()).await;
         let first = InProcessTransport::for_workspace(workspace.path())
             .await
             .expect("first transport");
@@ -1679,7 +1756,7 @@ mod tests {
     #[tokio::test]
     async fn workspace_transport_falls_back_to_latest_thread_when_pointer_is_stale() {
         let workspace = tempdir().expect("workspace");
-        install_workspace_mock_provider(workspace.path());
+        let _provider = IsolatedGlobalMockProvider::install_for_workspace(workspace.path()).await;
         let first = InProcessTransport::for_workspace(workspace.path())
             .await
             .expect("first transport");
@@ -1786,7 +1863,7 @@ mod tests {
     #[tokio::test]
     async fn prompt_updates_resumed_thread_metadata_by_session() {
         let workspace = tempdir().expect("workspace");
-        install_workspace_mock_provider(workspace.path());
+        let _provider = IsolatedGlobalMockProvider::install_for_workspace(workspace.path()).await;
         let transport = InProcessTransport::for_workspace(workspace.path())
             .await
             .expect("transport");
@@ -1822,7 +1899,7 @@ mod tests {
     #[tokio::test]
     async fn prompt_updates_placeholder_thread_title_from_prompt() {
         let workspace = tempdir().expect("workspace");
-        install_workspace_mock_provider(workspace.path());
+        let _provider = IsolatedGlobalMockProvider::install_for_workspace(workspace.path()).await;
         let transport = InProcessTransport::for_workspace(workspace.path())
             .await
             .expect("transport");
@@ -1856,7 +1933,7 @@ mod tests {
     #[tokio::test]
     async fn resumed_session_context_includes_previous_conversation_summary() {
         let workspace = tempdir().expect("workspace");
-        install_workspace_mock_provider(workspace.path());
+        let _provider = IsolatedGlobalMockProvider::install_for_workspace(workspace.path()).await;
         let transport = InProcessTransport::for_workspace(workspace.path())
             .await
             .expect("transport");
@@ -1886,11 +1963,28 @@ mod tests {
             )
             .await
             .expect("contributors");
+        let environment = contributors
+            .iter()
+            .find(|contributor| contributor.name == "environment_context")
+            .expect("environment context contributor");
         let history = contributors
             .iter()
             .find(|contributor| contributor.name == "conversation_history")
             .expect("history contributor");
 
+        assert_eq!(environment.role, ProviderRole::User);
+        assert!(environment.content.contains("<environment_context>"));
+        assert!(environment.content.contains("<cwd>"));
+        assert!(
+            environment.content.contains(
+                &workspace
+                    .path()
+                    .canonicalize()
+                    .expect("cwd")
+                    .display()
+                    .to_string()
+            )
+        );
         assert!(
             history
                 .content
@@ -1903,7 +1997,7 @@ mod tests {
     #[tokio::test]
     async fn prompt_with_explicit_thread_id_starts_new_thread_without_overwriting_default() {
         let workspace = tempdir().expect("workspace");
-        install_workspace_mock_provider(workspace.path());
+        let _provider = IsolatedGlobalMockProvider::install_for_workspace(workspace.path()).await;
         let transport = InProcessTransport::for_workspace(workspace.path())
             .await
             .expect("transport");
@@ -1941,7 +2035,7 @@ mod tests {
     #[tokio::test]
     async fn prompt_runs_mock_agent_loop_and_writes_file() {
         let workspace = tempdir().expect("workspace");
-        install_workspace_mock_provider(workspace.path());
+        let _provider = IsolatedGlobalMockProvider::install_for_workspace(workspace.path()).await;
         let transport = InProcessTransport::for_workspace(workspace.path())
             .await
             .expect("transport");
@@ -1994,7 +2088,7 @@ mod tests {
     #[tokio::test]
     async fn prompt_plain_conversation_completes_without_tool_evidence() {
         let workspace = tempdir().expect("workspace");
-        install_workspace_mock_provider(workspace.path());
+        let _provider = IsolatedGlobalMockProvider::install_for_workspace(workspace.path()).await;
         let transport = InProcessTransport::for_workspace(workspace.path())
             .await
             .expect("transport");
@@ -2029,7 +2123,8 @@ mod tests {
     #[test]
     fn plain_conversation_plan_does_not_send_workspace_tools() {
         let workspace = tempdir().expect("workspace");
-        install_workspace_mock_provider(workspace.path());
+        let _provider =
+            IsolatedGlobalMockProvider::install_for_workspace_blocking(workspace.path());
 
         let plan = mock_provider_plan(Some(workspace.path()), &json!({"prompt": "你好"}), "你好")
             .expect("provider plan");
@@ -2041,7 +2136,8 @@ mod tests {
     #[test]
     fn workspace_objective_plan_still_sends_workspace_tools() {
         let workspace = tempdir().expect("workspace");
-        install_workspace_mock_provider(workspace.path());
+        let _provider =
+            IsolatedGlobalMockProvider::install_for_workspace_blocking(workspace.path());
 
         let plan = mock_provider_plan(
             Some(workspace.path()),
@@ -2057,7 +2153,7 @@ mod tests {
     #[tokio::test]
     async fn prompt_write_file_natural_language_uses_requested_path_and_content() {
         let workspace = tempdir().expect("workspace");
-        install_workspace_mock_provider(workspace.path());
+        let _provider = IsolatedGlobalMockProvider::install_for_workspace(workspace.path()).await;
         let transport = InProcessTransport::for_workspace(workspace.path())
             .await
             .expect("transport");
@@ -2095,6 +2191,13 @@ mod tests {
                 content: "explicit".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn environment_context_prompt_escapes_xml_text() {
+        let prompt = environment_context_prompt(Path::new("/tmp/a&b<c>d"));
+
+        assert!(prompt.contains("<cwd>/tmp/a&amp;b&lt;c&gt;d</cwd>"));
     }
 
     #[tokio::test]
@@ -2159,15 +2262,15 @@ mod tests {
         command_with_payload(session_id, json!({"prompt": prompt}))
     }
 
-    fn install_workspace_mock_provider(workspace_root: &Path) {
+    fn install_user_mock_provider(workspace_root: impl AsRef<std::path::Path>) {
         let paths = ProviderConfigPaths::for_workspace(workspace_root).expect("provider paths");
         ProviderInstallPlan {
-            scope: ProviderConfigScope::Workspace,
+            scope: ProviderConfigScope::User,
             profile: ProviderProfile::mock(),
             activate: true,
         }
         .apply(&paths)
-        .expect("workspace mock provider");
+        .expect("global mock provider");
     }
 
     fn command_with_payload(session_id: SessionId, payload: Value) -> SessionCommand {

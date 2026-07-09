@@ -324,7 +324,7 @@ fn parse_auth_use(tokens: &[String]) -> SlashInput {
     let Some(profile) = tokens.get(2).cloned() else {
         return SlashInput::Error("/auth use requires a profile name".to_owned());
     };
-    let scope = match parse_auth_scope(tokens.get(3).map(String::as_str).unwrap_or("workspace")) {
+    let scope = match parse_auth_scope(tokens.get(3).map(String::as_str).unwrap_or("user")) {
         Ok(scope) => scope,
         Err(error) => return SlashInput::Error(error),
     };
@@ -517,8 +517,10 @@ fn parse_positive_u64(value: &str, option: &str) -> Result<u64, String> {
 fn parse_auth_scope(value: &str) -> Result<AuthConfigScope, String> {
     match value {
         "user" => Ok(AuthConfigScope::User),
-        "workspace" => Ok(AuthConfigScope::Workspace),
-        _ => Err("auth scope must be `user` or `workspace`".to_owned()),
+        "workspace" => {
+            Err("workspace provider config is no longer supported; use `--scope user`".to_owned())
+        }
+        _ => Err("auth scope must be `user`".to_owned()),
     }
 }
 
@@ -577,7 +579,7 @@ mod tests {
         );
         assert_eq!(
             parse_slash_input(
-                "/auth login --base-url api.golutra.cn --model qwen --api-key-env GOLUTRA_KEY --scope workspace"
+                "/auth login --base-url api.golutra.cn --model qwen --api-key-env GOLUTRA_KEY --scope user"
             ),
             SlashInput::Command(SlashCommand::Auth(SlashAuthCommand::Login(
                 OpenAiCompatibleLogin {
@@ -588,10 +590,18 @@ mod tests {
                     api_key_env: "GOLUTRA_KEY".to_owned(),
                     api_key: None,
                     generation_config: None,
-                    scope: AuthConfigScope::Workspace,
+                    scope: AuthConfigScope::User,
                 }
             )))
         );
+    }
+
+    #[test]
+    fn slash_parser_rejects_workspace_auth_scope() {
+        assert!(matches!(
+            parse_slash_input("/auth login --base-url api.golutra.cn --model qwen --scope workspace"),
+            SlashInput::Error(error) if error.contains("workspace provider config is no longer supported")
+        ));
     }
 
     #[test]

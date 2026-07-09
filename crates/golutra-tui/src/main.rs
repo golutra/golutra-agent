@@ -594,7 +594,7 @@ impl TuiApp {
                 self.auth_dialog = None;
                 self.push_system_message(
                     "Auth updated",
-                    vec!["workspace provider switched to mock".to_owned()],
+                    vec!["global provider switched to mock".to_owned()],
                 );
             }
             SlashAuthCommand::Use { profile, scope } => {
@@ -604,12 +604,14 @@ impl TuiApp {
                 match update_provider_settings_verified(
                     &paths,
                     workspace_root,
-                    move |user_settings, workspace_settings| {
-                        let settings = match provider_scope(scope) {
-                            ProviderConfigScope::User => user_settings,
-                            ProviderConfigScope::Workspace => workspace_settings,
-                        };
-                        settings.set_active_profile(selected_profile)?;
+                    move |user_settings, _workspace_settings| {
+                        if provider_scope(scope) == ProviderConfigScope::Workspace {
+                            return Err(golutra_config::ConfigError::Validation(
+                                "workspace provider config is no longer supported; use global user provider config"
+                                    .to_owned(),
+                            ));
+                        }
+                        user_settings.set_active_profile(selected_profile)?;
                         Ok(())
                     },
                 )
@@ -2270,7 +2272,7 @@ fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         app.input.clone()
     };
     let mut lines = vec![Line::from(vec![
-        Span::styled("> ", Style::default().fg(Color::Cyan)),
+        Span::styled("› ", Style::default().fg(Color::Cyan)),
         Span::styled(input_line, composer_style(app)),
     ])];
     lines.extend(slash_candidate_lines(app, &candidates));
@@ -2297,7 +2299,7 @@ fn slash_candidate_lines(app: &TuiApp, candidates: &[SlashCommandCandidate]) -> 
         .enumerate()
         .map(|(index, candidate)| {
             let selected = index == app.slash_selected.min(candidates.len().saturating_sub(1));
-            let marker = if selected { "> " } else { "  " };
+            let marker = if selected { "› " } else { "  " };
             Line::from(vec![
                 Span::styled(
                     marker,
@@ -2751,10 +2753,8 @@ fn readable_step_label(label: &str) -> String {
 
 fn role_marker(role: &TranscriptRole) -> &'static str {
     match role {
-        TranscriptRole::User => "u ",
-        TranscriptRole::Assistant => "g ",
-        TranscriptRole::Status => "- ",
-        TranscriptRole::System => "* ",
+        TranscriptRole::User => "› ",
+        TranscriptRole::Assistant | TranscriptRole::Status | TranscriptRole::System => "• ",
     }
 }
 
@@ -2991,10 +2991,7 @@ fn build_auth_review(
     let login = auth_login(dialog)?;
     let paths = provider_paths_for_tui(transport).map_err(|error| error.to_string())?;
     let scope = provider_scope(login.scope);
-    let config_path = match scope {
-        ProviderConfigScope::User => paths.user_config.clone(),
-        ProviderConfigScope::Workspace => paths.workspace_config.clone(),
-    };
+    let config_path = paths.user_config.clone();
     let settings = ProviderSettings::load(&config_path).map_err(|error| error.to_string())?;
     let updates_existing_profile = settings
         .profiles
@@ -3190,7 +3187,7 @@ fn generation_config_summary(config: Option<&ProviderGenerationConfig>) -> Strin
 fn apply_auth_mock(transport: &InProcessTransport) -> miette::Result<()> {
     let paths = provider_paths_for_tui(transport)?;
     ProviderInstallPlan {
-        scope: ProviderConfigScope::Workspace,
+        scope: ProviderConfigScope::User,
         profile: ProviderProfile::mock(),
         activate: true,
     }
@@ -3208,9 +3205,9 @@ fn slash_help_lines() -> Vec<String> {
         "/auth status  show provider onboarding state".to_owned(),
         "/auth setup  open provider setup".to_owned(),
         "/auth protocols  list registered provider protocols".to_owned(),
-        "/auth mock  switch this workspace to mock provider".to_owned(),
-        "/auth login --base-url <url> --model <model> [--api-key <key>|--api-key-env <env>] [--scope user|workspace]".to_owned(),
-        "/auth use <profile> [user|workspace]  activate saved provider profile".to_owned(),
+        "/auth mock  switch global provider to mock".to_owned(),
+        "/auth login --base-url <url> --model <model> [--api-key <key>|--api-key-env <env>] [--scope user]".to_owned(),
+        "/auth use <profile> [user]  activate saved global provider profile".to_owned(),
         "/status  show current session/task status".to_owned(),
         "/debug  toggle debug timeline".to_owned(),
         "/abort  abort active task".to_owned(),
@@ -3325,11 +3322,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_dialog_mock_choice_persists_workspace_provider() {
+    async fn auth_dialog_mock_choice_persists_global_provider() {
         let dir = tempfile::tempdir().expect("dir");
+        let home = tempfile::tempdir().expect("home");
         let transport = InProcessTransport::for_workspace(dir.path())
             .await
             .expect("transport");
+        let _guard = env_lock_guard().await;
+        let previous_home = std::env::var("GOLUTRA_HOME").ok();
+        unsafe {
+            std::env::set_var("GOLUTRA_HOME", home.path());
+        }
         let mut app = TuiApp::new(
             ThreadId::new(),
             SessionId::new(),
@@ -3341,13 +3344,26 @@ mod tests {
         let dialog = app.auth_dialog.as_mut().expect("dialog");
         dialog.selected = 3;
 
-        advance_auth_dialog(&mut app, &transport)
-            .await
-            .expect("advance");
+        let result = advance_auth_dialog(&mut app, &transport).await;
 
+        result.expect("advance");
         assert!(app.auth_dialog.is_none());
         assert_eq!(app.provider_message, "ready (mock)");
         assert!(initial_auth_dialog(&transport).is_none());
+        let settings = ProviderSettings::load(home.path().join("provider.json")).expect("settings");
+        assert_eq!(
+            settings.active_profile().expect("profile").protocol,
+            ProviderProtocol::Mock
+        );
+        assert!(!dir.path().join(".golutra/provider.json").exists());
+        match previous_home {
+            Some(value) => unsafe {
+                std::env::set_var("GOLUTRA_HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("GOLUTRA_HOME");
+            },
+        }
     }
 
     #[tokio::test]
@@ -3406,14 +3422,6 @@ mod tests {
         );
 
         let result = advance_auth_dialog(&mut app, &transport).await;
-        match previous_home {
-            Some(value) => unsafe {
-                std::env::set_var("GOLUTRA_HOME", value);
-            },
-            None => unsafe {
-                std::env::remove_var("GOLUTRA_HOME");
-            },
-        }
         result.expect("advance");
 
         assert!(app.auth_dialog.is_none());
@@ -3430,6 +3438,15 @@ mod tests {
             Some("test-key")
         );
         assert!(profile.api_key.is_none());
+        assert!(!dir.path().join(".golutra/provider.json").exists());
+        match previous_home {
+            Some(value) => unsafe {
+                std::env::set_var("GOLUTRA_HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("GOLUTRA_HOME");
+            },
+        }
     }
 
     #[tokio::test]
@@ -3535,8 +3552,16 @@ mod tests {
 
         assert!(lines.contains("/new"));
         assert!(lines.contains("/resume"));
-        assert!(lines.contains("> /threads"));
+        assert!(lines.contains("› /threads"));
         assert_eq!(bottom_pane_height(&app), 8);
+    }
+
+    #[test]
+    fn transcript_role_markers_follow_codex_symbols() {
+        assert_eq!(role_marker(&TranscriptRole::User), "› ");
+        assert_eq!(role_marker(&TranscriptRole::Assistant), "• ");
+        assert_eq!(role_marker(&TranscriptRole::Status), "• ");
+        assert_eq!(role_marker(&TranscriptRole::System), "• ");
     }
 
     #[tokio::test]

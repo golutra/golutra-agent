@@ -14,7 +14,6 @@ use thiserror::Error;
 
 const GOLUTRA_HOME: &str = "GOLUTRA_HOME";
 const PROVIDER_FILE: &str = "provider.json";
-const WORKSPACE_DIR: &str = ".golutra";
 const USER_KEY_SENTINEL: &str = "<stored:user-provider-key>";
 const GOLUTRA_PROVIDER_GENERATION_CONFIG: &str = "GOLUTRA_PROVIDER_GENERATION_CONFIG";
 pub const CUSTOM_PROVIDER_API_KEY_ENV_PREFIX: &str = "GOLUTRA_CUSTOM_PROVIDER_API_KEY_";
@@ -85,17 +84,12 @@ impl RuntimeConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderConfigPaths {
     pub user_config: PathBuf,
-    pub workspace_config: PathBuf,
 }
 
 impl ProviderConfigPaths {
-    pub fn for_workspace(workspace_root: impl AsRef<Path>) -> Result<Self, ConfigError> {
+    pub fn for_workspace(_workspace_root: impl AsRef<Path>) -> Result<Self, ConfigError> {
         Ok(Self {
             user_config: golutra_home()?.join(PROVIDER_FILE),
-            workspace_config: workspace_root
-                .as_ref()
-                .join(WORKSPACE_DIR)
-                .join(PROVIDER_FILE),
         })
     }
 }
@@ -293,15 +287,13 @@ pub struct ProviderInstallPlan {
 impl ProviderInstallPlan {
     pub fn apply(&self, paths: &ProviderConfigPaths) -> Result<(), ConfigError> {
         self.profile.validate()?;
-        let path = match self.scope {
-            ProviderConfigScope::User => &paths.user_config,
-            ProviderConfigScope::Workspace => &paths.workspace_config,
-        };
-        if self.scope == ProviderConfigScope::Workspace && self.profile.api_key.is_some() {
+        if self.scope == ProviderConfigScope::Workspace {
             return Err(ConfigError::Validation(
-                "workspace provider config must not store api_key".to_owned(),
+                "workspace provider config is no longer supported; use global user provider config"
+                    .to_owned(),
             ));
         }
+        let path = &paths.user_config;
         let mut settings = ProviderSettings::load(path)?;
         persist_profile_in_settings(&mut settings, self.profile.clone(), self.activate)?;
         settings.save(path)
@@ -366,22 +358,18 @@ pub fn provider_onboarding_state(
 ) -> Result<ProviderOnboardingState, ConfigError> {
     let paths = ProviderConfigPaths::for_workspace(workspace_root)?;
     let user = ProviderSettings::load(&paths.user_config)?;
-    let workspace = ProviderSettings::load(&paths.workspace_config)?;
-    let merged = merge_provider_settings(user, workspace);
-    let source = if paths.workspace_config.exists() {
-        "workspace"
-    } else if paths.user_config.exists() {
+    let source = if paths.user_config.exists() {
         "user"
     } else {
         "none"
     }
     .to_owned();
-    let active_profile = merged
+    let active_profile = user
         .active_profile()
-        .map(|profile| redacted_profile_with_credentials(&merged, profile));
+        .map(|profile| redacted_profile_with_credentials(&user, profile));
     let missing_fields = active_profile
         .as_ref()
-        .map(|profile| missing_fields(&merged, profile))
+        .map(|profile| missing_fields(&user, profile))
         .unwrap_or_else(|| vec!["active_profile".to_owned()]);
     Ok(ProviderOnboardingState {
         configured: missing_fields.is_empty(),
@@ -394,43 +382,15 @@ pub fn provider_onboarding_state(
 pub fn load_merged_provider_settings(
     paths: &ProviderConfigPaths,
 ) -> Result<ProviderSettings, ConfigError> {
-    let user = ProviderSettings::load(&paths.user_config)?;
-    let workspace = ProviderSettings::load(&paths.workspace_config)?;
-    Ok(merge_provider_settings(user, workspace))
+    ProviderSettings::load(&paths.user_config)
 }
 
 #[must_use]
 pub fn merge_provider_settings(
     user: ProviderSettings,
-    workspace: ProviderSettings,
+    _workspace: ProviderSettings,
 ) -> ProviderSettings {
-    let ProviderSettings {
-        version: _user_version,
-        active_profile: user_active_profile,
-        env: user_env,
-        profiles: user_profiles,
-    } = user;
-    let ProviderSettings {
-        version: _workspace_version,
-        active_profile: workspace_active_profile,
-        env: workspace_env,
-        profiles: workspace_profiles,
-    } = workspace;
-    let mut by_name = BTreeMap::<String, ProviderProfile>::new();
-    let mut env = user_env;
-    for profile in user_profiles {
-        by_name.insert(profile.name.clone(), profile);
-    }
-    env.extend(workspace_env);
-    for profile in workspace_profiles {
-        by_name.insert(profile.name.clone(), profile);
-    }
-    ProviderSettings {
-        version: 1,
-        active_profile: workspace_active_profile.or(user_active_profile),
-        env,
-        profiles: by_name.into_values().collect(),
-    }
+    user
 }
 
 #[must_use]
@@ -509,6 +469,12 @@ pub async fn apply_provider_install_plan_verified(
     workspace_root: impl AsRef<Path>,
     plan: &ProviderInstallPlan,
 ) -> Result<(), ProviderInstallError> {
+    if plan.scope == ProviderConfigScope::Workspace {
+        return Err(provider_install_error(
+            "mutate",
+            "workspace provider config is no longer supported; use global user provider config",
+        ));
+    }
     run_provider_settings_transaction(paths, workspace_root, |user, workspace| {
         plan.profile.validate()?;
         match plan.scope {
@@ -582,26 +548,23 @@ where
     let workspace_root = workspace_root.as_ref().to_path_buf();
     let user_snapshot = snapshot_provider_settings_file(&paths.user_config)
         .map_err(|error| provider_install_error("backup", error.to_string()))?;
-    let workspace_snapshot = snapshot_provider_settings_file(&paths.workspace_config)
-        .map_err(|error| provider_install_error("backup", error.to_string()))?;
 
     let mut user_settings = user_snapshot.settings.clone();
-    let mut workspace_settings = workspace_snapshot.settings.clone();
+    let mut workspace_settings = ProviderSettings::default();
     let transaction_result = async {
         mutate(&mut user_settings, &mut workspace_settings)
             .map_err(|error| provider_install_error("mutate", error.to_string()))?;
+        if workspace_settings != ProviderSettings::default() {
+            return Err(provider_install_error(
+                "mutate",
+                "workspace provider config is no longer supported; use global user provider config",
+            ));
+        }
 
         persist_provider_settings_file(&paths.user_config, &user_snapshot, &user_settings)
             .map_err(|error| provider_install_error("persist", error.to_string()))?;
-        persist_provider_settings_file(
-            &paths.workspace_config,
-            &workspace_snapshot,
-            &workspace_settings,
-        )
-        .map_err(|error| provider_install_error("persist", error.to_string()))?;
 
-        probe_provider_after_settings_update(&workspace_root, &user_settings, &workspace_settings)
-            .await
+        probe_provider_after_settings_update(&workspace_root, &user_settings).await
     }
     .await;
 
@@ -612,14 +575,6 @@ where
                 format!("{}; rollback failed: {restore}", error.message),
             )
         })?;
-        restore_provider_settings_file(&paths.workspace_config, &workspace_snapshot).map_err(
-            |restore| {
-                provider_install_error(
-                    "rollback",
-                    format!("{}; rollback failed: {restore}", error.message),
-                )
-            },
-        )?;
         return Err(error);
     }
 
@@ -667,16 +622,14 @@ fn restore_provider_settings_file(
 async fn probe_provider_after_settings_update(
     workspace_root: &Path,
     user_settings: &ProviderSettings,
-    workspace_settings: &ProviderSettings,
 ) -> Result<(), ProviderInstallError> {
-    let merged = merge_provider_settings(user_settings.clone(), workspace_settings.clone());
-    let Some(active_profile) = merged.active_profile() else {
+    let Some(active_profile) = user_settings.active_profile() else {
         return Ok(());
     };
     if active_profile.protocol == ProviderProtocol::Mock {
         return Ok(());
     }
-    let runtime_env = runtime_env_from_settings(&merged);
+    let runtime_env = runtime_env_from_settings(user_settings);
     ConfiguredProvider::probe_from_reader(|key| runtime_env.get(key))
         .await
         .map_err(|error| {
@@ -1064,28 +1017,31 @@ mod tests {
     }
 
     #[test]
-    fn workspace_config_rejects_stored_api_key() {
+    fn workspace_provider_config_scope_is_rejected() {
         let _home = IsolatedGolutraHome::new();
         let dir = tempdir().expect("dir");
         let paths = ProviderConfigPaths::for_workspace(dir.path()).expect("paths");
-        let mut profile = ProviderProfile::openai_compatible(
+        let profile = ProviderProfile::openai_compatible(
             "golutra",
             "api.golutra.cn",
             "gpt-test",
             "GOLUTRA_PROVIDER_API_KEY",
         )
         .expect("profile");
-        profile.api_key = Some("secret".to_owned());
         let plan = ProviderInstallPlan {
             scope: ProviderConfigScope::Workspace,
             profile,
             activate: true,
         };
 
-        assert!(matches!(
-            plan.apply(&paths),
-            Err(ConfigError::Validation(_))
-        ));
+        let error = plan.apply(&paths).expect_err("workspace scope rejected");
+
+        assert!(matches!(error, ConfigError::Validation(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("workspace provider config is no longer supported")
+        );
     }
 
     #[test]
@@ -1163,7 +1119,7 @@ mod tests {
         let dir = tempdir().expect("dir");
         let paths = ProviderConfigPaths::for_workspace(dir.path()).expect("paths");
         ProviderInstallPlan {
-            scope: ProviderConfigScope::Workspace,
+            scope: ProviderConfigScope::User,
             profile: ProviderProfile::mock(),
             activate: true,
         }
@@ -1173,7 +1129,7 @@ mod tests {
         let state = provider_onboarding_state(dir.path()).expect("onboarding");
 
         assert!(state.configured);
-        assert_eq!(state.source, "workspace");
+        assert_eq!(state.source, "user");
         assert!(state.missing_fields.is_empty());
         assert_eq!(
             state.active_profile.expect("profile").protocol,
@@ -1252,7 +1208,7 @@ mod tests {
     }
 
     #[test]
-    fn merged_provider_env_prefers_workspace_non_secret_fields() {
+    fn merged_provider_settings_ignores_workspace_provider_config() {
         let user_profile = ProviderProfile::openai_compatible(
             "golutra",
             "https://user.example/v1",
@@ -1286,7 +1242,7 @@ mod tests {
 
         assert_eq!(
             runtime_env.get("GOLUTRA_PROVIDER_MODEL"),
-            Some("workspace-model".to_owned())
+            Some("user-model".to_owned())
         );
         assert_eq!(
             runtime_env.get("GOLUTRA_PROVIDER_API_KEY"),
@@ -1442,7 +1398,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verified_workspace_provider_install_persists_env_map_without_inline_key() {
+    async fn verified_workspace_provider_install_is_rejected() {
         let _home = IsolatedGolutraHome::new();
         let dir = tempdir().expect("dir");
         let paths = ProviderConfigPaths::for_workspace(dir.path()).expect("paths");
@@ -1456,7 +1412,7 @@ mod tests {
         .expect("profile");
         profile.api_key = Some("good-key".to_owned());
 
-        apply_provider_install_plan_verified(
+        let error = apply_provider_install_plan_verified(
             &paths,
             dir.path(),
             &ProviderInstallPlan {
@@ -1466,19 +1422,15 @@ mod tests {
             },
         )
         .await
-        .expect("probe should pass");
+        .expect_err("workspace scope rejected");
 
-        let settings = ProviderSettings::load(&paths.workspace_config).expect("settings");
-        let active = settings.active_profile().expect("active");
-        assert_eq!(active.name, "custom");
-        assert_eq!(active.api_key, None);
-        assert_eq!(
-            settings
-                .env
-                .get("GOLUTRA_CUSTOM_PROVIDER_API_KEY_TEST")
-                .map(String::as_str),
-            Some("good-key")
+        assert_eq!(error.step, "mutate");
+        assert!(
+            error
+                .message
+                .contains("workspace provider config is no longer supported")
         );
+        assert!(!paths.user_config.exists());
     }
 
     #[test]

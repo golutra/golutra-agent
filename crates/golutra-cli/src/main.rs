@@ -105,7 +105,7 @@ enum ProviderCommand {
     },
     Use {
         profile: String,
-        #[arg(long, default_value = "workspace")]
+        #[arg(long, default_value = "user")]
         scope: String,
     },
 }
@@ -382,7 +382,6 @@ async fn main() -> miette::Result<()> {
                         "plan": plan,
                         "paths": {
                             "user": paths.user_config,
-                            "workspace": paths.workspace_config,
                         }
                     }))
                     .unwrap_or_default()
@@ -435,12 +434,14 @@ async fn main() -> miette::Result<()> {
                 update_provider_settings_verified(
                     &paths,
                     workspace_root,
-                    move |user_settings, workspace_settings| {
-                        let settings = match scope {
-                            ProviderConfigScope::User => user_settings,
-                            ProviderConfigScope::Workspace => workspace_settings,
-                        };
-                        settings.set_active_profile(profile_name)?;
+                    move |user_settings, _workspace_settings| {
+                        if scope == ProviderConfigScope::Workspace {
+                            return Err(golutra_config::ConfigError::Validation(
+                                "workspace provider config is no longer supported; use global user provider config"
+                                    .to_owned(),
+                            ));
+                        }
+                        user_settings.set_active_profile(profile_name)?;
                         Ok(())
                     },
                 )
@@ -491,10 +492,10 @@ fn parse_provider_protocol(value: &str) -> miette::Result<ProviderProtocol> {
 fn parse_provider_scope(value: &str) -> miette::Result<ProviderConfigScope> {
     match value.trim().to_ascii_lowercase().as_str() {
         "user" => Ok(ProviderConfigScope::User),
-        "workspace" => Ok(ProviderConfigScope::Workspace),
-        _ => Err(miette::miette!(
-            "provider scope must be `user` or `workspace`"
+        "workspace" => Err(miette::miette!(
+            "workspace provider config is no longer supported; use `--scope user`"
         )),
+        _ => Err(miette::miette!("provider scope must be `user`")),
     }
 }
 

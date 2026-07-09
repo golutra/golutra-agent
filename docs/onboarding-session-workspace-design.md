@@ -8,7 +8,7 @@
 - LLM provider 凭据、配置和运行时状态应该持久化在哪里。
 - resume、多 session、多工作区应该如何设计，避免 CLI/TUI/Web 各自维护状态。
 
-结论：Golutra 已具备 provider onboarding 与 thread resume/fork 的最小闭环。默认仍可使用 `mock` provider；真实 provider 可通过 `golutra provider login` 写入用户级或 workspace 级 `provider.json`，运行时会把该配置与进程环境变量合并后解析。TUI 首次进入会检查 active provider profile；没有显式配置时打开 provider setup，支持 qwen-code 风格的 provider 分组、第三方 provider 选型、OpenAI-compatible base URL/API key/model/advanced config 填写、保存前 review，或选择 mock provider。Custom Provider 的 envKey 会按协议和 baseUrl 自动派生，避免多个自定义 endpoint 共用一个固定 key。已有 provider 时首屏不打断，输入 `/auth` 或 `/auth setup` 可随时重新打开并覆盖同名 profile。
+结论：Golutra 已具备 provider onboarding 与 thread resume/fork 的最小闭环。默认仍可使用 `mock` provider；真实 provider 可通过 `golutra provider login` 写入全局 `$GOLUTRA_HOME/provider.json`，运行时会把该全局配置与进程环境变量合并后解析。TUI 首次进入会检查 active provider profile；没有显式配置时打开 provider setup，支持 qwen-code 风格的 provider 分组、第三方 provider 选型、OpenAI-compatible base URL/API key/model/advanced config 填写、保存前 review，或选择 mock provider。Custom Provider 的 envKey 会按协议和 baseUrl 自动派生，避免多个自定义 endpoint 共用一个固定 key。已有 provider 时首屏不打断，输入 `/auth` 或 `/auth setup` 可随时重新打开并覆盖同名 profile。
 
 ## qwen-code 参考结论
 
@@ -54,11 +54,10 @@ Golutra 不应照搬把明文 key 默认写入 workspace。推荐持久化分层
 | 类型 | Golutra 路径 | 允许内容 |
 | --- | --- | --- |
 | 全局 home | `GOLUTRA_HOME`，否则 `~/.golutra` | 用户配置、secret ref、provider catalog |
-| 全局 provider 配置 | `$GOLUTRA_HOME/provider.json` | provider catalog、默认 selection、envKey、secretRef、脱敏 fingerprint |
-| workspace provider 配置 | `<workspace>/.golutra/provider.json` | 团队可共享 provider catalog、默认 model、envKey 名称；禁止默认保存 secret value |
+| 全局 provider/auth 配置 | `$GOLUTRA_HOME/provider.json` | provider catalog、默认 selection、envKey、用户级 key/env map、脱敏 fingerprint |
 | workspace runtime | `<workspace>/.golutra/runtime.sqlite` | session/task/event/projection/thread index，不保存明文 secret |
 | session rollouts | `<workspace>/.golutra/sessions/YYYY/MM/DD/*.jsonl` 或 `$GOLUTRA_HOME/sessions/...` | append-only 历史，已脱敏 provider payload |
-| secrets | OS keychain 或用户显式 opt-in 的 `$GOLUTRA_HOME/secrets.json` | 明文 key/token，仅 owner-only 权限；workspace 禁止 |
+| secrets | 当前为 `$GOLUTRA_HOME/provider.json.env`，未来可迁移 OS keychain 或 `$GOLUTRA_HOME/secrets.json` | 明文 key/token，仅 owner-only 权限；workspace 禁止 |
 
 P1 可以先实现 env-api-key：用户输入 key 后，默认只写到 user-level provider 配置的 `env` 或 keychain；如果选择写入文件，必须提示保存位置，并保证 owner-only 权限和原子写。
 
@@ -132,7 +131,7 @@ ProviderInstallPlan
   credential: env_key | secret_ref | inline_secret_once
   provider_catalog_patch
   user_config_patch
-  workspace_config_patch
+  global_config_patch
   runtime_reload
   probe_policy
   rollback_snapshot
@@ -141,7 +140,7 @@ ProviderInstallPlan
 实现约束：
 
 - `inline_secret_once` 只能在 install plan 内存中出现，不能进入 runtime event。
-- workspace 配置默认只写 envKey/secretRef，不写 secret value。
+- workspace `.golutra` 不参与 provider/auth 配置；provider envKey、secretRef 和 key/env map 均属于全局用户配置。
 - 写入 user config 或 secrets 必须 temp file + rename，并收紧权限。
 - refresh/probe 失败必须 rollback active selection 和 runtime provider registry。
 - 未实现 adapter 的协议可以作为 catalog/diagnostic 入口展示，但不能被保存为 enabled/ready active provider。
@@ -281,9 +280,9 @@ TUI 输入框现在先经过 slash command parser：
 | `/auth`、`/auth setup` | 打开 provider setup |
 | `/auth status` | 展示 provider onboarding 状态 |
 | `/auth protocols` | 展示注册 provider protocols |
-| `/auth mock` | 将 workspace provider 切换为 mock |
-| `/auth login --base-url <url> --model <model> [--api-key <key>\|--api-key-env <env>] [--enable-thinking] [--reasoning-effort low\|medium\|high\|xhigh] [--context-window-size <n>] [--max-tokens <n>] [--scope user\|workspace]` | 保存 OpenAI-compatible provider 配置；明文 key 只允许保存到用户级配置，workspace 配置禁止保存 secret value |
-| `/auth use <profile> [user|workspace]` | 激活已保存 provider profile |
+| `/auth mock` | 将全局 provider 切换为 mock |
+| `/auth login --base-url <url> --model <model> [--api-key <key>\|--api-key-env <env>] [--enable-thinking] [--reasoning-effort low\|medium\|high\|xhigh] [--context-window-size <n>] [--max-tokens <n>] [--scope user]` | 保存 OpenAI-compatible provider 配置到 `$GOLUTRA_HOME/provider.json` |
+| `/auth use <profile> [user]` | 激活已保存的全局 provider profile |
 | `/status`、`/debug`、`/abort`、`/clear`、`/quit` | 本地状态、debug、abort 和退出控制 |
 
 输入体验对齐 Codex：
@@ -299,7 +298,7 @@ TUI 输入框现在先经过 slash command parser：
 ## 当前差距
 
 - 当前 TUI 已有 qwen-code 风格 provider setup：Golutra API、Third-party Providers、Custom Provider、mock 分组选择；第三方内置 OpenAI、OpenRouter、DeepSeek、Qwen/DashScope compatible 和本地 OpenAI-compatible preset；OpenAI-compatible setup 已按 baseUrl -> API key -> model -> advanced config -> review -> install 顺序执行，review 会展示脱敏 `ProviderInstallPlan`、保存路径和同名 profile 覆盖提示；Custom Provider 会生成 `GOLUTRA_CUSTOM_PROVIDER_API_KEY_...` envKey；Anthropic/Gemini 等未实现 live adapter 的协议会被安装层拒绝保存为 ready provider；保存链路会先落盘后 probe，失败自动 rollback；还没有手动 envKey/secretRef 选择和 OAuth。
-- 当前 provider 配置已支持 `$GOLUTRA_HOME/provider.json` 和 `<workspace>/.golutra/provider.json`；用户级 API key 已按 qwen-code 风格写入 `provider.json` 的 `env` map，profile 只保留 `api_key_env` 引用，workspace 配置继续禁止保存明文 key；但 OS keychain、OAuth 和 secret-ref 还未实现。
+- 当前 provider/auth 持久化已按 Codex 风格收敛为全局用户级 `$GOLUTRA_HOME/provider.json`；API key 写入 `env` map，profile 只保留 `api_key_env` 引用；workspace `.golutra` 只承载 runtime/session 状态，不再读取或写入 provider 覆盖；OS keychain、OAuth 和 secret-ref 还未实现。
 - 当前 `threads` 表、`.golutra/default-thread`、`golutra thread list`、`golutra resume [THREAD_ID]` 和 `golutra fork THREAD_ID` 已可用；fork 当前复制元数据并创建新 session，还未复制/截断 rollout JSONL 历史。
 - 当前完成任务会写入 `AssistantMessage`，`UserProjection.final_message` 和 TUI transcript 可在 resume 后恢复最终回复；下一轮 prompt 会携带当前 session 的压缩历史摘要。
 - 当前多工作区仍以 workspace SQLite 为事实来源；`$GOLUTRA_HOME/index.sqlite` 的跨 workspace 全局索引还未实现。
