@@ -1,4 +1,4 @@
-use golutra_llm::ProviderProtocol;
+use golutra_llm::{ProviderGenerationConfig, ProviderProtocol, ProviderReasoningEffort};
 use serde_json::Value;
 
 pub use golutra_protocol::{DebugProjection, RuntimeEvent, UserProjection};
@@ -86,6 +86,7 @@ pub struct OpenAiCompatibleLogin {
     pub model: String,
     pub api_key_env: String,
     pub api_key: Option<String>,
+    pub generation_config: Option<ProviderGenerationConfig>,
     pub scope: AuthConfigScope,
 }
 
@@ -337,6 +338,10 @@ fn parse_auth_login(tokens: &[String]) -> SlashInput {
     let mut model = None;
     let mut api_key_env = "GOLUTRA_PROVIDER_API_KEY".to_owned();
     let mut api_key = None;
+    let mut enable_thinking = false;
+    let mut reasoning_effort = None;
+    let mut context_window_size = None;
+    let mut max_tokens = None;
     let mut scope = AuthConfigScope::User;
     let mut index = 2;
     while index < tokens.len() {
@@ -400,6 +405,39 @@ fn parse_auth_login(tokens: &[String]) -> SlashInput {
                 };
                 api_key = Some(value.clone());
             }
+            "--enable-thinking" => {
+                enable_thinking = true;
+            }
+            "--reasoning-effort" => {
+                index += 1;
+                let Some(value) = tokens.get(index) else {
+                    return SlashInput::Error("--reasoning-effort requires a value".to_owned());
+                };
+                reasoning_effort = match parse_reasoning_effort(value) {
+                    Ok(value) => Some(value),
+                    Err(error) => return SlashInput::Error(error),
+                };
+            }
+            "--context-window-size" => {
+                index += 1;
+                let Some(value) = tokens.get(index) else {
+                    return SlashInput::Error("--context-window-size requires a value".to_owned());
+                };
+                context_window_size = match parse_positive_u64(value, "--context-window-size") {
+                    Ok(value) => Some(value),
+                    Err(error) => return SlashInput::Error(error),
+                };
+            }
+            "--max-tokens" => {
+                index += 1;
+                let Some(value) = tokens.get(index) else {
+                    return SlashInput::Error("--max-tokens requires a value".to_owned());
+                };
+                max_tokens = match parse_positive_u64(value, "--max-tokens") {
+                    Ok(value) => Some(value),
+                    Err(error) => return SlashInput::Error(error),
+                };
+            }
             "--scope" => {
                 index += 1;
                 let Some(value) = tokens.get(index) else {
@@ -430,9 +468,50 @@ fn parse_auth_login(tokens: &[String]) -> SlashInput {
             model,
             api_key_env,
             api_key,
+            generation_config: build_generation_config(
+                enable_thinking,
+                reasoning_effort,
+                context_window_size,
+                max_tokens,
+            ),
             scope,
         },
     )))
+}
+
+fn build_generation_config(
+    enable_thinking: bool,
+    reasoning_effort: Option<ProviderReasoningEffort>,
+    context_window_size: Option<u64>,
+    max_tokens: Option<u64>,
+) -> Option<ProviderGenerationConfig> {
+    let config = ProviderGenerationConfig {
+        enable_thinking,
+        reasoning_effort,
+        context_window_size,
+        max_tokens,
+    };
+    (!config.is_empty()).then_some(config)
+}
+
+fn parse_reasoning_effort(value: &str) -> Result<ProviderReasoningEffort, String> {
+    match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "low" => Ok(ProviderReasoningEffort::Low),
+        "medium" => Ok(ProviderReasoningEffort::Medium),
+        "high" => Ok(ProviderReasoningEffort::High),
+        "xhigh" | "x_high" => Ok(ProviderReasoningEffort::Xhigh),
+        _ => Err("reasoning effort must be one of: low, medium, high, xhigh".to_owned()),
+    }
+}
+
+fn parse_positive_u64(value: &str, option: &str) -> Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| format!("{option} must be a positive integer"))?;
+    if parsed == 0 {
+        return Err(format!("{option} must be a positive integer"));
+    }
+    Ok(parsed)
 }
 
 fn parse_auth_scope(value: &str) -> Result<AuthConfigScope, String> {
@@ -508,9 +587,30 @@ mod tests {
                     model: "qwen".to_owned(),
                     api_key_env: "GOLUTRA_KEY".to_owned(),
                     api_key: None,
+                    generation_config: None,
                     scope: AuthConfigScope::Workspace,
                 }
             )))
+        );
+    }
+
+    #[test]
+    fn slash_parser_accepts_auth_generation_config() {
+        let input = parse_slash_input(
+            "/auth login --base-url api.golutra.cn --model gpt-5.5 --enable-thinking --reasoning-effort high --context-window-size 128000 --max-tokens 512",
+        );
+
+        let SlashInput::Command(SlashCommand::Auth(SlashAuthCommand::Login(login))) = input else {
+            panic!("expected auth login");
+        };
+        assert_eq!(
+            login.generation_config,
+            Some(ProviderGenerationConfig {
+                enable_thinking: true,
+                reasoning_effort: Some(ProviderReasoningEffort::High),
+                context_window_size: Some(128_000),
+                max_tokens: Some(512),
+            })
         );
     }
 

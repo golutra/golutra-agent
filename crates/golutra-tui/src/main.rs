@@ -17,10 +17,14 @@ use crossterm::{
 use golutra_client::{InProcessTransport, RuntimeClient};
 use golutra_config::{
     ProviderConfigPaths, ProviderConfigScope, ProviderInstallPlan, ProviderProfile,
-    ProviderSettings, provider_onboarding_state,
+    ProviderSettings, apply_provider_install_plan_verified, generate_custom_provider_api_key_env,
+    provider_onboarding_state, provider_protocol_has_runtime_adapter,
+    update_provider_settings_verified,
 };
 use golutra_core::{Actor, ActorKind, CommandId, QueryId, SessionId, TaskId, ThreadId};
-use golutra_llm::{ProviderProtocol, provider_protocol_catalog};
+use golutra_llm::{
+    ProviderGenerationConfig, ProviderProtocol, ProviderReasoningEffort, provider_protocol_catalog,
+};
 use golutra_protocol::{
     EventFilter, RuntimeEvent, RuntimeEventType, RuntimeQuery, RuntimeQueryKind, SessionCommand,
     SessionCommandKind, UserProjection, VisibleStep,
@@ -595,36 +599,52 @@ impl TuiApp {
             }
             SlashAuthCommand::Use { profile, scope } => {
                 let paths = provider_paths_for_tui(transport)?;
-                let path = match provider_scope(scope) {
-                    ProviderConfigScope::User => &paths.user_config,
-                    ProviderConfigScope::Workspace => &paths.workspace_config,
-                };
-                let mut settings =
-                    ProviderSettings::load(path).map_err(|error| miette::miette!("{error}"))?;
-                settings
-                    .set_active_profile(profile.clone())
-                    .map_err(|error| miette::miette!("{error}"))?;
-                settings
-                    .save(path)
-                    .map_err(|error| miette::miette!("{error}"))?;
-                self.provider_message = provider_status_message(transport);
-                self.push_system_message(
-                    "Auth updated",
-                    vec![format!("active provider profile set to {profile}")],
-                );
+                let workspace_root = provider_workspace_root_for_tui(transport)?;
+                let selected_profile = profile.clone();
+                match update_provider_settings_verified(
+                    &paths,
+                    workspace_root,
+                    move |user_settings, workspace_settings| {
+                        let settings = match provider_scope(scope) {
+                            ProviderConfigScope::User => user_settings,
+                            ProviderConfigScope::Workspace => workspace_settings,
+                        };
+                        settings.set_active_profile(selected_profile)?;
+                        Ok(())
+                    },
+                )
+                .await
+                {
+                    Ok(()) => {
+                        self.provider_message = provider_status_message(transport);
+                        self.push_system_message(
+                            "Auth updated",
+                            vec![format!("active provider profile set to {profile}")],
+                        );
+                    }
+                    Err(error) => {
+                        self.push_system_message("Auth failed", vec![error.to_string()]);
+                        self.status_message = "provider setup failed".to_owned();
+                    }
+                }
             }
-            SlashAuthCommand::Login(login) => {
-                apply_auth_login(transport, login)?;
-                self.provider_message = provider_status_message(transport);
-                self.auth_dialog = None;
-                self.push_system_message(
-                    "Auth updated",
-                    vec![
-                        "OpenAI-compatible provider saved".to_owned(),
-                        self.provider_message.clone(),
-                    ],
-                );
-            }
+            SlashAuthCommand::Login(login) => match apply_auth_login(transport, login).await {
+                Ok(()) => {
+                    self.provider_message = provider_status_message(transport);
+                    self.auth_dialog = None;
+                    self.push_system_message(
+                        "Auth updated",
+                        vec![
+                            "OpenAI-compatible provider saved".to_owned(),
+                            self.provider_message.clone(),
+                        ],
+                    );
+                }
+                Err(error) => {
+                    self.push_system_message("Auth failed", vec![error.to_string()]);
+                    self.status_message = "provider setup failed".to_owned();
+                }
+            },
         }
         Ok(())
     }
@@ -705,6 +725,11 @@ struct AuthDialogState {
     base_url: String,
     model: String,
     api_key: String,
+    enable_thinking: bool,
+    reasoning_effort: Option<ProviderReasoningEffort>,
+    context_window_size: String,
+    max_tokens: String,
+    advanced_selected: usize,
     review: Option<AuthReview>,
     error: Option<String>,
 }
@@ -757,6 +782,7 @@ struct AuthReview {
     base_url: String,
     model: String,
     api_key: String,
+    advanced: String,
     scope: ProviderConfigScope,
     config_path: PathBuf,
     updates_existing_profile: bool,
@@ -781,6 +807,11 @@ impl AuthDialogState {
             base_url: String::new(),
             model: String::new(),
             api_key: String::new(),
+            enable_thinking: false,
+            reasoning_effort: None,
+            context_window_size: String::new(),
+            max_tokens: String::new(),
+            advanced_selected: 0,
             review: None,
             error: None,
         }
@@ -812,6 +843,11 @@ impl AuthDialogState {
         self.base_url = provider.base_url.unwrap_or_default().to_owned();
         self.model = provider.model.unwrap_or_default().to_owned();
         self.api_key.clear();
+        self.enable_thinking = false;
+        self.reasoning_effort = None;
+        self.context_window_size.clear();
+        self.max_tokens.clear();
+        self.advanced_selected = 0;
         self.review = None;
         self.error = None;
         self.step = if provider.protocol_options.len() > 1 {
@@ -870,15 +906,23 @@ impl AuthDialogState {
             }
             AuthDialogStep::Protocol => self.protocol_options().len().saturating_sub(1),
             AuthDialogStep::Model => self.custom_model_index(),
-            AuthDialogStep::BaseUrl
-            | AuthDialogStep::ApiKey
-            | AuthDialogStep::AdvancedConfig
-            | AuthDialogStep::Review => 0,
+            AuthDialogStep::AdvancedConfig => AUTH_ADVANCED_ITEMS.saturating_sub(1),
+            AuthDialogStep::BaseUrl | AuthDialogStep::ApiKey | AuthDialogStep::Review => 0,
         };
-        self.selected = match direction {
-            ResumeSelectionDirection::Previous => self.selected.saturating_sub(1),
-            ResumeSelectionDirection::Next => (self.selected + 1).min(last_index),
+        let current = if self.step == AuthDialogStep::AdvancedConfig {
+            self.advanced_selected
+        } else {
+            self.selected
         };
+        let target = match direction {
+            ResumeSelectionDirection::Previous => current.saturating_sub(1),
+            ResumeSelectionDirection::Next => (current + 1).min(last_index),
+        };
+        if self.step == AuthDialogStep::AdvancedConfig {
+            self.advanced_selected = target;
+        } else {
+            self.selected = target;
+        }
         self.error = None;
     }
 
@@ -887,11 +931,15 @@ impl AuthDialogState {
             AuthDialogStep::BaseUrl => Some(&mut self.base_url),
             AuthDialogStep::ApiKey => Some(&mut self.api_key),
             AuthDialogStep::Model if self.is_custom_model_selected() => Some(&mut self.model),
+            AuthDialogStep::AdvancedConfig => match self.advanced_selected {
+                2 => Some(&mut self.context_window_size),
+                3 => Some(&mut self.max_tokens),
+                _ => None,
+            },
             AuthDialogStep::GroupChoice
             | AuthDialogStep::ThirdPartyChoice
             | AuthDialogStep::Protocol
             | AuthDialogStep::Model
-            | AuthDialogStep::AdvancedConfig
             | AuthDialogStep::Review => None,
         }
     }
@@ -934,8 +982,18 @@ impl AuthDialogState {
             AuthDialogStep::Protocol => AuthDialogStep::GroupChoice,
         };
     }
+
+    fn toggle_advanced_item(&mut self) {
+        match self.advanced_selected {
+            0 => self.enable_thinking = !self.enable_thinking,
+            1 => self.reasoning_effort = next_reasoning_effort(self.reasoning_effort),
+            _ => {}
+        }
+        self.error = None;
+    }
 }
 
+const AUTH_ADVANCED_ITEMS: usize = 4;
 const OPENAI_PROTOCOL_ONLY: &[ProviderProtocol] = &[ProviderProtocol::OpenAiCompatible];
 const CUSTOM_PROTOCOL_OPTIONS: &[ProviderProtocol] = &[
     ProviderProtocol::OpenAiCompatible,
@@ -1249,29 +1307,21 @@ async fn handle_auth_dialog_key(
             }
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            if let Some(dialog) = &mut app.auth_dialog
-                && matches!(
-                    dialog.step,
-                    AuthDialogStep::GroupChoice
-                        | AuthDialogStep::ThirdPartyChoice
-                        | AuthDialogStep::Protocol
-                        | AuthDialogStep::Model
-                )
-            {
-                dialog.move_selection(ResumeSelectionDirection::Previous);
+            if let Some(dialog) = &mut app.auth_dialog {
+                if key.code == KeyCode::Up || auth_step_accepts_vim_selection_keys(dialog) {
+                    dialog.move_selection(ResumeSelectionDirection::Previous);
+                } else if let KeyCode::Char(character) = key.code {
+                    handle_auth_dialog_character(dialog, character);
+                }
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if let Some(dialog) = &mut app.auth_dialog
-                && matches!(
-                    dialog.step,
-                    AuthDialogStep::GroupChoice
-                        | AuthDialogStep::ThirdPartyChoice
-                        | AuthDialogStep::Protocol
-                        | AuthDialogStep::Model
-                )
-            {
-                dialog.move_selection(ResumeSelectionDirection::Next);
+            if let Some(dialog) = &mut app.auth_dialog {
+                if key.code == KeyCode::Down || auth_step_accepts_vim_selection_keys(dialog) {
+                    dialog.move_selection(ResumeSelectionDirection::Next);
+                } else if let KeyCode::Char(character) = key.code {
+                    handle_auth_dialog_character(dialog, character);
+                }
             }
         }
         KeyCode::Backspace => {
@@ -1284,7 +1334,9 @@ async fn handle_auth_dialog_key(
             }
         }
         KeyCode::Enter => {
-            advance_auth_dialog(app, transport)?;
+            if let Err(error) = advance_auth_dialog(app, transport).await {
+                report_auth_dialog_error(app, error);
+            }
         }
         KeyCode::Char(character) if character.is_ascii_digit() => {
             if let Some(dialog) = &mut app.auth_dialog
@@ -1312,11 +1364,17 @@ async fn handle_auth_dialog_key(
                 };
                 if (index as usize) <= last_index {
                     dialog.selected = index as usize;
-                    advance_auth_dialog(app, transport)?;
+                    if let Err(error) = advance_auth_dialog(app, transport).await {
+                        report_auth_dialog_error(app, error);
+                    }
                 }
             } else if let Some(dialog) = &mut app.auth_dialog {
                 if dialog.step == AuthDialogStep::Model {
                     dialog.prepare_custom_model_input().push(character);
+                } else if dialog.step == AuthDialogStep::AdvancedConfig {
+                    if let Some(input) = dialog.current_input_mut() {
+                        input.push(character);
+                    }
                 } else if let Some(input) = dialog.current_input_mut() {
                     input.push(character);
                 }
@@ -1324,11 +1382,7 @@ async fn handle_auth_dialog_key(
         }
         KeyCode::Char(character) => {
             if let Some(dialog) = &mut app.auth_dialog {
-                if dialog.step == AuthDialogStep::Model {
-                    dialog.prepare_custom_model_input().push(character);
-                } else if let Some(input) = dialog.current_input_mut() {
-                    input.push(character);
-                }
+                handle_auth_dialog_character(dialog, character);
             }
         }
         _ => {}
@@ -1336,7 +1390,58 @@ async fn handle_auth_dialog_key(
     Ok(())
 }
 
-fn advance_auth_dialog(app: &mut TuiApp, transport: &InProcessTransport) -> miette::Result<()> {
+fn auth_step_accepts_vim_selection_keys(dialog: &AuthDialogState) -> bool {
+    matches!(
+        dialog.step,
+        AuthDialogStep::GroupChoice
+            | AuthDialogStep::ThirdPartyChoice
+            | AuthDialogStep::Protocol
+            | AuthDialogStep::AdvancedConfig
+    )
+}
+
+fn handle_auth_dialog_character(dialog: &mut AuthDialogState, character: char) {
+    if dialog.step == AuthDialogStep::AdvancedConfig {
+        handle_auth_advanced_character(dialog, character);
+    } else if dialog.step == AuthDialogStep::Model {
+        dialog.prepare_custom_model_input().push(character);
+    } else if let Some(input) = dialog.current_input_mut() {
+        input.push(character);
+    }
+}
+
+fn handle_auth_advanced_character(dialog: &mut AuthDialogState, character: char) {
+    match character {
+        ' ' => dialog.toggle_advanced_item(),
+        't' | 'T' => {
+            dialog.advanced_selected = 0;
+            dialog.toggle_advanced_item();
+        }
+        'r' | 'R' => {
+            dialog.advanced_selected = 1;
+            dialog.toggle_advanced_item();
+        }
+        'c' | 'C' => {
+            dialog.advanced_selected = 2;
+            dialog.error = None;
+        }
+        'm' | 'M' => {
+            dialog.advanced_selected = 3;
+            dialog.error = None;
+        }
+        character if character.is_ascii_digit() => {
+            if let Some(input) = dialog.current_input_mut() {
+                input.push(character);
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn advance_auth_dialog(
+    app: &mut TuiApp,
+    transport: &InProcessTransport,
+) -> miette::Result<()> {
     let action = {
         let Some(dialog) = &mut app.auth_dialog else {
             return Ok(());
@@ -1367,7 +1472,11 @@ fn advance_auth_dialog(app: &mut TuiApp, transport: &InProcessTransport) -> miet
             }
             AuthDialogStep::Protocol => {
                 dialog.protocol = dialog.selected_protocol();
-                if dialog.base_url.is_empty() {
+                if dialog.base_url.is_empty()
+                    && dialog
+                        .provider
+                        .is_none_or(|provider| provider.source != AuthProviderSource::Custom)
+                {
                     dialog.base_url =
                         AuthDialogState::default_base_url_for_protocol(dialog.protocol).to_owned();
                 }
@@ -1421,7 +1530,9 @@ fn advance_auth_dialog(app: &mut TuiApp, transport: &InProcessTransport) -> miet
                 }
             }
             AuthDialogStep::AdvancedConfig => {
-                match build_auth_review(dialog, transport) {
+                match validate_generation_config(dialog)
+                    .and_then(|_| build_auth_review(dialog, transport))
+                {
                     Ok(review) => {
                         dialog.review = Some(review);
                         dialog.step = AuthDialogStep::Review;
@@ -1433,7 +1544,13 @@ fn advance_auth_dialog(app: &mut TuiApp, transport: &InProcessTransport) -> miet
                 }
                 AuthAdvanceAction::None
             }
-            AuthDialogStep::Review => AuthAdvanceAction::SaveOpenAiCompatible(auth_login(dialog)),
+            AuthDialogStep::Review => match auth_login(dialog) {
+                Ok(login) => AuthAdvanceAction::SaveOpenAiCompatible(login),
+                Err(error) => {
+                    dialog.error = Some(error);
+                    AuthAdvanceAction::None
+                }
+            },
         }
     };
     match action {
@@ -1445,7 +1562,7 @@ fn advance_auth_dialog(app: &mut TuiApp, transport: &InProcessTransport) -> miet
             app.status_message = "using mock provider".to_owned();
         }
         AuthAdvanceAction::SaveOpenAiCompatible(login) => {
-            apply_auth_login(transport, login)?;
+            apply_auth_login(transport, login).await?;
             app.provider_message = provider_status_message(transport);
             app.auth_dialog = None;
             app.status_message = "provider connected".to_owned();
@@ -1455,8 +1572,16 @@ fn advance_auth_dialog(app: &mut TuiApp, transport: &InProcessTransport) -> miet
     Ok(())
 }
 
+fn report_auth_dialog_error(app: &mut TuiApp, error: miette::Report) {
+    let message = error.to_string();
+    if let Some(dialog) = &mut app.auth_dialog {
+        dialog.error = Some(message);
+    }
+    app.status_message = "provider setup failed".to_owned();
+}
+
 fn custom_provider_protocol_is_runtime_supported(protocol: ProviderProtocol) -> bool {
-    protocol == ProviderProtocol::OpenAiCompatible
+    provider_protocol_has_runtime_adapter(protocol)
 }
 
 async fn handle_resume_picker_key(
@@ -1782,17 +1907,45 @@ fn auth_advanced_config_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
                 .add_modifier(Modifier::BOLD),
         )]),
         Line::from(""),
-        Line::from(Span::styled(
-            "No advanced generation overrides are saved in this runtime stage.",
-            Style::default().fg(Color::Gray),
-        )),
-        Line::from(Span::styled(
-            "Provider protocol, base URL, API key, and model will be validated in the review step.",
-            Style::default().fg(Color::DarkGray),
-        )),
+        auth_option_line(
+            0,
+            "Thinking",
+            if dialog.enable_thinking {
+                "enabled"
+            } else {
+                "default"
+            },
+            dialog.advanced_selected == 0,
+        ),
+        auth_option_line(
+            1,
+            "Reasoning effort",
+            reasoning_effort_label(dialog.reasoning_effort),
+            dialog.advanced_selected == 1,
+        ),
+        auth_option_line(
+            2,
+            "Context window",
+            if dialog.context_window_size.is_empty() {
+                "default"
+            } else {
+                dialog.context_window_size.as_str()
+            },
+            dialog.advanced_selected == 2,
+        ),
+        auth_option_line(
+            3,
+            "Max output tokens",
+            if dialog.max_tokens.is_empty() {
+                "default"
+            } else {
+                dialog.max_tokens.as_str()
+            },
+            dialog.advanced_selected == 3,
+        ),
         Line::from(""),
         Line::from(Span::styled(
-            "Enter continue   Esc back   Ctrl+C twice quit",
+            "Up/Down select   Space toggle/cycle   Type digits for numeric fields   Enter continue   Esc back",
             Style::default().fg(Color::DarkGray),
         )),
     ];
@@ -1826,6 +1979,7 @@ fn auth_review_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
         auth_kv_line("Base URL", &review.base_url),
         auth_kv_line("Model", &review.model),
         auth_kv_line("API key", &review.api_key),
+        auth_kv_line("Advanced", &review.advanced),
         auth_kv_line("Scope", provider_scope_label(review.scope)),
         auth_kv_line("Config", &review.config_path.display().to_string()),
         auth_kv_line("Plan", update_line),
@@ -2189,7 +2343,35 @@ fn auth_composer_line(dialog: &AuthDialogState) -> String {
             .selected_recommended_model()
             .unwrap_or("Custom model")
             .to_owned(),
-        AuthDialogStep::AdvancedConfig => "Advanced config".to_owned(),
+        AuthDialogStep::AdvancedConfig => match dialog.advanced_selected {
+            0 => format!(
+                "Thinking: {}",
+                if dialog.enable_thinking {
+                    "enabled"
+                } else {
+                    "default"
+                }
+            ),
+            1 => format!(
+                "Reasoning effort: {}",
+                reasoning_effort_label(dialog.reasoning_effort)
+            ),
+            2 => {
+                if dialog.context_window_size.is_empty() {
+                    "Context window".to_owned()
+                } else {
+                    dialog.context_window_size.clone()
+                }
+            }
+            3 => {
+                if dialog.max_tokens.is_empty() {
+                    "Max output tokens".to_owned()
+                } else {
+                    dialog.max_tokens.clone()
+                }
+            }
+            _ => "Advanced config".to_owned(),
+        },
         AuthDialogStep::Review => "Review install plan".to_owned(),
     }
 }
@@ -2599,10 +2781,16 @@ fn parse_thread_id(value: &str) -> miette::Result<ThreadId> {
 }
 
 fn provider_paths_for_tui(transport: &InProcessTransport) -> miette::Result<ProviderConfigPaths> {
-    let workspace = transport
-        .workspace_root()
-        .ok_or_else(|| miette::miette!("provider config requires a workspace"))?;
+    let workspace = provider_workspace_root_for_tui(transport)?;
     ProviderConfigPaths::for_workspace(workspace).map_err(|error| miette::miette!("{error}"))
+}
+
+fn provider_workspace_root_for_tui(
+    transport: &InProcessTransport,
+) -> miette::Result<&std::path::Path> {
+    transport
+        .workspace_root()
+        .ok_or_else(|| miette::miette!("provider config requires a workspace"))
 }
 
 fn provider_scope(scope: AuthConfigScope) -> ProviderConfigScope {
@@ -2612,17 +2800,26 @@ fn provider_scope(scope: AuthConfigScope) -> ProviderConfigScope {
     }
 }
 
-fn auth_login(dialog: &AuthDialogState) -> OpenAiCompatibleLogin {
+fn auth_login(dialog: &AuthDialogState) -> Result<OpenAiCompatibleLogin, String> {
     let provider = dialog.provider.unwrap_or(CUSTOM_PROVIDER_PRESET);
-    OpenAiCompatibleLogin {
+    let api_key_env = match provider.source {
+        AuthProviderSource::Custom => {
+            generate_custom_provider_api_key_env(dialog.protocol, dialog.base_url.trim())
+        }
+        AuthProviderSource::Official | AuthProviderSource::ThirdParty => {
+            "GOLUTRA_PROVIDER_API_KEY".to_owned()
+        }
+    };
+    Ok(OpenAiCompatibleLogin {
         profile: provider.profile.to_owned(),
         protocol: dialog.protocol,
         base_url: dialog.base_url.trim().to_owned(),
         model: dialog.model.trim().to_owned(),
-        api_key_env: "GOLUTRA_PROVIDER_API_KEY".to_owned(),
+        api_key_env,
         api_key: Some(dialog.api_key.trim().to_owned()),
+        generation_config: validate_generation_config(dialog)?,
         scope: AuthConfigScope::User,
-    }
+    })
 }
 
 fn build_auth_review(
@@ -2630,7 +2827,7 @@ fn build_auth_review(
     transport: &InProcessTransport,
 ) -> Result<AuthReview, String> {
     let provider = dialog.provider.unwrap_or(CUSTOM_PROVIDER_PRESET);
-    let login = auth_login(dialog);
+    let login = auth_login(dialog)?;
     let paths = provider_paths_for_tui(transport).map_err(|error| error.to_string())?;
     let scope = provider_scope(login.scope);
     let config_path = match scope {
@@ -2651,6 +2848,7 @@ fn build_auth_review(
         login.api_key_env,
     )
     .map_err(|error| error.to_string())?;
+    preview_profile.generation_config = login.generation_config.clone();
     preview_profile.api_key = Some(mask_api_key(login.api_key.as_deref().unwrap_or_default()));
     let preview_plan = ProviderInstallPlan {
         scope,
@@ -2667,6 +2865,7 @@ fn build_auth_review(
         base_url: login.base_url,
         model: login.model,
         api_key: mask_api_key(login.api_key.as_deref().unwrap_or_default()),
+        advanced: generation_config_summary(login.generation_config.as_ref()),
         scope,
         config_path,
         updates_existing_profile,
@@ -2717,11 +2916,12 @@ fn mask_api_key(value: &str) -> String {
     format!("{prefix}...{suffix}")
 }
 
-fn apply_auth_login(
+async fn apply_auth_login(
     transport: &InProcessTransport,
     login: OpenAiCompatibleLogin,
 ) -> miette::Result<()> {
     let paths = provider_paths_for_tui(transport)?;
+    let workspace_root = provider_workspace_root_for_tui(transport)?;
     let scope = provider_scope(login.scope);
     let mut profile = ProviderProfile::live_profile(
         login.profile,
@@ -2732,13 +2932,102 @@ fn apply_auth_login(
     )
     .map_err(|error| miette::miette!("{error}"))?;
     profile.api_key = login.api_key;
-    ProviderInstallPlan {
-        scope,
-        profile,
-        activate: true,
+    profile.generation_config = login.generation_config;
+    let mut persisted_profile = profile;
+    if scope == ProviderConfigScope::Workspace {
+        persisted_profile.api_key = None;
     }
-    .apply(&paths)
-    .map_err(|error| miette::miette!("{error}"))
+    apply_provider_install_plan_verified(
+        &paths,
+        workspace_root,
+        &ProviderInstallPlan {
+            scope,
+            profile: persisted_profile,
+            activate: true,
+        },
+    )
+    .await
+    .map_err(|error| miette::miette!("{error}"))?;
+
+    Ok(())
+}
+
+fn validate_generation_config(
+    dialog: &AuthDialogState,
+) -> Result<Option<ProviderGenerationConfig>, String> {
+    let context_window_size =
+        parse_optional_positive_u64(&dialog.context_window_size, "Context window size")?;
+    let max_tokens = parse_optional_positive_u64(&dialog.max_tokens, "Max output tokens")?;
+    let config = ProviderGenerationConfig {
+        enable_thinking: dialog.enable_thinking,
+        reasoning_effort: dialog.reasoning_effort,
+        context_window_size,
+        max_tokens,
+    };
+    Ok((!config.is_empty()).then_some(config))
+}
+
+fn parse_optional_positive_u64(value: &str, label: &str) -> Result<Option<u64>, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let parsed = trimmed
+        .parse::<u64>()
+        .map_err(|_| format!("{label} must be a positive integer"))?;
+    if parsed == 0 {
+        return Err(format!("{label} must be a positive integer"));
+    }
+    Ok(Some(parsed))
+}
+
+fn next_reasoning_effort(
+    value: Option<ProviderReasoningEffort>,
+) -> Option<ProviderReasoningEffort> {
+    match value {
+        None => Some(ProviderReasoningEffort::Low),
+        Some(ProviderReasoningEffort::Low) => Some(ProviderReasoningEffort::Medium),
+        Some(ProviderReasoningEffort::Medium) => Some(ProviderReasoningEffort::High),
+        Some(ProviderReasoningEffort::High) => Some(ProviderReasoningEffort::Xhigh),
+        Some(ProviderReasoningEffort::Xhigh) => None,
+    }
+}
+
+fn reasoning_effort_label(value: Option<ProviderReasoningEffort>) -> &'static str {
+    match value {
+        None => "default",
+        Some(ProviderReasoningEffort::Low) => "low",
+        Some(ProviderReasoningEffort::Medium) => "medium",
+        Some(ProviderReasoningEffort::High) => "high",
+        Some(ProviderReasoningEffort::Xhigh) => "xhigh",
+    }
+}
+
+fn generation_config_summary(config: Option<&ProviderGenerationConfig>) -> String {
+    let Some(config) = config else {
+        return "default".to_owned();
+    };
+    let mut parts = Vec::new();
+    if config.enable_thinking {
+        parts.push("thinking=on".to_owned());
+    }
+    if let Some(reasoning_effort) = config.reasoning_effort {
+        parts.push(format!(
+            "effort={}",
+            reasoning_effort_label(Some(reasoning_effort))
+        ));
+    }
+    if let Some(context_window_size) = config.context_window_size {
+        parts.push(format!("context={context_window_size}"));
+    }
+    if let Some(max_tokens) = config.max_tokens {
+        parts.push(format!("max_tokens={max_tokens}"));
+    }
+    if parts.is_empty() {
+        "default".to_owned()
+    } else {
+        parts.join(", ")
+    }
 }
 
 fn apply_auth_mock(transport: &InProcessTransport) -> miette::Result<()> {
@@ -2799,9 +3088,39 @@ fn provider_status_message(transport: &InProcessTransport) -> String {
 
 #[cfg(test)]
 mod tests {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::{Mutex, MutexGuard},
+    };
+
     use super::*;
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    async fn env_lock_guard() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().await
+    }
+
+    async fn spawn_probe_server(body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buffer = [0_u8; 2048];
+            let _ = stream.read(&mut buffer).await.expect("read request");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+        format!("http://{address}/v1")
+    }
 
     #[tokio::test]
     async fn initial_session_without_argument_starts_new_thread_and_session() {
@@ -2831,7 +3150,7 @@ mod tests {
         let transport = InProcessTransport::for_workspace(dir.path())
             .await
             .expect("transport");
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = env_lock_guard().await;
         let previous_home = std::env::var("GOLUTRA_HOME").ok();
         unsafe {
             std::env::set_var("GOLUTRA_HOME", home.path());
@@ -2865,7 +3184,9 @@ mod tests {
         let dialog = app.auth_dialog.as_mut().expect("dialog");
         dialog.selected = 3;
 
-        advance_auth_dialog(&mut app, &transport).expect("advance");
+        advance_auth_dialog(&mut app, &transport)
+            .await
+            .expect("advance");
 
         assert!(app.auth_dialog.is_none());
         assert_eq!(app.provider_message, "ready (mock)");
@@ -2876,10 +3197,11 @@ mod tests {
     async fn auth_dialog_openai_flow_persists_user_key() {
         let dir = tempfile::tempdir().expect("dir");
         let home = tempfile::tempdir().expect("home");
+        let base_url = spawn_probe_server(r#"{"data":[{"id":"qwen-coder"}]}"#).await;
         let transport = InProcessTransport::for_workspace(dir.path())
             .await
             .expect("transport");
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = env_lock_guard().await;
         let previous_home = std::env::var("GOLUTRA_HOME").ok();
         unsafe {
             std::env::set_var("GOLUTRA_HOME", home.path());
@@ -2896,29 +3218,37 @@ mod tests {
             let dialog = app.auth_dialog.as_mut().expect("dialog");
             dialog.provider = Some(OFFICIAL_PROVIDER_PRESET);
             dialog.step = AuthDialogStep::BaseUrl;
-            dialog.base_url = "https://api.golutra.cn/v1".to_owned();
+            dialog.base_url = base_url;
             dialog.model = "qwen-coder".to_owned();
             dialog.api_key = "test-key".to_owned();
         }
 
-        advance_auth_dialog(&mut app, &transport).expect("base url");
-        advance_auth_dialog(&mut app, &transport).expect("api key");
+        advance_auth_dialog(&mut app, &transport)
+            .await
+            .expect("base url");
+        advance_auth_dialog(&mut app, &transport)
+            .await
+            .expect("api key");
         {
             let dialog = app.auth_dialog.as_mut().expect("dialog");
             dialog.selected = dialog.custom_model_index();
         }
-        advance_auth_dialog(&mut app, &transport).expect("model");
+        advance_auth_dialog(&mut app, &transport)
+            .await
+            .expect("model");
         assert_eq!(
             app.auth_dialog.as_ref().map(|dialog| dialog.step),
             Some(AuthDialogStep::AdvancedConfig)
         );
-        advance_auth_dialog(&mut app, &transport).expect("advanced config");
+        advance_auth_dialog(&mut app, &transport)
+            .await
+            .expect("advanced config");
         assert_eq!(
             app.auth_dialog.as_ref().map(|dialog| dialog.step),
             Some(AuthDialogStep::Review)
         );
 
-        let result = advance_auth_dialog(&mut app, &transport);
+        let result = advance_auth_dialog(&mut app, &transport).await;
         match previous_home {
             Some(value) => unsafe {
                 std::env::set_var("GOLUTRA_HOME", value);
@@ -2935,7 +3265,14 @@ mod tests {
         let profile = settings.active_profile().expect("profile");
         assert_eq!(profile.name, "golutra");
         assert_eq!(profile.model_id.as_deref(), Some("qwen-coder"));
-        assert_eq!(profile.api_key.as_deref(), Some("test-key"));
+        assert_eq!(
+            settings
+                .env
+                .get("GOLUTRA_PROVIDER_API_KEY")
+                .map(String::as_str),
+            Some("test-key")
+        );
+        assert!(profile.api_key.is_none());
     }
 
     #[tokio::test]
@@ -2959,7 +3296,9 @@ mod tests {
             dialog.base_url = "api.golutra.cn".to_owned();
         }
 
-        advance_auth_dialog(&mut app, &transport).expect("advance");
+        advance_auth_dialog(&mut app, &transport)
+            .await
+            .expect("advance");
 
         let dialog = app.auth_dialog.as_ref().expect("dialog");
         assert_eq!(dialog.step, AuthDialogStep::BaseUrl);
@@ -3050,7 +3389,7 @@ mod tests {
         let transport = InProcessTransport::for_workspace(dir.path())
             .await
             .expect("transport");
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = env_lock_guard().await;
         let previous_home = std::env::var("GOLUTRA_HOME").ok();
         unsafe {
             std::env::set_var("GOLUTRA_HOME", home.path());
@@ -3086,8 +3425,260 @@ mod tests {
         }
 
         assert!(review.updates_existing_profile);
-        assert!(review.preview_json.contains("\"api_key\": \"***\""));
+        assert_eq!(review.api_key, "***");
+        assert!(!review.preview_json.contains("\"api_key\""));
         assert!(!review.preview_json.contains("test-key"));
+    }
+
+    #[tokio::test]
+    async fn auth_review_custom_provider_uses_derived_env_key() {
+        let dir = tempfile::tempdir().expect("dir");
+        let home = tempfile::tempdir().expect("home");
+        let transport = InProcessTransport::for_workspace(dir.path())
+            .await
+            .expect("transport");
+        let _guard = env_lock_guard().await;
+        let previous_home = std::env::var("GOLUTRA_HOME").ok();
+        unsafe {
+            std::env::set_var("GOLUTRA_HOME", home.path());
+        }
+        let mut dialog = AuthDialogState::new();
+        dialog.select_provider(CUSTOM_PROVIDER_PRESET);
+        dialog.protocol = ProviderProtocol::OpenAiCompatible;
+        dialog.base_url = "https://api.example.com/v1/".to_owned();
+        dialog.model = "gpt-5.5".to_owned();
+        dialog.api_key = "test-key".to_owned();
+
+        let review = build_auth_review(&dialog, &transport).expect("review");
+
+        match previous_home {
+            Some(value) => unsafe {
+                std::env::set_var("GOLUTRA_HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("GOLUTRA_HOME");
+            },
+        }
+        let expected_env = generate_custom_provider_api_key_env(
+            ProviderProtocol::OpenAiCompatible,
+            "https://api.example.com/v1/",
+        );
+        assert!(review.preview_json.contains(&expected_env));
+        assert!(!review.preview_json.contains("test-key"));
+        assert!(
+            !review
+                .preview_json
+                .contains("\"api_key_env\": \"GOLUTRA_PROVIDER_API_KEY\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_review_includes_generation_config() {
+        let dir = tempfile::tempdir().expect("dir");
+        let home = tempfile::tempdir().expect("home");
+        let transport = InProcessTransport::for_workspace(dir.path())
+            .await
+            .expect("transport");
+        let _guard = env_lock_guard().await;
+        let previous_home = std::env::var("GOLUTRA_HOME").ok();
+        unsafe {
+            std::env::set_var("GOLUTRA_HOME", home.path());
+        }
+        let mut dialog = AuthDialogState::new();
+        dialog.select_provider(CUSTOM_PROVIDER_PRESET);
+        dialog.protocol = ProviderProtocol::OpenAiCompatible;
+        dialog.base_url = "https://api.example.com/v1".to_owned();
+        dialog.model = "gpt-5.5".to_owned();
+        dialog.api_key = "test-key".to_owned();
+        dialog.enable_thinking = true;
+        dialog.reasoning_effort = Some(ProviderReasoningEffort::High);
+        dialog.context_window_size = "128000".to_owned();
+        dialog.max_tokens = "512".to_owned();
+
+        let review = build_auth_review(&dialog, &transport).expect("review");
+
+        match previous_home {
+            Some(value) => unsafe {
+                std::env::set_var("GOLUTRA_HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("GOLUTRA_HOME");
+            },
+        }
+        assert_eq!(
+            review.advanced,
+            "thinking=on, effort=high, context=128000, max_tokens=512"
+        );
+        assert!(review.preview_json.contains("\"enable_thinking\": true"));
+        assert!(
+            review
+                .preview_json
+                .contains("\"reasoning_effort\": \"high\"")
+        );
+        assert!(review.preview_json.contains("\"max_tokens\": 512"));
+    }
+
+    #[tokio::test]
+    async fn slash_auth_login_rejects_catalog_only_protocol_without_persisting() {
+        let dir = tempfile::tempdir().expect("dir");
+        let home = tempfile::tempdir().expect("home");
+        let transport = InProcessTransport::for_workspace(dir.path())
+            .await
+            .expect("transport");
+        let _guard = env_lock_guard().await;
+        let previous_home = std::env::var("GOLUTRA_HOME").ok();
+        unsafe {
+            std::env::set_var("GOLUTRA_HOME", home.path());
+        }
+        let login = OpenAiCompatibleLogin {
+            profile: "anthropic".to_owned(),
+            protocol: ProviderProtocol::Anthropic,
+            base_url: "https://api.anthropic.com/v1".to_owned(),
+            model: "claude-sonnet-4".to_owned(),
+            api_key_env: "GOLUTRA_PROVIDER_API_KEY".to_owned(),
+            api_key: Some("test-key".to_owned()),
+            generation_config: None,
+            scope: AuthConfigScope::User,
+        };
+
+        let error = apply_auth_login(&transport, login)
+            .await
+            .expect_err("unsupported protocol rejected");
+        let paths = provider_paths_for_tui(&transport).expect("paths");
+        let settings = ProviderSettings::load(&paths.user_config).expect("settings");
+
+        match previous_home {
+            Some(value) => unsafe {
+                std::env::set_var("GOLUTRA_HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("GOLUTRA_HOME");
+            },
+        }
+        assert!(error.to_string().contains("has no live adapter yet"));
+        assert!(settings.profiles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn auth_dialog_keeps_dialog_open_and_rolls_back_when_probe_fails() {
+        let dir = tempfile::tempdir().expect("dir");
+        let home = tempfile::tempdir().expect("home");
+        let transport = InProcessTransport::for_workspace(dir.path())
+            .await
+            .expect("transport");
+        let _guard = env_lock_guard().await;
+        let previous_home = std::env::var("GOLUTRA_HOME").ok();
+        unsafe {
+            std::env::set_var("GOLUTRA_HOME", home.path());
+        }
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            SessionId::new(),
+            None,
+            false,
+            provider_status_message(&transport),
+            Some(AuthDialogState::new()),
+        );
+        {
+            let dialog = app.auth_dialog.as_mut().expect("dialog");
+            dialog.provider = Some(CUSTOM_PROVIDER_PRESET);
+            dialog.protocol = ProviderProtocol::OpenAiCompatible;
+            dialog.step = AuthDialogStep::Review;
+            dialog.base_url = "http://127.0.0.1:9/v1".to_owned();
+            dialog.model = "gpt-5.5".to_owned();
+            dialog.api_key = "test-key".to_owned();
+        }
+
+        handle_auth_dialog_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            &transport,
+        )
+        .await
+        .expect("enter review");
+
+        let paths = provider_paths_for_tui(&transport).expect("paths");
+        let settings = ProviderSettings::load(&paths.user_config).expect("settings");
+
+        match previous_home {
+            Some(value) => unsafe {
+                std::env::set_var("GOLUTRA_HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("GOLUTRA_HOME");
+            },
+        }
+
+        let dialog = app.auth_dialog.as_ref().expect("dialog still open");
+        assert_eq!(dialog.step, AuthDialogStep::Review);
+        assert!(
+            dialog
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("provider probe failed"))
+        );
+        assert_eq!(app.status_message, "provider setup failed");
+        assert!(settings.profiles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn slash_auth_login_failure_reports_error_without_persisting_profile() {
+        let dir = tempfile::tempdir().expect("dir");
+        let home = tempfile::tempdir().expect("home");
+        let transport = InProcessTransport::for_workspace(dir.path())
+            .await
+            .expect("transport");
+        let _guard = env_lock_guard().await;
+        let previous_home = std::env::var("GOLUTRA_HOME").ok();
+        unsafe {
+            std::env::set_var("GOLUTRA_HOME", home.path());
+        }
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            SessionId::new(),
+            None,
+            false,
+            provider_status_message(&transport),
+            None,
+        );
+
+        app.execute_auth_command(
+            &transport,
+            SlashAuthCommand::Login(OpenAiCompatibleLogin {
+                profile: "custom".to_owned(),
+                protocol: ProviderProtocol::OpenAiCompatible,
+                base_url: "http://127.0.0.1:9/v1".to_owned(),
+                model: "gpt-5.5".to_owned(),
+                api_key_env: "GOLUTRA_CUSTOM_PROVIDER_API_KEY_TEST".to_owned(),
+                api_key: Some("test-key".to_owned()),
+                generation_config: None,
+                scope: AuthConfigScope::User,
+            }),
+        )
+        .await
+        .expect("login command");
+
+        let paths = provider_paths_for_tui(&transport).expect("paths");
+        let settings = ProviderSettings::load(&paths.user_config).expect("settings");
+
+        match previous_home {
+            Some(value) => unsafe {
+                std::env::set_var("GOLUTRA_HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("GOLUTRA_HOME");
+            },
+        }
+
+        assert_eq!(app.status_message, "provider setup failed");
+        assert!(settings.profiles.is_empty());
+        assert!(app.command_messages.iter().any(|item| {
+            item.title == "Auth failed"
+                && item
+                    .body
+                    .iter()
+                    .any(|line| line.contains("provider probe failed"))
+        }));
     }
 
     #[test]
@@ -3140,6 +3731,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auth_dialog_custom_provider_does_not_prefill_base_url_from_protocol() {
+        let dir = tempfile::tempdir().expect("dir");
+        let transport = InProcessTransport::for_workspace(dir.path())
+            .await
+            .expect("transport");
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            SessionId::new(),
+            None,
+            false,
+            provider_status_message(&transport),
+            Some(AuthDialogState::new()),
+        );
+        {
+            let dialog = app.auth_dialog.as_mut().expect("dialog");
+            dialog.select_provider(CUSTOM_PROVIDER_PRESET);
+            dialog.selected = 0;
+        }
+
+        advance_auth_dialog(&mut app, &transport)
+            .await
+            .expect("advance");
+
+        let dialog = app.auth_dialog.as_ref().expect("dialog");
+        assert_eq!(dialog.step, AuthDialogStep::BaseUrl);
+        assert!(dialog.base_url.is_empty());
+    }
+
+    #[tokio::test]
     async fn auth_dialog_blocks_custom_protocols_without_live_adapter() {
         let dir = tempfile::tempdir().expect("dir");
         let transport = InProcessTransport::for_workspace(dir.path())
@@ -3163,7 +3783,9 @@ mod tests {
             dialog.api_key = "test-key".to_owned();
         }
 
-        advance_auth_dialog(&mut app, &transport).expect("advance");
+        advance_auth_dialog(&mut app, &transport)
+            .await
+            .expect("advance");
 
         let dialog = app.auth_dialog.as_ref().expect("dialog");
         assert_eq!(dialog.step, AuthDialogStep::Model);
@@ -3225,6 +3847,54 @@ mod tests {
         assert_eq!(dialog.step, AuthDialogStep::Model);
         assert!(dialog.is_custom_model_selected());
         assert_eq!(dialog.model, "gpt-5.5");
+    }
+
+    #[tokio::test]
+    async fn auth_text_inputs_do_not_swallow_vim_key_characters() {
+        let dir = tempfile::tempdir().expect("dir");
+        let transport = InProcessTransport::for_workspace(dir.path())
+            .await
+            .expect("transport");
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            SessionId::new(),
+            None,
+            false,
+            provider_status_message(&transport),
+            Some(AuthDialogState::new()),
+        );
+        {
+            let dialog = app.auth_dialog.as_mut().expect("dialog");
+            dialog.select_provider(OFFICIAL_PROVIDER_PRESET);
+            dialog.step = AuthDialogStep::ApiKey;
+        }
+
+        for character in "sk-key".chars() {
+            handle_auth_dialog_key(
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                &mut app,
+                &transport,
+            )
+            .await
+            .expect("type api key character");
+        }
+        {
+            let dialog = app.auth_dialog.as_mut().expect("dialog");
+            assert_eq!(dialog.api_key, "sk-key");
+            dialog.step = AuthDialogStep::Model;
+        }
+        for character in "jkl-model".chars() {
+            handle_auth_dialog_key(
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                &mut app,
+                &transport,
+            )
+            .await
+            .expect("type model character");
+        }
+
+        let dialog = app.auth_dialog.as_ref().expect("dialog");
+        assert_eq!(dialog.model, "jkl-model");
     }
 
     #[test]

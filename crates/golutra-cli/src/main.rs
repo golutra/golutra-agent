@@ -2,10 +2,14 @@ use clap::{Parser, Subcommand};
 use golutra_client::{InProcessTransport, RuntimeClient};
 use golutra_config::{
     ProviderConfigPaths, ProviderConfigScope, ProviderInstallPlan, ProviderProfile,
-    load_provider_runtime_env, provider_onboarding_state,
+    apply_provider_install_plan_verified, load_provider_runtime_env, provider_onboarding_state,
+    update_provider_settings_verified, validate_provider_protocol_runtime_supported,
 };
 use golutra_core::{Actor, ActorKind, CommandId, SessionId, TaskStatus, ThreadId};
-use golutra_llm::{ConfiguredProvider, ProviderProtocol, provider_protocol_catalog};
+use golutra_llm::{
+    ConfiguredProvider, ProviderGenerationConfig, ProviderProtocol, ProviderReasoningEffort,
+    provider_protocol_catalog,
+};
 use golutra_protocol::{RuntimeQuery, RuntimeQueryKind, SessionCommand, SessionCommandKind};
 use tokio::time::{Duration, sleep};
 use uuid::Uuid;
@@ -80,6 +84,14 @@ enum ProviderCommand {
         api_key_env: String,
         #[arg(long)]
         api_key: Option<String>,
+        #[arg(long, default_value_t = false)]
+        enable_thinking: bool,
+        #[arg(long)]
+        reasoning_effort: Option<String>,
+        #[arg(long)]
+        context_window_size: Option<u64>,
+        #[arg(long)]
+        max_tokens: Option<u64>,
         #[arg(long, default_value = "user")]
         scope: String,
         #[arg(long, default_value_t = true)]
@@ -315,12 +327,19 @@ async fn main() -> miette::Result<()> {
                 model,
                 api_key_env,
                 api_key,
+                enable_thinking,
+                reasoning_effort,
+                context_window_size,
+                max_tokens,
                 scope,
                 activate,
             } => {
                 let protocol = parse_provider_protocol(&protocol)?;
+                validate_provider_protocol_runtime_supported(protocol)
+                    .map_err(|error| miette::miette!("{error}"))?;
                 let scope = parse_provider_scope(&scope)?;
                 let paths = provider_paths_for_cli(&transport)?;
+                let workspace_root = provider_workspace_root_for_cli(&transport)?;
                 let mut provider_profile = match protocol {
                     ProviderProtocol::Mock => ProviderProfile::mock(),
                     ProviderProtocol::OpenAiCompatible => ProviderProfile::openai_compatible(
@@ -334,14 +353,15 @@ async fn main() -> miette::Result<()> {
                         api_key_env,
                     )
                     .map_err(|error| miette::miette!("{error}"))?,
-                    _ => {
-                        return Err(miette::miette!(
-                            "provider protocol `{}` is catalog-only and has no live adapter yet",
-                            protocol.id()
-                        ));
-                    }
+                    _ => unreachable!("unsupported provider protocols are rejected before install"),
                 };
                 provider_profile.api_key = api_key;
+                provider_profile.generation_config = generation_config_from_cli(
+                    enable_thinking,
+                    reasoning_effort.as_deref(),
+                    context_window_size,
+                    max_tokens,
+                )?;
                 let plan = ProviderInstallPlan {
                     scope,
                     profile: provider_profile.redacted(),
@@ -351,13 +371,14 @@ async fn main() -> miette::Result<()> {
                 if scope == ProviderConfigScope::Workspace {
                     persisted_profile.api_key = None;
                 }
-                ProviderInstallPlan {
+                let persisted_plan = ProviderInstallPlan {
                     scope,
                     profile: persisted_profile,
                     activate,
-                }
-                .apply(&paths)
-                .map_err(|error| miette::miette!("{error}"))?;
+                };
+                apply_provider_install_plan_verified(&paths, workspace_root, &persisted_plan)
+                    .await
+                    .map_err(|error| miette::miette!("{error}"))?;
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
@@ -373,21 +394,38 @@ async fn main() -> miette::Result<()> {
             }
             ProviderCommand::SetKey { profile, api_key } => {
                 let paths = provider_paths_for_cli(&transport)?;
-                let mut settings = golutra_config::ProviderSettings::load(&paths.user_config)
-                    .map_err(|error| miette::miette!("{error}"))?;
-                let target = settings
-                    .profiles
-                    .iter_mut()
-                    .find(|item| item.name == profile)
-                    .ok_or_else(|| {
-                        miette::miette!(
-                            "provider profile `{profile}` does not exist in user config"
-                        )
-                    })?;
-                target.api_key = Some(api_key);
-                settings
-                    .save(&paths.user_config)
-                    .map_err(|error| miette::miette!("{error}"))?;
+                let workspace_root = provider_workspace_root_for_cli(&transport)?;
+                let profile_name = profile.clone();
+                let missing_profile = profile.clone();
+                let api_key_value = api_key.clone();
+                update_provider_settings_verified(
+                    &paths,
+                    workspace_root,
+                    move |user_settings, _workspace_settings| {
+                        let target_index = user_settings
+                            .profiles
+                            .iter()
+                            .position(|item| item.name == profile_name)
+                            .ok_or_else(|| {
+                                golutra_config::ConfigError::Validation(format!(
+                                    "provider profile `{missing_profile}` does not exist in user config"
+                                ))
+                            })?;
+                        let env_key = user_settings.profiles[target_index]
+                            .api_key_env
+                            .clone()
+                            .ok_or_else(|| {
+                            golutra_config::ConfigError::Validation(format!(
+                                "provider profile `{missing_profile}` does not declare api_key_env"
+                            ))
+                        })?;
+                        user_settings.env.insert(env_key, api_key_value);
+                        user_settings.profiles[target_index].api_key = None;
+                        Ok(())
+                    },
+                )
+                .await
+                .map_err(|error| miette::miette!("{error}"))?;
                 println!(
                     "{}",
                     serde_json::json!({"updated": true, "profile": profile})
@@ -396,18 +434,22 @@ async fn main() -> miette::Result<()> {
             ProviderCommand::Use { profile, scope } => {
                 let scope = parse_provider_scope(&scope)?;
                 let paths = provider_paths_for_cli(&transport)?;
-                let path = match scope {
-                    ProviderConfigScope::User => &paths.user_config,
-                    ProviderConfigScope::Workspace => &paths.workspace_config,
-                };
-                let mut settings = golutra_config::ProviderSettings::load(path)
-                    .map_err(|error| miette::miette!("{error}"))?;
-                settings
-                    .set_active_profile(profile.clone())
-                    .map_err(|error| miette::miette!("{error}"))?;
-                settings
-                    .save(path)
-                    .map_err(|error| miette::miette!("{error}"))?;
+                let workspace_root = provider_workspace_root_for_cli(&transport)?;
+                let profile_name = profile.clone();
+                update_provider_settings_verified(
+                    &paths,
+                    workspace_root,
+                    move |user_settings, workspace_settings| {
+                        let settings = match scope {
+                            ProviderConfigScope::User => user_settings,
+                            ProviderConfigScope::Workspace => workspace_settings,
+                        };
+                        settings.set_active_profile(profile_name)?;
+                        Ok(())
+                    },
+                )
+                .await
+                .map_err(|error| miette::miette!("{error}"))?;
                 println!(
                     "{}",
                     serde_json::json!({"updated": true, "active_profile": profile, "scope": scope})
@@ -419,27 +461,29 @@ async fn main() -> miette::Result<()> {
 }
 
 fn provider_paths_for_cli(transport: &InProcessTransport) -> miette::Result<ProviderConfigPaths> {
-    let workspace = transport
-        .workspace_root()
-        .ok_or_else(|| miette::miette!("provider config requires a workspace"))?;
+    let workspace = provider_workspace_root_for_cli(transport)?;
     ProviderConfigPaths::for_workspace(workspace).map_err(|error| miette::miette!("{error}"))
+}
+
+fn provider_workspace_root_for_cli(
+    transport: &InProcessTransport,
+) -> miette::Result<&std::path::Path> {
+    transport
+        .workspace_root()
+        .ok_or_else(|| miette::miette!("provider config requires a workspace"))
 }
 
 fn provider_env_for_cli(
     transport: &InProcessTransport,
 ) -> miette::Result<golutra_config::ProviderRuntimeEnv> {
-    let workspace = transport
-        .workspace_root()
-        .ok_or_else(|| miette::miette!("provider config requires a workspace"))?;
+    let workspace = provider_workspace_root_for_cli(transport)?;
     load_provider_runtime_env(workspace).map_err(|error| miette::miette!("{error}"))
 }
 
 fn provider_onboarding_for_cli(
     transport: &InProcessTransport,
 ) -> miette::Result<golutra_config::ProviderOnboardingState> {
-    let workspace = transport
-        .workspace_root()
-        .ok_or_else(|| miette::miette!("provider config requires a workspace"))?;
+    let workspace = provider_workspace_root_for_cli(transport)?;
     provider_onboarding_state(workspace).map_err(|error| miette::miette!("{error}"))
 }
 
@@ -458,6 +502,33 @@ fn parse_provider_scope(value: &str) -> miette::Result<ProviderConfigScope> {
     }
 }
 
+fn generation_config_from_cli(
+    enable_thinking: bool,
+    reasoning_effort: Option<&str>,
+    context_window_size: Option<u64>,
+    max_tokens: Option<u64>,
+) -> miette::Result<Option<ProviderGenerationConfig>> {
+    let config = ProviderGenerationConfig {
+        enable_thinking,
+        reasoning_effort: reasoning_effort.map(parse_reasoning_effort).transpose()?,
+        context_window_size,
+        max_tokens,
+    };
+    Ok((!config.is_empty()).then_some(config))
+}
+
+fn parse_reasoning_effort(value: &str) -> miette::Result<ProviderReasoningEffort> {
+    match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "low" => Ok(ProviderReasoningEffort::Low),
+        "medium" => Ok(ProviderReasoningEffort::Medium),
+        "high" => Ok(ProviderReasoningEffort::High),
+        "xhigh" | "x_high" => Ok(ProviderReasoningEffort::Xhigh),
+        _ => Err(miette::miette!(
+            "reasoning effort must be one of: low, medium, high, xhigh"
+        )),
+    }
+}
+
 fn provider_error_config(error: String) -> golutra_llm::RedactedProviderConfig {
     golutra_llm::RedactedProviderConfig {
         mode: "unknown".to_owned(),
@@ -468,6 +539,7 @@ fn provider_error_config(error: String) -> golutra_llm::RedactedProviderConfig {
         model_id: None,
         api_key_env: None,
         api_key_configured: false,
+        generation_config: None,
         missing_env: Vec::new(),
         supported: false,
         status: error,

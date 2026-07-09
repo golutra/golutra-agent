@@ -8,7 +8,7 @@
 - LLM provider 凭据、配置和运行时状态应该持久化在哪里。
 - resume、多 session、多工作区应该如何设计，避免 CLI/TUI/Web 各自维护状态。
 
-结论：Golutra 已具备 provider onboarding 与 thread resume/fork 的最小闭环。默认仍可使用 `mock` provider；真实 provider 可通过 `golutra provider login` 写入用户级或 workspace 级 `provider.json`，运行时会把该配置与进程环境变量合并后解析。TUI 首次进入会检查 active provider profile；没有显式配置时打开 provider setup，支持 qwen-code 风格的 provider 分组、第三方 provider 选型、OpenAI-compatible base URL/API key/model 填写、保存前 review，或选择 mock provider。已有 provider 时首屏不打断，输入 `/auth` 或 `/auth setup` 可随时重新打开并覆盖同名 profile。
+结论：Golutra 已具备 provider onboarding 与 thread resume/fork 的最小闭环。默认仍可使用 `mock` provider；真实 provider 可通过 `golutra provider login` 写入用户级或 workspace 级 `provider.json`，运行时会把该配置与进程环境变量合并后解析。TUI 首次进入会检查 active provider profile；没有显式配置时打开 provider setup，支持 qwen-code 风格的 provider 分组、第三方 provider 选型、OpenAI-compatible base URL/API key/model/advanced config 填写、保存前 review，或选择 mock provider。Custom Provider 的 envKey 会按协议和 baseUrl 自动派生，避免多个自定义 endpoint 共用一个固定 key。已有 provider 时首屏不打断，输入 `/auth` 或 `/auth setup` 可随时重新打开并覆盖同名 profile。
 
 ## qwen-code 参考结论
 
@@ -47,6 +47,7 @@ qwen-code 的 settings 写入要点：
 - `ProviderInstallPlan` 一次性描述 env、modelProviders、authType、legacyCredentials、modelSelection 和 providerState。
 - 应用 install plan 时先备份 settings 和 process env；persist、reload、refreshAuth 任一步失败都会 rollback settings、env 和 runtime provider registry。
 - 禁止 install plan 写 `NODE_OPTIONS`、`LD_PRELOAD`、`PATH`、`HOME` 等进程劫持 env。
+- Custom Provider 的 envKey 由 `(protocol, baseUrl)` 加 hash 后缀派生，避免 `api.example.com`、`api-example.com` 这类规范化碰撞覆盖同一份 key。
 
 Golutra 不应照搬把明文 key 默认写入 workspace。推荐持久化分层：
 
@@ -117,8 +118,9 @@ ProviderOnboardingState
 3. 输入或选择 baseUrl；TUI 交互要求 `http://` 或 `https://` 开头。
 4. 输入 API key，或选择 envKey / secretRef。
 5. 选择推荐 model，或输入自定义 model id。
-6. review：展示脱敏 install plan、保存路径、scope、是否覆盖同名 profile。
-7. probe；成功后应用配置，失败则保留表单但不污染 active selection。
+6. 填写 advanced config：Thinking、Reasoning effort、Context window、Max output tokens。
+7. review：展示脱敏 install plan、保存路径、scope、是否覆盖同名 profile。
+8. probe；成功后应用配置，失败则保留表单但不污染 active selection。
 
 应用配置必须走 `ProviderInstallPlan` 等价结构：
 
@@ -142,7 +144,7 @@ ProviderInstallPlan
 - workspace 配置默认只写 envKey/secretRef，不写 secret value。
 - 写入 user config 或 secrets 必须 temp file + rename，并收紧权限。
 - refresh/probe 失败必须 rollback active selection 和 runtime provider registry。
-- 未实现 adapter 的协议可以被保存为 catalog entry，但不能被设为 ready active provider。
+- 未实现 adapter 的协议可以作为 catalog/diagnostic 入口展示，但不能被保存为 enabled/ready active provider。
 
 ### Session / thread 存储
 
@@ -280,7 +282,7 @@ TUI 输入框现在先经过 slash command parser：
 | `/auth status` | 展示 provider onboarding 状态 |
 | `/auth protocols` | 展示注册 provider protocols |
 | `/auth mock` | 将 workspace provider 切换为 mock |
-| `/auth login --base-url <url> --model <model> [--api-key <key>\|--api-key-env <env>] [--scope user\|workspace]` | 保存 OpenAI-compatible provider 配置；明文 key 只允许保存到用户级配置，workspace 配置禁止保存 secret value |
+| `/auth login --base-url <url> --model <model> [--api-key <key>\|--api-key-env <env>] [--enable-thinking] [--reasoning-effort low\|medium\|high\|xhigh] [--context-window-size <n>] [--max-tokens <n>] [--scope user\|workspace]` | 保存 OpenAI-compatible provider 配置；明文 key 只允许保存到用户级配置，workspace 配置禁止保存 secret value |
 | `/auth use <profile> [user|workspace]` | 激活已保存 provider profile |
 | `/status`、`/debug`、`/abort`、`/clear`、`/quit` | 本地状态、debug、abort 和退出控制 |
 
@@ -296,8 +298,8 @@ TUI 输入框现在先经过 slash command parser：
 
 ## 当前差距
 
-- 当前 TUI 已有 qwen-code 风格 provider setup：Golutra API、Third-party Providers、Custom Provider、mock 分组选择；第三方内置 OpenAI、OpenRouter、DeepSeek、Qwen/DashScope compatible 和本地 OpenAI-compatible preset；OpenAI-compatible setup 已按 baseUrl -> API key -> model -> review -> install 顺序执行，review 会展示脱敏 `ProviderInstallPlan`、保存路径和同名 profile 覆盖提示；还没有 advanced config、secretRef/envKey 选择和 probe rollback。
-- 当前 provider 配置已支持 `$GOLUTRA_HOME/provider.json` 和 `<workspace>/.golutra/provider.json`，workspace 配置禁止保存明文 key；但 OS keychain、OAuth 和 secret-ref 还未实现。
+- 当前 TUI 已有 qwen-code 风格 provider setup：Golutra API、Third-party Providers、Custom Provider、mock 分组选择；第三方内置 OpenAI、OpenRouter、DeepSeek、Qwen/DashScope compatible 和本地 OpenAI-compatible preset；OpenAI-compatible setup 已按 baseUrl -> API key -> model -> advanced config -> review -> install 顺序执行，review 会展示脱敏 `ProviderInstallPlan`、保存路径和同名 profile 覆盖提示；Custom Provider 会生成 `GOLUTRA_CUSTOM_PROVIDER_API_KEY_...` envKey；Anthropic/Gemini 等未实现 live adapter 的协议会被安装层拒绝保存为 ready provider；保存链路会先落盘后 probe，失败自动 rollback；还没有手动 envKey/secretRef 选择和 OAuth。
+- 当前 provider 配置已支持 `$GOLUTRA_HOME/provider.json` 和 `<workspace>/.golutra/provider.json`；用户级 API key 已按 qwen-code 风格写入 `provider.json` 的 `env` map，profile 只保留 `api_key_env` 引用，workspace 配置继续禁止保存明文 key；但 OS keychain、OAuth 和 secret-ref 还未实现。
 - 当前 `threads` 表、`.golutra/default-thread`、`golutra thread list`、`golutra resume [THREAD_ID]` 和 `golutra fork THREAD_ID` 已可用；fork 当前复制元数据并创建新 session，还未复制/截断 rollout JSONL 历史。
 - 当前完成任务会写入 `AssistantMessage`，`UserProjection.final_message` 和 TUI transcript 可在 resume 后恢复最终回复；下一轮 prompt 会携带当前 session 的压缩历史摘要。
 - 当前多工作区仍以 workspace SQLite 为事实来源；`$GOLUTRA_HOME/index.sqlite` 的跨 workspace 全局索引还未实现。

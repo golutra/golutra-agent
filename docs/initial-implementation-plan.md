@@ -26,7 +26,7 @@
 - LLM 协议 catalog 已注册 `mock`、`openai-compatible`、`anthropic`、`gemini`、`vertex-ai`、`genai`；除 `mock` 与 `openai-compatible` 外，其它协议当前处于 catalog/diagnostic ready 状态，选择后会返回 `adapter_not_implemented` 而不是静默 fallback。
 - provider onboarding、凭据持久化和 thread resume/fork 已完成最小闭环：`golutra-config` 支持 `$GOLUTRA_HOME/provider.json` 与 `<workspace>/.golutra/provider.json`，CLI 支持 `provider login/set-key/use/current/probe`，TUI 首屏展示 provider 状态，store/client/CLI 支持 `ThreadId`、`threads` 表、`.golutra/default-thread`、`thread list/resume/fork`。
 - 用户可见 conversation 层已完成轻量闭环：`TaskCreated` 记录用户输入，`AssistantMessage` 记录最终回复，`UserProjection.final_message` 可从历史事件恢复；resume 后继续任务时，RuntimeHost 会把同一 session 的压缩历史摘要加入 provider context。
-- P1 provider onboarding 已补齐 TUI `/auth` qwen-code 风格主流程：provider 分组、第三方 preset、baseUrl/API key/model、保存前 review 和同名 profile 覆盖提示。复杂自动化、Web connect modal、probe rollback、OAuth/secretRef 和高级模型配置仍通过 TODO 决策位收敛。
+- P1 provider onboarding 已补齐 TUI `/auth` qwen-code 风格主流程：provider 分组、第三方 preset、baseUrl/API key/model/advanced config、保存前 review 和同名 profile 覆盖提示；Custom Provider 已按 `(protocol, baseUrl)` 派生 envKey，未实现 live adapter 的协议不能保存为 ready active provider；保存后 probe 失败会 rollback。复杂自动化、Web connect modal、OAuth/secretRef 和 Web 侧 provider flow 仍通过 TODO 决策位收敛。
 - 第一阶段范围已在 `implementation-blueprint.md` 中明确，不能继续扩张到复杂 multi-agent 或不可审计的自动自我改进。
 
 ## 实施原则
@@ -139,7 +139,7 @@ P0 可以先创建全部 crate 空壳，但只实现 P0 必需模块：
 
 TODO 决策占位：
 
-- TODO(provider-config)：P0 env 入口已确定为 `GOLUTRA_PROVIDER_PROTOCOL`、`GOLUTRA_PROVIDER_*`、`OPENAI_*` 兼容 fallback 和默认 mock；user/workspace provider config 文件路径已落地，secretRef/OAuth 存储策略仍待确定。
+- TODO(provider-config)：P0 env 入口已确定为 `GOLUTRA_PROVIDER_PROTOCOL`、`GOLUTRA_PROVIDER_*`、`OPENAI_*` 兼容 fallback、`GOLUTRA_PROVIDER_GENERATION_CONFIG` 和默认 mock；user/workspace provider config 文件路径已落地，secretRef/OAuth 存储策略仍待确定。
 - TODO(sqlite-path)：确定默认数据目录，建议遵守 XDG / macOS app support，并支持 `GOLUTRA_HOME` 覆盖。
 - TODO(event-log-layout)：决定 P0 event log 只用 SQLite，还是 SQLite + JSONL 双写。
 - TODO(runtime-host)：补齐 `RuntimeHost`，让 `InProcessTransport` 和 `HttpSseTransport` 都连接同一 host，而不是各自包一份 store。
@@ -593,8 +593,8 @@ P1 在 P0 稳定后推进，不反向污染 P0：
 - [ ] 真实 provider golden tests。TODO(provider-golden)：需要确定真实 provider、模型、密钥环境变量和可提交的脱敏 golden fixture。
 - [x] Provider onboarding 基础层：实现 `ProviderInstallPlan`、`provider login/set-key/use`、TUI provider 状态提示和 `/auth` slash command。
 - [x] Thread/session 基础层：引入用户可见 `ThreadId`、`threads` 表、`default-thread`、`thread list/resume/fork` 和 TUI `/resume`、`/threads`、`/fork` slash command。
-- [x] TUI 首次 connect provider flow：补 qwen-code 风格 provider setup，支持 Golutra API / Third-party Providers / Custom Provider / mock 分组，第三方 provider preset，OpenAI-compatible base URL/API key/model，以及保存前 review、脱敏 install plan 和同名 profile 覆盖提示。
-- [ ] Web 首次 connect provider flow 与 provider probe rollback。TODO(provider-web-onboarding)：Web 需要复用 RuntimeHost/config service 的 provider command，配置失败时回滚 active selection。
+- [x] TUI 首次 connect provider flow：补 qwen-code 风格 provider setup，支持 Golutra API / Third-party Providers / Custom Provider / mock 分组，第三方 provider preset，OpenAI-compatible base URL/API key/model/advanced config，以及保存前 review、脱敏 install plan、同名 profile 覆盖提示、Custom Provider 派生 envKey、catalog-only 协议安装阻断和 probe 失败 rollback。
+- [ ] Web 首次 connect provider flow。TODO(provider-web-onboarding)：Web 需要复用 RuntimeHost/config service 的 provider command，配置失败时回滚 active selection。
 - [ ] TUI resume picker：当前 workspace / all workspaces、resume / fork、预览 transcript。
 - [ ] 多工作区索引：增加 `$GOLUTRA_HOME/index.sqlite`，跨 workspace 列出最近 thread，同时保持 workspace SQLite 为事实来源。
 - [x] 更完整的 config loader 和 model catalog。

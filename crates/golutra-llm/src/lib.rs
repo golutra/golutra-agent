@@ -8,8 +8,10 @@ use thiserror::Error;
 const GOLUTRA_PROVIDER_MODE: &str = "GOLUTRA_PROVIDER_MODE";
 const GOLUTRA_PROVIDER_PROTOCOL: &str = "GOLUTRA_PROVIDER_PROTOCOL";
 const GOLUTRA_PROVIDER_API_KEY: &str = "GOLUTRA_PROVIDER_API_KEY";
+const GOLUTRA_PROVIDER_API_KEY_ENV: &str = "GOLUTRA_PROVIDER_API_KEY_ENV";
 const GOLUTRA_PROVIDER_MODEL: &str = "GOLUTRA_PROVIDER_MODEL";
 const GOLUTRA_PROVIDER_BASE_URL: &str = "GOLUTRA_PROVIDER_BASE_URL";
+const GOLUTRA_PROVIDER_GENERATION_CONFIG: &str = "GOLUTRA_PROVIDER_GENERATION_CONFIG";
 const OPENAI_API_KEY: &str = "OPENAI_API_KEY";
 const OPENAI_MODEL: &str = "OPENAI_MODEL";
 const OPENAI_BASE_URL: &str = "OPENAI_BASE_URL";
@@ -96,6 +98,49 @@ pub enum ProviderProtocol {
     Gemini,
     VertexAi,
     Genai,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderReasoningEffort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+impl ProviderReasoningEffort {
+    #[must_use]
+    pub fn as_wire_value(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderGenerationConfig {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub enable_thinking: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ProviderReasoningEffort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+}
+
+impl ProviderGenerationConfig {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        !self.enable_thinking
+            && self.reasoning_effort.is_none()
+            && self.context_window_size.is_none()
+            && self.max_tokens.is_none()
+    }
 }
 
 impl ProviderProtocol {
@@ -263,6 +308,7 @@ pub struct OpenAiCompatibleProvider {
     api_key_env: String,
     base_url: String,
     model_id: String,
+    generation_config: ProviderGenerationConfig,
     client: reqwest::Client,
 }
 
@@ -273,6 +319,7 @@ pub struct OpenAiCompatibleProviderConfig {
     pub base_url: String,
     pub model_id: String,
     pub protocol: ProviderProtocol,
+    pub generation_config: ProviderGenerationConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -285,6 +332,7 @@ pub struct RedactedProviderConfig {
     pub model_id: Option<String>,
     pub api_key_env: Option<String>,
     pub api_key_configured: bool,
+    pub generation_config: Option<ProviderGenerationConfig>,
     pub missing_env: Vec<String>,
     pub supported: bool,
     pub status: String,
@@ -312,6 +360,7 @@ impl OpenAiCompatibleProvider {
             api_key_env: GOLUTRA_PROVIDER_API_KEY.to_owned(),
             base_url: normalize_openai_base_url(&base_url.into()),
             model_id: model_id.into(),
+            generation_config: ProviderGenerationConfig::default(),
             client: reqwest::Client::new(),
         }
     }
@@ -323,6 +372,7 @@ impl OpenAiCompatibleProvider {
             api_key_env: config.api_key_env,
             base_url: normalize_openai_base_url(&config.base_url),
             model_id: config.model_id,
+            generation_config: config.generation_config,
             client: reqwest::Client::new(),
         }
     }
@@ -347,7 +397,7 @@ impl OpenAiCompatibleProvider {
             return Err(unsupported_protocol_error(protocol));
         }
         let mapping = env_mapping(protocol);
-        let (api_key_env, api_key) = first_env(&reader, mapping.api_key)
+        let (api_key_env, api_key) = configured_or_first_env(&reader, mapping.api_key)
             .ok_or_else(|| missing_env_error(mapping.api_key))?;
         let (_, model_id) =
             first_env(&reader, mapping.model).ok_or_else(|| missing_env_error(mapping.model))?;
@@ -355,12 +405,14 @@ impl OpenAiCompatibleProvider {
             .map(|(_, value)| value)
             .or_else(|| mapping.default_base_url.map(ToOwned::to_owned))
             .ok_or_else(|| missing_env_error(mapping.base_url))?;
+        let generation_config = generation_config_from_reader(&reader)?;
         Ok(OpenAiCompatibleProviderConfig {
             api_key,
             api_key_env,
             base_url: normalize_openai_base_url(&base_url),
             model_id,
             protocol,
+            generation_config,
         })
     }
 
@@ -375,6 +427,8 @@ impl OpenAiCompatibleProvider {
             model_id: Some(self.model_id.clone()),
             api_key_env: Some(self.api_key_env.clone()),
             api_key_configured: !self.api_key.is_empty(),
+            generation_config: (!self.generation_config.is_empty())
+                .then_some(self.generation_config.clone()),
             missing_env: Vec::new(),
             supported: true,
             status: "ready".to_owned(),
@@ -443,6 +497,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
             body["tools"] = Value::Array(request.tools.iter().map(openai_tool_schema).collect());
             body["tool_choice"] = Value::String("auto".to_owned());
         }
+        apply_generation_config_to_openai_body(&mut body, &self.generation_config);
 
         let response = self
             .client
@@ -550,6 +605,7 @@ impl ConfiguredProvider {
                 model_id: Some("mock-model".to_owned()),
                 api_key_env: None,
                 api_key_configured: false,
+                generation_config: None,
                 missing_env: Vec::new(),
                 supported: true,
                 status: "ready".to_owned(),
@@ -1075,7 +1131,7 @@ where
     F: Fn(&str) -> Option<String>,
 {
     let mapping = env_mapping(ProviderProtocol::OpenAiCompatible);
-    let api_key = first_env(reader, mapping.api_key);
+    let api_key = configured_or_first_env(reader, mapping.api_key);
     let model = first_env(reader, mapping.model);
     let base_url = first_env(reader, mapping.base_url)
         .map(|(_, value)| value)
@@ -1088,6 +1144,7 @@ where
         missing_env.push(mapping.model.join(" or "));
     }
     let ready = missing_env.is_empty();
+    let generation_config = generation_config_from_reader(reader).ok();
 
     RedactedProviderConfig {
         mode: "live".to_owned(),
@@ -1098,6 +1155,7 @@ where
         model_id: model.as_ref().map(|(_, value)| value.clone()),
         api_key_env: api_key.as_ref().map(|(key, _)| key.clone()),
         api_key_configured: api_key.is_some(),
+        generation_config: generation_config.filter(|config| !config.is_empty()),
         missing_env,
         supported: true,
         status: if ready { "ready" } else { "missing_env" }.to_owned(),
@@ -1112,7 +1170,7 @@ where
     F: Fn(&str) -> Option<String>,
 {
     let mapping = env_mapping(protocol);
-    let api_key = first_env(reader, mapping.api_key);
+    let api_key = configured_or_first_env(reader, mapping.api_key);
     let model = first_env(reader, mapping.model);
     let base_url = first_env(reader, mapping.base_url)
         .map(|(_, value)| value)
@@ -1127,6 +1185,7 @@ where
     if !mapping.base_url.is_empty() && mapping.default_base_url.is_none() && base_url.is_none() {
         missing_env.push(mapping.base_url.join(" or "));
     }
+    let generation_config = generation_config_from_reader(reader).ok();
 
     RedactedProviderConfig {
         mode: "live".to_owned(),
@@ -1137,6 +1196,7 @@ where
         model_id: model.as_ref().map(|(_, value)| value.clone()),
         api_key_env: api_key.as_ref().map(|(key, _)| key.clone()),
         api_key_configured: api_key.is_some(),
+        generation_config: generation_config.filter(|config| !config.is_empty()),
         missing_env,
         supported: false,
         status: "adapter_not_implemented".to_owned(),
@@ -1228,6 +1288,47 @@ where
     })
 }
 
+fn configured_or_first_env<F>(reader: &F, keys: &[&str]) -> Option<(String, String)>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(configured_key) = reader(GOLUTRA_PROVIDER_API_KEY_ENV)
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        && let Some(value) = reader(&configured_key).filter(|value| !value.trim().is_empty())
+    {
+        return Some((configured_key, value));
+    }
+    first_env(reader, keys)
+}
+
+fn generation_config_from_reader<F>(reader: &F) -> Result<ProviderGenerationConfig, ProviderError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let Some(value) = reader(GOLUTRA_PROVIDER_GENERATION_CONFIG)
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(ProviderGenerationConfig::default());
+    };
+    serde_json::from_str(&value).map_err(|error| ProviderError::NotConfigured {
+        message: format!("{GOLUTRA_PROVIDER_GENERATION_CONFIG} must be valid JSON: {error}"),
+    })
+}
+
+fn apply_generation_config_to_openai_body(body: &mut Value, config: &ProviderGenerationConfig) {
+    if config.enable_thinking {
+        body["extra_body"]["enable_thinking"] = Value::Bool(true);
+    }
+    if let Some(reasoning_effort) = config.reasoning_effort {
+        body["reasoning_effort"] = Value::String(reasoning_effort.as_wire_value().to_owned());
+    }
+    if let Some(max_tokens) = config.max_tokens {
+        body["max_tokens"] = Value::Number(max_tokens.into());
+    }
+}
+
 #[must_use]
 pub fn normalize_openai_base_url(value: &str) -> String {
     let trimmed = value.trim().trim_end_matches('/');
@@ -1248,14 +1349,52 @@ pub fn normalize_openai_base_url(value: &str) -> String {
     }
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn sanitize_provider_error(message: &str) -> String {
     let single_line = message.replace(['\n', '\r'], " ");
-    let trimmed = single_line.trim();
+    let redacted = redact_provider_secret_fragments(&single_line);
+    let trimmed = redacted.trim();
     if trimmed.chars().count() <= 512 {
         trimmed.to_owned()
     } else {
         format!("{}...", trimmed.chars().take(512).collect::<String>())
     }
+}
+
+fn redact_provider_secret_fragments(message: &str) -> String {
+    message
+        .split_whitespace()
+        .map(|token| {
+            if provider_error_token_looks_secret(token) {
+                "<redacted-api-key>"
+            } else {
+                token
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn provider_error_token_looks_secret(token: &str) -> bool {
+    let trimmed = token.trim_matches(|character: char| {
+        !character.is_ascii_alphanumeric() && !matches!(character, '-' | '_' | '*' | '.')
+    });
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("sk-") || lower.starts_with("sk_") {
+        return true;
+    }
+    let star_count = trimmed
+        .chars()
+        .filter(|character| *character == '*')
+        .count();
+    let alpha_numeric_count = trimmed
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .count();
+    star_count >= 6 && alpha_numeric_count >= 6
 }
 
 fn usage(input_tokens: u64, output_tokens: u64) -> ProviderUsage {
@@ -1408,6 +1547,26 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_protocol_redacted_config_prefers_configured_custom_api_key_env() {
+        let config = ConfiguredProvider::redacted_from_reader(|key| match key {
+            GOLUTRA_PROVIDER_PROTOCOL => Some("anthropic".to_owned()),
+            GOLUTRA_PROVIDER_API_KEY_ENV => Some("GOLUTRA_CUSTOM_PROVIDER_API_KEY_TEST".to_owned()),
+            "GOLUTRA_CUSTOM_PROVIDER_API_KEY_TEST" => Some("custom-key".to_owned()),
+            ANTHROPIC_API_KEY => Some("generic-key".to_owned()),
+            ANTHROPIC_MODEL => Some("claude-sonnet-4".to_owned()),
+            _ => None,
+        })
+        .expect("config");
+
+        assert_eq!(config.protocol, ProviderProtocol::Anthropic);
+        assert_eq!(
+            config.api_key_env.as_deref(),
+            Some("GOLUTRA_CUSTOM_PROVIDER_API_KEY_TEST")
+        );
+        assert!(config.api_key_configured);
+    }
+
+    #[test]
     fn openai_base_url_accepts_bare_host() {
         assert_eq!(
             normalize_openai_base_url("api.golutra.cn"),
@@ -1454,6 +1613,51 @@ mod tests {
     }
 
     #[test]
+    fn openai_config_prefers_configured_custom_api_key_env() {
+        let config = OpenAiCompatibleProvider::config_from_env_reader(|key| match key {
+            GOLUTRA_PROVIDER_API_KEY_ENV => Some("GOLUTRA_CUSTOM_PROVIDER_API_KEY_TEST".to_owned()),
+            "GOLUTRA_CUSTOM_PROVIDER_API_KEY_TEST" => Some("custom-key".to_owned()),
+            GOLUTRA_PROVIDER_API_KEY => Some("generic-key".to_owned()),
+            GOLUTRA_PROVIDER_MODEL => Some("gpt-5.5".to_owned()),
+            GOLUTRA_PROVIDER_BASE_URL => Some("https://api.example.com/v1".to_owned()),
+            _ => None,
+        })
+        .expect("config");
+
+        assert_eq!(config.api_key, "custom-key");
+        assert_eq!(config.api_key_env, "GOLUTRA_CUSTOM_PROVIDER_API_KEY_TEST");
+    }
+
+    #[test]
+    fn openai_config_reads_generation_config_and_applies_request_body() {
+        let config = OpenAiCompatibleProvider::config_from_env_reader(|key| match key {
+            GOLUTRA_PROVIDER_API_KEY => Some("golutra-key".to_owned()),
+            GOLUTRA_PROVIDER_MODEL => Some("gpt-5.5".to_owned()),
+            GOLUTRA_PROVIDER_BASE_URL => Some("api.golutra.cn".to_owned()),
+            GOLUTRA_PROVIDER_GENERATION_CONFIG => Some(
+                json!({
+                    "enable_thinking": true,
+                    "reasoning_effort": "high",
+                    "context_window_size": 128000,
+                    "max_tokens": 512
+                })
+                .to_string(),
+            ),
+            _ => None,
+        })
+        .expect("config");
+        let mut body = json!({"model": "gpt-5.5", "messages": []});
+
+        apply_generation_config_to_openai_body(&mut body, &config.generation_config);
+
+        assert_eq!(config.generation_config.context_window_size, Some(128_000));
+        assert_eq!(body["extra_body"]["enable_thinking"], json!(true));
+        assert_eq!(body["reasoning_effort"], json!("high"));
+        assert_eq!(body["max_tokens"], json!(512));
+        assert!(body.get("context_window_size").is_none());
+    }
+
+    #[test]
     fn openai_config_rejects_registered_unsupported_protocol() {
         let error = OpenAiCompatibleProvider::config_from_env_reader(|key| match key {
             GOLUTRA_PROVIDER_PROTOCOL => Some("anthropic".to_owned()),
@@ -1475,6 +1679,26 @@ mod tests {
         .expect_err("model is required");
 
         assert!(matches!(error, ProviderError::NotConfigured { .. }));
+    }
+
+    #[test]
+    fn redacted_config_prefers_configured_custom_api_key_env() {
+        let config = ConfiguredProvider::redacted_from_reader(|key| match key {
+            GOLUTRA_PROVIDER_PROTOCOL => Some("openai-compatible".to_owned()),
+            GOLUTRA_PROVIDER_API_KEY_ENV => Some("GOLUTRA_CUSTOM_PROVIDER_API_KEY_TEST".to_owned()),
+            "GOLUTRA_CUSTOM_PROVIDER_API_KEY_TEST" => Some("custom-key".to_owned()),
+            GOLUTRA_PROVIDER_API_KEY => Some("generic-key".to_owned()),
+            GOLUTRA_PROVIDER_MODEL => Some("gpt-5.5".to_owned()),
+            GOLUTRA_PROVIDER_BASE_URL => Some("https://api.example.com/v1".to_owned()),
+            _ => None,
+        })
+        .expect("config");
+
+        assert_eq!(
+            config.api_key_env.as_deref(),
+            Some("GOLUTRA_CUSTOM_PROVIDER_API_KEY_TEST")
+        );
+        assert!(config.api_key_configured);
     }
 
     #[test]
@@ -1525,6 +1749,37 @@ mod tests {
             provider_error_message(&value),
             "model does not support tools"
         );
+    }
+
+    #[test]
+    fn provider_error_message_redacts_api_key_fragments() {
+        let value = json!({
+            "error": {
+                "code": "invalid_api_key",
+                "message": "Incorrect API key provided: sk-test1234567890abcdef. You can find your API key in settings."
+            }
+        });
+
+        let message = provider_error_message(&value);
+
+        assert!(message.contains("<redacted-api-key>"));
+        assert!(!message.contains("sk-test"));
+        assert!(!message.contains("abcdef"));
+    }
+
+    #[test]
+    fn provider_error_message_redacts_masked_api_key_fragments() {
+        let value = json!({
+            "error": {
+                "message": "Incorrect API key provided: sk-123456**********************abcd."
+            }
+        });
+
+        let message = provider_error_message(&value);
+
+        assert!(message.contains("<redacted-api-key>"));
+        assert!(!message.contains("123456"));
+        assert!(!message.contains("abcd"));
     }
 
     fn request() -> ProviderRequest {
