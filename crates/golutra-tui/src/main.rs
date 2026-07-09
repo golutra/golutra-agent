@@ -2430,10 +2430,16 @@ fn transcript_items(app: &TuiApp) -> Vec<TranscriptItem> {
         return Vec::new();
     }
     let mut items = Vec::new();
+    let event_items = event_transcript_items(&app.events);
+    let has_event_items = !event_items.is_empty();
+    items.extend(event_items);
     items.extend(app.command_messages.clone());
-    items.extend(user_prompt_items(&app.events));
     if let Some(projection) = &app.projection {
-        items.extend(projection_items(projection));
+        if has_event_items {
+            items.extend(projection_overlay_items(projection));
+        } else {
+            items.extend(projection_items(projection));
+        }
     } else {
         items.push(TranscriptItem {
             role: TranscriptRole::System,
@@ -2486,24 +2492,160 @@ fn transcript_scroll_status(scroll_offset: usize) -> String {
     }
 }
 
-fn user_prompt_items(events: &[Value]) -> Vec<TranscriptItem> {
-    events
+#[derive(Debug, Default)]
+struct TranscriptTurn {
+    task_id: Option<TaskId>,
+    user: Option<TranscriptItem>,
+    status: Vec<TranscriptItem>,
+    assistant: Vec<TranscriptItem>,
+}
+
+fn event_transcript_items(events: &[Value]) -> Vec<TranscriptItem> {
+    let mut typed_events = events
         .iter()
         .filter_map(|value| serde_json::from_value::<RuntimeEvent>(value.clone()).ok())
-        .filter(|event| event.event_type == RuntimeEventType::TaskCreated)
-        .filter_map(|event| {
-            event
-                .payload
-                .get("payload")
-                .and_then(|payload| payload.get("prompt"))
-                .and_then(Value::as_str)
-                .map(|prompt| TranscriptItem {
-                    role: TranscriptRole::User,
-                    title: "You".to_owned(),
-                    body: vec![prompt.to_owned()],
-                })
+        .collect::<Vec<_>>();
+    typed_events.sort_by_key(|event| event.sequence_no);
+
+    let mut turns = Vec::<TranscriptTurn>::new();
+    for event in typed_events {
+        match event.event_type {
+            RuntimeEventType::TaskCreated => {
+                let mut turn = TranscriptTurn {
+                    task_id: event.task_id,
+                    ..TranscriptTurn::default()
+                };
+                turn.user = task_created_transcript_item(&event);
+                turns.push(turn);
+            }
+            RuntimeEventType::AssistantMessage => {
+                if let Some(item) = assistant_event_transcript_item(&event) {
+                    ensure_transcript_turn(&mut turns, event.task_id)
+                        .assistant
+                        .push(item);
+                }
+            }
+            _ => {
+                if let Some(item) = status_event_transcript_item(&event) {
+                    ensure_transcript_turn(&mut turns, event.task_id)
+                        .status
+                        .push(item);
+                }
+            }
+        }
+    }
+
+    turns
+        .into_iter()
+        .flat_map(|turn| {
+            let mut items = Vec::new();
+            if let Some(user) = turn.user {
+                items.push(user);
+            }
+            items.extend(turn.status);
+            items.extend(turn.assistant);
+            items
         })
         .collect()
+}
+
+fn ensure_transcript_turn(
+    turns: &mut Vec<TranscriptTurn>,
+    task_id: Option<TaskId>,
+) -> &mut TranscriptTurn {
+    if let Some(task_id) = task_id
+        && let Some(index) = turns.iter().position(|turn| turn.task_id == Some(task_id))
+    {
+        return &mut turns[index];
+    }
+    turns.push(TranscriptTurn {
+        task_id,
+        ..TranscriptTurn::default()
+    });
+    turns.last_mut().expect("turn was just inserted")
+}
+
+fn task_created_transcript_item(event: &RuntimeEvent) -> Option<TranscriptItem> {
+    event
+        .payload
+        .get("payload")
+        .and_then(|payload| payload.get("prompt"))
+        .and_then(Value::as_str)
+        .filter(|prompt| !prompt.trim().is_empty())
+        .map(|prompt| TranscriptItem {
+            role: TranscriptRole::User,
+            title: "You".to_owned(),
+            body: vec![prompt.to_owned()],
+        })
+}
+
+fn assistant_event_transcript_item(event: &RuntimeEvent) -> Option<TranscriptItem> {
+    event
+        .payload
+        .get("content")
+        .and_then(Value::as_str)
+        .filter(|content| !content.trim().is_empty())
+        .map(|content| TranscriptItem {
+            role: TranscriptRole::Assistant,
+            title: "Golutra".to_owned(),
+            body: vec![content.to_owned()],
+        })
+}
+
+fn status_event_transcript_item(event: &RuntimeEvent) -> Option<TranscriptItem> {
+    let title = event_status_title(event.event_type)?;
+    let summary = event_summary(event)?;
+    if event.event_type == RuntimeEventType::LoopDecided
+        && !summary.contains("failed")
+        && !summary.contains("error")
+    {
+        return None;
+    }
+    Some(TranscriptItem {
+        role: TranscriptRole::Status,
+        title: title.to_owned(),
+        body: vec![summary],
+    })
+}
+
+fn event_status_title(event_type: RuntimeEventType) -> Option<&'static str> {
+    match event_type {
+        RuntimeEventType::ToolCompleted => Some("Tool Completed"),
+        RuntimeEventType::TaskCompleted => Some("Task Completed"),
+        RuntimeEventType::CommandRejected => Some("Command Rejected"),
+        RuntimeEventType::BusyPolicyDecided => Some("Busy Policy Decided"),
+        RuntimeEventType::LoopDecided => Some("Loop Decided"),
+        _ => None,
+    }
+}
+
+fn event_summary(event: &RuntimeEvent) -> Option<String> {
+    event
+        .payload
+        .get("summary")
+        .and_then(Value::as_str)
+        .map_or_else(
+            || {
+                event
+                    .payload
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(|error| {
+                        if error.trim().is_empty() {
+                            "runtime event recorded".to_owned()
+                        } else {
+                            error.to_owned()
+                        }
+                    })
+            },
+            |summary| {
+                if summary.trim().is_empty() {
+                    None
+                } else {
+                    Some(summary.to_owned())
+                }
+            },
+        )
 }
 
 fn projection_items(projection: &UserProjection) -> Vec<TranscriptItem> {
@@ -2530,6 +2672,25 @@ fn projection_items(projection: &UserProjection) -> Vec<TranscriptItem> {
         });
     }
 
+    if !projection.residual_risks.is_empty() {
+        items.push(TranscriptItem {
+            role: TranscriptRole::Status,
+            title: "Residual risks".to_owned(),
+            body: projection.residual_risks.clone(),
+        });
+    }
+    items
+}
+
+fn projection_overlay_items(projection: &UserProjection) -> Vec<TranscriptItem> {
+    let mut items = Vec::new();
+    if let Some(pending_approval) = &projection.pending_approval {
+        items.push(TranscriptItem {
+            role: TranscriptRole::Status,
+            title: "Approval required".to_owned(),
+            body: vec![pending_approval.to_owned()],
+        });
+    }
     if !projection.residual_risks.is_empty() {
         items.push(TranscriptItem {
             role: TranscriptRole::Status,
@@ -3992,6 +4153,30 @@ mod tests {
         assert!(items[0].body[0].contains("model not found"));
     }
 
+    fn transcript_event(
+        sequence_no: u64,
+        session_id: SessionId,
+        task_id: TaskId,
+        event_type: RuntimeEventType,
+        payload: Value,
+    ) -> Value {
+        serde_json::to_value(RuntimeEvent {
+            id: golutra_core::EventId::new(),
+            sequence_no,
+            session_id,
+            turn_id: None,
+            task_id: Some(task_id),
+            parent_event_id: None,
+            event_type,
+            timestamp: chrono::Utc::now(),
+            source: golutra_protocol::RuntimeEventSource::Runtime,
+            payload,
+            payload_ref: None,
+            durable: true,
+        })
+        .expect("event serializes")
+    }
+
     #[test]
     fn resumed_completed_history_renders_user_prompt_and_terminal_steps() {
         let session_id = SessionId::new();
@@ -4005,26 +4190,45 @@ mod tests {
             None,
         );
         app.events = vec![
-            serde_json::to_value(RuntimeEvent {
-                id: golutra_core::EventId::new(),
-                sequence_no: 1,
+            transcript_event(
+                1,
                 session_id,
-                turn_id: None,
-                task_id: Some(task_id),
-                parent_event_id: None,
-                event_type: RuntimeEventType::TaskCreated,
-                timestamp: chrono::Utc::now(),
-                source: golutra_protocol::RuntimeEventSource::Runtime,
-                payload: json!({
+                task_id,
+                RuntimeEventType::TaskCreated,
+                json!({
                     "payload": {
                         "prompt": "write file chain.txt with content ok"
                     },
                     "summary": "runtime lane started task",
                 }),
-                payload_ref: None,
-                durable: true,
-            })
-            .expect("event serializes"),
+            ),
+            transcript_event(
+                2,
+                session_id,
+                task_id,
+                RuntimeEventType::ToolCompleted,
+                json!({"summary": "file written"}),
+            ),
+            transcript_event(
+                3,
+                session_id,
+                task_id,
+                RuntimeEventType::TaskCompleted,
+                json!({
+                    "summary": "runtime task finished with Completed",
+                    "status": "completed",
+                }),
+            ),
+            transcript_event(
+                4,
+                session_id,
+                task_id,
+                RuntimeEventType::AssistantMessage,
+                json!({
+                    "summary": "Completed: file written",
+                    "content": "Completed: file written",
+                }),
+            ),
         ];
         app.projection = Some(UserProjection {
             session_id,
@@ -4067,6 +4271,105 @@ mod tests {
         assert!(body.contains("file written"));
         assert!(body.contains("runtime task finished with Completed"));
         assert!(body.contains("Completed: file written"));
+    }
+
+    #[test]
+    fn transcript_groups_multiple_turns_from_events_top_to_bottom() {
+        let session_id = SessionId::new();
+        let first_task = TaskId::new();
+        let second_task = TaskId::new();
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            session_id,
+            None,
+            false,
+            "ready (mock)".to_owned(),
+            None,
+        );
+        app.events = vec![
+            transcript_event(
+                1,
+                session_id,
+                first_task,
+                RuntimeEventType::TaskCreated,
+                json!({"payload": {"prompt": "hi"}}),
+            ),
+            transcript_event(
+                2,
+                session_id,
+                first_task,
+                RuntimeEventType::AssistantMessage,
+                json!({"content": "Hello"}),
+            ),
+            transcript_event(
+                3,
+                session_id,
+                first_task,
+                RuntimeEventType::TaskCompleted,
+                json!({"summary": "runtime task finished with Completed"}),
+            ),
+            transcript_event(
+                4,
+                session_id,
+                second_task,
+                RuntimeEventType::TaskCreated,
+                json!({"payload": {"prompt": "what next"}}),
+            ),
+            transcript_event(
+                5,
+                session_id,
+                second_task,
+                RuntimeEventType::AssistantMessage,
+                json!({"content": "Tell me what to work on."}),
+            ),
+            transcript_event(
+                6,
+                session_id,
+                second_task,
+                RuntimeEventType::TaskCompleted,
+                json!({"summary": "runtime task finished with Completed"}),
+            ),
+        ];
+        app.projection = Some(UserProjection {
+            session_id,
+            task_id: Some(second_task),
+            status: golutra_core::TaskStatus::Completed,
+            visible_steps: Vec::new(),
+            pending_approval: None,
+            final_message: Some("stale projection final should not duplicate".to_owned()),
+            residual_risks: Vec::new(),
+        });
+
+        let items = transcript_items(&app);
+        let titles = items
+            .iter()
+            .map(|item| item.title.as_str())
+            .collect::<Vec<_>>();
+        let bodies = items
+            .iter()
+            .map(|item| item.body.join("\n"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            titles,
+            vec![
+                "You",
+                "Task Completed",
+                "Golutra",
+                "You",
+                "Task Completed",
+                "Golutra"
+            ]
+        );
+        assert_eq!(bodies[0], "hi");
+        assert_eq!(bodies[2], "Hello");
+        assert_eq!(bodies[3], "what next");
+        assert_eq!(bodies[5], "Tell me what to work on.");
+        assert!(
+            bodies
+                .iter()
+                .all(|body| !body.contains("stale projection final"))
+        );
     }
 
     #[test]
