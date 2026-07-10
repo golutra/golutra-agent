@@ -91,7 +91,7 @@ Plugin Marketplace
 - `MemoryCandidate` 只作为候选，长期 memory 不能从 transcript 自动晋升。
 - `RuntimeLane` 负责同一 task 的串行执行和运行中输入处理，入口层不能私自排队、注入或中断。
 - `LoopGuardRule` 把重复工具失败、空回复、context overflow、max iteration 等循环异常变成显式规则。
-- `WorkspaceCheckpoint` 负责 coding agent 文件副作用后的恢复点，不能污染用户自己的 `.git`。
+- `WorkspaceCheckpoint` 在 coding agent 文件副作用前捕获并持久化 before-image、checksum 和恢复引用；不能污染用户自己的 `.git`。
 
 这些是第一阶段的架构约束，不等于要实现完整 benchmark hardening、复杂 multi-agent、自改进或动态评测系统。
 
@@ -394,7 +394,7 @@ WorkspaceCheckpoint
   checkpoint_type: shadow_git | snapshot | external
   changed_files
   artifact_refs
-  created_after_event_id
+  created_before_tool_call_id
   restore_hint
   retention_policy
 ```
@@ -835,7 +835,7 @@ Debug Projection 只在 debug/audit/replay 模式启用。
 | retry | 有副作用的 tool retry 必须依赖 idempotency 或显式阻断 |
 | loop guard | 重复工具失败、空回复、context overflow、max iteration 都有明确 `LoopDecision`，不能无界循环 |
 | artifact | raw output 可通过 checksum 校验，模型只读取摘要或受控 excerpt |
-| workspace checkpoint | 文件副作用后有可恢复引用，且不修改用户 `.git` |
+| workspace checkpoint | 文件副作用前已持久化 before-image、artifact 和可恢复引用，且不修改用户 `.git` |
 | verification | 没有足够 evidence 时不能 `stop_success`，只能 `stop_partial`、`stop_failed` 或 `blocked` |
 | memory | `MemoryCandidate` 不自动晋升长期 memory，必须保留 evidence、scope 和 rollback 信息 |
 
@@ -875,7 +875,7 @@ Debug Projection 只在 debug/audit/replay 模式启用。
 - 每个工具结果有 ToolResultEnvelope。
 - 运行中用户输入经过 RuntimeLane 和 BusyPolicyDecision。
 - raw output、日志和大内容有 ArtifactRecord，关键结论有 EvidenceRecord。
-- 文件副作用后能生成 WorkspaceCheckpoint 或明确说明不可快照原因。
+- 文件副作用前能捕获 WorkspaceCheckpoint before-image，或在执行前明确阻断并说明不可快照原因。
 - 每个任务结束有 VerificationRecord。
 - 每次循环结束有 LoopDecision。
 - 普通用户只看到 UserProjection。

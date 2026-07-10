@@ -7,9 +7,14 @@
     ".": "./src/index.ts"
   },
   "scripts": {
+    "generate": "node scripts/generate.mjs",
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "eventsource-parser": "^3.1.0"
+  },
   "devDependencies": {
+    "json-schema-to-typescript": "^15.0.4",
     "typescript": "^5.5.0"
   }
 }

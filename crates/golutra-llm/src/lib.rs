@@ -28,10 +28,18 @@ const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub enum ProviderError {
     #[error("provider failed: {message}")]
     Failed { message: String },
+    #[error("provider is temporarily unavailable: {message}")]
+    Unavailable { message: String },
     #[error("provider rate limited: {message}")]
     RateLimited { message: String },
     #[error("provider is not configured: {message}")]
     NotConfigured { message: String },
+    #[error("provider response is malformed: {message}")]
+    Malformed { message: String },
+    #[error("provider request timed out: {message}")]
+    Timeout { message: String },
+    #[error("provider request was cancelled")]
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +57,12 @@ pub struct ProviderRequest {
 pub struct ProviderMessage {
     pub role: ProviderRole,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ProviderToolCall>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,6 +230,9 @@ impl MockProvider {
                 message: Some(ProviderMessage {
                     role: ProviderRole::Assistant,
                     content: content.into(),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: Vec::new(),
                 }),
                 tool_calls: Vec::new(),
                 usage: usage(128, 32),
@@ -248,7 +265,41 @@ impl MockProvider {
 
 #[async_trait]
 impl LlmProvider for MockProvider {
-    async fn complete(&self, _request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+    async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        if !self.response.tool_calls.is_empty()
+            && request
+                .messages
+                .iter()
+                .any(|message| message.role == ProviderRole::Tool)
+        {
+            let summary = request
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == ProviderRole::Tool)
+                .and_then(|message| serde_json::from_str::<Value>(&message.content).ok())
+                .and_then(|value| {
+                    value
+                        .get("summary")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+                .unwrap_or_else(|| "tool result accepted".to_owned());
+            return Ok(ProviderResponse {
+                response_id: ProviderResponseId::new(),
+                message: Some(ProviderMessage {
+                    role: ProviderRole::Assistant,
+                    content: format!("Completed: {summary}"),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: Vec::new(),
+                }),
+                tool_calls: Vec::new(),
+                usage: usage(64, 16),
+                finish_reason: ProviderFinishReason::Stop,
+                raw_metadata: json!({"provider": "mock", "phase": "after_tool"}),
+            });
+        }
         Ok(self.response.clone())
     }
 
@@ -367,13 +418,18 @@ impl OpenAiCompatibleProvider {
 
     #[must_use]
     pub fn from_config(config: OpenAiCompatibleProviderConfig) -> Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .expect("static reqwest client configuration is valid");
         Self {
             api_key: config.api_key,
             api_key_env: config.api_key_env,
             base_url: normalize_openai_base_url(&config.base_url),
             model_id: config.model_id,
             generation_config: config.generation_config,
-            client: reqwest::Client::new(),
+            client,
         }
     }
 
@@ -442,9 +498,7 @@ impl OpenAiCompatibleProvider {
             .bearer_auth(&self.api_key)
             .send()
             .await
-            .map_err(|error| ProviderError::Failed {
-                message: error.to_string(),
-            })?;
+            .map_err(provider_transport_error)?;
         let status = response.status();
         let value = response_json_or_error(response).await?;
         if status.as_u16() == 429 {
@@ -453,9 +507,7 @@ impl OpenAiCompatibleProvider {
             });
         }
         if !status.is_success() {
-            return Err(ProviderError::Failed {
-                message: provider_error_message(&value),
-            });
+            return Err(provider_http_error(status, &value));
         }
         let discovered_models = value
             .get("data")
@@ -506,9 +558,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|error| ProviderError::Failed {
-                message: error.to_string(),
-            })?;
+            .map_err(provider_transport_error)?;
         let status = response.status();
         let value = response_json_or_error(response).await?;
         if status.as_u16() == 429 {
@@ -517,16 +567,10 @@ impl LlmProvider for OpenAiCompatibleProvider {
             });
         }
         if !status.is_success() {
-            return Err(ProviderError::Failed {
-                message: provider_error_message(&value),
-            });
+            return Err(provider_http_error(status, &value));
         }
 
-        Ok(provider_response_from_openai(
-            value,
-            request.task_id,
-            request.turn_id,
-        ))
+        provider_response_from_openai(value, request.task_id, request.turn_id)
     }
 
     fn contract(&self) -> ProviderContract {
@@ -576,16 +620,6 @@ impl ConfiguredProvider {
             .map(Self::OpenAiCompatible)
     }
 
-    #[must_use]
-    pub fn from_env_or_mock(mock: MockProvider) -> Self {
-        if selected_protocol_from_env().is_none_or(|protocol| protocol == ProviderProtocol::Mock) {
-            return Self::Mock(Box::new(mock));
-        }
-        OpenAiCompatibleProvider::from_env()
-            .map(Self::OpenAiCompatible)
-            .unwrap_or_else(|_| Self::Mock(Box::new(mock)))
-    }
-
     pub fn redacted_from_env() -> Result<RedactedProviderConfig, ProviderError> {
         Self::redacted_from_reader(|key| std::env::var(key).ok())
     }
@@ -627,6 +661,16 @@ impl ConfiguredProvider {
     {
         let protocol =
             selected_protocol_from_reader(&reader).unwrap_or(ProviderProtocol::OpenAiCompatible);
+        if protocol == ProviderProtocol::Mock {
+            return Ok(ProviderProbeResult {
+                provider_id: "mock".to_owned(),
+                protocol: "in_memory".to_owned(),
+                base_url: "in-memory".to_owned(),
+                model_id: "mock-model".to_owned(),
+                model_available: Some(true),
+                discovered_models: vec!["mock-model".to_owned()],
+            });
+        }
         if protocol != ProviderProtocol::OpenAiCompatible {
             return Err(unsupported_protocol_error(protocol));
         }
@@ -813,7 +857,7 @@ fn mock_contract() -> ProviderContract {
 }
 
 fn openai_message(message: &ProviderMessage) -> Value {
-    json!({
+    let mut value = json!({
         "role": match message.role {
             ProviderRole::System => "system",
             ProviderRole::User => "user",
@@ -821,6 +865,33 @@ fn openai_message(message: &ProviderMessage) -> Value {
             ProviderRole::Tool => "tool",
         },
         "content": message.content,
+    });
+    if let Some(tool_call_id) = &message.tool_call_id {
+        value["tool_call_id"] = Value::String(tool_call_id.clone());
+    }
+    if let Some(tool_name) = &message.tool_name {
+        value["name"] = Value::String(tool_name.clone());
+    }
+    if !message.tool_calls.is_empty() {
+        value["tool_calls"] = Value::Array(
+            message
+                .tool_calls
+                .iter()
+                .map(openai_assistant_tool_call)
+                .collect(),
+        );
+    }
+    value
+}
+
+fn openai_assistant_tool_call(tool_call: &ProviderToolCall) -> Value {
+    json!({
+        "id": tool_call.tool_call_id,
+        "type": "function",
+        "function": {
+            "name": tool_call.tool_name,
+            "arguments": tool_call.arguments.to_string(),
+        }
     })
 }
 
@@ -918,14 +989,21 @@ fn provider_response_from_openai(
     value: Value,
     _task_id: TaskId,
     _turn_id: TurnId,
-) -> ProviderResponse {
+) -> Result<ProviderResponse, ProviderError> {
     let choice = value
         .get("choices")
         .and_then(Value::as_array)
         .and_then(|choices| choices.first())
         .cloned()
-        .unwrap_or_else(|| json!({}));
-    let message = choice.get("message").cloned().unwrap_or_else(|| json!({}));
+        .ok_or_else(|| ProviderError::Malformed {
+            message: "response choices is empty".to_owned(),
+        })?;
+    let message = choice
+        .get("message")
+        .cloned()
+        .ok_or_else(|| ProviderError::Malformed {
+            message: "response choice has no message".to_owned(),
+        })?;
     let content = message
         .get("content")
         .and_then(Value::as_str)
@@ -933,17 +1011,24 @@ fn provider_response_from_openai(
         .map(|content| ProviderMessage {
             role: ProviderRole::Assistant,
             content: content.to_owned(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
         });
     let tool_calls = message
         .get("tool_calls")
         .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(provider_tool_call_from_openai)
-        .collect::<Vec<_>>();
+        .map(|calls| {
+            calls
+                .iter()
+                .map(provider_tool_call_from_openai)
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
     let usage_value = value.get("usage").cloned().unwrap_or_else(|| json!({}));
 
-    ProviderResponse {
+    Ok(ProviderResponse {
         response_id: ProviderResponseId::new(),
         message: content,
         tool_calls,
@@ -963,23 +1048,39 @@ fn provider_response_from_openai(
                 .unwrap_or_default(),
         ),
         raw_metadata: value,
-    }
+    })
 }
 
-fn provider_tool_call_from_openai(value: &Value) -> Option<ProviderToolCall> {
-    let function = value.get("function")?;
+fn provider_tool_call_from_openai(value: &Value) -> Result<ProviderToolCall, ProviderError> {
+    let function = value
+        .get("function")
+        .ok_or_else(|| ProviderError::Malformed {
+            message: "tool call has no function".to_owned(),
+        })?;
     let arguments = function
         .get("arguments")
         .and_then(Value::as_str)
-        .and_then(|arguments| serde_json::from_str(arguments).ok())
-        .unwrap_or_else(|| json!({}));
-    Some(ProviderToolCall {
+        .ok_or_else(|| ProviderError::Malformed {
+            message: "tool call arguments is not a JSON string".to_owned(),
+        })
+        .and_then(|arguments| {
+            serde_json::from_str(arguments).map_err(|error| ProviderError::Malformed {
+                message: format!("tool call arguments is invalid JSON: {error}"),
+            })
+        })?;
+    Ok(ProviderToolCall {
         tool_call_id: value
             .get("id")
             .and_then(Value::as_str)
             .unwrap_or("provider-tool-call")
             .to_owned(),
-        tool_name: function.get("name")?.as_str()?.to_owned(),
+        tool_name: function
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ProviderError::Malformed {
+                message: "tool call function has no name".to_owned(),
+            })?
+            .to_owned(),
         arguments,
     })
 }
@@ -1018,13 +1119,33 @@ fn provider_error_message(value: &Value) -> String {
     }
 }
 
+fn provider_transport_error(error: reqwest::Error) -> ProviderError {
+    if error.is_timeout() {
+        ProviderError::Timeout {
+            message: sanitize_provider_error(&error.to_string()),
+        }
+    } else if error.is_connect() {
+        ProviderError::Unavailable {
+            message: sanitize_provider_error(&error.to_string()),
+        }
+    } else {
+        ProviderError::Failed {
+            message: sanitize_provider_error(&error.to_string()),
+        }
+    }
+}
+
+fn provider_http_error(status: reqwest::StatusCode, value: &Value) -> ProviderError {
+    let message = provider_error_message(value);
+    if status.is_server_error() {
+        ProviderError::Unavailable { message }
+    } else {
+        ProviderError::Failed { message }
+    }
+}
+
 async fn response_json_or_error(response: reqwest::Response) -> Result<Value, ProviderError> {
-    let text = response
-        .text()
-        .await
-        .map_err(|error| ProviderError::Failed {
-            message: error.to_string(),
-        })?;
+    let text = response.text().await.map_err(provider_transport_error)?;
     Ok(serde_json::from_str(&text).unwrap_or_else(|_| {
         json!({
             "error": {
@@ -1048,10 +1169,6 @@ where
             reader(GOLUTRA_PROVIDER_MODE)
                 .and_then(|value| ProviderProtocol::from_config_value(&value))
         })
-}
-
-fn selected_protocol_from_env() -> Option<ProviderProtocol> {
-    selected_protocol_from_reader(&|key| std::env::var(key).ok())
 }
 
 fn env_mapping(protocol: ProviderProtocol) -> ProviderEnvMapping {
@@ -1426,6 +1543,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_mock_provider_probe_reports_ready() {
+        let result = ConfiguredProvider::probe_from_reader(|key| {
+            (key == GOLUTRA_PROVIDER_PROTOCOL).then(|| "mock".to_owned())
+        })
+        .await
+        .expect("mock probe");
+
+        assert_eq!(result.provider_id, "mock");
+        assert_eq!(result.protocol, "in_memory");
+        assert_eq!(result.model_available, Some(true));
+        assert_eq!(result.discovered_models, vec!["mock-model"]);
+    }
+
+    #[tokio::test]
     async fn mock_provider_returns_tool_call() {
         let provider = MockProvider::tool_call("read_file", json!({"path": "README.md"}));
         let response = provider.complete(request()).await.expect("response");
@@ -1792,6 +1923,9 @@ mod tests {
             messages: vec![ProviderMessage {
                 role: ProviderRole::User,
                 content: "hello".to_owned(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
             }],
             tools: Vec::new(),
         }

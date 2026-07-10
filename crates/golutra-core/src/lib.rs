@@ -1,3 +1,4 @@
+pub mod approval;
 pub mod artifact;
 pub mod checkpoint;
 pub mod ids;
@@ -9,6 +10,7 @@ pub mod token;
 pub mod tool;
 pub mod verification;
 
+pub use approval::*;
 pub use artifact::*;
 pub use checkpoint::*;
 pub use ids::*;

@@ -9,6 +9,8 @@ use thiserror::Error;
 pub enum ContextError {
     #[error("context budget exceeded: planned {planned} > limit {limit}")]
     BudgetExceeded { planned: u64, limit: u64 },
+    #[error("context budget requires user action: planned {planned} > limit {limit}")]
+    UserActionRequired { planned: u64, limit: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +26,8 @@ pub struct ContextBuildPlan {
     pub contributors: Vec<String>,
     pub messages: Vec<ProviderMessage>,
     pub budget_snapshot: TokenBudgetSnapshot,
+    pub original_planned_input_tokens: u64,
+    pub trimmed_contributors: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,26 +64,46 @@ impl ContextBuilder {
         &self,
         task_id: TaskId,
         turn_id: TurnId,
-        contributors: Vec<ContextContributor>,
+        mut contributors: Vec<ContextContributor>,
     ) -> Result<ContextBuildPlan, ContextError> {
+        let original_planned_input_tokens = contributors
+            .iter()
+            .map(|contributor| estimate_tokens(&contributor.content))
+            .sum::<u64>();
+        let mut trimmed_contributors = Vec::new();
+        if original_planned_input_tokens > self.policy.budget_limit {
+            match self.policy.action_if_exceeded {
+                BudgetOverflowAction::Block => {
+                    return Err(ContextError::BudgetExceeded {
+                        planned: original_planned_input_tokens,
+                        limit: self.policy.budget_limit,
+                    });
+                }
+                BudgetOverflowAction::AskUser => {
+                    return Err(ContextError::UserActionRequired {
+                        planned: original_planned_input_tokens,
+                        limit: self.policy.budget_limit,
+                    });
+                }
+                BudgetOverflowAction::Trim | BudgetOverflowAction::Compact => {
+                    trimmed_contributors =
+                        trim_contributors(&mut contributors, self.policy.budget_limit);
+                }
+            }
+        }
         let planned_input_tokens = contributors
             .iter()
             .map(|contributor| estimate_tokens(&contributor.content))
             .sum::<u64>();
-        if planned_input_tokens > self.policy.budget_limit
-            && self.policy.action_if_exceeded == BudgetOverflowAction::Block
-        {
-            return Err(ContextError::BudgetExceeded {
-                planned: planned_input_tokens,
-                limit: self.policy.budget_limit,
-            });
-        }
 
         let messages = contributors
             .iter()
             .map(|contributor| ProviderMessage {
                 role: contributor.role,
                 content: contributor.content.clone(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
             })
             .collect::<Vec<_>>();
         let contributor_names = contributors
@@ -90,6 +114,8 @@ impl ContextBuilder {
         Ok(ContextBuildPlan {
             contributors: contributor_names,
             messages,
+            original_planned_input_tokens,
+            trimmed_contributors,
             budget_snapshot: TokenBudgetSnapshot {
                 snapshot_id: TokenBudgetSnapshotId::new(),
                 task_id,
@@ -105,6 +131,66 @@ impl ContextBuilder {
                 action_if_exceeded: self.policy.action_if_exceeded,
             },
         })
+    }
+}
+
+fn trim_contributors(contributors: &mut [ContextContributor], budget_limit: u64) -> Vec<String> {
+    let mut trimmed = Vec::new();
+    for contributor in contributors.iter_mut() {
+        let current_tokens = estimate_tokens(&contributor.content);
+        if contributor.token_budget_hint > 0 && current_tokens > contributor.token_budget_hint {
+            contributor.content = truncate_contributor(
+                &contributor.name,
+                &contributor.content,
+                contributor.token_budget_hint,
+            );
+            trimmed.push(contributor.name.clone());
+        }
+    }
+
+    const TRIM_PRIORITY: &[&str] = &[
+        "memory",
+        "conversation_history",
+        "environment_context",
+        "system",
+        "objective",
+    ];
+    for name in TRIM_PRIORITY {
+        let total = contributors
+            .iter()
+            .map(|contributor| estimate_tokens(&contributor.content))
+            .sum::<u64>();
+        if total <= budget_limit {
+            break;
+        }
+        if let Some(contributor) = contributors
+            .iter_mut()
+            .find(|contributor| contributor.name == *name)
+        {
+            let current_tokens = estimate_tokens(&contributor.content);
+            let overflow = total.saturating_sub(budget_limit);
+            let target = current_tokens.saturating_sub(overflow).max(16);
+            contributor.content = truncate_contributor(name, &contributor.content, target);
+            if !trimmed.iter().any(|trimmed_name| trimmed_name == name) {
+                trimmed.push((*name).to_owned());
+            }
+        }
+    }
+    trimmed
+}
+
+fn truncate_contributor(name: &str, content: &str, token_limit: u64) -> String {
+    let character_limit = usize::try_from(token_limit.saturating_mul(4)).unwrap_or(usize::MAX);
+    let characters = content.chars().collect::<Vec<_>>();
+    if characters.len() <= character_limit {
+        return content.to_owned();
+    }
+    if matches!(name, "conversation_history" | "memory") {
+        characters[characters.len().saturating_sub(character_limit)..]
+            .iter()
+            .collect()
+    } else {
+        characters[..character_limit].iter().collect()
     }
 }
 
@@ -221,5 +307,31 @@ mod tests {
 
         assert_eq!(record.total_tokens, Some(15));
         assert_eq!(record.budget_snapshot_ref, plan.budget_snapshot.snapshot_id);
+    }
+
+    #[test]
+    fn trims_oversized_history_to_the_declared_budget() {
+        let plan = ContextBuilder::new(ContextBudgetPolicy {
+            context_window: 128,
+            max_output: 16,
+            budget_limit: 32,
+            action_if_exceeded: BudgetOverflowAction::Trim,
+        })
+        .build(
+            TaskId::new(),
+            TurnId::new(),
+            vec![ContextContributor {
+                name: "conversation_history".to_owned(),
+                role: ProviderRole::System,
+                content: format!("old {} latest", "history ".repeat(80)),
+                token_budget_hint: 24,
+            }],
+        )
+        .expect("context trims");
+
+        assert!(plan.budget_snapshot.planned_input_tokens <= 32);
+        assert_eq!(plan.trimmed_contributors, vec!["conversation_history"]);
+        assert!(plan.messages[0].content.ends_with("latest"));
+        assert!(plan.original_planned_input_tokens > plan.budget_snapshot.planned_input_tokens);
     }
 }

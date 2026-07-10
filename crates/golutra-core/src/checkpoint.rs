@@ -1,7 +1,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{ArtifactId, CheckpointId, EventId, TaskId, TurnId, WorkspaceId};
+use crate::{ArtifactId, CheckpointId, TaskId, ToolCallId, TurnId, WorkspaceId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -20,7 +20,7 @@ pub struct WorkspaceCheckpoint {
     pub checkpoint_type: CheckpointType,
     pub changed_files: Vec<String>,
     pub artifact_refs: Vec<ArtifactId>,
-    pub created_after_event_id: EventId,
+    pub created_before_tool_call_id: ToolCallId,
     pub restore_hint: String,
     pub retention_policy: String,
 }

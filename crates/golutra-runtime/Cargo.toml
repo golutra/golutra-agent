@@ -7,16 +7,22 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 chrono.workspace = true
 golutra-context = { path = "../golutra-context" }
 golutra-core.workspace = true
+golutra-governor = { path = "../golutra-governor" }
 golutra-llm = { path = "../golutra-llm" }
 golutra-protocol.workspace = true
 golutra-tools = { path = "../golutra-tools" }
 golutra-verify = { path = "../golutra-verify" }
+ignore.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
 
 [dev-dependencies]
 golutra-policy = { path = "../golutra-policy" }

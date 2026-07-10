@@ -35,6 +35,7 @@ pub enum TaskStatus {
     Partial,
     Failed,
     Blocked,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

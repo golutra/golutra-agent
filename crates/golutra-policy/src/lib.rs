@@ -89,20 +89,31 @@ impl WorkspacePolicy {
     }
 
     pub fn evaluate_shell(&self, command: &str) -> PolicyEvaluation {
+        let parsed = shlex::split(command);
         let blocked = contains_shell_metacharacter(command)
             || self
                 .denied_shell_fragments
                 .iter()
-                .any(|fragment| command.contains(fragment));
+                .any(|fragment| command.contains(fragment))
+            || parsed.is_none()
+            || parsed
+                .as_deref()
+                .is_some_and(|parts| self.shell_command_is_blocked(parts));
         let decision = if blocked {
             PolicyDecision::Block
-        } else {
+        } else if parsed
+            .as_deref()
+            .is_some_and(|parts| self.shell_command_is_preapproved(parts))
+        {
             PolicyDecision::Allow
+        } else {
+            PolicyDecision::Ask
         };
         let reason = match decision {
-            PolicyDecision::Allow => "shell command passed P0 deny-list",
+            PolicyDecision::Allow => "read-only or build command is pre-approved",
+            PolicyDecision::Ask => "process command requires explicit user approval",
             PolicyDecision::Block => "shell command matched P0 deny-list or metacharacter guard",
-            PolicyDecision::Ask | PolicyDecision::Deny => "unused P0 shell policy result",
+            PolicyDecision::Deny => "shell command denied by policy",
         };
 
         PolicyEvaluation {
@@ -143,10 +154,95 @@ impl WorkspacePolicy {
     }
 
     fn is_sensitive_path(&self, path: &Path) -> bool {
-        let path_text = path.to_string_lossy();
-        self.sensitive_path_fragments
-            .iter()
-            .any(|fragment| path_text.contains(fragment))
+        let path_text = path.to_string_lossy().to_ascii_lowercase();
+        has_internal_runtime_component(path)
+            || self
+                .sensitive_path_fragments
+                .iter()
+                .any(|fragment| path_text.contains(fragment))
+    }
+
+    fn shell_command_is_blocked(&self, parts: &[String]) -> bool {
+        let Some(program) = parts.first().map(String::as_str) else {
+            return true;
+        };
+        let arguments = &parts[1..];
+        let sensitive_argument = arguments.iter().any(|argument| {
+            let lower = argument.to_ascii_lowercase();
+            argument
+                .split(['/', '\\'])
+                .any(|component| matches!(component, ".git" | ".golutra"))
+                || self
+                    .sensitive_path_fragments
+                    .iter()
+                    .any(|fragment| lower.contains(fragment))
+        });
+        let dangerous_program_option = match program {
+            "find" => arguments.iter().any(|argument| {
+                matches!(
+                    argument.as_str(),
+                    "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir"
+                )
+            }),
+            "rg" => arguments
+                .iter()
+                .any(|argument| argument == "--pre" || argument.starts_with("--pre=")),
+            "rm" => {
+                let recursive_force = arguments.iter().any(|argument| {
+                    argument.starts_with('-') && argument.contains('r') && argument.contains('f')
+                });
+                recursive_force && arguments.iter().any(|argument| argument == "/")
+            }
+            "mkfs" | "shutdown" | "reboot" => true,
+            _ => false,
+        };
+        sensitive_argument || dangerous_program_option
+    }
+
+    fn shell_command_is_preapproved(&self, parts: &[String]) -> bool {
+        let Some(program) = parts.first().map(String::as_str) else {
+            return false;
+        };
+        let arguments = &parts[1..];
+        if arguments.iter().any(|argument| {
+            let path = Path::new(argument);
+            path.is_absolute() && !path.starts_with(&self.workspace_root)
+                || path
+                    .components()
+                    .any(|component| component == std::path::Component::ParentDir)
+        }) {
+            return false;
+        }
+        match program {
+            "cargo" => arguments.first().is_some_and(|subcommand| {
+                matches!(
+                    subcommand.as_str(),
+                    "build" | "check" | "clippy" | "metadata" | "test"
+                )
+            }),
+            "rustc" => arguments == ["--version"],
+            "rg" | "ls" | "head" | "tail" | "wc" => true,
+            "pwd" => arguments.is_empty(),
+            "git" => arguments.first().is_some_and(|subcommand| {
+                matches!(
+                    subcommand.as_str(),
+                    "status" | "diff" | "log" | "show" | "rev-parse"
+                ) && !arguments
+                    .iter()
+                    .any(|argument| matches!(argument.as_str(), "--ext-diff" | "--textconv"))
+            }),
+            "npm" | "pnpm" | "yarn" => match arguments.first().map(String::as_str) {
+                Some("test") => true,
+                Some("run") => arguments.get(1).is_some_and(|script| {
+                    matches!(
+                        script.as_str(),
+                        "build" | "check" | "lint" | "test" | "typecheck"
+                    )
+                }),
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
     fn evaluation(
@@ -188,6 +284,15 @@ fn canonicalize_existing(path: &Path) -> Result<PathBuf, PolicyError> {
         .map_err(|_| PolicyError::Canonicalization(path.display().to_string()))
 }
 
+fn has_internal_runtime_component(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::Normal(value) if matches!(value.to_str(), Some(".git" | ".golutra"))
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -210,6 +315,39 @@ mod tests {
     }
 
     #[test]
+    fn blocks_internal_runtime_and_git_paths_without_blocking_github_files() {
+        let workspace = tempdir().expect("workspace");
+        fs::create_dir_all(workspace.path().join(".git")).expect("git directory");
+        fs::create_dir_all(workspace.path().join(".golutra")).expect("runtime directory");
+        fs::create_dir_all(workspace.path().join(".github")).expect("github directory");
+        fs::write(workspace.path().join(".git/config"), "config").expect("git config");
+        fs::write(workspace.path().join(".golutra/runtime.sqlite"), "state")
+            .expect("runtime state");
+        fs::write(workspace.path().join(".github/workflow.yml"), "workflow")
+            .expect("github workflow");
+        let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
+
+        assert_eq!(
+            policy
+                .evaluate_path("write_file", ".git/config", true)
+                .decision,
+            PolicyDecision::Block
+        );
+        assert_eq!(
+            policy
+                .evaluate_path("write_file", ".golutra/runtime.sqlite", true)
+                .decision,
+            PolicyDecision::Block
+        );
+        assert_eq!(
+            policy
+                .evaluate_path("write_file", ".github/workflow.yml", true)
+                .decision,
+            PolicyDecision::Allow
+        );
+    }
+
+    #[test]
     fn allows_paths_inside_workspace() {
         let workspace = tempdir().expect("workspace");
         let file = workspace.path().join("src.txt");
@@ -229,5 +367,75 @@ mod tests {
         let evaluation = policy.evaluate_shell("cargo test; cat .env");
 
         assert_eq!(evaluation.decision, PolicyDecision::Block);
+    }
+
+    #[test]
+    fn asks_for_unknown_process_commands() {
+        let workspace = tempdir().expect("workspace");
+        let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
+
+        let evaluation = policy.evaluate_shell("sleep 5");
+
+        assert_eq!(evaluation.decision, PolicyDecision::Ask);
+    }
+
+    #[test]
+    fn preapproves_build_and_read_only_commands() {
+        let workspace = tempdir().expect("workspace");
+        let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
+
+        assert_eq!(
+            policy.evaluate_shell("cargo test -p golutra-core").decision,
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            policy.evaluate_shell("git status --short").decision,
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            policy.evaluate_shell("rg 'two words' crates").decision,
+            PolicyDecision::Allow
+        );
+    }
+
+    #[test]
+    fn blocks_shell_execution_flags_and_sensitive_paths() {
+        let workspace = tempdir().expect("workspace");
+        let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
+
+        for command in [
+            "find . -delete",
+            "find . -exec rm {} +",
+            "rg --pre 'cat payload' pattern",
+            "rg token .env",
+        ] {
+            assert_eq!(
+                policy.evaluate_shell(command).decision,
+                PolicyDecision::Block,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn requires_approval_for_mutating_or_broad_commands() {
+        let workspace = tempdir().expect("workspace");
+        let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
+
+        for command in [
+            "sed -i backup src/lib.rs",
+            "find . -name '*.rs'",
+            "cargo run",
+            "cargo fmt",
+            "git branch -D old",
+            "npm run deploy",
+            "ls /tmp",
+        ] {
+            assert_eq!(
+                policy.evaluate_shell(command).decision,
+                PolicyDecision::Ask,
+                "{command}"
+            );
+        }
     }
 }

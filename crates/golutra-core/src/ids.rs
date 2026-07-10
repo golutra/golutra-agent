@@ -61,6 +61,8 @@ define_id!(QueryId);
 define_id!(EventId);
 define_id!(LaneId);
 define_id!(DecisionId);
+define_id!(ApprovalId);
+define_id!(MemoryId);
 define_id!(ToolCallId);
 define_id!(ArtifactId);
 define_id!(EvidenceId);

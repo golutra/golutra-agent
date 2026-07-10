@@ -2,25 +2,42 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
+use async_trait::async_trait;
 use golutra_context::{
-    ContextBuilder, ContextContributor, ContextError, provider_request_from_plan,
+    ContextBuilder, ContextContributor, ContextError, estimate_tokens, provider_request_from_plan,
     token_usage_record,
 };
 use golutra_core::{
-    Actor, BudgetState, BusyPolicy, BusyPolicyDecision, CheckpointId, CheckpointType, CommandId,
-    DecisionId, EventId, LaneId, LoopAction, LoopDecision, LoopDecisionId, PolicyId, RuntimeLane,
-    SessionId, TaskId, TaskStatus, ToolResultStatus, TurnId, VerificationCheck, VerificationId,
+    Actor, ApprovalDecision, ApprovalId, ApprovalRequest, ApprovalResolution, BudgetState,
+    BusyPolicy, BusyPolicyDecision, CheckpointId, CheckpointType, CommandId, DecisionId, LaneId,
+    LoopAction, LoopDecision, LoopDecisionId, PolicyDecision, PolicyId, RuntimeLane, SessionId,
+    TaskId, TaskStatus, ToolCallId, ToolResultStatus, TurnId, VerificationCheck, VerificationId,
     VerificationRecord, VerificationResult, WorkspaceCheckpoint, WorkspaceId,
 };
-use golutra_llm::{LlmProvider, ProviderError, ProviderFinishReason};
+use golutra_governor::{
+    GoalLedger, GovernorAction, GovernorObservation, GovernorPhase, RuntimeGovernor,
+    RuntimeGovernorDecision,
+};
+use golutra_llm::{
+    LlmProvider, ProviderError, ProviderFinishReason, ProviderMessage, ProviderRequest,
+    ProviderResponse, ProviderRole,
+};
 use golutra_protocol::{RuntimeEvent, RuntimeEventSource, RuntimeEventType};
-use golutra_tools::{BasicToolExecutor, ToolError, ToolExecutionReport, ToolRequest};
+use golutra_tools::{
+    BasicToolExecutor, FileBeforeImage, ToolError, ToolExecutionReport, ToolRequest,
+};
 use golutra_verify::{VerificationInput, VerificationRunner};
+use ignore::gitignore::GitignoreBuilder;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tokio::sync::{mpsc, watch};
+use tokio_util::sync::CancellationToken;
 
 pub use golutra_protocol::UserProjection;
 
@@ -42,6 +59,10 @@ pub enum AgentLoopError {
     Provider(#[from] ProviderError),
     #[error("tool execution failed")]
     Tool(#[from] ToolError),
+    #[error("checkpoint persistence failed: {0}")]
+    Checkpoint(String),
+    #[error("agent task was cancelled")]
+    Cancelled,
 }
 
 #[derive(Debug, Error)]
@@ -52,6 +73,8 @@ pub enum CheckpointError {
     OutsideWorkspace(String),
     #[error("changed file is excluded from checkpoint: {0}")]
     Excluded(String),
+    #[error("checkpoint manifest is invalid: {0}")]
+    InvalidManifest(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -86,10 +109,105 @@ pub struct AgentLoopOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingAgentTurn {
+    pub command_id: CommandId,
+    pub turn_id: TurnId,
+    pub content: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentExecutionHandle {
+    cancellation: CancellationToken,
+    pause: watch::Sender<bool>,
+    pending_turns: mpsc::Sender<PendingAgentTurn>,
+    approvals: mpsc::Sender<ApprovalResolution>,
+}
+
+impl AgentExecutionHandle {
+    pub fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    pub fn pause(&self) {
+        self.pause.send_replace(true);
+    }
+
+    pub fn resume(&self) {
+        self.pause.send_replace(false);
+    }
+
+    pub async fn append_turn(&self, turn: PendingAgentTurn) -> Result<(), AgentLoopError> {
+        self.pending_turns
+            .send(turn)
+            .await
+            .map_err(|_| AgentLoopError::Cancelled)
+    }
+
+    pub async fn resolve_approval(
+        &self,
+        resolution: ApprovalResolution,
+    ) -> Result<(), AgentLoopError> {
+        self.approvals
+            .send(resolution)
+            .await
+            .map_err(|_| AgentLoopError::Cancelled)
+    }
+
+    #[must_use]
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+}
+
+#[derive(Debug)]
+pub struct AgentExecutionControl {
+    cancellation: CancellationToken,
+    pause: watch::Receiver<bool>,
+    pending_turns: mpsc::Receiver<PendingAgentTurn>,
+    approvals: mpsc::Receiver<ApprovalResolution>,
+}
+
+#[async_trait]
+pub trait BeforeSideEffectRecorder: std::fmt::Debug + Send + Sync {
+    async fn persist_before_side_effect(
+        &self,
+        request: &ToolRequest,
+        before_images: &[FileBeforeImage],
+    ) -> Result<(), AgentLoopError>;
+}
+
+#[must_use]
+pub fn agent_execution_channel(capacity: usize) -> (AgentExecutionHandle, AgentExecutionControl) {
+    let cancellation = CancellationToken::new();
+    let (pause_tx, pause_rx) = watch::channel(false);
+    let (pending_tx, pending_rx) = mpsc::channel(capacity.max(1));
+    let (approval_tx, approval_rx) = mpsc::channel(capacity.max(1));
+    (
+        AgentExecutionHandle {
+            cancellation: cancellation.clone(),
+            pause: pause_tx,
+            pending_turns: pending_tx,
+            approvals: approval_tx,
+        },
+        AgentExecutionControl {
+            cancellation,
+            pause: pause_rx,
+            pending_turns: pending_rx,
+            approvals: approval_rx,
+        },
+    )
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum AgentLoopTraceEvent {
     ContextBuilt {
         contributors: Vec<String>,
         planned_input_tokens: u64,
+    },
+    ContextCompacted {
+        original_input_tokens: u64,
+        planned_input_tokens: u64,
+        trimmed_contributors: Vec<String>,
     },
     ProviderStarted {
         provider_id: String,
@@ -100,14 +218,32 @@ pub enum AgentLoopTraceEvent {
         model_id: String,
         finish_reason: ProviderFinishReason,
         tool_call_count: usize,
+        usage: golutra_core::ProviderUsage,
+        raw_metadata: serde_json::Value,
     },
+    TokenUsageRecorded(golutra_core::TokenUsageRecord),
     ToolStarted {
         tool_name: String,
     },
-    ToolCompleted {
-        tool_name: String,
-        summary: String,
+    ToolCompleted(ToolExecutionReport),
+    PolicyEvaluated(golutra_core::PolicyEvaluation),
+    ApprovalRequested(ApprovalRequest),
+    ApprovalResolved(ApprovalResolution),
+    RetryScheduled {
+        attempt: u32,
+        reason: String,
     },
+    ProviderFallback {
+        from_provider: String,
+        to_provider: String,
+        reason: String,
+    },
+    LoopGuardTriggered {
+        trigger: golutra_core::LoopGuardTrigger,
+        reason: String,
+    },
+    GovernorDecided(RuntimeGovernorDecision),
+    PendingTurnStarted(PendingAgentTurn),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,29 +266,51 @@ impl WorkspaceCheckpointManager {
         workspace_id: WorkspaceId,
         task_id: TaskId,
         turn_id: TurnId,
-        changed_files: &[PathBuf],
-        created_after_event_id: EventId,
+        before_images: &[FileBeforeImage],
+        created_before_tool_call_id: ToolCallId,
     ) -> Result<WorkspaceCheckpoint, CheckpointError> {
         let checkpoint_id = CheckpointId::new();
         let checkpoint_dir = self.checkpoint_root.join(checkpoint_id.to_string());
+        fs::create_dir_all(&self.checkpoint_root)
+            .map_err(|error| CheckpointError::Io(error.to_string()))?;
+        set_owner_only_checkpoint_dir(&self.checkpoint_root)?;
         fs::create_dir_all(&checkpoint_dir)
             .map_err(|error| CheckpointError::Io(error.to_string()))?;
+        set_owner_only_checkpoint_dir(&checkpoint_dir)?;
 
-        let mut copied_files = Vec::new();
-        for changed_file in changed_files {
-            let relative_path = self.relative_checkpoint_path(changed_file)?;
-            let source_path = self.workspace_root.join(&relative_path);
-            if source_path.is_file() {
-                let target_path = checkpoint_dir.join(&relative_path);
+        let mut entries = Vec::new();
+        for before_image in before_images {
+            let relative_path = self.relative_checkpoint_path(&before_image.path)?;
+            if let Some(content) = &before_image.content {
+                let target_path = checkpoint_dir.join("files").join(&relative_path);
                 if let Some(parent) = target_path.parent() {
                     fs::create_dir_all(parent)
                         .map_err(|error| CheckpointError::Io(error.to_string()))?;
                 }
-                fs::copy(&source_path, &target_path)
+                fs::write(&target_path, content)
                     .map_err(|error| CheckpointError::Io(error.to_string()))?;
-                copied_files.push(relative_path.display().to_string());
+                set_owner_only_checkpoint_file(&target_path)?;
             }
+            entries.push(CheckpointManifestEntry {
+                path: relative_path.display().to_string(),
+                existed: before_image.content.is_some(),
+                checksum: before_image.content.as_deref().map(checksum_bytes),
+            });
         }
+        let manifest = CheckpointManifest { entries };
+        let manifest_path = checkpoint_dir.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest)
+                .map_err(|error| CheckpointError::InvalidManifest(error.to_string()))?,
+        )
+        .map_err(|error| CheckpointError::Io(error.to_string()))?;
+        set_owner_only_checkpoint_file(&manifest_path)?;
+        let changed_files = manifest
+            .entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect();
 
         Ok(WorkspaceCheckpoint {
             checkpoint_id,
@@ -160,12 +318,47 @@ impl WorkspaceCheckpointManager {
             task_id,
             turn_id,
             checkpoint_type: CheckpointType::Snapshot,
-            changed_files: copied_files,
+            changed_files,
             artifact_refs: Vec::new(),
-            created_after_event_id,
-            restore_hint: format!("copy files from {}", checkpoint_dir.display()),
+            created_before_tool_call_id,
+            restore_hint: format!(
+                "restore files using manifest {}",
+                checkpoint_dir.join("manifest.json").display()
+            ),
             retention_policy: "p0_keep_until_task_cleanup".to_owned(),
         })
+    }
+
+    pub fn restore_checkpoint(&self, checkpoint_id: CheckpointId) -> Result<(), CheckpointError> {
+        let checkpoint_dir = self.checkpoint_root.join(checkpoint_id.to_string());
+        let manifest_bytes = fs::read(checkpoint_dir.join("manifest.json"))
+            .map_err(|error| CheckpointError::Io(error.to_string()))?;
+        let manifest: CheckpointManifest = serde_json::from_slice(&manifest_bytes)
+            .map_err(|error| CheckpointError::InvalidManifest(error.to_string()))?;
+        for entry in manifest.entries {
+            let target = self.workspace_root.join(&entry.path);
+            if entry.existed {
+                let source = checkpoint_dir.join("files").join(&entry.path);
+                let content =
+                    fs::read(&source).map_err(|error| CheckpointError::Io(error.to_string()))?;
+                let actual_checksum = checksum_bytes(&content);
+                if entry.checksum.as_deref() != Some(actual_checksum.as_str()) {
+                    return Err(CheckpointError::InvalidManifest(format!(
+                        "checkpoint content checksum mismatch: {}",
+                        entry.path
+                    )));
+                }
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|error| CheckpointError::Io(error.to_string()))?;
+                }
+                fs::write(target, content)
+                    .map_err(|error| CheckpointError::Io(error.to_string()))?;
+            } else if target.exists() {
+                fs::remove_file(target).map_err(|error| CheckpointError::Io(error.to_string()))?;
+            }
+        }
+        Ok(())
     }
 
     fn relative_checkpoint_path(&self, changed_file: &Path) -> Result<PathBuf, CheckpointError> {
@@ -178,9 +371,21 @@ impl WorkspaceCheckpointManager {
             .workspace_root
             .canonicalize()
             .map_err(|error| CheckpointError::Io(error.to_string()))?;
-        let canonical_path = path
-            .canonicalize()
-            .map_err(|error| CheckpointError::Io(error.to_string()))?;
+        let canonical_path = if path.exists() {
+            path.canonicalize()
+                .map_err(|error| CheckpointError::Io(error.to_string()))?
+        } else {
+            let parent = path.parent().ok_or_else(|| {
+                CheckpointError::Io(format!("changed file has no parent: {}", path.display()))
+            })?;
+            let canonical_parent = parent
+                .canonicalize()
+                .map_err(|error| CheckpointError::Io(error.to_string()))?;
+            let file_name = path.file_name().ok_or_else(|| {
+                CheckpointError::Io(format!("changed file has no name: {}", path.display()))
+            })?;
+            canonical_parent.join(file_name)
+        };
         let relative = canonical_path
             .strip_prefix(&canonical_workspace)
             .map_err(|_| CheckpointError::OutsideWorkspace(path.display().to_string()))?;
@@ -188,16 +393,65 @@ impl WorkspaceCheckpointManager {
         if is_checkpoint_excluded(relative) {
             return Err(CheckpointError::Excluded(relative.display().to_string()));
         }
+        if self.is_gitignored(relative)? {
+            return Err(CheckpointError::Excluded(relative.display().to_string()));
+        }
         Ok(relative.to_path_buf())
     }
+
+    fn is_gitignored(&self, relative_path: &Path) -> Result<bool, CheckpointError> {
+        let mut builder = GitignoreBuilder::new(&self.workspace_root);
+        let mut directory = self.workspace_root.clone();
+        add_gitignore_file(&mut builder, &directory)?;
+        if let Some(parent) = relative_path.parent() {
+            for component in parent.components() {
+                directory.push(component.as_os_str());
+                add_gitignore_file(&mut builder, &directory)?;
+            }
+        }
+        let matcher = builder
+            .build()
+            .map_err(|error| CheckpointError::Io(error.to_string()))?;
+        Ok(matcher
+            .matched_path_or_any_parents(relative_path, false)
+            .is_ignore())
+    }
+}
+
+fn add_gitignore_file(
+    builder: &mut GitignoreBuilder,
+    directory: &Path,
+) -> Result<(), CheckpointError> {
+    let path = directory.join(".gitignore");
+    if path.exists()
+        && let Some(error) = builder.add(path)
+    {
+        return Err(CheckpointError::Io(error.to_string()));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CheckpointManifest {
+    entries: Vec<CheckpointManifestEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CheckpointManifestEntry {
+    path: String,
+    existed: bool,
+    checksum: Option<String>,
 }
 
 #[derive(Debug)]
 pub struct AgentLoop<P> {
     provider: P,
+    fallback_provider: Option<P>,
     context_builder: ContextBuilder,
     tool_executor: BasicToolExecutor,
     verifier: VerificationRunner,
+    governor: RuntimeGovernor,
+    before_side_effect_recorder: Option<Arc<dyn BeforeSideEffectRecorder>>,
     max_iterations: u32,
 }
 
@@ -213,20 +467,61 @@ where
     ) -> Self {
         Self {
             provider,
+            fallback_provider: None,
             context_builder,
             tool_executor,
             verifier: VerificationRunner,
+            governor: RuntimeGovernor::default(),
+            before_side_effect_recorder: None,
             max_iterations: 4,
         }
     }
 
+    #[must_use]
+    pub fn with_fallback(mut self, provider: P) -> Self {
+        self.fallback_provider = Some(provider);
+        self
+    }
+
+    #[must_use]
+    pub fn with_governor(mut self, governor: RuntimeGovernor) -> Self {
+        self.max_iterations = governor.limits().max_iterations;
+        self.governor = governor;
+        self
+    }
+
+    #[must_use]
+    pub fn with_before_side_effect_recorder(
+        mut self,
+        recorder: Arc<dyn BeforeSideEffectRecorder>,
+    ) -> Self {
+        self.before_side_effect_recorder = Some(recorder);
+        self
+    }
+
     pub async fn run(&self, request: AgentTaskRequest) -> Result<AgentLoopOutcome, AgentLoopError> {
-        self.run_with_trace(request, |_| {}).await
+        let (_handle, control) = agent_execution_channel(1);
+        self.run_with_control_and_trace(request, control, |_| {})
+            .await
     }
 
     pub async fn run_with_trace<F>(
         &self,
         request: AgentTaskRequest,
+        trace: F,
+    ) -> Result<AgentLoopOutcome, AgentLoopError>
+    where
+        F: FnMut(AgentLoopTraceEvent),
+    {
+        let (_handle, control) = agent_execution_channel(1);
+        self.run_with_control_and_trace(request, control, trace)
+            .await
+    }
+
+    pub async fn run_with_control_and_trace<F>(
+        &self,
+        request: AgentTaskRequest,
+        mut control: AgentExecutionControl,
         mut trace: F,
     ) -> Result<AgentLoopOutcome, AgentLoopError>
     where
@@ -234,6 +529,24 @@ where
     {
         let mut tool_reports = Vec::new();
         let mut last_assistant_message = None;
+        let mut current_turn_id = request.turn_id;
+        let mut guard_reason = None;
+        let mut repeated_failure_signature = None;
+        let mut repeated_failure_count = 0_u32;
+        let mut empty_response_count = 0_u32;
+        let mut terminated = false;
+        let started_at = Instant::now();
+        let mut tool_call_count = 0_u32;
+        let mut failed_tool_call_count = 0_u32;
+        let mut governor_action = None;
+        let goal_ledger = GoalLedger {
+            task_id: request.task_id,
+            original_objective: request.objective.clone(),
+            success_criteria: request.completion_criteria.clone(),
+            current_plan: request.completion_criteria.clone(),
+            completed_steps: Vec::new(),
+            open_risks: Vec::new(),
+        };
         let mut last_budget_state = BudgetState {
             planned_input_tokens: None,
             actual_input_tokens: None,
@@ -244,26 +557,77 @@ where
             compact_recommended: false,
             cost_risk: "low".to_owned(),
         };
+        let base_plan = self.context_builder.build(
+            request.task_id,
+            current_turn_id,
+            request.contributors.clone(),
+        )?;
+        if !base_plan.trimmed_contributors.is_empty() {
+            trace(AgentLoopTraceEvent::ContextCompacted {
+                original_input_tokens: base_plan.original_planned_input_tokens,
+                planned_input_tokens: base_plan.budget_snapshot.planned_input_tokens,
+                trimmed_contributors: base_plan.trimmed_contributors.clone(),
+            });
+        }
+        let mut messages = base_plan.messages.clone();
 
-        for iteration in 0..self.max_iterations {
-            if iteration > 0 && !tool_reports.is_empty() {
-                break;
-            }
-
-            let plan = self.context_builder.build(
-                request.task_id,
-                request.turn_id,
-                request.contributors.clone(),
-            )?;
+        'agent_loop: for iteration in 0..=self.max_iterations {
+            control.wait_until_runnable().await?;
+            let mut plan = base_plan.clone();
+            plan.messages = messages.clone();
+            plan.budget_snapshot.turn_id = current_turn_id;
+            plan.budget_snapshot.planned_input_tokens = messages
+                .iter()
+                .map(|message| {
+                    estimate_tokens(&message.content)
+                        + message
+                            .tool_calls
+                            .iter()
+                            .map(|call| estimate_tokens(&call.arguments.to_string()))
+                            .sum::<u64>()
+                })
+                .sum();
             trace(AgentLoopTraceEvent::ContextBuilt {
                 contributors: plan.contributors.clone(),
                 planned_input_tokens: plan.budget_snapshot.planned_input_tokens,
             });
+            let governance = self.governor.evaluate(
+                &goal_ledger,
+                &GovernorObservation {
+                    phase: GovernorPhase::Provider,
+                    iteration: iteration.saturating_add(1),
+                    tool_calls: tool_call_count,
+                    failed_tool_calls: failed_tool_call_count,
+                    planned_input_tokens: plan.budget_snapshot.planned_input_tokens,
+                    elapsed_ms: elapsed_millis(started_at),
+                    latest_action: request.objective.clone(),
+                },
+            );
+            let permits_execution = governance.permits_execution();
+            if !permits_execution {
+                guard_reason = Some(governance.reason.clone());
+                governor_action = Some(governance.action);
+            }
+            trace(AgentLoopTraceEvent::GovernorDecided(governance));
+            if !permits_execution {
+                trace(AgentLoopTraceEvent::LoopGuardTriggered {
+                    trigger: if iteration >= self.max_iterations {
+                        golutra_core::LoopGuardTrigger::MaxIteration
+                    } else {
+                        golutra_core::LoopGuardTrigger::ContextOverflow
+                    },
+                    reason: guard_reason
+                        .clone()
+                        .unwrap_or_else(|| "runtime governor blocked execution".to_owned()),
+                });
+                terminated = true;
+                break;
+            }
             let provider_contract = self.provider.contract();
             let provider_request = provider_request_from_plan(
                 &plan,
                 request.task_id,
-                request.turn_id,
+                current_turn_id,
                 provider_contract.provider_id.clone(),
                 provider_contract.model_id.clone(),
                 request.tools.clone(),
@@ -272,7 +636,16 @@ where
                 provider_id: provider_request.provider_id.clone(),
                 model_id: provider_request.model_id.clone(),
             });
-            let provider_response = self.provider.complete(provider_request.clone()).await?;
+            let provider_response = self
+                .complete_with_retry(provider_request.clone(), &mut control, &mut trace)
+                .await
+                .map_err(|error| {
+                    if error == ProviderError::Cancelled {
+                        AgentLoopError::Cancelled
+                    } else {
+                        AgentLoopError::Provider(error)
+                    }
+                })?;
             if let Some(message) = provider_response
                 .message
                 .as_ref()
@@ -285,6 +658,8 @@ where
                 model_id: provider_request.model_id.clone(),
                 finish_reason: provider_response.finish_reason,
                 tool_call_count: provider_response.tool_calls.len(),
+                usage: provider_response.usage.clone(),
+                raw_metadata: provider_response.raw_metadata.clone(),
             });
             let usage_record = token_usage_record(
                 &provider_request,
@@ -292,6 +667,9 @@ where
                 &plan.budget_snapshot,
                 &provider_response.usage,
             );
+            trace(AgentLoopTraceEvent::TokenUsageRecorded(
+                usage_record.clone(),
+            ));
             last_budget_state = BudgetState {
                 planned_input_tokens: Some(plan.budget_snapshot.planned_input_tokens),
                 actual_input_tokens: usage_record.input_tokens,
@@ -307,26 +685,215 @@ where
             };
 
             if provider_response.tool_calls.is_empty() {
+                if let Some(message) = provider_response.message {
+                    messages.push(message);
+                    empty_response_count = 0;
+                } else {
+                    empty_response_count = empty_response_count.saturating_add(1);
+                    if empty_response_count < 2 {
+                        trace(AgentLoopTraceEvent::RetryScheduled {
+                            attempt: empty_response_count,
+                            reason: "provider returned an empty response".to_owned(),
+                        });
+                        messages.push(ProviderMessage {
+                            role: ProviderRole::User,
+                            content: "Return a concrete response or a valid tool call.".to_owned(),
+                            tool_call_id: None,
+                            tool_name: None,
+                            tool_calls: Vec::new(),
+                        });
+                        continue;
+                    }
+                    let reason = "provider returned empty responses repeatedly".to_owned();
+                    trace(AgentLoopTraceEvent::LoopGuardTriggered {
+                        trigger: golutra_core::LoopGuardTrigger::EmptyResponse,
+                        reason: reason.clone(),
+                    });
+                    guard_reason = Some(reason);
+                    terminated = true;
+                    break;
+                }
+
+                if let Ok(pending_turn) = control.pending_turns.try_recv() {
+                    current_turn_id = pending_turn.turn_id;
+                    trace(AgentLoopTraceEvent::PendingTurnStarted(
+                        pending_turn.clone(),
+                    ));
+                    messages.push(ProviderMessage {
+                        role: ProviderRole::User,
+                        content: pending_turn.content,
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls: Vec::new(),
+                    });
+                    continue;
+                }
+                terminated = true;
                 break;
             }
 
+            messages.push(ProviderMessage {
+                role: ProviderRole::Assistant,
+                content: provider_response
+                    .message
+                    .as_ref()
+                    .map(|message| message.content.clone())
+                    .unwrap_or_default(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: provider_response.tool_calls.clone(),
+            });
             for tool_call in provider_response.tool_calls {
+                control.wait_until_runnable().await?;
+                let tool_action = format!("{} {}", tool_call.tool_name, tool_call.arguments);
+                let governance = self.governor.evaluate(
+                    &goal_ledger,
+                    &GovernorObservation {
+                        phase: GovernorPhase::Tool,
+                        iteration: iteration.saturating_add(1),
+                        tool_calls: tool_call_count.saturating_add(1),
+                        failed_tool_calls: failed_tool_call_count,
+                        planned_input_tokens: plan.budget_snapshot.planned_input_tokens,
+                        elapsed_ms: elapsed_millis(started_at),
+                        latest_action: tool_action,
+                    },
+                );
+                let permits_execution = governance.permits_execution();
+                if !permits_execution {
+                    guard_reason = Some(governance.reason.clone());
+                    governor_action = Some(governance.action);
+                }
+                trace(AgentLoopTraceEvent::GovernorDecided(governance));
+                if !permits_execution {
+                    terminated = true;
+                    break 'agent_loop;
+                }
+                tool_call_count = tool_call_count.saturating_add(1);
                 trace(AgentLoopTraceEvent::ToolStarted {
                     tool_name: tool_call.tool_name.clone(),
                 });
-                let report = self.tool_executor.execute(ToolRequest {
+                let provider_tool_call_id = tool_call.tool_call_id.clone();
+                let failure_signature = format!("{}:{}", tool_call.tool_name, tool_call.arguments);
+                let tool_request = ToolRequest {
                     tool_call_id: golutra_core::ToolCallId::new(),
                     session_id: request.session_id,
-                    turn_id: Some(request.turn_id),
+                    turn_id: Some(current_turn_id),
                     tool_name: tool_call.tool_name,
                     arguments: tool_call.arguments,
-                })?;
-                trace(AgentLoopTraceEvent::ToolCompleted {
-                    tool_name: report.envelope.tool_name.clone(),
-                    summary: report.envelope.summary.clone(),
+                };
+                let policy = self.tool_executor.evaluate(&tool_request)?;
+                trace(AgentLoopTraceEvent::PolicyEvaluated(policy.clone()));
+                let approved = if policy.decision == PolicyDecision::Ask {
+                    let approval = ApprovalRequest {
+                        approval_id: ApprovalId::new(),
+                        task_id: request.task_id,
+                        turn_id: current_turn_id,
+                        tool_call_id: tool_request.tool_call_id,
+                        tool_name: tool_request.tool_name.clone(),
+                        resource: policy.resource.clone(),
+                        reason: policy.reason.clone(),
+                    };
+                    trace(AgentLoopTraceEvent::ApprovalRequested(approval.clone()));
+                    let resolution = control.wait_for_approval(approval.approval_id).await?;
+                    let approved = resolution.decision == ApprovalDecision::Approved;
+                    trace(AgentLoopTraceEvent::ApprovalResolved(resolution));
+                    approved
+                } else {
+                    false
+                };
+                control.wait_until_runnable().await?;
+                let may_execute = match policy.decision {
+                    PolicyDecision::Allow => true,
+                    PolicyDecision::Ask => approved,
+                    PolicyDecision::Deny | PolicyDecision::Block => false,
+                };
+                let before_images = if may_execute {
+                    self.tool_executor
+                        .prepare_side_effect(&tool_request)
+                        .await?
+                } else {
+                    Vec::new()
+                };
+                if !before_images.is_empty()
+                    && let Some(recorder) = &self.before_side_effect_recorder
+                {
+                    recorder
+                        .persist_before_side_effect(&tool_request, &before_images)
+                        .await?;
+                }
+                control.wait_until_runnable().await?;
+                let report = self
+                    .tool_executor
+                    .execute_with_policy_and_before_images(
+                        tool_request,
+                        policy,
+                        approved,
+                        control.cancellation.clone(),
+                        before_images,
+                    )
+                    .await?;
+                trace(AgentLoopTraceEvent::ToolCompleted(report.clone()));
+                if report.envelope.status == ToolResultStatus::Ok {
+                    repeated_failure_signature = None;
+                    repeated_failure_count = 0;
+                } else if repeated_failure_signature.as_deref() == Some(failure_signature.as_str())
+                {
+                    failed_tool_call_count = failed_tool_call_count.saturating_add(1);
+                    repeated_failure_count = repeated_failure_count.saturating_add(1);
+                } else {
+                    failed_tool_call_count = failed_tool_call_count.saturating_add(1);
+                    repeated_failure_signature = Some(failure_signature);
+                    repeated_failure_count = 1;
+                }
+                let result_governance = self.governor.evaluate(
+                    &goal_ledger,
+                    &GovernorObservation {
+                        phase: GovernorPhase::ToolResult,
+                        iteration: iteration.saturating_add(1),
+                        tool_calls: tool_call_count,
+                        failed_tool_calls: failed_tool_call_count,
+                        planned_input_tokens: plan.budget_snapshot.planned_input_tokens,
+                        elapsed_ms: elapsed_millis(started_at),
+                        latest_action: report.envelope.summary.clone(),
+                    },
+                );
+                let permits_continuation = result_governance.permits_execution();
+                if !permits_continuation {
+                    guard_reason = Some(result_governance.reason.clone());
+                    governor_action = Some(result_governance.action);
+                }
+                trace(AgentLoopTraceEvent::GovernorDecided(result_governance));
+                messages.push(ProviderMessage {
+                    role: ProviderRole::Tool,
+                    content: serde_json::to_string(&report.envelope)
+                        .unwrap_or_else(|_| report.envelope.summary.clone()),
+                    tool_call_id: Some(provider_tool_call_id),
+                    tool_name: Some(report.envelope.tool_name.clone()),
+                    tool_calls: Vec::new(),
                 });
                 tool_reports.push(report);
+                if !permits_continuation {
+                    terminated = true;
+                    break 'agent_loop;
+                }
             }
+            if repeated_failure_count >= 2 {
+                let reason = "the same deterministic tool call failed repeatedly".to_owned();
+                trace(AgentLoopTraceEvent::LoopGuardTriggered {
+                    trigger: golutra_core::LoopGuardTrigger::RepeatedToolFailure,
+                    reason: reason.clone(),
+                });
+                guard_reason = Some(reason);
+                terminated = true;
+                break;
+            }
+        }
+
+        if !terminated && guard_reason.is_none() {
+            guard_reason = Some(format!(
+                "agent loop reached max iteration {}",
+                self.max_iterations
+            ));
         }
 
         let evidence_refs = tool_reports
@@ -343,7 +910,7 @@ where
                 message: report.envelope.summary.clone(),
             })
             .collect::<Vec<_>>();
-        let verification = if accepts_text_response_without_evidence(
+        let mut verification = if accepts_text_response_without_evidence(
             &request,
             last_assistant_message.as_deref(),
             &tool_reports,
@@ -359,12 +926,49 @@ where
                 touched_code: request.touched_code,
             })
         };
-        let loop_decision = loop_decision_from_verification(
+        let completion_governance = self.governor.evaluate(
+            &goal_ledger,
+            &GovernorObservation {
+                phase: GovernorPhase::Completion,
+                iteration: self.max_iterations.min(tool_call_count.saturating_add(1)),
+                tool_calls: tool_call_count,
+                failed_tool_calls: failed_tool_call_count,
+                planned_input_tokens: last_budget_state.planned_input_tokens.unwrap_or_default(),
+                elapsed_ms: elapsed_millis(started_at),
+                latest_action: last_assistant_message
+                    .clone()
+                    .unwrap_or_else(|| request.objective.clone()),
+            },
+        );
+        if !completion_governance.permits_execution() {
+            guard_reason = Some(completion_governance.reason.clone());
+            governor_action = Some(completion_governance.action);
+        }
+        trace(AgentLoopTraceEvent::GovernorDecided(completion_governance));
+        if let Some(reason) = &guard_reason {
+            if verification.result == VerificationResult::Pass {
+                verification.result = VerificationResult::Partial;
+            }
+            verification.residual_risks.push(reason.clone());
+        }
+        let mut loop_decision = loop_decision_from_verification(
             request.task_id,
             request.turn_id,
             &verification,
             last_budget_state,
         );
+        if let Some(action) = governor_action {
+            loop_decision.action = match action {
+                GovernorAction::AskUser => LoopAction::AskUser,
+                GovernorAction::Block => LoopAction::Blocked,
+                GovernorAction::Allow | GovernorAction::Warn => loop_decision.action,
+            };
+            loop_decision.reason = guard_reason
+                .clone()
+                .unwrap_or_else(|| "runtime governor stopped execution".to_owned());
+            loop_decision.next_step =
+                Some("user must revise the objective or runtime budget".to_owned());
+        }
 
         Ok(AgentLoopOutcome {
             final_message: final_message_from_outcome(
@@ -377,6 +981,128 @@ where
             tool_reports,
         })
     }
+
+    async fn complete_with_retry<F>(
+        &self,
+        request: ProviderRequest,
+        control: &mut AgentExecutionControl,
+        trace: &mut F,
+    ) -> Result<ProviderResponse, ProviderError>
+    where
+        F: FnMut(AgentLoopTraceEvent),
+    {
+        match self
+            .complete_provider(&self.provider, request.clone(), control, trace)
+            .await
+        {
+            Ok(response) => Ok(response),
+            Err(primary_error) => {
+                let Some(fallback) = &self.fallback_provider else {
+                    return Err(primary_error);
+                };
+                let from_provider = self.provider.contract().provider_id;
+                let to_provider = fallback.contract().provider_id;
+                trace(AgentLoopTraceEvent::ProviderFallback {
+                    from_provider,
+                    to_provider: to_provider.clone(),
+                    reason: primary_error.to_string(),
+                });
+                let mut fallback_request = request;
+                fallback_request.provider_id = to_provider;
+                fallback_request.model_id = fallback.contract().model_id;
+                self.complete_provider(fallback, fallback_request, control, trace)
+                    .await
+            }
+        }
+    }
+
+    async fn complete_provider<F>(
+        &self,
+        provider: &P,
+        request: ProviderRequest,
+        control: &mut AgentExecutionControl,
+        trace: &mut F,
+    ) -> Result<ProviderResponse, ProviderError>
+    where
+        F: FnMut(AgentLoopTraceEvent),
+    {
+        const MAX_ATTEMPTS: u32 = 3;
+        for attempt in 1..=MAX_ATTEMPTS {
+            control
+                .wait_until_runnable()
+                .await
+                .map_err(|_| ProviderError::Cancelled)?;
+            let result = tokio::select! {
+                biased;
+                _ = control.cancellation.cancelled() => Err(ProviderError::Cancelled),
+                result = provider.complete(request.clone()) => result,
+            };
+            match result {
+                Ok(response) => return Ok(response),
+                Err(error) if provider_error_is_retryable(&error) && attempt < MAX_ATTEMPTS => {
+                    trace(AgentLoopTraceEvent::RetryScheduled {
+                        attempt,
+                        reason: error.to_string(),
+                    });
+                    let delay = tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt)));
+                    tokio::pin!(delay);
+                    tokio::select! {
+                        _ = control.cancellation.cancelled() => return Err(ProviderError::Cancelled),
+                        _ = &mut delay => {}
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("provider retry loop always returns")
+    }
+}
+
+impl AgentExecutionControl {
+    async fn wait_until_runnable(&mut self) -> Result<(), AgentLoopError> {
+        loop {
+            if self.cancellation.is_cancelled() {
+                return Err(AgentLoopError::Cancelled);
+            }
+            if !*self.pause.borrow() {
+                return Ok(());
+            }
+            tokio::select! {
+                _ = self.cancellation.cancelled() => return Err(AgentLoopError::Cancelled),
+                changed = self.pause.changed() => {
+                    if changed.is_err() {
+                        return Err(AgentLoopError::Cancelled);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn wait_for_approval(
+        &mut self,
+        approval_id: ApprovalId,
+    ) -> Result<ApprovalResolution, AgentLoopError> {
+        loop {
+            tokio::select! {
+                _ = self.cancellation.cancelled() => return Err(AgentLoopError::Cancelled),
+                resolution = self.approvals.recv() => {
+                    let resolution = resolution.ok_or(AgentLoopError::Cancelled)?;
+                    if resolution.approval_id == approval_id {
+                        return Ok(resolution);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn provider_error_is_retryable(error: &ProviderError) -> bool {
+    matches!(
+        error,
+        ProviderError::Unavailable { .. }
+            | ProviderError::RateLimited { .. }
+            | ProviderError::Timeout { .. }
+    )
 }
 
 impl RuntimeLaneManager {
@@ -465,6 +1191,43 @@ impl RuntimeLaneManager {
         })
     }
 
+    pub fn queue_turn(
+        &mut self,
+        session_id: SessionId,
+        turn_id: TurnId,
+        sequence_no: u64,
+    ) -> Result<RuntimeTransition, RuntimeLaneError> {
+        let lane = self
+            .lanes_by_session
+            .get_mut(&session_id)
+            .ok_or(RuntimeLaneError::LaneNotFound)?;
+        lane.pending_turns.push(turn_id);
+        Ok(RuntimeTransition {
+            lane: lane.clone(),
+            event: lane_event(
+                lane,
+                turn_id,
+                sequence_no,
+                RuntimeEventType::TurnQueued,
+                "user turn queued on active runtime lane",
+            ),
+        })
+    }
+
+    pub fn start_queued_turn(
+        &mut self,
+        session_id: SessionId,
+        turn_id: TurnId,
+    ) -> Result<(), RuntimeLaneError> {
+        let lane = self
+            .lanes_by_session
+            .get_mut(&session_id)
+            .ok_or(RuntimeLaneError::LaneNotFound)?;
+        lane.pending_turns.retain(|pending| *pending != turn_id);
+        lane.active_turn_id = Some(turn_id);
+        Ok(())
+    }
+
     pub fn abort(
         &mut self,
         session_id: SessionId,
@@ -474,7 +1237,7 @@ impl RuntimeLaneManager {
             session_id,
             TaskStatus::Aborting,
             sequence_no,
-            RuntimeEventType::TaskAborted,
+            RuntimeEventType::TaskAbortRequested,
         )
     }
 
@@ -487,7 +1250,7 @@ impl RuntimeLaneManager {
             session_id,
             TaskStatus::Paused,
             sequence_no,
-            RuntimeEventType::LoopDecided,
+            RuntimeEventType::TaskPaused,
         )
     }
 
@@ -500,7 +1263,7 @@ impl RuntimeLaneManager {
             session_id,
             TaskStatus::Running,
             sequence_no,
-            RuntimeEventType::TurnStarted,
+            RuntimeEventType::TaskResumed,
         )
     }
 
@@ -510,12 +1273,12 @@ impl RuntimeLaneManager {
         status: TaskStatus,
         sequence_no: u64,
     ) -> Result<RuntimeTransition, RuntimeLaneError> {
-        self.set_status(
-            session_id,
-            status,
-            sequence_no,
-            RuntimeEventType::TaskCompleted,
-        )
+        let event_type = if status == TaskStatus::Cancelled {
+            RuntimeEventType::TaskAborted
+        } else {
+            RuntimeEventType::TaskCompleted
+        };
+        self.set_status(session_id, status, sequence_no, event_type)
     }
 
     #[must_use]
@@ -717,6 +1480,7 @@ pub fn is_active_status(status: TaskStatus) -> bool {
             | TaskStatus::WaitingApproval
             | TaskStatus::Pausing
             | TaskStatus::Paused
+            | TaskStatus::Aborting
     )
 }
 
@@ -757,13 +1521,53 @@ pub fn checkpoint_fingerprint(checkpoint: &WorkspaceCheckpoint) -> String {
     format!("sha256:{:x}", hasher.finalize())
 }
 
+fn checksum_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    format!("sha256:{digest:x}")
+}
+
 fn is_checkpoint_excluded(relative_path: &Path) -> bool {
     let path_text = relative_path.to_string_lossy();
-    path_text.starts_with(".git")
+    relative_path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::Normal(value) if matches!(value.to_str(), Some(".git" | ".golutra"))
+        )
+    })
         || path_text.contains(".env")
         || path_text.contains(".ssh")
         || path_text.contains("id_rsa")
         || path_text.contains("id_ed25519")
+}
+
+#[cfg(unix)]
+fn set_owner_only_checkpoint_dir(path: &Path) -> Result<(), CheckpointError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|error| CheckpointError::Io(error.to_string()))
+}
+
+#[cfg(not(unix))]
+fn set_owner_only_checkpoint_dir(_path: &Path) -> Result<(), CheckpointError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_owner_only_checkpoint_file(path: &Path) -> Result<(), CheckpointError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| CheckpointError::Io(error.to_string()))
+}
+
+#[cfg(not(unix))]
+fn set_owner_only_checkpoint_file(_path: &Path) -> Result<(), CheckpointError> {
+    Ok(())
+}
+
+fn elapsed_millis(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -772,6 +1576,7 @@ mod tests {
 
     use golutra_context::ContextBuilder;
     use golutra_core::ActorKind;
+    use golutra_governor::GovernorLimits;
     use golutra_llm::MockProvider;
     use golutra_policy::WorkspacePolicy;
     use golutra_tools::BasicToolExecutor;
@@ -889,7 +1694,11 @@ mod tests {
         let transition = manager.abort(session_id, 2).expect("abort works");
 
         assert_eq!(transition.lane.status, TaskStatus::Aborting);
-        assert_eq!(transition.event.event_type, RuntimeEventType::TaskAborted);
+        assert_eq!(
+            transition.event.event_type,
+            RuntimeEventType::TaskAbortRequested
+        );
+        assert!(is_active_status(TaskStatus::Aborting));
     }
 
     fn actor(id: &str) -> Actor {
@@ -923,6 +1732,48 @@ mod tests {
 
         assert!(error.to_string().contains("provider call failed"));
         assert!(error.to_string().contains("provider is not configured"));
+    }
+
+    #[tokio::test]
+    async fn agent_loop_governor_blocks_before_iteration_budget_is_exceeded() {
+        let workspace = tempdir().expect("workspace");
+        let executor =
+            BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+        let governor = RuntimeGovernor::new(GovernorLimits {
+            max_iterations: 0,
+            ..GovernorLimits::default()
+        });
+        let agent_loop = AgentLoop::new(
+            MockProvider::text_response("should not run"),
+            ContextBuilder::default(),
+            executor,
+        )
+        .with_governor(governor);
+        let mut trace = Vec::new();
+
+        let outcome = agent_loop
+            .run_with_trace(
+                AgentTaskRequest {
+                    session_id: SessionId::new(),
+                    task_id: TaskId::new(),
+                    turn_id: TurnId::new(),
+                    objective: "inspect runtime".to_owned(),
+                    completion_criteria: vec!["runtime inspected".to_owned()],
+                    touched_code: false,
+                    contributors: Vec::new(),
+                    tools: Vec::new(),
+                },
+                |event| trace.push(event),
+            )
+            .await
+            .expect("governed outcome");
+
+        assert_eq!(outcome.loop_decision.action, LoopAction::Blocked);
+        assert!(trace.iter().any(|event| matches!(
+            event,
+            AgentLoopTraceEvent::GovernorDecided(decision)
+                if decision.action == GovernorAction::Block
+        )));
     }
 
     #[tokio::test]
@@ -1072,8 +1923,122 @@ mod tests {
         assert_eq!(outcome.verification.result, VerificationResult::Partial);
     }
 
+    #[tokio::test]
+    async fn agent_loop_waits_for_approval_before_process_execution() {
+        let workspace = tempdir().expect("workspace");
+        let provider = MockProvider::tool_call("shell", json!({"command": "echo approved"}));
+        let executor =
+            BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+        let agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor);
+        let (handle, control) = agent_execution_channel(4);
+        let (trace_tx, mut trace_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            agent_loop
+                .run_with_control_and_trace(
+                    AgentTaskRequest {
+                        session_id: SessionId::new(),
+                        task_id: TaskId::new(),
+                        turn_id: TurnId::new(),
+                        objective: "run approved command".to_owned(),
+                        completion_criteria: vec!["command evidence".to_owned()],
+                        touched_code: false,
+                        contributors: Vec::new(),
+                        tools: vec!["shell".to_owned()],
+                    },
+                    control,
+                    move |event| {
+                        let _ = trace_tx.send(event);
+                    },
+                )
+                .await
+        });
+        let approval = loop {
+            let event = trace_rx.recv().await.expect("approval trace");
+            if let AgentLoopTraceEvent::ApprovalRequested(approval) = event {
+                break approval;
+            }
+        };
+
+        assert!(!task.is_finished());
+        handle
+            .resolve_approval(ApprovalResolution {
+                approval_id: approval.approval_id,
+                decision: ApprovalDecision::Approved,
+                reason: "approved by test".to_owned(),
+            })
+            .await
+            .expect("approval resolves");
+        let outcome = task.await.expect("task joins").expect("loop completes");
+
+        assert_eq!(outcome.tool_reports.len(), 1);
+        assert_eq!(
+            outcome.tool_reports[0].envelope.status,
+            ToolResultStatus::Ok
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paused_approval_does_not_execute_tool_until_resume() {
+        let workspace = tempdir().expect("workspace");
+        let output = workspace.path().join("paused.txt");
+        let provider = MockProvider::tool_call("shell", json!({"command": "touch paused.txt"}));
+        let executor =
+            BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+        let agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor);
+        let (handle, control) = agent_execution_channel(4);
+        let (trace_tx, mut trace_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            agent_loop
+                .run_with_control_and_trace(
+                    AgentTaskRequest {
+                        session_id: SessionId::new(),
+                        task_id: TaskId::new(),
+                        turn_id: TurnId::new(),
+                        objective: "run command after resume".to_owned(),
+                        completion_criteria: vec!["command evidence".to_owned()],
+                        touched_code: false,
+                        contributors: Vec::new(),
+                        tools: vec!["shell".to_owned()],
+                    },
+                    control,
+                    move |event| {
+                        let _ = trace_tx.send(event);
+                    },
+                )
+                .await
+        });
+        let approval = loop {
+            let event = trace_rx.recv().await.expect("approval trace");
+            if let AgentLoopTraceEvent::ApprovalRequested(approval) = event {
+                break approval;
+            }
+        };
+
+        handle.pause();
+        handle
+            .resolve_approval(ApprovalResolution {
+                approval_id: approval.approval_id,
+                decision: ApprovalDecision::Approved,
+                reason: "approved while paused".to_owned(),
+            })
+            .await
+            .expect("approval resolves");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(!output.exists());
+        assert!(!task.is_finished());
+        handle.resume();
+        let outcome = task.await.expect("task joins").expect("loop completes");
+        assert!(output.exists());
+        assert_eq!(
+            outcome.tool_reports[0].envelope.status,
+            ToolResultStatus::Ok
+        );
+    }
+
     #[test]
-    fn checkpoint_copies_changed_files_without_touching_git() {
+    fn checkpoint_restores_file_before_image_without_touching_git() {
         let workspace = tempdir().expect("workspace");
         let checkpoint_root = tempdir().expect("checkpoint");
         let source = workspace.path().join("src/lib.rs");
@@ -1086,14 +2051,73 @@ mod tests {
                 WorkspaceId::new(),
                 TaskId::new(),
                 TurnId::new(),
-                &[PathBuf::from("src/lib.rs")],
-                EventId::new(),
+                &[FileBeforeImage {
+                    path: PathBuf::from("src/lib.rs"),
+                    content: Some(b"pub fn value() -> u8 { 1 }".to_vec()),
+                }],
+                ToolCallId::new(),
             )
             .expect("checkpoint");
 
+        fs::write(&source, "pub fn value() -> u8 { 2 }").expect("updated source");
+        manager
+            .restore_checkpoint(checkpoint.checkpoint_id)
+            .expect("checkpoint restores");
+
         assert_eq!(checkpoint.changed_files, vec!["src/lib.rs"]);
         assert!(checkpoint_fingerprint(&checkpoint).starts_with("sha256:"));
+        assert_eq!(
+            fs::read_to_string(source).expect("restored source"),
+            "pub fn value() -> u8 { 1 }"
+        );
         assert!(!workspace.path().join(".git").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let checkpoint_dir = checkpoint_root
+                .path()
+                .join(checkpoint.checkpoint_id.to_string());
+            let mode = |path: &Path| {
+                fs::metadata(path)
+                    .expect("checkpoint metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777
+            };
+            assert_eq!(mode(checkpoint_root.path()), 0o700);
+            assert_eq!(mode(&checkpoint_dir), 0o700);
+            assert_eq!(mode(&checkpoint_dir.join("manifest.json")), 0o600);
+            assert_eq!(mode(&checkpoint_dir.join("files/src/lib.rs")), 0o600);
+        }
+    }
+
+    #[test]
+    fn checkpoint_restore_removes_file_created_by_task() {
+        let workspace = tempdir().expect("workspace");
+        let checkpoint_root = tempdir().expect("checkpoint");
+        let source = workspace.path().join("created.txt");
+        let manager = WorkspaceCheckpointManager::new(workspace.path(), checkpoint_root.path());
+
+        let checkpoint = manager
+            .create_checkpoint(
+                WorkspaceId::new(),
+                TaskId::new(),
+                TurnId::new(),
+                &[FileBeforeImage {
+                    path: PathBuf::from("created.txt"),
+                    content: None,
+                }],
+                ToolCallId::new(),
+            )
+            .expect("checkpoint");
+
+        fs::write(&source, "created by task").expect("created source");
+        manager
+            .restore_checkpoint(checkpoint.checkpoint_id)
+            .expect("checkpoint restores");
+
+        assert!(!source.exists());
     }
 
     #[test]
@@ -1109,10 +2133,40 @@ mod tests {
             WorkspaceId::new(),
             TaskId::new(),
             TurnId::new(),
-            &[outside_file],
-            EventId::new(),
+            &[FileBeforeImage {
+                path: outside_file,
+                content: Some(b"secret".to_vec()),
+            }],
+            ToolCallId::new(),
         );
 
         assert!(matches!(result, Err(CheckpointError::OutsideWorkspace(_))));
+    }
+
+    #[test]
+    fn checkpoint_rejects_gitignored_before_images() {
+        let workspace = tempdir().expect("workspace");
+        let checkpoint_root = tempdir().expect("checkpoint");
+        fs::write(workspace.path().join(".gitignore"), "ignored/\n*.secret\n").expect("gitignore");
+        fs::create_dir(workspace.path().join("ignored")).expect("ignored directory");
+        let manager = WorkspaceCheckpointManager::new(workspace.path(), checkpoint_root.path());
+
+        for path in ["ignored/new.txt", "token.secret"] {
+            let result = manager.create_checkpoint(
+                WorkspaceId::new(),
+                TaskId::new(),
+                TurnId::new(),
+                &[FileBeforeImage {
+                    path: workspace.path().join(path),
+                    content: None,
+                }],
+                ToolCallId::new(),
+            );
+
+            assert!(
+                matches!(result, Err(CheckpointError::Excluded(_))),
+                "{path}"
+            );
+        }
     }
 }

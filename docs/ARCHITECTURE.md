@@ -56,7 +56,7 @@ GoalLedger
 -> LoopDecision
 ```
 
-这些能力属于后续治理增强，不是第一阶段同步链路的必做项。第一阶段只保留扩展位，避免过早引入额外判断、索引和模型评估成本。
+这些能力不属于第一阶段的最低门槛。当前实现已经在 P0 闭环稳定后接入轻量 `RuntimeGovernor`、project memory 和 evaluation/promotion guardrail，但没有把判断外包给额外模型，也没有开放高风险自动晋升。
 
 ## 阶段分层
 
@@ -65,8 +65,8 @@ GoalLedger
 | 层级 | 说明 | 当前状态 |
 | --- | --- | --- |
 | 目标态 | 完整 Runtime OS，包含多投影、多入口、改进闭环、回放与治理增强 | 架构方向 |
-| 第一阶段 | coding agent 主场景下的单 agent、单 active task、强 verification、可 replay 核心 runtime | 当前实现目标 |
-| 后续增强 | GoalLedger、RuntimeGovernor、VerificationTier、EventSamplingPolicy、ContextProjectionCache、自动晋升等 | 后续演进 |
+| 第一阶段 | coding agent 主场景下的单 agent、单 active task、强 verification、可 replay 核心 runtime | 已完成并持续硬化 |
+| 后续增强 | GoalLedger、RuntimeGovernor、VerificationTier、EventSamplingPolicy、ContextProjectionCache、自动晋升等 | 已完成受控最小实现，完整自动化后置 |
 
 阅读原则：
 
@@ -81,7 +81,7 @@ GoalLedger
 - Agent 核心是 runtime，不是 prompt 包装器。CLI、TUI、API、SDK 都要进入同一套 runtime loop。
 - 任务完成必须由 `VerificationRecord` 判定，不能只看模型自然语言。
 - `ProviderContract`、`ToolContract`、`PolicyEvaluation`、`ArtifactRecord`、`EvidenceRecord` 属于支持层，细节见 `implementation-blueprint.md` 和观测/记忆专题文档。
-- `GoalLedger`、`RuntimeGovernor`、`VerificationTier`、`EventSamplingPolicy`、`ContextProjectionCache` 只作为后续治理增强入口，不进入第一阶段主链路。
+- `GoalLedger`、`RuntimeGovernor`、`VerificationTier`、`EventSamplingPolicy`、`ContextProjectionCache` 属于治理增强；当前只有轻量确定性 governor 进入 runtime loop，重型评估仍保持后台或离线。
 - 多入口只共享同一套 session protocol，入口层不能各自实现状态机。
 - 长期 memory 是受治理的 durable state，不是直接回灌完整历史。
 
@@ -138,6 +138,7 @@ Golutra 当前主场景是 coding agent，不按通用 agent 平台做第一阶�
 - `inject` 只能在安全边界处发生，不能打断正在执行的文件写入、shell、网络或外部系统副作用。
 - 所有 busy policy 决策都必须写入 `RuntimeEvent`，并进入 `StateProjection`。
 - `interrupt` 与 `abort` 都必须走 `CancellationContract`，不能只停止 UI stream。
+- 当前 task handle 使用 `CancellationToken` 驱动 provider/tool loop；shell cancel 在 Unix 上终止整个进程组并继续排空 stdout/stderr，pause/resume 和 pending turn queue 都属于 `RuntimeHost` 状态。
 
 ## 四个核心系统
 
@@ -228,7 +229,7 @@ MemoryGovernance
 10. ToolResultEnvelope 写入 summary、structured facts、artifact ref、evidence refs
 11. Verification 判断任务是否达成、证据是否可靠、是否违反 policy
 12. LoopGuard 与 LoopDecision 判断 continue / compact / retry / fallback / ask_user / stop
-13. WorkspaceCheckpoint 在文件副作用后生成可恢复快照
+13. WorkspaceCheckpoint 在文件副作用前持久化 before-image、checksum、artifact ref 和 restore metadata，成功落盘后才允许工具修改文件
 14. 任务结束后按需生成 PostTaskReview 和可选 ImprovementCandidate
 15. Projection Layer 按用途生成 User / Runtime Control / Debug / Evaluation 四类投影
 16. 后续治理增强可在第 5、6、9、11、12 步之间接入 GoalLedger、RuntimeGovernor、VerificationTier、EventSamplingPolicy 和 ContextProjectionCache
@@ -252,7 +253,7 @@ MemoryGovernance
 | `golutra-eval` | EvaluationCase、EvaluationRun、Scorer、TrajectoryReplay、CounterfactualReplay、CausalComparison、benchmark、regression |
 | `golutra-tui` | 只展示 runtime projection 的 TUI |
 | `golutra-cli` | 薄 CLI 入口 |
-| `golutra-app-server` | HTTP/WebSocket/SSE 入口 |
+| `golutra-app-server` | HTTP command/query + SSE 入口；WebSocket 后置 |
 | `golutra-vis` | replay、trace、context、artifact 审计视图 |
 
 ## Host / Transport / Projection
@@ -269,6 +270,23 @@ Frontend
   -> RuntimeEvent / RuntimeQuery
   -> Projection
 ```
+
+当前生产路径具体收敛为：
+
+```text
+CLI / TUI / TypeScript SDK
+  -> RuntimeTransport
+  -> HttpSseTransport
+  -> workspace loopback daemon
+  -> RuntimeHost
+  -> RuntimeLane / AgentLoop / RuntimeStore / EventBus
+
+tests / explicit embedding
+  -> InProcessTransport
+  -> 同一套 RuntimeHost 语义
+```
+
+每个 workspace 用文件锁保证只有一个 daemon，`runtime-host.json` 发布 instance、PID、loopback URL、workspace/session/thread ID。CLI/TUI 拉起的 daemon 使用独立 process group，不随前台入口退出或 Ctrl+C 被终止。客户端在连接前校验 canonical workspace、instance ID 和 loopback endpoint；daemon 未配置 transport auth 前拒绝非 loopback bind，并通过 Host/Origin guard 阻断浏览器 CSRF/DNS rebinding。`.golutra` 不允许是 symlink，Unix runtime facts 使用目录 `0700`、文件 `0600`；工具 policy 同时阻断 `.git` 与 `.golutra` 内部路径。
 
 各层职责：
 
@@ -307,6 +325,8 @@ golutra-tui
 - `subscribe` 不能只是一次性返回历史 `Vec<Event>`，必须支持 `cursor replay + live event stream`。
 - TUI 的本地状态只能用于渲染，例如输入框、选中项、滚动位置，不能成为任务状态真相。
 - TUI 复杂组件应在 `RuntimeHost + EventBus + stable session resolver` 打通后再做；否则 UI 越复杂，越容易复制 runtime 状态机。
+
+当前这些边界已经落地：TUI 默认创建新的本地 thread/session，首个 prompt 才持久化；`/resume` 只列当前 workspace 历史；普通 transcript 只渲染用户可见事件，debug timeline 才展开 runtime facts。
 
 最低可用目标不是“界面完整”，而是：
 

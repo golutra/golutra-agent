@@ -14,7 +14,7 @@ use crossterm::{
         EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
     },
 };
-use golutra_client::{InProcessTransport, RuntimeClient};
+use golutra_client::{RuntimeClient, RuntimeTransport};
 use golutra_config::{
     ProviderConfigPaths, ProviderConfigScope, ProviderInstallPlan, ProviderProfile,
     ProviderSettings, apply_provider_install_plan_verified, generate_custom_provider_api_key_env,
@@ -126,7 +126,7 @@ impl TuiApp {
         }
     }
 
-    async fn refresh(&mut self, transport: &InProcessTransport) -> miette::Result<()> {
+    async fn refresh(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
         let previous_row_count = self.transcript_row_count;
         let projection = transport
             .query(RuntimeQuery {
@@ -143,25 +143,24 @@ impl TuiApp {
         self.projection = serde_json::from_value(projection)
             .map(Some)
             .map_err(|error| miette::miette!("{error}"))?;
-
-        let new_events = transport
-            .subscribe(EventFilter {
-                session_id: self.session_id,
-                task_id: self.task_id,
-                after_sequence_no: self.cursor,
-            })
-            .await
-            .map_err(|error| miette::miette!("{error}"))?;
-        self.events.extend(new_events);
-        self.cursor = event_timeline_lines(&self.events)
-            .into_iter()
-            .map(|line| line.sequence_no)
-            .max();
         self.sync_transcript_row_count(previous_row_count);
         Ok(())
     }
 
-    async fn send_prompt(&mut self, transport: &InProcessTransport) -> miette::Result<()> {
+    fn apply_runtime_event(&mut self, event: RuntimeEvent) {
+        if self
+            .cursor
+            .is_some_and(|sequence_no| event.sequence_no <= sequence_no)
+        {
+            return;
+        }
+        self.cursor = Some(event.sequence_no);
+        if let Ok(value) = serde_json::to_value(event) {
+            self.events.push(value);
+        }
+    }
+
+    async fn send_prompt(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
         if self.auth_dialog.is_some() {
             self.status_message = "finish provider setup first".to_owned();
             self.input.clear();
@@ -194,7 +193,7 @@ impl TuiApp {
 
     async fn accept_slash_candidate(
         &mut self,
-        transport: &InProcessTransport,
+        transport: &RuntimeTransport,
     ) -> miette::Result<bool> {
         let candidates = self.slash_candidates();
         let Some(candidate) = candidates
@@ -309,7 +308,7 @@ impl TuiApp {
 
     async fn send_runtime_prompt(
         &mut self,
-        transport: &InProcessTransport,
+        transport: &RuntimeTransport,
         prompt: String,
     ) -> miette::Result<()> {
         if prompt.trim().is_empty() {
@@ -336,7 +335,7 @@ impl TuiApp {
 
     async fn execute_slash_command(
         &mut self,
-        transport: &InProcessTransport,
+        transport: &RuntimeTransport,
         command: SlashCommand,
     ) -> miette::Result<()> {
         match command {
@@ -448,6 +447,26 @@ impl TuiApp {
             SlashCommand::Abort => {
                 self.abort(transport).await?;
             }
+            SlashCommand::Pause => {
+                self.send_control_command(transport, SessionCommandKind::Pause)
+                    .await?;
+            }
+            SlashCommand::Continue => {
+                self.send_control_command(transport, SessionCommandKind::Resume)
+                    .await?;
+            }
+            SlashCommand::Approve => {
+                self.resolve_pending_approval(transport, SessionCommandKind::Approve)
+                    .await?;
+            }
+            SlashCommand::Deny => {
+                self.resolve_pending_approval(transport, SessionCommandKind::Deny)
+                    .await?;
+            }
+            SlashCommand::Compact => {
+                self.send_control_command(transport, SessionCommandKind::Compact)
+                    .await?;
+            }
             SlashCommand::Clear => {
                 self.command_messages.clear();
                 self.reset_transcript_view();
@@ -460,7 +479,7 @@ impl TuiApp {
         Ok(())
     }
 
-    async fn open_resume_picker(&mut self, transport: &InProcessTransport) -> miette::Result<()> {
+    async fn open_resume_picker(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
         let threads = transport
             .list_threads(50)
             .await
@@ -507,7 +526,7 @@ impl TuiApp {
 
     async fn resume_thread(
         &mut self,
-        transport: &InProcessTransport,
+        transport: &RuntimeTransport,
         thread_id: ThreadId,
     ) -> miette::Result<()> {
         let thread = transport
@@ -529,10 +548,7 @@ impl TuiApp {
         self.refresh(transport).await
     }
 
-    async fn resume_selected_thread(
-        &mut self,
-        transport: &InProcessTransport,
-    ) -> miette::Result<()> {
+    async fn resume_selected_thread(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
         let Some(thread_id) = self
             .resume_picker
             .as_ref()
@@ -563,7 +579,7 @@ impl TuiApp {
 
     async fn execute_auth_command(
         &mut self,
-        transport: &InProcessTransport,
+        transport: &RuntimeTransport,
         command: SlashAuthCommand,
     ) -> miette::Result<()> {
         match command {
@@ -651,7 +667,7 @@ impl TuiApp {
         Ok(())
     }
 
-    async fn abort(&mut self, transport: &InProcessTransport) -> miette::Result<()> {
+    async fn abort(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
         let ack = transport
             .send_command(session_command(
                 self.session_id,
@@ -664,7 +680,41 @@ impl TuiApp {
         self.refresh(transport).await
     }
 
-    async fn interrupt_or_quit(&mut self, transport: &InProcessTransport) -> miette::Result<()> {
+    async fn send_control_command(
+        &mut self,
+        transport: &RuntimeTransport,
+        kind: SessionCommandKind,
+    ) -> miette::Result<()> {
+        let ack = transport
+            .send_command(session_command(self.session_id, kind, json!({})))
+            .await
+            .map_err(|error| miette::miette!("{error}"))?;
+        self.status_message = compact_ack_reason(&ack.reason);
+        self.refresh(transport).await
+    }
+
+    async fn resolve_pending_approval(
+        &mut self,
+        transport: &RuntimeTransport,
+        kind: SessionCommandKind,
+    ) -> miette::Result<()> {
+        let approval_id = self
+            .projection
+            .as_ref()
+            .and_then(|projection| projection.pending_approval.clone());
+        let payload = approval_id.map_or_else(
+            || json!({}),
+            |approval_id| json!({"approval_id": approval_id}),
+        );
+        let ack = transport
+            .send_command(session_command(self.session_id, kind, payload))
+            .await
+            .map_err(|error| miette::miette!("{error}"))?;
+        self.status_message = compact_ack_reason(&ack.reason);
+        self.refresh(transport).await
+    }
+
+    async fn interrupt_or_quit(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
         if self.quit_shortcut_is_active() {
             self.should_quit = true;
             return Ok(());
@@ -1140,11 +1190,14 @@ impl ResumePickerState {
 
 #[tokio::main]
 async fn main() -> miette::Result<()> {
+    if golutra_app_server::run_embedded_daemon_if_requested().await? {
+        return Ok(());
+    }
     let args = Args::parse();
     let task_id = parse_task_id(args.task_id.as_deref())?;
     let transport = match args.workspace.as_deref() {
-        Some(workspace) => InProcessTransport::for_workspace(workspace).await,
-        None => InProcessTransport::for_current_workspace().await,
+        Some(workspace) => RuntimeTransport::for_workspace(workspace).await,
+        None => RuntimeTransport::for_current_workspace().await,
     }
     .map_err(|error| miette::miette!("{error}"))?;
     let (thread_id, session_id) = initial_session(args.session_id.as_deref(), &transport)?;
@@ -1171,19 +1224,27 @@ async fn main() -> miette::Result<()> {
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     mut app: TuiApp,
-    transport: InProcessTransport,
+    transport: RuntimeTransport,
 ) -> miette::Result<()> {
+    let mut subscribed_session = app.session_id;
+    let mut subscribed_task = app.task_id;
+    let mut subscription = transport
+        .subscribe(EventFilter {
+            session_id: subscribed_session,
+            task_id: subscribed_task,
+            after_sequence_no: app.cursor,
+        })
+        .await
+        .map_err(|error| miette::miette!("{error}"))?;
     app.refresh(&transport).await?;
     let tick_rate = Duration::from_millis(250);
-    let mut last_tick = Instant::now();
 
     while !app.should_quit {
         terminal
             .draw(|frame| draw_ui(frame, &app))
             .map_err(|error| miette::miette!("{error}"))?;
 
-        let timeout = tick_rate.saturating_sub(last_tick.elapsed());
-        if event::poll(timeout).map_err(|error| miette::miette!("{error}"))? {
+        if event::poll(tick_rate).map_err(|error| miette::miette!("{error}"))? {
             let event = event::read().map_err(|error| miette::miette!("{error}"))?;
             match event {
                 CrosstermEvent::Key(key) => {
@@ -1196,9 +1257,39 @@ async fn run_app(
             }
         }
 
-        if last_tick.elapsed() >= tick_rate {
+        if app.session_id != subscribed_session || app.task_id != subscribed_task {
+            subscribed_session = app.session_id;
+            subscribed_task = app.task_id;
+            subscription = transport
+                .subscribe(EventFilter {
+                    session_id: subscribed_session,
+                    task_id: subscribed_task,
+                    after_sequence_no: app.cursor,
+                })
+                .await
+                .map_err(|error| miette::miette!("{error}"))?;
             app.refresh(&transport).await?;
-            last_tick = Instant::now();
+        }
+
+        let mut received_event = false;
+        loop {
+            match subscription.try_recv() {
+                Ok(Ok(event)) => {
+                    app.apply_runtime_event(event);
+                    received_event = true;
+                }
+                Ok(Err(error)) => {
+                    app.status_message = format!("event stream reconnecting: {error}");
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    app.status_message = "event stream disconnected".to_owned();
+                    break;
+                }
+            }
+        }
+        if received_event {
+            app.refresh(&transport).await?;
         }
     }
 
@@ -1208,7 +1299,7 @@ async fn run_app(
 async fn handle_key(
     key: KeyEvent,
     app: &mut TuiApp,
-    transport: &InProcessTransport,
+    transport: &RuntimeTransport,
 ) -> miette::Result<()> {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return app.interrupt_or_quit(transport).await;
@@ -1218,6 +1309,27 @@ async fn handle_key(
     }
     if app.auth_dialog.is_some() {
         return handle_auth_dialog_key(key, app, transport).await;
+    }
+    if app.input.is_empty()
+        && app
+            .projection
+            .as_ref()
+            .and_then(|projection| projection.pending_approval.as_ref())
+            .is_some()
+    {
+        match key.code {
+            KeyCode::Char('y') if key.modifiers.is_empty() => {
+                return app
+                    .resolve_pending_approval(transport, SessionCommandKind::Approve)
+                    .await;
+            }
+            KeyCode::Char('n') if key.modifiers.is_empty() => {
+                return app
+                    .resolve_pending_approval(transport, SessionCommandKind::Deny)
+                    .await;
+            }
+            _ => {}
+        }
     }
 
     match key.code {
@@ -1300,7 +1412,7 @@ fn handle_mouse(mouse: MouseEvent, app: &mut TuiApp) {
 async fn handle_auth_dialog_key(
     key: KeyEvent,
     app: &mut TuiApp,
-    transport: &InProcessTransport,
+    transport: &RuntimeTransport,
 ) -> miette::Result<()> {
     match key.code {
         KeyCode::Esc => {
@@ -1440,10 +1552,7 @@ fn handle_auth_advanced_character(dialog: &mut AuthDialogState, character: char)
     }
 }
 
-async fn advance_auth_dialog(
-    app: &mut TuiApp,
-    transport: &InProcessTransport,
-) -> miette::Result<()> {
+async fn advance_auth_dialog(app: &mut TuiApp, transport: &RuntimeTransport) -> miette::Result<()> {
     let action = {
         let Some(dialog) = &mut app.auth_dialog else {
             return Ok(());
@@ -1589,7 +1698,7 @@ fn custom_provider_protocol_is_runtime_supported(protocol: ProviderProtocol) -> 
 async fn handle_resume_picker_key(
     key: KeyEvent,
     app: &mut TuiApp,
-    transport: &InProcessTransport,
+    transport: &RuntimeTransport,
 ) -> miette::Result<()> {
     match key.code {
         KeyCode::Esc => app.close_resume_picker(),
@@ -2777,6 +2886,7 @@ fn status_chip(app: &TuiApp) -> &'static str {
         Some(golutra_core::TaskStatus::Completed) => "complete",
         Some(golutra_core::TaskStatus::Failed) => "failed",
         Some(golutra_core::TaskStatus::Blocked) => "blocked",
+        Some(golutra_core::TaskStatus::Cancelled) => "cancelled",
         Some(golutra_core::TaskStatus::Aborting) => "aborting",
         Some(golutra_core::TaskStatus::Paused) => "paused",
         Some(golutra_core::TaskStatus::Pausing) => "pausing",
@@ -2792,9 +2902,9 @@ fn status_color(app: &TuiApp) -> Color {
     match app.projection.as_ref().map(|projection| projection.status) {
         Some(golutra_core::TaskStatus::Running) => Color::Cyan,
         Some(golutra_core::TaskStatus::Completed) => Color::Green,
-        Some(golutra_core::TaskStatus::Failed) | Some(golutra_core::TaskStatus::Blocked) => {
-            Color::Red
-        }
+        Some(golutra_core::TaskStatus::Failed)
+        | Some(golutra_core::TaskStatus::Blocked)
+        | Some(golutra_core::TaskStatus::Cancelled) => Color::Red,
         Some(golutra_core::TaskStatus::WaitingApproval)
         | Some(golutra_core::TaskStatus::Aborting)
         | Some(golutra_core::TaskStatus::Pausing)
@@ -2906,7 +3016,7 @@ fn session_command(
 
 fn initial_session(
     value: Option<&str>,
-    transport: &InProcessTransport,
+    transport: &RuntimeTransport,
 ) -> miette::Result<(ThreadId, SessionId)> {
     if let Some(value) = value {
         let session_id = Uuid::parse_str(value)
@@ -2917,7 +3027,7 @@ fn initial_session(
     Ok((ThreadId::new(), SessionId::new()))
 }
 
-fn initial_auth_dialog(transport: &InProcessTransport) -> Option<AuthDialogState> {
+fn initial_auth_dialog(transport: &RuntimeTransport) -> Option<AuthDialogState> {
     let workspace_root = transport.workspace_root()?;
     match provider_onboarding_state(workspace_root) {
         Ok(state) if state.configured => None,
@@ -2941,13 +3051,13 @@ fn parse_thread_id(value: &str) -> miette::Result<ThreadId> {
         .map_err(|error: uuid::Error| miette::miette!("invalid thread id: {error}"))
 }
 
-fn provider_paths_for_tui(transport: &InProcessTransport) -> miette::Result<ProviderConfigPaths> {
+fn provider_paths_for_tui(transport: &RuntimeTransport) -> miette::Result<ProviderConfigPaths> {
     let workspace = provider_workspace_root_for_tui(transport)?;
     ProviderConfigPaths::for_workspace(workspace).map_err(|error| miette::miette!("{error}"))
 }
 
 fn provider_workspace_root_for_tui(
-    transport: &InProcessTransport,
+    transport: &RuntimeTransport,
 ) -> miette::Result<&std::path::Path> {
     transport
         .workspace_root()
@@ -2985,7 +3095,7 @@ fn auth_login(dialog: &AuthDialogState) -> Result<OpenAiCompatibleLogin, String>
 
 fn build_auth_review(
     dialog: &AuthDialogState,
-    transport: &InProcessTransport,
+    transport: &RuntimeTransport,
 ) -> Result<AuthReview, String> {
     let provider = dialog.provider.unwrap_or(CUSTOM_PROVIDER_PRESET);
     let login = auth_login(dialog)?;
@@ -3075,7 +3185,7 @@ fn mask_api_key(value: &str) -> String {
 }
 
 async fn apply_auth_login(
-    transport: &InProcessTransport,
+    transport: &RuntimeTransport,
     login: OpenAiCompatibleLogin,
 ) -> miette::Result<()> {
     let paths = provider_paths_for_tui(transport)?;
@@ -3184,7 +3294,7 @@ fn generation_config_summary(config: Option<&ProviderGenerationConfig>) -> Strin
     }
 }
 
-fn apply_auth_mock(transport: &InProcessTransport) -> miette::Result<()> {
+fn apply_auth_mock(transport: &RuntimeTransport) -> miette::Result<()> {
     let paths = provider_paths_for_tui(transport)?;
     ProviderInstallPlan {
         scope: ProviderConfigScope::User,
@@ -3211,12 +3321,17 @@ fn slash_help_lines() -> Vec<String> {
         "/status  show current session/task status".to_owned(),
         "/debug  toggle debug timeline".to_owned(),
         "/abort  abort active task".to_owned(),
+        "/pause  pause active task".to_owned(),
+        "/continue  resume paused task".to_owned(),
+        "/approve  approve pending tool execution".to_owned(),
+        "/deny  deny pending tool execution".to_owned(),
+        "/compact  compact durable conversation history".to_owned(),
         "/clear  clear local command messages".to_owned(),
         "/quit  leave TUI".to_owned(),
     ]
 }
 
-fn provider_status_message(transport: &InProcessTransport) -> String {
+fn provider_status_message(transport: &RuntimeTransport) -> String {
     let Some(workspace_root) = transport.workspace_root() else {
         return "workspace config unavailable".to_owned();
     };
@@ -3278,7 +3393,7 @@ mod tests {
 
     #[tokio::test]
     async fn initial_session_without_argument_starts_new_thread_and_session() {
-        let transport = InProcessTransport::in_memory().await.expect("transport");
+        let transport = RuntimeTransport::in_memory().await.expect("transport");
         let (thread_id, session_id) = initial_session(None, &transport).expect("initial session");
 
         assert_ne!(thread_id, transport.default_thread_id());
@@ -3287,7 +3402,7 @@ mod tests {
 
     #[tokio::test]
     async fn initial_session_with_argument_keeps_explicit_session() {
-        let transport = InProcessTransport::in_memory().await.expect("transport");
+        let transport = RuntimeTransport::in_memory().await.expect("transport");
         let explicit_session_id = SessionId::new();
         let (thread_id, session_id) =
             initial_session(Some(&explicit_session_id.to_string()), &transport)
@@ -3301,7 +3416,7 @@ mod tests {
     async fn initial_auth_dialog_opens_without_provider_config() {
         let dir = tempfile::tempdir().expect("dir");
         let home = tempfile::tempdir().expect("home");
-        let transport = InProcessTransport::for_workspace(dir.path())
+        let transport = RuntimeTransport::for_workspace(dir.path())
             .await
             .expect("transport");
         let _guard = env_lock_guard().await;
@@ -3325,7 +3440,7 @@ mod tests {
     async fn auth_dialog_mock_choice_persists_global_provider() {
         let dir = tempfile::tempdir().expect("dir");
         let home = tempfile::tempdir().expect("home");
-        let transport = InProcessTransport::for_workspace(dir.path())
+        let transport = RuntimeTransport::for_workspace(dir.path())
             .await
             .expect("transport");
         let _guard = env_lock_guard().await;
@@ -3371,7 +3486,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("dir");
         let home = tempfile::tempdir().expect("home");
         let base_url = spawn_probe_server(r#"{"data":[{"id":"qwen-coder"}]}"#).await;
-        let transport = InProcessTransport::for_workspace(dir.path())
+        let transport = RuntimeTransport::for_workspace(dir.path())
             .await
             .expect("transport");
         let _guard = env_lock_guard().await;
@@ -3452,7 +3567,7 @@ mod tests {
     #[tokio::test]
     async fn auth_dialog_base_url_requires_http_scheme() {
         let dir = tempfile::tempdir().expect("dir");
-        let transport = InProcessTransport::for_workspace(dir.path())
+        let transport = RuntimeTransport::for_workspace(dir.path())
             .await
             .expect("transport");
         let mut app = TuiApp::new(
@@ -3484,7 +3599,7 @@ mod tests {
 
     #[tokio::test]
     async fn q_key_does_not_exit_tui() {
-        let transport = InProcessTransport::in_memory().await.expect("transport");
+        let transport = RuntimeTransport::in_memory().await.expect("transport");
         let mut app = TuiApp::new(
             ThreadId::new(),
             SessionId::new(),
@@ -3508,7 +3623,7 @@ mod tests {
 
     #[tokio::test]
     async fn ctrl_c_requires_second_press_to_exit() {
-        let transport = InProcessTransport::in_memory().await.expect("transport");
+        let transport = RuntimeTransport::in_memory().await.expect("transport");
         let mut app = TuiApp::new(
             ThreadId::new(),
             SessionId::new(),
@@ -3568,7 +3683,7 @@ mod tests {
     async fn auth_review_marks_existing_profile_updates() {
         let dir = tempfile::tempdir().expect("dir");
         let home = tempfile::tempdir().expect("home");
-        let transport = InProcessTransport::for_workspace(dir.path())
+        let transport = RuntimeTransport::for_workspace(dir.path())
             .await
             .expect("transport");
         let _guard = env_lock_guard().await;
@@ -3616,7 +3731,7 @@ mod tests {
     async fn auth_review_custom_provider_uses_derived_env_key() {
         let dir = tempfile::tempdir().expect("dir");
         let home = tempfile::tempdir().expect("home");
-        let transport = InProcessTransport::for_workspace(dir.path())
+        let transport = RuntimeTransport::for_workspace(dir.path())
             .await
             .expect("transport");
         let _guard = env_lock_guard().await;
@@ -3658,7 +3773,7 @@ mod tests {
     async fn auth_review_includes_generation_config() {
         let dir = tempfile::tempdir().expect("dir");
         let home = tempfile::tempdir().expect("home");
-        let transport = InProcessTransport::for_workspace(dir.path())
+        let transport = RuntimeTransport::for_workspace(dir.path())
             .await
             .expect("transport");
         let _guard = env_lock_guard().await;
@@ -3704,7 +3819,7 @@ mod tests {
     async fn slash_auth_login_rejects_catalog_only_protocol_without_persisting() {
         let dir = tempfile::tempdir().expect("dir");
         let home = tempfile::tempdir().expect("home");
-        let transport = InProcessTransport::for_workspace(dir.path())
+        let transport = RuntimeTransport::for_workspace(dir.path())
             .await
             .expect("transport");
         let _guard = env_lock_guard().await;
@@ -3745,7 +3860,7 @@ mod tests {
     async fn auth_dialog_keeps_dialog_open_and_rolls_back_when_probe_fails() {
         let dir = tempfile::tempdir().expect("dir");
         let home = tempfile::tempdir().expect("home");
-        let transport = InProcessTransport::for_workspace(dir.path())
+        let transport = RuntimeTransport::for_workspace(dir.path())
             .await
             .expect("transport");
         let _guard = env_lock_guard().await;
@@ -3807,7 +3922,7 @@ mod tests {
     async fn slash_auth_login_failure_reports_error_without_persisting_profile() {
         let dir = tempfile::tempdir().expect("dir");
         let home = tempfile::tempdir().expect("home");
-        let transport = InProcessTransport::for_workspace(dir.path())
+        let transport = RuntimeTransport::for_workspace(dir.path())
             .await
             .expect("transport");
         let _guard = env_lock_guard().await;
@@ -3915,7 +4030,7 @@ mod tests {
     #[tokio::test]
     async fn auth_dialog_custom_provider_does_not_prefill_base_url_from_protocol() {
         let dir = tempfile::tempdir().expect("dir");
-        let transport = InProcessTransport::for_workspace(dir.path())
+        let transport = RuntimeTransport::for_workspace(dir.path())
             .await
             .expect("transport");
         let mut app = TuiApp::new(
@@ -3944,7 +4059,7 @@ mod tests {
     #[tokio::test]
     async fn auth_dialog_blocks_custom_protocols_without_live_adapter() {
         let dir = tempfile::tempdir().expect("dir");
-        let transport = InProcessTransport::for_workspace(dir.path())
+        let transport = RuntimeTransport::for_workspace(dir.path())
             .await
             .expect("transport");
         let mut app = TuiApp::new(
@@ -3997,7 +4112,7 @@ mod tests {
     #[tokio::test]
     async fn auth_model_input_accepts_numeric_custom_model_ids() {
         let dir = tempfile::tempdir().expect("dir");
-        let transport = InProcessTransport::for_workspace(dir.path())
+        let transport = RuntimeTransport::for_workspace(dir.path())
             .await
             .expect("transport");
         let mut app = TuiApp::new(
@@ -4034,7 +4149,7 @@ mod tests {
     #[tokio::test]
     async fn auth_text_inputs_do_not_swallow_vim_key_characters() {
         let dir = tempfile::tempdir().expect("dir");
-        let transport = InProcessTransport::for_workspace(dir.path())
+        let transport = RuntimeTransport::for_workspace(dir.path())
             .await
             .expect("transport");
         let mut app = TuiApp::new(
@@ -4425,7 +4540,7 @@ mod tests {
 
     #[tokio::test]
     async fn resume_thread_clears_previous_visible_transcript_state() {
-        let transport = InProcessTransport::in_memory().await.expect("transport");
+        let transport = RuntimeTransport::in_memory().await.expect("transport");
         let mut app = TuiApp::new(
             ThreadId::new(),
             SessionId::new(),

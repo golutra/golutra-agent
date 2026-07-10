@@ -21,6 +21,7 @@ pub enum ToolResultStatus {
     Error,
     Blocked,
     Cancelled,
+    Timeout,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

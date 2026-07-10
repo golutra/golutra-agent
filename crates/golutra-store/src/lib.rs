@@ -3,13 +3,20 @@ use golutra_core::{
     ThreadId, Timestamp, ToolResultEnvelope, VerificationRecord,
 };
 use golutra_protocol::{
-    DebugProjection, RuntimeEvent, RuntimeEventType, StateProjection, UserProjection, VisibleStep,
+    CommandAck, DebugProjection, RuntimeEvent, RuntimeEventType, StateProjection, UserProjection,
+    VisibleStep,
 };
+use sha2::{Digest, Sha256};
 use sqlx::{
     Row, SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
-use std::str::FromStr;
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::Arc,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -20,9 +27,15 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("stored id is invalid: {0}")]
     InvalidId(String),
+    #[error("artifact IO failed: {0}")]
+    ArtifactIo(String),
+    #[error("artifact checksum mismatch for {0}")]
+    ArtifactChecksum(String),
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
+
+const MAX_PROJECTION_VISIBLE_STEPS: usize = 512;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ThreadRecord {
@@ -41,22 +54,50 @@ pub struct ThreadRecord {
 #[derive(Debug, Clone)]
 pub struct RuntimeStore {
     pool: SqlitePool,
+    artifact_root: PathBuf,
+    _temporary_artifact_root: Option<Arc<tempfile::TempDir>>,
 }
 
 impl RuntimeStore {
     pub async fn connect(database_url: &str) -> StoreResult<Self> {
+        let artifact_root = artifact_root_for_database_url(database_url);
+        Self::connect_with_artifact_root(database_url, artifact_root).await
+    }
+
+    pub async fn connect_with_artifact_root(
+        database_url: &str,
+        artifact_root: impl Into<PathBuf>,
+    ) -> StoreResult<Self> {
         let options = SqliteConnectOptions::from_str(database_url)?.create_if_missing(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(options)
             .await?;
-        let store = Self { pool };
+        let store = Self {
+            pool,
+            artifact_root: artifact_root.into(),
+            _temporary_artifact_root: None,
+        };
         store.initialize().await?;
         Ok(store)
     }
 
     pub async fn in_memory() -> StoreResult<Self> {
-        Self::connect("sqlite::memory:").await
+        let temporary = Arc::new(
+            tempfile::tempdir().map_err(|error| StoreError::ArtifactIo(error.to_string()))?,
+        );
+        let options = SqliteConnectOptions::from_str("sqlite::memory:")?;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await?;
+        let store = Self {
+            pool,
+            artifact_root: temporary.path().join("artifacts"),
+            _temporary_artifact_root: Some(temporary),
+        };
+        store.initialize().await?;
+        Ok(store)
     }
 
     pub async fn initialize(&self) -> StoreResult<()> {
@@ -66,8 +107,43 @@ impl RuntimeStore {
         Ok(())
     }
 
+    pub async fn command_ack(&self, idempotency_key: &str) -> StoreResult<Option<CommandAck>> {
+        let row = sqlx::query("SELECT ack_json FROM command_acks WHERE idempotency_key = ?")
+            .bind(idempotency_key)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| {
+            let ack_json: String = row.try_get("ack_json")?;
+            Ok(serde_json::from_str(&ack_json)?)
+        })
+        .transpose()
+    }
+
+    pub async fn store_command_ack(
+        &self,
+        idempotency_key: &str,
+        ack: &CommandAck,
+    ) -> StoreResult<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO command_acks (idempotency_key, command_id, ack_json, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(idempotency_key) DO UPDATE SET
+                ack_json = excluded.ack_json
+            "#,
+        )
+        .bind(idempotency_key)
+        .bind(ack.command_id.to_string())
+        .bind(serde_json::to_string(ack)?)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn append_event(&self, event: &RuntimeEvent) -> StoreResult<()> {
         let event_json = serde_json::to_string(event)?;
+        let mut transaction = self.pool.begin().await?;
         sqlx::query(
             r#"
             INSERT INTO runtime_events (
@@ -87,9 +163,38 @@ impl RuntimeStore {
         .bind(event.durable)
         .bind(serde_json::to_string(&event.payload)?)
         .bind(event_json)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
+        let projection_row =
+            sqlx::query("SELECT projection_json FROM state_projections WHERE session_id = ?")
+                .bind(event.session_id.to_string())
+                .fetch_optional(&mut *transaction)
+                .await?;
+        let mut projection = match projection_row {
+            Some(row) => {
+                let projection_json: String = row.try_get("projection_json")?;
+                serde_json::from_str(&projection_json)?
+            }
+            None => initial_projection(event.session_id),
+        };
+        apply_event_to_state(&mut projection, event);
+        persist_runtime_indexes(&mut transaction, event, &projection).await?;
+        transaction.commit().await?;
         Ok(())
+    }
+
+    pub async fn list_session_states(&self) -> StoreResult<Vec<StateProjection>> {
+        let rows = sqlx::query(
+            "SELECT projection_json FROM state_projections ORDER BY last_sequence_no ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let projection_json: String = row.try_get("projection_json")?;
+                Ok(serde_json::from_str(&projection_json)?)
+            })
+            .collect()
     }
 
     pub async fn max_sequence_no(&self) -> StoreResult<u64> {
@@ -134,26 +239,10 @@ impl RuntimeStore {
     }
 
     pub fn reduce_state(session_id: SessionId, events: &[RuntimeEvent]) -> StateProjection {
-        let mut projection = StateProjection {
-            session_id,
-            active_task_id: None,
-            task_status: TaskStatus::Idle,
-            runtime_lane: None,
-            last_sequence_no: 0,
-            visible_steps: Vec::new(),
-            pending_approval: None,
-            final_message: None,
-            last_loop_decision: None,
-            last_verification: None,
-        };
+        let mut projection = initial_projection(session_id);
 
         for event in events {
-            projection.last_sequence_no = projection.last_sequence_no.max(event.sequence_no);
-            if let Some(task_id) = event.task_id {
-                projection.active_task_id = Some(task_id);
-            }
-
-            apply_event_to_projection(&mut projection, event);
+            apply_event_to_state(&mut projection, event);
         }
 
         projection
@@ -164,6 +253,16 @@ impl RuntimeStore {
         session_id: SessionId,
         task_id: Option<TaskId>,
     ) -> StoreResult<StateProjection> {
+        if task_id.is_none()
+            && let Some(row) =
+                sqlx::query("SELECT projection_json FROM state_projections WHERE session_id = ?")
+                    .bind(session_id.to_string())
+                    .fetch_optional(&self.pool)
+                    .await?
+        {
+            let projection_json: String = row.try_get("projection_json")?;
+            return Ok(serde_json::from_str(&projection_json)?);
+        }
         let events = self.load_events(session_id, task_id, None).await?;
         Ok(Self::reduce_state(session_id, &events))
     }
@@ -194,8 +293,6 @@ impl RuntimeStore {
         task_id: Option<TaskId>,
     ) -> StoreResult<DebugProjection> {
         let events = self.load_events(session_id, task_id, None).await?;
-        let artifacts = self.load_artifacts_for_session(session_id).await?;
-        let evidence = self.load_evidence_records().await?;
         let tool_results = events
             .iter()
             .filter(|event| event.event_type == RuntimeEventType::ToolCompleted)
@@ -207,6 +304,24 @@ impl RuntimeStore {
                     .and_then(|value| serde_json::from_value::<ToolResultEnvelope>(value).ok())
             })
             .collect::<Vec<_>>();
+        let referenced_artifacts = tool_results
+            .iter()
+            .filter_map(|result| result.raw_artifact_ref)
+            .chain(events.iter().filter_map(|event| event.payload_ref))
+            .collect::<HashSet<_>>();
+        let artifacts = self
+            .load_artifacts_for_session(session_id)
+            .await?
+            .into_iter()
+            .filter(|artifact| {
+                task_id.is_none() || referenced_artifacts.contains(&artifact.artifact_id)
+            })
+            .collect::<Vec<_>>();
+        let artifact_ids = artifacts
+            .iter()
+            .map(|artifact| artifact.artifact_id)
+            .collect::<HashSet<_>>();
+        let evidence = self.load_evidence_records(&artifact_ids).await?;
         let verification = events
             .iter()
             .rev()
@@ -230,7 +345,21 @@ impl RuntimeStore {
         })
     }
 
-    pub async fn store_artifact(&self, artifact: &ArtifactRecord) -> StoreResult<()> {
+    pub async fn store_artifact(&self, artifact: &ArtifactRecord, bytes: &[u8]) -> StoreResult<()> {
+        verify_artifact_checksum(artifact, bytes)?;
+        tokio::fs::create_dir_all(&self.artifact_root)
+            .await
+            .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
+        set_owner_only_dir(&self.artifact_root).await?;
+        let final_path = self.artifact_blob_path(artifact.artifact_id);
+        let temporary_path = final_path.with_extension(format!("tmp-{}", uuid::Uuid::now_v7()));
+        tokio::fs::write(&temporary_path, bytes)
+            .await
+            .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
+        set_owner_only_file(&temporary_path).await?;
+        tokio::fs::rename(&temporary_path, &final_path)
+            .await
+            .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
         sqlx::query(
             r#"
             INSERT INTO artifact_records (artifact_id, session_id, uri, checksum, artifact_json)
@@ -267,6 +396,25 @@ impl RuntimeStore {
             Ok(serde_json::from_str(&artifact_json)?)
         })
         .transpose()
+    }
+
+    pub async fn load_artifact_bytes(
+        &self,
+        artifact_id: ArtifactId,
+    ) -> StoreResult<Option<Vec<u8>>> {
+        let Some(artifact) = self.load_artifact(artifact_id).await? else {
+            return Ok(None);
+        };
+        let path = self.artifact_blob_path(artifact_id);
+        let bytes = tokio::fs::read(&path)
+            .await
+            .map_err(|error| StoreError::ArtifactIo(format!("{}: {error}", path.display())))?;
+        verify_artifact_checksum(&artifact, &bytes)?;
+        Ok(Some(bytes))
+    }
+
+    fn artifact_blob_path(&self, artifact_id: ArtifactId) -> PathBuf {
+        self.artifact_root.join(format!("{artifact_id}.blob"))
     }
 
     pub async fn store_evidence(&self, evidence: &EvidenceRecord) -> StoreResult<()> {
@@ -404,7 +552,10 @@ impl RuntimeStore {
             .collect()
     }
 
-    async fn load_evidence_records(&self) -> StoreResult<Vec<EvidenceRecord>> {
+    async fn load_evidence_records(
+        &self,
+        artifact_ids: &HashSet<ArtifactId>,
+    ) -> StoreResult<Vec<EvidenceRecord>> {
         let rows = sqlx::query(
             r#"
             SELECT evidence_json
@@ -415,18 +566,53 @@ impl RuntimeStore {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.into_iter()
+        let records = rows
+            .into_iter()
             .map(|row| {
                 let evidence_json: String = row.try_get("evidence_json")?;
                 Ok(serde_json::from_str(&evidence_json)?)
             })
-            .collect()
+            .collect::<StoreResult<Vec<EvidenceRecord>>>()?;
+        Ok(records
+            .into_iter()
+            .filter(|record| {
+                record
+                    .artifact_refs
+                    .iter()
+                    .any(|artifact_id| artifact_ids.contains(artifact_id))
+            })
+            .collect())
     }
+}
+
+fn initial_projection(session_id: SessionId) -> StateProjection {
+    StateProjection {
+        session_id,
+        active_task_id: None,
+        task_status: TaskStatus::Idle,
+        runtime_lane: None,
+        last_sequence_no: 0,
+        visible_steps: Vec::new(),
+        pending_approval: None,
+        final_message: None,
+        last_loop_decision: None,
+        last_verification: None,
+    }
+}
+
+fn apply_event_to_state(projection: &mut StateProjection, event: &RuntimeEvent) {
+    projection.last_sequence_no = projection.last_sequence_no.max(event.sequence_no);
+    if let Some(task_id) = event.task_id {
+        projection.active_task_id = Some(task_id);
+    }
+    apply_event_to_projection(projection, event);
 }
 
 fn apply_event_to_projection(projection: &mut StateProjection, event: &RuntimeEvent) {
     match event.event_type {
-        RuntimeEventType::TaskCreated | RuntimeEventType::TurnStarted => {
+        RuntimeEventType::TaskCreated
+        | RuntimeEventType::TurnStarted
+        | RuntimeEventType::TaskResumed => {
             projection.task_status = TaskStatus::Running;
         }
         RuntimeEventType::TaskCompleted => {
@@ -437,8 +623,26 @@ fn apply_event_to_projection(projection: &mut StateProjection, event: &RuntimeEv
                 .and_then(|value| serde_json::from_value(value).ok())
                 .unwrap_or(TaskStatus::Completed);
         }
-        RuntimeEventType::TaskAborted => {
+        RuntimeEventType::TaskAbortRequested => {
             projection.task_status = TaskStatus::Aborting;
+        }
+        RuntimeEventType::TaskAborted => {
+            projection.task_status = TaskStatus::Cancelled;
+        }
+        RuntimeEventType::TaskPaused => {
+            projection.task_status = TaskStatus::Paused;
+        }
+        RuntimeEventType::ApprovalRequested => {
+            projection.task_status = TaskStatus::WaitingApproval;
+            projection.pending_approval = event
+                .payload
+                .get("approval_id")
+                .and_then(|value| value.as_str())
+                .map(ToOwned::to_owned);
+        }
+        RuntimeEventType::ApprovalResolved => {
+            projection.pending_approval = None;
+            projection.task_status = TaskStatus::Running;
         }
         RuntimeEventType::VerificationCompleted => {
             projection.last_verification = verification_from_event(event);
@@ -466,6 +670,13 @@ fn apply_event_to_projection(projection: &mut StateProjection, event: &RuntimeEv
             .unwrap_or("runtime event recorded")
             .to_owned(),
     });
+    let overflow = projection
+        .visible_steps
+        .len()
+        .saturating_sub(MAX_PROJECTION_VISIBLE_STEPS);
+    if overflow > 0 {
+        projection.visible_steps.drain(..overflow);
+    }
 }
 
 fn verification_from_event(event: &RuntimeEvent) -> Option<VerificationRecord> {
@@ -484,6 +695,95 @@ fn loop_decision_from_event(event: &RuntimeEvent) -> Option<LoopDecision> {
         .cloned()
         .or_else(|| Some(event.payload.clone()))
         .and_then(|value| serde_json::from_value(value).ok())
+}
+
+async fn persist_runtime_indexes(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    event: &RuntimeEvent,
+    projection: &StateProjection,
+) -> StoreResult<()> {
+    let status = serde_json::to_value(projection.task_status)?
+        .as_str()
+        .unwrap_or("idle")
+        .to_owned();
+    let timestamp = event.timestamp.to_rfc3339();
+    sqlx::query(
+        r#"
+        INSERT INTO sessions (session_id, status, active_task_id, last_sequence_no, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+            status = excluded.status,
+            active_task_id = excluded.active_task_id,
+            last_sequence_no = excluded.last_sequence_no,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(event.session_id.to_string())
+    .bind(&status)
+    .bind(projection.active_task_id.map(|id| id.to_string()))
+    .bind(i64::try_from(projection.last_sequence_no).unwrap_or(i64::MAX))
+    .bind(&timestamp)
+    .bind(&timestamp)
+    .execute(&mut **transaction)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO state_projections (session_id, last_sequence_no, projection_json, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+            last_sequence_no = excluded.last_sequence_no,
+            projection_json = excluded.projection_json,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(event.session_id.to_string())
+    .bind(i64::try_from(projection.last_sequence_no).unwrap_or(i64::MAX))
+    .bind(serde_json::to_string(projection)?)
+    .bind(&timestamp)
+    .execute(&mut **transaction)
+    .await?;
+    if let Some(task_id) = event.task_id {
+        sqlx::query(
+            r#"
+            INSERT INTO tasks (task_id, session_id, status, last_sequence_no, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(task_id) DO UPDATE SET
+                status = excluded.status,
+                last_sequence_no = excluded.last_sequence_no,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(task_id.to_string())
+        .bind(event.session_id.to_string())
+        .bind(&status)
+        .bind(i64::try_from(projection.last_sequence_no).unwrap_or(i64::MAX))
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .execute(&mut **transaction)
+        .await?;
+    }
+    if let Some(turn_id) = event.turn_id {
+        sqlx::query(
+            r#"
+            INSERT INTO turns (turn_id, session_id, task_id, status, last_sequence_no, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(turn_id) DO UPDATE SET
+                status = excluded.status,
+                last_sequence_no = excluded.last_sequence_no,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(turn_id.to_string())
+        .bind(event.session_id.to_string())
+        .bind(event.task_id.map(|id| id.to_string()))
+        .bind(&status)
+        .bind(i64::try_from(projection.last_sequence_no).unwrap_or(i64::MAX))
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .execute(&mut **transaction)
+        .await?;
+    }
+    Ok(())
 }
 
 const MIGRATIONS: &[&str] = &[
@@ -508,6 +808,65 @@ const MIGRATIONS: &[&str] = &[
     r#"
     CREATE INDEX IF NOT EXISTS idx_runtime_events_task_sequence
     ON runtime_events (task_id, sequence_no)
+    "#,
+    r#"
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_events_sequence_no
+    ON runtime_events (sequence_no)
+    "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS command_acks (
+        idempotency_key TEXT PRIMARY KEY,
+        command_id TEXT NOT NULL,
+        ack_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS sessions (
+        session_id TEXT PRIMARY KEY,
+        status TEXT NOT NULL,
+        active_task_id TEXT,
+        last_sequence_no INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS tasks (
+        task_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        last_sequence_no INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    "#,
+    r#"
+    CREATE INDEX IF NOT EXISTS idx_tasks_session_updated
+    ON tasks (session_id, updated_at DESC)
+    "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS turns (
+        turn_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        task_id TEXT,
+        status TEXT NOT NULL,
+        last_sequence_no INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    "#,
+    r#"
+    CREATE INDEX IF NOT EXISTS idx_turns_session_updated
+    ON turns (session_id, updated_at DESC)
+    "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS state_projections (
+        session_id TEXT PRIMARY KEY,
+        last_sequence_no INTEGER NOT NULL,
+        projection_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
     "#,
     r#"
     CREATE TABLE IF NOT EXISTS artifact_records (
@@ -549,6 +908,61 @@ const MIGRATIONS: &[&str] = &[
     "#,
 ];
 
+fn artifact_root_for_database_url(database_url: &str) -> PathBuf {
+    database_url
+        .strip_prefix("sqlite://")
+        .or_else(|| database_url.strip_prefix("sqlite:"))
+        .filter(|path| !path.is_empty() && *path != ":memory:")
+        .map(PathBuf::from)
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("artifacts")
+}
+
+fn verify_artifact_checksum(artifact: &ArtifactRecord, bytes: &[u8]) -> StoreResult<()> {
+    let checksum = artifact_checksum(bytes);
+    if checksum == artifact.checksum {
+        Ok(())
+    } else {
+        Err(StoreError::ArtifactChecksum(
+            artifact.artifact_id.to_string(),
+        ))
+    }
+}
+
+fn artifact_checksum(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    format!("sha256:{digest:x}")
+}
+
+#[cfg(unix)]
+async fn set_owner_only_dir(path: &Path) -> StoreResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .await
+        .map_err(|error| StoreError::ArtifactIo(error.to_string()))
+}
+
+#[cfg(not(unix))]
+async fn set_owner_only_dir(_path: &Path) -> StoreResult<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn set_owner_only_file(path: &Path) -> StoreResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .await
+        .map_err(|error| StoreError::ArtifactIo(error.to_string()))
+}
+
+#[cfg(not(unix))]
+async fn set_owner_only_file(_path: &Path) -> StoreResult<()> {
+    Ok(())
+}
+
 fn thread_from_row(row: sqlx::sqlite::SqliteRow) -> StoreResult<ThreadRecord> {
     let thread_id: String = row.try_get("thread_id")?;
     let session_id: String = row.try_get("session_id")?;
@@ -576,11 +990,32 @@ fn thread_from_row(row: sqlx::sqlite::SqliteRow) -> StoreResult<ThreadRecord> {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use golutra_core::{ArtifactId, RedactionStatus, ToolCallId, TurnId};
+    use golutra_core::{ArtifactId, CommandId, RedactionStatus, ToolCallId, TurnId};
     use golutra_protocol::{RuntimeEventSource, RuntimeEventType};
     use serde_json::json;
+    use tempfile::tempdir;
 
     use super::*;
+
+    #[tokio::test]
+    async fn command_ack_is_durable_by_idempotency_key() {
+        let store = RuntimeStore::in_memory().await.expect("store");
+        let ack = CommandAck {
+            command_id: CommandId::new(),
+            accepted: true,
+            reason: Some("accepted".to_owned()),
+        };
+
+        store
+            .store_command_ack("same-command", &ack)
+            .await
+            .expect("store ack");
+
+        assert_eq!(
+            store.command_ack("same-command").await.expect("load ack"),
+            Some(ack)
+        );
+    }
 
     #[tokio::test]
     async fn appends_events_and_reduces_state() {
@@ -655,6 +1090,7 @@ mod tests {
     async fn stores_artifact_metadata() {
         let store = RuntimeStore::in_memory().await.expect("store opens");
         let session_id = SessionId::new();
+        let bytes = b"fixture";
         let artifact = ArtifactRecord {
             artifact_id: ArtifactId::new(),
             session_id,
@@ -662,8 +1098,8 @@ mod tests {
             tool_call_id: Some(ToolCallId::new()),
             artifact_type: "stdout".to_owned(),
             uri: "artifact://fixture/stdout".to_owned(),
-            checksum: "sha256:fixture".to_owned(),
-            size_bytes: 42,
+            checksum: artifact_checksum(bytes),
+            size_bytes: bytes.len() as u64,
             created_at: Utc::now(),
             producer: "test".to_owned(),
             redaction_status: RedactionStatus::NotRequired,
@@ -672,7 +1108,7 @@ mod tests {
         };
 
         store
-            .store_artifact(&artifact)
+            .store_artifact(&artifact, bytes)
             .await
             .expect("artifact stored");
         let loaded = store
@@ -680,7 +1116,31 @@ mod tests {
             .await
             .expect("artifact loads");
 
-        assert_eq!(loaded, Some(artifact));
+        assert_eq!(loaded, Some(artifact.clone()));
+        assert_eq!(
+            store
+                .load_artifact_bytes(loaded.expect("artifact").artifact_id)
+                .await
+                .expect("blob loads"),
+            Some(bytes.to_vec())
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let directory_mode = std::fs::metadata(&store.artifact_root)
+                .expect("artifact directory")
+                .permissions()
+                .mode()
+                & 0o777;
+            let file_mode = std::fs::metadata(store.artifact_blob_path(artifact.artifact_id))
+                .expect("artifact blob")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(directory_mode, 0o700);
+            assert_eq!(file_mode, 0o600);
+        }
     }
 
     #[tokio::test]
@@ -701,6 +1161,7 @@ mod tests {
             payload_ref: None,
             durable: true,
         };
+        let bytes = b"x";
         let artifact = ArtifactRecord {
             artifact_id: ArtifactId::new(),
             session_id,
@@ -708,7 +1169,7 @@ mod tests {
             tool_call_id: Some(ToolCallId::new()),
             artifact_type: "log".to_owned(),
             uri: "artifact://fixture/log".to_owned(),
-            checksum: "sha256:fixture".to_owned(),
+            checksum: artifact_checksum(bytes),
             size_bytes: 1,
             created_at: Utc::now(),
             producer: "test".to_owned(),
@@ -717,7 +1178,10 @@ mod tests {
             provenance_refs: Vec::new(),
         };
         store.append_event(&event).await.expect("event");
-        store.store_artifact(&artifact).await.expect("artifact");
+        store
+            .store_artifact(&artifact, bytes)
+            .await
+            .expect("artifact");
 
         let projection = store
             .debug_projection(session_id, None)
@@ -759,5 +1223,46 @@ mod tests {
         assert_eq!(loaded.thread_id, thread.thread_id);
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].session_id, thread.session_id);
+    }
+
+    #[tokio::test]
+    async fn durable_projection_and_runtime_indexes_survive_reopen() {
+        let directory = tempdir().expect("directory");
+        let database_url = format!(
+            "sqlite://{}",
+            directory.path().join("runtime.sqlite").display()
+        );
+        let session_id = SessionId::new();
+        let task_id = TaskId::new();
+        let event = RuntimeEvent {
+            id: golutra_core::EventId::new(),
+            sequence_no: 1,
+            session_id,
+            turn_id: Some(TurnId::new()),
+            task_id: Some(task_id),
+            parent_event_id: None,
+            event_type: RuntimeEventType::TaskCreated,
+            timestamp: Utc::now(),
+            source: RuntimeEventSource::Runtime,
+            payload: json!({"summary": "durable task"}),
+            payload_ref: None,
+            durable: true,
+        };
+        let store = RuntimeStore::connect(&database_url).await.expect("store");
+        store.append_event(&event).await.expect("event");
+        drop(store);
+
+        let reopened = RuntimeStore::connect(&database_url)
+            .await
+            .expect("reopened");
+        let state = reopened
+            .query_state(session_id, None)
+            .await
+            .expect("projection");
+        let states = reopened.list_session_states().await.expect("states");
+
+        assert_eq!(state.active_task_id, Some(task_id));
+        assert_eq!(state.task_status, TaskStatus::Running);
+        assert_eq!(states, vec![state]);
     }
 }

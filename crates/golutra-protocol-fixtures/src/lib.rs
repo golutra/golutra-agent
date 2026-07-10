@@ -3,9 +3,16 @@ use golutra_core::{
     Actor, ActorKind, BudgetState, EvidenceId, LoopAction, LoopDecision, LoopDecisionId, SessionId,
     TaskId, TaskStatus, TurnId, VerificationId,
 };
+use golutra_eval::{
+    AppliedCandidate, AutomationCandidate, BenchmarkPromotion, EvaluationCase, EvaluationResult,
+    EvaluationRun, GeneratedTask, ImprovementCandidate, PostTaskReview, PromotionDecision,
+    RegressionResult, SkillCandidate,
+};
+use golutra_governor::RuntimeGovernorDecision;
+use golutra_memory::MemoryRecord;
 use golutra_protocol::{
-    RuntimeEvent, RuntimeEventSource, RuntimeEventType, SessionCommand, SessionCommandKind,
-    StateProjection, UserProjection, VisibleStep,
+    CommandAck, DebugProjection, EventFilter, RuntimeEvent, RuntimeEventSource, RuntimeEventType,
+    RuntimeQuery, SessionCommand, SessionCommandKind, StateProjection, UserProjection, VisibleStep,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -18,6 +25,32 @@ pub struct ScenarioFixture {
     pub events: Vec<RuntimeEvent>,
     pub state_projection: StateProjection,
     pub user_projection: UserProjection,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SdkProtocolBundle {
+    pub command: SessionCommand,
+    pub command_ack: CommandAck,
+    pub query: RuntimeQuery,
+    pub event_filter: EventFilter,
+    pub event: RuntimeEvent,
+    pub state_projection: StateProjection,
+    pub user_projection: UserProjection,
+    pub debug_projection: DebugProjection,
+    pub memory_record: MemoryRecord,
+    pub evaluation_result: EvaluationResult,
+    pub evaluation_case: EvaluationCase,
+    pub evaluation_run: EvaluationRun,
+    pub post_task_review: PostTaskReview,
+    pub improvement_candidate: ImprovementCandidate,
+    pub automation_candidate: AutomationCandidate,
+    pub generated_task: GeneratedTask,
+    pub skill_candidate: SkillCandidate,
+    pub benchmark_promotion: BenchmarkPromotion,
+    pub regression_result: RegressionResult,
+    pub promotion_decision: PromotionDecision,
+    pub applied_candidate: AppliedCandidate,
+    pub governor_decision: RuntimeGovernorDecision,
 }
 
 #[must_use]
@@ -189,7 +222,18 @@ pub fn protocol_schema_names() -> Vec<&'static str> {
         "RuntimeEvent",
         "StateProjection",
         "UserProjection",
+        "SdkProtocolBundle",
     ]
+}
+
+pub fn export_sdk_schema(path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+    let schema = schemars::schema_for!(SdkProtocolBundle);
+    let bytes = serde_json::to_vec_pretty(&schema)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    if let Some(parent) = path.as_ref().parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, bytes)
 }
 
 #[cfg(test)]
@@ -220,6 +264,6 @@ mod tests {
         assert!(scenario_json.is_object());
         assert!(command_json.is_object());
         assert!(event_json.is_object());
-        assert_eq!(protocol_schema_names().len(), 5);
+        assert_eq!(protocol_schema_names().len(), 6);
     }
 }

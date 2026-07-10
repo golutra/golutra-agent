@@ -860,6 +860,12 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    fn lock_test_env() -> MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     struct IsolatedGolutraHome {
         previous: Option<OsString>,
         _dir: TempDir,
@@ -868,7 +874,7 @@ mod tests {
 
     impl IsolatedGolutraHome {
         fn new() -> Self {
-            let guard = ENV_LOCK.lock().expect("env lock");
+            let guard = lock_test_env();
             let dir = tempdir().expect("home");
             let previous = std::env::var_os(GOLUTRA_HOME);
             unsafe {
@@ -878,6 +884,34 @@ mod tests {
                 previous,
                 _dir: dir,
                 _guard: guard,
+            }
+        }
+    }
+
+    struct ScopedEnvVar {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => unsafe {
+                    std::env::set_var(self.key, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(self.key);
+                },
             }
         }
     }
@@ -1174,10 +1208,7 @@ mod tests {
         let _home = IsolatedGolutraHome::new();
         let dir = tempdir().expect("dir");
         let paths = ProviderConfigPaths::for_workspace(dir.path()).expect("paths");
-        let previous = std::env::var_os("GOLUTRA_PROVIDER_API_KEY");
-        unsafe {
-            std::env::set_var("GOLUTRA_PROVIDER_API_KEY", "secret-from-env");
-        }
+        let _api_key = ScopedEnvVar::set("GOLUTRA_PROVIDER_API_KEY", "secret-from-env");
         let profile = ProviderProfile::openai_compatible(
             "golutra",
             "api.golutra.cn",
@@ -1195,14 +1226,6 @@ mod tests {
 
         let state = provider_onboarding_state(dir.path()).expect("onboarding");
 
-        match previous {
-            Some(value) => unsafe {
-                std::env::set_var("GOLUTRA_PROVIDER_API_KEY", value);
-            },
-            None => unsafe {
-                std::env::remove_var("GOLUTRA_PROVIDER_API_KEY");
-            },
-        }
         assert!(state.configured);
         assert!(state.missing_fields.is_empty());
     }
@@ -1252,10 +1275,8 @@ mod tests {
 
     #[test]
     fn runtime_env_prefers_active_profile_key_over_process_env() {
-        let previous = std::env::var_os("GOLUTRA_PROVIDER_API_KEY");
-        unsafe {
-            std::env::set_var("GOLUTRA_PROVIDER_API_KEY", "process-secret");
-        }
+        let _guard = lock_test_env();
+        let _api_key = ScopedEnvVar::set("GOLUTRA_PROVIDER_API_KEY", "process-secret");
         let profile = ProviderProfile::openai_compatible(
             "custom",
             "https://api.golutra.cn/v1",
@@ -1275,14 +1296,6 @@ mod tests {
 
         let runtime_env = runtime_env_from_settings(&settings);
 
-        match previous {
-            Some(value) => unsafe {
-                std::env::set_var("GOLUTRA_PROVIDER_API_KEY", value);
-            },
-            None => unsafe {
-                std::env::remove_var("GOLUTRA_PROVIDER_API_KEY");
-            },
-        }
         assert_eq!(
             runtime_env.get("GOLUTRA_PROVIDER_API_KEY"),
             Some("profile-secret".to_owned())

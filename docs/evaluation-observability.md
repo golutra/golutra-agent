@@ -7,6 +7,20 @@
 主架构见 `ARCHITECTURE.md`。
 改进候选、回归验证和晋升决策见 `agent-improvement-loop.md`。
 
+## 当前实现状态
+
+截至 2026-07-10，runtime 已具备 durable evaluation 最小闭环：
+
+- 每个 terminal task 生成 `PostTaskReview`、`EvaluationCase`、`TrajectoryReplay`、`EvaluationRun` 和 `EvaluationResult`，并持久化到 `<workspace>/.golutra/evaluation.json`；同步文件 I/O 在 blocking pool 执行，Unix 文件权限为 `0600`。
+- pass/partial/fail、latency、evidence refs、residual risks 和 failure taxonomy 来自 runtime facts 与 verification，不从聊天文本反推。
+- 失败或 partial trajectory 会生成 benchmark 与 generated-task 候选；成功且有 durable evidence 的 trajectory 可生成 skill candidate。所有候选初始状态都是 `proposed`。
+- `run_regression` 生成 durable `RegressionResult`；没有 clean regression 的候选不能进入 promotion decision。
+- `PromotionGate` 只允许低风险 benchmark 由 system reviewer 自动 approve/apply；GeneratedTask、Skill 及中高风险候选保持 proposed 或 needs-human-review。
+- apply 会记录 applied version 与 rollback ref；rollback 保留原始 candidate、decision、regression 和 applied record，形成可审计状态转换。
+- CLI、HTTP transport 和 TypeScript SDK 已提供 results、improvements、candidates、regress、apply、rollback 查询/命令；daemon 重启后这些状态可恢复。
+
+当前 evaluation runner 使用 durable replay facts，不会重新执行 provider，也不等价于完整 counterfactual benchmark。外部 scorer、LLM judge、CI dataset 和长期版本监控仍是后续工作。
+
 ## 核心原则
 
 ```text

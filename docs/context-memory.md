@@ -10,6 +10,19 @@
 - 第一阶段以 [implementation-blueprint.md](/Users/skyseek/Desktop/project/open/golutra-agent/golutra-agent/docs/implementation-blueprint.md) 为准，只默认实现 `WorkingSummary`、`CompactionRecord`、`MemoryCandidate` 和 `project-scoped retrieval`。
 - `user/global` 长期 memory 晋升、复杂 memory promotion 和重型检索策略属于后续增强，不是第一阶段必做。
 
+## 当前实现状态
+
+截至 2026-07-10，已落地以下受控最小闭环：
+
+- `ContextBuilder` 按 contributor 构建 stable system prompt、canonical workspace environment context、会话摘要、project memory、evidence 和工具说明；provider request 前后分别记录 `TokenBudgetSnapshot` 与 `TokenUsageRecord`。
+- compact 是 durable command/event；后续 turn 会复用 compact summary，同一 session 的历史不会作为完整 transcript 无界回灌。
+- `MemoryStore` 持久化到 `<workspace>/.golutra/memory.json`，写入通过临时文件原子替换；文件 I/O 使用 `spawn_blocking`，不会阻塞 async runtime worker。Unix runtime 目录为 `0700`、memory 文件为 `0600`。
+- 成功任务只能从 durable evidence 生成 project-scoped `MemoryCandidate`；promotion gate 检查 evidence、confidence、scope、敏感内容和 contradiction，失败或不安全候选不会写入 active memory。
+- 每轮 task 会记录 `MemoryRetrieved`，只有 active、未过期且与 query 相关的 project memory 才进入 context；完整 memory 记录不直接当作 prompt 历史。
+- `memory list` 和 `memory rollback` 已通过 CLI、HTTP transport 和 TypeScript SDK 暴露；rollback 保留事实记录和原因，不物理擦除审计历史。
+
+当前没有实现 user/global memory、向量数据库、OS 级 secret store 或自动覆盖已有 memory。上述能力继续按本文件的治理边界后置。
+
 核心原则：
 
 ```text

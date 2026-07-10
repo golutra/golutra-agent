@@ -10,6 +10,10 @@ pub enum RuntimeQueryKind {
     UserProjection,
     DebugProjection,
     ReplayCursor,
+    MemoryList,
+    EvaluationResults,
+    ImprovementCandidates,
+    AutomationCandidates,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

@@ -1,0 +1,2233 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SdkProtocolBundle",
+  "type": "object",
+  "properties": {
+    "applied_candidate": {
+      "$ref": "#/$defs/AppliedCandidate"
+    },
+    "automation_candidate": {
+      "$ref": "#/$defs/AutomationCandidate"
+    },
+    "benchmark_promotion": {
+      "$ref": "#/$defs/BenchmarkPromotion"
+    },
+    "command": {
+      "$ref": "#/$defs/SessionCommand"
+    },
+    "command_ack": {
+      "$ref": "#/$defs/CommandAck"
+    },
+    "debug_projection": {
+      "$ref": "#/$defs/DebugProjection"
+    },
+    "evaluation_case": {
+      "$ref": "#/$defs/EvaluationCase"
+    },
+    "evaluation_result": {
+      "$ref": "#/$defs/EvaluationResult"
+    },
+    "evaluation_run": {
+      "$ref": "#/$defs/EvaluationRun"
+    },
+    "event": {
+      "$ref": "#/$defs/RuntimeEvent"
+    },
+    "event_filter": {
+      "$ref": "#/$defs/EventFilter"
+    },
+    "generated_task": {
+      "$ref": "#/$defs/GeneratedTask"
+    },
+    "governor_decision": {
+      "$ref": "#/$defs/RuntimeGovernorDecision"
+    },
+    "improvement_candidate": {
+      "$ref": "#/$defs/ImprovementCandidate"
+    },
+    "memory_record": {
+      "$ref": "#/$defs/MemoryRecord"
+    },
+    "post_task_review": {
+      "$ref": "#/$defs/PostTaskReview"
+    },
+    "promotion_decision": {
+      "$ref": "#/$defs/PromotionDecision"
+    },
+    "query": {
+      "$ref": "#/$defs/RuntimeQuery"
+    },
+    "regression_result": {
+      "$ref": "#/$defs/RegressionResult"
+    },
+    "skill_candidate": {
+      "$ref": "#/$defs/SkillCandidate"
+    },
+    "state_projection": {
+      "$ref": "#/$defs/StateProjection"
+    },
+    "user_projection": {
+      "$ref": "#/$defs/UserProjection"
+    }
+  },
+  "required": [
+    "command",
+    "command_ack",
+    "query",
+    "event_filter",
+    "event",
+    "state_projection",
+    "user_projection",
+    "debug_projection",
+    "memory_record",
+    "evaluation_result",
+    "evaluation_case",
+    "evaluation_run",
+    "post_task_review",
+    "improvement_candidate",
+    "automation_candidate",
+    "generated_task",
+    "skill_candidate",
+    "benchmark_promotion",
+    "regression_result",
+    "promotion_decision",
+    "applied_candidate",
+    "governor_decision"
+  ],
+  "$defs": {
+    "Actor": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ActorKind"
+        }
+      },
+      "required": [
+        "kind",
+        "id"
+      ]
+    },
+    "ActorKind": {
+      "type": "string",
+      "enum": [
+        "user",
+        "api",
+        "tui",
+        "cli",
+        "sdk",
+        "web",
+        "ide",
+        "runtime"
+      ]
+    },
+    "AppliedCandidate": {
+      "type": "object",
+      "properties": {
+        "applied_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "applied_version": {
+          "type": "string"
+        },
+        "candidate_id": {
+          "type": "string"
+        },
+        "rollback_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rollback_ref": {
+          "type": "string"
+        },
+        "rolled_back_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "candidate_id",
+        "applied_version",
+        "rollback_ref",
+        "applied_at"
+      ]
+    },
+    "ArtifactRecord": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "artifact_type": {
+          "type": "string"
+        },
+        "checksum": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "producer": {
+          "type": "string"
+        },
+        "provenance_refs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "redaction_status": {
+          "$ref": "#/$defs/RedactionStatus"
+        },
+        "retention_policy": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "tool_call_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "turn_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "uri": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "session_id",
+        "artifact_type",
+        "uri",
+        "checksum",
+        "size_bytes",
+        "created_at",
+        "producer",
+        "redaction_status",
+        "retention_policy",
+        "provenance_refs"
+      ]
+    },
+    "AutomationCandidate": {
+      "type": "object",
+      "properties": {
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/AutomationCandidateKind"
+        },
+        "regression_plan": {
+          "type": "string"
+        },
+        "risk_level": {
+          "$ref": "#/$defs/CandidateRisk"
+        },
+        "rollback_ref": {
+          "type": "string"
+        },
+        "source_task_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "status": {
+          "$ref": "#/$defs/CandidateStatus"
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "source_task_id",
+        "kind",
+        "summary",
+        "risk_level",
+        "evidence_refs",
+        "regression_plan",
+        "rollback_ref",
+        "status"
+      ]
+    },
+    "AutomationCandidateKind": {
+      "type": "string",
+      "enum": [
+        "benchmark",
+        "generated_task",
+        "skill",
+        "runtime_change"
+      ]
+    },
+    "BenchmarkPromotion": {
+      "type": "object",
+      "properties": {
+        "accepted_by": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "anti_overfit_notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "evaluator": {
+          "type": "string"
+        },
+        "failure_taxonomy": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "fixture": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "promotion_status": {
+          "$ref": "#/$defs/CandidateStatus"
+        },
+        "rollback_ref": {
+          "type": "string"
+        },
+        "source_task_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "id",
+        "source_task_id",
+        "failure_taxonomy",
+        "fixture",
+        "evaluator",
+        "anti_overfit_notes",
+        "rollback_ref",
+        "promotion_status"
+      ]
+    },
+    "BudgetState": {
+      "type": "object",
+      "properties": {
+        "actual_input_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "budget_remaining": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "compact_recommended": {
+          "type": "boolean"
+        },
+        "cost_risk": {
+          "type": "string"
+        },
+        "estimated_cost": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "output_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "planned_input_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "total_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "compact_recommended",
+        "cost_risk"
+      ]
+    },
+    "BusyPolicy": {
+      "type": "string",
+      "enum": [
+        "append",
+        "inject",
+        "interrupt",
+        "reject"
+      ]
+    },
+    "BusyPolicyDecision": {
+      "type": "object",
+      "properties": {
+        "affected_turn_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "applied_policy": {
+          "$ref": "#/$defs/BusyPolicy"
+        },
+        "command_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "decision_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "lane_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "requested_policy": {
+          "$ref": "#/$defs/BusyPolicy"
+        },
+        "safe_to_inject": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "decision_id",
+        "lane_id",
+        "command_id",
+        "requested_policy",
+        "applied_policy",
+        "reason",
+        "safe_to_inject"
+      ]
+    },
+    "CandidateRisk": {
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical"
+      ]
+    },
+    "CandidateStatus": {
+      "type": "string",
+      "enum": [
+        "proposed",
+        "regression_passed",
+        "needs_human_review",
+        "approved",
+        "applied",
+        "rejected",
+        "rolled_back"
+      ]
+    },
+    "CommandAck": {
+      "type": "object",
+      "properties": {
+        "accepted": {
+          "type": "boolean"
+        },
+        "command_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "command_id",
+        "accepted"
+      ]
+    },
+    "DebugProjection": {
+      "type": "object",
+      "properties": {
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArtifactRecord"
+          }
+        },
+        "busy_policy_decisions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BusyPolicyDecision"
+          }
+        },
+        "events": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RuntimeEvent"
+          }
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EvidenceRecord"
+          }
+        },
+        "loop_decisions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LoopDecision"
+          }
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "task_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "tool_results": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ToolResultEnvelope"
+          }
+        },
+        "verification": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VerificationRecord"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "session_id",
+        "events",
+        "busy_policy_decisions",
+        "tool_results",
+        "artifacts",
+        "evidence",
+        "loop_decisions"
+      ]
+    },
+    "EvaluationCase": {
+      "type": "object",
+      "properties": {
+        "case_id": {
+          "type": "string"
+        },
+        "expected_outcome": {
+          "type": "string"
+        },
+        "fixture_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "objective": {
+          "type": "string"
+        },
+        "policy_constraints": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "required_evidence": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "source": {
+          "type": "string"
+        },
+        "source_task_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "success_criteria": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "task_type": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "case_id",
+        "source",
+        "task_type",
+        "objective",
+        "expected_outcome",
+        "success_criteria",
+        "required_evidence",
+        "policy_constraints",
+        "fixture_refs",
+        "tags"
+      ]
+    },
+    "EvaluationResult": {
+      "type": "object",
+      "properties": {
+        "case_id": {
+          "type": "string"
+        },
+        "cost": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "failure_taxonomy": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "latency_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "quality_score": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "residual_risks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "result_id": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "source_task_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "verdict": {
+          "$ref": "#/$defs/EvaluationVerdict"
+        }
+      },
+      "required": [
+        "result_id",
+        "run_id",
+        "case_id",
+        "source_task_id",
+        "verdict",
+        "evidence_refs",
+        "failure_taxonomy",
+        "residual_risks"
+      ]
+    },
+    "EvaluationRun": {
+      "type": "object",
+      "properties": {
+        "case_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "completed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "cost": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "dataset_id": {
+          "type": "string"
+        },
+        "latency_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "provider_config_ref": {
+          "type": "string"
+        },
+        "result_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "runtime_config_ref": {
+          "type": "string"
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "system_version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id",
+        "dataset_id",
+        "case_ids",
+        "system_version",
+        "provider_config_ref",
+        "runtime_config_ref",
+        "started_at",
+        "completed_at",
+        "result_refs"
+      ]
+    },
+    "EvaluationVerdict": {
+      "type": "string",
+      "enum": [
+        "pass",
+        "fail",
+        "partial",
+        "unknown"
+      ]
+    },
+    "EventFilter": {
+      "type": "object",
+      "properties": {
+        "after_sequence_no": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "task_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "session_id"
+      ]
+    },
+    "EvidenceRecord": {
+      "type": "object",
+      "properties": {
+        "artifact_refs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "claim": {
+          "type": "string"
+        },
+        "confidence": {
+          "type": "number",
+          "format": "float"
+        },
+        "evidence_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "evidence_strength": {
+          "$ref": "#/$defs/EvidenceStrength"
+        },
+        "limitations": {
+          "type": "string"
+        },
+        "source_event_refs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "verifier": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "evidence_id",
+        "claim",
+        "artifact_refs",
+        "source_event_refs",
+        "evidence_strength",
+        "verifier",
+        "confidence",
+        "limitations"
+      ]
+    },
+    "EvidenceStrength": {
+      "type": "string",
+      "enum": [
+        "weak",
+        "medium",
+        "strong"
+      ]
+    },
+    "GeneratedTask": {
+      "type": "object",
+      "properties": {
+        "difficulty_score": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "environment_recipe": {
+          "type": "string"
+        },
+        "expected_learning_value": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "novelty_score": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "objective": {
+          "type": "string"
+        },
+        "promotion_status": {
+          "$ref": "#/$defs/CandidateStatus"
+        },
+        "safety_constraints": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "source": {
+          "type": "string"
+        },
+        "source_task_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "id",
+        "source_task_id",
+        "source",
+        "objective",
+        "expected_learning_value",
+        "environment_recipe",
+        "safety_constraints",
+        "promotion_status"
+      ]
+    },
+    "GoalAlignmentCheck": {
+      "type": "object",
+      "properties": {
+        "aligned": {
+          "type": "boolean"
+        },
+        "alignment_score": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "drift_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "reason": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "task_id",
+        "aligned",
+        "alignment_score",
+        "reason",
+        "evidence_refs"
+      ]
+    },
+    "GovernorAction": {
+      "type": "string",
+      "enum": [
+        "allow",
+        "warn",
+        "ask_user",
+        "block"
+      ]
+    },
+    "GovernorPhase": {
+      "type": "string",
+      "enum": [
+        "provider",
+        "tool",
+        "tool_result",
+        "completion"
+      ]
+    },
+    "ImprovementCandidate": {
+      "type": "object",
+      "properties": {
+        "benchmark_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "causal_evidence_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "expected_effect": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "proposed_change": {
+          "type": "string"
+        },
+        "risk_level": {
+          "$ref": "#/$defs/CandidateRisk"
+        },
+        "rollback_plan": {
+          "type": "string"
+        },
+        "source_failure_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "source_task_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "status": {
+          "$ref": "#/$defs/CandidateStatus"
+        },
+        "target_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "target_type": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "source_task_id",
+        "source_failure_ids",
+        "target_type",
+        "proposed_change",
+        "expected_effect",
+        "risk_level",
+        "evidence_refs",
+        "causal_evidence_refs",
+        "benchmark_refs",
+        "rollback_plan",
+        "status"
+      ]
+    },
+    "LoopAction": {
+      "type": "string",
+      "enum": [
+        "continue",
+        "compact",
+        "retry",
+        "fallback",
+        "ask_user",
+        "verify",
+        "stop_success",
+        "stop_partial",
+        "stop_failed",
+        "blocked"
+      ]
+    },
+    "LoopDecision": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/LoopAction"
+        },
+        "budget_state": {
+          "$ref": "#/$defs/BudgetState"
+        },
+        "decision_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "model_state": {
+          "type": "string"
+        },
+        "next_step": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "policy_ref": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "tool_state": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "verification_ref": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "decision_id",
+        "task_id",
+        "turn_id",
+        "action",
+        "reason",
+        "evidence_refs",
+        "budget_state",
+        "tool_state",
+        "model_state"
+      ]
+    },
+    "MemoryRecord": {
+      "type": "object",
+      "properties": {
+        "confidence": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "content": {
+          "type": "string"
+        },
+        "contradiction_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "evidence_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "expires_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "memory_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "rollback_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scope": {
+          "type": "string"
+        },
+        "source_task_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "status": {
+          "$ref": "#/$defs/MemoryStatus"
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "memory_id",
+        "content",
+        "scope",
+        "confidence",
+        "source_task_id",
+        "evidence_ids",
+        "contradiction_ids",
+        "created_at",
+        "version",
+        "status"
+      ]
+    },
+    "MemoryStatus": {
+      "type": "string",
+      "enum": [
+        "active",
+        "rolled_back"
+      ]
+    },
+    "PostTaskReview": {
+      "type": "object",
+      "properties": {
+        "context_issues": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "evidence_quality": {
+          "type": "string"
+        },
+        "failure_reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "mode": {
+          "type": "string"
+        },
+        "outcome": {
+          "type": "string"
+        },
+        "policy_issues": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "promotion_candidates": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "provider_issues": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "success_reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "suggested_improvements": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "task_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "tool_issues": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "task_id",
+        "mode",
+        "outcome",
+        "success_reasons",
+        "failure_reasons",
+        "evidence_quality",
+        "policy_issues",
+        "context_issues",
+        "tool_issues",
+        "provider_issues",
+        "suggested_improvements",
+        "promotion_candidates"
+      ]
+    },
+    "PromotionDecision": {
+      "type": "object",
+      "properties": {
+        "applied_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "candidate_id": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "decision": {
+          "$ref": "#/$defs/PromotionDecisionKind"
+        },
+        "decision_id": {
+          "type": "string"
+        },
+        "expires_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "type": "string"
+        },
+        "reviewer": {
+          "$ref": "#/$defs/PromotionReviewer"
+        },
+        "rollback_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "decision_id",
+        "candidate_id",
+        "decision",
+        "reason",
+        "reviewer",
+        "created_at"
+      ]
+    },
+    "PromotionDecisionKind": {
+      "type": "string",
+      "enum": [
+        "approve",
+        "reject",
+        "needs_human_review"
+      ]
+    },
+    "PromotionReviewer": {
+      "type": "string",
+      "enum": [
+        "system",
+        "human",
+        "agent"
+      ]
+    },
+    "RedactionStatus": {
+      "type": "string",
+      "enum": [
+        "raw",
+        "redacted",
+        "not_required"
+      ]
+    },
+    "RegressionResult": {
+      "type": "object",
+      "properties": {
+        "baseline_version": {
+          "type": "string"
+        },
+        "candidate_id": {
+          "type": "string"
+        },
+        "candidate_version": {
+          "type": "string"
+        },
+        "cases_run": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "causal_comparison_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "cost_delta": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "failed_cases": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "latency_delta": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "passed_cases": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "quality_delta": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "regression_id": {
+          "type": "string"
+        },
+        "regressions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "security_delta": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "verdict": {
+          "$ref": "#/$defs/RegressionVerdict"
+        }
+      },
+      "required": [
+        "regression_id",
+        "candidate_id",
+        "baseline_version",
+        "candidate_version",
+        "cases_run",
+        "passed_cases",
+        "failed_cases",
+        "regressions",
+        "causal_comparison_refs",
+        "verdict",
+        "created_at"
+      ]
+    },
+    "RegressionVerdict": {
+      "type": "string",
+      "enum": [
+        "pass",
+        "fail",
+        "needs_review"
+      ]
+    },
+    "RuntimeEvent": {
+      "type": "object",
+      "properties": {
+        "durable": {
+          "type": "boolean"
+        },
+        "event_type": {
+          "$ref": "#/$defs/RuntimeEventType"
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "parent_event_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "payload": true,
+        "payload_ref": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "sequence_no": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "source": {
+          "$ref": "#/$defs/RuntimeEventSource"
+        },
+        "task_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "turn_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "id",
+        "sequence_no",
+        "session_id",
+        "event_type",
+        "timestamp",
+        "source",
+        "payload",
+        "durable"
+      ]
+    },
+    "RuntimeEventSource": {
+      "type": "string",
+      "enum": [
+        "runtime",
+        "provider",
+        "tool",
+        "policy",
+        "verifier",
+        "memory",
+        "evaluator",
+        "governor",
+        "user"
+      ]
+    },
+    "RuntimeEventType": {
+      "type": "string",
+      "enum": [
+        "command_accepted",
+        "command_rejected",
+        "session_created",
+        "task_created",
+        "turn_started",
+        "turn_queued",
+        "busy_policy_decided",
+        "context_built",
+        "provider_started",
+        "provider_streamed",
+        "provider_completed",
+        "token_usage_recorded",
+        "assistant_message",
+        "tool_started",
+        "tool_completed",
+        "policy_evaluated",
+        "verification_completed",
+        "loop_decided",
+        "checkpoint_created",
+        "task_completed",
+        "task_abort_requested",
+        "task_aborted",
+        "task_paused",
+        "task_resumed",
+        "approval_requested",
+        "approval_resolved",
+        "retry_scheduled",
+        "provider_fallback",
+        "loop_guard_triggered",
+        "compaction_completed",
+        "memory_retrieved",
+        "memory_promoted",
+        "memory_promotion_rejected",
+        "memory_rolled_back",
+        "post_task_reviewed",
+        "evaluation_completed",
+        "improvement_candidate_created",
+        "automation_candidate_created",
+        "regression_completed",
+        "promotion_decided",
+        "candidate_applied",
+        "candidate_rolled_back",
+        "governor_decided"
+      ]
+    },
+    "RuntimeGovernorDecision": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/GovernorAction"
+        },
+        "alignment": {
+          "$ref": "#/$defs/GoalAlignmentCheck"
+        },
+        "budget_risk": {
+          "type": "string"
+        },
+        "failed_tool_calls": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "iteration": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "phase": {
+          "$ref": "#/$defs/GovernorPhase"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "security_risk": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "tool_calls": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "task_id",
+        "phase",
+        "action",
+        "reason",
+        "budget_risk",
+        "security_risk",
+        "iteration",
+        "tool_calls",
+        "failed_tool_calls",
+        "alignment"
+      ]
+    },
+    "RuntimeLane": {
+      "type": "object",
+      "properties": {
+        "active_controller": {
+          "$ref": "#/$defs/Actor"
+        },
+        "active_turn_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "busy_policy_default": {
+          "$ref": "#/$defs/BusyPolicy"
+        },
+        "injected_inputs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "lane_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "pending_turns": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "status": {
+          "$ref": "#/$defs/TaskStatus"
+        },
+        "task_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "workspace_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "lane_id",
+        "workspace_id",
+        "session_id",
+        "task_id",
+        "active_controller",
+        "status",
+        "pending_turns",
+        "injected_inputs",
+        "busy_policy_default"
+      ]
+    },
+    "RuntimeQuery": {
+      "type": "object",
+      "properties": {
+        "cursor": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "kind": {
+          "$ref": "#/$defs/RuntimeQueryKind"
+        },
+        "query_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "requester": {
+          "$ref": "#/$defs/ActorKind"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "task_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "query_id",
+        "session_id",
+        "kind",
+        "requester",
+        "timestamp"
+      ]
+    },
+    "RuntimeQueryKind": {
+      "type": "string",
+      "enum": [
+        "session_state",
+        "task_state",
+        "user_projection",
+        "debug_projection",
+        "replay_cursor",
+        "memory_list",
+        "evaluation_results",
+        "improvement_candidates",
+        "automation_candidates"
+      ]
+    },
+    "SessionCommand": {
+      "type": "object",
+      "properties": {
+        "actor": {
+          "$ref": "#/$defs/Actor"
+        },
+        "command_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "idempotency_key": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/SessionCommandKind"
+        },
+        "payload": true,
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "command_id",
+        "kind",
+        "idempotency_key",
+        "actor",
+        "payload",
+        "timestamp"
+      ]
+    },
+    "SessionCommandKind": {
+      "type": "string",
+      "enum": [
+        "create",
+        "prompt",
+        "approve",
+        "deny",
+        "pause",
+        "resume",
+        "abort",
+        "compact",
+        "memory_rollback",
+        "run_regression",
+        "apply_candidate",
+        "rollback_candidate",
+        "verify",
+        "replay",
+        "export"
+      ]
+    },
+    "SkillCandidate": {
+      "type": "object",
+      "properties": {
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "id": {
+          "type": "string"
+        },
+        "promotion_status": {
+          "$ref": "#/$defs/CandidateStatus"
+        },
+        "regression_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "reusable_pattern": {
+          "type": "string"
+        },
+        "rollback_ref": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "string"
+        },
+        "source_task_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "source_trajectory": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "source_task_id",
+        "source_trajectory",
+        "reusable_pattern",
+        "evidence_refs",
+        "regression_refs",
+        "scope",
+        "rollback_ref",
+        "promotion_status"
+      ]
+    },
+    "StateProjection": {
+      "type": "object",
+      "properties": {
+        "active_task_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "final_message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_loop_decision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LoopDecision"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "last_sequence_no": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "last_verification": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VerificationRecord"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "pending_approval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runtime_lane": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RuntimeLane"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "task_status": {
+          "$ref": "#/$defs/TaskStatus"
+        },
+        "visible_steps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/VisibleStep"
+          }
+        }
+      },
+      "required": [
+        "session_id",
+        "task_status",
+        "last_sequence_no",
+        "visible_steps"
+      ]
+    },
+    "TaskStatus": {
+      "type": "string",
+      "enum": [
+        "idle",
+        "running",
+        "waiting_approval",
+        "pausing",
+        "paused",
+        "aborting",
+        "completed",
+        "partial",
+        "failed",
+        "blocked",
+        "cancelled"
+      ]
+    },
+    "ToolResultEnvelope": {
+      "type": "object",
+      "properties": {
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "model_visible_excerpt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "raw_artifact_ref": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "risk": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/ToolResultStatus"
+        },
+        "structured_facts": true,
+        "summary": {
+          "type": "string"
+        },
+        "tool_call_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "tool_name": {
+          "type": "string"
+        },
+        "verification_hint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "tool_call_id",
+        "tool_name",
+        "status",
+        "summary",
+        "structured_facts",
+        "evidence_refs",
+        "risk"
+      ]
+    },
+    "ToolResultStatus": {
+      "type": "string",
+      "enum": [
+        "ok",
+        "error",
+        "blocked",
+        "cancelled",
+        "timeout"
+      ]
+    },
+    "UserProjection": {
+      "type": "object",
+      "properties": {
+        "final_message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pending_approval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "residual_risks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "status": {
+          "$ref": "#/$defs/TaskStatus"
+        },
+        "task_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "visible_steps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/VisibleStep"
+          }
+        }
+      },
+      "required": [
+        "session_id",
+        "status",
+        "visible_steps",
+        "residual_risks"
+      ]
+    },
+    "VerificationCheck": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "message": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "passed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "passed",
+        "evidence_refs",
+        "message"
+      ]
+    },
+    "VerificationRecord": {
+      "type": "object",
+      "properties": {
+        "checks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/VerificationCheck"
+          }
+        },
+        "completion_criteria": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "objective": {
+          "type": "string"
+        },
+        "policy_status": {
+          "type": "string"
+        },
+        "residual_risks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "result": {
+          "$ref": "#/$defs/VerificationResult"
+        },
+        "task_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "verification_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "verification_id",
+        "task_id",
+        "objective",
+        "completion_criteria",
+        "checks",
+        "evidence_refs",
+        "result",
+        "policy_status",
+        "residual_risks"
+      ]
+    },
+    "VerificationResult": {
+      "type": "string",
+      "enum": [
+        "pass",
+        "fail",
+        "partial",
+        "unknown"
+      ]
+    },
+    "VisibleStep": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "label",
+        "status",
+        "summary"
+      ]
+    }
+  }
+}

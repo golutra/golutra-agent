@@ -7,6 +7,17 @@
 主架构见 `ARCHITECTURE.md`。
 第一阶段实现范围见 `implementation-blueprint.md`。
 
+## 当前实现状态
+
+截至 2026-07-10，第一阶段硬契约已进入可运行链路：
+
+- `ToolContract` 使用 JSON Schema 校验输入；policy、workspace guard、approval、execution、artifact/evidence 顺序固定。
+- shell 使用 `shlex` 解析结构化 argv，不经过 shell 解释器；policy 会阻断敏感路径、`find -exec/-delete`、`rg --pre` 等执行型参数，把 `sed -i`、`cargo run`、未知脚本等降为 Ask；执行器支持 timeout、`CancellationToken`、每管道 2 MiB 上限，并在 Unix 上终止整个进程组后排空管道。
+- `RuntimeHost` 保存 task handle、pending turn queue 和 durable command ack；pause/resume/abort 影响真实执行，不是 UI 标记。
+- `AgentLoop` 支持多轮 assistant/tool message、LoopGuard、有限 retry/fallback 和 verification-backed terminal state。
+- 文件工具在修改前捕获并持久化 before-image；checkpoint manifest 与 owner-only artifact blob 带 checksum、redaction 状态和 rollback metadata，持久化失败时不执行文件副作用。
+- app-server/SSE 与 in-process transport 使用同一 `SessionCommand`、`RuntimeQuery`、`RuntimeEvent` 语义；本地 daemon 在 transport auth 落地前仅允许 loopback，并校验 Host/Origin。event writer 串行化 sequence 最终分配、SQLite append 与 broadcast，保证 cursor 顺序。
+
 ## 核心原则
 
 ```text
@@ -236,6 +247,7 @@ WorkspaceCheckpointContract
 要求：
 
 - checkpoint 只能作为 Golutra 恢复网，不能修改用户自己的 `.git` 历史。
+- checkpoint 和工具 policy 必须排除 `.git`、`.golutra`、`.gitignore` 命中项及 secret path；新文件也要在创建前形成 `existed=false` 恢复记录。
 - 默认遵守 `.gitignore` 和 policy 排除规则，避免保存依赖目录、构建产物和敏感文件。
 - checkpoint 失败不能让任务成功假象化；必须写入 event，并在必要时降级为 residual risk。
 - 非文件副作用不能伪装成可回滚，必须单独记录补偿或不可回滚风险。

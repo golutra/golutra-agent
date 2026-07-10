@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use golutra_client::{InProcessTransport, RuntimeClient};
+use golutra_client::{RuntimeClient, RuntimeTransport};
 use golutra_config::{
     ProviderConfigPaths, ProviderConfigScope, ProviderInstallPlan, ProviderProfile,
     apply_provider_install_plan_verified, load_provider_runtime_env, provider_onboarding_state,
@@ -40,6 +40,14 @@ enum Command {
         thread_id: String,
     },
     Abort,
+    Pause,
+    Approve {
+        approval_id: Option<String>,
+    },
+    Deny {
+        approval_id: Option<String>,
+    },
+    Compact,
     Trace,
     Export,
     Thread {
@@ -49,6 +57,14 @@ enum Command {
     Provider {
         #[command(subcommand)]
         command: ProviderCommand,
+    },
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
+    },
+    Eval {
+        #[command(subcommand)]
+        command: EvalCommand,
     },
 }
 
@@ -110,12 +126,43 @@ enum ProviderCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum MemoryCommand {
+    List,
+    Rollback {
+        memory_id: String,
+        #[arg(long, default_value = "rolled back by user")]
+        reason: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EvalCommand {
+    Results,
+    Improvements,
+    Candidates,
+    Regress {
+        candidate_id: String,
+    },
+    Apply {
+        candidate_id: String,
+    },
+    Rollback {
+        candidate_id: String,
+        #[arg(long, default_value = "rolled back by user")]
+        reason: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> miette::Result<()> {
+    if golutra_app_server::run_embedded_daemon_if_requested().await? {
+        return Ok(());
+    }
     let cli = Cli::parse();
     let transport = match cli.workspace.as_deref() {
-        Some(workspace) => InProcessTransport::for_workspace(workspace).await,
-        None => InProcessTransport::for_current_workspace().await,
+        Some(workspace) => RuntimeTransport::for_workspace(workspace).await,
+        None => RuntimeTransport::for_current_workspace().await,
     }
     .map_err(|error| miette::miette!("{error}"))?;
     let session_id = resolve_session_id(cli.session_id.as_deref(), &transport)?;
@@ -203,6 +250,50 @@ async fn main() -> miette::Result<()> {
                 .send_command(command(
                     session_id,
                     SessionCommandKind::Abort,
+                    serde_json::json!({}),
+                ))
+                .await
+                .map_err(|error| miette::miette!("{error}"))?;
+            println!("{}", serde_json::to_string_pretty(&ack).unwrap_or_default());
+        }
+        Command::Pause => {
+            let ack = transport
+                .send_command(command(
+                    session_id,
+                    SessionCommandKind::Pause,
+                    serde_json::json!({}),
+                ))
+                .await
+                .map_err(|error| miette::miette!("{error}"))?;
+            println!("{}", serde_json::to_string_pretty(&ack).unwrap_or_default());
+        }
+        Command::Approve { approval_id } => {
+            let ack = transport
+                .send_command(command(
+                    session_id,
+                    SessionCommandKind::Approve,
+                    approval_payload(approval_id),
+                ))
+                .await
+                .map_err(|error| miette::miette!("{error}"))?;
+            println!("{}", serde_json::to_string_pretty(&ack).unwrap_or_default());
+        }
+        Command::Deny { approval_id } => {
+            let ack = transport
+                .send_command(command(
+                    session_id,
+                    SessionCommandKind::Deny,
+                    approval_payload(approval_id),
+                ))
+                .await
+                .map_err(|error| miette::miette!("{error}"))?;
+            println!("{}", serde_json::to_string_pretty(&ack).unwrap_or_default());
+        }
+        Command::Compact => {
+            let ack = transport
+                .send_command(command(
+                    session_id,
+                    SessionCommandKind::Compact,
                     serde_json::json!({}),
                 ))
                 .await
@@ -453,17 +544,150 @@ async fn main() -> miette::Result<()> {
                 );
             }
         },
+        Command::Memory { command: memory } => match memory {
+            MemoryCommand::List => {
+                let records = transport
+                    .query(RuntimeQuery {
+                        query_id: golutra_core::QueryId::new(),
+                        session_id,
+                        task_id: None,
+                        kind: RuntimeQueryKind::MemoryList,
+                        requester: ActorKind::Cli,
+                        cursor: None,
+                        timestamp: chrono::Utc::now(),
+                    })
+                    .await
+                    .map_err(|error| miette::miette!("{error}"))?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&records).unwrap_or_default()
+                );
+            }
+            MemoryCommand::Rollback { memory_id, reason } => {
+                let ack = transport
+                    .send_command(command(
+                        session_id,
+                        SessionCommandKind::MemoryRollback,
+                        serde_json::json!({
+                            "memory_id": memory_id,
+                            "reason": reason,
+                        }),
+                    ))
+                    .await
+                    .map_err(|error| miette::miette!("{error}"))?;
+                println!("{}", serde_json::to_string_pretty(&ack).unwrap_or_default());
+            }
+        },
+        Command::Eval {
+            command: evaluation,
+        } => match evaluation {
+            EvalCommand::Results => {
+                print_runtime_query(&transport, session_id, RuntimeQueryKind::EvaluationResults)
+                    .await?;
+            }
+            EvalCommand::Improvements => {
+                print_runtime_query(
+                    &transport,
+                    session_id,
+                    RuntimeQueryKind::ImprovementCandidates,
+                )
+                .await?;
+            }
+            EvalCommand::Candidates => {
+                print_runtime_query(
+                    &transport,
+                    session_id,
+                    RuntimeQueryKind::AutomationCandidates,
+                )
+                .await?;
+            }
+            EvalCommand::Regress { candidate_id } => {
+                print_command_ack(
+                    &transport,
+                    command(
+                        session_id,
+                        SessionCommandKind::RunRegression,
+                        serde_json::json!({"candidate_id": candidate_id}),
+                    ),
+                )
+                .await?;
+            }
+            EvalCommand::Apply { candidate_id } => {
+                print_command_ack(
+                    &transport,
+                    command(
+                        session_id,
+                        SessionCommandKind::ApplyCandidate,
+                        serde_json::json!({"candidate_id": candidate_id}),
+                    ),
+                )
+                .await?;
+            }
+            EvalCommand::Rollback {
+                candidate_id,
+                reason,
+            } => {
+                print_command_ack(
+                    &transport,
+                    command(
+                        session_id,
+                        SessionCommandKind::RollbackCandidate,
+                        serde_json::json!({
+                            "candidate_id": candidate_id,
+                            "reason": reason,
+                        }),
+                    ),
+                )
+                .await?;
+            }
+        },
     }
     Ok(())
 }
 
-fn provider_paths_for_cli(transport: &InProcessTransport) -> miette::Result<ProviderConfigPaths> {
+async fn print_runtime_query(
+    transport: &RuntimeTransport,
+    session_id: SessionId,
+    kind: RuntimeQueryKind,
+) -> miette::Result<()> {
+    let value = transport
+        .query(RuntimeQuery {
+            query_id: golutra_core::QueryId::new(),
+            session_id,
+            task_id: None,
+            kind,
+            requester: ActorKind::Cli,
+            cursor: None,
+            timestamp: chrono::Utc::now(),
+        })
+        .await
+        .map_err(|error| miette::miette!("{error}"))?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&value).unwrap_or_default()
+    );
+    Ok(())
+}
+
+async fn print_command_ack(
+    transport: &RuntimeTransport,
+    command: SessionCommand,
+) -> miette::Result<()> {
+    let ack = transport
+        .send_command(command)
+        .await
+        .map_err(|error| miette::miette!("{error}"))?;
+    println!("{}", serde_json::to_string_pretty(&ack).unwrap_or_default());
+    Ok(())
+}
+
+fn provider_paths_for_cli(transport: &RuntimeTransport) -> miette::Result<ProviderConfigPaths> {
     let workspace = provider_workspace_root_for_cli(transport)?;
     ProviderConfigPaths::for_workspace(workspace).map_err(|error| miette::miette!("{error}"))
 }
 
 fn provider_workspace_root_for_cli(
-    transport: &InProcessTransport,
+    transport: &RuntimeTransport,
 ) -> miette::Result<&std::path::Path> {
     transport
         .workspace_root()
@@ -471,14 +695,14 @@ fn provider_workspace_root_for_cli(
 }
 
 fn provider_env_for_cli(
-    transport: &InProcessTransport,
+    transport: &RuntimeTransport,
 ) -> miette::Result<golutra_config::ProviderRuntimeEnv> {
     let workspace = provider_workspace_root_for_cli(transport)?;
     load_provider_runtime_env(workspace).map_err(|error| miette::miette!("{error}"))
 }
 
 fn provider_onboarding_for_cli(
-    transport: &InProcessTransport,
+    transport: &RuntimeTransport,
 ) -> miette::Result<golutra_config::ProviderOnboardingState> {
     let workspace = provider_workspace_root_for_cli(transport)?;
     provider_onboarding_state(workspace).map_err(|error| miette::miette!("{error}"))
@@ -545,7 +769,7 @@ fn provider_error_config(error: String) -> golutra_llm::RedactedProviderConfig {
 
 fn parse_optional_thread_id(
     value: Option<&str>,
-    transport: &InProcessTransport,
+    transport: &RuntimeTransport,
 ) -> miette::Result<ThreadId> {
     value
         .map(parse_thread_id)
@@ -561,7 +785,7 @@ fn parse_thread_id(value: &str) -> miette::Result<ThreadId> {
 
 fn resolve_session_id(
     value: Option<&str>,
-    transport: &InProcessTransport,
+    transport: &RuntimeTransport,
 ) -> miette::Result<SessionId> {
     value
         .map(|value| {
@@ -592,8 +816,15 @@ fn command(
     }
 }
 
+fn approval_payload(approval_id: Option<String>) -> serde_json::Value {
+    approval_id.map_or_else(
+        || serde_json::json!({}),
+        |approval_id| serde_json::json!({"approval_id": approval_id}),
+    )
+}
+
 async fn wait_for_terminal_state(
-    transport: &InProcessTransport,
+    transport: &RuntimeTransport,
     session_id: SessionId,
 ) -> miette::Result<serde_json::Value> {
     let mut last_state = serde_json::Value::Null;
@@ -613,7 +844,9 @@ async fn wait_for_terminal_state(
         if state
             .get("task_status")
             .and_then(|value| serde_json::from_value::<TaskStatus>(value.clone()).ok())
-            .is_some_and(is_terminal_status)
+            .is_some_and(|status| {
+                is_terminal_status(status) || status == TaskStatus::WaitingApproval
+            })
         {
             return Ok(state);
         }
@@ -626,6 +859,10 @@ async fn wait_for_terminal_state(
 fn is_terminal_status(status: TaskStatus) -> bool {
     matches!(
         status,
-        TaskStatus::Completed | TaskStatus::Partial | TaskStatus::Failed | TaskStatus::Blocked
+        TaskStatus::Completed
+            | TaskStatus::Partial
+            | TaskStatus::Failed
+            | TaskStatus::Blocked
+            | TaskStatus::Cancelled
     )
 }

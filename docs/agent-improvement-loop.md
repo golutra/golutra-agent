@@ -7,9 +7,19 @@
 阶段边界说明：
 
 - 本文档描述的是完整改进闭环的目标态。
-- 第一阶段默认只做到 `deep PostTaskReview -> ImprovementCandidate -> 人工查看`。
-- `replay / regression / PromotionDecision` 是后续阶段重点。
+- 当前已做到 `deep PostTaskReview -> candidate -> durable replay -> regression -> PromotionDecision -> apply/rollback` 的受控最小闭环。
+- 当前 replay 复用 event/artifact facts，不重新执行 provider；完整 counterfactual replay 和跨版本 benchmark 仍是后续阶段重点。
 - “可自动晋升”是长期能力预留，不代表当前默认实现会自动 redeploy 或自动替换线上执行版本。
+
+## 当前实现边界
+
+截至 2026-07-10：
+
+- failed/partial trajectory 可生成 `ImprovementCandidate`、`BenchmarkPromotion`、`GeneratedTask` 和对应 `AutomationCandidate`；成功且有 evidence 的 trajectory 可生成 `SkillCandidate`。
+- 所有 GeneratedTask、Skill 和中高风险候选保持 `proposed`，当前没有自动改 prompt、policy、tool schema、runtime code 或 skill 文件的路径。
+- 只有低风险 benchmark candidate 在 clean regression 后可由 system reviewer approve；apply 只更新 workspace evaluation dataset 状态，不执行任意代码。
+- candidate 状态转换受约束，不能跳过 regression/promotion gate；apply 后可 rollback，原因和 applied version 会持久化。
+- `RuntimeGovernor` 在 provider/tool/result/completion 阶段执行确定性预算、风险和目标对齐检查，但不自动生成或部署改动。
 
 核心原则：
 
@@ -158,7 +168,7 @@ PromotionDecision
 
 ## 分阶段落地
 
-第一阶段：
+已完成的基础阶段：
 
 ```text
 失败任务
@@ -167,7 +177,7 @@ PromotionDecision
 -> 人工查看
 ```
 
-第二阶段：
+已完成的受控最小阶段：
 
 ```text
 ImprovementCandidate
@@ -176,7 +186,7 @@ ImprovementCandidate
 -> PromotionDecision
 ```
 
-第三阶段：
+后续完整自动化阶段：
 
 ```text
 低风险候选自动晋升

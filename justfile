@@ -16,6 +16,8 @@ check:
     cargo check --workspace
 
 schema:
+    cargo run -p golutra-protocol-fixtures --bin export_sdk_schema -- schemas/sdk-protocol.schema.json
+    npm run --prefix sdk/typescript generate
     cargo test -p golutra-protocol-fixtures schema_smoke -- --nocapture
 
 fixture:

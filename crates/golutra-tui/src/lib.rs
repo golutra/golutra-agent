@@ -55,6 +55,11 @@ pub enum SlashCommand {
     Status,
     Debug,
     Abort,
+    Pause,
+    Continue,
+    Approve,
+    Deny,
+    Compact,
     Clear,
     Quit,
 }
@@ -157,6 +162,31 @@ const TOP_LEVEL_SLASH_HINTS: &[SlashCommandHint] = &[
     SlashCommandHint {
         command: "/abort",
         description: "abort active task",
+        selection: SlashCommandSelection::Execute,
+    },
+    SlashCommandHint {
+        command: "/pause",
+        description: "pause active task",
+        selection: SlashCommandSelection::Execute,
+    },
+    SlashCommandHint {
+        command: "/continue",
+        description: "resume paused task",
+        selection: SlashCommandSelection::Execute,
+    },
+    SlashCommandHint {
+        command: "/approve",
+        description: "approve pending tool",
+        selection: SlashCommandSelection::Execute,
+    },
+    SlashCommandHint {
+        command: "/deny",
+        description: "deny pending tool",
+        selection: SlashCommandSelection::Execute,
+    },
+    SlashCommandHint {
+        command: "/compact",
+        description: "compact conversation history",
         selection: SlashCommandSelection::Execute,
     },
     SlashCommandHint {
@@ -290,6 +320,11 @@ pub fn parse_slash_input(input: &str) -> SlashInput {
         "/status" => SlashInput::Command(SlashCommand::Status),
         "/debug" => SlashInput::Command(SlashCommand::Debug),
         "/abort" => SlashInput::Command(SlashCommand::Abort),
+        "/pause" => SlashInput::Command(SlashCommand::Pause),
+        "/continue" => SlashInput::Command(SlashCommand::Continue),
+        "/approve" => SlashInput::Command(SlashCommand::Approve),
+        "/deny" => SlashInput::Command(SlashCommand::Deny),
+        "/compact" => SlashInput::Command(SlashCommand::Compact),
         "/clear" => SlashInput::Command(SlashCommand::Clear),
         "/quit" | "/exit" => SlashInput::Command(SlashCommand::Quit),
         other => SlashInput::Error(format!("unknown slash command `{other}`; try /help")),
