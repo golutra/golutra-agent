@@ -59,7 +59,7 @@ Frontend
 
 第一阶段推荐优先级：
 
-- `CLI + TUI + InProcessTransport`
+- `CLI + TUI + EmbeddedTransport`
 - `app-server + HttpSseTransport`
 - `SDK / Web attach`
 - `IDE attach`
@@ -189,8 +189,8 @@ trait RuntimeClient {
 
 推荐 transport 分层：
 
-- `InProcessTransport`：TUI / CLI 第一阶段首选。和 `RuntimeHost / RuntimeCore` 同进程，最简单、最省资源。
-- `HttpSseTransport`：Web / SDK / daemon 模式第一阶段首选。HTTP 发 command 和 query，SSE 接 event stream。
+- `EmbeddedTransport`：TUI / CLI 默认入口。和 `RuntimeHost / RuntimeCore` 同进程，但连接 `$GOLUTRA_HOME/state/runtime.sqlite`，不是临时 store。
+- `HttpSseTransport`：Web / SDK / 显式 daemon/remote 模式入口。先用 `/runtime/attach` 绑定 canonical cwd，HTTP 发 command/query，SSE 接 event stream。
 - `WebSocketTransport`：后续用于高频双向同步或远程协作，不作为第一阶段必做。
 - `IpcTransport`：后续用于 IDE companion、本地桌面端或侧车进程。
 
@@ -198,8 +198,8 @@ trait RuntimeClient {
 
 - transport 可以不同，但 `SessionCommand`、`RuntimeQuery`、`RuntimeEvent` 语义必须完全一致。
 - 一个 task 在 SDK 中运行时，TUI / Web attach 后应通过同一 client 语义查询到相同状态，并订阅到同一条流式输出。
-- daemon 只是 `RuntimeHost + HttpSseTransport` 的组合，不是新的任务接口体系。
-- `InProcessTransport` 不能退化成“每个入口各自创建一份 `sqlite::memory:` store”。它必须连接同一 `RuntimeHost`，否则 CLI、TUI、app-server 看到的 task 天然不一致。
+- daemon 只是用户级 `cwd -> RuntimeHost` registry + `HttpSseTransport`，不是新的任务接口体系，也不是每个 workspace 一个进程。
+- `EmbeddedTransport` 不能退化成 `sqlite::memory:`；它必须持有完整 `RuntimeHost` 并连接全局 durable store。不同 Embedded 进程共享历史，但 live task handle 只属于持有 session lease 的进程。
 - `subscribe` 的目标形态是 `cursor replay + live stream`。一次性返回历史事件只适合 smoke，不足以支撑 TUI、Web 或 SDK 观察运行中任务。
 - TUI 的复杂度应限制在输入、布局、渲染和 debug panel；任务排队、运行中输入、abort、approval、provider/tool loop 都归 `RuntimeHost`。
 
@@ -624,9 +624,9 @@ Extension
 8. 建 `golutra-context`：working summary、history 分层、compact boundary、token budget。
 9. 建 `golutra-verify`：验证结果结构化。
 10. 建 `golutra-protocol`：协议类型、schema、TS 类型生成。
-11. 建 `golutra-client`：`RuntimeClient`、`InProcessTransport`、query / subscribe 语义。
+11. 建 `golutra-client`：`RuntimeClient`、`EmbeddedTransport`、`HttpSseTransport`、query / subscribe 语义。
 12. 建 `golutra-cli`：薄 CLI 命令面。
-13. 建 `golutra-tui`：`crossterm + ratatui + Golutra 业务组件`，通过 `InProcessTransport` 访问 runtime。
+13. 建 `golutra-tui`：`crossterm + ratatui + Golutra 业务组件`，默认通过 `EmbeddedTransport` 访问 runtime。
 14. 建 `golutra-app-server`：HTTP/WebSocket/SSE 入口，先实现 `HttpSseTransport`，复用同一 runtime facts。
 15. 建 `golutra-test-client`：协议 fixture、transport 对拍、app-server smoke。
 16. 建 `golutra-otel`：先承载 `tracing` 查询和调试出口，OpenTelemetry 导出后续按需补充。

@@ -55,9 +55,10 @@ Golutra 不应照搬把明文 key 默认写入 workspace。推荐持久化分层
 | --- | --- | --- |
 | 全局 home | `GOLUTRA_HOME`，否则 `~/.golutra` | 用户配置、secret ref、provider catalog |
 | 全局 provider/auth 配置 | `$GOLUTRA_HOME/provider.json` | provider catalog、默认 selection、envKey、用户级 key/env map、脱敏 fingerprint |
-| workspace runtime | `<workspace>/.golutra/runtime.sqlite` | session/task/event/projection/thread index，不保存明文 secret |
-| session rollouts | `<workspace>/.golutra/sessions/YYYY/MM/DD/*.jsonl` 或 `$GOLUTRA_HOME/sessions/...` | append-only 历史，已脱敏 provider payload |
-| secrets | 当前为 `$GOLUTRA_HOME/provider.json.env`，未来可迁移 OS keychain 或 `$GOLUTRA_HOME/secrets.json` | 明文 key/token，仅 owner-only 权限；workspace 禁止 |
+| 全局 runtime facts | `$GOLUTRA_HOME/state/runtime.sqlite` | 所有 cwd 的 session/task/event/projection/thread index，不保存明文 secret |
+| cwd 分区状态 | `$GOLUTRA_HOME/state/workspaces/<cwd-hash>/` | checkpoint、memory、evaluation、task lock |
+| session rollouts | 未来 `$GOLUTRA_HOME/state/sessions/YYYY/MM/DD/*.jsonl` | append-only 历史，已脱敏 provider payload |
+| secrets | 当前为 owner-only `$GOLUTRA_HOME/provider.json` 的 `env` map，未来迁移 OS keychain/secretRef | 明文 key/token；项目目录禁止 |
 
 P1 可以先实现 env-api-key：用户输入 key 后，默认只写到 user-level provider 配置的 `env` 或 keychain；如果选择写入文件，必须提示保存位置，并保证 owner-only 权限和原子写。
 
@@ -165,8 +166,7 @@ WorkspaceId
 | `runtime_events` | 现有 event log，继续作为 runtime 事实 |
 | `thread_events` 或 rollout JSONL | append-only transcript/replay 历史 |
 | `thread_spawn_edges` | future multi-agent / fork / child agent 关系 |
-| `.golutra/default-thread` | 当前 workspace 最近活跃 thread，替代单一 default-session 心智 |
-| `.golutra/default-session` | 兼容旧入口，后续由 default-thread 派生 |
+| cwd 查询索引 | 从全局 `threads(workspace_root, recency_at)` 选择当前 cwd 最近 thread；无历史时不写 placeholder |
 
 当前实现采用轻量 conversation 层作为 rollout JSONL 前置方案：
 
@@ -216,8 +216,8 @@ tokens_used
 新增命令语义：
 
 ```bash
-golutra thread list [--workspace PATH] [--all-workspaces] [--provider ID] [--archived] [--cursor CURSOR]
-golutra resume [THREAD_ID] [--workspace PATH]
+golutra --cwd PATH thread list [--all-workspaces] [--provider ID] [--archived] [--cursor CURSOR]
+golutra --cwd PATH resume [THREAD_ID]
 golutra fork THREAD_ID [--from-turn TURN_ID]
 golutra tui --resume THREAD_ID
 golutra tui --picker
@@ -240,30 +240,35 @@ Fork 规则：
 
 ### 多工作区
 
-Golutra 当前 workspace SQLite 适合 P0，但多工作区需要全局索引：
+Golutra 当前直接使用一个全局事实库，不再维护“workspace DB + 全局二级 index”双写模型：
 
 ```text
-$GOLUTRA_HOME/index.sqlite
-  workspaces(workspace_id, canonical_path, last_seen_at, default_thread_id)
-  threads(thread_id, workspace_id, cwd, title, preview, recency_at, provider_id, model_id, archived_at)
+$GOLUTRA_HOME/state/runtime.sqlite
+  threads(thread_id, session_id, workspace_root, title, preview, recency_at, archived)
+  runtime_events / projections / artifacts
+
+$GOLUTRA_HOME/state/
+  session-locks / command-locks
+
+$GOLUTRA_HOME/state/workspaces/<cwd-hash>/
+  checkpoints / memory / evaluation
 ```
 
 原则：
 
-- workspace 内 `.golutra/runtime.sqlite` 仍是该 workspace 的事实来源。
-- `$GOLUTRA_HOME/index.sqlite` 只做跨工作区列表、最近使用、搜索入口和 repair 指针。
-- 每次 workspace runtime 写入 thread 元数据后，异步 upsert 到全局 index。
-- TUI resume picker 默认当前 workspace；按键切换 All workspaces。
-- 全局 index 失效时可以从各 workspace `.golutra/runtime.sqlite` 和 rollouts 重建。
+- canonical cwd 写入 thread 元数据，并作为执行权限与默认 resume 过滤边界。
+- CLI/TUI 默认只列当前 cwd；全局库允许后续直接增加 All workspaces 查询，不需要扫描项目目录。
+- cwd hash 只用于文件分区，用户可见身份和历史仍以 canonical cwd、ThreadId、SessionId 为准。
+- 项目删除或移动不会污染代码仓库；路径迁移与历史重绑定仍需单独设计。
 
 ### P1 落地顺序
 
-1. 增加 `golutra-config` provider user/workspace 配置读写，支持 owner-only 原子写。
+1. 增加 `golutra-config` 全局 user provider 配置读写，支持 owner-only 原子写。
 2. 增加 `ProviderInstallPlan` 和 `provider login/use/set-key` CLI。
 3. TUI 首次进入接 `ProviderOnboardingState`，支持 mock 跳过和 provider setup。
-4. 增加 `threads` 表、`default-thread`、`thread list/resume/fork` 最小命令。
+4. 增加全局 `threads` 表和按 cwd 的 `thread list/resume/fork` 最小命令。
 5. TUI 增加 resume picker：当前 workspace / all workspaces、resume / fork、预览 transcript。
-6. 增加 `$GOLUTRA_HOME/index.sqlite`，支持跨 workspace 最近 thread 列表。
+6. 使用 `$GOLUTRA_HOME/state/runtime.sqlite` 统一承载跨 cwd thread index。
 7. 将 app-server 协议扩展为 `thread/start`、`thread/list`、`thread/resume`、`thread/fork`，CLI/TUI/Web 统一消费。
 
 ### TUI slash command 层
@@ -298,11 +303,11 @@ TUI 输入框现在先经过 slash command parser：
 ## 当前差距
 
 - 当前 TUI 已有 qwen-code 风格 provider setup：Golutra API、Third-party Providers、Custom Provider、mock 分组选择；第三方内置 OpenAI、OpenRouter、DeepSeek、Qwen/DashScope compatible 和本地 OpenAI-compatible preset；OpenAI-compatible setup 已按 baseUrl -> API key -> model -> advanced config -> review -> install 顺序执行，review 会展示脱敏 `ProviderInstallPlan`、保存路径和同名 profile 覆盖提示；Custom Provider 会生成 `GOLUTRA_CUSTOM_PROVIDER_API_KEY_...` envKey；Anthropic/Gemini 等未实现 live adapter 的协议会被安装层拒绝保存为 ready provider；保存链路会先落盘后 probe，失败自动 rollback；还没有手动 envKey/secretRef 选择和 OAuth。
-- 当前 provider/auth 持久化已按 Codex 风格收敛为全局用户级 `$GOLUTRA_HOME/provider.json`；API key 写入 `env` map，profile 只保留 `api_key_env` 引用；workspace `.golutra` 只承载 runtime/session 状态，不再读取或写入 provider 覆盖；OS keychain、OAuth 和 secret-ref 还未实现。
-- 当前 `threads` 表、`.golutra/default-thread`、`golutra thread list`、`golutra resume [THREAD_ID]` 和 `golutra fork THREAD_ID` 已可用；fork 当前复制元数据并创建新 session，还未复制/截断 rollout JSONL 历史。
+- 当前 provider/auth 持久化已按 Codex 风格收敛为全局用户级 `$GOLUTRA_HOME/provider.json`；API key 写入 `env` map，profile 只保留 `api_key_env` 引用；项目 `.golutra` 不参与 provider 或 runtime 持久化；OS keychain、OAuth 和 secret-ref 还未实现。
+- 当前全局 `threads` 表、`golutra thread list`、`golutra resume [THREAD_ID]` 和 `golutra fork THREAD_ID` 已可用；默认按当前 canonical cwd 过滤，每个显式新 session 使用独立 thread 主键，daemon 重新 attach 会刷新最近 thread/session；fork 当前复制元数据并创建新 session，还未复制/截断 rollout JSONL 历史。
 - 当前完成任务会写入 `AssistantMessage`，`UserProjection.final_message` 和 TUI transcript 可在 resume 后恢复最终回复；下一轮 prompt 会携带当前 session 的压缩历史摘要。
-- 当前多工作区仍以 workspace SQLite 为事实来源；`$GOLUTRA_HOME/index.sqlite` 的跨 workspace 全局索引还未实现。
+- 当前全局 SQLite 已覆盖多 cwd 事实与索引；TUI 还没有 All workspaces 切换 UI。
 - 当前 TUI provider setup 直接写本地 provider config；后续应改为通过 RuntimeHost/config service 返回 `ProviderConfigured`、`ProviderProbeCompleted` 或 `ProviderAuthFailed`。
-- 当前 session 事实在 workspace SQLite，缺少 rollout JSONL 和跨 workspace index。
+- 当前 session 事实位于全局 SQLite，仍缺少 rollout JSONL 和路径迁移/rebind 工具。
 
 这些差距不影响当前 P0 mock/live OpenAI-compatible smoke，但会影响真实用户首次使用、恢复历史任务和多项目日常使用。

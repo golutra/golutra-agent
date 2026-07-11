@@ -1,5 +1,8 @@
 use async_trait::async_trait;
-use golutra_core::{ProviderContract, ProviderRequestId, ProviderResponseId, TaskId, TurnId};
+use futures_util::StreamExt;
+use golutra_core::{
+    ProviderContract, ProviderRequestId, ProviderResponseId, TaskId, ToolContract, TurnId,
+};
 pub use golutra_core::{ProviderUsage, UsageSource};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -23,6 +26,10 @@ const GEMINI_MODEL: &str = "GEMINI_MODEL";
 const GOOGLE_API_KEY: &str = "GOOGLE_API_KEY";
 const GOOGLE_MODEL: &str = "GOOGLE_MODEL";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+const MAX_PROVIDER_MESSAGE_BYTES: usize = 128 * 1024;
+const MAX_PROVIDER_TOOL_ARGUMENT_BYTES: usize = 256 * 1024;
+const MAX_PROVIDER_TOOL_CALL_ID_BYTES: usize = 256;
+const MAX_PROVIDER_TOOL_NAME_BYTES: usize = 128;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ProviderError {
@@ -50,7 +57,7 @@ pub struct ProviderRequest {
     pub provider_id: String,
     pub model_id: String,
     pub messages: Vec<ProviderMessage>,
-    pub tools: Vec<String>,
+    pub tools: Vec<ToolContract>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,6 +161,22 @@ impl ProviderGenerationConfig {
             && self.reasoning_effort.is_none()
             && self.context_window_size.is_none()
             && self.max_tokens.is_none()
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.context_window_size == Some(0) {
+            return Err("context_window_size must be greater than zero".to_owned());
+        }
+        if self.max_tokens == Some(0) {
+            return Err("max_tokens must be greater than zero".to_owned());
+        }
+        if let (Some(context_window), Some(max_tokens)) =
+            (self.context_window_size, self.max_tokens)
+            && max_tokens >= context_window
+        {
+            return Err("max_tokens must be smaller than context_window_size".to_owned());
+        }
+        Ok(())
     }
 }
 
@@ -412,24 +435,19 @@ impl OpenAiCompatibleProvider {
             base_url: normalize_openai_base_url(&base_url.into()),
             model_id: model_id.into(),
             generation_config: ProviderGenerationConfig::default(),
-            client: reqwest::Client::new(),
+            client: provider_http_client(),
         }
     }
 
     #[must_use]
     pub fn from_config(config: OpenAiCompatibleProviderConfig) -> Self {
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(120))
-            .build()
-            .expect("static reqwest client configuration is valid");
         Self {
             api_key: config.api_key,
             api_key_env: config.api_key_env,
             base_url: normalize_openai_base_url(&config.base_url),
             model_id: config.model_id,
             generation_config: config.generation_config,
-            client,
+            client: provider_http_client(),
         }
     }
 
@@ -461,11 +479,13 @@ impl OpenAiCompatibleProvider {
             .map(|(_, value)| value)
             .or_else(|| mapping.default_base_url.map(ToOwned::to_owned))
             .ok_or_else(|| missing_env_error(mapping.base_url))?;
+        let base_url = validate_openai_base_url(&base_url)
+            .map_err(|message| ProviderError::NotConfigured { message })?;
         let generation_config = generation_config_from_reader(&reader)?;
         Ok(OpenAiCompatibleProviderConfig {
             api_key,
             api_key_env,
-            base_url: normalize_openai_base_url(&base_url),
+            base_url,
             model_id,
             protocol,
             generation_config,
@@ -607,11 +627,12 @@ impl ConfiguredProvider {
     where
         F: Fn(&str) -> Option<String>,
     {
-        let protocol = selected_protocol_from_reader(&reader);
-        if protocol.is_none_or(|protocol| protocol == ProviderProtocol::Mock) {
+        let Some(protocol) = selected_protocol_from_reader(&reader) else {
+            return Ok(Self::Mock(Box::new(mock)));
+        };
+        if protocol == ProviderProtocol::Mock {
             return Ok(Self::Mock(Box::new(mock)));
         }
-        let protocol = protocol.expect("checked above");
         if protocol != ProviderProtocol::OpenAiCompatible {
             return Err(unsupported_protocol_error(protocol));
         }
@@ -659,8 +680,7 @@ impl ConfiguredProvider {
     where
         F: Fn(&str) -> Option<String>,
     {
-        let protocol =
-            selected_protocol_from_reader(&reader).unwrap_or(ProviderProtocol::OpenAiCompatible);
+        let protocol = selected_protocol_from_reader(&reader).unwrap_or(ProviderProtocol::Mock);
         if protocol == ProviderProtocol::Mock {
             return Ok(ProviderProbeResult {
                 provider_id: "mock".to_owned(),
@@ -895,92 +915,22 @@ fn openai_assistant_tool_call(tool_call: &ProviderToolCall) -> Value {
     })
 }
 
-fn openai_tool_schema(tool_name: &String) -> Value {
-    let (description, parameters) = match tool_name.as_str() {
-        "read_file" => (
-            "Read a UTF-8 text file from the current workspace.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Workspace-relative file path"}
-                },
-                "required": ["path"],
-                "additionalProperties": false
-            }),
-        ),
-        "write_file" => (
-            "Write UTF-8 text content to a workspace-relative file.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Workspace-relative file path"},
-                    "content": {"type": "string", "description": "Full file content to write"}
-                },
-                "required": ["path", "content"],
-                "additionalProperties": false
-            }),
-        ),
-        "edit_file" => (
-            "Replace the first exact text match in a workspace-relative file.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Workspace-relative file path"},
-                    "search": {"type": "string", "description": "Exact text to replace"},
-                    "replace": {"type": "string", "description": "Replacement text"}
-                },
-                "required": ["path", "search", "replace"],
-                "additionalProperties": false
-            }),
-        ),
-        "list_dir" => (
-            "List entries in a workspace-relative directory.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Workspace-relative directory path, defaults to ."}
-                },
-                "additionalProperties": false
-            }),
-        ),
-        "rg_search" => (
-            "Search workspace files with ripgrep.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "ripgrep search pattern"},
-                    "path": {"type": "string", "description": "Workspace-relative path, defaults to ."}
-                },
-                "required": ["pattern"],
-                "additionalProperties": false
-            }),
-        ),
-        "shell" => (
-            "Run a simple command without shell metacharacters in the workspace.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "Command and arguments, for example `cargo test -p golutra-llm`"},
-                    "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 30000}
-                },
-                "required": ["command"],
-                "additionalProperties": false
-            }),
-        ),
-        _ => (
-            "Golutra workspace tool.",
-            json!({
-                "type": "object",
-                "additionalProperties": true
-            }),
-        ),
+fn openai_tool_schema(contract: &ToolContract) -> Value {
+    let description = match contract.tool_name.as_str() {
+        "read_file" => "Read a UTF-8 text file from the current workspace.",
+        "write_file" => "Write UTF-8 text content to a workspace-relative file.",
+        "edit_file" => "Replace the first exact text match in a workspace-relative file.",
+        "list_dir" => "List entries in a workspace-relative directory.",
+        "rg_search" => "Search workspace files with ripgrep.",
+        "shell" => "Run a simple command without shell metacharacters in the workspace.",
+        _ => "Golutra workspace tool.",
     };
     json!({
         "type": "function",
         "function": {
-            "name": tool_name,
+            "name": contract.tool_name,
             "description": description,
-            "parameters": parameters
+            "parameters": contract.input_schema
         }
     })
 }
@@ -1008,13 +958,23 @@ fn provider_response_from_openai(
         .get("content")
         .and_then(Value::as_str)
         .filter(|content| !content.is_empty())
-        .map(|content| ProviderMessage {
-            role: ProviderRole::Assistant,
-            content: content.to_owned(),
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls: Vec::new(),
-        });
+        .map(|content| {
+            if content.len() > MAX_PROVIDER_MESSAGE_BYTES {
+                return Err(ProviderError::Malformed {
+                    message: format!(
+                        "assistant message exceeds {MAX_PROVIDER_MESSAGE_BYTES} byte limit"
+                    ),
+                });
+            }
+            Ok(ProviderMessage {
+                role: ProviderRole::Assistant,
+                content: content.to_owned(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+            })
+        })
+        .transpose()?;
     let tool_calls = message
         .get("tool_calls")
         .and_then(Value::as_array)
@@ -1068,19 +1028,45 @@ fn provider_tool_call_from_openai(value: &Value) -> Result<ProviderToolCall, Pro
                 message: format!("tool call arguments is invalid JSON: {error}"),
             })
         })?;
+    let serialized_argument_size = serde_json::to_vec(&arguments)
+        .map_err(|error| ProviderError::Malformed {
+            message: format!("tool call arguments could not be serialized: {error}"),
+        })?
+        .len();
+    if serialized_argument_size > MAX_PROVIDER_TOOL_ARGUMENT_BYTES {
+        return Err(ProviderError::Malformed {
+            message: format!(
+                "tool call arguments exceed {MAX_PROVIDER_TOOL_ARGUMENT_BYTES} byte limit"
+            ),
+        });
+    }
+    let tool_call_id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| ProviderError::Malformed {
+            message: "tool call has no non-empty id".to_owned(),
+        })?;
+    if tool_call_id.len() > MAX_PROVIDER_TOOL_CALL_ID_BYTES {
+        return Err(ProviderError::Malformed {
+            message: format!("tool call id exceeds {MAX_PROVIDER_TOOL_CALL_ID_BYTES} byte limit"),
+        });
+    }
+    let tool_name = function
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| ProviderError::Malformed {
+            message: "tool call function has no non-empty name".to_owned(),
+        })?;
+    if tool_name.len() > MAX_PROVIDER_TOOL_NAME_BYTES {
+        return Err(ProviderError::Malformed {
+            message: format!("tool name exceeds {MAX_PROVIDER_TOOL_NAME_BYTES} byte limit"),
+        });
+    }
     Ok(ProviderToolCall {
-        tool_call_id: value
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or("provider-tool-call")
-            .to_owned(),
-        tool_name: function
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ProviderError::Malformed {
-                message: "tool call function has no name".to_owned(),
-            })?
-            .to_owned(),
+        tool_call_id: tool_call_id.to_owned(),
+        tool_name: tool_name.to_owned(),
         arguments,
     })
 }
@@ -1135,6 +1121,14 @@ fn provider_transport_error(error: reqwest::Error) -> ProviderError {
     }
 }
 
+fn provider_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .expect("static reqwest client configuration is valid")
+}
+
 fn provider_http_error(status: reqwest::StatusCode, value: &Value) -> ProviderError {
     let message = provider_error_message(value);
     if status.is_server_error() {
@@ -1145,7 +1139,29 @@ fn provider_http_error(status: reqwest::StatusCode, value: &Value) -> ProviderEr
 }
 
 async fn response_json_or_error(response: reqwest::Response) -> Result<Value, ProviderError> {
-    let text = response.text().await.map_err(provider_transport_error)?;
+    const MAX_PROVIDER_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BYTES as u64)
+    {
+        return Err(ProviderError::Malformed {
+            message: format!("provider response exceeds {MAX_PROVIDER_RESPONSE_BYTES} byte limit"),
+        });
+    }
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(provider_transport_error)?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_PROVIDER_RESPONSE_BYTES {
+            return Err(ProviderError::Malformed {
+                message: format!(
+                    "provider response exceeds {MAX_PROVIDER_RESPONSE_BYTES} byte limit"
+                ),
+            });
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let text = String::from_utf8_lossy(&bytes);
     Ok(serde_json::from_str(&text).unwrap_or_else(|_| {
         json!({
             "error": {
@@ -1429,14 +1445,21 @@ where
     else {
         return Ok(ProviderGenerationConfig::default());
     };
-    serde_json::from_str(&value).map_err(|error| ProviderError::NotConfigured {
-        message: format!("{GOLUTRA_PROVIDER_GENERATION_CONFIG} must be valid JSON: {error}"),
-    })
+    let config: ProviderGenerationConfig =
+        serde_json::from_str(&value).map_err(|error| ProviderError::NotConfigured {
+            message: format!("{GOLUTRA_PROVIDER_GENERATION_CONFIG} must be valid JSON: {error}"),
+        })?;
+    config
+        .validate()
+        .map_err(|message| ProviderError::NotConfigured {
+            message: format!("{GOLUTRA_PROVIDER_GENERATION_CONFIG} is invalid: {message}"),
+        })?;
+    Ok(config)
 }
 
 fn apply_generation_config_to_openai_body(body: &mut Value, config: &ProviderGenerationConfig) {
     if config.enable_thinking {
-        body["extra_body"]["enable_thinking"] = Value::Bool(true);
+        body["enable_thinking"] = Value::Bool(true);
     }
     if let Some(reasoning_effort) = config.reasoning_effort {
         body["reasoning_effort"] = Value::String(reasoning_effort.as_wire_value().to_owned());
@@ -1464,6 +1487,40 @@ pub fn normalize_openai_base_url(value: &str) -> String {
     } else {
         format!("{without_slash}/v1")
     }
+}
+
+pub fn validate_openai_base_url(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("provider base URL cannot be empty".to_owned());
+    }
+    if let Some((scheme, _)) = value.split_once("://")
+        && !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https")
+    {
+        return Err("provider base URL must use http or https".to_owned());
+    }
+    let lower = value.to_ascii_lowercase();
+    if (lower.starts_with("http:") && !lower.starts_with("http://"))
+        || (lower.starts_with("https:") && !lower.starts_with("https://"))
+    {
+        return Err("provider base URL has an invalid HTTP scheme".to_owned());
+    }
+    let normalized = normalize_openai_base_url(value);
+    let parsed = reqwest::Url::parse(&normalized)
+        .map_err(|error| format!("provider base URL is invalid: {error}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("provider base URL must use http or https".to_owned());
+    }
+    if parsed.host_str().is_none() {
+        return Err("provider base URL must include a host".to_owned());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("provider base URL must not include user credentials".to_owned());
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("provider base URL must not include a query or fragment".to_owned());
+    }
+    Ok(normalized)
 }
 
 fn is_false(value: &bool) -> bool {
@@ -1529,6 +1586,10 @@ fn usage(input_tokens: u64, output_tokens: u64) -> ProviderUsage {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     use super::*;
 
@@ -1557,12 +1618,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unconfigured_provider_probe_matches_default_mock_resolution() {
+        let result = ConfiguredProvider::probe_from_reader(|_| None)
+            .await
+            .expect("default mock probe");
+
+        assert_eq!(result.provider_id, "mock");
+        assert_eq!(result.protocol, "in_memory");
+        assert_eq!(result.model_available, Some(true));
+    }
+
+    #[tokio::test]
+    async fn provider_response_rejects_oversized_content_length_before_buffering() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.expect("request");
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 16777217\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .expect("response");
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .expect("HTTP response");
+
+        let error = response_json_or_error(response)
+            .await
+            .expect_err("oversized response must be rejected");
+
+        assert!(matches!(error, ProviderError::Malformed { .. }));
+    }
+
+    #[tokio::test]
     async fn mock_provider_returns_tool_call() {
         let provider = MockProvider::tool_call("read_file", json!({"path": "README.md"}));
         let response = provider.complete(request()).await.expect("response");
 
         assert_eq!(response.finish_reason, ProviderFinishReason::ToolCalls);
         assert_eq!(response.tool_calls[0].tool_name, "read_file");
+    }
+
+    #[test]
+    fn openai_tool_parameters_come_from_the_runtime_tool_contract() {
+        let input_schema = json!({
+            "type": "object",
+            "properties": {"custom": {"type": "integer"}},
+            "required": ["custom"],
+            "additionalProperties": false
+        });
+        let contract = ToolContract {
+            tool_name: "custom_tool".to_owned(),
+            input_schema: input_schema.clone(),
+            output_schema: json!({}),
+            error_schema: json!({}),
+            side_effect_type: golutra_core::SideEffectType::None,
+            idempotency_key_policy: "not_required".to_owned(),
+            timeout_policy: "bounded".to_owned(),
+            cancellation_policy: "supported".to_owned(),
+            retry_policy: "none".to_owned(),
+            artifact_policy: "none".to_owned(),
+            permission_policy_ref: None,
+        };
+
+        let schema = openai_tool_schema(&contract);
+
+        assert_eq!(schema["function"]["parameters"], input_schema);
+    }
+
+    #[test]
+    fn openai_tool_call_requires_a_non_empty_provider_id() {
+        let error = provider_tool_call_from_openai(&json!({
+            "function": {
+                "name": "read_file",
+                "arguments": "{\"path\":\"README.md\"}"
+            }
+        }))
+        .expect_err("missing tool call id");
+
+        assert!(matches!(error, ProviderError::Malformed { .. }));
+        assert!(error.to_string().contains("non-empty id"));
+    }
+
+    #[test]
+    fn openai_tool_call_requires_a_non_empty_function_name() {
+        let error = provider_tool_call_from_openai(&json!({
+            "id": "call-1",
+            "function": {
+                "name": "",
+                "arguments": "{}"
+            }
+        }))
+        .expect_err("empty tool name");
+
+        assert!(matches!(error, ProviderError::Malformed { .. }));
+        assert!(error.to_string().contains("non-empty name"));
+    }
+
+    #[test]
+    fn openai_response_rejects_oversized_event_fields() {
+        let oversized_message = json!({
+            "choices": [{
+                "message": {"content": "x".repeat(MAX_PROVIDER_MESSAGE_BYTES + 1)},
+                "finish_reason": "stop"
+            }]
+        });
+        let error = provider_response_from_openai(oversized_message, TaskId::new(), TurnId::new())
+            .expect_err("oversized assistant message");
+        assert!(error.to_string().contains("assistant message exceeds"));
+
+        let error = provider_tool_call_from_openai(&json!({
+            "id": "call-1",
+            "function": {
+                "name": "x".repeat(MAX_PROVIDER_TOOL_NAME_BYTES + 1),
+                "arguments": "{}"
+            }
+        }))
+        .expect_err("oversized tool name");
+        assert!(error.to_string().contains("tool name exceeds"));
     }
 
     #[tokio::test]
@@ -1710,6 +1889,26 @@ mod tests {
     }
 
     #[test]
+    fn openai_base_url_validation_rejects_missing_hosts_and_unsafe_components() {
+        for invalid in [
+            "",
+            "file:///tmp/provider",
+            "https://user:secret@api.example.com/v1",
+            "https://api.example.com/v1?token=secret",
+            "https://api.example.com/v1#fragment",
+        ] {
+            assert!(
+                validate_openai_base_url(invalid).is_err(),
+                "{invalid} must be rejected"
+            );
+        }
+        assert_eq!(
+            validate_openai_base_url("api.golutra.cn").expect("bare host"),
+            "https://api.golutra.cn/v1"
+        );
+    }
+
+    #[test]
     fn openai_config_reads_golutra_env_first() {
         let config = OpenAiCompatibleProvider::config_from_env_reader(|key| match key {
             GOLUTRA_PROVIDER_API_KEY => Some("golutra-key".to_owned()),
@@ -1782,7 +1981,8 @@ mod tests {
         apply_generation_config_to_openai_body(&mut body, &config.generation_config);
 
         assert_eq!(config.generation_config.context_window_size, Some(128_000));
-        assert_eq!(body["extra_body"]["enable_thinking"], json!(true));
+        assert_eq!(body["enable_thinking"], json!(true));
+        assert!(body.get("extra_body").is_none());
         assert_eq!(body["reasoning_effort"], json!("high"));
         assert_eq!(body["max_tokens"], json!(512));
         assert!(body.get("context_window_size").is_none());
@@ -1830,18 +2030,6 @@ mod tests {
             Some("GOLUTRA_CUSTOM_PROVIDER_API_KEY_TEST")
         );
         assert!(config.api_key_configured);
-    }
-
-    #[test]
-    fn write_file_tool_schema_has_required_arguments() {
-        let schema = openai_tool_schema(&"write_file".to_owned());
-        let required = schema
-            .pointer("/function/parameters/required")
-            .and_then(Value::as_array)
-            .expect("required");
-
-        assert!(required.contains(&json!("path")));
-        assert!(required.contains(&json!("content")));
     }
 
     #[test]

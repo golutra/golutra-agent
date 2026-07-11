@@ -9,14 +9,14 @@
 
 ## 当前实现状态
 
-截至 2026-07-10，第一阶段硬契约已进入可运行链路：
+截至 2026-07-11，第一阶段硬契约已进入可运行链路：
 
-- `ToolContract` 使用 JSON Schema 校验输入；policy、workspace guard、approval、execution、artifact/evidence 顺序固定。
+- `ToolContract` 使用唯一的 JSON Schema 校验输入；必填 path/pattern/edit search 拒绝空串，校验错误隐藏实例值，summary、structured facts 和 raw output 在持久化前统一脱敏；policy、workspace guard、approval、execution、artifact/evidence 顺序固定。
 - shell 使用 `shlex` 解析结构化 argv，不经过 shell 解释器；policy 会阻断敏感路径、`find -exec/-delete`、`rg --pre` 等执行型参数，把 `sed -i`、`cargo run`、未知脚本等降为 Ask；执行器支持 timeout、`CancellationToken`、每管道 2 MiB 上限，并在 Unix 上终止整个进程组后排空管道。
-- `RuntimeHost` 保存 task handle、pending turn queue 和 durable command ack；pause/resume/abort 影响真实执行，不是 UI 标记。
-- `AgentLoop` 支持多轮 assistant/tool message、LoopGuard、有限 retry/fallback 和 verification-backed terminal state。
+- `RuntimeHost` 保存 task handle、pending turn queue 和 durable command ack；pause/resume/abort 影响真实执行，不是 UI 标记。终态 lane 拒绝控制转换；若 owner 已退出且新 host 成功取得 session lease，则先以 durable `TaskAborted` 回收孤儿状态，再把 `TurnQueued` 中尚未出现 `TurnStarted` 的输入转移到 recovery task。
+- `AgentLoop` 支持多轮 assistant/tool message、LoopGuard、有限 retry/fallback 和 verification-backed terminal state。初始或工具消息累积导致的 context overflow 会产生 `LoopGuardTriggered` 和 Blocked/AskUser `LoopDecision`，不会降级成笼统执行错误。
 - 文件工具在修改前捕获并持久化 before-image；checkpoint manifest 与 owner-only artifact blob 带 checksum、redaction 状态和 rollback metadata，持久化失败时不执行文件副作用。
-- app-server/SSE 与 in-process transport 使用同一 `SessionCommand`、`RuntimeQuery`、`RuntimeEvent` 语义；本地 daemon 在 transport auth 落地前仅允许 loopback，并校验 Host/Origin。event writer 串行化 sequence 最终分配、SQLite append 与 broadcast，保证 cursor 顺序。
+- app-server/SSE 与 Embedded transport 使用同一 `SessionCommand`、`RuntimeQuery`、`RuntimeEvent` 语义；用户级 daemon 通过 attachment 路由多个 cwd，在 transport auth 落地前仅允许 loopback并校验 Host/Origin。SQLite 在 event append 事务内原子分配全局 sequence，host 再按提交顺序 publish；command lease 与 durable ack 负责重试去重，但 command ack 与后续业务事件仍不是一个跨运行时事务。
 
 ## 核心原则
 
@@ -59,7 +59,6 @@ ToolContract
   retry_policy
   artifact_policy
   permission_policy_ref
-  sandbox_policy_ref
 ```
 
 最低要求：
@@ -207,7 +206,7 @@ LoopGuardContract
 
 - 同一工具连续确定性失败达到阈值后，必须改变策略、询问用户或 blocked。
 - provider 空回复只能有限恢复，恢复用的 synthetic message 不能进入长期历史。
-- context overflow 优先裁剪旧工具输出和低价值上下文；裁剪失败进入 `LoopDecision`。
+- context overflow 优先裁剪旧工具输出和低价值上下文；裁剪失败必须产生 `LoopGuardTriggered`，并进入 Blocked/AskUser `LoopDecision`。
 - max iteration 后必须产生 `stop_partial`、`stop_failed` 或 `blocked`，不能无声结束。
 - retry / fallback 的 token 和成本必须进入预算判断。
 

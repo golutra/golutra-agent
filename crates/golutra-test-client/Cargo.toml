@@ -13,4 +13,5 @@ golutra-core.workspace = true
 golutra-protocol.workspace = true
 miette.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 tokio.workspace = true

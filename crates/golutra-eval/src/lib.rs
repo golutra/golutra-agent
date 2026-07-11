@@ -1,16 +1,19 @@
 use std::{
-    fs::{self, OpenOptions},
-    io::Write,
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use golutra_core::{EvidenceId, TaskId, TaskStatus, VerificationRecord, VerificationResult};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
+
+const MAX_EVALUATION_STATE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -610,6 +613,8 @@ pub enum EvaluationError {
     },
     #[error("evaluation store invariant failed: {0}")]
     Invariant(String),
+    #[error("evaluation store limit exceeded: {0}")]
+    Limit(String),
 }
 
 impl EvaluationStore {
@@ -634,6 +639,7 @@ impl EvaluationStore {
             .state
             .lock()
             .map_err(|_| EvaluationError::LockPoisoned)?;
+        let _file_lock = self.acquire_file_lock()?;
         self.ensure_loaded(&mut state)?;
         Ok(state.data.clone())
     }
@@ -924,6 +930,7 @@ impl EvaluationStore {
             .state
             .lock()
             .map_err(|_| EvaluationError::LockPoisoned)?;
+        let _file_lock = self.acquire_file_lock()?;
         self.ensure_loaded(&mut state)?;
         let mut next = state.data.clone();
         let result = operation(&mut next)?;
@@ -933,16 +940,13 @@ impl EvaluationStore {
     }
 
     fn ensure_loaded(&self, state: &mut EvaluationStoreState) -> Result<(), EvaluationError> {
-        if state.loaded {
+        if self.path.is_none() && state.loaded {
             return Ok(());
         }
         state.data = match &self.path {
-            Some(path) => match fs::read(path) {
-                Ok(bytes) => serde_json::from_slice(&bytes)?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    EvaluationState::default()
-                }
-                Err(error) => return Err(EvaluationError::Io(error.to_string())),
+            Some(path) => match read_bounded_evaluation_file(path)? {
+                Some(bytes) => serde_json::from_slice(&bytes)?,
+                None => EvaluationState::default(),
             },
             None => EvaluationState::default(),
         };
@@ -950,7 +954,36 @@ impl EvaluationStore {
         Ok(())
     }
 
+    fn acquire_file_lock(&self) -> Result<Option<File>, EvaluationError> {
+        let Some(path) = &self.path else {
+            return Ok(None);
+        };
+        let parent = path.parent().ok_or_else(|| {
+            EvaluationError::Io(format!("evaluation path has no parent: {}", path.display()))
+        })?;
+        fs::create_dir_all(parent).map_err(|error| EvaluationError::Io(error.to_string()))?;
+        set_owner_only_evaluation_dir(parent)?;
+        let lock_path = path.with_extension("lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| EvaluationError::Io(error.to_string()))?;
+        set_owner_only_evaluation_file(&lock_path)?;
+        file.lock_exclusive()
+            .map_err(|error| EvaluationError::Io(error.to_string()))?;
+        Ok(Some(file))
+    }
+
     fn save(&self, data: &EvaluationState) -> Result<(), EvaluationError> {
+        let encoded = serde_json::to_vec_pretty(data)?;
+        if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > MAX_EVALUATION_STATE_BYTES {
+            return Err(EvaluationError::Limit(format!(
+                "serialized state exceeds {MAX_EVALUATION_STATE_BYTES} bytes"
+            )));
+        }
         let Some(path) = &self.path else {
             return Ok(());
         };
@@ -965,14 +998,61 @@ impl EvaluationStore {
             .write(true)
             .open(&temporary)
             .map_err(|error| EvaluationError::Io(error.to_string()))?;
-        file.write_all(&serde_json::to_vec_pretty(data)?)
+        file.write_all(&encoded)
             .map_err(|error| EvaluationError::Io(error.to_string()))?;
         file.sync_all()
             .map_err(|error| EvaluationError::Io(error.to_string()))?;
         set_owner_only_evaluation_file(&temporary)?;
         fs::rename(&temporary, path).map_err(|error| EvaluationError::Io(error.to_string()))?;
-        set_owner_only_evaluation_file(path)
+        set_owner_only_evaluation_file(path)?;
+        File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| EvaluationError::Io(error.to_string()))?;
+        if let Some(parent) = path.parent() {
+            sync_evaluation_directory(parent)?;
+        }
+        Ok(())
     }
+}
+
+fn read_bounded_evaluation_file(path: &Path) -> Result<Option<Vec<u8>>, EvaluationError> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(EvaluationError::Io(error.to_string())),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|error| EvaluationError::Io(error.to_string()))?;
+    if metadata.len() > MAX_EVALUATION_STATE_BYTES {
+        return Err(EvaluationError::Limit(format!(
+            "{} exceeds {MAX_EVALUATION_STATE_BYTES} bytes",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_EVALUATION_STATE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| EvaluationError::Io(error.to_string()))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_EVALUATION_STATE_BYTES {
+        return Err(EvaluationError::Limit(format!(
+            "{} grew beyond {MAX_EVALUATION_STATE_BYTES} bytes while reading",
+            path.display()
+        )));
+    }
+    Ok(Some(bytes))
+}
+
+#[cfg(unix)]
+fn sync_evaluation_directory(path: &Path) -> Result<(), EvaluationError> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| EvaluationError::Io(error.to_string()))
+}
+
+#[cfg(not(unix))]
+fn sync_evaluation_directory(_path: &Path) -> Result<(), EvaluationError> {
+    Ok(())
 }
 
 #[must_use]
@@ -1269,6 +1349,18 @@ mod tests {
     }
 
     #[test]
+    fn oversized_evaluation_state_is_rejected_before_deserialization() {
+        let directory = tempdir().expect("directory");
+        let path = directory.path().join("evaluation.json");
+        let file = fs::File::create(&path).expect("state file");
+        file.set_len(MAX_EVALUATION_STATE_BYTES + 1)
+            .expect("oversized fixture");
+        let store = EvaluationStore::new(path);
+
+        assert!(matches!(store.snapshot(), Err(EvaluationError::Limit(_))));
+    }
+
+    #[test]
     fn failed_task_generates_review_and_proposed_candidates() {
         let task_id = TaskId::new();
         let bundle = EvaluationRunner.evaluate_task(failed_input(task_id, EvidenceId::new()));
@@ -1330,6 +1422,35 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[test]
+    fn independent_evaluation_instances_refresh_before_writing() {
+        let directory = tempdir().expect("directory");
+        let path = directory.path().join("evaluation.json");
+        let first = EvaluationStore::new(&path);
+        let second = EvaluationStore::new(&path);
+        assert!(
+            second
+                .snapshot()
+                .expect("initial snapshot")
+                .results
+                .is_empty()
+        );
+
+        first
+            .record_task_evaluation(
+                EvaluationRunner.evaluate_task(failed_input(TaskId::new(), EvidenceId::new())),
+            )
+            .expect("first evaluation");
+        second
+            .record_task_evaluation(
+                EvaluationRunner.evaluate_task(failed_input(TaskId::new(), EvidenceId::new())),
+            )
+            .expect("second evaluation");
+
+        assert_eq!(first.snapshot().expect("shared snapshot").results.len(), 2);
+        assert!(path.with_extension("lock").exists());
     }
 
     #[test]

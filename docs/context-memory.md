@@ -16,7 +16,7 @@
 
 - `ContextBuilder` 按 contributor 构建 stable system prompt、canonical workspace environment context、会话摘要、project memory、evidence 和工具说明；provider request 前后分别记录 `TokenBudgetSnapshot` 与 `TokenUsageRecord`。
 - compact 是 durable command/event；后续 turn 会复用 compact summary，同一 session 的历史不会作为完整 transcript 无界回灌。
-- `MemoryStore` 持久化到 `<workspace>/.golutra/memory.json`，写入通过临时文件原子替换；文件 I/O 使用 `spawn_blocking`，不会阻塞 async runtime worker。Unix runtime 目录为 `0700`、memory 文件为 `0600`。
+- `MemoryStore` 按 canonical cwd hash 持久化到 `$GOLUTRA_HOME/state/workspaces/<cwd-hash>/memory.json`，写入通过跨进程文件锁和临时文件原子替换；文件 I/O 使用 `spawn_blocking`，不会阻塞 async runtime worker。Unix runtime 目录为 `0700`、memory/lock 文件为 `0600`。
 - 成功任务只能从 durable evidence 生成 project-scoped `MemoryCandidate`；promotion gate 检查 evidence、confidence、scope、敏感内容和 contradiction，失败或不安全候选不会写入 active memory。
 - 每轮 task 会记录 `MemoryRetrieved`，只有 active、未过期且与 query 相关的 project memory 才进入 context；完整 memory 记录不直接当作 prompt 历史。
 - `memory list` 和 `memory rollback` 已通过 CLI、HTTP transport 和 TypeScript SDK 暴露；rollback 保留事实记录和原因，不物理擦除审计历史。

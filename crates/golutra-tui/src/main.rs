@@ -1,6 +1,8 @@
 use std::{
+    collections::HashSet,
     io::{self, Stdout},
     path::PathBuf,
+    sync::LazyLock,
     time::{Duration, Instant},
 };
 
@@ -44,12 +46,19 @@ use ratatui::{
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+static TUI_ACTOR_ID: LazyLock<String> =
+    LazyLock::new(|| format!("golutra-tui-{}-{}", std::process::id(), Uuid::now_v7()));
+
 #[derive(Debug, Parser)]
 #[command(name = "golutra-tui")]
 #[command(about = "Golutra terminal chat UI")]
 struct Args {
     #[arg(long)]
-    workspace: Option<std::path::PathBuf>,
+    cwd: Option<std::path::PathBuf>,
+    #[arg(long, conflicts_with = "connect")]
+    daemon: bool,
+    #[arg(long, value_name = "URL", conflicts_with = "daemon")]
+    connect: Option<String>,
     #[arg(long, value_name = "UUID")]
     session_id: Option<String>,
     #[arg(long, value_name = "UUID")]
@@ -338,6 +347,15 @@ impl TuiApp {
         transport: &RuntimeTransport,
         command: SlashCommand,
     ) -> miette::Result<()> {
+        if has_active_task(self)
+            && matches!(
+                &command,
+                SlashCommand::New | SlashCommand::Resume { .. } | SlashCommand::Fork { .. }
+            )
+        {
+            self.status_message = "interrupt the active task before switching sessions".to_owned();
+            return Ok(());
+        }
         match command {
             SlashCommand::Auth(SlashAuthCommand::Setup) => {
                 self.open_auth_dialog();
@@ -365,7 +383,7 @@ impl TuiApp {
                     .await
                     .map_err(|error| miette::miette!("{error}"))?;
                 let lines = if threads.is_empty() {
-                    vec!["no threads in this workspace yet".to_owned()]
+                    vec!["no threads in this cwd yet".to_owned()]
                 } else {
                     threads
                         .into_iter()
@@ -444,6 +462,10 @@ impl TuiApp {
                     "debug timeline hidden".to_owned()
                 };
             }
+            SlashCommand::Takeover => {
+                self.send_control_command(transport, SessionCommandKind::Takeover)
+                    .await?;
+            }
             SlashCommand::Abort => {
                 self.abort(transport).await?;
             }
@@ -495,10 +517,7 @@ impl TuiApp {
             .collect::<Vec<_>>();
 
         if items.is_empty() {
-            self.push_system_message(
-                "Resume",
-                vec!["no sessions in this workspace yet".to_owned()],
-            );
+            self.push_system_message("Resume", vec!["no sessions in this cwd yet".to_owned()]);
             return Ok(());
         }
 
@@ -587,7 +606,7 @@ impl TuiApp {
                 self.open_auth_dialog();
             }
             SlashAuthCommand::Status => {
-                self.provider_message = provider_status_message(transport);
+                self.provider_message = provider_status_message();
                 self.push_system_message("Auth status", vec![self.provider_message.clone()]);
             }
             SlashAuthCommand::Protocols => {
@@ -605,8 +624,8 @@ impl TuiApp {
                 self.push_system_message("Auth protocols", lines);
             }
             SlashAuthCommand::Mock => {
-                apply_auth_mock(transport)?;
-                self.provider_message = provider_status_message(transport);
+                apply_auth_mock()?;
+                self.provider_message = provider_status_message();
                 self.auth_dialog = None;
                 self.push_system_message(
                     "Auth updated",
@@ -614,13 +633,13 @@ impl TuiApp {
                 );
             }
             SlashAuthCommand::Use { profile, scope } => {
-                let paths = provider_paths_for_tui(transport)?;
-                let workspace_root = provider_workspace_root_for_tui(transport)?;
+                let paths = provider_paths_for_tui()?;
+                let cwd = provider_cwd_for_tui(transport)?;
                 let selected_profile = profile.clone();
                 match update_provider_settings_verified(
                     &paths,
-                    workspace_root,
-                    move |user_settings, _workspace_settings| {
+                    cwd,
+                    move |user_settings| {
                         if provider_scope(scope) == ProviderConfigScope::Workspace {
                             return Err(golutra_config::ConfigError::Validation(
                                 "workspace provider config is no longer supported; use global user provider config"
@@ -634,7 +653,7 @@ impl TuiApp {
                 .await
                 {
                     Ok(()) => {
-                        self.provider_message = provider_status_message(transport);
+                        self.provider_message = provider_status_message();
                         self.push_system_message(
                             "Auth updated",
                             vec![format!("active provider profile set to {profile}")],
@@ -648,7 +667,7 @@ impl TuiApp {
             }
             SlashAuthCommand::Login(login) => match apply_auth_login(transport, login).await {
                 Ok(()) => {
-                    self.provider_message = provider_status_message(transport);
+                    self.provider_message = provider_status_message();
                     self.auth_dialog = None;
                     self.push_system_message(
                         "Auth updated",
@@ -1190,19 +1209,24 @@ impl ResumePickerState {
 
 #[tokio::main]
 async fn main() -> miette::Result<()> {
-    if golutra_app_server::run_embedded_daemon_if_requested().await? {
-        return Ok(());
-    }
     let args = Args::parse();
     let task_id = parse_task_id(args.task_id.as_deref())?;
-    let transport = match args.workspace.as_deref() {
-        Some(workspace) => RuntimeTransport::for_workspace(workspace).await,
-        None => RuntimeTransport::for_current_workspace().await,
+    let cwd = args
+        .cwd
+        .clone()
+        .map_or_else(std::env::current_dir, Ok)
+        .map_err(|error| miette::miette!("{error}"))?;
+    let transport = if let Some(base_url) = args.connect.clone() {
+        RuntimeTransport::connect(base_url, &cwd).await
+    } else if args.daemon {
+        RuntimeTransport::local_daemon(&cwd).await
+    } else {
+        RuntimeTransport::for_cwd(&cwd).await
     }
     .map_err(|error| miette::miette!("{error}"))?;
-    let (thread_id, session_id) = initial_session(args.session_id.as_deref(), &transport)?;
-    let provider_message = provider_status_message(&transport);
-    let auth_dialog = initial_auth_dialog(&transport);
+    let (thread_id, session_id) = initial_session(args.session_id.as_deref(), &transport).await?;
+    let provider_message = provider_status_message();
+    let auth_dialog = initial_auth_dialog();
     let mut terminal = setup_terminal()?;
     let result = run_app(
         &mut terminal,
@@ -1641,9 +1665,7 @@ async fn advance_auth_dialog(app: &mut TuiApp, transport: &RuntimeTransport) -> 
                 }
             }
             AuthDialogStep::AdvancedConfig => {
-                match validate_generation_config(dialog)
-                    .and_then(|_| build_auth_review(dialog, transport))
-                {
+                match validate_generation_config(dialog).and_then(|_| build_auth_review(dialog)) {
                     Ok(review) => {
                         dialog.review = Some(review);
                         dialog.step = AuthDialogStep::Review;
@@ -1667,14 +1689,14 @@ async fn advance_auth_dialog(app: &mut TuiApp, transport: &RuntimeTransport) -> 
     match action {
         AuthAdvanceAction::None => {}
         AuthAdvanceAction::SaveMock => {
-            apply_auth_mock(transport)?;
-            app.provider_message = provider_status_message(transport);
+            apply_auth_mock()?;
+            app.provider_message = provider_status_message();
             app.auth_dialog = None;
             app.status_message = "using mock provider".to_owned();
         }
         AuthAdvanceAction::SaveOpenAiCompatible(login) => {
             apply_auth_login(transport, login).await?;
-            app.provider_message = provider_status_message(transport);
+            app.provider_message = provider_status_message();
             app.auth_dialog = None;
             app.status_message = "provider connected".to_owned();
         }
@@ -2555,7 +2577,7 @@ fn transcript_items(app: &TuiApp) -> Vec<TranscriptItem> {
         items.push(TranscriptItem {
             role: TranscriptRole::System,
             title: "Connecting".to_owned(),
-            body: vec!["loading workspace runtime state".to_owned()],
+            body: vec!["loading runtime state".to_owned()],
         });
     }
 
@@ -2603,14 +2625,6 @@ fn transcript_scroll_status(scroll_offset: usize) -> String {
     }
 }
 
-#[derive(Debug, Default)]
-struct TranscriptTurn {
-    task_id: Option<TaskId>,
-    user: Option<TranscriptItem>,
-    status: Vec<TranscriptItem>,
-    assistant: Vec<TranscriptItem>,
-}
-
 fn event_transcript_items(events: &[Value]) -> Vec<TranscriptItem> {
     let mut typed_events = events
         .iter()
@@ -2618,65 +2632,34 @@ fn event_transcript_items(events: &[Value]) -> Vec<TranscriptItem> {
         .collect::<Vec<_>>();
     typed_events.sort_by_key(|event| event.sequence_no);
 
-    let mut turns = Vec::<TranscriptTurn>::new();
+    let mut items = Vec::new();
+    let mut visible_user_turns = HashSet::new();
     for event in typed_events {
         match event.event_type {
-            RuntimeEventType::TaskCreated => {
-                let mut turn = TranscriptTurn {
-                    task_id: event.task_id,
-                    ..TranscriptTurn::default()
-                };
-                turn.user = task_created_transcript_item(&event);
-                turns.push(turn);
+            RuntimeEventType::TaskCreated | RuntimeEventType::TurnQueued => {
+                let is_new_turn = event
+                    .turn_id
+                    .is_none_or(|turn_id| visible_user_turns.insert(turn_id));
+                if is_new_turn && let Some(item) = user_event_transcript_item(&event) {
+                    items.push(item);
+                }
             }
             RuntimeEventType::AssistantMessage => {
                 if let Some(item) = assistant_event_transcript_item(&event) {
-                    ensure_transcript_turn(&mut turns, event.task_id)
-                        .assistant
-                        .push(item);
+                    items.push(item);
                 }
             }
             _ => {
                 if let Some(item) = status_event_transcript_item(&event) {
-                    ensure_transcript_turn(&mut turns, event.task_id)
-                        .status
-                        .push(item);
+                    items.push(item);
                 }
             }
         }
     }
-
-    turns
-        .into_iter()
-        .flat_map(|turn| {
-            let mut items = Vec::new();
-            if let Some(user) = turn.user {
-                items.push(user);
-            }
-            items.extend(turn.status);
-            items.extend(turn.assistant);
-            items
-        })
-        .collect()
+    items
 }
 
-fn ensure_transcript_turn(
-    turns: &mut Vec<TranscriptTurn>,
-    task_id: Option<TaskId>,
-) -> &mut TranscriptTurn {
-    if let Some(task_id) = task_id
-        && let Some(index) = turns.iter().position(|turn| turn.task_id == Some(task_id))
-    {
-        return &mut turns[index];
-    }
-    turns.push(TranscriptTurn {
-        task_id,
-        ..TranscriptTurn::default()
-    });
-    turns.last_mut().expect("turn was just inserted")
-}
-
-fn task_created_transcript_item(event: &RuntimeEvent) -> Option<TranscriptItem> {
+fn user_event_transcript_item(event: &RuntimeEvent) -> Option<TranscriptItem> {
     event
         .payload
         .get("payload")
@@ -2704,6 +2687,36 @@ fn assistant_event_transcript_item(event: &RuntimeEvent) -> Option<TranscriptIte
 }
 
 fn status_event_transcript_item(event: &RuntimeEvent) -> Option<TranscriptItem> {
+    if event.event_type == RuntimeEventType::ApprovalRequested {
+        let request = event.payload.get("request")?;
+        let tool_name = request
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .unwrap_or("tool");
+        let resource = request
+            .get("resource")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown resource");
+        let reason = request
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("explicit approval is required");
+        return Some(TranscriptItem {
+            role: TranscriptRole::Status,
+            title: "Approval required".to_owned(),
+            body: vec![format!("{tool_name}: {resource}"), reason.to_owned()],
+        });
+    }
+    if event.event_type == RuntimeEventType::TaskCompleted
+        && event
+            .payload
+            .get("status")
+            .cloned()
+            .and_then(|status| serde_json::from_value::<golutra_core::TaskStatus>(status).ok())
+            == Some(golutra_core::TaskStatus::Completed)
+    {
+        return None;
+    }
     let title = event_status_title(event.event_type)?;
     let summary = event_summary(event)?;
     if event.event_type == RuntimeEventType::LoopDecided
@@ -2724,7 +2737,7 @@ fn event_status_title(event_type: RuntimeEventType) -> Option<&'static str> {
         RuntimeEventType::ToolCompleted => Some("Tool Completed"),
         RuntimeEventType::TaskCompleted => Some("Task Completed"),
         RuntimeEventType::CommandRejected => Some("Command Rejected"),
-        RuntimeEventType::BusyPolicyDecided => Some("Busy Policy Decided"),
+        RuntimeEventType::ControllerChanged => Some("Controller Changed"),
         RuntimeEventType::LoopDecided => Some("Loop Decided"),
         _ => None,
     }
@@ -2795,13 +2808,6 @@ fn projection_items(projection: &UserProjection) -> Vec<TranscriptItem> {
 
 fn projection_overlay_items(projection: &UserProjection) -> Vec<TranscriptItem> {
     let mut items = Vec::new();
-    if let Some(pending_approval) = &projection.pending_approval {
-        items.push(TranscriptItem {
-            role: TranscriptRole::Status,
-            title: "Approval required".to_owned(),
-            body: vec![pending_approval.to_owned()],
-        });
-    }
     if !projection.residual_risks.is_empty() {
         items.push(TranscriptItem {
             role: TranscriptRole::Status,
@@ -2813,11 +2819,10 @@ fn projection_overlay_items(projection: &UserProjection) -> Vec<TranscriptItem> 
 }
 
 fn significant_step(step: &VisibleStep) -> bool {
-    matches!(
-        step.label.as_str(),
-        "ToolCompleted" | "TaskCompleted" | "CommandRejected" | "BusyPolicyDecided"
-    ) || (step.label == "LoopDecided"
-        && (step.summary.contains("failed") || step.summary.contains("error")))
+    matches!(step.label.as_str(), "ToolCompleted" | "CommandRejected")
+        || (step.label == "TaskCompleted" && step.status != "Completed")
+        || (step.label == "LoopDecided"
+            && (step.summary.contains("failed") || step.summary.contains("error")))
 }
 
 fn step_item(step: &VisibleStep) -> TranscriptItem {
@@ -3007,14 +3012,14 @@ fn session_command(
         idempotency_key: CommandId::new().to_string(),
         actor: Actor {
             kind: ActorKind::Tui,
-            id: "golutra-tui".to_owned(),
+            id: TUI_ACTOR_ID.as_str().to_owned(),
         },
         payload,
         timestamp: chrono::Utc::now(),
     }
 }
 
-fn initial_session(
+async fn initial_session(
     value: Option<&str>,
     transport: &RuntimeTransport,
 ) -> miette::Result<(ThreadId, SessionId)> {
@@ -3022,14 +3027,18 @@ fn initial_session(
         let session_id = Uuid::parse_str(value)
             .map(SessionId)
             .map_err(|error| miette::miette!("invalid session id: {error}"))?;
-        return Ok((transport.default_thread_id(), session_id));
+        let thread_id = transport
+            .thread_for_session(session_id)
+            .await
+            .map_err(|error| miette::miette!("{error}"))?
+            .map_or_else(ThreadId::new, |thread| thread.thread_id);
+        return Ok((thread_id, session_id));
     }
     Ok((ThreadId::new(), SessionId::new()))
 }
 
-fn initial_auth_dialog(transport: &RuntimeTransport) -> Option<AuthDialogState> {
-    let workspace_root = transport.workspace_root()?;
-    match provider_onboarding_state(workspace_root) {
+fn initial_auth_dialog() -> Option<AuthDialogState> {
+    match provider_onboarding_state() {
         Ok(state) if state.configured => None,
         Ok(_) | Err(_) => Some(AuthDialogState::new()),
     }
@@ -3051,17 +3060,14 @@ fn parse_thread_id(value: &str) -> miette::Result<ThreadId> {
         .map_err(|error: uuid::Error| miette::miette!("invalid thread id: {error}"))
 }
 
-fn provider_paths_for_tui(transport: &RuntimeTransport) -> miette::Result<ProviderConfigPaths> {
-    let workspace = provider_workspace_root_for_tui(transport)?;
-    ProviderConfigPaths::for_workspace(workspace).map_err(|error| miette::miette!("{error}"))
+fn provider_paths_for_tui() -> miette::Result<ProviderConfigPaths> {
+    ProviderConfigPaths::global().map_err(|error| miette::miette!("{error}"))
 }
 
-fn provider_workspace_root_for_tui(
-    transport: &RuntimeTransport,
-) -> miette::Result<&std::path::Path> {
+fn provider_cwd_for_tui(transport: &RuntimeTransport) -> miette::Result<&std::path::Path> {
     transport
-        .workspace_root()
-        .ok_or_else(|| miette::miette!("provider config requires a workspace"))
+        .cwd()
+        .ok_or_else(|| miette::miette!("provider config requires a cwd"))
 }
 
 fn provider_scope(scope: AuthConfigScope) -> ProviderConfigScope {
@@ -3093,13 +3099,10 @@ fn auth_login(dialog: &AuthDialogState) -> Result<OpenAiCompatibleLogin, String>
     })
 }
 
-fn build_auth_review(
-    dialog: &AuthDialogState,
-    transport: &RuntimeTransport,
-) -> Result<AuthReview, String> {
+fn build_auth_review(dialog: &AuthDialogState) -> Result<AuthReview, String> {
     let provider = dialog.provider.unwrap_or(CUSTOM_PROVIDER_PRESET);
     let login = auth_login(dialog)?;
-    let paths = provider_paths_for_tui(transport).map_err(|error| error.to_string())?;
+    let paths = provider_paths_for_tui().map_err(|error| error.to_string())?;
     let scope = provider_scope(login.scope);
     let config_path = paths.user_config.clone();
     let settings = ProviderSettings::load(&config_path).map_err(|error| error.to_string())?;
@@ -3188,8 +3191,8 @@ async fn apply_auth_login(
     transport: &RuntimeTransport,
     login: OpenAiCompatibleLogin,
 ) -> miette::Result<()> {
-    let paths = provider_paths_for_tui(transport)?;
-    let workspace_root = provider_workspace_root_for_tui(transport)?;
+    let paths = provider_paths_for_tui()?;
+    let cwd = provider_cwd_for_tui(transport)?;
     let scope = provider_scope(login.scope);
     let mut profile = ProviderProfile::live_profile(
         login.profile,
@@ -3203,7 +3206,7 @@ async fn apply_auth_login(
     profile.generation_config = login.generation_config;
     apply_provider_install_plan_verified(
         &paths,
-        workspace_root,
+        cwd,
         &ProviderInstallPlan {
             scope,
             profile,
@@ -3294,8 +3297,8 @@ fn generation_config_summary(config: Option<&ProviderGenerationConfig>) -> Strin
     }
 }
 
-fn apply_auth_mock(transport: &RuntimeTransport) -> miette::Result<()> {
-    let paths = provider_paths_for_tui(transport)?;
+fn apply_auth_mock() -> miette::Result<()> {
+    let paths = provider_paths_for_tui()?;
     ProviderInstallPlan {
         scope: ProviderConfigScope::User,
         profile: ProviderProfile::mock(),
@@ -3308,9 +3311,9 @@ fn apply_auth_mock(transport: &RuntimeTransport) -> miette::Result<()> {
 fn slash_help_lines() -> Vec<String> {
     vec![
         "/new  start a new session".to_owned(),
-        "/resume  open current workspace session list".to_owned(),
-        "/resume <thread-id>  resume a specific current-workspace thread".to_owned(),
-        "/threads [limit]  list recent workspace threads".to_owned(),
+        "/resume  open current cwd session list".to_owned(),
+        "/resume <thread-id>  resume a specific current-cwd thread".to_owned(),
+        "/threads [limit]  list recent threads for this cwd".to_owned(),
         "/fork <thread-id>  fork a thread and switch to it".to_owned(),
         "/auth status  show provider onboarding state".to_owned(),
         "/auth setup  open provider setup".to_owned(),
@@ -3331,11 +3334,8 @@ fn slash_help_lines() -> Vec<String> {
     ]
 }
 
-fn provider_status_message(transport: &RuntimeTransport) -> String {
-    let Some(workspace_root) = transport.workspace_root() else {
-        return "workspace config unavailable".to_owned();
-    };
-    match provider_onboarding_state(workspace_root) {
+fn provider_status_message() -> String {
+    match provider_onboarding_state() {
         Ok(state) if state.configured => {
             let profile = state
                 .active_profile
@@ -3394,7 +3394,9 @@ mod tests {
     #[tokio::test]
     async fn initial_session_without_argument_starts_new_thread_and_session() {
         let transport = RuntimeTransport::in_memory().await.expect("transport");
-        let (thread_id, session_id) = initial_session(None, &transport).expect("initial session");
+        let (thread_id, session_id) = initial_session(None, &transport)
+            .await
+            .expect("initial session");
 
         assert_ne!(thread_id, transport.default_thread_id());
         assert_ne!(session_id, transport.default_session_id());
@@ -3406,26 +3408,46 @@ mod tests {
         let explicit_session_id = SessionId::new();
         let (thread_id, session_id) =
             initial_session(Some(&explicit_session_id.to_string()), &transport)
+                .await
                 .expect("initial session");
 
-        assert_eq!(thread_id, transport.default_thread_id());
+        assert_ne!(thread_id, transport.default_thread_id());
         assert_eq!(session_id, explicit_session_id);
     }
 
     #[tokio::test]
-    async fn initial_auth_dialog_opens_without_provider_config() {
-        let dir = tempfile::tempdir().expect("dir");
-        let home = tempfile::tempdir().expect("home");
-        let transport = RuntimeTransport::for_workspace(dir.path())
+    async fn initial_session_resolves_the_thread_owned_by_an_existing_session() {
+        let transport = RuntimeTransport::in_memory().await.expect("transport");
+        let session_id = SessionId::new();
+        let thread_id = ThreadId::new();
+        transport
+            .send_command(session_command(
+                session_id,
+                SessionCommandKind::Prompt,
+                json!({
+                    "prompt": "existing session",
+                    "_thread_id": thread_id.to_string(),
+                }),
+            ))
             .await
-            .expect("transport");
+            .expect("prompt");
+
+        let resolved = initial_session(Some(&session_id.to_string()), &transport)
+            .await
+            .expect("initial session");
+
+        assert_eq!(resolved, (thread_id, session_id));
+    }
+
+    #[tokio::test]
+    async fn initial_auth_dialog_opens_without_provider_config() {
+        let home = tempfile::tempdir().expect("home");
         let _guard = env_lock_guard().await;
         let previous_home = std::env::var("GOLUTRA_HOME").ok();
         unsafe {
             std::env::set_var("GOLUTRA_HOME", home.path());
         }
-
-        assert!(initial_auth_dialog(&transport).is_some());
+        assert!(initial_auth_dialog().is_some());
         match previous_home {
             Some(value) => unsafe {
                 std::env::set_var("GOLUTRA_HOME", value);
@@ -3440,20 +3462,20 @@ mod tests {
     async fn auth_dialog_mock_choice_persists_global_provider() {
         let dir = tempfile::tempdir().expect("dir");
         let home = tempfile::tempdir().expect("home");
-        let transport = RuntimeTransport::for_workspace(dir.path())
-            .await
-            .expect("transport");
         let _guard = env_lock_guard().await;
         let previous_home = std::env::var("GOLUTRA_HOME").ok();
         unsafe {
             std::env::set_var("GOLUTRA_HOME", home.path());
         }
+        let transport = RuntimeTransport::for_cwd(dir.path())
+            .await
+            .expect("transport");
         let mut app = TuiApp::new(
             ThreadId::new(),
             SessionId::new(),
             None,
             false,
-            provider_status_message(&transport),
+            provider_status_message(),
             Some(AuthDialogState::new()),
         );
         let dialog = app.auth_dialog.as_mut().expect("dialog");
@@ -3464,7 +3486,7 @@ mod tests {
         result.expect("advance");
         assert!(app.auth_dialog.is_none());
         assert_eq!(app.provider_message, "ready (mock)");
-        assert!(initial_auth_dialog(&transport).is_none());
+        assert!(initial_auth_dialog().is_none());
         let settings = ProviderSettings::load(home.path().join("provider.json")).expect("settings");
         assert_eq!(
             settings.active_profile().expect("profile").protocol,
@@ -3486,20 +3508,20 @@ mod tests {
         let dir = tempfile::tempdir().expect("dir");
         let home = tempfile::tempdir().expect("home");
         let base_url = spawn_probe_server(r#"{"data":[{"id":"qwen-coder"}]}"#).await;
-        let transport = RuntimeTransport::for_workspace(dir.path())
-            .await
-            .expect("transport");
         let _guard = env_lock_guard().await;
         let previous_home = std::env::var("GOLUTRA_HOME").ok();
         unsafe {
             std::env::set_var("GOLUTRA_HOME", home.path());
         }
+        let transport = RuntimeTransport::for_cwd(dir.path())
+            .await
+            .expect("transport");
         let mut app = TuiApp::new(
             ThreadId::new(),
             SessionId::new(),
             None,
             false,
-            provider_status_message(&transport),
+            provider_status_message(),
             Some(AuthDialogState::new()),
         );
         {
@@ -3566,16 +3588,13 @@ mod tests {
 
     #[tokio::test]
     async fn auth_dialog_base_url_requires_http_scheme() {
-        let dir = tempfile::tempdir().expect("dir");
-        let transport = RuntimeTransport::for_workspace(dir.path())
-            .await
-            .expect("transport");
+        let transport = RuntimeTransport::in_memory().await.expect("transport");
         let mut app = TuiApp::new(
             ThreadId::new(),
             SessionId::new(),
             None,
             false,
-            provider_status_message(&transport),
+            provider_status_message(),
             Some(AuthDialogState::new()),
         );
         {
@@ -3681,17 +3700,13 @@ mod tests {
 
     #[tokio::test]
     async fn auth_review_marks_existing_profile_updates() {
-        let dir = tempfile::tempdir().expect("dir");
         let home = tempfile::tempdir().expect("home");
-        let transport = RuntimeTransport::for_workspace(dir.path())
-            .await
-            .expect("transport");
         let _guard = env_lock_guard().await;
         let previous_home = std::env::var("GOLUTRA_HOME").ok();
         unsafe {
             std::env::set_var("GOLUTRA_HOME", home.path());
         }
-        let paths = provider_paths_for_tui(&transport).expect("paths");
+        let paths = provider_paths_for_tui().expect("paths");
         ProviderInstallPlan {
             scope: ProviderConfigScope::User,
             profile: ProviderProfile::openai_compatible(
@@ -3711,7 +3726,7 @@ mod tests {
         dialog.model = "qwen-coder".to_owned();
         dialog.api_key = "test-key".to_owned();
 
-        let review = build_auth_review(&dialog, &transport).expect("review");
+        let review = build_auth_review(&dialog).expect("review");
         match previous_home {
             Some(value) => unsafe {
                 std::env::set_var("GOLUTRA_HOME", value);
@@ -3729,11 +3744,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_review_custom_provider_uses_derived_env_key() {
-        let dir = tempfile::tempdir().expect("dir");
         let home = tempfile::tempdir().expect("home");
-        let transport = RuntimeTransport::for_workspace(dir.path())
-            .await
-            .expect("transport");
         let _guard = env_lock_guard().await;
         let previous_home = std::env::var("GOLUTRA_HOME").ok();
         unsafe {
@@ -3746,7 +3757,7 @@ mod tests {
         dialog.model = "gpt-5.5".to_owned();
         dialog.api_key = "test-key".to_owned();
 
-        let review = build_auth_review(&dialog, &transport).expect("review");
+        let review = build_auth_review(&dialog).expect("review");
 
         match previous_home {
             Some(value) => unsafe {
@@ -3771,11 +3782,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_review_includes_generation_config() {
-        let dir = tempfile::tempdir().expect("dir");
         let home = tempfile::tempdir().expect("home");
-        let transport = RuntimeTransport::for_workspace(dir.path())
-            .await
-            .expect("transport");
         let _guard = env_lock_guard().await;
         let previous_home = std::env::var("GOLUTRA_HOME").ok();
         unsafe {
@@ -3792,7 +3799,7 @@ mod tests {
         dialog.context_window_size = "128000".to_owned();
         dialog.max_tokens = "512".to_owned();
 
-        let review = build_auth_review(&dialog, &transport).expect("review");
+        let review = build_auth_review(&dialog).expect("review");
 
         match previous_home {
             Some(value) => unsafe {
@@ -3819,14 +3826,14 @@ mod tests {
     async fn slash_auth_login_rejects_catalog_only_protocol_without_persisting() {
         let dir = tempfile::tempdir().expect("dir");
         let home = tempfile::tempdir().expect("home");
-        let transport = RuntimeTransport::for_workspace(dir.path())
-            .await
-            .expect("transport");
         let _guard = env_lock_guard().await;
         let previous_home = std::env::var("GOLUTRA_HOME").ok();
         unsafe {
             std::env::set_var("GOLUTRA_HOME", home.path());
         }
+        let transport = RuntimeTransport::for_cwd(dir.path())
+            .await
+            .expect("transport");
         let login = OpenAiCompatibleLogin {
             profile: "anthropic".to_owned(),
             protocol: ProviderProtocol::Anthropic,
@@ -3841,7 +3848,7 @@ mod tests {
         let error = apply_auth_login(&transport, login)
             .await
             .expect_err("unsupported protocol rejected");
-        let paths = provider_paths_for_tui(&transport).expect("paths");
+        let paths = provider_paths_for_tui().expect("paths");
         let settings = ProviderSettings::load(&paths.user_config).expect("settings");
 
         match previous_home {
@@ -3860,20 +3867,20 @@ mod tests {
     async fn auth_dialog_keeps_dialog_open_and_rolls_back_when_probe_fails() {
         let dir = tempfile::tempdir().expect("dir");
         let home = tempfile::tempdir().expect("home");
-        let transport = RuntimeTransport::for_workspace(dir.path())
-            .await
-            .expect("transport");
         let _guard = env_lock_guard().await;
         let previous_home = std::env::var("GOLUTRA_HOME").ok();
         unsafe {
             std::env::set_var("GOLUTRA_HOME", home.path());
         }
+        let transport = RuntimeTransport::for_cwd(dir.path())
+            .await
+            .expect("transport");
         let mut app = TuiApp::new(
             ThreadId::new(),
             SessionId::new(),
             None,
             false,
-            provider_status_message(&transport),
+            provider_status_message(),
             Some(AuthDialogState::new()),
         );
         {
@@ -3894,7 +3901,7 @@ mod tests {
         .await
         .expect("enter review");
 
-        let paths = provider_paths_for_tui(&transport).expect("paths");
+        let paths = provider_paths_for_tui().expect("paths");
         let settings = ProviderSettings::load(&paths.user_config).expect("settings");
 
         match previous_home {
@@ -3922,20 +3929,20 @@ mod tests {
     async fn slash_auth_login_failure_reports_error_without_persisting_profile() {
         let dir = tempfile::tempdir().expect("dir");
         let home = tempfile::tempdir().expect("home");
-        let transport = RuntimeTransport::for_workspace(dir.path())
-            .await
-            .expect("transport");
         let _guard = env_lock_guard().await;
         let previous_home = std::env::var("GOLUTRA_HOME").ok();
         unsafe {
             std::env::set_var("GOLUTRA_HOME", home.path());
         }
+        let transport = RuntimeTransport::for_cwd(dir.path())
+            .await
+            .expect("transport");
         let mut app = TuiApp::new(
             ThreadId::new(),
             SessionId::new(),
             None,
             false,
-            provider_status_message(&transport),
+            provider_status_message(),
             None,
         );
 
@@ -3955,7 +3962,7 @@ mod tests {
         .await
         .expect("login command");
 
-        let paths = provider_paths_for_tui(&transport).expect("paths");
+        let paths = provider_paths_for_tui().expect("paths");
         let settings = ProviderSettings::load(&paths.user_config).expect("settings");
 
         match previous_home {
@@ -4029,16 +4036,13 @@ mod tests {
 
     #[tokio::test]
     async fn auth_dialog_custom_provider_does_not_prefill_base_url_from_protocol() {
-        let dir = tempfile::tempdir().expect("dir");
-        let transport = RuntimeTransport::for_workspace(dir.path())
-            .await
-            .expect("transport");
+        let transport = RuntimeTransport::in_memory().await.expect("transport");
         let mut app = TuiApp::new(
             ThreadId::new(),
             SessionId::new(),
             None,
             false,
-            provider_status_message(&transport),
+            provider_status_message(),
             Some(AuthDialogState::new()),
         );
         {
@@ -4058,16 +4062,13 @@ mod tests {
 
     #[tokio::test]
     async fn auth_dialog_blocks_custom_protocols_without_live_adapter() {
-        let dir = tempfile::tempdir().expect("dir");
-        let transport = RuntimeTransport::for_workspace(dir.path())
-            .await
-            .expect("transport");
+        let transport = RuntimeTransport::in_memory().await.expect("transport");
         let mut app = TuiApp::new(
             ThreadId::new(),
             SessionId::new(),
             None,
             false,
-            provider_status_message(&transport),
+            provider_status_message(),
             Some(AuthDialogState::new()),
         );
         {
@@ -4111,16 +4112,13 @@ mod tests {
 
     #[tokio::test]
     async fn auth_model_input_accepts_numeric_custom_model_ids() {
-        let dir = tempfile::tempdir().expect("dir");
-        let transport = RuntimeTransport::for_workspace(dir.path())
-            .await
-            .expect("transport");
+        let transport = RuntimeTransport::in_memory().await.expect("transport");
         let mut app = TuiApp::new(
             ThreadId::new(),
             SessionId::new(),
             None,
             false,
-            provider_status_message(&transport),
+            provider_status_message(),
             Some(AuthDialogState::new()),
         );
         {
@@ -4148,16 +4146,13 @@ mod tests {
 
     #[tokio::test]
     async fn auth_text_inputs_do_not_swallow_vim_key_characters() {
-        let dir = tempfile::tempdir().expect("dir");
-        let transport = RuntimeTransport::for_workspace(dir.path())
-            .await
-            .expect("transport");
+        let transport = RuntimeTransport::in_memory().await.expect("transport");
         let mut app = TuiApp::new(
             ThreadId::new(),
             SessionId::new(),
             None,
             false,
-            provider_status_message(&transport),
+            provider_status_message(),
             Some(AuthDialogState::new()),
         );
         {
@@ -4257,9 +4252,8 @@ mod tests {
 
         let items = transcript_items(&app);
 
-        assert_eq!(items.len(), 2);
+        assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "Tool Completed");
-        assert_eq!(items[1].title, "Task Completed");
     }
 
     #[test]
@@ -4291,6 +4285,31 @@ mod tests {
 
         assert_eq!(items[0].title, "Loop Decided");
         assert!(items[0].body[0].contains("model not found"));
+    }
+
+    #[test]
+    fn approval_transcript_shows_tool_resource_and_reason() {
+        let event = transcript_event(
+            1,
+            SessionId::new(),
+            TaskId::new(),
+            RuntimeEventType::ApprovalRequested,
+            json!({
+                "summary": "approval required for shell",
+                "request": {
+                    "tool_name": "shell",
+                    "resource": "cargo test --workspace",
+                    "reason": "process command requires explicit user approval"
+                }
+            }),
+        );
+
+        let items = event_transcript_items(&[event]);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "Approval required");
+        assert_eq!(items[0].body[0], "shell: cargo test --workspace");
+        assert!(items[0].body[1].contains("explicit user approval"));
     }
 
     fn transcript_event(
@@ -4403,13 +4422,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert_eq!(
-            titles,
-            vec!["You", "Tool Completed", "Task Completed", "Golutra"]
-        );
+        assert_eq!(titles, vec!["You", "Tool Completed", "Golutra"]);
         assert!(body.contains("write file chain.txt with content ok"));
         assert!(body.contains("file written"));
-        assert!(body.contains("runtime task finished with Completed"));
+        assert!(!body.contains("runtime task finished with Completed"));
         assert!(body.contains("Completed: file written"));
     }
 
@@ -4446,7 +4462,10 @@ mod tests {
                 session_id,
                 first_task,
                 RuntimeEventType::TaskCompleted,
-                json!({"summary": "runtime task finished with Completed"}),
+                json!({
+                    "summary": "runtime task finished with Completed",
+                    "status": "completed"
+                }),
             ),
             transcript_event(
                 4,
@@ -4467,7 +4486,10 @@ mod tests {
                 session_id,
                 second_task,
                 RuntimeEventType::TaskCompleted,
-                json!({"summary": "runtime task finished with Completed"}),
+                json!({
+                    "summary": "runtime task finished with Completed",
+                    "status": "completed"
+                }),
             ),
         ];
         app.projection = Some(UserProjection {
@@ -4490,21 +4512,11 @@ mod tests {
             .map(|item| item.body.join("\n"))
             .collect::<Vec<_>>();
 
-        assert_eq!(
-            titles,
-            vec![
-                "You",
-                "Task Completed",
-                "Golutra",
-                "You",
-                "Task Completed",
-                "Golutra"
-            ]
-        );
+        assert_eq!(titles, vec!["You", "Golutra", "You", "Golutra"]);
         assert_eq!(bodies[0], "hi");
-        assert_eq!(bodies[2], "Hello");
-        assert_eq!(bodies[3], "what next");
-        assert_eq!(bodies[5], "Tell me what to work on.");
+        assert_eq!(bodies[1], "Hello");
+        assert_eq!(bodies[2], "what next");
+        assert_eq!(bodies[3], "Tell me what to work on.");
         assert!(
             bodies
                 .iter()
@@ -4541,6 +4553,42 @@ mod tests {
     #[tokio::test]
     async fn resume_thread_clears_previous_visible_transcript_state() {
         let transport = RuntimeTransport::in_memory().await.expect("transport");
+        let target_thread_id = ThreadId::new();
+        let target_session_id = SessionId::new();
+        transport
+            .send_command(session_command(
+                target_session_id,
+                SessionCommandKind::Prompt,
+                json!({
+                    "prompt": "resume target",
+                    "_thread_id": target_thread_id.to_string(),
+                }),
+            ))
+            .await
+            .expect("create resumable thread");
+        let mut completed = false;
+        for _ in 0..100 {
+            let projection = transport
+                .query(RuntimeQuery {
+                    query_id: QueryId::new(),
+                    session_id: target_session_id,
+                    task_id: None,
+                    kind: RuntimeQueryKind::UserProjection,
+                    requester: ActorKind::Tui,
+                    cursor: None,
+                    timestamp: chrono::Utc::now(),
+                })
+                .await
+                .expect("projection");
+            if golutra_client::projection_status(&projection)
+                == Some(golutra_core::TaskStatus::Completed)
+            {
+                completed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(completed, "target thread task should complete");
         let mut app = TuiApp::new(
             ThreadId::new(),
             SessionId::new(),
@@ -4560,7 +4608,7 @@ mod tests {
         app.transcript_scroll_offset = 12;
         app.transcript_row_count = 30;
 
-        app.resume_thread(&transport, transport.default_thread_id())
+        app.resume_thread(&transport, target_thread_id)
             .await
             .expect("resume");
 
@@ -4623,6 +4671,41 @@ mod tests {
         assert!(!app.debug_mode);
         assert_eq!(app.transcript_scroll_offset, 0);
         assert_eq!(app.status_message, "new session");
+    }
+
+    #[tokio::test]
+    async fn active_task_blocks_session_switching_commands() {
+        let transport = RuntimeTransport::in_memory().await.expect("transport");
+        let thread_id = ThreadId::new();
+        let session_id = SessionId::new();
+        let mut app = TuiApp::new(
+            thread_id,
+            session_id,
+            Some(TaskId::new()),
+            false,
+            "ready (mock)".to_owned(),
+            None,
+        );
+        app.projection = Some(UserProjection {
+            session_id,
+            task_id: app.task_id,
+            status: golutra_core::TaskStatus::Running,
+            visible_steps: Vec::new(),
+            pending_approval: None,
+            final_message: None,
+            residual_risks: Vec::new(),
+        });
+
+        app.execute_slash_command(&transport, SlashCommand::New)
+            .await
+            .expect("command");
+
+        assert_eq!(app.thread_id, thread_id);
+        assert_eq!(app.session_id, session_id);
+        assert_eq!(
+            app.status_message,
+            "interrupt the active task before switching sessions"
+        );
     }
 
     #[test]

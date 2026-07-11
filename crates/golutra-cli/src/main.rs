@@ -10,16 +10,26 @@ use golutra_llm::{
     ConfiguredProvider, ProviderGenerationConfig, ProviderProtocol, ProviderReasoningEffort,
     provider_protocol_catalog,
 };
-use golutra_protocol::{RuntimeQuery, RuntimeQueryKind, SessionCommand, SessionCommandKind};
+use golutra_protocol::{
+    EventFilter, RuntimeEvent, RuntimeEventType, RuntimeQuery, RuntimeQueryKind, SessionCommand,
+    SessionCommandKind,
+};
+use std::io::{IsTerminal, Write};
 use tokio::time::{Duration, sleep};
 use uuid::Uuid;
+
+const CLI_ACTOR_ID: &str = "golutra-cli";
 
 #[derive(Debug, Parser)]
 #[command(name = "golutra")]
 #[command(about = "Golutra coding agent runtime CLI")]
 struct Cli {
     #[arg(long, global = true)]
-    workspace: Option<std::path::PathBuf>,
+    cwd: Option<std::path::PathBuf>,
+    #[arg(long, global = true, conflicts_with = "connect")]
+    daemon: bool,
+    #[arg(long, global = true, value_name = "URL", conflicts_with = "daemon")]
+    connect: Option<String>,
     #[arg(long, global = true, value_name = "UUID")]
     session_id: Option<String>,
     #[command(subcommand)]
@@ -28,6 +38,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    AppServer {
+        #[arg(long, env = "GOLUTRA_APP_ADDR", default_value = "127.0.0.1:47831")]
+        addr: std::net::SocketAddr,
+    },
     Chat {
         #[arg(default_value = "")]
         prompt: String,
@@ -40,6 +54,7 @@ enum Command {
         thread_id: String,
     },
     Abort,
+    Takeover,
     Pause,
     Approve {
         approval_id: Option<String>,
@@ -156,18 +171,27 @@ enum EvalCommand {
 
 #[tokio::main]
 async fn main() -> miette::Result<()> {
-    if golutra_app_server::run_embedded_daemon_if_requested().await? {
-        return Ok(());
-    }
     let cli = Cli::parse();
-    let transport = match cli.workspace.as_deref() {
-        Some(workspace) => RuntimeTransport::for_workspace(workspace).await,
-        None => RuntimeTransport::for_current_workspace().await,
+    if let Command::AppServer { addr } = &cli.command {
+        return golutra_app_server::run(*addr).await;
+    }
+    let cwd = cli
+        .cwd
+        .clone()
+        .map_or_else(std::env::current_dir, Ok)
+        .map_err(|error| miette::miette!("{error}"))?;
+    let transport = if let Some(base_url) = cli.connect.clone() {
+        RuntimeTransport::connect(base_url, &cwd).await
+    } else if cli.daemon {
+        RuntimeTransport::local_daemon(&cwd).await
+    } else {
+        RuntimeTransport::for_cwd(&cwd).await
     }
     .map_err(|error| miette::miette!("{error}"))?;
     let session_id = resolve_session_id(cli.session_id.as_deref(), &transport)?;
 
     match cli.command {
+        Command::AppServer { .. } => unreachable!("app-server exits before runtime setup"),
         Command::Chat { prompt } => {
             let ack = transport
                 .send_command(command(
@@ -250,6 +274,17 @@ async fn main() -> miette::Result<()> {
                 .send_command(command(
                     session_id,
                     SessionCommandKind::Abort,
+                    serde_json::json!({}),
+                ))
+                .await
+                .map_err(|error| miette::miette!("{error}"))?;
+            println!("{}", serde_json::to_string_pretty(&ack).unwrap_or_default());
+        }
+        Command::Takeover => {
+            let ack = transport
+                .send_command(command(
+                    session_id,
+                    SessionCommandKind::Takeover,
                     serde_json::json!({}),
                 ))
                 .await
@@ -374,7 +409,7 @@ async fn main() -> miette::Result<()> {
         },
         Command::Provider { command } => match command {
             ProviderCommand::Current => {
-                let config = provider_env_for_cli(&transport)
+                let config = provider_env_for_cli()
                     .ok()
                     .map(|env| ConfiguredProvider::redacted_from_reader(|key| env.get(key)))
                     .transpose()
@@ -383,7 +418,7 @@ async fn main() -> miette::Result<()> {
                         ConfiguredProvider::redacted_from_env()
                             .unwrap_or_else(|error| provider_error_config(error.to_string()))
                     });
-                let onboarding = provider_onboarding_for_cli(&transport)?;
+                let onboarding = provider_onboarding_for_cli()?;
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
@@ -394,8 +429,7 @@ async fn main() -> miette::Result<()> {
                 );
             }
             ProviderCommand::Probe => {
-                let env =
-                    provider_env_for_cli(&transport).map_err(|error| miette::miette!("{error}"))?;
+                let env = provider_env_for_cli().map_err(|error| miette::miette!("{error}"))?;
                 let result = ConfiguredProvider::probe_from_reader(|key| env.get(key))
                     .await
                     .map_err(|error| miette::miette!("{error}"))?;
@@ -429,8 +463,8 @@ async fn main() -> miette::Result<()> {
                 validate_provider_protocol_runtime_supported(protocol)
                     .map_err(|error| miette::miette!("{error}"))?;
                 let scope = parse_provider_scope(&scope)?;
-                let paths = provider_paths_for_cli(&transport)?;
-                let workspace_root = provider_workspace_root_for_cli(&transport)?;
+                let paths = provider_paths_for_cli()?;
+                let cwd = provider_cwd_for_cli(&transport)?;
                 let mut provider_profile = match protocol {
                     ProviderProtocol::Mock => ProviderProfile::mock(),
                     ProviderProtocol::OpenAiCompatible => ProviderProfile::openai_compatible(
@@ -463,7 +497,7 @@ async fn main() -> miette::Result<()> {
                     profile: provider_profile,
                     activate,
                 };
-                apply_provider_install_plan_verified(&paths, workspace_root, &install_plan)
+                apply_provider_install_plan_verified(&paths, cwd, &install_plan)
                     .await
                     .map_err(|error| miette::miette!("{error}"))?;
                 println!(
@@ -479,37 +513,33 @@ async fn main() -> miette::Result<()> {
                 );
             }
             ProviderCommand::SetKey { profile, api_key } => {
-                let paths = provider_paths_for_cli(&transport)?;
-                let workspace_root = provider_workspace_root_for_cli(&transport)?;
+                let paths = provider_paths_for_cli()?;
+                let cwd = provider_cwd_for_cli(&transport)?;
                 let profile_name = profile.clone();
                 let missing_profile = profile.clone();
                 let api_key_value = api_key.clone();
-                update_provider_settings_verified(
-                    &paths,
-                    workspace_root,
-                    move |user_settings, _workspace_settings| {
-                        let target_index = user_settings
-                            .profiles
-                            .iter()
-                            .position(|item| item.name == profile_name)
-                            .ok_or_else(|| {
-                                golutra_config::ConfigError::Validation(format!(
-                                    "provider profile `{missing_profile}` does not exist in user config"
-                                ))
-                            })?;
-                        let env_key = user_settings.profiles[target_index]
-                            .api_key_env
-                            .clone()
-                            .ok_or_else(|| {
+                update_provider_settings_verified(&paths, cwd, move |user_settings| {
+                    let target_index = user_settings
+                        .profiles
+                        .iter()
+                        .position(|item| item.name == profile_name)
+                        .ok_or_else(|| {
+                            golutra_config::ConfigError::Validation(format!(
+                                "provider profile `{missing_profile}` does not exist in user config"
+                            ))
+                        })?;
+                    let env_key = user_settings.profiles[target_index]
+                        .api_key_env
+                        .clone()
+                        .ok_or_else(|| {
                             golutra_config::ConfigError::Validation(format!(
                                 "provider profile `{missing_profile}` does not declare api_key_env"
                             ))
                         })?;
-                        user_settings.env.insert(env_key, api_key_value);
-                        user_settings.profiles[target_index].api_key = None;
-                        Ok(())
-                    },
-                )
+                    user_settings.env.insert(env_key, api_key_value);
+                    user_settings.profiles[target_index].api_key = None;
+                    Ok(())
+                })
                 .await
                 .map_err(|error| miette::miette!("{error}"))?;
                 println!(
@@ -519,13 +549,13 @@ async fn main() -> miette::Result<()> {
             }
             ProviderCommand::Use { profile, scope } => {
                 let scope = parse_provider_scope(&scope)?;
-                let paths = provider_paths_for_cli(&transport)?;
-                let workspace_root = provider_workspace_root_for_cli(&transport)?;
+                let paths = provider_paths_for_cli()?;
+                let cwd = provider_cwd_for_cli(&transport)?;
                 let profile_name = profile.clone();
                 update_provider_settings_verified(
                     &paths,
-                    workspace_root,
-                    move |user_settings, _workspace_settings| {
+                    cwd,
+                    move |user_settings| {
                         if scope == ProviderConfigScope::Workspace {
                             return Err(golutra_config::ConfigError::Validation(
                                 "workspace provider config is no longer supported; use global user provider config"
@@ -681,31 +711,22 @@ async fn print_command_ack(
     Ok(())
 }
 
-fn provider_paths_for_cli(transport: &RuntimeTransport) -> miette::Result<ProviderConfigPaths> {
-    let workspace = provider_workspace_root_for_cli(transport)?;
-    ProviderConfigPaths::for_workspace(workspace).map_err(|error| miette::miette!("{error}"))
+fn provider_paths_for_cli() -> miette::Result<ProviderConfigPaths> {
+    ProviderConfigPaths::global().map_err(|error| miette::miette!("{error}"))
 }
 
-fn provider_workspace_root_for_cli(
-    transport: &RuntimeTransport,
-) -> miette::Result<&std::path::Path> {
+fn provider_cwd_for_cli(transport: &RuntimeTransport) -> miette::Result<&std::path::Path> {
     transport
-        .workspace_root()
-        .ok_or_else(|| miette::miette!("provider config requires a workspace"))
+        .cwd()
+        .ok_or_else(|| miette::miette!("provider config requires a cwd"))
 }
 
-fn provider_env_for_cli(
-    transport: &RuntimeTransport,
-) -> miette::Result<golutra_config::ProviderRuntimeEnv> {
-    let workspace = provider_workspace_root_for_cli(transport)?;
-    load_provider_runtime_env(workspace).map_err(|error| miette::miette!("{error}"))
+fn provider_env_for_cli() -> miette::Result<golutra_config::ProviderRuntimeEnv> {
+    load_provider_runtime_env().map_err(|error| miette::miette!("{error}"))
 }
 
-fn provider_onboarding_for_cli(
-    transport: &RuntimeTransport,
-) -> miette::Result<golutra_config::ProviderOnboardingState> {
-    let workspace = provider_workspace_root_for_cli(transport)?;
-    provider_onboarding_state(workspace).map_err(|error| miette::miette!("{error}"))
+fn provider_onboarding_for_cli() -> miette::Result<golutra_config::ProviderOnboardingState> {
+    provider_onboarding_state().map_err(|error| miette::miette!("{error}"))
 }
 
 fn parse_provider_protocol(value: &str) -> miette::Result<ProviderProtocol> {
@@ -809,7 +830,7 @@ fn command(
         idempotency_key: CommandId::new().to_string(),
         actor: Actor {
             kind: ActorKind::Cli,
-            id: "golutra-cli".to_owned(),
+            id: CLI_ACTOR_ID.to_owned(),
         },
         payload,
         timestamp: chrono::Utc::now(),
@@ -827,8 +848,9 @@ async fn wait_for_terminal_state(
     transport: &RuntimeTransport,
     session_id: SessionId,
 ) -> miette::Result<serde_json::Value> {
-    let mut last_state = serde_json::Value::Null;
-    for _ in 0..200 {
+    let mut interrupt_count = 0_u8;
+    let mut handled_approval = None;
+    loop {
         let state = transport
             .query(RuntimeQuery {
                 query_id: golutra_core::QueryId::new(),
@@ -841,19 +863,142 @@ async fn wait_for_terminal_state(
             })
             .await
             .map_err(|error| miette::miette!("{error}"))?;
-        if state
+        let status = state
             .get("task_status")
-            .and_then(|value| serde_json::from_value::<TaskStatus>(value.clone()).ok())
-            .is_some_and(|status| {
-                is_terminal_status(status) || status == TaskStatus::WaitingApproval
-            })
-        {
+            .and_then(|value| serde_json::from_value::<TaskStatus>(value.clone()).ok());
+        if status.is_some_and(is_terminal_status) {
             return Ok(state);
         }
-        last_state = state;
-        sleep(Duration::from_millis(50)).await;
+        if status == Some(TaskStatus::WaitingApproval) {
+            let approval_id = state
+                .get("pending_approval")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    miette::miette!("runtime is waiting for approval without an approval id")
+                })?
+                .to_owned();
+            if handled_approval.as_deref() != Some(approval_id.as_str()) {
+                let approved = prompt_for_cli_approval(transport, session_id, &approval_id).await?;
+                let ack = transport
+                    .send_command(command(
+                        session_id,
+                        if approved {
+                            SessionCommandKind::Approve
+                        } else {
+                            SessionCommandKind::Deny
+                        },
+                        serde_json::json!({"approval_id": approval_id}),
+                    ))
+                    .await
+                    .map_err(|error| miette::miette!("{error}"))?;
+                if !ack.accepted {
+                    return Err(miette::miette!(
+                        "runtime rejected approval resolution: {}",
+                        ack.reason.unwrap_or_else(|| "unknown reason".to_owned())
+                    ));
+                }
+                handled_approval = Some(approval_id);
+            }
+        } else {
+            handled_approval = None;
+        }
+
+        tokio::select! {
+            _ = sleep(Duration::from_millis(100)) => {}
+            signal = tokio::signal::ctrl_c() => {
+                signal.map_err(|error| miette::miette!("failed to listen for Ctrl+C: {error}"))?;
+                if interrupt_count > 0 {
+                    return Err(miette::miette!("runtime wait interrupted"));
+                }
+                interrupt_count = interrupt_count.saturating_add(1);
+                let ack = transport
+                    .send_command(command(
+                        session_id,
+                        SessionCommandKind::Abort,
+                        serde_json::json!({}),
+                    ))
+                    .await
+                    .map_err(|error| miette::miette!("{error}"))?;
+                if !ack.accepted {
+                    return Err(miette::miette!(
+                        "runtime abort was rejected: {}",
+                        ack.reason.unwrap_or_else(|| "unknown reason".to_owned())
+                    ));
+                }
+                eprintln!("abort requested; press Ctrl+C again to stop waiting");
+            }
+        }
     }
-    Ok(last_state)
+}
+
+async fn prompt_for_cli_approval(
+    transport: &RuntimeTransport,
+    session_id: SessionId,
+    approval_id: &str,
+) -> miette::Result<bool> {
+    let detail = approval_detail(transport, session_id, approval_id).await?;
+    if !std::io::stdin().is_terminal() {
+        eprintln!("approval denied because stdin is not interactive: {detail}");
+        return Ok(false);
+    }
+    let prompt = format!("Approval required: {detail}\nApprove? [y/N] ");
+    tokio::task::spawn_blocking(move || {
+        eprint!("{prompt}");
+        std::io::stderr()
+            .flush()
+            .map_err(|error| miette::miette!("failed to flush approval prompt: {error}"))?;
+        let mut response = String::new();
+        std::io::stdin()
+            .read_line(&mut response)
+            .map_err(|error| miette::miette!("failed to read approval response: {error}"))?;
+        Ok(matches!(
+            response.trim().to_ascii_lowercase().as_str(),
+            "y" | "yes"
+        ))
+    })
+    .await
+    .map_err(|error| miette::miette!("approval prompt task failed: {error}"))?
+}
+
+async fn approval_detail(
+    transport: &RuntimeTransport,
+    session_id: SessionId,
+    approval_id: &str,
+) -> miette::Result<String> {
+    let events = transport
+        .replay_events(EventFilter {
+            session_id,
+            task_id: None,
+            after_sequence_no: None,
+        })
+        .await
+        .map_err(|error| miette::miette!("{error}"))?;
+    let detail = events
+        .into_iter()
+        .filter_map(|value| serde_json::from_value::<RuntimeEvent>(value).ok())
+        .rev()
+        .find(|event| {
+            event.event_type == RuntimeEventType::ApprovalRequested
+                && event
+                    .payload
+                    .get("approval_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(approval_id)
+        })
+        .and_then(|event| event.payload.get("request").cloned())
+        .map(|request| {
+            let tool = request
+                .get("tool_name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool");
+            let resource = request
+                .get("resource")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown resource");
+            format!("{tool}: {resource}")
+        })
+        .unwrap_or_else(|| format!("approval {approval_id}"));
+    Ok(detail)
 }
 
 fn is_terminal_status(status: TaskStatus) -> bool {
@@ -865,4 +1010,23 @@ fn is_terminal_status(status: TaskStatus) -> bool {
             | TaskStatus::Blocked
             | TaskStatus::Cancelled
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn separate_cli_commands_use_the_same_controller_identity() {
+        let session_id = SessionId::new();
+        let takeover = command(
+            session_id,
+            SessionCommandKind::Takeover,
+            serde_json::json!({}),
+        );
+        let abort = command(session_id, SessionCommandKind::Abort, serde_json::json!({}));
+
+        assert_eq!(takeover.actor, abort.actor);
+        assert_eq!(takeover.actor.id, CLI_ACTOR_ID);
+    }
 }

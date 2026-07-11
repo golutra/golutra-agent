@@ -110,7 +110,7 @@ impl WorkspacePolicy {
             PolicyDecision::Ask
         };
         let reason = match decision {
-            PolicyDecision::Allow => "read-only or build command is pre-approved",
+            PolicyDecision::Allow => "inert workspace command is pre-approved",
             PolicyDecision::Ask => "process command requires explicit user approval",
             PolicyDecision::Block => "shell command matched P0 deny-list or metacharacter guard",
             PolicyDecision::Deny => "shell command denied by policy",
@@ -200,49 +200,7 @@ impl WorkspacePolicy {
     }
 
     fn shell_command_is_preapproved(&self, parts: &[String]) -> bool {
-        let Some(program) = parts.first().map(String::as_str) else {
-            return false;
-        };
-        let arguments = &parts[1..];
-        if arguments.iter().any(|argument| {
-            let path = Path::new(argument);
-            path.is_absolute() && !path.starts_with(&self.workspace_root)
-                || path
-                    .components()
-                    .any(|component| component == std::path::Component::ParentDir)
-        }) {
-            return false;
-        }
-        match program {
-            "cargo" => arguments.first().is_some_and(|subcommand| {
-                matches!(
-                    subcommand.as_str(),
-                    "build" | "check" | "clippy" | "metadata" | "test"
-                )
-            }),
-            "rustc" => arguments == ["--version"],
-            "rg" | "ls" | "head" | "tail" | "wc" => true,
-            "pwd" => arguments.is_empty(),
-            "git" => arguments.first().is_some_and(|subcommand| {
-                matches!(
-                    subcommand.as_str(),
-                    "status" | "diff" | "log" | "show" | "rev-parse"
-                ) && !arguments
-                    .iter()
-                    .any(|argument| matches!(argument.as_str(), "--ext-diff" | "--textconv"))
-            }),
-            "npm" | "pnpm" | "yarn" => match arguments.first().map(String::as_str) {
-                Some("test") => true,
-                Some("run") => arguments.get(1).is_some_and(|script| {
-                    matches!(
-                        script.as_str(),
-                        "build" | "check" | "lint" | "test" | "typecheck"
-                    )
-                }),
-                _ => false,
-            },
-            _ => false,
-        }
+        parts == ["pwd"]
     }
 
     fn evaluation(
@@ -380,22 +338,23 @@ mod tests {
     }
 
     #[test]
-    fn preapproves_build_and_read_only_commands() {
+    fn only_preapproves_inert_shell_commands_without_a_sandbox() {
         let workspace = tempdir().expect("workspace");
         let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
 
-        assert_eq!(
-            policy.evaluate_shell("cargo test -p golutra-core").decision,
-            PolicyDecision::Allow
-        );
-        assert_eq!(
-            policy.evaluate_shell("git status --short").decision,
-            PolicyDecision::Allow
-        );
-        assert_eq!(
-            policy.evaluate_shell("rg 'two words' crates").decision,
-            PolicyDecision::Allow
-        );
+        assert_eq!(policy.evaluate_shell("pwd").decision, PolicyDecision::Allow);
+        for command in [
+            "cargo test -p golutra-core",
+            "git status --short",
+            "rg 'two words' crates",
+            "npm test",
+        ] {
+            assert_eq!(
+                policy.evaluate_shell(command).decision,
+                PolicyDecision::Ask,
+                "{command} can execute workspace-controlled code or configuration"
+            );
+        }
     }
 
     #[test]

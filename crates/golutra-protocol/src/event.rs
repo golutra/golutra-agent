@@ -27,6 +27,7 @@ pub enum RuntimeEventType {
     TurnStarted,
     TurnQueued,
     BusyPolicyDecided,
+    ControllerChanged,
     ContextBuilt,
     ProviderStarted,
     ProviderStreamed,

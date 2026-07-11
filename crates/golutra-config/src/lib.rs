@@ -1,18 +1,20 @@
 use std::{
-    collections::BTreeMap,
-    fs,
+    collections::{BTreeMap, BTreeSet},
+    fs::{self, File, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
 };
 
+use fs2::FileExt;
 use golutra_llm::{
     ConfiguredProvider, ModelCatalog, ProviderGenerationConfig, ProviderProtocol,
-    normalize_openai_base_url,
+    validate_openai_base_url,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const GOLUTRA_HOME: &str = "GOLUTRA_HOME";
+pub const GOLUTRA_HOME_ENV: &str = "GOLUTRA_HOME";
 const PROVIDER_FILE: &str = "provider.json";
 const USER_KEY_SENTINEL: &str = "<stored:user-provider-key>";
 const GOLUTRA_PROVIDER_GENERATION_CONFIG: &str = "GOLUTRA_PROVIDER_GENERATION_CONFIG";
@@ -59,7 +61,7 @@ impl RuntimeConfig {
     #[must_use]
     pub fn p1_default() -> Self {
         Self {
-            data_dir: "${GOLUTRA_HOME:-.golutra}/state".to_owned(),
+            data_dir: "${GOLUTRA_HOME:-~/.golutra}/state".to_owned(),
             event_log_layout: "sqlite".to_owned(),
             checkpoint_strategy: "snapshot".to_owned(),
             sandbox_profile: "p0_workspace_guard".to_owned(),
@@ -87,9 +89,19 @@ pub struct ProviderConfigPaths {
 }
 
 impl ProviderConfigPaths {
-    pub fn for_workspace(_workspace_root: impl AsRef<Path>) -> Result<Self, ConfigError> {
+    pub fn global() -> Result<Self, ConfigError> {
+        Self::from_home(golutra_home()?)
+    }
+
+    pub fn from_home(home: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        let home = home.as_ref();
+        if home.as_os_str().is_empty() {
+            return Err(ConfigError::Validation(
+                "provider config home cannot be empty".to_owned(),
+            ));
+        }
         Ok(Self {
-            user_config: golutra_home()?.join(PROVIDER_FILE),
+            user_config: home.join(PROVIDER_FILE),
         })
     }
 }
@@ -124,25 +136,64 @@ impl Default for ProviderSettings {
 impl ProviderSettings {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
-        if !path.exists() {
-            return Ok(Self::default());
+        match fs::read_to_string(path) {
+            Ok(content) => {
+                let settings: Self = serde_json::from_str(&content)
+                    .map_err(|error| ConfigError::Json(error.to_string()))?;
+                settings.validate()?;
+                Ok(settings)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(ConfigError::Io(error.to_string())),
         }
-        let content =
-            fs::read_to_string(path).map_err(|error| ConfigError::Io(error.to_string()))?;
-        serde_json::from_str(&content).map_err(|error| ConfigError::Json(error.to_string()))
     }
 
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), ConfigError> {
         self.validate()?;
-        write_json_owner_only(path.as_ref(), self)
+        let path = path.as_ref();
+        let _lock = acquire_provider_settings_lock(path)?;
+        self.save_unlocked(path)
+    }
+
+    fn save_unlocked(&self, path: &Path) -> Result<(), ConfigError> {
+        write_json_owner_only(path, self)
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.version != 1 {
+            return Err(ConfigError::Validation(format!(
+                "unsupported provider settings version {}",
+                self.version
+            )));
+        }
         for key in self.env.keys() {
             validate_env_key(key)?;
         }
+        let mut profile_names = BTreeSet::new();
         for profile in &self.profiles {
             profile.validate()?;
+            if !profile_names.insert(profile.name.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "provider profile `{}` is duplicated",
+                    profile.name
+                )));
+            }
+        }
+        if let Some(active_profile) = &self.active_profile {
+            let profile = self
+                .profiles
+                .iter()
+                .find(|profile| &profile.name == active_profile)
+                .ok_or_else(|| {
+                    ConfigError::Validation(format!(
+                        "active provider profile `{active_profile}` does not exist"
+                    ))
+                })?;
+            if !profile.enabled {
+                return Err(ConfigError::Validation(format!(
+                    "active provider profile `{active_profile}` is disabled"
+                )));
+            }
         }
         Ok(())
     }
@@ -152,7 +203,6 @@ impl ProviderSettings {
         self.active_profile
             .as_ref()
             .and_then(|name| self.profiles.iter().find(|profile| &profile.name == name))
-            .or_else(|| self.profiles.iter().find(|profile| profile.enabled))
     }
 
     pub fn upsert_profile(&mut self, profile: ProviderProfile, activate: bool) {
@@ -173,12 +223,16 @@ impl ProviderSettings {
 
     pub fn set_active_profile(&mut self, name: impl Into<String>) -> Result<(), ConfigError> {
         let name = name.into();
-        if self.profiles.iter().any(|profile| profile.name == name) {
+        if self
+            .profiles
+            .iter()
+            .any(|profile| profile.name == name && profile.enabled)
+        {
             self.active_profile = Some(name);
             Ok(())
         } else {
             Err(ConfigError::Validation(format!(
-                "provider profile `{name}` does not exist"
+                "provider profile `{name}` does not exist or is disabled"
             )))
         }
     }
@@ -236,7 +290,7 @@ impl ProviderProfile {
         model_id: impl Into<String>,
         api_key_env: impl Into<String>,
     ) -> Result<Self, ConfigError> {
-        let base_url = normalize_provider_base_url(protocol, &base_url.into());
+        let base_url = normalize_provider_base_url(protocol, &base_url.into())?;
         let profile = Self {
             name: name.into(),
             protocol,
@@ -263,6 +317,15 @@ impl ProviderProfile {
             require_non_empty(self.model_id.as_deref(), "model_id")?;
             require_non_empty(self.base_url.as_deref(), "base_url")?;
             require_non_empty(self.api_key_env.as_deref(), "api_key_env")?;
+            if self.protocol == ProviderProtocol::OpenAiCompatible {
+                validate_openai_base_url(self.base_url.as_deref().unwrap_or_default())
+                    .map_err(ConfigError::Validation)?;
+            }
+        }
+        if let Some(generation_config) = &self.generation_config {
+            generation_config
+                .validate()
+                .map_err(ConfigError::Validation)?;
         }
         Ok(())
     }
@@ -294,9 +357,10 @@ impl ProviderInstallPlan {
             ));
         }
         let path = &paths.user_config;
+        let _lock = acquire_provider_settings_lock(path)?;
         let mut settings = ProviderSettings::load(path)?;
         persist_profile_in_settings(&mut settings, self.profile.clone(), self.activate)?;
-        settings.save(path)
+        settings.save_unlocked(path)
     }
 }
 
@@ -334,7 +398,11 @@ impl ProviderRuntimeEnv {
         self.values
             .iter()
             .map(|(key, value)| {
-                let redacted = if key.ends_with("API_KEY") || key.ends_with("TOKEN") {
+                let normalized = key.to_ascii_uppercase();
+                let redacted = if ["API_KEY", "TOKEN", "SECRET", "PASSWORD", "AUTHORIZATION"]
+                    .iter()
+                    .any(|marker| normalized.contains(marker))
+                {
                     "<redacted>".to_owned()
                 } else {
                     value.clone()
@@ -345,18 +413,20 @@ impl ProviderRuntimeEnv {
     }
 }
 
-pub fn load_provider_runtime_env(
-    workspace_root: impl AsRef<Path>,
+pub fn load_provider_runtime_env() -> Result<ProviderRuntimeEnv, ConfigError> {
+    let paths = ProviderConfigPaths::global()?;
+    load_provider_runtime_env_from_paths(&paths)
+}
+
+pub fn load_provider_runtime_env_from_paths(
+    paths: &ProviderConfigPaths,
 ) -> Result<ProviderRuntimeEnv, ConfigError> {
-    let paths = ProviderConfigPaths::for_workspace(workspace_root)?;
-    let merged = load_merged_provider_settings(&paths)?;
+    let merged = load_merged_provider_settings(paths)?;
     Ok(runtime_env_from_settings(&merged))
 }
 
-pub fn provider_onboarding_state(
-    workspace_root: impl AsRef<Path>,
-) -> Result<ProviderOnboardingState, ConfigError> {
-    let paths = ProviderConfigPaths::for_workspace(workspace_root)?;
+pub fn provider_onboarding_state() -> Result<ProviderOnboardingState, ConfigError> {
+    let paths = ProviderConfigPaths::global()?;
     let user = ProviderSettings::load(&paths.user_config)?;
     let source = if paths.user_config.exists() {
         "user"
@@ -383,14 +453,6 @@ pub fn load_merged_provider_settings(
     paths: &ProviderConfigPaths,
 ) -> Result<ProviderSettings, ConfigError> {
     ProviderSettings::load(&paths.user_config)
-}
-
-#[must_use]
-pub fn merge_provider_settings(
-    user: ProviderSettings,
-    _workspace: ProviderSettings,
-) -> ProviderSettings {
-    user
 }
 
 #[must_use]
@@ -475,16 +537,9 @@ pub async fn apply_provider_install_plan_verified(
             "workspace provider config is no longer supported; use global user provider config",
         ));
     }
-    run_provider_settings_transaction(paths, workspace_root, |user, workspace| {
+    run_provider_settings_transaction(paths, workspace_root, |user| {
         plan.profile.validate()?;
-        match plan.scope {
-            ProviderConfigScope::User => {
-                persist_profile_in_settings(user, plan.profile.clone(), plan.activate)?;
-            }
-            ProviderConfigScope::Workspace => {
-                persist_profile_in_settings(workspace, plan.profile.clone(), plan.activate)?;
-            }
-        }
+        persist_profile_in_settings(user, plan.profile.clone(), plan.activate)?;
         Ok(())
     })
     .await
@@ -496,7 +551,7 @@ pub async fn update_provider_settings_verified<F>(
     mutate: F,
 ) -> Result<(), ProviderInstallError>
 where
-    F: FnOnce(&mut ProviderSettings, &mut ProviderSettings) -> Result<(), ConfigError>,
+    F: FnOnce(&mut ProviderSettings) -> Result<(), ConfigError>,
 {
     run_provider_settings_transaction(paths, workspace_root, mutate).await
 }
@@ -528,12 +583,18 @@ pub fn generate_custom_provider_api_key_env(
     )
 }
 
-fn golutra_home() -> Result<PathBuf, ConfigError> {
-    if let Ok(value) = std::env::var(GOLUTRA_HOME) {
+pub fn golutra_home() -> Result<PathBuf, ConfigError> {
+    if let Some(value) = std::env::var_os(GOLUTRA_HOME_ENV) {
+        if value.is_empty() {
+            return Err(ConfigError::Validation(
+                "GOLUTRA_HOME cannot be empty".to_owned(),
+            ));
+        }
         return Ok(PathBuf::from(value));
     }
-    let home =
-        std::env::var("HOME").map_err(|_| ConfigError::Validation("HOME is not set".to_owned()))?;
+    let home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ConfigError::Validation("HOME is not set".to_owned()))?;
     Ok(PathBuf::from(home).join(".golutra"))
 }
 
@@ -543,23 +604,17 @@ async fn run_provider_settings_transaction<F>(
     mutate: F,
 ) -> Result<(), ProviderInstallError>
 where
-    F: FnOnce(&mut ProviderSettings, &mut ProviderSettings) -> Result<(), ConfigError>,
+    F: FnOnce(&mut ProviderSettings) -> Result<(), ConfigError>,
 {
     let workspace_root = workspace_root.as_ref().to_path_buf();
+    let _lock = acquire_provider_settings_lock_async(paths.user_config.clone()).await?;
     let user_snapshot = snapshot_provider_settings_file(&paths.user_config)
         .map_err(|error| provider_install_error("backup", error.to_string()))?;
 
     let mut user_settings = user_snapshot.settings.clone();
-    let mut workspace_settings = ProviderSettings::default();
     let transaction_result = async {
-        mutate(&mut user_settings, &mut workspace_settings)
+        mutate(&mut user_settings)
             .map_err(|error| provider_install_error("mutate", error.to_string()))?;
-        if workspace_settings != ProviderSettings::default() {
-            return Err(provider_install_error(
-                "mutate",
-                "workspace provider config is no longer supported; use global user provider config",
-            ));
-        }
 
         persist_provider_settings_file(&paths.user_config, &user_snapshot, &user_settings)
             .map_err(|error| provider_install_error("persist", error.to_string()))?;
@@ -601,9 +656,10 @@ fn persist_provider_settings_file(
     }
     if snapshot.existed && *settings == ProviderSettings::default() {
         fs::remove_file(path).map_err(|error| ConfigError::Io(error.to_string()))?;
+        sync_directory(normalized_parent(path))?;
         return Ok(());
     }
-    settings.save(path)
+    settings.save_unlocked(path)
 }
 
 fn restore_provider_settings_file(
@@ -613,10 +669,36 @@ fn restore_provider_settings_file(
     if !snapshot.existed {
         if path.exists() {
             fs::remove_file(path).map_err(|error| ConfigError::Io(error.to_string()))?;
+            sync_directory(normalized_parent(path))?;
         }
         return Ok(());
     }
-    snapshot.settings.save(path)
+    snapshot.settings.save_unlocked(path)
+}
+
+async fn acquire_provider_settings_lock_async(path: PathBuf) -> Result<File, ProviderInstallError> {
+    tokio::task::spawn_blocking(move || acquire_provider_settings_lock(&path))
+        .await
+        .map_err(|error| provider_install_error("lock", error.to_string()))?
+        .map_err(|error| provider_install_error("lock", error.to_string()))
+}
+
+fn acquire_provider_settings_lock(path: &Path) -> Result<File, ConfigError> {
+    let parent = normalized_parent(path);
+    fs::create_dir_all(parent).map_err(|error| ConfigError::Io(error.to_string()))?;
+    set_owner_only_dir(parent)?;
+    let lock_path = path.with_extension("lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|error| ConfigError::Io(error.to_string()))?;
+    set_owner_only_file(&lock_path)?;
+    file.lock_exclusive()
+        .map_err(|error| ConfigError::Io(error.to_string()))?;
+    Ok(file)
 }
 
 async fn probe_provider_after_settings_update(
@@ -686,18 +768,51 @@ fn redacted_profile_with_credentials(
 }
 
 fn write_json_owner_only<T: Serialize>(path: &Path, value: &T) -> Result<(), ConfigError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| ConfigError::Io(error.to_string()))?;
-        set_owner_only_dir(parent)?;
-    }
-    let temp_path = path.with_extension("json.tmp");
+    let parent = normalized_parent(path);
+    fs::create_dir_all(parent).map_err(|error| ConfigError::Io(error.to_string()))?;
+    set_owner_only_dir(parent)?;
     let content = serde_json::to_string_pretty(value)
         .map_err(|error| ConfigError::Json(error.to_string()))?;
-    fs::write(&temp_path, format!("{content}\n"))
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
         .map_err(|error| ConfigError::Io(error.to_string()))?;
-    set_owner_only_file(&temp_path)?;
-    fs::rename(&temp_path, path).map_err(|error| ConfigError::Io(error.to_string()))?;
-    set_owner_only_file(path)
+    temporary
+        .write_all(format!("{content}\n").as_bytes())
+        .map_err(|error| ConfigError::Io(error.to_string()))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| ConfigError::Io(error.to_string()))?;
+    set_owner_only_file(temporary.path())?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| ConfigError::Io(error.to_string()))?;
+    temporary
+        .persist(path)
+        .map_err(|error| ConfigError::Io(error.error.to_string()))?;
+    set_owner_only_file(path)?;
+    File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| ConfigError::Io(error.to_string()))?;
+    sync_directory(parent)
+}
+
+fn normalized_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<(), ConfigError> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| ConfigError::Io(error.to_string()))
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<(), ConfigError> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -778,11 +893,14 @@ fn live_profile_requires_connection_fields(protocol: ProviderProtocol) -> bool {
     protocol != ProviderProtocol::Mock
 }
 
-fn normalize_provider_base_url(protocol: ProviderProtocol, value: &str) -> String {
+fn normalize_provider_base_url(
+    protocol: ProviderProtocol,
+    value: &str,
+) -> Result<String, ConfigError> {
     if protocol == ProviderProtocol::OpenAiCompatible {
-        normalize_openai_base_url(value)
+        validate_openai_base_url(value).map_err(ConfigError::Validation)
     } else {
-        value.trim().trim_end_matches('/').to_owned()
+        Ok(value.trim().trim_end_matches('/').to_owned())
     }
 }
 
@@ -876,9 +994,9 @@ mod tests {
         fn new() -> Self {
             let guard = lock_test_env();
             let dir = tempdir().expect("home");
-            let previous = std::env::var_os(GOLUTRA_HOME);
+            let previous = std::env::var_os(GOLUTRA_HOME_ENV);
             unsafe {
-                std::env::set_var(GOLUTRA_HOME, dir.path());
+                std::env::set_var(GOLUTRA_HOME_ENV, dir.path());
             }
             Self {
                 previous,
@@ -920,10 +1038,10 @@ mod tests {
         fn drop(&mut self) {
             match &self.previous {
                 Some(value) => unsafe {
-                    std::env::set_var(GOLUTRA_HOME, value);
+                    std::env::set_var(GOLUTRA_HOME_ENV, value);
                 },
                 None => unsafe {
-                    std::env::remove_var(GOLUTRA_HOME);
+                    std::env::remove_var(GOLUTRA_HOME_ENV);
                 },
             }
         }
@@ -963,10 +1081,19 @@ mod tests {
     }
 
     #[test]
+    fn empty_golutra_home_is_rejected() {
+        let _guard = lock_test_env();
+        let _home = ScopedEnvVar::set(GOLUTRA_HOME_ENV, "");
+
+        let error = golutra_home().expect_err("empty home must be rejected");
+
+        assert!(error.to_string().contains("cannot be empty"));
+    }
+
+    #[test]
     fn provider_settings_persists_env_map_and_omits_inline_api_key() {
         let _home = IsolatedGolutraHome::new();
-        let dir = tempdir().expect("dir");
-        let paths = ProviderConfigPaths::for_workspace(dir.path()).expect("paths");
+        let paths = ProviderConfigPaths::global().expect("paths");
         let mut profile = ProviderProfile::openai_compatible(
             "golutra",
             "api.golutra.cn",
@@ -993,6 +1120,35 @@ mod tests {
             Some("secret")
         );
         assert!(loaded.active_profile().expect("profile").api_key.is_none());
+    }
+
+    #[test]
+    fn concurrent_global_provider_updates_preserve_both_profiles() {
+        let _home = IsolatedGolutraHome::new();
+        let paths = ProviderConfigPaths::global().expect("paths");
+        let plan = |name: &str| {
+            let mut profile = ProviderProfile::mock();
+            profile.name = name.to_owned();
+            ProviderInstallPlan {
+                scope: ProviderConfigScope::User,
+                profile,
+                activate: false,
+            }
+        };
+        let first_paths = paths.clone();
+        let second_paths = paths.clone();
+        std::thread::scope(|scope| {
+            scope.spawn(move || plan("first").apply(&first_paths).expect("first update"));
+            scope.spawn(move || plan("second").apply(&second_paths).expect("second update"));
+        });
+
+        let settings = ProviderSettings::load(&paths.user_config).expect("settings");
+        let names = settings
+            .profiles
+            .iter()
+            .map(|profile| profile.name.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(names, std::collections::HashSet::from(["first", "second"]));
     }
 
     #[test]
@@ -1053,8 +1209,7 @@ mod tests {
     #[test]
     fn workspace_provider_config_scope_is_rejected() {
         let _home = IsolatedGolutraHome::new();
-        let dir = tempdir().expect("dir");
-        let paths = ProviderConfigPaths::for_workspace(dir.path()).expect("paths");
+        let paths = ProviderConfigPaths::global().expect("paths");
         let profile = ProviderProfile::openai_compatible(
             "golutra",
             "api.golutra.cn",
@@ -1107,8 +1262,7 @@ mod tests {
     #[test]
     fn provider_install_plan_rejects_catalog_only_live_protocols() {
         let _home = IsolatedGolutraHome::new();
-        let dir = tempdir().expect("dir");
-        let paths = ProviderConfigPaths::for_workspace(dir.path()).expect("paths");
+        let paths = ProviderConfigPaths::global().expect("paths");
         let profile = ProviderProfile {
             name: "anthropic".to_owned(),
             protocol: ProviderProtocol::Anthropic,
@@ -1136,10 +1290,28 @@ mod tests {
     }
 
     #[test]
+    fn provider_profile_rejects_an_invalid_or_credentialed_base_url() {
+        for base_url in [
+            "",
+            "file:///tmp/provider",
+            "https://user:secret@api.example.com/v1",
+            "https://api.example.com/v1?token=secret",
+        ] {
+            let error = ProviderProfile::openai_compatible(
+                "invalid",
+                base_url,
+                "model",
+                "GOLUTRA_PROVIDER_API_KEY",
+            )
+            .expect_err("invalid provider URL");
+            assert!(error.to_string().contains("base URL"));
+        }
+    }
+
+    #[test]
     fn onboarding_requires_explicit_provider_profile() {
         let _home = IsolatedGolutraHome::new();
-        let dir = tempdir().expect("dir");
-        let state = provider_onboarding_state(dir.path()).expect("onboarding");
+        let state = provider_onboarding_state().expect("onboarding");
 
         assert!(!state.configured);
         assert_eq!(state.source, "none");
@@ -1148,10 +1320,55 @@ mod tests {
     }
 
     #[test]
+    fn onboarding_does_not_implicitly_activate_the_first_enabled_profile() {
+        let _home = IsolatedGolutraHome::new();
+        let paths = ProviderConfigPaths::global().expect("paths");
+        ProviderInstallPlan {
+            scope: ProviderConfigScope::User,
+            profile: ProviderProfile::mock(),
+            activate: false,
+        }
+        .apply(&paths)
+        .expect("install inactive profile");
+
+        let state = provider_onboarding_state().expect("onboarding");
+
+        assert!(!state.configured);
+        assert_eq!(state.missing_fields, vec!["active_profile"]);
+        assert!(state.active_profile.is_none());
+        assert!(
+            load_provider_runtime_env()
+                .expect("runtime env")
+                .get("GOLUTRA_PROVIDER_PROTOCOL")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn disabled_profile_cannot_be_active() {
+        let mut profile = ProviderProfile::mock();
+        profile.enabled = false;
+        let mut settings = ProviderSettings {
+            profiles: vec![profile],
+            ..ProviderSettings::default()
+        };
+
+        let error = settings
+            .set_active_profile("mock")
+            .expect_err("disabled profile cannot be selected");
+        assert!(error.to_string().contains("disabled"));
+
+        settings.active_profile = Some("mock".to_owned());
+        let error = settings
+            .validate()
+            .expect_err("disabled active profile is invalid");
+        assert!(error.to_string().contains("disabled"));
+    }
+
+    #[test]
     fn onboarding_accepts_explicit_mock_provider() {
         let _home = IsolatedGolutraHome::new();
-        let dir = tempdir().expect("dir");
-        let paths = ProviderConfigPaths::for_workspace(dir.path()).expect("paths");
+        let paths = ProviderConfigPaths::global().expect("paths");
         ProviderInstallPlan {
             scope: ProviderConfigScope::User,
             profile: ProviderProfile::mock(),
@@ -1160,7 +1377,7 @@ mod tests {
         .apply(&paths)
         .expect("install mock");
 
-        let state = provider_onboarding_state(dir.path()).expect("onboarding");
+        let state = provider_onboarding_state().expect("onboarding");
 
         assert!(state.configured);
         assert_eq!(state.source, "user");
@@ -1174,8 +1391,7 @@ mod tests {
     #[test]
     fn onboarding_accepts_user_openai_key_from_env_map() {
         let _home = IsolatedGolutraHome::new();
-        let dir = tempdir().expect("dir");
-        let paths = ProviderConfigPaths::for_workspace(dir.path()).expect("paths");
+        let paths = ProviderConfigPaths::global().expect("paths");
         let mut profile = ProviderProfile::openai_compatible(
             "golutra",
             "api.golutra.cn",
@@ -1192,7 +1408,7 @@ mod tests {
         .apply(&paths)
         .expect("install provider");
 
-        let state = provider_onboarding_state(dir.path()).expect("onboarding");
+        let state = provider_onboarding_state().expect("onboarding");
 
         assert!(state.configured);
         assert_eq!(state.source, "user");
@@ -1206,8 +1422,7 @@ mod tests {
     #[test]
     fn onboarding_accepts_key_from_configured_env_var() {
         let _home = IsolatedGolutraHome::new();
-        let dir = tempdir().expect("dir");
-        let paths = ProviderConfigPaths::for_workspace(dir.path()).expect("paths");
+        let paths = ProviderConfigPaths::global().expect("paths");
         let _api_key = ScopedEnvVar::set("GOLUTRA_PROVIDER_API_KEY", "secret-from-env");
         let profile = ProviderProfile::openai_compatible(
             "golutra",
@@ -1224,53 +1439,10 @@ mod tests {
         .apply(&paths)
         .expect("install provider");
 
-        let state = provider_onboarding_state(dir.path()).expect("onboarding");
+        let state = provider_onboarding_state().expect("onboarding");
 
         assert!(state.configured);
         assert!(state.missing_fields.is_empty());
-    }
-
-    #[test]
-    fn merged_provider_settings_ignores_workspace_provider_config() {
-        let user_profile = ProviderProfile::openai_compatible(
-            "golutra",
-            "https://user.example/v1",
-            "user-model",
-            "GOLUTRA_PROVIDER_API_KEY",
-        )
-        .expect("user");
-        let workspace_profile = ProviderProfile::openai_compatible(
-            "golutra",
-            "https://workspace.example/v1",
-            "workspace-model",
-            "GOLUTRA_PROVIDER_API_KEY",
-        )
-        .expect("workspace");
-
-        let merged = merge_provider_settings(
-            ProviderSettings {
-                version: 1,
-                active_profile: Some("golutra".to_owned()),
-                env: BTreeMap::from([("GOLUTRA_PROVIDER_API_KEY".to_owned(), "secret".to_owned())]),
-                profiles: vec![user_profile],
-            },
-            ProviderSettings {
-                version: 1,
-                active_profile: Some("golutra".to_owned()),
-                env: BTreeMap::new(),
-                profiles: vec![workspace_profile],
-            },
-        );
-        let runtime_env = runtime_env_from_settings(&merged);
-
-        assert_eq!(
-            runtime_env.get("GOLUTRA_PROVIDER_MODEL"),
-            Some("user-model".to_owned())
-        );
-        assert_eq!(
-            runtime_env.get("GOLUTRA_PROVIDER_API_KEY"),
-            Some("secret".to_owned())
-        );
     }
 
     #[test]
@@ -1347,11 +1519,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn redacted_runtime_env_hides_hashed_custom_provider_keys() {
+        let key = "GOLUTRA_CUSTOM_PROVIDER_API_KEY_OPENAI_COMPATIBLE_EXAMPLE_1234";
+        let environment = ProviderRuntimeEnv {
+            values: BTreeMap::from([
+                (key.to_owned(), "private-value".to_owned()),
+                ("GOLUTRA_PROVIDER_MODEL".to_owned(), "model".to_owned()),
+            ]),
+        };
+
+        let redacted = environment.redacted_values();
+
+        assert_eq!(redacted.get(key).map(String::as_str), Some("<redacted>"));
+        assert_eq!(
+            redacted.get("GOLUTRA_PROVIDER_MODEL").map(String::as_str),
+            Some("model")
+        );
+    }
+
     #[tokio::test]
     async fn verified_provider_install_rolls_back_on_probe_failure() {
         let _home = IsolatedGolutraHome::new();
         let dir = tempdir().expect("dir");
-        let paths = ProviderConfigPaths::for_workspace(dir.path()).expect("paths");
+        let paths = ProviderConfigPaths::global().expect("paths");
         let mut profile = ProviderProfile::openai_compatible(
             "custom",
             "http://127.0.0.1:9/v1",
@@ -1381,7 +1572,7 @@ mod tests {
     async fn verified_provider_install_persists_when_probe_succeeds() {
         let _home = IsolatedGolutraHome::new();
         let dir = tempdir().expect("dir");
-        let paths = ProviderConfigPaths::for_workspace(dir.path()).expect("paths");
+        let paths = ProviderConfigPaths::global().expect("paths");
         let base_url = spawn_probe_server(r#"{"data":[{"id":"gpt-5.5"}]}"#).await;
         let mut profile = ProviderProfile::openai_compatible(
             "custom",
@@ -1414,7 +1605,7 @@ mod tests {
     async fn verified_workspace_provider_install_is_rejected() {
         let _home = IsolatedGolutraHome::new();
         let dir = tempdir().expect("dir");
-        let paths = ProviderConfigPaths::for_workspace(dir.path()).expect("paths");
+        let paths = ProviderConfigPaths::global().expect("paths");
         let base_url = spawn_probe_server(r#"{"data":[{"id":"gpt-5.5"}]}"#).await;
         let mut profile = ProviderProfile::openai_compatible(
             "custom",

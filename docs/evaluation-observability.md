@@ -11,7 +11,7 @@
 
 截至 2026-07-10，runtime 已具备 durable evaluation 最小闭环：
 
-- 每个 terminal task 生成 `PostTaskReview`、`EvaluationCase`、`TrajectoryReplay`、`EvaluationRun` 和 `EvaluationResult`，并持久化到 `<workspace>/.golutra/evaluation.json`；同步文件 I/O 在 blocking pool 执行，Unix 文件权限为 `0600`。
+- 每个 terminal task 生成 `PostTaskReview`、`EvaluationCase`、`TrajectoryReplay`、`EvaluationRun` 和 `EvaluationResult`，并按 canonical cwd hash 持久化到 `$GOLUTRA_HOME/state/workspaces/<cwd-hash>/evaluation.json`；独立 runtime 进程通过文件锁串行更新并在写前刷新磁盘状态，同步文件 I/O 在 blocking pool 执行，Unix 文件权限为 `0600`。
 - pass/partial/fail、latency、evidence refs、residual risks 和 failure taxonomy 来自 runtime facts 与 verification，不从聊天文本反推。
 - 失败或 partial trajectory 会生成 benchmark 与 generated-task 候选；成功且有 durable evidence 的 trajectory 可生成 skill candidate。所有候选初始状态都是 `proposed`。
 - `run_regression` 生成 durable `RegressionResult`；没有 clean regression 的候选不能进入 promotion decision。

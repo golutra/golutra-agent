@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+futures-util.workspace = true
 golutra-core.workspace = true
 reqwest.workspace = true
 serde.workspace = true

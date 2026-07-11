@@ -54,6 +54,7 @@ pub enum SlashCommand {
     Fork { thread_id: String },
     Status,
     Debug,
+    Takeover,
     Abort,
     Pause,
     Continue,
@@ -157,6 +158,11 @@ const TOP_LEVEL_SLASH_HINTS: &[SlashCommandHint] = &[
     SlashCommandHint {
         command: "/debug",
         description: "toggle timeline",
+        selection: SlashCommandSelection::Execute,
+    },
+    SlashCommandHint {
+        command: "/takeover",
+        description: "take control of active task",
         selection: SlashCommandSelection::Execute,
     },
     SlashCommandHint {
@@ -319,6 +325,7 @@ pub fn parse_slash_input(input: &str) -> SlashInput {
         "/auth" => parse_auth_command(&tokens),
         "/status" => SlashInput::Command(SlashCommand::Status),
         "/debug" => SlashInput::Command(SlashCommand::Debug),
+        "/takeover" => SlashInput::Command(SlashCommand::Takeover),
         "/abort" => SlashInput::Command(SlashCommand::Abort),
         "/pause" => SlashInput::Command(SlashCommand::Pause),
         "/continue" => SlashInput::Command(SlashCommand::Continue),

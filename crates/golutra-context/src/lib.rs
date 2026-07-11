@@ -1,6 +1,6 @@
 use golutra_core::{
     BudgetOverflowAction, TaskId, TokenBudgetSnapshot, TokenBudgetSnapshotId, TokenUsageRecord,
-    TurnId,
+    ToolContract, TurnId,
 };
 use golutra_llm::{ProviderMessage, ProviderRequest, ProviderRole, ProviderUsage};
 use thiserror::Error;
@@ -95,6 +95,12 @@ impl ContextBuilder {
             .iter()
             .map(|contributor| estimate_tokens(&contributor.content))
             .sum::<u64>();
+        if planned_input_tokens > self.policy.budget_limit {
+            return Err(ContextError::BudgetExceeded {
+                planned: planned_input_tokens,
+                limit: self.policy.budget_limit,
+            });
+        }
 
         let messages = contributors
             .iter()
@@ -206,7 +212,7 @@ pub fn provider_request_from_plan(
     turn_id: TurnId,
     provider_id: impl Into<String>,
     model_id: impl Into<String>,
-    tools: Vec<String>,
+    tools: Vec<ToolContract>,
 ) -> ProviderRequest {
     ProviderRequest {
         request_id: golutra_core::ProviderRequestId::new(),
@@ -333,5 +339,27 @@ mod tests {
         assert_eq!(plan.trimmed_contributors, vec!["conversation_history"]);
         assert!(plan.messages[0].content.ends_with("latest"));
         assert!(plan.original_planned_input_tokens > plan.budget_snapshot.planned_input_tokens);
+    }
+
+    #[test]
+    fn rejects_a_budget_that_cannot_retain_minimum_contributor_context() {
+        let result = ContextBuilder::new(ContextBudgetPolicy {
+            context_window: 32,
+            max_output: 16,
+            budget_limit: 1,
+            action_if_exceeded: BudgetOverflowAction::Trim,
+        })
+        .build(
+            TaskId::new(),
+            TurnId::new(),
+            vec![ContextContributor {
+                name: "objective".to_owned(),
+                role: ProviderRole::User,
+                content: "a deliberately oversized objective".repeat(20),
+                token_budget_hint: 16,
+            }],
+        );
+
+        assert!(matches!(result, Err(ContextError::BudgetExceeded { .. })));
     }
 }

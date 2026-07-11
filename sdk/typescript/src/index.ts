@@ -23,17 +23,32 @@ import type {
   SkillCandidate,
 } from "./generated.js";
 
+const JSON_REQUEST_TIMEOUT_MS = 30_000;
+const MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024;
+
 export * from "./generated.js";
 
 export interface RuntimeHostInfo {
   instance_id: string;
   pid: number;
   base_url: string;
-  workspace_root: string;
+  cwd: string;
   workspace_id: string;
   default_session_id: string;
   default_thread_id: string;
   started_at: string;
+}
+
+export interface AppServerInfo {
+  instance_id: string;
+  pid: number;
+  base_url: string;
+  started_at: string;
+}
+
+export interface RuntimeAttachment {
+  attachment_id: string;
+  runtime: RuntimeHostInfo;
 }
 
 export interface ThreadRecord {
@@ -81,17 +96,38 @@ export interface AutomationSnapshot {
 
 export class GolutraClient {
   private readonly baseUrl: URL;
+  private readonly cwd: string;
+  private readonly actorId = `typescript-sdk-${globalThis.crypto.randomUUID()}`;
+  private attachment: Promise<RuntimeAttachment> | undefined;
 
-  constructor(baseUrl: string | URL) {
+  constructor(baseUrl: string | URL, cwd: string) {
     this.baseUrl = new URL(baseUrl);
+    const normalizedCwd = cwd.trim();
+    if (!normalizedCwd) {
+      throw new Error("GolutraClient requires a cwd");
+    }
+    if (!isAbsoluteFilesystemPath(normalizedCwd)) {
+      throw new Error(`GolutraClient requires an absolute cwd: ${normalizedCwd}`);
+    }
+    this.cwd = normalizedCwd;
   }
 
   async runtimeInfo(): Promise<RuntimeHostInfo> {
-    return this.getJson<RuntimeHostInfo>("/runtime/info");
+    return (await this.runtimeAttachment()).runtime;
+  }
+
+  async serverInfo(): Promise<AppServerInfo> {
+    return this.rawJson<AppServerInfo>(new URL("/runtime/info", this.baseUrl));
   }
 
   async sendCommand(command: SessionCommand): Promise<CommandAck> {
     return this.postJson<CommandAck>("/commands", command);
+  }
+
+  async takeover(sessionId: string, actorId?: string): Promise<CommandAck> {
+    return this.sendCommand(
+      this.sessionCommand(sessionId, "takeover", actorId ?? this.actorId, {}),
+    );
   }
 
   async query<T = unknown>(query: RuntimeQuery): Promise<T> {
@@ -122,10 +158,10 @@ export class GolutraClient {
     sessionId: string,
     memoryId: string,
     reason = "rolled back by SDK user",
-    actorId = "typescript-sdk",
+    actorId?: string,
   ): Promise<CommandAck> {
     return this.sendCommand(
-      this.sessionCommand(sessionId, "memory_rollback", actorId, {
+      this.sessionCommand(sessionId, "memory_rollback", actorId ?? this.actorId, {
         memory_id: memoryId,
         reason,
       }),
@@ -135,10 +171,10 @@ export class GolutraClient {
   async runRegression(
     sessionId: string,
     candidateId: string,
-    actorId = "typescript-sdk",
+    actorId?: string,
   ): Promise<CommandAck> {
     return this.sendCommand(
-      this.sessionCommand(sessionId, "run_regression", actorId, {
+      this.sessionCommand(sessionId, "run_regression", actorId ?? this.actorId, {
         candidate_id: candidateId,
       }),
     );
@@ -147,10 +183,10 @@ export class GolutraClient {
   async applyCandidate(
     sessionId: string,
     candidateId: string,
-    actorId = "typescript-sdk",
+    actorId?: string,
   ): Promise<CommandAck> {
     return this.sendCommand(
-      this.sessionCommand(sessionId, "apply_candidate", actorId, {
+      this.sessionCommand(sessionId, "apply_candidate", actorId ?? this.actorId, {
         candidate_id: candidateId,
       }),
     );
@@ -160,10 +196,10 @@ export class GolutraClient {
     sessionId: string,
     candidateId: string,
     reason = "rolled back by SDK user",
-    actorId = "typescript-sdk",
+    actorId?: string,
   ): Promise<CommandAck> {
     return this.sendCommand(
-      this.sessionCommand(sessionId, "rollback_candidate", actorId, {
+      this.sessionCommand(sessionId, "rollback_candidate", actorId ?? this.actorId, {
         candidate_id: candidateId,
         reason,
       }),
@@ -178,6 +214,12 @@ export class GolutraClient {
     const url = new URL("/threads", this.baseUrl);
     url.searchParams.set("limit", String(limit));
     return this.getJson<ThreadRecord[]>(url);
+  }
+
+  async threadForSession(sessionId: string): Promise<ThreadRecord | null> {
+    return this.getJson<ThreadRecord | null>(
+      `/sessions/${encodeURIComponent(sessionId)}/thread`,
+    );
   }
 
   async resumeThread(threadId: string): Promise<ThreadRecord> {
@@ -225,12 +267,14 @@ export class GolutraClient {
         if (cursor !== undefined) {
           headers.set("last-event-id", String(cursor));
         }
-        const response = await fetch(this.eventPath("/events", requestFilter), {
+        const response = await this.fetchWithAttachment(this.eventPath("/events", requestFilter), {
           headers,
           signal,
         });
         if (!response.ok) {
-          throw new Error(`Golutra SSE failed: ${response.status} ${await response.text()}`);
+          throw new Error(
+            `Golutra SSE failed: ${response.status} ${await readBoundedResponseText(response)}`,
+          );
         }
         if (!response.body) {
           throw new Error("Golutra SSE response has no body");
@@ -316,7 +360,10 @@ export class GolutraClient {
   }
 
   private async getJson<T>(path: string | URL): Promise<T> {
-    const response = await fetch(path instanceof URL ? path : new URL(path, this.baseUrl));
+    const response = await this.fetchWithAttachment(
+      path instanceof URL ? path : new URL(path, this.baseUrl),
+      { signal: AbortSignal.timeout(JSON_REQUEST_TIMEOUT_MS) },
+    );
     return decodeJson<T>(response);
   }
 
@@ -324,20 +371,121 @@ export class GolutraClient {
     const request: RequestInit = {
       method: "POST",
       headers: { "content-type": "application/json" },
+      signal: AbortSignal.timeout(JSON_REQUEST_TIMEOUT_MS),
     };
     if (value !== undefined) {
       request.body = JSON.stringify(value);
     }
-    const response = await fetch(new URL(path, this.baseUrl), request);
+    const response = await this.fetchWithAttachment(new URL(path, this.baseUrl), request);
     return decodeJson<T>(response);
+  }
+
+  private async attachRuntime(cwd: string): Promise<RuntimeAttachment> {
+    const response = await fetch(new URL("/runtime/attach", this.baseUrl), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ cwd }),
+      signal: AbortSignal.timeout(JSON_REQUEST_TIMEOUT_MS),
+    });
+    return decodeJson<RuntimeAttachment>(response);
+  }
+
+  private runtimeAttachment(): Promise<RuntimeAttachment> {
+    if (!this.attachment) {
+      const pending = this.attachRuntime(this.cwd);
+      this.attachment = pending;
+      void pending.catch(() => {
+        if (this.attachment === pending) {
+          this.attachment = undefined;
+        }
+      });
+    }
+    return this.attachment;
+  }
+
+  private async refreshRuntimeAttachment(staleAttachmentId: string): Promise<RuntimeAttachment> {
+    const stalePromise = this.attachment;
+    if (stalePromise) {
+      const current = await stalePromise;
+      if (current.attachment_id !== staleAttachmentId) {
+        return current;
+      }
+      if (this.attachment === stalePromise) {
+        this.attachment = undefined;
+      }
+    }
+    return this.runtimeAttachment();
+  }
+
+  private async fetchWithAttachment(url: URL, init: RequestInit = {}): Promise<Response> {
+    const send = (attachmentId: string) => {
+      const headers = new Headers(init.headers);
+      headers.set("x-golutra-attachment", attachmentId);
+      return fetch(url, { ...init, headers });
+    };
+    const attachment = await this.runtimeAttachment();
+    const response = await send(attachment.attachment_id);
+    if (response.status !== 401) {
+      return response;
+    }
+    const refreshed = await this.refreshRuntimeAttachment(attachment.attachment_id);
+    return send(refreshed.attachment_id);
+  }
+
+  private async rawJson<T>(url: URL): Promise<T> {
+    return decodeJson<T>(
+      await fetch(url, { signal: AbortSignal.timeout(JSON_REQUEST_TIMEOUT_MS) }),
+    );
   }
 }
 
 async function decodeJson<T>(response: Response): Promise<T> {
+  const body = await readBoundedResponseText(response);
   if (!response.ok) {
-    throw new Error(`Golutra request failed: ${response.status} ${await response.text()}`);
+    throw new Error(`Golutra request failed: ${response.status} ${body}`);
   }
-  return (await response.json()) as T;
+  try {
+    return JSON.parse(body) as T;
+  } catch (cause) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    throw new Error(`Golutra response was not valid JSON: ${detail}`);
+  }
+}
+
+async function readBoundedResponseText(
+  response: Response,
+  maxBytes = MAX_JSON_RESPONSE_BYTES,
+): Promise<string> {
+  const contentLength = response.headers.get("content-length");
+  if (contentLength && /^\d+$/u.test(contentLength) && Number(contentLength) > maxBytes) {
+    await response.body?.cancel();
+    throw new Error(`Golutra response exceeds ${maxBytes} bytes`);
+  }
+  if (!response.body) {
+    return "";
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    totalBytes += value.byteLength;
+    if (totalBytes > maxBytes) {
+      await reader.cancel();
+      throw new Error(`Golutra response exceeds ${maxBytes} bytes`);
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
 }
 
 async function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
@@ -361,4 +509,8 @@ async function abortableDelay(milliseconds: number, signal: AbortSignal): Promis
       finish();
     }
   });
+}
+
+function isAbsoluteFilesystemPath(value: string): boolean {
+  return value.startsWith("/") || /^[A-Za-z]:[\\/]/u.test(value) || value.startsWith("\\\\");
 }

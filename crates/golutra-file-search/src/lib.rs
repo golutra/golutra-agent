@@ -1,12 +1,16 @@
 use std::{
     fs,
+    io::Read,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
+    thread,
+    time::{Duration, Instant},
 };
 
 use golutra_policy::WorkspacePolicy;
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
+use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -19,7 +23,18 @@ pub enum FileSearchError {
     Rg(String),
     #[error("file metadata index failed: {0}")]
     Metadata(String),
+    #[error("file search limit exceeded: {0}")]
+    Limit(String),
+    #[error("file search timed out after {0} ms")]
+    Timeout(u64),
+    #[error("file search was cancelled")]
+    Cancelled,
 }
+
+const MAX_INDEXED_FILES: usize = 100_000;
+const MAX_RG_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
+const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileEntry {
@@ -47,7 +62,9 @@ pub struct FileMetadataIndex {
 
 impl FileMetadataIndex {
     pub async fn in_memory() -> Result<Self, FileSearchError> {
-        let pool = SqlitePool::connect("sqlite::memory:")
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
             .await
             .map_err(|error| FileSearchError::Metadata(error.to_string()))?;
         let index = Self { pool };
@@ -65,7 +82,12 @@ impl FileMetadataIndex {
     }
 
     pub async fn index_workspace(&self, search: &FileSearch) -> Result<u64, FileSearchError> {
-        let files = search.list_files()?;
+        let search = search.clone();
+        let files = tokio::task::spawn_blocking(move || search.list_files())
+            .await
+            .map_err(|error| {
+                FileSearchError::Io(format!("file indexing task failed: {error}"))
+            })??;
         self.replace_all(&files).await
     }
 
@@ -147,8 +169,20 @@ impl FileSearch {
     }
 
     pub fn list_files(&self) -> Result<Vec<FileEntry>, FileSearchError> {
+        self.list_files_with_cancellation(&AtomicBool::new(false))
+    }
+
+    pub fn list_files_with_cancellation(
+        &self,
+        cancellation: &AtomicBool,
+    ) -> Result<Vec<FileEntry>, FileSearchError> {
         let mut entries = Vec::new();
-        self.collect_files(self.policy.workspace_root(), &mut entries)?;
+        self.collect_files(
+            self.policy.workspace_root(),
+            &mut entries,
+            cancellation,
+            Instant::now() + DEFAULT_OPERATION_TIMEOUT,
+        )?;
         entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
         Ok(entries)
     }
@@ -158,54 +192,116 @@ impl FileSearch {
         pattern: &str,
         path: impl AsRef<Path>,
     ) -> Result<Vec<SearchMatch>, FileSearchError> {
+        self.search_with_cancellation(pattern, path, &AtomicBool::new(false))
+    }
+
+    pub fn search_with_cancellation(
+        &self,
+        pattern: &str,
+        path: impl AsRef<Path>,
+        cancellation: &AtomicBool,
+    ) -> Result<Vec<SearchMatch>, FileSearchError> {
+        let deadline = Instant::now() + DEFAULT_OPERATION_TIMEOUT;
+        check_operation_state(cancellation, deadline)?;
         let evaluation = self
             .policy
             .evaluate_path("file_search", path.as_ref(), true);
         if evaluation.decision != golutra_core::PolicyDecision::Allow {
             return Err(FileSearchError::Policy(evaluation.reason));
         }
-        let resolved_path = self
-            .policy
-            .resolve_path(path, true)
-            .map_err(|error| FileSearchError::Policy(error.to_string()))?;
-        let output = Command::new("rg")
+        let resolved_path = PathBuf::from(evaluation.resource);
+        let mut child = Command::new("rg")
+            .arg("--json")
             .arg("--line-number")
             .arg("--no-heading")
+            .arg("--")
             .arg(pattern)
             .arg(&resolved_path)
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
             .map_err(|error| FileSearchError::Rg(error.to_string()))?;
-
-        if !(output.status.success() || output.status.code() == Some(1)) {
-            return Err(FileSearchError::Rg(
-                String::from_utf8_lossy(&output.stderr).to_string(),
-            ));
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| FileSearchError::Rg("rg stdout is unavailable".to_owned()))?;
+        let reader = thread::spawn(move || read_bounded_rg_output(stdout));
+        let status = loop {
+            if let Err(error) = check_operation_state(cancellation, deadline) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err(error);
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => thread::sleep(PROCESS_POLL_INTERVAL),
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = reader.join();
+                    return Err(FileSearchError::Rg(error.to_string()));
+                }
+            }
+        };
+        let bytes = reader
+            .join()
+            .map_err(|_| FileSearchError::Rg("rg output reader panicked".to_owned()))??;
+        if bytes.len() as u64 > MAX_RG_OUTPUT_BYTES {
+            return Err(FileSearchError::Limit(format!(
+                "rg output exceeds {MAX_RG_OUTPUT_BYTES} bytes"
+            )));
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        Ok(stdout
+        if !(status.success() || status.code() == Some(1)) {
+            return Err(FileSearchError::Rg(format!(
+                "rg exited with status {status}"
+            )));
+        }
+
+        let stdout = String::from_utf8_lossy(&bytes);
+        stdout
             .lines()
-            .filter_map(|line| parse_rg_line(line, self.policy.workspace_root()))
-            .collect())
+            .filter_map(|line| parse_rg_json_line(line, self.policy.workspace_root()))
+            .collect()
     }
 
     fn collect_files(
         &self,
         dir: &Path,
         entries: &mut Vec<FileEntry>,
+        cancellation: &AtomicBool,
+        deadline: Instant,
     ) -> Result<(), FileSearchError> {
-        for entry in fs::read_dir(dir).map_err(|error| FileSearchError::Io(error.to_string()))? {
-            let entry = entry.map_err(|error| FileSearchError::Io(error.to_string()))?;
-            let path = entry.path();
-            if should_skip(&path) {
-                continue;
-            }
-            if path.is_dir() {
-                self.collect_files(&path, entries)?;
-            } else if path.is_file() {
-                let metadata = entry
-                    .metadata()
+        let mut pending_dirs = vec![dir.to_path_buf()];
+        while let Some(directory) = pending_dirs.pop() {
+            check_operation_state(cancellation, deadline)?;
+            for entry in
+                fs::read_dir(&directory).map_err(|error| FileSearchError::Io(error.to_string()))?
+            {
+                check_operation_state(cancellation, deadline)?;
+                let entry = entry.map_err(|error| FileSearchError::Io(error.to_string()))?;
+                let path = entry.path();
+                if should_skip(&path) {
+                    continue;
+                }
+                let metadata = fs::symlink_metadata(&path)
                     .map_err(|error| FileSearchError::Io(error.to_string()))?;
+                if metadata.file_type().is_symlink() {
+                    continue;
+                }
+                if metadata.is_dir() {
+                    pending_dirs.push(path);
+                    continue;
+                }
+                if !metadata.is_file() {
+                    continue;
+                }
+                if entries.len() >= MAX_INDEXED_FILES {
+                    return Err(FileSearchError::Limit(format!(
+                        "workspace contains more than {MAX_INDEXED_FILES} indexable files"
+                    )));
+                }
                 let relative_path = path
                     .strip_prefix(self.policy.workspace_root())
                     .map_err(|error| FileSearchError::Io(error.to_string()))?
@@ -221,38 +317,72 @@ impl FileSearch {
     }
 }
 
-fn parse_rg_line(line: &str, workspace_root: &Path) -> Option<SearchMatch> {
-    let mut parts = line.splitn(3, ':');
-    let path = PathBuf::from(parts.next()?);
-    let line_number = parts.next()?.parse().ok()?;
-    let line = parts.next()?.to_owned();
+fn read_bounded_rg_output(
+    mut stdout: std::process::ChildStdout,
+) -> Result<Vec<u8>, FileSearchError> {
+    let mut bytes = Vec::new();
+    stdout
+        .by_ref()
+        .take(MAX_RG_OUTPUT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| FileSearchError::Rg(error.to_string()))?;
+    Ok(bytes)
+}
+
+fn check_operation_state(
+    cancellation: &AtomicBool,
+    deadline: Instant,
+) -> Result<(), FileSearchError> {
+    if cancellation.load(Ordering::Acquire) {
+        return Err(FileSearchError::Cancelled);
+    }
+    if Instant::now() >= deadline {
+        return Err(FileSearchError::Timeout(
+            u64::try_from(DEFAULT_OPERATION_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_rg_json_line(
+    line: &str,
+    workspace_root: &Path,
+) -> Option<Result<SearchMatch, FileSearchError>> {
+    let value: serde_json::Value = match serde_json::from_str(line) {
+        Ok(value) => value,
+        Err(error) => return Some(Err(FileSearchError::Rg(error.to_string()))),
+    };
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("match") {
+        return None;
+    }
+    let data = value.get("data")?;
+    let path = PathBuf::from(data.get("path")?.get("text")?.as_str()?);
+    let line_number = data.get("line_number")?.as_u64()?;
+    let line = data.get("lines")?.get("text")?.as_str()?.to_owned();
     let relative_path = path
         .strip_prefix(workspace_root)
         .unwrap_or(&path)
         .display()
         .to_string();
-    Some(SearchMatch {
+    Some(Ok(SearchMatch {
         relative_path,
         line_number,
         line,
-    })
+    }))
 }
 
 fn should_skip(path: &Path) -> bool {
-    let text = path.to_string_lossy();
-    text.contains("/.git/")
-        || text.ends_with("/.git")
-        || text.contains("/.ssh/")
-        || text.ends_with("/.ssh")
-        || text.contains("/.env")
-        || text.contains("/secrets/")
-        || text.ends_with("/secrets")
-        || text.contains("/target/")
-        || text.ends_with("/target")
-        || text.contains("/node_modules/")
-        || text.ends_with("/node_modules")
-        || text.contains("/.golutra/")
-        || text.ends_with("/.golutra")
+    path.components().any(|component| {
+        let std::path::Component::Normal(component) = component else {
+            return false;
+        };
+        let name = component.to_string_lossy().to_ascii_lowercase();
+        matches!(
+            name.as_str(),
+            ".git" | ".ssh" | ".golutra" | "secrets" | "target" | "node_modules"
+        ) || name == ".env"
+            || name.starts_with(".env.")
+    })
 }
 
 #[cfg(test)]
@@ -278,6 +408,37 @@ mod tests {
     }
 
     #[test]
+    fn file_listing_and_search_honor_preexisting_cancellation() {
+        let workspace = tempdir().expect("workspace");
+        fs::write(workspace.path().join("README.md"), "hello").expect("readme");
+        let search = FileSearch::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+        let cancellation = AtomicBool::new(true);
+
+        assert!(matches!(
+            search.list_files_with_cancellation(&cancellation),
+            Err(FileSearchError::Cancelled)
+        ));
+        assert!(matches!(
+            search.search_with_cancellation("hello", ".", &cancellation),
+            Err(FileSearchError::Cancelled)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_index_does_not_follow_directory_symlinks_outside_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempdir().expect("workspace");
+        let outside = tempdir().expect("outside");
+        fs::write(outside.path().join("secret.txt"), "secret").expect("outside file");
+        symlink(outside.path(), workspace.path().join("linked")).expect("directory symlink");
+        let search = FileSearch::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+
+        assert!(search.list_files().expect("files").is_empty());
+    }
+
+    #[test]
     fn searches_with_rg_when_available() {
         let workspace = tempdir().expect("workspace");
         fs::write(workspace.path().join("README.md"), "hello\nworld").expect("readme");
@@ -288,6 +449,18 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].relative_path, "README.md");
         assert_eq!(matches[0].line_number, 2);
+    }
+
+    #[test]
+    fn search_pattern_starting_with_dash_is_not_treated_as_an_option() {
+        let workspace = tempdir().expect("workspace");
+        fs::write(workspace.path().join("README.md"), "--pre=sh\n").expect("readme");
+        let search = FileSearch::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+
+        let matches = search.search("--pre=sh", ".").expect("search");
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].relative_path, "README.md");
     }
 
     #[tokio::test]

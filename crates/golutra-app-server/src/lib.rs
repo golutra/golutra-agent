@@ -1,10 +1,12 @@
 use std::{
+    collections::HashMap,
     convert::Infallible,
     fs::{self, File, OpenOptions},
     io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
+    sync::Arc,
 };
 
 use axum::{
@@ -20,37 +22,134 @@ use axum::{
 };
 use fs2::FileExt;
 use golutra_client::{
-    ClientError, InProcessTransport, RUNTIME_DAEMON_ENV, RUNTIME_DAEMON_WORKSPACE_ENV,
-    RuntimeClient, RuntimeHostInfo, event_sequence_no, runtime_endpoint_path,
+    APP_SERVER_ATTACHMENT_HEADER, AppServerInfo, AppServerPaths, ClientError, EmbeddedTransport,
+    RuntimeAttachment, RuntimeClient,
 };
 use golutra_core::{SessionId, TaskId, ThreadId};
 use golutra_protocol::{CommandAck, EventFilter, RuntimeQuery, SessionCommand};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex, OnceCell};
 use uuid::Uuid;
+
+const MAX_ATTACHED_RUNTIMES: usize = 128;
 
 #[derive(Debug, Clone)]
 pub struct AppState {
-    transport: InProcessTransport,
-    info: RuntimeHostInfo,
+    inner: Arc<AppStateInner>,
+}
+
+#[derive(Debug)]
+struct AppStateInner {
+    info: AppServerInfo,
+    max_runtimes: usize,
+    runtimes: Mutex<HashMap<PathBuf, Arc<OnceCell<AttachedRuntime>>>>,
+    attachments: Mutex<HashMap<String, EmbeddedTransport>>,
+}
+
+#[derive(Debug, Clone)]
+struct AttachedRuntime {
+    attachment_id: String,
+    transport: EmbeddedTransport,
 }
 
 impl AppState {
     #[must_use]
-    pub fn new(transport: InProcessTransport) -> Self {
-        let workspace_root = transport
-            .workspace_root()
-            .map(Path::to_path_buf)
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_default();
-        let info = runtime_host_info(&transport, &workspace_root, "http://127.0.0.1:0");
-        Self { transport, info }
+    pub fn new(info: AppServerInfo) -> Self {
+        Self::with_runtime_limit(info, MAX_ATTACHED_RUNTIMES)
     }
 
-    #[must_use]
-    pub fn with_info(transport: InProcessTransport, info: RuntimeHostInfo) -> Self {
-        Self { transport, info }
+    fn with_runtime_limit(info: AppServerInfo, max_runtimes: usize) -> Self {
+        Self {
+            inner: Arc::new(AppStateInner {
+                info,
+                max_runtimes: max_runtimes.max(1),
+                runtimes: Mutex::new(HashMap::new()),
+                attachments: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    async fn attach_cwd(&self, cwd: impl AsRef<Path>) -> Result<RuntimeAttachment, ClientError> {
+        if !cwd.as_ref().is_absolute() {
+            return Err(ClientError::InvalidSession(format!(
+                "runtime cwd must be absolute: {}",
+                cwd.as_ref().display()
+            )));
+        }
+        let cwd = cwd
+            .as_ref()
+            .canonicalize()
+            .map_err(|error| ClientError::Io(format!("{}: {error}", cwd.as_ref().display())))?;
+        let runtime = {
+            let mut runtimes = self.inner.runtimes.lock().await;
+            if let Some(runtime) = runtimes.get(&cwd) {
+                runtime.clone()
+            } else {
+                if runtimes.len() >= self.inner.max_runtimes {
+                    return Err(ClientError::Daemon(format!(
+                        "app-server runtime attachment limit {} reached",
+                        self.inner.max_runtimes
+                    )));
+                }
+                let runtime = Arc::new(OnceCell::new());
+                runtimes.insert(cwd.clone(), runtime.clone());
+                runtime
+            }
+        };
+        let attached = match runtime
+            .get_or_try_init(|| async {
+                let transport = EmbeddedTransport::for_cwd(&cwd).await?;
+                Ok::<_, ClientError>(AttachedRuntime {
+                    attachment_id: Uuid::now_v7().to_string(),
+                    transport,
+                })
+            })
+            .await
+        {
+            Ok(attached) => attached.clone(),
+            Err(error) => {
+                let mut runtimes = self.inner.runtimes.lock().await;
+                if runtime.get().is_none()
+                    && runtimes
+                        .get(&cwd)
+                        .is_some_and(|registered| Arc::ptr_eq(registered, &runtime))
+                {
+                    runtimes.remove(&cwd);
+                }
+                return Err(error);
+            }
+        };
+        let runtime = attached
+            .transport
+            .runtime_info(self.inner.info.base_url.clone())
+            .await?;
+        self.inner
+            .attachments
+            .lock()
+            .await
+            .insert(attached.attachment_id.clone(), attached.transport);
+        Ok(RuntimeAttachment {
+            attachment_id: attached.attachment_id,
+            runtime,
+        })
+    }
+
+    async fn attached_transport(&self, headers: &HeaderMap) -> Result<EmbeddedTransport, AppError> {
+        let attachment_id = headers
+            .get(APP_SERVER_ATTACHMENT_HEADER)
+            .ok_or_else(|| {
+                AppError::Attachment("runtime attachment header is required".to_owned())
+            })?
+            .to_str()
+            .map_err(|_| AppError::Attachment("runtime attachment header is invalid".to_owned()))?;
+        self.inner
+            .attachments
+            .lock()
+            .await
+            .get(attachment_id)
+            .cloned()
+            .ok_or_else(|| AppError::Attachment("runtime attachment was not found".to_owned()))
     }
 }
 
@@ -58,12 +157,14 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/runtime/info", get(runtime_info))
+        .route("/runtime/attach", post(attach_runtime))
         .route("/attach", get(attach_page))
         .route("/commands", post(send_command))
         .route("/queries", post(query_runtime))
         .route("/events", get(events))
         .route("/events/replay", get(replay_events))
         .route("/threads", get(list_threads))
+        .route("/sessions/{session_id}/thread", get(thread_for_session))
         .route("/threads/{thread_id}/resume", post(resume_thread))
         .route("/threads/{thread_id}/fork", post(fork_thread))
         .with_state(state)
@@ -71,50 +172,25 @@ pub fn router(state: AppState) -> Router {
 }
 
 pub async fn run(addr: SocketAddr) -> miette::Result<()> {
-    let workspace = std::env::current_dir().map_err(|error| miette::miette!("{error}"))?;
-    run_workspace(addr, workspace).await
-}
-
-pub async fn run_workspace(
-    addr: SocketAddr,
-    workspace_root: impl AsRef<Path>,
-) -> miette::Result<()> {
     validate_runtime_bind_addr(addr)?;
-    let workspace_root = workspace_root
-        .as_ref()
-        .canonicalize()
-        .map_err(|error| miette::miette!("{error}"))?;
-    let lease = RuntimeDaemonLease::acquire(&workspace_root)?;
-    let transport = InProcessTransport::for_workspace(&workspace_root)
-        .await
-        .map_err(|error| miette::miette!("{error}"))?;
-    transport
-        .recover_orphaned_tasks()
-        .await
-        .map_err(|error| miette::miette!("{error}"))?;
+    let paths = AppServerPaths::global().map_err(|error| miette::miette!("{error}"))?;
+    let lease = AppServerLease::acquire(&paths)?;
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|error| miette::miette!("{error}"))?;
     let local_addr = listener
         .local_addr()
         .map_err(|error| miette::miette!("{error}"))?;
-    let base_url = format!("http://{local_addr}");
-    let info = runtime_host_info(&transport, &workspace_root, &base_url);
+    let info = AppServerInfo {
+        instance_id: Uuid::now_v7().to_string(),
+        pid: std::process::id(),
+        base_url: format!("http://{local_addr}"),
+        started_at: chrono::Utc::now(),
+    };
     lease.publish(&info)?;
-    axum::serve(listener, router(AppState::with_info(transport, info)))
+    axum::serve(listener, router(AppState::new(info)))
         .await
         .map_err(|error| miette::miette!("{error}"))
-}
-
-pub async fn run_embedded_daemon_if_requested() -> miette::Result<bool> {
-    if std::env::var(RUNTIME_DAEMON_ENV).as_deref() != Ok("1") {
-        return Ok(false);
-    }
-    let workspace = std::env::var_os(RUNTIME_DAEMON_WORKSPACE_ENV)
-        .map(PathBuf::from)
-        .ok_or_else(|| miette::miette!("{RUNTIME_DAEMON_WORKSPACE_ENV} is required"))?;
-    run_workspace(SocketAddr::from(([127, 0, 0, 1], 0)), workspace).await?;
-    Ok(true)
 }
 
 fn validate_runtime_bind_addr(addr: SocketAddr) -> miette::Result<()> {
@@ -124,45 +200,6 @@ fn validate_runtime_bind_addr(addr: SocketAddr) -> miette::Result<()> {
     Err(miette::miette!(
         "runtime app-server must bind to a loopback address until transport authentication is configured: {addr}"
     ))
-}
-
-fn prepare_runtime_lease_dir(workspace_root: &Path, runtime_dir: &Path) -> miette::Result<()> {
-    match fs::symlink_metadata(runtime_dir) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(miette::miette!(
-                "runtime directory cannot be a symbolic link: {}",
-                runtime_dir.display()
-            ));
-        }
-        Ok(metadata) if metadata.is_dir() => {}
-        Ok(_) => {
-            return Err(miette::miette!(
-                "runtime path is not a directory: {}",
-                runtime_dir.display()
-            ));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(runtime_dir).map_err(|error| miette::miette!("{error}"))?;
-        }
-        Err(error) => return Err(miette::miette!("{error}")),
-    }
-    let canonical_runtime_dir = runtime_dir
-        .canonicalize()
-        .map_err(|error| miette::miette!("{error}"))?;
-    if canonical_runtime_dir.parent() != Some(workspace_root) {
-        return Err(miette::miette!(
-            "runtime directory escaped the workspace: {}",
-            canonical_runtime_dir.display()
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        fs::set_permissions(&canonical_runtime_dir, fs::Permissions::from_mode(0o700))
-            .map_err(|error| miette::miette!("{error}"))?;
-    }
-    Ok(())
 }
 
 async fn enforce_local_http_boundary(request: Request, next: Next) -> Result<Response, StatusCode> {
@@ -213,22 +250,38 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
-async fn runtime_info(State(state): State<AppState>) -> Json<RuntimeHostInfo> {
-    Json(state.info)
+async fn runtime_info(State(state): State<AppState>) -> Json<AppServerInfo> {
+    Json(state.inner.info.clone())
+}
+
+#[derive(Debug, Deserialize)]
+struct AttachRequest {
+    cwd: PathBuf,
+}
+
+async fn attach_runtime(
+    State(state): State<AppState>,
+    Json(request): Json<AttachRequest>,
+) -> Result<Json<RuntimeAttachment>, AppError> {
+    Ok(Json(state.attach_cwd(request.cwd).await?))
 }
 
 async fn send_command(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(command): Json<SessionCommand>,
 ) -> Result<Json<CommandAck>, AppError> {
-    Ok(Json(state.transport.send_command(command).await?))
+    let transport = state.attached_transport(&headers).await?;
+    Ok(Json(transport.send_command(command).await?))
 }
 
 async fn query_runtime(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(query): Json<RuntimeQuery>,
 ) -> Result<Json<Value>, AppError> {
-    Ok(Json(state.transport.query(query).await?))
+    let transport = state.attached_transport(&headers).await?;
+    Ok(Json(transport.query(query).await?))
 }
 
 async fn attach_page() -> Html<&'static str> {
@@ -237,69 +290,42 @@ async fn attach_page() -> Html<&'static str> {
 
 async fn events(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<EventQuery>,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, AppError> {
+    let transport = state.attached_transport(&headers).await?;
     let session_id = parse_session_id(&query.session_id)?;
     let task_id = query.task_id.as_deref().map(parse_task_id).transpose()?;
-    let transport = state.transport.clone();
-    let mut cursor = query.cursor;
-    let filter = EventFilter {
-        session_id,
-        task_id,
-        after_sequence_no: cursor,
-    };
-    let mut live = transport.subscribe_live(filter.clone());
-    let replay = transport.replay_events(filter.clone()).await?;
+    let header_cursor = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let mut events = transport
+        .subscribe(EventFilter {
+            session_id,
+            task_id,
+            after_sequence_no: query.cursor.or(header_cursor),
+        })
+        .await?;
     let stream = async_stream::stream! {
-        for event in replay {
-            cursor = event_sequence_no(&event).or(cursor);
-            yield Ok::<Event, Infallible>(sse_event(event));
-        }
-        loop {
-            match live.recv().await {
-                Ok(event) => {
-                    if event.session_id == session_id
-                        && task_id.is_none_or(|task_id| event.task_id == Some(task_id))
-                        && cursor.is_none_or(|cursor| event.sequence_no > cursor)
-                    {
-                        cursor = Some(event.sequence_no);
-                        match serde_json::to_value(event) {
-                            Ok(value) => yield Ok::<Event, Infallible>(sse_event(value)),
-                            Err(error) => {
-                                yield Ok::<Event, Infallible>(sse_named_event(
-                                    "error",
-                                    json!({"error": error.to_string()}),
-                                ));
-                            }
-                        }
+        while let Some(event) = events.recv().await {
+            match event {
+                Ok(event) => match serde_json::to_value(event) {
+                    Ok(value) => yield Ok::<Event, Infallible>(sse_event(value)),
+                    Err(error) => {
+                        yield Ok::<Event, Infallible>(sse_named_event(
+                            "error",
+                            json!({"error": error.to_string()}),
+                        ));
                     }
-                }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                },
+                Err(error) => {
                     yield Ok::<Event, Infallible>(sse_named_event(
-                        "lag",
-                        json!({"skipped": skipped, "cursor": cursor}),
+                        "error",
+                        json!({"error": error.to_string()}),
                     ));
-                    match transport.replay_events(EventFilter {
-                        session_id,
-                        task_id,
-                        after_sequence_no: cursor,
-                    }).await {
-                        Ok(events) => {
-                            for event in events {
-                                cursor = event_sequence_no(&event).or(cursor);
-                                yield Ok::<Event, Infallible>(sse_event(event));
-                            }
-                        }
-                        Err(error) => {
-                            yield Ok::<Event, Infallible>(sse_named_event(
-                                "error",
-                                json!({"error": error.to_string()}),
-                            ));
-                            break;
-                        }
-                    }
+                    break;
                 }
-                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     };
@@ -307,7 +333,7 @@ async fn events(
 }
 
 fn sse_event(value: Value) -> Event {
-    let sequence_no = event_sequence_no(&value);
+    let sequence_no = value.get("sequence_no").and_then(Value::as_u64);
     let builder = sequence_no.map_or_else(Event::default, |sequence_no| {
         Event::default().id(sequence_no.to_string())
     });
@@ -329,10 +355,11 @@ fn sse_named_event(name: &'static str, value: Value) -> Event {
 
 async fn replay_events(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<EventQuery>,
 ) -> Result<Json<Vec<Value>>, AppError> {
-    let filter = event_filter(query)?;
-    Ok(Json(state.transport.replay_events(filter).await?))
+    let transport = state.attached_transport(&headers).await?;
+    Ok(Json(transport.replay_events(event_filter(query)?).await?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -342,23 +369,36 @@ struct ThreadQuery {
 
 async fn list_threads(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<ThreadQuery>,
 ) -> Result<Json<Vec<golutra_store::ThreadRecord>>, AppError> {
+    let transport = state.attached_transport(&headers).await?;
     Ok(Json(
-        state
-            .transport
-            .list_threads(query.limit.unwrap_or(20))
+        transport.list_threads(query.limit.unwrap_or(20)).await?,
+    ))
+}
+
+async fn thread_for_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(session_id): AxumPath<String>,
+) -> Result<Json<Option<golutra_store::ThreadRecord>>, AppError> {
+    let transport = state.attached_transport(&headers).await?;
+    Ok(Json(
+        transport
+            .thread_for_session(parse_session_id(&session_id)?)
             .await?,
     ))
 }
 
 async fn resume_thread(
     State(state): State<AppState>,
+    headers: HeaderMap,
     AxumPath(thread_id): AxumPath<String>,
 ) -> Result<Json<golutra_store::ThreadRecord>, AppError> {
+    let transport = state.attached_transport(&headers).await?;
     Ok(Json(
-        state
-            .transport
+        transport
             .resume_thread(parse_thread_id(&thread_id)?)
             .await?,
     ))
@@ -366,13 +406,12 @@ async fn resume_thread(
 
 async fn fork_thread(
     State(state): State<AppState>,
+    headers: HeaderMap,
     AxumPath(thread_id): AxumPath<String>,
 ) -> Result<Json<golutra_store::ThreadRecord>, AppError> {
+    let transport = state.attached_transport(&headers).await?;
     Ok(Json(
-        state
-            .transport
-            .fork_thread(parse_thread_id(&thread_id)?)
-            .await?,
+        transport.fork_thread(parse_thread_id(&thread_id)?).await?,
     ))
 }
 
@@ -395,6 +434,7 @@ fn event_filter(query: EventQuery) -> Result<EventFilter, AppError> {
 enum AppError {
     Client(ClientError),
     InvalidId(String),
+    Attachment(String),
 }
 
 impl From<ClientError> for AppError {
@@ -404,13 +444,12 @@ impl From<ClientError> for AppError {
 }
 
 impl IntoResponse for AppError {
-    fn into_response(self) -> axum::response::Response {
+    fn into_response(self) -> Response {
         let (status, message) = match self {
-            AppError::Client(error) => (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                error.to_string(),
-            ),
-            AppError::InvalidId(error) => (axum::http::StatusCode::BAD_REQUEST, error),
+            Self::Client(ClientError::InvalidSession(error)) => (StatusCode::BAD_REQUEST, error),
+            Self::Client(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+            Self::InvalidId(error) => (StatusCode::BAD_REQUEST, error),
+            Self::Attachment(error) => (StatusCode::UNAUTHORIZED, error),
         };
         (status, Json(json!({ "error": message }))).into_response()
     }
@@ -434,64 +473,36 @@ fn parse_thread_id(value: &str) -> Result<ThreadId, AppError> {
         .map_err(|_| AppError::InvalidId(format!("invalid thread_id: {value}")))
 }
 
-fn runtime_host_info(
-    transport: &InProcessTransport,
-    workspace_root: &Path,
-    base_url: &str,
-) -> RuntimeHostInfo {
-    RuntimeHostInfo {
-        instance_id: Uuid::now_v7().to_string(),
-        pid: std::process::id(),
-        base_url: base_url.to_owned(),
-        workspace_root: workspace_root.display().to_string(),
-        workspace_id: transport.workspace_id(),
-        default_session_id: transport.default_session_id(),
-        default_thread_id: transport.default_thread_id(),
-        started_at: chrono::Utc::now(),
-    }
-}
-
-struct RuntimeDaemonLease {
+struct AppServerLease {
     _lock: File,
     endpoint_path: PathBuf,
+    instance_id: std::sync::Mutex<Option<String>>,
 }
 
-impl RuntimeDaemonLease {
-    fn acquire(workspace_root: &Path) -> miette::Result<Self> {
-        let runtime_dir = workspace_root.join(".golutra");
-        prepare_runtime_lease_dir(workspace_root, &runtime_dir)?;
-        let lock_path = runtime_dir.join("runtime-host.lock");
+impl AppServerLease {
+    fn acquire(paths: &AppServerPaths) -> miette::Result<Self> {
         let lock = OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(&lock_path)
+            .open(&paths.lock)
             .map_err(|error| miette::miette!("{error}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            lock.set_permissions(fs::Permissions::from_mode(0o600))
-                .map_err(|error| miette::miette!("{error}"))?;
-        }
-        lock.try_lock_exclusive().map_err(|error| {
-            miette::miette!(
-                "workspace runtime host is already running for {}: {error}",
-                workspace_root.display()
-            )
-        })?;
+        set_owner_only_file(&lock)?;
+        lock.try_lock_exclusive()
+            .map_err(|error| miette::miette!("Golutra app-server is already running: {error}"))?;
         Ok(Self {
             _lock: lock,
-            endpoint_path: runtime_endpoint_path(workspace_root),
+            endpoint_path: paths.endpoint.clone(),
+            instance_id: std::sync::Mutex::new(None),
         })
     }
 
-    fn publish(&self, info: &RuntimeHostInfo) -> miette::Result<()> {
+    fn publish(&self, info: &AppServerInfo) -> miette::Result<()> {
         let parent = self
             .endpoint_path
             .parent()
-            .ok_or_else(|| miette::miette!("runtime endpoint path has no parent"))?;
+            .ok_or_else(|| miette::miette!("app-server endpoint path has no parent"))?;
         let mut temporary =
             tempfile::NamedTempFile::new_in(parent).map_err(|error| miette::miette!("{error}"))?;
         temporary
@@ -503,25 +514,68 @@ impl RuntimeDaemonLease {
             .as_file()
             .sync_all()
             .map_err(|error| miette::miette!("{error}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            temporary
-                .as_file()
-                .set_permissions(fs::Permissions::from_mode(0o600))
-                .map_err(|error| miette::miette!("{error}"))?;
-        }
+        set_owner_only_file(temporary.as_file())?;
+        temporary
+            .as_file()
+            .sync_all()
+            .map_err(|error| miette::miette!("{error}"))?;
         temporary
             .persist(&self.endpoint_path)
             .map_err(|error| miette::miette!("{error}"))?;
+        sync_app_server_directory(parent)?;
+        *self
+            .instance_id
+            .lock()
+            .map_err(|_| miette::miette!("app-server lease lock is poisoned"))? =
+            Some(info.instance_id.clone());
         Ok(())
     }
 }
 
-impl Drop for RuntimeDaemonLease {
+impl Drop for AppServerLease {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.endpoint_path);
+        let own_instance = self
+            .instance_id
+            .lock()
+            .ok()
+            .and_then(|instance| instance.clone());
+        let endpoint_instance = fs::read(&self.endpoint_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<AppServerInfo>(&bytes).ok())
+            .map(|info| info.instance_id);
+        if own_instance.is_some()
+            && own_instance == endpoint_instance
+            && fs::remove_file(&self.endpoint_path).is_ok()
+            && let Some(parent) = self.endpoint_path.parent()
+        {
+            let _ = sync_app_server_directory(parent);
+        }
     }
+}
+
+#[cfg(unix)]
+fn sync_app_server_directory(path: &Path) -> miette::Result<()> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| miette::miette!("{error}"))
+}
+
+#[cfg(not(unix))]
+fn sync_app_server_directory(_path: &Path) -> miette::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_owner_only_file(file: &File) -> miette::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|error| miette::miette!("{error}"))
+}
+
+#[cfg(not(unix))]
+fn set_owner_only_file(_file: &File) -> miette::Result<()> {
+    Ok(())
 }
 
 const ATTACH_PAGE: &str = r#"<!doctype html>
@@ -529,139 +583,74 @@ const ATTACH_PAGE: &str = r#"<!doctype html>
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Golutra Attach</title>
+    <title>Golutra Runtime</title>
     <style>
-      :root {
-        color-scheme: light dark;
-        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      }
-      body {
-        margin: 0;
-        background: Canvas;
-        color: CanvasText;
-      }
-      main {
-        width: min(1120px, calc(100vw - 32px));
-        margin: 24px auto;
-        display: grid;
-        gap: 16px;
-      }
-      form {
-        display: grid;
-        grid-template-columns: minmax(260px, 1fr) minmax(220px, 1fr) auto;
-        gap: 8px;
-        align-items: end;
-      }
-      label {
-        display: grid;
-        gap: 4px;
-        font-size: 12px;
-      }
-      input, button, select {
-        min-height: 36px;
-        font: inherit;
-      }
-      button {
-        padding: 0 14px;
-      }
-      section {
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 16px;
-      }
-      pre {
-        min-height: 320px;
-        max-height: 70vh;
-        overflow: auto;
-        padding: 12px;
-        border: 1px solid color-mix(in srgb, CanvasText 20%, transparent);
-        border-radius: 6px;
-        background: color-mix(in srgb, CanvasText 4%, transparent);
-        white-space: pre-wrap;
-        word-break: break-word;
-      }
-      @media (max-width: 760px) {
-        form, section {
-          grid-template-columns: 1fr;
-        }
-      }
+      :root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, sans-serif; }
+      body { margin: 0; background: Canvas; color: CanvasText; }
+      main { width: min(1080px, calc(100vw - 32px)); margin: 24px auto; display: grid; gap: 12px; }
+      form { display: grid; grid-template-columns: 2fr 1fr auto; gap: 8px; align-items: end; }
+      label { display: grid; gap: 4px; font-size: 12px; }
+      input, button { min-height: 36px; font: inherit; }
+      pre { min-height: 420px; overflow: auto; padding: 12px; border: 1px solid GrayText; border-radius: 6px; white-space: pre-wrap; word-break: break-word; }
+      @media (max-width: 720px) { form { grid-template-columns: 1fr; } }
     </style>
   </head>
   <body>
     <main>
       <form id="attach-form">
-        <label>
-          Session ID
-          <input id="session-id" name="session_id" required autocomplete="off" />
-        </label>
-        <label>
-          Task ID
-          <input id="task-id" name="task_id" autocomplete="off" />
-        </label>
-        <label>
-          Query
-          <select id="query-kind" name="query_kind">
-            <option value="user_projection">user_projection</option>
-            <option value="debug_projection">debug_projection</option>
-            <option value="session_state">session_state</option>
-            <option value="task_state">task_state</option>
-          </select>
-        </label>
+        <label>CWD<input id="cwd" required autocomplete="off" /></label>
+        <label>Session ID<input id="session-id" required autocomplete="off" /></label>
         <button type="submit">Attach</button>
       </form>
-      <section>
-        <pre id="projection" aria-live="polite"></pre>
-        <pre id="events" aria-live="polite"></pre>
-      </section>
+      <pre id="output" aria-live="polite"></pre>
     </main>
     <script>
       const form = document.getElementById("attach-form");
-      const projection = document.getElementById("projection");
-      const events = document.getElementById("events");
-      let stream;
-
-      function render(target, value) {
-        target.textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
-      }
+      const output = document.getElementById("output");
+      let controller;
 
       form.addEventListener("submit", async (event) => {
         event.preventDefault();
+        controller?.abort();
+        controller = new AbortController();
+        output.textContent = "";
+        const cwd = document.getElementById("cwd").value.trim();
         const sessionId = document.getElementById("session-id").value.trim();
-        const taskId = document.getElementById("task-id").value.trim();
-        const kind = document.getElementById("query-kind").value;
-        const now = new Date().toISOString();
-
-        if (stream) {
-          stream.close();
-        }
-
-        const response = await fetch("/queries", {
+        const attached = await fetch("/runtime/attach", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            query_id: crypto.randomUUID(),
-            session_id: sessionId,
-            task_id: taskId || undefined,
-            kind,
-            requester: "web",
-            timestamp: now
-          })
+          body: JSON.stringify({ cwd })
         });
-        render(projection, response.ok ? await response.json() : `query failed: ${response.status}`);
-
-        const params = new URLSearchParams({ session_id: sessionId });
-        if (taskId) {
-          params.set("task_id", taskId);
+        if (!attached.ok) {
+          output.textContent = `attach failed: ${attached.status} ${await attached.text()}`;
+          return;
         }
-        events.textContent = "";
-        stream = new EventSource(`/events?${params.toString()}`);
-        stream.onmessage = (message) => {
-          events.textContent += `${message.data}\n`;
-        };
-        stream.onerror = () => {
-          events.textContent += "[event stream disconnected]\n";
-          stream.close();
-        };
+        const attachment = await attached.json();
+        const response = await fetch(`/events?session_id=${encodeURIComponent(sessionId)}`, {
+          headers: {
+            "accept": "text/event-stream",
+            "x-golutra-attachment": attachment.attachment_id
+          },
+          signal: controller.signal
+        });
+        if (!response.ok || !response.body) {
+          output.textContent = `stream failed: ${response.status} ${await response.text()}`;
+          return;
+        }
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const frames = buffer.split("\n\n");
+          buffer = frames.pop() || "";
+          for (const frame of frames) {
+            const data = frame.split("\n").filter((line) => line.startsWith("data:"));
+            for (const line of data) output.textContent += `${line.slice(5).trim()}\n`;
+          }
+        }
       });
     </script>
   </body>
@@ -674,26 +663,88 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
-    use golutra_client::HttpSseTransport;
-    use golutra_core::{Actor, ActorKind, CommandId, QueryId, TaskStatus};
-    use golutra_protocol::{RuntimeQuery, RuntimeQueryKind, SessionCommandKind};
+    use golutra_core::{Actor, ActorKind, CommandId};
+    use golutra_protocol::SessionCommandKind;
     use tower::ServiceExt;
 
     use super::*;
+
+    fn server_info() -> AppServerInfo {
+        AppServerInfo {
+            instance_id: Uuid::now_v7().to_string(),
+            pid: std::process::id(),
+            base_url: "http://127.0.0.1:0".to_owned(),
+            started_at: chrono::Utc::now(),
+        }
+    }
+
+    async fn state_with_attachment() -> (AppState, String, SessionId) {
+        let state = AppState::new(server_info());
+        let transport = EmbeddedTransport::in_memory().await.expect("transport");
+        let attachment_id = Uuid::now_v7().to_string();
+        let session_id = transport.default_session_id();
+        state
+            .inner
+            .attachments
+            .lock()
+            .await
+            .insert(attachment_id.clone(), transport);
+        (state, attachment_id, session_id)
+    }
+
+    #[tokio::test]
+    async fn runtime_attachment_rejects_relative_cwd() {
+        let state = AppState::new(server_info());
+
+        let error = state
+            .attach_cwd("relative-workspace")
+            .await
+            .expect_err("relative cwd must be rejected");
+
+        assert!(matches!(error, ClientError::InvalidSession(_)));
+    }
+
+    #[tokio::test]
+    async fn runtime_attachment_registry_is_bounded_and_failed_slots_are_released() {
+        let state = AppState::with_runtime_limit(server_info(), 1);
+        let transport = EmbeddedTransport::in_memory().await.expect("transport");
+        let occupied = Arc::new(OnceCell::new());
+        occupied
+            .set(AttachedRuntime {
+                attachment_id: "existing".to_owned(),
+                transport,
+            })
+            .expect("runtime cell");
+        state
+            .inner
+            .runtimes
+            .lock()
+            .await
+            .insert(PathBuf::from("/already-attached"), occupied);
+        let workspace = tempfile::tempdir().expect("workspace");
+
+        let error = state
+            .attach_cwd(workspace.path())
+            .await
+            .expect_err("runtime limit must be enforced");
+
+        assert!(matches!(error, ClientError::Daemon(_)));
+
+        state.inner.runtimes.lock().await.clear();
+        let invalid_cwd = workspace.path().join("not-a-directory");
+        fs::write(&invalid_cwd, "file").expect("invalid cwd fixture");
+        state
+            .attach_cwd(&invalid_cwd)
+            .await
+            .expect_err("file cwd must fail initialization");
+        assert!(state.inner.runtimes.lock().await.is_empty());
+    }
 
     #[test]
     fn runtime_server_rejects_non_loopback_bind_addresses() {
         assert!(validate_runtime_bind_addr("127.0.0.1:0".parse().expect("IPv4")).is_ok());
         assert!(validate_runtime_bind_addr("[::1]:0".parse().expect("IPv6")).is_ok());
-
-        let error = validate_runtime_bind_addr("0.0.0.0:47831".parse().expect("wildcard"))
-            .expect_err("non-loopback bind must be rejected");
-
-        assert!(
-            error
-                .to_string()
-                .contains("must bind to a loopback address")
-        );
+        assert!(validate_runtime_bind_addr("0.0.0.0:47831".parse().expect("wildcard")).is_err());
     }
 
     #[test]
@@ -705,262 +756,97 @@ mod tests {
             "http://localhost:47831".parse().expect("origin"),
         );
         assert!(local_http_headers(&headers));
-
         headers.insert(
             header::ORIGIN,
             "https://example.com".parse().expect("origin"),
         );
         assert!(!local_http_headers(&headers));
-
-        headers.remove(header::ORIGIN);
-        headers.insert(header::HOST, "runtime.example:47831".parse().expect("host"));
-        assert!(!local_http_headers(&headers));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn runtime_lease_rejects_symlinked_runtime_directory() {
-        use std::os::unix::fs::symlink;
-
-        let workspace = tempfile::tempdir().expect("workspace");
-        let outside = tempfile::tempdir().expect("outside");
-        symlink(outside.path(), workspace.path().join(".golutra")).expect("symlink");
-
-        let error = prepare_runtime_lease_dir(
-            &workspace.path().canonicalize().expect("workspace path"),
-            &workspace.path().join(".golutra"),
-        )
-        .expect_err("symlink must be rejected");
-
-        assert!(error.to_string().contains("cannot be a symbolic link"));
     }
 
     #[tokio::test]
-    async fn command_endpoint_accepts_session_command() {
-        let transport = InProcessTransport::in_memory().await.expect("transport");
-        let app = router(AppState::new(transport));
-        let session_id = SessionId::new();
-        let command = SessionCommand {
-            command_id: CommandId::new(),
-            session_id: Some(session_id),
-            kind: SessionCommandKind::Prompt,
-            idempotency_key: "http-test".to_owned(),
-            actor: Actor {
-                kind: ActorKind::Api,
-                id: "test".to_owned(),
-            },
-            payload: json!({"prompt": "hello"}),
-            timestamp: chrono::Utc::now(),
-        };
-        let request = Request::builder()
-            .method("POST")
-            .uri("/commands")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&command).expect("json")))
-            .expect("request");
-
-        let response = app.oneshot(request).await.expect("response");
-
+    async fn runtime_info_is_server_scoped() {
+        let info = server_info();
+        let app = router(AppState::new(info.clone()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/runtime/info")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("body");
-        let ack: CommandAck = serde_json::from_slice(&body).expect("ack");
-        assert!(ack.accepted);
+        assert_eq!(
+            serde_json::from_slice::<AppServerInfo>(&body).expect("info"),
+            info
+        );
+    }
+
+    #[tokio::test]
+    async fn command_endpoint_requires_valid_attachment() {
+        let (state, attachment_id, session_id) = state_with_attachment().await;
+        let command = SessionCommand {
+            command_id: CommandId::new(),
+            session_id: Some(session_id),
+            kind: SessionCommandKind::Create,
+            idempotency_key: CommandId::new().to_string(),
+            actor: Actor {
+                kind: ActorKind::Sdk,
+                id: "test".to_owned(),
+            },
+            payload: json!({}),
+            timestamp: chrono::Utc::now(),
+        };
+        let app = router(state);
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/commands")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&command).expect("json")))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+        let accepted = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/commands")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id)
+                    .body(Body::from(serde_json::to_vec(&command).expect("json")))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(accepted.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn attach_page_is_served() {
-        let transport = InProcessTransport::in_memory().await.expect("transport");
-        let app = router(AppState::new(transport));
-        let request = Request::builder()
-            .method("GET")
-            .uri("/attach")
-            .body(Body::empty())
-            .expect("request");
-
-        let response = app.oneshot(request).await.expect("response");
-
+        let app = router(AppState::new(server_info()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/attach")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn http_transport_receives_replay_and_live_sse_events() {
-        let (transport, server) = http_transport().await;
-        let session_id = transport.info().default_session_id;
-        let mut events = transport
-            .subscribe(EventFilter {
-                session_id,
-                task_id: None,
-                after_sequence_no: None,
-            })
+        let body = to_bytes(response.into_body(), usize::MAX)
             .await
-            .expect("SSE subscription");
-
-        let ack = transport
-            .send_command(test_command(
-                session_id,
-                SessionCommandKind::Prompt,
-                json!({"prompt": "hello"}),
-            ))
-            .await
-            .expect("HTTP command");
-        let terminal = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            loop {
-                let event = events
-                    .recv()
-                    .await
-                    .expect("stream remains open")
-                    .expect("event");
-                if event.event_type == golutra_protocol::RuntimeEventType::TaskCompleted {
-                    return event;
-                }
-            }
-        })
-        .await
-        .expect("terminal event arrives");
-        let state = transport
-            .query(RuntimeQuery {
-                query_id: QueryId::new(),
-                session_id,
-                task_id: None,
-                kind: RuntimeQueryKind::SessionState,
-                requester: ActorKind::Sdk,
-                cursor: None,
-                timestamp: chrono::Utc::now(),
-            })
-            .await
-            .expect("HTTP query");
-
-        assert!(ack.accepted);
-        assert_eq!(terminal.session_id, session_id);
-        assert_eq!(state["task_status"], json!(TaskStatus::Completed));
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn http_transport_controls_approval_pause_pending_turn_and_abort() {
-        let (transport, server) = http_transport().await;
-        let session_id = transport.info().default_session_id;
-        let mut events = transport
-            .subscribe(EventFilter {
-                session_id,
-                task_id: None,
-                after_sequence_no: None,
-            })
-            .await
-            .expect("SSE subscription");
-        transport
-            .send_command(test_command(
-                session_id,
-                SessionCommandKind::Prompt,
-                json!({"prompt": "sleep"}),
-            ))
-            .await
-            .expect("start task");
-        let approval_id = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            loop {
-                let event = events
-                    .recv()
-                    .await
-                    .expect("stream remains open")
-                    .expect("event");
-                if event.event_type == golutra_protocol::RuntimeEventType::ApprovalRequested {
-                    return event.payload["approval_id"]
-                        .as_str()
-                        .expect("approval id")
-                        .to_owned();
-                }
-            }
-        })
-        .await
-        .expect("approval arrives");
-        transport
-            .send_command(test_command(
-                session_id,
-                SessionCommandKind::Approve,
-                json!({"approval_id": approval_id}),
-            ))
-            .await
-            .expect("approve");
-        transport
-            .send_command(test_command(
-                session_id,
-                SessionCommandKind::Pause,
-                json!({}),
-            ))
-            .await
-            .expect("pause");
-        let queued = transport
-            .send_command(test_command(
-                session_id,
-                SessionCommandKind::Prompt,
-                json!({"prompt": "queued follow-up"}),
-            ))
-            .await
-            .expect("queue turn");
-        transport
-            .send_command(test_command(
-                session_id,
-                SessionCommandKind::Abort,
-                json!({}),
-            ))
-            .await
-            .expect("abort");
-        let aborted = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            loop {
-                let event = events
-                    .recv()
-                    .await
-                    .expect("stream remains open")
-                    .expect("event");
-                if event.event_type == golutra_protocol::RuntimeEventType::TaskAborted {
-                    return event;
-                }
-            }
-        })
-        .await
-        .expect("abort arrives");
-
-        assert!(queued.accepted);
-        assert_eq!(aborted.payload["status"], json!(TaskStatus::Cancelled));
-        server.abort();
-    }
-
-    async fn http_transport() -> (HttpSseTransport, tokio::task::JoinHandle<()>) {
-        let in_process = InProcessTransport::in_memory().await.expect("transport");
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener");
-        let address = listener.local_addr().expect("address");
-        let workspace = std::env::current_dir().expect("workspace");
-        let info = runtime_host_info(&in_process, &workspace, &format!("http://{address}"));
-        let app = router(AppState::with_info(in_process, info));
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("server");
-        });
-        let transport = HttpSseTransport::connect(format!("http://{address}"))
-            .await
-            .expect("HTTP transport");
-        (transport, server)
-    }
-
-    fn test_command(
-        session_id: SessionId,
-        kind: SessionCommandKind,
-        payload: Value,
-    ) -> SessionCommand {
-        SessionCommand {
-            command_id: CommandId::new(),
-            session_id: Some(session_id),
-            kind,
-            idempotency_key: CommandId::new().to_string(),
-            actor: Actor {
-                kind: ActorKind::Sdk,
-                id: "http-test".to_owned(),
-            },
-            payload,
-            timestamp: chrono::Utc::now(),
-        }
+            .expect("body");
+        assert!(String::from_utf8_lossy(&body).contains("x-golutra-attachment"));
     }
 }

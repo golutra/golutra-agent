@@ -680,17 +680,17 @@ PromotionDecision
 
 ### RuntimeHost 与事件流边界
 
-多前端一致性的前提是存在一个中心 `RuntimeHost`。如果 CLI、TUI、app-server 各自创建本地内存 store，即使协议类型一致，也只是三个互不相干的演示 runtime。
+多前端实时一致性的前提是它们连接同一个 `RuntimeHost` attachment。默认 Embedded 进程可以各自持有 host，但必须共享全局 durable store，并通过 session lease 禁止两个进程同时拥有同一 active session；如果各自创建本地内存 store，则仍只是互不相干的演示 runtime。
 
 第一阶段需要明确以下实现边界：
 
 - `RuntimeHost` 是执行与状态所有权边界，负责接收 `SessionCommand`、驱动 `RuntimeLane / AgentLoop`、写入 event、更新 projection、广播 live event。
 - `RuntimeStore` 是 durable facts，不直接等于 runtime host；store 可以恢复状态，但不能替代任务调度、运行中取消、订阅和 provider/tool loop。
 - `EventBus` 负责把 durable event 与 live event 统一起来：先 append 到 store，再发布给订阅者；断线重连时按 cursor replay，再接 live stream。
-- `InProcessTransport` 第一阶段可以用于 CLI/TUI，但它必须持有或连接 `Arc<RuntimeHost>`，不能只包 `RuntimeStore`。
-- `HttpSseTransport` 用于 Web / SDK / daemon 模式，语义必须与 `InProcessTransport` 对拍一致。
+- `EmbeddedTransport` 是 CLI/TUI 默认入口，必须持有 `Arc<RuntimeHost>` 并连接 `$GOLUTRA_HOME/state/runtime.sqlite`，不能只包临时 `RuntimeStore`。
+- `HttpSseTransport` 用于 Web / SDK / 显式 daemon/remote 模式，必须先按 cwd attachment，语义与 `EmbeddedTransport` 对拍一致。
 - `RuntimeClient::subscribe` 的目标语义是 event stream；如果短期保留 snapshot API，也必须新增 live watch 能力，不能让 TUI 长期轮询历史事件。
-- `SessionResolver` 必须稳定解析 workspace 当前 session / task，不能每次入口启动都生成新的默认 session。
+- cwd thread resolver 从全局 thread index 选择当前 cwd 最近 session/thread；TUI 新建会话可以显式生成新 ID，但首个 prompt 前不持久化 placeholder。
 
 这条边界决定了 TUI 的实施顺序：先让多个入口看到同一 task，再完善终端布局和组件。否则 TUI 会被迫维护自己的状态机，最终和 runtime 脱节。
 
@@ -701,9 +701,9 @@ PromotionDecision
 - `SessionCommand`、`RuntimeQuery`、`RuntimeEvent` 要有稳定 schema 产物。
 - TypeScript SDK 应尽量从协议产物生成类型，避免手写接口漂移。
 - Python SDK 第一阶段可以后置，但其 transport 语义必须与 TypeScript SDK 和 app-server 一致。
-- 本地 SDK 允许两种运行方式：
-  - 连接已运行的 `app-server`
-  - 按配置拉起本地 runtime host
+- 本地入口允许两种运行方式：
+  - CLI/TUI 进程内创建 durable Embedded host
+  - SDK/Web/CLI/TUI 连接显式启动的用户级 `app-server`
 - 无论哪种运行方式，`task_id`、event 顺序、approval、resume、replay 语义必须一致。
 
 ### 协议测试与 smoke 约束
@@ -850,16 +850,16 @@ Debug Projection 只在 debug/audit/replay 模式启用。
 7. `golutra-tools`：tool schema、permission、ToolResultEnvelope。
 8. `golutra-store` checkpoint 子模块：workspace checkpoint。
 9. `golutra-verify`：任务类型基础验证策略。
-10. `golutra-runtime` host 子模块：`RuntimeHost`、`SessionResolver`、`EventBus`、workspace 默认 SQLite 路径。
+10. `golutra-client` host 子模块：`RuntimeHost`、cwd thread resolver、`EventBus`、全局 `RuntimePaths`。
 11. `golutra-client`：统一 `RuntimeClient`、`RuntimeQuery`、event replay 和 live subscription 接口。
-12. `golutra-cli` / `golutra-tui`：通过 `InProcessTransport` 连接同一 `RuntimeHost`，只消费 command/query/event。
-13. `golutra-app-server`：暴露 `HttpSseTransport`，支持 Web / SDK attach、query、stream。
+12. `golutra-cli` / `golutra-tui`：默认通过 `EmbeddedTransport`，可显式选择 daemon/remote，只消费 command/query/event。
+13. `golutra-app-server`：用户级单实例管理多 cwd attachment，暴露 HTTP command/query 与 SSE stream。
 14. `golutra-vis`：DebugProjection 和 replay 查询。
 15. `golutra-eval`：ImprovementCandidate、RegressionResult、PromotionDecision 的离线链路。
 
 入口优先级默认值：
 
-1. `CLI + TUI + InProcessTransport`
+1. `CLI + TUI + EmbeddedTransport`
 2. `app-server + HttpSseTransport`
 3. `SDK + Web attach`
 4. `IDE attach`

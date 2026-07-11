@@ -87,17 +87,18 @@ GoalLedger
 
 ## Runtime-First 多前端边界
 
-Golutra 要支持的不是“多个前端各跑一套 agent”，而是“一个 runtime 被多个前端同时观察和驱动”。
+Golutra 同时支持进程内运行和多前端共享运行，但两者必须使用同一套协议与 durable facts。
 
 统一边界如下：
 
-- 同一 `workspace_id + session_id + task_id` 只能有一份 runtime 真相，来源是 `RuntimeEventLog + StateProjection`。
+- 同一 `workspace_id + session_id + task_id` 只能有一份 durable runtime 真相，来源是全局 `RuntimeEventLog + StateProjection`。
 - SDK、TUI、Web、IDE、API 只能通过统一协议访问 runtime，不能各自维护私有任务状态。
-- 一个前端提交 `SessionCommand` 后，其他已附着到同一 session/task 的前端应该看到同样的运行状态变化。
+- 默认 Embedded 模式由当前 CLI/TUI 进程持有 task handle、CancellationToken 和 live EventBus；多个进程不能同时接管同一 active session，session lease 会拒绝第二个 owner。
+- 需要多前端实时共享时，各入口连接同一个 app-server attachment；一个前端提交 `SessionCommand` 后，其他附着到同一 session/task 的前端会看到相同状态变化。
 - 流式输出也属于共享 runtime 事件；差异只允许出现在 projection 和渲染层，不允许出现在任务事实层。
 - daemon 不是额外的一套业务接口，只是 `RuntimeCore` 的一种 host / transport 承载方式。
 
-这意味着下面这种场景必须成立：
+在 daemon/remote attachment 模式下，下面这种场景必须成立：
 
 ```text
 SDK 正在执行某个 workspace 里的 task
@@ -138,7 +139,7 @@ Golutra 当前主场景是 coding agent，不按通用 agent 平台做第一阶�
 - `inject` 只能在安全边界处发生，不能打断正在执行的文件写入、shell、网络或外部系统副作用。
 - 所有 busy policy 决策都必须写入 `RuntimeEvent`，并进入 `StateProjection`。
 - `interrupt` 与 `abort` 都必须走 `CancellationContract`，不能只停止 UI stream。
-- 当前 task handle 使用 `CancellationToken` 驱动 provider/tool loop；shell cancel 在 Unix 上终止整个进程组并继续排空 stdout/stderr，pause/resume 和 pending turn queue 都属于 `RuntimeHost` 状态。
+- 当前 task handle 使用 `CancellationToken` 驱动 provider/tool loop；shell cancel 在 Unix 上终止整个进程组并继续排空 stdout/stderr，pause/resume 和 pending turn queue 都属于 `RuntimeHost` 状态。`TurnQueued` 是 durable queue fact；owner 崩溃后，尚未产生 `TurnStarted` 的 turn 会在新 host 取得 session lease 后转移到 recovery task，已经开始的 turn 不做不安全的自动重放。
 
 ## 四个核心系统
 
@@ -271,22 +272,57 @@ Frontend
   -> Projection
 ```
 
-当前生产路径具体收敛为：
+当前运行路径收敛为混合进程模型：
 
 ```text
-CLI / TUI / TypeScript SDK
+CLI / TUI（默认）
   -> RuntimeTransport
-  -> HttpSseTransport
-  -> workspace loopback daemon
+  -> EmbeddedTransport
+  -> 当前前端进程内 RuntimeHost
+  -> 全局 durable RuntimeStore
+
+CLI / TUI --daemon / TypeScript SDK / Web
+  -> RuntimeTransport / HttpSseTransport
+  -> 用户级单实例 app-server
+  -> POST /runtime/attach { cwd }
+  -> cwd -> EmbeddedTransport registry
   -> RuntimeHost
   -> RuntimeLane / AgentLoop / RuntimeStore / EventBus
 
-tests / explicit embedding
-  -> InProcessTransport
-  -> 同一套 RuntimeHost 语义
+CLI / TUI --connect <URL>
+  -> 显式远端 app-server
+  -> 同一 attachment 协议
 ```
 
-每个 workspace 用文件锁保证只有一个 daemon，`runtime-host.json` 发布 instance、PID、loopback URL、workspace/session/thread ID。CLI/TUI 拉起的 daemon 使用独立 process group，不随前台入口退出或 Ctrl+C 被终止。客户端在连接前校验 canonical workspace、instance ID 和 loopback endpoint；daemon 未配置 transport auth 前拒绝非 loopback bind，并通过 Host/Origin guard 阻断浏览器 CSRF/DNS rebinding。`.golutra` 不允许是 symlink，Unix runtime facts 使用目录 `0700`、文件 `0600`；工具 policy 同时阻断 `.git` 与 `.golutra` 内部路径。
+cwd 只决定执行目录、工具权限、checkpoint/memory/evaluation 分区和 thread 过滤，不决定进程生命周期。所有 durable facts 位于 `$GOLUTRA_HOME/state`：全局 `runtime.sqlite`、`artifacts/` 以及 `workspaces/<cwd-hash>/`；项目 `.golutra` 不参与 runtime 持久化。SQLite 在 event append 事务内分配全局 sequence；全局 session lease 防止多个 Embedded 进程同时控制同一会话，command lease 与 durable ack 提供幂等重试。owner 异常退出后，能够重新取得 lease 的 host 会取消孤儿 active task，并恢复尚未开始的 durable pending turn。用户级 app-server 用 `$GOLUTRA_HOME/app-server/daemon.lock` 保证单实例，并发布 owner-only `app-server.json`；cwd runtime registry 默认最多保留 128 个 attachment，初始化失败会释放槽位。每次 cwd attachment 都从全局 thread index 刷新最近 session/thread，数据库以唯一索引保证一个 session 只绑定一个 thread。未配置 transport auth 前仅允许 loopback，同时校验 Host/Origin；`HttpSseTransport` 始终使用调用方传入的连接 URL 发后续请求，服务端广告地址只作诊断，从而支持 SSH 端口转发和反向代理。
+
+```text
+$GOLUTRA_HOME/
+  provider.json
+  state/
+    runtime.sqlite
+    artifacts/
+    session-locks/
+    command-locks/
+    workspaces/<cwd-sha256>/
+      checkpoints/
+      memory.json
+      evaluation.json
+  app-server/
+    daemon.lock
+    app-server.json
+```
+
+入口选择是显式的：
+
+```text
+golutra --cwd <path> chat "..."          # 默认 Embedded
+golutra-tui --cwd <path>                 # 默认 Embedded
+golutra app-server                       # 启动用户级 daemon
+golutra --cwd <path> --daemon status     # 连接本地 daemon
+golutra --cwd <path> --connect <url> ... # 连接指定 endpoint
+new GolutraClient(baseUrl, cwd)          # SDK 自动创建/复用 attachment
+```
 
 各层职责：
 
@@ -311,7 +347,7 @@ TUI 的难点不在终端绘制，而在是否存在一个可共享、可恢复�
 ```text
 golutra-tui
   -> RuntimeClient
-  -> InProcessTransport 或 HttpSseTransport
+  -> EmbeddedTransport、LocalDaemonTransport 或 RemoteTransport
   -> RuntimeHost
   -> RuntimeCore / RuntimeLane / AgentLoop
   -> RuntimeStore + EventBus
@@ -320,15 +356,15 @@ golutra-tui
 硬性边界：
 
 - `RuntimeHost` 必须拥有 `RuntimeStore`、`RuntimeLaneManager`、`AgentLoop`、`EventBus` 和 session/task 生命周期。
-- `InProcessTransport` 不能只是包一层临时 `RuntimeStore`，必须路由到 `RuntimeHost`。
-- CLI、TUI、app-server、SDK 不能各自创建 `sqlite::memory:` 作为主路径，否则它们看到的是不同任务世界。
+- `EmbeddedTransport` 必须持有完整 `RuntimeHost`，并连接全局 durable store；`sqlite::memory:` 只允许测试显式使用。
+- Embedded 进程共享历史事实但不共享 task handle；跨前端实时观察和控制必须通过同一 app-server attachment。
 - `subscribe` 不能只是一次性返回历史 `Vec<Event>`，必须支持 `cursor replay + live event stream`。
 - TUI 的本地状态只能用于渲染，例如输入框、选中项、滚动位置，不能成为任务状态真相。
-- TUI 复杂组件应在 `RuntimeHost + EventBus + stable session resolver` 打通后再做；否则 UI 越复杂，越容易复制 runtime 状态机。
+- TUI 复杂组件必须建立在 `RuntimeHost + EventBus + cwd thread resolver` 之上，不能复制 runtime 状态机。
 
-当前这些边界已经落地：TUI 默认创建新的本地 thread/session，首个 prompt 才持久化；`/resume` 只列当前 workspace 历史；普通 transcript 只渲染用户可见事件，debug timeline 才展开 runtime facts。
+当前这些边界已经落地：TUI 默认创建新的本地 thread/session，首个 prompt 才持久化；`/resume` 按当前 canonical cwd 过滤全局历史；普通 transcript 只渲染用户可见事件，debug timeline 才展开 runtime facts。
 
-最低可用目标不是“界面完整”，而是：
+daemon/remote 模式的最低可用目标不是“界面完整”，而是：
 
 ```text
 CLI 创建或驱动 task

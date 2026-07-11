@@ -24,6 +24,7 @@
 - `modelProviders` 保存模型目录和 envKey 引用，真正的 key 优先从环境变量读取；把 key 直接写入 settings 只作为低优先级兼容路径。
 - 自定义 provider 的 envKey 要由协议和 baseUrl 派生，并带 hash 后缀，避免不同 endpoint 折叠到同一个环境变量名。
 - provider 模型配置是原子包。选中 provider model 后，它的 baseUrl、envKey、generation config 应整体生效，不能被低优先级配置半覆盖。
+- qwen-code 的 `generationConfig.extra_body` 是配置容器；OpenAI-compatible provider 的 `buildRequest()` 会把其中字段展开到最终 HTTP JSON 顶层。Golutra 直接构造 wire body，因此不能把 `extra_body` 容器原样发送。
 - 运行中凭据请求要用统一结构表达 `bearer`、`basic`、`header`、`query`、`multi-header`，UI 只负责采集和取消，不持久化业务状态。
 - 安装 provider 时要能 rollback settings、process env 和 runtime model registry，避免 auth refresh 失败后留下半更新状态。
 
@@ -31,12 +32,12 @@ Golutra 不直接复制 qwen-code 的配置文件形状。Golutra 的核心仍�
 
 ## 当前状态
 
-截至 2026-07-09：
+截至 2026-07-11：
 
 - `golutra-llm` 已有 `MockProvider` 和 OpenAI-compatible live adapter。
 - 默认 provider 是 mock。
 - CLI 已支持 `golutra provider login`、`golutra provider set-key` 和 `golutra provider use`；`provider login` 可填写 `--enable-thinking`、`--reasoning-effort low|medium|high|xhigh`、`--context-window-size <n>`、`--max-tokens <n>`。TUI 首次进入会检查 provider onboarding 状态。
-- 如果当前用户和 workspace 都没有 active provider profile，TUI 会打开 provider setup；用户可以先选 Golutra API、Third-party Providers、Custom Provider 或 mock，再按 qwen-code 风格填写 OpenAI-compatible base URL、API key、推荐或自定义 model、高级生成配置，最后在 review 页确认脱敏 install plan 后保存。
+- 如果全局用户配置没有 active provider profile，TUI 会打开 provider setup；用户可以先选 Golutra API、Third-party Providers、Custom Provider 或 mock，再按 qwen-code 风格填写 OpenAI-compatible base URL、API key、推荐或自定义 model、高级生成配置，最后在 review 页确认脱敏 install plan 后保存。
 - Custom Provider 的 API key envKey 已按 qwen-code 规则由 `(protocol, baseUrl)` 派生：`GOLUTRA_CUSTOM_PROVIDER_API_KEY_{PROTOCOL}_{NORMALIZED_BASE_URL}_{12_HEX_HASH}`。同一个 endpoint 的尾随 `/` 不会生成不同 key，不同协议或不同 endpoint 不会共享固定 `GOLUTRA_PROVIDER_API_KEY`。
 - 真实联网调用必须显式选择协议并配置凭据。推荐设置：
   - `GOLUTRA_PROVIDER_PROTOCOL=openai-compatible`
@@ -54,7 +55,8 @@ Golutra 不直接复制 qwen-code 的配置文件形状。Golutra 的核心仍�
 - CLI/env base URL 会做 P0 规范化：例如 `api.golutra.cn` 会解析成 `https://api.golutra.cn/v1`。TUI provider setup 为了对齐 qwen-code 的交互校验，要求用户输入 `http://` 或 `https://` 开头的 endpoint；Golutra 官方 preset 默认填入 `https://api.golutra.cn/v1`。
 - CLI 已提供 `golutra provider protocols`、`golutra provider current` 和 `golutra provider probe`，输出只包含协议目录、脱敏配置与 probe 结果，不输出 API key。
 - provider/auth 配置已按 Codex 风格持久化到 `$GOLUTRA_HOME/provider.json`；workspace `.golutra` 不再作为 provider 配置来源。用户级配置使用原子写和 owner-only 权限，API key 持久化到 `provider.json` 的 `env` map，profile 只保存 `api_key_env` 引用；旧 JSON 中的 profile 内联 `api_key` 会被忽略，用户需要重新 `/auth` 或 `provider login` 写入新格式。
-- 高级生成配置跟随 active profile 保存为 `generation_config`，运行时序列化到 `GOLUTRA_PROVIDER_GENERATION_CONFIG`。OpenAI-compatible adapter 当前会下发 `extra_body.enable_thinking`、`reasoning_effort` 和 `max_tokens`；`context_window_size` 作为上下文预算元数据保留，不写入 Chat Completions 请求体。
+- 高级生成配置跟随 active profile 保存为 `generation_config`，运行时序列化到 `GOLUTRA_PROVIDER_GENERATION_CONFIG`。对齐 qwen-code provider 展开语义后，OpenAI-compatible adapter 会在最终 Chat Completions JSON 顶层下发 `enable_thinking`、`reasoning_effort` 和 `max_tokens`；`context_window_size` 不写入 provider 请求体，但会收紧 `ContextBuilder` 的 context window、reserved output 和输入预算。
+- `provider current`、运行时 resolver 与 `provider probe` 在没有任何配置时都一致解析为 deterministic mock；显式 live 配置损坏或缺失仍返回错误，不静默 fallback。
 - live 模式下配置缺失会显式失败，不再静默回退到 mock。
 - 这套 env 入口保留为 P0 兼容路径，后续 provider catalog / secretRef / OAuth 配置系统必须能包住它，而不是破坏现有 smoke 和 CLI 行为。
 - TUI 已有 provider onboarding gate 和 `/auth` setup；已有 active provider 时不会首屏打断，但输入 `/auth` 可随时重新打开同一套选型并覆盖同名 profile。Web 首次 connect provider flow 仍待补齐，CLI 非交互场景保持结构化诊断。
@@ -78,7 +80,7 @@ CLI / TUI / Web / SDK
 
 | 模块 | 职责 |
 | --- | --- |
-| `golutra-config` | 读取用户级、workspace 级和 env provider 配置，输出脱敏后的 `ResolvedProviderConfig` |
+| `golutra-config` | 读取全局用户级和 process env provider 配置，输出脱敏后的 `ResolvedProviderConfig` |
 | `golutra-llm` | 定义 provider trait、adapter、catalog、capability、usage 和错误归一化 |
 | `golutra-runtime` | 只消费 `ProviderContract`，负责 fallback、retry、verification 和事件写入 |
 | `golutra-client` | 提供 provider command/query，透传 auth required / probe 结果 |
@@ -88,7 +90,7 @@ CLI / TUI / Web / SDK
 
 - 不让 runtime core 依赖 OpenAI、Anthropic、Gemini、DashScope 等原生类型。
 - 不让 adapter 私自 fallback 到别的 provider。
-- 不把 provider key 写进 `.golutra/runtime.sqlite` 的 event payload。
+- 不把 provider key 写进 `$GOLUTRA_HOME/state/runtime.sqlite` 的 event payload。
 - 不让 TUI / Web 自己维护 provider 连接状态机。
 
 ## Provider 协议分类
@@ -193,7 +195,7 @@ GOLUTRA_CUSTOM_PROVIDER_API_KEY_{PROTOCOL}_{NORMALIZED_BASE_URL}_{SHA256(protoco
 
 特殊规则：
 
-- workspace 配置可以声明 provider catalog，但默认不能保存 secret value。
+- provider catalog/profile 只允许写入全局用户配置；cwd 不覆盖 provider 或 secret。
 - user 配置也优先保存 envKey / secretRef；直接保存 secret 只作为显式 opt-in 兼容能力。
 - 当前 `GOLUTRA_PROVIDER_MODE=live` 继续作为快捷开关；如果 catalog 已明确选择 provider，则 catalog 优先。
 - provider model 命中后，`generationConfig` 不向低优先级配置做深合并，避免温度、reasoning、extra body、headers 被半覆盖。
@@ -220,7 +222,7 @@ P0 只要求 `env-api-key` 稳定。P1 开始补 `provider login`、`set-key` �
 
 强制规则：
 
-- `.golutra/runtime.sqlite` 不保存明文 API key、OAuth access token、refresh token、basic password 或 multi-header value。
+- `$GOLUTRA_HOME/state/runtime.sqlite` 不保存明文 API key、OAuth access token、refresh token、basic password 或 multi-header value。
 - runtime event payload 只保存 `credential_ref`、`envKey`、脱敏 fingerprint、auth mode、providerId、modelId、baseUrl hash。
 - provider raw response 可以写 artifact，但必须先经过 secret redaction。
 - CLI/TUI/Web 展示错误时不得回显 key；只展示 envKey、secretRef 或 key fingerprint。
@@ -233,7 +235,7 @@ P0 只要求 `env-api-key` 稳定。P1 开始补 `provider login`、`set-key` �
 | shell env / `.env` | 明文 key；文件必须 gitignore |
 | OS keychain | 明文 key/token |
 | user provider config | envKey、provider catalog、默认模型、当前用户 key/env map |
-| runtime.sqlite | 脱敏后的运行事实、credential fingerprint、probe 结果 |
+| `$GOLUTRA_HOME/state/runtime.sqlite` | 脱敏后的运行事实、credential fingerprint、probe 结果 |
 
 key fingerprint 推荐：
 

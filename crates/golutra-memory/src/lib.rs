@@ -1,15 +1,21 @@
 use std::{
     collections::HashSet,
-    fs,
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
 };
 
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use golutra_core::{EvidenceId, MemoryId, TaskId};
+use regex::Regex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+const MAX_MEMORY_CONTENT_BYTES: usize = 64 * 1024;
+const MAX_MEMORY_STATE_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WorkingSummary {
@@ -110,6 +116,8 @@ impl MemoryPromotionGate {
             Some("memory candidate has unresolved contradictions")
         } else if content.trim().is_empty() {
             Some("memory candidate content is empty")
+        } else if content.len() > MAX_MEMORY_CONTENT_BYTES {
+            Some("memory candidate content exceeds the promotion limit")
         } else if contains_secret(content) {
             Some("memory candidate may contain a secret")
         } else {
@@ -148,6 +156,8 @@ pub enum MemoryError {
     Duplicate(MemoryId),
     #[error("memory record not found: {0}")]
     NotFound(MemoryId),
+    #[error("memory store limit exceeded: {0}")]
+    Limit(String),
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +188,7 @@ impl MemoryStore {
 
     pub fn list(&self) -> Result<Vec<MemoryRecord>, MemoryError> {
         let _guard = self.lock.lock().map_err(|_| MemoryError::LockPoisoned)?;
+        let _file_lock = self.acquire_file_lock()?;
         self.load_unlocked()
     }
 
@@ -189,7 +200,9 @@ impl MemoryStore {
     ) -> Result<MemoryRecord, MemoryError> {
         let content = content.into();
         let _guard = self.lock.lock().map_err(|_| MemoryError::LockPoisoned)?;
+        let _file_lock = self.acquire_file_lock()?;
         let mut records = self.load_unlocked()?;
+        let now = Utc::now();
         let mut checked_candidate = candidate.clone();
         checked_candidate
             .contradiction_ids
@@ -207,6 +220,7 @@ impl MemoryStore {
         if let Some(existing) = records.iter().find(|record| {
             record.status == MemoryStatus::Active
                 && record.scope == candidate.proposed_scope
+                && record.expires_at.is_none_or(|expiry| expiry > now)
                 && normalize_content(&record.content) == normalize_content(&content)
         }) {
             return Err(MemoryError::Duplicate(existing.memory_id));
@@ -302,6 +316,7 @@ impl MemoryStore {
         reason: impl Into<String>,
     ) -> Result<MemoryRecord, MemoryError> {
         let _guard = self.lock.lock().map_err(|_| MemoryError::LockPoisoned)?;
+        let _file_lock = self.acquire_file_lock()?;
         let mut records = self.load_unlocked()?;
         let record = records
             .iter_mut()
@@ -314,6 +329,29 @@ impl MemoryStore {
         Ok(rolled_back)
     }
 
+    fn acquire_file_lock(&self) -> Result<Option<File>, MemoryError> {
+        let Some(path) = &self.path else {
+            return Ok(None);
+        };
+        let parent = path.parent().ok_or_else(|| {
+            MemoryError::Io(format!("memory path has no parent: {}", path.display()))
+        })?;
+        fs::create_dir_all(parent).map_err(|error| MemoryError::Io(error.to_string()))?;
+        set_owner_only_memory_dir(parent)?;
+        let lock_path = path.with_extension("lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| MemoryError::Io(error.to_string()))?;
+        set_owner_only_memory_file(&lock_path)?;
+        file.lock_exclusive()
+            .map_err(|error| MemoryError::Io(error.to_string()))?;
+        Ok(Some(file))
+    }
+
     fn load_unlocked(&self) -> Result<Vec<MemoryRecord>, MemoryError> {
         let Some(path) = &self.path else {
             return self
@@ -322,14 +360,19 @@ impl MemoryStore {
                 .map(|records| records.clone())
                 .map_err(|_| MemoryError::LockPoisoned);
         };
-        match fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(MemoryError::from),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(error) => Err(MemoryError::Io(error.to_string())),
+        match read_bounded_memory_file(path)? {
+            Some(bytes) => serde_json::from_slice(&bytes).map_err(MemoryError::from),
+            None => Ok(Vec::new()),
         }
     }
 
     fn save_unlocked(&self, records: &[MemoryRecord]) -> Result<(), MemoryError> {
+        let encoded = serde_json::to_vec_pretty(records)?;
+        if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > MAX_MEMORY_STATE_BYTES {
+            return Err(MemoryError::Limit(format!(
+                "serialized state exceeds {MAX_MEMORY_STATE_BYTES} bytes"
+            )));
+        }
         let Some(path) = &self.path else {
             *self
                 .in_memory_records
@@ -342,12 +385,55 @@ impl MemoryStore {
             set_owner_only_memory_dir(parent)?;
         }
         let temporary = temporary_path(path);
-        fs::write(&temporary, serde_json::to_vec_pretty(records)?)
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|error| MemoryError::Io(error.to_string()))?;
+        file.write_all(&encoded)
+            .map_err(|error| MemoryError::Io(error.to_string()))?;
+        file.sync_all()
             .map_err(|error| MemoryError::Io(error.to_string()))?;
         set_owner_only_memory_file(&temporary)?;
         fs::rename(&temporary, path).map_err(|error| MemoryError::Io(error.to_string()))?;
-        set_owner_only_memory_file(path)
+        set_owner_only_memory_file(path)?;
+        File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| MemoryError::Io(error.to_string()))?;
+        if let Some(parent) = path.parent() {
+            sync_memory_directory(parent)?;
+        }
+        Ok(())
     }
+}
+
+fn read_bounded_memory_file(path: &Path) -> Result<Option<Vec<u8>>, MemoryError> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(MemoryError::Io(error.to_string())),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|error| MemoryError::Io(error.to_string()))?;
+    if metadata.len() > MAX_MEMORY_STATE_BYTES {
+        return Err(MemoryError::Limit(format!(
+            "{} exceeds {MAX_MEMORY_STATE_BYTES} bytes",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_MEMORY_STATE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| MemoryError::Io(error.to_string()))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_MEMORY_STATE_BYTES {
+        return Err(MemoryError::Limit(format!(
+            "{} grew beyond {MAX_MEMORY_STATE_BYTES} bytes while reading",
+            path.display()
+        )));
+    }
+    Ok(Some(bytes))
 }
 
 #[must_use]
@@ -373,6 +459,18 @@ fn temporary_path(path: &Path) -> PathBuf {
         .map(|extension| format!("{extension}.tmp"))
         .unwrap_or_else(|| "tmp".to_owned());
     path.with_extension(extension)
+}
+
+#[cfg(unix)]
+fn sync_memory_directory(path: &Path) -> Result<(), MemoryError> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| MemoryError::Io(error.to_string()))
+}
+
+#[cfg(not(unix))]
+fn sync_memory_directory(_path: &Path) -> Result<(), MemoryError> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -424,6 +522,7 @@ fn contradiction_ids_from_records(
     content: &str,
     scope: &str,
 ) -> Vec<String> {
+    let now = Utc::now();
     let candidate_terms = terms(content);
     if candidate_terms.is_empty() {
         return Vec::new();
@@ -431,7 +530,11 @@ fn contradiction_ids_from_records(
     let candidate_content = normalize_content(content);
     records
         .iter()
-        .filter(|record| record.status == MemoryStatus::Active && record.scope == scope)
+        .filter(|record| {
+            record.status == MemoryStatus::Active
+                && record.scope == scope
+                && record.expires_at.is_none_or(|expiry| expiry > now)
+        })
         .filter(|record| normalize_content(&record.content) != candidate_content)
         .filter(|record| {
             let existing_terms = terms(&record.content);
@@ -444,18 +547,27 @@ fn contradiction_ids_from_records(
 }
 
 fn contains_secret(value: &str) -> bool {
+    static LABELED_SECRET: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?i)(?:api[_-]?key|access[_-]?token|token|secret|password|authorization)["']?\s*[:=]\s*["']?(?:bearer\s+)?[^\s,;"']{8,}"#,
+        )
+        .expect("memory secret regex is valid")
+    });
     let lower = value.to_ascii_lowercase();
-    ["sk-", "ghp_", "github_pat_"].iter().any(|prefix| {
-        lower.match_indices(prefix).any(|(start, _)| {
-            value[start..]
-                .chars()
-                .take_while(|character| {
-                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+    LABELED_SECRET.is_match(value)
+        || ["sk-", "ghp_", "github_pat_", "xoxb-", "xoxp-"]
+            .iter()
+            .any(|prefix| {
+                lower.match_indices(prefix).any(|(start, _)| {
+                    value[start..]
+                        .chars()
+                        .take_while(|character| {
+                            character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+                        })
+                        .count()
+                        >= 12
                 })
-                .count()
-                >= 12
-        })
-    })
+            })
 }
 
 #[cfg(test)]
@@ -526,6 +638,32 @@ mod tests {
                 .decision,
             MemoryPromotionDecisionKind::Reject
         );
+        assert_eq!(
+            gate.evaluate(&candidate, "API_KEY=plain-secret-value")
+                .decision,
+            MemoryPromotionDecisionKind::Reject
+        );
+        assert_eq!(
+            gate.evaluate(&candidate, "PASSWORD=p@ssw0rd!").decision,
+            MemoryPromotionDecisionKind::Reject
+        );
+        assert_eq!(
+            gate.evaluate(&candidate, &"x".repeat(MAX_MEMORY_CONTENT_BYTES + 1))
+                .decision,
+            MemoryPromotionDecisionKind::Reject
+        );
+    }
+
+    #[test]
+    fn oversized_memory_state_is_rejected_before_deserialization() {
+        let directory = tempdir().expect("directory");
+        let path = directory.path().join("memory.json");
+        let file = fs::File::create(&path).expect("state file");
+        file.set_len(MAX_MEMORY_STATE_BYTES + 1)
+            .expect("oversized fixture");
+        let store = MemoryStore::new(path);
+
+        assert!(matches!(store.list(), Err(MemoryError::Limit(_))));
     }
 
     #[test]
@@ -541,6 +679,32 @@ mod tests {
             .expect("promotion");
 
         assert_eq!(store.list().expect("list").len(), 1);
+    }
+
+    #[test]
+    fn file_backed_store_preserves_updates_from_independent_instances() {
+        let directory = tempdir().expect("directory");
+        let path = directory.path().join("memory.json");
+        let first = MemoryStore::new(&path);
+        let second = MemoryStore::new(&path);
+
+        first
+            .promote(
+                &MemoryPromotionGate::default(),
+                &propose_project_memory(TaskId::new(), vec![EvidenceId::new()]),
+                "first process validates cargo tests",
+            )
+            .expect("first promotion");
+        second
+            .promote(
+                &MemoryPromotionGate::default(),
+                &propose_project_memory(TaskId::new(), vec![EvidenceId::new()]),
+                "second process validates runtime events",
+            )
+            .expect("second promotion");
+
+        assert_eq!(first.list().expect("shared records").len(), 2);
+        assert!(path.with_extension("lock").exists());
     }
 
     #[test]
@@ -562,5 +726,37 @@ mod tests {
             .expect("contradiction check");
 
         assert_eq!(contradictions.len(), 1);
+    }
+
+    #[test]
+    fn expired_active_memory_does_not_block_promotion_or_contradiction_checks() {
+        let store = MemoryStore::in_memory();
+        let mut expired = propose_project_memory(TaskId::new(), vec![EvidenceId::new()]);
+        expired.expiry = Some((Utc::now() - chrono::Duration::seconds(1)).to_rfc3339());
+        store
+            .promote(
+                &MemoryPromotionGate::default(),
+                &expired,
+                "runtime tests use cargo test and validate durable events",
+            )
+            .expect("expired record promotion");
+
+        assert!(
+            store
+                .contradiction_ids(
+                    "runtime tests use cargo test and reject durable events",
+                    "project",
+                )
+                .expect("contradiction check")
+                .is_empty()
+        );
+        store
+            .promote(
+                &MemoryPromotionGate::default(),
+                &propose_project_memory(TaskId::new(), vec![EvidenceId::new()]),
+                "runtime tests use cargo test and validate durable events",
+            )
+            .expect("expired duplicate does not block replacement");
+        assert_eq!(store.list().expect("records").len(), 2);
     }
 }
