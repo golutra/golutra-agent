@@ -1,0 +1,10 @@
+{
+  "id": "msg_golden_text",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-test",
+  "content": [{"type": "text", "text": "golden answer"}],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {"input_tokens": 12, "output_tokens": 3}
+}

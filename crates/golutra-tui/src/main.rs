@@ -16,14 +16,19 @@ use crossterm::{
         EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
     },
 };
+use golutra_auth::{
+    CredentialRef, CredentialSource, OAuthFlow, OAuthProviderDescriptor, SecretKind,
+};
 use golutra_client::{RuntimeClient, RuntimeTransport};
 use golutra_config::{
-    ProviderConfigPaths, ProviderConfigScope, ProviderInstallPlan, ProviderProfile,
-    ProviderSettings, apply_provider_install_plan_verified, generate_custom_provider_api_key_env,
-    provider_onboarding_state, provider_protocol_has_runtime_adapter,
+    BuiltinOAuthMethod, ProviderConfigPaths, ProviderConfigScope, ProviderInstallPlan,
+    ProviderProfile, apply_oauth_provider_install_plan_verified,
+    apply_provider_install_plan_verified, builtin_oauth_methods_for_provider,
+    generate_custom_provider_api_key_env, load_provider_settings, logout_provider_profile_verified,
+    provider_auth_service, provider_onboarding_state, provider_protocol_has_runtime_adapter,
     update_provider_settings_verified,
 };
-use golutra_core::{Actor, ActorKind, CommandId, QueryId, SessionId, TaskId, ThreadId};
+use golutra_core::{Actor, ActorKind, CommandId, QueryId, SessionId, TaskId, ThreadId, TurnId};
 use golutra_llm::{
     ProviderGenerationConfig, ProviderProtocol, ProviderReasoningEffort, provider_protocol_catalog,
 };
@@ -32,8 +37,9 @@ use golutra_protocol::{
     SessionCommandKind, UserProjection, VisibleStep,
 };
 use golutra_tui::{
-    AuthConfigScope, OpenAiCompatibleLogin, SlashAuthCommand, SlashCommand, SlashCommandCandidate,
-    SlashInput, event_timeline_lines, parse_slash_input, slash_command_candidates,
+    AuthConfigScope, AuthCredentialStore, OAuthLoginCommand, OpenAiCompatibleLogin,
+    SlashAuthCommand, SlashCommand, SlashCommandCandidate, SlashInput, event_timeline_lines,
+    parse_slash_input, slash_command_candidates,
 };
 use ratatui::{
     Frame, Terminal,
@@ -43,7 +49,10 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
 };
+use secrecy::SecretString;
 use serde_json::{Value, json};
+use tokio::{sync::mpsc, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 static TUI_ACTOR_ID: LazyLock<String> =
@@ -77,6 +86,7 @@ struct TuiApp {
     command_messages: Vec<TranscriptItem>,
     resume_picker: Option<ResumePickerState>,
     auth_dialog: Option<AuthDialogState>,
+    auth_operation: Option<PendingAuthOperation>,
     input: String,
     slash_selected: usize,
     status_message: String,
@@ -122,6 +132,7 @@ impl TuiApp {
             command_messages: Vec::new(),
             resume_picker: None,
             auth_dialog,
+            auth_operation: None,
             input: String::new(),
             slash_selected: 0,
             status_message: String::new(),
@@ -170,6 +181,11 @@ impl TuiApp {
     }
 
     async fn send_prompt(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
+        if self.auth_operation.is_some() {
+            self.status_message = "finish or cancel the auth operation first".to_owned();
+            self.input.clear();
+            return Ok(());
+        }
         if self.auth_dialog.is_some() {
             self.status_message = "finish provider setup first".to_owned();
             self.input.clear();
@@ -227,7 +243,10 @@ impl TuiApp {
     }
 
     fn slash_candidates(&self) -> Vec<SlashCommandCandidate> {
-        if self.auth_dialog.is_some() || self.resume_picker.is_some() {
+        if self.auth_operation.is_some()
+            || self.auth_dialog.is_some()
+            || self.resume_picker.is_some()
+        {
             return Vec::new();
         }
         slash_command_candidates(&self.input)
@@ -398,9 +417,15 @@ impl TuiApp {
                 };
                 self.push_system_message("Threads", lines);
             }
-            SlashCommand::Fork { thread_id } => {
+            SlashCommand::Fork {
+                thread_id,
+                from_turn_id,
+            } => {
                 let thread = transport
-                    .fork_thread(parse_thread_id(&thread_id)?)
+                    .fork_thread(
+                        parse_thread_id(&thread_id)?,
+                        from_turn_id.as_deref().map(parse_turn_id).transpose()?,
+                    )
                     .await
                     .map_err(|error| miette::miette!("{error}"))?;
                 self.thread_id = thread.thread_id;
@@ -665,14 +690,14 @@ impl TuiApp {
                     }
                 }
             }
-            SlashAuthCommand::Login(login) => match apply_auth_login(transport, login).await {
+            SlashAuthCommand::Login(login) => match apply_auth_login(transport, *login).await {
                 Ok(()) => {
                     self.provider_message = provider_status_message();
                     self.auth_dialog = None;
                     self.push_system_message(
                         "Auth updated",
                         vec![
-                            "OpenAI-compatible provider saved".to_owned(),
+                            "provider profile saved".to_owned(),
                             self.provider_message.clone(),
                         ],
                     );
@@ -682,8 +707,166 @@ impl TuiApp {
                     self.status_message = "provider setup failed".to_owned();
                 }
             },
+            SlashAuthCommand::OAuthLogin(command) => {
+                self.start_oauth_login(transport, *command)?;
+            }
+            SlashAuthCommand::Logout { profile } => {
+                self.start_auth_logout(transport, profile)?;
+            }
         }
         Ok(())
+    }
+
+    fn start_oauth_login(
+        &mut self,
+        transport: &RuntimeTransport,
+        command: OAuthLoginCommand,
+    ) -> miette::Result<()> {
+        let cwd = provider_cwd_for_tui(transport)?.to_path_buf();
+        let descriptor_path = resolve_auth_descriptor_path(&cwd, &command.descriptor_path);
+        let descriptor = load_oauth_descriptor_for_tui(&descriptor_path)
+            .map_err(|error| miette::miette!("{error}"))?;
+        self.start_oauth_login_with_descriptor(transport, descriptor, command)
+    }
+
+    fn start_builtin_oauth_login(
+        &mut self,
+        transport: &RuntimeTransport,
+        method: BuiltinOAuthMethod,
+    ) -> miette::Result<()> {
+        method
+            .validate()
+            .map_err(|error| miette::miette!("{error}"))?;
+        let command = OAuthLoginCommand {
+            descriptor_path: format!("builtin:{}:{}", method.provider_id, method.method_id),
+            flow: method.flow,
+            profile: method.profile,
+            protocol: method.protocol,
+            base_url: method.base_url,
+            model: method.default_model,
+            credential_store: default_auth_credential_store(),
+            no_open_browser: false,
+            generation_config: None,
+        };
+        self.start_oauth_login_with_descriptor(transport, method.descriptor, command)
+    }
+
+    fn start_oauth_login_with_descriptor(
+        &mut self,
+        transport: &RuntimeTransport,
+        descriptor: OAuthProviderDescriptor,
+        command: OAuthLoginCommand,
+    ) -> miette::Result<()> {
+        if self.auth_operation.is_some() {
+            self.status_message = "an auth operation is already running".to_owned();
+            return Ok(());
+        }
+        let paths = provider_paths_for_tui()?;
+        let cwd = provider_cwd_for_tui(transport)?.to_path_buf();
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let (progress_tx, progress) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            run_oauth_login_task(
+                paths,
+                cwd,
+                descriptor,
+                command,
+                task_cancellation,
+                progress_tx,
+            )
+            .await
+        });
+        self.auth_operation = Some(PendingAuthOperation {
+            cancellation,
+            progress,
+            task,
+        });
+        self.status_message = "starting OAuth authorization".to_owned();
+        Ok(())
+    }
+
+    fn start_auth_logout(
+        &mut self,
+        transport: &RuntimeTransport,
+        profile: Option<String>,
+    ) -> miette::Result<()> {
+        if self.auth_operation.is_some() {
+            self.status_message = "an auth operation is already running".to_owned();
+            return Ok(());
+        }
+        let paths = provider_paths_for_tui()?;
+        let cwd = provider_cwd_for_tui(transport)?.to_path_buf();
+        let profile = match profile {
+            Some(profile) => profile,
+            None => load_provider_settings(&paths)
+                .map_err(|error| miette::miette!("{error}"))?
+                .active_profile
+                .ok_or_else(|| miette::miette!("no active provider profile to log out"))?,
+        };
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let (_progress_tx, progress) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            if task_cancellation.is_cancelled() {
+                return Err("provider logout cancelled".to_owned());
+            }
+            let result = logout_provider_profile_verified(&paths, &cwd, profile.clone()).await;
+            if let Err(error) = result {
+                return Err(error.to_string());
+            }
+            Ok(AuthTaskOutcome {
+                title: "Auth updated".to_owned(),
+                body: vec![format!("provider profile {profile} logged out")],
+            })
+        });
+        self.auth_operation = Some(PendingAuthOperation {
+            cancellation,
+            progress,
+            task,
+        });
+        self.status_message = "logging out provider".to_owned();
+        Ok(())
+    }
+
+    async fn poll_auth_operation(&mut self) {
+        let mut progress_items = Vec::new();
+        let finished = if let Some(operation) = &mut self.auth_operation {
+            while let Ok(progress) = operation.progress.try_recv() {
+                progress_items.push(progress);
+            }
+            operation.task.is_finished()
+        } else {
+            false
+        };
+        for progress in progress_items {
+            self.push_system_message(progress.title, progress.body);
+        }
+        if !finished {
+            return;
+        }
+        let Some(operation) = self.auth_operation.take() else {
+            return;
+        };
+        match operation.task.await {
+            Ok(Ok(outcome)) => {
+                self.provider_message = provider_status_message();
+                self.push_system_message(outcome.title, outcome.body);
+            }
+            Ok(Err(error)) => {
+                self.push_system_message("Auth failed", vec![error]);
+                self.status_message = "provider auth failed".to_owned();
+            }
+            Err(error) if error.is_cancelled() => {
+                self.push_system_message(
+                    "Auth cancelled",
+                    vec!["authorization stopped".to_owned()],
+                );
+            }
+            Err(error) => {
+                self.push_system_message("Auth failed", vec![format!("auth task failed: {error}")]);
+            }
+        }
     }
 
     async fn abort(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
@@ -739,7 +922,11 @@ impl TuiApp {
             return Ok(());
         }
         self.arm_quit_shortcut();
-        if has_active_task(self) {
+        if let Some(operation) = &self.auth_operation {
+            operation.cancellation.cancel();
+            self.status_message =
+                "auth cancellation requested; press Ctrl+C again to quit".to_owned();
+        } else if has_active_task(self) {
             self.abort(transport).await?;
             self.status_message = "interrupt requested; press Ctrl+C again to quit".to_owned();
         } else {
@@ -787,6 +974,25 @@ struct ResumeThreadItem {
     preview: String,
 }
 
+#[derive(Debug)]
+struct PendingAuthOperation {
+    cancellation: CancellationToken,
+    progress: mpsc::UnboundedReceiver<AuthTaskProgress>,
+    task: JoinHandle<Result<AuthTaskOutcome, String>>,
+}
+
+#[derive(Debug)]
+struct AuthTaskProgress {
+    title: String,
+    body: Vec<String>,
+}
+
+#[derive(Debug)]
+struct AuthTaskOutcome {
+    title: String,
+    body: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 struct AuthDialogState {
     step: AuthDialogStep,
@@ -796,6 +1002,8 @@ struct AuthDialogState {
     base_url: String,
     model: String,
     api_key: String,
+    api_key_env: String,
+    credential_store: AuthCredentialStore,
     enable_thinking: bool,
     reasoning_effort: Option<ProviderReasoningEffort>,
     context_window_size: String,
@@ -809,9 +1017,12 @@ struct AuthDialogState {
 enum AuthDialogStep {
     GroupChoice,
     ThirdPartyChoice,
+    AuthMethod,
     Protocol,
     BaseUrl,
+    CredentialStore,
     ApiKey,
+    EnvKey,
     Model,
     AdvancedConfig,
     Review,
@@ -843,6 +1054,8 @@ struct AuthProviderPreset {
     base_url: Option<&'static str>,
     model: Option<&'static str>,
     recommended_models: &'static [&'static str],
+    oauth_provider_id: Option<&'static str>,
+    api_key_supported: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -852,7 +1065,8 @@ struct AuthReview {
     protocol: String,
     base_url: String,
     model: String,
-    api_key: String,
+    credential: String,
+    credential_ref: CredentialRef,
     advanced: String,
     scope: ProviderConfigScope,
     config_path: PathBuf,
@@ -864,8 +1078,20 @@ struct AuthReview {
 enum AuthAdvanceAction {
     None,
     SaveMock,
-    SaveOpenAiCompatible(OpenAiCompatibleLogin),
+    SaveOpenAiCompatible(Box<OpenAiCompatibleLogin>),
+    StartBuiltinOAuth(Box<BuiltinOAuthMethod>),
     Quit,
+}
+
+fn default_auth_credential_store() -> AuthCredentialStore {
+    #[cfg(test)]
+    {
+        AuthCredentialStore::Ephemeral
+    }
+    #[cfg(not(test))]
+    {
+        AuthCredentialStore::Disk
+    }
 }
 
 impl AuthDialogState {
@@ -878,6 +1104,8 @@ impl AuthDialogState {
             base_url: String::new(),
             model: String::new(),
             api_key: String::new(),
+            api_key_env: String::new(),
+            credential_store: default_auth_credential_store(),
             enable_thinking: false,
             reasoning_effort: None,
             context_window_size: String::new(),
@@ -914,6 +1142,8 @@ impl AuthDialogState {
         self.base_url = provider.base_url.unwrap_or_default().to_owned();
         self.model = provider.model.unwrap_or_default().to_owned();
         self.api_key.clear();
+        self.api_key_env.clear();
+        self.credential_store = default_auth_credential_store();
         self.enable_thinking = false;
         self.reasoning_effort = None;
         self.context_window_size.clear();
@@ -921,7 +1151,9 @@ impl AuthDialogState {
         self.advanced_selected = 0;
         self.review = None;
         self.error = None;
-        self.step = if provider.protocol_options.len() > 1 {
+        self.step = if !self.oauth_methods().is_empty() {
+            AuthDialogStep::AuthMethod
+        } else if provider.protocol_options.len() > 1 {
             AuthDialogStep::Protocol
         } else {
             AuthDialogStep::BaseUrl
@@ -935,6 +1167,32 @@ impl AuthDialogState {
             .unwrap_or(&[])
     }
 
+    fn oauth_methods(&self) -> Vec<BuiltinOAuthMethod> {
+        self.provider
+            .and_then(|provider| provider.oauth_provider_id)
+            .map(builtin_oauth_methods_for_provider)
+            .unwrap_or_default()
+    }
+
+    fn auth_method_count(&self) -> usize {
+        self.oauth_methods().len()
+            + usize::from(
+                self.provider
+                    .is_some_and(|provider| provider.api_key_supported),
+            )
+    }
+
+    fn selected_oauth_method(&self) -> Option<BuiltinOAuthMethod> {
+        self.oauth_methods().get(self.selected).cloned()
+    }
+
+    fn api_key_method_selected(&self) -> bool {
+        let methods = self.oauth_methods();
+        self.provider
+            .is_some_and(|provider| provider.api_key_supported)
+            && self.selected >= methods.len()
+    }
+
     fn selected_protocol(&self) -> ProviderProtocol {
         self.protocol_options()
             .get(self.selected)
@@ -946,7 +1204,7 @@ impl AuthDialogState {
         match protocol {
             ProviderProtocol::OpenAiCompatible => "https://api.openai.com/v1",
             ProviderProtocol::Anthropic => "https://api.anthropic.com/v1",
-            ProviderProtocol::Gemini => "https://generativelanguage.googleapis.com",
+            ProviderProtocol::Gemini => "https://generativelanguage.googleapis.com/v1beta",
             _ => "",
         }
     }
@@ -975,10 +1233,15 @@ impl AuthDialogState {
             AuthDialogStep::ThirdPartyChoice => {
                 THIRD_PARTY_PROVIDER_PRESETS.len().saturating_sub(1)
             }
+            AuthDialogStep::AuthMethod => self.auth_method_count().saturating_sub(1),
             AuthDialogStep::Protocol => self.protocol_options().len().saturating_sub(1),
+            AuthDialogStep::CredentialStore => 1,
             AuthDialogStep::Model => self.custom_model_index(),
             AuthDialogStep::AdvancedConfig => AUTH_ADVANCED_ITEMS.saturating_sub(1),
-            AuthDialogStep::BaseUrl | AuthDialogStep::ApiKey | AuthDialogStep::Review => 0,
+            AuthDialogStep::BaseUrl
+            | AuthDialogStep::ApiKey
+            | AuthDialogStep::EnvKey
+            | AuthDialogStep::Review => 0,
         };
         let current = if self.step == AuthDialogStep::AdvancedConfig {
             self.advanced_selected
@@ -1001,6 +1264,7 @@ impl AuthDialogState {
         match self.step {
             AuthDialogStep::BaseUrl => Some(&mut self.base_url),
             AuthDialogStep::ApiKey => Some(&mut self.api_key),
+            AuthDialogStep::EnvKey => Some(&mut self.api_key_env),
             AuthDialogStep::Model if self.is_custom_model_selected() => Some(&mut self.model),
             AuthDialogStep::AdvancedConfig => match self.advanced_selected {
                 2 => Some(&mut self.context_window_size),
@@ -1009,7 +1273,9 @@ impl AuthDialogState {
             },
             AuthDialogStep::GroupChoice
             | AuthDialogStep::ThirdPartyChoice
+            | AuthDialogStep::AuthMethod
             | AuthDialogStep::Protocol
+            | AuthDialogStep::CredentialStore
             | AuthDialogStep::Model
             | AuthDialogStep::Review => None,
         }
@@ -1039,15 +1305,34 @@ impl AuthDialogState {
         self.step = match self.step {
             AuthDialogStep::GroupChoice => AuthDialogStep::GroupChoice,
             AuthDialogStep::ThirdPartyChoice => AuthDialogStep::GroupChoice,
+            AuthDialogStep::AuthMethod => match self.provider.map(|provider| provider.source) {
+                Some(AuthProviderSource::ThirdParty) => AuthDialogStep::ThirdPartyChoice,
+                _ => AuthDialogStep::GroupChoice,
+            },
             AuthDialogStep::BaseUrl => match self.provider.map(|provider| provider.source) {
+                Some(_) if !self.oauth_methods().is_empty() => AuthDialogStep::AuthMethod,
                 Some(AuthProviderSource::Custom) if self.protocol_options().len() > 1 => {
                     AuthDialogStep::Protocol
                 }
                 Some(AuthProviderSource::ThirdParty) => AuthDialogStep::ThirdPartyChoice,
                 _ => AuthDialogStep::GroupChoice,
             },
-            AuthDialogStep::ApiKey => AuthDialogStep::BaseUrl,
-            AuthDialogStep::Model => AuthDialogStep::ApiKey,
+            AuthDialogStep::CredentialStore => AuthDialogStep::BaseUrl,
+            AuthDialogStep::ApiKey => {
+                if self.credential_store == AuthCredentialStore::Ephemeral {
+                    AuthDialogStep::BaseUrl
+                } else {
+                    AuthDialogStep::CredentialStore
+                }
+            }
+            AuthDialogStep::EnvKey => AuthDialogStep::CredentialStore,
+            AuthDialogStep::Model => {
+                if self.credential_store == AuthCredentialStore::Environment {
+                    AuthDialogStep::EnvKey
+                } else {
+                    AuthDialogStep::ApiKey
+                }
+            }
             AuthDialogStep::AdvancedConfig => AuthDialogStep::Model,
             AuthDialogStep::Review => AuthDialogStep::AdvancedConfig,
             AuthDialogStep::Protocol => AuthDialogStep::GroupChoice,
@@ -1070,9 +1355,11 @@ const CUSTOM_PROTOCOL_OPTIONS: &[ProviderProtocol] = &[
     ProviderProtocol::OpenAiCompatible,
     ProviderProtocol::Anthropic,
     ProviderProtocol::Gemini,
+    ProviderProtocol::VertexAi,
+    ProviderProtocol::Genai,
 ];
 const OFFICIAL_MODELS: &[&str] = &["gpt-test", "gpt-4.1", "qwen-coder-plus"];
-const OPENAI_MODELS: &[&str] = &["gpt-4.1", "gpt-4.1-mini", "o4-mini"];
+const OPENAI_MODELS: &[&str] = &["gpt-5.5", "gpt-5.4", "gpt-4.1"];
 const OPENROUTER_MODELS: &[&str] = &[
     "openai/gpt-4.1",
     "anthropic/claude-sonnet-4",
@@ -1081,6 +1368,12 @@ const OPENROUTER_MODELS: &[&str] = &[
 const DEEPSEEK_MODELS: &[&str] = &["deepseek-chat", "deepseek-reasoner"];
 const QWEN_MODELS: &[&str] = &["qwen-coder-plus", "qwen-plus", "qwen-max"];
 const LOCAL_MODELS: &[&str] = &["qwen2.5-coder", "llama3.1", "deepseek-coder"];
+const XAI_MODELS: &[&str] = &[
+    "grok-4-1-fast-reasoning",
+    "grok-4-1-fast-non-reasoning",
+    "grok-4",
+];
+const COPILOT_MODELS: &[&str] = &["gpt-5.5", "gpt-5.3-codex", "gpt-5-mini"];
 const CUSTOM_MODELS: &[&str] = &[];
 
 const OFFICIAL_PROVIDER_PRESET: AuthProviderPreset = AuthProviderPreset {
@@ -1092,6 +1385,8 @@ const OFFICIAL_PROVIDER_PRESET: AuthProviderPreset = AuthProviderPreset {
     base_url: Some("https://api.golutra.cn/v1"),
     model: Some("gpt-test"),
     recommended_models: OFFICIAL_MODELS,
+    oauth_provider_id: None,
+    api_key_supported: true,
 };
 
 const CUSTOM_PROVIDER_PRESET: AuthProviderPreset = AuthProviderPreset {
@@ -1103,6 +1398,8 @@ const CUSTOM_PROVIDER_PRESET: AuthProviderPreset = AuthProviderPreset {
     base_url: None,
     model: None,
     recommended_models: CUSTOM_MODELS,
+    oauth_provider_id: None,
+    api_key_supported: true,
 };
 
 const THIRD_PARTY_PROVIDER_PRESETS: &[AuthProviderPreset] = &[
@@ -1113,8 +1410,10 @@ const THIRD_PARTY_PROVIDER_PRESETS: &[AuthProviderPreset] = &[
         source: AuthProviderSource::ThirdParty,
         protocol_options: OPENAI_PROTOCOL_ONLY,
         base_url: Some("https://api.openai.com/v1"),
-        model: Some("gpt-4.1"),
+        model: Some("gpt-5.5"),
         recommended_models: OPENAI_MODELS,
+        oauth_provider_id: Some("openai-chatgpt"),
+        api_key_supported: true,
     },
     AuthProviderPreset {
         profile: "openrouter",
@@ -1125,6 +1424,8 @@ const THIRD_PARTY_PROVIDER_PRESETS: &[AuthProviderPreset] = &[
         base_url: Some("https://openrouter.ai/api/v1"),
         model: Some("openai/gpt-4.1"),
         recommended_models: OPENROUTER_MODELS,
+        oauth_provider_id: None,
+        api_key_supported: true,
     },
     AuthProviderPreset {
         profile: "deepseek",
@@ -1135,6 +1436,8 @@ const THIRD_PARTY_PROVIDER_PRESETS: &[AuthProviderPreset] = &[
         base_url: Some("https://api.deepseek.com/v1"),
         model: Some("deepseek-chat"),
         recommended_models: DEEPSEEK_MODELS,
+        oauth_provider_id: None,
+        api_key_supported: true,
     },
     AuthProviderPreset {
         profile: "qwen",
@@ -1145,6 +1448,32 @@ const THIRD_PARTY_PROVIDER_PRESETS: &[AuthProviderPreset] = &[
         base_url: Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
         model: Some("qwen-coder-plus"),
         recommended_models: QWEN_MODELS,
+        oauth_provider_id: None,
+        api_key_supported: true,
+    },
+    AuthProviderPreset {
+        profile: "xai",
+        title: "xAI",
+        detail: "SuperGrok OAuth or xAI API key",
+        source: AuthProviderSource::ThirdParty,
+        protocol_options: OPENAI_PROTOCOL_ONLY,
+        base_url: Some("https://api.x.ai/v1"),
+        model: Some("grok-4-1-fast-reasoning"),
+        recommended_models: XAI_MODELS,
+        oauth_provider_id: Some("xai"),
+        api_key_supported: true,
+    },
+    AuthProviderPreset {
+        profile: "github-copilot",
+        title: "GitHub Copilot",
+        detail: "GitHub device authorization",
+        source: AuthProviderSource::ThirdParty,
+        protocol_options: OPENAI_PROTOCOL_ONLY,
+        base_url: Some("https://api.githubcopilot.com/v1"),
+        model: Some("gpt-5.5"),
+        recommended_models: COPILOT_MODELS,
+        oauth_provider_id: Some("github-copilot"),
+        api_key_supported: false,
     },
     AuthProviderPreset {
         profile: "local",
@@ -1155,6 +1484,8 @@ const THIRD_PARTY_PROVIDER_PRESETS: &[AuthProviderPreset] = &[
         base_url: Some("http://localhost:11434/v1"),
         model: Some("qwen2.5-coder"),
         recommended_models: LOCAL_MODELS,
+        oauth_provider_id: None,
+        api_key_supported: true,
     },
 ];
 
@@ -1315,6 +1646,7 @@ async fn run_app(
         if received_event {
             app.refresh(&transport).await?;
         }
+        app.poll_auth_operation().await;
     }
 
     Ok(())
@@ -1482,7 +1814,9 @@ async fn handle_auth_dialog_key(
                     dialog.step,
                     AuthDialogStep::GroupChoice
                         | AuthDialogStep::ThirdPartyChoice
+                        | AuthDialogStep::AuthMethod
                         | AuthDialogStep::Protocol
+                        | AuthDialogStep::CredentialStore
                 )
                 && let Some(index) = character
                     .to_digit(10)
@@ -1493,9 +1827,12 @@ async fn handle_auth_dialog_key(
                     AuthDialogStep::ThirdPartyChoice => {
                         THIRD_PARTY_PROVIDER_PRESETS.len().saturating_sub(1)
                     }
+                    AuthDialogStep::AuthMethod => dialog.auth_method_count().saturating_sub(1),
                     AuthDialogStep::Protocol => dialog.protocol_options().len().saturating_sub(1),
+                    AuthDialogStep::CredentialStore => 1,
                     AuthDialogStep::BaseUrl
                     | AuthDialogStep::ApiKey
+                    | AuthDialogStep::EnvKey
                     | AuthDialogStep::Model
                     | AuthDialogStep::AdvancedConfig
                     | AuthDialogStep::Review => 0,
@@ -1533,7 +1870,9 @@ fn auth_step_accepts_vim_selection_keys(dialog: &AuthDialogState) -> bool {
         dialog.step,
         AuthDialogStep::GroupChoice
             | AuthDialogStep::ThirdPartyChoice
+            | AuthDialogStep::AuthMethod
             | AuthDialogStep::Protocol
+            | AuthDialogStep::CredentialStore
             | AuthDialogStep::AdvancedConfig
     )
 }
@@ -1605,6 +1944,23 @@ async fn advance_auth_dialog(app: &mut TuiApp, transport: &RuntimeTransport) -> 
                 dialog.select_provider(provider);
                 AuthAdvanceAction::None
             }
+            AuthDialogStep::AuthMethod => {
+                if let Some(method) = dialog.selected_oauth_method() {
+                    AuthAdvanceAction::StartBuiltinOAuth(Box::new(method))
+                } else if dialog.api_key_method_selected() {
+                    dialog.step = if dialog.protocol_options().len() > 1 {
+                        AuthDialogStep::Protocol
+                    } else {
+                        AuthDialogStep::BaseUrl
+                    };
+                    dialog.selected = 0;
+                    dialog.error = None;
+                    AuthAdvanceAction::None
+                } else {
+                    dialog.error = Some("No available authentication method".to_owned());
+                    AuthAdvanceAction::None
+                }
+            }
             AuthDialogStep::Protocol => {
                 dialog.protocol = dialog.selected_protocol();
                 if dialog.base_url.is_empty()
@@ -1624,13 +1980,36 @@ async fn advance_auth_dialog(app: &mut TuiApp, transport: &RuntimeTransport) -> 
                 match validate_auth_base_url(&dialog.base_url) {
                     Ok(base_url) => {
                         dialog.base_url = base_url;
-                        dialog.step = AuthDialogStep::ApiKey;
+                        dialog.api_key_env = suggested_api_key_env(dialog);
+                        dialog.step = if dialog.credential_store == AuthCredentialStore::Ephemeral {
+                            AuthDialogStep::ApiKey
+                        } else {
+                            AuthDialogStep::CredentialStore
+                        };
                         dialog.error = None;
                     }
                     Err(error) => {
                         dialog.error = Some(error);
                     }
                 }
+                AuthAdvanceAction::None
+            }
+            AuthDialogStep::CredentialStore => {
+                dialog.credential_store = if dialog.selected == 1 {
+                    AuthCredentialStore::Environment
+                } else {
+                    AuthCredentialStore::Disk
+                };
+                if dialog.credential_store == AuthCredentialStore::Environment {
+                    dialog.api_key.clear();
+                }
+                dialog.step = if dialog.credential_store == AuthCredentialStore::Environment {
+                    AuthDialogStep::EnvKey
+                } else {
+                    AuthDialogStep::ApiKey
+                };
+                dialog.selected = 0;
+                dialog.error = None;
                 AuthAdvanceAction::None
             }
             AuthDialogStep::ApiKey => {
@@ -1641,6 +2020,18 @@ async fn advance_auth_dialog(app: &mut TuiApp, transport: &RuntimeTransport) -> 
                     dialog.step = AuthDialogStep::Model;
                     dialog.selected = 0;
                     dialog.error = None;
+                }
+                AuthAdvanceAction::None
+            }
+            AuthDialogStep::EnvKey => {
+                match CredentialRef::environment(dialog.api_key_env.trim(), SecretKind::ApiKey) {
+                    Ok(_) => {
+                        dialog.api_key_env = dialog.api_key_env.trim().to_owned();
+                        dialog.step = AuthDialogStep::Model;
+                        dialog.selected = 0;
+                        dialog.error = None;
+                    }
+                    Err(error) => dialog.error = Some(error.to_string()),
                 }
                 AuthAdvanceAction::None
             }
@@ -1678,7 +2069,7 @@ async fn advance_auth_dialog(app: &mut TuiApp, transport: &RuntimeTransport) -> 
                 AuthAdvanceAction::None
             }
             AuthDialogStep::Review => match auth_login(dialog) {
-                Ok(login) => AuthAdvanceAction::SaveOpenAiCompatible(login),
+                Ok(login) => AuthAdvanceAction::SaveOpenAiCompatible(Box::new(login)),
                 Err(error) => {
                     dialog.error = Some(error);
                     AuthAdvanceAction::None
@@ -1695,10 +2086,14 @@ async fn advance_auth_dialog(app: &mut TuiApp, transport: &RuntimeTransport) -> 
             app.status_message = "using mock provider".to_owned();
         }
         AuthAdvanceAction::SaveOpenAiCompatible(login) => {
-            apply_auth_login(transport, login).await?;
+            apply_auth_login(transport, *login).await?;
             app.provider_message = provider_status_message();
             app.auth_dialog = None;
             app.status_message = "provider connected".to_owned();
+        }
+        AuthAdvanceAction::StartBuiltinOAuth(method) => {
+            app.auth_dialog = None;
+            app.start_builtin_oauth_login(transport, *method)?;
         }
         AuthAdvanceAction::Quit => app.should_quit = true,
     }
@@ -1857,6 +2252,7 @@ fn draw_auth_dialog(frame: &mut Frame<'_>, area: Rect, dialog: &AuthDialogState)
     let lines = match dialog.step {
         AuthDialogStep::GroupChoice => auth_group_lines(dialog),
         AuthDialogStep::ThirdPartyChoice => auth_third_party_lines(dialog),
+        AuthDialogStep::AuthMethod => auth_method_lines(dialog),
         AuthDialogStep::Protocol => auth_protocol_lines(dialog),
         AuthDialogStep::BaseUrl => auth_input_lines(
             &auth_step_title(dialog),
@@ -1866,13 +2262,22 @@ fn draw_auth_dialog(frame: &mut Frame<'_>, area: Rect, dialog: &AuthDialogState)
             dialog.error.as_deref(),
             false,
         ),
+        AuthDialogStep::CredentialStore => auth_credential_store_lines(dialog),
         AuthDialogStep::ApiKey => auth_input_lines(
             &auth_step_title(dialog),
             "API key",
-            "stored in user provider config",
+            "stored in $GOLUTRA_HOME/credentials.json",
             &dialog.api_key,
             dialog.error.as_deref(),
             true,
+        ),
+        AuthDialogStep::EnvKey => auth_input_lines(
+            &auth_step_title(dialog),
+            "Environment variable",
+            "for example OPENAI_API_KEY",
+            &dialog.api_key_env,
+            dialog.error.as_deref(),
+            false,
         ),
         AuthDialogStep::Model => auth_model_lines(dialog),
         AuthDialogStep::AdvancedConfig => auth_advanced_config_lines(dialog),
@@ -1928,6 +2333,47 @@ fn auth_third_party_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
     lines
 }
 
+fn auth_method_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
+    let provider = dialog
+        .provider
+        .map(|provider| provider.title)
+        .unwrap_or("Provider");
+    let mut lines = vec![Line::from(vec![Span::styled(
+        format!("{provider} authentication"),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )])];
+    lines.push(Line::from(""));
+    let methods = dialog.oauth_methods();
+    lines.extend(methods.iter().enumerate().map(|(index, method)| {
+        let detail = match method.flow {
+            OAuthFlow::BrowserPkce => "Open browser and complete PKCE authorization",
+            OAuthFlow::DeviceCode => "Open a verification page and enter a device code",
+            OAuthFlow::OpenAiDeviceAuth => "Open the ChatGPT device page and enter a code",
+        };
+        auth_option_line(index, &method.label, detail, index == dialog.selected)
+    }));
+    if dialog
+        .provider
+        .is_some_and(|provider| provider.api_key_supported)
+    {
+        lines.push(auth_option_line(
+            methods.len(),
+            "API key",
+            "Store a key on local disk or reference an environment variable",
+            dialog.selected >= methods.len(),
+        ));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Enter to select, Up/Down to navigate, Esc to go back",
+        Style::default().fg(Color::DarkGray),
+    )));
+    push_auth_error(&mut lines, dialog.error.as_deref());
+    lines
+}
+
 fn auth_protocol_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(vec![Span::styled(
         auth_step_title(dialog),
@@ -1955,6 +2401,35 @@ fn auth_protocol_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
     lines
 }
 
+fn auth_credential_store_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(vec![Span::styled(
+        auth_step_title(dialog),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )])];
+    lines.push(Line::from(""));
+    lines.push(auth_option_line(
+        0,
+        "Local disk",
+        "Store in $GOLUTRA_HOME/credentials.json (owner-only)",
+        dialog.selected == 0,
+    ));
+    lines.push(auth_option_line(
+        1,
+        "Environment variable",
+        "Store only a read-only env reference for CI or managed shells",
+        dialog.selected == 1,
+    ));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Enter to select, Up/Down to navigate, Esc to go back",
+        Style::default().fg(Color::DarkGray),
+    )));
+    push_auth_error(&mut lines, dialog.error.as_deref());
+    lines
+}
+
 fn protocol_option_text(protocol: ProviderProtocol) -> (&'static str, &'static str) {
     match protocol {
         ProviderProtocol::OpenAiCompatible => (
@@ -1963,6 +2438,11 @@ fn protocol_option_text(protocol: ProviderProtocol) -> (&'static str, &'static s
         ),
         ProviderProtocol::Anthropic => ("Anthropic-compatible", "Anthropic Messages API format"),
         ProviderProtocol::Gemini => ("Gemini-compatible", "Google Gemini API format"),
+        ProviderProtocol::VertexAi => (
+            "Vertex AI",
+            "Google Cloud project/location endpoint with OAuth token",
+        ),
+        ProviderProtocol::Genai => ("rust-genai", "Model-routed native provider adapter"),
         _ => ("Unsupported", "Not available for custom provider setup"),
     }
 }
@@ -2111,7 +2591,7 @@ fn auth_review_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
         auth_kv_line("Protocol", &review.protocol),
         auth_kv_line("Base URL", &review.base_url),
         auth_kv_line("Model", &review.model),
-        auth_kv_line("API key", &review.api_key),
+        auth_kv_line("Credential", &review.credential),
         auth_kv_line("Advanced", &review.advanced),
         auth_kv_line("Scope", provider_scope_label(review.scope)),
         auth_kv_line("Config", &review.config_path.display().to_string()),
@@ -2200,13 +2680,17 @@ fn auth_step_title(dialog: &AuthDialogState) -> String {
         Some(AuthProviderSource::Custom)
     ) {
         let step = match dialog.step {
-            AuthDialogStep::Protocol => "Step 1/6 · Protocol",
-            AuthDialogStep::BaseUrl => "Step 2/6 · Base URL",
-            AuthDialogStep::ApiKey => "Step 3/6 · API Key",
-            AuthDialogStep::Model => "Step 4/6 · Model IDs",
-            AuthDialogStep::AdvancedConfig => "Step 5/6 · Advanced Config",
-            AuthDialogStep::Review => "Step 6/6 · Review",
-            AuthDialogStep::GroupChoice | AuthDialogStep::ThirdPartyChoice => "",
+            AuthDialogStep::Protocol => "Step 1/7 · Protocol",
+            AuthDialogStep::BaseUrl => "Step 2/7 · Base URL",
+            AuthDialogStep::CredentialStore => "Step 3/7 · Credential storage",
+            AuthDialogStep::ApiKey => "Step 4/7 · API Key",
+            AuthDialogStep::EnvKey => "Step 4/7 · Environment variable",
+            AuthDialogStep::Model => "Step 5/7 · Model IDs",
+            AuthDialogStep::AdvancedConfig => "Step 6/7 · Advanced Config",
+            AuthDialogStep::Review => "Step 7/7 · Review",
+            AuthDialogStep::GroupChoice
+            | AuthDialogStep::ThirdPartyChoice
+            | AuthDialogStep::AuthMethod => "",
         };
         if step.is_empty() {
             provider_title.to_owned()
@@ -2464,11 +2948,20 @@ fn auth_composer_line(dialog: &AuthDialogState) -> String {
     match dialog.step {
         AuthDialogStep::GroupChoice => "Select provider group".to_owned(),
         AuthDialogStep::ThirdPartyChoice => "Select provider".to_owned(),
+        AuthDialogStep::AuthMethod => "Select authentication method".to_owned(),
         AuthDialogStep::Protocol => "Select protocol".to_owned(),
         AuthDialogStep::BaseUrl if dialog.base_url.is_empty() => "Base URL".to_owned(),
         AuthDialogStep::BaseUrl => dialog.base_url.clone(),
+        AuthDialogStep::CredentialStore => match dialog.selected {
+            1 => "Environment variable".to_owned(),
+            _ => "Local disk".to_owned(),
+        },
         AuthDialogStep::ApiKey if dialog.api_key.is_empty() => "API key".to_owned(),
         AuthDialogStep::ApiKey => "*".repeat(dialog.api_key.chars().count()),
+        AuthDialogStep::EnvKey if dialog.api_key_env.is_empty() => {
+            "Environment variable".to_owned()
+        }
+        AuthDialogStep::EnvKey => dialog.api_key_env.clone(),
         AuthDialogStep::Model if dialog.is_custom_model_selected() && !dialog.model.is_empty() => {
             dialog.model.clone()
         }
@@ -2945,9 +3438,12 @@ fn composer_style(app: &TuiApp) -> Style {
         let empty = match dialog.step {
             AuthDialogStep::GroupChoice
             | AuthDialogStep::ThirdPartyChoice
-            | AuthDialogStep::Protocol => true,
+            | AuthDialogStep::AuthMethod
+            | AuthDialogStep::Protocol
+            | AuthDialogStep::CredentialStore => true,
             AuthDialogStep::BaseUrl => dialog.base_url.is_empty(),
             AuthDialogStep::ApiKey => dialog.api_key.is_empty(),
+            AuthDialogStep::EnvKey => dialog.api_key_env.is_empty(),
             AuthDialogStep::Model => dialog.is_custom_model_selected() && dialog.model.is_empty(),
             AuthDialogStep::AdvancedConfig => false,
             AuthDialogStep::Review => false,
@@ -3060,6 +3556,12 @@ fn parse_thread_id(value: &str) -> miette::Result<ThreadId> {
         .map_err(|error: uuid::Error| miette::miette!("invalid thread id: {error}"))
 }
 
+fn parse_turn_id(value: &str) -> miette::Result<TurnId> {
+    value
+        .parse()
+        .map_err(|error: uuid::Error| miette::miette!("invalid turn id: {error}"))
+}
+
 fn provider_paths_for_tui() -> miette::Result<ProviderConfigPaths> {
     ProviderConfigPaths::global().map_err(|error| miette::miette!("{error}"))
 }
@@ -3068,6 +3570,178 @@ fn provider_cwd_for_tui(transport: &RuntimeTransport) -> miette::Result<&std::pa
     transport
         .cwd()
         .ok_or_else(|| miette::miette!("provider config requires a cwd"))
+}
+
+fn resolve_auth_descriptor_path(cwd: &std::path::Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn load_oauth_descriptor_for_tui(
+    path: &std::path::Path,
+) -> Result<OAuthProviderDescriptor, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|error| format!("failed to read OAuth descriptor: {error}"))?;
+    let descriptor: OAuthProviderDescriptor = serde_json::from_str(&content)
+        .map_err(|error| format!("OAuth descriptor JSON is invalid: {error}"))?;
+    descriptor.validate().map_err(|error| error.to_string())?;
+    Ok(descriptor)
+}
+
+fn oauth_credential_source(store: AuthCredentialStore) -> Result<CredentialSource, String> {
+    match store {
+        AuthCredentialStore::Disk => Ok(CredentialSource::Disk),
+        AuthCredentialStore::Ephemeral => Ok(CredentialSource::Ephemeral),
+        AuthCredentialStore::Environment => {
+            Err("OAuth login requires disk or ephemeral storage".to_owned())
+        }
+    }
+}
+
+async fn run_oauth_login_task(
+    paths: ProviderConfigPaths,
+    cwd: PathBuf,
+    descriptor: OAuthProviderDescriptor,
+    command: OAuthLoginCommand,
+    cancellation: CancellationToken,
+    progress: mpsc::UnboundedSender<AuthTaskProgress>,
+) -> Result<AuthTaskOutcome, String> {
+    descriptor.validate().map_err(|error| error.to_string())?;
+    if !descriptor.flows.contains(&command.flow) {
+        return Err(format!(
+            "OAuth descriptor `{}` does not support {:?}",
+            descriptor.provider_id, command.flow
+        ));
+    }
+    let validation_reference = CredentialRef::ephemeral(SecretKind::OAuthTokenSet);
+    let mut profile = ProviderProfile::live_profile(
+        command.profile.clone(),
+        command.protocol,
+        command.base_url,
+        command.model,
+        validation_reference,
+    )
+    .map_err(|error| error.to_string())?;
+    profile.oauth = Some(descriptor.clone());
+    profile.generation_config = command.generation_config;
+    profile.validate().map_err(|error| error.to_string())?;
+    let auth = provider_auth_service(&paths).map_err(|error| error.to_string())?;
+    let source = oauth_credential_source(command.credential_store)?;
+    let login_result = match command.flow {
+        OAuthFlow::BrowserPkce => {
+            let login = auth
+                .begin_browser_login(descriptor.clone(), source)
+                .await
+                .map_err(|error| error.to_string())?;
+            let authorization_url = login.authorization_url().to_owned();
+            let _ = progress.send(AuthTaskProgress {
+                title: "OAuth authorization".to_owned(),
+                body: vec![
+                    "Open this URL in your browser:".to_owned(),
+                    authorization_url,
+                ],
+            });
+            if !command.no_open_browser
+                && let Err(error) = login.open_browser().await
+            {
+                let _ = progress.send(AuthTaskProgress {
+                    title: "OAuth browser".to_owned(),
+                    body: vec![format!(
+                        "browser could not be opened automatically: {error}"
+                    )],
+                });
+            }
+            tokio::select! {
+                () = cancellation.cancelled() => return Err("OAuth authorization cancelled".to_owned()),
+                result = login.complete() => result.map_err(|error| error.to_string())?,
+            }
+        }
+        OAuthFlow::DeviceCode => {
+            let login = auth
+                .begin_device_login(descriptor.clone(), source)
+                .await
+                .map_err(|error| error.to_string())?;
+            let verification_url = login
+                .verification_uri_complete()
+                .unwrap_or_else(|| login.verification_uri());
+            let _ = progress.send(AuthTaskProgress {
+                title: "OAuth device authorization".to_owned(),
+                body: vec![
+                    format!("Open {verification_url}"),
+                    format!("Enter code {}", login.user_code()),
+                ],
+            });
+            tokio::select! {
+                () = cancellation.cancelled() => return Err("OAuth authorization cancelled".to_owned()),
+                result = login.complete() => result.map_err(|error| error.to_string())?,
+            }
+        }
+        OAuthFlow::OpenAiDeviceAuth => {
+            let login = auth
+                .begin_openai_device_login(descriptor.clone(), source)
+                .await
+                .map_err(|error| error.to_string())?;
+            let _ = progress.send(AuthTaskProgress {
+                title: "OAuth device authorization".to_owned(),
+                body: vec![
+                    format!("Open {}", login.verification_uri()),
+                    format!("Enter code {}", login.user_code()),
+                ],
+            });
+            if !command.no_open_browser
+                && let Err(error) = login.open_browser().await
+            {
+                let _ = progress.send(AuthTaskProgress {
+                    title: "OAuth browser".to_owned(),
+                    body: vec![format!(
+                        "browser could not be opened automatically: {error}"
+                    )],
+                });
+            }
+            tokio::select! {
+                () = cancellation.cancelled() => return Err("OAuth authorization cancelled".to_owned()),
+                result = login.complete() => result.map_err(|error| error.to_string())?,
+            }
+        }
+    };
+    if cancellation.is_cancelled() {
+        let _ = auth
+            .logout(&login_result.credential_ref, Some(&descriptor))
+            .await;
+        return Err("OAuth authorization cancelled".to_owned());
+    }
+    profile.credential_ref = Some(login_result.credential_ref);
+    apply_oauth_provider_install_plan_verified(
+        &paths,
+        &cwd,
+        &ProviderInstallPlan {
+            scope: ProviderConfigScope::User,
+            profile,
+            activate: true,
+            pending_secret: None,
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(AuthTaskOutcome {
+        title: "Auth updated".to_owned(),
+        body: vec![
+            format!("provider profile {} connected", command.profile),
+            format!("OAuth provider {}", descriptor.provider_id),
+            format!(
+                "token refresh {}",
+                if login_result.metadata.refreshable {
+                    "enabled"
+                } else {
+                    "requires re-login after expiry"
+                }
+            ),
+        ],
+    })
 }
 
 fn provider_scope(scope: AuthConfigScope) -> ProviderConfigScope {
@@ -3079,13 +3753,10 @@ fn provider_scope(scope: AuthConfigScope) -> ProviderConfigScope {
 
 fn auth_login(dialog: &AuthDialogState) -> Result<OpenAiCompatibleLogin, String> {
     let provider = dialog.provider.unwrap_or(CUSTOM_PROVIDER_PRESET);
-    let api_key_env = match provider.source {
-        AuthProviderSource::Custom => {
-            generate_custom_provider_api_key_env(dialog.protocol, dialog.base_url.trim())
-        }
-        AuthProviderSource::Official | AuthProviderSource::ThirdParty => {
-            "GOLUTRA_PROVIDER_API_KEY".to_owned()
-        }
+    let api_key_env = if dialog.api_key_env.trim().is_empty() {
+        suggested_api_key_env(dialog)
+    } else {
+        dialog.api_key_env.trim().to_owned()
     };
     Ok(OpenAiCompatibleLogin {
         profile: provider.profile.to_owned(),
@@ -3093,10 +3764,27 @@ fn auth_login(dialog: &AuthDialogState) -> Result<OpenAiCompatibleLogin, String>
         base_url: dialog.base_url.trim().to_owned(),
         model: dialog.model.trim().to_owned(),
         api_key_env,
-        api_key: Some(dialog.api_key.trim().to_owned()),
+        api_key: (dialog.credential_store != AuthCredentialStore::Environment)
+            .then(|| dialog.api_key.trim().to_owned()),
+        credential_store: dialog.credential_store,
+        credential_ref: dialog
+            .review
+            .as_ref()
+            .map(|review| review.credential_ref.clone()),
         generation_config: validate_generation_config(dialog)?,
         scope: AuthConfigScope::User,
     })
+}
+
+fn suggested_api_key_env(dialog: &AuthDialogState) -> String {
+    match dialog.provider.unwrap_or(CUSTOM_PROVIDER_PRESET).source {
+        AuthProviderSource::Custom => {
+            generate_custom_provider_api_key_env(dialog.protocol, dialog.base_url.trim())
+        }
+        AuthProviderSource::Official | AuthProviderSource::ThirdParty => {
+            "GOLUTRA_PROVIDER_API_KEY".to_owned()
+        }
+    }
 }
 
 fn build_auth_review(dialog: &AuthDialogState) -> Result<AuthReview, String> {
@@ -3105,26 +3793,27 @@ fn build_auth_review(dialog: &AuthDialogState) -> Result<AuthReview, String> {
     let paths = provider_paths_for_tui().map_err(|error| error.to_string())?;
     let scope = provider_scope(login.scope);
     let config_path = paths.user_config.clone();
-    let settings = ProviderSettings::load(&config_path).map_err(|error| error.to_string())?;
+    let settings = load_provider_settings(&paths).map_err(|error| error.to_string())?;
     let updates_existing_profile = settings
         .profiles
         .iter()
         .any(|profile| profile.name == login.profile);
 
+    let (credential_ref, _) = credential_for_login(&login)?;
     let mut preview_profile = ProviderProfile::live_profile(
         login.profile.clone(),
         login.protocol,
         login.base_url.clone(),
         login.model.clone(),
-        login.api_key_env,
+        credential_ref.clone(),
     )
     .map_err(|error| error.to_string())?;
     preview_profile.generation_config = login.generation_config.clone();
-    preview_profile.api_key = Some(mask_api_key(login.api_key.as_deref().unwrap_or_default()));
     let preview_plan = ProviderInstallPlan {
         scope,
         profile: preview_profile,
         activate: true,
+        pending_secret: None,
     };
     let preview_json =
         serde_json::to_string_pretty(&preview_plan).map_err(|error| error.to_string())?;
@@ -3135,7 +3824,15 @@ fn build_auth_review(dialog: &AuthDialogState) -> Result<AuthReview, String> {
         protocol: login.protocol.id().to_owned(),
         base_url: login.base_url,
         model: login.model,
-        api_key: mask_api_key(login.api_key.as_deref().unwrap_or_default()),
+        credential: match login.credential_store {
+            AuthCredentialStore::Environment => format!("env:{}", login.api_key_env),
+            AuthCredentialStore::Disk => "disk:$GOLUTRA_HOME/credentials.json".to_owned(),
+            AuthCredentialStore::Ephemeral => format!(
+                "ephemeral:{}",
+                mask_api_key(login.api_key.as_deref().unwrap_or_default())
+            ),
+        },
+        credential_ref,
         advanced: generation_config_summary(login.generation_config.as_ref()),
         scope,
         config_path,
@@ -3194,15 +3891,16 @@ async fn apply_auth_login(
     let paths = provider_paths_for_tui()?;
     let cwd = provider_cwd_for_tui(transport)?;
     let scope = provider_scope(login.scope);
+    let (credential_ref, pending_secret) =
+        credential_for_login(&login).map_err(|error| miette::miette!("{error}"))?;
     let mut profile = ProviderProfile::live_profile(
         login.profile,
         login.protocol,
         login.base_url,
         login.model,
-        login.api_key_env,
+        credential_ref,
     )
     .map_err(|error| miette::miette!("{error}"))?;
-    profile.api_key = login.api_key;
     profile.generation_config = login.generation_config;
     apply_provider_install_plan_verified(
         &paths,
@@ -3211,12 +3909,62 @@ async fn apply_auth_login(
             scope,
             profile,
             activate: true,
+            pending_secret,
         },
     )
     .await
     .map_err(|error| miette::miette!("{error}"))?;
 
     Ok(())
+}
+
+fn credential_for_login(
+    login: &OpenAiCompatibleLogin,
+) -> Result<(CredentialRef, Option<SecretString>), String> {
+    match login
+        .api_key
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        Some(api_key) => {
+            let reference = match (login.credential_ref.clone(), login.credential_store) {
+                (Some(reference), AuthCredentialStore::Disk)
+                    if matches!(reference.source, CredentialSource::Disk) =>
+                {
+                    reference
+                }
+                (Some(reference), AuthCredentialStore::Ephemeral)
+                    if matches!(reference.source, CredentialSource::Ephemeral) =>
+                {
+                    reference
+                }
+                (Some(_), _) => {
+                    return Err("reviewed credential source no longer matches setup".to_owned());
+                }
+                (None, AuthCredentialStore::Disk) => CredentialRef::disk(SecretKind::ApiKey),
+                (None, AuthCredentialStore::Environment) => {
+                    return Err(
+                        "an inline API key cannot use environment storage; omit --api-key and provide --api-key-env"
+                            .to_owned(),
+                    );
+                }
+                (None, AuthCredentialStore::Ephemeral) => {
+                    CredentialRef::ephemeral(SecretKind::ApiKey)
+                }
+            };
+            Ok((reference, Some(SecretString::from(api_key.to_owned()))))
+        }
+        None => match login.credential_ref.clone() {
+            Some(reference) if matches!(reference.source, CredentialSource::Environment { .. }) => {
+                Ok((reference, None))
+            }
+            Some(_) => Err("reviewed credential source no longer matches setup".to_owned()),
+            None => CredentialRef::environment(login.api_key_env.clone(), SecretKind::ApiKey)
+                .map(|reference| (reference, None))
+                .map_err(|error| error.to_string()),
+        },
+    }
 }
 
 fn validate_generation_config(
@@ -3303,6 +4051,7 @@ fn apply_auth_mock() -> miette::Result<()> {
         scope: ProviderConfigScope::User,
         profile: ProviderProfile::mock(),
         activate: true,
+        pending_secret: None,
     }
     .apply(&paths)
     .map_err(|error| miette::miette!("{error}"))
@@ -3314,7 +4063,7 @@ fn slash_help_lines() -> Vec<String> {
         "/resume  open current cwd session list".to_owned(),
         "/resume <thread-id>  resume a specific current-cwd thread".to_owned(),
         "/threads [limit]  list recent threads for this cwd".to_owned(),
-        "/fork <thread-id>  fork a thread and switch to it".to_owned(),
+        "/fork <thread-id> [--from-turn <turn-id>]  fork history and switch to it".to_owned(),
         "/auth status  show provider onboarding state".to_owned(),
         "/auth setup  open provider setup".to_owned(),
         "/auth protocols  list registered provider protocols".to_owned(),
@@ -3357,6 +4106,8 @@ fn provider_status_message() -> String {
 
 #[cfg(test)]
 mod tests {
+    use golutra_auth::{CredentialSource, OpenAiDeviceAuthorizationDescriptor};
+    use golutra_config::ProviderSettings;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -3389,6 +4140,67 @@ mod tests {
                 .expect("write response");
         });
         format!("http://{address}/v1")
+    }
+
+    async fn spawn_oauth_probe_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut buffer = [0_u8; 4_096];
+                let read = stream.read(&mut buffer).await.expect("read request");
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .expect("path");
+                let body = match path {
+                    "/device" => serde_json::json!({
+                        "device_code": "device-secret",
+                        "user_code": "GOLUTRA-123",
+                        "verification_uri": "https://example.com/device",
+                        "expires_in": 600,
+                        "interval": 1
+                    })
+                    .to_string(),
+                    "/openai-usercode" => serde_json::json!({
+                        "device_auth_id": "openai-device-secret",
+                        "user_code": "OPENAI-123",
+                        "interval": "1"
+                    })
+                    .to_string(),
+                    "/openai-poll" => serde_json::json!({
+                        "authorization_code": "openai-device-code",
+                        "code_verifier": "openai-device-verifier"
+                    })
+                    .to_string(),
+                    "/token" => serde_json::json!({
+                        "access_token": "oauth-access-token",
+                        "refresh_token": "oauth-refresh-token",
+                        "token_type": "Bearer",
+                        "expires_in": 3600
+                    })
+                    .to_string(),
+                    "/v1/models" => serde_json::json!({
+                        "data": [{"id": "oauth-model"}]
+                    })
+                    .to_string(),
+                    other => panic!("unexpected OAuth test path {other}"),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+            }
+        });
+        format!("http://{address}")
     }
 
     #[tokio::test]
@@ -3557,6 +4369,12 @@ mod tests {
             app.auth_dialog.as_ref().map(|dialog| dialog.step),
             Some(AuthDialogStep::Review)
         );
+        let reviewed_credential_id = app
+            .auth_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.review.as_ref())
+            .map(|review| review.credential_ref.id.clone())
+            .expect("reviewed credential");
 
         let result = advance_auth_dialog(&mut app, &transport).await;
         result.expect("advance");
@@ -3567,14 +4385,23 @@ mod tests {
         let profile = settings.active_profile().expect("profile");
         assert_eq!(profile.name, "golutra");
         assert_eq!(profile.model_id.as_deref(), Some("qwen-coder"));
+        assert!(matches!(
+            profile
+                .credential_ref
+                .as_ref()
+                .map(|reference| &reference.source),
+            Some(CredentialSource::Ephemeral)
+        ));
         assert_eq!(
-            settings
-                .env
-                .get("GOLUTRA_PROVIDER_API_KEY")
-                .map(String::as_str),
-            Some("test-key")
+            profile
+                .credential_ref
+                .as_ref()
+                .map(|reference| reference.id.as_str()),
+            Some(reviewed_credential_id.as_str())
         );
-        assert!(profile.api_key.is_none());
+        let persisted = std::fs::read_to_string(home.path().join("provider.json"))
+            .expect("persisted provider settings");
+        assert!(!persisted.contains("test-key"));
         assert!(!dir.path().join(".golutra/provider.json").exists());
         match previous_home {
             Some(value) => unsafe {
@@ -3713,10 +4540,11 @@ mod tests {
                 "golutra",
                 "https://api.golutra.cn/v1",
                 "gpt-test",
-                "GOLUTRA_PROVIDER_API_KEY",
+                CredentialRef::ephemeral(SecretKind::ApiKey),
             )
             .expect("profile"),
             activate: true,
+            pending_secret: None,
         }
         .apply(&paths)
         .expect("install");
@@ -3737,7 +4565,7 @@ mod tests {
         }
 
         assert!(review.updates_existing_profile);
-        assert_eq!(review.api_key, "***");
+        assert_eq!(review.credential, "ephemeral:***");
         assert!(!review.preview_json.contains("\"api_key\""));
         assert!(!review.preview_json.contains("test-key"));
     }
@@ -3755,7 +4583,8 @@ mod tests {
         dialog.protocol = ProviderProtocol::OpenAiCompatible;
         dialog.base_url = "https://api.example.com/v1/".to_owned();
         dialog.model = "gpt-5.5".to_owned();
-        dialog.api_key = "test-key".to_owned();
+        dialog.credential_store = AuthCredentialStore::Environment;
+        dialog.api_key_env = suggested_api_key_env(&dialog);
 
         let review = build_auth_review(&dialog).expect("review");
 
@@ -3823,7 +4652,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slash_auth_login_rejects_catalog_only_protocol_without_persisting() {
+    async fn slash_auth_login_persists_native_anthropic_protocol_after_probe() {
         let dir = tempfile::tempdir().expect("dir");
         let home = tempfile::tempdir().expect("home");
         let _guard = env_lock_guard().await;
@@ -3834,20 +4663,26 @@ mod tests {
         let transport = RuntimeTransport::for_cwd(dir.path())
             .await
             .expect("transport");
+        let base_url = spawn_probe_server(
+            r#"{"id":"msg-probe","type":"message","role":"assistant","model":"claude-test","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        )
+        .await;
         let login = OpenAiCompatibleLogin {
             profile: "anthropic".to_owned(),
             protocol: ProviderProtocol::Anthropic,
-            base_url: "https://api.anthropic.com/v1".to_owned(),
-            model: "claude-sonnet-4".to_owned(),
+            base_url,
+            model: "claude-test".to_owned(),
             api_key_env: "GOLUTRA_PROVIDER_API_KEY".to_owned(),
             api_key: Some("test-key".to_owned()),
+            credential_store: AuthCredentialStore::Ephemeral,
+            credential_ref: None,
             generation_config: None,
             scope: AuthConfigScope::User,
         };
 
-        let error = apply_auth_login(&transport, login)
+        apply_auth_login(&transport, login)
             .await
-            .expect_err("unsupported protocol rejected");
+            .expect("native protocol installed");
         let paths = provider_paths_for_tui().expect("paths");
         let settings = ProviderSettings::load(&paths.user_config).expect("settings");
 
@@ -3859,8 +4694,10 @@ mod tests {
                 std::env::remove_var("GOLUTRA_HOME");
             },
         }
-        assert!(error.to_string().contains("has no live adapter yet"));
-        assert!(settings.profiles.is_empty());
+        assert_eq!(
+            settings.active_profile().expect("profile").protocol,
+            ProviderProtocol::Anthropic
+        );
     }
 
     #[tokio::test]
@@ -3948,16 +4785,18 @@ mod tests {
 
         app.execute_auth_command(
             &transport,
-            SlashAuthCommand::Login(OpenAiCompatibleLogin {
+            SlashAuthCommand::Login(Box::new(OpenAiCompatibleLogin {
                 profile: "custom".to_owned(),
                 protocol: ProviderProtocol::OpenAiCompatible,
                 base_url: "http://127.0.0.1:9/v1".to_owned(),
                 model: "gpt-5.5".to_owned(),
                 api_key_env: "GOLUTRA_CUSTOM_PROVIDER_API_KEY_TEST".to_owned(),
                 api_key: Some("test-key".to_owned()),
+                credential_store: AuthCredentialStore::Ephemeral,
+                credential_ref: None,
                 generation_config: None,
                 scope: AuthConfigScope::User,
-            }),
+            })),
         )
         .await
         .expect("login command");
@@ -4017,6 +4856,57 @@ mod tests {
     }
 
     #[test]
+    fn auth_dialog_exposes_provider_specific_oauth_methods() {
+        let preset = |profile: &str| {
+            THIRD_PARTY_PROVIDER_PRESETS
+                .iter()
+                .find(|preset| preset.profile == profile)
+                .copied()
+                .expect("provider preset")
+        };
+
+        let mut openai = AuthDialogState::new();
+        openai.select_provider(preset("openai"));
+        assert_eq!(openai.step, AuthDialogStep::AuthMethod);
+        assert_eq!(openai.auth_method_count(), 3);
+        assert_eq!(
+            openai.selected_oauth_method().map(|method| method.protocol),
+            Some(ProviderProtocol::OpenAiResponses)
+        );
+        let openai_lines = auth_method_lines(&openai)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(openai_lines.contains("ChatGPT Pro/Plus (browser)"));
+        assert!(openai_lines.contains("ChatGPT Pro/Plus (headless)"));
+        assert!(openai_lines.contains("API key"));
+
+        let mut xai = AuthDialogState::new();
+        xai.select_provider(preset("xai"));
+        assert_eq!(xai.oauth_methods().len(), 2);
+        assert_eq!(xai.auth_method_count(), 3);
+        let xai_lines = auth_method_lines(&xai)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(xai_lines.contains("xAI Grok OAuth (browser)"));
+        assert!(xai_lines.contains("xAI Grok OAuth (headless/device)"));
+
+        let mut copilot = AuthDialogState::new();
+        copilot.select_provider(preset("github-copilot"));
+        assert_eq!(copilot.auth_method_count(), 1);
+        let copilot_lines = auth_method_lines(&copilot)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(copilot_lines.contains("Login with GitHub Copilot"));
+        assert!(!copilot_lines.contains("API key"));
+    }
+
+    #[test]
     fn auth_dialog_custom_provider_exposes_protocol_step() {
         let mut dialog = AuthDialogState::new();
         dialog.select_provider(CUSTOM_PROVIDER_PRESET);
@@ -4028,7 +4918,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(lines.contains("Custom Provider · Step 1/6 · Protocol"));
+        assert!(lines.contains("Custom Provider · Step 1/7 · Protocol"));
         assert!(lines.contains("OpenAI-compatible"));
         assert!(lines.contains("Anthropic-compatible"));
         assert!(lines.contains("Gemini-compatible"));
@@ -4061,7 +4951,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_dialog_blocks_custom_protocols_without_live_adapter() {
+    async fn auth_dialog_advances_for_native_custom_protocols() {
         let transport = RuntimeTransport::in_memory().await.expect("transport");
         let mut app = TuiApp::new(
             ThreadId::new(),
@@ -4086,13 +4976,8 @@ mod tests {
             .expect("advance");
 
         let dialog = app.auth_dialog.as_ref().expect("dialog");
-        assert_eq!(dialog.step, AuthDialogStep::Model);
-        assert!(
-            dialog
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("only supports OpenAI-compatible"))
-        );
+        assert_eq!(dialog.step, AuthDialogStep::AdvancedConfig);
+        assert!(dialog.error.is_none());
     }
 
     #[test]
@@ -4706,6 +5591,208 @@ mod tests {
             app.status_message,
             "interrupt the active task before switching sessions"
         );
+    }
+
+    #[tokio::test]
+    async fn auth_dialog_offers_disk_or_environment_reference() {
+        let transport = RuntimeTransport::in_memory().await.expect("transport");
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            SessionId::new(),
+            None,
+            false,
+            "missing provider".to_owned(),
+            Some(AuthDialogState::new()),
+        );
+        {
+            let dialog = app.auth_dialog.as_mut().expect("dialog");
+            dialog.select_provider(OFFICIAL_PROVIDER_PRESET);
+            dialog.credential_store = AuthCredentialStore::Disk;
+            dialog.step = AuthDialogStep::BaseUrl;
+        }
+
+        advance_auth_dialog(&mut app, &transport)
+            .await
+            .expect("base URL");
+        assert_eq!(
+            app.auth_dialog.as_ref().map(|dialog| dialog.step),
+            Some(AuthDialogStep::CredentialStore)
+        );
+        {
+            let dialog = app.auth_dialog.as_mut().expect("dialog");
+            let lines = auth_credential_store_lines(dialog)
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(lines.contains("Local disk"));
+            assert!(lines.contains("$GOLUTRA_HOME/credentials.json"));
+            assert!(lines.contains("Environment variable"));
+            dialog.selected = 1;
+        }
+        advance_auth_dialog(&mut app, &transport)
+            .await
+            .expect("credential store");
+        let dialog = app.auth_dialog.as_ref().expect("dialog");
+        assert_eq!(dialog.step, AuthDialogStep::EnvKey);
+        assert_eq!(dialog.api_key_env, "GOLUTRA_PROVIDER_API_KEY");
+
+        let review = build_auth_review(dialog).expect("review");
+        assert_eq!(review.credential, "env:GOLUTRA_PROVIDER_API_KEY");
+        assert!(review.preview_json.contains("environment"));
+        assert!(!review.preview_json.contains("oauth-access-token"));
+    }
+
+    #[tokio::test]
+    async fn oauth_device_task_installs_secret_ref_and_logout_removes_it() {
+        let home = tempfile::tempdir().expect("home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let endpoint = spawn_oauth_probe_server().await;
+        let descriptor = OAuthProviderDescriptor {
+            provider_id: "test-oauth".to_owned(),
+            client_id: "test-client".to_owned(),
+            authorization_endpoint: format!("{endpoint}/authorize"),
+            token_endpoint: format!("{endpoint}/token"),
+            device_authorization_endpoint: Some(format!("{endpoint}/device")),
+            revocation_endpoint: None,
+            scopes: vec!["model.invoke".to_owned()],
+            audience: None,
+            browser_redirect_uri: None,
+            authorization_params: std::collections::BTreeMap::new(),
+            authorization_nonce: false,
+            openai_device_authorization: None,
+            flows: vec![OAuthFlow::DeviceCode],
+        };
+        let _guard = env_lock_guard().await;
+        let previous_home = std::env::var("GOLUTRA_HOME").ok();
+        unsafe {
+            std::env::set_var("GOLUTRA_HOME", home.path());
+        }
+        let paths = ProviderConfigPaths::global().expect("paths");
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+
+        let outcome = run_oauth_login_task(
+            paths.clone(),
+            cwd.path().to_path_buf(),
+            descriptor,
+            OAuthLoginCommand {
+                descriptor_path: "oauth.json".to_owned(),
+                flow: OAuthFlow::DeviceCode,
+                profile: "oauth".to_owned(),
+                protocol: ProviderProtocol::OpenAiCompatible,
+                base_url: format!("{endpoint}/v1"),
+                model: "oauth-model".to_owned(),
+                credential_store: AuthCredentialStore::Ephemeral,
+                no_open_browser: true,
+                generation_config: None,
+            },
+            CancellationToken::new(),
+            progress_tx,
+        )
+        .await
+        .expect("OAuth task");
+
+        assert_eq!(outcome.title, "Auth updated");
+        let progress = progress_rx.try_recv().expect("device instructions");
+        assert!(progress.body.join(" ").contains("GOLUTRA-123"));
+        let persisted = std::fs::read_to_string(&paths.user_config).expect("config");
+        assert!(persisted.contains("oauth-token-set"));
+        assert!(!persisted.contains("oauth-access-token"));
+        assert!(!persisted.contains("oauth-refresh-token"));
+
+        logout_provider_profile_verified(&paths, cwd.path(), "oauth")
+            .await
+            .expect("logout");
+        let settings = ProviderSettings::load(&paths.user_config).expect("settings");
+        let profile = settings
+            .profiles
+            .iter()
+            .find(|profile| profile.name == "oauth")
+            .expect("profile");
+        assert!(!profile.enabled);
+        assert!(profile.credential_ref.is_none());
+
+        match previous_home {
+            Some(value) => unsafe {
+                std::env::set_var("GOLUTRA_HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("GOLUTRA_HOME");
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_headless_task_shows_code_and_installs_secret_ref() {
+        let home = tempfile::tempdir().expect("home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let endpoint = spawn_oauth_probe_server().await;
+        let descriptor = OAuthProviderDescriptor {
+            provider_id: "openai-test".to_owned(),
+            client_id: "test-client".to_owned(),
+            authorization_endpoint: format!("{endpoint}/authorize"),
+            token_endpoint: format!("{endpoint}/token"),
+            device_authorization_endpoint: None,
+            revocation_endpoint: None,
+            scopes: vec!["model.invoke".to_owned()],
+            audience: None,
+            browser_redirect_uri: None,
+            authorization_params: std::collections::BTreeMap::new(),
+            authorization_nonce: false,
+            openai_device_authorization: Some(OpenAiDeviceAuthorizationDescriptor {
+                user_code_endpoint: format!("{endpoint}/openai-usercode"),
+                token_poll_endpoint: format!("{endpoint}/openai-poll"),
+                verification_uri: format!("{endpoint}/verify"),
+                redirect_uri: format!("{endpoint}/callback"),
+            }),
+            flows: vec![OAuthFlow::OpenAiDeviceAuth],
+        };
+        let _guard = env_lock_guard().await;
+        let previous_home = std::env::var("GOLUTRA_HOME").ok();
+        unsafe {
+            std::env::set_var("GOLUTRA_HOME", home.path());
+        }
+        let paths = ProviderConfigPaths::global().expect("paths");
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+
+        let outcome = run_oauth_login_task(
+            paths.clone(),
+            cwd.path().to_path_buf(),
+            descriptor,
+            OAuthLoginCommand {
+                descriptor_path: "builtin:openai-test:headless".to_owned(),
+                flow: OAuthFlow::OpenAiDeviceAuth,
+                profile: "openai-headless".to_owned(),
+                protocol: ProviderProtocol::OpenAiCompatible,
+                base_url: format!("{endpoint}/v1"),
+                model: "oauth-model".to_owned(),
+                credential_store: AuthCredentialStore::Ephemeral,
+                no_open_browser: true,
+                generation_config: None,
+            },
+            CancellationToken::new(),
+            progress_tx,
+        )
+        .await
+        .expect("OpenAI headless OAuth task");
+
+        assert_eq!(outcome.title, "Auth updated");
+        let progress = progress_rx.try_recv().expect("headless instructions");
+        assert!(progress.body.join(" ").contains("OPENAI-123"));
+        let persisted = std::fs::read_to_string(&paths.user_config).expect("config");
+        assert!(persisted.contains("openai-device-auth"));
+        assert!(persisted.contains("oauth-token-set"));
+        assert!(!persisted.contains("oauth-access-token"));
+        assert!(!persisted.contains("oauth-refresh-token"));
+
+        match previous_home {
+            Some(value) => unsafe {
+                std::env::set_var("GOLUTRA_HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("GOLUTRA_HOME");
+            },
+        }
     }
 
     #[test]

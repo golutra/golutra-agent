@@ -55,13 +55,36 @@ export interface ThreadRecord {
   thread_id: string;
   session_id: string;
   parent_thread_id?: string | null;
+  forked_from_turn_id?: string | null;
+  forked_from_sequence_no?: number | null;
   workspace_root?: string | null;
+  rebound_from_workspace_root?: string | null;
+  rollout_path?: string | null;
   title: string;
   preview: string;
   created_at: string;
   updated_at: string;
   recency_at: string;
   archived: boolean;
+}
+
+export interface ForkThreadOptions {
+  fromTurnId?: string;
+}
+
+export interface RolloutExport {
+  thread_id: string;
+  session_id: string;
+  path: string;
+  event_count: number;
+  last_sequence_no: number | null;
+}
+
+export interface ThreadRebindResult {
+  thread: ThreadRecord;
+  previous_workspace_root: string;
+  rollout_rebuilt: boolean;
+  checkpoint_compatibility: string;
 }
 
 export interface SubscriptionOptions {
@@ -226,8 +249,27 @@ export class GolutraClient {
     return this.postJson<ThreadRecord>(`/threads/${encodeURIComponent(threadId)}/resume`, undefined);
   }
 
-  async forkThread(threadId: string): Promise<ThreadRecord> {
-    return this.postJson<ThreadRecord>(`/threads/${encodeURIComponent(threadId)}/fork`, undefined);
+  async forkThread(threadId: string, options: ForkThreadOptions = {}): Promise<ThreadRecord> {
+    return this.postJson<ThreadRecord>(`/threads/${encodeURIComponent(threadId)}/fork`, {
+      from_turn_id: options.fromTurnId ?? null,
+    });
+  }
+
+  async exportThreadRollout(threadId: string): Promise<RolloutExport> {
+    return this.postJson<RolloutExport>(
+      `/threads/${encodeURIComponent(threadId)}/rollout/export`,
+      undefined,
+    );
+  }
+
+  async rebindThread(threadId: string, fromWorkspaceRoot: string): Promise<ThreadRebindResult> {
+    if (!isAbsoluteFilesystemPath(fromWorkspaceRoot)) {
+      throw new Error(`rebind source must be an absolute path: ${fromWorkspaceRoot}`);
+    }
+    return this.postJson<ThreadRebindResult>(
+      `/threads/${encodeURIComponent(threadId)}/rebind`,
+      { from_workspace_root: fromWorkspaceRoot },
+    );
   }
 
   subscribe(

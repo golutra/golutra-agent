@@ -195,6 +195,91 @@ async fn existing_http_transport_reattaches_after_daemon_restart_on_the_same_end
     second_daemon.0.kill().await.expect("stop second daemon");
 }
 
+#[tokio::test]
+async fn daemon_fork_rollout_and_rebind_survive_restart() {
+    let old_cwd = tempdir().expect("old cwd");
+    let new_cwd = tempdir().expect("new cwd");
+    let home = tempdir().expect("home");
+    install_mock_provider(home.path());
+    let mut daemon = spawn_daemon(home.path());
+    let old_transport = wait_for_transport(home.path(), old_cwd.path()).await;
+    let session_id = old_transport.info().default_session_id;
+    assert!(
+        old_transport
+            .send_command(prompt_command(session_id, "history before daemon fork"))
+            .await
+            .expect("parent command")
+            .accepted
+    );
+    wait_for_terminal(&old_transport, session_id).await;
+    let parent = old_transport
+        .list_threads(10)
+        .await
+        .expect("parent threads")
+        .into_iter()
+        .next()
+        .expect("parent thread");
+
+    let child = old_transport
+        .fork_thread(parent.thread_id, None)
+        .await
+        .expect("HTTP fork");
+    let rollout = old_transport
+        .export_thread_rollout(child.thread_id)
+        .await
+        .expect("HTTP rollout export");
+    assert!(Path::new(&rollout.path).exists());
+    assert!(rollout.event_count > 0);
+
+    let new_transport = wait_for_transport(home.path(), new_cwd.path()).await;
+    let rebound = new_transport
+        .rebind_thread(child.thread_id, old_cwd.path())
+        .await
+        .expect("HTTP rebind");
+    assert_eq!(rebound.thread.session_id, child.session_id);
+    assert_eq!(
+        new_transport
+            .list_threads(10)
+            .await
+            .expect("new cwd threads")
+            .len(),
+        1
+    );
+    assert_eq!(
+        old_transport
+            .list_threads(10)
+            .await
+            .expect("old cwd threads")
+            .len(),
+        1
+    );
+
+    daemon.0.kill().await.expect("stop daemon");
+    let mut restarted = spawn_daemon(home.path());
+    let restarted_new = wait_for_transport(home.path(), new_cwd.path()).await;
+    let resumed = restarted_new
+        .resume_thread(child.thread_id)
+        .await
+        .expect("rebound child after restart");
+    assert_eq!(resumed.session_id, child.session_id);
+    assert!(
+        restarted_new
+            .replay_events(EventFilter {
+                session_id: child.session_id,
+                task_id: None,
+                after_sequence_no: None,
+            })
+            .await
+            .expect("fork replay")
+            .iter()
+            .any(|event| {
+                event.get("event_type").and_then(serde_json::Value::as_str)
+                    == Some("thread_rebound")
+            })
+    );
+    restarted.0.kill().await.expect("stop restarted daemon");
+}
+
 fn prompt_command(session_id: golutra_core::SessionId, prompt: &str) -> SessionCommand {
     SessionCommand {
         command_id: CommandId::new(),
@@ -214,7 +299,7 @@ fn install_mock_provider(home: &Path) {
     fs::write(
         home.join("provider.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
-            "version": 1,
+            "version": 2,
             "active_profile": "mock",
             "profiles": [{
                 "name": "mock",

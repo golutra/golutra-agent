@@ -720,6 +720,9 @@ where
                             .iter()
                             .map(|call| estimate_tokens(&call.arguments.to_string()))
                             .sum::<u64>()
+                        + serde_json::to_string(&message.metadata)
+                            .map(|metadata| estimate_tokens(&metadata))
+                            .unwrap_or_default()
                 })
                 .sum::<u64>()
                 .saturating_add(planned_tool_tokens);
@@ -876,6 +879,7 @@ where
                             tool_call_id: None,
                             tool_name: None,
                             tool_calls: Vec::new(),
+                            metadata: Default::default(),
                         });
                         continue;
                     }
@@ -912,6 +916,7 @@ where
                         tool_call_id: None,
                         tool_name: None,
                         tool_calls: Vec::new(),
+                        metadata: Default::default(),
                     });
                     continue;
                 }
@@ -929,6 +934,11 @@ where
                 tool_call_id: None,
                 tool_name: None,
                 tool_calls: provider_response.tool_calls.clone(),
+                metadata: provider_response
+                    .message
+                    .as_ref()
+                    .map(|message| message.metadata.clone())
+                    .unwrap_or_default(),
             });
             for tool_call in provider_response.tool_calls {
                 control.wait_until_runnable().await?;
@@ -1069,6 +1079,7 @@ where
                     tool_call_id: Some(provider_tool_call_id),
                     tool_name: Some(report.envelope.tool_name.clone()),
                     tool_calls: Vec::new(),
+                    metadata: Default::default(),
                 });
                 tool_reports.push(report);
                 if !permits_continuation {
@@ -2287,7 +2298,9 @@ mod tests {
     #[tokio::test]
     async fn agent_loop_provider_error_includes_detail() {
         let workspace = tempdir().expect("workspace");
-        let provider = golutra_llm::GenaiProviderAdapter::unconfigured();
+        let provider = FallbackTestProvider::Failing(Box::new(
+            MockProvider::text_response("unused").contract(),
+        ));
         let executor =
             BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
         let agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor);
@@ -2307,7 +2320,7 @@ mod tests {
             .expect_err("provider error");
 
         assert!(error.to_string().contains("provider call failed"));
-        assert!(error.to_string().contains("provider is not configured"));
+        assert!(error.to_string().contains("primary failed"));
     }
 
     #[tokio::test]

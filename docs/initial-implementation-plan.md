@@ -15,21 +15,22 @@
 
 ## 当前状态
 
-截至 2026-07-11：
+截至 2026-07-13：
 
-- 仓库已初始化 Rust workspace，并具备 core、protocol、store、runtime、tools、policy、llm、context、verify、client、CLI、TUI、app-server、test-client、eval、config、governor、memory 和 file-search crate。
+- 仓库已初始化 Rust workspace，并具备 core、protocol、store、runtime、tools、policy、auth、llm、context、verify、client、CLI、TUI、app-server、test-client、eval、config、governor、memory 和 file-search crate。
 - 当前代码采用 Codex 式混合进程模型：CLI/TUI 默认通过 durable `EmbeddedTransport` 在当前进程运行 `RuntimeHost`；显式 `--daemon` 连接用户级单实例 app-server，`--connect` 连接指定远端；TypeScript SDK 先按 canonical cwd 创建 attachment。cwd 只决定执行、权限和历史过滤，不决定进程生命周期。
 - `RuntimeHost` 统一持有 `RuntimeStore`、`RuntimeLaneManager`、`AgentLoop`、EventBus、sequence 分配、task handle、`CancellationToken`、pending turn queue 和 session 生命周期；command ack 按 workspace-scoped idempotency key 持久化，已完成 ack 的重试不会重复启动 task。command provisional ack 与后续业务事件仍不是同一个事务，极端 owner crash 窗口保持 at-least-once 语义。
 - app-server 是 `$GOLUTRA_HOME/app-server` 下的用户级单实例，维护有 128 cwd 上限的 `cwd -> EmbeddedTransport` registry 和 attachment 路由，失败初始化会释放槽位；每次 attach 刷新该 cwd 最近 thread/session，HTTP transport 以调用方连接 URL 为请求基址，兼容端口转发和反向代理；`/events` 已实现 cursor 历史 replay + live stream，`HttpSseTransport` 支持断线续订。daemon 在没有 transport auth 前强制绑定 loopback，并校验 Host/Origin 和本地 endpoint root HTTP loopback URL。
 - `RuntimeHost` 已接入后台 `AgentLoop` 执行器，P0 可通过 mock provider 触发本地工具、写入 artifact/evidence、checkpoint、verification/loop decision，并把终态投影给 CLI/TUI/app-server。
-- `golutra-llm` 已提供可用的 OpenAI-compatible live provider adapter；默认仍走 deterministic mock provider，只有显式设置 `GOLUTRA_PROVIDER_PROTOCOL=openai-compatible` 或兼容的 `GOLUTRA_PROVIDER_MODE=live` 且配置 key/model 时才联网。live 配置缺失会显式失败，支持 `GOLUTRA_PROVIDER_*` 与 `OPENAI_*` env，并提供 CLI `provider protocols/current/probe` 脱敏检查入口。
-- LLM 协议 catalog 已注册 `mock`、`openai-compatible`、`anthropic`、`gemini`、`vertex-ai`、`genai`；除 `mock` 与 `openai-compatible` 外，其它协议当前处于 catalog/diagnostic ready 状态，选择后会返回 `adapter_not_implemented` 而不是静默 fallback。
-- provider onboarding、凭据持久化和 thread resume/fork 已完成最小闭环：`golutra-config` 按 Codex 风格使用 `$GOLUTRA_HOME/provider.json` 作为全局 provider/auth 配置，CLI 支持 `provider login/set-key/use/current/probe`，TUI 首屏展示 provider 状态；未配置时 current/probe/runtime 一致解析为 mock。thread 元数据统一位于全局 SQLite，session 唯一索引保证一对一绑定，并按 canonical cwd 过滤 `list/resume/fork`。
+- `golutra-llm` 已提供独立 OpenAI-compatible Chat Completions adapter、ChatGPT OAuth 专用 OpenAI Responses SSE adapter，以及基于固定 `rust-genai` 版本的 `GenaiProviderAdapter`。后者按协议强制路由 Anthropic Messages、Gemini generateContent、Vertex AI generateContent，或按 model namespace 执行 `genai` 路由；provider 原生类型不会进入 core/protocol/runtime。
+- LLM 协议 catalog 中的 `mock`、`openai-compatible`、`openai-responses`、`anthropic`、`gemini`、`vertex-ai`、`genai` 均可执行。统一映射 system/user/assistant/tool message、tool call/result、usage、reasoning effort、finish reason 和脱敏错误；Responses 的 encrypted reasoning item 可跨工具回合安全 replay；缺失或损坏的 live 配置显式失败，不静默 fallback。
+- provider onboarding、凭据持久化和 thread resume/fork 已完成最小闭环：`golutra-config` 使用 `$GOLUTRA_HOME/provider.json` v2 作为全局 provider/auth 配置，profile 只保存 SecretRef 和非敏感 metadata；`golutra-auth` 负责 owner-only `$GOLUTRA_HOME/credentials.json`/env 凭据解析与 OAuth token 生命周期，不访问 OS keychain。受审计 catalog 参考 opencode 内置 OpenAI ChatGPT browser/headless、xAI browser/device 和 GitHub Copilot device，并将 auth method 固定绑定实际模型 adapter；CLI 支持 `provider auth-methods/login/set-key/oauth-login/logout/use/current/probe`，TUI `/auth` 按 provider 展示 OAuth/API key 选项。未配置时 current/probe/runtime 一致解析为 mock。thread 元数据统一位于全局 SQLite，session 唯一索引保证一对一绑定，并按 canonical cwd 过滤 `list/resume/fork`。
 - 用户可见 conversation 层已完成轻量闭环：`TaskCreated` 记录用户输入，`AssistantMessage` 记录最终回复，`UserProjection.final_message` 可从历史事件恢复；resume 后继续任务时，RuntimeHost 会把同一 session 的压缩历史摘要加入 provider context。
-- P1 provider onboarding 已补齐 TUI `/auth` qwen-code 风格主流程：provider 分组、第三方 preset、baseUrl/API key/model/advanced config、保存前 review 和同名 profile 覆盖提示；Custom Provider 已按 `(protocol, baseUrl)` 派生 envKey，未实现 live adapter 的协议不能保存为 ready active provider；保存后 probe 失败会 rollback。复杂自动化、Web connect modal、OAuth/secretRef 和 Web 侧 provider flow 仍通过 TODO 决策位收敛。
+- P1 provider onboarding 已补齐 TUI `/auth` qwen-code 风格主流程：provider 分组、第三方 preset、provider-specific auth method、协议选择、baseUrl、disk/env 凭据、model/advanced config、保存前 review 和同名 profile 覆盖提示；Custom Provider 已按 `(protocol, baseUrl)` 派生 envKey，保存后 probe 失败会 rollback。内置 OpenAI/xAI/Copilot OAuth 与显式 `/auth oauth-login`、`/auth logout` 已接入 browser PKCE/device flow、固定/动态 loopback callback、OpenID account metadata、token refresh/revoke 和取消；Web 首次 provider onboarding 不在当前产品范围。
 - `AgentLoop` 已支持 provider/tool 多轮消息、LoopGuard、provider retry/fallback、governor 检查和终态 verification；初始或累积 context overflow 会形成结构化 Blocked/AskUser `LoopDecision`。pause/resume/abort 会驱动真实 task cancellation，运行中 prompt 进入 durable pending turn queue；owner 重启后只自动恢复尚未产生 `TurnStarted` 的 turn。
 - 文件副作用已使用修改前持久化的 before-image checkpoint，checkpoint 成功写入 owner-only manifest/artifact blob 后才执行修改；runtime DB、artifact、checkpoint、memory/evaluation 和 endpoint metadata 在 Unix 上使用 owner-only 权限，项目 `.golutra` 不参与 runtime 持久化，工具 policy 仍阻断 `.git`/`.golutra` 内部路径；artifact blob 带 SHA-256 checksum 和敏感字段清洗。ToolContract 使用 JSON Schema 校验，必填路径/搜索参数拒绝空串，schema 错误隐藏实例值，structured facts 递归脱敏；shell 与 file-search 均有 timeout/cancel/output 边界。
-- TypeScript SDK 由 Rust schema 生成，已提供 cwd attachment、command/query/SSE 以及 memory/evaluation/candidate 高层 API；JSON 请求使用 30 秒超时和 16 MiB 响应上限。跨进程测试覆盖一个 daemon 同时路由两个 cwd、daemon 重启、SSE replay/live、command 幂等和 durable memory/evaluation 恢复。
+- TypeScript SDK 由 Rust schema 生成，已提供 cwd attachment、command/query/SSE、thread fork/rollout export/rebind 以及 memory/evaluation/candidate 高层 API；JSON 请求使用 30 秒超时和 16 MiB 响应上限。跨进程测试覆盖一个 daemon 同时路由两个 cwd、daemon 重启、SSE replay/live、command 幂等、fork/rebind 和 durable memory/evaluation 恢复。
+- SQLite `runtime_events` 是 thread 历史的 canonical facts；每个 cwd 分区会物化 owner-only、逐行 checksum、递归脱敏的 rollout JSONL。启动和显式 export 会从 SQLite 原子重建，增量 append 与重建共享跨进程锁。fork 可复制完整历史或截断到指定 turn，在单一 SQLite 事务中重建 EventId/TaskId/TurnId，并保留 immutable artifact lineage；rebind 要求显式旧 canonical cwd，只允许 inactive 且未被其它 runtime 持有的 thread。
 - project memory、deep evaluation、RegressionResult、PromotionDecision 和 RuntimeGovernor 已完成受控最小实现：memory 只有 evidence-backed candidate 可晋升并支持 expiry-aware contradiction gate/rollback，单条内容和 memory/evaluation 状态文件有尺寸边界；自动 apply 仅限通过 clean regression 的低风险 benchmark，GeneratedTask/Skill 保持 `proposed`。
 - 第一阶段范围已在 `implementation-blueprint.md` 中明确，不能继续扩张到复杂 multi-agent 或不可审计的自动自我改进。
 
@@ -39,7 +40,7 @@
 - 已产生 `TurnStarted` 的中断 turn 不会自动重放；runtime 只能安全恢复尚未开始的 pending turn，并把原 active task 标为 cancelled。
 - checkpoint 对单文件使用临时文件 + fsync + 原子替换；多文件 rollback 会先完整校验 manifest，但不是跨文件系统事务。
 - `/events/replay`、DebugProjection 和 TUI 当前会物化请求范围内的完整历史；SSE 主链按页 replay，但超长 session 的显式全量 debug/export 仍需要后续分页协议和 UI 虚拟化。
-- native Anthropic/Gemini/Vertex/genai adapter、OAuth/secretRef、正式 Web onboarding、完整 OS sandbox 和 checkpoint retention 仍属于 P1/P2，不应描述为已完成。
+- 完整 OS sandbox、checkpoint retention、provider streaming、动态 capability discovery，以及运行中跨客户端 `ProviderAuthRequired` 请求仍属于后续边界；OAuth/SecretRef 本地 CLI/TUI 主链已完成。
 
 ## 实施原则
 
@@ -91,7 +92,7 @@ CLI 创建 coding task
 | P0.8 | app-server、RuntimeClient、多入口一致性 | 中 | 多端看到同一 task 状态和 event stream；支持 cursor replay + live stream |
 | P0.9 | checkpoint、debug、replay、改进候选 | 中 | 文件副作用有恢复点，失败任务可复盘 |
 
-P1 剩余重点：真实 provider golden tests、Web provider onboarding、thread rollout JSONL、跨 workspace index、OAuth/secretRef。
+P1 剩余重点：provider streaming、动态 capability discovery 与运行时动态凭据请求协议。
 P2 已落地受控最小闭环，完整 benchmark hardening、人工 review UI、长期监控和自动 redeploy 仍后置。
 
 ## 推荐 Workspace 结构
@@ -102,6 +103,7 @@ P2 已落地受控最小闭环，完整 benchmark hardening、人工 review UI�
 crates/
   golutra-core
   golutra-config
+  golutra-auth
   golutra-protocol
   golutra-protocol-fixtures
   golutra-event
@@ -144,21 +146,21 @@ P0 可以先创建全部 crate 空壳，但只实现 P0 必需模块：
 | Schema | `schemars` | 生成 JSON Schema |
 | TS 类型 | `ts-rs` | P1 用于 TypeScript SDK |
 | Store | SQLite + `sqlx` | 状态、索引、session/task 元数据 |
-| Event log | append-only JSONL 或 SQLite table | P0 可先 SQLite table，保留 JSONL export |
+| Event log | SQLite canonical table + derived rollout JSONL | SQLite 负责事务事实，JSONL 负责可携带 replay/export |
 | Artifact | 文件系统 blob + SQLite metadata | 大输出、raw provider、diff、日志 |
 | Provider | 自研 contract + `genai` adapter | `genai` 不进入 core 类型 |
 | 搜索 | `rg` 调用封装 | P0 先作为工具，P1 再独立 file-search |
 
 已确定的技术决策：
 
-- provider 配置使用全局 `$GOLUTRA_HOME/provider.json`；workspace 不覆盖 auth，secretRef/OAuth 存储仍待确定。
+- provider 配置使用全局 `$GOLUTRA_HOME/provider.json` v2；workspace 不覆盖 auth。配置只保存 `credential_ref` 和非敏感 metadata，API key 与 OAuth access/refresh token set 进入 owner-only `$GOLUTRA_HOME/credentials.json`，CI 继续使用只读 env ref；v1 明文 `env` map 仅在持锁的一次性迁移中读取并写入 disk SecretRef，不涉及 OS keychain。
 - runtime state、event log、projection 和 thread index 使用 `$GOLUTRA_HOME/state/runtime.sqlite`；artifact 和 cwd 分区状态位于同一 state 根目录，项目目录不写 runtime 文件。
 - CLI/TUI 默认使用 durable `EmbeddedTransport`；用户级 loopback app-server 和远端 endpoint 只在显式 `--daemon` / `--connect` 时使用。
 - event stream 使用 `cursor replay + broadcast live stream`；lag 必须显式产生 skipped/lag 语义。
 - checkpoint 使用独立 artifact before-image，不修改用户 Git。
 - shell 默认无网络工具、只执行结构化 argv，并受 policy、approval、timeout、cancel 和 workspace guard 约束；完整 OS sandbox 仍待实现。
 - schema 初始版本为 `v0.1`；破坏性协议兼容策略仍待确定。
-- thread resolver 从全局 SQLite 按 canonical cwd 选择最近 session/thread；无历史时只生成内存 ID，首个 prompt 才持久化；显式新 session 会创建独立 thread，不能覆盖旧 thread。session owner 异常退出后，后续成功取得 lease 的 host 会按需取消孤儿 active task。rollout JSONL 后置。
+- thread resolver 从全局 SQLite 按 canonical cwd 选择最近 session/thread；无历史时只生成内存 ID，首个 prompt 才持久化；显式新 session 会创建独立 thread，不能覆盖旧 thread。session owner 异常退出后，后续成功取得 lease 的 host 会按需取消孤儿 active task。rollout 位于 cwd hash 分区并可从 SQLite 重建。
 
 ## P0.0 工程骨架
 
@@ -402,7 +404,7 @@ Provider 内部模型：
 
 - 在 `golutra-llm` 定义 provider trait 和 contract。
 - 实现 `MockProvider`，用于 P0 smoke 和 fixture。
-- 实现 `GenaiProviderAdapter` 基础骨架。
+- 实现 OpenAI-compatible adapter 与 `GenaiProviderAdapter`，覆盖 Anthropic、Gemini、Vertex AI 和 model-routed genai。
 - 归一化 stream event、tool call、usage、finish reason、error、rate limit。
 - provider raw metadata 进入 debug artifact 或 event payload ref。
 - 在 `golutra-context` 实现 `ContextContributor`、`ContextBuilder`、`TokenBudgetTracker`。
@@ -418,9 +420,9 @@ Provider 内部模型：
 - context overflow 会进入 `LoopDecision`。
 - `genai` 类型不出现在 `core/protocol/runtime` 公共类型中。
 
-TODO 配置占位：
+后续配置项：
 
-- TODO(genai-version)：确定 `genai` crate 版本和最小 provider 覆盖。
+- `genai` crate 已固定为 `0.7.0-beta.12`；升级必须先更新所有协议 golden fixture 并通过 wire diff 审查。
 - TODO(model-catalog)：P0 已有内置 protocol catalog 与最小模型能力字段；P1 仍需补 provider 品牌目录、可安装模型列表、streaming/vision/json/schema/reasoning 等能力矩阵。
 - TODO(tokenizer)：确定 P0 token 估算方式，允许先用粗略估算但必须标记来源。
 
@@ -601,13 +603,13 @@ P1 在 P0 稳定后推进，不反向污染 P0：
 
 - [x] TypeScript SDK 从 schema/type 产物消费协议。
 - [x] Web attach 页面，只展示 projection 和 event stream。
-- [ ] 真实 provider golden tests。TODO(provider-golden)：需要确定真实 provider、模型、密钥环境变量和可提交的脱敏 golden fixture。
+- [x] 真实 provider golden tests：对 OpenAI-compatible、OpenAI Responses、Anthropic、Gemini、Vertex AI、genai 的实际 adapter wire 做本地 HTTP 捕获，覆盖完整请求、tool round-trip、encrypted reasoning replay、usage/finish reason、auth header 和 401；live smoke 只读取专用 `GOLUTRA_LIVE_*` env，缺失时安全跳过。
 - [x] Provider onboarding 基础层：实现 `ProviderInstallPlan`、`provider login/set-key/use`、TUI provider 状态提示和 `/auth` slash command。
 - [x] Thread/session 基础层：引入用户可见 `ThreadId`、全局 `threads` 表、按 cwd 的 `thread list/resume/fork` 和 TUI `/resume`、`/threads`、`/fork` slash command。
-- [x] TUI 首次 connect provider flow：补 qwen-code 风格 provider setup，支持 Golutra API / Third-party Providers / Custom Provider / mock 分组，第三方 provider preset，OpenAI-compatible base URL/API key/model/advanced config，以及保存前 review、脱敏 install plan、同名 profile 覆盖提示、Custom Provider 派生 envKey、catalog-only 协议安装阻断和 probe 失败 rollback。
-- [ ] Web 首次 connect provider flow。TODO(provider-web-onboarding)：Web 需要复用 RuntimeHost/config service 的 provider command，配置失败时回滚 active selection。
+- [x] TUI 首次 connect provider flow：补 qwen-code 风格 provider setup，支持 Golutra API / Third-party Providers / Custom Provider / mock 分组，第三方 provider preset，OpenAI-compatible/Anthropic/Gemini/Vertex AI/genai 协议、base URL/API key/model/advanced config，以及保存前 review、脱敏 install plan、同名 profile 覆盖提示、Custom Provider 派生 envKey 和 probe 失败 rollback。
+- [x] SecretRef/OAuth：新增独立 `golutra-auth`，provider config v2 只保存 credential ref；交互 API key 和 OAuth token set 默认写 owner-only `$GOLUTRA_HOME/credentials.json`，CI 使用 env ref；支持受审计 provider auth catalog、browser PKCE/device flow、固定/动态 loopback callback、持久 token set、OpenID account metadata、提前刷新、401 单次重试、进程内/跨进程 single-flight、revoke/logout 和 v1 到 disk 的原子迁移。
+- [x] Thread rollout/fork/rebind：物化 checksum + redaction JSONL，支持按 turn 完整 fork、artifact lineage、CLI/TUI/HTTP/SDK export 与显式路径 rebind，并覆盖 daemon restart。
 - [x] TUI 当前 workspace resume picker：支持 session 列表、resume / fork、历史 transcript 恢复和滚动。
-- [ ] TUI all-workspaces resume picker。TODO(resume-all-workspaces)：全局 thread index 已具备，待补 All/cwd 过滤切换 UI。
 - [x] 多工作区事实索引：全局 `$GOLUTRA_HOME/state/runtime.sqlite` 存储所有 thread，并按 canonical cwd 建索引和过滤。
 - [x] 更完整的 config loader 和 model catalog。
 - [x] file-search 独立模块，加入 SQLite metadata + rg。
@@ -778,7 +780,7 @@ P0 不做：
 - [x] P0.4-3 实现 write/edit 和 changed files 记录。
 - [x] P0.5-1 实现 MockProvider。
 - [x] P0.5-2 实现 ContextBuilder 和 TokenBudgetSnapshot。
-- [x] P0.5-3 接入 GenaiProviderAdapter 骨架。
+- [x] P0.5-3 完成 OpenAI-compatible、Anthropic、Gemini、Vertex AI 与 genai adapter 及 provider golden tests。
 - [x] P0.6-1 实现 AgentLoop 和 LoopGuard。
 - [x] P0.6-2 实现 VerificationRunner 和 terminal states。
 - [x] P0.7-1 实现 CLI 演示入口。
@@ -797,3 +799,4 @@ P0 不做：
 - [x] Hardening-5 补齐 approval、ToolContract JSON Schema、异步 shell timeout/cancel/process-group termination。
 - [x] Hardening-6 完成 SSE replay/live、`HttpSseTransport`、schema 生成 SDK 和跨进程重启测试。
 - [x] Hardening-7 接入 project memory、durable evaluation、regression/promotion gate、RuntimeGovernor 和受控 P2 candidate 状态机。
+- [x] Hardening-8 完成 rollout JSONL、完整历史/指定 turn fork、artifact lineage、显式 cwd rebind 和跨进程重启验收。

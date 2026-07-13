@@ -94,6 +94,8 @@ ProviderContract
 - 统一 stream event、tool call、usage、finish reason 和 error 语义。
 - provider 原始字段要进入 debug / replay 上下文，而不是被静默吞掉。
 - fallback 只能由 loop 层触发，provider adapter 不允许私自切换任务语义。
+- OpenAI-compatible、OpenAI Responses 与 native provider wire 都必须经过 committed golden fixture；升级 HTTP client、SSE parser 或 rust-genai 时，wire diff 必须显式审查。
+- live smoke 只能读取专用测试 env，不能隐式读取 `$GOLUTRA_HOME/provider.json` 或正常用户凭据。
 
 ## TerminalStateContract
 
@@ -250,6 +252,28 @@ WorkspaceCheckpointContract
 - 默认遵守 `.gitignore` 和 policy 排除规则，避免保存依赖目录、构建产物和敏感文件。
 - checkpoint 失败不能让任务成功假象化；必须写入 event，并在必要时降级为 residual risk。
 - 非文件副作用不能伪装成可回滚，必须单独记录补偿或不可回滚风险。
+
+## Rollout、Fork 与 Rebind Contract
+
+SQLite `runtime_events` 是 canonical facts，rollout JSONL 是可重建的历史物化层：
+
+```text
+RolloutEnvelope
+  version
+  thread_id
+  session_id
+  sequence_no
+  checksum
+  redacted_event
+```
+
+要求：
+
+- 每行必须有版本和基于脱敏事件字节的 SHA-256 checksum；凭据字段和值要递归脱敏，但 token usage 等非凭据计数不能被破坏。
+- rollout 目录和文件必须 owner-only；append、export 和启动重建共享跨进程锁，重建使用临时文件、fsync 和原子替换。
+- fork 必须在一个 SQLite 事务内复制截止点历史，重新生成 EventId/TaskId/TurnId，并让 parent/child 后续事件相互独立。
+- fork 不复制 immutable artifact blob；child 保留 artifact/evidence 引用，debug projection 必须能沿 lineage 读取。
+- rebind 必须显式校验旧 canonical cwd，拒绝 active 或被其他 runtime 持有的 thread；checkpoint 只能标记为 `historical_only`，memory/evaluation 不自动迁移。
 
 ## P0 验收口径
 

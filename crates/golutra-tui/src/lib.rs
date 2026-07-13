@@ -1,3 +1,4 @@
+use golutra_auth::{CredentialRef, OAuthFlow};
 use golutra_llm::{ProviderGenerationConfig, ProviderProtocol, ProviderReasoningEffort};
 use serde_json::Value;
 
@@ -49,9 +50,16 @@ pub enum SlashCommand {
     Help,
     New,
     Auth(SlashAuthCommand),
-    Resume { thread_id: Option<String> },
-    Threads { limit: u32 },
-    Fork { thread_id: String },
+    Resume {
+        thread_id: Option<String>,
+    },
+    Threads {
+        limit: u32,
+    },
+    Fork {
+        thread_id: String,
+        from_turn_id: Option<String>,
+    },
     Status,
     Debug,
     Takeover,
@@ -75,13 +83,24 @@ pub enum SlashAuthCommand {
         profile: String,
         scope: AuthConfigScope,
     },
-    Login(OpenAiCompatibleLogin),
+    Login(Box<OpenAiCompatibleLogin>),
+    OAuthLogin(Box<OAuthLoginCommand>),
+    Logout {
+        profile: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthConfigScope {
     User,
     Workspace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthCredentialStore {
+    Disk,
+    Environment,
+    Ephemeral,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,8 +111,23 @@ pub struct OpenAiCompatibleLogin {
     pub model: String,
     pub api_key_env: String,
     pub api_key: Option<String>,
+    pub credential_store: AuthCredentialStore,
+    pub credential_ref: Option<CredentialRef>,
     pub generation_config: Option<ProviderGenerationConfig>,
     pub scope: AuthConfigScope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthLoginCommand {
+    pub descriptor_path: String,
+    pub flow: OAuthFlow,
+    pub profile: String,
+    pub protocol: ProviderProtocol,
+    pub base_url: String,
+    pub model: String,
+    pub credential_store: AuthCredentialStore,
+    pub no_open_browser: bool,
+    pub generation_config: Option<ProviderGenerationConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,7 +264,17 @@ const AUTH_SLASH_HINTS: &[SlashCommandHint] = &[
     },
     SlashCommandHint {
         command: "/auth login",
-        description: "save OpenAI-compatible profile",
+        description: "save API key profile",
+        selection: SlashCommandSelection::Fill,
+    },
+    SlashCommandHint {
+        command: "/auth oauth-login",
+        description: "authorize with OAuth descriptor",
+        selection: SlashCommandSelection::Fill,
+    },
+    SlashCommandHint {
+        command: "/auth logout",
+        description: "remove provider credential",
         selection: SlashCommandSelection::Fill,
     },
     SlashCommandHint {
@@ -317,11 +361,7 @@ pub fn parse_slash_input(input: &str) -> SlashInput {
             thread_id: tokens.get(1).cloned(),
         }),
         "/threads" | "/thread" => parse_threads_command(&tokens),
-        "/fork" => tokens
-            .get(1)
-            .cloned()
-            .map(|thread_id| SlashInput::Command(SlashCommand::Fork { thread_id }))
-            .unwrap_or_else(|| SlashInput::Error("/fork requires a thread id".to_owned())),
+        "/fork" => parse_fork_command(&tokens),
         "/auth" => parse_auth_command(&tokens),
         "/status" => SlashInput::Command(SlashCommand::Status),
         "/debug" => SlashInput::Command(SlashCommand::Debug),
@@ -336,6 +376,33 @@ pub fn parse_slash_input(input: &str) -> SlashInput {
         "/quit" | "/exit" => SlashInput::Command(SlashCommand::Quit),
         other => SlashInput::Error(format!("unknown slash command `{other}`; try /help")),
     }
+}
+
+fn parse_fork_command(tokens: &[String]) -> SlashInput {
+    let Some(thread_id) = tokens.get(1).cloned() else {
+        return SlashInput::Error("/fork requires a thread id".to_owned());
+    };
+    let from_turn_id = match tokens.get(2).map(String::as_str) {
+        None => None,
+        Some("--from-turn") => {
+            let Some(turn_id) = tokens.get(3).cloned() else {
+                return SlashInput::Error("--from-turn requires a turn id".to_owned());
+            };
+            if tokens.len() > 4 {
+                return SlashInput::Error("/fork received unexpected arguments".to_owned());
+            }
+            Some(turn_id)
+        }
+        Some(_) => {
+            return SlashInput::Error(
+                "/fork syntax: /fork <thread-id> [--from-turn <turn-id>]".to_owned(),
+            );
+        }
+    };
+    SlashInput::Command(SlashCommand::Fork {
+        thread_id,
+        from_turn_id,
+    })
 }
 
 fn parse_threads_command(tokens: &[String]) -> SlashInput {
@@ -356,10 +423,21 @@ fn parse_auth_command(tokens: &[String]) -> SlashInput {
         "mock" => SlashInput::Command(SlashCommand::Auth(SlashAuthCommand::Mock)),
         "use" => parse_auth_use(tokens),
         "login" => parse_auth_login(tokens),
+        "oauth-login" => parse_auth_oauth_login(tokens),
+        "logout" => parse_auth_logout(tokens),
         other => SlashInput::Error(format!(
-            "unknown /auth action `{other}`; use setup, status, protocols, mock, use or login"
+            "unknown /auth action `{other}`; use setup, status, protocols, mock, use, login, oauth-login or logout"
         )),
     }
+}
+
+fn parse_auth_logout(tokens: &[String]) -> SlashInput {
+    if tokens.len() > 3 {
+        return SlashInput::Error("/auth logout syntax: /auth logout [profile]".to_owned());
+    }
+    SlashInput::Command(SlashCommand::Auth(SlashAuthCommand::Logout {
+        profile: tokens.get(2).cloned(),
+    }))
 }
 
 fn parse_auth_use(tokens: &[String]) -> SlashInput {
@@ -380,6 +458,7 @@ fn parse_auth_login(tokens: &[String]) -> SlashInput {
     let mut model = None;
     let mut api_key_env = "GOLUTRA_PROVIDER_API_KEY".to_owned();
     let mut api_key = None;
+    let mut credential_store = AuthCredentialStore::Disk;
     let mut enable_thinking = false;
     let mut reasoning_effort = None;
     let mut context_window_size = None;
@@ -404,7 +483,9 @@ fn parse_auth_login(tokens: &[String]) -> SlashInput {
                     Some(
                         protocol @ (ProviderProtocol::OpenAiCompatible
                         | ProviderProtocol::Anthropic
-                        | ProviderProtocol::Gemini),
+                        | ProviderProtocol::Gemini
+                        | ProviderProtocol::VertexAi
+                        | ProviderProtocol::Genai),
                     ) => protocol,
                     Some(other) => {
                         return SlashInput::Error(format!(
@@ -414,7 +495,8 @@ fn parse_auth_login(tokens: &[String]) -> SlashInput {
                     }
                     None => {
                         return SlashInput::Error(
-                            "--protocol must be openai-compatible, anthropic, or gemini".to_owned(),
+                            "--protocol must be openai-compatible, anthropic, gemini, vertex-ai, or genai"
+                                .to_owned(),
                         );
                     }
                 };
@@ -446,6 +528,19 @@ fn parse_auth_login(tokens: &[String]) -> SlashInput {
                     return SlashInput::Error("--api-key requires a value".to_owned());
                 };
                 api_key = Some(value.clone());
+            }
+            "--store" => {
+                index += 1;
+                let Some(value) = tokens.get(index) else {
+                    return SlashInput::Error("--store requires a value".to_owned());
+                };
+                credential_store = match value.as_str() {
+                    "disk" => AuthCredentialStore::Disk,
+                    "environment" | "env" => AuthCredentialStore::Environment,
+                    _ => {
+                        return SlashInput::Error("--store must be disk or environment".to_owned());
+                    }
+                };
             }
             "--enable-thinking" => {
                 enable_thinking = true;
@@ -502,7 +597,7 @@ fn parse_auth_login(tokens: &[String]) -> SlashInput {
     let Some(model) = model else {
         return SlashInput::Error("/auth login requires --model".to_owned());
     };
-    SlashInput::Command(SlashCommand::Auth(SlashAuthCommand::Login(
+    SlashInput::Command(SlashCommand::Auth(SlashAuthCommand::Login(Box::new(
         OpenAiCompatibleLogin {
             profile,
             protocol,
@@ -510,6 +605,8 @@ fn parse_auth_login(tokens: &[String]) -> SlashInput {
             model,
             api_key_env,
             api_key,
+            credential_store,
+            credential_ref: None,
             generation_config: build_generation_config(
                 enable_thinking,
                 reasoning_effort,
@@ -518,7 +615,164 @@ fn parse_auth_login(tokens: &[String]) -> SlashInput {
             ),
             scope,
         },
-    )))
+    ))))
+}
+
+fn parse_auth_oauth_login(tokens: &[String]) -> SlashInput {
+    let mut descriptor_path = None;
+    let mut flow = OAuthFlow::BrowserPkce;
+    let mut profile = "default".to_owned();
+    let mut protocol = ProviderProtocol::OpenAiCompatible;
+    let mut base_url = None;
+    let mut model = None;
+    let mut credential_store = AuthCredentialStore::Disk;
+    let mut no_open_browser = false;
+    let mut enable_thinking = false;
+    let mut reasoning_effort = None;
+    let mut context_window_size = None;
+    let mut max_tokens = None;
+    let mut index = 2;
+    while index < tokens.len() {
+        match tokens[index].as_str() {
+            "--descriptor" => {
+                index += 1;
+                let Some(value) = tokens.get(index) else {
+                    return SlashInput::Error("--descriptor requires a path".to_owned());
+                };
+                descriptor_path = Some(value.clone());
+            }
+            "--flow" => {
+                index += 1;
+                let Some(value) = tokens.get(index) else {
+                    return SlashInput::Error("--flow requires a value".to_owned());
+                };
+                flow = match value.as_str() {
+                    "browser" | "browser-pkce" => OAuthFlow::BrowserPkce,
+                    "device" | "device-code" => OAuthFlow::DeviceCode,
+                    _ => {
+                        return SlashInput::Error("--flow must be browser or device".to_owned());
+                    }
+                };
+            }
+            "--profile" => {
+                index += 1;
+                let Some(value) = tokens.get(index) else {
+                    return SlashInput::Error("--profile requires a value".to_owned());
+                };
+                profile = value.clone();
+            }
+            "--protocol" => {
+                index += 1;
+                let Some(value) = tokens.get(index) else {
+                    return SlashInput::Error("--protocol requires a value".to_owned());
+                };
+                protocol = match ProviderProtocol::from_config_value(value) {
+                    Some(
+                        protocol @ (ProviderProtocol::OpenAiCompatible
+                        | ProviderProtocol::Anthropic
+                        | ProviderProtocol::Gemini
+                        | ProviderProtocol::VertexAi
+                        | ProviderProtocol::Genai),
+                    ) => protocol,
+                    _ => {
+                        return SlashInput::Error(
+                            "--protocol must be openai-compatible, anthropic, gemini, vertex-ai, or genai"
+                                .to_owned(),
+                        );
+                    }
+                };
+            }
+            "--base-url" => {
+                index += 1;
+                let Some(value) = tokens.get(index) else {
+                    return SlashInput::Error("--base-url requires a value".to_owned());
+                };
+                base_url = Some(value.clone());
+            }
+            "--model" => {
+                index += 1;
+                let Some(value) = tokens.get(index) else {
+                    return SlashInput::Error("--model requires a value".to_owned());
+                };
+                model = Some(value.clone());
+            }
+            "--store" => {
+                index += 1;
+                let Some(value) = tokens.get(index) else {
+                    return SlashInput::Error("--store requires a value".to_owned());
+                };
+                credential_store = match value.as_str() {
+                    "disk" => AuthCredentialStore::Disk,
+                    _ => {
+                        return SlashInput::Error("--store must be disk".to_owned());
+                    }
+                };
+            }
+            "--no-open-browser" => no_open_browser = true,
+            "--enable-thinking" => enable_thinking = true,
+            "--reasoning-effort" => {
+                index += 1;
+                let Some(value) = tokens.get(index) else {
+                    return SlashInput::Error("--reasoning-effort requires a value".to_owned());
+                };
+                reasoning_effort = match parse_reasoning_effort(value) {
+                    Ok(value) => Some(value),
+                    Err(error) => return SlashInput::Error(error),
+                };
+            }
+            "--context-window-size" => {
+                index += 1;
+                let Some(value) = tokens.get(index) else {
+                    return SlashInput::Error("--context-window-size requires a value".to_owned());
+                };
+                context_window_size = match parse_positive_u64(value, "--context-window-size") {
+                    Ok(value) => Some(value),
+                    Err(error) => return SlashInput::Error(error),
+                };
+            }
+            "--max-tokens" => {
+                index += 1;
+                let Some(value) = tokens.get(index) else {
+                    return SlashInput::Error("--max-tokens requires a value".to_owned());
+                };
+                max_tokens = match parse_positive_u64(value, "--max-tokens") {
+                    Ok(value) => Some(value),
+                    Err(error) => return SlashInput::Error(error),
+                };
+            }
+            value => {
+                return SlashInput::Error(format!("unknown /auth oauth-login option `{value}`"));
+            }
+        }
+        index += 1;
+    }
+    let Some(descriptor_path) = descriptor_path else {
+        return SlashInput::Error("/auth oauth-login requires --descriptor".to_owned());
+    };
+    let Some(base_url) = base_url else {
+        return SlashInput::Error("/auth oauth-login requires --base-url".to_owned());
+    };
+    let Some(model) = model else {
+        return SlashInput::Error("/auth oauth-login requires --model".to_owned());
+    };
+    SlashInput::Command(SlashCommand::Auth(SlashAuthCommand::OAuthLogin(Box::new(
+        OAuthLoginCommand {
+            descriptor_path,
+            flow,
+            profile,
+            protocol,
+            base_url,
+            model,
+            credential_store,
+            no_open_browser,
+            generation_config: build_generation_config(
+                enable_thinking,
+                reasoning_effort,
+                context_window_size,
+                max_tokens,
+            ),
+        },
+    ))))
 }
 
 fn build_generation_config(
@@ -623,7 +877,7 @@ mod tests {
             parse_slash_input(
                 "/auth login --base-url api.golutra.cn --model qwen --api-key-env GOLUTRA_KEY --scope user"
             ),
-            SlashInput::Command(SlashCommand::Auth(SlashAuthCommand::Login(
+            SlashInput::Command(SlashCommand::Auth(SlashAuthCommand::Login(Box::new(
                 OpenAiCompatibleLogin {
                     profile: "default".to_owned(),
                     protocol: ProviderProtocol::OpenAiCompatible,
@@ -631,10 +885,12 @@ mod tests {
                     model: "qwen".to_owned(),
                     api_key_env: "GOLUTRA_KEY".to_owned(),
                     api_key: None,
+                    credential_store: AuthCredentialStore::Disk,
+                    credential_ref: None,
                     generation_config: None,
                     scope: AuthConfigScope::User,
                 }
-            )))
+            ))))
         );
     }
 
@@ -667,11 +923,65 @@ mod tests {
     }
 
     #[test]
+    fn slash_parser_accepts_oauth_login_and_logout() {
+        let input = parse_slash_input(
+            "/auth oauth-login --descriptor oauth.json --flow device --profile qwen --base-url https://api.example.com/v1 --model qwen-coder --reasoning-effort high",
+        );
+        let SlashInput::Command(SlashCommand::Auth(SlashAuthCommand::OAuthLogin(command))) = input
+        else {
+            panic!("expected OAuth login command");
+        };
+        assert_eq!(command.descriptor_path, "oauth.json");
+        assert_eq!(command.flow, OAuthFlow::DeviceCode);
+        assert_eq!(command.profile, "qwen");
+        assert_eq!(
+            command.generation_config,
+            Some(ProviderGenerationConfig {
+                enable_thinking: false,
+                reasoning_effort: Some(ProviderReasoningEffort::High),
+                context_window_size: None,
+                max_tokens: None,
+            })
+        );
+        assert_eq!(
+            parse_slash_input("/auth logout qwen"),
+            SlashInput::Command(SlashCommand::Auth(SlashAuthCommand::Logout {
+                profile: Some("qwen".to_owned()),
+            }))
+        );
+        assert_eq!(
+            parse_slash_input("/auth logout"),
+            SlashInput::Command(SlashCommand::Auth(SlashAuthCommand::Logout {
+                profile: None,
+            }))
+        );
+    }
+
+    #[test]
     fn slash_parser_reports_missing_arguments() {
         assert!(matches!(parse_slash_input("/fork"), SlashInput::Error(_)));
         assert!(matches!(
             parse_slash_input("/auth login --model qwen"),
             SlashInput::Error(_)
+        ));
+    }
+
+    #[test]
+    fn slash_parser_accepts_fork_turn_boundary() {
+        assert_eq!(
+            parse_slash_input("/fork thread-1 --from-turn turn-1"),
+            SlashInput::Command(SlashCommand::Fork {
+                thread_id: "thread-1".to_owned(),
+                from_turn_id: Some("turn-1".to_owned()),
+            })
+        );
+        assert!(matches!(
+            parse_slash_input("/fork thread-1 --from-turn"),
+            SlashInput::Error(error) if error.contains("requires a turn id")
+        ));
+        assert!(matches!(
+            parse_slash_input("/fork thread-1 --unknown turn-1"),
+            SlashInput::Error(error) if error.contains("syntax")
         ));
     }
 
@@ -707,12 +1017,19 @@ mod tests {
                 "/auth status - show provider state".to_owned(),
                 "/auth protocols - list protocols".to_owned(),
                 "/auth mock - use mock provider".to_owned(),
-                "/auth login - save OpenAI-compatible profile".to_owned(),
+                "/auth login - save API key profile".to_owned(),
             ]
         );
         assert_eq!(
             slash_command_suggestions("/auth l"),
-            vec!["/auth login - save OpenAI-compatible profile".to_owned()]
+            vec![
+                "/auth login - save API key profile".to_owned(),
+                "/auth logout - remove provider credential".to_owned(),
+            ]
+        );
+        assert_eq!(
+            slash_command_suggestions("/auth o"),
+            vec!["/auth oauth-login - authorize with OAuth descriptor".to_owned()]
         );
     }
 

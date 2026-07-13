@@ -34,6 +34,8 @@ export type RuntimeEventType =
   | "command_accepted"
   | "command_rejected"
   | "session_created"
+  | "thread_forked"
+  | "thread_rebound"
   | "task_created"
   | "turn_started"
   | "turn_queued"

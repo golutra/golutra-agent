@@ -23,6 +23,8 @@ pub enum RuntimeEventType {
     CommandAccepted,
     CommandRejected,
     SessionCreated,
+    ThreadForked,
+    ThreadRebound,
     TaskCreated,
     TurnStarted,
     TurnQueued,

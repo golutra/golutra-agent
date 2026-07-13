@@ -167,6 +167,11 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{session_id}/thread", get(thread_for_session))
         .route("/threads/{thread_id}/resume", post(resume_thread))
         .route("/threads/{thread_id}/fork", post(fork_thread))
+        .route(
+            "/threads/{thread_id}/rollout/export",
+            post(export_thread_rollout),
+        )
+        .route("/threads/{thread_id}/rebind", post(rebind_thread))
         .with_state(state)
         .layer(middleware::from_fn(enforce_local_http_boundary))
 }
@@ -408,10 +413,50 @@ async fn fork_thread(
     State(state): State<AppState>,
     headers: HeaderMap,
     AxumPath(thread_id): AxumPath<String>,
+    Json(request): Json<ForkThreadRequest>,
 ) -> Result<Json<golutra_store::ThreadRecord>, AppError> {
     let transport = state.attached_transport(&headers).await?;
     Ok(Json(
-        transport.fork_thread(parse_thread_id(&thread_id)?).await?,
+        transport
+            .fork_thread(parse_thread_id(&thread_id)?, request.from_turn_id)
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct ForkThreadRequest {
+    from_turn_id: Option<golutra_core::TurnId>,
+}
+
+async fn export_thread_rollout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(thread_id): AxumPath<String>,
+) -> Result<Json<golutra_client::RolloutExport>, AppError> {
+    let transport = state.attached_transport(&headers).await?;
+    Ok(Json(
+        transport
+            .export_thread_rollout(parse_thread_id(&thread_id)?)
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct RebindThreadRequest {
+    from_workspace_root: String,
+}
+
+async fn rebind_thread(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(thread_id): AxumPath<String>,
+    Json(request): Json<RebindThreadRequest>,
+) -> Result<Json<golutra_client::ThreadRebindResult>, AppError> {
+    let transport = state.attached_transport(&headers).await?;
+    Ok(Json(
+        transport
+            .rebind_thread(parse_thread_id(&thread_id)?, request.from_workspace_root)
+            .await?,
     ))
 }
 

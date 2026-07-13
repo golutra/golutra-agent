@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
     sync::{
         Arc, RwLock,
@@ -59,6 +60,8 @@ const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_COMMAND_PAYLOAD_JSON_BYTES: usize = 256 * 1024;
 const MAX_IDEMPOTENCY_KEY_CHARS: usize = 512;
 const MAX_ACTOR_ID_CHARS: usize = 256;
+const MAX_ROLLOUT_LINE_BYTES: usize = 20 * 1024 * 1024;
+const ROLLOUT_FORMAT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppServerPaths {
@@ -95,6 +98,7 @@ pub struct RuntimePaths {
     pub artifacts_dir: PathBuf,
     pub workspace_state_dir: PathBuf,
     pub checkpoints_dir: PathBuf,
+    pub rollouts_dir: PathBuf,
     pub memory_file: PathBuf,
     pub evaluation_file: PathBuf,
     pub session_locks_dir: PathBuf,
@@ -125,6 +129,7 @@ impl RuntimePaths {
         let workspace_hash = workspace_hash(&cwd);
         let workspace_state_dir = workspaces_dir.join(&workspace_hash);
         let checkpoints_dir = workspace_state_dir.join("checkpoints");
+        let rollouts_dir = workspace_state_dir.join("rollouts");
         let session_locks_dir = state_dir.join("session-locks");
         let command_locks_dir = state_dir.join("command-locks");
         for path in [
@@ -133,6 +138,7 @@ impl RuntimePaths {
             &workspaces_dir,
             &workspace_state_dir,
             &checkpoints_dir,
+            &rollouts_dir,
             &session_locks_dir,
             &command_locks_dir,
         ] {
@@ -150,6 +156,7 @@ impl RuntimePaths {
             artifacts_dir,
             workspace_state_dir,
             checkpoints_dir,
+            rollouts_dir,
             session_locks_dir,
             command_locks_dir,
             app_server_dir: app_server_paths.app_server_dir,
@@ -178,6 +185,38 @@ impl RuntimePaths {
         let digest = Sha256::digest(idempotency_key.as_bytes());
         self.command_locks_dir.join(format!("{digest:x}.lock"))
     }
+
+    #[must_use]
+    pub fn rollout_path(&self, thread_id: ThreadId) -> PathBuf {
+        self.rollouts_dir.join(format!("{thread_id}.jsonl"))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RolloutEnvelope {
+    pub version: u32,
+    pub thread_id: ThreadId,
+    pub session_id: SessionId,
+    pub sequence_no: u64,
+    pub checksum: String,
+    pub event: RuntimeEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutExport {
+    pub thread_id: ThreadId,
+    pub session_id: SessionId,
+    pub path: String,
+    pub event_count: usize,
+    pub last_sequence_no: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadRebindResult {
+    pub thread: ThreadRecord,
+    pub previous_workspace_root: String,
+    pub rollout_rebuilt: bool,
+    pub checkpoint_compatibility: String,
 }
 
 #[derive(Debug, Error)]
@@ -307,8 +346,29 @@ impl EmbeddedTransport {
         self.host.resume_thread(thread_id).await
     }
 
-    pub async fn fork_thread(&self, thread_id: ThreadId) -> Result<ThreadRecord, ClientError> {
-        self.host.fork_thread(thread_id).await
+    pub async fn fork_thread(
+        &self,
+        thread_id: ThreadId,
+        from_turn_id: Option<TurnId>,
+    ) -> Result<ThreadRecord, ClientError> {
+        self.host.fork_thread(thread_id, from_turn_id).await
+    }
+
+    pub async fn export_thread_rollout(
+        &self,
+        thread_id: ThreadId,
+    ) -> Result<RolloutExport, ClientError> {
+        self.host.export_thread_rollout(thread_id).await
+    }
+
+    pub async fn rebind_thread(
+        &self,
+        thread_id: ThreadId,
+        from_workspace_root: impl AsRef<Path>,
+    ) -> Result<ThreadRebindResult, ClientError> {
+        self.host
+            .rebind_thread(thread_id, from_workspace_root)
+            .await
     }
 
     pub async fn recover_orphaned_tasks(&self) -> Result<usize, ClientError> {
@@ -501,12 +561,50 @@ impl HttpSseTransport {
         decode_http_response(response).await
     }
 
-    pub async fn fork_thread(&self, thread_id: ThreadId) -> Result<ThreadRecord, ClientError> {
+    pub async fn fork_thread(
+        &self,
+        thread_id: ThreadId,
+        from_turn_id: Option<TurnId>,
+    ) -> Result<ThreadRecord, ClientError> {
         let response = self
             .send_attached(|attachment_id| {
                 self.client
                     .post(self.url(&format!("/threads/{thread_id}/fork")))
                     .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id)
+                    .json(&json!({"from_turn_id": from_turn_id}))
+                    .timeout(Duration::from_secs(30))
+            })
+            .await?;
+        decode_http_response(response).await
+    }
+
+    pub async fn export_thread_rollout(
+        &self,
+        thread_id: ThreadId,
+    ) -> Result<RolloutExport, ClientError> {
+        let response = self
+            .send_attached(|attachment_id| {
+                self.client
+                    .post(self.url(&format!("/threads/{thread_id}/rollout/export")))
+                    .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id)
+                    .timeout(Duration::from_secs(30))
+            })
+            .await?;
+        decode_http_response(response).await
+    }
+
+    pub async fn rebind_thread(
+        &self,
+        thread_id: ThreadId,
+        from_workspace_root: impl AsRef<Path>,
+    ) -> Result<ThreadRebindResult, ClientError> {
+        let from_workspace_root = from_workspace_root.as_ref().display().to_string();
+        let response = self
+            .send_attached(|attachment_id| {
+                self.client
+                    .post(self.url(&format!("/threads/{thread_id}/rebind")))
+                    .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id)
+                    .json(&json!({"from_workspace_root": from_workspace_root}))
                     .timeout(Duration::from_secs(30))
             })
             .await?;
@@ -909,11 +1007,46 @@ impl RuntimeTransport {
         }
     }
 
-    pub async fn fork_thread(&self, thread_id: ThreadId) -> Result<ThreadRecord, ClientError> {
+    pub async fn fork_thread(
+        &self,
+        thread_id: ThreadId,
+        from_turn_id: Option<TurnId>,
+    ) -> Result<ThreadRecord, ClientError> {
         match self {
-            Self::Embedded(transport) => transport.fork_thread(thread_id).await,
+            Self::Embedded(transport) => transport.fork_thread(thread_id, from_turn_id).await,
             Self::LocalDaemon(transport) | Self::Remote(transport) => {
-                transport.fork_thread(thread_id).await
+                transport.fork_thread(thread_id, from_turn_id).await
+            }
+        }
+    }
+
+    pub async fn export_thread_rollout(
+        &self,
+        thread_id: ThreadId,
+    ) -> Result<RolloutExport, ClientError> {
+        match self {
+            Self::Embedded(transport) => transport.export_thread_rollout(thread_id).await,
+            Self::LocalDaemon(transport) | Self::Remote(transport) => {
+                transport.export_thread_rollout(thread_id).await
+            }
+        }
+    }
+
+    pub async fn rebind_thread(
+        &self,
+        thread_id: ThreadId,
+        from_workspace_root: impl AsRef<Path>,
+    ) -> Result<ThreadRebindResult, ClientError> {
+        match self {
+            Self::Embedded(transport) => {
+                transport
+                    .rebind_thread(thread_id, from_workspace_root)
+                    .await
+            }
+            Self::LocalDaemon(transport) | Self::Remote(transport) => {
+                transport
+                    .rebind_thread(thread_id, from_workspace_root)
+                    .await
             }
         }
     }
@@ -1149,6 +1282,7 @@ impl RuntimeHost {
             default_thread_id,
         )
         .await?;
+        host.synchronize_workspace_rollouts().await?;
         host.recover_orphaned_tasks().await?;
         Ok(host)
     }
@@ -2474,17 +2608,56 @@ impl RuntimeHost {
         Ok(thread)
     }
 
-    pub async fn fork_thread(&self, thread_id: ThreadId) -> Result<ThreadRecord, ClientError> {
+    pub async fn fork_thread(
+        &self,
+        thread_id: ThreadId,
+        from_turn_id: Option<TurnId>,
+    ) -> Result<ThreadRecord, ClientError> {
         let parent = self.store.thread_by_id(thread_id).await?.ok_or_else(|| {
             ClientError::InvalidSession(format!("thread `{thread_id}` not found"))
         })?;
         self.ensure_thread_in_workspace(&parent)?;
+        let parent_state = self.store.query_state(parent.session_id, None).await?;
+        if is_active_status(parent_state.task_status) {
+            return Err(ClientError::InvalidSession(format!(
+                "thread `{thread_id}` cannot be forked while its task is active"
+            )));
+        }
+        let parent_events = self
+            .store
+            .load_events(parent.session_id, None, None)
+            .await?;
+        let through_sequence_no = match from_turn_id {
+            Some(turn_id) => parent_events
+                .iter()
+                .filter(|event| event.turn_id == Some(turn_id))
+                .map(|event| event.sequence_no)
+                .max()
+                .ok_or_else(|| {
+                    ClientError::InvalidSession(format!(
+                        "turn `{turn_id}` was not found in thread `{thread_id}`"
+                    ))
+                })?,
+            None => parent_events
+                .last()
+                .map(|event| event.sequence_no)
+                .unwrap_or_default(),
+        };
         let now = chrono::Utc::now();
+        let child_thread_id = ThreadId::new();
+        let child_session_id = SessionId::new();
         let child = ThreadRecord {
-            thread_id: ThreadId::new(),
-            session_id: SessionId::new(),
+            thread_id: child_thread_id,
+            session_id: child_session_id,
             parent_thread_id: Some(parent.thread_id),
+            forked_from_turn_id: from_turn_id,
+            forked_from_sequence_no: Some(through_sequence_no),
             workspace_root: parent.workspace_root.clone(),
+            rebound_from_workspace_root: None,
+            rollout_path: self
+                .runtime_paths
+                .as_ref()
+                .map(|paths| paths.rollout_path(child_thread_id).display().to_string()),
             title: format!("Fork of {}", parent.title),
             preview: parent.preview.clone(),
             created_at: now,
@@ -2492,8 +2665,151 @@ impl RuntimeHost {
             recency_at: now,
             archived: false,
         };
-        self.store.upsert_thread(&child).await?;
+        let _writer = self.event_writer.lock().await;
+        let forked_events = self
+            .store
+            .create_forked_thread(&child, parent.session_id, through_sequence_no)
+            .await?;
+        for event in &forked_events {
+            let _ = self.event_bus.send(event.clone());
+        }
+        drop(_writer);
+        let child_state = self.store.query_state(child.session_id, None).await?;
+        if is_active_status(child_state.task_status) {
+            self.record_event(host_event(
+                self.next_sequence_no(),
+                child.session_id,
+                child_state.active_task_id,
+                RuntimeEventType::TaskCompleted,
+                RuntimeEventSource::Runtime,
+                json!({
+                    "summary": "fork history closed at the selected turn boundary",
+                    "status": TaskStatus::Completed,
+                    "fork_boundary": true,
+                }),
+            ))
+            .await?;
+        }
+        self.record_event(host_event(
+            self.next_sequence_no(),
+            child.session_id,
+            None,
+            RuntimeEventType::ThreadForked,
+            RuntimeEventSource::Runtime,
+            json!({
+                "summary": format!("thread forked from {}", parent.thread_id),
+                "parent_thread_id": parent.thread_id,
+                "forked_from_turn_id": from_turn_id,
+                "forked_from_sequence_no": through_sequence_no,
+            }),
+        ))
+        .await?;
+        self.rebuild_thread_rollout(&child).await?;
         Ok(child)
+    }
+
+    pub async fn export_thread_rollout(
+        &self,
+        thread_id: ThreadId,
+    ) -> Result<RolloutExport, ClientError> {
+        let mut thread = self.store.thread_by_id(thread_id).await?.ok_or_else(|| {
+            ClientError::InvalidSession(format!("thread `{thread_id}` not found"))
+        })?;
+        self.ensure_thread_in_workspace(&thread)?;
+        self.ensure_thread_rollout_path(&mut thread).await?;
+        self.rebuild_thread_rollout(&thread).await
+    }
+
+    pub async fn rebind_thread(
+        &self,
+        thread_id: ThreadId,
+        from_workspace_root: impl AsRef<Path>,
+    ) -> Result<ThreadRebindResult, ClientError> {
+        let new_workspace_root = self.workspace_root_string().ok_or_else(|| {
+            ClientError::InvalidSession("thread rebind requires a cwd runtime".to_owned())
+        })?;
+        let source_workspace_root = normalize_rebind_source(from_workspace_root.as_ref())?;
+        let from_workspace_root = source_workspace_root.display().to_string();
+        let mut thread = self.store.thread_by_id(thread_id).await?.ok_or_else(|| {
+            ClientError::InvalidSession(format!("thread `{thread_id}` not found"))
+        })?;
+        if thread.workspace_root.as_deref() != Some(from_workspace_root.as_str()) {
+            return Err(ClientError::InvalidSession(format!(
+                "thread `{thread_id}` belongs to `{}`, not `{from_workspace_root}`",
+                thread.workspace_root.as_deref().unwrap_or("<none>")
+            )));
+        }
+        let state = self.store.query_state(thread.session_id, None).await?;
+        if is_active_status(state.task_status) {
+            return Err(ClientError::InvalidSession(format!(
+                "thread `{thread_id}` cannot be rebound while its task is active"
+            )));
+        }
+        let SessionLeaseAttempt::Acquired(_lease) =
+            self.try_acquire_session_lease(thread.session_id)?
+        else {
+            return Err(ClientError::InvalidSession(format!(
+                "thread `{thread_id}` is owned by another runtime"
+            )));
+        };
+        let expected_old_rollout_path = self.runtime_paths.as_ref().map(|paths| {
+            rollout_path_for_workspace(paths, &source_workspace_root, thread.thread_id)
+        });
+        let old_rollout_path = match (&thread.rollout_path, expected_old_rollout_path) {
+            (Some(configured), Some(expected)) if Path::new(configured) == expected => {
+                Some(expected)
+            }
+            (Some(configured), Some(expected)) => {
+                return Err(ClientError::InvalidSession(format!(
+                    "thread `{thread_id}` rollout path `{configured}` does not match source workspace path `{}`",
+                    expected.display()
+                )));
+            }
+            (Some(_), None) => {
+                return Err(ClientError::InvalidSession(
+                    "thread rebind requires durable runtime paths".to_owned(),
+                ));
+            }
+            (None, _) => None,
+        };
+        thread.workspace_root = Some(new_workspace_root.clone());
+        thread.rebound_from_workspace_root = Some(from_workspace_root.clone());
+        thread.rollout_path = self
+            .runtime_paths
+            .as_ref()
+            .map(|paths| paths.rollout_path(thread.thread_id).display().to_string());
+        thread.updated_at = chrono::Utc::now();
+        thread.recency_at = thread.updated_at;
+        self.store.upsert_thread(&thread).await?;
+        let rollout = self.rebuild_thread_rollout(&thread).await?;
+        self.record_event(host_event(
+            self.next_sequence_no(),
+            thread.session_id,
+            state.active_task_id,
+            RuntimeEventType::ThreadRebound,
+            RuntimeEventSource::Runtime,
+            json!({
+                "summary": format!("thread rebound from {from_workspace_root} to {new_workspace_root}"),
+                "thread_id": thread.thread_id,
+                "from_workspace_root": from_workspace_root,
+                "to_workspace_root": new_workspace_root,
+                "checkpoint_compatibility": "historical_only",
+            }),
+        ))
+        .await?;
+        if let Some(old_path) = old_rollout_path
+            && thread.rollout_path.as_deref() != Some(old_path.to_string_lossy().as_ref())
+            && old_path.exists()
+        {
+            fs::remove_file(&old_path)
+                .map_err(|error| ClientError::Io(format!("{}: {error}", old_path.display())))?;
+        }
+        Ok(ThreadRebindResult {
+            thread,
+            previous_workspace_root: from_workspace_root,
+            rollout_rebuilt: rollout.event_count > 0,
+            checkpoint_compatibility: "historical_only".to_owned(),
+        })
     }
 
     async fn upsert_current_thread(
@@ -2545,7 +2861,19 @@ impl RuntimeHost {
             thread_id,
             session_id,
             parent_thread_id: source_thread.and_then(|thread| thread.parent_thread_id),
+            forked_from_turn_id: source_thread.and_then(|thread| thread.forked_from_turn_id),
+            forked_from_sequence_no: source_thread
+                .and_then(|thread| thread.forked_from_sequence_no),
             workspace_root: self.workspace_root_string(),
+            rebound_from_workspace_root: source_thread
+                .and_then(|thread| thread.rebound_from_workspace_root.clone()),
+            rollout_path: source_thread
+                .and_then(|thread| thread.rollout_path.clone())
+                .or_else(|| {
+                    self.runtime_paths
+                        .as_ref()
+                        .map(|paths| paths.rollout_path(thread_id).display().to_string())
+                }),
             title: thread_title_for_prompt(source_thread, payload),
             preview: preview_from_payload(payload),
             created_at: source_thread.map(|thread| thread.created_at).unwrap_or(now),
@@ -2560,8 +2888,92 @@ impl RuntimeHost {
     async fn record_event(&self, event: RuntimeEvent) -> Result<(), ClientError> {
         let _writer = self.event_writer.lock().await;
         let event = self.store.append_event_assigning_sequence(event).await?;
+        self.append_rollout_event(&event).await?;
         let _ = self.event_bus.send(event);
         Ok(())
+    }
+
+    async fn synchronize_workspace_rollouts(&self) -> Result<(), ClientError> {
+        let Some(workspace_root) = self.workspace_root_string() else {
+            return Ok(());
+        };
+        let threads = self
+            .store
+            .list_threads(Some(&workspace_root), u32::MAX)
+            .await?;
+        for mut thread in threads {
+            self.ensure_thread_rollout_path(&mut thread).await?;
+            self.rebuild_thread_rollout(&thread).await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_thread_rollout_path(
+        &self,
+        thread: &mut ThreadRecord,
+    ) -> Result<(), ClientError> {
+        let Some(paths) = &self.runtime_paths else {
+            thread.rollout_path = None;
+            return Ok(());
+        };
+        let expected = paths.rollout_path(thread.thread_id).display().to_string();
+        if thread.rollout_path.as_deref() != Some(expected.as_str()) {
+            thread.rollout_path = Some(expected);
+            thread.updated_at = chrono::Utc::now();
+            self.store.upsert_thread(thread).await?;
+        }
+        Ok(())
+    }
+
+    async fn append_rollout_event(&self, event: &RuntimeEvent) -> Result<(), ClientError> {
+        let Some(mut thread) = self.store.thread_by_session(event.session_id).await? else {
+            return Ok(());
+        };
+        self.ensure_thread_rollout_path(&mut thread).await?;
+        let Some(path) = thread.rollout_path.as_deref().map(PathBuf::from) else {
+            return Ok(());
+        };
+        if !path.exists() {
+            self.rebuild_thread_rollout(&thread).await?;
+            return Ok(());
+        }
+        let line = rollout_line(&thread, event)?;
+        run_blocking(move || append_rollout_line(&path, &line)).await??;
+        Ok(())
+    }
+
+    async fn rebuild_thread_rollout(
+        &self,
+        thread: &ThreadRecord,
+    ) -> Result<RolloutExport, ClientError> {
+        let Some(path) = thread.rollout_path.as_deref().map(PathBuf::from) else {
+            return Ok(RolloutExport {
+                thread_id: thread.thread_id,
+                session_id: thread.session_id,
+                path: String::new(),
+                event_count: 0,
+                last_sequence_no: None,
+            });
+        };
+        let events = self
+            .store
+            .load_events(thread.session_id, None, None)
+            .await?;
+        let lines = events
+            .iter()
+            .map(|event| rollout_line(thread, event))
+            .collect::<Result<Vec<_>, _>>()?;
+        let last_sequence_no = events.last().map(|event| event.sequence_no);
+        let event_count = events.len();
+        let export_path = path.display().to_string();
+        run_blocking(move || rebuild_rollout_file(&path, &lines)).await??;
+        Ok(RolloutExport {
+            thread_id: thread.thread_id,
+            session_id: thread.session_id,
+            path: export_path,
+            event_count,
+            last_sequence_no,
+        })
     }
 
     async fn persisted_active_task(
@@ -3515,6 +3927,212 @@ impl RuntimeHost {
     }
 }
 
+fn rollout_line(thread: &ThreadRecord, event: &RuntimeEvent) -> Result<Vec<u8>, ClientError> {
+    let mut event = event.clone();
+    redact_rollout_value(&mut event.payload, None);
+    let event_bytes = serde_json::to_vec(&event)?;
+    let checksum = format!("sha256:{:x}", Sha256::digest(&event_bytes));
+    let envelope = RolloutEnvelope {
+        version: ROLLOUT_FORMAT_VERSION,
+        thread_id: thread.thread_id,
+        session_id: thread.session_id,
+        sequence_no: event.sequence_no,
+        checksum,
+        event,
+    };
+    let line = serde_json::to_vec(&envelope)?;
+    if line.len() > MAX_ROLLOUT_LINE_BYTES {
+        return Err(ClientError::Io(format!(
+            "rollout event exceeds {MAX_ROLLOUT_LINE_BYTES} byte limit"
+        )));
+    }
+    Ok(line)
+}
+
+fn redact_rollout_value(value: &mut Value, key: Option<&str>) {
+    let sensitive_key = key.is_some_and(is_sensitive_rollout_key);
+    if sensitive_key {
+        *value = Value::String("<redacted-secret>".to_owned());
+        return;
+    }
+    match value {
+        Value::String(content) => {
+            *content = redact_sensitive_text(content).0;
+        }
+        Value::Array(values) => {
+            for value in values {
+                redact_rollout_value(value, None);
+            }
+        }
+        Value::Object(values) => {
+            for (key, value) in values {
+                redact_rollout_value(value, Some(key));
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn is_sensitive_rollout_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase().replace('-', "_");
+    matches!(
+        normalized.as_str(),
+        "api_key"
+            | "apikey"
+            | "authorization"
+            | "token"
+            | "access_token"
+            | "refresh_token"
+            | "id_token"
+            | "bearer_token"
+            | "secret"
+            | "client_secret"
+            | "password"
+            | "credential"
+            | "credentials"
+    ) || normalized.ends_with("_api_key")
+        || normalized.ends_with("_access_token")
+        || normalized.ends_with("_refresh_token")
+        || normalized.ends_with("_id_token")
+        || normalized.ends_with("_secret")
+        || normalized.ends_with("_password")
+}
+
+fn append_rollout_line(path: &Path, line: &[u8]) -> Result<(), ClientError> {
+    let parent = path.parent().ok_or_else(|| {
+        ClientError::Io(format!("rollout path has no parent: {}", path.display()))
+    })?;
+    ensure_private_dir(parent)?;
+    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(ClientError::Io(format!(
+            "rollout file cannot be a symbolic link: {}",
+            path.display()
+        )));
+    }
+    let lock = lock_rollout_file(path)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| ClientError::Io(format!("{}: {error}", path.display())))?;
+    set_owner_only_file(path)?;
+    file.write_all(line)
+        .and_then(|()| file.write_all(b"\n"))
+        .and_then(|()| file.sync_data())
+        .map_err(|error| ClientError::Io(format!("{}: {error}", path.display())))?;
+    FileExt::unlock(&lock).map_err(|error| ClientError::Io(format!("{}: {error}", path.display())))
+}
+
+fn rebuild_rollout_file(path: &Path, lines: &[Vec<u8>]) -> Result<(), ClientError> {
+    let parent = path.parent().ok_or_else(|| {
+        ClientError::Io(format!("rollout path has no parent: {}", path.display()))
+    })?;
+    ensure_private_dir(parent)?;
+    let lock = lock_rollout_file(path)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| ClientError::Io(format!("{}: {error}", parent.display())))?;
+    for line in lines {
+        temporary
+            .write_all(line)
+            .and_then(|()| temporary.write_all(b"\n"))
+            .map_err(|error| ClientError::Io(format!("{}: {error}", path.display())))?;
+    }
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| ClientError::Io(format!("{}: {error}", path.display())))?;
+    set_owner_only_file(temporary.path())?;
+    temporary
+        .persist(path)
+        .map_err(|error| ClientError::Io(format!("{}: {}", path.display(), error.error)))?;
+    set_owner_only_file(path)?;
+    sync_runtime_directory(parent)?;
+    FileExt::unlock(&lock).map_err(|error| ClientError::Io(format!("{}: {error}", path.display())))
+}
+
+fn lock_rollout_file(path: &Path) -> Result<File, ClientError> {
+    let lock_path = rollout_lock_path(path);
+    if fs::symlink_metadata(&lock_path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(ClientError::Io(format!(
+            "rollout lock cannot be a symbolic link: {}",
+            lock_path.display()
+        )));
+    }
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|error| ClientError::Io(format!("{}: {error}", lock_path.display())))?;
+    set_owner_only_file(&lock_path)?;
+    lock.lock_exclusive()
+        .map_err(|error| ClientError::Io(format!("{}: {error}", lock_path.display())))?;
+    Ok(lock)
+}
+
+fn rollout_lock_path(path: &Path) -> PathBuf {
+    path.with_extension("jsonl.lock")
+}
+
+fn rollout_path_for_workspace(
+    paths: &RuntimePaths,
+    workspace_root: &Path,
+    thread_id: ThreadId,
+) -> PathBuf {
+    paths
+        .state_dir
+        .join("workspaces")
+        .join(workspace_hash(workspace_root))
+        .join("rollouts")
+        .join(format!("{thread_id}.jsonl"))
+}
+
+#[cfg(unix)]
+fn sync_runtime_directory(path: &Path) -> Result<(), ClientError> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| ClientError::Io(format!("{}: {error}", path.display())))
+}
+
+#[cfg(not(unix))]
+fn sync_runtime_directory(_path: &Path) -> Result<(), ClientError> {
+    Ok(())
+}
+
+fn normalize_rebind_source(path: &Path) -> Result<PathBuf, ClientError> {
+    match path.canonicalize() {
+        Ok(path) => return Ok(path),
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(ClientError::Io(format!("{}: {error}", path.display())));
+        }
+        Err(_) => {}
+    }
+    if !path.is_absolute() {
+        return Err(ClientError::InvalidSession(format!(
+            "nonexistent rebind source must be absolute: {}",
+            path.display()
+        )));
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                normalized.push(component.as_os_str());
+            }
+            std::path::Component::Normal(component) => normalized.push(component),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                return Err(ClientError::InvalidSession(format!(
+                    "rebind source must not contain `..`: {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(normalized)
+}
+
 fn absolute_path(path: &Path) -> Result<PathBuf, ClientError> {
     if path.is_absolute() {
         return Ok(path.to_path_buf());
@@ -3999,7 +4617,11 @@ fn resolve_configured_provider(
     mock: MockProvider,
 ) -> Result<ConfiguredProvider, ProviderError> {
     if let Some(provider_env) = provider_env {
-        ConfiguredProvider::resolve_from_reader(mock, |key| provider_env.get(key))
+        ConfiguredProvider::resolve_from_reader_with_credential(
+            mock,
+            |key| provider_env.get(key),
+            provider_env.credential_provider(),
+        )
     } else {
         ConfiguredProvider::resolve_from_env(mock)
     }
@@ -4503,6 +5125,7 @@ fn with_command_payload(
 mod tests {
     use std::{ffi::OsString, fs};
 
+    use golutra_auth::{AuthService, CredentialRef, MemorySecretStore, SecretKind, SecretStore};
     use golutra_config::{
         ProviderConfigPaths, ProviderConfigScope, ProviderInstallPlan, ProviderProfile,
         ProviderSettings, runtime_env_from_settings,
@@ -5291,6 +5914,7 @@ mod tests {
             scope: ProviderConfigScope::User,
             profile: ProviderProfile::mock(),
             activate: true,
+            pending_secret: None,
         }
         .apply(&provider_paths)
         .expect("mock provider");
@@ -5527,7 +6151,7 @@ mod tests {
             .expect("parent command");
         wait_for_status(&transport, parent_session_id, TaskStatus::Completed).await;
         let child = transport
-            .fork_thread(parent_thread_id)
+            .fork_thread(parent_thread_id, None)
             .await
             .expect("fork thread");
 
@@ -5552,6 +6176,367 @@ mod tests {
 
         assert_eq!(child_after.preview, "write child output");
         assert_eq!(child_after.parent_thread_id, Some(parent_thread_id));
+    }
+
+    #[tokio::test]
+    async fn rollout_jsonl_is_complete_checksummed_redacted_and_owner_only() {
+        let workspace = tempdir().expect("workspace");
+        let _provider = IsolatedGlobalMockProvider::install().await;
+        let transport = EmbeddedTransport::for_cwd(workspace.path())
+            .await
+            .expect("transport");
+        let session_id = transport.default_session_id();
+        transport
+            .send_command(command_with_payload(
+                session_id,
+                json!({
+                    "prompt": "hello rollout",
+                    "api_key": "sk-rollout-secret-123456789",
+                }),
+            ))
+            .await
+            .expect("command");
+        wait_for_status(&transport, session_id, TaskStatus::Completed).await;
+
+        let export = transport
+            .export_thread_rollout(transport.default_thread_id())
+            .await
+            .expect("rollout export");
+        let content = fs::read_to_string(&export.path).expect("rollout content");
+        assert!(!content.contains("sk-rollout-secret-123456789"));
+        let envelopes = content
+            .lines()
+            .map(|line| serde_json::from_str::<RolloutEnvelope>(line).expect("rollout line"))
+            .collect::<Vec<_>>();
+        assert_eq!(envelopes.len(), export.event_count);
+        assert_eq!(
+            export.last_sequence_no,
+            envelopes.last().map(|envelope| envelope.sequence_no)
+        );
+        for envelope in &envelopes {
+            assert_eq!(envelope.version, ROLLOUT_FORMAT_VERSION);
+            assert_eq!(envelope.thread_id, transport.default_thread_id());
+            assert_eq!(envelope.session_id, session_id);
+            let bytes = serde_json::to_vec(&envelope.event).expect("event JSON");
+            assert_eq!(
+                envelope.checksum,
+                format!("sha256:{:x}", Sha256::digest(bytes))
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                fs::metadata(&export.path)
+                    .expect("rollout metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(rollout_lock_path(Path::new(&export.path)))
+                    .expect("rollout lock metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_from_turn_copies_complete_history_with_fresh_runtime_ids() {
+        let workspace = tempdir().expect("workspace");
+        let _provider = IsolatedGlobalMockProvider::install().await;
+        let transport = EmbeddedTransport::for_cwd(workspace.path())
+            .await
+            .expect("transport");
+        let parent_session_id = transport.default_session_id();
+        transport
+            .send_command(command_with_payload(
+                parent_session_id,
+                json!({
+                    "prompt": "first fork turn writes an artifact",
+                    "path": "fork-parent.txt",
+                    "content": "parent artifact",
+                }),
+            ))
+            .await
+            .expect("first command");
+        wait_for_status(&transport, parent_session_id, TaskStatus::Completed).await;
+        let after_first = transport
+            .host
+            .store
+            .load_events(parent_session_id, None, None)
+            .await
+            .expect("first history");
+        let first_turn_id = after_first
+            .iter()
+            .find_map(|event| event.turn_id)
+            .expect("first turn");
+        transport
+            .send_command(command(parent_session_id, "second fork turn"))
+            .await
+            .expect("second command");
+        wait_for_status(&transport, parent_session_id, TaskStatus::Completed).await;
+
+        let child = transport
+            .fork_thread(transport.default_thread_id(), Some(first_turn_id))
+            .await
+            .expect("fork at first turn");
+        let child_events = transport
+            .host
+            .store
+            .load_events(child.session_id, None, None)
+            .await
+            .expect("child history");
+        let child_history = child_events
+            .iter()
+            .filter_map(conversation_history_line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(child_history.contains("first fork turn writes an artifact"));
+        assert!(!child_history.contains("second fork turn"));
+        assert_eq!(child.parent_thread_id, Some(transport.default_thread_id()));
+        assert_eq!(child.forked_from_turn_id, Some(first_turn_id));
+        assert!(child.forked_from_sequence_no.is_some());
+
+        let parent_event_ids = after_first
+            .iter()
+            .map(|event| event.id)
+            .collect::<std::collections::HashSet<_>>();
+        assert!(
+            child_events
+                .iter()
+                .all(|event| !parent_event_ids.contains(&event.id))
+        );
+        assert!(
+            child_events
+                .iter()
+                .all(|event| event.session_id == child.session_id)
+        );
+        assert!(!is_active_status(
+            transport
+                .host
+                .store
+                .query_state(child.session_id, None)
+                .await
+                .expect("child state")
+                .task_status
+        ));
+
+        let contributors = transport
+            .host
+            .context_contributors_for_task(
+                child.session_id,
+                TaskId::new(),
+                "continue child".to_owned(),
+            )
+            .await
+            .expect("child context");
+        let history = contributors
+            .iter()
+            .find(|contributor| contributor.name == "conversation_history")
+            .expect("fork history contributor");
+        assert!(
+            history
+                .content
+                .contains("first fork turn writes an artifact")
+        );
+        assert!(!history.content.contains("second fork turn"));
+        let debug = transport
+            .host
+            .store
+            .debug_projection(child.session_id, None)
+            .await
+            .expect("child debug projection");
+        let inherited_artifact = debug
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.session_id == parent_session_id)
+            .expect("fork retains immutable parent artifact lineage");
+        assert!(
+            transport
+                .host
+                .store
+                .load_artifact_bytes(inherited_artifact.artifact_id)
+                .await
+                .expect("inherited artifact bytes")
+                .is_some()
+        );
+        let export = transport
+            .export_thread_rollout(child.thread_id)
+            .await
+            .expect("child rollout");
+        assert_eq!(export.event_count, child_events.len() + 1);
+    }
+
+    #[test]
+    fn rollout_redaction_preserves_token_counts_and_redacts_credentials() {
+        let mut payload = json!({
+            "input_tokens": 12,
+            "output_tokens": 3,
+            "access_token": "secret-access-token",
+            "nested": {
+                "provider_api_key": "secret-api-key",
+                "token": "secret-token",
+            }
+        });
+
+        redact_rollout_value(&mut payload, None);
+
+        assert_eq!(payload["input_tokens"], 12);
+        assert_eq!(payload["output_tokens"], 3);
+        assert_eq!(payload["access_token"], "<redacted-secret>");
+        assert_eq!(payload["nested"]["provider_api_key"], "<redacted-secret>");
+        assert_eq!(payload["nested"]["token"], "<redacted-secret>");
+    }
+
+    #[tokio::test]
+    async fn rebind_moves_thread_to_current_cwd_and_rebuilds_rollout() {
+        let old_workspace = tempdir().expect("old workspace");
+        let new_workspace = tempdir().expect("new workspace");
+        let _provider = IsolatedGlobalMockProvider::install().await;
+        let old_transport = EmbeddedTransport::for_cwd(old_workspace.path())
+            .await
+            .expect("old transport");
+        old_transport
+            .send_command(command(
+                old_transport.default_session_id(),
+                "history before path migration",
+            ))
+            .await
+            .expect("old command");
+        wait_for_status(
+            &old_transport,
+            old_transport.default_session_id(),
+            TaskStatus::Completed,
+        )
+        .await;
+        let thread_id = old_transport.default_thread_id();
+        let old_thread = old_transport
+            .resume_thread(thread_id)
+            .await
+            .expect("old thread");
+        let old_rollout = PathBuf::from(old_thread.rollout_path.expect("old rollout"));
+        assert!(old_rollout.exists());
+
+        let new_transport = EmbeddedTransport::for_cwd(new_workspace.path())
+            .await
+            .expect("new transport");
+        let result = new_transport
+            .rebind_thread(thread_id, old_workspace.path())
+            .await
+            .expect("thread rebound");
+
+        assert_eq!(
+            result.thread.workspace_root.as_deref(),
+            Some(
+                new_workspace
+                    .path()
+                    .canonicalize()
+                    .expect("new canonical")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert_eq!(result.checkpoint_compatibility, "historical_only");
+        assert!(result.rollout_rebuilt);
+        assert!(!old_rollout.exists());
+        let new_rollout = PathBuf::from(result.thread.rollout_path.as_ref().expect("new rollout"));
+        assert!(new_rollout.exists());
+        assert!(
+            old_transport
+                .list_threads(10)
+                .await
+                .expect("old threads")
+                .is_empty()
+        );
+        assert_eq!(
+            new_transport
+                .resume_thread(thread_id)
+                .await
+                .expect("new thread")
+                .session_id,
+            old_thread.session_id
+        );
+        let events = new_transport
+            .host
+            .store
+            .load_events(old_thread.session_id, None, None)
+            .await
+            .expect("rebound events");
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == RuntimeEventType::ThreadRebound)
+        );
+    }
+
+    #[tokio::test]
+    async fn rebind_rejects_a_rollout_path_outside_the_source_workspace_partition() {
+        let old_workspace = tempdir().expect("old workspace");
+        let new_workspace = tempdir().expect("new workspace");
+        let victim_directory = tempdir().expect("victim directory");
+        let victim = victim_directory.path().join("must-remain.txt");
+        fs::write(&victim, "keep").expect("victim file");
+        let _provider = IsolatedGlobalMockProvider::install().await;
+        let old_transport = EmbeddedTransport::for_cwd(old_workspace.path())
+            .await
+            .expect("old transport");
+        old_transport
+            .send_command(command(
+                old_transport.default_session_id(),
+                "history before invalid rebind",
+            ))
+            .await
+            .expect("old command");
+        wait_for_status(
+            &old_transport,
+            old_transport.default_session_id(),
+            TaskStatus::Completed,
+        )
+        .await;
+        let thread_id = old_transport.default_thread_id();
+        let mut thread = old_transport
+            .resume_thread(thread_id)
+            .await
+            .expect("old thread");
+        thread.rollout_path = Some(victim.display().to_string());
+        old_transport
+            .host
+            .store
+            .upsert_thread(&thread)
+            .await
+            .expect("tampered rollout metadata");
+        let new_transport = EmbeddedTransport::for_cwd(new_workspace.path())
+            .await
+            .expect("new transport");
+
+        let error = new_transport
+            .rebind_thread(thread_id, old_workspace.path())
+            .await
+            .expect_err("foreign rollout path must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not match source workspace")
+        );
+        assert_eq!(fs::read_to_string(&victim).expect("victim remains"), "keep");
+        assert_eq!(
+            new_transport
+                .host
+                .store
+                .thread_by_id(thread_id)
+                .await
+                .expect("thread query")
+                .expect("thread remains")
+                .workspace_root,
+            thread.workspace_root
+        );
     }
 
     #[tokio::test]
@@ -6037,19 +7022,26 @@ mod tests {
 
     #[test]
     fn live_provider_keeps_workspace_tools_available_for_queued_turns() {
+        let home = tempdir().expect("home");
+        let store = Arc::new(MemorySecretStore::default());
+        let reference = CredentialRef::disk(SecretKind::ApiKey);
+        store
+            .set(
+                &reference,
+                &secrecy::SecretString::from("secret".to_owned()),
+            )
+            .expect("secret");
+        let auth = AuthService::new(home.path(), store).expect("auth");
         let mut settings = ProviderSettings::default();
         let profile = ProviderProfile::openai_compatible(
             "live",
             "https://example.com/v1",
             "model",
-            "TEST_PROVIDER_KEY",
+            reference,
         )
         .expect("profile");
-        settings
-            .env
-            .insert("TEST_PROVIDER_KEY".to_owned(), "secret".to_owned());
         settings.upsert_profile(profile, true);
-        let environment = runtime_env_from_settings(&settings);
+        let environment = runtime_env_from_settings(&settings, &auth).expect("environment");
 
         let plan = configured_provider_plan(
             Some(&environment),
@@ -6739,6 +7731,7 @@ mod tests {
             scope: ProviderConfigScope::User,
             profile: ProviderProfile::mock(),
             activate: true,
+            pending_secret: None,
         }
         .apply(&paths)
         .expect("global mock provider");

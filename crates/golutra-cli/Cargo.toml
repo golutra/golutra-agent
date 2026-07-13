@@ -10,6 +10,7 @@ rust-version.workspace = true
 chrono.workspace = true
 clap.workspace = true
 golutra-app-server = { path = "../golutra-app-server" }
+golutra-auth = { path = "../golutra-auth" }
 golutra-client = { path = "../golutra-client" }
 golutra-config = { path = "../golutra-config" }
 golutra-core.workspace = true
@@ -17,5 +18,6 @@ golutra-llm = { path = "../golutra-llm" }
 golutra-protocol.workspace = true
 miette.workspace = true
 serde_json.workspace = true
+secrecy.workspace = true
 tokio.workspace = true
 uuid.workspace = true

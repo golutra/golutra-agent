@@ -11,7 +11,7 @@ pub async fn transport_smoke() -> miette::Result<bool> {
     fs::write(
         home.path().join("provider.json"),
         serde_json::to_vec_pretty(&json!({
-            "version": 1,
+            "version": 2,
             "active_profile": "mock",
             "profiles": [{
                 "name": "mock",

@@ -280,7 +280,7 @@ schema validation -> pre hook -> permission -> sandbox -> execute -> post hook -
 | HTTP client | `reqwest` | runtime 自有 HTTP 能力、测试和非 provider 网络调用 |
 | Streaming | `tokio` | LLM stream、tool task、background task |
 | Provider abstraction | 自研 trait | 不把 runtime 绑死到某个 vendor SDK |
-| LLM provider 调用 | `genai` | 长期唯一默认 provider adapter，底层协议差异交给 `genai` |
+| LLM provider 调用 | `reqwest` + `eventsource-stream` + `genai` | OpenAI-compatible/Responses 使用受控 HTTP adapter，native 协议差异交给 `genai` |
 
 建议核心用 provider abstraction：
 
@@ -292,7 +292,7 @@ trait LlmProvider {
 
 原因：
 
-- provider 调用需要方便接入多家模型，第一阶段不维护多套 provider 协议实现。
+- provider 调用需要方便接入多家模型，第一阶段不手写多套 provider 协议实现。
 - 不同模型对 tool call、usage、reasoning token 的返回差异很大，必须在 Golutra contract 层归一化。
 - `genai` 可以作为 provider 调用层，但不要让它的类型进入 runtime core。
 
@@ -302,7 +302,7 @@ Provider 层不直接照搬某个项目：
 - 吸收 OpenCode 的 provider 覆盖意识，但不把 AI SDK 或第三方 SDK 类型作为 Rust core 依赖。
 - 吸收 Pi 的 provider contract 思路，但不采用 Pi 式多协议自研矩阵。
 - 吸收 Hermes Agent 的 plugin discovery，但插件必须经过 capability matrix 和 policy gate。
-- 吸收 Claude Code Best 对 provider 深能力的经验，但第一阶段不为单一 provider 单独维护 native adapter。
+- 吸收 Claude Code Best 对 provider 深能力的经验，但不为单一 provider 单独维护手写 adapter 类型。
 
 `genai` 的定位是 Golutra 长期默认 LLM provider adapter，不是 Golutra 的核心 Provider 协议。推荐采用一层反腐适配：
 
@@ -314,7 +314,7 @@ Golutra ProviderContract
 
 这样可以获得 `genai` 对 OpenAI、OpenAI Responses、Anthropic、Gemini、Ollama、OpenRouter、Groq、DeepSeek、xAI、Bedrock、Vertex、Moonshot、Aliyun 等 provider 的覆盖，同时保留 Golutra 自己的 request、stream event、tool call、usage、error、capability 和 telemetry 标准。
 
-Golutra 不规划并行维护 `OpenAICompatibleAdapter`、`AnthropicNativeAdapter`、`AisdkProviderAdapter` 或其他 provider native adapter。各家模型协议差异统一交给 `genai` 处理；如果某个 provider 暂时不满足需求，优先通过 `genai` 支持的配置、OpenAI-compatible endpoint、上游 issue 或 PR 解决，而不是在 Golutra 内新增协议分叉。
+Golutra 保留独立 `OpenAiCompatibleProvider` 和 ChatGPT OAuth 专用 `OpenAiResponsesProvider`，并用一个 `GenaiProviderAdapter` 承担 Anthropic、Gemini、Vertex 和 model-routed genai。Responses adapter 的存在理由是 subscription token、account header、SSE 和 encrypted reasoning replay 不能由 Chat Completions 兼容层正确表达；不会再并行维护 `AnthropicNativeAdapter`、`GeminiNativeAdapter` 等手写类型。各家 native wire 差异统一交给固定版本的 `genai` 处理，并由协议 golden tests 锁定升级影响。
 
 `genai` 只对应 Maka / Vercel AI SDK 的 provider client 层，不承担完整 `streamText` / tool loop / UI stream / agent framework 职责。Golutra 的 agent loop、tool execution、permission、verification、fallback、replay 和 UI projection 仍由 runtime 自己掌控。
 
@@ -334,8 +334,10 @@ Custom Provider 的交互流程要对齐 qwen-code 的协议优先设计，不�
 ```text
 Step 1/6 Protocol
   OpenAI-compatible
-  Anthropic-compatible
-  Gemini-compatible
+  Anthropic
+  Gemini
+  Vertex AI
+  genai model router
 Step 2/6 Base URL
 Step 3/6 API Key
 Step 4/6 Model IDs
@@ -347,11 +349,11 @@ Step 6/6 Review
 
 - Step 1 必须先确定协议，因为 base URL 默认值、env key、模型格式、tool call 映射和后续连通性 probe 都依赖协议。
 - OpenAI-compatible 默认走 Chat Completions 兼容路径，base URL 可规范化到 `/v1`。
-- Anthropic-compatible 和 Gemini-compatible 可以进入 UI 协议选择，但在 live adapter 未接通前不能假装连接成功。
-- 当前实现阶段只能保存并启用 OpenAI-compatible live provider；Anthropic/Gemini 应返回明确错误，提示协议已识别但 live runtime 只支持 OpenAI-compatible。
+- Anthropic、Gemini、Vertex AI 和 genai 已进入 UI 协议选择，并通过同一个 `GenaiProviderAdapter` 路由到各自 native wire。
+- 所有 live profile 都必须在保存前通过实际 adapter probe；认证、endpoint 或模型错误不能显示为连接成功。
 - Review 阶段必须展示 protocol、base URL、model、API key 掩码、scope 和 config path。
 - provider 配置校验必须按 protocol 检查必填字段，不能只校验 OpenAI-compatible。
-- 后续接入 `genai` 后，放开 Anthropic/Gemini 的保存和 probe，但仍要通过 Golutra 的 `ProviderContract` 归一化 request、stream、usage、tool call 和 error。
+- adapter 仍要通过 Golutra 的 `ProviderContract` 归一化 request、usage、tool call、finish reason 和 error；streaming 后续接入时不能改变该边界。
 
 完整 ProviderContract 至少要记录：
 

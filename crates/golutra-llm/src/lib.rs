@@ -1,12 +1,22 @@
+use std::{fmt, sync::Arc};
+
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use golutra_auth::{CredentialProvider, FixedCredentialProvider};
 use golutra_core::{
     ProviderContract, ProviderRequestId, ProviderResponseId, TaskId, ToolContract, TurnId,
 };
 pub use golutra_core::{ProviderUsage, UsageSource};
+use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
+
+mod genai_adapter;
+mod openai_responses;
+
+pub use genai_adapter::{GenaiProviderAdapter, GenaiProviderConfig};
+pub use openai_responses::{OpenAiResponsesProvider, OpenAiResponsesProviderConfig};
 
 const GOLUTRA_PROVIDER_MODE: &str = "GOLUTRA_PROVIDER_MODE";
 const GOLUTRA_PROVIDER_PROTOCOL: &str = "GOLUTRA_PROVIDER_PROTOCOL";
@@ -15,6 +25,7 @@ const GOLUTRA_PROVIDER_API_KEY_ENV: &str = "GOLUTRA_PROVIDER_API_KEY_ENV";
 const GOLUTRA_PROVIDER_MODEL: &str = "GOLUTRA_PROVIDER_MODEL";
 const GOLUTRA_PROVIDER_BASE_URL: &str = "GOLUTRA_PROVIDER_BASE_URL";
 const GOLUTRA_PROVIDER_GENERATION_CONFIG: &str = "GOLUTRA_PROVIDER_GENERATION_CONFIG";
+const GOLUTRA_PROVIDER_AUTH_PROVIDER: &str = "GOLUTRA_PROVIDER_AUTH_PROVIDER";
 const OPENAI_API_KEY: &str = "OPENAI_API_KEY";
 const OPENAI_MODEL: &str = "OPENAI_MODEL";
 const OPENAI_BASE_URL: &str = "OPENAI_BASE_URL";
@@ -25,7 +36,15 @@ const GEMINI_API_KEY: &str = "GEMINI_API_KEY";
 const GEMINI_MODEL: &str = "GEMINI_MODEL";
 const GOOGLE_API_KEY: &str = "GOOGLE_API_KEY";
 const GOOGLE_MODEL: &str = "GOOGLE_MODEL";
+const GOOGLE_OAUTH_ACCESS_TOKEN: &str = "GOOGLE_OAUTH_ACCESS_TOKEN";
+const VERTEX_API_KEY: &str = "VERTEX_API_KEY";
+const GENAI_API_KEY: &str = "GENAI_API_KEY";
+const GENAI_MODEL: &str = "GENAI_MODEL";
+const GENAI_BASE_URL: &str = "GENAI_BASE_URL";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
+const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
+const MAX_PROVIDER_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROVIDER_MESSAGE_BYTES: usize = 128 * 1024;
 const MAX_PROVIDER_TOOL_ARGUMENT_BYTES: usize = 256 * 1024;
 const MAX_PROVIDER_TOOL_CALL_ID_BYTES: usize = 256;
@@ -70,6 +89,20 @@ pub struct ProviderMessage {
     pub tool_name: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ProviderToolCall>,
+    #[serde(default, skip_serializing_if = "ProviderMessageMetadata::is_empty")]
+    pub metadata: ProviderMessageMetadata,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderMessageMetadata {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub openai_responses_replay_items: Vec<Value>,
+}
+
+impl ProviderMessageMetadata {
+    fn is_empty(&self) -> bool {
+        self.openai_responses_replay_items.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +148,8 @@ pub enum ProviderProtocol {
     Mock,
     #[serde(rename = "openai-compatible")]
     OpenAiCompatible,
+    #[serde(rename = "openai-responses")]
+    OpenAiResponses,
     Anthropic,
     Gemini,
     VertexAi,
@@ -186,6 +221,7 @@ impl ProviderProtocol {
         match self {
             Self::Mock => "mock",
             Self::OpenAiCompatible => "openai-compatible",
+            Self::OpenAiResponses => "openai-responses",
             Self::Anthropic => "anthropic",
             Self::Gemini => "gemini",
             Self::VertexAi => "vertex-ai",
@@ -200,6 +236,7 @@ impl ProviderProtocol {
             "live" | "openai" | "openai-compatible" | "open-ai-compatible" => {
                 Some(Self::OpenAiCompatible)
             }
+            "openai-responses" | "responses" | "chatgpt-codex" => Some(Self::OpenAiResponses),
             "anthropic" | "claude" => Some(Self::Anthropic),
             "gemini" | "google-genai" => Some(Self::Gemini),
             "vertex-ai" | "vertex" => Some(Self::VertexAi),
@@ -256,6 +293,7 @@ impl MockProvider {
                     tool_call_id: None,
                     tool_name: None,
                     tool_calls: Vec::new(),
+                    metadata: ProviderMessageMetadata::default(),
                 }),
                 tool_calls: Vec::new(),
                 usage: usage(128, 32),
@@ -316,6 +354,7 @@ impl LlmProvider for MockProvider {
                     tool_call_id: None,
                     tool_name: None,
                     tool_calls: Vec::new(),
+                    metadata: ProviderMessageMetadata::default(),
                 }),
                 tool_calls: Vec::new(),
                 usage: usage(64, 16),
@@ -331,69 +370,53 @@ impl LlmProvider for MockProvider {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct GenaiProviderAdapter {
-    configured: bool,
-}
-
-impl GenaiProviderAdapter {
-    #[must_use]
-    pub fn unconfigured() -> Self {
-        Self { configured: false }
-    }
-}
-
-#[async_trait]
-impl LlmProvider for GenaiProviderAdapter {
-    async fn complete(&self, _request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
-        if self.configured {
-            Err(ProviderError::Failed {
-                message: "genai adapter transport is not implemented in P0 scaffold".to_owned(),
-            })
-        } else {
-            Err(ProviderError::NotConfigured {
-                message: "genai adapter requires provider configuration".to_owned(),
-            })
-        }
-    }
-
-    fn contract(&self) -> ProviderContract {
-        ProviderContract {
-            provider_id: "genai".to_owned(),
-            model_id: "configured-at-runtime".to_owned(),
-            native_protocol: "genai".to_owned(),
-            stream_event_mapping: "adapter_owned".to_owned(),
-            tool_call_mapping: "adapter_owned".to_owned(),
-            usage_mapping: "adapter_owned".to_owned(),
-            reasoning_mapping: "adapter_owned".to_owned(),
-            finish_reason_mapping: "adapter_owned".to_owned(),
-            error_mapping: "adapter_owned".to_owned(),
-            rate_limit_mapping: "adapter_owned".to_owned(),
-            cost_model: "configured-at-runtime".to_owned(),
-            capability_matrix_ref: None,
-            golden_fixture_refs: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpenAiCompatibleProvider {
-    api_key: String,
+    credential: Arc<dyn CredentialProvider>,
     api_key_env: String,
+    provider_id: String,
     base_url: String,
     model_id: String,
     generation_config: ProviderGenerationConfig,
     client: reqwest::Client,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct OpenAiCompatibleProviderConfig {
     pub api_key: String,
     pub api_key_env: String,
+    pub provider_id: String,
     pub base_url: String,
     pub model_id: String,
     pub protocol: ProviderProtocol,
     pub generation_config: ProviderGenerationConfig,
+}
+
+impl fmt::Debug for OpenAiCompatibleProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OpenAiCompatibleProvider")
+            .field("credential_source", &self.api_key_env)
+            .field("provider_id", &self.provider_id)
+            .field("base_url", &self.base_url)
+            .field("model_id", &self.model_id)
+            .field("generation_config", &self.generation_config)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for OpenAiCompatibleProviderConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OpenAiCompatibleProviderConfig")
+            .field("api_key_env", &self.api_key_env)
+            .field("provider_id", &self.provider_id)
+            .field("base_url", &self.base_url)
+            .field("model_id", &self.model_id)
+            .field("protocol", &self.protocol)
+            .field("generation_config", &self.generation_config)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -423,15 +446,40 @@ pub struct ProviderProbeResult {
 }
 
 impl OpenAiCompatibleProvider {
+    fn authenticated_request(
+        &self,
+        builder: reqwest::RequestBuilder,
+        token: &str,
+        initiator: &str,
+    ) -> reqwest::RequestBuilder {
+        let builder = builder.bearer_auth(token);
+        if self.provider_id != "github-copilot" {
+            return builder;
+        }
+        builder
+            .header(
+                reqwest::header::USER_AGENT,
+                format!("golutra/{}", env!("CARGO_PKG_VERSION")),
+            )
+            .header("X-GitHub-Api-Version", "2026-06-01")
+            .header("Openai-Intent", "conversation-edits")
+            .header("x-initiator", initiator)
+    }
+
     #[must_use]
     pub fn new(
         api_key: impl Into<String>,
         base_url: impl Into<String>,
         model_id: impl Into<String>,
     ) -> Self {
+        let api_key = api_key.into();
         Self {
-            api_key: api_key.into(),
+            credential: Arc::new(FixedCredentialProvider::new(
+                api_key,
+                GOLUTRA_PROVIDER_API_KEY,
+            )),
             api_key_env: GOLUTRA_PROVIDER_API_KEY.to_owned(),
+            provider_id: "openai-compatible".to_owned(),
             base_url: normalize_openai_base_url(&base_url.into()),
             model_id: model_id.into(),
             generation_config: ProviderGenerationConfig::default(),
@@ -441,9 +489,22 @@ impl OpenAiCompatibleProvider {
 
     #[must_use]
     pub fn from_config(config: OpenAiCompatibleProviderConfig) -> Self {
+        let credential = Arc::new(FixedCredentialProvider::new(
+            config.api_key.clone(),
+            config.api_key_env.clone(),
+        ));
+        Self::from_config_with_credential(config, credential)
+    }
+
+    #[must_use]
+    pub fn from_config_with_credential(
+        config: OpenAiCompatibleProviderConfig,
+        credential: Arc<dyn CredentialProvider>,
+    ) -> Self {
         Self {
-            api_key: config.api_key,
+            credential,
             api_key_env: config.api_key_env,
+            provider_id: config.provider_id,
             base_url: normalize_openai_base_url(&config.base_url),
             model_id: config.model_id,
             generation_config: config.generation_config,
@@ -468,7 +529,12 @@ impl OpenAiCompatibleProvider {
         let protocol =
             selected_protocol_from_reader(&reader).unwrap_or(ProviderProtocol::OpenAiCompatible);
         if protocol != ProviderProtocol::OpenAiCompatible {
-            return Err(unsupported_protocol_error(protocol));
+            return Err(ProviderError::NotConfigured {
+                message: format!(
+                    "provider protocol `{}` is not OpenAI-compatible",
+                    protocol.id()
+                ),
+            });
         }
         let mapping = env_mapping(protocol);
         let (api_key_env, api_key) = configured_or_first_env(&reader, mapping.api_key)
@@ -485,6 +551,9 @@ impl OpenAiCompatibleProvider {
         Ok(OpenAiCompatibleProviderConfig {
             api_key,
             api_key_env,
+            provider_id: reader(GOLUTRA_PROVIDER_AUTH_PROVIDER)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "openai-compatible".to_owned()),
             base_url,
             model_id,
             protocol,
@@ -496,13 +565,13 @@ impl OpenAiCompatibleProvider {
     pub fn redacted_config(&self) -> RedactedProviderConfig {
         RedactedProviderConfig {
             mode: "live".to_owned(),
-            provider_id: "openai_compatible".to_owned(),
+            provider_id: self.provider_id.clone(),
             protocol: ProviderProtocol::OpenAiCompatible,
             native_protocol: "openai_chat_completions".to_owned(),
             base_url: Some(self.base_url.clone()),
             model_id: Some(self.model_id.clone()),
             api_key_env: Some(self.api_key_env.clone()),
-            api_key_configured: !self.api_key.is_empty(),
+            api_key_configured: true,
             generation_config: (!self.generation_config.is_empty())
                 .then_some(self.generation_config.clone()),
             missing_env: Vec::new(),
@@ -511,14 +580,72 @@ impl OpenAiCompatibleProvider {
         }
     }
 
-    pub async fn probe(&self) -> Result<ProviderProbeResult, ProviderError> {
+    async fn get_with_auth_retry(&self, url: &str) -> Result<reqwest::Response, ProviderError> {
+        let token = self
+            .credential
+            .credential(false)
+            .await
+            .map_err(provider_credential_error)?;
         let response = self
-            .client
-            .get(format!("{}/models", self.base_url.trim_end_matches('/')))
-            .bearer_auth(&self.api_key)
+            .authenticated_request(self.client.get(url), token.expose_secret(), "user")
             .send()
             .await
             .map_err(provider_transport_error)?;
+        if response.status().as_u16() != 401 {
+            return Ok(response);
+        }
+        let token = self
+            .credential
+            .credential(true)
+            .await
+            .map_err(provider_credential_error)?;
+        self.authenticated_request(self.client.get(url), token.expose_secret(), "user")
+            .send()
+            .await
+            .map_err(provider_transport_error)
+    }
+
+    async fn post_with_auth_retry(
+        &self,
+        url: &str,
+        body: &Value,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let token = self
+            .credential
+            .credential(false)
+            .await
+            .map_err(provider_credential_error)?;
+        let initiator = openai_request_initiator(body);
+        let response = self
+            .authenticated_request(
+                self.client.post(url).json(body),
+                token.expose_secret(),
+                initiator,
+            )
+            .send()
+            .await
+            .map_err(provider_transport_error)?;
+        if response.status().as_u16() != 401 {
+            return Ok(response);
+        }
+        let token = self
+            .credential
+            .credential(true)
+            .await
+            .map_err(provider_credential_error)?;
+        self.authenticated_request(
+            self.client.post(url).json(body),
+            token.expose_secret(),
+            initiator,
+        )
+        .send()
+        .await
+        .map_err(provider_transport_error)
+    }
+
+    pub async fn probe(&self) -> Result<ProviderProbeResult, ProviderError> {
+        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
+        let response = self.get_with_auth_retry(&url).await?;
         let status = response.status();
         let value = response_json_or_error(response).await?;
         if status.as_u16() == 429 {
@@ -547,7 +674,7 @@ impl OpenAiCompatibleProvider {
             )
         };
         Ok(ProviderProbeResult {
-            provider_id: "openai_compatible".to_owned(),
+            provider_id: self.provider_id.clone(),
             protocol: "openai_chat_completions".to_owned(),
             base_url: self.base_url.clone(),
             model_id: self.model_id.clone(),
@@ -571,14 +698,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
         }
         apply_generation_config_to_openai_body(&mut body, &self.generation_config);
 
-        let response = self
-            .client
-            .post(url)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(provider_transport_error)?;
+        let response = self.post_with_auth_retry(&url, &body).await?;
         let status = response.status();
         let value = response_json_or_error(response).await?;
         if status.as_u16() == 429 {
@@ -595,7 +715,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
 
     fn contract(&self) -> ProviderContract {
         ProviderContract {
-            provider_id: "openai_compatible".to_owned(),
+            provider_id: self.provider_id.clone(),
             model_id: self.model_id.clone(),
             native_protocol: "openai_chat_completions".to_owned(),
             stream_event_mapping: "non_streaming_p0".to_owned(),
@@ -607,7 +727,15 @@ impl LlmProvider for OpenAiCompatibleProvider {
             rate_limit_mapping: "http_429".to_owned(),
             cost_model: "external".to_owned(),
             capability_matrix_ref: None,
-            golden_fixture_refs: Vec::new(),
+            golden_fixture_refs: [
+                "request",
+                "text_response",
+                "tool_response",
+                "error_response",
+            ]
+            .into_iter()
+            .map(|fixture| format!("tests/fixtures/openai-compatible/{fixture}.json"))
+            .collect(),
         }
     }
 }
@@ -616,6 +744,11 @@ impl LlmProvider for OpenAiCompatibleProvider {
 pub enum ConfiguredProvider {
     Mock(Box<MockProvider>),
     OpenAiCompatible(OpenAiCompatibleProvider),
+    OpenAiResponses(OpenAiResponsesProvider),
+    Anthropic(GenaiProviderAdapter),
+    Gemini(GenaiProviderAdapter),
+    VertexAi(GenaiProviderAdapter),
+    Genai(GenaiProviderAdapter),
 }
 
 impl ConfiguredProvider {
@@ -627,18 +760,51 @@ impl ConfiguredProvider {
     where
         F: Fn(&str) -> Option<String>,
     {
+        Self::resolve_from_reader_with_credential(mock, reader, None)
+    }
+
+    pub fn resolve_from_reader_with_credential<F>(
+        mock: MockProvider,
+        reader: F,
+        credential: Option<Arc<dyn CredentialProvider>>,
+    ) -> Result<Self, ProviderError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
         let Some(protocol) = selected_protocol_from_reader(&reader) else {
             return Ok(Self::Mock(Box::new(mock)));
         };
         if protocol == ProviderProtocol::Mock {
             return Ok(Self::Mock(Box::new(mock)));
         }
-        if protocol != ProviderProtocol::OpenAiCompatible {
-            return Err(unsupported_protocol_error(protocol));
+        if protocol == ProviderProtocol::OpenAiCompatible {
+            return OpenAiCompatibleProvider::config_from_env_reader(reader)
+                .map(|config| match credential {
+                    Some(credential) => {
+                        OpenAiCompatibleProvider::from_config_with_credential(config, credential)
+                    }
+                    None => OpenAiCompatibleProvider::from_config(config),
+                })
+                .map(Self::OpenAiCompatible);
         }
-        OpenAiCompatibleProvider::config_from_env_reader(reader)
-            .map(OpenAiCompatibleProvider::from_config)
-            .map(Self::OpenAiCompatible)
+        if protocol == ProviderProtocol::OpenAiResponses {
+            return OpenAiResponsesProvider::config_from_env_reader(reader)
+                .map(|config| match credential {
+                    Some(credential) => {
+                        OpenAiResponsesProvider::from_config_with_credential(config, credential)
+                    }
+                    None => OpenAiResponsesProvider::from_config(config),
+                })
+                .map(Self::OpenAiResponses);
+        }
+        let config = GenaiProviderAdapter::config_from_env_reader(reader)?;
+        let provider = match credential {
+            Some(credential) => {
+                GenaiProviderAdapter::from_config_with_credential(config, credential)
+            }
+            None => GenaiProviderAdapter::from_config(config),
+        };
+        Ok(configured_native_provider(protocol, provider))
     }
 
     pub fn redacted_from_env() -> Result<RedactedProviderConfig, ProviderError> {
@@ -666,10 +832,15 @@ impl ConfiguredProvider {
                 status: "ready".to_owned(),
             });
         }
-        if protocol == ProviderProtocol::OpenAiCompatible {
-            return Ok(redacted_openai_from_reader(&reader));
+        match protocol {
+            ProviderProtocol::Mock => unreachable!("mock is returned above"),
+            ProviderProtocol::OpenAiCompatible => Ok(redacted_openai_from_reader(&reader)),
+            ProviderProtocol::OpenAiResponses => Ok(redacted_openai_responses_from_reader(&reader)),
+            ProviderProtocol::Anthropic
+            | ProviderProtocol::Gemini
+            | ProviderProtocol::VertexAi
+            | ProviderProtocol::Genai => Ok(redacted_native_from_reader(protocol, &reader)),
         }
-        Ok(redacted_unsupported_from_reader(protocol, &reader))
     }
 
     pub async fn probe_from_env() -> Result<ProviderProbeResult, ProviderError> {
@@ -677,6 +848,16 @@ impl ConfiguredProvider {
     }
 
     pub async fn probe_from_reader<F>(reader: F) -> Result<ProviderProbeResult, ProviderError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        Self::probe_from_reader_with_credential(reader, None).await
+    }
+
+    pub async fn probe_from_reader_with_credential<F>(
+        reader: F,
+        credential: Option<Arc<dyn CredentialProvider>>,
+    ) -> Result<ProviderProbeResult, ProviderError>
     where
         F: Fn(&str) -> Option<String>,
     {
@@ -691,13 +872,37 @@ impl ConfiguredProvider {
                 discovered_models: vec!["mock-model".to_owned()],
             });
         }
-        if protocol != ProviderProtocol::OpenAiCompatible {
-            return Err(unsupported_protocol_error(protocol));
-        }
-        OpenAiCompatibleProvider::config_from_env_reader(reader)
-            .map(OpenAiCompatibleProvider::from_config)?
+        if protocol == ProviderProtocol::OpenAiCompatible {
+            let config = OpenAiCompatibleProvider::config_from_env_reader(reader)?;
+            return match credential {
+                Some(credential) => {
+                    OpenAiCompatibleProvider::from_config_with_credential(config, credential)
+                }
+                None => OpenAiCompatibleProvider::from_config(config),
+            }
             .probe()
-            .await
+            .await;
+        }
+        if protocol == ProviderProtocol::OpenAiResponses {
+            let config = OpenAiResponsesProvider::config_from_env_reader(reader)?;
+            return match credential {
+                Some(credential) => {
+                    OpenAiResponsesProvider::from_config_with_credential(config, credential)
+                }
+                None => OpenAiResponsesProvider::from_config(config),
+            }
+            .probe()
+            .await;
+        }
+        let config = GenaiProviderAdapter::config_from_env_reader(reader)?;
+        match credential {
+            Some(credential) => {
+                GenaiProviderAdapter::from_config_with_credential(config, credential)
+            }
+            None => GenaiProviderAdapter::from_config(config),
+        }
+        .probe()
+        .await
     }
 }
 
@@ -707,6 +912,11 @@ impl LlmProvider for ConfiguredProvider {
         match self {
             Self::Mock(provider) => provider.complete(request).await,
             Self::OpenAiCompatible(provider) => provider.complete(request).await,
+            Self::OpenAiResponses(provider) => provider.complete(request).await,
+            Self::Anthropic(provider)
+            | Self::Gemini(provider)
+            | Self::VertexAi(provider)
+            | Self::Genai(provider) => provider.complete(request).await,
         }
     }
 
@@ -714,6 +924,28 @@ impl LlmProvider for ConfiguredProvider {
         match self {
             Self::Mock(provider) => provider.contract(),
             Self::OpenAiCompatible(provider) => provider.contract(),
+            Self::OpenAiResponses(provider) => provider.contract(),
+            Self::Anthropic(provider)
+            | Self::Gemini(provider)
+            | Self::VertexAi(provider)
+            | Self::Genai(provider) => provider.contract(),
+        }
+    }
+}
+
+fn configured_native_provider(
+    protocol: ProviderProtocol,
+    provider: GenaiProviderAdapter,
+) -> ConfiguredProvider {
+    match protocol {
+        ProviderProtocol::Anthropic => ConfiguredProvider::Anthropic(provider),
+        ProviderProtocol::Gemini => ConfiguredProvider::Gemini(provider),
+        ProviderProtocol::VertexAi => ConfiguredProvider::VertexAi(provider),
+        ProviderProtocol::Genai => ConfiguredProvider::Genai(provider),
+        ProviderProtocol::Mock
+        | ProviderProtocol::OpenAiCompatible
+        | ProviderProtocol::OpenAiResponses => {
+            unreachable!("native provider helper only accepts native protocols")
         }
     }
 }
@@ -769,6 +1001,14 @@ impl ModelCatalog {
                     model_id: "configured-at-runtime".to_owned(),
                     auth_env: Some("GOLUTRA_PROVIDER_API_KEY".to_owned()),
                     base_url: Some(DEFAULT_OPENAI_BASE_URL.to_owned()),
+                    enabled: false,
+                },
+                ProviderConfig {
+                    provider_id: "openai-chatgpt".to_owned(),
+                    protocol: ProviderProtocol::OpenAiResponses,
+                    model_id: "configured-at-runtime".to_owned(),
+                    auth_env: Some(GOLUTRA_PROVIDER_API_KEY.to_owned()),
+                    base_url: Some("https://chatgpt.com/backend-api/codex".to_owned()),
                     enabled: false,
                 },
                 ProviderConfig {
@@ -847,6 +1087,7 @@ impl ModelCatalog {
 pub fn provider_protocol_catalog() -> Vec<ProviderProtocolSpec> {
     [
         ProviderProtocol::OpenAiCompatible,
+        ProviderProtocol::OpenAiResponses,
         ProviderProtocol::Anthropic,
         ProviderProtocol::Gemini,
         ProviderProtocol::VertexAi,
@@ -915,6 +1156,20 @@ fn openai_assistant_tool_call(tool_call: &ProviderToolCall) -> Value {
     })
 }
 
+fn openai_request_initiator(body: &Value) -> &'static str {
+    let last_role = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .and_then(|messages| messages.last())
+        .and_then(|message| message.get("role"))
+        .and_then(Value::as_str);
+    if last_role == Some("user") {
+        "user"
+    } else {
+        "agent"
+    }
+}
+
 fn openai_tool_schema(contract: &ToolContract) -> Value {
     let description = match contract.tool_name.as_str() {
         "read_file" => "Read a UTF-8 text file from the current workspace.",
@@ -972,6 +1227,7 @@ fn provider_response_from_openai(
                 tool_call_id: None,
                 tool_name: None,
                 tool_calls: Vec::new(),
+                metadata: ProviderMessageMetadata::default(),
             })
         })
         .transpose()?;
@@ -1105,6 +1361,12 @@ fn provider_error_message(value: &Value) -> String {
     }
 }
 
+fn provider_credential_error(error: golutra_auth::AuthError) -> ProviderError {
+    ProviderError::NotConfigured {
+        message: sanitize_provider_error(&error.to_string()),
+    }
+}
+
 fn provider_transport_error(error: reqwest::Error) -> ProviderError {
     if error.is_timeout() {
         ProviderError::Timeout {
@@ -1139,7 +1401,6 @@ fn provider_http_error(status: reqwest::StatusCode, value: &Value) -> ProviderEr
 }
 
 async fn response_json_or_error(response: reqwest::Response) -> Result<Value, ProviderError> {
-    const MAX_PROVIDER_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
     if response
         .content_length()
         .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BYTES as u64)
@@ -1201,20 +1462,31 @@ fn env_mapping(protocol: ProviderProtocol) -> ProviderEnvMapping {
             model: &[GOLUTRA_PROVIDER_MODEL, OPENAI_MODEL],
             default_base_url: Some(DEFAULT_OPENAI_BASE_URL),
         },
+        ProviderProtocol::OpenAiResponses => ProviderEnvMapping {
+            api_key: &[GOLUTRA_PROVIDER_API_KEY],
+            base_url: &[GOLUTRA_PROVIDER_BASE_URL],
+            model: &[GOLUTRA_PROVIDER_MODEL],
+            default_base_url: Some("https://chatgpt.com/backend-api/codex"),
+        },
         ProviderProtocol::Anthropic => ProviderEnvMapping {
             api_key: &[GOLUTRA_PROVIDER_API_KEY, ANTHROPIC_API_KEY],
             base_url: &[GOLUTRA_PROVIDER_BASE_URL, ANTHROPIC_BASE_URL],
             model: &[GOLUTRA_PROVIDER_MODEL, ANTHROPIC_MODEL],
-            default_base_url: None,
+            default_base_url: Some(DEFAULT_ANTHROPIC_BASE_URL),
         },
         ProviderProtocol::Gemini => ProviderEnvMapping {
-            api_key: &[GOLUTRA_PROVIDER_API_KEY, GEMINI_API_KEY],
+            api_key: &[GOLUTRA_PROVIDER_API_KEY, GEMINI_API_KEY, GOOGLE_API_KEY],
             base_url: &[GOLUTRA_PROVIDER_BASE_URL],
             model: &[GOLUTRA_PROVIDER_MODEL, GEMINI_MODEL],
-            default_base_url: None,
+            default_base_url: Some(DEFAULT_GEMINI_BASE_URL),
         },
         ProviderProtocol::VertexAi => ProviderEnvMapping {
-            api_key: &[GOLUTRA_PROVIDER_API_KEY, GOOGLE_API_KEY],
+            api_key: &[
+                GOLUTRA_PROVIDER_API_KEY,
+                GOOGLE_OAUTH_ACCESS_TOKEN,
+                VERTEX_API_KEY,
+                GOOGLE_API_KEY,
+            ],
             base_url: &[GOLUTRA_PROVIDER_BASE_URL],
             model: &[GOLUTRA_PROVIDER_MODEL, GOOGLE_MODEL],
             default_base_url: None,
@@ -1222,6 +1494,7 @@ fn env_mapping(protocol: ProviderProtocol) -> ProviderEnvMapping {
         ProviderProtocol::Genai => ProviderEnvMapping {
             api_key: &[
                 GOLUTRA_PROVIDER_API_KEY,
+                GENAI_API_KEY,
                 OPENAI_API_KEY,
                 ANTHROPIC_API_KEY,
                 GEMINI_API_KEY,
@@ -1229,11 +1502,13 @@ fn env_mapping(protocol: ProviderProtocol) -> ProviderEnvMapping {
             ],
             base_url: &[
                 GOLUTRA_PROVIDER_BASE_URL,
+                GENAI_BASE_URL,
                 OPENAI_BASE_URL,
                 ANTHROPIC_BASE_URL,
             ],
             model: &[
                 GOLUTRA_PROVIDER_MODEL,
+                GENAI_MODEL,
                 OPENAI_MODEL,
                 ANTHROPIC_MODEL,
                 GEMINI_MODEL,
@@ -1247,15 +1522,6 @@ fn env_mapping(protocol: ProviderProtocol) -> ProviderEnvMapping {
 fn missing_env_error(keys: &[&str]) -> ProviderError {
     ProviderError::NotConfigured {
         message: format!("required env is not set: {}", keys.join(" or ")),
-    }
-}
-
-fn unsupported_protocol_error(protocol: ProviderProtocol) -> ProviderError {
-    ProviderError::NotConfigured {
-        message: format!(
-            "provider protocol `{}` is registered but its live adapter is not implemented yet",
-            protocol.id()
-        ),
     }
 }
 
@@ -1278,7 +1544,6 @@ where
     }
     let ready = missing_env.is_empty();
     let generation_config = generation_config_from_reader(reader).ok();
-
     RedactedProviderConfig {
         mode: "live".to_owned(),
         provider_id: "openai_compatible".to_owned(),
@@ -1295,10 +1560,44 @@ where
     }
 }
 
-fn redacted_unsupported_from_reader<F>(
-    protocol: ProviderProtocol,
-    reader: &F,
-) -> RedactedProviderConfig
+fn redacted_openai_responses_from_reader<F>(reader: &F) -> RedactedProviderConfig
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let mapping = env_mapping(ProviderProtocol::OpenAiResponses);
+    let api_key = configured_or_first_env(reader, mapping.api_key);
+    let model = first_env(reader, mapping.model);
+    let base_url = first_env(reader, mapping.base_url)
+        .map(|(_, value)| value)
+        .or_else(|| mapping.default_base_url.map(ToOwned::to_owned));
+    let mut missing_env = Vec::new();
+    if api_key.is_none() {
+        missing_env.push(mapping.api_key.join(" or "));
+    }
+    if model.is_none() {
+        missing_env.push(mapping.model.join(" or "));
+    }
+    let ready = missing_env.is_empty();
+    RedactedProviderConfig {
+        mode: "live".to_owned(),
+        provider_id: reader(GOLUTRA_PROVIDER_AUTH_PROVIDER)
+            .unwrap_or_else(|| "openai-chatgpt".to_owned()),
+        protocol: ProviderProtocol::OpenAiResponses,
+        native_protocol: "openai_responses_sse".to_owned(),
+        base_url,
+        model_id: model.as_ref().map(|(_, value)| value.clone()),
+        api_key_env: api_key.as_ref().map(|(key, _)| key.clone()),
+        api_key_configured: api_key.is_some(),
+        generation_config: generation_config_from_reader(reader)
+            .ok()
+            .filter(|config| !config.is_empty()),
+        missing_env,
+        supported: true,
+        status: if ready { "ready" } else { "missing_env" }.to_owned(),
+    }
+}
+
+fn redacted_native_from_reader<F>(protocol: ProviderProtocol, reader: &F) -> RedactedProviderConfig
 where
     F: Fn(&str) -> Option<String>,
 {
@@ -1318,6 +1617,7 @@ where
     if !mapping.base_url.is_empty() && mapping.default_base_url.is_none() && base_url.is_none() {
         missing_env.push(mapping.base_url.join(" or "));
     }
+    let ready = missing_env.is_empty();
     let generation_config = generation_config_from_reader(reader).ok();
 
     RedactedProviderConfig {
@@ -1331,8 +1631,8 @@ where
         api_key_configured: api_key.is_some(),
         generation_config: generation_config.filter(|config| !config.is_empty()),
         missing_env,
-        supported: false,
-        status: "adapter_not_implemented".to_owned(),
+        supported: true,
+        status: if ready { "ready" } else { "missing_env" }.to_owned(),
     }
 }
 
@@ -1354,36 +1654,43 @@ fn protocol_spec(protocol: ProviderProtocol) -> ProviderProtocolSpec {
             true,
             "Live Chat Completions adapter for OpenAI-compatible endpoints.".to_owned(),
         ),
+        ProviderProtocol::OpenAiResponses => (
+            "OpenAI Responses".to_owned(),
+            "supported".to_owned(),
+            true,
+            true,
+            "Responses SSE adapter for explicitly registered subscription OAuth providers."
+                .to_owned(),
+        ),
         ProviderProtocol::Anthropic => (
             "Anthropic".to_owned(),
-            "catalog_only".to_owned(),
+            "supported".to_owned(),
             true,
-            false,
-            "Protocol selection and diagnostics are available; native live adapter is pending."
-                .to_owned(),
+            true,
+            "Native Anthropic Messages adapter backed by rust-genai.".to_owned(),
         ),
         ProviderProtocol::Gemini => (
             "Gemini".to_owned(),
-            "catalog_only".to_owned(),
+            "supported".to_owned(),
             true,
-            false,
-            "Protocol selection and diagnostics are available; native live adapter is pending."
-                .to_owned(),
+            true,
+            "Native Gemini generateContent adapter backed by rust-genai.".to_owned(),
         ),
         ProviderProtocol::VertexAi => (
             "Vertex AI".to_owned(),
-            "catalog_only".to_owned(),
+            "supported".to_owned(),
             true,
-            false,
-            "Protocol selection and diagnostics are available; native live adapter is pending."
+            true,
+            "Native Vertex AI adapter using an OAuth access token and project/location endpoint."
                 .to_owned(),
         ),
         ProviderProtocol::Genai => (
             "rust-genai".to_owned(),
-            "catalog_only".to_owned(),
+            "supported".to_owned(),
             true,
-            false,
-            "Reserved aggregation protocol for future multi-provider adapters.".to_owned(),
+            true,
+            "Multi-provider adapter selected from the configured rust-genai model namespace."
+                .to_owned(),
         ),
     };
 
@@ -1506,6 +1813,33 @@ pub fn validate_openai_base_url(value: &str) -> Result<String, String> {
         return Err("provider base URL has an invalid HTTP scheme".to_owned());
     }
     let normalized = normalize_openai_base_url(value);
+    let parsed = reqwest::Url::parse(&normalized)
+        .map_err(|error| format!("provider base URL is invalid: {error}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("provider base URL must use http or https".to_owned());
+    }
+    if parsed.host_str().is_none() {
+        return Err("provider base URL must include a host".to_owned());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("provider base URL must not include user credentials".to_owned());
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("provider base URL must not include a query or fragment".to_owned());
+    }
+    Ok(normalized)
+}
+
+pub fn validate_native_base_url(value: &str) -> Result<String, String> {
+    let value = value.trim().trim_end_matches('/');
+    if value.is_empty() {
+        return Err("provider base URL cannot be empty".to_owned());
+    }
+    let normalized = if value.starts_with("http://") || value.starts_with("https://") {
+        value.to_owned()
+    } else {
+        format!("https://{value}")
+    };
     let parsed = reqwest::Url::parse(&normalized)
         .map_err(|error| format!("provider base URL is invalid: {error}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
@@ -1744,16 +2078,22 @@ mod tests {
         assert!(error.to_string().contains("tool name exceeds"));
     }
 
-    #[tokio::test]
-    async fn genai_adapter_does_not_leak_native_types() {
-        let provider = GenaiProviderAdapter::unconfigured();
-        let error = provider
-            .complete(request())
-            .await
-            .expect_err("not configured");
+    #[test]
+    fn configured_provider_resolves_native_anthropic_adapter() {
+        let provider =
+            ConfiguredProvider::resolve_from_reader(MockProvider::text_response("mock"), |key| {
+                match key {
+                    GOLUTRA_PROVIDER_PROTOCOL => Some("anthropic".to_owned()),
+                    ANTHROPIC_API_KEY => Some("anthropic-key".to_owned()),
+                    ANTHROPIC_MODEL => Some("claude-test".to_owned()),
+                    _ => None,
+                }
+            })
+            .expect("native provider");
 
-        assert!(matches!(error, ProviderError::NotConfigured { .. }));
-        assert_eq!(provider.contract().provider_id, "genai");
+        assert!(matches!(provider, ConfiguredProvider::Anthropic(_)));
+        assert_eq!(provider.contract().native_protocol, "anthropic_messages");
+        assert!(!provider.contract().golden_fixture_refs.is_empty());
     }
 
     #[test]
@@ -1832,6 +2172,7 @@ mod tests {
             protocols,
             vec![
                 ProviderProtocol::OpenAiCompatible,
+                ProviderProtocol::OpenAiResponses,
                 ProviderProtocol::Anthropic,
                 ProviderProtocol::Gemini,
                 ProviderProtocol::VertexAi,
@@ -1842,12 +2183,12 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_protocol_redacted_config_is_diagnostic_only() {
-        let config = redacted_unsupported_from_reader(ProviderProtocol::Anthropic, &|_| None);
+    fn native_protocol_redacted_config_reports_missing_fields() {
+        let config = redacted_native_from_reader(ProviderProtocol::Anthropic, &|_| None);
 
         assert_eq!(config.protocol, ProviderProtocol::Anthropic);
-        assert!(!config.supported);
-        assert_eq!(config.status, "adapter_not_implemented");
+        assert!(config.supported);
+        assert_eq!(config.status, "missing_env");
         assert!(
             config
                 .missing_env
@@ -1857,7 +2198,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_protocol_redacted_config_prefers_configured_custom_api_key_env() {
+    fn native_protocol_redacted_config_prefers_configured_custom_api_key_env() {
         let config = ConfiguredProvider::redacted_from_reader(|key| match key {
             GOLUTRA_PROVIDER_PROTOCOL => Some("anthropic".to_owned()),
             GOLUTRA_PROVIDER_API_KEY_ENV => Some("GOLUTRA_CUSTOM_PROVIDER_API_KEY_TEST".to_owned()),
@@ -2114,6 +2455,7 @@ mod tests {
                 tool_call_id: None,
                 tool_name: None,
                 tool_calls: Vec::new(),
+                metadata: ProviderMessageMetadata::default(),
             }],
             tools: Vec::new(),
         }

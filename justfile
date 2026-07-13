@@ -32,5 +32,11 @@ replay-smoke:
 transport-smoke:
     cargo test -p golutra-client
 
+provider-golden:
+    cargo test -p golutra-llm --test provider_golden -- --skip live_provider_smoke_is_opt_in_and_never_reads_normal_user_credentials
+
+provider-live-smoke:
+    cargo test -p golutra-llm --test provider_golden live_provider_smoke_is_opt_in_and_never_reads_normal_user_credentials -- --nocapture
+
 ts-check:
     npm run --prefix sdk/typescript typecheck

@@ -1,0 +1,5 @@
+{
+  "candidates": [{"content": {"role": "model", "parts": [{"text": "golden answer"}]}, "finishReason": "STOP"}],
+  "usageMetadata": {"promptTokenCount": 12, "candidatesTokenCount": 3, "totalTokenCount": 15},
+  "modelVersion": "gemini-test"
+}

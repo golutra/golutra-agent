@@ -1,6 +1,7 @@
 use golutra_core::{
-    ArtifactId, ArtifactRecord, BusyPolicyDecision, EvidenceRecord, LoopDecision, SessionId,
-    TaskId, TaskStatus, ThreadId, Timestamp, ToolResultEnvelope, VerificationRecord,
+    ArtifactId, ArtifactRecord, BusyPolicyDecision, EventId, EvidenceRecord, LoopDecision,
+    SessionId, TaskId, TaskStatus, ThreadId, Timestamp, ToolResultEnvelope, TurnId,
+    VerificationRecord,
 };
 use golutra_protocol::{
     CommandAck, DebugProjection, RuntimeEvent, RuntimeEventType, StateProjection, UserProjection,
@@ -12,7 +13,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
 };
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::ErrorKind,
     path::{Path, PathBuf},
     str::FromStr,
@@ -45,7 +46,15 @@ pub struct ThreadRecord {
     pub thread_id: ThreadId,
     pub session_id: SessionId,
     pub parent_thread_id: Option<ThreadId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from_turn_id: Option<TurnId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from_sequence_no: Option<u64>,
     pub workspace_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebound_from_workspace_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout_path: Option<String>,
     pub title: String,
     pub preview: String,
     pub created_at: Timestamp,
@@ -109,6 +118,32 @@ impl RuntimeStore {
     pub async fn initialize(&self) -> StoreResult<()> {
         for statement in MIGRATIONS {
             sqlx::query(statement).execute(&self.pool).await?;
+        }
+        self.ensure_thread_columns().await?;
+        Ok(())
+    }
+
+    async fn ensure_thread_columns(&self) -> StoreResult<()> {
+        let rows = sqlx::query("PRAGMA table_info(threads)")
+            .fetch_all(&self.pool)
+            .await?;
+        let existing = rows
+            .into_iter()
+            .map(|row| row.try_get::<String, _>("name"))
+            .collect::<Result<HashSet<_>, _>>()?;
+        for (name, declaration) in [
+            ("forked_from_turn_id", "TEXT"),
+            ("forked_from_sequence_no", "INTEGER"),
+            ("rebound_from_workspace_root", "TEXT"),
+            ("rollout_path", "TEXT"),
+        ] {
+            if !existing.contains(name) {
+                sqlx::query(&format!(
+                    "ALTER TABLE threads ADD COLUMN {name} {declaration}"
+                ))
+                .execute(&self.pool)
+                .await?;
+            }
         }
         Ok(())
     }
@@ -436,14 +471,19 @@ impl RuntimeStore {
             .filter_map(|result| result.raw_artifact_ref)
             .chain(events.iter().filter_map(|event| event.payload_ref))
             .collect::<HashSet<_>>();
-        let artifacts = self
-            .load_artifacts_for_session(session_id)
-            .await?
-            .into_iter()
-            .filter(|artifact| {
-                task_id.is_none() || referenced_artifacts.contains(&artifact.artifact_id)
-            })
-            .collect::<Vec<_>>();
+        let mut artifacts = self.load_artifacts_for_session(session_id).await?;
+        for artifact_id in &referenced_artifacts {
+            if !artifacts
+                .iter()
+                .any(|artifact| artifact.artifact_id == *artifact_id)
+                && let Some(artifact) = self.load_artifact(*artifact_id).await?
+            {
+                artifacts.push(artifact);
+            }
+        }
+        if task_id.is_some() {
+            artifacts.retain(|artifact| referenced_artifacts.contains(&artifact.artifact_id));
+        }
         let artifact_ids = artifacts
             .iter()
             .map(|artifact| artifact.artifact_id)
@@ -610,44 +650,86 @@ impl RuntimeStore {
     }
 
     pub async fn upsert_thread(&self, thread: &ThreadRecord) -> StoreResult<()> {
-        sqlx::query(
+        let mut transaction = self.pool.begin().await?;
+        upsert_thread_in_transaction(&mut transaction, thread).await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn create_forked_thread(
+        &self,
+        child: &ThreadRecord,
+        parent_session_id: SessionId,
+        through_sequence_no: u64,
+    ) -> StoreResult<Vec<RuntimeEvent>> {
+        let mut transaction = self.pool.begin().await?;
+        let rows = sqlx::query(
             r#"
-            INSERT INTO threads (
-                thread_id, session_id, parent_thread_id, workspace_root, title, preview,
-                created_at, updated_at, recency_at, archived
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(thread_id) DO UPDATE SET
-                session_id = excluded.session_id,
-                parent_thread_id = excluded.parent_thread_id,
-                workspace_root = excluded.workspace_root,
-                title = excluded.title,
-                preview = excluded.preview,
-                updated_at = excluded.updated_at,
-                recency_at = excluded.recency_at,
-                archived = excluded.archived
+            SELECT event_json
+            FROM runtime_events
+            WHERE session_id = ? AND sequence_no <= ?
+            ORDER BY sequence_no ASC
             "#,
         )
-        .bind(thread.thread_id.to_string())
-        .bind(thread.session_id.to_string())
-        .bind(thread.parent_thread_id.map(|id| id.to_string()))
-        .bind(&thread.workspace_root)
-        .bind(&thread.title)
-        .bind(&thread.preview)
-        .bind(thread.created_at)
-        .bind(thread.updated_at)
-        .bind(thread.recency_at)
-        .bind(thread.archived)
-        .execute(&self.pool)
+        .bind(parent_session_id.to_string())
+        .bind(i64::try_from(through_sequence_no).unwrap_or(i64::MAX))
+        .fetch_all(&mut *transaction)
         .await?;
-        Ok(())
+        let parent_events = rows
+            .into_iter()
+            .map(|row| {
+                let event_json: String = row.try_get("event_json")?;
+                Ok(serde_json::from_str::<RuntimeEvent>(&event_json)?)
+            })
+            .collect::<StoreResult<Vec<_>>>()?;
+
+        let event_ids = parent_events
+            .iter()
+            .map(|event| (event.id, EventId::new()))
+            .collect::<HashMap<_, _>>();
+        let task_ids = parent_events
+            .iter()
+            .filter_map(|event| event.task_id)
+            .map(|task_id| (task_id, TaskId::new()))
+            .collect::<HashMap<_, _>>();
+        let turn_ids = parent_events
+            .iter()
+            .filter_map(|event| event.turn_id)
+            .map(|turn_id| (turn_id, TurnId::new()))
+            .collect::<HashMap<_, _>>();
+        let replacements = fork_id_replacements(
+            parent_session_id,
+            child.session_id,
+            &event_ids,
+            &task_ids,
+            &turn_ids,
+        );
+
+        upsert_thread_in_transaction(&mut transaction, child).await?;
+        let mut forked_events = Vec::with_capacity(parent_events.len());
+        for mut event in parent_events {
+            event.id = event_ids[&event.id];
+            event.sequence_no = next_sequence_in_transaction(&mut transaction).await?;
+            event.session_id = child.session_id;
+            event.task_id = event.task_id.map(|task_id| task_ids[&task_id]);
+            event.turn_id = event.turn_id.map(|turn_id| turn_ids[&turn_id]);
+            event.parent_event_id = event
+                .parent_event_id
+                .and_then(|event_id| event_ids.get(&event_id).copied());
+            remap_json_ids(&mut event.payload, &replacements);
+            append_event_in_transaction(&mut transaction, &event).await?;
+            forked_events.push(event);
+        }
+        transaction.commit().await?;
+        Ok(forked_events)
     }
 
     pub async fn thread_by_id(&self, thread_id: ThreadId) -> StoreResult<Option<ThreadRecord>> {
         let row = sqlx::query(
             r#"
-            SELECT thread_id, session_id, parent_thread_id, workspace_root, title, preview,
-                   created_at, updated_at, recency_at, archived
+            SELECT thread_id, session_id, parent_thread_id, forked_from_turn_id,
+                   forked_from_sequence_no, workspace_root, rebound_from_workspace_root,
+                   rollout_path, title, preview, created_at, updated_at, recency_at, archived
             FROM threads
             WHERE thread_id = ?
             "#,
@@ -665,8 +747,9 @@ impl RuntimeStore {
     ) -> StoreResult<Option<ThreadRecord>> {
         let row = sqlx::query(
             r#"
-            SELECT thread_id, session_id, parent_thread_id, workspace_root, title, preview,
-                   created_at, updated_at, recency_at, archived
+            SELECT thread_id, session_id, parent_thread_id, forked_from_turn_id,
+                   forked_from_sequence_no, workspace_root, rebound_from_workspace_root,
+                   rollout_path, title, preview, created_at, updated_at, recency_at, archived
             FROM threads
             WHERE session_id = ?
             ORDER BY recency_at DESC
@@ -687,8 +770,9 @@ impl RuntimeStore {
     ) -> StoreResult<Vec<ThreadRecord>> {
         let rows = sqlx::query(
             r#"
-            SELECT thread_id, session_id, parent_thread_id, workspace_root, title, preview,
-                   created_at, updated_at, recency_at, archived
+            SELECT thread_id, session_id, parent_thread_id, forked_from_turn_id,
+                   forked_from_sequence_no, workspace_root, rebound_from_workspace_root,
+                   rollout_path, title, preview, created_at, updated_at, recency_at, archived
             FROM threads
             WHERE archived = 0
               AND (? IS NULL OR workspace_root = ?)
@@ -759,6 +843,118 @@ impl RuntimeStore {
                     .any(|artifact_id| artifact_ids.contains(artifact_id))
             })
             .collect())
+    }
+}
+
+async fn upsert_thread_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    thread: &ThreadRecord,
+) -> StoreResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO threads (
+            thread_id, session_id, parent_thread_id, forked_from_turn_id,
+            forked_from_sequence_no, workspace_root, rebound_from_workspace_root,
+            rollout_path, title, preview, created_at, updated_at, recency_at, archived
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(thread_id) DO UPDATE SET
+            session_id = excluded.session_id,
+            parent_thread_id = excluded.parent_thread_id,
+            forked_from_turn_id = excluded.forked_from_turn_id,
+            forked_from_sequence_no = excluded.forked_from_sequence_no,
+            workspace_root = excluded.workspace_root,
+            rebound_from_workspace_root = excluded.rebound_from_workspace_root,
+            rollout_path = excluded.rollout_path,
+            title = excluded.title,
+            preview = excluded.preview,
+            updated_at = excluded.updated_at,
+            recency_at = excluded.recency_at,
+            archived = excluded.archived
+        "#,
+    )
+    .bind(thread.thread_id.to_string())
+    .bind(thread.session_id.to_string())
+    .bind(thread.parent_thread_id.map(|id| id.to_string()))
+    .bind(thread.forked_from_turn_id.map(|id| id.to_string()))
+    .bind(
+        thread
+            .forked_from_sequence_no
+            .map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
+    )
+    .bind(&thread.workspace_root)
+    .bind(&thread.rebound_from_workspace_root)
+    .bind(&thread.rollout_path)
+    .bind(&thread.title)
+    .bind(&thread.preview)
+    .bind(thread.created_at)
+    .bind(thread.updated_at)
+    .bind(thread.recency_at)
+    .bind(thread.archived)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn next_sequence_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> StoreResult<u64> {
+    let row = sqlx::query(
+        "UPDATE runtime_sequence
+         SET last_sequence_no = last_sequence_no + 1
+         WHERE singleton = 1
+         RETURNING last_sequence_no",
+    )
+    .fetch_one(&mut **transaction)
+    .await?;
+    let sequence_no: i64 = row.try_get("last_sequence_no")?;
+    Ok(u64::try_from(sequence_no).unwrap_or(u64::MAX))
+}
+
+fn fork_id_replacements(
+    parent_session_id: SessionId,
+    child_session_id: SessionId,
+    event_ids: &HashMap<EventId, EventId>,
+    task_ids: &HashMap<TaskId, TaskId>,
+    turn_ids: &HashMap<TurnId, TurnId>,
+) -> HashMap<String, String> {
+    std::iter::once((parent_session_id.to_string(), child_session_id.to_string()))
+        .chain(
+            event_ids
+                .iter()
+                .map(|(source, target)| (source.to_string(), target.to_string())),
+        )
+        .chain(
+            task_ids
+                .iter()
+                .map(|(source, target)| (source.to_string(), target.to_string())),
+        )
+        .chain(
+            turn_ids
+                .iter()
+                .map(|(source, target)| (source.to_string(), target.to_string())),
+        )
+        .collect()
+}
+
+fn remap_json_ids(value: &mut serde_json::Value, replacements: &HashMap<String, String>) {
+    match value {
+        serde_json::Value::String(value) => {
+            if let Some(replacement) = replacements.get(value) {
+                *value = replacement.clone();
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                remap_json_ids(value, replacements);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                remap_json_ids(value, replacements);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
     }
 }
 
@@ -1150,7 +1346,11 @@ const MIGRATIONS: &[&str] = &[
         thread_id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL,
         parent_thread_id TEXT,
+        forked_from_turn_id TEXT,
+        forked_from_sequence_no INTEGER,
         workspace_root TEXT,
+        rebound_from_workspace_root TEXT,
+        rollout_path TEXT,
         title TEXT NOT NULL,
         preview TEXT NOT NULL,
         created_at TEXT NOT NULL,
@@ -1263,6 +1463,8 @@ fn thread_from_row(row: sqlx::sqlite::SqliteRow) -> StoreResult<ThreadRecord> {
     let thread_id: String = row.try_get("thread_id")?;
     let session_id: String = row.try_get("session_id")?;
     let parent_thread_id: Option<String> = row.try_get("parent_thread_id")?;
+    let forked_from_turn_id: Option<String> = row.try_get("forked_from_turn_id")?;
+    let forked_from_sequence_no: Option<i64> = row.try_get("forked_from_sequence_no")?;
     Ok(ThreadRecord {
         thread_id: ThreadId::from_str(&thread_id)
             .map_err(|error| StoreError::InvalidId(error.to_string()))?,
@@ -1273,7 +1475,21 @@ fn thread_from_row(row: sqlx::sqlite::SqliteRow) -> StoreResult<ThreadRecord> {
                 ThreadId::from_str(&value).map_err(|error| StoreError::InvalidId(error.to_string()))
             })
             .transpose()?,
+        forked_from_turn_id: forked_from_turn_id
+            .map(|value| {
+                TurnId::from_str(&value).map_err(|error| StoreError::InvalidId(error.to_string()))
+            })
+            .transpose()?,
+        forked_from_sequence_no: forked_from_sequence_no
+            .map(|value| {
+                u64::try_from(value).map_err(|_| {
+                    StoreError::InvalidId("negative forked_from_sequence_no".to_owned())
+                })
+            })
+            .transpose()?,
         workspace_root: row.try_get("workspace_root")?,
+        rebound_from_workspace_root: row.try_get("rebound_from_workspace_root")?,
+        rollout_path: row.try_get("rollout_path")?,
         title: row.try_get("title")?,
         preview: row.try_get("preview")?,
         created_at: row.try_get("created_at")?,
@@ -1797,7 +2013,11 @@ mod tests {
             thread_id: ThreadId::new(),
             session_id: SessionId::new(),
             parent_thread_id: None,
+            forked_from_turn_id: None,
+            forked_from_sequence_no: None,
             workspace_root: Some("/workspace".to_owned()),
+            rebound_from_workspace_root: None,
+            rollout_path: Some("/state/rollouts/thread.jsonl".to_owned()),
             title: "Implement provider setup".to_owned(),
             preview: "Implement provider setup and persistence".to_owned(),
             created_at: now,
@@ -1823,6 +2043,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fork_transaction_copies_boundary_history_and_remaps_runtime_ids() {
+        let store = RuntimeStore::in_memory().await.expect("store opens");
+        let parent_session_id = SessionId::new();
+        let parent_task_id = TaskId::new();
+        let parent_turn_id = TurnId::new();
+        let first = store
+            .append_event_assigning_sequence(RuntimeEvent {
+                id: EventId::new(),
+                sequence_no: 0,
+                session_id: parent_session_id,
+                turn_id: Some(parent_turn_id),
+                task_id: Some(parent_task_id),
+                parent_event_id: None,
+                event_type: RuntimeEventType::TaskCreated,
+                timestamp: Utc::now(),
+                source: RuntimeEventSource::Runtime,
+                payload: json!({
+                    "summary": "parent task",
+                    "session_id": parent_session_id,
+                    "task_id": parent_task_id,
+                    "turn_id": parent_turn_id,
+                }),
+                payload_ref: None,
+                durable: true,
+            })
+            .await
+            .expect("first parent event");
+        let second = store
+            .append_event_assigning_sequence(RuntimeEvent {
+                id: EventId::new(),
+                sequence_no: 0,
+                session_id: parent_session_id,
+                turn_id: Some(parent_turn_id),
+                task_id: Some(parent_task_id),
+                parent_event_id: Some(first.id),
+                event_type: RuntimeEventType::AssistantMessage,
+                timestamp: Utc::now(),
+                source: RuntimeEventSource::Runtime,
+                payload: json!({"summary": "parent answer"}),
+                payload_ref: None,
+                durable: true,
+            })
+            .await
+            .expect("second parent event");
+        store
+            .append_event_assigning_sequence(RuntimeEvent {
+                id: EventId::new(),
+                sequence_no: 0,
+                session_id: parent_session_id,
+                turn_id: Some(TurnId::new()),
+                task_id: Some(TaskId::new()),
+                parent_event_id: None,
+                event_type: RuntimeEventType::TaskCreated,
+                timestamp: Utc::now(),
+                source: RuntimeEventSource::Runtime,
+                payload: json!({"summary": "outside fork boundary"}),
+                payload_ref: None,
+                durable: true,
+            })
+            .await
+            .expect("event outside boundary");
+        let now = Utc::now();
+        let child = ThreadRecord {
+            thread_id: ThreadId::new(),
+            session_id: SessionId::new(),
+            parent_thread_id: Some(ThreadId::new()),
+            forked_from_turn_id: Some(parent_turn_id),
+            forked_from_sequence_no: Some(second.sequence_no),
+            workspace_root: Some("/workspace".to_owned()),
+            rebound_from_workspace_root: None,
+            rollout_path: Some("/state/rollouts/child.jsonl".to_owned()),
+            title: "Fork".to_owned(),
+            preview: "Fork preview".to_owned(),
+            created_at: now,
+            updated_at: now,
+            recency_at: now,
+            archived: false,
+        };
+
+        let forked = store
+            .create_forked_thread(&child, parent_session_id, second.sequence_no)
+            .await
+            .expect("fork transaction");
+
+        assert_eq!(forked.len(), 2);
+        assert!(
+            forked
+                .iter()
+                .all(|event| event.session_id == child.session_id)
+        );
+        assert!(
+            forked
+                .iter()
+                .all(|event| event.id != first.id && event.id != second.id)
+        );
+        assert_eq!(forked[1].parent_event_id, Some(forked[0].id));
+        assert_ne!(forked[0].task_id, Some(parent_task_id));
+        assert_eq!(forked[0].task_id, forked[1].task_id);
+        assert_ne!(forked[0].turn_id, Some(parent_turn_id));
+        assert_eq!(forked[0].turn_id, forked[1].turn_id);
+        assert_eq!(
+            forked[0].payload["session_id"],
+            child.session_id.to_string()
+        );
+        assert_eq!(
+            forked[0].payload["task_id"],
+            forked[0].task_id.expect("child task id").to_string()
+        );
+        assert_eq!(
+            store
+                .load_events(child.session_id, None, None)
+                .await
+                .expect("child events"),
+            forked
+        );
+        assert_eq!(
+            store
+                .thread_by_id(child.thread_id)
+                .await
+                .expect("child thread query"),
+            Some(child)
+        );
+    }
+
+    #[tokio::test]
     async fn different_threads_cannot_bind_the_same_session() {
         let store = RuntimeStore::in_memory().await.expect("store opens");
         let now = Utc::now();
@@ -1831,7 +2176,11 @@ mod tests {
             thread_id,
             session_id,
             parent_thread_id: None,
+            forked_from_turn_id: None,
+            forked_from_sequence_no: None,
             workspace_root: Some("/workspace".to_owned()),
+            rebound_from_workspace_root: None,
+            rollout_path: None,
             title: "Thread".to_owned(),
             preview: "Thread preview".to_owned(),
             created_at: now,
@@ -1930,6 +2279,10 @@ mod tests {
             .expect("deduplicated thread");
 
         assert_eq!(thread.thread_id, newer_thread_id);
+        assert!(thread.forked_from_turn_id.is_none());
+        assert!(thread.forked_from_sequence_no.is_none());
+        assert!(thread.rebound_from_workspace_root.is_none());
+        assert!(thread.rollout_path.is_none());
         assert_eq!(
             store
                 .list_threads(Some("/workspace"), 10)

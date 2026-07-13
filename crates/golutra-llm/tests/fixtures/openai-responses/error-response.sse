@@ -1,0 +1,4 @@
+event: response.failed
+data: {"type":"response.failed","response":{"id":"resp_golden_error","error":{"code":"invalid_request","message":"golden responses failure"}}}
+
+data: [DONE]

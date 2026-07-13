@@ -164,6 +164,7 @@ Golutra 当前主场景是 coding agent，不按通用 agent 平台做第一阶�
 ```text
 SQLite state
 Durable event log
+Derived rollout JSONL
 Artifact store
 rg-backed content search
 State snapshot
@@ -176,6 +177,7 @@ Replay timeline
 - UI 展示事件和 durable runtime event 必须分离。
 - 大工具输出、diff、日志、网页内容默认进入 artifact，不直接进入 prompt。
 - 任意 turn 都应该能通过 event + state + artifact 恢复和 replay。
+- SQLite event 是 canonical facts；rollout JSONL 是带版本、checksum 和脱敏的可重建导出层，不能形成第二份主真相。
 
 ### Context & Memory
 
@@ -246,7 +248,9 @@ MemoryGovernance
 | `golutra-context` | ContextBuilder、TokenBudgetTracker、TokenBudgetSnapshot、WorkingSummary、context projection |
 | `golutra-memory` | MemoryRetriever、MemoryGovernance、memory promotion/rollback |
 | `golutra-store` | SQLite、event log、artifact store、state snapshot、workspace checkpoint refs |
-| `golutra-llm` | Provider adapter、CapabilityMatrix、routing、usage normalization、TokenUsageRecord |
+| `golutra-auth` | CredentialRef、owner-only disk/env SecretStore、OAuth PKCE/device/refresh/revoke 和非敏感 credential metadata |
+| `golutra-config` | 全局 provider v2、受审计 provider auth catalog、v1 到 disk SecretRef 原子迁移、verified install/probe/rollback |
+| `golutra-llm` | OpenAI-compatible/Responses/native Provider adapter、CapabilityMatrix、routing、usage normalization、TokenUsageRecord |
 | `golutra-tools` | ToolContract、tool registry、tool execution、ToolResultEnvelope |
 | `golutra-governor` | 后续治理增强：GoalLedger、RuntimeGovernor、GovernanceDecision |
 | `golutra-policy` | PermissionPolicy、PolicyEvaluation、workspace isolation |
@@ -294,11 +298,15 @@ CLI / TUI --connect <URL>
   -> 同一 attachment 协议
 ```
 
-cwd 只决定执行目录、工具权限、checkpoint/memory/evaluation 分区和 thread 过滤，不决定进程生命周期。所有 durable facts 位于 `$GOLUTRA_HOME/state`：全局 `runtime.sqlite`、`artifacts/` 以及 `workspaces/<cwd-hash>/`；项目 `.golutra` 不参与 runtime 持久化。SQLite 在 event append 事务内分配全局 sequence；全局 session lease 防止多个 Embedded 进程同时控制同一会话，command lease 与 durable ack 提供幂等重试。owner 异常退出后，能够重新取得 lease 的 host 会取消孤儿 active task，并恢复尚未开始的 durable pending turn。用户级 app-server 用 `$GOLUTRA_HOME/app-server/daemon.lock` 保证单实例，并发布 owner-only `app-server.json`；cwd runtime registry 默认最多保留 128 个 attachment，初始化失败会释放槽位。每次 cwd attachment 都从全局 thread index 刷新最近 session/thread，数据库以唯一索引保证一个 session 只绑定一个 thread。未配置 transport auth 前仅允许 loopback，同时校验 Host/Origin；`HttpSseTransport` 始终使用调用方传入的连接 URL 发后续请求，服务端广告地址只作诊断，从而支持 SSH 端口转发和反向代理。
+cwd 只决定执行目录、工具权限、checkpoint/memory/evaluation/rollout 分区和 thread 过滤，不决定进程生命周期。所有 durable facts 位于 `$GOLUTRA_HOME/state`：全局 `runtime.sqlite`、`artifacts/` 以及 `workspaces/<cwd-hash>/`；项目 `.golutra` 不参与 runtime 持久化。provider selection 位于全局 `provider.json` v2，API key 与 OAuth token set 位于 owner-only `$GOLUTRA_HOME/credentials.json` 或只读进程 env；`provider.json`、runtime event 和 rollout 都不保存 secret。凭据文件使用跨进程锁、大小上限、临时文件 fsync 和原子替换，Unix 权限为目录 `0700`、凭据/锁文件 `0600`。OpenAI/xAI/Copilot 等 OAuth 只通过受审计 catalog 启用并固定绑定对应 request adapter，Custom endpoint 不推断 OAuth；`auth/refresh` 只保存 owner-only 跨进程锁。SQLite 在 event append 事务内分配全局 sequence；rollout 从 SQLite 物化，append 与原子重建共享跨进程锁。全局 session lease 防止多个 Embedded 进程同时控制同一会话，command lease 与 durable ack 提供幂等重试。owner 异常退出后，能够重新取得 lease 的 host 会取消孤儿 active task，并恢复尚未开始的 durable pending turn。用户级 app-server 用 `$GOLUTRA_HOME/app-server/daemon.lock` 保证单实例，并发布 owner-only `app-server.json`；cwd runtime registry 默认最多保留 128 个 attachment，初始化失败会释放槽位。每次 cwd attachment 都从全局 thread index 刷新最近 session/thread，数据库以唯一索引保证一个 session 只绑定一个 thread。未配置 transport auth 前仅允许 loopback，同时校验 Host/Origin；`HttpSseTransport` 始终使用调用方传入的连接 URL 发后续请求，服务端广告地址只作诊断，从而支持 SSH 端口转发和反向代理。
 
 ```text
 $GOLUTRA_HOME/
   provider.json
+  credentials.json
+  credentials.lock
+  auth/
+    refresh/<credential-hash>.lock
   state/
     runtime.sqlite
     artifacts/
@@ -306,6 +314,7 @@ $GOLUTRA_HOME/
     command-locks/
     workspaces/<cwd-sha256>/
       checkpoints/
+      rollouts/<thread-id>.jsonl
       memory.json
       evaluation.json
   app-server/
@@ -361,8 +370,10 @@ golutra-tui
 - `subscribe` 不能只是一次性返回历史 `Vec<Event>`，必须支持 `cursor replay + live event stream`。
 - TUI 的本地状态只能用于渲染，例如输入框、选中项、滚动位置，不能成为任务状态真相。
 - TUI 复杂组件必须建立在 `RuntimeHost + EventBus + cwd thread resolver` 之上，不能复制 runtime 状态机。
+- fork 必须复制完整 history 或明确的 turn boundary、重新生成 runtime IDs 并保留 immutable artifact lineage；普通 resume/fork 不能跨 canonical cwd。
+- cwd 迁移只能通过显式 rebind，要求 inactive/unowned thread 和精确旧路径；checkpoint、memory、evaluation 不能被无条件解释为新 cwd 事实。
 
-当前这些边界已经落地：TUI 默认创建新的本地 thread/session，首个 prompt 才持久化；`/resume` 按当前 canonical cwd 过滤全局历史；普通 transcript 只渲染用户可见事件，debug timeline 才展开 runtime facts。
+当前这些边界已经落地：TUI 默认创建新的本地 thread/session，首个 prompt 才持久化；`/resume` 按当前 canonical cwd 过滤全局历史；`/fork --from-turn`、rollout export 和 thread rebind 通过同一 transport/API；普通 transcript 只渲染用户可见事件，debug timeline 才展开 runtime facts。
 
 daemon/remote 模式的最低可用目标不是“界面完整”，而是：
 

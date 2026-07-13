@@ -178,15 +178,17 @@ RuntimeEvent -> UiState projection
 
 ## Provider 选型
 
-推荐：
+当前实现：
 
 ```text
 Golutra ProviderContract
-  -> GenaiProviderAdapter
-       -> genai::Client
+  -> OpenAiCompatibleProvider -> Chat Completions endpoint
+  -> OpenAiResponsesProvider  -> ChatGPT Codex Responses SSE endpoint
+  -> GenaiProviderAdapter      -> genai::Client
+       -> Anthropic / Gemini / Vertex / model-routed genai
 ```
 
-`rust-genai` 是 Golutra 长期唯一默认 LLM provider adapter，用来覆盖多 provider，但不进入核心数据模型。
+`rust-genai` 是 Golutra 的 native multi-provider adapter；独立 OpenAI-compatible adapter 保留给大量兼容 endpoint 和自定义网关；OpenAI Responses adapter 只服务需要 subscription OAuth、account header 和 encrypted reasoning replay 的 ChatGPT Codex wire。三者都不能让第三方类型进入核心数据模型。
 
 必须保留：
 
@@ -198,8 +200,8 @@ Golutra ProviderContract
 
 原因：
 
-- genai adapter 负责接入 OpenAI、Anthropic、Gemini、Ollama、OpenRouter、DeepSeek 等常见 provider。
-- Golutra 不规划 OpenAI / Anthropic / Gemini 等 provider native adapter，避免第一阶段和长期架构变成多协议维护矩阵。
+- OpenAI-compatible adapter 覆盖兼容网关；OpenAI Responses adapter 负责 ChatGPT OAuth/Codex wire；genai adapter 负责 Anthropic、Gemini、Vertex 和按模型 namespace 路由的 provider。
+- Golutra 不为每家 provider 手写并行 adapter 类型，native wire 差异统一委托给固定版本的 rust-genai，并用 committed golden fixture 锁定升级影响。
 - fallback 需要 loop 层掌握上下文一致性，不能由 adapter 私自处理。
 
 ## Storage 选型

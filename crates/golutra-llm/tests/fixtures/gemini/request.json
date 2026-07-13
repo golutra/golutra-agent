@@ -1,0 +1,46 @@
+{
+  "path": "/v1beta/models/gemini-test:generateContent",
+  "body": {
+    "contents": [
+      {"role": "user", "parts": [{"text": "Read the project file."}]},
+      {
+        "role": "model",
+        "parts": [
+          {"functionCall": {"name": "read_file", "args": {"path": "README.md"}}}
+        ]
+      },
+      {
+        "role": "user",
+        "parts": [
+          {
+            "functionResponse": {
+              "name": "read_file",
+              "response": {
+                "name": "read_file",
+                "content": "{\"summary\":\"project file read\"}"
+              }
+            }
+          }
+        ]
+      },
+      {"role": "user", "parts": [{"text": "Summarize it."}]}
+    ],
+    "generationConfig": {"maxOutputTokens": 128},
+    "systemInstruction": {"parts": [{"text": "You are concise."}]},
+    "tools": [
+      {
+        "functionDeclarations": [
+          {
+            "name": "read_file",
+            "description": "Read a UTF-8 text file from the current workspace.",
+            "parametersJsonSchema": {
+              "type": "object",
+              "properties": {"path": {"type": "string"}},
+              "required": ["path"]
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "input": [
+    {
+      "content": [
+        {
+          "text": "Say hello.",
+          "type": "input_text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "instructions": "",
+  "model": "gpt-golden",
+  "store": false,
+  "stream": true
+}

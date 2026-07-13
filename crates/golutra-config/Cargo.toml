@@ -8,7 +8,9 @@ rust-version.workspace = true
 
 [dependencies]
 fs2.workspace = true
+golutra-auth = { path = "../golutra-auth" }
 golutra-llm = { path = "../golutra-llm" }
+secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

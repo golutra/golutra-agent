@@ -83,7 +83,8 @@ Plugin Marketplace
 - `RuntimeQuery` 是查询当前 session / task 状态的统一接口；不同前端不能各自维护私有状态快照作为真相。
 - 协议类型必须有统一 schema 产物；Rust、TypeScript、Python 侧不能各自手写一套含义接近但字段漂移的契约。
 - `ProviderContract` 是 provider 反腐层，统一 stream event、tool call、usage、finish_reason、error、rate limit 和 cost。
-- Custom Provider 设置必须协议优先：先选 OpenAI-compatible / Anthropic-compatible / Gemini-compatible，再填写 base URL、API key、model、advanced config 和 review；当前 live adapter 未支持的协议必须明确拦截，不能显示为连接成功。
+- Custom Provider 设置必须协议优先：先选 OpenAI-compatible / Anthropic / Gemini / Vertex AI / genai，再填写 base URL、API key、model、advanced config 和 review；保存前必须使用同一 runtime adapter probe，失败回滚 active selection。
+- OAuth 必须由受审计 provider auth method 同时绑定 flow、callback、scope、模型协议和 API endpoint；OpenAI ChatGPT subscription token 固定走 Responses adapter，xAI/Copilot 使用各自注册的 OpenAI-compatible 请求扩展，Custom Provider 不自动推断 OAuth。
 - `ToolContract` 先于工具实现定义，明确 schema、错误、取消、重试、幂等、副作用和 artifact 策略。
 - `ArtifactRecord` / `EvidenceRecord` 是事实层，raw output 默认进 artifact，模型只读取受控摘要和 evidence refs。
 - `VerificationRecord` 决定任务是否完成，模型自然语言不能直接触发成功终止。
@@ -826,7 +827,7 @@ Debug Projection 只在 debug/audit/replay 模式启用。
 | 多前端一致性 | 同一 `workspace/session/task` 在 SDK / TUI / Web 查询到相同状态，并能看到同一条运行中事件流 |
 | 运行中输入 | active task 运行时，新输入必须被记录为 append / inject / interrupt / reject 之一，且其他前端看到同一状态 |
 | provider 正常流 | stream event、usage、finish_reason、tool call 映射进 `ProviderContract` |
-| custom provider 验证 | 协议选择、base URL、API key、model、review 都通过校验；未实现 live adapter 的协议不能保存成 ready |
+| custom provider 验证 | 协议选择、base URL、API key、model、review 都通过校验；OpenAI-compatible/Anthropic/Gemini/Vertex AI/genai 使用实际 adapter probe 后才能保存成 ready |
 | provider 异常流 | truncated stream、malformed event、rate limit、network error 都有结构化错误 |
 | token 观测 | 每次 provider request 前有 `TokenBudgetSnapshot`，response 后有 `TokenUsageRecord`；usage 缺失时记录 unknown 或估算来源 |
 | tool 成功 | `ToolContract` 校验通过，生成 `ToolResultEnvelope`、artifact refs 和 evidence refs |
