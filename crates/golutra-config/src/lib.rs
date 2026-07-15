@@ -405,16 +405,29 @@ impl ProviderInstallPlan {
         let path = &paths.user_config;
         let _lock = acquire_provider_settings_lock(path)?;
         let store = default_secret_store(paths)?;
-        let mut settings = load_or_migrate_provider_settings_unlocked(paths, store.as_ref())?;
+        let mut settings =
+            load_provider_settings_for_install_unlocked(paths, store.as_ref())?.settings;
         persist_profile_in_settings(&mut settings, self.profile.clone(), self.activate)?;
         settings.save_unlocked(path)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvalidProviderSettingsPolicy {
+    Reject,
+    ReplaceJson,
+}
+
+struct LoadedProviderSettings {
+    settings: ProviderSettings,
+    rollback_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProviderSettingsSnapshot {
     existed: bool,
     settings: ProviderSettings,
+    rollback_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Clone)]
@@ -734,7 +747,7 @@ pub async fn apply_provider_install_plan_verified_with_store(
             "workspace provider config is no longer supported; use global user provider config",
         ));
     }
-    run_provider_settings_transaction(paths, workspace_root, store, |user| {
+    run_provider_install_transaction(paths, workspace_root, store, |user| {
         let previous_reference = user
             .profiles
             .iter()
@@ -1098,6 +1111,27 @@ fn load_or_migrate_provider_settings_unlocked(
     }
 }
 
+fn load_provider_settings_for_install_unlocked(
+    paths: &ProviderConfigPaths,
+    store: &dyn SecretStore,
+) -> Result<LoadedProviderSettings, ConfigError> {
+    match load_or_migrate_provider_settings_unlocked(paths, store) {
+        Ok(settings) => Ok(LoadedProviderSettings {
+            settings,
+            rollback_bytes: None,
+        }),
+        Err(ConfigError::Json(_)) => {
+            let rollback_bytes =
+                fs::read(&paths.user_config).map_err(|error| ConfigError::Io(error.to_string()))?;
+            Ok(LoadedProviderSettings {
+                settings: ProviderSettings::default(),
+                rollback_bytes: Some(rollback_bytes),
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn migrate_legacy_provider_settings(
     paths: &ProviderConfigPaths,
     store: &dyn SecretStore,
@@ -1297,12 +1331,61 @@ async fn run_provider_settings_transaction<F>(
 where
     F: FnOnce(&mut ProviderSettings) -> Result<Vec<SecretMutation>, ConfigError>,
 {
+    run_provider_settings_transaction_with_policy(
+        paths,
+        workspace_root,
+        store,
+        InvalidProviderSettingsPolicy::Reject,
+        mutate,
+    )
+    .await
+}
+
+async fn run_provider_install_transaction<F>(
+    paths: &ProviderConfigPaths,
+    workspace_root: impl AsRef<Path>,
+    store: Arc<dyn SecretStore>,
+    mutate: F,
+) -> Result<(), ProviderInstallError>
+where
+    F: FnOnce(&mut ProviderSettings) -> Result<Vec<SecretMutation>, ConfigError>,
+{
+    run_provider_settings_transaction_with_policy(
+        paths,
+        workspace_root,
+        store,
+        InvalidProviderSettingsPolicy::ReplaceJson,
+        mutate,
+    )
+    .await
+}
+
+async fn run_provider_settings_transaction_with_policy<F>(
+    paths: &ProviderConfigPaths,
+    workspace_root: impl AsRef<Path>,
+    store: Arc<dyn SecretStore>,
+    invalid_settings_policy: InvalidProviderSettingsPolicy,
+    mutate: F,
+) -> Result<(), ProviderInstallError>
+where
+    F: FnOnce(&mut ProviderSettings) -> Result<Vec<SecretMutation>, ConfigError>,
+{
     let workspace_root = workspace_root.as_ref().to_path_buf();
     let _lock = acquire_provider_settings_lock_async(paths.user_config.clone()).await?;
-    let initial_settings = load_or_migrate_provider_settings_unlocked(paths, store.as_ref())
-        .map_err(|error| provider_install_error("load", error.to_string()))?;
-    let user_snapshot = snapshot_provider_settings_file(&paths.user_config, initial_settings)
-        .map_err(|error| provider_install_error("backup", error.to_string()))?;
+    let loaded = match invalid_settings_policy {
+        InvalidProviderSettingsPolicy::Reject => LoadedProviderSettings {
+            settings: load_or_migrate_provider_settings_unlocked(paths, store.as_ref())
+                .map_err(|error| provider_install_error("load", error.to_string()))?,
+            rollback_bytes: None,
+        },
+        InvalidProviderSettingsPolicy::ReplaceJson => {
+            load_provider_settings_for_install_unlocked(paths, store.as_ref())
+                .map_err(|error| provider_install_error("load", error.to_string()))?
+        }
+    };
+    let user_snapshot =
+        snapshot_provider_settings_file(&paths.user_config, loaded.settings, loaded.rollback_bytes)
+            .map_err(|error| provider_install_error("backup", error.to_string()))?;
     let mut user_settings = user_snapshot.settings.clone();
     let secret_mutations = mutate(&mut user_settings)
         .map_err(|error| provider_install_error("mutate", error.to_string()))?;
@@ -1350,10 +1433,12 @@ where
 fn snapshot_provider_settings_file(
     path: &Path,
     settings: ProviderSettings,
+    rollback_bytes: Option<Vec<u8>>,
 ) -> Result<ProviderSettingsSnapshot, ConfigError> {
     Ok(ProviderSettingsSnapshot {
         existed: path.exists(),
         settings,
+        rollback_bytes,
     })
 }
 
@@ -1386,6 +1471,9 @@ fn restore_provider_settings_file(
             sync_directory(normalized_parent(path))?;
         }
         return Ok(());
+    }
+    if let Some(rollback_bytes) = &snapshot.rollback_bytes {
+        return write_owner_only(path, rollback_bytes);
     }
     snapshot.settings.save_unlocked(path)
 }
@@ -1488,15 +1576,20 @@ fn replaced_credential(
 }
 
 fn write_json_owner_only<T: Serialize>(path: &Path, value: &T) -> Result<(), ConfigError> {
+    let mut content =
+        serde_json::to_vec_pretty(value).map_err(|error| ConfigError::Json(error.to_string()))?;
+    content.push(b'\n');
+    write_owner_only(path, &content)
+}
+
+fn write_owner_only(path: &Path, content: &[u8]) -> Result<(), ConfigError> {
     let parent = normalized_parent(path);
     fs::create_dir_all(parent).map_err(|error| ConfigError::Io(error.to_string()))?;
     set_owner_only_dir(parent)?;
-    let content = serde_json::to_string_pretty(value)
-        .map_err(|error| ConfigError::Json(error.to_string()))?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
         .map_err(|error| ConfigError::Io(error.to_string()))?;
     temporary
-        .write_all(format!("{content}\n").as_bytes())
+        .write_all(content)
         .map_err(|error| ConfigError::Io(error.to_string()))?;
     temporary
         .as_file()
@@ -1796,6 +1889,29 @@ mod tests {
         CredentialRef::disk(SecretKind::ApiKey)
     }
 
+    fn unreadable_provider_settings() -> &'static [u8] {
+        br#"{
+  "version": 2,
+  "active_profile": "legacy",
+  "profiles": [
+    {
+      "name": "legacy",
+      "protocol": "openai-compatible",
+      "model_id": "legacy-model",
+      "base_url": "https://legacy.example.com/v1",
+      "credential_ref": {
+        "id": "cred_legacy",
+        "source": {"kind": "removed-backend"},
+        "secret_kind": "api-key",
+        "revision": "rev_legacy"
+      },
+      "enabled": true
+    }
+  ]
+}
+"#
+    }
+
     fn oauth_credential() -> CredentialRef {
         CredentialRef::ephemeral(SecretKind::OAuthTokenSet)
     }
@@ -1886,6 +2002,27 @@ mod tests {
         assert_eq!(loaded.version, PROVIDER_SETTINGS_VERSION);
         assert!(serialized.contains("credential_ref"));
         assert!(!serialized.contains("secret-value"));
+    }
+
+    #[test]
+    fn explicit_provider_install_replaces_unreadable_credential_source() {
+        let home = tempdir().expect("home");
+        let paths = ProviderConfigPaths::from_home(home.path()).expect("paths");
+        fs::write(&paths.user_config, unreadable_provider_settings()).expect("legacy config");
+
+        ProviderInstallPlan {
+            scope: ProviderConfigScope::User,
+            profile: ProviderProfile::mock(),
+            activate: true,
+            pending_secret: None,
+        }
+        .apply(&paths)
+        .expect("replace unreadable config");
+
+        let settings = ProviderSettings::load(&paths.user_config).expect("settings");
+        let persisted = fs::read_to_string(&paths.user_config).expect("config");
+        assert_eq!(settings.active_profile().expect("active").name, "mock");
+        assert!(!persisted.contains("removed-backend"));
     }
 
     #[test]
@@ -2408,6 +2545,42 @@ mod tests {
 
         assert_eq!(error.step, "probe");
         assert!(!paths.user_config.exists());
+        assert!(!store.contains(&reference));
+    }
+
+    #[tokio::test]
+    async fn failed_install_restores_unreadable_config_without_persisting_secret() {
+        let home = tempdir().expect("home");
+        let workspace = tempdir().expect("workspace");
+        let paths = ProviderConfigPaths::from_home(home.path()).expect("paths");
+        let original = unreadable_provider_settings();
+        fs::write(&paths.user_config, original).expect("legacy config");
+        let store = Arc::new(golutra_auth::MemorySecretStore::default());
+        let reference = disk_credential();
+        let profile = ProviderProfile::openai_compatible(
+            "custom",
+            "http://127.0.0.1:9/v1",
+            "gpt-5.5",
+            reference.clone(),
+        )
+        .expect("profile");
+
+        let error = apply_provider_install_plan_verified_with_store(
+            &paths,
+            workspace.path(),
+            &ProviderInstallPlan {
+                scope: ProviderConfigScope::User,
+                profile,
+                activate: true,
+                pending_secret: Some(SecretString::from("bad-key".to_owned())),
+            },
+            store.clone(),
+        )
+        .await
+        .expect_err("probe should fail");
+
+        assert_eq!(error.step, "probe");
+        assert_eq!(fs::read(&paths.user_config).expect("restored"), original);
         assert!(!store.contains(&reference));
     }
 

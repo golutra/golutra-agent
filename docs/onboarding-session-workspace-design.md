@@ -60,7 +60,7 @@ Golutra 不应照搬把明文 key 默认写入 workspace。推荐持久化分层
 | thread rollouts | `$GOLUTRA_HOME/state/workspaces/<cwd-hash>/rollouts/<thread-id>.jsonl` | 从 SQLite facts 物化的 versioned、checksum、脱敏历史 |
 | 全局凭据文件 | `$GOLUTRA_HOME/credentials.json`；CI 可使用进程 env | owner-only 明文 API key、OAuth access/refresh token set；项目目录和 provider config 禁止 secret |
 
-当前实现使用 v2并删除明文 `provider.json.env`：交互输入默认写 `$GOLUTRA_HOME/credentials.json`，CI/非交互模式可保存 env ref，profile 只保存 `credential_ref` 和非敏感 OAuth descriptor。凭据文件使用独立锁、大小上限和原子替换，Unix 下目录为 `0700`、文件为 `0600`。首次读取 v1 时在 provider settings lock 内把明文 env map 原子迁移到 disk SecretRef；失败会恢复 secret snapshot 并保留原配置，整个过程不访问 OS keychain。
+当前实现使用 v2，并删除明文 `provider.json.env`：交互输入默认写 `$GOLUTRA_HOME/credentials.json`，CI/非交互模式可保存 env ref，profile 只保存 `credential_ref` 和非敏感 OAuth descriptor。凭据文件使用独立锁、大小上限和原子替换，Unix 下目录为 `0700`、文件为 `0600`。首次读取 v1 时在 provider settings lock 内把明文 env map 原子迁移到 disk SecretRef；失败会恢复 secret snapshot 并保留原配置，整个过程不访问 OS keychain。若显式 `/auth` 或 provider login 遇到已删除 backend 导致的不可读 JSON 配置，Review 会标明替换计划；保存成功后只保留新 profile，probe 失败则原样恢复旧文件和 secret snapshot，同样不会读取已删除 backend。
 
 ## Codex 参考结论
 

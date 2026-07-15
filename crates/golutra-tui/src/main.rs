@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     io::{self, Stdout},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::LazyLock,
     time::{Duration, Instant},
 };
@@ -91,6 +91,8 @@ struct TuiApp {
     slash_selected: usize,
     status_message: String,
     provider_message: String,
+    provider_model: String,
+    workspace_path: PathBuf,
     debug_mode: bool,
     cursor: Option<u64>,
     transcript_scroll_offset: usize,
@@ -114,6 +116,11 @@ struct TranscriptItem {
     body: Vec<String>,
 }
 
+struct ProviderUiStatus {
+    message: String,
+    model: String,
+}
+
 impl TuiApp {
     fn new(
         thread_id: ThreadId,
@@ -123,6 +130,8 @@ impl TuiApp {
         provider_message: String,
         auth_dialog: Option<AuthDialogState>,
     ) -> Self {
+        let provider_model = provider_model_from_status(&provider_message);
+        let workspace_path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self {
             thread_id,
             session_id,
@@ -137,6 +146,8 @@ impl TuiApp {
             slash_selected: 0,
             status_message: String::new(),
             provider_message,
+            provider_model,
+            workspace_path,
             debug_mode,
             cursor: None,
             transcript_scroll_offset: 0,
@@ -144,6 +155,22 @@ impl TuiApp {
             quit_shortcut_expires_at: None,
             should_quit: false,
         }
+    }
+
+    fn with_footer_context(
+        mut self,
+        workspace_path: impl Into<PathBuf>,
+        provider_model: impl Into<String>,
+    ) -> Self {
+        self.workspace_path = workspace_path.into();
+        self.provider_model = provider_model.into();
+        self
+    }
+
+    fn refresh_provider_status(&mut self) {
+        let status = current_provider_ui_status();
+        self.provider_message = status.message;
+        self.provider_model = status.model;
     }
 
     async fn refresh(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
@@ -631,7 +658,7 @@ impl TuiApp {
                 self.open_auth_dialog();
             }
             SlashAuthCommand::Status => {
-                self.provider_message = provider_status_message();
+                self.refresh_provider_status();
                 self.push_system_message("Auth status", vec![self.provider_message.clone()]);
             }
             SlashAuthCommand::Protocols => {
@@ -650,7 +677,7 @@ impl TuiApp {
             }
             SlashAuthCommand::Mock => {
                 apply_auth_mock()?;
-                self.provider_message = provider_status_message();
+                self.refresh_provider_status();
                 self.auth_dialog = None;
                 self.push_system_message(
                     "Auth updated",
@@ -678,7 +705,7 @@ impl TuiApp {
                 .await
                 {
                     Ok(()) => {
-                        self.provider_message = provider_status_message();
+                        self.refresh_provider_status();
                         self.push_system_message(
                             "Auth updated",
                             vec![format!("active provider profile set to {profile}")],
@@ -692,7 +719,7 @@ impl TuiApp {
             }
             SlashAuthCommand::Login(login) => match apply_auth_login(transport, *login).await {
                 Ok(()) => {
-                    self.provider_message = provider_status_message();
+                    self.refresh_provider_status();
                     self.auth_dialog = None;
                     self.push_system_message(
                         "Auth updated",
@@ -850,7 +877,7 @@ impl TuiApp {
         };
         match operation.task.await {
             Ok(Ok(outcome)) => {
-                self.provider_message = provider_status_message();
+                self.refresh_provider_status();
                 self.push_system_message(outcome.title, outcome.body);
             }
             Ok(Err(error)) => {
@@ -1071,6 +1098,7 @@ struct AuthReview {
     scope: ProviderConfigScope,
     config_path: PathBuf,
     updates_existing_profile: bool,
+    replaces_unreadable_config: bool,
     preview_json: String,
 }
 
@@ -1556,22 +1584,20 @@ async fn main() -> miette::Result<()> {
     }
     .map_err(|error| miette::miette!("{error}"))?;
     let (thread_id, session_id) = initial_session(args.session_id.as_deref(), &transport).await?;
-    let provider_message = provider_status_message();
+    let provider_status = current_provider_ui_status();
+    let runtime_cwd = transport.cwd().unwrap_or(&cwd).to_path_buf();
     let auth_dialog = initial_auth_dialog();
-    let mut terminal = setup_terminal()?;
-    let result = run_app(
-        &mut terminal,
-        TuiApp::new(
-            thread_id,
-            session_id,
-            task_id,
-            args.debug,
-            provider_message,
-            auth_dialog,
-        ),
-        transport,
+    let app = TuiApp::new(
+        thread_id,
+        session_id,
+        task_id,
+        args.debug,
+        provider_status.message,
+        auth_dialog,
     )
-    .await;
+    .with_footer_context(runtime_cwd, provider_status.model);
+    let mut terminal = setup_terminal()?;
+    let result = run_app(&mut terminal, app, transport).await;
     restore_terminal(&mut terminal)?;
     result
 }
@@ -2081,13 +2107,13 @@ async fn advance_auth_dialog(app: &mut TuiApp, transport: &RuntimeTransport) -> 
         AuthAdvanceAction::None => {}
         AuthAdvanceAction::SaveMock => {
             apply_auth_mock()?;
-            app.provider_message = provider_status_message();
+            app.refresh_provider_status();
             app.auth_dialog = None;
             app.status_message = "using mock provider".to_owned();
         }
         AuthAdvanceAction::SaveOpenAiCompatible(login) => {
             apply_auth_login(transport, *login).await?;
-            app.provider_message = provider_status_message();
+            app.refresh_provider_status();
             app.auth_dialog = None;
             app.status_message = "provider connected".to_owned();
         }
@@ -2177,14 +2203,9 @@ fn draw_ui(frame: &mut Frame<'_>, app: &TuiApp) {
 
 fn bottom_pane_height(app: &TuiApp) -> u16 {
     let slash_rows = app.slash_candidates().len() as u16;
-    if app.auth_dialog.is_some()
-        || app.resume_picker.is_some()
-        || provider_footer_line(app).is_some()
-    {
-        4 + slash_rows
-    } else {
-        3 + slash_rows
-    }
+    let overlay_rows = u16::from(app.auth_dialog.is_some() || app.resume_picker.is_some());
+    let provider_rows = u16::from(provider_footer_line(app).is_some());
+    3 + slash_rows + overlay_rows + provider_rows
 }
 
 fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
@@ -2573,7 +2594,9 @@ fn auth_review_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
             Style::default().fg(Color::Red),
         ))];
     };
-    let update_line = if review.updates_existing_profile {
+    let update_line = if review.replaces_unreadable_config {
+        "will replace unreadable provider config"
+    } else if review.updates_existing_profile {
         "will update existing profile"
     } else {
         "will create new profile"
@@ -2868,15 +2891,14 @@ fn draw_debug_timeline(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 }
 
 fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let help = if app.auth_dialog.is_some() {
-        "Provider setup   Enter continue   Esc back   Ctrl+C twice quit"
+    let overlay_help = if app.auth_dialog.is_some() {
+        Some("Provider setup   Enter continue   Esc back   Ctrl+C twice quit")
     } else if app.resume_picker.is_some() {
-        "Enter resume   Up/Down select   Esc cancel   Ctrl+C twice quit"
+        Some("Enter resume   Up/Down select   Esc cancel   Ctrl+C twice quit")
     } else {
-        "Enter send   PgUp/PgDn history   Home/End jump   Ctrl+C interrupt"
+        None
     };
     let candidates = app.slash_candidates();
-    let help_line = help.to_owned();
     let input_line = if let Some(dialog) = &app.auth_dialog {
         auth_composer_line(dialog)
     } else if app.resume_picker.is_some() {
@@ -2891,17 +2913,23 @@ fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         Span::styled(input_line, composer_style(app)),
     ])];
     lines.extend(slash_candidate_lines(app, &candidates));
-    lines.push(footer_status_line(app));
+    if overlay_help.is_some() {
+        lines.push(footer_status_line(app));
+    } else {
+        lines.push(footer_context_line(app, usize::from(area.width)));
+    }
     if let Some(provider_line) = provider_footer_line(app) {
         lines.push(Line::from(Span::styled(
             provider_line,
             Style::default().fg(provider_color(app)),
         )));
     }
-    lines.push(Line::from(Span::styled(
-        help_line,
-        Style::default().fg(Color::DarkGray),
-    )));
+    if let Some(help) = overlay_help {
+        lines.push(Line::from(Span::styled(
+            help,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
     let paragraph = Paragraph::new(lines)
         .block(Block::default().borders(Borders::TOP))
         .wrap(Wrap { trim: false });
@@ -3000,6 +3028,123 @@ fn auth_composer_line(dialog: &AuthDialogState) -> String {
         },
         AuthDialogStep::Review => "Review install plan".to_owned(),
     }
+}
+
+fn footer_context_line(app: &TuiApp, max_width: usize) -> Line<'static> {
+    const INDENT_WIDTH: usize = 2;
+    let indent_width = INDENT_WIDTH.min(max_width);
+    let content_width = max_width.saturating_sub(indent_width);
+    let indent = " ".repeat(indent_width);
+    if app.quit_shortcut_is_active() && !app.status_message.trim().is_empty() {
+        return Line::from(vec![
+            Span::raw(indent),
+            Span::styled(
+                truncate_end_to_width(&app.status_message, content_width),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]);
+    }
+    Line::from(vec![
+        Span::raw(indent),
+        Span::styled(
+            footer_context_text(app, content_width),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
+}
+
+fn footer_context_text(app: &TuiApp, max_width: usize) -> String {
+    let model = if app.provider_model.trim().is_empty() {
+        "unconfigured"
+    } else {
+        app.provider_model.trim()
+    };
+    let workspace = workspace_path_label(&app.workspace_path);
+    fit_model_and_workspace(model, &workspace, max_width)
+}
+
+fn fit_model_and_workspace(model: &str, workspace: &str, max_width: usize) -> String {
+    const SEPARATOR: &str = " · ";
+    let full = format!("{model}{SEPARATOR}{workspace}");
+    if display_width(&full) <= max_width {
+        return full;
+    }
+    let separator_width = display_width(SEPARATOR);
+    if max_width <= separator_width + 2 {
+        return truncate_end_to_width(&full, max_width);
+    }
+    let minimum_workspace_width = 8.min(max_width / 2);
+    let model_budget = max_width
+        .saturating_sub(separator_width)
+        .saturating_sub(minimum_workspace_width)
+        .max(1);
+    let model = truncate_end_to_width(model, model_budget);
+    let workspace_budget = max_width
+        .saturating_sub(display_width(&model))
+        .saturating_sub(separator_width);
+    let workspace = truncate_start_to_width(workspace, workspace_budget);
+    format!("{model}{SEPARATOR}{workspace}")
+}
+
+fn workspace_path_label(path: &Path) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    workspace_path_label_with_home(path, home.as_deref())
+}
+
+fn workspace_path_label_with_home(path: &Path, home: Option<&Path>) -> String {
+    if let Some(home) = home
+        && let Ok(relative) = path.strip_prefix(home)
+    {
+        if relative.as_os_str().is_empty() {
+            return "~".to_owned();
+        }
+        return format!("~{}{}", std::path::MAIN_SEPARATOR, relative.display());
+    }
+    path.display().to_string()
+}
+
+fn truncate_end_to_width(value: &str, max_width: usize) -> String {
+    if display_width(value) <= max_width {
+        return value.to_owned();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    let mut result = String::new();
+    for character in value.chars() {
+        let mut candidate = result.clone();
+        candidate.push(character);
+        if display_width(&candidate) + 1 > max_width {
+            break;
+        }
+        result.push(character);
+    }
+    result.push('…');
+    result
+}
+
+fn truncate_start_to_width(value: &str, max_width: usize) -> String {
+    if display_width(value) <= max_width {
+        return value.to_owned();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    let mut reversed = String::new();
+    for character in value.chars().rev() {
+        let mut candidate = reversed.clone();
+        candidate.push(character);
+        let suffix = candidate.chars().rev().collect::<String>();
+        if display_width(&suffix) + 1 > max_width {
+            break;
+        }
+        reversed.push(character);
+    }
+    format!("…{}", reversed.chars().rev().collect::<String>())
+}
+
+fn display_width(value: &str) -> usize {
+    Line::from(value).width()
 }
 
 fn footer_status_line(app: &TuiApp) -> Line<'static> {
@@ -3378,6 +3523,9 @@ fn status_chip(app: &TuiApp) -> &'static str {
     if app.auth_dialog.is_some() {
         return "auth";
     }
+    if app.resume_picker.is_some() {
+        return "resume";
+    }
     match app.projection.as_ref().map(|projection| projection.status) {
         Some(golutra_core::TaskStatus::Running) => "running",
         Some(golutra_core::TaskStatus::WaitingApproval) => "waiting approval",
@@ -3394,7 +3542,7 @@ fn status_chip(app: &TuiApp) -> &'static str {
 }
 
 fn status_color(app: &TuiApp) -> Color {
-    if app.auth_dialog.is_some() {
+    if app.auth_dialog.is_some() || app.resume_picker.is_some() {
         return Color::Cyan;
     }
     match app.projection.as_ref().map(|projection| projection.status) {
@@ -3793,11 +3941,18 @@ fn build_auth_review(dialog: &AuthDialogState) -> Result<AuthReview, String> {
     let paths = provider_paths_for_tui().map_err(|error| error.to_string())?;
     let scope = provider_scope(login.scope);
     let config_path = paths.user_config.clone();
-    let settings = load_provider_settings(&paths).map_err(|error| error.to_string())?;
-    let updates_existing_profile = settings
-        .profiles
-        .iter()
-        .any(|profile| profile.name == login.profile);
+    let (updates_existing_profile, replaces_unreadable_config) =
+        match load_provider_settings(&paths) {
+            Ok(settings) => (
+                settings
+                    .profiles
+                    .iter()
+                    .any(|profile| profile.name == login.profile),
+                false,
+            ),
+            Err(golutra_config::ConfigError::Json(_)) => (false, true),
+            Err(error) => return Err(error.to_string()),
+        };
 
     let (credential_ref, _) = credential_for_login(&login)?;
     let mut preview_profile = ProviderProfile::live_profile(
@@ -3837,6 +3992,7 @@ fn build_auth_review(dialog: &AuthDialogState) -> Result<AuthReview, String> {
         scope,
         config_path,
         updates_existing_profile,
+        replaces_unreadable_config,
         preview_json,
     })
 }
@@ -4083,14 +4239,23 @@ fn slash_help_lines() -> Vec<String> {
     ]
 }
 
-fn provider_status_message() -> String {
+fn current_provider_ui_status() -> ProviderUiStatus {
     match provider_onboarding_state() {
         Ok(state) if state.configured => {
-            let profile = state
+            let profile_name = state
                 .active_profile
-                .map(|profile| profile.name)
+                .as_ref()
+                .map(|profile| profile.name.clone())
                 .unwrap_or_else(|| "default".to_owned());
-            format!("ready ({profile})")
+            let model = state
+                .active_profile
+                .as_ref()
+                .map(provider_profile_footer_label)
+                .unwrap_or_else(|| profile_name.clone());
+            ProviderUiStatus {
+                message: format!("ready ({profile_name})"),
+                model,
+            }
         }
         Ok(state) => {
             let missing = if state.missing_fields.is_empty() {
@@ -4098,16 +4263,58 @@ fn provider_status_message() -> String {
             } else {
                 state.missing_fields.join(", ")
             };
-            format!("missing {missing}; use /auth setup")
+            let model = state
+                .active_profile
+                .as_ref()
+                .map(provider_profile_footer_label)
+                .unwrap_or_else(|| "unconfigured".to_owned());
+            ProviderUiStatus {
+                message: format!("missing {missing}; use /auth setup"),
+                model,
+            }
         }
-        Err(error) => format!("provider config error: {error}"),
+        Err(error) => ProviderUiStatus {
+            message: format!("provider config error: {error}"),
+            model: "unconfigured".to_owned(),
+        },
     }
+}
+
+#[cfg(test)]
+fn provider_status_message() -> String {
+    current_provider_ui_status().message
+}
+
+fn provider_profile_footer_label(profile: &ProviderProfile) -> String {
+    let model = profile.model_id.as_deref().unwrap_or_else(|| {
+        if profile.protocol == ProviderProtocol::Mock {
+            "mock"
+        } else {
+            profile.name.as_str()
+        }
+    });
+    let mode = profile.generation_config.as_ref().and_then(|config| {
+        config
+            .reasoning_effort
+            .map(|effort| reasoning_effort_label(Some(effort)))
+            .or_else(|| config.enable_thinking.then_some("thinking"))
+    });
+    mode.map_or_else(|| model.to_owned(), |mode| format!("{model} {mode}"))
+}
+
+fn provider_model_from_status(message: &str) -> String {
+    message
+        .strip_prefix("ready (")
+        .and_then(|value| value.strip_suffix(')'))
+        .unwrap_or("unconfigured")
+        .to_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use golutra_auth::{CredentialSource, OpenAiDeviceAuthorizationDescriptor};
     use golutra_config::ProviderSettings;
+    use ratatui::backend::TestBackend;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -4518,6 +4725,74 @@ mod tests {
     }
 
     #[test]
+    fn footer_context_shows_model_and_home_relative_workspace_without_wrapping() {
+        let workspace =
+            Path::new("/Users/skyseek/Desktop/project/open/golutra-agent/golutra-agent");
+        let label = workspace_path_label_with_home(workspace, Some(Path::new("/Users/skyseek")));
+
+        assert_eq!(
+            fit_model_and_workspace("gpt-5.6-sol ultra", &label, 120),
+            "gpt-5.6-sol ultra · ~/Desktop/project/open/golutra-agent/golutra-agent"
+        );
+
+        let narrow = fit_model_and_workspace("gpt-5.6-sol ultra", &label, 30);
+        assert!(display_width(&narrow) <= 30);
+        assert!(narrow.contains(" · "));
+        assert!(narrow.ends_with("agent"));
+    }
+
+    #[test]
+    fn bottom_pane_renders_context_instead_of_task_status() {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/home/test"));
+        let workspace = home.join("Desktop/project/open/golutra-agent/golutra-agent");
+        let app = TuiApp::new(
+            ThreadId::new(),
+            SessionId::new(),
+            None,
+            false,
+            "ready (custom)".to_owned(),
+            None,
+        )
+        .with_footer_context(workspace, "gpt-5.6-sol ultra");
+        let mut terminal = Terminal::new(TestBackend::new(100, 3)).expect("terminal");
+
+        terminal
+            .draw(|frame| draw_bottom_pane(frame, frame.area(), &app))
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        let footer = (0..100)
+            .filter_map(|x| buffer.cell((x, 2)))
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        let expected = "gpt-5.6-sol ultra · ~/Desktop/project/open/golutra-agent/golutra-agent";
+        assert!(footer.contains(expected));
+        assert_eq!(footer.find(expected), Some(2));
+        assert!(!footer.contains("ready"));
+    }
+
+    #[test]
+    fn provider_footer_adds_configured_reasoning_effort() {
+        let mut profile = ProviderProfile::openai_compatible(
+            "custom",
+            "https://api.example.com/v1",
+            "gpt-5.6-sol",
+            CredentialRef::ephemeral(SecretKind::ApiKey),
+        )
+        .expect("profile");
+        profile.generation_config = Some(ProviderGenerationConfig {
+            enable_thinking: true,
+            reasoning_effort: Some(ProviderReasoningEffort::Xhigh),
+            context_window_size: None,
+            max_tokens: None,
+        });
+
+        assert_eq!(provider_profile_footer_label(&profile), "gpt-5.6-sol xhigh");
+    }
+
+    #[test]
     fn transcript_role_markers_follow_codex_symbols() {
         assert_eq!(role_marker(&TranscriptRole::User), "› ");
         assert_eq!(role_marker(&TranscriptRole::Assistant), "• ");
@@ -4568,6 +4843,63 @@ mod tests {
         assert_eq!(review.credential, "ephemeral:***");
         assert!(!review.preview_json.contains("\"api_key\""));
         assert!(!review.preview_json.contains("test-key"));
+    }
+
+    #[tokio::test]
+    async fn auth_review_can_replace_an_unreadable_provider_config() {
+        let home = tempfile::tempdir().expect("home");
+        let _guard = env_lock_guard().await;
+        let previous_home = std::env::var("GOLUTRA_HOME").ok();
+        unsafe {
+            std::env::set_var("GOLUTRA_HOME", home.path());
+        }
+        std::fs::write(
+            home.path().join("provider.json"),
+            r#"{
+  "version": 2,
+  "active_profile": "legacy",
+  "profiles": [{
+    "name": "legacy",
+    "protocol": "openai-compatible",
+    "model_id": "legacy-model",
+    "base_url": "https://legacy.example.com/v1",
+    "credential_ref": {
+      "id": "cred_legacy",
+      "source": {"kind": "removed-backend"},
+      "secret_kind": "api-key",
+      "revision": "rev_legacy"
+    },
+    "enabled": true
+  }]
+}
+"#,
+        )
+        .expect("unreadable config");
+        let mut dialog = AuthDialogState::new();
+        dialog.provider = Some(OFFICIAL_PROVIDER_PRESET);
+        dialog.base_url = "https://api.golutra.cn/v1".to_owned();
+        dialog.model = "qwen-coder".to_owned();
+        dialog.api_key = "test-key".to_owned();
+
+        let review = build_auth_review(&dialog).expect("review");
+        dialog.review = Some(review.clone());
+        let lines = auth_review_lines(&dialog)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        match previous_home {
+            Some(value) => unsafe {
+                std::env::set_var("GOLUTRA_HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("GOLUTRA_HOME");
+            },
+        }
+        assert!(review.replaces_unreadable_config);
+        assert!(!review.updates_existing_profile);
+        assert!(lines.contains("will replace unreadable provider config"));
     }
 
     #[tokio::test]
