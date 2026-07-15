@@ -39,7 +39,7 @@
 - command ack/claim 与命令产生的全部业务事件尚未组成单一数据库事务；owner 在两者之间崩溃时可能重处理 provisional command，因此副作用仍必须依赖 checkpoint、policy 和幂等约束。
 - 已产生 `TurnStarted` 的中断 turn 不会自动重放；runtime 只能安全恢复尚未开始的 pending turn，并把原 active task 标为 cancelled。
 - checkpoint 对单文件使用临时文件 + fsync + 原子替换；多文件 rollback 会先完整校验 manifest，但不是跨文件系统事务。
-- `/events/replay`、DebugProjection 和 TUI 当前会物化请求范围内的完整历史；SSE 主链按页 replay，但超长 session 的显式全量 debug/export 仍需要后续分页协议和 UI 虚拟化。
+- `/events/replay`、DebugProjection 和显式 TUI developer mode 当前会物化请求范围内的完整历史；普通 TUI 不查询该投影。SSE 主链按页 replay，但超长 session 的显式全量 debug/export 仍需要后续分页协议和 UI 虚拟化。
 - 完整 OS sandbox、checkpoint retention、provider streaming、动态 capability discovery，以及运行中跨客户端 `ProviderAuthRequired` 请求仍属于后续边界；OAuth/SecretRef 本地 CLI/TUI 主链已完成。
 
 ## 实施原则
@@ -502,7 +502,7 @@ TUI P0 功能：
 - 展示 user projection。
 - 展示工具进度。
 - 展示 approval / abort 状态。
-- debug panel 最小展示 event timeline。
+- 普通启动只展示 UserProjection；显式 developer/debug panel 展示 runtime facts、verification、LoopDecision、evaluation/improvement 阶段计数和最近 event，不污染用户 transcript。
 
 任务：
 
@@ -785,7 +785,7 @@ P0 不做：
 - [x] P0.6-2 实现 VerificationRunner 和 terminal states。
 - [x] P0.7-1 实现 CLI 演示入口。
 - [x] P0.7-2 实现 `RuntimeHost + cwd thread resolver + 全局持久化 store`。
-- [x] P0.7-3 让 `EmbeddedTransport` 持有完整 `RuntimeHost`，并让 TUI composer / debug timeline 消费同一 runtime。
+- [x] P0.7-3 让 `EmbeddedTransport` 持有完整 `RuntimeHost`，并让 TUI composer / developer debug projection 消费同一 runtime。
 - [x] P0.8-1 实现 app-server command/query/SSE 演示入口。
 - [x] P0.8-2 实现 `cursor replay + live stream` SSE。
 - [x] P0.8-3 实现 test client 多入口一致性 smoke。

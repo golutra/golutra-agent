@@ -20,7 +20,7 @@ pub(crate) fn draw_ui(frame: &mut Frame<'_>, app: &TuiApp) {
         vec![
             Constraint::Length(1),
             Constraint::Min(8),
-            Constraint::Length(8),
+            Constraint::Length(10),
             Constraint::Length(bottom_height),
         ]
     } else {
@@ -38,7 +38,7 @@ pub(crate) fn draw_ui(frame: &mut Frame<'_>, app: &TuiApp) {
     draw_header(frame, chunks[0], app);
     draw_transcript(frame, chunks[1], app);
     if app.debug_mode {
-        draw_debug_timeline(frame, chunks[2], app);
+        draw_developer_panel(frame, chunks[2], app);
         draw_bottom_pane(frame, chunks[3], app);
     } else {
         draw_bottom_pane(frame, chunks[2], app);
@@ -75,7 +75,7 @@ pub(crate) fn header_mode(app: &TuiApp) -> String {
         return "  resume".to_owned();
     }
     if app.debug_mode {
-        return "  debug".to_owned();
+        return "  developer".to_owned();
     }
     match app.projection.as_ref().map(|projection| projection.status) {
         Some(golutra_core::TaskStatus::Running) => "  running".to_owned(),
@@ -709,35 +709,46 @@ pub(crate) fn resume_picker_offset(
         .min(last_window_start)
 }
 
-pub(crate) fn draw_debug_timeline(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let mut lines = event_timeline_lines(&app.events);
-    lines.truncate(6);
-
-    let items = if lines.is_empty() {
-        vec![ListItem::new(Line::from(Span::styled(
-            "no runtime events yet",
-            Style::default().fg(Color::DarkGray),
-        )))]
+pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let content_width = usize::from(area.width.saturating_sub(2));
+    let rows = if let Some(error) = &app.developer_error {
+        vec![DeveloperPanelRow::Summary(format!("error {}", error))]
+    } else if let Some(projection) = &app.developer_projection {
+        developer_panel_rows(projection, 4)
     } else {
-        lines
-            .into_iter()
-            .rev()
-            .map(|line| {
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!("#{} ", line.sequence_no),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::styled(line.label, Style::default().fg(Color::Yellow)),
-                    Span::styled("  ", Style::default()),
-                    Span::raw(line.summary),
-                ]))
-            })
-            .collect()
+        vec![DeveloperPanelRow::Summary(
+            "loading developer projection".to_owned(),
+        )]
     };
+    let items = rows
+        .into_iter()
+        .map(|row| match row {
+            DeveloperPanelRow::Summary(summary) => ListItem::new(Line::from(Span::styled(
+                truncate_end_to_width(&summary, content_width),
+                Style::default().fg(Color::Cyan),
+            ))),
+            DeveloperPanelRow::Event {
+                sequence_no,
+                label,
+                summary,
+            } => {
+                let sequence = format!("#{sequence_no} ");
+                let summary_width = content_width
+                    .saturating_sub(display_width(&sequence))
+                    .saturating_sub(display_width(&label))
+                    .saturating_sub(2);
+                ListItem::new(Line::from(vec![
+                    Span::styled(sequence, Style::default().fg(Color::DarkGray)),
+                    Span::styled(label, Style::default().fg(Color::Yellow)),
+                    Span::styled("  ", Style::default()),
+                    Span::raw(truncate_end_to_width(&summary, summary_width)),
+                ]))
+            }
+        })
+        .collect::<Vec<_>>();
     let list = List::new(items).block(
         Block::default()
-            .title("Debug timeline")
+            .title("Developer runtime")
             .borders(Borders::TOP),
     );
     frame.render_widget(list, area);

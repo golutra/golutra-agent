@@ -389,7 +389,7 @@ golutra-tui
 - fork 必须复制完整 history 或明确的 turn boundary、重新生成 runtime IDs 并保留 immutable artifact lineage；普通 resume/fork 不能跨 canonical cwd。
 - cwd 迁移只能通过显式 rebind，要求 inactive/unowned thread 和精确旧路径；checkpoint、memory、evaluation 不能被无条件解释为新 cwd 事实。
 
-当前这些边界已经落地：TUI 默认创建新的本地 thread/session，首个 prompt 才持久化；`/resume` 按当前 canonical cwd 过滤全局历史；`/fork --from-turn`、rollout export 和 thread rebind 通过同一 transport/API；普通 transcript 只渲染用户可见事件，debug timeline 才展开 runtime facts。
+当前这些边界已经落地：TUI 默认创建新的本地 thread/session，首个 prompt 才持久化；`/resume` 按当前 canonical cwd 过滤全局历史；`/fork --from-turn`、rollout export 和 thread rebind 通过同一 transport/API；普通 transcript 只渲染用户可见事件，也不查询开发者投影。只有显式 `--debug` 或 `/debug` 才启用 developer mode，按事件刷新 `DebugProjection` 并展示事实、verification、LoopDecision、evaluation/improvement 阶段计数和最近 runtime event。
 
 daemon/remote 模式的最低可用目标不是“界面完整”，而是：
 
@@ -428,6 +428,7 @@ Debug / Audit / Replay 模式使用 `Debug / Audit Projection`：
 
 - 展示 runtime event、LoopDecision、PolicyEvaluation、EvidenceRecord、VerificationRecord、context projection、token budget、provider raw event。
 - 用于调试、复盘、benchmark 和回归验证。
+- TUI developer mode 提供同步运行时摘要和最近事件；完整历史、artifact/evidence 明细继续由 `golutra trace`、`golutra export` 或 SDK debug query 获取，避免把全量审计数据塞进终端主对话区。
 
 Evaluation / Improvement 模式使用 `Evaluation / Improvement Projection`：
 

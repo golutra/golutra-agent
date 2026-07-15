@@ -33,8 +33,8 @@ use golutra_protocol::{
 };
 use golutra_tui::{
     AuthConfigScope, AuthCredentialStore, OAuthLoginCommand, OpenAiCompatibleLogin,
-    SlashAuthCommand, SlashCommand, SlashCommandCandidate, SlashInput, event_timeline_lines,
-    parse_slash_input, slash_command_candidates,
+    SlashAuthCommand, SlashCommand, SlashCommandCandidate, SlashInput, parse_slash_input,
+    slash_command_candidates,
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use secrecy::SecretString;
@@ -48,10 +48,12 @@ static TUI_ACTOR_ID: LazyLock<String> =
 
 mod auth_flow;
 mod auth_state;
+mod developer;
 mod render;
 mod session;
 pub(crate) use auth_flow::*;
 pub(crate) use auth_state::*;
+pub(crate) use developer::*;
 pub(crate) use render::*;
 pub(crate) use session::*;
 
@@ -79,6 +81,8 @@ struct TuiApp {
     session_id: SessionId,
     task_id: Option<TaskId>,
     projection: Option<UserProjection>,
+    developer_projection: Option<golutra_protocol::DebugProjection>,
+    developer_error: Option<String>,
     events: Vec<Value>,
     command_messages: Vec<TranscriptItem>,
     resume_picker: Option<ResumePickerState>,
@@ -134,6 +138,8 @@ impl TuiApp {
             session_id,
             task_id,
             projection: None,
+            developer_projection: None,
+            developer_error: None,
             events: Vec::new(),
             command_messages: Vec::new(),
             resume_picker: None,
@@ -187,7 +193,39 @@ impl TuiApp {
         self.projection = serde_json::from_value(projection)
             .map(Some)
             .map_err(|error| miette::miette!("{error}"))?;
+        if self.debug_mode {
+            match load_debug_projection(transport, self.session_id, self.task_id).await {
+                Ok(projection) => {
+                    self.developer_projection = Some(projection);
+                    self.developer_error = None;
+                }
+                Err(error) => {
+                    self.developer_projection = None;
+                    self.developer_error = Some(error);
+                }
+            }
+        } else {
+            self.developer_projection = None;
+            self.developer_error = None;
+        }
         self.sync_transcript_row_count(previous_row_count);
+        Ok(())
+    }
+
+    async fn set_debug_mode(
+        &mut self,
+        transport: &RuntimeTransport,
+        enabled: bool,
+    ) -> miette::Result<()> {
+        self.debug_mode = enabled;
+        if enabled {
+            self.refresh(transport).await?;
+            self.status_message = "developer runtime view visible".to_owned();
+        } else {
+            self.developer_projection = None;
+            self.developer_error = None;
+            self.status_message = "developer runtime view hidden".to_owned();
+        }
         Ok(())
     }
 
@@ -456,6 +494,8 @@ impl TuiApp {
                 self.session_id = thread.session_id;
                 self.task_id = None;
                 self.projection = None;
+                self.developer_projection = None;
+                self.developer_error = None;
                 self.events.clear();
                 self.command_messages.clear();
                 self.input.clear();
@@ -504,12 +544,7 @@ impl TuiApp {
                 );
             }
             SlashCommand::Debug => {
-                self.debug_mode = !self.debug_mode;
-                self.status_message = if self.debug_mode {
-                    "debug timeline visible".to_owned()
-                } else {
-                    "debug timeline hidden".to_owned()
-                };
+                self.set_debug_mode(transport, !self.debug_mode).await?;
             }
             SlashCommand::Takeover => {
                 self.send_control_command(transport, SessionCommandKind::Takeover)
@@ -581,6 +616,8 @@ impl TuiApp {
         self.session_id = SessionId::new();
         self.task_id = None;
         self.projection = None;
+        self.developer_projection = None;
+        self.developer_error = None;
         self.events.clear();
         self.command_messages.clear();
         self.input.clear();
@@ -605,6 +642,8 @@ impl TuiApp {
         self.session_id = thread.session_id;
         self.task_id = None;
         self.projection = None;
+        self.developer_projection = None;
+        self.developer_error = None;
         self.events.clear();
         self.command_messages.clear();
         self.input.clear();
@@ -1152,13 +1191,6 @@ async fn handle_key(
         KeyCode::Tab => {
             if app.move_slash_selection(ResumeSelectionDirection::Next) {
                 app.status_message = "slash command selected".to_owned();
-            } else {
-                app.debug_mode = !app.debug_mode;
-                app.status_message = if app.debug_mode {
-                    "debug timeline visible".to_owned()
-                } else {
-                    "debug timeline hidden".to_owned()
-                };
             }
         }
         KeyCode::Up => {
@@ -1271,7 +1303,7 @@ fn slash_help_lines() -> Vec<String> {
         "/auth login --base-url <url> --model <model> [--api-key <key>|--api-key-env <env>] [--scope user]".to_owned(),
         "/auth use <profile> [user]  activate saved global provider profile".to_owned(),
         "/status  show current session/task status".to_owned(),
-        "/debug  toggle debug timeline".to_owned(),
+        "/debug  toggle developer runtime facts and event view".to_owned(),
         "/abort  abort active task".to_owned(),
         "/pause  pause active task".to_owned(),
         "/continue  resume paused task".to_owned(),

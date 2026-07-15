@@ -363,6 +363,30 @@ async fn q_key_does_not_exit_tui() {
 }
 
 #[tokio::test]
+async fn tab_without_slash_candidates_does_not_enable_developer_mode() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+
+    handle_key(
+        KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("handle key");
+
+    assert!(!app.debug_mode);
+    assert!(app.developer_projection.is_none());
+}
+
+#[tokio::test]
 async fn ctrl_c_requires_second_press_to_exit() {
     let transport = RuntimeTransport::in_memory().await.expect("transport");
     let mut app = TuiApp::new(
@@ -1161,6 +1185,256 @@ fn normal_transcript_keeps_only_user_visible_runtime_milestones() {
 }
 
 #[test]
+fn developer_panel_exposes_governance_without_leaking_into_normal_view() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let events = vec![
+        transcript_event(
+            1,
+            session_id,
+            task_id,
+            RuntimeEventType::ProviderStarted,
+            json!({"summary": "provider request started"}),
+        ),
+        transcript_event(
+            2,
+            session_id,
+            task_id,
+            RuntimeEventType::ToolCompleted,
+            json!({"summary": "file written"}),
+        ),
+        transcript_event(
+            3,
+            session_id,
+            task_id,
+            RuntimeEventType::VerificationCompleted,
+            json!({"summary": "verification result: Pass"}),
+        ),
+        transcript_event(
+            4,
+            session_id,
+            task_id,
+            RuntimeEventType::PostTaskReviewed,
+            json!({"summary": "deep post-task review outcome: pass"}),
+        ),
+        transcript_event(
+            5,
+            session_id,
+            task_id,
+            RuntimeEventType::EvaluationCompleted,
+            json!({"summary": "task evaluation verdict: Pass"}),
+        ),
+        transcript_event(
+            6,
+            session_id,
+            task_id,
+            RuntimeEventType::ImprovementCandidateCreated,
+            json!({"summary": "improvement candidate proposed"}),
+        ),
+        transcript_event(
+            7,
+            session_id,
+            task_id,
+            RuntimeEventType::RegressionCompleted,
+            json!({"summary": "candidate regression completed"}),
+        ),
+        transcript_event(
+            8,
+            session_id,
+            task_id,
+            RuntimeEventType::PromotionDecided,
+            json!({"summary": "candidate promotion decision: Approve"}),
+        ),
+    ];
+    let verification = golutra_core::VerificationRecord {
+        verification_id: golutra_core::VerificationId::new(),
+        task_id,
+        objective: "write a file".to_owned(),
+        completion_criteria: vec!["file exists".to_owned()],
+        checks: vec![golutra_core::VerificationCheck {
+            name: "file_exists".to_owned(),
+            command: None,
+            passed: true,
+            evidence_refs: Vec::new(),
+            message: "file exists".to_owned(),
+        }],
+        evidence_refs: Vec::new(),
+        result: golutra_core::VerificationResult::Pass,
+        policy_status: "verified".to_owned(),
+        residual_risks: Vec::new(),
+    };
+    let debug_projection = golutra_protocol::DebugProjection {
+        session_id,
+        task_id: Some(task_id),
+        events: events
+            .clone()
+            .into_iter()
+            .map(|value| serde_json::from_value(value).expect("runtime event"))
+            .collect(),
+        busy_policy_decisions: Vec::new(),
+        tool_results: Vec::new(),
+        artifacts: Vec::new(),
+        evidence: Vec::new(),
+        verification: Some(verification),
+        loop_decisions: Vec::new(),
+    };
+
+    let rows = developer_panel_rows(&debug_projection, 2);
+    let row_text = rows
+        .iter()
+        .map(|row| format!("{row:?}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(row_text.contains("verify Pass checks=1 evidence=0 risks=0"));
+    assert!(
+        row_text.contains(
+            "reviews=1 evaluations=1 improvements=1 regressions=1 promotions=1 applied=0"
+        )
+    );
+    assert!(row_text.contains("sequence_no: 7"));
+    assert!(row_text.contains("RegressionCompleted/Runtime"));
+    assert!(row_text.contains("sequence_no: 8"));
+    assert!(row_text.contains("PromotionDecided/Runtime"));
+
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.developer_projection = Some(debug_projection);
+    let mut normal_terminal = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
+    normal_terminal
+        .draw(|frame| draw_ui(frame, &app))
+        .expect("draw normal view");
+    let normal_text = normal_terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(!normal_text.contains("Developer runtime"));
+
+    app.debug_mode = true;
+    let mut developer_terminal = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
+    developer_terminal
+        .draw(|frame| draw_ui(frame, &app))
+        .expect("draw developer view");
+    let developer_text = developer_terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(developer_text.contains("Developer runtime"));
+    assert!(developer_text.contains("verify Pass"));
+}
+
+#[tokio::test]
+async fn developer_projection_is_only_loaded_in_explicit_debug_mode() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+
+    app.refresh(&transport).await.expect("normal refresh");
+    assert!(app.developer_projection.is_none());
+
+    app.set_debug_mode(&transport, true)
+        .await
+        .expect("enable developer mode");
+    assert!(app.developer_projection.is_some());
+    assert!(app.developer_error.is_none());
+
+    app.set_debug_mode(&transport, false)
+        .await
+        .expect("disable developer mode");
+    assert!(app.developer_projection.is_none());
+    assert!(app.developer_error.is_none());
+}
+
+#[tokio::test]
+async fn developer_mode_observes_runtime_verification_and_evaluation_events() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let session_id = SessionId::new();
+    let thread_id = ThreadId::new();
+    transport
+        .send_command(session_command(
+            session_id,
+            SessionCommandKind::Prompt,
+            json!({
+                "prompt": "hello",
+                "_thread_id": thread_id.to_string(),
+            }),
+        ))
+        .await
+        .expect("start task");
+
+    let completed = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let projection = transport
+                .query(RuntimeQuery {
+                    query_id: QueryId::new(),
+                    session_id,
+                    task_id: None,
+                    kind: RuntimeQueryKind::UserProjection,
+                    requester: ActorKind::Tui,
+                    cursor: None,
+                    timestamp: chrono::Utc::now(),
+                })
+                .await
+                .expect("projection");
+            if golutra_client::projection_status(&projection)
+                == Some(golutra_core::TaskStatus::Completed)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(completed.is_ok(), "runtime task should complete");
+
+    let mut app = TuiApp::new(
+        thread_id,
+        session_id,
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.set_debug_mode(&transport, true)
+        .await
+        .expect("enable developer mode");
+    let projection = app
+        .developer_projection
+        .as_ref()
+        .expect("developer projection");
+    assert!(projection.verification.is_some());
+    assert!(
+        projection
+            .events
+            .iter()
+            .any(|event| { event.event_type == RuntimeEventType::VerificationCompleted })
+    );
+    assert!(
+        projection
+            .events
+            .iter()
+            .any(|event| { event.event_type == RuntimeEventType::EvaluationCompleted })
+    );
+}
+
+#[test]
 fn failed_loop_decision_is_visible_in_transcript() {
     let mut app = TuiApp::new(
         ThreadId::new(),
@@ -1543,6 +1817,8 @@ fn start_new_session_resets_visible_tui_state() {
         final_message: Some("old answer".to_owned()),
         residual_risks: Vec::new(),
     });
+    app.developer_error = Some("old developer state".to_owned());
+    app.debug_mode = true;
     app.command_messages.push(TranscriptItem {
         role: TranscriptRole::System,
         title: "Old".to_owned(),
@@ -1565,6 +1841,8 @@ fn start_new_session_resets_visible_tui_state() {
     assert_ne!(app.session_id, original_session_id);
     assert!(app.task_id.is_none());
     assert!(app.projection.is_none());
+    assert!(app.developer_projection.is_none());
+    assert!(app.developer_error.is_none());
     assert!(app.command_messages.is_empty());
     assert!(app.events.is_empty());
     assert!(app.input.is_empty());
