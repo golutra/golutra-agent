@@ -1535,6 +1535,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "unicode-segmentation",
+ "unicode-width 0.1.14",
  "uuid",
 ]
 

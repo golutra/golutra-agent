@@ -3,6 +3,7 @@ use golutra_config::ProviderSettings;
 use golutra_llm::ProviderReasoningEffort;
 use golutra_protocol::VisibleStep;
 use ratatui::backend::TestBackend;
+use ratatui::layout::{Position, Rect};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -359,7 +360,108 @@ async fn q_key_does_not_exit_tui() {
     .expect("handle key");
 
     assert!(!app.should_quit);
-    assert_eq!(app.input, "q");
+    assert_eq!(app.input.text(), "q");
+}
+
+#[tokio::test]
+async fn composer_keys_edit_unicode_at_the_grapheme_boundary() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+
+    for character in ['你', '好', '👍'] {
+        handle_key(
+            KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            &mut app,
+            &transport,
+        )
+        .await
+        .expect("insert character");
+    }
+    handle_key(
+        KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("move cursor");
+    handle_key(
+        KeyEvent::new(KeyCode::Char('啊'), KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("insert in the middle");
+    assert_eq!(app.input.text(), "你好啊👍");
+
+    handle_key(
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("delete grapheme");
+    assert_eq!(app.input.text(), "你好👍");
+}
+
+#[test]
+fn bracketed_paste_preserves_chinese_and_newlines() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+
+    handle_paste("你好\r\n世界", &mut app);
+
+    assert_eq!(app.input.text(), "你好\n世界");
+    assert_eq!(app.input.cursor(), "你好\n世界".len());
+}
+
+#[test]
+fn composer_renders_terminal_cursor_at_unicode_display_column() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.input.set_text("你好");
+    app.input.move_left();
+    let mut terminal = Terminal::new(TestBackend::new(40, 3)).expect("terminal");
+
+    terminal
+        .draw(|frame| draw_bottom_pane(frame, frame.area(), &app))
+        .expect("draw");
+
+    terminal
+        .backend_mut()
+        .assert_cursor_position(Position::new(4, 1));
+}
+
+#[test]
+fn composer_hides_cursor_when_the_terminal_is_too_narrow_for_input() {
+    let app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+
+    assert_eq!(composer_cursor_position(Rect::new(0, 0, 2, 3), &app), None);
 }
 
 #[tokio::test]
@@ -421,7 +523,7 @@ fn slash_candidates_render_below_composer_with_selection() {
         "ready (mock)".to_owned(),
         None,
     );
-    app.input = "/".to_owned();
+    app.input.set_text("/");
     app.slash_selected = 2;
     let candidates = app.slash_candidates();
     let lines = slash_candidate_lines(&app, &candidates)
@@ -1780,7 +1882,7 @@ async fn resume_thread_clears_previous_visible_transcript_state() {
         body: vec!["old session only".to_owned()],
     });
     app.events.push(json!({"old": true}));
-    app.input = "/resume".to_owned();
+    app.input.set_text("/resume");
     app.slash_selected = 2;
     app.transcript_scroll_offset = 12;
     app.transcript_row_count = 30;
@@ -1825,7 +1927,7 @@ fn start_new_session_resets_visible_tui_state() {
         body: vec!["old session only".to_owned()],
     });
     app.events.push(json!({"old": true}));
-    app.input = "/new".to_owned();
+    app.input.set_text("/new");
     app.slash_selected = 2;
     app.cursor = Some(9);
     app.resume_picker = Some(ResumePickerState {

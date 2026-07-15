@@ -7,8 +7,10 @@ use std::{
 
 use clap::Parser;
 use crossterm::{
+    cursor::SetCursorStyle,
     event::{
-        self, Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
+        self, DisableBracketedPaste, EnableBracketedPaste, Event as CrosstermEvent, KeyCode,
+        KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -48,11 +50,13 @@ static TUI_ACTOR_ID: LazyLock<String> =
 
 mod auth_flow;
 mod auth_state;
+mod composer_input;
 mod developer;
 mod render;
 mod session;
 pub(crate) use auth_flow::*;
 pub(crate) use auth_state::*;
+pub(crate) use composer_input::*;
 pub(crate) use developer::*;
 pub(crate) use render::*;
 pub(crate) use session::*;
@@ -88,7 +92,7 @@ struct TuiApp {
     resume_picker: Option<ResumePickerState>,
     auth_dialog: Option<AuthDialogState>,
     auth_operation: Option<PendingAuthOperation>,
-    input: String,
+    input: ComposerInput,
     slash_selected: usize,
     status_message: String,
     provider_message: String,
@@ -145,7 +149,7 @@ impl TuiApp {
             resume_picker: None,
             auth_dialog,
             auth_operation: None,
-            input: String::new(),
+            input: ComposerInput::default(),
             slash_selected: 0,
             status_message: String::new(),
             provider_message,
@@ -259,7 +263,7 @@ impl TuiApp {
             return Ok(());
         }
 
-        let input = self.input.trim().to_owned();
+        let input = self.input.trimmed();
         match parse_slash_input(&input) {
             SlashInput::Prompt(prompt) => self.send_runtime_prompt(transport, prompt).await,
             SlashInput::Command(command) => {
@@ -289,15 +293,15 @@ impl TuiApp {
         else {
             return Ok(false);
         };
-        let trimmed_input = self.input.trim();
+        let trimmed_input = self.input.text().trim();
         if trimmed_input.starts_with(&format!("{} ", candidate.command)) {
             return Ok(false);
         }
         if candidate.execute_on_select {
-            self.input = candidate.command;
+            self.input.set_text(candidate.command);
             self.send_prompt(transport).await?;
         } else {
-            self.input = format!("{} ", candidate.command);
+            self.input.set_text(format!("{} ", candidate.command));
             self.slash_selected = 0;
             self.status_message = "complete slash command arguments".to_owned();
         }
@@ -311,7 +315,7 @@ impl TuiApp {
         {
             return Vec::new();
         }
-        slash_command_candidates(&self.input)
+        slash_command_candidates(self.input.text())
     }
 
     fn move_slash_selection(&mut self, direction: ResumeSelectionDirection) -> bool {
@@ -1091,6 +1095,9 @@ async fn run_app(
                 CrosstermEvent::Mouse(mouse) => {
                     handle_mouse(mouse, &mut app);
                 }
+                CrosstermEvent::Paste(pasted) => {
+                    handle_paste(&pasted, &mut app);
+                }
                 _ => {}
             }
         }
@@ -1140,6 +1147,9 @@ async fn handle_key(
     app: &mut TuiApp,
     transport: &RuntimeTransport,
 ) -> miette::Result<()> {
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return Ok(());
+    }
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return app.interrupt_or_quit(transport).await;
     }
@@ -1182,7 +1192,20 @@ async fn handle_key(
             }
         }
         KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.abort(transport).await?;
+            app.input.move_to_start();
+        }
+        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.input.move_to_end();
+        }
+        KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.input.move_left();
+        }
+        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.input.move_right();
+        }
+        KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.input.delete_backward();
+            app.reset_slash_selection();
         }
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.input.clear();
@@ -1206,10 +1229,24 @@ async fn handle_key(
             app.scroll_transcript(TranscriptScrollAction::PageDown, transcript_page_rows(app));
         }
         KeyCode::Home => {
-            app.scroll_transcript(TranscriptScrollAction::Top, transcript_page_rows(app));
+            if app.input.is_empty() {
+                app.scroll_transcript(TranscriptScrollAction::Top, transcript_page_rows(app));
+            } else {
+                app.input.move_to_start();
+            }
         }
         KeyCode::End => {
-            app.scroll_transcript(TranscriptScrollAction::Bottom, transcript_page_rows(app));
+            if app.input.is_empty() {
+                app.scroll_transcript(TranscriptScrollAction::Bottom, transcript_page_rows(app));
+            } else {
+                app.input.move_to_end();
+            }
+        }
+        KeyCode::Left => {
+            app.input.move_left();
+        }
+        KeyCode::Right => {
+            app.input.move_right();
         }
         KeyCode::Enter => {
             if !app.accept_slash_candidate(transport).await? {
@@ -1217,16 +1254,46 @@ async fn handle_key(
             }
         }
         KeyCode::Backspace => {
-            app.input.pop();
+            app.input.delete_backward();
             app.reset_slash_selection();
         }
-        KeyCode::Char(character) => {
-            app.input.push(character);
+        KeyCode::Delete => {
+            app.input.delete_forward();
+            app.reset_slash_selection();
+        }
+        KeyCode::Char(character)
+            if !key.modifiers.intersects(
+                KeyModifiers::CONTROL
+                    | KeyModifiers::ALT
+                    | KeyModifiers::SUPER
+                    | KeyModifiers::HYPER
+                    | KeyModifiers::META,
+            ) =>
+        {
+            app.input.insert_char(character);
             app.reset_slash_selection();
         }
         _ => {}
     }
     Ok(())
+}
+
+fn handle_paste(pasted: &str, app: &mut TuiApp) {
+    if app.resume_picker.is_some() {
+        return;
+    }
+
+    let normalized = pasted.replace("\r\n", "\n").replace('\r', "\n");
+    if let Some(dialog) = &mut app.auth_dialog {
+        if let Some(input) = dialog.current_input_mut() {
+            input.push_str(&normalized.replace('\n', ""));
+            dialog.error = None;
+        }
+        return;
+    }
+
+    app.input.insert_str(&normalized);
+    app.reset_slash_selection();
 }
 
 fn handle_mouse(mouse: MouseEvent, app: &mut TuiApp) {
@@ -1277,13 +1344,19 @@ fn setup_terminal() -> miette::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode().map_err(|error| miette::miette!("{error}"))?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).map_err(|error| miette::miette!("{error}"))?;
+    let _ = execute!(stdout, EnableBracketedPaste, SetCursorStyle::SteadyBar);
     Terminal::new(CrosstermBackend::new(stdout)).map_err(|error| miette::miette!("{error}"))
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> miette::Result<()> {
     disable_raw_mode().map_err(|error| miette::miette!("{error}"))?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)
-        .map_err(|error| miette::miette!("{error}"))?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        SetCursorStyle::DefaultUserShape,
+        LeaveAlternateScreen
+    )
+    .map_err(|error| miette::miette!("{error}"))?;
     terminal
         .show_cursor()
         .map_err(|error| miette::miette!("{error}"))

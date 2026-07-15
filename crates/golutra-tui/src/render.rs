@@ -14,8 +14,12 @@ use ratatui::{
 
 use super::*;
 
+const COMPOSER_PREFIX: &str = "› ";
+const COMPOSER_PREFIX_WIDTH: u16 = 2;
+const MAX_COMPOSER_ROWS: u16 = 5;
+
 pub(crate) fn draw_ui(frame: &mut Frame<'_>, app: &TuiApp) {
-    let bottom_height = bottom_pane_height(app);
+    let bottom_height = bottom_pane_height_for_width(app, frame.area().width);
     let constraints = if app.debug_mode {
         vec![
             Constraint::Length(1),
@@ -45,11 +49,30 @@ pub(crate) fn draw_ui(frame: &mut Frame<'_>, app: &TuiApp) {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn bottom_pane_height(app: &TuiApp) -> u16 {
+    let width = size().map(|(width, _)| width).unwrap_or(80);
+    bottom_pane_height_for_width(app, width)
+}
+
+pub(crate) fn bottom_pane_height_for_width(app: &TuiApp, width: u16) -> u16 {
     let slash_rows = app.slash_candidates().len() as u16;
     let overlay_rows = u16::from(app.auth_dialog.is_some() || app.resume_picker.is_some());
     let provider_rows = u16::from(provider_footer_line(app).is_some());
-    3 + slash_rows + overlay_rows + provider_rows
+    let composer_rows = if app.auth_dialog.is_some() || app.resume_picker.is_some() {
+        1
+    } else {
+        app.input
+            .viewport(
+                width.saturating_sub(COMPOSER_PREFIX_WIDTH).max(1),
+                MAX_COMPOSER_ROWS,
+            )
+            .lines
+            .len()
+            .try_into()
+            .unwrap_or(MAX_COMPOSER_ROWS)
+    };
+    2 + composer_rows + slash_rows + overlay_rows + provider_rows
 }
 
 pub(crate) fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
@@ -763,19 +786,37 @@ pub(crate) fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
         None
     };
     let candidates = app.slash_candidates();
-    let input_line = if let Some(dialog) = &app.auth_dialog {
-        auth_composer_line(dialog)
+    let mut lines = if let Some(dialog) = &app.auth_dialog {
+        vec![Line::from(vec![
+            Span::styled(COMPOSER_PREFIX, Style::default().fg(Color::Cyan)),
+            Span::styled(auth_composer_line(dialog), composer_style(app)),
+        ])]
     } else if app.resume_picker.is_some() {
-        "Select a session to resume".to_owned()
-    } else if app.input.is_empty() {
-        "Ask Golutra to change code or inspect the workspace".to_owned()
+        vec![Line::from(vec![
+            Span::styled(COMPOSER_PREFIX, Style::default().fg(Color::Cyan)),
+            Span::styled("Select a session to resume", composer_style(app)),
+        ])]
     } else {
-        app.input.clone()
+        let text_width = area.width.saturating_sub(COMPOSER_PREFIX_WIDTH).max(1);
+        let viewport = app.input.viewport(text_width, MAX_COMPOSER_ROWS);
+        viewport
+            .lines
+            .into_iter()
+            .enumerate()
+            .map(|(index, line)| {
+                let prefix = if index == 0 { COMPOSER_PREFIX } else { "  " };
+                let content = if index == 0 && app.input.is_empty() {
+                    "Ask Golutra to change code or inspect the workspace".to_owned()
+                } else {
+                    line
+                };
+                Line::from(vec![
+                    Span::styled(prefix, Style::default().fg(Color::Cyan)),
+                    Span::styled(content, composer_style(app)),
+                ])
+            })
+            .collect()
     };
-    let mut lines = vec![Line::from(vec![
-        Span::styled("› ", Style::default().fg(Color::Cyan)),
-        Span::styled(input_line, composer_style(app)),
-    ])];
     lines.extend(slash_candidate_lines(app, &candidates));
     if overlay_help.is_some() {
         lines.push(footer_status_line(app));
@@ -794,10 +835,50 @@ pub(crate) fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
             Style::default().fg(Color::DarkGray),
         )));
     }
-    let paragraph = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::TOP))
-        .wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::TOP));
     frame.render_widget(paragraph, area);
+    if let Some((x, y)) = composer_cursor_position(area, app) {
+        frame.set_cursor_position((x, y));
+    }
+}
+
+pub(crate) fn composer_cursor_position(area: Rect, app: &TuiApp) -> Option<(u16, u16)> {
+    if app.resume_picker.is_some() || area.width <= COMPOSER_PREFIX_WIDTH || area.height <= 1 {
+        return None;
+    }
+
+    let text_x = area.x.saturating_add(COMPOSER_PREFIX_WIDTH);
+    let text_width = area.width.saturating_sub(COMPOSER_PREFIX_WIDTH).max(1);
+    let cursor = if app.auth_dialog.is_some() {
+        auth_cursor_column(app.auth_dialog.as_ref()?)?
+    } else {
+        let viewport = app.input.viewport(text_width, MAX_COMPOSER_ROWS);
+        return Some((
+            text_x.saturating_add(viewport.cursor.0),
+            area.y
+                .saturating_add(1)
+                .saturating_add(viewport.cursor.1)
+                .min(area.bottom().saturating_sub(1)),
+        ));
+    };
+
+    Some((
+        text_x.saturating_add(cursor.min(text_width.saturating_sub(1))),
+        area.y.saturating_add(1),
+    ))
+}
+
+fn auth_cursor_column(dialog: &AuthDialogState) -> Option<u16> {
+    let value = match dialog.step {
+        AuthDialogStep::BaseUrl => Some(dialog.base_url.as_str()),
+        AuthDialogStep::ApiKey => {
+            return Some(dialog.api_key.chars().count().min(u16::MAX as usize) as u16);
+        }
+        AuthDialogStep::EnvKey => Some(dialog.api_key_env.as_str()),
+        AuthDialogStep::Model if dialog.is_custom_model_selected() => Some(dialog.model.as_str()),
+        _ => None,
+    }?;
+    Some(display_width(value).min(u16::MAX as usize) as u16)
 }
 
 pub(crate) fn slash_candidate_lines(
@@ -1112,11 +1193,11 @@ pub(crate) fn transcript_visible_window(
 }
 
 pub(crate) fn transcript_page_rows(app: &TuiApp) -> usize {
-    let terminal_height = size().map(|(_, height)| height).unwrap_or(24);
+    let (terminal_width, terminal_height) = size().unwrap_or((80, 24));
     usize::from(
         terminal_height
             .saturating_sub(1)
-            .saturating_sub(bottom_pane_height(app))
+            .saturating_sub(bottom_pane_height_for_width(app, terminal_width))
             .saturating_sub(1)
             .max(1),
     )

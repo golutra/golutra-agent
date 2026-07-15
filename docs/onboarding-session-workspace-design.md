@@ -311,10 +311,12 @@ TUI 输入框现在先经过 slash command parser：
 - 输入 `/` 或 `/auth ` 时，底部输入框下方显示候选命令列表，而不是只显示一行 help 文案。
 - Up/Down 或 Tab 可移动候选，Enter 会启动可直接执行的命令；需要参数的命令会先补全命令文本并等待用户继续输入。
 - `/resume` 选择 session 后会清空当前 TUI 的本地 command messages、event cursor、输入框和 transcript scroll 状态，再 replay 目标 session 的历史；这样不会把旧 session 的提示或历史混到新 session。
-- 普通 transcript 默认跟随最新内容；PageUp/PageDown 按页翻历史，Home/End 跳到最旧/最新。TUI 默认不捕获鼠标，优先保留终端选择复制能力。
+- 普通 transcript 默认跟随最新内容；PageUp/PageDown 按页翻历史，输入框有草稿时 Home/End 移动编辑光标，草稿为空时 Home/End 才跳到最旧/最新。TUI 默认不捕获鼠标，优先保留终端选择复制能力。
 - 普通 `q` 是文本输入，不作为全局退出键。
 - Ctrl+C 第一按用于中断当前运行任务并展示退出提示；在短时间内第二次按 Ctrl+C 才退出 TUI。
 - Esc 用于关闭局部 picker/dialog 或清空当前输入，不作为常规退出路径。
+- 主输入框按 Unicode grapheme cluster 编辑，左右移动、删除不会拆开中文、emoji 或组合字符；光标列按终端显示宽度计算并在每帧显式同步，输入过长时视口跟随光标。
+- TUI 开启 bracketed paste，粘贴内容以完整字符串事件插入并将 CR/CRLF 归一为 LF；非 ASCII 的 IME 提交字符直接插入，不等待 ASCII 粘贴启发式。
 
 ## 当前差距
 

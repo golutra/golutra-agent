@@ -37,7 +37,7 @@ pub(crate) async fn handle_auth_dialog_key(
                 .as_mut()
                 .and_then(AuthDialogState::current_input_mut)
             {
-                input.pop();
+                delete_last_grapheme(input);
             }
         }
         KeyCode::Enter => {
