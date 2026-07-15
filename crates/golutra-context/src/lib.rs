@@ -156,6 +156,7 @@ fn trim_contributors(contributors: &mut [ContextContributor], budget_limit: u64)
     }
 
     const TRIM_PRIORITY: &[&str] = &[
+        "project_skills",
         "memory",
         "conversation_history",
         "environment_context",
@@ -232,7 +233,18 @@ pub fn token_usage_record(
     response_event_id: golutra_core::ProviderResponseId,
     budget_snapshot: &TokenBudgetSnapshot,
     usage: &ProviderUsage,
+    cost_model: &str,
 ) -> TokenUsageRecord {
+    let system_prompt_tokens = message_tokens(request, ProviderRole::System);
+    let user_message_tokens = message_tokens(request, ProviderRole::User);
+    let assistant_recent_tokens = message_tokens(request, ProviderRole::Assistant);
+    let tool_result_tokens = message_tokens(request, ProviderRole::Tool);
+    let total_tokens = usage.total_tokens.or_else(|| {
+        usage
+            .input_tokens
+            .zip(usage.output_tokens)
+            .map(|(input, output)| input.saturating_add(output))
+    });
     TokenUsageRecord {
         task_id: request.task_id,
         turn_id: request.turn_id,
@@ -244,13 +256,48 @@ pub fn token_usage_record(
         output_tokens: usage.output_tokens,
         reasoning_tokens: usage.reasoning_tokens,
         cached_input_tokens: usage.cached_input_tokens,
-        tool_result_tokens: Some(0),
-        total_tokens: usage.total_tokens,
-        estimated_cost: None,
+        tool_result_tokens: Some(tool_result_tokens),
+        total_tokens,
+        estimated_cost: (cost_model == "zero").then_some(0.0),
         budget_snapshot_ref: budget_snapshot.snapshot_id,
-        attribution_ref: None,
-        usage_source: format!("{:?}", usage.usage_source),
+        attribution_ref: Some(golutra_core::TokenAttribution {
+            system_prompt_tokens: Some(system_prompt_tokens),
+            developer_instruction_tokens: None,
+            runtime_context_tokens: None,
+            policy_tokens: None,
+            user_message_tokens: Some(user_message_tokens),
+            assistant_recent_tokens: Some(assistant_recent_tokens),
+            working_summary_tokens: None,
+            memory_tokens: None,
+            evidence_tokens: None,
+            tool_instruction_tokens: None,
+            tool_result_excerpt_tokens: Some(tool_result_tokens),
+            output_tokens: usage.output_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+            source: match usage.usage_source {
+                golutra_core::UsageSource::Provider => "mixed",
+                golutra_core::UsageSource::Estimated => "tokenizer",
+                golutra_core::UsageSource::Unknown => "tokenizer",
+            }
+            .to_owned(),
+        }),
+        usage_source: match usage.usage_source {
+            golutra_core::UsageSource::Provider => "provider",
+            golutra_core::UsageSource::Estimated => "estimated",
+            golutra_core::UsageSource::Unknown => "unknown",
+        }
+        .to_owned(),
     }
+}
+
+fn message_tokens(request: &ProviderRequest, role: ProviderRole) -> u64 {
+    request
+        .messages
+        .iter()
+        .filter(|message| message.role == role)
+        .map(|message| estimate_tokens(&message.content))
+        .fold(0_u64, u64::saturating_add)
 }
 
 #[must_use]
@@ -310,9 +357,20 @@ mod tests {
             golutra_core::ProviderResponseId::new(),
             &plan.budget_snapshot,
             &usage,
+            "zero",
         );
 
         assert_eq!(record.total_tokens, Some(15));
+        assert_eq!(record.estimated_cost, Some(0.0));
+        assert_eq!(record.usage_source, "provider");
+        assert_eq!(record.tool_result_tokens, Some(0));
+        assert_eq!(
+            record
+                .attribution_ref
+                .as_ref()
+                .map(|value| value.source.as_str()),
+            Some("mixed")
+        );
         assert_eq!(record.budget_snapshot_ref, plan.budget_snapshot.snapshot_id);
     }
 

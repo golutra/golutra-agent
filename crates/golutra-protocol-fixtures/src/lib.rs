@@ -4,15 +4,22 @@ use golutra_core::{
     TaskId, TaskStatus, TurnId, VerificationId,
 };
 use golutra_eval::{
-    AppliedCandidate, AutomationCandidate, BenchmarkPromotion, EvaluationCase, EvaluationResult,
-    EvaluationRun, GeneratedTask, ImprovementCandidate, PostTaskReview, PromotionDecision,
-    RegressionResult, SkillCandidate,
+    AppliedCandidate, AutomationCandidate, BenchmarkPromotion, BenchmarkRun, CausalComparison,
+    CostRecord, CounterfactualReplay, EvaluationCase, EvaluationResult, EvaluationRun,
+    GeneratedTask, ImprovementCandidate, PostTaskReview, PromotionDecision, RegressionResult,
+    SecurityUtilityResult, SkillCandidate,
+};
+use golutra_evolution::{
+    EnvironmentRecipe, EvolutionState, GeneratedTaskExecution, NoveltyRecord, OpenEndedBudget,
+    OpenEndedRun, SkillLifecycleRecord, SkillManifest,
 };
 use golutra_governor::RuntimeGovernorDecision;
 use golutra_memory::MemoryRecord;
 use golutra_protocol::{
-    CommandAck, DebugProjection, EventFilter, RuntimeEvent, RuntimeEventSource, RuntimeEventType,
-    RuntimeQuery, SessionCommand, SessionCommandKind, StateProjection, UserProjection, VisibleStep,
+    CommandAck, DebugProjection, EventFilter, EventPage, EventPageRequest, ProtocolHandshake,
+    RuntimeEvent, RuntimeEventSource, RuntimeEventType, RuntimeQuery, SessionCommand,
+    SessionCommandKind, StateProjection, StorageMaintenanceReport, StorageStats, UserProjection,
+    VisibleStep,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -33,6 +40,8 @@ pub struct SdkProtocolBundle {
     pub command_ack: CommandAck,
     pub query: RuntimeQuery,
     pub event_filter: EventFilter,
+    pub event_page_request: EventPageRequest,
+    pub event_page: EventPage,
     pub event: RuntimeEvent,
     pub state_projection: StateProjection,
     pub user_projection: UserProjection,
@@ -47,10 +56,26 @@ pub struct SdkProtocolBundle {
     pub generated_task: GeneratedTask,
     pub skill_candidate: SkillCandidate,
     pub benchmark_promotion: BenchmarkPromotion,
+    pub benchmark_run: BenchmarkRun,
+    pub counterfactual_replay: CounterfactualReplay,
+    pub causal_comparison: CausalComparison,
+    pub cost_record: CostRecord,
+    pub security_utility_result: SecurityUtilityResult,
     pub regression_result: RegressionResult,
     pub promotion_decision: PromotionDecision,
     pub applied_candidate: AppliedCandidate,
+    pub open_ended_budget: OpenEndedBudget,
+    pub open_ended_run: OpenEndedRun,
+    pub environment_recipe: EnvironmentRecipe,
+    pub novelty_record: NoveltyRecord,
+    pub generated_task_execution: GeneratedTaskExecution,
+    pub skill_manifest: SkillManifest,
+    pub skill_lifecycle_record: SkillLifecycleRecord,
+    pub evolution_state: EvolutionState,
     pub governor_decision: RuntimeGovernorDecision,
+    pub storage_stats: StorageStats,
+    pub storage_maintenance_report: StorageMaintenanceReport,
+    pub protocol_handshake: ProtocolHandshake,
 }
 
 #[must_use]

@@ -1,0 +1,24 @@
+[package]
+name = "golutra-vis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+clap.workspace = true
+golutra-client = { path = "../golutra-client" }
+golutra-core.workspace = true
+golutra-protocol.workspace = true
+golutra-tools = { path = "../golutra-tools" }
+miette.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -13,7 +13,7 @@
 
 ## 第一阶段目标
 
-第一阶段不追求完整开放式演进，也不追求复杂多 agent。目标是跑通单 agent、多入口、可恢复、可验证、可 debug 的核心 runtime。
+第一阶段不追求复杂多 agent。目标是跑通单 agent、多入口、可恢复、可验证、可 debug 的核心 runtime；截至 2026-07-15，该阶段及其生产硬化已经完成。
 
 主场景默认按 coding agent 收敛：
 
@@ -55,25 +55,19 @@ CausalComparison
 SecurityUtilityResult
 ```
 
-暂不作为第一阶段核心：
+第一阶段之后的落地状态：
 
 ```text
-Open-Endedness
-Dynamic Benchmark
-Skill Promotion
-GoalLedger / RuntimeGovernor
-GoalAlignmentCheck
-VerificationTier
-EventSamplingPolicy
-ContextProjectionCache
-Plugin Marketplace
-复杂 Multi-Agent Orchestration
-自动修改 runtime 代码
+Open-Endedness / Dynamic Benchmark / Skill Promotion：已完成受控本地最小闭环
+GoalLedger / RuntimeGovernor / GoalAlignmentCheck：已进入同步 runtime 边界
+VerificationTier：以结构化 check kind 和任务分类进入主链，schema 保留可配置 tier
+EventSamplingPolicy / ContextProjectionCache：保留 schema，不启用无收益的派生索引/cache
+Plugin/MCP：已完成本地 reviewed package 与 sandboxed stdio 主链
+复杂 Multi-Agent Orchestration：非当前产品范围
+自动修改或部署 runtime 代码：明确禁止
 ```
 
-第一阶段只生成 `ImprovementCandidate`，不自动应用改动。
-`EvaluationCase`、`EvaluationRun` 和 `EvaluationResult` 第一阶段只作为离线评估的最小数据模型，不进入普通用户任务同步链路。
-`CounterfactualReplay`、`CausalComparison` 和 `SecurityUtilityResult` 属于后续离线评估增强，第一阶段只保留 schema 方向，不阻塞 P0 runtime。
+`ImprovementCandidate`、Evaluation、counterfactual comparison、regression/promotion 和 Evolution 都在后台或显式命令中运行，不污染普通用户同步链路。自动 apply 只允许 clean regression 后的低风险 benchmark state；Skill 必须人工 review，runtime code/policy 放宽不会自动应用。
 
 ## 第一阶段吸收的架构启示
 
@@ -96,9 +90,9 @@ Plugin Marketplace
 
 这些是第一阶段的架构约束，不等于要实现完整 benchmark hardening、复杂 multi-agent、自改进或动态评测系统。
 
-## 后续治理增强
+## 治理增强状态
 
-以下能力有架构价值，但不适合放进第一阶段同步链路。原因是它们会增加 schema、判断逻辑、索引策略和额外模型调用，前期容易把 runtime 做复杂，也会浪费 token。
+以下能力有架构价值，但不应全部变成昂贵的同步模型调用。当前实现采用确定性同步治理与后台深度评估分层：
 
 ```text
 GoalLedger
@@ -110,17 +104,15 @@ EventSamplingPolicy
 ContextProjectionCache
 ```
 
-建议放到后续大版本，触发条件是：基础 runtime 已经稳定，真实失败轨迹足够多，且确实观察到目标漂移、验证成本过高或上下文构造成本过高。
+当前状态：
 
-推荐落地顺序：
+1. `GoalLedger + GoalAlignmentCheck + RuntimeGovernor` 已在 provider/tool/result/completion 边界执行，不调用额外 judge。
+2. 验证已按 plain conversation、workspace objective、workspace change 和 code change 分级，并用 `VerificationCheckKind` 记录客观来源。
+3. deep PostTaskReview/evaluation 在终态后后台运行，普通 TUI 不查询 debug/evaluation projection。
+4. `EventSamplingPolicy` 只保留配置模型；canonical RuntimeEvent 不能采样丢失，当前也没有独立高成本派生索引需要抽样。
+5. `ContextProjectionCache` 只保留带 invalidation refs 的模型；当前 ContextBuilder 成本未形成瓶颈，启用 cache 反而会引入 stale context 风险。
 
-1. `VerificationTier`：先把验证分级做起来，收益最大，成本最低。
-2. `EventSamplingPolicy`：再控制 debug/audit/eval 的索引和分析成本。
-3. `ContextProjectionCache`：当 context 构造成为明确瓶颈时再做。
-4. `GoalLedger + GoalAlignmentCheck`：长任务和多步骤任务稳定后再加。
-5. `RuntimeGovernor + GovernanceDecision`：最后统一治理层，避免前期过早抽象。
-
-前期只保留这些能力的扩展位：
+稳定扩展位：
 
 - `LoopDecision.reason` 能记录目标偏移、预算超限、权限阻塞等原因。
 - `VerificationRecord` 能记录检查来源和残余风险。
@@ -665,7 +657,7 @@ PromotionDecision
 
 - `StateProjection` 是当前任务状态的唯一投影结果。
 - `RuntimeEvent` 是流式输出、工具进度、权限请求、完成状态的唯一事实来源。
-- TUI、Web、IDE、SDK 对同一 task 的实时展示，必须来自同一条 event stream 或同一份 projection 查询结果。
+- TUI、Web attach、TypeScript/Python SDK 对同一 task 的实时展示，必须来自同一条 event stream 或同一份 projection 查询结果。
 - 一个前端发起 `approve`、`deny`、`abort`、`resume` 后，其他前端应通过后续 event 看到同一状态变化。
 - 前端本地缓存只能用于渲染加速，断线重连后必须能通过 `RuntimeQuery + RuntimeEvent` 恢复一致状态。
 
@@ -689,7 +681,7 @@ PromotionDecision
 - `RuntimeStore` 是 durable facts，不直接等于 runtime host；store 可以恢复状态，但不能替代任务调度、运行中取消、订阅和 provider/tool loop。
 - `EventBus` 负责把 durable event 与 live event 统一起来：先 append 到 store，再发布给订阅者；断线重连时按 cursor replay，再接 live stream。
 - `EmbeddedTransport` 是 CLI/TUI 默认入口，必须持有 `Arc<RuntimeHost>` 并连接 `$GOLUTRA_HOME/state/runtime.sqlite`，不能只包临时 `RuntimeStore`。
-- `HttpSseTransport` 用于 Web / SDK / 显式 daemon/remote 模式，必须先按 cwd attachment，语义与 `EmbeddedTransport` 对拍一致。
+- `UnixIpcTransport` 用于 Unix 本地 daemon，`HttpSseTransport` 用于 Windows/Web/SDK/显式 remote；两者必须先按 cwd attachment，并与 `EmbeddedTransport` 对拍一致。
 - `RuntimeClient::subscribe` 的目标语义是 event stream；如果短期保留 snapshot API，也必须新增 live watch 能力，不能让 TUI 长期轮询历史事件。
 - cwd thread resolver 从全局 thread index 选择当前 cwd 最近 session/thread；TUI 新建会话可以显式生成新 ID，但首个 prompt 前不持久化 placeholder。
 
@@ -700,11 +692,10 @@ PromotionDecision
 第一阶段需要把“runtime 协议”当成独立资产，而不只是 Rust 内部类型：
 
 - `SessionCommand`、`RuntimeQuery`、`RuntimeEvent` 要有稳定 schema 产物。
-- TypeScript SDK 应尽量从协议产物生成类型，避免手写接口漂移。
-- Python SDK 第一阶段可以后置，但其 transport 语义必须与 TypeScript SDK 和 app-server 一致。
+- TypeScript 与 Python SDK 都从同一 Rust schema 生成类型，生成后必须执行漂移检查，不能手写近似协议。
 - 本地入口允许两种运行方式：
   - CLI/TUI 进程内创建 durable Embedded host
-  - SDK/Web/CLI/TUI 连接显式启动的用户级 `app-server`
+- SDK/Web/CLI/TUI 连接显式启动的用户级 `app-server`；Unix CLI/TUI 使用 IPC，其他客户端使用 HTTP/SSE
 - 无论哪种运行方式，`task_id`、event 顺序、approval、resume、replay 语义必须一致。
 
 ### 协议测试与 smoke 约束
@@ -727,17 +718,17 @@ coding agent 第一阶段默认采用强客观验证：
 
 ### Coding Agent 记忆默认值
 
-第一阶段不做重型长期记忆，默认只做：
+当前 runtime 默认只自动使用：
 
 - `WorkingSummary`
 - `CompactionRecord`
-- `MemoryCandidate`
-- `project-scoped retrieval`
+- evidence-backed `MemoryCandidate`
+- expiry/contradiction-aware project-scoped promotion、retrieval、feedback 和 rollback
 
-第一阶段不默认实现：
+当前明确不自动执行：
 
-- 自动晋升长期 memory
-- `user/global` 长期记忆写入
+- 无 evidence 或未通过 gate 的长期 memory 晋升
+- `user/global` 长期记忆自动写入；这些 scope 需要 human review
 - 向量记忆作为基础依赖
 
 ### 后台可跑
@@ -752,7 +743,7 @@ coding agent 第一阶段默认采用强客观验证：
 - ImprovementCandidate 生成。
 - 从失败或高价值 trajectory 生成 EvaluationCase 候选。
 
-### 离线运行
+### 后台或显式治理命令
 
 这些能力用于长期改进，不属于普通任务执行链路：
 
@@ -762,7 +753,7 @@ coding agent 第一阶段默认采用强客观验证：
 - CounterfactualReplay / CausalComparison / SecurityUtilityResult。
 - regression suite。
 - dynamic benchmark promotion。
-- open-ended task generation。
+- open-ended plan/run；GeneratedTask 只进入隔离 RuntimeHost。
 - runtime / prompt / tool schema 改进实验。
 - RegressionResult。
 - PromotionDecision。
@@ -838,7 +829,7 @@ Debug Projection 只在 debug/audit/replay 模式启用。
 | artifact | raw output 可通过 checksum 校验，模型只读取摘要或受控 excerpt |
 | workspace checkpoint | 文件副作用前已持久化 before-image、artifact 和可恢复引用，且不修改用户 `.git` |
 | verification | 没有足够 evidence 时不能 `stop_success`，只能 `stop_partial`、`stop_failed` 或 `blocked` |
-| memory | `MemoryCandidate` 不自动晋升长期 memory，必须保留 evidence、scope 和 rollback 信息 |
+| memory | 只有 evidence-backed project candidate 可按 gate 晋升；user/global 或冲突候选必须 human review，并保留 scope/expiry/rollback |
 
 ## 第一阶段落地顺序
 
@@ -854,16 +845,19 @@ Debug Projection 只在 debug/audit/replay 模式启用。
 10. `golutra-client` host 子模块：`RuntimeHost`、cwd thread resolver、`EventBus`、全局 `RuntimePaths`。
 11. `golutra-client`：统一 `RuntimeClient`、`RuntimeQuery`、event replay 和 live subscription 接口。
 12. `golutra-cli` / `golutra-tui`：默认通过 `EmbeddedTransport`，可显式选择 daemon/remote，只消费 command/query/event。
-13. `golutra-app-server`：用户级单实例管理多 cwd attachment，暴露 HTTP command/query 与 SSE stream。
-14. `golutra-vis`：DebugProjection 和 replay 查询。
-15. `golutra-eval`：ImprovementCandidate、RegressionResult、PromotionDecision 的离线链路。
+13. `golutra-app-server`：用户级单实例管理多 cwd attachment，暴露 Unix IPC 与 HTTP command/query/SSE stream。
+14. `golutra-vis`：DebugProjection、event replay、audit 和 OTel JSON。
+15. `golutra-eval` / `golutra-evolution`：ImprovementCandidate、RegressionResult、PromotionDecision、GeneratedTask 与 Skill 生命周期。
+16. `golutra-plugin` / `golutra-mcp`：reviewed package、OS sandbox、approval 和统一 ToolContract bridge。
+17. TypeScript/Python SDK 与安装/三平台 CI 交付。
 
 入口优先级默认值：
 
 1. `CLI + TUI + EmbeddedTransport`
-2. `app-server + HttpSseTransport`
-3. `SDK + Web attach`
-4. `IDE attach`
+2. `app-server + UnixIpcTransport/HttpSseTransport`
+3. `TypeScript/Python SDK + Web attach`
+
+IDE 产品入口不在当前范围；未来只能复用现有 transport/protocol，不能新增状态机。
 
 ## 通过标准
 

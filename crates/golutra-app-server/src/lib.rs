@@ -22,17 +22,25 @@ use axum::{
 };
 use fs2::FileExt;
 use golutra_client::{
-    APP_SERVER_ATTACHMENT_HEADER, AppServerInfo, AppServerPaths, ClientError, EmbeddedTransport,
-    RuntimeAttachment, RuntimeClient,
+    APP_SERVER_ATTACHMENT_HEADER, APP_SERVER_PROTOCOL_HEADER, AppServerInfo, AppServerPaths,
+    ClientError, EmbeddedTransport, RuntimeAttachment, RuntimeClient,
 };
 use golutra_core::{SessionId, TaskId, ThreadId};
-use golutra_protocol::{CommandAck, EventFilter, RuntimeQuery, SessionCommand};
+use golutra_protocol::{
+    CommandAck, EventFilter, EventPage, EventPageRequest, ProtocolVersionRange,
+    RUNTIME_PROTOCOL_VERSION, RuntimeQuery, SessionCommand,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, OnceCell};
 use uuid::Uuid;
 
 const MAX_ATTACHED_RUNTIMES: usize = 128;
+
+mod ipc;
+mod transport_security;
+
+use transport_security::TransportAuth;
 
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -43,6 +51,7 @@ pub struct AppState {
 struct AppStateInner {
     info: AppServerInfo,
     max_runtimes: usize,
+    transport_auth: TransportAuth,
     runtimes: Mutex<HashMap<PathBuf, Arc<OnceCell<AttachedRuntime>>>>,
     attachments: Mutex<HashMap<String, EmbeddedTransport>>,
 }
@@ -54,16 +63,28 @@ struct AttachedRuntime {
 }
 
 impl AppState {
-    #[must_use]
-    pub fn new(info: AppServerInfo) -> Self {
-        Self::with_runtime_limit(info, MAX_ATTACHED_RUNTIMES)
+    pub fn new(info: AppServerInfo, transport_token: &str) -> miette::Result<Self> {
+        Self::with_runtime_limit(info, transport_token, MAX_ATTACHED_RUNTIMES)
     }
 
-    fn with_runtime_limit(info: AppServerInfo, max_runtimes: usize) -> Self {
+    fn with_runtime_limit(
+        info: AppServerInfo,
+        transport_token: &str,
+        max_runtimes: usize,
+    ) -> miette::Result<Self> {
+        Ok(Self::from_auth(
+            info,
+            TransportAuth::from_token(transport_token)?,
+            max_runtimes,
+        ))
+    }
+
+    fn from_auth(info: AppServerInfo, transport_auth: TransportAuth, max_runtimes: usize) -> Self {
         Self {
             inner: Arc::new(AppStateInner {
                 info,
                 max_runtimes: max_runtimes.max(1),
+                transport_auth,
                 runtimes: Mutex::new(HashMap::new()),
                 attachments: Mutex::new(HashMap::new()),
             }),
@@ -162,6 +183,7 @@ pub fn router(state: AppState) -> Router {
         .route("/commands", post(send_command))
         .route("/queries", post(query_runtime))
         .route("/events", get(events))
+        .route("/events/page", get(event_page))
         .route("/events/replay", get(replay_events))
         .route("/threads", get(list_threads))
         .route("/sessions/{session_id}/thread", get(thread_for_session))
@@ -172,30 +194,118 @@ pub fn router(state: AppState) -> Router {
             post(export_thread_rollout),
         )
         .route("/threads/{thread_id}/rebind", post(rebind_thread))
-        .with_state(state)
-        .layer(middleware::from_fn(enforce_local_http_boundary))
+        .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(state, enforce_http_boundary))
 }
 
 pub async fn run(addr: SocketAddr) -> miette::Result<()> {
     validate_runtime_bind_addr(addr)?;
     let paths = AppServerPaths::global().map_err(|error| miette::miette!("{error}"))?;
     let lease = AppServerLease::acquire(&paths)?;
+    let transport_auth = TransportAuth::load_or_create(&paths)?;
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|error| miette::miette!("{error}"))?;
     let local_addr = listener
         .local_addr()
         .map_err(|error| miette::miette!("{error}"))?;
+    #[cfg(unix)]
+    let (ipc_listener, _ipc_guard) = bind_ipc_socket(&paths.ipc_socket)?;
     let info = AppServerInfo {
         instance_id: Uuid::now_v7().to_string(),
         pid: std::process::id(),
         base_url: format!("http://{local_addr}"),
+        ipc_path: app_server_ipc_path(&paths),
+        protocol_versions: ProtocolVersionRange::runtime(),
         started_at: chrono::Utc::now(),
     };
     lease.publish(&info)?;
-    axum::serve(listener, router(AppState::new(info)))
-        .await
-        .map_err(|error| miette::miette!("{error}"))
+    let app = router(AppState::from_auth(
+        info,
+        transport_auth,
+        MAX_ATTACHED_RUNTIMES,
+    ));
+    #[cfg(unix)]
+    {
+        tokio::select! {
+            result = axum::serve(listener, app.clone()) => {
+                result.map_err(|error| miette::miette!("{error}"))
+            }
+            result = ipc::serve(ipc_listener, app) => {
+                result.map_err(|error| miette::miette!("{error}"))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        axum::serve(listener, app)
+            .await
+            .map_err(|error| miette::miette!("{error}"))
+    }
+}
+
+#[cfg(unix)]
+fn app_server_ipc_path(paths: &AppServerPaths) -> Option<String> {
+    Some(paths.ipc_socket.to_string_lossy().to_string())
+}
+
+#[cfg(not(unix))]
+fn app_server_ipc_path(_paths: &AppServerPaths) -> Option<String> {
+    None
+}
+
+#[cfg(unix)]
+fn bind_ipc_socket(path: &Path) -> miette::Result<(tokio::net::UnixListener, IpcSocketGuard)> {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(miette::miette!(
+                "app-server IPC path cannot be a symbolic link: {}",
+                path.display()
+            ));
+        }
+        Ok(metadata) if metadata.file_type().is_socket() => {
+            fs::remove_file(path).map_err(|error| miette::miette!("{error}"))?;
+        }
+        Ok(_) => {
+            return Err(miette::miette!(
+                "app-server IPC path is not a socket: {}",
+                path.display()
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(miette::miette!("{error}")),
+    }
+    let listener =
+        tokio::net::UnixListener::bind(path).map_err(|error| miette::miette!("{error}"))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| miette::miette!("{error}"))?;
+    Ok((
+        listener,
+        IpcSocketGuard {
+            path: path.to_path_buf(),
+        },
+    ))
+}
+
+#[cfg(unix)]
+struct IpcSocketGuard {
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for IpcSocketGuard {
+    fn drop(&mut self) {
+        use std::os::unix::fs::FileTypeExt;
+
+        if fs::symlink_metadata(&self.path)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_socket())
+        {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 
 fn validate_runtime_bind_addr(addr: SocketAddr) -> miette::Result<()> {
@@ -207,12 +317,29 @@ fn validate_runtime_bind_addr(addr: SocketAddr) -> miette::Result<()> {
     ))
 }
 
-async fn enforce_local_http_boundary(request: Request, next: Next) -> Result<Response, StatusCode> {
-    if local_http_headers(request.headers()) {
-        Ok(next.run(request).await)
-    } else {
-        Err(StatusCode::FORBIDDEN)
+async fn enforce_http_boundary(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if !local_http_headers(request.headers()) {
+        return Err(StatusCode::FORBIDDEN);
     }
+    if matches!(request.uri().path(), "/health" | "/attach") {
+        return Ok(next.run(request).await);
+    }
+    if !state.inner.transport_auth.authorizes(request.headers()) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let protocol_version = request
+        .headers()
+        .get(APP_SERVER_PROTOCOL_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u32>().ok());
+    if !protocol_version.is_some_and(|version| ProtocolVersionRange::runtime().accepts(version)) {
+        return Err(StatusCode::UPGRADE_REQUIRED);
+    }
+    Ok(next.run(request).await)
 }
 
 fn local_http_headers(headers: &HeaderMap) -> bool {
@@ -262,12 +389,19 @@ async fn runtime_info(State(state): State<AppState>) -> Json<AppServerInfo> {
 #[derive(Debug, Deserialize)]
 struct AttachRequest {
     cwd: PathBuf,
+    protocol_version: u32,
 }
 
 async fn attach_runtime(
     State(state): State<AppState>,
     Json(request): Json<AttachRequest>,
 ) -> Result<Json<RuntimeAttachment>, AppError> {
+    if request.protocol_version != RUNTIME_PROTOCOL_VERSION {
+        return Err(AppError::Protocol(format!(
+            "client runtime protocol {} is incompatible with server protocol {}",
+            request.protocol_version, RUNTIME_PROTOCOL_VERSION
+        )));
+    }
     Ok(Json(state.attach_cwd(request.cwd).await?))
 }
 
@@ -365,6 +499,15 @@ async fn replay_events(
 ) -> Result<Json<Vec<Value>>, AppError> {
     let transport = state.attached_transport(&headers).await?;
     Ok(Json(transport.replay_events(event_filter(query)?).await?))
+}
+
+async fn event_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(request): Query<EventPageRequest>,
+) -> Result<Json<EventPage>, AppError> {
+    let transport = state.attached_transport(&headers).await?;
+    Ok(Json(transport.event_page(request).await?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -480,6 +623,7 @@ enum AppError {
     Client(ClientError),
     InvalidId(String),
     Attachment(String),
+    Protocol(String),
 }
 
 impl From<ClientError> for AppError {
@@ -494,7 +638,8 @@ impl IntoResponse for AppError {
             Self::Client(ClientError::InvalidSession(error)) => (StatusCode::BAD_REQUEST, error),
             Self::Client(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
             Self::InvalidId(error) => (StatusCode::BAD_REQUEST, error),
-            Self::Attachment(error) => (StatusCode::UNAUTHORIZED, error),
+            Self::Attachment(error) => (StatusCode::GONE, error),
+            Self::Protocol(error) => (StatusCode::UPGRADE_REQUIRED, error),
         };
         (status, Json(json!({ "error": message }))).into_response()
     }
@@ -633,7 +778,7 @@ const ATTACH_PAGE: &str = r#"<!doctype html>
       :root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, sans-serif; }
       body { margin: 0; background: Canvas; color: CanvasText; }
       main { width: min(1080px, calc(100vw - 32px)); margin: 24px auto; display: grid; gap: 12px; }
-      form { display: grid; grid-template-columns: 2fr 1fr auto; gap: 8px; align-items: end; }
+      form { display: grid; grid-template-columns: 2fr 1fr 1fr auto; gap: 8px; align-items: end; }
       label { display: grid; gap: 4px; font-size: 12px; }
       input, button { min-height: 36px; font: inherit; }
       pre { min-height: 420px; overflow: auto; padding: 12px; border: 1px solid GrayText; border-radius: 6px; white-space: pre-wrap; word-break: break-word; }
@@ -645,6 +790,7 @@ const ATTACH_PAGE: &str = r#"<!doctype html>
       <form id="attach-form">
         <label>CWD<input id="cwd" required autocomplete="off" /></label>
         <label>Session ID<input id="session-id" required autocomplete="off" /></label>
+        <label>Transport token<input id="transport-token" type="password" required autocomplete="off" /></label>
         <button type="submit">Attach</button>
       </form>
       <pre id="output" aria-live="polite"></pre>
@@ -661,10 +807,15 @@ const ATTACH_PAGE: &str = r#"<!doctype html>
         output.textContent = "";
         const cwd = document.getElementById("cwd").value.trim();
         const sessionId = document.getElementById("session-id").value.trim();
+        const transportToken = document.getElementById("transport-token").value.trim();
+        const transportHeaders = {
+          "authorization": `Bearer ${transportToken}`,
+          "x-golutra-protocol-version": "1"
+        };
         const attached = await fetch("/runtime/attach", {
           method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ cwd })
+          headers: { ...transportHeaders, "content-type": "application/json" },
+          body: JSON.stringify({ cwd, protocol_version: 1 })
         });
         if (!attached.ok) {
           output.textContent = `attach failed: ${attached.status} ${await attached.text()}`;
@@ -673,6 +824,7 @@ const ATTACH_PAGE: &str = r#"<!doctype html>
         const attachment = await attached.json();
         const response = await fetch(`/events?session_id=${encodeURIComponent(sessionId)}`, {
           headers: {
+            ...transportHeaders,
             "accept": "text/event-stream",
             "x-golutra-attachment": attachment.attachment_id
           },
@@ -714,17 +866,31 @@ mod tests {
 
     use super::*;
 
+    const TEST_TRANSPORT_TOKEN: &str =
+        "test-transport-token-000000000000000000000000000000000000000000000000";
+
     fn server_info() -> AppServerInfo {
         AppServerInfo {
             instance_id: Uuid::now_v7().to_string(),
             pid: std::process::id(),
             base_url: "http://127.0.0.1:0".to_owned(),
+            ipc_path: None,
+            protocol_versions: ProtocolVersionRange::runtime(),
             started_at: chrono::Utc::now(),
         }
     }
 
+    fn authorized_request(builder: axum::http::request::Builder) -> axum::http::request::Builder {
+        builder
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {TEST_TRANSPORT_TOKEN}"),
+            )
+            .header(APP_SERVER_PROTOCOL_HEADER, RUNTIME_PROTOCOL_VERSION)
+    }
+
     async fn state_with_attachment() -> (AppState, String, SessionId) {
-        let state = AppState::new(server_info());
+        let state = AppState::new(server_info(), TEST_TRANSPORT_TOKEN).expect("app state");
         let transport = EmbeddedTransport::in_memory().await.expect("transport");
         let attachment_id = Uuid::now_v7().to_string();
         let session_id = transport.default_session_id();
@@ -739,7 +905,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_attachment_rejects_relative_cwd() {
-        let state = AppState::new(server_info());
+        let state = AppState::new(server_info(), TEST_TRANSPORT_TOKEN).expect("app state");
 
         let error = state
             .attach_cwd("relative-workspace")
@@ -751,7 +917,8 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_attachment_registry_is_bounded_and_failed_slots_are_released() {
-        let state = AppState::with_runtime_limit(server_info(), 1);
+        let state = AppState::with_runtime_limit(server_info(), TEST_TRANSPORT_TOKEN, 1)
+            .expect("app state");
         let transport = EmbeddedTransport::in_memory().await.expect("transport");
         let occupied = Arc::new(OnceCell::new());
         occupied
@@ -811,11 +978,10 @@ mod tests {
     #[tokio::test]
     async fn runtime_info_is_server_scoped() {
         let info = server_info();
-        let app = router(AppState::new(info.clone()));
+        let app = router(AppState::new(info.clone(), TEST_TRANSPORT_TOKEN).expect("app state"));
         let response = app
             .oneshot(
-                Request::builder()
-                    .uri("/runtime/info")
+                authorized_request(Request::builder().uri("/runtime/info"))
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -829,6 +995,51 @@ mod tests {
             serde_json::from_slice::<AppServerInfo>(&body).expect("info"),
             info
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_protocol_endpoints_require_bearer_auth_and_version() {
+        let app = router(AppState::new(server_info(), TEST_TRANSPORT_TOKEN).expect("app state"));
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/runtime/info")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong_token = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/runtime/info")
+                    .header(header::AUTHORIZATION, format!("Bearer {}", "x".repeat(64)))
+                    .header(APP_SERVER_PROTOCOL_HEADER, RUNTIME_PROTOCOL_VERSION)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(wrong_token.status(), StatusCode::UNAUTHORIZED);
+
+        let missing_version = app
+            .oneshot(
+                Request::builder()
+                    .uri("/runtime/info")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {TEST_TRANSPORT_TOKEN}"),
+                    )
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(missing_version.status(), StatusCode::UPGRADE_REQUIRED);
     }
 
     #[tokio::test]
@@ -850,26 +1061,30 @@ mod tests {
         let missing = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/commands")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(serde_json::to_vec(&command).expect("json")))
-                    .expect("request"),
+                authorized_request(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/commands")
+                        .header(header::CONTENT_TYPE, "application/json"),
+                )
+                .body(Body::from(serde_json::to_vec(&command).expect("json")))
+                .expect("request"),
             )
             .await
             .expect("response");
-        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(missing.status(), StatusCode::GONE);
 
         let accepted = app
             .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/commands")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id)
-                    .body(Body::from(serde_json::to_vec(&command).expect("json")))
-                    .expect("request"),
+                authorized_request(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/commands")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id),
+                )
+                .body(Body::from(serde_json::to_vec(&command).expect("json")))
+                .expect("request"),
             )
             .await
             .expect("response");
@@ -878,7 +1093,7 @@ mod tests {
 
     #[tokio::test]
     async fn attach_page_is_served() {
-        let app = router(AppState::new(server_info()));
+        let app = router(AppState::new(server_info(), TEST_TRANSPORT_TOKEN).expect("app state"));
         let response = app
             .oneshot(
                 Request::builder()

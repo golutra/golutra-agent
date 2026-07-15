@@ -2,6 +2,7 @@
 
 use std::{path::Path, process::Stdio, time::Duration};
 
+use golutra_sandbox::{SandboxRequest, SystemSandbox, WorkspaceAccess};
 #[cfg(unix)]
 use nix::{
     sys::signal::{Signal, killpg},
@@ -20,6 +21,8 @@ pub(crate) struct ShellOutput {
     pub(crate) timed_out: bool,
     pub(crate) cancelled: bool,
     pub(crate) raw_output: String,
+    pub(crate) sandbox_backend: golutra_sandbox::SandboxBackendKind,
+    pub(crate) sandbox_os_enforced: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,11 +55,30 @@ pub(crate) async fn run_process(
     cwd: &Path,
     timeout_ms: u64,
     cancellation: CancellationToken,
+    sandbox: &SystemSandbox,
+    workspace_access: WorkspaceAccess,
 ) -> Result<ShellOutput, ToolError> {
-    let mut command = Command::new(program);
+    let scratch = tempfile::Builder::new()
+        .prefix("golutra-sandbox-")
+        .tempdir()
+        .map_err(|error| ToolError::Execution(format!("sandbox scratch setup failed: {error}")))?;
+    let launch = sandbox
+        .plan(&SandboxRequest {
+            program: program.into(),
+            args: args.iter().map(Into::into).collect(),
+            cwd: cwd.to_path_buf(),
+            workspace_root: cwd.to_path_buf(),
+            scratch_dir: scratch.path().to_path_buf(),
+            workspace_access,
+            allow_network: false,
+        })
+        .map_err(|error| ToolError::Execution(error.to_string()))?;
+    let mut command = Command::new(&launch.program);
     command
-        .args(args)
+        .args(&launch.args)
         .current_dir(cwd)
+        .env_clear()
+        .envs(&launch.environment)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -112,6 +134,8 @@ pub(crate) async fn run_process(
         timed_out,
         cancelled,
         raw_output,
+        sandbox_backend: launch.backend,
+        sandbox_os_enforced: launch.os_enforced,
     })
 }
 

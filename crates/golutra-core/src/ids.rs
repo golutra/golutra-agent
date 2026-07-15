@@ -71,6 +71,7 @@ define_id!(PolicyId);
 define_id!(CheckpointId);
 define_id!(ProviderRequestId);
 define_id!(ProviderResponseId);
+define_id!(ProviderAuthRequestId);
 define_id!(TokenBudgetSnapshotId);
 define_id!(TokenUsageRecordId);
 define_id!(LoopDecisionId);

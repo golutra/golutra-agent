@@ -56,7 +56,7 @@ Golutra 不应照搬把明文 key 默认写入 workspace。推荐持久化分层
 | 全局 home | `GOLUTRA_HOME`，否则 `~/.golutra` | 用户配置、secret ref、provider catalog |
 | 全局 provider/auth 配置 | `$GOLUTRA_HOME/provider.json` | provider catalog、默认 selection、`credential_ref`、随机 credential revision 和 OAuth 非敏感 metadata |
 | 全局 runtime facts | `$GOLUTRA_HOME/state/runtime.sqlite` | 所有 cwd 的 session/task/event/projection/thread index，不保存明文 secret |
-| cwd 分区状态 | `$GOLUTRA_HOME/state/workspaces/<cwd-hash>/` | checkpoint、memory、evaluation、rollout |
+| cwd 分区状态 | `$GOLUTRA_HOME/state/workspaces/<cwd-hash>/` | checkpoint、memory、evaluation、evolution、skill、code index、rollout |
 | thread rollouts | `$GOLUTRA_HOME/state/workspaces/<cwd-hash>/rollouts/<thread-id>.jsonl` | 从 SQLite facts 物化的 versioned、checksum、脱敏历史 |
 | 全局凭据文件 | `$GOLUTRA_HOME/credentials.json`；CI 可使用进程 env | owner-only 明文 API key、OAuth access/refresh token set；项目目录和 provider config 禁止 secret |
 
@@ -117,7 +117,7 @@ ProviderOnboardingState
 3. 输入或选择 baseUrl；TUI 交互要求 `http://` 或 `https://` 开头。
 4. 选择 Local disk 或 env ref；disk 模式输入脱敏 API key并写入 `$GOLUTRA_HOME/credentials.json`，env 模式只填写已有变量名。
 5. 选择推荐 model，或输入自定义 model id。
-6. 填写 advanced config：Thinking、Reasoning effort、Context window、Max output tokens。
+6. 填写 advanced config：Thinking、Reasoning effort、Context window、Max output tokens、custom header literal/env ref。
 7. review：展示脱敏 install plan、保存路径、scope、是否覆盖同名 profile。
 8. probe；成功后应用配置，失败则保留表单但不污染 active selection。
 
@@ -164,7 +164,7 @@ WorkspaceId
 | `threads` | 用户可见会话列表和 resume/fork 元数据 |
 | `runtime_events` | 现有 event log，继续作为 runtime 事实 |
 | rollout JSONL | 从 `runtime_events` 物化的 append/replay/export 历史 |
-| `thread_spawn_edges` | future multi-agent / fork / child agent 关系 |
+| fork lineage event/artifact refs | 记录 parent thread、turn cutoff 和 immutable artifact lineage，不引入 multi-agent 状态机 |
 | cwd 查询索引 | 从全局 `threads(workspace_root, recency_at)` 选择当前 cwd 最近 thread；无历史时不写 placeholder |
 
 当前实现同时保留 conversation projection 和完整 rollout：
@@ -264,7 +264,7 @@ $GOLUTRA_HOME/state/
   session-locks / command-locks
 
 $GOLUTRA_HOME/state/workspaces/<cwd-hash>/
-  checkpoints / memory / evaluation / rollouts
+  checkpoints / memory / evaluation / evolution / skills / code-index / rollouts
 ```
 
 原则：
@@ -318,15 +318,15 @@ TUI 输入框现在先经过 slash command parser：
 - 主输入框按 Unicode grapheme cluster 编辑，左右移动、删除不会拆开中文、emoji 或组合字符；光标列按终端显示宽度计算并在每帧显式同步，输入过长时视口跟随光标。
 - TUI 开启 bracketed paste，粘贴内容以完整字符串事件插入并将 CR/CRLF 归一为 LF；非 ASCII 的 IME 提交字符直接插入，不等待 ASCII 粘贴启发式。
 
-## 当前差距
+## 当前状态与边界
 
 - 当前 TUI 已有 qwen-code 风格 provider setup：Golutra API、Third-party Providers、Custom Provider、mock 分组选择；第三方内置 OpenAI、OpenRouter、DeepSeek、Qwen/DashScope compatible、xAI、GitHub Copilot 和本地 OpenAI-compatible preset；OpenAI 展示 ChatGPT browser/headless OAuth/API key，xAI 展示 browser/device OAuth/API key，GitHub Copilot 只展示 device OAuth。Custom Provider 可选 OpenAI-compatible、Anthropic、Gemini、Vertex AI、genai，但不自动获得 OAuth。setup 的 API key 路径按 protocol/baseUrl -> credential storage/API key 或 envKey -> model -> advanced config -> review -> install 执行；OAuth 路径直接启动后台授权并在成功后 verified probe/install。review 展示脱敏 `ProviderInstallPlan`、保存路径和同名 profile 覆盖提示；secret/config/probe 失败自动 rollback，成功覆盖会删除旧 credential。
 - 当前 provider/auth 持久化已收敛为全局用户级 `$GOLUTRA_HOME/provider.json` v2和 disk/env SecretRef；磁盘 secret 位于 `$GOLUTRA_HOME/credentials.json`，OAuth browser/device、refresh、revoke/logout 已接通。项目 `.golutra` 不参与 provider 或 runtime 持久化。
 - 当前全局 `threads` 表、`golutra thread list`、`golutra resume [THREAD_ID]`、`golutra fork THREAD_ID [--from-turn TURN_ID]`、`golutra thread export` 和 `golutra thread rebind --from` 已可用；默认按当前 canonical cwd 过滤，每个显式新 session 使用独立 thread 主键，daemon 重新 attach 会刷新最近 thread/session。
 - 当前完成任务会写入 `AssistantMessage`，`UserProjection.final_message` 和 TUI transcript 可在 resume 后恢复最终回复；下一轮 prompt 会携带当前 session 的压缩历史摘要。
 - 当前全局 SQLite 已覆盖多 cwd 事实与索引；TUI 按产品边界只展示当前 canonical cwd 的 session。
-- 当前 TUI provider setup 直接写本地 provider config；后续应改为通过 RuntimeHost/config service 返回 `ProviderConfigured`、`ProviderProbeCompleted` 或 `ProviderAuthFailed`。
-- 当前受审计 OAuth catalog 已内置 OpenAI ChatGPT browser/headless、xAI browser/device、GitHub Copilot device，并绑定各自实际模型 adapter；其他 provider 仍需要显式 descriptor/registry 扩展。运行中跨客户端 `ProviderAuthRequired` 协议仍后置，Web 首次 provider onboarding 不在范围内。
-- 当前 session 事实位于全局 SQLite，rollout/fork/rebind 已闭环；剩余 session 方向主要是超长历史分页/虚拟化与更丰富的全文检索。
+- TUI/CLI 的 provider install 由 `golutra-config` 事务服务执行 SecretStore/config/probe/rollback，成功后发送 `ProviderConfigured` 或 `ProviderAuthSubmitted` 给 RuntimeHost；runtime 统一产生 `ProviderConfigured`、`ProviderProbeCompleted`、`ProviderAuthFailed` 等 durable event，TUI 不维护任务认证状态机。
+- 当前受审计 OAuth catalog 已内置 OpenAI ChatGPT browser/headless、xAI browser/device、GitHub Copilot device，并绑定各自实际模型 adapter；其他 provider 仍需要显式 descriptor/registry 扩展。运行中跨客户端 `ProviderAuthRequired`、verified reload/resume 和 cancel 已完成；Web 首次 provider onboarding不在范围内。
+- 当前 session 事实位于全局 SQLite，rollout/fork/rebind、向前/向后 event page 和 code index 已闭环。显式全量 debug/export 仍会物化所选范围；超长历史 UI 虚拟化属于性能优化，不改变 session 正确性。
 
-这些剩余差距不影响当前 mock/live provider、历史恢复、fork 和项目路径迁移主链。
+这些边界不影响当前 mock/live provider、动态认证、历史恢复、fork 和项目路径迁移主链。

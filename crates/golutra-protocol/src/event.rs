@@ -14,12 +14,15 @@ pub enum RuntimeEventSource {
     Memory,
     Evaluator,
     Governor,
+    Evolution,
     User,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeEventType {
+    CommandReceived,
+    CommandCompleted,
     CommandAccepted,
     CommandRejected,
     SessionCreated,
@@ -51,12 +54,22 @@ pub enum RuntimeEventType {
     ApprovalResolved,
     RetryScheduled,
     ProviderFallback,
+    ProviderAuthRequired,
+    ProviderAuthSubmitted,
+    ProviderAuthCancelled,
+    ProviderConfigured,
+    ProviderProbeStarted,
+    ProviderProbeCompleted,
+    ProviderAuthFailed,
+    ProviderRateLimited,
+    ProviderCredentialRefreshed,
     LoopGuardTriggered,
     CompactionCompleted,
     MemoryRetrieved,
     MemoryPromoted,
     MemoryPromotionRejected,
     MemoryRolledBack,
+    MemoryFeedbackRecorded,
     PostTaskReviewed,
     EvaluationCompleted,
     ImprovementCandidateCreated,
@@ -65,7 +78,18 @@ pub enum RuntimeEventType {
     PromotionDecided,
     CandidateApplied,
     CandidateRolledBack,
+    BenchmarkRecorded,
+    CounterfactualCompared,
+    EvolutionPlanned,
+    EvolutionTaskStarted,
+    EvolutionTaskCompleted,
+    EvolutionCompleted,
+    SkillStaged,
+    SkillReviewed,
+    SkillInstalled,
+    SkillRolledBack,
     GovernorDecided,
+    StorageMaintenanceCompleted,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -89,4 +113,29 @@ pub struct EventFilter {
     pub session_id: SessionId,
     pub task_id: Option<TaskId>,
     pub after_sequence_no: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EventPageDirection {
+    Forward,
+    Backward,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct EventPageRequest {
+    pub session_id: SessionId,
+    pub task_id: Option<TaskId>,
+    pub cursor: Option<u64>,
+    pub direction: EventPageDirection,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct EventPage {
+    pub direction: EventPageDirection,
+    pub events: Vec<RuntimeEvent>,
+    pub start_cursor: Option<u64>,
+    pub end_cursor: Option<u64>,
+    pub has_more: bool,
 }

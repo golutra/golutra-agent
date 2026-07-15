@@ -4,24 +4,30 @@ members = [
   "crates/golutra-auth",
   "crates/golutra-cli",
   "crates/golutra-client",
+  "crates/golutra-code-intelligence",
   "crates/golutra-config",
   "crates/golutra-context",
   "crates/golutra-core",
   "crates/golutra-eval",
+  "crates/golutra-evolution",
   "crates/golutra-event",
   "crates/golutra-file-search",
   "crates/golutra-governor",
   "crates/golutra-llm",
   "crates/golutra-memory",
+  "crates/golutra-mcp",
   "crates/golutra-policy",
+  "crates/golutra-plugin",
   "crates/golutra-protocol",
   "crates/golutra-protocol-fixtures",
   "crates/golutra-runtime",
+  "crates/golutra-sandbox",
   "crates/golutra-store",
   "crates/golutra-test-client",
   "crates/golutra-tools",
   "crates/golutra-tui",
   "crates/golutra-verify",
+  "crates/golutra-vis",
 ]
 resolver = "3"
 
@@ -53,6 +59,7 @@ oauth2 = { version = "5.0", default-features = false, features = ["reqwest", "ru
 ratatui = "0.28"
 regex = "1.11"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rmcp = { version = "2.2.0", default-features = false, features = ["client", "transport-child-process"] }
 schemars = { version = "1.0", features = ["chrono04", "uuid1"] }
 secrecy = "0.10"
 serde = { version = "1.0", features = ["derive"] }
@@ -62,6 +69,10 @@ shlex = "1.3"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono", "uuid", "json"] }
 tempfile = "3.20"
 thiserror = "2.0"
+tree-sitter = "0.25"
+tree-sitter-python = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
 tokio = { version = "1.47", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -70,7 +81,9 @@ uuid = { version = "1.17", features = ["serde", "v4", "v7"] }
 unicode-segmentation = "1.13"
 unicode-width = "0.1.14"
 webbrowser = "1.0"
+walkdir = "2.5"
 
 golutra-core = { path = "crates/golutra-core" }
 golutra-protocol = { path = "crates/golutra-protocol" }
 golutra-protocol-fixtures = { path = "crates/golutra-protocol-fixtures" }
+golutra-sandbox = { path = "crates/golutra-sandbox" }

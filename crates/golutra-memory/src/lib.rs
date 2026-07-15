@@ -17,6 +17,23 @@ use thiserror::Error;
 const MAX_MEMORY_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_MEMORY_STATE_BYTES: u64 = 32 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryScope {
+    #[default]
+    Project,
+    User,
+    Global,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryFeedbackKind {
+    Helpful,
+    Irrelevant,
+    Incorrect,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WorkingSummary {
     pub objective: String,
@@ -35,7 +52,7 @@ pub struct WorkingSummary {
 pub struct MemoryCandidate {
     pub source_task_id: TaskId,
     pub evidence_ids: Vec<EvidenceId>,
-    pub proposed_scope: String,
+    pub proposed_scope: MemoryScope,
     pub confidence: u8,
     pub contradiction_ids: Vec<String>,
     pub expiry: Option<String>,
@@ -61,7 +78,7 @@ pub enum MemoryStatus {
 pub struct MemoryRecord {
     pub memory_id: MemoryId,
     pub content: String,
-    pub scope: String,
+    pub scope: MemoryScope,
     pub confidence: u8,
     pub source_task_id: TaskId,
     pub evidence_ids: Vec<EvidenceId>,
@@ -71,6 +88,18 @@ pub struct MemoryRecord {
     pub version: u64,
     pub status: MemoryStatus,
     pub rollback_reason: Option<String>,
+    #[serde(default)]
+    pub promotion_reviewer: Option<String>,
+    #[serde(default)]
+    pub helpful_count: u32,
+    #[serde(default)]
+    pub irrelevant_count: u32,
+    #[serde(default)]
+    pub incorrect_count: u32,
+    #[serde(default)]
+    pub access_count: u64,
+    #[serde(default)]
+    pub last_accessed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -78,6 +107,7 @@ pub struct RetrievedMemory {
     pub record: MemoryRecord,
     pub relevance_score: u32,
     pub matched_terms: Vec<String>,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -85,12 +115,14 @@ pub struct RetrievedMemory {
 pub enum MemoryPromotionDecisionKind {
     Approve,
     Reject,
+    NeedsHumanReview,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct MemoryPromotionDecision {
     pub decision: MemoryPromotionDecisionKind,
     pub reason: String,
+    pub reviewer: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,9 +138,7 @@ impl MemoryPromotionGate {
 
     #[must_use]
     pub fn evaluate(&self, candidate: &MemoryCandidate, content: &str) -> MemoryPromotionDecision {
-        let rejection = if candidate.proposed_scope != "project" {
-            Some("only project-scoped memory can be promoted automatically")
-        } else if candidate.evidence_ids.is_empty() {
+        let rejection = if candidate.evidence_ids.is_empty() {
             Some("memory candidate has no durable evidence")
         } else if candidate.confidence < self.minimum_confidence {
             Some("memory candidate confidence is below the promotion threshold")
@@ -127,10 +157,17 @@ impl MemoryPromotionGate {
             Some(reason) => MemoryPromotionDecision {
                 decision: MemoryPromotionDecisionKind::Reject,
                 reason: reason.to_owned(),
+                reviewer: None,
+            },
+            None if candidate.proposed_scope != MemoryScope::Project => MemoryPromotionDecision {
+                decision: MemoryPromotionDecisionKind::NeedsHumanReview,
+                reason: "user/global memory requires explicit human review".to_owned(),
+                reviewer: None,
             },
             None => MemoryPromotionDecision {
                 decision: MemoryPromotionDecisionKind::Approve,
                 reason: "evidence-backed project memory passed the promotion gate".to_owned(),
+                reviewer: Some("system".to_owned()),
             },
         }
     }
@@ -198,7 +235,37 @@ impl MemoryStore {
         candidate: &MemoryCandidate,
         content: impl Into<String>,
     ) -> Result<MemoryRecord, MemoryError> {
-        let content = content.into();
+        self.promote_internal(gate, candidate, content.into(), None)
+    }
+
+    pub fn promote_reviewed(
+        &self,
+        gate: &MemoryPromotionGate,
+        candidate: &MemoryCandidate,
+        content: impl Into<String>,
+        reviewer: &str,
+        approved: bool,
+    ) -> Result<MemoryRecord, MemoryError> {
+        if !approved {
+            return Err(MemoryError::PromotionRejected(
+                "memory candidate was rejected by the human reviewer".to_owned(),
+            ));
+        }
+        if reviewer.trim().is_empty() {
+            return Err(MemoryError::PromotionRejected(
+                "human reviewer id is required".to_owned(),
+            ));
+        }
+        self.promote_internal(gate, candidate, content.into(), Some(reviewer.to_owned()))
+    }
+
+    fn promote_internal(
+        &self,
+        gate: &MemoryPromotionGate,
+        candidate: &MemoryCandidate,
+        content: String,
+        human_reviewer: Option<String>,
+    ) -> Result<MemoryRecord, MemoryError> {
         let _guard = self.lock.lock().map_err(|_| MemoryError::LockPoisoned)?;
         let _file_lock = self.acquire_file_lock()?;
         let mut records = self.load_unlocked()?;
@@ -209,13 +276,17 @@ impl MemoryStore {
             .extend(contradiction_ids_from_records(
                 &records,
                 &content,
-                &candidate.proposed_scope,
+                candidate.proposed_scope,
             ));
         checked_candidate.contradiction_ids.sort();
         checked_candidate.contradiction_ids.dedup();
         let decision = gate.evaluate(&checked_candidate, &content);
-        if decision.decision != MemoryPromotionDecisionKind::Approve {
-            return Err(MemoryError::PromotionRejected(decision.reason));
+        match decision.decision {
+            MemoryPromotionDecisionKind::Approve => {}
+            MemoryPromotionDecisionKind::NeedsHumanReview if human_reviewer.is_some() => {}
+            MemoryPromotionDecisionKind::NeedsHumanReview | MemoryPromotionDecisionKind::Reject => {
+                return Err(MemoryError::PromotionRejected(decision.reason));
+            }
         }
         if let Some(existing) = records.iter().find(|record| {
             record.status == MemoryStatus::Active
@@ -235,7 +306,7 @@ impl MemoryStore {
         let record = MemoryRecord {
             memory_id: MemoryId::new(),
             content,
-            scope: candidate.proposed_scope.clone(),
+            scope: candidate.proposed_scope,
             confidence: candidate.confidence,
             source_task_id: candidate.source_task_id,
             evidence_ids: candidate.evidence_ids.clone(),
@@ -250,6 +321,12 @@ impl MemoryStore {
                 .saturating_add(1),
             status: MemoryStatus::Active,
             rollback_reason: None,
+            promotion_reviewer: human_reviewer.or(decision.reviewer),
+            helpful_count: 0,
+            irrelevant_count: 0,
+            incorrect_count: 0,
+            access_count: 0,
+            last_accessed_at: None,
         };
         records.push(record.clone());
         self.save_unlocked(&records)?;
@@ -259,17 +336,20 @@ impl MemoryStore {
     pub fn retrieve(
         &self,
         query: &str,
-        scope: &str,
+        scope: MemoryScope,
         limit: usize,
     ) -> Result<Vec<RetrievedMemory>, MemoryError> {
         let query_terms = terms(query);
         if query_terms.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
+        let _guard = self.lock.lock().map_err(|_| MemoryError::LockPoisoned)?;
+        let _file_lock = self.acquire_file_lock()?;
+        let mut records = self.load_unlocked()?;
         let now = Utc::now();
-        let mut retrieved = self
-            .list()?
-            .into_iter()
+        let normalized_query = normalize_content(query);
+        let mut retrieved = records
+            .iter_mut()
             .filter(|record| record.status == MemoryStatus::Active)
             .filter(|record| record.scope == scope)
             .filter(|record| record.expires_at.is_none_or(|expiry| expiry > now))
@@ -280,11 +360,35 @@ impl MemoryStore {
                     .cloned()
                     .collect::<Vec<_>>();
                 matched_terms.sort();
-                (!matched_terms.is_empty()).then_some(RetrievedMemory {
-                    relevance_score: u32::try_from(matched_terms.len()).unwrap_or(u32::MAX)
-                        * u32::from(record.confidence),
+                if matched_terms.is_empty() {
+                    return None;
+                }
+                let phrase_bonus = u32::from(
+                    !normalized_query.is_empty()
+                        && normalize_content(&record.content).contains(&normalized_query),
+                ) * 200;
+                let recency_bonus =
+                    u32::from(now.signed_duration_since(record.created_at).num_days() <= 30) * 25;
+                let positive = u32::try_from(matched_terms.len())
+                    .unwrap_or(u32::MAX)
+                    .saturating_mul(u32::from(record.confidence))
+                    .saturating_add(phrase_bonus)
+                    .saturating_add(recency_bonus)
+                    .saturating_add(record.helpful_count.saturating_mul(50));
+                let penalty = record.irrelevant_count.saturating_mul(100);
+                record.access_count = record.access_count.saturating_add(1);
+                record.last_accessed_at = Some(now);
+                Some(RetrievedMemory {
+                    relevance_score: positive.saturating_sub(penalty),
+                    reason: format!(
+                        "matched {} term(s), confidence {}, helpful {}, irrelevant {}",
+                        matched_terms.len(),
+                        record.confidence,
+                        record.helpful_count,
+                        record.irrelevant_count
+                    ),
                     matched_terms,
-                    record,
+                    record: record.clone(),
                 })
             })
             .collect::<Vec<_>>();
@@ -295,13 +399,52 @@ impl MemoryStore {
                 .then_with(|| right.record.created_at.cmp(&left.record.created_at))
         });
         retrieved.truncate(limit);
+        if !retrieved.is_empty() {
+            self.save_unlocked(&records)?;
+        }
         Ok(retrieved)
+    }
+
+    pub fn record_feedback(
+        &self,
+        memory_id: MemoryId,
+        feedback: MemoryFeedbackKind,
+        reason: impl Into<String>,
+    ) -> Result<MemoryRecord, MemoryError> {
+        let reason = reason.into();
+        let _guard = self.lock.lock().map_err(|_| MemoryError::LockPoisoned)?;
+        let _file_lock = self.acquire_file_lock()?;
+        let mut records = self.load_unlocked()?;
+        let record = records
+            .iter_mut()
+            .find(|record| record.memory_id == memory_id)
+            .ok_or(MemoryError::NotFound(memory_id))?;
+        match feedback {
+            MemoryFeedbackKind::Helpful => {
+                record.helpful_count = record.helpful_count.saturating_add(1);
+            }
+            MemoryFeedbackKind::Irrelevant => {
+                record.irrelevant_count = record.irrelevant_count.saturating_add(1);
+            }
+            MemoryFeedbackKind::Incorrect => {
+                record.incorrect_count = record.incorrect_count.saturating_add(1);
+                record.status = MemoryStatus::RolledBack;
+                record.rollback_reason = Some(if reason.trim().is_empty() {
+                    "memory marked incorrect by retrieval feedback".to_owned()
+                } else {
+                    reason
+                });
+            }
+        }
+        let updated = record.clone();
+        self.save_unlocked(&records)?;
+        Ok(updated)
     }
 
     pub fn contradiction_ids(
         &self,
         content: &str,
-        scope: &str,
+        scope: MemoryScope,
     ) -> Result<Vec<String>, MemoryError> {
         Ok(contradiction_ids_from_records(
             &self.list()?,
@@ -444,7 +587,7 @@ pub fn propose_project_memory(
     MemoryCandidate {
         source_task_id,
         evidence_ids,
-        proposed_scope: "project".to_owned(),
+        proposed_scope: MemoryScope::Project,
         confidence: 80,
         contradiction_ids: Vec::new(),
         expiry: None,
@@ -520,7 +663,7 @@ fn normalize_content(value: &str) -> String {
 fn contradiction_ids_from_records(
     records: &[MemoryRecord],
     content: &str,
-    scope: &str,
+    scope: MemoryScope,
 ) -> Vec<String> {
     let now = Utc::now();
     let candidate_terms = terms(content);
@@ -590,7 +733,7 @@ mod tests {
             )
             .expect("promotion");
         let retrieved = store
-            .retrieve("validate runtime with cargo test", "project", 3)
+            .retrieve("validate runtime with cargo test", MemoryScope::Project, 3)
             .expect("retrieval");
         let rolled_back = store
             .rollback(promoted.memory_id, "superseded")
@@ -601,7 +744,7 @@ mod tests {
         assert_eq!(rolled_back.status, MemoryStatus::RolledBack);
         assert!(
             store
-                .retrieve("cargo test runtime", "project", 3)
+                .retrieve("cargo test runtime", MemoryScope::Project, 3)
                 .expect("retrieval after rollback")
                 .is_empty()
         );
@@ -651,6 +794,49 @@ mod tests {
             gate.evaluate(&candidate, &"x".repeat(MAX_MEMORY_CONTENT_BYTES + 1))
                 .decision,
             MemoryPromotionDecisionKind::Reject
+        );
+    }
+
+    #[test]
+    fn user_memory_requires_human_review_and_feedback_affects_lifecycle() {
+        let store = MemoryStore::in_memory();
+        let mut candidate = propose_project_memory(TaskId::new(), vec![EvidenceId::new()]);
+        candidate.proposed_scope = MemoryScope::User;
+        let gate = MemoryPromotionGate::default();
+
+        assert_eq!(
+            gate.evaluate(&candidate, "use cargo test for runtime changes")
+                .decision,
+            MemoryPromotionDecisionKind::NeedsHumanReview
+        );
+        assert!(matches!(
+            store.promote(&gate, &candidate, "use cargo test for runtime changes"),
+            Err(MemoryError::PromotionRejected(_))
+        ));
+        let record = store
+            .promote_reviewed(
+                &gate,
+                &candidate,
+                "use cargo test for runtime changes",
+                "maintainer-1",
+                true,
+            )
+            .expect("human promotion");
+        let helpful = store
+            .record_feedback(record.memory_id, MemoryFeedbackKind::Helpful, "reused")
+            .expect("helpful feedback");
+        let incorrect = store
+            .record_feedback(record.memory_id, MemoryFeedbackKind::Incorrect, "outdated")
+            .expect("incorrect feedback");
+
+        assert_eq!(record.promotion_reviewer.as_deref(), Some("maintainer-1"));
+        assert_eq!(helpful.helpful_count, 1);
+        assert_eq!(incorrect.status, MemoryStatus::RolledBack);
+        assert!(
+            store
+                .retrieve("cargo test runtime", MemoryScope::User, 3)
+                .expect("retrieve")
+                .is_empty()
         );
     }
 
@@ -721,7 +907,7 @@ mod tests {
         let contradictions = store
             .contradiction_ids(
                 "runtime tests use cargo test and reject durable events",
-                "project",
+                MemoryScope::Project,
             )
             .expect("contradiction check");
 
@@ -745,7 +931,7 @@ mod tests {
             store
                 .contradiction_ids(
                     "runtime tests use cargo test and reject durable events",
-                    "project",
+                    MemoryScope::Project,
                 )
                 .expect("contradiction check")
                 .is_empty()

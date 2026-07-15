@@ -12,8 +12,18 @@ pub enum VerificationResult {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationCheckKind {
+    ToolExecution,
+    WorkspaceChange,
+    ObjectiveValidation,
+    AssistantResponse,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct VerificationCheck {
+    pub kind: VerificationCheckKind,
     pub name: String,
     pub command: Option<String>,
     pub passed: bool,

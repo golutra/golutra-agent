@@ -1,6 +1,7 @@
-use std::{fmt, sync::Arc};
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use async_trait::async_trait;
+use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use golutra_auth::{CredentialProvider, FixedCredentialProvider};
 use golutra_core::{
@@ -19,10 +20,11 @@ mod provider_config;
 pub use genai_adapter::{GenaiProviderAdapter, GenaiProviderConfig};
 pub use openai_responses::{OpenAiResponsesProvider, OpenAiResponsesProviderConfig};
 pub(crate) use provider_config::{
-    apply_generation_config_to_openai_body, configured_or_first_env, env_mapping, first_env,
-    generation_config_from_reader, is_false, missing_env_error, normalize_protocol_value,
-    protocol_spec, redacted_native_from_reader, redacted_openai_from_reader,
-    redacted_openai_responses_from_reader, sanitize_provider_error, selected_protocol_from_reader,
+    apply_generation_config_to_openai_body, configured_or_first_env, custom_headers_from_reader,
+    env_mapping, first_env, generation_config_from_reader, is_false, missing_env_error,
+    normalize_protocol_value, protocol_spec, redacted_native_from_reader,
+    redacted_openai_from_reader, redacted_openai_responses_from_reader, sanitize_provider_error,
+    selected_protocol_from_reader,
 };
 pub use provider_config::{
     normalize_openai_base_url, validate_native_base_url, validate_openai_base_url,
@@ -35,6 +37,7 @@ const GOLUTRA_PROVIDER_API_KEY_ENV: &str = "GOLUTRA_PROVIDER_API_KEY_ENV";
 const GOLUTRA_PROVIDER_MODEL: &str = "GOLUTRA_PROVIDER_MODEL";
 const GOLUTRA_PROVIDER_BASE_URL: &str = "GOLUTRA_PROVIDER_BASE_URL";
 const GOLUTRA_PROVIDER_GENERATION_CONFIG: &str = "GOLUTRA_PROVIDER_GENERATION_CONFIG";
+pub const GOLUTRA_PROVIDER_CUSTOM_HEADERS: &str = "GOLUTRA_PROVIDER_CUSTOM_HEADERS";
 const GOLUTRA_PROVIDER_AUTH_PROVIDER: &str = "GOLUTRA_PROVIDER_AUTH_PROVIDER";
 const OPENAI_API_KEY: &str = "OPENAI_API_KEY";
 const OPENAI_MODEL: &str = "OPENAI_MODEL";
@@ -59,6 +62,8 @@ const MAX_PROVIDER_MESSAGE_BYTES: usize = 128 * 1024;
 const MAX_PROVIDER_TOOL_ARGUMENT_BYTES: usize = 256 * 1024;
 const MAX_PROVIDER_TOOL_CALL_ID_BYTES: usize = 256;
 const MAX_PROVIDER_TOOL_NAME_BYTES: usize = 128;
+const MAX_PROVIDER_CUSTOM_HEADERS: usize = 32;
+const MAX_PROVIDER_HEADER_VALUE_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ProviderError {
@@ -141,6 +146,22 @@ pub struct ProviderToolCall {
     pub arguments: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProviderStreamEvent {
+    TextDelta {
+        text: String,
+    },
+    ReasoningDelta {
+        text: String,
+    },
+    ToolCallDelta {
+        index: usize,
+        tool_call_id: Option<String>,
+        tool_name: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderFinishReason {
@@ -164,6 +185,104 @@ pub enum ProviderProtocol {
     Gemini,
     VertexAi,
     Genai,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum ProviderHeaderValue {
+    Literal { value: String },
+    Environment { key: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderHeaderConfig {
+    pub name: String,
+    pub value: ProviderHeaderValue,
+}
+
+impl ProviderHeaderConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        let name = reqwest::header::HeaderName::from_bytes(self.name.as_bytes())
+            .map_err(|_| format!("provider header name `{}` is invalid", self.name))?;
+        if is_forbidden_custom_header(name.as_str()) {
+            return Err(format!(
+                "provider header `{}` is controlled by the HTTP transport",
+                self.name
+            ));
+        }
+        match &self.value {
+            ProviderHeaderValue::Literal { value } => {
+                if is_sensitive_header(name.as_str()) {
+                    return Err(format!(
+                        "sensitive provider header `{}` must use an environment source",
+                        self.name
+                    ));
+                }
+                validate_provider_header_value(value)?;
+            }
+            ProviderHeaderValue::Environment { key } => {
+                if key.trim().is_empty() || key.len() > 256 {
+                    return Err("provider header environment key is invalid".to_owned());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ProviderHttpHeaders {
+    values: BTreeMap<String, String>,
+}
+
+impl fmt::Debug for ProviderHttpHeaders {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderHttpHeaders")
+            .field("names", &self.values.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl ProviderHttpHeaders {
+    fn from_resolved(values: BTreeMap<String, String>) -> Result<Self, ProviderError> {
+        if values.len() > MAX_PROVIDER_CUSTOM_HEADERS {
+            return Err(ProviderError::NotConfigured {
+                message: format!(
+                    "provider custom headers exceed the {MAX_PROVIDER_CUSTOM_HEADERS} entry limit"
+                ),
+            });
+        }
+        for (name, value) in &values {
+            ProviderHeaderConfig {
+                name: name.clone(),
+                value: ProviderHeaderValue::Environment {
+                    key: "RESOLVED_PROVIDER_HEADER".to_owned(),
+                },
+            }
+            .validate()
+            .map_err(|message| ProviderError::NotConfigured { message })?;
+            validate_provider_header_value(value)
+                .map_err(|message| ProviderError::NotConfigured { message })?;
+        }
+        Ok(Self { values })
+    }
+
+    fn to_header_map(&self) -> reqwest::header::HeaderMap {
+        self.values
+            .iter()
+            .filter_map(|(name, value)| {
+                let name = reqwest::header::HeaderName::from_bytes(name.as_bytes()).ok()?;
+                let value = reqwest::header::HeaderValue::from_str(value).ok()?;
+                Some((name, value))
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn names(&self) -> Vec<String> {
+        self.values.keys().cloned().collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -265,8 +384,8 @@ pub struct ProviderProtocolSpec {
     pub base_url_env: Vec<String>,
     pub model_env: Vec<String>,
     pub default_base_url: Option<String>,
-    pub supports_tool_calls: bool,
     pub supports_probe: bool,
+    pub capabilities: ProviderCapabilities,
     pub notes: String,
 }
 
@@ -281,6 +400,30 @@ struct ProviderEnvMapping {
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError>;
+
+    async fn complete_stream(
+        &self,
+        request: ProviderRequest,
+        on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
+    ) -> Result<ProviderResponse, ProviderError> {
+        let response = self.complete(request).await?;
+        if let Some(message) = &response.message
+            && !message.content.is_empty()
+        {
+            on_event(ProviderStreamEvent::TextDelta {
+                text: message.content.clone(),
+            });
+        }
+        for (index, tool_call) in response.tool_calls.iter().enumerate() {
+            on_event(ProviderStreamEvent::ToolCallDelta {
+                index,
+                tool_call_id: Some(tool_call.tool_call_id.clone()),
+                tool_name: Some(tool_call.tool_name.clone()),
+            });
+        }
+        Ok(response)
+    }
+
     fn contract(&self) -> ProviderContract;
 }
 
@@ -388,6 +531,7 @@ pub struct OpenAiCompatibleProvider {
     base_url: String,
     model_id: String,
     generation_config: ProviderGenerationConfig,
+    custom_headers: ProviderHttpHeaders,
     client: reqwest::Client,
 }
 
@@ -400,6 +544,7 @@ pub struct OpenAiCompatibleProviderConfig {
     pub model_id: String,
     pub protocol: ProviderProtocol,
     pub generation_config: ProviderGenerationConfig,
+    pub custom_headers: ProviderHttpHeaders,
 }
 
 impl fmt::Debug for OpenAiCompatibleProvider {
@@ -411,6 +556,7 @@ impl fmt::Debug for OpenAiCompatibleProvider {
             .field("base_url", &self.base_url)
             .field("model_id", &self.model_id)
             .field("generation_config", &self.generation_config)
+            .field("custom_header_names", &self.custom_headers.names())
             .finish_non_exhaustive()
     }
 }
@@ -425,6 +571,7 @@ impl fmt::Debug for OpenAiCompatibleProviderConfig {
             .field("model_id", &self.model_id)
             .field("protocol", &self.protocol)
             .field("generation_config", &self.generation_config)
+            .field("custom_header_names", &self.custom_headers.names())
             .finish_non_exhaustive()
     }
 }
@@ -453,6 +600,27 @@ pub struct ProviderProbeResult {
     pub model_id: String,
     pub model_available: Option<bool>,
     pub discovered_models: Vec<String>,
+    pub capabilities: ProviderCapabilities,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderCapabilitySource {
+    Declared,
+    Discovered,
+    Inferred,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCapabilities {
+    pub supports_streaming: bool,
+    pub supports_tools: bool,
+    pub supports_json_schema: bool,
+    pub supports_reasoning: bool,
+    pub supports_vision: bool,
+    pub context_window: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    pub source: ProviderCapabilitySource,
 }
 
 impl OpenAiCompatibleProvider {
@@ -463,17 +631,19 @@ impl OpenAiCompatibleProvider {
         initiator: &str,
     ) -> reqwest::RequestBuilder {
         let builder = builder.bearer_auth(token);
-        if self.provider_id != "github-copilot" {
-            return builder;
-        }
-        builder
-            .header(
-                reqwest::header::USER_AGENT,
-                format!("golutra/{}", env!("CARGO_PKG_VERSION")),
-            )
-            .header("X-GitHub-Api-Version", "2026-06-01")
-            .header("Openai-Intent", "conversation-edits")
-            .header("x-initiator", initiator)
+        let builder = if self.provider_id == "github-copilot" {
+            builder
+                .header(
+                    reqwest::header::USER_AGENT,
+                    format!("golutra/{}", env!("CARGO_PKG_VERSION")),
+                )
+                .header("X-GitHub-Api-Version", "2026-06-01")
+                .header("Openai-Intent", "conversation-edits")
+                .header("x-initiator", initiator)
+        } else {
+            builder
+        };
+        builder.headers(self.custom_headers.to_header_map())
     }
 
     #[must_use]
@@ -493,6 +663,7 @@ impl OpenAiCompatibleProvider {
             base_url: normalize_openai_base_url(&base_url.into()),
             model_id: model_id.into(),
             generation_config: ProviderGenerationConfig::default(),
+            custom_headers: ProviderHttpHeaders::default(),
             client: provider_http_client(),
         }
     }
@@ -518,6 +689,7 @@ impl OpenAiCompatibleProvider {
             base_url: normalize_openai_base_url(&config.base_url),
             model_id: config.model_id,
             generation_config: config.generation_config,
+            custom_headers: config.custom_headers,
             client: provider_http_client(),
         }
     }
@@ -558,6 +730,7 @@ impl OpenAiCompatibleProvider {
         let base_url = validate_openai_base_url(&base_url)
             .map_err(|message| ProviderError::NotConfigured { message })?;
         let generation_config = generation_config_from_reader(&reader)?;
+        let custom_headers = custom_headers_from_reader(&reader)?;
         Ok(OpenAiCompatibleProviderConfig {
             api_key,
             api_key_env,
@@ -568,6 +741,7 @@ impl OpenAiCompatibleProvider {
             model_id,
             protocol,
             generation_config,
+            custom_headers,
         })
     }
 
@@ -690,6 +864,7 @@ impl OpenAiCompatibleProvider {
             model_id: self.model_id.clone(),
             model_available,
             discovered_models,
+            capabilities: openai_capabilities_from_models(&value, &self.model_id),
         })
     }
 }
@@ -698,15 +873,7 @@ impl OpenAiCompatibleProvider {
 impl LlmProvider for OpenAiCompatibleProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let mut body = json!({
-            "model": self.model_id,
-            "messages": request.messages.iter().map(openai_message).collect::<Vec<_>>(),
-        });
-        if !request.tools.is_empty() {
-            body["tools"] = Value::Array(request.tools.iter().map(openai_tool_schema).collect());
-            body["tool_choice"] = Value::String("auto".to_owned());
-        }
-        apply_generation_config_to_openai_body(&mut body, &self.generation_config);
+        let body = openai_completion_body(&request, &self.model_id, &self.generation_config, false);
 
         let response = self.post_with_auth_retry(&url, &body).await?;
         let status = response.status();
@@ -723,12 +890,34 @@ impl LlmProvider for OpenAiCompatibleProvider {
         provider_response_from_openai(value, request.task_id, request.turn_id)
     }
 
+    async fn complete_stream(
+        &self,
+        request: ProviderRequest,
+        on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
+    ) -> Result<ProviderResponse, ProviderError> {
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let body = openai_completion_body(&request, &self.model_id, &self.generation_config, true);
+        let response = self.post_with_auth_retry(&url, &body).await?;
+        let status = response.status();
+        if status.as_u16() == 429 {
+            let value = response_json_or_error(response).await?;
+            return Err(ProviderError::RateLimited {
+                message: provider_error_message(&value),
+            });
+        }
+        if !status.is_success() {
+            let value = response_json_or_error(response).await?;
+            return Err(provider_http_error(status, &value));
+        }
+        provider_response_from_openai_stream(response, on_event).await
+    }
+
     fn contract(&self) -> ProviderContract {
         ProviderContract {
             provider_id: self.provider_id.clone(),
             model_id: self.model_id.clone(),
             native_protocol: "openai_chat_completions".to_owned(),
-            stream_event_mapping: "non_streaming_p0".to_owned(),
+            stream_event_mapping: "chat_completion_sse_delta".to_owned(),
             tool_call_mapping: "function_tool_calls".to_owned(),
             usage_mapping: "chat_completion_usage".to_owned(),
             reasoning_mapping: "not_exposed".to_owned(),
@@ -880,6 +1069,7 @@ impl ConfiguredProvider {
                 model_id: "mock-model".to_owned(),
                 model_available: Some(true),
                 discovered_models: vec!["mock-model".to_owned()],
+                capabilities: protocol_capabilities(ProviderProtocol::Mock),
             });
         }
         if protocol == ProviderProtocol::OpenAiCompatible {
@@ -927,6 +1117,22 @@ impl LlmProvider for ConfiguredProvider {
             | Self::Gemini(provider)
             | Self::VertexAi(provider)
             | Self::Genai(provider) => provider.complete(request).await,
+        }
+    }
+
+    async fn complete_stream(
+        &self,
+        request: ProviderRequest,
+        on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
+    ) -> Result<ProviderResponse, ProviderError> {
+        match self {
+            Self::Mock(provider) => provider.complete_stream(request, on_event).await,
+            Self::OpenAiCompatible(provider) => provider.complete_stream(request, on_event).await,
+            Self::OpenAiResponses(provider) => provider.complete_stream(request, on_event).await,
+            Self::Anthropic(provider)
+            | Self::Gemini(provider)
+            | Self::VertexAi(provider)
+            | Self::Genai(provider) => provider.complete_stream(request, on_event).await,
         }
     }
 
@@ -981,9 +1187,7 @@ pub struct ProviderConfig {
 pub struct ModelCapability {
     pub provider_id: String,
     pub model_id: String,
-    pub supports_tools: bool,
-    pub context_window: u64,
-    pub max_output: u64,
+    pub capabilities: ProviderCapabilities,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -1058,16 +1262,12 @@ impl ModelCatalog {
                 ModelCapability {
                     provider_id: "mock".to_owned(),
                     model_id: "mock-model".to_owned(),
-                    supports_tools: true,
-                    context_window: 8_192,
-                    max_output: 1_024,
+                    capabilities: protocol_capabilities(ProviderProtocol::Mock),
                 },
                 ModelCapability {
                     provider_id: "openai-compatible".to_owned(),
                     model_id: "configured-at-runtime".to_owned(),
-                    supports_tools: true,
-                    context_window: 128_000,
-                    max_output: 8_192,
+                    capabilities: protocol_capabilities(ProviderProtocol::OpenAiCompatible),
                 },
             ],
         }
@@ -1078,6 +1278,22 @@ impl ModelCatalog {
         self.capabilities.iter().find(|capability| {
             capability.provider_id == provider_id && capability.model_id == model_id
         })
+    }
+
+    pub fn apply_probe(&mut self, probe: &ProviderProbeResult) {
+        let capability = ModelCapability {
+            provider_id: probe.provider_id.clone(),
+            model_id: probe.model_id.clone(),
+            capabilities: probe.capabilities.clone(),
+        };
+        if let Some(existing) = self.capabilities.iter_mut().find(|existing| {
+            existing.provider_id == capability.provider_id
+                && existing.model_id == capability.model_id
+        }) {
+            *existing = capability;
+        } else {
+            self.capabilities.push(capability);
+        }
     }
 
     #[must_use]
@@ -1107,6 +1323,89 @@ pub fn provider_protocol_catalog() -> Vec<ProviderProtocolSpec> {
     .into_iter()
     .map(protocol_spec)
     .collect()
+}
+
+#[must_use]
+pub fn protocol_capabilities(protocol: ProviderProtocol) -> ProviderCapabilities {
+    let (streaming, tools, json_schema, reasoning, context_window, max_output_tokens) =
+        match protocol {
+            ProviderProtocol::Mock => (false, true, false, false, Some(8_192), Some(1_024)),
+            ProviderProtocol::OpenAiCompatible => {
+                (true, true, true, true, Some(128_000), Some(8_192))
+            }
+            ProviderProtocol::OpenAiResponses => {
+                (true, true, false, true, Some(200_000), Some(100_000))
+            }
+            ProviderProtocol::Anthropic => (true, true, false, true, Some(200_000), Some(8_192)),
+            ProviderProtocol::Gemini | ProviderProtocol::VertexAi => {
+                (true, true, false, true, Some(1_000_000), Some(8_192))
+            }
+            ProviderProtocol::Genai => (true, true, false, true, None, None),
+        };
+    ProviderCapabilities {
+        supports_streaming: streaming,
+        supports_tools: tools,
+        supports_json_schema: json_schema,
+        supports_reasoning: reasoning,
+        supports_vision: false,
+        context_window,
+        max_output_tokens,
+        source: ProviderCapabilitySource::Declared,
+    }
+}
+
+fn openai_capabilities_from_models(value: &Value, model_id: &str) -> ProviderCapabilities {
+    let mut capabilities = protocol_capabilities(ProviderProtocol::OpenAiCompatible);
+    let Some(model) = value
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|model| model.get("id").and_then(Value::as_str) == Some(model_id))
+    else {
+        return capabilities;
+    };
+    let parameters = model
+        .get("supported_parameters")
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if !parameters.is_empty() {
+        capabilities.supports_streaming = parameters.contains(&"stream");
+        capabilities.supports_tools = parameters
+            .iter()
+            .any(|value| matches!(*value, "tools" | "tool_choice" | "function_call"));
+        capabilities.supports_json_schema = parameters.iter().any(|value| {
+            matches!(
+                *value,
+                "response_format" | "structured_outputs" | "json_schema"
+            )
+        });
+        capabilities.supports_reasoning = parameters
+            .iter()
+            .any(|value| matches!(*value, "reasoning" | "reasoning_effort"));
+    }
+    capabilities.context_window = model
+        .get("context_length")
+        .or_else(|| model.get("context_window"))
+        .and_then(Value::as_u64)
+        .or(capabilities.context_window);
+    capabilities.max_output_tokens = model
+        .get("max_output_tokens")
+        .or_else(|| {
+            model
+                .get("top_provider")
+                .and_then(|provider| provider.get("max_completion_tokens"))
+        })
+        .and_then(Value::as_u64)
+        .or(capabilities.max_output_tokens);
+    capabilities.supports_vision = model
+        .get("architecture")
+        .and_then(|architecture| architecture.get("input_modalities"))
+        .and_then(Value::as_array)
+        .is_some_and(|values| values.iter().any(|value| value.as_str() == Some("image")));
+    capabilities.source = ProviderCapabilitySource::Discovered;
+    capabilities
 }
 
 fn mock_contract() -> ProviderContract {
@@ -1180,6 +1479,41 @@ fn openai_request_initiator(body: &Value) -> &'static str {
     }
 }
 
+fn validate_provider_header_value(value: &str) -> Result<(), String> {
+    if value.len() > MAX_PROVIDER_HEADER_VALUE_BYTES {
+        return Err(format!(
+            "provider header value exceeds {MAX_PROVIDER_HEADER_VALUE_BYTES} byte limit"
+        ));
+    }
+    reqwest::header::HeaderValue::from_str(value)
+        .map(|_| ())
+        .map_err(|_| "provider header value contains invalid characters".to_owned())
+}
+
+fn is_forbidden_custom_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "connection"
+            | "content-length"
+            | "host"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+fn is_sensitive_header(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains("api-key")
+        || name.contains("token")
+        || name.contains("secret")
+        || name.contains("credential")
+        || name == "cookie"
+}
+
 fn openai_tool_schema(contract: &ToolContract) -> Value {
     let description = match contract.tool_name.as_str() {
         "read_file" => "Read a UTF-8 text file from the current workspace.",
@@ -1197,6 +1531,249 @@ fn openai_tool_schema(contract: &ToolContract) -> Value {
             "description": description,
             "parameters": contract.input_schema
         }
+    })
+}
+
+fn openai_completion_body(
+    request: &ProviderRequest,
+    model_id: &str,
+    generation_config: &ProviderGenerationConfig,
+    streaming: bool,
+) -> Value {
+    let mut body = json!({
+        "model": model_id,
+        "messages": request.messages.iter().map(openai_message).collect::<Vec<_>>(),
+    });
+    if !request.tools.is_empty() {
+        body["tools"] = Value::Array(request.tools.iter().map(openai_tool_schema).collect());
+        body["tool_choice"] = Value::String("auto".to_owned());
+    }
+    if streaming {
+        body["stream"] = Value::Bool(true);
+        body["stream_options"] = json!({"include_usage": true});
+    }
+    apply_generation_config_to_openai_body(&mut body, generation_config);
+    body
+}
+
+#[derive(Debug, Default)]
+struct OpenAiToolCallAccumulator {
+    tool_call_id: String,
+    tool_name: String,
+    arguments: String,
+}
+
+async fn provider_response_from_openai_stream(
+    response: reqwest::Response,
+    on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
+) -> Result<ProviderResponse, ProviderError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BYTES as u64)
+    {
+        return Err(ProviderError::Malformed {
+            message: format!("provider response exceeds {MAX_PROVIDER_RESPONSE_BYTES} byte limit"),
+        });
+    }
+    let mut stream = response.bytes_stream().eventsource();
+    let mut parsed_bytes = 0_usize;
+    let mut output_text = String::new();
+    let mut tool_calls = BTreeMap::<usize, OpenAiToolCallAccumulator>::new();
+    let mut usage_value = json!({});
+    let mut response_id = None;
+    let mut finish_reason = None;
+    let mut stream_terminated = false;
+
+    while let Some(event) = stream.next().await {
+        let event = event.map_err(|error| ProviderError::Failed {
+            message: sanitize_provider_error(&error.to_string()),
+        })?;
+        parsed_bytes = parsed_bytes.saturating_add(event.data.len());
+        if parsed_bytes > MAX_PROVIDER_RESPONSE_BYTES {
+            return Err(ProviderError::Malformed {
+                message: format!(
+                    "provider response exceeds {MAX_PROVIDER_RESPONSE_BYTES} byte limit"
+                ),
+            });
+        }
+        if event.data.trim() == "[DONE]" {
+            stream_terminated = true;
+            continue;
+        }
+        if event.data.trim().is_empty() {
+            continue;
+        }
+        let value: Value =
+            serde_json::from_str(&event.data).map_err(|error| ProviderError::Malformed {
+                message: format!("chat completion SSE event is invalid JSON: {error}"),
+            })?;
+        if value.get("error").is_some() {
+            return Err(ProviderError::Failed {
+                message: provider_error_message(&value),
+            });
+        }
+        response_id = response_id.or_else(|| {
+            value
+                .get("id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        });
+        if let Some(usage) = value.get("usage")
+            && !usage.is_null()
+        {
+            usage_value = usage.clone();
+        }
+        let Some(choice) = value
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+        else {
+            continue;
+        };
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+            finish_reason = Some(finish_reason_from_openai(reason));
+            stream_terminated = true;
+        }
+        let Some(delta) = choice.get("delta") else {
+            continue;
+        };
+        if let Some(text) = delta.get("content").and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            if output_text.len().saturating_add(text.len()) > MAX_PROVIDER_MESSAGE_BYTES {
+                return Err(ProviderError::Malformed {
+                    message: format!(
+                        "assistant message exceeds {MAX_PROVIDER_MESSAGE_BYTES} byte limit"
+                    ),
+                });
+            }
+            output_text.push_str(text);
+            on_event(ProviderStreamEvent::TextDelta {
+                text: text.to_owned(),
+            });
+        }
+        if let Some(text) = delta
+            .get("reasoning_content")
+            .or_else(|| delta.get("reasoning"))
+            .and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            on_event(ProviderStreamEvent::ReasoningDelta {
+                text: text.to_owned(),
+            });
+        }
+        for tool_delta in delta
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let index = tool_delta
+                .get("index")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| ProviderError::Malformed {
+                    message: "streamed tool call has no valid index".to_owned(),
+                })?;
+            let accumulator = tool_calls.entry(index).or_default();
+            if let Some(id) = tool_delta.get("id").and_then(Value::as_str)
+                && !id.is_empty()
+            {
+                accumulator.tool_call_id = id.to_owned();
+            }
+            let function = tool_delta.get("function").unwrap_or(&Value::Null);
+            if let Some(name) = function.get("name").and_then(Value::as_str)
+                && !name.is_empty()
+            {
+                accumulator.tool_name.push_str(name);
+            }
+            if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                if accumulator.arguments.len().saturating_add(arguments.len())
+                    > MAX_PROVIDER_TOOL_ARGUMENT_BYTES
+                {
+                    return Err(ProviderError::Malformed {
+                        message: format!(
+                            "tool call arguments exceed {MAX_PROVIDER_TOOL_ARGUMENT_BYTES} byte limit"
+                        ),
+                    });
+                }
+                accumulator.arguments.push_str(arguments);
+            }
+            on_event(ProviderStreamEvent::ToolCallDelta {
+                index,
+                tool_call_id: (!accumulator.tool_call_id.is_empty())
+                    .then(|| accumulator.tool_call_id.clone()),
+                tool_name: (!accumulator.tool_name.is_empty())
+                    .then(|| accumulator.tool_name.clone()),
+            });
+        }
+    }
+    if !stream_terminated {
+        return Err(ProviderError::Malformed {
+            message: "chat completion SSE stream ended before a terminal event".to_owned(),
+        });
+    }
+
+    let tool_calls = tool_calls
+        .into_values()
+        .map(|call| {
+            provider_tool_call_from_openai(&json!({
+                "id": call.tool_call_id,
+                "function": {
+                    "name": call.tool_name,
+                    "arguments": call.arguments,
+                }
+            }))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let message = (!output_text.is_empty()).then_some(ProviderMessage {
+        role: ProviderRole::Assistant,
+        content: output_text,
+        tool_call_id: None,
+        tool_name: None,
+        tool_calls: Vec::new(),
+        metadata: ProviderMessageMetadata::default(),
+    });
+    let finish_reason = finish_reason.unwrap_or({
+        if tool_calls.is_empty() {
+            ProviderFinishReason::Unknown
+        } else {
+            ProviderFinishReason::ToolCalls
+        }
+    });
+    Ok(ProviderResponse {
+        response_id: ProviderResponseId::new(),
+        message,
+        tool_calls,
+        usage: ProviderUsage {
+            input_tokens: usage_value.get("prompt_tokens").and_then(Value::as_u64),
+            output_tokens: usage_value.get("completion_tokens").and_then(Value::as_u64),
+            reasoning_tokens: usage_value
+                .get("completion_tokens_details")
+                .and_then(|details| details.get("reasoning_tokens"))
+                .and_then(Value::as_u64),
+            cached_input_tokens: usage_value
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(Value::as_u64),
+            total_tokens: usage_value.get("total_tokens").and_then(Value::as_u64),
+            usage_source: if usage_value
+                .as_object()
+                .is_some_and(|value| value.is_empty())
+            {
+                UsageSource::Unknown
+            } else {
+                UsageSource::Provider
+            },
+            raw: usage_value.clone(),
+        },
+        finish_reason,
+        raw_metadata: json!({
+            "provider": "openai-compatible",
+            "response_id": response_id,
+            "streamed": true,
+            "usage": usage_value,
+        }),
     })
 }
 

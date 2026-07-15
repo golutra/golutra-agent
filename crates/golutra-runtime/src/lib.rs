@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    path::Path,
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
@@ -12,8 +13,8 @@ use golutra_context::{
 use golutra_core::{
     ApprovalDecision, ApprovalId, ApprovalRequest, ApprovalResolution, BudgetState, CommandId,
     LoopAction, LoopDecision, LoopDecisionId, PolicyDecision, PolicyId, SessionId, TaskId,
-    ToolResultStatus, TurnId, VerificationCheck, VerificationId, VerificationRecord,
-    VerificationResult,
+    ToolResultStatus, TurnId, VerificationCheck, VerificationCheckKind, VerificationId,
+    VerificationRecord, VerificationResult,
 };
 use golutra_governor::{
     GoalLedger, GovernorAction, GovernorObservation, GovernorPhase, RuntimeGovernor,
@@ -21,7 +22,7 @@ use golutra_governor::{
 };
 use golutra_llm::{
     LlmProvider, ProviderError, ProviderFinishReason, ProviderMessage, ProviderRequest,
-    ProviderResponse, ProviderRole,
+    ProviderResponse, ProviderRole, ProviderStreamEvent,
 };
 use golutra_tools::{
     BasicToolExecutor, FileBeforeImage, ToolError, ToolExecutionReport, ToolRequest,
@@ -246,6 +247,11 @@ pub enum AgentLoopTraceEvent {
         provider_id: String,
         model_id: String,
     },
+    ProviderStreamed {
+        provider_id: String,
+        model_id: String,
+        event: ProviderStreamEvent,
+    },
     ProviderCompleted {
         provider_id: String,
         model_id: String,
@@ -351,7 +357,7 @@ where
         trace: F,
     ) -> Result<AgentLoopOutcome, AgentLoopError>
     where
-        F: FnMut(AgentLoopTraceEvent),
+        F: FnMut(AgentLoopTraceEvent) + Send,
     {
         let (_handle, control) = agent_execution_channel(1);
         self.run_with_control_and_trace(request, control, trace)
@@ -365,7 +371,7 @@ where
         mut trace: F,
     ) -> Result<AgentLoopOutcome, AgentLoopError>
     where
-        F: FnMut(AgentLoopTraceEvent),
+        F: FnMut(AgentLoopTraceEvent) + Send,
     {
         let mut tool_reports = Vec::new();
         let mut last_assistant_message = None;
@@ -381,6 +387,7 @@ where
         let started_at = Instant::now();
         let mut tool_call_count = 0_u32;
         let mut failed_tool_call_count = 0_u32;
+        let mut estimated_cost_microusd: Option<u64> = None;
         let mut governor_action = None;
         let mut goal_ledger = GoalLedger {
             task_id: request.task_id,
@@ -496,6 +503,9 @@ where
                     planned_input_tokens: plan.budget_snapshot.planned_input_tokens,
                     elapsed_ms: elapsed_millis(started_at),
                     latest_action: current_objective.clone(),
+                    estimated_cost_microusd,
+                    policy_decision: None,
+                    security_risk: "low".to_owned(),
                 },
             );
             let permits_execution = governance.permits_execution();
@@ -561,10 +571,18 @@ where
                 provider_response.response_id,
                 &plan.budget_snapshot,
                 &provider_response.usage,
+                &provider_contract.cost_model,
             );
             trace(AgentLoopTraceEvent::TokenUsageRecorded(
                 usage_record.clone(),
             ));
+            if let Some(cost) = usage_record.estimated_cost.and_then(cost_to_microusd) {
+                estimated_cost_microusd = Some(
+                    estimated_cost_microusd
+                        .unwrap_or_default()
+                        .saturating_add(cost),
+                );
+            }
             last_budget_state = BudgetState {
                 planned_input_tokens: Some(plan.budget_snapshot.planned_input_tokens),
                 actual_input_tokens: usage_record.input_tokens,
@@ -576,7 +594,12 @@ where
                     .budget_limit
                     .checked_sub(plan.budget_snapshot.planned_input_tokens),
                 compact_recommended: false,
-                cost_risk: "low".to_owned(),
+                cost_risk: if usage_record.estimated_cost.is_some() {
+                    "low"
+                } else {
+                    "unknown"
+                }
+                .to_owned(),
             };
 
             if let Some(content) = provider_response
@@ -684,6 +707,9 @@ where
                         planned_input_tokens: plan.budget_snapshot.planned_input_tokens,
                         elapsed_ms: elapsed_millis(started_at),
                         latest_action: tool_action,
+                        estimated_cost_microusd,
+                        policy_decision: None,
+                        security_risk: "medium".to_owned(),
                     },
                 );
                 let permits_execution = governance.permits_execution();
@@ -795,6 +821,9 @@ where
                         planned_input_tokens: plan.budget_snapshot.planned_input_tokens,
                         elapsed_ms: elapsed_millis(started_at),
                         latest_action: report.envelope.summary.clone(),
+                        estimated_cost_microusd,
+                        policy_decision: Some(report.policy_evaluation.decision),
+                        security_risk: report.envelope.risk.clone(),
                     },
                 );
                 let permits_continuation = result_governance.permits_execution();
@@ -841,9 +870,10 @@ where
             .iter()
             .flat_map(|report| report.evidence.iter().map(|evidence| evidence.evidence_id))
             .collect::<Vec<_>>();
-        let command_checks = tool_reports
+        let mut command_checks = tool_reports
             .iter()
             .map(|report| VerificationCheck {
+                kind: VerificationCheckKind::ToolExecution,
                 name: format!("tool:{}", report.envelope.tool_name),
                 command: None,
                 passed: report.envelope.status == ToolResultStatus::Ok,
@@ -851,13 +881,48 @@ where
                 message: report.envelope.summary.clone(),
             })
             .collect::<Vec<_>>();
-        let touched_code = current_turn_touched_code
+        let changed_files = tool_reports
+            .iter()
+            .flat_map(|report| report.changed_files.iter())
+            .collect::<Vec<_>>();
+        if !changed_files.is_empty() {
+            command_checks.push(VerificationCheck {
+                kind: VerificationCheckKind::WorkspaceChange,
+                name: "workspace_diff".to_owned(),
+                command: None,
+                passed: true,
+                evidence_refs: tool_reports
+                    .iter()
+                    .flat_map(|report| report.envelope.evidence_refs.iter().copied())
+                    .collect(),
+                message: format!("{} workspace file(s) changed", changed_files.len()),
+            });
+        }
+        let code_files_changed = changed_files.iter().any(|path| is_code_file(path));
+        for report in &tool_reports {
+            if is_objective_validation_report(report, code_files_changed) {
+                command_checks.push(VerificationCheck {
+                    kind: VerificationCheckKind::ObjectiveValidation,
+                    name: format!("objective:{}", report.envelope.tool_name),
+                    command: report
+                        .envelope
+                        .structured_facts
+                        .get("command")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned),
+                    passed: true,
+                    evidence_refs: report.envelope.evidence_refs.clone(),
+                    message: report.envelope.summary.clone(),
+                });
+            }
+        }
+        let requires_workspace_evidence = current_turn_touched_code
             || tool_reports
                 .iter()
                 .any(|report| !report.changed_files.is_empty());
         let mut verification = if accepts_text_response_without_evidence(
             &current_objective,
-            touched_code,
+            requires_workspace_evidence,
             last_assistant_message.as_deref(),
             &tool_reports,
         ) {
@@ -873,7 +938,8 @@ where
                 completion_criteria: request.completion_criteria.clone(),
                 evidence_refs,
                 command_checks,
-                touched_code,
+                requires_workspace_evidence,
+                code_files_changed,
             })
         };
         let completion_governance = self.governor.evaluate(
@@ -888,6 +954,9 @@ where
                 latest_action: last_assistant_message
                     .clone()
                     .unwrap_or_else(|| current_objective.clone()),
+                estimated_cost_microusd,
+                policy_decision: None,
+                security_risk: "low".to_owned(),
             },
         );
         if !completion_governance.permits_execution() {
@@ -947,7 +1016,7 @@ where
         trace: &mut F,
     ) -> Result<(ProviderResponse, ProviderRequest), ProviderError>
     where
-        F: FnMut(AgentLoopTraceEvent),
+        F: FnMut(AgentLoopTraceEvent) + Send,
     {
         match self
             .complete_provider(&self.provider, request.clone(), control, trace)
@@ -987,7 +1056,7 @@ where
         trace: &mut F,
     ) -> Result<ProviderResponse, ProviderError>
     where
-        F: FnMut(AgentLoopTraceEvent),
+        F: FnMut(AgentLoopTraceEvent) + Send,
     {
         const MAX_ATTEMPTS: u32 = 3;
         for attempt in 1..=MAX_ATTEMPTS {
@@ -995,10 +1064,22 @@ where
                 .wait_until_runnable()
                 .await
                 .map_err(|_| ProviderError::Cancelled)?;
-            let result = tokio::select! {
-                biased;
-                _ = control.cancellation.cancelled() => Err(ProviderError::Cancelled),
-                result = provider.complete(request.clone()) => result,
+            let contract = provider.contract();
+            let result = {
+                let provider_id = contract.provider_id;
+                let model_id = contract.model_id;
+                let mut on_event = |event| {
+                    trace(AgentLoopTraceEvent::ProviderStreamed {
+                        provider_id: provider_id.clone(),
+                        model_id: model_id.clone(),
+                        event,
+                    });
+                };
+                tokio::select! {
+                    biased;
+                    _ = control.cancellation.cancelled() => Err(ProviderError::Cancelled),
+                    result = provider.complete_stream(request.clone(), &mut on_event) => result,
+                }
             };
             match result {
                 Ok(response) => return Ok(response),
@@ -1022,6 +1103,11 @@ where
 }
 
 impl AgentExecutionControl {
+    #[must_use]
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
     async fn wait_until_runnable(&mut self) -> Result<(), AgentLoopError> {
         loop {
             if self.cancellation.is_cancelled() {
@@ -1079,7 +1165,7 @@ fn context_guard_outcome<F>(
     trace: &mut F,
 ) -> AgentLoopOutcome
 where
-    F: FnMut(AgentLoopTraceEvent),
+    F: FnMut(AgentLoopTraceEvent) + Send,
 {
     let (planned, limit, action) = match error {
         ContextError::BudgetExceeded { planned, limit } => (planned, limit, LoopAction::Blocked),
@@ -1234,6 +1320,7 @@ fn text_response_verification(
         objective,
         completion_criteria,
         checks: vec![VerificationCheck {
+            kind: VerificationCheckKind::AssistantResponse,
             name: "assistant_response".to_owned(),
             command: None,
             passed: true,
@@ -1244,6 +1331,71 @@ fn text_response_verification(
         result: VerificationResult::Pass,
         policy_status: "conversation_response".to_owned(),
         residual_risks: Vec::new(),
+    }
+}
+
+fn is_code_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some(
+            "c" | "cc"
+                | "cpp"
+                | "cs"
+                | "go"
+                | "h"
+                | "hpp"
+                | "java"
+                | "js"
+                | "jsx"
+                | "kt"
+                | "kts"
+                | "php"
+                | "py"
+                | "rb"
+                | "rs"
+                | "swift"
+                | "ts"
+                | "tsx"
+        )
+    )
+}
+
+fn is_objective_validation_report(report: &ToolExecutionReport, code_files_changed: bool) -> bool {
+    if report.envelope.status != ToolResultStatus::Ok {
+        return false;
+    }
+    if report.envelope.tool_name == "shell" {
+        return report
+            .envelope
+            .structured_facts
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_objective_validation_command);
+    }
+    !code_files_changed
+        && report.changed_files.iter().any(|path| !is_code_file(path))
+        && matches!(
+            report.envelope.tool_name.as_str(),
+            "write_file" | "edit_file"
+        )
+}
+
+fn is_objective_validation_command(command: &str) -> bool {
+    let Some(parts) = shlex::split(command) else {
+        return false;
+    };
+    let Some(program) = parts.first().map(String::as_str) else {
+        return false;
+    };
+    match program {
+        "cargo" => parts
+            .iter()
+            .any(|part| matches!(part.as_str(), "test" | "check" | "clippy" | "build" | "fmt")),
+        "npm" | "pnpm" | "yarn" | "bun" => parts
+            .iter()
+            .any(|part| matches!(part.as_str(), "test" | "check" | "typecheck" | "build")),
+        "pytest" | "go" | "make" | "mvn" | "gradle" | "swift" => true,
+        _ => false,
     }
 }
 
@@ -1303,6 +1455,18 @@ fn objective_requires_workspace_evidence(objective: &str) -> bool {
 
 fn elapsed_millis(started_at: Instant) -> u64 {
     u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn cost_to_microusd(cost_usd: f64) -> Option<u64> {
+    if !cost_usd.is_finite() || cost_usd.is_sign_negative() {
+        return None;
+    }
+    let microusd = cost_usd * 1_000_000.0;
+    if microusd >= u64::MAX as f64 {
+        Some(u64::MAX)
+    } else {
+        Some(microusd.round() as u64)
+    }
 }
 
 #[cfg(test)]

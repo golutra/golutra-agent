@@ -1,12 +1,13 @@
 use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use genai::{
     Client, ModelIden, ServiceTarget, WebConfig,
     adapter::AdapterKind,
     chat::{
-        ChatMessage, ChatOptions, ChatRequest, ContentPart, MessageContent, ReasoningEffort,
-        StopReason, Tool, ToolCall, ToolResponse,
+        ChatMessage, ChatOptions, ChatRequest, ChatStreamEvent, ContentPart, MessageContent,
+        ReasoningEffort, StopReason, StreamEnd, Tool, ToolCall, ToolResponse,
     },
     resolver::{AuthData, Endpoint},
 };
@@ -16,11 +17,12 @@ use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 
 use super::{
-    ProviderError, ProviderFinishReason, ProviderGenerationConfig, ProviderMessage,
-    ProviderProbeResult, ProviderProtocol, ProviderRequest, ProviderResponse, ProviderRole,
-    ProviderToolCall, ProviderUsage, UsageSource, configured_or_first_env, env_mapping, first_env,
-    generation_config_from_reader, missing_env_error, sanitize_provider_error,
-    selected_protocol_from_reader, validate_native_base_url,
+    ProviderError, ProviderFinishReason, ProviderGenerationConfig, ProviderHttpHeaders,
+    ProviderMessage, ProviderProbeResult, ProviderProtocol, ProviderRequest, ProviderResponse,
+    ProviderRole, ProviderStreamEvent, ProviderToolCall, ProviderUsage, UsageSource,
+    configured_or_first_env, custom_headers_from_reader, env_mapping, first_env,
+    generation_config_from_reader, missing_env_error, protocol_capabilities,
+    sanitize_provider_error, selected_protocol_from_reader, validate_native_base_url,
 };
 
 #[derive(Clone, PartialEq, Eq)]
@@ -31,6 +33,7 @@ pub struct GenaiProviderConfig {
     pub model_id: String,
     pub protocol: ProviderProtocol,
     pub generation_config: ProviderGenerationConfig,
+    pub custom_headers: ProviderHttpHeaders,
 }
 
 #[derive(Clone)]
@@ -49,6 +52,7 @@ impl fmt::Debug for GenaiProviderConfig {
             .field("model_id", &self.model_id)
             .field("protocol", &self.protocol)
             .field("generation_config", &self.generation_config)
+            .field("custom_header_names", &self.custom_headers.names())
             .finish_non_exhaustive()
     }
 }
@@ -62,6 +66,7 @@ impl fmt::Debug for GenaiProviderAdapter {
             .field("model_id", &self.config.model_id)
             .field("protocol", &self.config.protocol)
             .field("generation_config", &self.config.generation_config)
+            .field("custom_header_names", &self.config.custom_headers.names())
             .finish_non_exhaustive()
     }
 }
@@ -81,16 +86,14 @@ impl GenaiProviderAdapter {
         config: GenaiProviderConfig,
         credential: Arc<dyn CredentialProvider>,
     ) -> Self {
+        let web_config = WebConfig::default()
+            .with_connect_timeout(std::time::Duration::from_secs(10))
+            .with_timeout(std::time::Duration::from_secs(120))
+            .with_default_headers(config.custom_headers.to_header_map());
         Self {
             config,
             credential,
-            client: Client::builder()
-                .with_web_config(
-                    WebConfig::default()
-                        .with_connect_timeout(std::time::Duration::from_secs(10))
-                        .with_timeout(std::time::Duration::from_secs(120)),
-                )
-                .build(),
+            client: Client::builder().with_web_config(web_config).build(),
         }
     }
 
@@ -142,6 +145,7 @@ impl GenaiProviderAdapter {
             model_id,
             protocol,
             generation_config,
+            custom_headers: custom_headers_from_reader(&reader)?,
         })
     }
 
@@ -173,6 +177,7 @@ impl GenaiProviderAdapter {
             model_id: self.config.model_id.clone(),
             model_available: Some(true),
             discovered_models: vec![self.config.model_id.clone()],
+            capabilities: protocol_capabilities(self.config.protocol),
         })
     }
 
@@ -216,7 +221,7 @@ impl GenaiProviderAdapter {
             .await
             .map_err(super::provider_credential_error)?;
         let chat_request = genai_chat_request(request)?;
-        let options = genai_chat_options(&self.config.generation_config)?;
+        let options = genai_chat_options(&self.config.generation_config, false)?;
         let response = self
             .client
             .exec_chat(
@@ -247,6 +252,79 @@ impl GenaiProviderAdapter {
             Err(error) => Err(map_genai_error(error)),
         }
     }
+
+    async fn execute_stream(
+        &self,
+        request: &ProviderRequest,
+        on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
+    ) -> Result<ProviderResponse, ProviderError> {
+        let mut force_refresh = false;
+        let response = loop {
+            let api_key = self
+                .credential
+                .credential(force_refresh)
+                .await
+                .map_err(super::provider_credential_error)?;
+            let chat_request = genai_chat_request(request)?;
+            let options = genai_chat_options(&self.config.generation_config, true)?;
+            match self
+                .client
+                .exec_chat_stream(
+                    self.service_target(api_key.expose_secret())?,
+                    chat_request,
+                    Some(&options),
+                )
+                .await
+            {
+                Ok(response) => break response,
+                Err(error) if !force_refresh && genai_error_requires_auth_refresh(&error) => {
+                    force_refresh = true;
+                }
+                Err(error) => return Err(map_genai_error(error)),
+            }
+        };
+        let model_id = response.model_iden.to_string();
+        let mut stream = response.stream;
+        let mut stream_end = None;
+        let mut tool_delta_index = 0_usize;
+        while let Some(event) = stream.next().await {
+            match event.map_err(map_genai_error)? {
+                ChatStreamEvent::Start | ChatStreamEvent::ThoughtSignatureChunk(_) => {}
+                ChatStreamEvent::Chunk(chunk) => {
+                    if !chunk.content.is_empty() {
+                        on_event(ProviderStreamEvent::TextDelta {
+                            text: chunk.content,
+                        });
+                    }
+                }
+                ChatStreamEvent::ReasoningChunk(chunk) => {
+                    if !chunk.content.is_empty() {
+                        on_event(ProviderStreamEvent::ReasoningDelta {
+                            text: chunk.content,
+                        });
+                    }
+                }
+                ChatStreamEvent::ToolCallChunk(chunk) => {
+                    on_event(ProviderStreamEvent::ToolCallDelta {
+                        index: tool_delta_index,
+                        tool_call_id: (!chunk.tool_call.call_id.is_empty())
+                            .then(|| chunk.tool_call.call_id.clone()),
+                        tool_name: (!chunk.tool_call.fn_name.is_empty())
+                            .then(|| chunk.tool_call.fn_name.clone()),
+                    });
+                    tool_delta_index = tool_delta_index.saturating_add(1);
+                }
+                ChatStreamEvent::End(end) => {
+                    stream_end = Some(end);
+                    break;
+                }
+            }
+        }
+        let end = stream_end.ok_or_else(|| ProviderError::Malformed {
+            message: "native provider stream ended before a terminal event".to_owned(),
+        })?;
+        provider_response_from_genai_stream(end, &model_id)
+    }
 }
 
 #[async_trait]
@@ -255,12 +333,20 @@ impl super::LlmProvider for GenaiProviderAdapter {
         self.execute(&request, false).await
     }
 
+    async fn complete_stream(
+        &self,
+        request: ProviderRequest,
+        on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
+    ) -> Result<ProviderResponse, ProviderError> {
+        self.execute_stream(&request, on_event).await
+    }
+
     fn contract(&self) -> ProviderContract {
         ProviderContract {
             provider_id: self.config.protocol.id().to_owned(),
             model_id: self.config.model_id.clone(),
             native_protocol: native_protocol(self.config.protocol).to_owned(),
-            stream_event_mapping: "non_streaming_genai".to_owned(),
+            stream_event_mapping: "genai_normalized_stream".to_owned(),
             tool_call_mapping: "genai_normalized_function_calls".to_owned(),
             usage_mapping: "genai_normalized_usage".to_owned(),
             reasoning_mapping: "genai_reasoning_effort".to_owned(),
@@ -342,8 +428,18 @@ fn genai_message(message: &ProviderMessage) -> Result<ChatMessage, ProviderError
     }
 }
 
-fn genai_chat_options(config: &ProviderGenerationConfig) -> Result<ChatOptions, ProviderError> {
+fn genai_chat_options(
+    config: &ProviderGenerationConfig,
+    streaming: bool,
+) -> Result<ChatOptions, ProviderError> {
     let mut options = ChatOptions::default().with_capture_raw_body(true);
+    if streaming {
+        options = options
+            .with_capture_usage(true)
+            .with_capture_content(true)
+            .with_capture_reasoning_content(true)
+            .with_capture_tool_calls(true);
+    }
     if let Some(max_tokens) = config.max_tokens {
         options = options.with_max_tokens(u32::try_from(max_tokens).map_err(|_| {
             ProviderError::NotConfigured {
@@ -364,6 +460,72 @@ fn genai_chat_options(config: &ProviderGenerationConfig) -> Result<ChatOptions, 
         options = options.with_reasoning_effort(effort);
     }
     Ok(options)
+}
+
+fn provider_response_from_genai_stream(
+    end: StreamEnd,
+    model_id: &str,
+) -> Result<ProviderResponse, ProviderError> {
+    let content = end
+        .captured_content
+        .as_ref()
+        .map(|content| content.texts().join(""))
+        .unwrap_or_default();
+    if content.len() > super::MAX_PROVIDER_MESSAGE_BYTES {
+        return Err(ProviderError::Malformed {
+            message: format!(
+                "assistant message exceeds {} byte limit",
+                super::MAX_PROVIDER_MESSAGE_BYTES
+            ),
+        });
+    }
+    let tool_calls = end
+        .captured_content
+        .as_ref()
+        .map(MessageContent::tool_calls)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|call| {
+            validate_tool_call(&call.call_id, &call.fn_name, &call.fn_arguments)?;
+            Ok(ProviderToolCall {
+                tool_call_id: call.call_id.clone(),
+                tool_name: call.fn_name.clone(),
+                arguments: call.fn_arguments.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, ProviderError>>()?;
+    let usage = match end.captured_usage.as_ref() {
+        Some(usage) => provider_usage_from_genai(usage)?,
+        None => ProviderUsage {
+            input_tokens: None,
+            output_tokens: None,
+            reasoning_tokens: None,
+            cached_input_tokens: None,
+            total_tokens: None,
+            usage_source: UsageSource::Unknown,
+            raw: json!({}),
+        },
+    };
+    let finish_reason = finish_reason_from_genai(end.captured_stop_reason.as_ref());
+    Ok(ProviderResponse {
+        response_id: ProviderResponseId::new(),
+        message: (!content.is_empty()).then_some(ProviderMessage {
+            role: ProviderRole::Assistant,
+            content,
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        }),
+        tool_calls,
+        usage,
+        finish_reason,
+        raw_metadata: json!({
+            "provider_model": model_id,
+            "response_id": end.captured_response_id,
+            "streamed": true,
+        }),
+    })
 }
 
 fn provider_response_from_genai(
@@ -405,34 +567,8 @@ fn provider_response_from_genai(
             })
         })
         .collect::<Result<Vec<_>, ProviderError>>()?;
-    let usage_raw =
-        serde_json::to_value(&response.usage).map_err(|error| ProviderError::Malformed {
-            message: format!("genai usage could not be serialized: {error}"),
-        })?;
-    let usage = ProviderUsage {
-        input_tokens: non_negative_u64(response.usage.prompt_tokens),
-        output_tokens: non_negative_u64(response.usage.completion_tokens),
-        reasoning_tokens: response
-            .usage
-            .completion_tokens_details
-            .as_ref()
-            .and_then(|details| non_negative_u64(details.reasoning_tokens)),
-        cached_input_tokens: response
-            .usage
-            .prompt_tokens_details
-            .as_ref()
-            .and_then(|details| non_negative_u64(details.cached_tokens)),
-        total_tokens: non_negative_u64(response.usage.total_tokens),
-        usage_source: UsageSource::Provider,
-        raw: usage_raw,
-    };
-    let finish_reason = match response.stop_reason.as_ref() {
-        Some(StopReason::Completed(_) | StopReason::StopSequence(_)) => ProviderFinishReason::Stop,
-        Some(StopReason::MaxTokens(_)) => ProviderFinishReason::Length,
-        Some(StopReason::ToolCall(_)) => ProviderFinishReason::ToolCalls,
-        Some(StopReason::ContentFilter(_)) => ProviderFinishReason::ContentFilter,
-        Some(StopReason::Other(_)) | None => ProviderFinishReason::Unknown,
-    };
+    let usage = provider_usage_from_genai(&response.usage)?;
+    let finish_reason = finish_reason_from_genai(response.stop_reason.as_ref());
     let raw_metadata = response.captured_raw_body.unwrap_or_else(|| {
         json!({
             "provider_model": response.provider_model_iden.to_string(),
@@ -454,6 +590,37 @@ fn provider_response_from_genai(
         finish_reason,
         raw_metadata,
     })
+}
+
+fn provider_usage_from_genai(usage: &genai::chat::Usage) -> Result<ProviderUsage, ProviderError> {
+    let usage_raw = serde_json::to_value(usage).map_err(|error| ProviderError::Malformed {
+        message: format!("genai usage could not be serialized: {error}"),
+    })?;
+    Ok(ProviderUsage {
+        input_tokens: non_negative_u64(usage.prompt_tokens),
+        output_tokens: non_negative_u64(usage.completion_tokens),
+        reasoning_tokens: usage
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|details| non_negative_u64(details.reasoning_tokens)),
+        cached_input_tokens: usage
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|details| non_negative_u64(details.cached_tokens)),
+        total_tokens: non_negative_u64(usage.total_tokens),
+        usage_source: UsageSource::Provider,
+        raw: usage_raw,
+    })
+}
+
+fn finish_reason_from_genai(reason: Option<&StopReason>) -> ProviderFinishReason {
+    match reason {
+        Some(StopReason::Completed(_) | StopReason::StopSequence(_)) => ProviderFinishReason::Stop,
+        Some(StopReason::MaxTokens(_)) => ProviderFinishReason::Length,
+        Some(StopReason::ToolCall(_)) => ProviderFinishReason::ToolCalls,
+        Some(StopReason::ContentFilter(_)) => ProviderFinishReason::ContentFilter,
+        Some(StopReason::Other(_)) | None => ProviderFinishReason::Unknown,
+    }
 }
 
 fn validate_tool_call(call_id: &str, name: &str, arguments: &Value) -> Result<(), ProviderError> {
@@ -582,6 +749,7 @@ mod tests {
             model_id: "claude-test".to_owned(),
             protocol: ProviderProtocol::Anthropic,
             generation_config: ProviderGenerationConfig::default(),
+            custom_headers: ProviderHttpHeaders::default(),
         });
 
         let debug = format!("{provider:?}");
@@ -592,12 +760,15 @@ mod tests {
 
     #[test]
     fn generation_config_maps_reasoning_effort_and_output_limit() {
-        let options = genai_chat_options(&ProviderGenerationConfig {
-            enable_thinking: true,
-            reasoning_effort: Some(super::super::ProviderReasoningEffort::Xhigh),
-            context_window_size: Some(128_000),
-            max_tokens: Some(4_096),
-        })
+        let options = genai_chat_options(
+            &ProviderGenerationConfig {
+                enable_thinking: true,
+                reasoning_effort: Some(super::super::ProviderReasoningEffort::Xhigh),
+                context_window_size: Some(128_000),
+                max_tokens: Some(4_096),
+            },
+            false,
+        )
         .expect("generation options");
 
         assert_eq!(options.max_tokens, Some(4_096));

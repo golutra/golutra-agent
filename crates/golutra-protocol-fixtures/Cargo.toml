@@ -10,6 +10,7 @@ rust-version.workspace = true
 chrono.workspace = true
 golutra-core.workspace = true
 golutra-eval = { path = "../golutra-eval" }
+golutra-evolution = { path = "../golutra-evolution" }
 golutra-governor = { path = "../golutra-governor" }
 golutra-memory = { path = "../golutra-memory" }
 golutra-protocol.workspace = true

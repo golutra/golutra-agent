@@ -175,6 +175,61 @@ impl WorkspaceCheckpointManager {
         Ok(())
     }
 
+    pub fn checkpoint_count(&self) -> Result<u64, CheckpointError> {
+        Ok(self.checkpoint_directories()?.len() as u64)
+    }
+
+    pub fn prune_checkpoints(&self, keep_latest: usize) -> Result<u64, CheckpointError> {
+        let mut checkpoints = self.checkpoint_directories()?;
+        checkpoints.sort_by(|left, right| right.1.cmp(&left.1));
+        let mut removed = 0_u64;
+        for (path, _) in checkpoints.into_iter().skip(keep_latest) {
+            fs::remove_dir_all(&path)
+                .map_err(|error| CheckpointError::Io(format!("{}: {error}", path.display())))?;
+            removed = removed.saturating_add(1);
+        }
+        if removed > 0 {
+            sync_checkpoint_directory(&self.checkpoint_root)?;
+        }
+        Ok(removed)
+    }
+
+    fn checkpoint_directories(
+        &self,
+    ) -> Result<Vec<(PathBuf, std::time::SystemTime)>, CheckpointError> {
+        let entries = match fs::read_dir(&self.checkpoint_root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(CheckpointError::Io(error.to_string())),
+        };
+        let mut checkpoints = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| CheckpointError::Io(error.to_string()))?;
+            let metadata = fs::symlink_metadata(entry.path())
+                .map_err(|error| CheckpointError::Io(error.to_string()))?;
+            if metadata.file_type().is_symlink() {
+                return Err(CheckpointError::Io(format!(
+                    "checkpoint entry cannot be a symbolic link: {}",
+                    entry.path().display()
+                )));
+            }
+            if !metadata.is_dir()
+                || entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                    .is_none()
+            {
+                continue;
+            }
+            let modified = metadata
+                .modified()
+                .map_err(|error| CheckpointError::Io(error.to_string()))?;
+            checkpoints.push((entry.path(), modified));
+        }
+        Ok(checkpoints)
+    }
+
     fn relative_checkpoint_path(&self, changed_file: &Path) -> Result<PathBuf, CheckpointError> {
         let path = if changed_file.is_absolute() {
             changed_file.to_path_buf()

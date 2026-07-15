@@ -1,10 +1,62 @@
 use std::{fs, path::Path, process::Stdio, time::Duration};
 
+#[cfg(unix)]
+use golutra_client::UnixIpcTransport;
 use golutra_client::{AppServerInfo, HttpSseTransport, RuntimeClient};
 use golutra_core::{Actor, ActorKind, CommandId, SessionId, ThreadId};
 use golutra_protocol::{EventFilter, RuntimeEventType, SessionCommand, SessionCommandKind};
+use secrecy::SecretString;
 use tempfile::tempdir;
 use tokio::process::{Child, Command};
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unix_ipc_and_http_share_commands_history_and_event_streams() {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+    let cwd = tempdir().expect("cwd");
+    let home = tempdir().expect("home");
+    install_mock_provider(home.path());
+    let _child = spawn_daemon(home.path());
+    let http = wait_for_transport(home.path(), cwd.path()).await;
+    let ipc = wait_for_ipc_transport(home.path(), cwd.path()).await;
+    assert_eq!(
+        http.server_info().instance_id,
+        ipc.server_info().instance_id
+    );
+    assert_eq!(http.info().workspace_id, ipc.info().workspace_id);
+    let socket = fs::symlink_metadata(home.path().join("app-server/app-server.sock"))
+        .expect("IPC socket metadata");
+    assert!(socket.file_type().is_socket());
+    assert_eq!(socket.permissions().mode() & 0o777, 0o600);
+
+    let session_id = ipc.info().default_session_id;
+    let mut stream = ipc
+        .subscribe(EventFilter {
+            session_id,
+            task_id: None,
+            after_sequence_no: None,
+        })
+        .await
+        .expect("IPC subscription");
+    assert!(
+        ipc.send_command(prompt_command(session_id, "hello over IPC"))
+            .await
+            .expect("IPC command")
+            .accepted
+    );
+    wait_for_completion(&mut stream).await;
+
+    let filter = EventFilter {
+        session_id,
+        task_id: None,
+        after_sequence_no: None,
+    };
+    let ipc_events = ipc.replay_events(filter.clone()).await.expect("IPC replay");
+    let http_events = http.replay_events(filter).await.expect("HTTP replay");
+    assert_eq!(ipc_events, http_events);
+    assert_eq!(ipc.list_threads(20).await.expect("IPC threads").len(), 1);
+}
 
 struct ChildGuard(Child);
 
@@ -106,10 +158,15 @@ async fn one_daemon_routes_multiple_cwds_and_preserves_history() {
             .accepted
     );
     wait_for_completion(&mut latest_events_a).await;
-    let reattached_a =
-        HttpSseTransport::connect(transport_a.server_info().base_url.clone(), cwd_a.path())
-            .await
-            .expect("reattach cwd a");
+    let transport_token = fs::read_to_string(home.path().join("app-server/transport.token"))
+        .expect("transport token");
+    let reattached_a = HttpSseTransport::connect_with_token(
+        transport_a.server_info().base_url.clone(),
+        cwd_a.path(),
+        SecretString::from(transport_token.trim().to_owned()),
+    )
+    .await
+    .expect("reattach cwd a");
     assert_eq!(reattached_a.info().default_session_id, latest_session_a);
     assert_eq!(reattached_a.info().default_thread_id, latest_thread_a);
     assert_eq!(
@@ -193,6 +250,128 @@ async fn existing_http_transport_reattaches_after_daemon_restart_on_the_same_end
             .is_empty()
     );
     second_daemon.0.kill().await.expect("stop second daemon");
+}
+
+#[tokio::test]
+async fn daemon_resumes_a_waiting_task_after_provider_configuration_reload() {
+    let cwd = tempdir().expect("cwd");
+    let home = tempdir().expect("home");
+    fs::write(home.path().join("provider.json"), "{invalid-json")
+        .expect("malformed provider config");
+    let mut daemon = spawn_daemon(home.path());
+    let transport = wait_for_transport(home.path(), cwd.path()).await;
+    let session_id = transport.info().default_session_id;
+    let mut events = transport
+        .subscribe(EventFilter {
+            session_id,
+            task_id: None,
+            after_sequence_no: None,
+        })
+        .await
+        .expect("provider auth SSE subscription");
+
+    assert!(
+        transport
+            .send_command(prompt_command(session_id, "hello"))
+            .await
+            .expect("prompt command")
+            .accepted
+    );
+    let request_id = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = events
+                .recv()
+                .await
+                .expect("stream remains open")
+                .expect("runtime event");
+            if event.event_type == RuntimeEventType::ProviderAuthRequired {
+                return event
+                    .payload
+                    .get("request_id")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("provider auth request id")
+                    .to_owned();
+            }
+        }
+    })
+    .await
+    .expect("provider auth request");
+
+    install_mock_provider(home.path());
+    assert!(
+        transport
+            .send_command(runtime_command(
+                session_id,
+                SessionCommandKind::ProviderConfigured,
+                serde_json::json!({"request_id": request_id, "verified": true}),
+            ))
+            .await
+            .expect("provider configured command")
+            .accepted
+    );
+
+    let mut saw_configured = false;
+    let mut saw_assistant = false;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = events
+                .recv()
+                .await
+                .expect("stream remains open")
+                .expect("runtime event");
+            saw_configured |= event.event_type == RuntimeEventType::ProviderConfigured;
+            saw_assistant |= event.event_type == RuntimeEventType::AssistantMessage;
+            if event.event_type == RuntimeEventType::TaskCompleted {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("resumed task completion");
+    assert!(saw_configured);
+    assert!(saw_assistant);
+    daemon.0.kill().await.expect("stop daemon");
+}
+
+#[tokio::test]
+async fn daemon_transport_token_is_private_and_rejects_wrong_credentials() {
+    let cwd = tempdir().expect("cwd");
+    let home = tempdir().expect("home");
+    install_mock_provider(home.path());
+    let mut daemon = spawn_daemon(home.path());
+    let transport = wait_for_transport(home.path(), cwd.path()).await;
+    let endpoint_path = home.path().join("app-server/app-server.json");
+    let token_path = home.path().join("app-server/transport.token");
+    let endpoint = fs::read_to_string(&endpoint_path).expect("endpoint metadata");
+    let token = fs::read_to_string(&token_path).expect("transport token");
+    assert!(!endpoint.contains(token.trim()));
+    assert_eq!(
+        transport.server_info().protocol_versions,
+        golutra_protocol::ProtocolVersionRange::runtime()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert_eq!(
+            fs::metadata(&token_path)
+                .expect("token metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    let error = HttpSseTransport::connect_with_token(
+        transport.server_info().base_url.clone(),
+        cwd.path(),
+        SecretString::from("wrong-transport-token-0000000000000000000000000000000000000000"),
+    )
+    .await
+    .expect_err("wrong transport token must fail");
+    assert!(error.to_string().contains("401"));
+    daemon.0.kill().await.expect("stop daemon");
 }
 
 #[tokio::test]
@@ -295,6 +474,25 @@ fn prompt_command(session_id: golutra_core::SessionId, prompt: &str) -> SessionC
     }
 }
 
+fn runtime_command(
+    session_id: SessionId,
+    kind: SessionCommandKind,
+    payload: serde_json::Value,
+) -> SessionCommand {
+    SessionCommand {
+        command_id: CommandId::new(),
+        session_id: Some(session_id),
+        kind,
+        idempotency_key: CommandId::new().to_string(),
+        actor: Actor {
+            kind: ActorKind::Sdk,
+            id: "cross-process-test".to_owned(),
+        },
+        payload,
+        timestamp: chrono::Utc::now(),
+    }
+}
+
 fn install_mock_provider(home: &Path) {
     fs::write(
         home.join("provider.json"),
@@ -342,9 +540,16 @@ async fn wait_for_transport(home: &Path, cwd: &Path) -> HttpSseTransport {
                 .map_err(|error| error.to_string())?;
             let info: AppServerInfo =
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-            HttpSseTransport::connect(info.base_url, cwd)
+            let token = tokio::fs::read_to_string(home.join("app-server/transport.token"))
                 .await
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())?;
+            HttpSseTransport::connect_with_token(
+                info.base_url,
+                cwd,
+                SecretString::from(token.trim().to_owned()),
+            )
+            .await
+            .map_err(|error| error.to_string())
         }
         .await;
         match attempt {
@@ -355,6 +560,22 @@ async fn wait_for_transport(home: &Path, cwd: &Path) -> HttpSseTransport {
     }
     panic!(
         "daemon endpoint did not become ready: {}",
+        last_error.unwrap_or_else(|| "unknown error".to_owned())
+    );
+}
+
+#[cfg(unix)]
+async fn wait_for_ipc_transport(home: &Path, cwd: &Path) -> UnixIpcTransport {
+    let mut last_error = None;
+    for _ in 0..200 {
+        match UnixIpcTransport::from_home_and_cwd(home, cwd).await {
+            Ok(transport) => return transport,
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!(
+        "daemon IPC endpoint did not become ready: {}",
         last_error.unwrap_or_else(|| "unknown error".to_owned())
     );
 }

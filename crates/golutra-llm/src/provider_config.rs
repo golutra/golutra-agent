@@ -18,6 +18,25 @@ where
         })
 }
 
+pub(crate) fn custom_headers_from_reader<F>(
+    reader: &F,
+) -> Result<ProviderHttpHeaders, ProviderError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let Some(raw) =
+        reader(GOLUTRA_PROVIDER_CUSTOM_HEADERS).filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(ProviderHttpHeaders::default());
+    };
+    let values = serde_json::from_str::<BTreeMap<String, String>>(&raw).map_err(|error| {
+        ProviderError::NotConfigured {
+            message: format!("provider custom headers are invalid JSON: {error}"),
+        }
+    })?;
+    ProviderHttpHeaders::from_resolved(values)
+}
+
 pub(crate) fn env_mapping(protocol: ProviderProtocol) -> ProviderEnvMapping {
     match protocol {
         ProviderProtocol::Mock => ProviderEnvMapping {
@@ -211,11 +230,10 @@ where
 
 pub(crate) fn protocol_spec(protocol: ProviderProtocol) -> ProviderProtocolSpec {
     let mapping = env_mapping(protocol);
-    let (display_name, status, supports_tool_calls, supports_probe, notes) = match protocol {
+    let (display_name, status, supports_probe, notes) = match protocol {
         ProviderProtocol::Mock => (
             "Mock".to_owned(),
             "supported".to_owned(),
-            true,
             false,
             "Deterministic local provider for smoke tests, replay, and offline development."
                 .to_owned(),
@@ -224,13 +242,11 @@ pub(crate) fn protocol_spec(protocol: ProviderProtocol) -> ProviderProtocolSpec 
             "OpenAI-compatible".to_owned(),
             "supported".to_owned(),
             true,
-            true,
             "Live Chat Completions adapter for OpenAI-compatible endpoints.".to_owned(),
         ),
         ProviderProtocol::OpenAiResponses => (
             "OpenAI Responses".to_owned(),
             "supported".to_owned(),
-            true,
             true,
             "Responses SSE adapter for explicitly registered subscription OAuth providers."
                 .to_owned(),
@@ -239,13 +255,11 @@ pub(crate) fn protocol_spec(protocol: ProviderProtocol) -> ProviderProtocolSpec 
             "Anthropic".to_owned(),
             "supported".to_owned(),
             true,
-            true,
             "Native Anthropic Messages adapter backed by rust-genai.".to_owned(),
         ),
         ProviderProtocol::Gemini => (
             "Gemini".to_owned(),
             "supported".to_owned(),
-            true,
             true,
             "Native Gemini generateContent adapter backed by rust-genai.".to_owned(),
         ),
@@ -253,14 +267,12 @@ pub(crate) fn protocol_spec(protocol: ProviderProtocol) -> ProviderProtocolSpec 
             "Vertex AI".to_owned(),
             "supported".to_owned(),
             true,
-            true,
             "Native Vertex AI adapter using an OAuth access token and project/location endpoint."
                 .to_owned(),
         ),
         ProviderProtocol::Genai => (
             "rust-genai".to_owned(),
             "supported".to_owned(),
-            true,
             true,
             "Multi-provider adapter selected from the configured rust-genai model namespace."
                 .to_owned(),
@@ -283,8 +295,8 @@ pub(crate) fn protocol_spec(protocol: ProviderProtocol) -> ProviderProtocolSpec 
             .collect(),
         model_env: mapping.model.iter().map(|key| (*key).to_owned()).collect(),
         default_base_url: mapping.default_base_url.map(ToOwned::to_owned),
-        supports_tool_calls,
         supports_probe,
+        capabilities: protocol_capabilities(protocol),
         notes,
     }
 }

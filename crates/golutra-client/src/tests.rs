@@ -97,6 +97,26 @@ fn local_app_server_endpoint_requires_loopback_root_http_url() {
 }
 
 #[test]
+fn remote_app_server_endpoint_requires_https_or_loopback_http() {
+    for valid in [
+        "https://runtime.example.com",
+        "http://127.0.0.1:47831",
+        "http://localhost:47831",
+    ] {
+        validate_remote_app_server_base_url(valid).expect("safe remote endpoint");
+    }
+    for invalid in [
+        "http://runtime.example.com",
+        "https://user@runtime.example.com",
+        "https://runtime.example.com/api",
+        "ftp://runtime.example.com",
+    ] {
+        validate_remote_app_server_base_url(invalid)
+            .expect_err("unsafe remote endpoint must be rejected");
+    }
+}
+
+#[test]
 fn runtime_paths_reject_a_file_as_cwd() {
     let home = tempdir().expect("home");
     let directory = tempdir().expect("directory");
@@ -139,6 +159,8 @@ fn http_transport_uses_the_connected_url_instead_of_advertised_runtime_url() {
             instance_id: "server".to_owned(),
             pid: 1,
             base_url: "http://127.0.0.1:9".to_owned(),
+            ipc_path: None,
+            protocol_versions: ProtocolVersionRange::runtime(),
             started_at: chrono::Utc::now(),
         },
         info: RuntimeHostInfo {
@@ -153,6 +175,7 @@ fn http_transport_uses_the_connected_url_instead_of_advertised_runtime_url() {
         },
         cwd: PathBuf::from("/workspace"),
         attachment_id: Arc::new(RwLock::new("attachment".to_owned())),
+        transport_token: Arc::new(secrecy::SecretString::from("a".repeat(64))),
     };
 
     assert_eq!(
@@ -202,6 +225,127 @@ async fn event_writer_assigns_sequence_numbers_in_record_order() {
     assert_eq!(
         events[1].get("event_type").and_then(Value::as_str),
         Some("command_rejected")
+    );
+}
+
+#[tokio::test]
+async fn event_pages_move_backward_and_forward_without_overlap() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let session_id = host.default_session_id();
+    for index in 0..5 {
+        host.record_event(host_event(
+            0,
+            session_id,
+            None,
+            RuntimeEventType::CommandAccepted,
+            RuntimeEventSource::Runtime,
+            json!({"summary": format!("event {index}")}),
+        ))
+        .await
+        .expect("event");
+    }
+
+    let latest = host
+        .event_page(EventPageRequest {
+            session_id,
+            task_id: None,
+            cursor: None,
+            direction: EventPageDirection::Backward,
+            limit: 2,
+        })
+        .await
+        .expect("latest page");
+    assert_eq!(
+        latest
+            .events
+            .iter()
+            .map(|event| event.sequence_no)
+            .collect::<Vec<_>>(),
+        vec![4, 5]
+    );
+    assert!(latest.has_more);
+
+    let older = host
+        .event_page(EventPageRequest {
+            session_id,
+            task_id: None,
+            cursor: latest.start_cursor,
+            direction: EventPageDirection::Backward,
+            limit: 2,
+        })
+        .await
+        .expect("older page");
+    assert_eq!(
+        older
+            .events
+            .iter()
+            .map(|event| event.sequence_no)
+            .collect::<Vec<_>>(),
+        vec![2, 3]
+    );
+    assert!(older.has_more);
+
+    let forward = host
+        .event_page(EventPageRequest {
+            session_id,
+            task_id: None,
+            cursor: Some(3),
+            direction: EventPageDirection::Forward,
+            limit: 2,
+        })
+        .await
+        .expect("forward page");
+    assert_eq!(
+        forward
+            .events
+            .iter()
+            .map(|event| event.sequence_no)
+            .collect::<Vec<_>>(),
+        vec![4, 5]
+    );
+    assert!(!forward.has_more);
+}
+
+#[tokio::test]
+async fn storage_maintenance_command_records_a_report_and_exposes_stats() {
+    let transport = EmbeddedTransport::in_memory().await.expect("transport");
+    let session_id = transport.default_session_id();
+    let ack = transport
+        .send_command(runtime_command(
+            session_id,
+            SessionCommandKind::RunStorageMaintenance,
+            json!({}),
+        ))
+        .await
+        .expect("maintenance command");
+    assert!(ack.accepted);
+
+    let stats = transport
+        .query(RuntimeQuery {
+            query_id: QueryId::new(),
+            session_id,
+            task_id: None,
+            kind: RuntimeQueryKind::StorageStatus,
+            requester: ActorKind::Sdk,
+            cursor: None,
+            timestamp: chrono::Utc::now(),
+        })
+        .await
+        .expect("storage stats");
+    assert_eq!(stats["artifact_records"], 0);
+    assert!(
+        transport
+            .replay_events(EventFilter {
+                session_id,
+                task_id: None,
+                after_sequence_no: None,
+            })
+            .await
+            .expect("events")
+            .into_iter()
+            .any(|event| {
+                event["event_type"] == json!(RuntimeEventType::StorageMaintenanceCompleted)
+            })
     );
 }
 
@@ -605,24 +749,40 @@ async fn idempotency_keys_are_scoped_to_the_attached_workspace() {
 }
 
 #[tokio::test]
-async fn stale_provisional_command_ack_is_reprocessed_after_owner_exit() {
+async fn processing_command_journal_entry_is_reconciled_after_owner_exit() {
     let workspace = tempdir().expect("workspace");
     let _provider = IsolatedGlobalMockProvider::install().await;
     let host = RuntimeHost::for_cwd(workspace.path()).await.expect("host");
     let transport = EmbeddedTransport::new(host.clone());
     let session_id = transport.default_session_id();
     let command = command(session_id, "recover claimed command");
-    host.store
-        .store_command_ack(
+    let claim = host
+        .store
+        .claim_command(
             &host.scoped_idempotency_key(&command.idempotency_key),
+            command.command_id,
             &CommandAck {
                 command_id: command.command_id,
                 accepted: true,
                 reason: Some(PROVISIONAL_COMMAND_ACK_REASON.to_owned()),
             },
+            host_event(
+                0,
+                session_id,
+                None,
+                RuntimeEventType::CommandReceived,
+                RuntimeEventSource::Runtime,
+                json!({"command_id": command.command_id}),
+            ),
         )
         .await
-        .expect("provisional ack");
+        .expect("processing command claim");
+    assert!(matches!(
+        claim,
+        CommandClaim::Claimed {
+            receipt_event: Some(_)
+        }
+    ));
 
     let ack = transport
         .send_command(command)
@@ -706,7 +866,7 @@ async fn evaluation_candidate_requires_regression_and_supports_rollback() {
         payload: json!({"prompt": "reproduce provider failure"}),
     };
     let evidence_id = EvidenceId::new();
-    transport
+    let mut evaluation_input = transport
         .host
         .evaluate_completed_task(
             &task,
@@ -719,6 +879,7 @@ async fn evaluation_candidate_requires_regression_and_supports_rollback() {
                     objective: "reproduce provider failure".to_owned(),
                     completion_criteria: vec!["provider succeeds".to_owned()],
                     checks: vec![VerificationCheck {
+                        kind: golutra_core::VerificationCheckKind::ToolExecution,
                         name: "provider".to_owned(),
                         command: None,
                         passed: false,
@@ -737,6 +898,12 @@ async fn evaluation_candidate_requires_regression_and_supports_rollback() {
         )
         .await
         .expect("evaluation");
+    evaluation_input.event_count = 1;
+    transport
+        .host
+        .record_task_evaluation(&task, EvaluationRunner.evaluate_task(evaluation_input))
+        .await
+        .expect("deep evaluation");
     let candidate_id = format!("automation-benchmark-{task_id}");
     let apply_without_regression = transport
         .send_command(runtime_command(
@@ -772,13 +939,199 @@ async fn evaluation_candidate_requires_regression_and_supports_rollback() {
 
     assert!(matches!(
         apply_without_regression,
-        Err(ClientError::Evaluation(
-            EvaluationError::InvalidCandidateState { .. }
-        ))
+        Err(ClientError::Evaluation(EvaluationError::PromotionRequired(
+            _
+        )))
     ));
     assert!(regression.accepted);
     assert!(apply.accepted);
     assert!(rollback.accepted);
+}
+
+#[tokio::test]
+async fn evolution_plan_executes_generated_task_in_isolated_mock_runtime() {
+    let workspace = tempdir().expect("workspace");
+    let home = tempdir().expect("home");
+    let transport = EmbeddedTransport::from_home_and_cwd(home.path(), workspace.path())
+        .await
+        .expect("transport");
+    let session_id = transport.default_session_id();
+    let task_id = TaskId::new();
+    let task = HostedAgentTask {
+        session_id,
+        task_id,
+        turn_id: TurnId::new(),
+        payload: json!({"prompt": "reproduce provider failure"}),
+    };
+    let evaluation_input = transport
+        .host
+        .evaluate_completed_task(
+            &task,
+            HostedTaskEvaluation {
+                objective: "reproduce provider failure",
+                task_status: TaskStatus::Failed,
+                verification: None,
+                tool_reports: &[],
+                failure_summary: Some("provider failed".to_owned()),
+                latency: Duration::ZERO,
+            },
+        )
+        .await
+        .expect("evaluation");
+    transport
+        .host
+        .record_task_evaluation(&task, EvaluationRunner.evaluate_task(evaluation_input))
+        .await
+        .expect("deep evaluation");
+
+    let plan = transport
+        .send_command(runtime_command(
+            session_id,
+            SessionCommandKind::PlanEvolution,
+            json!({"objective": "expand provider robustness"}),
+        ))
+        .await
+        .expect("plan");
+    let run = transport
+        .send_command(runtime_command(
+            session_id,
+            SessionCommandKind::RunEvolution,
+            json!({}),
+        ))
+        .await
+        .expect("run");
+    let state = transport
+        .query(RuntimeQuery {
+            query_id: QueryId::new(),
+            session_id,
+            task_id: None,
+            kind: RuntimeQueryKind::EvolutionState,
+            requester: ActorKind::Cli,
+            cursor: None,
+            timestamp: chrono::Utc::now(),
+        })
+        .await
+        .expect("evolution state");
+
+    assert!(plan.accepted);
+    assert!(run.accepted);
+    assert_eq!(state["runs"][0]["status"], "completed");
+    assert_eq!(state["executions"][0]["status"], "completed");
+    let sandbox_workspace = state["executions"][0]["sandbox_workspace"]
+        .as_str()
+        .expect("sandbox workspace");
+    assert!(
+        sandbox_workspace.starts_with(
+            home.path()
+                .canonicalize()
+                .expect("canonical home")
+                .to_string_lossy()
+                .as_ref()
+        )
+    );
+    assert!(
+        !sandbox_workspace.starts_with(
+            workspace
+                .path()
+                .canonicalize()
+                .expect("canonical workspace")
+                .to_string_lossy()
+                .as_ref()
+        )
+    );
+}
+
+#[tokio::test]
+async fn reviewed_skill_is_installed_and_injected_only_for_matching_objectives() {
+    let transport = EmbeddedTransport::in_memory().await.expect("transport");
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let task = HostedAgentTask {
+        session_id,
+        task_id,
+        turn_id: TurnId::new(),
+        payload: json!({"prompt": "list workspace files"}),
+    };
+    let evidence_id = EvidenceId::new();
+    let evaluation_input = transport
+        .host
+        .evaluate_completed_task(
+            &task,
+            HostedTaskEvaluation {
+                objective: "list workspace files",
+                task_status: TaskStatus::Completed,
+                verification: Some(VerificationRecord {
+                    verification_id: VerificationId::new(),
+                    task_id,
+                    objective: "list workspace files".to_owned(),
+                    completion_criteria: vec!["files listed".to_owned()],
+                    checks: Vec::new(),
+                    evidence_refs: vec![evidence_id],
+                    result: VerificationResult::Pass,
+                    policy_status: "allowed".to_owned(),
+                    residual_risks: Vec::new(),
+                }),
+                tool_reports: &[],
+                failure_summary: None,
+                latency: Duration::ZERO,
+            },
+        )
+        .await
+        .expect("evaluation");
+    transport
+        .host
+        .record_task_evaluation(&task, EvaluationRunner.evaluate_task(evaluation_input))
+        .await
+        .expect("deep evaluation");
+    let skill_id = format!("skill-{task_id}");
+
+    for command in [
+        runtime_command(
+            session_id,
+            SessionCommandKind::StageSkill,
+            json!({"candidate_id": skill_id}),
+        ),
+        runtime_command(
+            session_id,
+            SessionCommandKind::ReviewSkill,
+            json!({
+                "skill_id": skill_id,
+                "decision": "approve",
+                "reason": "verified by maintainer",
+                "regression_refs": ["regression-pass"],
+            }),
+        ),
+        runtime_command(
+            session_id,
+            SessionCommandKind::InstallSkill,
+            json!({"skill_id": skill_id}),
+        ),
+    ] {
+        assert!(
+            transport
+                .send_command(command)
+                .await
+                .expect("skill command")
+                .accepted
+        );
+    }
+
+    assert!(
+        transport
+            .host
+            .active_skill_context("list workspace files")
+            .await
+            .expect("skill context")
+            .is_some()
+    );
+    assert!(
+        transport
+            .host
+            .active_skill_context("configure an unrelated provider")
+            .await
+            .expect("unrelated context")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -1371,6 +1724,18 @@ async fn rebind_rejects_a_rollout_path_outside_the_source_workspace_partition() 
         TaskStatus::Completed,
     )
     .await;
+    let task_id = old_transport
+        .host
+        .store
+        .query_state(old_transport.default_session_id(), None)
+        .await
+        .expect("completed state")
+        .active_task_id
+        .expect("completed task");
+    old_transport
+        .host
+        .wait_for_deep_task_evaluation(task_id)
+        .await;
     let thread_id = old_transport.default_thread_id();
     let mut thread = old_transport
         .resume_thread(thread_id)
@@ -1763,6 +2128,26 @@ async fn prompt_plain_conversation_completes_without_tool_evidence() {
         projection.get("final_message").and_then(Value::as_str),
         Some("mock provider completed without tool calls")
     );
+    let events = transport
+        .replay_events(EventFilter {
+            session_id,
+            task_id: None,
+            after_sequence_no: None,
+        })
+        .await
+        .expect("stream events")
+        .into_iter()
+        .map(|event| serde_json::from_value::<RuntimeEvent>(event).expect("runtime event"))
+        .collect::<Vec<_>>();
+    let streamed = events
+        .iter()
+        .position(|event| event.event_type == RuntimeEventType::ProviderStreamed)
+        .expect("provider delta");
+    let completed = events
+        .iter()
+        .position(|event| event.event_type == RuntimeEventType::AssistantMessage)
+        .expect("assistant message");
+    assert!(streamed < completed);
 }
 
 #[tokio::test]
@@ -1957,6 +2342,150 @@ async fn malformed_provider_config_does_not_silently_fallback_to_mock() {
 
     assert!(matches!(error, ProviderError::NotConfigured { .. }));
     assert!(error.to_string().contains("could not be loaded"));
+}
+
+#[tokio::test]
+async fn runtime_waits_for_provider_auth_and_resumes_after_verified_reload() {
+    let workspace = tempdir().expect("workspace");
+    let home = IsolatedGlobalMockProvider::empty().await;
+    let paths = ProviderConfigPaths::global().expect("provider paths");
+    fs::write(&paths.user_config, "{invalid-json").expect("malformed provider config");
+    let transport = EmbeddedTransport::from_home_and_cwd(home._home.path(), workspace.path())
+        .await
+        .expect("transport");
+    let session_id = transport.default_session_id();
+
+    let ack = transport
+        .send_command(command(session_id, "hello"))
+        .await
+        .expect("prompt");
+    assert!(ack.accepted);
+    wait_for_status(&transport, session_id, TaskStatus::WaitingAuthentication).await;
+    let events = transport
+        .replay_events(EventFilter {
+            session_id,
+            task_id: None,
+            after_sequence_no: None,
+        })
+        .await
+        .expect("auth events")
+        .into_iter()
+        .map(|event| serde_json::from_value::<RuntimeEvent>(event).expect("runtime event"))
+        .collect::<Vec<_>>();
+    let request_id = events
+        .iter()
+        .find(|event| event.event_type == RuntimeEventType::ProviderAuthRequired)
+        .and_then(|event| event.payload.get("request_id"))
+        .and_then(Value::as_str)
+        .expect("provider auth request")
+        .to_owned();
+
+    let mut settings = ProviderSettings::default();
+    settings.upsert_profile(ProviderProfile::mock(), true);
+    settings
+        .save(&paths.user_config)
+        .expect("valid provider config");
+    let reload = transport
+        .send_command(runtime_command(
+            session_id,
+            SessionCommandKind::ProviderConfigured,
+            json!({"request_id": request_id, "verified": true}),
+        ))
+        .await
+        .expect("provider reload");
+    assert!(reload.accepted, "{:?}", reload.reason);
+    wait_for_status(&transport, session_id, TaskStatus::Completed).await;
+    let provider_state = transport
+        .query(RuntimeQuery {
+            query_id: QueryId::new(),
+            session_id,
+            task_id: None,
+            kind: RuntimeQueryKind::ProviderState,
+            requester: ActorKind::Cli,
+            cursor: None,
+            timestamp: chrono::Utc::now(),
+        })
+        .await
+        .expect("provider state");
+    assert_eq!(provider_state["provider"]["protocol"], "mock");
+
+    let events = transport
+        .replay_events(EventFilter {
+            session_id,
+            task_id: None,
+            after_sequence_no: None,
+        })
+        .await
+        .expect("completed auth events")
+        .into_iter()
+        .map(|event| serde_json::from_value::<RuntimeEvent>(event).expect("runtime event"))
+        .collect::<Vec<_>>();
+    for expected in [
+        RuntimeEventType::ProviderAuthRequired,
+        RuntimeEventType::ProviderConfigured,
+        RuntimeEventType::ProviderProbeCompleted,
+        RuntimeEventType::ProviderAuthSubmitted,
+        RuntimeEventType::AssistantMessage,
+    ] {
+        assert!(
+            events.iter().any(|event| event.event_type == expected),
+            "missing {expected:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn provider_auth_cancellation_stops_the_waiting_task() {
+    let workspace = tempdir().expect("workspace");
+    let home = IsolatedGlobalMockProvider::empty().await;
+    let paths = ProviderConfigPaths::global().expect("provider paths");
+    fs::write(&paths.user_config, "{invalid-json").expect("malformed provider config");
+    let transport = EmbeddedTransport::from_home_and_cwd(home._home.path(), workspace.path())
+        .await
+        .expect("transport");
+    let session_id = transport.default_session_id();
+    transport
+        .send_command(command(session_id, "hello"))
+        .await
+        .expect("prompt");
+    wait_for_status(&transport, session_id, TaskStatus::WaitingAuthentication).await;
+    let request_id = transport
+        .replay_events(EventFilter {
+            session_id,
+            task_id: None,
+            after_sequence_no: None,
+        })
+        .await
+        .expect("auth events")
+        .into_iter()
+        .filter_map(|event| serde_json::from_value::<RuntimeEvent>(event).ok())
+        .find(|event| event.event_type == RuntimeEventType::ProviderAuthRequired)
+        .and_then(|event| event.payload.get("request_id").cloned())
+        .expect("request id");
+
+    let ack = transport
+        .send_command(runtime_command(
+            session_id,
+            SessionCommandKind::ProviderAuthCancelled,
+            json!({"request_id": request_id}),
+        ))
+        .await
+        .expect("cancel auth");
+
+    assert!(ack.accepted);
+    wait_for_status(&transport, session_id, TaskStatus::Cancelled).await;
+    let events = transport
+        .replay_events(EventFilter {
+            session_id,
+            task_id: None,
+            after_sequence_no: None,
+        })
+        .await
+        .expect("cancel events");
+    assert!(events.into_iter().any(|event| {
+        serde_json::from_value::<RuntimeEvent>(event)
+            .is_ok_and(|event| event.event_type == RuntimeEventType::ProviderAuthCancelled)
+    }));
 }
 
 #[tokio::test]

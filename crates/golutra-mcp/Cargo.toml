@@ -1,0 +1,24 @@
+[package]
+name = "golutra-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+golutra-core.workspace = true
+golutra-plugin = { path = "../golutra-plugin" }
+golutra-sandbox.workspace = true
+golutra-tools = { path = "../golutra-tools" }
+rmcp.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+golutra-policy = { path = "../golutra-policy" }
+tempfile.workspace = true

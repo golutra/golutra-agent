@@ -1,5 +1,6 @@
 use golutra_core::{
-    EvidenceId, TaskId, VerificationCheck, VerificationId, VerificationRecord, VerificationResult,
+    EvidenceId, TaskId, VerificationCheck, VerificationCheckKind, VerificationId,
+    VerificationRecord, VerificationResult,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9,7 +10,8 @@ pub struct VerificationInput {
     pub completion_criteria: Vec<String>,
     pub evidence_refs: Vec<EvidenceId>,
     pub command_checks: Vec<VerificationCheck>,
-    pub touched_code: bool,
+    pub requires_workspace_evidence: bool,
+    pub code_files_changed: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -20,11 +22,32 @@ impl VerificationRunner {
     pub fn verify(&self, input: VerificationInput) -> VerificationRecord {
         let has_evidence = !input.evidence_refs.is_empty();
         let commands_passed = input.command_checks.iter().all(|check| check.passed);
-        let result = match (has_evidence, commands_passed) {
-            (true, true) => VerificationResult::Pass,
-            (true, false) => VerificationResult::Partial,
-            (false, _) if input.touched_code => VerificationResult::Fail,
-            (false, _) => VerificationResult::Unknown,
+        let change_recorded = passed_check(
+            &input.command_checks,
+            VerificationCheckKind::WorkspaceChange,
+        );
+        let objective_validated = passed_check(
+            &input.command_checks,
+            VerificationCheckKind::ObjectiveValidation,
+        );
+        let result = if input.code_files_changed {
+            match (
+                has_evidence,
+                commands_passed,
+                change_recorded,
+                objective_validated,
+            ) {
+                (true, true, true, true) => VerificationResult::Pass,
+                (true, _, true, _) => VerificationResult::Partial,
+                _ => VerificationResult::Fail,
+            }
+        } else {
+            match (has_evidence, commands_passed) {
+                (true, true) => VerificationResult::Pass,
+                (true, false) => VerificationResult::Partial,
+                (false, _) if input.requires_workspace_evidence => VerificationResult::Fail,
+                (false, _) => VerificationResult::Unknown,
+            }
         };
 
         VerificationRecord {
@@ -39,6 +62,12 @@ impl VerificationRunner {
             residual_risks: residual_risks(result),
         }
     }
+}
+
+fn passed_check(checks: &[VerificationCheck], kind: VerificationCheckKind) -> bool {
+    checks
+        .iter()
+        .any(|check| check.kind == kind && check.passed)
 }
 
 #[must_use]
@@ -67,7 +96,8 @@ mod tests {
             completion_criteria: vec!["evidence exists".to_owned()],
             evidence_refs: Vec::new(),
             command_checks: Vec::new(),
-            touched_code: true,
+            requires_workspace_evidence: true,
+            code_files_changed: true,
         });
 
         assert_eq!(record.result, VerificationResult::Fail);
@@ -81,15 +111,45 @@ mod tests {
             completion_criteria: vec!["evidence exists".to_owned()],
             evidence_refs: vec![EvidenceId::new()],
             command_checks: vec![VerificationCheck {
+                kind: VerificationCheckKind::ToolExecution,
                 name: "command".to_owned(),
                 command: Some("true".to_owned()),
                 passed: true,
                 evidence_refs: Vec::new(),
                 message: "ok".to_owned(),
             }],
-            touched_code: false,
+            requires_workspace_evidence: false,
+            code_files_changed: false,
         });
 
         assert_eq!(record.result, VerificationResult::Pass);
+    }
+
+    #[test]
+    fn code_change_requires_diff_and_objective_validation() {
+        let evidence = EvidenceId::new();
+        let record = VerificationRunner.verify(VerificationInput {
+            task_id: TaskId::new(),
+            objective: "change code".to_owned(),
+            completion_criteria: vec!["tests pass".to_owned()],
+            evidence_refs: vec![evidence],
+            command_checks: vec![VerificationCheck {
+                kind: VerificationCheckKind::WorkspaceChange,
+                name: "workspace_diff".to_owned(),
+                command: None,
+                passed: true,
+                evidence_refs: vec![evidence],
+                message: "code changed".to_owned(),
+            }],
+            requires_workspace_evidence: true,
+            code_files_changed: true,
+        });
+
+        assert_eq!(record.result, VerificationResult::Partial);
+        assert!(
+            record
+                .residual_risks
+                .contains(&"some objective checks failed".to_owned())
+        );
     }
 }

@@ -14,11 +14,12 @@ use super::{
     GOLUTRA_PROVIDER_AUTH_PROVIDER, MAX_PROVIDER_MESSAGE_BYTES, MAX_PROVIDER_RESPONSE_BYTES,
     MAX_PROVIDER_TOOL_ARGUMENT_BYTES, MAX_PROVIDER_TOOL_CALL_ID_BYTES,
     MAX_PROVIDER_TOOL_NAME_BYTES, ProviderError, ProviderFinishReason, ProviderGenerationConfig,
-    ProviderMessage, ProviderMessageMetadata, ProviderProbeResult, ProviderProtocol,
-    ProviderRequest, ProviderResponse, ProviderRole, ProviderToolCall, ProviderUsage, UsageSource,
-    configured_or_first_env, env_mapping, first_env, generation_config_from_reader,
-    missing_env_error, provider_credential_error, provider_error_message, provider_http_client,
-    provider_http_error, provider_transport_error, response_json_or_error,
+    ProviderHttpHeaders, ProviderMessage, ProviderMessageMetadata, ProviderProbeResult,
+    ProviderProtocol, ProviderRequest, ProviderResponse, ProviderRole, ProviderStreamEvent,
+    ProviderToolCall, ProviderUsage, UsageSource, configured_or_first_env,
+    custom_headers_from_reader, env_mapping, first_env, generation_config_from_reader,
+    missing_env_error, protocol_capabilities, provider_credential_error, provider_error_message,
+    provider_http_client, provider_http_error, provider_transport_error, response_json_or_error,
     validate_native_base_url,
 };
 
@@ -33,6 +34,7 @@ pub struct OpenAiResponsesProviderConfig {
     pub base_url: String,
     pub model_id: String,
     pub generation_config: ProviderGenerationConfig,
+    pub custom_headers: ProviderHttpHeaders,
 }
 
 #[derive(Clone)]
@@ -51,6 +53,7 @@ impl fmt::Debug for OpenAiResponsesProviderConfig {
             .field("base_url", &self.base_url)
             .field("model_id", &self.model_id)
             .field("generation_config", &self.generation_config)
+            .field("custom_header_names", &self.custom_headers.names())
             .finish_non_exhaustive()
     }
 }
@@ -64,6 +67,7 @@ impl fmt::Debug for OpenAiResponsesProvider {
             .field("base_url", &self.config.base_url)
             .field("model_id", &self.config.model_id)
             .field("generation_config", &self.config.generation_config)
+            .field("custom_header_names", &self.config.custom_headers.names())
             .finish_non_exhaustive()
     }
 }
@@ -117,6 +121,7 @@ impl OpenAiResponsesProvider {
             base_url,
             model_id,
             generation_config: generation_config_from_reader(&reader)?,
+            custom_headers: custom_headers_from_reader(&reader)?,
         })
     }
 
@@ -159,6 +164,7 @@ impl OpenAiResponsesProvider {
             model_id: self.config.model_id.clone(),
             model_available,
             discovered_models,
+            capabilities: protocol_capabilities(ProviderProtocol::OpenAiResponses),
         })
     }
 
@@ -196,6 +202,7 @@ impl OpenAiResponsesProvider {
         {
             headers.insert(CHATGPT_ACCOUNT_ID_HEADER, value);
         }
+        headers.extend(self.config.custom_headers.to_header_map());
         builder.bearer_auth(access_token).headers(headers)
     }
 
@@ -249,6 +256,15 @@ impl OpenAiResponsesProvider {
 #[async_trait]
 impl super::LlmProvider for OpenAiResponsesProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        let mut ignore = |_| {};
+        self.complete_stream(request, &mut ignore).await
+    }
+
+    async fn complete_stream(
+        &self,
+        request: ProviderRequest,
+        on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
+    ) -> Result<ProviderResponse, ProviderError> {
         let mut response = self.send_completion(&request, false).await?;
         if response.status().as_u16() == 401 {
             response = self.send_completion(&request, true).await?;
@@ -263,7 +279,7 @@ impl super::LlmProvider for OpenAiResponsesProvider {
             }
             return Err(provider_http_error(status, &value));
         }
-        responses_provider_response(response).await
+        responses_provider_response(response, on_event).await
     }
 
     fn contract(&self) -> ProviderContract {
@@ -271,7 +287,7 @@ impl super::LlmProvider for OpenAiResponsesProvider {
             provider_id: self.config.provider_id.clone(),
             model_id: self.config.model_id.clone(),
             native_protocol: "openai_responses_sse".to_owned(),
-            stream_event_mapping: "responses_sse_collected".to_owned(),
+            stream_event_mapping: "responses_sse_delta".to_owned(),
             tool_call_mapping: "responses_function_call".to_owned(),
             usage_mapping: "responses_completed_usage".to_owned(),
             reasoning_mapping: "responses_reasoning_effort".to_owned(),
@@ -454,6 +470,7 @@ fn responses_tool_schema(contract: &ToolContract) -> Value {
 
 async fn responses_provider_response(
     response: reqwest::Response,
+    on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
 ) -> Result<ProviderResponse, ProviderError> {
     if response
         .content_length()
@@ -507,12 +524,32 @@ async fn responses_provider_response(
                         });
                     }
                     output_text.push_str(delta);
+                    on_event(ProviderStreamEvent::TextDelta {
+                        text: delta.to_owned(),
+                    });
+                }
+            }
+            "response.reasoning_summary_text.delta" => {
+                if let Some(delta) = value.get("delta").and_then(Value::as_str)
+                    && !delta.is_empty()
+                {
+                    on_event(ProviderStreamEvent::ReasoningDelta {
+                        text: delta.to_owned(),
+                    });
                 }
             }
             "response.output_item.done" => {
                 if let Some(item) = value.get("item") {
                     match item.get("type").and_then(Value::as_str).unwrap_or_default() {
-                        "function_call" => tool_calls.push(responses_tool_call(item)?),
+                        "function_call" => {
+                            let call = responses_tool_call(item)?;
+                            on_event(ProviderStreamEvent::ToolCallDelta {
+                                index: tool_calls.len(),
+                                tool_call_id: Some(call.tool_call_id.clone()),
+                                tool_name: Some(call.tool_name.clone()),
+                            });
+                            tool_calls.push(call);
+                        }
                         "reasoning" => {
                             replay_items.push(normalize_reasoning_replay_item(item)?);
                         }
@@ -549,6 +586,7 @@ async fn responses_provider_response(
     if output_text.is_empty()
         && let Some(text) = completed_text
     {
+        on_event(ProviderStreamEvent::TextDelta { text: text.clone() });
         output_text = text;
     }
     let message =
@@ -767,6 +805,7 @@ mod tests {
                 base_url: "https://chatgpt.com/backend-api/codex".to_owned(),
                 model_id: "gpt-5.5".to_owned(),
                 generation_config: ProviderGenerationConfig::default(),
+                custom_headers: ProviderHttpHeaders::default(),
             },
         )
         .expect("request body");

@@ -28,6 +28,17 @@ Open-Endedness 不等于让 agent 无限乱跑，也不等于让模型自己改�
 
 在 Golutra 里，它不应该替代 Runtime Kernel、Decision Audit 或 Evaluation Harness，而应该作为 `Evolution System` 的高级形态。
 
+## 当前实现状态
+
+截至 2026-07-15，Golutra 已完成受控的本地 Evolution/Skill 闭环：
+
+- `golutra-evolution` 从 durable evaluation state 读取 GeneratedTask，计算 lexical novelty、difficulty、CapabilityFrontier 和 CurriculumItem；只有 fixture-only、no-external-side-effects 且位于配置难度区间的任务可被选择。
+- OpenEndedBudget 限制生成数、选中数、每任务工具数和 wall-clock；越界计划被拒绝，不会无界探索。
+- 每个选中任务在 `$GOLUTRA_HOME/state/workspaces/<cwd-hash>/evolution-runs` 的隔离目录中启动独立 RuntimeHost，强制 deterministic mock provider、内置工具和无网络环境，不触碰用户主 workspace。
+- run、plan、novelty、curriculum、environment recipe、frontier、execution 和 verification ref 持久化到 owner-only `evolution.json`，CLI/transport/TypeScript/Python SDK 可查询与驱动。
+- SkillCandidate 必须经过 stage、regression-backed human review、checksum install，安装后只对匹配目标注入最多 3 条 context contributor，并支持 rollback。
+- Evolution 不会自动修改 prompt、policy、provider route、runtime code 或主 workspace；网络探索、environment mutation 和自动二进制部署不在当前范围。
+
 ## 前沿共识
 
 ### 1. 开放式系统需要自动课程
@@ -95,7 +106,7 @@ Artifact Store
 Replay
 ```
 
-Open-Endedness 要新增的是：
+当前 `golutra-evolution` 已承载：
 
 ```text
 Open-Endedness System
@@ -108,7 +119,7 @@ Open-Endedness System
   Promotion Gate
 ```
 
-它不绕过 runtime，不直接调用工具，不直接写 skill/memory/policy。它只产生候选项，再交给 Runtime OS 执行、验证、审计和晋升。
+它不绕过 runtime，不直接调用工具，不直接写 memory/policy。GeneratedTask 交给隔离 RuntimeHost 执行；Skill 只通过受治理 store 的 stage/review/install API 写入，并继续受 checksum、regression 和 rollback 约束。
 
 ## 完整链路
 
@@ -455,20 +466,18 @@ candidate
 -> promotion
 ```
 
-## 推荐落地顺序
+## 落地状态与边界
 
-Open-Endedness 属于高级演进层，不是第一阶段 runtime core。第一阶段只需要保留 PromotionGate 接口和候选记录能力，不启动主动开放式探索。
-主动开放式探索产生的任何改动都必须先进入 `ImprovementCandidate`，不能直接修改默认 prompt、tool、policy、memory 或 runtime code。
+以下顺序已经完成：
 
-1. 先把 `PostTaskReview -> Failure Taxonomy -> BenchmarkPromotion` 做起来。
-2. 再做 `GeneratedTask` 和 `CurriculumItem`，只从历史失败生成任务。
-3. 增加 `EnvironmentRecipe`，保证自动任务可回放。
-4. 做 `SkillCandidate`，只从成功 trajectory 挖技能。
-5. 增加 `SkillPromotionRecord` 和 regression gate。
-6. 做 `CapabilityFrontier`，统计 mastered / near-miss / failed / blocked。
-7. 最后才做更主动的 task generation 和 environment mutation。
+1. `PostTaskReview -> Failure Taxonomy -> BenchmarkPromotion`。
+2. 从历史 evaluation 生成 `GeneratedTask`、`CurriculumItem` 与 `NoveltyRecord`。
+3. 为选中任务固定 `EnvironmentRecipe`、预算和隔离路径。
+4. 通过同一 RuntimeHost/Verification 主链执行 fixture GeneratedTask。
+5. 从成功 trajectory 形成 `SkillCandidate`，通过 regression-backed human review 安装。
+6. 持久化 `CapabilityFrontier` 的 mastered / near-miss / failed / blocked / missing-tools。
 
-不要一开始就让系统自由探索真实 workspace。开放式能力应该先在历史失败、fixture 和 benchmark 里跑通。
+当前长期边界是：不自由探索真实 workspace，不自动 mutation environment，不自动改默认 prompt/tool/policy/memory/runtime code，不自动部署新二进制。未来若扩大范围，仍必须先进入 `ImprovementCandidate`、隔离执行、regression 和 human review，不能复用当前完成状态绕过门禁。
 
 ## 参考论文与项目
 

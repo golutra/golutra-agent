@@ -2,15 +2,22 @@
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::sync::RwLock;
 
 use super::*;
 
+#[cfg(unix)]
+mod ipc;
+#[cfg(unix)]
+pub use ipc::UnixIpcTransport;
+
 #[async_trait]
 pub trait RuntimeClient {
     async fn send_command(&self, command: SessionCommand) -> Result<CommandAck, ClientError>;
     async fn query(&self, query: RuntimeQuery) -> Result<Value, ClientError>;
+    async fn event_page(&self, request: EventPageRequest) -> Result<EventPage, ClientError>;
     async fn replay_events(&self, filter: EventFilter) -> Result<Vec<Value>, ClientError>;
     async fn subscribe(&self, filter: EventFilter) -> Result<RuntimeEventStream, ClientError>;
 }
@@ -155,6 +162,10 @@ impl RuntimeClient for EmbeddedTransport {
         self.host.query(query).await
     }
 
+    async fn event_page(&self, request: EventPageRequest) -> Result<EventPage, ClientError> {
+        self.host.event_page(request).await
+    }
+
     async fn replay_events(&self, filter: EventFilter) -> Result<Vec<Value>, ClientError> {
         self.host.replay_events(filter).await
     }
@@ -181,6 +192,9 @@ pub struct AppServerInfo {
     pub instance_id: String,
     pub pid: u32,
     pub base_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipc_path: Option<String>,
+    pub protocol_versions: ProtocolVersionRange,
     pub started_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -198,6 +212,7 @@ pub struct HttpSseTransport {
     pub(crate) info: RuntimeHostInfo,
     pub(crate) cwd: PathBuf,
     pub(crate) attachment_id: Arc<RwLock<String>>,
+    pub(crate) transport_token: Arc<SecretString>,
 }
 
 impl HttpSseTransport {
@@ -205,11 +220,26 @@ impl HttpSseTransport {
         base_url: impl Into<String>,
         cwd: impl AsRef<Path>,
     ) -> Result<Self, ClientError> {
+        let token = std::env::var(APP_SERVER_TRANSPORT_TOKEN_ENV).map_err(|_| {
+            ClientError::Http(format!(
+                "remote runtime requires {APP_SERVER_TRANSPORT_TOKEN_ENV}"
+            ))
+        })?;
+        Self::connect_with_token(base_url, cwd, SecretString::from(token)).await
+    }
+
+    pub async fn connect_with_token(
+        base_url: impl Into<String>,
+        cwd: impl AsRef<Path>,
+        transport_token: SecretString,
+    ) -> Result<Self, ClientError> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(2))
             .build()
             .map_err(|error| ClientError::Http(error.to_string()))?;
         let base_url = base_url.into().trim_end_matches('/').to_owned();
+        validate_remote_app_server_base_url(&base_url)?;
+        validate_transport_token(transport_token.expose_secret())?;
         let requested_cwd = cwd.as_ref().to_path_buf();
         if !requested_cwd.is_absolute() {
             return Err(ClientError::Http(format!(
@@ -217,20 +247,38 @@ impl HttpSseTransport {
                 requested_cwd.display()
             )));
         }
-        let response = client
-            .get(format!("{base_url}/runtime/info"))
-            .timeout(Duration::from_secs(30))
-            .send()
-            .await
-            .map_err(|error| ClientError::Http(error.to_string()))?;
+        let response = authenticated_request(
+            client.get(format!("{base_url}/runtime/info")),
+            &transport_token,
+        )
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|error| ClientError::Http(error.to_string()))?;
         let server_info: AppServerInfo = decode_http_response(response).await?;
-        let response = client
-            .post(format!("{base_url}/runtime/attach"))
-            .json(&json!({ "cwd": requested_cwd }))
-            .timeout(Duration::from_secs(30))
-            .send()
-            .await
-            .map_err(|error| ClientError::Http(error.to_string()))?;
+        if !server_info
+            .protocol_versions
+            .accepts(RUNTIME_PROTOCOL_VERSION)
+        {
+            return Err(ClientError::Http(format!(
+                "runtime protocol {} is incompatible with server range {}..={}",
+                RUNTIME_PROTOCOL_VERSION,
+                server_info.protocol_versions.minimum,
+                server_info.protocol_versions.current,
+            )));
+        }
+        let response = authenticated_request(
+            client.post(format!("{base_url}/runtime/attach")),
+            &transport_token,
+        )
+        .json(&json!({
+            "cwd": requested_cwd,
+            "protocol_version": RUNTIME_PROTOCOL_VERSION,
+        }))
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|error| ClientError::Http(error.to_string()))?;
         let attachment: RuntimeAttachment = decode_http_response(response).await?;
         let attached_cwd = PathBuf::from(&attachment.runtime.cwd);
         if !attached_cwd.is_absolute() {
@@ -246,6 +294,7 @@ impl HttpSseTransport {
             info: attachment.runtime,
             cwd: attached_cwd,
             attachment_id: Arc::new(RwLock::new(attachment.attachment_id)),
+            transport_token: Arc::new(transport_token),
         })
     }
 
@@ -257,7 +306,9 @@ impl HttpSseTransport {
         })?;
         let endpoint: AppServerInfo = serde_json::from_slice(&bytes)?;
         validate_local_app_server_base_url(&endpoint.base_url)?;
-        let transport = Self::connect(&endpoint.base_url, &paths.cwd).await?;
+        let transport_token = read_transport_token(&paths.app_server_transport_token).await?;
+        let transport =
+            Self::connect_with_token(&endpoint.base_url, &paths.cwd, transport_token).await?;
         if transport.server_info.instance_id != endpoint.instance_id {
             return Err(ClientError::Daemon(
                 "app-server endpoint metadata does not match the running server".to_owned(),
@@ -286,8 +337,7 @@ impl HttpSseTransport {
     pub async fn list_threads(&self, limit: u32) -> Result<Vec<ThreadRecord>, ClientError> {
         let response = self
             .send_attached(|attachment_id| {
-                self.client
-                    .get(self.url("/threads"))
+                self.authenticated(self.client.get(self.url("/threads")))
                     .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id)
                     .query(&[("limit", limit)])
                     .timeout(Duration::from_secs(30))
@@ -302,10 +352,12 @@ impl HttpSseTransport {
     ) -> Result<Option<ThreadRecord>, ClientError> {
         let response = self
             .send_attached(|attachment_id| {
-                self.client
-                    .get(self.url(&format!("/sessions/{session_id}/thread")))
-                    .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id)
-                    .timeout(Duration::from_secs(30))
+                self.authenticated(
+                    self.client
+                        .get(self.url(&format!("/sessions/{session_id}/thread"))),
+                )
+                .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id)
+                .timeout(Duration::from_secs(30))
             })
             .await?;
         decode_http_response(response).await
@@ -314,10 +366,12 @@ impl HttpSseTransport {
     pub async fn resume_thread(&self, thread_id: ThreadId) -> Result<ThreadRecord, ClientError> {
         let response = self
             .send_attached(|attachment_id| {
-                self.client
-                    .post(self.url(&format!("/threads/{thread_id}/resume")))
-                    .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id)
-                    .timeout(Duration::from_secs(30))
+                self.authenticated(
+                    self.client
+                        .post(self.url(&format!("/threads/{thread_id}/resume"))),
+                )
+                .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id)
+                .timeout(Duration::from_secs(30))
             })
             .await?;
         decode_http_response(response).await
@@ -330,11 +384,13 @@ impl HttpSseTransport {
     ) -> Result<ThreadRecord, ClientError> {
         let response = self
             .send_attached(|attachment_id| {
-                self.client
-                    .post(self.url(&format!("/threads/{thread_id}/fork")))
-                    .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id)
-                    .json(&json!({"from_turn_id": from_turn_id}))
-                    .timeout(Duration::from_secs(30))
+                self.authenticated(
+                    self.client
+                        .post(self.url(&format!("/threads/{thread_id}/fork"))),
+                )
+                .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id)
+                .json(&json!({"from_turn_id": from_turn_id}))
+                .timeout(Duration::from_secs(30))
             })
             .await?;
         decode_http_response(response).await
@@ -346,10 +402,12 @@ impl HttpSseTransport {
     ) -> Result<RolloutExport, ClientError> {
         let response = self
             .send_attached(|attachment_id| {
-                self.client
-                    .post(self.url(&format!("/threads/{thread_id}/rollout/export")))
-                    .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id)
-                    .timeout(Duration::from_secs(30))
+                self.authenticated(
+                    self.client
+                        .post(self.url(&format!("/threads/{thread_id}/rollout/export"))),
+                )
+                .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id)
+                .timeout(Duration::from_secs(30))
             })
             .await?;
         decode_http_response(response).await
@@ -363,11 +421,13 @@ impl HttpSseTransport {
         let from_workspace_root = from_workspace_root.as_ref().display().to_string();
         let response = self
             .send_attached(|attachment_id| {
-                self.client
-                    .post(self.url(&format!("/threads/{thread_id}/rebind")))
-                    .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id)
-                    .json(&json!({"from_workspace_root": from_workspace_root}))
-                    .timeout(Duration::from_secs(30))
+                self.authenticated(
+                    self.client
+                        .post(self.url(&format!("/threads/{thread_id}/rebind"))),
+                )
+                .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id)
+                .json(&json!({"from_workspace_root": from_workspace_root}))
+                .timeout(Duration::from_secs(30))
             })
             .await?;
         decode_http_response(response).await
@@ -375,6 +435,10 @@ impl HttpSseTransport {
 
     pub(crate) fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
+    }
+
+    fn authenticated(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        authenticated_request(request, &self.transport_token)
     }
 
     fn current_attachment_id(&self) -> Result<String, ClientError> {
@@ -390,9 +454,11 @@ impl HttpSseTransport {
             return Ok(current);
         }
         let response = self
-            .client
-            .post(self.url("/runtime/attach"))
-            .json(&json!({ "cwd": self.cwd }))
+            .authenticated(self.client.post(self.url("/runtime/attach")))
+            .json(&json!({
+                "cwd": self.cwd,
+                "protocol_version": RUNTIME_PROTOCOL_VERSION,
+            }))
             .timeout(Duration::from_secs(30))
             .send()
             .await
@@ -424,7 +490,7 @@ impl HttpSseTransport {
             .send()
             .await
             .map_err(|error| ClientError::Http(error.to_string()))?;
-        if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+        if response.status() != reqwest::StatusCode::GONE {
             return Ok(response);
         }
         let attachment_id = self.refresh_attachment(&attachment_id).await?;
@@ -435,20 +501,88 @@ impl HttpSseTransport {
     }
 }
 
+fn authenticated_request(
+    request: reqwest::RequestBuilder,
+    transport_token: &SecretString,
+) -> reqwest::RequestBuilder {
+    request
+        .bearer_auth(transport_token.expose_secret())
+        .header(APP_SERVER_PROTOCOL_HEADER, RUNTIME_PROTOCOL_VERSION)
+}
+
+fn validate_transport_token(token: &str) -> Result<(), ClientError> {
+    if token.len() < 32 || token.len() > 512 || token.chars().any(char::is_whitespace) {
+        return Err(ClientError::Http(
+            "runtime transport token must contain 32..=512 non-whitespace characters".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn read_transport_token(path: &Path) -> Result<SecretString, ClientError> {
+    let metadata = tokio::fs::symlink_metadata(path)
+        .await
+        .map_err(|error| ClientError::Daemon(format!("{}: {error}", path.display())))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 1024 {
+        return Err(ClientError::Daemon(format!(
+            "app-server transport token path is not a bounded regular file: {}",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(ClientError::Daemon(format!(
+                "app-server transport token must be owner-only: {}",
+                path.display()
+            )));
+        }
+    }
+    let token = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|error| ClientError::Daemon(format!("{}: {error}", path.display())))?;
+    let token = token.trim().to_owned();
+    validate_transport_token(&token)?;
+    Ok(SecretString::from(token))
+}
+
+pub(crate) fn validate_remote_app_server_base_url(base_url: &str) -> Result<(), ClientError> {
+    let parsed = reqwest::Url::parse(base_url)
+        .map_err(|error| ClientError::Http(format!("runtime endpoint URL is invalid: {error}")))?;
+    let host_is_loopback = parsed.host_str().is_some_and(loopback_host);
+    let transport_is_safe =
+        parsed.scheme() == "https" || (parsed.scheme() == "http" && host_is_loopback);
+    let is_root_url = parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.path() == "/"
+        && parsed.query().is_none()
+        && parsed.fragment().is_none();
+    if transport_is_safe && is_root_url {
+        return Ok(());
+    }
+    Err(ClientError::Http(
+        "remote app-server endpoint must use a root HTTPS URL or loopback HTTP URL".to_owned(),
+    ))
+}
+
+fn loopback_host(host: &str) -> bool {
+    let address_host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    address_host.eq_ignore_ascii_case("localhost")
+        || address_host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
 pub(crate) fn validate_local_app_server_base_url(base_url: &str) -> Result<(), ClientError> {
     let parsed = reqwest::Url::parse(base_url).map_err(|error| {
         ClientError::Daemon(format!("runtime endpoint base URL is invalid: {error}"))
     })?;
-    let host_is_loopback = parsed.host_str().is_some_and(|host| {
-        let address_host = host
-            .strip_prefix('[')
-            .and_then(|host| host.strip_suffix(']'))
-            .unwrap_or(host);
-        address_host.eq_ignore_ascii_case("localhost")
-            || address_host
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|address| address.is_loopback())
-    });
+    let host_is_loopback = parsed.host_str().is_some_and(loopback_host);
     let is_root_http_url = parsed.scheme() == "http"
         && parsed.username().is_empty()
         && parsed.password().is_none()
@@ -468,8 +602,7 @@ impl RuntimeClient for HttpSseTransport {
     async fn send_command(&self, command: SessionCommand) -> Result<CommandAck, ClientError> {
         let response = self
             .send_attached(|attachment_id| {
-                self.client
-                    .post(self.url("/commands"))
+                self.authenticated(self.client.post(self.url("/commands")))
                     .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id)
                     .json(&command)
                     .timeout(Duration::from_secs(30))
@@ -481,10 +614,21 @@ impl RuntimeClient for HttpSseTransport {
     async fn query(&self, query: RuntimeQuery) -> Result<Value, ClientError> {
         let response = self
             .send_attached(|attachment_id| {
-                self.client
-                    .post(self.url("/queries"))
+                self.authenticated(self.client.post(self.url("/queries")))
                     .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id)
                     .json(&query)
+                    .timeout(Duration::from_secs(30))
+            })
+            .await?;
+        decode_http_response(response).await
+    }
+
+    async fn event_page(&self, request: EventPageRequest) -> Result<EventPage, ClientError> {
+        let response = self
+            .send_attached(|attachment_id| {
+                self.authenticated(self.client.get(self.url("/events/page")))
+                    .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id)
+                    .query(&request)
                     .timeout(Duration::from_secs(30))
             })
             .await?;
@@ -495,8 +639,7 @@ impl RuntimeClient for HttpSseTransport {
         let response = self
             .send_attached(|attachment_id| {
                 let mut request = self
-                    .client
-                    .get(self.url("/events/replay"))
+                    .authenticated(self.client.get(self.url("/events/replay")))
                     .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id)
                     .query(&[("session_id", filter.session_id.to_string())]);
                 if let Some(task_id) = filter.task_id {
@@ -565,8 +708,7 @@ impl HttpSseTransport {
         let response = self
             .send_attached(|attachment_id| {
                 let mut request = self
-                    .client
-                    .get(self.url("/events"))
+                    .authenticated(self.client.get(self.url("/events")))
                     .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id)
                     .query(&[("session_id", filter.session_id.to_string())]);
                 if let Some(task_id) = filter.task_id {
@@ -618,10 +760,11 @@ impl HttpSseTransport {
                 if cursor.is_some_and(|sequence_no| runtime_event.sequence_no <= sequence_no) {
                     continue;
                 }
-                *cursor = Some(runtime_event.sequence_no);
+                let sequence_no = runtime_event.sequence_no;
                 if sender.send(Ok(runtime_event)).await.is_err() {
                     return Ok(());
                 }
+                *cursor = Some(sequence_no);
             }
         }
         Err(ClientError::Http("SSE connection closed".to_owned()))
@@ -671,6 +814,8 @@ pub(crate) fn parse_sse_frame(frame: &[u8]) -> Result<Option<ParsedSseEvent>, Cl
 pub enum RuntimeTransport {
     Embedded(EmbeddedTransport),
     LocalDaemon(HttpSseTransport),
+    #[cfg(unix)]
+    LocalIpc(UnixIpcTransport),
     Remote(HttpSseTransport),
 }
 
@@ -689,9 +834,18 @@ impl RuntimeTransport {
     }
 
     pub async fn local_daemon(cwd: impl AsRef<Path>) -> Result<Self, ClientError> {
-        HttpSseTransport::connect_local_daemon(cwd)
-            .await
-            .map(Self::LocalDaemon)
+        #[cfg(unix)]
+        {
+            UnixIpcTransport::connect_local_daemon(cwd)
+                .await
+                .map(Self::LocalIpc)
+        }
+        #[cfg(not(unix))]
+        {
+            HttpSseTransport::connect_local_daemon(cwd)
+                .await
+                .map(Self::LocalDaemon)
+        }
     }
 
     pub async fn connect(
@@ -703,10 +857,22 @@ impl RuntimeTransport {
             .map(Self::Remote)
     }
 
+    pub async fn connect_with_token(
+        base_url: impl Into<String>,
+        cwd: impl AsRef<Path>,
+        transport_token: SecretString,
+    ) -> Result<Self, ClientError> {
+        HttpSseTransport::connect_with_token(base_url, cwd, transport_token)
+            .await
+            .map(Self::Remote)
+    }
+
     #[must_use]
     pub fn default_session_id(&self) -> SessionId {
         match self {
             Self::Embedded(transport) => transport.default_session_id(),
+            #[cfg(unix)]
+            Self::LocalIpc(transport) => transport.info.default_session_id,
             Self::LocalDaemon(transport) | Self::Remote(transport) => {
                 transport.info.default_session_id
             }
@@ -717,6 +883,8 @@ impl RuntimeTransport {
     pub fn default_thread_id(&self) -> ThreadId {
         match self {
             Self::Embedded(transport) => transport.default_thread_id(),
+            #[cfg(unix)]
+            Self::LocalIpc(transport) => transport.info.default_thread_id,
             Self::LocalDaemon(transport) | Self::Remote(transport) => {
                 transport.info.default_thread_id
             }
@@ -727,6 +895,8 @@ impl RuntimeTransport {
     pub fn cwd(&self) -> Option<&Path> {
         match self {
             Self::Embedded(transport) => transport.cwd(),
+            #[cfg(unix)]
+            Self::LocalIpc(transport) => Some(&transport.cwd),
             Self::LocalDaemon(transport) | Self::Remote(transport) => Some(&transport.cwd),
         }
     }
@@ -735,6 +905,8 @@ impl RuntimeTransport {
     pub fn workspace_id(&self) -> WorkspaceId {
         match self {
             Self::Embedded(transport) => transport.workspace_id(),
+            #[cfg(unix)]
+            Self::LocalIpc(transport) => transport.info.workspace_id,
             Self::LocalDaemon(transport) | Self::Remote(transport) => transport.info.workspace_id,
         }
     }
@@ -742,6 +914,8 @@ impl RuntimeTransport {
     pub async fn list_threads(&self, limit: u32) -> Result<Vec<ThreadRecord>, ClientError> {
         match self {
             Self::Embedded(transport) => transport.list_threads(limit).await,
+            #[cfg(unix)]
+            Self::LocalIpc(transport) => transport.list_threads(limit).await,
             Self::LocalDaemon(transport) | Self::Remote(transport) => {
                 transport.list_threads(limit).await
             }
@@ -754,6 +928,8 @@ impl RuntimeTransport {
     ) -> Result<Option<ThreadRecord>, ClientError> {
         match self {
             Self::Embedded(transport) => transport.thread_for_session(session_id).await,
+            #[cfg(unix)]
+            Self::LocalIpc(transport) => transport.thread_for_session(session_id).await,
             Self::LocalDaemon(transport) | Self::Remote(transport) => {
                 transport.thread_for_session(session_id).await
             }
@@ -763,6 +939,8 @@ impl RuntimeTransport {
     pub async fn resume_thread(&self, thread_id: ThreadId) -> Result<ThreadRecord, ClientError> {
         match self {
             Self::Embedded(transport) => transport.resume_thread(thread_id).await,
+            #[cfg(unix)]
+            Self::LocalIpc(transport) => transport.resume_thread(thread_id).await,
             Self::LocalDaemon(transport) | Self::Remote(transport) => {
                 transport.resume_thread(thread_id).await
             }
@@ -776,6 +954,8 @@ impl RuntimeTransport {
     ) -> Result<ThreadRecord, ClientError> {
         match self {
             Self::Embedded(transport) => transport.fork_thread(thread_id, from_turn_id).await,
+            #[cfg(unix)]
+            Self::LocalIpc(transport) => transport.fork_thread(thread_id, from_turn_id).await,
             Self::LocalDaemon(transport) | Self::Remote(transport) => {
                 transport.fork_thread(thread_id, from_turn_id).await
             }
@@ -788,6 +968,8 @@ impl RuntimeTransport {
     ) -> Result<RolloutExport, ClientError> {
         match self {
             Self::Embedded(transport) => transport.export_thread_rollout(thread_id).await,
+            #[cfg(unix)]
+            Self::LocalIpc(transport) => transport.export_thread_rollout(thread_id).await,
             Self::LocalDaemon(transport) | Self::Remote(transport) => {
                 transport.export_thread_rollout(thread_id).await
             }
@@ -801,6 +983,12 @@ impl RuntimeTransport {
     ) -> Result<ThreadRebindResult, ClientError> {
         match self {
             Self::Embedded(transport) => {
+                transport
+                    .rebind_thread(thread_id, from_workspace_root)
+                    .await
+            }
+            #[cfg(unix)]
+            Self::LocalIpc(transport) => {
                 transport
                     .rebind_thread(thread_id, from_workspace_root)
                     .await
@@ -819,6 +1007,8 @@ impl RuntimeClient for RuntimeTransport {
     async fn send_command(&self, command: SessionCommand) -> Result<CommandAck, ClientError> {
         match self {
             Self::Embedded(transport) => transport.send_command(command).await,
+            #[cfg(unix)]
+            Self::LocalIpc(transport) => transport.send_command(command).await,
             Self::LocalDaemon(transport) | Self::Remote(transport) => {
                 transport.send_command(command).await
             }
@@ -828,13 +1018,28 @@ impl RuntimeClient for RuntimeTransport {
     async fn query(&self, query: RuntimeQuery) -> Result<Value, ClientError> {
         match self {
             Self::Embedded(transport) => transport.query(query).await,
+            #[cfg(unix)]
+            Self::LocalIpc(transport) => transport.query(query).await,
             Self::LocalDaemon(transport) | Self::Remote(transport) => transport.query(query).await,
+        }
+    }
+
+    async fn event_page(&self, request: EventPageRequest) -> Result<EventPage, ClientError> {
+        match self {
+            Self::Embedded(transport) => transport.event_page(request).await,
+            #[cfg(unix)]
+            Self::LocalIpc(transport) => transport.event_page(request).await,
+            Self::LocalDaemon(transport) | Self::Remote(transport) => {
+                transport.event_page(request).await
+            }
         }
     }
 
     async fn replay_events(&self, filter: EventFilter) -> Result<Vec<Value>, ClientError> {
         match self {
             Self::Embedded(transport) => transport.replay_events(filter).await,
+            #[cfg(unix)]
+            Self::LocalIpc(transport) => transport.replay_events(filter).await,
             Self::LocalDaemon(transport) | Self::Remote(transport) => {
                 transport.replay_events(filter).await
             }
@@ -844,6 +1049,8 @@ impl RuntimeClient for RuntimeTransport {
     async fn subscribe(&self, filter: EventFilter) -> Result<RuntimeEventStream, ClientError> {
         match self {
             Self::Embedded(transport) => transport.subscribe(filter).await,
+            #[cfg(unix)]
+            Self::LocalIpc(transport) => transport.subscribe(filter).await,
             Self::LocalDaemon(transport) | Self::Remote(transport) => {
                 transport.subscribe(filter).await
             }

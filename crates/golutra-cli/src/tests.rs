@@ -15,6 +15,78 @@ fn separate_cli_commands_use_the_same_controller_identity() {
 }
 
 #[test]
+fn evolution_commands_parse_governed_budget_and_skill_review() {
+    let plan = Cli::try_parse_from([
+        "golutra",
+        "evolution",
+        "plan",
+        "expand provider robustness",
+        "--max-selected-tasks",
+        "2",
+    ])
+    .expect("evolution plan");
+    assert!(matches!(
+        plan.command,
+        Command::Evolution {
+            command: EvolutionCommand::Plan {
+                max_selected_tasks: 2,
+                ..
+            }
+        }
+    ));
+
+    let review = Cli::try_parse_from([
+        "golutra",
+        "evolution",
+        "skill",
+        "review",
+        "skill-runtime-tests",
+        "--decision",
+        "approve",
+        "--reason",
+        "regression passed",
+        "--regression-ref",
+        "regression-1",
+    ])
+    .expect("skill review");
+    assert!(matches!(
+        review.command,
+        Command::Evolution {
+            command: EvolutionCommand::Skill {
+                command: EvolutionSkillCommand::Review {
+                    decision: ReviewDecisionArg::Approve,
+                    ..
+                }
+            }
+        }
+    ));
+}
+
+#[test]
+fn plugin_commands_parse_explicit_review_and_enable_steps() {
+    let review = Cli::try_parse_from(["golutra", "plugin", "review", "fixture", "revision-1"])
+        .expect("plugin review");
+    assert!(matches!(
+        review.command,
+        Command::Plugin {
+            command: PluginCommand::Review {
+                plugin_id,
+                revision_id,
+            }
+        } if plugin_id == "fixture" && revision_id == "revision-1"
+    ));
+
+    let enable = Cli::try_parse_from(["golutra", "plugin", "enable", "fixture", "revision-1"])
+        .expect("plugin enable");
+    assert!(matches!(
+        enable.command,
+        Command::Plugin {
+            command: PluginCommand::Enable { .. }
+        }
+    ));
+}
+
+#[test]
 fn provider_set_key_accepts_disk_or_environment_reference() {
     let disk = Cli::try_parse_from([
         "golutra",
@@ -28,15 +100,16 @@ fn provider_set_key_accepts_disk_or_environment_reference() {
         "disk",
     ])
     .expect("disk args");
+    let Command::Provider { command } = &disk.command else {
+        panic!("expected provider command");
+    };
     assert!(matches!(
-        disk.command,
-        Command::Provider {
-            command: ProviderCommand::SetKey {
-                api_key: Some(_),
-                env_key: None,
-                store: CredentialStoreArg::Disk,
-                ..
-            }
+        command.as_ref(),
+        ProviderCommand::SetKey {
+            api_key: Some(_),
+            env_key: None,
+            store: CredentialStoreArg::Disk,
+            ..
         }
     ));
 
@@ -50,14 +123,15 @@ fn provider_set_key_accepts_disk_or_environment_reference() {
         "CUSTOM_API_KEY",
     ])
     .expect("environment args");
+    let Command::Provider { command } = &environment.command else {
+        panic!("expected provider command");
+    };
     assert!(matches!(
-        environment.command,
-        Command::Provider {
-            command: ProviderCommand::SetKey {
-                api_key: None,
-                env_key: Some(_),
-                ..
-            }
+        command.as_ref(),
+        ProviderCommand::SetKey {
+            api_key: None,
+            env_key: Some(_),
+            ..
         }
     ));
 }
@@ -79,14 +153,15 @@ fn provider_oauth_login_requires_an_explicit_descriptor_file() {
     ])
     .expect("OAuth args");
 
+    let Command::Provider { command } = &cli.command else {
+        panic!("expected provider command");
+    };
     assert!(matches!(
-        cli.command,
-        Command::Provider {
-            command: ProviderCommand::OAuthLogin {
-                flow: Some(OAuthFlowArg::Device),
-                store: CredentialStoreArg::Disk,
-                ..
-            }
+        command.as_ref(),
+        ProviderCommand::OAuthLogin {
+            flow: Some(OAuthFlowArg::Device),
+            store: CredentialStoreArg::Disk,
+            ..
         }
     ));
 }
@@ -101,12 +176,13 @@ fn provider_auth_methods_and_builtin_oauth_login_are_parsed() {
         "openai-chatgpt",
     ])
     .expect("auth methods args");
+    let Command::Provider { command } = &methods.command else {
+        panic!("expected provider command");
+    };
     assert!(matches!(
-        methods.command,
-        Command::Provider {
-            command: ProviderCommand::AuthMethods {
-                provider: Some(ref provider)
-            }
+        command.as_ref(),
+        ProviderCommand::AuthMethods {
+            provider: Some(provider)
         } if provider == "openai-chatgpt"
     ));
 
@@ -120,15 +196,16 @@ fn provider_auth_methods_and_builtin_oauth_login_are_parsed() {
         "browser",
     ])
     .expect("builtin OAuth args");
+    let Command::Provider { command } = &login.command else {
+        panic!("expected provider command");
+    };
     assert!(matches!(
-        login.command,
-        Command::Provider {
-            command: ProviderCommand::OAuthLogin {
-                provider: Some(ref provider),
-                method: Some(ref method),
-                descriptor: None,
-                ..
-            }
+        command.as_ref(),
+        ProviderCommand::OAuthLogin {
+            provider: Some(provider),
+            method: Some(method),
+            descriptor: None,
+            ..
         } if provider == "openai-chatgpt" && method == "browser"
     ));
 }

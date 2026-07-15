@@ -1,7 +1,14 @@
-use golutra_core::{VerificationCheck, VerificationId};
+use std::fs;
+
+use chrono::Utc;
+use golutra_core::{
+    EvidenceId, TaskId, TaskStatus, VerificationCheck, VerificationCheckKind, VerificationId,
+    VerificationRecord, VerificationResult,
+};
 use tempfile::tempdir;
 
 use super::*;
+use crate::{runner::sanitize_text, store::MAX_EVALUATION_STATE_BYTES};
 
 fn failed_input(task_id: TaskId, evidence_id: EvidenceId) -> TaskEvaluationInput {
     TaskEvaluationInput {
@@ -14,6 +21,7 @@ fn failed_input(task_id: TaskId, evidence_id: EvidenceId) -> TaskEvaluationInput
             objective: "fix provider failure".to_owned(),
             completion_criteria: vec!["provider succeeds".to_owned()],
             checks: vec![VerificationCheck {
+                kind: VerificationCheckKind::ToolExecution,
                 name: "provider".to_owned(),
                 command: None,
                 passed: false,
@@ -30,6 +38,10 @@ fn failed_input(task_id: TaskId, evidence_id: EvidenceId) -> TaskEvaluationInput
         tool_count: 1,
         latency_ms: Some(20),
         failure_summary: Some("provider failed after tool execution".to_owned()),
+        token_usage: Vec::new(),
+        provider_config_ref: "provider:test".to_owned(),
+        runtime_config_ref: "runtime:test".to_owned(),
+        policy_violation_count: 0,
     }
 }
 
@@ -60,6 +72,17 @@ fn failed_task_generates_review_and_proposed_candidates() {
             .iter()
             .all(|candidate| candidate.status == CandidateStatus::Proposed)
     );
+}
+
+#[test]
+fn minimal_review_does_not_generate_automation_candidates() {
+    let task_id = TaskId::new();
+    let bundle = EvaluationRunner.evaluate_minimal(failed_input(task_id, EvidenceId::new()));
+
+    assert_eq!(bundle.review.mode, ReviewMode::Minimal);
+    assert!(bundle.improvement_candidate.is_none());
+    assert!(bundle.automation_candidates.is_empty());
+    assert!(benchmark_run_has_required_metadata(&bundle.benchmark_run));
 }
 
 #[test]
@@ -190,6 +213,10 @@ fn medium_risk_skill_requires_human_review() {
         quality_delta: Some(0.0),
         security_delta: Some(0.0),
         causal_comparison_refs: vec!["replay".to_owned()],
+        suite_kind: BenchmarkSuiteKind::Regression,
+        case_results: Vec::new(),
+        baseline_benchmark_refs: Vec::new(),
+        candidate_benchmark_refs: Vec::new(),
         verdict: RegressionVerdict::Pass,
         created_at: Utc::now(),
     };
@@ -198,6 +225,66 @@ fn medium_risk_skill_requires_human_review() {
         decide_low_risk_promotion(&candidate, &regression).decision,
         PromotionDecisionKind::NeedsHumanReview
     );
+}
+
+#[test]
+fn human_reviewer_can_approve_a_medium_risk_candidate_after_regression() {
+    let task_id = TaskId::new();
+    let store = EvaluationStore::in_memory();
+    store
+        .record_task_evaluation(
+            EvaluationRunner.evaluate_task(failed_input(task_id, EvidenceId::new())),
+        )
+        .expect("record");
+    let candidate_id = format!("automation-generated-task-{task_id}");
+    let regression = store.run_regression(&candidate_id).expect("regression");
+    assert_eq!(regression.verdict, RegressionVerdict::Pass);
+    let automatic = store
+        .decide_promotion(&candidate_id)
+        .expect("automatic gate");
+    assert_eq!(automatic.decision, PromotionDecisionKind::NeedsHumanReview);
+
+    let human = store
+        .review_promotion(
+            &candidate_id,
+            PromotionDecisionKind::Approve,
+            "maintainer-1",
+            "fixture replay and safety constraints were reviewed",
+        )
+        .expect("human approval");
+
+    assert_eq!(human.reviewer, PromotionReviewer::Human);
+    assert_eq!(human.decision, PromotionDecisionKind::Approve);
+}
+
+#[test]
+fn counterfactual_comparison_detects_scaffold_inflation() {
+    let task_id = TaskId::new();
+    let bundle = EvaluationRunner.evaluate_task(failed_input(task_id, EvidenceId::new()));
+    let mut baseline = bundle.benchmark_run.clone();
+    baseline.benchmark_id = "00-baseline".to_owned();
+    baseline.suite_kind = BenchmarkSuiteKind::Counterfactual;
+    baseline.counterfactual_group_id = Some("group-1".to_owned());
+    baseline.changed_layer = None;
+    let mut variant = baseline.clone();
+    variant.benchmark_id = "01-variant".to_owned();
+    variant.changed_layer = Some("scaffold".to_owned());
+    variant.scaffold_version = "thicker-scaffold".to_owned();
+    variant.score = baseline.score.map(|score| score + 0.1);
+    let store = EvaluationStore::in_memory();
+    store
+        .record_benchmark_run(baseline)
+        .expect("baseline benchmark");
+    store
+        .record_benchmark_run(variant)
+        .expect("variant benchmark");
+
+    let comparison = store
+        .compare_counterfactual("group-1")
+        .expect("counterfactual comparison");
+
+    assert!(comparison.scaffold_inflation);
+    assert!(comparison.quality_delta.is_some_and(|delta| delta > 0.0));
 }
 
 #[test]

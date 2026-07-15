@@ -1,6 +1,6 @@
 //! TUI 的布局与 transcript 投影。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crossterm::terminal::size;
 use golutra_protocol::VisibleStep;
@@ -103,6 +103,7 @@ pub(crate) fn header_mode(app: &TuiApp) -> String {
     match app.projection.as_ref().map(|projection| projection.status) {
         Some(golutra_core::TaskStatus::Running) => "  running".to_owned(),
         Some(golutra_core::TaskStatus::WaitingApproval) => "  waiting".to_owned(),
+        Some(golutra_core::TaskStatus::WaitingAuthentication) => "  auth required".to_owned(),
         Some(golutra_core::TaskStatus::Failed) => "  failed".to_owned(),
         Some(golutra_core::TaskStatus::Blocked) => "  blocked".to_owned(),
         Some(golutra_core::TaskStatus::Completed) => "  complete".to_owned(),
@@ -444,9 +445,19 @@ pub(crate) fn auth_advanced_config_lines(dialog: &AuthDialogState) -> Vec<Line<'
             },
             dialog.advanced_selected == 3,
         ),
+        auth_option_line(
+            4,
+            "Custom headers",
+            if dialog.custom_headers.is_empty() {
+                "none"
+            } else {
+                dialog.custom_headers.as_str()
+            },
+            dialog.advanced_selected == 4,
+        ),
         Line::from(""),
         Line::from(Span::styled(
-            "Up/Down select   Space toggle/cycle   Type digits for numeric fields   Enter continue   Esc back",
+            "Up/Down select   Space toggle/cycle   Enter continue   Esc back",
             Style::default().fg(Color::DarkGray),
         )),
     ];
@@ -972,6 +983,13 @@ pub(crate) fn auth_composer_line(dialog: &AuthDialogState) -> String {
                     dialog.max_tokens.clone()
                 }
             }
+            4 => {
+                if dialog.custom_headers.is_empty() {
+                    "Name=Value; X-Api-Key=@ENV".to_owned()
+                } else {
+                    dialog.custom_headers.clone()
+                }
+            }
             _ => "Advanced config".to_owned(),
         },
         AuthDialogStep::Review => "Review install plan".to_owned(),
@@ -1220,6 +1238,7 @@ pub(crate) fn event_transcript_items(events: &[Value]) -> Vec<TranscriptItem> {
 
     let mut items = Vec::new();
     let mut visible_user_turns = HashSet::new();
+    let mut streamed_assistant_items = HashMap::new();
     for event in typed_events {
         match event.event_type {
             RuntimeEventType::TaskCreated | RuntimeEventType::TurnQueued => {
@@ -1230,9 +1249,40 @@ pub(crate) fn event_transcript_items(events: &[Value]) -> Vec<TranscriptItem> {
                     items.push(item);
                 }
             }
+            RuntimeEventType::ProviderStreamed => {
+                let Some(delta) = provider_stream_text_delta(&event) else {
+                    continue;
+                };
+                let Some(turn_id) = event.turn_id else {
+                    continue;
+                };
+                if let Some(index) = streamed_assistant_items.get(&turn_id).copied() {
+                    if let Some(body) = items
+                        .get_mut(index)
+                        .and_then(|item: &mut TranscriptItem| item.body.first_mut())
+                    {
+                        body.push_str(delta);
+                    }
+                } else {
+                    let index = items.len();
+                    items.push(TranscriptItem {
+                        role: TranscriptRole::Assistant,
+                        title: "Golutra".to_owned(),
+                        body: vec![delta.to_owned()],
+                    });
+                    streamed_assistant_items.insert(turn_id, index);
+                }
+            }
             RuntimeEventType::AssistantMessage => {
                 if let Some(item) = assistant_event_transcript_item(&event) {
-                    items.push(item);
+                    if let Some(index) = event
+                        .turn_id
+                        .and_then(|turn_id| streamed_assistant_items.remove(&turn_id))
+                    {
+                        items[index] = item;
+                    } else {
+                        items.push(item);
+                    }
                 }
             }
             _ => {
@@ -1243,6 +1293,14 @@ pub(crate) fn event_transcript_items(events: &[Value]) -> Vec<TranscriptItem> {
         }
     }
     items
+}
+
+fn provider_stream_text_delta(event: &RuntimeEvent) -> Option<&str> {
+    let delta = event.payload.get("delta")?;
+    (delta.get("kind").and_then(Value::as_str) == Some("text_delta"))
+        .then(|| delta.get("text").and_then(Value::as_str))
+        .flatten()
+        .filter(|text| !text.is_empty())
 }
 
 pub(crate) fn user_event_transcript_item(event: &RuntimeEvent) -> Option<TranscriptItem> {
@@ -1477,6 +1535,7 @@ pub(crate) fn status_chip(app: &TuiApp) -> &'static str {
     match app.projection.as_ref().map(|projection| projection.status) {
         Some(golutra_core::TaskStatus::Running) => "running",
         Some(golutra_core::TaskStatus::WaitingApproval) => "waiting approval",
+        Some(golutra_core::TaskStatus::WaitingAuthentication) => "auth required",
         Some(golutra_core::TaskStatus::Completed) => "complete",
         Some(golutra_core::TaskStatus::Failed) => "failed",
         Some(golutra_core::TaskStatus::Blocked) => "blocked",
@@ -1500,6 +1559,7 @@ pub(crate) fn status_color(app: &TuiApp) -> Color {
         | Some(golutra_core::TaskStatus::Blocked)
         | Some(golutra_core::TaskStatus::Cancelled) => Color::Red,
         Some(golutra_core::TaskStatus::WaitingApproval)
+        | Some(golutra_core::TaskStatus::WaitingAuthentication)
         | Some(golutra_core::TaskStatus::Aborting)
         | Some(golutra_core::TaskStatus::Pausing)
         | Some(golutra_core::TaskStatus::Partial) => Color::Yellow,
@@ -1523,6 +1583,7 @@ pub(crate) fn has_active_task(app: &TuiApp) -> bool {
         app.projection.as_ref().map(|projection| projection.status),
         Some(golutra_core::TaskStatus::Running)
             | Some(golutra_core::TaskStatus::WaitingApproval)
+            | Some(golutra_core::TaskStatus::WaitingAuthentication)
             | Some(golutra_core::TaskStatus::Aborting)
             | Some(golutra_core::TaskStatus::Pausing)
             | Some(golutra_core::TaskStatus::Paused)

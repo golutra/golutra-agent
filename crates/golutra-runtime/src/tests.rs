@@ -330,6 +330,14 @@ async fn fallback_completion_and_usage_are_attributed_to_the_actual_provider() {
     )));
     assert!(trace.iter().any(|event| matches!(
         event,
+        AgentLoopTraceEvent::ProviderStreamed {
+            provider_id,
+            model_id,
+            event: ProviderStreamEvent::TextDelta { text },
+        } if provider_id == "mock" && model_id == "mock-model" && text == "fallback"
+    )));
+    assert!(trace.iter().any(|event| matches!(
+        event,
         AgentLoopTraceEvent::TokenUsageRecorded(record)
             if record.provider_id == "mock" && record.model_id == "mock-model"
     )));
@@ -538,6 +546,51 @@ async fn agent_loop_stops_success_when_tool_evidence_exists() {
 }
 
 #[tokio::test]
+async fn code_change_without_an_objective_validation_is_partial() {
+    let workspace = tempdir().expect("workspace");
+    let provider = MockProvider::tool_call(
+        "write_file",
+        json!({"path": "src/lib.rs", "content": "pub fn answer() -> u8 { 42 }"}),
+    );
+    fs::create_dir_all(workspace.path().join("src")).expect("source directory");
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor);
+
+    let outcome = agent_loop
+        .run(AgentTaskRequest {
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            turn_id: TurnId::new(),
+            objective: "write Rust code".to_owned(),
+            completion_criteria: vec!["tests pass".to_owned()],
+            touched_code: true,
+            contributors: Vec::new(),
+            tools: vec!["write_file".to_owned()],
+        })
+        .await
+        .expect("loop runs");
+
+    assert_eq!(outcome.verification.result, VerificationResult::Partial);
+    assert_eq!(outcome.loop_decision.action, LoopAction::StopPartial);
+    assert!(outcome.verification.checks.iter().any(|check| {
+        check.kind == golutra_core::VerificationCheckKind::WorkspaceChange && check.passed
+    }));
+    assert!(!outcome.verification.checks.iter().any(|check| {
+        check.kind == golutra_core::VerificationCheckKind::ObjectiveValidation && check.passed
+    }));
+}
+
+#[test]
+fn verification_command_classifier_rejects_arbitrary_shell_success() {
+    assert!(is_objective_validation_command(
+        "cargo test -p golutra-runtime"
+    ));
+    assert!(is_objective_validation_command("npm run typecheck"));
+    assert!(!is_objective_validation_command("echo done"));
+    assert!(!is_objective_validation_command("git status --short"));
+}
+
+#[tokio::test]
 async fn agent_loop_returns_invalid_tool_calls_to_the_provider_as_tool_results() {
     let workspace = tempdir().expect("workspace");
     let provider = MockProvider::tool_call("missing_tool", json!({"bad": true}));
@@ -713,7 +766,15 @@ async fn agent_loop_does_not_stop_success_when_tool_fails() {
         .await
         .expect("loop runs");
 
-    assert_eq!(outcome.loop_decision.action, LoopAction::StopPartial);
+    assert_eq!(outcome.loop_decision.action, LoopAction::Blocked);
+    assert!(
+        outcome
+            .loop_decision
+            .reason
+            .contains("security or policy boundary rejected"),
+        "{:?}",
+        outcome.loop_decision
+    );
     assert_eq!(outcome.verification.result, VerificationResult::Partial);
 }
 
@@ -766,7 +827,9 @@ async fn agent_loop_waits_for_approval_before_process_execution() {
     assert_eq!(outcome.tool_reports.len(), 1);
     assert_eq!(
         outcome.tool_reports[0].envelope.status,
-        ToolResultStatus::Ok
+        ToolResultStatus::Ok,
+        "{:?}",
+        outcome.tool_reports[0]
     );
 }
 
@@ -822,7 +885,7 @@ async fn paused_approval_does_not_execute_tool_until_resume() {
     assert!(!task.is_finished());
     handle.resume();
     let outcome = task.await.expect("task joins").expect("loop completes");
-    assert!(output.exists());
+    assert!(output.exists(), "{:?}", outcome.tool_reports);
     assert_eq!(
         outcome.tool_reports[0].envelope.status,
         ToolResultStatus::Ok
@@ -884,6 +947,28 @@ fn checkpoint_restores_file_before_image_without_touching_git() {
         assert_eq!(mode(&checkpoint_dir.join("files/src/lib.rs")), 0o600);
         assert_eq!(mode(&source), 0o755);
     }
+}
+
+#[test]
+fn checkpoint_retention_keeps_only_the_latest_bounded_set() {
+    let workspace = tempdir().expect("workspace");
+    let checkpoint_root = tempdir().expect("checkpoint");
+    let manager = WorkspaceCheckpointManager::new(workspace.path(), checkpoint_root.path());
+    for _ in 0..3 {
+        manager
+            .create_checkpoint(
+                WorkspaceId::new(),
+                TaskId::new(),
+                TurnId::new(),
+                &[],
+                ToolCallId::new(),
+            )
+            .expect("checkpoint");
+    }
+
+    assert_eq!(manager.checkpoint_count().expect("count"), 3);
+    assert_eq!(manager.prune_checkpoints(1).expect("prune"), 2);
+    assert_eq!(manager.checkpoint_count().expect("count"), 1);
 }
 
 #[test]

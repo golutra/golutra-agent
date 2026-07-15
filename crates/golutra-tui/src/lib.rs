@@ -1,5 +1,8 @@
 use golutra_auth::{CredentialRef, OAuthFlow};
-use golutra_llm::{ProviderGenerationConfig, ProviderProtocol, ProviderReasoningEffort};
+use golutra_llm::{
+    ProviderGenerationConfig, ProviderHeaderConfig, ProviderHeaderValue, ProviderProtocol,
+    ProviderReasoningEffort,
+};
 use serde_json::Value;
 
 pub use golutra_protocol::{DebugProjection, RuntimeEvent, UserProjection};
@@ -114,6 +117,7 @@ pub struct OpenAiCompatibleLogin {
     pub credential_store: AuthCredentialStore,
     pub credential_ref: Option<CredentialRef>,
     pub generation_config: Option<ProviderGenerationConfig>,
+    pub custom_headers: Vec<ProviderHeaderConfig>,
     pub scope: AuthConfigScope,
 }
 
@@ -463,6 +467,7 @@ fn parse_auth_login(tokens: &[String]) -> SlashInput {
     let mut reasoning_effort = None;
     let mut context_window_size = None;
     let mut max_tokens = None;
+    let mut custom_headers = Vec::new();
     let mut scope = AuthConfigScope::User;
     let mut index = 2;
     while index < tokens.len() {
@@ -575,6 +580,19 @@ fn parse_auth_login(tokens: &[String]) -> SlashInput {
                     Err(error) => return SlashInput::Error(error),
                 };
             }
+            "--header" | "--header-env" => {
+                let environment = tokens[index] == "--header-env";
+                let flag = tokens[index].clone();
+                index += 1;
+                let Some(value) = tokens.get(index) else {
+                    return SlashInput::Error(format!("{flag} requires NAME=VALUE"));
+                };
+                let header = match parse_provider_header(value, environment) {
+                    Ok(header) => header,
+                    Err(error) => return SlashInput::Error(error),
+                };
+                custom_headers.push(header);
+            }
             "--scope" => {
                 index += 1;
                 let Some(value) = tokens.get(index) else {
@@ -613,6 +631,7 @@ fn parse_auth_login(tokens: &[String]) -> SlashInput {
                 context_window_size,
                 max_tokens,
             ),
+            custom_headers,
             scope,
         },
     ))))
@@ -800,6 +819,34 @@ fn parse_reasoning_effort(value: &str) -> Result<ProviderReasoningEffort, String
     }
 }
 
+fn parse_provider_header(
+    assignment: &str,
+    environment: bool,
+) -> Result<ProviderHeaderConfig, String> {
+    let (name, value) = assignment
+        .split_once('=')
+        .ok_or_else(|| "provider header requires NAME=VALUE".to_owned())?;
+    let name = name.trim();
+    let value = value.trim();
+    if name.is_empty() || value.is_empty() {
+        return Err("provider header requires non-empty NAME=VALUE".to_owned());
+    }
+    let header = ProviderHeaderConfig {
+        name: name.to_owned(),
+        value: if environment {
+            ProviderHeaderValue::Environment {
+                key: value.to_owned(),
+            }
+        } else {
+            ProviderHeaderValue::Literal {
+                value: value.to_owned(),
+            }
+        },
+    };
+    header.validate()?;
+    Ok(header)
+}
+
 fn parse_positive_u64(value: &str, option: &str) -> Result<u64, String> {
     let parsed = value
         .parse::<u64>()
@@ -888,6 +935,7 @@ mod tests {
                     credential_store: AuthCredentialStore::Disk,
                     credential_ref: None,
                     generation_config: None,
+                    custom_headers: Vec::new(),
                     scope: AuthConfigScope::User,
                 }
             ))))
@@ -900,6 +948,34 @@ mod tests {
             parse_slash_input("/auth login --base-url api.golutra.cn --model qwen --scope workspace"),
             SlashInput::Error(error) if error.contains("workspace provider config is no longer supported")
         ));
+    }
+
+    #[test]
+    fn slash_parser_accepts_literal_and_environment_provider_headers() {
+        let input = parse_slash_input(
+            "/auth login --base-url https://api.example.com/v1 --model model-test --header X-Client=golutra --header-env X-Api-Key=PROVIDER_HEADER_KEY",
+        );
+        let SlashInput::Command(SlashCommand::Auth(SlashAuthCommand::Login(login))) = input else {
+            panic!("expected auth login");
+        };
+
+        assert_eq!(
+            login.custom_headers,
+            vec![
+                ProviderHeaderConfig {
+                    name: "X-Client".to_owned(),
+                    value: ProviderHeaderValue::Literal {
+                        value: "golutra".to_owned(),
+                    },
+                },
+                ProviderHeaderConfig {
+                    name: "X-Api-Key".to_owned(),
+                    value: ProviderHeaderValue::Environment {
+                        key: "PROVIDER_HEADER_KEY".to_owned(),
+                    },
+                },
+            ]
+        );
     }
 
     #[test]

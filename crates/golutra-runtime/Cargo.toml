@@ -17,13 +17,15 @@ golutra-protocol.workspace = true
 golutra-tools = { path = "../golutra-tools" }
 golutra-verify = { path = "../golutra-verify" }
 ignore.workspace = true
-serde_json.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+shlex.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 golutra-policy = { path = "../golutra-policy" }

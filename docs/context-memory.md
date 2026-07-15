@@ -12,16 +12,18 @@
 
 ## 当前实现状态
 
-截至 2026-07-10，已落地以下受控最小闭环：
+截至 2026-07-15，已落地以下受控闭环：
 
 - `ContextBuilder` 按 contributor 构建 stable system prompt、canonical workspace environment context、会话摘要、project memory、evidence 和工具说明；provider request 前后分别记录 `TokenBudgetSnapshot` 与 `TokenUsageRecord`。
 - compact 是 durable command/event；后续 turn 会复用 compact summary，同一 session 的历史不会作为完整 transcript 无界回灌。
 - `MemoryStore` 按 canonical cwd hash 持久化到 `$GOLUTRA_HOME/state/workspaces/<cwd-hash>/memory.json`，写入通过跨进程文件锁和临时文件原子替换；文件 I/O 使用 `spawn_blocking`，不会阻塞 async runtime worker。Unix runtime 目录为 `0700`、memory/lock 文件为 `0600`。
 - 成功任务只能从 durable evidence 生成 project-scoped `MemoryCandidate`；promotion gate 检查 evidence、confidence、scope、敏感内容和 contradiction，失败或不安全候选不会写入 active memory。
 - 每轮 task 会记录 `MemoryRetrieved`，只有 active、未过期且与 query 相关的 project memory 才进入 context；完整 memory 记录不直接当作 prompt 历史。
-- `memory list` 和 `memory rollback` 已通过 CLI、HTTP transport 和 TypeScript SDK 暴露；rollback 保留事实记录和原因，不物理擦除审计历史。
+- memory list/feedback/rollback 已通过 CLI、IPC/HTTP transport、TypeScript/Python SDK 暴露；helpful/irrelevant/incorrect feedback 进入 durable lifecycle，incorrect 会阻止后续检索使用。
+- `golutra-code-intelligence` 以 tree-sitter 构造 Rust/Python/TypeScript symbol/reference/import graph，owner-only code index 有大小/版本边界；`symbol_search`、`find_references` 与 rg/file metadata 进入统一工具链。
+- reviewed/installed Skill 不直接改 system prompt；RuntimeHost 只按当前 objective 相关性选取最多 3 条 Skill manifest 作为独立 `ContextContributor`，rollback 后立即停止注入。
 
-当前没有实现 user/global memory、向量数据库、OS 级 secret store 或自动覆盖已有 memory。上述能力继续按本文件的治理边界后置。
+当前不自动晋升 user/global memory，不使用向量数据库或 OS keychain，也不自动覆盖已有 memory。user/global scope 只保留 human-review 模型边界；这些是明确治理选择，不是 project memory 主链缺口。
 
 核心原则：
 

@@ -197,6 +197,36 @@ fn model_catalog_routes_to_first_enabled_provider() {
 }
 
 #[test]
+fn openai_model_metadata_updates_dynamic_capabilities() {
+    let capabilities = openai_capabilities_from_models(
+        &json!({
+            "data": [{
+                "id": "model-test",
+                "context_length": 262_144,
+                "max_output_tokens": 16_384,
+                "supported_parameters": [
+                    "stream",
+                    "tools",
+                    "response_format",
+                    "reasoning_effort"
+                ],
+                "architecture": {"input_modalities": ["text", "image"]}
+            }]
+        }),
+        "model-test",
+    );
+
+    assert_eq!(capabilities.source, ProviderCapabilitySource::Discovered);
+    assert!(capabilities.supports_streaming);
+    assert!(capabilities.supports_tools);
+    assert!(capabilities.supports_json_schema);
+    assert!(capabilities.supports_reasoning);
+    assert!(capabilities.supports_vision);
+    assert_eq!(capabilities.context_window, Some(262_144));
+    assert_eq!(capabilities.max_output_tokens, Some(16_384));
+}
+
+#[test]
 fn provider_protocol_parses_qwen_style_aliases() {
     assert_eq!(
         ProviderProtocol::from_config_value("anthropic"),

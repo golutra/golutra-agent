@@ -28,6 +28,7 @@ pub enum TaskStatus {
     Idle,
     Running,
     WaitingApproval,
+    WaitingAuthentication,
     Pausing,
     Paused,
     Aborting,

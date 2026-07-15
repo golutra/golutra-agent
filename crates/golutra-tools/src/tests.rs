@@ -1,10 +1,61 @@
-use std::{fs, process::Stdio, time::Duration};
+use std::{
+    fs,
+    process::Stdio,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
+};
 
 use golutra_policy::WorkspacePolicy;
 use tempfile::tempdir;
 use tokio::process::Command;
 
 use super::*;
+
+#[derive(Debug)]
+struct FakeExternalBackend {
+    calls: AtomicUsize,
+    delay: Duration,
+    output: ExternalToolOutput,
+}
+
+impl FakeExternalBackend {
+    fn successful(delay: Duration) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            delay,
+            output: ExternalToolOutput {
+                summary: "external response".to_owned(),
+                content: "token=plain-secret-value\nexternal output".to_owned(),
+                structured_facts: json!({"provider": "fixture", "api_key": "secret"}),
+                is_error: false,
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl ExternalToolBackend for FakeExternalBackend {
+    fn contracts(&self) -> Vec<ToolContract> {
+        vec![contract(
+            "mcp__fixture__echo",
+            SideEffectType::ExternalSystem,
+        )]
+    }
+
+    async fn call(
+        &self,
+        _request: &ToolRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ExternalToolOutput, ToolError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        tokio::select! {
+            () = cancellation.cancelled() => Err(ToolError::Execution(
+                "external backend cancelled".to_owned(),
+            )),
+            () = tokio::time::sleep(self.delay) => Ok(self.output.clone()),
+        }
+    }
+}
 
 #[tokio::test]
 async fn registry_contains_p0_tools() {
@@ -19,13 +70,104 @@ async fn registry_contains_p0_tools() {
         names,
         vec![
             "edit_file",
+            "find_references",
             "list_dir",
             "read_file",
             "rg_search",
             "shell",
+            "symbol_search",
             "write_file"
         ]
     );
+}
+
+#[tokio::test]
+async fn external_tools_require_approval_and_redact_output() {
+    let workspace = tempdir().expect("workspace");
+    let backend = Arc::new(FakeExternalBackend::successful(Duration::ZERO));
+    let executor = executor(workspace.path())
+        .with_external_backend(backend.clone())
+        .expect("external backend registers");
+    let tool_request = request("mcp__fixture__echo", json!({}));
+
+    let policy = executor.evaluate(&tool_request).expect("policy");
+    assert_eq!(policy.decision, PolicyDecision::Ask);
+    assert_eq!(policy.resource, "external-tool:mcp__fixture__echo");
+
+    let blocked = executor
+        .execute(tool_request.clone(), CancellationToken::new())
+        .await
+        .expect("unapproved call returns report");
+    assert_eq!(blocked.envelope.status, ToolResultStatus::Blocked);
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+
+    let approved = executor
+        .execute_with_policy(tool_request, policy, true, CancellationToken::new())
+        .await
+        .expect("approved call runs");
+    assert_eq!(approved.envelope.status, ToolResultStatus::Ok);
+    assert_eq!(approved.envelope.risk, "external_mcp_tool");
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        approved.envelope.structured_facts["api_key"],
+        "<redacted-secret>"
+    );
+    assert!(
+        !String::from_utf8_lossy(&approved.artifact_contents[0].bytes)
+            .contains("plain-secret-value")
+    );
+}
+
+#[tokio::test]
+async fn external_tool_timeout_returns_a_terminal_envelope() {
+    let workspace = tempdir().expect("workspace");
+    let backend = Arc::new(FakeExternalBackend::successful(Duration::from_millis(
+        EXTERNAL_TOOL_TIMEOUT_MS + 100,
+    )));
+    let executor = executor(workspace.path())
+        .with_external_backend(backend)
+        .expect("external backend registers");
+    let tool_request = request("mcp__fixture__echo", json!({}));
+    let policy = executor.evaluate(&tool_request).expect("policy");
+
+    let report = executor
+        .execute_with_policy(tool_request, policy, true, CancellationToken::new())
+        .await
+        .expect("timeout returns report");
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Timeout);
+    assert_eq!(report.envelope.risk, "external_mcp_tool");
+}
+
+#[tokio::test]
+async fn code_intelligence_tools_find_symbols_and_references() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(
+        workspace.path().join("lib.rs"),
+        "pub struct RuntimeHost; fn attach(host: RuntimeHost) { let _ = host; }",
+    )
+    .expect("source");
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+
+    let symbols = executor
+        .execute(
+            request("symbol_search", json!({"query": "RuntimeHost"})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("symbol search");
+    let references = executor
+        .execute(
+            request("find_references", json!({"symbol": "RuntimeHost"})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("reference search");
+
+    assert_eq!(symbols.envelope.status, ToolResultStatus::Ok);
+    assert_eq!(symbols.envelope.structured_facts["matches"], json!(1));
+    assert_eq!(references.envelope.status, ToolResultStatus::Ok);
+    assert!(references.envelope.structured_facts["references"] == json!(1));
 }
 
 #[test]
@@ -433,6 +575,8 @@ async fn process_cancellation_terminates_descendants_and_drains_pipes() {
             workspace.path(),
             DEFAULT_TIMEOUT_MS,
             cancellation,
+            &golutra_sandbox::SystemSandbox::detect(),
+            golutra_sandbox::WorkspaceAccess::ReadWrite,
         ),
     )
     .await
@@ -454,6 +598,8 @@ async fn process_output_is_bounded_while_pipe_is_drained() {
             workspace.path(),
             20,
             CancellationToken::new(),
+            &golutra_sandbox::SystemSandbox::detect(),
+            golutra_sandbox::WorkspaceAccess::ReadWrite,
         ),
     )
     .await

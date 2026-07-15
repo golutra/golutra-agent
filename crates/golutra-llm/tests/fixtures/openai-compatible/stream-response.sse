@@ -1,0 +1,11 @@
+data: {"id":"chatcmpl-golden-stream","choices":[{"index":0,"delta":{"role":"assistant","content":"golden "},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-golden-stream","choices":[{"index":0,"delta":{"content":"stream"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-golden-stream","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-golden-stream","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":2,"total_tokens":14}}
+
+data: [DONE]
+
+: stream closed

@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+base64.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
 fs2.workspace = true
@@ -15,14 +16,18 @@ golutra-core.workspace = true
 golutra-config = { path = "../golutra-config" }
 golutra-context = { path = "../golutra-context" }
 golutra-eval = { path = "../golutra-eval" }
+golutra-evolution = { path = "../golutra-evolution" }
 golutra-llm = { path = "../golutra-llm" }
 golutra-memory = { path = "../golutra-memory" }
+golutra-mcp = { path = "../golutra-mcp" }
 golutra-policy = { path = "../golutra-policy" }
+golutra-plugin = { path = "../golutra-plugin" }
 golutra-protocol.workspace = true
 golutra-runtime = { path = "../golutra-runtime" }
 golutra-store = { path = "../golutra-store" }
 golutra-tools = { path = "../golutra-tools" }
 reqwest.workspace = true
+secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -34,4 +39,3 @@ uuid.workspace = true
 
 [dev-dependencies]
 golutra-auth = { path = "../golutra-auth" }
-secrecy.workspace = true

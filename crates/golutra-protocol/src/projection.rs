@@ -44,10 +44,19 @@ pub struct DebugProjection {
     pub session_id: SessionId,
     pub task_id: Option<TaskId>,
     pub events: Vec<RuntimeEvent>,
+    pub event_window: DebugEventWindow,
     pub busy_policy_decisions: Vec<BusyPolicyDecision>,
     pub tool_results: Vec<ToolResultEnvelope>,
     pub artifacts: Vec<ArtifactRecord>,
     pub evidence: Vec<EvidenceRecord>,
     pub verification: Option<VerificationRecord>,
     pub loop_decisions: Vec<LoopDecision>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DebugEventWindow {
+    pub start_cursor: Option<u64>,
+    pub end_cursor: Option<u64>,
+    pub has_more_before: bool,
+    pub limit: u32,
 }

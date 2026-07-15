@@ -28,10 +28,13 @@ use golutra_config::{
     update_provider_settings_verified,
 };
 use golutra_core::{ActorKind, QueryId, SessionId, TaskId, ThreadId};
-use golutra_llm::{ProviderGenerationConfig, ProviderProtocol, provider_protocol_catalog};
+use golutra_llm::{
+    ProviderGenerationConfig, ProviderHeaderConfig, ProviderHeaderValue, ProviderProtocol,
+    provider_protocol_catalog,
+};
 use golutra_protocol::{
-    EventFilter, RuntimeEvent, RuntimeEventType, RuntimeQuery, RuntimeQueryKind,
-    SessionCommandKind, UserProjection,
+    EventFilter, EventPageDirection, EventPageRequest, RuntimeEvent, RuntimeEventType,
+    RuntimeQuery, RuntimeQueryKind, SessionCommandKind, UserProjection,
 };
 use golutra_tui::{
     AuthConfigScope, AuthCredentialStore, OAuthLoginCommand, OpenAiCompatibleLogin,
@@ -47,6 +50,7 @@ use uuid::Uuid;
 
 static TUI_ACTOR_ID: LazyLock<String> =
     LazyLock::new(|| format!("golutra-tui-{}-{}", std::process::id(), Uuid::now_v7()));
+const TUI_HISTORY_PAGE_SIZE: u32 = 256;
 
 mod auth_flow;
 mod auth_state;
@@ -100,6 +104,9 @@ struct TuiApp {
     workspace_path: PathBuf,
     debug_mode: bool,
     cursor: Option<u64>,
+    history_start_cursor: Option<u64>,
+    history_has_more_before: bool,
+    history_load_requested: bool,
     transcript_scroll_offset: usize,
     transcript_row_count: usize,
     quit_shortcut_expires_at: Option<Instant>,
@@ -157,6 +164,9 @@ impl TuiApp {
             workspace_path,
             debug_mode,
             cursor: None,
+            history_start_cursor: None,
+            history_has_more_before: false,
+            history_load_requested: false,
             transcript_scroll_offset: 0,
             transcript_row_count: 0,
             quit_shortcut_expires_at: None,
@@ -197,6 +207,14 @@ impl TuiApp {
         self.projection = serde_json::from_value(projection)
             .map(Some)
             .map_err(|error| miette::miette!("{error}"))?;
+        if self.projection.as_ref().is_some_and(|projection| {
+            projection.status == golutra_core::TaskStatus::WaitingAuthentication
+        }) && self.auth_dialog.is_none()
+            && self.auth_operation.is_none()
+        {
+            self.auth_dialog = Some(AuthDialogState::new());
+            self.status_message = "provider authentication required".to_owned();
+        }
         if self.debug_mode {
             match load_debug_projection(transport, self.session_id, self.task_id).await {
                 Ok(projection) => {
@@ -213,6 +231,71 @@ impl TuiApp {
             self.developer_error = None;
         }
         self.sync_transcript_row_count(previous_row_count);
+        Ok(())
+    }
+
+    async fn load_recent_history(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
+        let page = transport
+            .event_page(EventPageRequest {
+                session_id: self.session_id,
+                task_id: self.task_id,
+                cursor: None,
+                direction: EventPageDirection::Backward,
+                limit: TUI_HISTORY_PAGE_SIZE,
+            })
+            .await
+            .map_err(|error| miette::miette!("{error}"))?;
+        self.events = page
+            .events
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| miette::miette!("{error}"))?;
+        self.history_start_cursor = page.start_cursor;
+        self.cursor = page.end_cursor;
+        self.history_has_more_before = page.has_more;
+        self.history_load_requested = false;
+        self.transcript_row_count = transcript_rows(self).len();
+        self.clamp_transcript_scroll();
+        Ok(())
+    }
+
+    async fn load_older_history(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
+        self.history_load_requested = false;
+        if !self.history_has_more_before {
+            return Ok(());
+        }
+        let previous_rows = transcript_rows(self).len();
+        let page = transport
+            .event_page(EventPageRequest {
+                session_id: self.session_id,
+                task_id: self.task_id,
+                cursor: self.history_start_cursor,
+                direction: EventPageDirection::Backward,
+                limit: TUI_HISTORY_PAGE_SIZE,
+            })
+            .await
+            .map_err(|error| miette::miette!("{error}"))?;
+        let mut older = page
+            .events
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| miette::miette!("{error}"))?;
+        if older.is_empty() {
+            self.history_has_more_before = false;
+            return Ok(());
+        }
+        older.append(&mut self.events);
+        self.events = older;
+        self.history_start_cursor = page.start_cursor;
+        self.history_has_more_before = page.has_more;
+        let current_rows = transcript_rows(self).len();
+        self.transcript_scroll_offset = self
+            .transcript_scroll_offset
+            .saturating_add(current_rows.saturating_sub(previous_rows));
+        self.transcript_row_count = current_rows;
+        self.clamp_transcript_scroll();
         Ok(())
     }
 
@@ -240,6 +323,7 @@ impl TuiApp {
         {
             return;
         }
+        self.history_start_cursor = self.history_start_cursor.or(Some(event.sequence_no));
         self.cursor = Some(event.sequence_no);
         if let Ok(value) = serde_json::to_value(event) {
             self.events.push(value);
@@ -343,6 +427,13 @@ impl TuiApp {
         self.transcript_row_count = transcript_rows(self).len();
     }
 
+    fn reset_history_window(&mut self) {
+        self.cursor = None;
+        self.history_start_cursor = None;
+        self.history_has_more_before = false;
+        self.history_load_requested = false;
+    }
+
     fn sync_transcript_row_count(&mut self, previous_row_count: usize) {
         let current_row_count = transcript_rows(self).len();
         if self.transcript_scroll_offset > 0 && current_row_count > previous_row_count {
@@ -380,6 +471,24 @@ impl TuiApp {
             }
         }
         self.clamp_transcript_scroll_for_rows(visible_rows);
+        if matches!(
+            action,
+            TranscriptScrollAction::LineDown
+                | TranscriptScrollAction::PageDown
+                | TranscriptScrollAction::Bottom
+        ) {
+            self.history_load_requested = false;
+        } else if self.history_has_more_before
+            && matches!(
+                action,
+                TranscriptScrollAction::LineUp
+                    | TranscriptScrollAction::PageUp
+                    | TranscriptScrollAction::Top
+            )
+            && self.transcript_scroll_offset == self.max_transcript_scroll_offset(visible_rows)
+        {
+            self.history_load_requested = true;
+        }
         self.status_message = transcript_scroll_status(self.transcript_scroll_offset);
     }
 
@@ -504,7 +613,7 @@ impl TuiApp {
                 self.command_messages.clear();
                 self.input.clear();
                 self.reset_slash_selection();
-                self.cursor = None;
+                self.reset_history_window();
                 self.reset_transcript_view();
                 self.status_message =
                     format!("forked thread {}", short_id(&thread.thread_id.to_string()));
@@ -626,7 +735,7 @@ impl TuiApp {
         self.command_messages.clear();
         self.input.clear();
         self.reset_slash_selection();
-        self.cursor = None;
+        self.reset_history_window();
         self.resume_picker = None;
         self.debug_mode = false;
         self.status_message = "new session".to_owned();
@@ -652,7 +761,7 @@ impl TuiApp {
         self.command_messages.clear();
         self.input.clear();
         self.reset_slash_selection();
-        self.cursor = None;
+        self.reset_history_window();
         self.resume_picker = None;
         self.status_message = format!("resumed {}", short_id(&thread.thread_id.to_string()));
         self.reset_transcript_view();
@@ -717,6 +826,7 @@ impl TuiApp {
             }
             SlashAuthCommand::Mock => {
                 apply_auth_mock()?;
+                notify_runtime_provider_configured(transport, self.session_id).await?;
                 self.refresh_provider_status();
                 self.auth_dialog = None;
                 self.push_system_message(
@@ -745,6 +855,7 @@ impl TuiApp {
                 .await
                 {
                     Ok(()) => {
+                        notify_runtime_provider_configured(transport, self.session_id).await?;
                         self.refresh_provider_status();
                         self.push_system_message(
                             "Auth updated",
@@ -759,6 +870,7 @@ impl TuiApp {
             }
             SlashAuthCommand::Login(login) => match apply_auth_login(transport, *login).await {
                 Ok(()) => {
+                    notify_runtime_provider_configured(transport, self.session_id).await?;
                     self.refresh_provider_status();
                     self.auth_dialog = None;
                     self.push_system_message(
@@ -896,7 +1008,7 @@ impl TuiApp {
         Ok(())
     }
 
-    async fn poll_auth_operation(&mut self) {
+    async fn poll_auth_operation(&mut self, transport: &RuntimeTransport) {
         let mut progress_items = Vec::new();
         let finished = if let Some(operation) = &mut self.auth_operation {
             while let Ok(progress) = operation.progress.try_recv() {
@@ -917,6 +1029,13 @@ impl TuiApp {
         };
         match operation.task.await {
             Ok(Ok(outcome)) => {
+                if let Err(error) =
+                    notify_runtime_provider_configured(transport, self.session_id).await
+                {
+                    self.push_system_message("Auth failed", vec![error.to_string()]);
+                    self.status_message = "provider runtime reload failed".to_owned();
+                    return;
+                }
                 self.refresh_provider_status();
                 self.push_system_message(outcome.title, outcome.body);
             }
@@ -1070,6 +1189,7 @@ async fn run_app(
 ) -> miette::Result<()> {
     let mut subscribed_session = app.session_id;
     let mut subscribed_task = app.task_id;
+    app.load_recent_history(&transport).await?;
     let mut subscription = transport
         .subscribe(EventFilter {
             session_id: subscribed_session,
@@ -1102,9 +1222,14 @@ async fn run_app(
             }
         }
 
+        if app.history_load_requested {
+            app.load_older_history(&transport).await?;
+        }
+
         if app.session_id != subscribed_session || app.task_id != subscribed_task {
             subscribed_session = app.session_id;
             subscribed_task = app.task_id;
+            app.load_recent_history(&transport).await?;
             subscription = transport
                 .subscribe(EventFilter {
                     session_id: subscribed_session,
@@ -1136,7 +1261,7 @@ async fn run_app(
         if received_event {
             app.refresh(&transport).await?;
         }
-        app.poll_auth_operation().await;
+        app.poll_auth_operation(&transport).await;
     }
 
     Ok(())

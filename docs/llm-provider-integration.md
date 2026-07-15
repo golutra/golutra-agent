@@ -2,9 +2,9 @@
 
 ## 文档定位
 
-本文档定义 Golutra 后续接入真实 LLM provider 时的配置、认证、凭据存储和运行时事件边界。
+本文档定义 Golutra 真实 LLM provider 的配置、认证、凭据存储和运行时事件边界。
 
-它补齐 `initial-implementation-plan.md` 中的 `TODO(provider-config)`，但不替代 `runtime-contracts.md` 的 provider 硬契约。实现时优先遵守：
+它固化 `initial-implementation-plan.md` 的 provider-config 决策，但不替代 `runtime-contracts.md` 的 provider 硬契约。实现时优先遵守：
 
 - runtime 只依赖 Golutra 自己的 `ProviderContract`。
 - provider native SDK / wire type 只能存在于 adapter 内。
@@ -51,7 +51,7 @@ Golutra 不直接复制 qwen-code 的配置文件形状。Golutra 的核心仍�
 
 ## 当前状态
 
-截至 2026-07-13：
+截至 2026-07-15：
 
 - `golutra-llm` 已有 `MockProvider`、独立 OpenAI-compatible live adapter，以及基于固定 `rust-genai 0.7.0-beta.12` 的 `GenaiProviderAdapter`。
 - 默认 provider 是 mock。
@@ -71,7 +71,7 @@ Golutra 不直接复制 qwen-code 的配置文件形状。Golutra 的核心仍�
 - OpenAI-compatible adapter 已支持 `OPENAI_API_KEY`、`OPENAI_MODEL`、`OPENAI_BASE_URL` 作为兼容 fallback。
 - provider protocol catalog 已注册且可执行 `mock`、`openai-compatible`、`openai-responses`、`anthropic`、`gemini`、`vertex-ai` 和 `genai`。
 - `anthropic` 强制使用 Anthropic Messages wire，`gemini` 使用 generateContent，`vertex-ai` 使用 Vertex generateContent 和 bearer/OAuth token，`genai` 根据 model namespace 选择 rust-genai adapter；它们统一映射 tool round-trip、usage、reasoning effort、finish reason 和脱敏错误。
-- live HTTP 调用使用 10 秒 connect timeout 和 120 秒总 timeout；OpenAI-compatible 流式读取与 genai captured raw metadata 都执行 16 MiB 响应边界，assistant message、tool id/name/arguments 另有更小字段上限。
+- live HTTP 调用使用 10 秒 connect timeout 和 120 秒总 timeout；OpenAI-compatible 已使用 SSE 增量读取并按顺序产生 text/tool/usage stream event，truncated/malformed stream 显式失败。SSE 与 genai captured raw metadata 都执行 16 MiB 响应边界，assistant message、tool id/name/arguments 另有更小字段上限。
 - CLI/env base URL 会做 P0 规范化：例如 `api.golutra.cn` 会解析成 `https://api.golutra.cn/v1`。TUI provider setup 为了对齐 qwen-code 的交互校验，要求用户输入 `http://` 或 `https://` 开头的 endpoint；Golutra 官方 preset 默认填入 `https://api.golutra.cn/v1`。
 - CLI 已提供 `golutra provider protocols`、`golutra provider current` 和 `golutra provider probe`，输出只包含协议目录、脱敏配置与 probe 结果，不输出 API key。
 - provider/auth 配置持久化到 `$GOLUTRA_HOME/provider.json` v2；workspace `.golutra` 不再作为 provider 配置来源。v2 使用原子写和 owner-only 权限，只保存 `credential_ref`、OAuth descriptor 与非敏感 provider metadata，不保存 API key 或 token。交互 secret 进入独立的 owner-only `$GOLUTRA_HOME/credentials.json`，CI/headless 配置可保存只读 env ref；v1 `env` map 会在 provider settings lock 内一次性迁移到 disk SecretStore，迁移失败会恢复 secret 并保留原配置。
@@ -81,6 +81,9 @@ Golutra 不直接复制 qwen-code 的配置文件形状。Golutra 的核心仍�
 - env 入口继续作为非交互配置协议，并已由 SecretRef 层作为只读 credential source 使用；明文值不会复制进 provider 配置。`golutra-auth` 已实现 browser PKCE、RFC 8628 device flow、OpenAI headless device-auth、token refresh/revoke/logout，LLM adapter 在 401 时只强制刷新并重试一次。受审计 catalog 已内置 OpenAI ChatGPT browser/headless、xAI browser/device 和 GitHub Copilot device；自定义 OAuth 仍要求显式 descriptor，不会从任意 OpenAI-compatible base URL 自动推断授权端点。
 - OpenAI ChatGPT OAuth 使用独立 `openai-responses` adapter：请求发往 Codex Responses SSE endpoint，account id 优先从 token response 的 `id_token` 安全提取，调用时携带 `ChatGPT-Account-Id`，并在 `store=false` 的多轮工具调用中保留/回送 encrypted reasoning item。GitHub Copilot adapter 增加其要求的 API version、intent、initiator 和 User-Agent header。
 - 已提交六组 provider golden fixture，通过本地 HTTP 捕获实际 adapter wire，覆盖完整 message/tool result 序列化、Responses SSE/reasoning replay、文本和 tool-call 响应、usage/finish reason、auth header 与 401。`just provider-live-smoke` 只读取专用 `GOLUTRA_LIVE_*` 环境变量，不读取正常用户凭据，变量不全时安全跳过。
+- provider capability 已有 declared/discovered 两级来源。OpenAI-compatible probe 从 `/models` 的 supported parameters、context window、max output 和 input modalities 更新 streaming/tools/JSON Schema/reasoning/vision；无法发现的字段保留 declared/unknown，不伪造能力。
+- Custom Provider 的 CLI/TUI/profile 已支持 literal 与 env-ref custom headers；Authorization、Host、Content-Length 等 transport header 和疑似明文 secret 会在保存前拒绝，runtime debug 只暴露 header 名称。
+- 任务执行中遇到缺失/损坏 provider 配置会进入 durable `ProviderAuthRequired` 和 `WaitingAuthentication`；任一已 attach 客户端可在完成 verified install 后提交 `ProviderConfigured/ProviderAuthSubmitted` 使原任务从安全边界继续，也可提交 `ProviderAuthCancelled` 取消。该链路已有 embedded 与跨进程 daemon 回归。
 - TUI 已有 provider onboarding gate 和 `/auth` setup；已有 active provider 时不会首屏打断，但输入 `/auth` 可随时重新打开同一套选型并覆盖同名 profile。Web 首次 provider onboarding 不在当前产品范围，CLI 非交互场景保持结构化诊断。
 
 ## 目标架构
@@ -440,12 +443,9 @@ TUI provider connect modal 按三组展示：
 - API key input：脱敏显示；默认保存到 `$GOLUTRA_HOME/credentials.json`，user provider config 只保存 SecretRef
 - model：内置推荐模型选择，或输入自定义 model id
 - advanced config：支持 Thinking、Reasoning effort、Context window、Max output tokens；字段保存到 profile 并随 active provider 生效
+- custom headers：CLI 支持 `--header Name=Value` / `--header-env Name=ENV_KEY`，TUI Advanced Config 支持同一语义；profile 保存 literal 非敏感值或 env ref，runtime 只在请求末端解析
 - review：展示 profile、baseUrl、model、advanced config、scope、保存路径、是否覆盖同名 profile，以及脱敏后的 `ProviderInstallPlan`
 - slash auth：`/auth oauth-login` 在后台执行 browser/device OAuth并展示 URL/code，Ctrl+C 可取消；`/auth logout` 清理指定或 active profile
-
-尚未实现字段：
-
-- custom headers / streaming override：当前还没有 UI 与 profile 字段
 
 Custom Provider 的 protocol selector 已支持 OpenAI-compatible、Anthropic、Gemini、Vertex AI 和 genai；Custom 模式不预填官方 base URL，避免把私有 endpoint 误连到协议官网。
 
@@ -453,28 +453,21 @@ Custom Provider 的 protocol selector 已支持 OpenAI-compatible、Anthropic、
 
 ### app-server / SDK
 
-app-server 后续需要支持运行时 auth required 事件，供已连接的 CLI/TUI/SDK 处理；这不是 Web 首次 onboarding：
+app-server 已支持运行时 auth required 事件，供已连接的 CLI/TUI/SDK 处理；这不是 Web 首次 onboarding：
 
 ```text
 ProviderAuthRequired
--> client 展示 CredentialRequest
--> client 提交 CredentialResponse
--> RuntimeHost 绑定 credential_ref 并重试安全边界内的 provider call
+-> client 根据 supported_methods 打开 API key 或 OAuth 安装流程
+-> config/auth service 将 secret 写入 SecretStore，并完成 verified install/probe
+-> client 只提交 request_id 与 ProviderConfigured/ProviderAuthSubmitted
+-> RuntimeHost 重新解析 credential_ref，并从安全边界继续原 task
 ```
 
-CredentialRequest 统一支持：
+runtime command 不承载 bearer/basic/header/query 等明文 credential value。认证形状由受审计 provider profile、custom header env ref 和 OAuth descriptor 表达；所有 secret 都先进入 disk/env SecretRef，再由 provider adapter 在请求末端解析。响应可取消，取消写入 `ProviderAuthCancelled`，任务不能假装成功。
 
-- `bearer`
-- `basic`
-- `header`
-- `query`
-- `multi-header`
+## 运行时动态认证事件
 
-所有响应必须可取消。取消写入 `ProviderAuthCancelled`，任务不能假装成功。
-
-## 后续运行时动态认证事件
-
-以下事件用于未来“任务执行中临时请求凭据”的 app-server/SDK 协议，不是已完成的本地 provider onboarding 或 OAuth 登录状态，也不属于 Web 首次 Connect Provider Flow：
+以下事件已用于“任务执行中缺少或需要重新配置凭据”的 app-server/SDK 协议，不属于 Web 首次 Connect Provider Flow：
 
 | 事件 | durable | 说明 |
 | --- | --- | --- |
@@ -486,7 +479,7 @@ CredentialRequest 统一支持：
 | `ProviderProbeCompleted` | 是 | probe 成功，记录 capabilities/latency/rate limit hints |
 | `ProviderAuthFailed` | 是 | 认证失败，记录脱敏错误 |
 | `ProviderRateLimited` | 是 | rate limit，记录 reset hint |
-| `ProviderCredentialRefreshed` | 是 | OAuth token refresh 成功，记录 token ref 和 expiry |
+| `ProviderCredentialRefreshed` | 预留 | 当前 refresh 在 SecretStore/AuthService 内原子完成，不产生含 token 的 runtime payload；需要跨客户端刷新可见性时再启用仅含 credential ref/revision/expiry 的事件 |
 
 事件 payload 禁止包含：
 
@@ -532,7 +525,7 @@ probe 结果进入 capability matrix，但不能把一次 probe 成功当作永�
 - 引入 `ProviderInstallPlan`，确保 settings/env/runtime reload/probe 失败时可 rollback。
 - TUI 接入首次 provider setup，不再让真实用户面对空白 mock 前端。
 - 支持 OpenAI-compatible 自定义 endpoint。
-- 已给 OpenAI-compatible 与四类 genai native 路由增加 tool calling、probe 和 wire golden tests；streaming 与动态 capability probe 后置。
+- 已给 OpenAI-compatible 与四类 genai native 路由增加 tool calling、probe 和 wire golden tests；OpenAI-compatible SSE streaming 与模型目录 capability discovery 已进入 runtime event 主链。
 
 ### P1 SecretRef（已完成）
 
@@ -549,6 +542,7 @@ probe 结果进入 capability matrix，但不能把一次 probe 成功当作永�
 3. CLI `provider auth-methods/oauth-login/logout` 与 TUI `/auth` provider method picker、显式 `/auth oauth-login`、`/auth logout` 复用 `AuthService` 和 verified install/logout；OpenAI ChatGPT、xAI、GitHub Copilot使用内置 method，其他 provider 使用显式 descriptor 扩展。
 4. 已覆盖取消、state/PKCE 校验、loopback callback、deadline、`invalid_grant`、revoke、重启读取、并发 refresh、OpenID account id、Responses SSE/reasoning replay、Copilot headers 和 secret/config 泄漏测试。
 5. `genai` adapter 与 native protocol route 已完成，继续保持 adapter 反腐边界；provider model catalog auto-update 后置，更新必须可 diff、可 rollback、不可覆盖用户自定义模型。
+6. 运行中动态认证已完成：task 进入 `WaitingAuthentication`，客户端执行 SecretRef/OAuth verified install 后仅提交 request id，runtime probe 成功再恢复；取消会终止等待任务。不会通过 command/event 传输明文 credential。
 
 ## 验收标准
 
@@ -558,7 +552,7 @@ probe 结果进入 capability matrix，但不能把一次 probe 成功当作永�
 - 设置对应协议 env 后，可以通过 OpenAI-compatible、Anthropic、Gemini、Vertex AI 或 genai endpoint 跑真实任务。
 - 缺 key 时错误指出缺哪个 envKey，不泄露任何 secret。
 - provider probe 失败不会修改当前 active provider selection。
-- 本地 CLI/TUI OAuth 与 SecretRef 已可验收；跨 CLI/TUI/SDK 的 `ProviderAuthRequired` 动态凭据请求仍是后续独立协议，不作为 Web onboarding 或本轮 OAuth 完成条件。
+- 本地 CLI/TUI OAuth、SecretRef 与跨 CLI/TUI/SDK 的 `ProviderAuthRequired` 等待/恢复/取消协议均可验收；Web 首次 provider onboarding 不在范围内。
 - runtime event、artifact、projection、debug export 中没有明文 key。
 - 重启后 provider selection 可恢复，secret 从 environment 或 `$GOLUTRA_HOME/credentials.json` 中的 SecretRef 解析。
 - committed golden tests 不读取用户配置；专用 live env 配齐时，`just provider-live-smoke` 对目标 endpoint 发起最小真实请求。

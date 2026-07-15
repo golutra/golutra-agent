@@ -81,6 +81,17 @@ pub(crate) fn apply_event_to_projection(projection: &mut StateProjection, event:
                 projection.task_status = TaskStatus::Running;
             }
         }
+        RuntimeEventType::ProviderAuthRequired => {
+            projection.task_status = TaskStatus::WaitingAuthentication;
+        }
+        RuntimeEventType::ProviderAuthSubmitted => {
+            if projection.task_status == TaskStatus::WaitingAuthentication {
+                projection.task_status = TaskStatus::Running;
+            }
+        }
+        RuntimeEventType::ProviderAuthCancelled => {
+            projection.task_status = TaskStatus::Blocked;
+        }
         RuntimeEventType::VerificationCompleted => {
             projection.last_verification = verification_from_event(event);
         }

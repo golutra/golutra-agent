@@ -90,6 +90,58 @@ pub(crate) fn mock_provider_plan(
     )
 }
 
+pub(crate) fn isolated_mock_provider_plan(
+    payload: &Value,
+    objective: &str,
+) -> Result<MockProviderPlan, ProviderError> {
+    let lower = objective.to_ascii_lowercase();
+    let (mock, touched_code, workspace_tools_enabled) = if lower.contains("write")
+        || lower.contains("create")
+        || payload.get("content").is_some()
+    {
+        let write_args = mock_write_file_args(payload, objective);
+        (
+            MockProvider::tool_call(
+                "write_file",
+                json!({"path": write_args.path, "content": write_args.content}),
+            ),
+            true,
+            true,
+        )
+    } else if lower.contains("read") {
+        (
+            MockProvider::tool_call(
+                "read_file",
+                json!({"path": string_payload(payload, "path", "README.md")}),
+            ),
+            false,
+            true,
+        )
+    } else if lower.contains("list") || lower.contains("ls") {
+        (
+            MockProvider::tool_call(
+                "list_dir",
+                json!({"path": string_payload(payload, "path", ".")}),
+            ),
+            false,
+            true,
+        )
+    } else {
+        (
+            MockProvider::text_response("isolated mock provider completed the generated task"),
+            false,
+            prompt_requests_workspace_tools(payload, objective),
+        )
+    };
+    Ok(MockProviderPlan {
+        provider: ConfiguredProvider::Mock(Box::new(mock)),
+        fallback_provider: None,
+        touched_code,
+        workspace_tools_enabled,
+        context_builder: ContextBuilder::default(),
+    })
+}
+
 pub(crate) fn configured_provider_plan(
     provider_env: Option<&golutra_config::ProviderRuntimeEnv>,
     mock: MockProvider,
@@ -98,7 +150,7 @@ pub(crate) fn configured_provider_plan(
 ) -> Result<MockProviderPlan, ProviderError> {
     let provider = resolve_configured_provider(provider_env, mock.clone())?;
     let workspace_tools_enabled =
-        workspace_tools_enabled || matches!(&provider, ConfiguredProvider::OpenAiCompatible(_));
+        workspace_tools_enabled || !matches!(&provider, ConfiguredProvider::Mock(_));
     let fallback_provider = provider_env
         .and_then(|environment| environment.get("GOLUTRA_PROVIDER_FALLBACK_PROTOCOL"))
         .or_else(|| std::env::var("GOLUTRA_PROVIDER_FALLBACK_PROTOCOL").ok())

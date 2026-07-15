@@ -15,7 +15,8 @@
 11. `evaluation-observability.md`：观测、验证、复盘、benchmark。
 12. `agent-improvement-loop.md`：失败轨迹如何变成可验证、可回滚的 agent 改进。
 13. `agent-open-endedness-design.md`：开放式探索、技能晋升和 Promotion Gate。
-14. `framework-comparison.md`：六个外部 agent 项目对 Golutra 的影响。
+14. `extensions-sdk-delivery.md`：Plugin/MCP、IPC、TypeScript/Python SDK 和安装交付。
+15. `framework-comparison.md`：六个外部 agent 项目对 Golutra 的影响。
 
 ## 文档分工
 
@@ -34,4 +35,5 @@
 | `evaluation-observability.md` | 观测、验证、复盘、评估 |
 | `agent-improvement-loop.md` | agent 改进闭环 |
 | `agent-open-endedness-design.md` | 开放式能力和演进门禁 |
+| `extensions-sdk-delivery.md` | Plugin/MCP、transport、SDK 和交付 |
 | `framework-comparison.md` | 外部项目调研结论 |

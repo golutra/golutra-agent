@@ -125,6 +125,11 @@ pub(crate) fn handle_auth_dialog_character(dialog: &mut AuthDialogState, charact
 }
 
 pub(crate) fn handle_auth_advanced_character(dialog: &mut AuthDialogState, character: char) {
+    if dialog.advanced_selected == 4 {
+        dialog.custom_headers.push(character);
+        dialog.error = None;
+        return;
+    }
     match character {
         ' ' => dialog.toggle_advanced_item(),
         't' | 'T' => {
@@ -321,12 +326,14 @@ pub(crate) async fn advance_auth_dialog(
         AuthAdvanceAction::None => {}
         AuthAdvanceAction::SaveMock => {
             apply_auth_mock()?;
+            notify_runtime_provider_configured(transport, app.session_id).await?;
             app.refresh_provider_status();
             app.auth_dialog = None;
             app.status_message = "using mock provider".to_owned();
         }
         AuthAdvanceAction::SaveOpenAiCompatible(login) => {
             apply_auth_login(transport, *login).await?;
+            notify_runtime_provider_configured(transport, app.session_id).await?;
             app.refresh_provider_status();
             app.auth_dialog = None;
             app.status_message = "provider connected".to_owned();
@@ -573,6 +580,7 @@ pub(crate) fn auth_login(dialog: &AuthDialogState) -> Result<OpenAiCompatibleLog
             .as_ref()
             .map(|review| review.credential_ref.clone()),
         generation_config: validate_generation_config(dialog)?,
+        custom_headers: parse_dialog_custom_headers(&dialog.custom_headers)?,
         scope: AuthConfigScope::User,
     })
 }
@@ -617,6 +625,7 @@ pub(crate) fn build_auth_review(dialog: &AuthDialogState) -> Result<AuthReview, 
     )
     .map_err(|error| error.to_string())?;
     preview_profile.generation_config = login.generation_config.clone();
+    preview_profile.custom_headers = login.custom_headers.clone();
     let preview_plan = ProviderInstallPlan {
         scope,
         profile: preview_profile,
@@ -641,7 +650,7 @@ pub(crate) fn build_auth_review(dialog: &AuthDialogState) -> Result<AuthReview, 
             ),
         },
         credential_ref,
-        advanced: generation_config_summary(login.generation_config.as_ref()),
+        advanced: advanced_config_summary(login.generation_config.as_ref(), &login.custom_headers),
         scope,
         config_path,
         updates_existing_profile,
@@ -711,6 +720,7 @@ pub(crate) async fn apply_auth_login(
     )
     .map_err(|error| miette::miette!("{error}"))?;
     profile.generation_config = login.generation_config;
+    profile.custom_headers = login.custom_headers;
     apply_provider_install_plan_verified(
         &paths,
         cwd,
@@ -725,6 +735,28 @@ pub(crate) async fn apply_auth_login(
     .map_err(|error| miette::miette!("{error}"))?;
 
     Ok(())
+}
+
+pub(crate) async fn notify_runtime_provider_configured(
+    transport: &RuntimeTransport,
+    session_id: SessionId,
+) -> miette::Result<()> {
+    let ack = transport
+        .send_command(session_command(
+            session_id,
+            SessionCommandKind::ProviderConfigured,
+            json!({"verified": true}),
+        ))
+        .await
+        .map_err(|error| miette::miette!("{error}"))?;
+    if ack.accepted {
+        Ok(())
+    } else {
+        Err(miette::miette!(
+            "runtime rejected provider reload: {}",
+            ack.reason.unwrap_or_else(|| "unknown reason".to_owned())
+        ))
+    }
 }
 
 pub(crate) fn credential_for_login(
@@ -789,6 +821,65 @@ pub(crate) fn validate_generation_config(
         max_tokens,
     };
     Ok((!config.is_empty()).then_some(config))
+}
+
+pub(crate) fn parse_dialog_custom_headers(
+    input: &str,
+) -> Result<Vec<ProviderHeaderConfig>, String> {
+    let mut headers = Vec::new();
+    let mut names = std::collections::BTreeSet::new();
+    for assignment in input
+        .split(';')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let (name, value) = assignment.split_once('=').ok_or_else(|| {
+            "Custom headers must use Name=Value separated by semicolons".to_owned()
+        })?;
+        let name = name.trim();
+        let value = value.trim();
+        if name.is_empty() || value.is_empty() {
+            return Err("Custom headers require non-empty names and values".to_owned());
+        }
+        let value = match value.strip_prefix('@') {
+            Some(key) if !key.trim().is_empty() => ProviderHeaderValue::Environment {
+                key: key.trim().to_owned(),
+            },
+            Some(_) => return Err("Custom header environment key cannot be empty".to_owned()),
+            None => ProviderHeaderValue::Literal {
+                value: value.to_owned(),
+            },
+        };
+        let header = ProviderHeaderConfig {
+            name: name.to_owned(),
+            value,
+        };
+        header.validate()?;
+        if !names.insert(name.to_ascii_lowercase()) {
+            return Err(format!(
+                "Custom header `{name}` is configured more than once"
+            ));
+        }
+        headers.push(header);
+    }
+    Ok(headers)
+}
+
+fn advanced_config_summary(
+    generation_config: Option<&ProviderGenerationConfig>,
+    headers: &[ProviderHeaderConfig],
+) -> String {
+    let generation = generation_config_summary(generation_config);
+    if headers.is_empty() {
+        generation
+    } else {
+        let names = headers
+            .iter()
+            .map(|header| header.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{generation}; headers: {names}")
+    }
 }
 
 pub(crate) fn parse_optional_positive_u64(value: &str, label: &str) -> Result<Option<u64>, String> {

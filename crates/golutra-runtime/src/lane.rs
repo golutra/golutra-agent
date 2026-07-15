@@ -215,7 +215,10 @@ impl RuntimeLaneManager {
         if !self.lanes_by_session.get(&session_id).is_some_and(|lane| {
             matches!(
                 lane.status,
-                TaskStatus::Running | TaskStatus::WaitingApproval | TaskStatus::Pausing
+                TaskStatus::Running
+                    | TaskStatus::WaitingApproval
+                    | TaskStatus::WaitingAuthentication
+                    | TaskStatus::Pausing
             )
         }) {
             return Err(RuntimeLaneError::LaneNotFound);
@@ -269,6 +272,39 @@ impl RuntimeLaneManager {
         self.set_status(session_id, status, sequence_no, event_type)
     }
 
+    pub fn wait_for_authentication(
+        &mut self,
+        session_id: SessionId,
+        sequence_no: u64,
+    ) -> Result<RuntimeTransition, RuntimeLaneError> {
+        self.set_status(
+            session_id,
+            TaskStatus::WaitingAuthentication,
+            sequence_no,
+            RuntimeEventType::ProviderAuthRequired,
+        )
+    }
+
+    pub fn authentication_resolved(
+        &mut self,
+        session_id: SessionId,
+        sequence_no: u64,
+    ) -> Result<RuntimeTransition, RuntimeLaneError> {
+        if !self
+            .lanes_by_session
+            .get(&session_id)
+            .is_some_and(|lane| lane.status == TaskStatus::WaitingAuthentication)
+        {
+            return Err(RuntimeLaneError::LaneNotFound);
+        }
+        self.set_status(
+            session_id,
+            TaskStatus::Running,
+            sequence_no,
+            RuntimeEventType::ProviderAuthSubmitted,
+        )
+    }
+
     #[must_use]
     pub fn lane(&self, session_id: SessionId) -> Option<&RuntimeLane> {
         self.lanes_by_session.get(&session_id)
@@ -306,6 +342,7 @@ pub fn is_active_status(status: TaskStatus) -> bool {
         status,
         TaskStatus::Running
             | TaskStatus::WaitingApproval
+            | TaskStatus::WaitingAuthentication
             | TaskStatus::Pausing
             | TaskStatus::Paused
             | TaskStatus::Aborting

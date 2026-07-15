@@ -458,6 +458,7 @@ fn provider_install_plan_accepts_native_live_protocols() {
         credential_ref: Some(env_credential("GOLUTRA_PROVIDER_API_KEY")),
         oauth: None,
         generation_config: None,
+        custom_headers: Vec::new(),
         enabled: true,
     };
     let plan = ProviderInstallPlan {
@@ -473,6 +474,79 @@ fn provider_install_plan_accepts_native_live_protocols() {
         settings.active_profile().expect("profile").protocol,
         ProviderProtocol::Anthropic
     );
+}
+
+#[test]
+fn provider_custom_headers_resolve_env_values_without_exposing_them_in_debug() {
+    let _home = IsolatedGolutraHome::new();
+    let _api_key = ScopedEnvVar::set("GOLUTRA_TEST_PROVIDER_KEY", "fake-provider-key");
+    let _header = ScopedEnvVar::set("GOLUTRA_TEST_HEADER_KEY", "fake-header-secret");
+    let paths = ProviderConfigPaths::global().expect("paths");
+    let mut profile = ProviderProfile::openai_compatible(
+        "custom-headers",
+        "https://api.example.com/v1",
+        "model-test",
+        env_credential("GOLUTRA_TEST_PROVIDER_KEY"),
+    )
+    .expect("profile");
+    profile.custom_headers = vec![
+        ProviderHeaderConfig {
+            name: "X-Client-Name".to_owned(),
+            value: ProviderHeaderValue::Literal {
+                value: "golutra-test".to_owned(),
+            },
+        },
+        ProviderHeaderConfig {
+            name: "X-Api-Key".to_owned(),
+            value: ProviderHeaderValue::Environment {
+                key: "GOLUTRA_TEST_HEADER_KEY".to_owned(),
+            },
+        },
+    ];
+    ProviderInstallPlan {
+        scope: ProviderConfigScope::User,
+        profile,
+        activate: true,
+        pending_secret: None,
+    }
+    .apply(&paths)
+    .expect("install custom headers");
+
+    let runtime = load_provider_runtime_env_from_paths(&paths).expect("runtime env");
+    let headers: BTreeMap<String, String> = serde_json::from_str(
+        &runtime
+            .get(GOLUTRA_PROVIDER_CUSTOM_HEADERS)
+            .expect("resolved headers"),
+    )
+    .expect("header JSON");
+
+    assert_eq!(headers["X-Client-Name"], "golutra-test");
+    assert_eq!(headers["X-Api-Key"], "fake-header-secret");
+    assert_eq!(
+        runtime.redacted_values()[GOLUTRA_PROVIDER_CUSTOM_HEADERS],
+        "<redacted>"
+    );
+    assert!(!format!("{runtime:?}").contains("fake-header-secret"));
+}
+
+#[test]
+fn provider_custom_headers_reject_literal_secrets_and_transport_headers() {
+    let mut profile = ProviderProfile::mock();
+    profile.custom_headers = vec![ProviderHeaderConfig {
+        name: "X-Api-Key".to_owned(),
+        value: ProviderHeaderValue::Literal {
+            value: "must-not-enter-provider-json".to_owned(),
+        },
+    }];
+    assert!(profile.validate().is_err());
+
+    profile.custom_headers = vec![ProviderHeaderConfig {
+        name: "Host".to_owned(),
+        value: ProviderHeaderValue::Literal {
+            value: "example.com".to_owned(),
+        },
+    }];
+    assert!(profile.validate().is_err());
 }
 
 #[test]

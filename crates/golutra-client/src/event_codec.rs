@@ -4,6 +4,7 @@ use golutra_core::{
     Actor, ActorKind, ArtifactId, ArtifactRecord, CommandId, EventId, LoopAction, RedactionStatus,
     SessionId, TaskId, TaskStatus, ThreadId, TurnId,
 };
+use golutra_llm::ProviderStreamEvent;
 use golutra_protocol::{EventFilter, RuntimeEvent, RuntimeEventSource, RuntimeEventType};
 use golutra_runtime::{AgentLoopTraceEvent, PendingAgentTurn};
 use golutra_store::ThreadRecord;
@@ -237,6 +238,30 @@ pub(crate) fn trace_event_payload(
                 "model_id": model_id,
             }),
         )),
+        AgentLoopTraceEvent::ProviderStreamed {
+            provider_id,
+            model_id,
+            event,
+        } => {
+            let delta = match event {
+                ProviderStreamEvent::ReasoningDelta { text } => json!({
+                    "kind": "reasoning_delta",
+                    "redacted": true,
+                    "byte_count": text.len(),
+                }),
+                event => json!(event),
+            };
+            Some((
+                RuntimeEventType::ProviderStreamed,
+                RuntimeEventSource::Provider,
+                json!({
+                    "summary": "provider response delta received",
+                    "provider_id": provider_id,
+                    "model_id": model_id,
+                    "delta": delta,
+                }),
+            ))
+        }
         AgentLoopTraceEvent::ProviderCompleted {
             provider_id,
             model_id,

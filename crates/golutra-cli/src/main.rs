@@ -7,16 +7,17 @@ use golutra_config::{
     BuiltinOAuthMethod, ProviderConfigPaths, ProviderConfigScope, ProviderInstallPlan,
     ProviderProfile, apply_oauth_provider_install_plan_verified,
     apply_provider_install_plan_verified, builtin_oauth_method, builtin_oauth_methods,
-    builtin_oauth_methods_for_provider, load_provider_runtime_env, load_provider_settings,
-    logout_provider_profile_verified, provider_auth_service, provider_onboarding_state,
-    replace_provider_credential_verified, update_provider_settings_verified,
-    validate_provider_protocol_runtime_supported,
+    builtin_oauth_methods_for_provider, golutra_home, load_provider_runtime_env,
+    load_provider_settings, logout_provider_profile_verified, provider_auth_service,
+    provider_onboarding_state, replace_provider_credential_verified,
+    update_provider_settings_verified, validate_provider_protocol_runtime_supported,
 };
 use golutra_core::{Actor, ActorKind, CommandId, SessionId, TaskStatus, ThreadId, TurnId};
 use golutra_llm::{
-    ConfiguredProvider, ProviderGenerationConfig, ProviderProtocol, ProviderReasoningEffort,
-    provider_protocol_catalog,
+    ConfiguredProvider, ProviderGenerationConfig, ProviderHeaderConfig, ProviderHeaderValue,
+    ProviderProtocol, ProviderReasoningEffort, provider_protocol_catalog,
 };
+use golutra_plugin::PluginStore;
 use golutra_protocol::{
     EventFilter, RuntimeEvent, RuntimeEventType, RuntimeQuery, RuntimeQueryKind, SessionCommand,
     SessionCommandKind,
@@ -81,7 +82,7 @@ enum Command {
     },
     Provider {
         #[command(subcommand)]
-        command: ProviderCommand,
+        command: Box<ProviderCommand>,
     },
     Memory {
         #[command(subcommand)]
@@ -90,6 +91,59 @@ enum Command {
     Eval {
         #[command(subcommand)]
         command: EvalCommand,
+    },
+    Evolution {
+        #[command(subcommand)]
+        command: EvolutionCommand,
+    },
+    Storage {
+        #[command(subcommand)]
+        command: StorageCommand,
+    },
+    Code {
+        #[command(subcommand)]
+        command: CodeCommand,
+    },
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PluginCommand {
+    List,
+    Stage {
+        package: std::path::PathBuf,
+    },
+    Review {
+        plugin_id: String,
+        revision_id: String,
+    },
+    Enable {
+        plugin_id: String,
+        revision_id: String,
+    },
+    Disable {
+        plugin_id: String,
+    },
+    Rollback {
+        plugin_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CodeCommand {
+    Index,
+    Symbols {
+        query: String,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    References {
+        symbol: String,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
     },
 }
 
@@ -115,6 +169,12 @@ enum ThreadCommand {
         #[arg(long, value_name = "OLD_PATH")]
         from: std::path::PathBuf,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum StorageCommand {
+    Status,
+    Clean,
 }
 
 #[derive(Debug, Subcommand)]
@@ -150,6 +210,10 @@ enum ProviderCommand {
         context_window_size: Option<u64>,
         #[arg(long)]
         max_tokens: Option<u64>,
+        #[arg(long, value_name = "NAME=VALUE")]
+        header: Vec<String>,
+        #[arg(long, value_name = "NAME=ENV")]
+        header_env: Vec<String>,
         #[arg(long, default_value = "user")]
         scope: String,
         #[arg(long, default_value_t = true)]
@@ -257,11 +321,35 @@ impl OAuthFlowArg {
 #[derive(Debug, Subcommand)]
 enum MemoryCommand {
     List,
+    Feedback {
+        memory_id: String,
+        #[arg(long, value_enum)]
+        feedback: MemoryFeedbackArg,
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
     Rollback {
         memory_id: String,
         #[arg(long, default_value = "rolled back by user")]
         reason: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum MemoryFeedbackArg {
+    Helpful,
+    Irrelevant,
+    Incorrect,
+}
+
+impl MemoryFeedbackArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Helpful => "helpful",
+            Self::Irrelevant => "irrelevant",
+            Self::Incorrect => "incorrect",
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -272,6 +360,13 @@ enum EvalCommand {
     Regress {
         candidate_id: String,
     },
+    Review {
+        candidate_id: String,
+        #[arg(long, value_enum)]
+        decision: ReviewDecisionArg,
+        #[arg(long)]
+        reason: String,
+    },
     Apply {
         candidate_id: String,
     },
@@ -280,6 +375,76 @@ enum EvalCommand {
         #[arg(long, default_value = "rolled back by user")]
         reason: String,
     },
+    RecordBenchmark {
+        #[arg(value_name = "JSON_FILE")]
+        file: std::path::PathBuf,
+    },
+    CompareCounterfactual {
+        group_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EvolutionCommand {
+    Status,
+    Plan {
+        #[arg(default_value = "expand verified workspace capabilities")]
+        objective: String,
+        #[arg(long, default_value_t = 20)]
+        max_generated_tasks: u32,
+        #[arg(long, default_value_t = 3)]
+        max_selected_tasks: u32,
+        #[arg(long, default_value_t = 8)]
+        max_tool_calls_per_task: u32,
+        #[arg(long, default_value_t = 120_000)]
+        max_runtime_ms_per_task: u64,
+    },
+    Run {
+        run_id: Option<String>,
+    },
+    Skill {
+        #[command(subcommand)]
+        command: EvolutionSkillCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EvolutionSkillCommand {
+    Stage {
+        candidate_id: String,
+    },
+    Review {
+        skill_id: String,
+        #[arg(long, value_enum)]
+        decision: ReviewDecisionArg,
+        #[arg(long)]
+        reason: String,
+        #[arg(long = "regression-ref")]
+        regression_refs: Vec<String>,
+    },
+    Install {
+        skill_id: String,
+    },
+    Rollback {
+        skill_id: String,
+        #[arg(long, default_value = "rolled back by user")]
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ReviewDecisionArg {
+    Approve,
+    Reject,
+}
+
+impl ReviewDecisionArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Reject => "reject",
+        }
+    }
 }
 
 #[tokio::main]
@@ -287,6 +452,9 @@ async fn main() -> miette::Result<()> {
     let cli = Cli::parse();
     if let Command::AppServer { addr } = &cli.command {
         return golutra_app_server::run(*addr).await;
+    }
+    if let Command::Plugin { command } = &cli.command {
+        return run_plugin_command(command);
     }
     let cwd = cli
         .cwd
@@ -305,6 +473,7 @@ async fn main() -> miette::Result<()> {
 
     match cli.command {
         Command::AppServer { .. } => unreachable!("app-server exits before runtime setup"),
+        Command::Plugin { .. } => unreachable!("plugin exits before runtime setup"),
         Command::Chat { prompt } => {
             let ack = transport
                 .send_command(command(
@@ -552,7 +721,7 @@ async fn main() -> miette::Result<()> {
                 );
             }
         },
-        Command::Provider { command } => match command {
+        Command::Provider { command } => match *command {
             ProviderCommand::Current => {
                 let env = provider_env_for_cli().map_err(|error| miette::miette!("{error}"))?;
                 let config = ConfiguredProvider::redacted_from_reader(|key| env.get(key))
@@ -609,6 +778,8 @@ async fn main() -> miette::Result<()> {
                 reasoning_effort,
                 context_window_size,
                 max_tokens,
+                header,
+                header_env,
                 scope,
                 activate,
             } => {
@@ -656,6 +827,7 @@ async fn main() -> miette::Result<()> {
                     context_window_size,
                     max_tokens,
                 )?;
+                provider_profile.custom_headers = provider_headers_from_cli(&header, &header_env)?;
                 let plan = ProviderInstallPlan {
                     scope,
                     profile: provider_profile.redacted(),
@@ -671,6 +843,7 @@ async fn main() -> miette::Result<()> {
                 apply_provider_install_plan_verified(&paths, cwd, &install_plan)
                     .await
                     .map_err(|error| miette::miette!("{error}"))?;
+                notify_provider_configured_cli(&transport).await?;
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
@@ -931,6 +1104,25 @@ async fn main() -> miette::Result<()> {
                     serde_json::to_string_pretty(&records).unwrap_or_default()
                 );
             }
+            MemoryCommand::Feedback {
+                memory_id,
+                feedback,
+                reason,
+            } => {
+                print_command_ack(
+                    &transport,
+                    command(
+                        session_id,
+                        SessionCommandKind::MemoryFeedback,
+                        serde_json::json!({
+                            "memory_id": memory_id,
+                            "feedback": feedback.as_str(),
+                            "reason": reason,
+                        }),
+                    ),
+                )
+                .await?;
+            }
             MemoryCommand::Rollback { memory_id, reason } => {
                 let ack = transport
                     .send_command(command(
@@ -980,6 +1172,25 @@ async fn main() -> miette::Result<()> {
                 )
                 .await?;
             }
+            EvalCommand::Review {
+                candidate_id,
+                decision,
+                reason,
+            } => {
+                print_command_ack(
+                    &transport,
+                    command(
+                        session_id,
+                        SessionCommandKind::ReviewCandidate,
+                        serde_json::json!({
+                            "candidate_id": candidate_id,
+                            "decision": decision.as_str(),
+                            "reason": reason,
+                        }),
+                    ),
+                )
+                .await?;
+            }
             EvalCommand::Apply { candidate_id } => {
                 print_command_ack(
                     &transport,
@@ -1008,7 +1219,204 @@ async fn main() -> miette::Result<()> {
                 )
                 .await?;
             }
+            EvalCommand::RecordBenchmark { file } => {
+                let content = std::fs::read_to_string(&file).map_err(|error| {
+                    miette::miette!("failed to read benchmark {}: {error}", file.display())
+                })?;
+                let run: golutra_eval::BenchmarkRun = serde_json::from_str(&content)
+                    .map_err(|error| miette::miette!("benchmark JSON is invalid: {error}"))?;
+                print_command_ack(
+                    &transport,
+                    command(
+                        session_id,
+                        SessionCommandKind::RecordBenchmark,
+                        serde_json::json!({"run": run}),
+                    ),
+                )
+                .await?;
+            }
+            EvalCommand::CompareCounterfactual { group_id } => {
+                print_command_ack(
+                    &transport,
+                    command(
+                        session_id,
+                        SessionCommandKind::CompareCounterfactual,
+                        serde_json::json!({"group_id": group_id}),
+                    ),
+                )
+                .await?;
+            }
         },
+        Command::Evolution { command: evolution } => match evolution {
+            EvolutionCommand::Status => {
+                print_runtime_query(&transport, session_id, RuntimeQueryKind::EvolutionState)
+                    .await?;
+            }
+            EvolutionCommand::Plan {
+                objective,
+                max_generated_tasks,
+                max_selected_tasks,
+                max_tool_calls_per_task,
+                max_runtime_ms_per_task,
+            } => {
+                print_command_ack(
+                    &transport,
+                    command(
+                        session_id,
+                        SessionCommandKind::PlanEvolution,
+                        serde_json::json!({
+                            "objective": objective,
+                            "budget": {
+                                "max_generated_tasks": max_generated_tasks,
+                                "max_selected_tasks": max_selected_tasks,
+                                "max_tool_calls_per_task": max_tool_calls_per_task,
+                                "max_runtime_ms_per_task": max_runtime_ms_per_task,
+                            },
+                        }),
+                    ),
+                )
+                .await?;
+            }
+            EvolutionCommand::Run { run_id } => {
+                print_command_ack(
+                    &transport,
+                    command(
+                        session_id,
+                        SessionCommandKind::RunEvolution,
+                        serde_json::json!({"run_id": run_id}),
+                    ),
+                )
+                .await?;
+            }
+            EvolutionCommand::Skill { command: skill } => match skill {
+                EvolutionSkillCommand::Stage { candidate_id } => {
+                    print_command_ack(
+                        &transport,
+                        command(
+                            session_id,
+                            SessionCommandKind::StageSkill,
+                            serde_json::json!({"candidate_id": candidate_id}),
+                        ),
+                    )
+                    .await?;
+                }
+                EvolutionSkillCommand::Review {
+                    skill_id,
+                    decision,
+                    reason,
+                    regression_refs,
+                } => {
+                    print_command_ack(
+                        &transport,
+                        command(
+                            session_id,
+                            SessionCommandKind::ReviewSkill,
+                            serde_json::json!({
+                                "skill_id": skill_id,
+                                "decision": decision.as_str(),
+                                "reason": reason,
+                                "regression_refs": regression_refs,
+                            }),
+                        ),
+                    )
+                    .await?;
+                }
+                EvolutionSkillCommand::Install { skill_id } => {
+                    print_command_ack(
+                        &transport,
+                        command(
+                            session_id,
+                            SessionCommandKind::InstallSkill,
+                            serde_json::json!({"skill_id": skill_id}),
+                        ),
+                    )
+                    .await?;
+                }
+                EvolutionSkillCommand::Rollback { skill_id, reason } => {
+                    print_command_ack(
+                        &transport,
+                        command(
+                            session_id,
+                            SessionCommandKind::RollbackSkill,
+                            serde_json::json!({"skill_id": skill_id, "reason": reason}),
+                        ),
+                    )
+                    .await?;
+                }
+            },
+        },
+        Command::Storage { command: storage } => match storage {
+            StorageCommand::Status => {
+                print_runtime_query(&transport, session_id, RuntimeQueryKind::StorageStatus)
+                    .await?;
+            }
+            StorageCommand::Clean => {
+                print_command_ack(
+                    &transport,
+                    command(
+                        session_id,
+                        SessionCommandKind::RunStorageMaintenance,
+                        serde_json::json!({}),
+                    ),
+                )
+                .await?;
+            }
+        },
+        Command::Code { command: code } => {
+            let cwd = transport
+                .cwd()
+                .ok_or_else(|| miette::miette!("code index requires a cwd"))?;
+            let paths = golutra_client::RuntimePaths::for_cwd(cwd)
+                .map_err(|error| miette::miette!("{error}"))?;
+            let indexer = golutra_code_intelligence::CodeIntelligence::new(&paths.cwd)
+                .map_err(|error| miette::miette!("{error}"))?;
+            let store = golutra_code_intelligence::CodeIndexStore::new(&paths.code_index_file);
+            match code {
+                CodeCommand::Index => {
+                    let graph = indexer
+                        .build()
+                        .map_err(|error| miette::miette!("{error}"))?;
+                    store
+                        .save(&graph)
+                        .map_err(|error| miette::miette!("{error}"))?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "path": paths.code_index_file,
+                            "files_indexed": graph.files_indexed,
+                            "symbols": graph.symbols.len(),
+                            "references": graph.references.len(),
+                            "source_digest": graph.source_digest,
+                        }))
+                        .unwrap_or_default()
+                    );
+                }
+                CodeCommand::Symbols { query, limit } => {
+                    let graph = load_or_build_code_graph(&indexer, &store)?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(
+                            &golutra_code_intelligence::CodeIntelligence::query_symbols(
+                                &graph, &query, limit,
+                            ),
+                        )
+                        .unwrap_or_default()
+                    );
+                }
+                CodeCommand::References { symbol, limit } => {
+                    let graph = load_or_build_code_graph(&indexer, &store)?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(
+                            &golutra_code_intelligence::CodeIntelligence::query_references(
+                                &graph, &symbol, limit,
+                            ),
+                        )
+                        .unwrap_or_default()
+                    );
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1047,6 +1455,22 @@ async fn print_command_ack(
         .map_err(|error| miette::miette!("{error}"))?;
     println!("{}", serde_json::to_string_pretty(&ack).unwrap_or_default());
     Ok(())
+}
+
+fn load_or_build_code_graph(
+    indexer: &golutra_code_intelligence::CodeIntelligence,
+    store: &golutra_code_intelligence::CodeIndexStore,
+) -> miette::Result<golutra_code_intelligence::CodeGraph> {
+    if let Some(graph) = store.load().map_err(|error| miette::miette!("{error}"))? {
+        return Ok(graph);
+    }
+    let graph = indexer
+        .build()
+        .map_err(|error| miette::miette!("{error}"))?;
+    store
+        .save(&graph)
+        .map_err(|error| miette::miette!("{error}"))?;
+    Ok(graph)
 }
 
 fn provider_paths_for_cli() -> miette::Result<ProviderConfigPaths> {
@@ -1201,6 +1625,25 @@ fn parse_provider_scope(value: &str) -> miette::Result<ProviderConfigScope> {
     }
 }
 
+async fn notify_provider_configured_cli(transport: &RuntimeTransport) -> miette::Result<()> {
+    let ack = transport
+        .send_command(command(
+            transport.default_session_id(),
+            SessionCommandKind::ProviderConfigured,
+            serde_json::json!({"verified": true}),
+        ))
+        .await
+        .map_err(|error| miette::miette!("{error}"))?;
+    if ack.accepted {
+        Ok(())
+    } else {
+        Err(miette::miette!(
+            "runtime rejected provider reload: {}",
+            ack.reason.unwrap_or_else(|| "unknown reason".to_owned())
+        ))
+    }
+}
+
 fn generation_config_from_cli(
     enable_thinking: bool,
     reasoning_effort: Option<&str>,
@@ -1214,6 +1657,52 @@ fn generation_config_from_cli(
         max_tokens,
     };
     Ok((!config.is_empty()).then_some(config))
+}
+
+fn provider_headers_from_cli(
+    literal_headers: &[String],
+    environment_headers: &[String],
+) -> miette::Result<Vec<ProviderHeaderConfig>> {
+    let mut headers = Vec::with_capacity(literal_headers.len() + environment_headers.len());
+    for raw in literal_headers {
+        let (name, value) = parse_header_assignment(raw, "--header")?;
+        headers.push(ProviderHeaderConfig {
+            name,
+            value: ProviderHeaderValue::Literal { value },
+        });
+    }
+    for raw in environment_headers {
+        let (name, key) = parse_header_assignment(raw, "--header-env")?;
+        headers.push(ProviderHeaderConfig {
+            name,
+            value: ProviderHeaderValue::Environment { key },
+        });
+    }
+    for header in &headers {
+        header.validate().map_err(|error| miette::miette!(error))?;
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for header in &headers {
+        if !names.insert(header.name.to_ascii_lowercase()) {
+            return Err(miette::miette!(
+                "provider header `{}` is configured more than once",
+                header.name
+            ));
+        }
+    }
+    Ok(headers)
+}
+
+fn parse_header_assignment(raw: &str, flag: &str) -> miette::Result<(String, String)> {
+    let (name, value) = raw
+        .split_once('=')
+        .ok_or_else(|| miette::miette!("{flag} requires NAME=VALUE"))?;
+    let name = name.trim();
+    let value = value.trim();
+    if name.is_empty() || value.is_empty() {
+        return Err(miette::miette!("{flag} requires non-empty NAME=VALUE"));
+    }
+    Ok((name.to_owned(), value.to_owned()))
 }
 
 fn parse_reasoning_effort(value: &str) -> miette::Result<ProviderReasoningEffort> {
@@ -1296,6 +1785,7 @@ async fn wait_for_terminal_state(
 ) -> miette::Result<serde_json::Value> {
     let mut interrupt_count = 0_u8;
     let mut handled_approval = None;
+    let mut reported_auth_required = false;
     loop {
         let state = transport
             .query(RuntimeQuery {
@@ -1347,6 +1837,16 @@ async fn wait_for_terminal_state(
             }
         } else {
             handled_approval = None;
+        }
+        if status == Some(TaskStatus::WaitingAuthentication) {
+            if !reported_auth_required {
+                eprintln!(
+                    "provider authentication is required; run `golutra provider login ...` in another terminal"
+                );
+                reported_auth_required = true;
+            }
+        } else {
+            reported_auth_required = false;
         }
 
         tokio::select! {
@@ -1456,6 +1956,54 @@ fn is_terminal_status(status: TaskStatus) -> bool {
             | TaskStatus::Blocked
             | TaskStatus::Cancelled
     )
+}
+
+fn run_plugin_command(command: &PluginCommand) -> miette::Result<()> {
+    let home = golutra_home().map_err(|error| miette::miette!("{error}"))?;
+    let store = PluginStore::new(home).map_err(|error| miette::miette!("{error}"))?;
+    let value = match command {
+        PluginCommand::List => {
+            serde_json::to_value(store.state().map_err(|error| miette::miette!("{error}"))?)
+        }
+        PluginCommand::Stage { package } => serde_json::to_value(
+            store
+                .stage(package)
+                .map_err(|error| miette::miette!("{error}"))?,
+        ),
+        PluginCommand::Review {
+            plugin_id,
+            revision_id,
+        } => serde_json::to_value(
+            store
+                .review(plugin_id, revision_id)
+                .map_err(|error| miette::miette!("{error}"))?,
+        ),
+        PluginCommand::Enable {
+            plugin_id,
+            revision_id,
+        } => serde_json::to_value(
+            store
+                .enable(plugin_id, revision_id)
+                .map_err(|error| miette::miette!("{error}"))?,
+        ),
+        PluginCommand::Disable { plugin_id } => serde_json::to_value(
+            store
+                .disable(plugin_id)
+                .map_err(|error| miette::miette!("{error}"))?,
+        ),
+        PluginCommand::Rollback { plugin_id } => serde_json::to_value(
+            store
+                .rollback(plugin_id)
+                .map_err(|error| miette::miette!("{error}"))?,
+        ),
+    }
+    .map_err(|error| miette::miette!("failed to encode plugin result: {error}"))?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&value)
+            .map_err(|error| miette::miette!("failed to encode plugin result: {error}"))?
+    );
+    Ok(())
 }
 
 #[cfg(test)]

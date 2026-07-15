@@ -7,18 +7,23 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 chrono.workspace = true
 golutra-core.workspace = true
+golutra-code-intelligence = { path = "../golutra-code-intelligence" }
 golutra-policy = { path = "../golutra-policy" }
+golutra-sandbox.workspace = true
 jsonschema.workspace = true
 regex.workspace = true
-nix.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 shlex.workspace = true
 thiserror.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
 [dev-dependencies]
-tempfile.workspace = true

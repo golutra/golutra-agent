@@ -18,6 +18,8 @@ pub struct AppServerPaths {
     pub app_server_dir: PathBuf,
     pub endpoint: PathBuf,
     pub lock: PathBuf,
+    pub transport_token: PathBuf,
+    pub ipc_socket: PathBuf,
 }
 
 impl AppServerPaths {
@@ -33,6 +35,8 @@ impl AppServerPaths {
         Ok(Self {
             endpoint: app_server_dir.join("app-server.json"),
             lock: app_server_dir.join("daemon.lock"),
+            transport_token: app_server_dir.join("transport.token"),
+            ipc_socket: app_server_dir.join("app-server.sock"),
             home,
             app_server_dir,
         })
@@ -50,11 +54,18 @@ pub struct RuntimePaths {
     pub rollouts_dir: PathBuf,
     pub memory_file: PathBuf,
     pub evaluation_file: PathBuf,
+    pub evolution_file: PathBuf,
+    pub evolution_skills_dir: PathBuf,
+    pub evolution_runs_dir: PathBuf,
+    pub mcp_scratch_dir: PathBuf,
+    pub code_index_file: PathBuf,
     pub session_locks_dir: PathBuf,
     pub command_locks_dir: PathBuf,
     pub app_server_dir: PathBuf,
     pub app_server_endpoint: PathBuf,
     pub app_server_lock: PathBuf,
+    pub app_server_transport_token: PathBuf,
+    pub app_server_ipc_socket: PathBuf,
     pub cwd: PathBuf,
     pub workspace_hash: String,
 }
@@ -79,6 +90,9 @@ impl RuntimePaths {
         let workspace_state_dir = workspaces_dir.join(&workspace_hash);
         let checkpoints_dir = workspace_state_dir.join("checkpoints");
         let rollouts_dir = workspace_state_dir.join("rollouts");
+        let evolution_skills_dir = workspace_state_dir.join("skills");
+        let evolution_runs_dir = workspace_state_dir.join("evolution-runs");
+        let mcp_scratch_dir = state_dir.join("mcp-scratch");
         let session_locks_dir = state_dir.join("session-locks");
         let command_locks_dir = state_dir.join("command-locks");
         for path in [
@@ -88,6 +102,9 @@ impl RuntimePaths {
             &workspace_state_dir,
             &checkpoints_dir,
             &rollouts_dir,
+            &evolution_skills_dir,
+            &evolution_runs_dir,
+            &mcp_scratch_dir,
             &session_locks_dir,
             &command_locks_dir,
         ] {
@@ -98,8 +115,15 @@ impl RuntimePaths {
             runtime_db: state_dir.join("runtime.sqlite"),
             memory_file: workspace_state_dir.join("memory.json"),
             evaluation_file: workspace_state_dir.join("evaluation.json"),
+            evolution_file: workspace_state_dir.join("evolution.json"),
+            evolution_skills_dir,
+            evolution_runs_dir,
+            mcp_scratch_dir,
+            code_index_file: workspace_state_dir.join("code-index.json"),
             app_server_endpoint: app_server_paths.endpoint,
             app_server_lock: app_server_paths.lock,
+            app_server_transport_token: app_server_paths.transport_token,
+            app_server_ipc_socket: app_server_paths.ipc_socket,
             home,
             state_dir,
             artifacts_dir,

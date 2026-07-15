@@ -28,6 +28,8 @@ Rust Runtime Kernel
 + ToolResultEnvelope / PermissionPolicy / SandboxBackend
 + ContextBuilder / CompactManager / MemoryGovernance
 + Verification / Replay / PostTaskReview
++ Unix IPC / HTTP-SSE / TypeScript-Python SDK
++ reviewed Plugin / sandboxed MCP
 ```
 
 ## Codex 的工程骨架影响
@@ -40,7 +42,7 @@ Codex 最值得吸收的不是某个单库，而是一组已经被工程化验�
 
 - 独立 `golutra-protocol`
 - 独立 schema 产物
-- TypeScript 类型生成
+- TypeScript/Python 类型生成
 - 协议 fixture
 
 影响：
@@ -83,7 +85,7 @@ Codex 最值得吸收的不是某个单库，而是一组已经被工程化验�
 - 独立 `golutra-file-search`
 - SQLite 元数据检索
 - rg 文件内容搜索
-- tree-sitter 结构切片
+- 独立 `golutra-code-intelligence` tree-sitter symbol/reference/import graph
 
 影响：
 
@@ -107,8 +109,7 @@ Codex 最值得吸收的不是某个单库，而是一组已经被工程化验�
 
 吸收点：
 
-- `golutra-otel`
-- tracing 查询出口
+- `golutra-vis` 的 Audit / Events / OpenTelemetry JSON 投影
 - debug context / replay 访问层
 
 影响：
@@ -125,7 +126,9 @@ Codex 最值得吸收的不是某个单库，而是一组已经被工程化验�
 3. state / thread-store / rollout
 4. file-search
 5. sandbox / execpolicy / process hardening
-6. otel / replay export
+6. vis / OTel projection / replay export
+7. owner-only Unix IPC、双 SDK 与跨进程对拍
+8. reviewed Plugin/MCP、approval 和 OS sandbox
 
 不建议照搬：
 

@@ -231,6 +231,7 @@ fn migrate_legacy_provider_settings(
                     credential_ref,
                     oauth: None,
                     generation_config: profile.generation_config,
+                    custom_headers: Vec::new(),
                     enabled: profile.enabled,
                 })
             })

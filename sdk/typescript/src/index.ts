@@ -3,15 +3,22 @@ import { createParser } from "eventsource-parser";
 import type {
   AppliedCandidate,
   AutomationCandidate,
+  BenchmarkRun,
   BenchmarkPromotion,
+  CausalComparison,
   CommandAck,
+  CounterfactualReplay,
   EvaluationCase,
   EvaluationResult,
   EvaluationRun,
+  EvolutionState,
   EventFilter,
+  EventPage,
+  EventPageRequest,
   GeneratedTask,
   ImprovementCandidate,
   MemoryRecord,
+  OpenEndedBudget,
   PostTaskReview,
   PromotionDecision,
   RegressionResult,
@@ -21,10 +28,12 @@ import type {
   SessionCommand,
   SessionCommandKind,
   SkillCandidate,
+  StorageStats,
 } from "./generated.js";
 
 const JSON_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024;
+export const RUNTIME_PROTOCOL_VERSION = 1;
 
 export * from "./generated.js";
 
@@ -32,6 +41,7 @@ export interface RuntimeHostInfo {
   instance_id: string;
   pid: number;
   base_url: string;
+  ipc_path?: string | null;
   cwd: string;
   workspace_id: string;
   default_session_id: string;
@@ -43,6 +53,10 @@ export interface AppServerInfo {
   instance_id: string;
   pid: number;
   base_url: string;
+  protocol_versions: {
+    minimum: number;
+    current: number;
+  };
   started_at: string;
 }
 
@@ -99,12 +113,19 @@ export interface RuntimeSubscription {
   close(): void;
 }
 
+export interface GolutraClientOptions {
+  transportToken: string;
+}
+
 export interface EvaluationSnapshot {
   cases: EvaluationCase[];
   runs: EvaluationRun[];
   results: EvaluationResult[];
   replays: unknown[];
   reviews: PostTaskReview[];
+  benchmark_runs: BenchmarkRun[];
+  counterfactual_replays: CounterfactualReplay[];
+  causal_comparisons: CausalComparison[];
 }
 
 export interface AutomationSnapshot {
@@ -117,13 +138,16 @@ export interface AutomationSnapshot {
   applied_candidates: AppliedCandidate[];
 }
 
+export type EvolutionSnapshot = EvolutionState;
+
 export class GolutraClient {
   private readonly baseUrl: URL;
   private readonly cwd: string;
+  private readonly transportToken: string;
   private readonly actorId = `typescript-sdk-${globalThis.crypto.randomUUID()}`;
   private attachment: Promise<RuntimeAttachment> | undefined;
 
-  constructor(baseUrl: string | URL, cwd: string) {
+  constructor(baseUrl: string | URL, cwd: string, options: GolutraClientOptions) {
     this.baseUrl = new URL(baseUrl);
     const normalizedCwd = cwd.trim();
     if (!normalizedCwd) {
@@ -133,6 +157,13 @@ export class GolutraClient {
       throw new Error(`GolutraClient requires an absolute cwd: ${normalizedCwd}`);
     }
     this.cwd = normalizedCwd;
+    const transportToken = options.transportToken.trim();
+    if (transportToken.length < 32 || transportToken.length > 512 || /\s/u.test(transportToken)) {
+      throw new Error(
+        "GolutraClient transportToken must contain 32..=512 non-whitespace characters",
+      );
+    }
+    this.transportToken = transportToken;
   }
 
   async runtimeInfo(): Promise<RuntimeHostInfo> {
@@ -140,7 +171,48 @@ export class GolutraClient {
   }
 
   async serverInfo(): Promise<AppServerInfo> {
-    return this.rawJson<AppServerInfo>(new URL("/runtime/info", this.baseUrl));
+    const info = await this.rawJson<AppServerInfo>(new URL("/runtime/info", this.baseUrl));
+    if (
+      RUNTIME_PROTOCOL_VERSION < info.protocol_versions.minimum ||
+      RUNTIME_PROTOCOL_VERSION > info.protocol_versions.current
+    ) {
+      throw new Error(
+        `Golutra protocol ${RUNTIME_PROTOCOL_VERSION} is incompatible with server range ${info.protocol_versions.minimum}..=${info.protocol_versions.current}`,
+      );
+    }
+    return info;
+  }
+
+  async eventPage(request: EventPageRequest): Promise<EventPage> {
+    const url = new URL("/events/page", this.baseUrl);
+    url.searchParams.set("session_id", request.session_id);
+    if (request.task_id) {
+      url.searchParams.set("task_id", request.task_id);
+    }
+    if (request.cursor !== undefined && request.cursor !== null) {
+      url.searchParams.set("cursor", String(request.cursor));
+    }
+    url.searchParams.set("direction", request.direction);
+    url.searchParams.set("limit", String(request.limit));
+    return this.getJson<EventPage>(url);
+  }
+
+  async storageStatus(sessionId: string): Promise<StorageStats> {
+    return this.query<StorageStats>(this.runtimeQuery(sessionId, "storage_status"));
+  }
+
+  async runStorageMaintenance(
+    sessionId: string,
+    actorId?: string,
+  ): Promise<CommandAck> {
+    return this.sendCommand(
+      this.sessionCommand(
+        sessionId,
+        "run_storage_maintenance",
+        actorId ?? this.actorId,
+        {},
+      ),
+    );
   }
 
   async sendCommand(command: SessionCommand): Promise<CommandAck> {
@@ -177,6 +249,98 @@ export class GolutraClient {
     );
   }
 
+  async evolutionState(sessionId: string): Promise<EvolutionSnapshot> {
+    return this.query<EvolutionSnapshot>(this.runtimeQuery(sessionId, "evolution_state"));
+  }
+
+  async planEvolution(
+    sessionId: string,
+    objective: string,
+    budget?: Partial<OpenEndedBudget>,
+    actorId?: string,
+  ): Promise<CommandAck> {
+    const normalizedBudget: OpenEndedBudget = {
+      max_generated_tasks: budget?.max_generated_tasks ?? 20,
+      max_selected_tasks: budget?.max_selected_tasks ?? 3,
+      max_tool_calls_per_task: budget?.max_tool_calls_per_task ?? 8,
+      max_runtime_ms_per_task: budget?.max_runtime_ms_per_task ?? 120_000,
+    };
+    return this.sendCommand(
+      this.sessionCommand(sessionId, "plan_evolution", actorId ?? this.actorId, {
+        objective,
+        budget: normalizedBudget,
+      }),
+    );
+  }
+
+  async runEvolution(
+    sessionId: string,
+    runId?: string,
+    actorId?: string,
+  ): Promise<CommandAck> {
+    return this.sendCommand(
+      this.sessionCommand(sessionId, "run_evolution", actorId ?? this.actorId, {
+        run_id: runId ?? null,
+      }),
+    );
+  }
+
+  async stageSkill(
+    sessionId: string,
+    candidateId: string,
+    actorId?: string,
+  ): Promise<CommandAck> {
+    return this.sendCommand(
+      this.sessionCommand(sessionId, "stage_skill", actorId ?? this.actorId, {
+        candidate_id: candidateId,
+      }),
+    );
+  }
+
+  async reviewSkill(
+    sessionId: string,
+    skillId: string,
+    decision: "approve" | "reject",
+    reason: string,
+    regressionRefs: string[] = [],
+    actorId?: string,
+  ): Promise<CommandAck> {
+    return this.sendCommand(
+      this.sessionCommand(sessionId, "review_skill", actorId ?? this.actorId, {
+        skill_id: skillId,
+        decision,
+        reason,
+        regression_refs: regressionRefs,
+      }),
+    );
+  }
+
+  async installSkill(
+    sessionId: string,
+    skillId: string,
+    actorId?: string,
+  ): Promise<CommandAck> {
+    return this.sendCommand(
+      this.sessionCommand(sessionId, "install_skill", actorId ?? this.actorId, {
+        skill_id: skillId,
+      }),
+    );
+  }
+
+  async rollbackSkill(
+    sessionId: string,
+    skillId: string,
+    reason = "rolled back by SDK user",
+    actorId?: string,
+  ): Promise<CommandAck> {
+    return this.sendCommand(
+      this.sessionCommand(sessionId, "rollback_skill", actorId ?? this.actorId, {
+        skill_id: skillId,
+        reason,
+      }),
+    );
+  }
+
   async rollbackMemory(
     sessionId: string,
     memoryId: string,
@@ -191,6 +355,22 @@ export class GolutraClient {
     );
   }
 
+  async recordMemoryFeedback(
+    sessionId: string,
+    memoryId: string,
+    feedback: "helpful" | "irrelevant" | "incorrect",
+    reason = "",
+    actorId?: string,
+  ): Promise<CommandAck> {
+    return this.sendCommand(
+      this.sessionCommand(sessionId, "memory_feedback", actorId ?? this.actorId, {
+        memory_id: memoryId,
+        feedback,
+        reason,
+      }),
+    );
+  }
+
   async runRegression(
     sessionId: string,
     candidateId: string,
@@ -199,6 +379,44 @@ export class GolutraClient {
     return this.sendCommand(
       this.sessionCommand(sessionId, "run_regression", actorId ?? this.actorId, {
         candidate_id: candidateId,
+      }),
+    );
+  }
+
+  async reviewCandidate(
+    sessionId: string,
+    candidateId: string,
+    decision: "approve" | "reject",
+    reason: string,
+    actorId?: string,
+  ): Promise<CommandAck> {
+    return this.sendCommand(
+      this.sessionCommand(sessionId, "review_candidate", actorId ?? this.actorId, {
+        candidate_id: candidateId,
+        decision,
+        reason,
+      }),
+    );
+  }
+
+  async recordBenchmark(
+    sessionId: string,
+    run: BenchmarkRun,
+    actorId?: string,
+  ): Promise<CommandAck> {
+    return this.sendCommand(
+      this.sessionCommand(sessionId, "record_benchmark", actorId ?? this.actorId, { run }),
+    );
+  }
+
+  async compareCounterfactual(
+    sessionId: string,
+    groupId: string,
+    actorId?: string,
+  ): Promise<CommandAck> {
+    return this.sendCommand(
+      this.sessionCommand(sessionId, "compare_counterfactual", actorId ?? this.actorId, {
+        group_id: groupId,
       }),
     );
   }
@@ -425,8 +643,8 @@ export class GolutraClient {
   private async attachRuntime(cwd: string): Promise<RuntimeAttachment> {
     const response = await fetch(new URL("/runtime/attach", this.baseUrl), {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ cwd }),
+      headers: this.transportHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify({ cwd, protocol_version: RUNTIME_PROTOCOL_VERSION }),
       signal: AbortSignal.timeout(JSON_REQUEST_TIMEOUT_MS),
     });
     return decodeJson<RuntimeAttachment>(response);
@@ -461,7 +679,7 @@ export class GolutraClient {
 
   private async fetchWithAttachment(url: URL, init: RequestInit = {}): Promise<Response> {
     const send = (attachmentId: string) => {
-      const headers = new Headers(init.headers);
+      const headers = this.transportHeaders(init.headers);
       headers.set("x-golutra-attachment", attachmentId);
       return fetch(url, { ...init, headers });
     };
@@ -476,8 +694,18 @@ export class GolutraClient {
 
   private async rawJson<T>(url: URL): Promise<T> {
     return decodeJson<T>(
-      await fetch(url, { signal: AbortSignal.timeout(JSON_REQUEST_TIMEOUT_MS) }),
+      await fetch(url, {
+        headers: this.transportHeaders(),
+        signal: AbortSignal.timeout(JSON_REQUEST_TIMEOUT_MS),
+      }),
     );
+  }
+
+  private transportHeaders(initial?: HeadersInit): Headers {
+    const headers = new Headers(initial);
+    headers.set("authorization", `Bearer ${this.transportToken}`);
+    headers.set("x-golutra-protocol-version", String(RUNTIME_PROTOCOL_VERSION));
+    return headers;
   }
 }
 

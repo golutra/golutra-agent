@@ -14,6 +14,9 @@ pub enum RuntimeQueryKind {
     EvaluationResults,
     ImprovementCandidates,
     AutomationCandidates,
+    EvolutionState,
+    ProviderState,
+    StorageStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

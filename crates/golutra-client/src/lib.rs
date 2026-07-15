@@ -11,29 +11,38 @@ use std::{
 
 use async_trait::async_trait;
 use fs2::FileExt;
+use golutra_config::{ProviderConfigPaths, load_provider_runtime_env_from_paths};
 use golutra_context::ContextContributor;
 use golutra_core::{
     Actor, ApprovalDecision, ApprovalId, ApprovalResolution, ArtifactId, ArtifactRecord,
-    BusyPolicy, EventId, MemoryId, RedactionStatus, SessionId, TaskId, TaskStatus, ThreadId,
-    TurnId, WorkspaceId,
+    BusyPolicy, CommandId, EventId, MemoryId, PolicyDecision, PolicyEvaluation,
+    ProviderAuthRequestId, RedactionStatus, SessionId, TaskId, TaskStatus, ThreadId,
+    TokenUsageRecord, TurnId, WorkspaceId,
 };
 use golutra_eval::{
-    EvaluationError, EvaluationRunner, EvaluationStore, PromotionDecisionKind,
-    TaskEvaluationBundle, TaskEvaluationInput,
+    BenchmarkRun, CandidateStatus, EvaluationError, EvaluationRunner, EvaluationStore,
+    PromotionDecisionKind, TaskEvaluationBundle, TaskEvaluationInput,
 };
-use golutra_llm::ProviderRole;
-use golutra_memory::{MemoryError, MemoryPromotionGate, MemoryStore, propose_project_memory};
+use golutra_evolution::{EvolutionError, EvolutionStore};
+use golutra_llm::{ConfiguredProvider, ProviderError, ProviderRole, protocol_capabilities};
+use golutra_mcp::McpToolBackend;
+use golutra_memory::{
+    MemoryError, MemoryFeedbackKind, MemoryPromotionGate, MemoryScope, MemoryStore,
+    propose_project_memory,
+};
+use golutra_plugin::PluginStore;
 use golutra_policy::WorkspacePolicy;
 use golutra_protocol::{
-    CommandAck, EventFilter, RuntimeEvent, RuntimeEventSource, RuntimeEventType, RuntimeQuery,
-    RuntimeQueryKind, SessionCommand, SessionCommandKind,
+    CommandAck, EventFilter, EventPage, EventPageDirection, EventPageRequest, ProtocolVersionRange,
+    RUNTIME_PROTOCOL_VERSION, RuntimeEvent, RuntimeEventSource, RuntimeEventType, RuntimeQuery,
+    RuntimeQueryKind, SessionCommand, SessionCommandKind, StorageMaintenanceReport, StorageStats,
 };
 use golutra_runtime::{
     AgentExecutionControl, AgentExecutionHandle, AgentLoop, AgentLoopError, AgentLoopTraceEvent,
     AgentTaskRequest, BeforeSideEffectRecorder, PendingAgentTurn, RuntimeLaneError,
     RuntimeLaneManager, WorkspaceCheckpointManager, agent_execution_channel, is_active_status,
 };
-use golutra_store::{RuntimeStore, StoreError, ThreadRecord};
+use golutra_store::{CommandClaim, RuntimeStore, StoreError, ThreadRecord};
 use golutra_tools::{BasicToolExecutor, FileBeforeImage, ToolRequest};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -42,11 +51,16 @@ use tokio::{
     sync::{Mutex, broadcast, mpsc, oneshot, watch},
     task::AbortHandle,
 };
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub const APP_SERVER_ATTACHMENT_HEADER: &str = "x-golutra-attachment";
+pub const APP_SERVER_PROTOCOL_HEADER: &str = "x-golutra-protocol-version";
+pub const APP_SERVER_TRANSPORT_TOKEN_ENV: &str = "GOLUTRA_TRANSPORT_TOKEN";
 const PROVISIONAL_COMMAND_ACK_REASON: &str = "command accepted for processing";
 const EVENT_REPLAY_PAGE_SIZE: u32 = 256;
+const MAX_EVENT_PAGE_SIZE: u32 = 512;
+const CHECKPOINTS_TO_RETAIN_PER_WORKSPACE: usize = 20;
 const MAX_HISTORY_SOURCE_EVENTS: u32 = 512;
 const MAX_HTTP_JSON_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
@@ -58,6 +72,7 @@ const ROLLOUT_FORMAT_VERSION: u32 = 1;
 
 mod context;
 mod event_codec;
+mod evolution;
 mod paths;
 mod provider_runtime;
 mod rollout;
@@ -79,7 +94,9 @@ pub(crate) use event_codec::{
 pub use event_codec::{event_sequence_no, projection_status};
 pub use paths::{AppServerPaths, RuntimePaths};
 pub(crate) use paths::{ensure_private_dir, set_owner_only_file, workspace_hash};
-pub(crate) use provider_runtime::{MockProviderPlan, mock_provider_plan};
+pub(crate) use provider_runtime::{
+    MockProviderPlan, isolated_mock_provider_plan, mock_provider_plan,
+};
 #[cfg(test)]
 pub(crate) use provider_runtime::{
     MockWriteFileArgs, configured_provider_plan, mock_write_file_args,
@@ -91,6 +108,8 @@ pub(crate) use rollout::{
 };
 #[cfg(test)]
 pub(crate) use rollout::{redact_rollout_value, rollout_lock_path};
+#[cfg(unix)]
+pub use transport::UnixIpcTransport;
 pub(crate) use transport::run_blocking;
 pub use transport::{
     AppServerInfo, EmbeddedTransport, HttpSseTransport, RuntimeAttachment, RuntimeClient,
@@ -99,6 +118,7 @@ pub use transport::{
 #[cfg(test)]
 pub(crate) use transport::{
     ParsedSseEvent, parse_sse_frame, sse_frame_complete, validate_local_app_server_base_url,
+    validate_remote_app_server_base_url,
 };
 
 #[derive(Debug, Error)]
@@ -125,6 +145,8 @@ pub enum ClientError {
     Memory(#[from] MemoryError),
     #[error("runtime evaluation failed")]
     Evaluation(#[from] EvaluationError),
+    #[error("runtime evolution failed")]
+    Evolution(#[from] EvolutionError),
 }
 
 #[derive(Debug)]
@@ -132,6 +154,7 @@ pub struct RuntimeHost {
     store: RuntimeStore,
     memory_store: MemoryStore,
     evaluation_store: EvaluationStore,
+    evolution_store: EvolutionStore,
     lane_manager: Mutex<RuntimeLaneManager>,
     event_bus: broadcast::Sender<RuntimeEvent>,
     next_sequence_no: AtomicU64,
@@ -145,6 +168,10 @@ pub struct RuntimeHost {
     started_at: chrono::DateTime<chrono::Utc>,
     command_mutex: Mutex<()>,
     task_controls: Mutex<HashMap<SessionId, HostedTaskControl>>,
+    provider_auth_waiters: Mutex<HashMap<SessionId, PendingProviderAuth>>,
+    deep_evaluation_jobs: Mutex<HashMap<TaskId, watch::Receiver<bool>>>,
+    force_mock_provider: bool,
+    _evolution_temp_root: Option<Arc<tempfile::TempDir>>,
 }
 
 #[derive(Debug, Clone)]
@@ -191,6 +218,18 @@ enum HostedTraceCommand {
     Flush(oneshot::Sender<Result<(), ClientError>>),
 }
 
+#[derive(Debug)]
+struct PendingProviderAuth {
+    request_id: ProviderAuthRequestId,
+    resolution: oneshot::Sender<ProviderAuthResolution>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderAuthResolution {
+    Submitted,
+    Cancelled,
+}
+
 #[derive(Debug, Clone)]
 struct HostedCheckpointRecorder {
     host: Arc<RuntimeHost>,
@@ -232,6 +271,7 @@ impl RuntimeHost {
             WorkspaceId::new(),
             default_session_id,
             default_thread_id,
+            false,
         )
         .await
     }
@@ -269,10 +309,12 @@ impl RuntimeHost {
             paths.workspace_id(),
             default_session_id,
             default_thread_id,
+            false,
         )
         .await?;
         host.synchronize_workspace_rollouts().await?;
         host.recover_orphaned_tasks().await?;
+        host.run_storage_maintenance().await?;
         Ok(host)
     }
 
@@ -283,6 +325,7 @@ impl RuntimeHost {
         workspace_id: WorkspaceId,
         default_session_id: SessionId,
         default_thread_id: ThreadId,
+        force_mock_provider: bool,
     ) -> Result<Arc<Self>, ClientError> {
         let (event_bus, _) = broadcast::channel(512);
         let max_sequence_no = store.max_sequence_no().await?;
@@ -297,10 +340,31 @@ impl RuntimeHost {
             .map_or_else(EvaluationStore::in_memory, |paths| {
                 EvaluationStore::new(paths.evaluation_file.clone())
             });
+        let evolution_temp_root = runtime_paths
+            .is_none()
+            .then(|| tempfile::tempdir().map(Arc::new))
+            .transpose()
+            .map_err(|error| ClientError::Io(error.to_string()))?;
+        let evolution_store = runtime_paths.as_ref().map_or_else(
+            || {
+                let root = evolution_temp_root
+                    .as_ref()
+                    .expect("temporary evolution root is initialized")
+                    .path();
+                EvolutionStore::new(root.join("evolution.json"), root.join("skills"))
+            },
+            |paths| {
+                EvolutionStore::new(
+                    paths.evolution_file.clone(),
+                    paths.evolution_skills_dir.clone(),
+                )
+            },
+        );
         Ok(Arc::new(Self {
             store,
             memory_store,
             evaluation_store,
+            evolution_store,
             lane_manager: Mutex::new(RuntimeLaneManager::new()),
             event_bus,
             next_sequence_no: AtomicU64::new(next_sequence_no),
@@ -314,6 +378,10 @@ impl RuntimeHost {
             started_at: chrono::Utc::now(),
             command_mutex: Mutex::new(()),
             task_controls: Mutex::new(HashMap::new()),
+            provider_auth_waiters: Mutex::new(HashMap::new()),
+            deep_evaluation_jobs: Mutex::new(HashMap::new()),
+            force_mock_provider,
+            _evolution_temp_root: evolution_temp_root,
         }))
     }
 
@@ -675,29 +743,51 @@ impl RuntimeHost {
         let _command_guard = self.command_mutex.lock().await;
         let _command_lease = self.acquire_command_lease(&scoped_idempotency_key).await?;
         let command_id = command.command_id;
-        if let Some(existing_ack) = self.store.command_ack(&scoped_idempotency_key).await? {
-            if existing_ack.command_id != command_id {
-                return Ok(CommandAck {
-                    command_id,
-                    accepted: false,
-                    reason: Some(format!(
-                        "idempotency key is already assigned to command {}",
-                        existing_ack.command_id
-                    )),
-                });
-            }
-            if existing_ack.reason.as_deref() != Some(PROVISIONAL_COMMAND_ACK_REASON) {
-                return Ok(existing_ack);
-            }
-        }
         let provisional_ack = CommandAck {
             command_id,
             accepted: true,
             reason: Some(PROVISIONAL_COMMAND_ACK_REASON.to_owned()),
         };
-        self.store
-            .store_command_ack(&scoped_idempotency_key, &provisional_ack)
-            .await?;
+        let payload_digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&command.payload)?)
+        );
+        match self
+            .claim_command_journal(
+                &scoped_idempotency_key,
+                command_id,
+                &provisional_ack,
+                host_event(
+                    0,
+                    session_id,
+                    None,
+                    RuntimeEventType::CommandReceived,
+                    RuntimeEventSource::Runtime,
+                    json!({
+                        "summary": "runtime command durably received",
+                        "command_id": command_id.to_string(),
+                        "kind": command.kind,
+                        "actor": &command.actor,
+                        "payload_sha256": payload_digest,
+                    }),
+                ),
+            )
+            .await?
+        {
+            CommandClaim::Existing(ack) => return Ok(ack),
+            CommandClaim::Conflict {
+                existing_command_id,
+            } => {
+                return Ok(CommandAck {
+                    command_id,
+                    accepted: false,
+                    reason: Some(format!(
+                        "idempotency key is already assigned to command {existing_command_id}"
+                    )),
+                });
+            }
+            CommandClaim::Claimed { .. } => {}
+        }
         let result: Result<CommandAck, ClientError> = async {
             let ack = match command.kind {
                 SessionCommandKind::Create => {
@@ -769,8 +859,16 @@ impl RuntimeHost {
                     self.handle_memory_rollback_command(session_id, command)
                         .await?
                 }
+                SessionCommandKind::MemoryFeedback => {
+                    self.handle_memory_feedback_command(session_id, command)
+                        .await?
+                }
                 SessionCommandKind::RunRegression => {
                     self.handle_regression_command(session_id, command).await?
+                }
+                SessionCommandKind::ReviewCandidate => {
+                    self.handle_review_candidate_command(session_id, command)
+                        .await?
                 }
                 SessionCommandKind::ApplyCandidate => {
                     self.handle_apply_candidate_command(session_id, command)
@@ -778,6 +876,50 @@ impl RuntimeHost {
                 }
                 SessionCommandKind::RollbackCandidate => {
                     self.handle_rollback_candidate_command(session_id, command)
+                        .await?
+                }
+                SessionCommandKind::RecordBenchmark => {
+                    self.handle_record_benchmark_command(session_id, command)
+                        .await?
+                }
+                SessionCommandKind::CompareCounterfactual => {
+                    self.handle_compare_counterfactual_command(session_id, command)
+                        .await?
+                }
+                SessionCommandKind::PlanEvolution => {
+                    self.handle_plan_evolution_command(session_id, command)
+                        .await?
+                }
+                SessionCommandKind::RunEvolution => {
+                    self.handle_run_evolution_command(session_id, command)
+                        .await?
+                }
+                SessionCommandKind::StageSkill => {
+                    self.handle_stage_skill_command(session_id, command).await?
+                }
+                SessionCommandKind::ReviewSkill => {
+                    self.handle_review_skill_command(session_id, command)
+                        .await?
+                }
+                SessionCommandKind::InstallSkill => {
+                    self.handle_install_skill_command(session_id, command)
+                        .await?
+                }
+                SessionCommandKind::RollbackSkill => {
+                    self.handle_rollback_skill_command(session_id, command)
+                        .await?
+                }
+                SessionCommandKind::ProviderConfigured
+                | SessionCommandKind::ProviderAuthSubmitted => {
+                    self.handle_provider_configured_command(session_id, command)
+                        .await?
+                }
+                SessionCommandKind::ProviderAuthCancelled => {
+                    self.handle_provider_auth_cancelled_command(session_id, command)
+                        .await?
+                }
+                SessionCommandKind::RunStorageMaintenance => {
+                    self.handle_storage_maintenance_command(session_id, command)
                         .await?
                 }
                 _ => {
@@ -806,22 +948,56 @@ impl RuntimeHost {
         .await;
         match result {
             Ok(ack) => {
-                self.store
-                    .store_command_ack(&scoped_idempotency_key, &ack)
-                    .await?;
+                self.complete_command_journal(
+                    &scoped_idempotency_key,
+                    command_id,
+                    &ack,
+                    host_event(
+                        0,
+                        session_id,
+                        None,
+                        RuntimeEventType::CommandCompleted,
+                        RuntimeEventSource::Runtime,
+                        json!({
+                            "summary": if ack.accepted {
+                                "runtime command accepted"
+                            } else {
+                                "runtime command rejected"
+                            },
+                            "command_id": command_id.to_string(),
+                            "accepted": ack.accepted,
+                            "reason": ack.reason,
+                        }),
+                    ),
+                )
+                .await?;
                 Ok(ack)
             }
             Err(error) => {
-                self.store
-                    .store_command_ack(
-                        &scoped_idempotency_key,
-                        &CommandAck {
-                            command_id,
-                            accepted: false,
-                            reason: Some(error.to_string()),
-                        },
-                    )
-                    .await?;
+                let ack = CommandAck {
+                    command_id,
+                    accepted: false,
+                    reason: Some(error.to_string()),
+                };
+                self.complete_command_journal(
+                    &scoped_idempotency_key,
+                    command_id,
+                    &ack,
+                    host_event(
+                        0,
+                        session_id,
+                        None,
+                        RuntimeEventType::CommandCompleted,
+                        RuntimeEventSource::Runtime,
+                        json!({
+                            "summary": "runtime command failed",
+                            "command_id": command_id.to_string(),
+                            "accepted": false,
+                            "reason": ack.reason,
+                        }),
+                    ),
+                )
+                .await?;
                 Err(error)
             }
         }
@@ -1123,6 +1299,204 @@ impl RuntimeHost {
         })
     }
 
+    async fn handle_provider_configured_command(
+        &self,
+        session_id: SessionId,
+        command: SessionCommand,
+    ) -> Result<CommandAck, ClientError> {
+        let paths = self
+            .runtime_paths
+            .as_ref()
+            .map_or_else(ProviderConfigPaths::global, |runtime_paths| {
+                ProviderConfigPaths::from_home(&runtime_paths.home)
+            })
+            .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
+        let environment = load_provider_runtime_env_from_paths(&paths)
+            .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
+        let redacted = ConfiguredProvider::redacted_from_reader(|key| environment.get(key))
+            .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
+        let protocol = redacted.protocol;
+        self.record_event(host_event(
+            self.next_sequence_no(),
+            session_id,
+            None,
+            RuntimeEventType::ProviderConfigured,
+            RuntimeEventSource::Runtime,
+            json!({
+                "summary": "provider configuration reloaded by runtime host",
+                "command_id": command.command_id,
+                "provider": redacted,
+            }),
+        ))
+        .await?;
+        let should_probe = command.kind == SessionCommandKind::ProviderAuthSubmitted
+            || command
+                .payload
+                .get("probe")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        if should_probe {
+            self.record_event(host_event(
+                self.next_sequence_no(),
+                session_id,
+                None,
+                RuntimeEventType::ProviderProbeStarted,
+                RuntimeEventSource::Provider,
+                json!({
+                    "summary": "provider capability probe started",
+                    "command_id": command.command_id,
+                }),
+            ))
+            .await?;
+            let probe = ConfiguredProvider::probe_from_reader_with_credential(
+                |key| environment.get(key),
+                environment.credential_provider(),
+            )
+            .await;
+            let probe = match probe {
+                Ok(probe) => probe,
+                Err(error) => {
+                    let event_type = if matches!(error, ProviderError::RateLimited { .. }) {
+                        RuntimeEventType::ProviderRateLimited
+                    } else {
+                        RuntimeEventType::ProviderAuthFailed
+                    };
+                    self.record_event(host_event(
+                        self.next_sequence_no(),
+                        session_id,
+                        None,
+                        event_type,
+                        RuntimeEventSource::Provider,
+                        json!({
+                            "summary": "provider capability probe failed",
+                            "command_id": command.command_id,
+                            "error": error.to_string(),
+                        }),
+                    ))
+                    .await?;
+                    return Ok(CommandAck {
+                        command_id: command.command_id,
+                        accepted: false,
+                        reason: Some(error.to_string()),
+                    });
+                }
+            };
+            self.record_event(host_event(
+                self.next_sequence_no(),
+                session_id,
+                None,
+                RuntimeEventType::ProviderProbeCompleted,
+                RuntimeEventSource::Provider,
+                json!({
+                    "summary": "provider capability probe completed",
+                    "command_id": command.command_id,
+                    "probe": probe,
+                }),
+            ))
+            .await?;
+        } else {
+            self.record_event(host_event(
+                self.next_sequence_no(),
+                session_id,
+                None,
+                RuntimeEventType::ProviderProbeCompleted,
+                RuntimeEventSource::Provider,
+                json!({
+                    "summary": "provider installation was already verified",
+                    "command_id": command.command_id,
+                    "capabilities": protocol_capabilities(protocol),
+                    "source": "verified_install",
+                }),
+            ))
+            .await?;
+        }
+
+        let requested_id = provider_auth_request_id_from_payload(&command.payload)?;
+        let pending = {
+            let mut waiters = self.provider_auth_waiters.lock().await;
+            if let Some(pending) = waiters.get(&session_id)
+                && requested_id.is_some_and(|request_id| request_id != pending.request_id)
+            {
+                return Ok(CommandAck {
+                    command_id: command.command_id,
+                    accepted: false,
+                    reason: Some(
+                        "provider auth request id does not match the active request".to_owned(),
+                    ),
+                });
+            }
+            waiters.remove(&session_id)
+        };
+        if let Some(pending) = pending {
+            let mut transition = self
+                .lane_manager
+                .lock()
+                .await
+                .authentication_resolved(session_id, self.next_sequence_no())?;
+            transition.event.payload["summary"] =
+                json!("provider authentication submitted and verified");
+            transition.event.payload["request_id"] = json!(pending.request_id);
+            transition.event.payload["command_id"] = json!(command.command_id);
+            transition.event.payload["runtime_lane"] = json!(transition.lane);
+            self.record_event(transition.event).await?;
+            let _ = pending.resolution.send(ProviderAuthResolution::Submitted);
+        }
+        Ok(CommandAck {
+            command_id: command.command_id,
+            accepted: true,
+            reason: Some("provider configuration loaded and verified".to_owned()),
+        })
+    }
+
+    async fn handle_provider_auth_cancelled_command(
+        &self,
+        session_id: SessionId,
+        command: SessionCommand,
+    ) -> Result<CommandAck, ClientError> {
+        let requested_id = provider_auth_request_id_from_payload(&command.payload)?;
+        let pending = {
+            let mut waiters = self.provider_auth_waiters.lock().await;
+            let Some(active) = waiters.get(&session_id) else {
+                return Ok(CommandAck {
+                    command_id: command.command_id,
+                    accepted: false,
+                    reason: Some("session has no pending provider auth request".to_owned()),
+                });
+            };
+            if requested_id.is_some_and(|request_id| request_id != active.request_id) {
+                return Ok(CommandAck {
+                    command_id: command.command_id,
+                    accepted: false,
+                    reason: Some(
+                        "provider auth request id does not match the active request".to_owned(),
+                    ),
+                });
+            }
+            waiters.remove(&session_id).expect("checked pending auth")
+        };
+        let lane = self.lane_manager.lock().await.lane(session_id).cloned();
+        let mut event = host_event(
+            self.next_sequence_no(),
+            session_id,
+            lane.as_ref().map(|lane| lane.task_id),
+            RuntimeEventType::ProviderAuthCancelled,
+            RuntimeEventSource::User,
+            json!({
+                "summary": "provider authentication was cancelled",
+                "request_id": pending.request_id,
+                "command_id": command.command_id,
+            }),
+        );
+        event.turn_id = lane.and_then(|lane| lane.active_turn_id);
+        self.record_event(event).await?;
+        let _ = pending.resolution.send(ProviderAuthResolution::Cancelled);
+        Ok(CommandAck {
+            command_id: command.command_id,
+            accepted: true,
+            reason: Some("provider authentication cancelled".to_owned()),
+        })
+    }
+
     async fn handle_takeover_command(
         &self,
         session_id: SessionId,
@@ -1355,12 +1729,70 @@ impl RuntimeHost {
         })
     }
 
+    async fn handle_memory_feedback_command(
+        &self,
+        session_id: SessionId,
+        command: SessionCommand,
+    ) -> Result<CommandAck, ClientError> {
+        let memory_id = command
+            .payload
+            .get("memory_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ClientError::InvalidSession("memory_id is required".to_owned()))?
+            .parse::<MemoryId>()
+            .map_err(|error| ClientError::InvalidSession(error.to_string()))?;
+        let feedback = match command.payload.get("feedback").and_then(Value::as_str) {
+            Some("helpful") => MemoryFeedbackKind::Helpful,
+            Some("irrelevant") => MemoryFeedbackKind::Irrelevant,
+            Some("incorrect") => MemoryFeedbackKind::Incorrect,
+            _ => {
+                return Ok(CommandAck {
+                    command_id: command.command_id,
+                    accepted: false,
+                    reason: Some(
+                        "memory feedback must be helpful, irrelevant, or incorrect".to_owned(),
+                    ),
+                });
+            }
+        };
+        let reason = command
+            .payload
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let memory_store = self.memory_store.clone();
+        let record =
+            run_blocking(move || memory_store.record_feedback(memory_id, feedback, reason))
+                .await??;
+        self.record_event(host_event(
+            self.next_sequence_no(),
+            session_id,
+            None,
+            RuntimeEventType::MemoryFeedbackRecorded,
+            RuntimeEventSource::Memory,
+            json!({
+                "summary": format!("project memory {memory_id} feedback recorded"),
+                "feedback": feedback,
+                "record": record,
+                "command_id": command.command_id,
+            }),
+        ))
+        .await?;
+        Ok(CommandAck {
+            command_id: command.command_id,
+            accepted: true,
+            reason: Some(format!("project memory {memory_id} feedback recorded")),
+        })
+    }
+
     async fn handle_regression_command(
         &self,
         session_id: SessionId,
         command: SessionCommand,
     ) -> Result<CommandAck, ClientError> {
         let candidate_id = candidate_id_from_payload(&command.payload)?.to_owned();
+        self.wait_for_candidate_evaluation(&candidate_id).await;
         let evaluation_store = self.evaluation_store.clone();
         let regression = run_blocking({
             let candidate_id = candidate_id.clone();
@@ -1387,19 +1819,40 @@ impl RuntimeHost {
         })
     }
 
-    async fn handle_apply_candidate_command(
+    async fn handle_review_candidate_command(
         &self,
         session_id: SessionId,
         command: SessionCommand,
     ) -> Result<CommandAck, ClientError> {
         let candidate_id = candidate_id_from_payload(&command.payload)?.to_owned();
+        self.wait_for_candidate_evaluation(&candidate_id).await;
+        let decision = match command.payload.get("decision").and_then(Value::as_str) {
+            Some("approve") => PromotionDecisionKind::Approve,
+            Some("reject") => PromotionDecisionKind::Reject,
+            _ => {
+                return Ok(CommandAck {
+                    command_id: command.command_id,
+                    accepted: false,
+                    reason: Some("candidate review decision must be approve or reject".to_owned()),
+                });
+            }
+        };
+        let reason = command
+            .payload
+            .get("reason")
+            .and_then(Value::as_str)
+            .filter(|reason| !reason.trim().is_empty())
+            .unwrap_or("reviewed by runtime controller")
+            .to_owned();
+        let reviewer_id = command.actor.id.clone();
         let evaluation_store = self.evaluation_store.clone();
-        let decision = run_blocking({
+        let review = run_blocking({
             let candidate_id = candidate_id.clone();
-            move || evaluation_store.decide_promotion(&candidate_id)
+            move || {
+                evaluation_store.review_promotion(&candidate_id, decision, &reviewer_id, &reason)
+            }
         })
         .await??;
-        let approved = decision.decision == PromotionDecisionKind::Approve;
         self.record_event(host_event(
             self.next_sequence_no(),
             session_id,
@@ -1407,18 +1860,148 @@ impl RuntimeHost {
             RuntimeEventType::PromotionDecided,
             RuntimeEventSource::Evaluator,
             json!({
-                "summary": format!("candidate {candidate_id} promotion decision: {:?}", decision.decision),
-                "record": decision,
+                "summary": format!("candidate {candidate_id} reviewed as {decision:?}"),
+                "record": review,
                 "command_id": command.command_id,
             }),
         ))
         .await?;
-        if !approved {
+        Ok(CommandAck {
+            command_id: command.command_id,
+            accepted: true,
+            reason: Some(format!("candidate {candidate_id} reviewed as {decision:?}")),
+        })
+    }
+
+    async fn handle_record_benchmark_command(
+        &self,
+        session_id: SessionId,
+        command: SessionCommand,
+    ) -> Result<CommandAck, ClientError> {
+        let run: BenchmarkRun =
+            serde_json::from_value(command.payload.get("run").cloned().ok_or_else(|| {
+                ClientError::InvalidSession("benchmark run is required".to_owned())
+            })?)?;
+        let benchmark_id = run.benchmark_id.clone();
+        let evaluation_store = self.evaluation_store.clone();
+        run_blocking(move || evaluation_store.record_benchmark_run(run)).await??;
+        self.record_event(host_event(
+            self.next_sequence_no(),
+            session_id,
+            None,
+            RuntimeEventType::BenchmarkRecorded,
+            RuntimeEventSource::Evaluator,
+            json!({
+                "summary": format!("benchmark run {benchmark_id} recorded"),
+                "benchmark_id": benchmark_id,
+                "command_id": command.command_id,
+            }),
+        ))
+        .await?;
+        Ok(CommandAck {
+            command_id: command.command_id,
+            accepted: true,
+            reason: Some(format!("benchmark run {benchmark_id} recorded")),
+        })
+    }
+
+    async fn handle_compare_counterfactual_command(
+        &self,
+        session_id: SessionId,
+        command: SessionCommand,
+    ) -> Result<CommandAck, ClientError> {
+        let group_id = command
+            .payload
+            .get("group_id")
+            .and_then(Value::as_str)
+            .filter(|group_id| !group_id.trim().is_empty())
+            .ok_or_else(|| {
+                ClientError::InvalidSession("counterfactual group_id is required".to_owned())
+            })?
+            .to_owned();
+        let evaluation_store = self.evaluation_store.clone();
+        let comparison = run_blocking({
+            let group_id = group_id.clone();
+            move || evaluation_store.compare_counterfactual(&group_id)
+        })
+        .await??;
+        self.record_event(host_event(
+            self.next_sequence_no(),
+            session_id,
+            None,
+            RuntimeEventType::CounterfactualCompared,
+            RuntimeEventSource::Evaluator,
+            json!({
+                "summary": format!("counterfactual group {group_id} compared"),
+                "record": comparison,
+                "command_id": command.command_id,
+            }),
+        ))
+        .await?;
+        Ok(CommandAck {
+            command_id: command.command_id,
+            accepted: true,
+            reason: Some(format!("counterfactual group {group_id} compared")),
+        })
+    }
+
+    async fn handle_apply_candidate_command(
+        &self,
+        session_id: SessionId,
+        command: SessionCommand,
+    ) -> Result<CommandAck, ClientError> {
+        let candidate_id = candidate_id_from_payload(&command.payload)?.to_owned();
+        self.wait_for_candidate_evaluation(&candidate_id).await;
+        let evaluation_store = self.evaluation_store.clone();
+        let candidate_status = run_blocking({
+            let candidate_id = candidate_id.clone();
+            move || {
+                evaluation_store
+                    .snapshot()?
+                    .automation_candidates
+                    .into_iter()
+                    .find(|candidate| candidate.id == candidate_id)
+                    .map(|candidate| candidate.status)
+                    .ok_or(EvaluationError::CandidateNotFound(candidate_id))
+            }
+        })
+        .await??;
+        if candidate_status == CandidateStatus::RegressionPassed {
+            let evaluation_store = self.evaluation_store.clone();
+            let decision = run_blocking({
+                let candidate_id = candidate_id.clone();
+                move || evaluation_store.decide_promotion(&candidate_id)
+            })
+            .await??;
+            let approved = decision.decision == PromotionDecisionKind::Approve;
+            self.record_event(host_event(
+                self.next_sequence_no(),
+                session_id,
+                None,
+                RuntimeEventType::PromotionDecided,
+                RuntimeEventSource::Evaluator,
+                json!({
+                    "summary": format!("candidate {candidate_id} promotion decision: {:?}", decision.decision),
+                    "record": decision,
+                    "command_id": command.command_id,
+                }),
+            ))
+            .await?;
+            if !approved {
+                return Ok(CommandAck {
+                    command_id: command.command_id,
+                    accepted: false,
+                    reason: Some(format!(
+                        "candidate {candidate_id} requires explicit human review"
+                    )),
+                });
+            }
+        } else if candidate_status == CandidateStatus::NeedsHumanReview {
             return Ok(CommandAck {
                 command_id: command.command_id,
                 accepted: false,
                 reason: Some(format!(
-                    "candidate {candidate_id} did not pass the automatic promotion gate"
+                    "candidate {candidate_id} requires explicit human review before apply"
                 )),
             });
         }
@@ -1487,6 +2070,32 @@ impl RuntimeHost {
         })
     }
 
+    async fn handle_storage_maintenance_command(
+        &self,
+        session_id: SessionId,
+        command: SessionCommand,
+    ) -> Result<CommandAck, ClientError> {
+        let report = self.run_storage_maintenance().await?;
+        self.record_event(host_event(
+            self.next_sequence_no(),
+            session_id,
+            None,
+            RuntimeEventType::StorageMaintenanceCompleted,
+            RuntimeEventSource::Runtime,
+            json!({
+                "summary": "runtime storage maintenance completed",
+                "command_id": command.command_id,
+                "report": report,
+            }),
+        ))
+        .await?;
+        Ok(CommandAck {
+            command_id: command.command_id,
+            accepted: true,
+            reason: Some("storage maintenance completed".to_owned()),
+        })
+    }
+
     async fn query(&self, query: RuntimeQuery) -> Result<Value, ClientError> {
         self.ensure_session_in_workspace(query.session_id).await?;
         let value = match query.kind {
@@ -1523,6 +2132,9 @@ impl RuntimeHost {
                     "results": state.results,
                     "replays": state.replays,
                     "reviews": state.reviews,
+                    "benchmark_runs": state.benchmark_runs,
+                    "counterfactual_replays": state.counterfactual_replays,
+                    "causal_comparisons": state.causal_comparisons,
                 })
             }
             RuntimeQueryKind::ImprovementCandidates => {
@@ -1546,6 +2158,57 @@ impl RuntimeHost {
                     "applied_candidates": state.applied_candidates,
                 })
             }
+            RuntimeQueryKind::EvolutionState => {
+                let evolution_store = self.evolution_store.clone();
+                serde_json::to_value(run_blocking(move || evolution_store.snapshot()).await??)?
+            }
+            RuntimeQueryKind::ProviderState => {
+                let provider =
+                    self.runtime_paths.as_ref().map_or_else(
+                        ConfiguredProvider::redacted_from_env,
+                        |paths| {
+                            let paths =
+                                ProviderConfigPaths::from_home(&paths.home).map_err(|error| {
+                                    ProviderError::NotConfigured {
+                                        message: error.to_string(),
+                                    }
+                                })?;
+                            let environment = load_provider_runtime_env_from_paths(&paths)
+                                .map_err(|error| ProviderError::NotConfigured {
+                                    message: error.to_string(),
+                                })?;
+                            ConfiguredProvider::redacted_from_reader(|key| environment.get(key))
+                        },
+                    );
+                let latest_runtime_fact = self
+                    .store
+                    .load_recent_events(query.session_id, query.task_id, None, 128)
+                    .await?
+                    .into_iter()
+                    .rev()
+                    .find(|event| {
+                        matches!(
+                            event.event_type,
+                            RuntimeEventType::ProviderAuthRequired
+                                | RuntimeEventType::ProviderAuthSubmitted
+                                | RuntimeEventType::ProviderAuthCancelled
+                                | RuntimeEventType::ProviderConfigured
+                                | RuntimeEventType::ProviderProbeCompleted
+                                | RuntimeEventType::ProviderAuthFailed
+                                | RuntimeEventType::ProviderRateLimited
+                        )
+                    });
+                let (provider, error) = match provider {
+                    Ok(provider) => (Some(provider), None),
+                    Err(error) => (None, Some(error.to_string())),
+                };
+                json!({
+                    "provider": provider,
+                    "error": error,
+                    "latest_runtime_fact": latest_runtime_fact,
+                })
+            }
+            RuntimeQueryKind::StorageStatus => serde_json::to_value(self.storage_stats().await?)?,
         };
         Ok(value)
     }
@@ -1561,6 +2224,52 @@ impl RuntimeHost {
             .map(serde_json::to_value)
             .collect::<Result<Vec<_>, _>>()
             .map_err(ClientError::Serialization)
+    }
+
+    pub async fn event_page(&self, request: EventPageRequest) -> Result<EventPage, ClientError> {
+        self.ensure_session_in_workspace(request.session_id).await?;
+        let limit = request.limit.clamp(1, MAX_EVENT_PAGE_SIZE);
+        let fetch_limit = limit.saturating_add(1);
+        let mut events = match request.direction {
+            EventPageDirection::Forward => {
+                self.store
+                    .load_events_page(
+                        request.session_id,
+                        request.task_id,
+                        request.cursor,
+                        fetch_limit,
+                    )
+                    .await?
+            }
+            EventPageDirection::Backward => {
+                self.store
+                    .load_events_before(
+                        request.session_id,
+                        request.task_id,
+                        request.cursor,
+                        fetch_limit,
+                    )
+                    .await?
+            }
+        };
+        let has_more = events.len() > limit as usize;
+        if has_more {
+            match request.direction {
+                EventPageDirection::Forward => {
+                    events.truncate(limit as usize);
+                }
+                EventPageDirection::Backward => {
+                    events.remove(0);
+                }
+            }
+        }
+        Ok(EventPage {
+            direction: request.direction,
+            start_cursor: events.first().map(|event| event.sequence_no),
+            end_cursor: events.last().map(|event| event.sequence_no),
+            events,
+            has_more,
+        })
     }
 
     pub async fn list_threads(&self, limit: u32) -> Result<Vec<ThreadRecord>, ClientError> {
@@ -1617,16 +2326,11 @@ impl RuntimeHost {
             .load_events(parent.session_id, None, None)
             .await?;
         let through_sequence_no = match from_turn_id {
-            Some(turn_id) => parent_events
-                .iter()
-                .filter(|event| event.turn_id == Some(turn_id))
-                .map(|event| event.sequence_no)
-                .max()
-                .ok_or_else(|| {
-                    ClientError::InvalidSession(format!(
-                        "turn `{turn_id}` was not found in thread `{thread_id}`"
-                    ))
-                })?,
+            Some(turn_id) => fork_sequence_for_turn(&parent_events, turn_id).ok_or_else(|| {
+                ClientError::InvalidSession(format!(
+                    "turn `{turn_id}` was not found in thread `{thread_id}`"
+                ))
+            })?,
             None => parent_events
                 .last()
                 .map(|event| event.sequence_no)
@@ -1706,7 +2410,40 @@ impl RuntimeHost {
         })?;
         self.ensure_thread_in_workspace(&thread)?;
         self.ensure_thread_rollout_path(&mut thread).await?;
-        self.rebuild_thread_rollout(&thread).await
+        let _writer = self.event_writer.lock().await;
+        let events = self
+            .store
+            .load_events(thread.session_id, None, None)
+            .await?;
+        let lines = events
+            .iter()
+            .map(|event| rollout_line(&thread, event))
+            .collect::<Result<Vec<_>, _>>()?;
+        let last_sequence_no = events.last().map(|event| event.sequence_no);
+        let event_count = events.len();
+        let exports_dir = self
+            .runtime_paths
+            .as_ref()
+            .map(|paths| paths.rollouts_dir.join("exports"))
+            .ok_or_else(|| {
+                ClientError::InvalidSession("rollout export requires a durable runtime".to_owned())
+            })?;
+        ensure_private_dir(&exports_dir)?;
+        let path = exports_dir.join(format!(
+            "{}-{}-{}.jsonl",
+            thread.thread_id,
+            last_sequence_no.unwrap_or_default(),
+            Uuid::now_v7()
+        ));
+        let export_path = path.display().to_string();
+        run_blocking(move || rebuild_rollout_file(&path, &lines)).await??;
+        Ok(RolloutExport {
+            thread_id: thread.thread_id,
+            session_id: thread.session_id,
+            path: export_path,
+            event_count,
+            last_sequence_no,
+        })
     }
 
     pub async fn rebind_thread(
@@ -1877,9 +2614,94 @@ impl RuntimeHost {
     async fn record_event(&self, event: RuntimeEvent) -> Result<(), ClientError> {
         let _writer = self.event_writer.lock().await;
         let event = self.store.append_event_assigning_sequence(event).await?;
+        self.publish_committed_event(event).await
+    }
+
+    async fn claim_command_journal(
+        &self,
+        idempotency_key: &str,
+        command_id: CommandId,
+        provisional_ack: &CommandAck,
+        receipt_event: RuntimeEvent,
+    ) -> Result<CommandClaim, ClientError> {
+        let _writer = self.event_writer.lock().await;
+        let claim = self
+            .store
+            .claim_command(idempotency_key, command_id, provisional_ack, receipt_event)
+            .await?;
+        if let CommandClaim::Claimed {
+            receipt_event: Some(event),
+        } = &claim
+        {
+            self.publish_committed_event(event.clone()).await?;
+        }
+        Ok(claim)
+    }
+
+    async fn complete_command_journal(
+        &self,
+        idempotency_key: &str,
+        command_id: CommandId,
+        ack: &CommandAck,
+        completion_event: RuntimeEvent,
+    ) -> Result<(), ClientError> {
+        let _writer = self.event_writer.lock().await;
+        let event = self
+            .store
+            .complete_command(idempotency_key, command_id, ack, completion_event)
+            .await?;
+        self.publish_committed_event(event).await
+    }
+
+    async fn publish_committed_event(&self, event: RuntimeEvent) -> Result<(), ClientError> {
         self.append_rollout_event(&event).await?;
         let _ = self.event_bus.send(event);
         Ok(())
+    }
+
+    async fn run_storage_maintenance(&self) -> Result<StorageMaintenanceReport, ClientError> {
+        let now = chrono::Utc::now();
+        let artifact_report = self.store.run_artifact_maintenance(now).await?;
+        let checkpoint_directories_removed = if let (Some(workspace_root), Some(paths)) =
+            (self.workspace_root.clone(), self.runtime_paths.clone())
+        {
+            run_blocking(move || {
+                WorkspaceCheckpointManager::new(workspace_root, paths.checkpoints_dir)
+                    .prune_checkpoints(CHECKPOINTS_TO_RETAIN_PER_WORKSPACE)
+                    .map_err(|error| ClientError::Io(error.to_string()))
+            })
+            .await??
+        } else {
+            0
+        };
+        Ok(StorageMaintenanceReport {
+            artifact_blobs_removed: artifact_report.artifact_blobs_removed,
+            protected_artifacts_skipped: artifact_report.protected_artifacts_skipped,
+            temporary_artifacts_removed: artifact_report.temporary_artifacts_removed,
+            checkpoint_directories_removed,
+            completed_at: now,
+            stats: self.storage_stats().await?,
+        })
+    }
+
+    async fn storage_stats(&self) -> Result<StorageStats, ClientError> {
+        let mut stats = self.store.storage_stats().await?;
+        if let (Some(workspace_root), Some(paths)) =
+            (self.workspace_root.clone(), self.runtime_paths.clone())
+        {
+            let (checkpoint_directories, rollout_files) = run_blocking(move || {
+                let checkpoint_directories =
+                    WorkspaceCheckpointManager::new(workspace_root, &paths.checkpoints_dir)
+                        .checkpoint_count()
+                        .map_err(|error| ClientError::Io(error.to_string()))?;
+                let rollout_files = count_regular_directory_entries(&paths.rollouts_dir, "jsonl")?;
+                Ok::<_, ClientError>((checkpoint_directories, rollout_files))
+            })
+            .await??;
+            stats.checkpoint_directories = checkpoint_directories;
+            stats.rollout_files = rollout_files;
+        }
+        Ok(stats)
     }
 
     async fn synchronize_workspace_rollouts(&self) -> Result<(), ClientError> {
@@ -2084,11 +2906,20 @@ impl RuntimeHost {
                 token_budget_hint: 2_048,
             });
         }
+        if let Some(skill_context) = self.active_skill_context(&objective).await? {
+            contributors.push(ContextContributor {
+                name: "project_skills".to_owned(),
+                role: ProviderRole::System,
+                content: skill_context,
+                token_budget_hint: 1_024,
+            });
+        }
 
         let memory_store = self.memory_store.clone();
         let memory_query = objective.clone();
         let memories =
-            run_blocking(move || memory_store.retrieve(&memory_query, "project", 5)).await??;
+            run_blocking(move || memory_store.retrieve(&memory_query, MemoryScope::Project, 5))
+                .await??;
         self.record_event(host_event(
             self.next_sequence_no(),
             session_id,
@@ -2264,6 +3095,7 @@ impl RuntimeHost {
         {
             controls.remove(&session_id);
         }
+        self.provider_auth_waiters.lock().await.remove(&session_id);
     }
 
     async fn run_agent_task(
@@ -2276,16 +3108,18 @@ impl RuntimeHost {
         let workspace_root = self.execution_workspace_root()?;
         let policy = WorkspacePolicy::new(workspace_root.clone())
             .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
-        let tool_executor = BasicToolExecutor::new(policy);
+        let tool_executor = self
+            .build_tool_executor(policy, workspace_root.clone())
+            .await?;
         let workspace_tool_names = tool_executor
             .registry()
             .contracts()
             .into_iter()
             .map(|contract| contract.tool_name.clone())
             .collect::<Vec<_>>();
-        let provider_plan =
-            mock_provider_plan(self.runtime_paths.as_ref(), &task.payload, &objective)
-                .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
+        let provider_plan = self
+            .resolve_provider_plan_with_auth(&task, &objective, control.cancellation_token())
+            .await?;
         let MockProviderPlan {
             provider,
             fallback_provider,
@@ -2399,26 +3233,145 @@ impl RuntimeHost {
             terminal_status,
         )
         .await?;
-        self.evaluate_completed_task(
-            &final_task,
-            HostedTaskEvaluation {
-                objective: &final_objective,
-                task_status: terminal_status,
-                verification: Some(outcome.verification.clone()),
-                tool_reports: &outcome.tool_reports,
-                failure_summary: Some(outcome.loop_decision.reason.clone()),
-                latency: started_at.elapsed(),
+        let evaluation_input = self
+            .evaluate_completed_task(
+                &final_task,
+                HostedTaskEvaluation {
+                    objective: &final_objective,
+                    task_status: terminal_status,
+                    verification: Some(outcome.verification.clone()),
+                    tool_reports: &outcome.tool_reports,
+                    failure_summary: Some(outcome.loop_decision.reason.clone()),
+                    latency: started_at.elapsed(),
+                },
+            )
+            .await?;
+        self.finish_lane(&final_task, terminal_status).await?;
+        self.spawn_deep_task_evaluation(final_task, evaluation_input)
+            .await;
+        Ok(())
+    }
+
+    async fn resolve_provider_plan_with_auth(
+        &self,
+        task: &HostedAgentTask,
+        objective: &str,
+        cancellation: CancellationToken,
+    ) -> Result<MockProviderPlan, ClientError> {
+        let mut pending = None;
+        loop {
+            let plan = if self.force_mock_provider {
+                isolated_mock_provider_plan(&task.payload, objective)
+            } else {
+                mock_provider_plan(self.runtime_paths.as_ref(), &task.payload, objective)
+            };
+            match plan {
+                Ok(plan) => {
+                    if let Some((request_id, _)) = pending.take() {
+                        self.provider_auth_waiters
+                            .lock()
+                            .await
+                            .remove(&task.session_id);
+                        self.record_provider_auth_resolved(
+                            task,
+                            request_id,
+                            "provider configuration became available",
+                        )
+                        .await?;
+                    }
+                    return Ok(plan);
+                }
+                Err(ProviderError::NotConfigured { message }) => {
+                    if pending.is_none() {
+                        pending = Some(self.begin_provider_auth(task, message).await?);
+                    }
+                }
+                Err(error) => return Err(ClientError::TaskExecution(error.to_string())),
+            }
+
+            let Some((_, receiver)) = pending.as_mut() else {
+                unreachable!("provider auth wait is created for not-configured providers")
+            };
+            tokio::select! {
+                _ = cancellation.cancelled() => {
+                    self.provider_auth_waiters.lock().await.remove(&task.session_id);
+                    return Err(ClientError::TaskCancelled);
+                }
+                resolution = receiver => {
+                    match resolution {
+                        Ok(ProviderAuthResolution::Submitted) => {
+                            pending = None;
+                        }
+                        Ok(ProviderAuthResolution::Cancelled) | Err(_) => {
+                            return Err(ClientError::TaskCancelled);
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
+        }
+    }
+
+    async fn begin_provider_auth(
+        &self,
+        task: &HostedAgentTask,
+        reason: String,
+    ) -> Result<
+        (
+            ProviderAuthRequestId,
+            oneshot::Receiver<ProviderAuthResolution>,
+        ),
+        ClientError,
+    > {
+        let request_id = ProviderAuthRequestId::new();
+        let (sender, receiver) = oneshot::channel();
+        self.provider_auth_waiters.lock().await.insert(
+            task.session_id,
+            PendingProviderAuth {
+                request_id,
+                resolution: sender,
             },
-        )
-        .await?;
-        self.finish_lane(&final_task, terminal_status).await
+        );
+        let mut transition = self
+            .lane_manager
+            .lock()
+            .await
+            .wait_for_authentication(task.session_id, self.next_sequence_no())?;
+        transition.event.task_id = Some(task.task_id);
+        transition.event.turn_id = Some(task.turn_id);
+        transition.event.payload["summary"] = json!("provider authentication is required");
+        transition.event.payload["request_id"] = json!(request_id);
+        transition.event.payload["reason"] = json!(reason);
+        transition.event.payload["supported_methods"] = json!(["api_key", "oauth"]);
+        transition.event.payload["runtime_lane"] = json!(transition.lane);
+        self.record_event(transition.event).await?;
+        Ok((request_id, receiver))
+    }
+
+    async fn record_provider_auth_resolved(
+        &self,
+        task: &HostedAgentTask,
+        request_id: ProviderAuthRequestId,
+        summary: &str,
+    ) -> Result<(), ClientError> {
+        let mut transition = self
+            .lane_manager
+            .lock()
+            .await
+            .authentication_resolved(task.session_id, self.next_sequence_no())?;
+        transition.event.task_id = Some(task.task_id);
+        transition.event.turn_id = Some(task.turn_id);
+        transition.event.payload["summary"] = json!(summary);
+        transition.event.payload["request_id"] = json!(request_id);
+        transition.event.payload["runtime_lane"] = json!(transition.lane);
+        self.record_event(transition.event).await
     }
 
     async fn evaluate_completed_task(
         &self,
         task: &HostedAgentTask,
         input: HostedTaskEvaluation<'_>,
-    ) -> Result<(), ClientError> {
+    ) -> Result<TaskEvaluationInput, ClientError> {
         let events = self
             .store
             .load_events(task.session_id, Some(task.task_id), None)
@@ -2428,7 +3381,29 @@ impl RuntimeHost {
             .iter()
             .map(|report| report.artifacts.len())
             .sum();
-        let bundle = EvaluationRunner.evaluate_task(TaskEvaluationInput {
+        let token_usage = events
+            .iter()
+            .filter(|event| event.event_type == RuntimeEventType::TokenUsageRecorded)
+            .filter_map(|event| event.payload.get("record").cloned())
+            .filter_map(|record| serde_json::from_value::<TokenUsageRecord>(record).ok())
+            .collect::<Vec<_>>();
+        let policy_violation_count = events
+            .iter()
+            .filter(|event| event.event_type == RuntimeEventType::PolicyEvaluated)
+            .filter_map(|event| event.payload.get("record").cloned())
+            .filter_map(|record| serde_json::from_value::<PolicyEvaluation>(record).ok())
+            .filter(|evaluation| {
+                matches!(
+                    evaluation.decision,
+                    PolicyDecision::Deny | PolicyDecision::Block
+                )
+            })
+            .count();
+        let provider_config_ref = token_usage.last().map_or_else(
+            || "runtime-active-profile".to_owned(),
+            |record| format!("{}:{}", record.provider_id, record.model_id),
+        );
+        let evaluation_input = TaskEvaluationInput {
             task_id: task.task_id,
             objective: input.objective.to_owned(),
             task_status: input.task_status,
@@ -2438,8 +3413,70 @@ impl RuntimeHost {
             tool_count: input.tool_reports.len(),
             latency_ms: Some(u64::try_from(input.latency.as_millis()).unwrap_or(u64::MAX)),
             failure_summary: input.failure_summary,
+            token_usage,
+            provider_config_ref,
+            runtime_config_ref: format!("golutra-runtime:{}", env!("CARGO_PKG_VERSION")),
+            policy_violation_count: u32::try_from(policy_violation_count).unwrap_or(u32::MAX),
+        };
+        let bundle = EvaluationRunner.evaluate_minimal(evaluation_input.clone());
+        self.record_task_evaluation(task, bundle).await?;
+        Ok(evaluation_input)
+    }
+
+    async fn spawn_deep_task_evaluation(
+        self: &Arc<Self>,
+        task: HostedAgentTask,
+        input: TaskEvaluationInput,
+    ) {
+        let (completion, receiver) = watch::channel(false);
+        self.deep_evaluation_jobs
+            .lock()
+            .await
+            .insert(task.task_id, receiver);
+        let host = self.clone();
+        tokio::spawn(async move {
+            let bundle = EvaluationRunner.evaluate_task(input);
+            if let Err(error) = host.record_task_evaluation(&task, bundle).await {
+                let _ = host
+                    .record_event(agent_event(
+                        host.next_sequence_no(),
+                        &task,
+                        RuntimeEventType::EvaluationCompleted,
+                        RuntimeEventSource::Evaluator,
+                        json!({
+                            "summary": "background deep task evaluation failed",
+                            "error": error.to_string(),
+                            "mode": "deep",
+                        }),
+                    ))
+                    .await;
+            }
+            completion.send_replace(true);
+            host.deep_evaluation_jobs.lock().await.remove(&task.task_id);
         });
-        self.record_task_evaluation(task, bundle).await
+    }
+
+    async fn wait_for_candidate_evaluation(&self, candidate_id: &str) {
+        let Some(task_id) = task_id_from_candidate_id(candidate_id) else {
+            return;
+        };
+        self.wait_for_deep_task_evaluation(task_id).await;
+    }
+
+    async fn wait_for_deep_task_evaluation(&self, task_id: TaskId) {
+        let receiver = self
+            .deep_evaluation_jobs
+            .lock()
+            .await
+            .get(&task_id)
+            .cloned();
+        let Some(mut receiver) = receiver else {
+            return;
+        };
+        if *receiver.borrow() {
+            return;
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(5), receiver.changed()).await;
     }
 
     async fn record_task_evaluation(
@@ -2474,7 +3511,7 @@ impl RuntimeHost {
             RuntimeEventType::PostTaskReviewed,
             RuntimeEventSource::Evaluator,
             json!({
-                "summary": format!("deep post-task review outcome: {}", review.outcome),
+                "summary": format!("{:?} post-task review outcome: {}", review.mode, review.outcome),
                 "record": review,
             }),
         ))
@@ -2803,7 +3840,7 @@ impl RuntimeHost {
     }
 
     async fn record_task_execution_failure(
-        &self,
+        self: &Arc<Self>,
         task: &HostedAgentTask,
         error: ClientError,
     ) -> Result<(), ClientError> {
@@ -2820,21 +3857,39 @@ impl RuntimeHost {
         };
         let objective = self.objective_for_task_turn(task, active_turn_id).await?;
         if matches!(error, ClientError::TaskCancelled) {
-            self.evaluate_completed_task(
-                &failure_task,
-                HostedTaskEvaluation {
-                    objective: &objective,
-                    task_status: TaskStatus::Cancelled,
-                    verification: None,
-                    tool_reports: &[],
-                    failure_summary: Some("task cancelled by controller".to_owned()),
-                    latency: Duration::ZERO,
-                },
-            )
-            .await?;
-            return self.finish_lane(&failure_task, TaskStatus::Cancelled).await;
+            let evaluation_input = self
+                .evaluate_completed_task(
+                    &failure_task,
+                    HostedTaskEvaluation {
+                        objective: &objective,
+                        task_status: TaskStatus::Cancelled,
+                        verification: None,
+                        tool_reports: &[],
+                        failure_summary: Some("task cancelled by controller".to_owned()),
+                        latency: Duration::ZERO,
+                    },
+                )
+                .await?;
+            self.finish_lane(&failure_task, TaskStatus::Cancelled)
+                .await?;
+            self.spawn_deep_task_evaluation(failure_task, evaluation_input)
+                .await;
+            return Ok(());
         }
         let error_summary = compact_event_summary(&error.to_string());
+        if provider_auth_failure_message(&error_summary) {
+            self.record_event(agent_event(
+                self.next_sequence_no(),
+                &failure_task,
+                RuntimeEventType::ProviderAuthFailed,
+                RuntimeEventSource::Provider,
+                json!({
+                    "summary": "provider rejected the configured credential",
+                    "error": error_summary.clone(),
+                }),
+            ))
+            .await?;
+        }
         self.record_event(agent_event(
             self.next_sequence_no(),
             &failure_task,
@@ -2846,19 +3901,23 @@ impl RuntimeHost {
             }),
         ))
         .await?;
-        self.evaluate_completed_task(
-            &failure_task,
-            HostedTaskEvaluation {
-                objective: &objective,
-                task_status: TaskStatus::Failed,
-                verification: None,
-                tool_reports: &[],
-                failure_summary: Some(error.to_string()),
-                latency: Duration::ZERO,
-            },
-        )
-        .await?;
-        self.finish_lane(&failure_task, TaskStatus::Failed).await
+        let evaluation_input = self
+            .evaluate_completed_task(
+                &failure_task,
+                HostedTaskEvaluation {
+                    objective: &objective,
+                    task_status: TaskStatus::Failed,
+                    verification: None,
+                    tool_reports: &[],
+                    failure_summary: Some(error.to_string()),
+                    latency: Duration::ZERO,
+                },
+            )
+            .await?;
+        self.finish_lane(&failure_task, TaskStatus::Failed).await?;
+        self.spawn_deep_task_evaluation(failure_task, evaluation_input)
+            .await;
+        Ok(())
     }
 
     async fn objective_for_task_turn(
@@ -2896,6 +3955,36 @@ impl RuntimeHost {
         })
     }
 
+    async fn build_tool_executor(
+        &self,
+        policy: WorkspacePolicy,
+        workspace_root: PathBuf,
+    ) -> Result<BasicToolExecutor, ClientError> {
+        let executor = BasicToolExecutor::new(policy);
+        let Some(paths) = self
+            .runtime_paths
+            .as_ref()
+            .filter(|_| !self.force_mock_provider)
+        else {
+            return Ok(executor);
+        };
+        let home = paths.home.clone();
+        let scratch_root = paths.mcp_scratch_dir.clone();
+        let backend = run_blocking(move || {
+            let store = PluginStore::new(home)
+                .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
+            McpToolBackend::from_store(store, workspace_root, scratch_root)
+                .map_err(|error| ClientError::TaskExecution(error.to_string()))
+        })
+        .await??;
+        match backend {
+            Some(backend) => executor
+                .with_external_backend(Arc::new(backend))
+                .map_err(|error| ClientError::TaskExecution(error.to_string())),
+            None => Ok(executor),
+        }
+    }
+
     fn workspace_root_string(&self) -> Option<String> {
         self.workspace_root
             .as_ref()
@@ -2914,6 +4003,110 @@ impl RuntimeHost {
             thread.thread_id
         )))
     }
+}
+
+fn task_id_from_candidate_id(candidate_id: &str) -> Option<TaskId> {
+    [
+        "automation-benchmark-",
+        "automation-generated-task-",
+        "automation-skill-",
+        "automation-runtime-change-",
+    ]
+    .iter()
+    .find_map(|prefix| candidate_id.strip_prefix(prefix))
+    .and_then(|task_id| task_id.parse().ok())
+}
+
+fn fork_sequence_for_turn(events: &[RuntimeEvent], turn_id: TurnId) -> Option<u64> {
+    let first_sequence = events
+        .iter()
+        .find(|event| event.turn_id == Some(turn_id))?
+        .sequence_no;
+    if let Some(next_turn_sequence) = events
+        .iter()
+        .find(|event| {
+            event.sequence_no > first_sequence
+                && event
+                    .turn_id
+                    .is_some_and(|event_turn_id| event_turn_id != turn_id)
+        })
+        .map(|event| event.sequence_no)
+    {
+        return Some(next_turn_sequence.saturating_sub(1));
+    }
+    events
+        .iter()
+        .filter(|event| event.turn_id == Some(turn_id))
+        .filter(|event| {
+            matches!(
+                event.event_type,
+                RuntimeEventType::TaskCompleted | RuntimeEventType::TaskAborted
+            )
+        })
+        .map(|event| event.sequence_no)
+        .max()
+        .or_else(|| {
+            events
+                .iter()
+                .filter(|event| event.turn_id == Some(turn_id))
+                .map(|event| event.sequence_no)
+                .max()
+        })
+}
+
+fn count_regular_directory_entries(path: &Path, extension: &str) -> Result<u64, ClientError> {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(ClientError::Io(error.to_string())),
+    };
+    let mut count = 0_u64;
+    for entry in entries {
+        let entry = entry.map_err(|error| ClientError::Io(error.to_string()))?;
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|error| ClientError::Io(error.to_string()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(ClientError::Io(format!(
+                "runtime storage entry cannot be a symbolic link: {}",
+                entry.path().display()
+            )));
+        }
+        if metadata.is_file()
+            && entry.path().extension().and_then(|value| value.to_str()) == Some(extension)
+        {
+            count = count.saturating_add(1);
+        }
+    }
+    Ok(count)
+}
+
+fn provider_auth_request_id_from_payload(
+    payload: &Value,
+) -> Result<Option<ProviderAuthRequestId>, ClientError> {
+    payload
+        .get("request_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            value.parse().map_err(|error: uuid::Error| {
+                ClientError::TaskExecution(format!("provider auth request id is invalid: {error}"))
+            })
+        })
+        .transpose()
+}
+
+fn provider_auth_failure_message(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    [
+        "invalid_api_key",
+        "invalid api key",
+        "authentication_error",
+        "unauthenticated",
+        "credential is missing",
+        "required env is not set",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
 }
 
 #[cfg(test)]

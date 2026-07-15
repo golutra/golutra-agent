@@ -7,19 +7,21 @@
 阶段边界说明：
 
 - 本文档描述的是完整改进闭环的目标态。
-- 当前已做到 `deep PostTaskReview -> candidate -> durable replay -> regression -> PromotionDecision -> apply/rollback` 的受控最小闭环。
-- 当前 replay 复用 event/artifact facts，不重新执行 provider；完整 counterfactual replay 和跨版本 benchmark 仍是后续阶段重点。
+- 当前已做到 `deep PostTaskReview -> candidate -> durable replay/counterfactual comparison -> regression -> PromotionDecision -> apply/rollback` 的受控闭环。
+- 当前 replay 复用 event/artifact facts；GeneratedTask 可以在独立 fixture RuntimeHost 中执行，但不会用真实用户 provider 或主 workspace 伪装成 deterministic replay。
 - “可自动晋升”是长期能力预留，不代表当前默认实现会自动 redeploy 或自动替换线上执行版本。
 
 ## 当前实现边界
 
-截至 2026-07-10：
+截至 2026-07-15：
 
 - failed/partial trajectory 可生成 `ImprovementCandidate`、`BenchmarkPromotion`、`GeneratedTask` 和对应 `AutomationCandidate`；成功且有 evidence 的 trajectory 可生成 `SkillCandidate`。
-- 所有 GeneratedTask、Skill 和中高风险候选保持 `proposed`，当前没有自动改 prompt、policy、tool schema、runtime code 或 skill 文件的路径。
+- GeneratedTask 只有通过 budget、novelty、difficulty、fixture-only 和 no-external-side-effects gate 才会在隔离目录、deterministic mock provider、同一 RuntimeHost/Verification 主链中执行；结果和 verification ref 持久化到 evolution state。
+- SkillCandidate 可以 stage 为 owner-only `SKILL.md`，但必须有 project scope、evidence、rollback metadata、regression refs 和显式 reviewer；review 后 checksum 未变化才可 install，安装后只按 objective 相关性注入，支持 rollback。
+- 中高风险 prompt/policy/tool schema/runtime code 候选仍不会自动 apply；没有自动改 runtime 代码或自动部署新二进制的路径。
 - 只有低风险 benchmark candidate 在 clean regression 后可由 system reviewer approve；apply 只更新 workspace evaluation dataset 状态，不执行任意代码。
 - candidate 状态转换受约束，不能跳过 regression/promotion gate；apply 后可 rollback，原因和 applied version 会持久化。
-- `RuntimeGovernor` 在 provider/tool/result/completion 阶段执行确定性预算、风险和目标对齐检查，但不自动生成或部署改动。
+- `RuntimeGovernor` 在 provider/tool/result/completion 阶段执行确定性 token/cost/tool/time budget、policy/security risk 和目标对齐检查，但不自动生成或部署改动。
 
 核心原则：
 
@@ -96,7 +98,7 @@ CounterfactualReplay
 - 修改工具输出策略前后，对同一批 case 比较 token、证据质量和任务通过率。
 - 修改 provider route 前后，对同一批 case 比较质量、延迟、成本和 tool calling 稳定性。
 
-第一阶段不要求自动生成 causal evidence，但文档和 schema 要保留引用位置。后续只有通过反事实对照或回归验证的 candidate，才适合进入 PromotionDecision。
+当前 `compare_counterfactual` 会从 baseline/variant durable run 生成 CausalComparison；无法控制变量或没有 paired run 时保持 inconclusive。只有通过反事实对照或 clean regression 的 candidate，才适合进入 PromotionDecision。
 
 ## RegressionResult
 
@@ -186,13 +188,14 @@ ImprovementCandidate
 -> PromotionDecision
 ```
 
-后续完整自动化阶段：
+已完成的受治理 Evolution/Skill 阶段：
 
 ```text
-低风险候选自动晋升
-高风险候选 human review
-晋升后持续监控新版本
+GeneratedTask -> isolated RuntimeHost -> Verification
+SkillCandidate -> stage -> regression-backed human review -> install/rollback
 ```
+
+组织级持续监控和自动 runtime redeploy 不在当前本地产品范围；高风险候选保持 human review，不因为阶段名称被解释为可自动晋升。
 
 ## 与其他系统的关系
 

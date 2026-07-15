@@ -822,6 +822,7 @@ async fn slash_auth_login_persists_native_anthropic_protocol_after_probe() {
         credential_store: AuthCredentialStore::Ephemeral,
         credential_ref: None,
         generation_config: None,
+        custom_headers: Vec::new(),
         scope: AuthConfigScope::User,
     };
 
@@ -940,6 +941,7 @@ async fn slash_auth_login_failure_reports_error_without_persisting_profile() {
             credential_store: AuthCredentialStore::Ephemeral,
             credential_ref: None,
             generation_config: None,
+            custom_headers: Vec::new(),
             scope: AuthConfigScope::User,
         })),
     )
@@ -1138,6 +1140,33 @@ fn auth_dialog_exposes_recommended_models_and_custom_input() {
 
     assert!(lines.contains("gpt-test"));
     assert!(lines.contains("Custom model"));
+}
+
+#[test]
+fn auth_advanced_custom_headers_parse_without_persisting_literal_secrets() {
+    let headers =
+        parse_dialog_custom_headers("X-Client=golutra; X-Api-Key=@GOLUTRA_PROVIDER_HEADER_KEY")
+            .expect("custom headers");
+
+    assert_eq!(headers.len(), 2);
+    assert!(matches!(
+        headers[1].value,
+        ProviderHeaderValue::Environment { ref key }
+            if key == "GOLUTRA_PROVIDER_HEADER_KEY"
+    ));
+    assert!(parse_dialog_custom_headers("X-Api-Key=inline-secret").is_err());
+}
+
+#[test]
+fn auth_advanced_header_field_accepts_full_text_input() {
+    let mut dialog = AuthDialogState::new();
+    dialog.step = AuthDialogStep::AdvancedConfig;
+    dialog.advanced_selected = 4;
+    for character in "X-Client=golutra".chars() {
+        handle_auth_advanced_character(&mut dialog, character);
+    }
+
+    assert_eq!(dialog.custom_headers, "X-Client=golutra");
 }
 
 #[tokio::test]
@@ -1354,6 +1383,7 @@ fn developer_panel_exposes_governance_without_leaking_into_normal_view() {
         objective: "write a file".to_owned(),
         completion_criteria: vec!["file exists".to_owned()],
         checks: vec![golutra_core::VerificationCheck {
+            kind: golutra_core::VerificationCheckKind::ObjectiveValidation,
             name: "file_exists".to_owned(),
             command: None,
             passed: true,
@@ -1373,6 +1403,12 @@ fn developer_panel_exposes_governance_without_leaking_into_normal_view() {
             .into_iter()
             .map(|value| serde_json::from_value(value).expect("runtime event"))
             .collect(),
+        event_window: golutra_protocol::DebugEventWindow {
+            start_cursor: Some(1),
+            end_cursor: Some(2),
+            has_more_before: false,
+            limit: 512,
+        },
         busy_policy_decisions: Vec::new(),
         tool_results: Vec::new(),
         artifacts: Vec::new(),
@@ -1804,6 +1840,56 @@ fn transcript_groups_multiple_turns_from_events_top_to_bottom() {
 }
 
 #[test]
+fn transcript_coalesces_provider_deltas_and_replaces_them_with_final_message() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let turn_id = golutra_core::TurnId::new();
+    let mut first_delta = transcript_event(
+        1,
+        session_id,
+        task_id,
+        RuntimeEventType::ProviderStreamed,
+        json!({"delta": {"kind": "text_delta", "text": "Hello "}}),
+    );
+    first_delta["turn_id"] = json!(turn_id);
+    let mut second_delta = transcript_event(
+        2,
+        session_id,
+        task_id,
+        RuntimeEventType::ProviderStreamed,
+        json!({"delta": {"kind": "text_delta", "text": "world"}}),
+    );
+    second_delta["turn_id"] = json!(turn_id);
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.events = vec![first_delta, second_delta];
+
+    let partial = event_transcript_items(&app.events);
+    assert_eq!(partial.len(), 1);
+    assert_eq!(partial[0].body, vec!["Hello world"]);
+
+    let mut completed = transcript_event(
+        3,
+        session_id,
+        task_id,
+        RuntimeEventType::AssistantMessage,
+        json!({"content": "Hello world."}),
+    );
+    completed["turn_id"] = json!(turn_id);
+    app.events.push(completed);
+    let final_items = event_transcript_items(&app.events);
+
+    assert_eq!(final_items.len(), 1);
+    assert_eq!(final_items[0].body, vec!["Hello world."]);
+}
+
+#[test]
 fn transcript_visible_window_pages_from_bottom_and_round_trips() {
     assert_eq!(transcript_visible_window(50, 10, 0), 40..50);
     assert_eq!(transcript_visible_window(50, 10, 10), 30..40);
@@ -1823,10 +1909,13 @@ fn transcript_visible_window_pages_from_bottom_and_round_trips() {
     assert_eq!(app.transcript_scroll_offset, 10);
     app.scroll_transcript(TranscriptScrollAction::PageDown, 10);
     assert_eq!(app.transcript_scroll_offset, 0);
+    app.history_has_more_before = true;
     app.scroll_transcript(TranscriptScrollAction::Top, 10);
     assert_eq!(app.transcript_scroll_offset, 40);
+    assert!(app.history_load_requested);
     app.scroll_transcript(TranscriptScrollAction::Bottom, 10);
     assert_eq!(app.transcript_scroll_offset, 0);
+    assert!(!app.history_load_requested);
 }
 
 #[tokio::test]

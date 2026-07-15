@@ -235,7 +235,7 @@ MemoryGovernance
 13. WorkspaceCheckpoint 在文件副作用前持久化 before-image、checksum、artifact ref 和 restore metadata，成功落盘后才允许工具修改文件
 14. 任务结束后按需生成 PostTaskReview 和可选 ImprovementCandidate
 15. Projection Layer 按用途生成 User / Runtime Control / Debug / Evaluation 四类投影
-16. 后续治理增强可在第 5、6、9、11、12 步之间接入 GoalLedger、RuntimeGovernor、VerificationTier、EventSamplingPolicy 和 ContextProjectionCache
+16. GoalLedger/RuntimeGovernor 已在 provider/tool/result/completion 边界同步运行；Verification 分级进入客观 check，EventSamplingPolicy/ContextProjectionCache 只在出现真实派生索引或构造瓶颈时启用
 ```
 
 ## 模块划分
@@ -248,18 +248,23 @@ MemoryGovernance
 | `golutra-context` | ContextBuilder、TokenBudgetTracker、TokenBudgetSnapshot、WorkingSummary、context projection |
 | `golutra-memory` | MemoryRetriever、MemoryGovernance、memory promotion/rollback |
 | `golutra-store` | SQLite、event log、artifact store、state snapshot、workspace checkpoint refs |
+| `golutra-sandbox` | macOS Seatbelt、Linux bubblewrap 与 process-only launch plan；统一 workspace/network/env 边界 |
+| `golutra-code-intelligence` | tree-sitter symbol/reference/import graph、ignore-aware 索引和 owner-only snapshot |
 | `golutra-auth` | CredentialRef、owner-only disk/env SecretStore、OAuth PKCE/device/refresh/revoke 和非敏感 credential metadata |
 | `golutra-config` | 全局 provider v2、受审计 provider auth catalog、v1 到 disk SecretRef 原子迁移、verified install/probe/rollback |
 | `golutra-llm` | OpenAI-compatible/Responses/native Provider adapter、CapabilityMatrix、routing、usage normalization、TokenUsageRecord |
 | `golutra-tools` | ToolContract、tool registry、tool execution、ToolResultEnvelope |
-| `golutra-governor` | 后续治理增强：GoalLedger、RuntimeGovernor、GovernanceDecision |
+| `golutra-governor` | GoalLedger、RuntimeGovernor、GoalAlignment、budget/security/policy GovernanceDecision |
 | `golutra-policy` | PermissionPolicy、PolicyEvaluation、workspace isolation |
 | `golutra-verify` | verification runner、PASS/FAIL/PARTIAL、证据记录 |
 | `golutra-eval` | EvaluationCase、EvaluationRun、Scorer、TrajectoryReplay、CounterfactualReplay、CausalComparison、benchmark、regression |
+| `golutra-evolution` | GeneratedTask、novelty/curriculum/frontier、隔离执行和 Skill stage/review/install/rollback |
+| `golutra-plugin` | 用户级插件 package、manifest、checksum 与 stage/review/enable/rollback 生命周期 |
+| `golutra-mcp` | 官方 rmcp stdio adapter、reviewed schema 对照、sandbox launch 和外部工具桥接 |
 | `golutra-tui` | 只展示 runtime projection 的 TUI |
 | `golutra-cli` | 薄 CLI 入口 |
-| `golutra-app-server` | HTTP command/query + SSE 入口；WebSocket 后置 |
-| `golutra-vis` | replay、trace、context、artifact 审计视图 |
+| `golutra-app-server` | 同一 Axum Router 上的 Unix IPC 与 HTTP command/query + SSE 入口 |
+| `golutra-vis` | replay、audit、event 和 OpenTelemetry JSON 投影视图 |
 
 ### 当前实现内部分层
 
@@ -267,7 +272,7 @@ MemoryGovernance
 
 | Crate | 内部模块 | 约束 |
 | --- | --- | --- |
-| `golutra-client` | `transport`、`paths`、`rollout`、`provider_runtime`、`context`、`event_codec` | `RuntimeHost` 负责用例编排；HTTP/SSE、路径权限、rollout 格式、provider plan、上下文文本和事件 wire 转换不得回流到 host 方法 |
+| `golutra-client` | `transport`、`transport::ipc`、`paths`、`rollout`、`provider_runtime`、`context`、`event_codec`、`evolution` | `RuntimeHost` 负责用例编排；IPC/HTTP/SSE、路径权限、rollout 格式、provider plan、上下文文本、事件 wire 和 Evolution 用例不得回流成单个巨型 host 方法 |
 | `golutra-runtime` | `lane`、`checkpoint` | lane 状态机与 checkpoint 文件事务独立于 `AgentLoop`；loop 不直接实现 session controller 转换或快照 IO |
 | `golutra-tui` | `auth_state`、`auth_flow`、`session`、`render` | 主文件只组装应用状态和事件循环；渲染不写 provider 配置，认证 flow 不编排 runtime task |
 | `golutra-config` | `provider_auth`、`provider_storage` | provider catalog 与凭据/配置事务分离；磁盘写入、锁、迁移、probe 和 rollback 统一由 storage 层负责 |
@@ -301,7 +306,13 @@ CLI / TUI（默认）
   -> 当前前端进程内 RuntimeHost
   -> 全局 durable RuntimeStore
 
-CLI / TUI --daemon / TypeScript SDK / Web
+CLI / TUI --daemon（Unix）
+  -> RuntimeTransport / UnixIpcTransport
+  -> owner-only app-server.sock
+  -> 同一个 Axum Router
+  -> 用户级单实例 app-server
+
+Windows 本地 daemon / TypeScript SDK / Python SDK / Web
   -> RuntimeTransport / HttpSseTransport
   -> 用户级单实例 app-server
   -> POST /runtime/attach { cwd }
@@ -314,7 +325,7 @@ CLI / TUI --connect <URL>
   -> 同一 attachment 协议
 ```
 
-cwd 只决定执行目录、工具权限、checkpoint/memory/evaluation/rollout 分区和 thread 过滤，不决定进程生命周期。所有 durable facts 位于 `$GOLUTRA_HOME/state`：全局 `runtime.sqlite`、`artifacts/` 以及 `workspaces/<cwd-hash>/`；项目 `.golutra` 不参与 runtime 持久化。provider selection 位于全局 `provider.json` v2，API key 与 OAuth token set 位于 owner-only `$GOLUTRA_HOME/credentials.json` 或只读进程 env；`provider.json`、runtime event 和 rollout 都不保存 secret。凭据文件使用跨进程锁、大小上限、临时文件 fsync 和原子替换，Unix 权限为目录 `0700`、凭据/锁文件 `0600`。OpenAI/xAI/Copilot 等 OAuth 只通过受审计 catalog 启用并固定绑定对应 request adapter，Custom endpoint 不推断 OAuth；`auth/refresh` 只保存 owner-only 跨进程锁。SQLite 在 event append 事务内分配全局 sequence；rollout 从 SQLite 物化，append 与原子重建共享跨进程锁。全局 session lease 防止多个 Embedded 进程同时控制同一会话，command lease 与 durable ack 提供幂等重试。owner 异常退出后，能够重新取得 lease 的 host 会取消孤儿 active task，并恢复尚未开始的 durable pending turn。用户级 app-server 用 `$GOLUTRA_HOME/app-server/daemon.lock` 保证单实例，并发布 owner-only `app-server.json`；cwd runtime registry 默认最多保留 128 个 attachment，初始化失败会释放槽位。每次 cwd attachment 都从全局 thread index 刷新最近 session/thread，数据库以唯一索引保证一个 session 只绑定一个 thread。未配置 transport auth 前仅允许 loopback，同时校验 Host/Origin；`HttpSseTransport` 始终使用调用方传入的连接 URL 发后续请求，服务端广告地址只作诊断，从而支持 SSH 端口转发和反向代理。
+cwd 只决定执行目录、工具权限、checkpoint/memory/evaluation/evolution/rollout 分区和 thread 过滤，不决定进程生命周期。所有 durable facts 位于 `$GOLUTRA_HOME/state`：全局 `runtime.sqlite`、`artifacts/` 以及 `workspaces/<cwd-hash>/`；项目 `.golutra` 不参与 runtime 持久化。provider selection 位于全局 `provider.json` v2，API key 与 OAuth token set 位于 owner-only `$GOLUTRA_HOME/credentials.json` 或只读进程 env；`provider.json`、runtime event 和 rollout 都不保存 secret。凭据文件使用跨进程锁、大小上限、临时文件 fsync 和原子替换，Unix 权限为目录 `0700`、凭据/锁文件 `0600`。OpenAI/xAI/Copilot 等 OAuth 只通过受审计 catalog 启用并固定绑定对应 request adapter，Custom endpoint 不推断 OAuth；`auth/refresh` 只保存 owner-only 跨进程锁。SQLite 在 event append 事务内分配全局 sequence；rollout 从 SQLite 物化，append 与原子重建共享跨进程锁。全局 session lease 防止多个 Embedded 进程同时控制同一会话，command lease 与 durable ack 提供幂等重试。owner 异常退出后，能够重新取得 lease 的 host 会取消孤儿 active task，并恢复尚未开始的 durable pending turn。用户级 app-server 用 `$GOLUTRA_HOME/app-server/daemon.lock` 保证单实例，并发布 owner-only `app-server.json` 与 Unix `app-server.sock`；cwd runtime registry 默认最多保留 128 个 attachment，初始化失败会释放槽位。IPC request 直接进入同一个 Router，HTTP/SSE 与 IPC 都执行 bearer/protocol version/attachment 校验。每次 cwd attachment 都从全局 thread index 刷新最近 session/thread，数据库以唯一索引保证一个 session 只绑定一个 thread。HTTP 未配置 transport auth 前仅允许 loopback，同时校验 Host/Origin；`HttpSseTransport` 始终使用调用方传入的连接 URL 发后续请求，服务端广告地址只作诊断，从而支持 SSH 端口转发和反向代理。
 
 ```text
 $GOLUTRA_HOME/
@@ -326,6 +337,7 @@ $GOLUTRA_HOME/
   state/
     runtime.sqlite
     artifacts/
+    mcp-scratch/
     session-locks/
     command-locks/
     workspaces/<cwd-sha256>/
@@ -333,9 +345,17 @@ $GOLUTRA_HOME/
       rollouts/<thread-id>.jsonl
       memory.json
       evaluation.json
+      evolution.json
+      skills/
+      evolution-runs/
+      code-index.json
+  plugins/
+    registry.json
+    packages/<plugin-id>/<revision-id>/
   app-server/
     daemon.lock
     app-server.json
+    app-server.sock
 ```
 
 入口选择是显式的：
@@ -346,14 +366,15 @@ golutra-tui --cwd <path>                 # 默认 Embedded
 golutra app-server                       # 启动用户级 daemon
 golutra --cwd <path> --daemon status     # 连接本地 daemon
 golutra --cwd <path> --connect <url> ... # 连接指定 endpoint
-new GolutraClient(baseUrl, cwd)          # SDK 自动创建/复用 attachment
+new GolutraClient(baseUrl, cwd)          # TypeScript SDK
+GolutraClient(base_url, cwd)             # Python SDK
 ```
 
 各层职责：
 
 - `RuntimeCore`：唯一执行核心，负责 loop、provider、tool、policy、verification。
 - `RuntimeHost`：承载 `RuntimeCore`，管理 session 生命周期，对外暴露本地或远程访问方式。
-- `Transport Adapter`：把统一协议映射到进程内调用、HTTP + SSE、WebSocket 或 IPC。
+- `Transport Adapter`：把统一协议映射到进程内调用、Unix IPC 或 HTTP + SSE。
 - `RuntimeClient`：前端统一客户端接口，屏蔽不同 transport。
 - `Projection`：把同一批 runtime facts 渲染成 User / Debug / Evaluation 等不同视图。
 
@@ -490,4 +511,5 @@ Evaluation / Improvement 模式使用 `Evaluation / Improvement Projection`：
 - `agent-improvement-loop.md`：失败轨迹如何变成可验证、可回滚的 agent 改进。
 - `implementation-blueprint.md`：第一阶段实现蓝图、最小 schema 和同步/后台边界。
 - `agent-open-endedness-design.md`：开放式能力和 Promotion Gate。
+- `extensions-sdk-delivery.md`：Plugin/MCP、IPC、TypeScript/Python SDK、安装与交付门禁。
 - `framework-comparison.md`：六个外部 agent 项目的架构影响。

@@ -1,9 +1,10 @@
 use golutra_core::{
-    ArtifactId, ArtifactRecord, BusyPolicyDecision, EventId, EvidenceRecord, SessionId, TaskId,
-    ThreadId, Timestamp, ToolResultEnvelope, TurnId,
+    ArtifactId, ArtifactRecord, BusyPolicyDecision, CommandId, EventId, EvidenceRecord, SessionId,
+    TaskId, ThreadId, Timestamp, ToolResultEnvelope, TurnId,
 };
 use golutra_protocol::{
-    CommandAck, DebugProjection, RuntimeEvent, RuntimeEventType, StateProjection, UserProjection,
+    CommandAck, DebugEventWindow, DebugProjection, RuntimeEvent, RuntimeEventType, StateProjection,
+    StorageStats, UserProjection,
 };
 use sha2::{Digest, Sha256};
 use sqlx::{
@@ -22,6 +23,12 @@ use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 
 mod projection;
+
+const DEBUG_PROJECTION_EVENT_LIMIT: u32 = 512;
+const DEBUG_ARTIFACT_RETENTION_DAYS: i64 = 30;
+const CHECKPOINT_ARTIFACT_RETENTION_DAYS: i64 = 30;
+const EPHEMERAL_ARTIFACT_RETENTION_DAYS: i64 = 1;
+const TEMPORARY_ARTIFACT_RETENTION_HOURS: u64 = 1;
 
 pub(crate) use projection::{
     apply_event_to_state, initial_projection, loop_decision_from_event, verification_from_event,
@@ -63,6 +70,20 @@ pub struct ThreadRecord {
     pub updated_at: Timestamp,
     pub recency_at: Timestamp,
     pub archived: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CommandClaim {
+    Claimed { receipt_event: Option<RuntimeEvent> },
+    Existing(CommandAck),
+    Conflict { existing_command_id: String },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ArtifactMaintenanceReport {
+    pub artifact_blobs_removed: u64,
+    pub protected_artifacts_skipped: u64,
+    pub temporary_artifacts_removed: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +143,80 @@ impl RuntimeStore {
             sqlx::query(statement).execute(&self.pool).await?;
         }
         self.ensure_thread_columns().await?;
+        self.ensure_command_columns().await?;
+        self.ensure_artifact_columns().await?;
+        Ok(())
+    }
+
+    async fn ensure_artifact_columns(&self) -> StoreResult<()> {
+        let rows = sqlx::query("PRAGMA table_info(artifact_records)")
+            .fetch_all(&self.pool)
+            .await?;
+        let existing = rows
+            .into_iter()
+            .map(|row| row.try_get::<String, _>("name"))
+            .collect::<Result<HashSet<_>, _>>()?;
+        for (name, declaration) in [
+            ("created_at", "TEXT"),
+            ("retention_policy", "TEXT"),
+            ("size_bytes", "INTEGER"),
+            ("expires_at", "TEXT"),
+            ("blob_deleted_at", "TEXT"),
+        ] {
+            if !existing.contains(name) {
+                sqlx::query(&format!(
+                    "ALTER TABLE artifact_records ADD COLUMN {name} {declaration}"
+                ))
+                .execute(&self.pool)
+                .await?;
+            }
+        }
+        let rows = sqlx::query(
+            "SELECT artifact_id, artifact_json FROM artifact_records
+             WHERE created_at IS NULL OR retention_policy IS NULL OR size_bytes IS NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for row in rows {
+            let artifact_id: String = row.try_get("artifact_id")?;
+            let artifact_json: String = row.try_get("artifact_json")?;
+            let artifact: ArtifactRecord = serde_json::from_str(&artifact_json)?;
+            sqlx::query(
+                "UPDATE artifact_records
+                 SET created_at = ?, retention_policy = ?, size_bytes = ?, expires_at = ?
+                 WHERE artifact_id = ?",
+            )
+            .bind(artifact.created_at.to_rfc3339())
+            .bind(&artifact.retention_policy)
+            .bind(i64::try_from(artifact.size_bytes).unwrap_or(i64::MAX))
+            .bind(artifact_expiration(&artifact).map(|value| value.to_rfc3339()))
+            .bind(artifact_id)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_command_columns(&self) -> StoreResult<()> {
+        let rows = sqlx::query("PRAGMA table_info(command_acks)")
+            .fetch_all(&self.pool)
+            .await?;
+        let existing = rows
+            .into_iter()
+            .map(|row| row.try_get::<String, _>("name"))
+            .collect::<Result<HashSet<_>, _>>()?;
+        for (name, declaration) in [
+            ("status", "TEXT NOT NULL DEFAULT 'completed'"),
+            ("updated_at", "TEXT"),
+        ] {
+            if !existing.contains(name) {
+                sqlx::query(&format!(
+                    "ALTER TABLE command_acks ADD COLUMN {name} {declaration}"
+                ))
+                .execute(&self.pool)
+                .await?;
+            }
+        }
         Ok(())
     }
 
@@ -162,28 +257,112 @@ impl RuntimeStore {
         .transpose()
     }
 
-    pub async fn store_command_ack(
+    pub async fn claim_command(
         &self,
         idempotency_key: &str,
-        ack: &CommandAck,
-    ) -> StoreResult<()> {
-        sqlx::query(
+        command_id: CommandId,
+        provisional_ack: &CommandAck,
+        mut receipt_event: RuntimeEvent,
+    ) -> StoreResult<CommandClaim> {
+        let mut transaction = self.pool.begin().await?;
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        let insert = sqlx::query(
             r#"
-            INSERT INTO command_acks (idempotency_key, command_id, ack_json, created_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(idempotency_key) DO UPDATE SET
-                command_id = excluded.command_id,
-                ack_json = excluded.ack_json,
-                created_at = excluded.created_at
+            INSERT OR IGNORE INTO command_acks (
+                idempotency_key, command_id, ack_json, status, created_at, updated_at
+            )
+            VALUES (?, ?, ?, 'processing', ?, ?)
             "#,
         )
         .bind(idempotency_key)
-        .bind(ack.command_id.to_string())
-        .bind(serde_json::to_string(ack)?)
-        .bind(chrono::Utc::now().to_rfc3339())
-        .execute(&self.pool)
+        .bind(command_id.to_string())
+        .bind(serde_json::to_string(provisional_ack)?)
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .execute(&mut *transaction)
         .await?;
-        Ok(())
+        if insert.rows_affected() == 0 {
+            let row = sqlx::query(
+                "SELECT command_id, ack_json, status FROM command_acks WHERE idempotency_key = ?",
+            )
+            .bind(idempotency_key)
+            .fetch_one(&mut *transaction)
+            .await?;
+            let existing_command_id: String = row.try_get("command_id")?;
+            if existing_command_id != command_id.to_string() {
+                transaction.commit().await?;
+                return Ok(CommandClaim::Conflict {
+                    existing_command_id,
+                });
+            }
+            let ack_json: String = row.try_get("ack_json")?;
+            let ack = serde_json::from_str(&ack_json)?;
+            let status: String = row.try_get("status")?;
+            transaction.commit().await?;
+            return if status == "processing" {
+                Ok(CommandClaim::Claimed {
+                    receipt_event: None,
+                })
+            } else {
+                Ok(CommandClaim::Existing(ack))
+            };
+        }
+
+        receipt_event.sequence_no = next_sequence_in_transaction(&mut transaction).await?;
+        append_event_in_transaction(&mut transaction, &receipt_event).await?;
+        transaction.commit().await?;
+        Ok(CommandClaim::Claimed {
+            receipt_event: Some(receipt_event),
+        })
+    }
+
+    pub async fn complete_command(
+        &self,
+        idempotency_key: &str,
+        command_id: CommandId,
+        ack: &CommandAck,
+        mut completion_event: RuntimeEvent,
+    ) -> StoreResult<RuntimeEvent> {
+        let mut transaction = self.pool.begin().await?;
+        let update = sqlx::query(
+            r#"
+            UPDATE command_acks
+            SET ack_json = ?, status = ?, updated_at = ?
+            WHERE idempotency_key = ? AND command_id = ?
+            "#,
+        )
+        .bind(serde_json::to_string(ack)?)
+        .bind(if ack.accepted {
+            "completed"
+        } else {
+            "rejected"
+        })
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(idempotency_key)
+        .bind(command_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        if update.rows_affected() == 0 {
+            let existing =
+                sqlx::query("SELECT command_id FROM command_acks WHERE idempotency_key = ?")
+                    .bind(idempotency_key)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+            let detail = match existing {
+                None => format!("command journal entry not found for `{idempotency_key}`"),
+                Some(row) => {
+                    let existing_command_id: String = row.try_get("command_id")?;
+                    format!(
+                        "idempotency key belongs to command {existing_command_id}, not {command_id}"
+                    )
+                }
+            };
+            return Err(StoreError::InvalidId(detail));
+        }
+        completion_event.sequence_no = next_sequence_in_transaction(&mut transaction).await?;
+        append_event_in_transaction(&mut transaction, &completion_event).await?;
+        transaction.commit().await?;
+        Ok(completion_event)
     }
 
     pub async fn append_event(&self, event: &RuntimeEvent) -> StoreResult<()> {
@@ -311,6 +490,50 @@ impl RuntimeStore {
                 Ok(serde_json::from_str(&event_json)?)
             })
             .collect()
+    }
+
+    pub async fn load_events_before(
+        &self,
+        session_id: SessionId,
+        task_id: Option<TaskId>,
+        before_sequence_no: Option<u64>,
+        limit: u32,
+    ) -> StoreResult<Vec<RuntimeEvent>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"
+            SELECT event_json
+            FROM runtime_events
+            WHERE session_id = ?
+              AND (? IS NULL OR task_id = ?)
+              AND sequence_no < ?
+            ORDER BY sequence_no DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(session_id.to_string())
+        .bind(task_id.map(|id| id.to_string()))
+        .bind(task_id.map(|id| id.to_string()))
+        .bind(
+            before_sequence_no
+                .and_then(|value| i64::try_from(value).ok())
+                .unwrap_or(i64::MAX),
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut events = rows
+            .into_iter()
+            .map(|row| {
+                let event_json: String = row.try_get("event_json")?;
+                Ok(serde_json::from_str(&event_json)?)
+            })
+            .collect::<StoreResult<Vec<RuntimeEvent>>>()?;
+        events.reverse();
+        Ok(events)
     }
 
     pub async fn load_event_by_sequence(
@@ -456,7 +679,18 @@ impl RuntimeStore {
         session_id: SessionId,
         task_id: Option<TaskId>,
     ) -> StoreResult<DebugProjection> {
-        let events = self.load_events(session_id, task_id, None).await?;
+        let mut events = self
+            .load_events_before(
+                session_id,
+                task_id,
+                None,
+                DEBUG_PROJECTION_EVENT_LIMIT.saturating_add(1),
+            )
+            .await?;
+        let has_more_before = events.len() > DEBUG_PROJECTION_EVENT_LIMIT as usize;
+        if has_more_before {
+            events.remove(0);
+        }
         let tool_results = events
             .iter()
             .filter(|event| event.event_type == RuntimeEventType::ToolCompleted)
@@ -473,18 +707,11 @@ impl RuntimeStore {
             .filter_map(|result| result.raw_artifact_ref)
             .chain(events.iter().filter_map(|event| event.payload_ref))
             .collect::<HashSet<_>>();
-        let mut artifacts = self.load_artifacts_for_session(session_id).await?;
+        let mut artifacts = Vec::with_capacity(referenced_artifacts.len());
         for artifact_id in &referenced_artifacts {
-            if !artifacts
-                .iter()
-                .any(|artifact| artifact.artifact_id == *artifact_id)
-                && let Some(artifact) = self.load_artifact(*artifact_id).await?
-            {
+            if let Some(artifact) = self.load_artifact(*artifact_id).await? {
                 artifacts.push(artifact);
             }
-        }
-        if task_id.is_some() {
-            artifacts.retain(|artifact| referenced_artifacts.contains(&artifact.artifact_id));
         }
         let artifact_ids = artifacts
             .iter()
@@ -515,6 +742,12 @@ impl RuntimeStore {
         Ok(DebugProjection {
             session_id,
             task_id,
+            event_window: DebugEventWindow {
+                start_cursor: events.first().map(|event| event.sequence_no),
+                end_cursor: events.last().map(|event| event.sequence_no),
+                has_more_before,
+                limit: DEBUG_PROJECTION_EVENT_LIMIT,
+            },
             events,
             busy_policy_decisions,
             tool_results,
@@ -569,12 +802,14 @@ impl RuntimeStore {
                 )));
             }
         }
+        let expires_at = artifact_expiration(artifact).map(|value| value.to_rfc3339());
         let result = sqlx::query(
             r#"
             INSERT OR IGNORE INTO artifact_records (
-                artifact_id, session_id, uri, checksum, artifact_json
+                artifact_id, session_id, uri, checksum, artifact_json,
+                created_at, retention_policy, size_bytes, expires_at, blob_deleted_at
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
             "#,
         )
         .bind(artifact.artifact_id.to_string())
@@ -582,6 +817,10 @@ impl RuntimeStore {
         .bind(&artifact.uri)
         .bind(&artifact.checksum)
         .bind(serde_json::to_string(artifact)?)
+        .bind(artifact.created_at.to_rfc3339())
+        .bind(&artifact.retention_policy)
+        .bind(i64::try_from(artifact.size_bytes).unwrap_or(i64::MAX))
+        .bind(expires_at)
         .execute(&self.pool)
         .await?;
         if result.rows_affected() == 0
@@ -591,6 +830,12 @@ impl RuntimeStore {
                 "artifact {} already has different metadata",
                 artifact.artifact_id
             )));
+        }
+        if result.rows_affected() == 0 {
+            sqlx::query("UPDATE artifact_records SET blob_deleted_at = NULL WHERE artifact_id = ?")
+                .bind(artifact.artifact_id.to_string())
+                .execute(&self.pool)
+                .await?;
         }
         Ok(())
     }
@@ -624,12 +869,180 @@ impl RuntimeStore {
         let Some(artifact) = self.load_artifact(artifact_id).await? else {
             return Ok(None);
         };
+        let blob_deleted_at: Option<String> = sqlx::query_scalar(
+            "SELECT blob_deleted_at FROM artifact_records WHERE artifact_id = ?",
+        )
+        .bind(artifact_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        if blob_deleted_at.is_some() {
+            return Ok(None);
+        }
         let path = self.artifact_blob_path(artifact_id);
         let bytes = tokio::fs::read(&path)
             .await
             .map_err(|error| StoreError::ArtifactIo(format!("{}: {error}", path.display())))?;
         verify_artifact_checksum(&artifact, &bytes)?;
         Ok(Some(bytes))
+    }
+
+    pub async fn storage_stats(&self) -> StoreResult<StorageStats> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*) AS artifact_records,
+                COALESCE(SUM(CASE WHEN blob_deleted_at IS NULL THEN 1 ELSE 0 END), 0)
+                    AS live_artifact_blobs,
+                COALESCE(SUM(CASE WHEN blob_deleted_at IS NOT NULL THEN 1 ELSE 0 END), 0)
+                    AS expired_artifact_blobs,
+                COALESCE(SUM(CASE WHEN blob_deleted_at IS NULL THEN size_bytes ELSE 0 END), 0)
+                    AS live_artifact_bytes
+            FROM artifact_records
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(StorageStats {
+            artifact_records: non_negative_database_count(&row, "artifact_records")?,
+            live_artifact_blobs: non_negative_database_count(&row, "live_artifact_blobs")?,
+            expired_artifact_blobs: non_negative_database_count(&row, "expired_artifact_blobs")?,
+            live_artifact_bytes: non_negative_database_count(&row, "live_artifact_bytes")?,
+            checkpoint_directories: 0,
+            rollout_files: 0,
+        })
+    }
+
+    pub async fn run_artifact_maintenance(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<ArtifactMaintenanceReport> {
+        tokio::fs::create_dir_all(&self.artifact_root)
+            .await
+            .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
+        set_owner_only_dir(&self.artifact_root).await?;
+        let protected = self.protected_artifact_ids().await?;
+        let active_sessions = self.active_session_ids().await?;
+        let rows = sqlx::query(
+            "SELECT artifact_id, session_id, artifact_json, expires_at
+             FROM artifact_records WHERE blob_deleted_at IS NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut report = ArtifactMaintenanceReport::default();
+        for row in rows {
+            let artifact_id_text: String = row.try_get("artifact_id")?;
+            let artifact_id = artifact_id_text
+                .parse::<uuid::Uuid>()
+                .map(ArtifactId)
+                .map_err(|_| StoreError::InvalidId(artifact_id_text.clone()))?;
+            let session_id: String = row.try_get("session_id")?;
+            let artifact_json: String = row.try_get("artifact_json")?;
+            let artifact: ArtifactRecord = serde_json::from_str(&artifact_json)?;
+            let expires_at = row
+                .try_get::<Option<String>, _>("expires_at")?
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
+                .map(|value| value.with_timezone(&chrono::Utc))
+                .or_else(|| artifact_expiration(&artifact));
+            if expires_at.is_none_or(|expires_at| expires_at > now) {
+                continue;
+            }
+            if protected.contains(&artifact_id) || active_sessions.contains(&session_id) {
+                report.protected_artifacts_skipped =
+                    report.protected_artifacts_skipped.saturating_add(1);
+                continue;
+            }
+            let path = self.artifact_blob_path(artifact_id);
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(StoreError::ArtifactIo(format!(
+                        "{}: {error}",
+                        path.display()
+                    )));
+                }
+            }
+            sqlx::query("UPDATE artifact_records SET blob_deleted_at = ? WHERE artifact_id = ?")
+                .bind(now.to_rfc3339())
+                .bind(&artifact_id_text)
+                .execute(&self.pool)
+                .await?;
+            report.artifact_blobs_removed = report.artifact_blobs_removed.saturating_add(1);
+        }
+        report.temporary_artifacts_removed = self.prune_temporary_artifacts().await?;
+        sync_artifact_directory(&self.artifact_root).await?;
+        Ok(report)
+    }
+
+    async fn protected_artifact_ids(&self) -> StoreResult<HashSet<ArtifactId>> {
+        let rows = sqlx::query("SELECT evidence_json FROM evidence_records")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut protected = HashSet::new();
+        for row in rows {
+            let evidence_json: String = row.try_get("evidence_json")?;
+            let evidence: EvidenceRecord = serde_json::from_str(&evidence_json)?;
+            protected.extend(evidence.artifact_refs);
+        }
+        Ok(protected)
+    }
+
+    async fn active_session_ids(&self) -> StoreResult<HashSet<String>> {
+        let rows = sqlx::query(
+            "SELECT session_id FROM sessions
+             WHERE status IN (
+                'running', 'waiting_approval', 'waiting_authentication',
+                'pausing', 'paused', 'aborting'
+             )",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| row.try_get::<String, _>("session_id"))
+            .collect::<Result<HashSet<_>, _>>()
+            .map_err(StoreError::Sqlx)
+    }
+
+    async fn prune_temporary_artifacts(&self) -> StoreResult<u64> {
+        let mut removed = 0_u64;
+        let mut entries = match tokio::fs::read_dir(&self.artifact_root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(StoreError::ArtifactIo(error.to_string())),
+        };
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|error| StoreError::ArtifactIo(error.to_string()))?
+        {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !name.contains(".tmp-") {
+                continue;
+            }
+            let metadata = entry
+                .metadata()
+                .await
+                .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
+            let old_enough = metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| {
+                    age >= Duration::from_secs(
+                        TEMPORARY_ARTIFACT_RETENTION_HOURS.saturating_mul(60 * 60),
+                    )
+                });
+            if metadata.is_file() && old_enough {
+                tokio::fs::remove_file(entry.path())
+                    .await
+                    .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
+                removed = removed.saturating_add(1);
+            }
+        }
+        Ok(removed)
     }
 
     fn artifact_blob_path(&self, artifact_id: ArtifactId) -> PathBuf {
@@ -789,30 +1202,6 @@ impl RuntimeStore {
         .await?;
 
         rows.into_iter().map(thread_from_row).collect()
-    }
-
-    async fn load_artifacts_for_session(
-        &self,
-        session_id: SessionId,
-    ) -> StoreResult<Vec<ArtifactRecord>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT artifact_json
-            FROM artifact_records
-            WHERE session_id = ?
-            ORDER BY artifact_id ASC
-            "#,
-        )
-        .bind(session_id.to_string())
-        .fetch_all(&self.pool)
-        .await?;
-
-        rows.into_iter()
-            .map(|row| {
-                let artifact_json: String = row.try_get("artifact_json")?;
-                Ok(serde_json::from_str(&artifact_json)?)
-            })
-            .collect()
     }
 
     async fn load_evidence_records(
@@ -1132,7 +1521,9 @@ const MIGRATIONS: &[&str] = &[
         idempotency_key TEXT PRIMARY KEY,
         command_id TEXT NOT NULL,
         ack_json TEXT NOT NULL,
-        created_at TEXT NOT NULL
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
     )
     "#,
     r#"
@@ -1188,7 +1579,12 @@ const MIGRATIONS: &[&str] = &[
         session_id TEXT NOT NULL,
         uri TEXT NOT NULL,
         checksum TEXT NOT NULL,
-        artifact_json TEXT NOT NULL
+        artifact_json TEXT NOT NULL,
+        created_at TEXT,
+        retention_policy TEXT,
+        size_bytes INTEGER,
+        expires_at TEXT,
+        blob_deleted_at TEXT
     )
     "#,
     r#"
@@ -1271,6 +1667,25 @@ fn verify_artifact_checksum(artifact: &ArtifactRecord, bytes: &[u8]) -> StoreRes
 fn artifact_checksum(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("sha256:{digest:x}")
+}
+
+fn artifact_expiration(artifact: &ArtifactRecord) -> Option<chrono::DateTime<chrono::Utc>> {
+    let retention_days = match artifact.retention_policy.as_str() {
+        "debug_default" => DEBUG_ARTIFACT_RETENTION_DAYS,
+        "restore_only_owner_access" => CHECKPOINT_ARTIFACT_RETENTION_DAYS,
+        "ephemeral" => EPHEMERAL_ARTIFACT_RETENTION_DAYS,
+        _ => return None,
+    };
+    artifact
+        .created_at
+        .checked_add_signed(chrono::Duration::days(retention_days))
+}
+
+fn non_negative_database_count(row: &sqlx::sqlite::SqliteRow, column: &str) -> StoreResult<u64> {
+    let value: i64 = row.try_get(column)?;
+    u64::try_from(value).map_err(|_| {
+        StoreError::InvalidId(format!("database aggregate `{column}` cannot be negative"))
+    })
 }
 
 #[cfg(unix)]

@@ -9,7 +9,7 @@
 
 ## 当前实现状态
 
-截至 2026-07-10，runtime 已具备 durable evaluation 最小闭环：
+截至 2026-07-15，runtime 已具备 durable evaluation 与可观察性闭环：
 
 - 每个 terminal task 生成 `PostTaskReview`、`EvaluationCase`、`TrajectoryReplay`、`EvaluationRun` 和 `EvaluationResult`，并按 canonical cwd hash 持久化到 `$GOLUTRA_HOME/state/workspaces/<cwd-hash>/evaluation.json`；独立 runtime 进程通过文件锁串行更新并在写前刷新磁盘状态，同步文件 I/O 在 blocking pool 执行，Unix 文件权限为 `0600`。
 - pass/partial/fail、latency、evidence refs、residual risks 和 failure taxonomy 来自 runtime facts 与 verification，不从聊天文本反推。
@@ -17,9 +17,13 @@
 - `run_regression` 生成 durable `RegressionResult`；没有 clean regression 的候选不能进入 promotion decision。
 - `PromotionGate` 只允许低风险 benchmark 由 system reviewer 自动 approve/apply；GeneratedTask、Skill 及中高风险候选保持 proposed 或 needs-human-review。
 - apply 会记录 applied version 与 rollback ref；rollback 保留原始 candidate、decision、regression 和 applied record，形成可审计状态转换。
-- CLI、HTTP transport 和 TypeScript SDK 已提供 results、improvements、candidates、regress、apply、rollback 查询/命令；daemon 重启后这些状态可恢复。
+- CLI、IPC/HTTP transport、TypeScript SDK 和 Python SDK 已提供 results、improvements、candidates、regress、apply、rollback 查询/命令；daemon 重启后这些状态可恢复。
+- deep evaluation 在 task 终态后由 supervisor 后台执行，不阻塞普通用户返回；event writer 会在导出边界生成不可变 rollout snapshot，迟到的 evaluation event 不会污染 turn fork cutoff。
+- `EvaluationStore::compare_counterfactual` 已支持 baseline/variant、changed layer、controlled variables、quality/cost/latency/security delta 和 scaffold inflation 判定；它比较 durable run facts，不伪装成重新执行 provider 的 live replay。
+- `golutra-vis` 可从 RuntimeEvent/DebugProjection 导出 Audit、Events 和 OpenTelemetry JSON span；属性包含 session/task/turn、provider/model/tool、token/cost/latency 等有界脱敏字段，不创建第二份观测事实库。
+- TUI 只有显式 `--debug` 或 `/debug` 才查询开发者投影；普通启动不读取、不渲染治理噪声。
 
-当前 evaluation runner 使用 durable replay facts，不会重新执行 provider，也不等价于完整 counterfactual benchmark。外部 scorer、LLM judge、CI dataset 和长期版本监控仍是后续工作。
+当前 evaluation runner 使用 durable replay facts；隔离 GeneratedTask 由 `golutra-evolution` 通过独立 RuntimeHost 执行。外部 SaaS scorer、LLM judge、组织级 CI dataset 和长期线上版本监控不是当前本地 runtime 的完成条件。
 
 ## 核心原则
 
@@ -48,7 +52,7 @@ Evaluation / Improvement Projection
 
 ## 前沿观点的客观采纳
 
-近一年 Agent 研究和工程实践对 Golutra 最有价值的提醒，不是“让模型更会规划”，而是“让运行时更可控”。这些方向对后续大版本有价值，但不应全部塞进第一阶段同步链路。
+近一年 Agent 研究和工程实践对 Golutra 最有价值的提醒，不是“让模型更会规划”，而是“让运行时更可控”。这些方向已经按成本分层进入当前实现，但不能全部塞进同步模型调用链路。
 
 | 方向 | 对 Golutra 的价值 | 采纳方式 | 局限 |
 | --- | --- | --- | --- |
@@ -58,7 +62,7 @@ Evaluation / Improvement Projection
 | Event Sampling | 避免完整观测导致存储、索引、评估成本爆炸 | 加入 `EventSamplingPolicy` | raw event 仍需轻量保存，否则恢复和 replay 会断链 |
 | Context Projection Cache | 降低 token，并减少长上下文造成的漂移 | 加入 `ContextProjectionCache` | cache 失效规则必须严格，否则会引用过期状态 |
 
-这些补充有借鉴意义，但不能直接照搬成“每一步都评估、每个事件都索引、每个任务都深度审计”。第一阶段只保留基础 event、LoopDecision、VerificationRecord、DebugProjection 和 PostTaskReview；后续在真实失败数据足够后再逐步加入。Golutra 的设计原则是：
+这些补充有借鉴意义，但不能直接照搬成“每一步都评估、每个事件都索引、每个任务都深度审计”。当前同步主链保留基础 event、LoopDecision、VerificationRecord、Goal/Governor decision 和 minimal PostTaskReview；deep evaluation、candidate/evolution 在终态后后台或显式运行。Golutra 的设计原则是：
 
 ```text
 运行时自用判断必须轻量同步；
@@ -392,7 +396,7 @@ MetaEvaluation
 
 ## Planning Drift 观测链路
 
-Planning Drift 的核心问题是：任务在执行过程中看起来每一步都合理，但整体逐渐偏离原始目标。这是后续治理增强要重点解决的问题，不是第一阶段的强制同步能力。
+Planning Drift 的核心问题是：任务在执行过程中看起来每一步都合理，但整体逐渐偏离原始目标。当前 `RuntimeGovernor` 已在 provider、tool、tool result 和 completion 边界执行确定性的 goal alignment、budget、policy 与 security check；它提供可审计的最小防线，不声称替代语义级 planner 或额外 judge。
 
 Golutra 用三层数据控制它：
 
@@ -504,7 +508,7 @@ residual_risks
 
 ### Verification Tier
 
-为控制成本，后续应把验证做成分级：
+为控制成本，验证按以下目标层级理解：
 
 | Tier | 适用动作 | 同步成本 | 处理方式 |
 | --- | --- | --- | --- |
@@ -513,7 +517,7 @@ residual_risks
 | Tier2 | 代码修改、配置修改、网络请求、策略边界动作 | 中 | diff、测试、lint、artifact、policy/evidence |
 | Tier3 | 删除、覆盖、权限升级、生产环境、改进晋升 | 高 | 强验证 + approval gate，必要时人工确认 |
 
-这样做解决的是 Cost Explosion：不是所有步骤都值得完整验证，但高风险动作必须强验证。第一阶段可以先用任务类型基础验证，等验证成本成为明确问题后再引入完整 `VerificationTier`。
+当前 runtime 已用结构化 `VerificationCheckKind` 区分 assistant response、tool execution、workspace change 和 objective validation，并用任务/文件类型决定是否要求代码验证；`VerificationTier` 数据模型保留可配置分级。这样解决 Cost Explosion：普通对话不强制工具 evidence，workspace/code change 必须有 diff 和目标验证，高风险工具继续经过 policy/approval。面向组织的自定义 tier policy 属于配置扩展，不是终态正确性缺口。
 
 ## PostTaskReview
 
@@ -675,7 +679,9 @@ UI 只展示 runtime projection，不维护自己的任务真相。
 
 ## Event Sampling
 
-完整保存和完整分析是两回事。第一阶段先轻量保存 runtime event，保证恢复、debug 和基本 replay。后续当 debug/audit/eval 数据变多后，Golutra 应采用三层事件策略：
+完整保存和完整分析是两回事。当前 canonical RuntimeEvent 轻量完整保存，deep evaluation 只在 terminal task 后后台运行，普通 TUI 不查询 DebugProjection。`EventSamplingPolicy` 保留为将来出现独立高成本索引时的配置模型；当前没有派生 event index，因此不会为了“实现采样”而丢弃 canonical facts。
+
+若未来增加派生索引，必须采用三层事件策略：
 
 ```text
 Raw Event
@@ -701,7 +707,9 @@ Evaluation Event
 
 ## Context Projection Cache
 
-长上下文会增加成本，也会提高目标漂移风险。第一阶段先做 `WorkingSummary` 和基础 `ContextProjection`；后续当 context 构造成为明确瓶颈时，再引入 `ContextProjectionCache`：
+长上下文会增加成本，也会提高目标漂移风险。当前已使用 `WorkingSummary`、durable compaction、bounded contributor 和基础 `ContextProjection`；`ContextProjectionCacheEntry` 只保留 schema。ContextBuilder 还不是性能瓶颈，启用 cache 会增加 stale context 风险，因此当前设计明确不缓存 prompt projection。
+
+只有在 profiling 证明 context 构造成为瓶颈后，才可按以下链路引入 cache：
 
 ```text
 RuntimeEvent
@@ -805,7 +813,7 @@ provider fallback failure
 
 ## OpenTelemetry 映射
 
-内部事件可以映射到 OTel span：
+内部事件已经由 `golutra-vis` 映射到 OTel-compatible span JSON：
 
 ```text
 planning

@@ -6,6 +6,16 @@
 
 主架构见 `evaluation-observability.md` 和 `agent-improvement-loop.md`。
 
+## 当前实现状态
+
+截至 2026-07-15：
+
+- `BenchmarkRun`、release/shadow/regression/adversarial/counterfactual suite kind、metadata check、leakage/judge check、cost/security/utility 与 artifact delivery 状态已经进入 durable evaluation model。
+- `benchmark_run_has_required_metadata` 会拒绝缺 dataset/harness/scaffold/provider/model/budget/attempt/runtime/token/cost/security/utility/check 的 run；结论不能只有 score。
+- `compare_counterfactual` 比较 baseline/variant 的 changed layer、controlled variables、quality/cost/latency/security delta，并识别 scaffold inflation；inconclusive 是合法结果。
+- candidate 必须先有 durable regression；低风险 benchmark 可由 system reviewer apply/rollback，中高风险或 Skill 必须 human review。apply 只更新受治理数据集/skill 状态，不执行任意代码或自动部署 runtime。
+- GeneratedTask 只在 fixture-only、no-external-side-effects 的隔离 RuntimeHost 中执行；公开 benchmark 答案不会被写入 memory 或普通 task context。
+
 ## 核心原则
 
 ```text

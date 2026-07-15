@@ -22,14 +22,14 @@
 | --- | --- | --- |
 | Runtime Core | Rust | 主语言，承载 query loop、state、tool pipeline、permission、store、verification |
 | CLI / TUI | Rust | 与 runtime 同进程或低成本调用，减少入口层复杂度 |
-| App Server | Rust | 用统一 runtime 对外暴露 HTTP/WebSocket/SSE |
-| SDK / Web UI | TypeScript | 适合前端、插件开发体验和对外类型分发 |
-| Python | 可选 | 只做 SDK、实验脚本、第三方生态适配，不做核心 runtime |
+| App Server | Rust | 用统一 runtime 对外暴露 Unix IPC 与 HTTP/SSE |
+| TypeScript SDK / Web UI | TypeScript | 适合前端、插件开发体验和对外类型分发 |
+| Python SDK | Python 3.11+ | schema 生成的兼容 SDK、实验脚本和第三方生态适配，不做核心 runtime |
 
 首推路线：
 
 ```text
-Rust core + Rust CLI/TUI/App Server + TypeScript SDK/Web
+Rust core + Rust CLI/TUI/App Server + TypeScript/Python SDK + Web attach
 ```
 
 完整推荐组合：
@@ -100,12 +100,17 @@ golutra-protocol-fixtures
 golutra-context
 golutra-tools
 golutra-policy
+golutra-sandbox
 golutra-store
 golutra-memory
+golutra-file-search
+golutra-code-intelligence
 golutra-llm
 golutra-verify
 golutra-eval
-golutra-otel
+golutra-evolution
+golutra-plugin
+golutra-mcp
 golutra-test-client
 golutra-cli
 golutra-tui
@@ -127,20 +132,25 @@ sdk/python
 | `golutra-context` | ContextBuilder、TokenBudgetTracker、WorkingSummary、CompactManager、history 分层、context projection |
 | `golutra-tools` | ToolSchema、ToolAccesses、tool registry、schema validation、tool execution、ToolResultEnvelope |
 | `golutra-policy` | PermissionPolicy、`allow/ask/deny`、workspace isolation、路径/网络/命令策略 |
+| `golutra-sandbox` | macOS Seatbelt、Linux bubblewrap、process-only fallback 与受控 launch environment |
 | `golutra-store` | SQLite state、durable event log、artifact store、workspace checkpoint ref、migration |
 | `golutra-memory` | MemoryRetriever、MemoryGovernance、项目索引、代码片段召回、memory promotion/rollback |
+| `golutra-file-search` | ignore-aware 文件枚举、rg 搜索和 SQLite metadata |
+| `golutra-code-intelligence` | tree-sitter symbol/reference/import graph 与 owner-only code index |
 | `golutra-llm` | ProviderConfig、ModelCatalog、CapabilityMatrix、ModelRouteDecision、adapter、usage 解析 |
 | `golutra-verify` | verification runner、PASS/FAIL/PARTIAL、证据记录 |
 | `golutra-eval` | eval_runner、trajectory_recorder、post_task_reviewer、vcr/golden fixture |
-| `golutra-otel` | tracing、metrics、event export/import |
+| `golutra-evolution` | GeneratedTask curriculum/frontier、隔离执行和 Skill 生命周期 |
+| `golutra-plugin` | reviewed plugin package、checksum、enable/disable/rollback |
+| `golutra-mcp` | 官方 rmcp stdio client、schema 对照、sandbox 与 ToolRegistry bridge |
 | `golutra-test-client` | app-server 协议 smoke、transport 对拍、fixture replay、SDK 集成验证 |
 | `golutra-client` | `RuntimeClient`、`RuntimeQuery`、event subscription、transport abstraction |
 | `golutra-cli` | 薄 CLI 入口 |
 | `golutra-tui` | TUI 入口，只展示 runtime projection，支持 normal/debug panel |
-| `golutra-vis` | 离线 replay、wire/event/context/blob 检查和审计视图 |
-| `golutra-app-server` | HTTP/WebSocket/SSE 入口 |
+| `golutra-vis` | replay、audit、event 和 OpenTelemetry JSON 投影 |
+| `golutra-app-server` | Unix IPC 与 HTTP/SSE 入口，共用同一个 Axum Router |
 | `sdk/typescript` | Web/插件/外部集成 SDK |
-| `sdk/python` | 可选兼容 SDK，不承载核心逻辑 |
+| `sdk/python` | schema 生成的 Python SDK，不承载核心逻辑 |
 
 ### 收敛边界
 
@@ -190,15 +200,14 @@ trait RuntimeClient {
 推荐 transport 分层：
 
 - `EmbeddedTransport`：TUI / CLI 默认入口。和 `RuntimeHost / RuntimeCore` 同进程，但连接 `$GOLUTRA_HOME/state/runtime.sqlite`，不是临时 store。
-- `HttpSseTransport`：Web / SDK / 显式 daemon/remote 模式入口。先用 `/runtime/attach` 绑定 canonical cwd，HTTP 发 command/query，SSE 接 event stream。
-- `WebSocketTransport`：后续用于高频双向同步或远程协作，不作为第一阶段必做。
-- `IpcTransport`：后续用于 IDE companion、本地桌面端或侧车进程。
+- `UnixIpcTransport`：Unix 本地 `--daemon` 默认入口，通过 owner-only socket 发送受限 HTTP-like frame，直接复用 app-server Router；不会形成第二套业务 API。
+- `HttpSseTransport`：Windows 本地 daemon、Web、TypeScript/Python SDK 和显式 remote 模式入口。先用 `/runtime/attach` 绑定 canonical cwd，HTTP 发 command/query，SSE 接 event stream。
 
 关键判断：
 
 - transport 可以不同，但 `SessionCommand`、`RuntimeQuery`、`RuntimeEvent` 语义必须完全一致。
 - 一个 task 在 SDK 中运行时，TUI / Web attach 后应通过同一 client 语义查询到相同状态，并订阅到同一条流式输出。
-- daemon 只是用户级 `cwd -> RuntimeHost` registry + `HttpSseTransport`，不是新的任务接口体系，也不是每个 workspace 一个进程。
+- daemon 只是用户级 `cwd -> RuntimeHost` registry + IPC/HTTP transport，Unix IPC 与 HTTP/SSE 共用认证、协议版本、attachment 和 cursor 语义；它不是新的任务接口体系，也不是每个 workspace 一个进程。
 - `EmbeddedTransport` 不能退化成 `sqlite::memory:`；它必须持有完整 `RuntimeHost` 并连接全局 durable store。不同 Embedded 进程共享历史，但 live task handle 只属于持有 session lease 的进程。
 - `subscribe` 的目标形态是 `cursor replay + live stream`。一次性返回历史事件只适合 smoke，不足以支撑 TUI、Web 或 SDK 观察运行中任务。
 - TUI 的复杂度应限制在输入、布局、渲染和 debug panel；任务排队、运行中输入、abort、approval、provider/tool loop 都归 `RuntimeHost`。
@@ -246,7 +255,7 @@ ReplayPanel
 | 能力 | 推荐库 | 用法 |
 | --- | --- | --- |
 | 异步 runtime | `tokio` | LLM streaming、tool task、background task、HTTP server |
-| Web/App Server | `axum` | 本地 API、SSE/WebSocket、桌面或 Web 前端入口 |
+| Web/App Server | `axum` | Unix IPC 复用 Router、本地/远端 HTTP API 与 SSE event stream |
 | Middleware 抽象 | `tower` | permission、hooks、telemetry、retry、rate limit |
 
 `tower` 的 service/middleware 思路很适合 tool pipeline：
@@ -353,7 +362,7 @@ Step 6/6 Review
 - 所有 live profile 都必须在保存前通过实际 adapter probe；认证、endpoint 或模型错误不能显示为连接成功。
 - Review 阶段必须展示 protocol、base URL、model、API key 掩码、scope 和 config path。
 - provider 配置校验必须按 protocol 检查必填字段，不能只校验 OpenAI-compatible。
-- adapter 仍要通过 Golutra 的 `ProviderContract` 归一化 request、usage、tool call、finish reason 和 error；streaming 后续接入时不能改变该边界。
+- adapter 仍要通过 Golutra 的 `ProviderContract` 归一化 request、stream event、usage、tool call、finish reason 和 error；OpenAI-compatible streaming 已按该边界进入 runtime，其他协议即使由 genai capture 也不能泄漏 native type。
 
 完整 ProviderContract 至少要记录：
 
@@ -431,22 +440,24 @@ Memory 优先使用可解释、可回放的检索链路：
 | 能力 | 推荐库 / 方案 | 建议 |
 | --- | --- | --- |
 | 权限决策 | 自研 policy engine | `allow/ask/deny` 必须可解释 |
-| 路径隔离 | `camino` + canonicalize + policy matcher | 防路径穿越、symlink 逃逸 |
+| 路径隔离 | `PathBuf` + canonicalize + policy matcher | 防路径穿越、symlink 逃逸 |
 | 进程执行 | `tokio::process` | 统一封装 stdout/stderr/exit code |
-| 插件 sandbox | `wasmtime` | 用于高风险插件隔离和可分发插件运行时 |
-| MCP | 官方 Rust SDK `rmcp` | 放在 adapter 层，不进入 core |
+| OS sandbox | `golutra-sandbox` | macOS Seatbelt、Linux bubblewrap；未检测到 OS sandbox 时外部插件拒绝执行 |
+| MCP | 官方 Rust SDK `rmcp 2.2.0` | 一次性 stdio client 放在 adapter 层，不进入 core |
 
 平台边界建议明确：
 
-- Linux / macOS / Windows 的 sandbox 与 exec policy 允许分别实现，不强求第一阶段抽成一个完全对称的实现。
-- 第一阶段优先保证主平台路径稳定，跨平台差异通过 `golutra-policy` / `golutra-sandbox-*` 分层吸收。
+- macOS 已使用 Seatbelt，Linux 在存在 bubblewrap 时使用 mount/network namespace；两者都以 workspace access、scratch 和 allow_network 生成 launch plan。
+- Windows 当前保留 process policy、timeout/cancel 和插件 package 管理，但没有可声明为 OS-enforced 的 MCP sandbox，所以外部插件执行会明确拒绝。
 
 Sandbox 和权限至少要覆盖：
 
-- read-only / shared / temp / worktree workspace 类型
-- destructive 操作识别
-- path allow/deny
-- shell command approval
+- workspace read-only/read-write、独立 scratch 与默认断网
+- destructive 操作识别、结构化 argv 与 shell metacharacter guard
+- canonical path allow/deny、symlink 和内部目录边界
+- shell/MCP command approval、timeout、cancel 和 process-group 回收
+
+Wasm plugin runtime、签名分发和 marketplace 是独立产品方向，不作为当前 MCP plugin 主链的未完成兼容层。
 
 ### Trace、Telemetry 与 Verification
 
@@ -454,7 +465,7 @@ Sandbox 和权限至少要覆盖：
 | --- | --- | --- |
 | 结构化日志 | `tracing` | runtime event、tool event、decision event |
 | 日志订阅 | `tracing-subscriber` | CLI/TUI/App Server 不同输出 |
-| 指标导出 | 后续按需接 OpenTelemetry | 第一阶段不作为默认实现 |
+| OpenTelemetry 投影 | `golutra-vis` | 从 durable RuntimeEvent 生成脱敏 trace/span JSON；不引入第二份观测真相 |
 | Snapshot/Golden test | `insta` | message、tool envelope、trace 输出测试 |
 | 临时目录 | `tempfile` | tool/sandbox/store 测试 |
 | Mock HTTP | `wiremock` 或 `httpmock` | LLM provider 测试 |
@@ -510,8 +521,9 @@ tool
 分发层建议：
 
 - 主分发物是 Rust 原生二进制。
-- npm / Python 包如果需要存在，应作为启动器、SDK 或安装壳，不承载 runtime 实现本体。
-- SDK 可以支持“连接已运行 app-server”和“按配置拉起本地 runtime host”两种模式，但协议语义必须一致。
+- TypeScript/Python 包只承载 SDK 和生成类型，不承载 runtime 实现本体。
+- 当前 SDK 连接已运行 app-server；CLI/TUI 负责 Embedded 或 local daemon 生命周期，避免 SDK 私自复制进程管理状态机。
+- Unix 与 PowerShell 安装脚本构建并安装 `golutra`、`golutra-tui`、`golutra-app-server`、`golutra-vis`；CI 在 Linux/macOS/Windows 编译全 workspace/all targets，并在 Linux 执行完整 Rust 与双 SDK 门禁。
 
 ## 完整目标技术栈
 
@@ -527,7 +539,7 @@ reqwest
 sqlx
 tracing / tracing-subscriber
 thiserror / miette
-ignore / globset / camino
+ignore / walkdir
 ratatui / crossterm
 axum
 SQLite
@@ -535,7 +547,8 @@ rg
 tree-sitter
 rmcp
 genai
-TypeScript SDK
+Seatbelt / bubblewrap
+TypeScript / Python SDK
 ```
 
 这些能力都属于目标架构，不是临时插件。实现顺序可以分阶段，但架构文档不应把它们写成可有可无的 MVP 外围能力。
@@ -629,12 +642,12 @@ Extension
 11. 建 `golutra-client`：`RuntimeClient`、`EmbeddedTransport`、`HttpSseTransport`、query / subscribe 语义。
 12. 建 `golutra-cli`：薄 CLI 命令面。
 13. 建 `golutra-tui`：`crossterm + ratatui + Golutra 业务组件`，默认通过 `EmbeddedTransport` 访问 runtime。
-14. 建 `golutra-app-server`：HTTP/WebSocket/SSE 入口，先实现 `HttpSseTransport`，复用同一 runtime facts。
+14. 建 `golutra-app-server`：Unix IPC 与 HTTP/SSE 入口，复用同一 Axum Router 和 runtime facts。
 15. 建 `golutra-test-client`：协议 fixture、transport 对拍、app-server smoke。
-16. 建 `golutra-otel`：先承载 `tracing` 查询和调试出口，OpenTelemetry 导出后续按需补充。
-17. 建 `golutra-vis`：离线 replay、event/wire/context/artifact 检查。
+16. 建 `golutra-vis`：承载 audit、event replay 与 OpenTelemetry JSON 投影，不另建事实库。
+17. 建 `golutra-sandbox`、`golutra-code-intelligence`：固化 OS 执行边界和结构化代码检索。
 18. 建 `golutra-eval`：eval_runner、trajectory_recorder、deep post_task_reviewer、vcr/golden fixture。
-19. 建 memory index、MCP ToolEntry bridge、plugin capability package、TypeScript/Python SDK 和 Web/IDE 集成。
+19. 建 `golutra-evolution`、`golutra-plugin`、`golutra-mcp` 和 TypeScript/Python SDK；Web/IDE 产品入口不在当前范围。
 
 ## 结合 Codex 的实施加权
 
@@ -666,22 +679,23 @@ Extension
 
 ### 第三优先级
 
-1. `golutra-otel`
-2. `golutra-vis`
-3. `golutra-eval`
+1. `golutra-vis`
+2. `golutra-eval`
+3. `golutra-evolution`
 
 原因：
 
 - 这三层决定系统是否真正可调试、可回放、可评估。
 - 没有它们，观测体系很容易停留在字段定义层。
 
-## 需要显式新增的模块
+## 已显式落地的模块
 
-结合 Codex 的实际工程结构，建议把下列模块从“隐含能力”升级为文档中的显式模块：
+结合 Codex 的实际工程结构，下列能力已经从“隐含能力”升级为显式模块：
 
-- `golutra-file-search`：独立承载 rg 搜索、ignore/glob 规则、snippet 和 tree-sitter 结构切片。
-- `golutra-daemon`：作为 `RuntimeHost` 的一种承载方式，不新增语义，只提供远程 attach / query / subscribe。
-- `golutra-sandbox-*`：按平台分层实现 Linux / macOS / Windows 的实际 sandbox 边界。
+- `golutra-file-search` 与 `golutra-code-intelligence`：分别承载 rg/ignore metadata 和 tree-sitter symbol/reference graph。
+- `golutra-app-server`：作为 `RuntimeHost` 的用户级 daemon 承载方式，不新增语义，只提供 IPC/HTTP attach、query、command 和 subscribe。
+- `golutra-sandbox`：统一生成 macOS Seatbelt、Linux bubblewrap 或 process-only launch plan，并显式暴露 `os_enforced`。
+- `golutra-plugin` 与 `golutra-mcp`：把 package review/lifecycle 与外部工具 transport 分开，最终汇入同一 ToolContract/policy/artifact/evidence 链。
 
 约束：
 

@@ -1,7 +1,7 @@
 use chrono::Utc;
 use golutra_core::{
-    Actor, ActorKind, ArtifactId, BusyPolicy, CommandId, LaneId, RedactionStatus, RuntimeLane,
-    TaskStatus, ToolCallId, TurnId, WorkspaceId,
+    Actor, ActorKind, ArtifactId, BusyPolicy, CommandId, EvidenceId, EvidenceStrength, LaneId,
+    RedactionStatus, RuntimeLane, TaskStatus, ToolCallId, TurnId, WorkspaceId,
 };
 use golutra_protocol::{RuntimeEventSource, RuntimeEventType};
 use serde_json::json;
@@ -10,23 +10,77 @@ use tempfile::tempdir;
 use super::*;
 
 #[tokio::test]
-async fn command_ack_is_durable_by_idempotency_key() {
+async fn command_journal_atomically_records_receipt_and_completion() {
     let store = RuntimeStore::in_memory().await.expect("store");
+    let session_id = SessionId::new();
+    let command_id = CommandId::new();
+    let provisional = CommandAck {
+        command_id,
+        accepted: true,
+        reason: Some("processing".to_owned()),
+    };
     let ack = CommandAck {
-        command_id: CommandId::new(),
+        command_id,
         accepted: true,
         reason: Some("accepted".to_owned()),
     };
+    let event = |event_type| RuntimeEvent {
+        id: EventId::new(),
+        sequence_no: 0,
+        session_id,
+        turn_id: None,
+        task_id: None,
+        parent_event_id: None,
+        event_type,
+        timestamp: Utc::now(),
+        source: RuntimeEventSource::Runtime,
+        payload: json!({"command_id": command_id}),
+        payload_ref: None,
+        durable: true,
+    };
 
-    store
-        .store_command_ack("same-command", &ack)
+    let claim = store
+        .claim_command(
+            "same-command",
+            command_id,
+            &provisional,
+            event(RuntimeEventType::CommandReceived),
+        )
         .await
-        .expect("store ack");
+        .expect("claim command");
+    assert!(matches!(
+        claim,
+        CommandClaim::Claimed {
+            receipt_event: Some(_)
+        }
+    ));
+    assert_eq!(
+        store.command_ack("same-command").await.expect("load ack"),
+        Some(provisional)
+    );
 
+    let completed = store
+        .complete_command(
+            "same-command",
+            command_id,
+            &ack,
+            event(RuntimeEventType::CommandCompleted),
+        )
+        .await
+        .expect("complete command");
+
+    assert_eq!(completed.sequence_no, 2);
     assert_eq!(
         store.command_ack("same-command").await.expect("load ack"),
         Some(ack)
     );
+    let events = store
+        .load_events(session_id, None, None)
+        .await
+        .expect("command journal events");
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].event_type, RuntimeEventType::CommandReceived);
+    assert_eq!(events[1].event_type, RuntimeEventType::CommandCompleted);
 }
 
 #[tokio::test]
@@ -454,10 +508,113 @@ async fn duplicate_artifact_id_cannot_overwrite_the_existing_blob() {
 }
 
 #[tokio::test]
+async fn storage_maintenance_expires_debug_blobs_but_keeps_metadata() {
+    let store = RuntimeStore::in_memory().await.expect("store opens");
+    let bytes = b"expired debug payload";
+    let artifact = ArtifactRecord {
+        artifact_id: ArtifactId::new(),
+        session_id: SessionId::new(),
+        turn_id: Some(TurnId::new()),
+        tool_call_id: None,
+        artifact_type: "provider_raw_metadata".to_owned(),
+        uri: "artifact://fixture/expired".to_owned(),
+        checksum: artifact_checksum(bytes),
+        size_bytes: bytes.len() as u64,
+        created_at: Utc::now() - chrono::Duration::days(31),
+        producer: "test".to_owned(),
+        redaction_status: RedactionStatus::Redacted,
+        retention_policy: "debug_default".to_owned(),
+        provenance_refs: Vec::new(),
+    };
+    store
+        .store_artifact(&artifact, bytes)
+        .await
+        .expect("artifact");
+
+    let report = store
+        .run_artifact_maintenance(Utc::now())
+        .await
+        .expect("maintenance");
+
+    assert_eq!(report.artifact_blobs_removed, 1);
+    assert_eq!(
+        store
+            .load_artifact_bytes(artifact.artifact_id)
+            .await
+            .expect("expired blob"),
+        None
+    );
+    assert_eq!(
+        store
+            .load_artifact(artifact.artifact_id)
+            .await
+            .expect("metadata"),
+        Some(artifact)
+    );
+    let stats = store.storage_stats().await.expect("stats");
+    assert_eq!(stats.artifact_records, 1);
+    assert_eq!(stats.expired_artifact_blobs, 1);
+    assert_eq!(stats.live_artifact_bytes, 0);
+}
+
+#[tokio::test]
+async fn storage_maintenance_preserves_evidence_backed_artifacts() {
+    let store = RuntimeStore::in_memory().await.expect("store opens");
+    let bytes = b"durable evidence";
+    let artifact = ArtifactRecord {
+        artifact_id: ArtifactId::new(),
+        session_id: SessionId::new(),
+        turn_id: Some(TurnId::new()),
+        tool_call_id: None,
+        artifact_type: "verification".to_owned(),
+        uri: "artifact://fixture/evidence".to_owned(),
+        checksum: artifact_checksum(bytes),
+        size_bytes: bytes.len() as u64,
+        created_at: Utc::now() - chrono::Duration::days(31),
+        producer: "test".to_owned(),
+        redaction_status: RedactionStatus::NotRequired,
+        retention_policy: "debug_default".to_owned(),
+        provenance_refs: Vec::new(),
+    };
+    store
+        .store_artifact(&artifact, bytes)
+        .await
+        .expect("artifact");
+    store
+        .store_evidence(&EvidenceRecord {
+            evidence_id: EvidenceId::new(),
+            claim: "verification output exists".to_owned(),
+            artifact_refs: vec![artifact.artifact_id],
+            source_event_refs: Vec::new(),
+            evidence_strength: EvidenceStrength::Strong,
+            verifier: "test".to_owned(),
+            confidence: 1.0,
+            limitations: "fixture".to_owned(),
+        })
+        .await
+        .expect("evidence");
+
+    let report = store
+        .run_artifact_maintenance(Utc::now())
+        .await
+        .expect("maintenance");
+
+    assert_eq!(report.artifact_blobs_removed, 0);
+    assert_eq!(report.protected_artifacts_skipped, 1);
+    assert_eq!(
+        store
+            .load_artifact_bytes(artifact.artifact_id)
+            .await
+            .expect("protected blob"),
+        Some(bytes.to_vec())
+    );
+}
+
+#[tokio::test]
 async fn debug_projection_includes_events_and_artifacts() {
     let store = RuntimeStore::in_memory().await.expect("store opens");
     let session_id = SessionId::new();
-    let event = RuntimeEvent {
+    let mut event = RuntimeEvent {
         id: golutra_core::EventId::new(),
         sequence_no: 1,
         session_id,
@@ -487,6 +644,7 @@ async fn debug_projection_includes_events_and_artifacts() {
         retention_policy: "test".to_owned(),
         provenance_refs: Vec::new(),
     };
+    event.payload_ref = Some(artifact.artifact_id);
     store.append_event(&event).await.expect("event");
     store
         .store_artifact(&artifact, bytes)

@@ -12,9 +12,12 @@ clap.workspace = true
 golutra-app-server = { path = "../golutra-app-server" }
 golutra-auth = { path = "../golutra-auth" }
 golutra-client = { path = "../golutra-client" }
+golutra-code-intelligence = { path = "../golutra-code-intelligence" }
 golutra-config = { path = "../golutra-config" }
 golutra-core.workspace = true
+golutra-eval = { path = "../golutra-eval" }
 golutra-llm = { path = "../golutra-llm" }
+golutra-plugin = { path = "../golutra-plugin" }
 golutra-protocol.workspace = true
 miette.workspace = true
 serde_json.workspace = true

@@ -45,6 +45,7 @@ pub(crate) struct AuthDialogState {
     pub(crate) reasoning_effort: Option<ProviderReasoningEffort>,
     pub(crate) context_window_size: String,
     pub(crate) max_tokens: String,
+    pub(crate) custom_headers: String,
     pub(crate) advanced_selected: usize,
     pub(crate) review: Option<AuthReview>,
     pub(crate) error: Option<String>,
@@ -148,6 +149,7 @@ impl AuthDialogState {
             reasoning_effort: None,
             context_window_size: String::new(),
             max_tokens: String::new(),
+            custom_headers: String::new(),
             advanced_selected: 0,
             review: None,
             error: None,
@@ -186,6 +188,7 @@ impl AuthDialogState {
         self.reasoning_effort = None;
         self.context_window_size.clear();
         self.max_tokens.clear();
+        self.custom_headers.clear();
         self.advanced_selected = 0;
         self.review = None;
         self.error = None;
@@ -307,6 +310,7 @@ impl AuthDialogState {
             AuthDialogStep::AdvancedConfig => match self.advanced_selected {
                 2 => Some(&mut self.context_window_size),
                 3 => Some(&mut self.max_tokens),
+                4 => Some(&mut self.custom_headers),
                 _ => None,
             },
             AuthDialogStep::GroupChoice
@@ -387,7 +391,7 @@ impl AuthDialogState {
     }
 }
 
-pub(crate) const AUTH_ADVANCED_ITEMS: usize = 4;
+pub(crate) const AUTH_ADVANCED_ITEMS: usize = 5;
 pub(crate) const OPENAI_PROTOCOL_ONLY: &[ProviderProtocol] = &[ProviderProtocol::OpenAiCompatible];
 pub(crate) const CUSTOM_PROTOCOL_OPTIONS: &[ProviderProtocol] = &[
     ProviderProtocol::OpenAiCompatible,

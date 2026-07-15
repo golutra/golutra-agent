@@ -18,6 +18,7 @@ check:
 schema:
     cargo run -p golutra-protocol-fixtures --bin export_sdk_schema -- schemas/sdk-protocol.schema.json
     npm run --prefix sdk/typescript generate
+    python3 sdk/python/scripts/generate.py
     cargo test -p golutra-protocol-fixtures schema_smoke -- --nocapture
 
 fixture:
@@ -40,3 +41,8 @@ provider-live-smoke:
 
 ts-check:
     npm run --prefix sdk/typescript typecheck
+
+py-check:
+    python3 sdk/python/scripts/generate.py
+    python3 -m compileall -q sdk/python/src sdk/python/tests
+    PYTHONPATH=sdk/python/src python3 -m unittest discover -s sdk/python/tests -v

@@ -4,6 +4,16 @@
 
 本文档定义 Golutra 的事实层：artifact 如何保存，evidence 如何建立，二者如何支撑 replay、verification、memory 和 benchmark。
 
+## 当前实现状态
+
+截至 2026-07-15：
+
+- artifact metadata 位于 SQLite，blob 位于 owner-only `$GOLUTRA_HOME/state/artifacts`；写入前统一 redaction，记录 SHA-256、size、created_at、retention policy、expiry 和 blob deletion state。
+- tool raw output、provider raw metadata、checkpoint before-image 与外部 MCP 输出都通过同一 ArtifactRecord/EvidenceRecord 链路，不直接进入 prompt；structured facts 递归脱敏。
+- rollout/fork 只复制 immutable artifact lineage，不复制 blob；DebugProjection 和 verification 可沿引用读取。
+- storage maintenance 会统计 live/expired blob，按 retention 清理过期与 temporary artifact，并保护仍被 rollback/lineage/verification 引用的内容；checkpoint 每 workspace 保留最近 20 个。
+- 普通 TUI 不展示 artifact 原文；developer/debug、`golutra-vis` 和 SDK query 才按需展开审计事实。
+
 ## 核心原则
 
 ```text

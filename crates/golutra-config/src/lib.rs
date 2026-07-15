@@ -12,8 +12,9 @@ use golutra_auth::{
     OAuthProviderDescriptor, SecretKind, SecretStore,
 };
 use golutra_llm::{
-    ConfiguredProvider, ModelCatalog, ProviderGenerationConfig, ProviderProtocol,
-    validate_native_base_url, validate_openai_base_url,
+    ConfiguredProvider, GOLUTRA_PROVIDER_CUSTOM_HEADERS, ModelCatalog, ProviderGenerationConfig,
+    ProviderHeaderConfig, ProviderHeaderValue, ProviderProtocol, validate_native_base_url,
+    validate_openai_base_url,
 };
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
@@ -278,6 +279,8 @@ pub struct ProviderProfile {
     pub oauth: Option<OAuthProviderDescriptor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation_config: Option<ProviderGenerationConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub custom_headers: Vec<ProviderHeaderConfig>,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -293,6 +296,7 @@ impl ProviderProfile {
             credential_ref: None,
             oauth: None,
             generation_config: None,
+            custom_headers: Vec::new(),
             enabled: true,
         }
     }
@@ -328,6 +332,7 @@ impl ProviderProfile {
             credential_ref: Some(credential_ref),
             oauth: None,
             generation_config: None,
+            custom_headers: Vec::new(),
             enabled: true,
         };
         profile.validate()?;
@@ -379,6 +384,20 @@ impl ProviderProfile {
             generation_config
                 .validate()
                 .map_err(ConfigError::Validation)?;
+        }
+        let mut header_names = BTreeSet::new();
+        for header in &self.custom_headers {
+            header.validate().map_err(ConfigError::Validation)?;
+            let normalized_name = header.name.to_ascii_lowercase();
+            if !header_names.insert(normalized_name) {
+                return Err(ConfigError::Validation(format!(
+                    "provider header `{}` is configured more than once",
+                    header.name
+                )));
+            }
+            if let ProviderHeaderValue::Environment { key } = &header.value {
+                validate_env_key(key)?;
+            }
         }
         Ok(())
     }
@@ -462,9 +481,10 @@ impl ProviderRuntimeEnv {
             .iter()
             .map(|(key, value)| {
                 let normalized = key.to_ascii_uppercase();
-                let redacted = if ["API_KEY", "TOKEN", "SECRET", "PASSWORD", "AUTHORIZATION"]
-                    .iter()
-                    .any(|marker| normalized.contains(marker))
+                let redacted = if normalized == GOLUTRA_PROVIDER_CUSTOM_HEADERS
+                    || ["API_KEY", "TOKEN", "SECRET", "PASSWORD", "AUTHORIZATION"]
+                        .iter()
+                        .any(|marker| normalized.contains(marker))
                 {
                     "<redacted>".to_owned()
                 } else {
@@ -584,6 +604,31 @@ pub fn runtime_env_from_settings(
             && let Ok(value) = serde_json::to_string(generation_config)
         {
             values.insert(GOLUTRA_PROVIDER_GENERATION_CONFIG.to_owned(), value);
+        }
+        if !profile.custom_headers.is_empty() {
+            let resolved_headers = profile
+                .custom_headers
+                .iter()
+                .map(|header| {
+                    let value = match &header.value {
+                        ProviderHeaderValue::Literal { value } => value.clone(),
+                        ProviderHeaderValue::Environment { key } => std::env::var(key)
+                            .ok()
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| {
+                                ConfigError::Validation(format!(
+                                    "provider header environment key `{key}` is not set"
+                                ))
+                            })?,
+                    };
+                    Ok((header.name.clone(), value))
+                })
+                .collect::<Result<BTreeMap<_, _>, ConfigError>>()?;
+            values.insert(
+                GOLUTRA_PROVIDER_CUSTOM_HEADERS.to_owned(),
+                serde_json::to_string(&resolved_headers)
+                    .map_err(|error| ConfigError::Json(error.to_string()))?,
+            );
         }
         if let Some(oauth) = &profile.oauth {
             values.insert(
@@ -1062,6 +1107,13 @@ fn missing_fields(
             .unwrap_or(false);
         if !api_key_ready {
             fields.push("api_key".to_owned());
+        }
+        for header in &profile.custom_headers {
+            if let ProviderHeaderValue::Environment { key } = &header.value
+                && std::env::var(key).ok().is_none_or(|value| value.is_empty())
+            {
+                fields.push(format!("header_env:{key}"));
+            }
         }
     }
     Ok(fields)

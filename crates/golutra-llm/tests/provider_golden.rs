@@ -7,7 +7,7 @@ use golutra_llm::{
     GenaiProviderAdapter, GenaiProviderConfig, LlmProvider, OpenAiCompatibleProvider,
     OpenAiCompatibleProviderConfig, OpenAiResponsesProvider, OpenAiResponsesProviderConfig,
     ProviderError, ProviderFinishReason, ProviderGenerationConfig, ProviderMessage,
-    ProviderProtocol, ProviderRequest, ProviderRole, ProviderToolCall,
+    ProviderProtocol, ProviderRequest, ProviderRole, ProviderStreamEvent, ProviderToolCall,
 };
 use secrecy::SecretString;
 use serde::Deserialize;
@@ -267,6 +267,7 @@ async fn openai_compatible_provider_matches_goldens() {
             model_id: "gpt-golden".to_owned(),
             protocol: ProviderProtocol::OpenAiCompatible,
             generation_config: ProviderGenerationConfig::default(),
+            custom_headers: Default::default(),
         },
         Arc::new(RefreshingCredential),
     )
@@ -289,6 +290,88 @@ async fn openai_compatible_provider_matches_goldens() {
 }
 
 #[tokio::test]
+async fn openai_compatible_stream_emits_ordered_text_deltas_and_usage() {
+    let (base_url, captured) = spawn_provider_sequence(vec![TestProviderResponse::sse(
+        200,
+        include_str!("fixtures/openai-compatible/stream-response.sse"),
+    )])
+    .await;
+    let provider = OpenAiCompatibleProvider::new(TEST_API_KEY, base_url, "gpt-golden");
+    let mut events = Vec::new();
+    let response = provider
+        .complete_stream(simple_request("gpt-golden"), &mut |event| {
+            events.push(event);
+        })
+        .await
+        .expect("OpenAI-compatible stream response");
+    let captured = captured.await.expect("stream request capture");
+
+    assert_eq!(captured[0].body["stream"], true);
+    assert_eq!(captured[0].body["stream_options"]["include_usage"], true);
+    assert_eq!(
+        events,
+        vec![
+            ProviderStreamEvent::TextDelta {
+                text: "golden ".to_owned(),
+            },
+            ProviderStreamEvent::TextDelta {
+                text: "stream".to_owned(),
+            },
+        ]
+    );
+    assert_eq!(response.finish_reason, ProviderFinishReason::Stop);
+    assert_eq!(response.usage.total_tokens, Some(14));
+    assert_eq!(
+        response
+            .message
+            .as_ref()
+            .map(|message| message.content.as_str()),
+        Some("golden stream")
+    );
+}
+
+#[tokio::test]
+async fn openai_compatible_custom_headers_are_applied_without_debug_values() {
+    let (base_url, captured) = spawn_provider(
+        200,
+        include_str!("fixtures/openai-compatible/text_response.json"),
+    )
+    .await;
+    let config = OpenAiCompatibleProvider::config_from_env_reader(|key| match key {
+        "GOLUTRA_PROVIDER_PROTOCOL" => Some("openai-compatible".to_owned()),
+        "GOLUTRA_PROVIDER_API_KEY" => Some(TEST_API_KEY.to_owned()),
+        "GOLUTRA_PROVIDER_MODEL" => Some("gpt-golden".to_owned()),
+        "GOLUTRA_PROVIDER_BASE_URL" => Some(base_url.clone()),
+        "GOLUTRA_PROVIDER_CUSTOM_HEADERS" => Some(
+            json!({
+                "X-Api-Key": "fake-supplemental-key",
+                "X-Client-Name": "golutra-golden",
+            })
+            .to_string(),
+        ),
+        _ => None,
+    })
+    .expect("custom header config");
+    let debug = format!("{config:?}");
+    let provider = OpenAiCompatibleProvider::from_config(config);
+    provider
+        .complete(simple_request("gpt-golden"))
+        .await
+        .expect("custom header request");
+    let captured = captured.await.expect("custom header capture");
+
+    assert_eq!(
+        captured.headers.get("x-api-key").map(String::as_str),
+        Some("fake-supplemental-key")
+    );
+    assert_eq!(
+        captured.headers.get("x-client-name").map(String::as_str),
+        Some("golutra-golden")
+    );
+    assert!(!debug.contains("fake-supplemental-key"));
+}
+
+#[tokio::test]
 async fn openai_responses_provider_matches_sse_goldens_and_auth_headers() {
     let (base_url, captured) = spawn_provider_sequence(vec![TestProviderResponse::sse(
         200,
@@ -296,8 +379,11 @@ async fn openai_responses_provider_matches_sse_goldens_and_auth_headers() {
     )])
     .await;
     let provider = openai_responses_provider(base_url);
+    let mut stream_events = Vec::new();
     let response = provider
-        .complete(simple_request("gpt-golden"))
+        .complete_stream(simple_request("gpt-golden"), &mut |event| {
+            stream_events.push(event);
+        })
         .await
         .expect("Responses text response");
     let captured = captured.await.expect("Responses request capture");
@@ -325,6 +411,17 @@ async fn openai_responses_provider_matches_sse_goldens_and_auth_headers() {
     );
     assert!(captured.headers.contains_key("session-id"));
     assert_eq!(response.finish_reason, ProviderFinishReason::Stop);
+    assert_eq!(
+        stream_events,
+        vec![
+            ProviderStreamEvent::TextDelta {
+                text: "golden ".to_owned(),
+            },
+            ProviderStreamEvent::TextDelta {
+                text: "answer".to_owned(),
+            },
+        ]
+    );
     assert_eq!(
         response
             .message
@@ -491,6 +588,7 @@ async fn github_copilot_adapter_adds_provider_required_headers() {
             model_id: "gpt-golden".to_owned(),
             protocol: ProviderProtocol::OpenAiCompatible,
             generation_config: ProviderGenerationConfig::default(),
+            custom_headers: Default::default(),
         },
         Arc::new(RefreshingCredential),
     );
@@ -570,6 +668,7 @@ async fn live_provider_smoke_is_opt_in_and_never_reads_normal_user_credentials()
                 max_tokens: Some(8),
                 ..ProviderGenerationConfig::default()
             },
+            custom_headers: Default::default(),
         });
 
         let response = provider
@@ -646,6 +745,7 @@ fn provider(case: ProtocolCase, base_url: String) -> GenaiProviderAdapter {
             max_tokens: Some(128),
             ..ProviderGenerationConfig::default()
         },
+        custom_headers: Default::default(),
     })
 }
 
@@ -658,6 +758,7 @@ fn openai_responses_provider(base_url: String) -> OpenAiResponsesProvider {
             base_url,
             model_id: "gpt-golden".to_owned(),
             generation_config: ProviderGenerationConfig::default(),
+            custom_headers: Default::default(),
         },
         Arc::new(RefreshingCredential),
     )
