@@ -261,6 +261,22 @@ MemoryGovernance
 | `golutra-app-server` | HTTP command/query + SSE 入口；WebSocket 后置 |
 | `golutra-vis` | replay、trace、context、artifact 审计视图 |
 
+### 当前实现内部分层
+
+为避免 crate 根文件重新承担全部职责，当前实现进一步固定以下内部边界：
+
+| Crate | 内部模块 | 约束 |
+| --- | --- | --- |
+| `golutra-client` | `transport`、`paths`、`rollout`、`provider_runtime`、`context`、`event_codec` | `RuntimeHost` 负责用例编排；HTTP/SSE、路径权限、rollout 格式、provider plan、上下文文本和事件 wire 转换不得回流到 host 方法 |
+| `golutra-runtime` | `lane`、`checkpoint` | lane 状态机与 checkpoint 文件事务独立于 `AgentLoop`；loop 不直接实现 session controller 转换或快照 IO |
+| `golutra-tui` | `auth_state`、`auth_flow`、`session`、`render` | 主文件只组装应用状态和事件循环；渲染不写 provider 配置，认证 flow 不编排 runtime task |
+| `golutra-config` | `provider_auth`、`provider_storage` | provider catalog 与凭据/配置事务分离；磁盘写入、锁、迁移、probe 和 rollback 统一由 storage 层负责 |
+| `golutra-llm` | `provider_config`、`openai_responses`、`genai_adapter` | 环境解析与 URL/错误处理不进入 adapter 执行循环；各协议 adapter 只处理自己的 wire contract |
+| `golutra-store` | `projection` | event reducer 保持纯函数；SQLite repository 只负责事实读写和持久化派生索引 |
+| `golutra-tools` | `process` | shell argv、进程组取消、timeout 和有界管道读取由单一模块维护 |
+
+每个大型入口的单元测试位于同目录 `tests.rs`；生产模块通过 `#[cfg(test)] mod tests;` 接入。测试可以验证 crate 内实现，但生产模块不能通过 test-only 重导出形成运行时依赖。
+
 ## Host / Transport / Projection
 
 Golutra 的多前端支持要按三层收敛，而不是为每个入口各造一套接口：
