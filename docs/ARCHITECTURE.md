@@ -511,5 +511,7 @@ Evaluation / Improvement 模式使用 `Evaluation / Improvement Projection`：
 - `agent-improvement-loop.md`：失败轨迹如何变成可验证、可回滚的 agent 改进。
 - `implementation-blueprint.md`：第一阶段实现蓝图、最小 schema 和同步/后台边界。
 - `agent-open-endedness-design.md`：开放式能力和 Promotion Gate。
+- `self-evolving-runtime-design.md`：内部/外部代码自进化、密封评测、连续发布和回滚的 P3 目标架构。
+- `research-self-evolving-agent-systems.md`：自修改 agent、防过拟合和发布完整性的一手资料研究。
 - `extensions-sdk-delivery.md`：Plugin/MCP、IPC、TypeScript/Python SDK、安装与交付门禁。
 - `framework-comparison.md`：六个外部 agent 项目的架构影响。

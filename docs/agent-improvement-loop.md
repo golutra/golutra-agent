@@ -4,6 +4,8 @@
 
 本文档定义 Golutra 如何从一次任务失败或低质量轨迹中产生可验证的 agent 改进。
 
+runtime code 自动修改、密封评测、不可变 release、canary 和下一版本接管任务的 P3 目标见 `self-evolving-runtime-design.md`；外部研究依据见 `research-self-evolving-agent-systems.md`。
+
 阶段边界说明：
 
 - 本文档描述的是完整改进闭环的目标态。
@@ -195,7 +197,7 @@ GeneratedTask -> isolated RuntimeHost -> Verification
 SkillCandidate -> stage -> regression-backed human review -> install/rollback
 ```
 
-组织级持续监控和自动 runtime redeploy 不在当前本地产品范围；高风险候选保持 human review，不因为阶段名称被解释为可自动晋升。
+组织级持续监控和自动 runtime redeploy 尚未实现；它们已进入 `self-evolving-runtime-design.md` 的 P3 目标，但不能因为目标已设计就被解释为当前可自动晋升。
 
 ## 与其他系统的关系
 

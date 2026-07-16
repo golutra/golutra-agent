@@ -64,10 +64,10 @@ VerificationTier：以结构化 check kind 和任务分类进入主链，schema 
 EventSamplingPolicy / ContextProjectionCache：保留 schema，不启用无收益的派生索引/cache
 Plugin/MCP：已完成本地 reviewed package 与 sandboxed stdio 主链
 复杂 Multi-Agent Orchestration：非当前产品范围
-自动修改或部署 runtime 代码：明确禁止
+自动修改或部署 runtime 代码：当前 P0/P1/P2 明确禁止，P3 目标另见 `self-evolving-runtime-design.md`
 ```
 
-`ImprovementCandidate`、Evaluation、counterfactual comparison、regression/promotion 和 Evolution 都在后台或显式命令中运行，不污染普通用户同步链路。自动 apply 只允许 clean regression 后的低风险 benchmark state；Skill 必须人工 review，runtime code/policy 放宽不会自动应用。
+`ImprovementCandidate`、Evaluation、counterfactual comparison、regression/promotion 和 Evolution 都在后台或显式命令中运行，不污染普通用户同步链路。当前自动 apply 只允许 clean regression 后的低风险 benchmark state；Skill 必须人工 review，runtime code/policy 放宽不会自动应用。未来 P3 即使加入代码候选和连续发布，也必须由独立 Supervisor 承担密封评测、不可变构建、canary 和 rollback，不能改变普通任务同步边界。
 
 ## 第一阶段吸收的架构启示
 

@@ -477,7 +477,7 @@ candidate
 5. 从成功 trajectory 形成 `SkillCandidate`，通过 regression-backed human review 安装。
 6. 持久化 `CapabilityFrontier` 的 mastered / near-miss / failed / blocked / missing-tools。
 
-当前长期边界是：不自由探索真实 workspace，不自动 mutation environment，不自动改默认 prompt/tool/policy/memory/runtime code，不自动部署新二进制。未来若扩大范围，仍必须先进入 `ImprovementCandidate`、隔离执行、regression 和 human review，不能复用当前完成状态绕过门禁。
+当前实现边界是：不自由探索真实 workspace，不自动 mutation environment，不自动改默认 prompt/tool/policy/memory/runtime code，不自动部署新二进制。P3 扩展目标见 `self-evolving-runtime-design.md`；未来即使实现内部/外部代码自进化，也必须经过独立 Supervisor、密封评测、不可变 release、canary 和 rollback，不能复用当前完成状态绕过门禁。
 
 ## 参考论文与项目
 

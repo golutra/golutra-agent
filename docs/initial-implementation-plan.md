@@ -45,7 +45,7 @@
 - `/events/replay`、DebugProjection 和显式 TUI developer mode 当前会物化请求范围内的完整历史；普通 TUI 不查询该投影。SSE 主链按页 replay，但超长 session 的显式全量 debug/export 仍需要后续分页协议和 UI 虚拟化。
 - macOS Seatbelt 与 Linux bubblewrap 已进入 shell/MCP 执行主链；Windows 当前只有 process policy、timeout/cancel 和插件管理能力，没有可声明为 OS-enforced 的外部插件 sandbox，因此 Windows 会拒绝执行 MCP server。
 - provider streaming、动态 capability discovery 和运行中跨客户端 `ProviderAuthRequired -> Submitted/Cancelled -> resume` 已完成；Web 首次 provider onboarding 不是当前产品范围。
-- 自动修改 runtime code、自动部署新版本、复杂 multi-agent orchestration、正式 Web/IDE 产品面和网络插件 marketplace 不属于当前交付范围；相关目标不得被写成 P0/P1 未完成项。
+- 自动修改 runtime code 和自动部署新版本不属于当前 P0/P1/P2 交付范围，其 P3 目标另见 `self-evolving-runtime-design.md`；复杂 multi-agent orchestration、正式 Web/IDE 产品面和网络插件 marketplace 仍不是当前交付目标。
 
 ## 实施原则
 
