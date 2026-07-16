@@ -988,3 +988,59 @@ async fn durable_projection_and_runtime_indexes_survive_reopen() {
     assert_eq!(state.task_status, TaskStatus::Running);
     assert_eq!(states, vec![state]);
 }
+
+#[tokio::test]
+async fn legacy_projection_without_verification_check_kind_remains_readable() {
+    let store = RuntimeStore::in_memory().await.expect("store opens");
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let projection = json!({
+        "session_id": session_id,
+        "active_task_id": task_id,
+        "task_status": "completed",
+        "runtime_lane": null,
+        "last_sequence_no": 1,
+        "visible_steps": [],
+        "pending_approval": null,
+        "final_message": "done",
+        "last_loop_decision": null,
+        "last_verification": {
+            "verification_id": golutra_core::VerificationId::new(),
+            "task_id": task_id,
+            "objective": "respond",
+            "completion_criteria": ["assistant responds"],
+            "checks": [{
+                "name": "assistant_response",
+                "command": null,
+                "passed": true,
+                "evidence_refs": [],
+                "message": "assistant response produced"
+            }],
+            "evidence_refs": [],
+            "result": "pass",
+            "policy_status": "conversation_response",
+            "residual_risks": []
+        }
+    });
+    sqlx::query(
+        "INSERT INTO state_projections (
+            session_id, last_sequence_no, projection_json, updated_at
+         ) VALUES (?, 1, ?, ?)",
+    )
+    .bind(session_id.to_string())
+    .bind(projection.to_string())
+    .bind(Utc::now().to_rfc3339())
+    .execute(&store.pool)
+    .await
+    .expect("legacy projection");
+
+    let restored = store
+        .query_state(session_id, None)
+        .await
+        .expect("legacy projection remains readable");
+
+    assert_eq!(
+        restored.last_verification.expect("verification").checks[0].kind,
+        golutra_core::VerificationCheckKind::AssistantResponse
+    );
+}

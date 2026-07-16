@@ -36,9 +36,9 @@ pub(crate) use projection::{
 
 #[derive(Debug, Error)]
 pub enum StoreError {
-    #[error("sqlite operation failed")]
+    #[error("sqlite operation failed: {0}")]
     Sqlx(#[from] sqlx::Error),
-    #[error("json serialization failed")]
+    #[error("json serialization failed: {0}")]
     Json(#[from] serde_json::Error),
     #[error("stored id is invalid: {0}")]
     InvalidId(String),

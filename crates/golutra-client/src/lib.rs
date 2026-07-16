@@ -123,7 +123,7 @@ pub(crate) use transport::{
 
 #[derive(Debug, Error)]
 pub enum ClientError {
-    #[error("runtime store failed")]
+    #[error("runtime store failed: {0}")]
     Store(#[from] StoreError),
     #[error("runtime lane failed")]
     RuntimeLane(#[from] RuntimeLaneError),
