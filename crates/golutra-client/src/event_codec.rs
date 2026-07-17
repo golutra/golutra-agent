@@ -1,10 +1,10 @@
 //! Runtime 领域记录与持久化协议事件之间的转换。
 
 use golutra_core::{
-    Actor, ActorKind, ArtifactId, ArtifactRecord, CommandId, EventId, LoopAction, RedactionStatus,
-    SessionId, TaskId, TaskStatus, ThreadId, TurnId,
+    Actor, ActorKind, ArtifactId, ArtifactRecord, CommandId, ContextSnapshot, EventId, LoopAction,
+    RedactionStatus, SessionId, TaskId, TaskStatus, ThreadId, TurnId,
 };
-use golutra_llm::ProviderStreamEvent;
+use golutra_llm::{ProviderRequest, ProviderStreamEvent};
 use golutra_protocol::{EventFilter, RuntimeEvent, RuntimeEventSource, RuntimeEventType};
 use golutra_runtime::{AgentLoopTraceEvent, PendingAgentTurn};
 use golutra_store::ThreadRecord;
@@ -135,6 +135,42 @@ pub(crate) fn provider_raw_artifact(
     ))
 }
 
+pub(crate) fn context_request_artifact(
+    task: &HostedAgentTask,
+    snapshot: &ContextSnapshot,
+    request: &ProviderRequest,
+) -> Result<(ArtifactRecord, Vec<u8>), ClientError> {
+    let raw = serde_json::to_value(request)?;
+    let mut redacted = raw.clone();
+    redact_provider_json(&mut redacted);
+    let redaction_status = if redacted == raw {
+        RedactionStatus::NotRequired
+    } else {
+        RedactionStatus::Redacted
+    };
+    let bytes = serde_json::to_vec(&redacted)?;
+    let checksum = Sha256::digest(&bytes);
+    let artifact_id = ArtifactId::new();
+    Ok((
+        ArtifactRecord {
+            artifact_id,
+            session_id: task.session_id,
+            turn_id: Some(snapshot.turn_id),
+            tool_call_id: None,
+            artifact_type: "context_request_redacted".to_owned(),
+            uri: format!("artifact://context/{artifact_id}"),
+            checksum: format!("sha256:{checksum:x}"),
+            size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            created_at: chrono::Utc::now(),
+            producer: "context-builder".to_owned(),
+            redaction_status,
+            retention_policy: "debug_default".to_owned(),
+            provenance_refs: Vec::new(),
+        },
+        bytes,
+    ))
+}
+
 pub(crate) fn redact_provider_json(value: &mut Value) {
     match value {
         Value::Object(object) => {
@@ -224,6 +260,42 @@ pub(crate) fn trace_event_payload(
                 "original_input_tokens": original_input_tokens,
                 "planned_input_tokens": planned_input_tokens,
                 "trimmed_contributors": trimmed_contributors,
+            }),
+        )),
+        AgentLoopTraceEvent::ContextSnapshot(snapshot) => Some((
+            RuntimeEventType::ContextSnapshotCreated,
+            RuntimeEventSource::Runtime,
+            json!({
+                "summary": "provider request context snapshot created",
+                "snapshot": snapshot,
+            }),
+        )),
+        AgentLoopTraceEvent::ContextSnapshotCaptured { snapshot, .. } => Some((
+            RuntimeEventType::ContextSnapshotCreated,
+            RuntimeEventSource::Runtime,
+            json!({
+                "summary": "provider request context snapshot created",
+                "snapshot": snapshot,
+            }),
+        )),
+        AgentLoopTraceEvent::VerificationPlanned(plan) => Some((
+            RuntimeEventType::VerificationPlanned,
+            RuntimeEventSource::Verifier,
+            json!({
+                "summary": format!("verification plan created for {:?}", plan.task_class),
+                "plan": plan,
+            }),
+        )),
+        AgentLoopTraceEvent::VerificationAssertionCompleted(assertion) => Some((
+            RuntimeEventType::VerificationAssertionCompleted,
+            RuntimeEventSource::Verifier,
+            json!({
+                "summary": format!(
+                    "verification assertion {} completed as {:?}",
+                    assertion.criterion_id,
+                    assertion.status
+                ),
+                "assertion": assertion,
             }),
         )),
         AgentLoopTraceEvent::ProviderStarted {
@@ -456,6 +528,7 @@ pub(crate) fn with_command_payload(
             .and_then(Value::as_str)
             .unwrap_or("runtime host accepted command"),
         "command_id": command_id.to_string(),
+        "runtime_identity": super::runtime_identity(),
         "payload": payload,
         "runtime": event.payload,
     });

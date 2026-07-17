@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::sync::RwLock;
 
 use super::*;
+use crate::RuntimeApplication;
 
 #[cfg(unix)]
 mod ipc;
@@ -20,6 +21,23 @@ pub trait RuntimeClient {
     async fn event_page(&self, request: EventPageRequest) -> Result<EventPage, ClientError>;
     async fn replay_events(&self, filter: EventFilter) -> Result<Vec<Value>, ClientError>;
     async fn subscribe(&self, filter: EventFilter) -> Result<RuntimeEventStream, ClientError>;
+}
+
+#[async_trait]
+pub trait TaskTraceClient {
+    async fn task_trace(&self, request: TaskTraceRequest) -> Result<TaskTracePage, ClientError>;
+
+    async fn complete_task_trace(
+        &self,
+        request: TaskTraceRequest,
+    ) -> Result<TaskTracePage, ClientError> {
+        crate::trace::read_complete_trace(request, |request| self.task_trace(request)).await
+    }
+
+    async fn read_artifact_chunk(
+        &self,
+        request: ArtifactReadRequest,
+    ) -> Result<Option<ArtifactChunk>, ClientError>;
 }
 
 #[derive(Debug)]
@@ -46,13 +64,22 @@ impl RuntimeEventStream {
 
 #[derive(Debug, Clone)]
 pub struct EmbeddedTransport {
+    #[allow(dead_code)]
     pub(crate) host: Arc<RuntimeHost>,
+    application: RuntimeApplication,
 }
 
 impl EmbeddedTransport {
     #[must_use]
     pub fn new(host: Arc<RuntimeHost>) -> Self {
-        Self { host }
+        let application = RuntimeApplication::from_host(host.clone());
+        Self { host, application }
+    }
+
+    #[must_use]
+    pub fn from_application(application: RuntimeApplication) -> Self {
+        let host = application.host().clone();
+        Self { host, application }
     }
 
     pub async fn in_memory() -> Result<Self, ClientError> {
@@ -77,42 +104,48 @@ impl EmbeddedTransport {
 
     #[must_use]
     pub fn default_session_id(&self) -> SessionId {
-        self.host.default_session_id()
+        self.application.session_service().default_session_id()
     }
 
     #[must_use]
     pub fn default_thread_id(&self) -> ThreadId {
-        self.host.default_thread_id()
+        self.application.session_service().default_thread_id()
     }
 
     #[must_use]
     pub fn cwd(&self) -> Option<&Path> {
-        self.host.workspace_root()
+        self.application.session_service().cwd()
     }
 
     #[must_use]
     pub fn workspace_id(&self) -> WorkspaceId {
-        self.host.workspace_id
+        self.application.session_service().workspace_id()
     }
 
     #[must_use]
     pub fn subscribe_live(&self, filter: EventFilter) -> broadcast::Receiver<RuntimeEvent> {
-        self.host.subscribe_live(filter)
+        self.application.query_service().subscribe_live(filter)
     }
 
     pub async fn list_threads(&self, limit: u32) -> Result<Vec<ThreadRecord>, ClientError> {
-        self.host.list_threads(limit).await
+        self.application.session_service().list_threads(limit).await
     }
 
     pub async fn thread_for_session(
         &self,
         session_id: SessionId,
     ) -> Result<Option<ThreadRecord>, ClientError> {
-        self.host.thread_for_session(session_id).await
+        self.application
+            .session_service()
+            .thread_for_session(session_id)
+            .await
     }
 
     pub async fn resume_thread(&self, thread_id: ThreadId) -> Result<ThreadRecord, ClientError> {
-        self.host.resume_thread(thread_id).await
+        self.application
+            .session_service()
+            .resume_thread(thread_id)
+            .await
     }
 
     pub async fn fork_thread(
@@ -120,14 +153,20 @@ impl EmbeddedTransport {
         thread_id: ThreadId,
         from_turn_id: Option<TurnId>,
     ) -> Result<ThreadRecord, ClientError> {
-        self.host.fork_thread(thread_id, from_turn_id).await
+        self.application
+            .session_service()
+            .fork_thread(thread_id, from_turn_id)
+            .await
     }
 
     pub async fn export_thread_rollout(
         &self,
         thread_id: ThreadId,
     ) -> Result<RolloutExport, ClientError> {
-        self.host.export_thread_rollout(thread_id).await
+        self.application
+            .session_service()
+            .export_thread_rollout(thread_id)
+            .await
     }
 
     pub async fn rebind_thread(
@@ -135,43 +174,64 @@ impl EmbeddedTransport {
         thread_id: ThreadId,
         from_workspace_root: impl AsRef<Path>,
     ) -> Result<ThreadRebindResult, ClientError> {
-        self.host
+        self.application
+            .session_service()
             .rebind_thread(thread_id, from_workspace_root)
             .await
     }
 
     pub async fn recover_orphaned_tasks(&self) -> Result<usize, ClientError> {
-        self.host.recover_orphaned_tasks().await
+        self.application
+            .session_service()
+            .recover_orphaned_tasks()
+            .await
     }
 
     pub async fn runtime_info(
         &self,
         base_url: impl Into<String>,
     ) -> Result<RuntimeHostInfo, ClientError> {
-        self.host.runtime_info(base_url).await
+        self.application
+            .session_service()
+            .runtime_info(base_url)
+            .await
     }
 }
 
 #[async_trait]
 impl RuntimeClient for EmbeddedTransport {
     async fn send_command(&self, command: SessionCommand) -> Result<CommandAck, ClientError> {
-        self.host.clone().handle_command(command).await
+        self.application.send_command(command).await
     }
 
     async fn query(&self, query: RuntimeQuery) -> Result<Value, ClientError> {
-        self.host.query(query).await
+        self.application.query(query).await
     }
 
     async fn event_page(&self, request: EventPageRequest) -> Result<EventPage, ClientError> {
-        self.host.event_page(request).await
+        self.application.event_page(request).await
     }
 
     async fn replay_events(&self, filter: EventFilter) -> Result<Vec<Value>, ClientError> {
-        self.host.replay_events(filter).await
+        self.application.replay_events(filter).await
     }
 
     async fn subscribe(&self, filter: EventFilter) -> Result<RuntimeEventStream, ClientError> {
-        self.host.clone().event_stream(filter).await
+        self.application.subscribe(filter).await
+    }
+}
+
+#[async_trait]
+impl TaskTraceClient for EmbeddedTransport {
+    async fn task_trace(&self, request: TaskTraceRequest) -> Result<TaskTracePage, ClientError> {
+        self.application.task_trace(request).await
+    }
+
+    async fn read_artifact_chunk(
+        &self,
+        request: ArtifactReadRequest,
+    ) -> Result<Option<ArtifactChunk>, ClientError> {
+        self.application.read_artifact_chunk(request).await
     }
 }
 
@@ -664,6 +724,36 @@ impl RuntimeClient for HttpSseTransport {
     }
 }
 
+#[async_trait]
+impl TaskTraceClient for HttpSseTransport {
+    async fn task_trace(&self, request: TaskTraceRequest) -> Result<TaskTracePage, ClientError> {
+        let response = self
+            .send_attached(|attachment_id| {
+                self.authenticated(self.client.post(self.url("/traces")))
+                    .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id)
+                    .json(&request)
+                    .timeout(Duration::from_secs(30))
+            })
+            .await?;
+        decode_http_response(response).await
+    }
+
+    async fn read_artifact_chunk(
+        &self,
+        request: ArtifactReadRequest,
+    ) -> Result<Option<ArtifactChunk>, ClientError> {
+        let response = self
+            .send_attached(|attachment_id| {
+                self.authenticated(self.client.post(self.url("/artifacts/chunk")))
+                    .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id)
+                    .json(&request)
+                    .timeout(Duration::from_secs(30))
+            })
+            .await?;
+        decode_http_response(response).await
+    }
+}
+
 impl HttpSseTransport {
     async fn run_sse_subscription(
         self,
@@ -1053,6 +1143,34 @@ impl RuntimeClient for RuntimeTransport {
             Self::LocalIpc(transport) => transport.subscribe(filter).await,
             Self::LocalDaemon(transport) | Self::Remote(transport) => {
                 transport.subscribe(filter).await
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl TaskTraceClient for RuntimeTransport {
+    async fn task_trace(&self, request: TaskTraceRequest) -> Result<TaskTracePage, ClientError> {
+        match self {
+            Self::Embedded(transport) => transport.task_trace(request).await,
+            #[cfg(unix)]
+            Self::LocalIpc(transport) => transport.task_trace(request).await,
+            Self::LocalDaemon(transport) | Self::Remote(transport) => {
+                transport.task_trace(request).await
+            }
+        }
+    }
+
+    async fn read_artifact_chunk(
+        &self,
+        request: ArtifactReadRequest,
+    ) -> Result<Option<ArtifactChunk>, ClientError> {
+        match self {
+            Self::Embedded(transport) => transport.read_artifact_chunk(request).await,
+            #[cfg(unix)]
+            Self::LocalIpc(transport) => transport.read_artifact_chunk(request).await,
+            Self::LocalDaemon(transport) | Self::Remote(transport) => {
+                transport.read_artifact_chunk(request).await
             }
         }
     }

@@ -5,12 +5,19 @@ use golutra_config::{
     ProviderConfigPaths, ProviderConfigScope, ProviderInstallPlan, ProviderProfile,
     ProviderSettings, runtime_env_from_settings,
 };
-use golutra_core::{
-    Actor, ActorKind, CommandId, EvidenceId, QueryId, VerificationCheck, VerificationId,
-    VerificationRecord, VerificationResult,
+use golutra_context::{
+    ContextBuilder, ContextContributor, context_snapshot_from_request, provider_request_from_plan,
 };
-use golutra_llm::{ConfiguredProvider, MockProvider, ProviderError};
-use golutra_protocol::RuntimeQueryKind;
+use golutra_core::{
+    Actor, ActorKind, ArtifactId, ArtifactRecord, CommandId, EvidenceId, PostTaskJob,
+    PostTaskJobId, PostTaskJobKind, PostTaskJobStatus, QueryId, RedactionStatus, TaskId,
+    TaskStatus, TraceView, TurnId, VerificationId, VerificationRecord, VerificationResult,
+    WorkspaceId,
+};
+use golutra_llm::{ConfiguredProvider, MockProvider, ProviderError, ProviderRole};
+use golutra_protocol::{
+    ArtifactReadRequest, EventFilter, RuntimeEventType, RuntimeQueryKind, TaskTraceRequest,
+};
 use tempfile::{TempDir, tempdir};
 use tokio::{
     sync::{Mutex, MutexGuard},
@@ -307,6 +314,252 @@ async fn event_pages_move_backward_and_forward_without_overlap() {
 }
 
 #[tokio::test]
+async fn task_trace_paginates_more_than_the_single_page_limit_and_reports_incomplete_sections() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let session_id = host.default_session_id();
+    let task_id = TaskId::new();
+    for index in 0..513 {
+        host.record_event(host_event(
+            0,
+            session_id,
+            Some(task_id),
+            RuntimeEventType::CommandAccepted,
+            RuntimeEventSource::Runtime,
+            json!({"summary": format!("event {index}")}),
+        ))
+        .await
+        .expect("event");
+    }
+
+    let first = host
+        .task_trace(TaskTraceRequest {
+            session_id,
+            task_id,
+            view: TraceView::Full,
+            cursor: None,
+            limit: 512,
+            wait_for_evaluation: false,
+        })
+        .await
+        .expect("first trace page");
+    assert_eq!(first.events.len(), 512);
+    assert!(first.has_more);
+    assert!(!first.integrity.complete);
+    assert!(
+        first
+            .integrity
+            .missing_sections
+            .contains(&"context_snapshot".to_owned())
+    );
+
+    let second = host
+        .task_trace(TaskTraceRequest {
+            session_id,
+            task_id,
+            view: TraceView::Full,
+            cursor: first.next_cursor,
+            limit: 512,
+            wait_for_evaluation: false,
+        })
+        .await
+        .expect("second trace page");
+    assert_eq!(second.events.len(), 1);
+    assert!(!second.has_more);
+    assert_eq!(second.integrity.event_count, 513);
+    assert!(first.events.last().unwrap().sequence_no < second.events[0].sequence_no);
+
+    let complete = TaskTraceService::new(host)
+        .read_complete(TaskTraceRequest {
+            session_id,
+            task_id,
+            view: TraceView::Full,
+            cursor: None,
+            limit: 512,
+            wait_for_evaluation: false,
+        })
+        .await
+        .expect("complete trace");
+    assert_eq!(complete.events.len(), 513);
+    assert!(!complete.has_more);
+    assert_eq!(complete.integrity.event_count, 513);
+}
+
+#[tokio::test]
+async fn task_scoped_governance_reads_reject_a_different_session() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let owner_session_id = host.default_session_id();
+    let other_session_id = SessionId::new();
+    let task_id = TaskId::new();
+    host.record_event(host_event(
+        0,
+        owner_session_id,
+        Some(task_id),
+        RuntimeEventType::TaskCreated,
+        RuntimeEventSource::Runtime,
+        json!({"prompt": "private task"}),
+    ))
+    .await
+    .expect("task event");
+
+    let trace_error = host
+        .task_trace(TaskTraceRequest {
+            session_id: other_session_id,
+            task_id,
+            view: TraceView::Full,
+            cursor: None,
+            limit: 64,
+            wait_for_evaluation: false,
+        })
+        .await
+        .expect_err("cross-session trace must fail");
+    let projection_error = host
+        .query(RuntimeQuery {
+            query_id: QueryId::new(),
+            session_id: other_session_id,
+            task_id: Some(task_id),
+            kind: RuntimeQueryKind::EvaluationProjection,
+            requester: ActorKind::Sdk,
+            cursor: None,
+            timestamp: chrono::Utc::now(),
+        })
+        .await
+        .expect_err("cross-session projection must fail");
+
+    assert!(matches!(trace_error, ClientError::InvalidSession(_)));
+    assert!(matches!(projection_error, ClientError::InvalidSession(_)));
+}
+
+#[tokio::test]
+async fn artifact_reads_reject_a_different_workspace_before_loading_blob_bytes() {
+    let home = tempdir().expect("home");
+    let workspace_a = tempdir().expect("workspace a");
+    let workspace_b = tempdir().expect("workspace b");
+    let host_a = RuntimeHost::from_home_and_cwd(home.path(), workspace_a.path())
+        .await
+        .expect("host a");
+    let host_b = RuntimeHost::from_home_and_cwd(home.path(), workspace_b.path())
+        .await
+        .expect("host b");
+    let bytes = b"workspace-a-only";
+    let artifact_id = ArtifactId::new();
+    host_a
+        .repositories
+        .artifacts
+        .store(
+            &ArtifactRecord {
+                artifact_id,
+                session_id: host_a.default_session_id(),
+                turn_id: None,
+                tool_call_id: None,
+                artifact_type: "test-private".to_owned(),
+                uri: format!("artifact://test/{artifact_id}"),
+                checksum: format!("sha256:{:x}", Sha256::digest(bytes)),
+                size_bytes: bytes.len() as u64,
+                created_at: chrono::Utc::now(),
+                producer: "test".to_owned(),
+                redaction_status: RedactionStatus::NotRequired,
+                retention_policy: "debug_default".to_owned(),
+                provenance_refs: Vec::new(),
+            },
+            bytes,
+        )
+        .await
+        .expect("artifact");
+
+    let error = host_b
+        .read_artifact_chunk(ArtifactReadRequest {
+            artifact_id,
+            offset: 0,
+            length: 64,
+        })
+        .await
+        .expect_err("foreign workspace artifact must be rejected");
+
+    assert!(matches!(error, ClientError::InvalidSession(_)));
+}
+
+#[tokio::test]
+async fn durable_post_task_worker_recovers_a_queued_job_after_host_restart() {
+    let home = tempdir().expect("home");
+    let workspace = tempdir().expect("workspace");
+    let paths = RuntimePaths::from_home_and_cwd(home.path(), workspace.path()).expect("paths");
+    let store =
+        RuntimeStore::connect_with_artifact_root(&paths.sqlite_url(), paths.artifacts_dir.clone())
+            .await
+            .expect("store");
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let turn_id = TurnId::new();
+    store
+        .append_event_assigning_sequence(host_event(
+            0,
+            session_id,
+            Some(task_id),
+            RuntimeEventType::TaskCreated,
+            RuntimeEventSource::Runtime,
+            json!({"prompt": "recovered evaluation"}),
+        ))
+        .await
+        .expect("task event");
+    store
+        .append_event_assigning_sequence(host_event(
+            0,
+            session_id,
+            Some(task_id),
+            RuntimeEventType::LoopDecided,
+            RuntimeEventSource::Runtime,
+            json!({"status": "completed", "summary": "recovered"}),
+        ))
+        .await
+        .expect("terminal event");
+    let now = chrono::Utc::now();
+    let job = PostTaskJob {
+        job_id: PostTaskJobId::new(),
+        kind: PostTaskJobKind::DeepEvaluation,
+        workspace_id: paths.workspace_id().to_string(),
+        session_id: session_id.to_string(),
+        task_id,
+        input_refs: vec![
+            format!("session:{session_id}"),
+            format!("task:{task_id}"),
+            format!("turn:{turn_id}"),
+        ],
+        status: PostTaskJobStatus::Queued,
+        attempt: 0,
+        max_attempts: 3,
+        lease_owner: None,
+        lease_expires_at: None,
+        result_refs: Vec::new(),
+        last_error: None,
+        created_at: now,
+        started_at: None,
+        completed_at: None,
+    };
+    store.enqueue_post_task_job(&job).await.expect("queued job");
+    drop(store);
+
+    let host = RuntimeHost::from_home_and_cwd(home.path(), workspace.path())
+        .await
+        .expect("restarted host");
+    host.wait_for_deep_task_evaluation(task_id).await;
+    let recovered = host
+        .store
+        .post_task_job(task_id)
+        .await
+        .expect("job state")
+        .expect("job");
+    assert_eq!(recovered.status, PostTaskJobStatus::Succeeded);
+    assert!(
+        host.store
+            .load_events(session_id, Some(task_id), None)
+            .await
+            .expect("evaluation events")
+            .iter()
+            .any(|event| event.event_type == RuntimeEventType::PostTaskJobCompleted)
+    );
+}
+
+#[tokio::test]
 async fn storage_maintenance_command_records_a_report_and_exposes_stats() {
     let transport = EmbeddedTransport::in_memory().await.expect("transport");
     let session_id = transport.default_session_id();
@@ -424,6 +677,112 @@ async fn command_query_and_subscribe_share_state() {
     assert!(ack.accepted);
     assert_eq!(projection_status(&state), Some(TaskStatus::Completed));
     assert!(events.len() >= 7);
+}
+
+#[tokio::test]
+async fn governed_runtime_facade_routes_the_canonical_task_and_trace_chain() {
+    let _provider = IsolatedGlobalMockProvider::install().await;
+    let application = RuntimeApplication::in_memory().await.expect("application");
+    let session_id = application.session_service().default_session_id();
+    let transport = EmbeddedTransport::from_application(application.clone());
+
+    let ack = application
+        .command_service()
+        .execute(command(session_id, "list workspace"))
+        .await
+        .expect("command");
+    let state = wait_for_status(&transport, session_id, TaskStatus::Completed).await;
+    let task_id = state
+        .get("active_task_id")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<TaskId>().ok())
+        .expect("completed task id");
+    let trace = application
+        .trace_service()
+        .read(TaskTraceRequest {
+            session_id,
+            task_id,
+            view: TraceView::Full,
+            cursor: None,
+            limit: 512,
+            wait_for_evaluation: true,
+        })
+        .await
+        .expect("trace");
+    let summary_trace = application
+        .trace_service()
+        .read(TaskTraceRequest {
+            session_id,
+            task_id,
+            view: TraceView::Summary,
+            cursor: None,
+            limit: 512,
+            wait_for_evaluation: true,
+        })
+        .await
+        .expect("summary trace");
+    let forensic_trace = application
+        .trace_service()
+        .read(TaskTraceRequest {
+            session_id,
+            task_id,
+            view: TraceView::Forensic,
+            cursor: None,
+            limit: 512,
+            wait_for_evaluation: true,
+        })
+        .await
+        .expect("forensic trace");
+    let post_task = application
+        .post_task_service()
+        .wait_for_terminal(task_id)
+        .await
+        .expect("post-task status")
+        .expect("post-task job");
+
+    assert!(ack.accepted);
+    assert!(!trace.events.is_empty());
+    assert!(trace.verification_plan.is_some());
+    assert!(trace.post_task_jobs.iter().any(|job| {
+        matches!(
+            job.status,
+            PostTaskJobStatus::Succeeded | PostTaskJobStatus::Failed | PostTaskJobStatus::Cancelled
+        )
+    }));
+    assert!(matches!(
+        post_task.status,
+        PostTaskJobStatus::Succeeded | PostTaskJobStatus::Failed | PostTaskJobStatus::Cancelled
+    ));
+    assert!(trace.evaluation.terminal);
+    assert!(trace.evaluation.integrity_warnings.is_empty());
+    assert!(trace.integrity.complete, "{:?}", trace.integrity);
+    assert!(summary_trace.context_snapshots.is_empty());
+    assert!(summary_trace.artifacts.is_empty());
+    assert!(summary_trace.evidence.is_empty());
+    assert!(summary_trace.integrity.complete);
+    assert!(
+        summary_trace
+            .integrity
+            .redacted_fields
+            .contains(&"event_payload_details".to_owned())
+    );
+    assert!(summary_trace.events.iter().all(|event| {
+        event.payload.as_object().is_some_and(|payload| {
+            payload.keys().all(|key| {
+                matches!(
+                    key.as_str(),
+                    "summary" | "status" | "result" | "decision" | "action" | "reason" | "error"
+                )
+            })
+        }) && event.payload_ref.is_none()
+    }));
+    assert!(!forensic_trace.integrity.complete);
+    assert!(
+        forensic_trace
+            .integrity
+            .retention_losses
+            .contains(&"restricted_context_capture_disabled".to_owned())
+    );
 }
 
 #[tokio::test]
@@ -795,7 +1154,7 @@ async fn processing_command_journal_entry_is_reconciled_after_owner_exit() {
 }
 
 #[tokio::test]
-async fn successful_task_promotes_retrieves_and_rolls_back_project_memory() {
+async fn successful_task_quarantines_reviews_retrieves_and_rolls_back_project_memory() {
     let transport = EmbeddedTransport::in_memory().await.expect("transport");
     let session_id = SessionId::new();
     transport
@@ -820,15 +1179,44 @@ async fn successful_task_promotes_retrieves_and_rolls_back_project_memory() {
         .and_then(|records| records.first())
         .and_then(|record| record.get("memory_id"))
         .and_then(Value::as_str)
-        .expect("promoted memory id")
+        .expect("quarantined memory id")
         .to_owned();
+    assert_eq!(memories[0]["status"], "quarantined");
 
     transport
         .send_command(command(session_id, "list workspace files again"))
         .await
         .expect("second prompt");
     let events = wait_for_task_completed_count(&transport, session_id, 2).await;
-    let retrieved = events
+    let retrieved_before_review = events
+        .iter()
+        .filter(|event| event.event_type == RuntimeEventType::MemoryRetrieved)
+        .filter_map(|event| event.payload.get("retrieved").and_then(Value::as_array))
+        .any(|records| !records.is_empty());
+
+    let review = transport
+        .send_command(SessionCommand {
+            command_id: CommandId::new(),
+            session_id: Some(session_id),
+            kind: SessionCommandKind::ReviewMemoryCandidate,
+            idempotency_key: "review-memory".to_owned(),
+            actor: Actor {
+                kind: ActorKind::Cli,
+                id: "test-reviewer".to_owned(),
+            },
+            payload: json!({"memory_id": memory_id, "decision": "approve"}),
+            timestamp: chrono::Utc::now(),
+        })
+        .await
+        .expect("memory review");
+    assert!(review.accepted);
+
+    transport
+        .send_command(command(session_id, "list workspace files once more"))
+        .await
+        .expect("third prompt");
+    let reviewed_events = wait_for_task_completed_count(&transport, session_id, 3).await;
+    let retrieved_after_review = reviewed_events
         .iter()
         .filter(|event| event.event_type == RuntimeEventType::MemoryRetrieved)
         .filter_map(|event| event.payload.get("retrieved").and_then(Value::as_array))
@@ -850,93 +1238,206 @@ async fn successful_task_promotes_retrieves_and_rolls_back_project_memory() {
         .await
         .expect("memory rollback");
 
-    assert!(retrieved);
+    assert!(!retrieved_before_review);
+    assert!(retrieved_after_review);
     assert!(rollback.accepted);
 }
 
 #[tokio::test]
-async fn evaluation_candidate_requires_regression_and_supports_rollback() {
-    let transport = EmbeddedTransport::in_memory().await.expect("transport");
-    let session_id = SessionId::new();
-    let task_id = TaskId::new();
-    let task = HostedAgentTask {
-        session_id,
-        task_id,
-        turn_id: TurnId::new(),
-        payload: json!({"prompt": "reproduce provider failure"}),
-    };
-    let evidence_id = EvidenceId::new();
-    let mut evaluation_input = transport
-        .host
-        .evaluate_completed_task(
-            &task,
-            HostedTaskEvaluation {
-                objective: "reproduce provider failure",
-                task_status: TaskStatus::Failed,
-                verification: Some(VerificationRecord {
-                    verification_id: VerificationId::new(),
-                    task_id,
-                    objective: "reproduce provider failure".to_owned(),
-                    completion_criteria: vec!["provider succeeds".to_owned()],
-                    checks: vec![VerificationCheck {
-                        kind: golutra_core::VerificationCheckKind::ToolExecution,
-                        name: "provider".to_owned(),
-                        command: None,
-                        passed: false,
-                        evidence_refs: vec![evidence_id],
-                        message: "provider failed".to_owned(),
-                    }],
-                    evidence_refs: vec![evidence_id],
-                    result: VerificationResult::Fail,
-                    policy_status: "allowed".to_owned(),
-                    residual_risks: vec!["provider request failed".to_owned()],
-                }),
-                tool_reports: &[],
-                failure_summary: Some("provider failed".to_owned()),
-                latency: Duration::ZERO,
-            },
-        )
+async fn failed_task_reaches_rejected_promotion_without_polluting_memory() {
+    let _provider = IsolatedGlobalMockProvider::install().await;
+    let application = RuntimeApplication::in_memory().await.expect("application");
+    let session_id = application.session_service().default_session_id();
+    let transport = EmbeddedTransport::from_application(application.clone());
+    let mut failed_prompt = command(session_id, "reproduce provider failure");
+    failed_prompt.payload["mock_provider_failure"] = json!(true);
+
+    let accepted = application
+        .send_command(failed_prompt)
         .await
-        .expect("evaluation");
-    evaluation_input.event_count = 1;
-    transport
-        .host
-        .record_task_evaluation(&task, EvaluationRunner.evaluate_task(evaluation_input))
+        .expect("failed task accepted");
+    let state = wait_for_status(&transport, session_id, TaskStatus::Failed).await;
+    let task_id = state
+        .get("active_task_id")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<TaskId>().ok())
+        .expect("failed task id");
+    let job = application
+        .post_task_service()
+        .wait_for_terminal(task_id)
         .await
-        .expect("deep evaluation");
-    let candidate_id = format!("automation-benchmark-{task_id}");
-    let apply_without_regression = transport
+        .expect("post-task wait")
+        .expect("post-task job");
+    let trace = application
+        .task_trace(TaskTraceRequest {
+            session_id,
+            task_id,
+            view: TraceView::Full,
+            cursor: None,
+            limit: 512,
+            wait_for_evaluation: true,
+        })
+        .await
+        .expect("failed task trace");
+    let candidate_id = trace
+        .evaluation
+        .automation_candidates
+        .iter()
+        .find(|candidate| candidate.id.starts_with("automation-benchmark-"))
+        .map(|candidate| candidate.id.clone())
+        .expect("benchmark candidate");
+    let memories = application
+        .query(RuntimeQuery {
+            query_id: QueryId::new(),
+            session_id,
+            task_id: Some(task_id),
+            kind: RuntimeQueryKind::MemoryList,
+            requester: ActorKind::Cli,
+            cursor: None,
+            timestamp: chrono::Utc::now(),
+        })
+        .await
+        .expect("memory projection");
+    let apply_without_regression = application
         .send_command(runtime_command(
             session_id,
             SessionCommandKind::ApplyCandidate,
-            json!({"candidate_id": candidate_id}),
+            json!({"candidate_id": &candidate_id}),
         ))
         .await;
-    let regression = transport
+    let evaluation_store = application.host().evaluation_store.clone();
+    let second_task_id = TaskId::new();
+    let second_bundle = EvaluationRunner.evaluate_task(TaskEvaluationInput {
+        task_id: second_task_id,
+        objective: "exercise a distinct holdout objective".to_owned(),
+        task_status: TaskStatus::Failed,
+        verification: None,
+        event_count: 1,
+        artifact_count: 0,
+        tool_count: 0,
+        latency_ms: Some(1),
+        failure_summary: Some("independent historical failure".to_owned()),
+        token_usage: Vec::new(),
+        provider_config_ref: "provider:test".to_owned(),
+        runtime_config_ref: "runtime:test".to_owned(),
+        policy_violation_count: 0,
+    });
+    let second_case_ref = second_bundle.case.case_id.clone();
+    evaluation_store
+        .record_task_evaluation(second_bundle)
+        .expect("second regression case");
+    let source_case_ref = evaluation_store
+        .snapshot()
+        .expect("evaluation state")
+        .cases
+        .iter()
+        .find(|case| case.source_task_id == Some(task_id))
+        .map(|case| case.case_id.clone())
+        .expect("source regression case");
+    let regression = application
         .send_command(runtime_command(
             session_id,
             SessionCommandKind::RunRegression,
-            json!({"candidate_id": candidate_id}),
+            json!({
+                "candidate_id": &candidate_id,
+                "case_refs": [&source_case_ref, &second_case_ref],
+                "candidate_files": {
+                    "regression-marker.txt": "candidate workspace"
+                }
+            }),
         ))
         .await
         .expect("regression");
-    let apply = transport
+    let evaluation_state = evaluation_store.snapshot().expect("evaluation state");
+    let campaign = evaluation_state
+        .regression_campaigns
+        .iter()
+        .rev()
+        .find(|campaign| campaign.candidate_id == candidate_id)
+        .expect("campaign");
+    let executions = evaluation_state
+        .regression_executions
+        .iter()
+        .filter(|execution| execution.campaign_id == campaign.campaign_id)
+        .collect::<Vec<_>>();
+    assert_eq!(executions.len(), 4);
+    assert!(campaign.case_refs.iter().all(|case_ref| {
+        executions
+            .iter()
+            .filter(|execution| execution.case_ref == *case_ref)
+            .count()
+            == 2
+    }));
+    for case_ref in &campaign.case_refs {
+        let pair = executions
+            .iter()
+            .filter(|execution| execution.case_ref == *case_ref)
+            .collect::<Vec<_>>();
+        assert_ne!(
+            pair[0].workspace_snapshot_digest,
+            pair[1].workspace_snapshot_digest
+        );
+        assert_ne!(pair[0].task_trace_ref, pair[1].task_trace_ref);
+    }
+    assert!(executions.iter().all(
+        |execution| execution.task_trace_ref.is_some() && execution.verification_ref.is_some()
+    ));
+    for execution in &executions {
+        let reference = execution.task_trace_ref.as_deref().expect("trace ref");
+        let artifact_id = reference
+            .strip_prefix("artifact://regression-trace/")
+            .and_then(|value| value.split('?').next())
+            .and_then(|value| value.parse::<ArtifactId>().ok())
+            .expect("durable regression trace artifact ref");
+        let bytes = application
+            .host()
+            .repositories
+            .artifacts
+            .bytes(artifact_id)
+            .await
+            .expect("trace artifact read")
+            .expect("trace artifact bytes");
+        let bundle: Value = serde_json::from_slice(&bytes).expect("trace bundle JSON");
+        assert_eq!(bundle["format"], "golutra.regression-trace-bundle.v1");
+        assert_eq!(bundle["case_ref"], execution.case_ref);
+    }
+    let apply_after_regression = application
         .send_command(runtime_command(
             session_id,
             SessionCommandKind::ApplyCandidate,
-            json!({"candidate_id": candidate_id}),
+            json!({"candidate_id": &candidate_id}),
         ))
+        .await;
+    let governed = application
+        .governance_service()
+        .evaluation_projection(session_id, task_id)
         .await
-        .expect("apply");
-    let rollback = transport
-        .send_command(runtime_command(
+        .expect("evaluation projection");
+    let governed_trace = application
+        .complete_task_trace(TaskTraceRequest {
             session_id,
-            SessionCommandKind::RollbackCandidate,
-            json!({"candidate_id": candidate_id, "reason": "test rollback"}),
-        ))
+            task_id,
+            view: TraceView::Full,
+            cursor: None,
+            limit: 512,
+            wait_for_evaluation: true,
+        })
         .await
-        .expect("rollback");
+        .expect("governed task trace");
 
+    assert!(accepted.accepted);
+    assert_eq!(job.status, PostTaskJobStatus::Succeeded);
+    assert_eq!(
+        trace.verification.as_ref().map(|record| record.result),
+        Some(VerificationResult::Fail)
+    );
+    assert!(trace.verification_plan.is_some());
+    assert!(trace.evaluation.terminal);
+    assert!(!trace.evaluation.reviews.is_empty());
+    assert!(!trace.evaluation.results.is_empty());
+    assert!(!trace.evaluation.improvement_candidates.is_empty());
+    assert!(trace.integrity.complete, "{:?}", trace.integrity);
+    assert!(memories.as_array().is_some_and(Vec::is_empty));
     assert!(matches!(
         apply_without_regression,
         Err(ClientError::Evaluation(EvaluationError::PromotionRequired(
@@ -944,8 +1445,42 @@ async fn evaluation_candidate_requires_regression_and_supports_rollback() {
         )))
     ));
     assert!(regression.accepted);
-    assert!(apply.accepted);
-    assert!(rollback.accepted);
+    assert!(matches!(
+        apply_after_regression,
+        Err(ClientError::Evaluation(EvaluationError::PromotionRequired(
+            _
+        )))
+    ));
+    assert!(!governed.regressions.is_empty());
+    assert!(governed.integrity_warnings.is_empty(), "{governed:?}");
+    assert!(governed.promotion_decisions.iter().any(|decision| {
+        decision.candidate_id == candidate_id && decision.decision == PromotionDecisionKind::Reject
+    }));
+    assert!(
+        governed_trace.integrity.complete,
+        "{:?}",
+        governed_trace.integrity
+    );
+    assert!(
+        governed_trace
+            .events
+            .iter()
+            .any(|event| event.event_type == RuntimeEventType::RegressionCompleted)
+    );
+    assert!(executions.iter().all(|execution| {
+        execution
+            .task_trace_ref
+            .as_deref()
+            .and_then(|reference| reference.strip_prefix("artifact://regression-trace/"))
+            .and_then(|value| value.split('?').next())
+            .and_then(|value| value.parse::<ArtifactId>().ok())
+            .is_some_and(|artifact_id| {
+                governed_trace
+                    .artifacts
+                    .iter()
+                    .any(|artifact| artifact.artifact_id == artifact_id)
+            })
+    }));
 }
 
 #[tokio::test]
@@ -1039,6 +1574,68 @@ async fn evolution_plan_executes_generated_task_in_isolated_mock_runtime() {
                 .as_ref()
         )
     );
+}
+
+#[tokio::test]
+async fn evaluation_persistence_failure_is_reported_to_the_durable_worker() {
+    let workspace = tempdir().expect("workspace");
+    let home = tempdir().expect("home");
+    let transport = EmbeddedTransport::from_home_and_cwd(home.path(), workspace.path())
+        .await
+        .expect("transport");
+    let paths = transport
+        .host
+        .runtime_paths
+        .as_ref()
+        .expect("runtime paths");
+    if paths.evaluation_file.exists() {
+        fs::remove_file(&paths.evaluation_file).expect("remove evaluation file");
+    }
+    fs::create_dir(&paths.evaluation_file).expect("block evaluation state file");
+    let task = HostedAgentTask {
+        session_id: transport.default_session_id(),
+        task_id: TaskId::new(),
+        turn_id: TurnId::new(),
+        payload: json!({"prompt": "evaluate persistence failure"}),
+    };
+    let bundle = EvaluationRunner.evaluate_minimal(TaskEvaluationInput {
+        task_id: task.task_id,
+        objective: "evaluate persistence failure".to_owned(),
+        task_status: TaskStatus::Completed,
+        verification: None,
+        event_count: 1,
+        artifact_count: 0,
+        tool_count: 0,
+        latency_ms: Some(1),
+        failure_summary: None,
+        token_usage: Vec::new(),
+        provider_config_ref: "provider:test".to_owned(),
+        runtime_config_ref: "runtime:test".to_owned(),
+        policy_violation_count: 0,
+    });
+
+    assert!(
+        !transport
+            .host
+            .record_task_evaluation(&task, bundle)
+            .await
+            .expect("failure event is durable")
+    );
+    let events = transport
+        .host
+        .repositories
+        .events
+        .load(task.session_id, Some(task.task_id), None)
+        .await
+        .expect("events");
+    assert!(events.iter().any(|event| {
+        event.event_type == RuntimeEventType::EvaluationCompleted
+            && event
+                .payload
+                .get("summary")
+                .and_then(serde_json::Value::as_str)
+                == Some("durable task evaluation failed")
+    }));
 }
 
 #[tokio::test]
@@ -1701,6 +2298,119 @@ async fn rebind_moves_thread_to_current_cwd_and_rebuilds_rollout() {
 }
 
 #[tokio::test]
+async fn post_task_worker_does_not_claim_or_rewrite_a_foreign_workspace_job() {
+    let home = tempdir().expect("home");
+    let old_workspace = tempdir().expect("old workspace");
+    let new_workspace = tempdir().expect("new workspace");
+    let old_paths =
+        RuntimePaths::from_home_and_cwd(home.path(), old_workspace.path()).expect("old paths");
+    let new_paths =
+        RuntimePaths::from_home_and_cwd(home.path(), new_workspace.path()).expect("new paths");
+    let store = RuntimeStore::connect_with_artifact_root(
+        &old_paths.sqlite_url(),
+        old_paths.artifacts_dir.clone(),
+    )
+    .await
+    .expect("store");
+    let now = chrono::Utc::now();
+    let thread_id = ThreadId::new();
+    let session_id = SessionId::new();
+    let old_rollout_path = old_paths.rollout_path(thread_id).display().to_string();
+    store
+        .upsert_thread(&ThreadRecord {
+            thread_id,
+            session_id,
+            parent_thread_id: None,
+            forked_from_turn_id: None,
+            forked_from_sequence_no: None,
+            workspace_root: Some(old_paths.cwd.display().to_string()),
+            rebound_from_workspace_root: None,
+            rollout_path: Some(old_rollout_path.clone()),
+            title: "foreign post-task job".to_owned(),
+            preview: "foreign post-task job".to_owned(),
+            created_at: now,
+            updated_at: now,
+            recency_at: now,
+            archived: false,
+        })
+        .await
+        .expect("thread");
+    let foreign_job = PostTaskJob {
+        job_id: PostTaskJobId::new(),
+        kind: PostTaskJobKind::DeepEvaluation,
+        workspace_id: old_paths.workspace_id().to_string(),
+        session_id: session_id.to_string(),
+        task_id: TaskId::new(),
+        input_refs: Vec::new(),
+        status: PostTaskJobStatus::Queued,
+        attempt: 0,
+        max_attempts: 1,
+        lease_owner: None,
+        lease_expires_at: None,
+        result_refs: Vec::new(),
+        last_error: None,
+        created_at: now,
+        started_at: None,
+        completed_at: None,
+    };
+    let local_job = PostTaskJob {
+        job_id: PostTaskJobId::new(),
+        workspace_id: new_paths.workspace_id().to_string(),
+        session_id: SessionId::new().to_string(),
+        task_id: TaskId::new(),
+        created_at: now + chrono::Duration::milliseconds(1),
+        ..foreign_job.clone()
+    };
+    store
+        .enqueue_post_task_job(&foreign_job)
+        .await
+        .expect("foreign job");
+    store
+        .enqueue_post_task_job(&local_job)
+        .await
+        .expect("local job");
+
+    let host = RuntimeHost::from_home_and_cwd(home.path(), new_workspace.path())
+        .await
+        .expect("new workspace host");
+    let mut processed_local = None;
+    for _ in 0..40 {
+        let job = store
+            .post_task_job_by_id(local_job.job_id)
+            .await
+            .expect("local job state")
+            .expect("local job exists");
+        if job.attempt > 0 {
+            processed_local = Some(job);
+            break;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    let foreign_after = store
+        .post_task_job_by_id(foreign_job.job_id)
+        .await
+        .expect("foreign job state")
+        .expect("foreign job exists");
+    let thread_after = store
+        .thread_by_id(thread_id)
+        .await
+        .expect("thread state")
+        .expect("thread exists");
+    drop(host);
+
+    assert!(
+        processed_local.is_some(),
+        "local worker did not poll its queue"
+    );
+    assert_eq!(foreign_after.status, PostTaskJobStatus::Queued);
+    assert_eq!(foreign_after.attempt, 0);
+    assert_eq!(
+        thread_after.rollout_path.as_deref(),
+        Some(old_rollout_path.as_str())
+    );
+}
+
+#[tokio::test]
 async fn rebind_rejects_a_rollout_path_outside_the_source_workspace_partition() {
     let old_workspace = tempdir().expect("old workspace");
     let new_workspace = tempdir().expect("new workspace");
@@ -2057,6 +2767,43 @@ async fn prompt_runs_mock_agent_loop_and_writes_file() {
             .any(|event| event["event_type"] == json!(RuntimeEventType::TokenUsageRecorded))
     }));
     let events = debug["events"].as_array().expect("debug events");
+    let context_snapshot = events
+        .iter()
+        .find(|event| event["event_type"] == json!(RuntimeEventType::ContextSnapshotCreated))
+        .and_then(|event| event["payload"]["snapshot"].as_object())
+        .expect("context snapshot event");
+    let request_artifact_id = context_snapshot["redacted_request_artifact_ref"]
+        .as_str()
+        .expect("redacted request artifact ref")
+        .parse::<uuid::Uuid>()
+        .expect("artifact id");
+    assert!(
+        context_snapshot["contributor_manifest"]
+            .as_array()
+            .is_some_and(|contributors| contributors
+                .iter()
+                .filter(|item| item["included"] == true)
+                .all(|item| item["redacted_content_ref"]
+                    == Value::String(request_artifact_id.to_string())))
+    );
+    let request_bytes = transport
+        .host
+        .store
+        .load_artifact_bytes(ArtifactId(request_artifact_id))
+        .await
+        .expect("request artifact")
+        .expect("request artifact bytes");
+    let request_json: Value = serde_json::from_slice(&request_bytes).expect("request JSON");
+    assert!(request_json["messages"].as_array().is_some_and(|messages| {
+        messages
+            .iter()
+            .any(|message| message["content"] == "write file")
+    }));
+    assert!(debug["artifacts"].as_array().is_some_and(|artifacts| {
+        artifacts
+            .iter()
+            .any(|artifact| artifact["artifact_type"] == "context_request_redacted")
+    }));
     let checkpoint_index = events
         .iter()
         .position(|event| event["event_type"] == json!(RuntimeEventType::CheckpointCreated))
@@ -2576,6 +3323,45 @@ fn provider_raw_artifact_reports_whether_redaction_changed_metadata() {
 
     assert_eq!(clean.redaction_status, RedactionStatus::NotRequired);
     assert_eq!(redacted.redaction_status, RedactionStatus::Redacted);
+}
+
+#[test]
+fn context_request_artifact_redacts_secrets_inside_model_visible_messages() {
+    let task = HostedAgentTask {
+        session_id: SessionId::new(),
+        task_id: TaskId::new(),
+        turn_id: TurnId::new(),
+        payload: json!({}),
+    };
+    let plan = ContextBuilder::default()
+        .build(
+            task.task_id,
+            task.turn_id,
+            vec![ContextContributor {
+                name: "objective".to_owned(),
+                role: ProviderRole::User,
+                content: "API_KEY=plain-secret-value".to_owned(),
+                token_budget_hint: 32,
+            }],
+        )
+        .expect("context plan");
+    let request = provider_request_from_plan(
+        &plan,
+        task.task_id,
+        task.turn_id,
+        "mock",
+        "mock-model",
+        Vec::new(),
+    );
+    let snapshot = context_snapshot_from_request(task.session_id, &plan, &request);
+    let (artifact, bytes) =
+        context_request_artifact(&task, &snapshot, &request).expect("context artifact");
+    let encoded = String::from_utf8(bytes).expect("artifact UTF-8");
+
+    assert_eq!(artifact.artifact_type, "context_request_redacted");
+    assert_eq!(artifact.redaction_status, RedactionStatus::Redacted);
+    assert!(!encoded.contains("plain-secret-value"));
+    assert!(encoded.contains("<redacted-secret>"));
 }
 
 #[tokio::test]

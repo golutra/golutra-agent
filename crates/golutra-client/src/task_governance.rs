@@ -1,0 +1,429 @@
+//! 任务终态后的评估输入、durable job、候选事件与 memory quarantine 编排。
+
+use super::*;
+
+impl RuntimeHost {
+    pub(super) async fn evaluate_completed_task(
+        &self,
+        task: &HostedAgentTask,
+        input: HostedTaskEvaluation<'_>,
+    ) -> Result<TaskEvaluationInput, ClientError> {
+        let events = self
+            .repositories
+            .events
+            .load(task.session_id, Some(task.task_id), None)
+            .await?;
+        let artifact_count = input
+            .tool_reports
+            .iter()
+            .map(|report| report.artifacts.len())
+            .sum();
+        let token_usage = events
+            .iter()
+            .filter(|event| event.event_type == RuntimeEventType::TokenUsageRecorded)
+            .filter_map(|event| event.payload.get("record").cloned())
+            .filter_map(|record| serde_json::from_value::<TokenUsageRecord>(record).ok())
+            .collect::<Vec<_>>();
+        let policy_violation_count = events
+            .iter()
+            .filter(|event| event.event_type == RuntimeEventType::PolicyEvaluated)
+            .filter_map(|event| event.payload.get("record").cloned())
+            .filter_map(|record| serde_json::from_value::<PolicyEvaluation>(record).ok())
+            .filter(|evaluation| {
+                matches!(
+                    evaluation.decision,
+                    PolicyDecision::Deny | PolicyDecision::Block
+                )
+            })
+            .count();
+        let provider_config_ref = token_usage.last().map_or_else(
+            || "runtime-active-profile".to_owned(),
+            |record| format!("{}:{}", record.provider_id, record.model_id),
+        );
+        let evaluation_input = TaskEvaluationInput {
+            task_id: task.task_id,
+            objective: input.objective.to_owned(),
+            task_status: input.task_status,
+            verification: input.verification,
+            event_count: events.len(),
+            artifact_count,
+            tool_count: input.tool_reports.len(),
+            latency_ms: Some(u64::try_from(input.latency.as_millis()).unwrap_or(u64::MAX)),
+            failure_summary: input.failure_summary,
+            token_usage,
+            provider_config_ref,
+            runtime_config_ref: format!("golutra-runtime:{}", env!("CARGO_PKG_VERSION")),
+            policy_violation_count: u32::try_from(policy_violation_count).unwrap_or(u32::MAX),
+        };
+        let bundle = self.governance.evaluate_minimal(evaluation_input.clone());
+        // Post-task governance is durable but does not rewrite the already-decided user task
+        // status. The deep worker will retry a failed persistence attempt independently.
+        let _ = self.record_task_evaluation(task, bundle).await?;
+        Ok(evaluation_input)
+    }
+
+    pub(super) async fn enqueue_deep_task_evaluation(
+        &self,
+        task: &HostedAgentTask,
+        input: TaskEvaluationInput,
+    ) -> Result<(), ClientError> {
+        if let Some(existing) = self.repositories.jobs.get_for_task(task.task_id).await? {
+            match existing.status {
+                PostTaskJobStatus::Queued
+                | PostTaskJobStatus::Leased
+                | PostTaskJobStatus::Running => {
+                    self.deep_evaluation_inputs
+                        .lock()
+                        .await
+                        .insert(existing.job_id, input);
+                    return Ok(());
+                }
+                PostTaskJobStatus::Succeeded => return Ok(()),
+                PostTaskJobStatus::Failed | PostTaskJobStatus::Cancelled => {}
+            }
+        }
+
+        let now = chrono::Utc::now();
+        let job = PostTaskJob {
+            job_id: PostTaskJobId::new(),
+            kind: PostTaskJobKind::DeepEvaluation,
+            workspace_id: self.workspace_id.to_string(),
+            session_id: task.session_id.to_string(),
+            task_id: task.task_id,
+            input_refs: vec![
+                format!("session:{}", task.session_id),
+                format!("task:{}", task.task_id),
+                format!("turn:{}", task.turn_id),
+            ],
+            status: PostTaskJobStatus::Queued,
+            attempt: 0,
+            max_attempts: POST_TASK_JOB_MAX_ATTEMPTS,
+            lease_owner: None,
+            lease_expires_at: None,
+            result_refs: Vec::new(),
+            last_error: None,
+            created_at: now,
+            started_at: None,
+            completed_at: None,
+        };
+        let event = agent_event(
+            0,
+            task,
+            RuntimeEventType::PostTaskJobQueued,
+            RuntimeEventSource::Evaluator,
+            json!({
+                "summary": "durable post-task evaluation queued",
+                "job": job,
+                "mode": "deep",
+            }),
+        );
+        let _writer = self.event_writer.lock().await;
+        let event = self
+            .repositories
+            .jobs
+            .enqueue_with_event(&job, event)
+            .await?;
+        self.next_sequence_no
+            .fetch_max(event.sequence_no.saturating_add(1), Ordering::SeqCst);
+        self.deep_evaluation_inputs
+            .lock()
+            .await
+            .insert(job.job_id, input);
+        self.publish_committed_event(event).await
+    }
+
+    pub(super) async fn reconstruct_post_task_context(
+        &self,
+        job: &PostTaskJob,
+    ) -> Result<(HostedAgentTask, TaskEvaluationInput), ClientError> {
+        let queued_input = self.deep_evaluation_inputs.lock().await.remove(&job.job_id);
+        let session_id = job.session_id.parse().map_err(|error: uuid::Error| {
+            ClientError::InvalidSession(format!("post-task job session id is invalid: {error}"))
+        })?;
+        let events = self
+            .repositories
+            .events
+            .load(session_id, Some(job.task_id), None)
+            .await?;
+        let objective = events
+            .iter()
+            .rev()
+            .find_map(|event| {
+                event
+                    .payload
+                    .get("prompt")
+                    .or_else(|| event.payload.get("objective"))
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .unwrap_or("recovered post-task evaluation")
+            .to_owned();
+        let turn_id = events
+            .iter()
+            .rev()
+            .find_map(|event| event.turn_id)
+            .unwrap_or_else(TurnId::new);
+        let task = HostedAgentTask {
+            session_id,
+            task_id: job.task_id,
+            turn_id,
+            payload: json!({"prompt": objective}),
+        };
+        let status = events
+            .iter()
+            .rev()
+            .find(|event| {
+                matches!(
+                    event.event_type,
+                    RuntimeEventType::TaskCompleted
+                        | RuntimeEventType::TaskAborted
+                        | RuntimeEventType::LoopDecided
+                )
+            })
+            .and_then(|event| event.payload.get("status"))
+            .cloned()
+            .and_then(|value| serde_json::from_value::<TaskStatus>(value).ok())
+            .unwrap_or(TaskStatus::Failed);
+        let verification = events
+            .iter()
+            .rev()
+            .find(|event| event.event_type == RuntimeEventType::VerificationCompleted)
+            .and_then(|event| event.payload.get("record"))
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok());
+        let token_usage = events
+            .iter()
+            .filter(|event| event.event_type == RuntimeEventType::TokenUsageRecorded)
+            .filter_map(|event| event.payload.get("record").cloned())
+            .filter_map(|value| serde_json::from_value::<TokenUsageRecord>(value).ok())
+            .collect::<Vec<_>>();
+        let policy_violation_count = events
+            .iter()
+            .filter(|event| event.event_type == RuntimeEventType::PolicyEvaluated)
+            .filter_map(|event| event.payload.get("record").cloned())
+            .filter_map(|value| serde_json::from_value::<PolicyEvaluation>(value).ok())
+            .filter(|evaluation| {
+                matches!(
+                    evaluation.decision,
+                    PolicyDecision::Deny | PolicyDecision::Block
+                )
+            })
+            .count();
+        let tool_events = events
+            .iter()
+            .filter(|event| event.event_type == RuntimeEventType::ToolCompleted)
+            .collect::<Vec<_>>();
+        let artifact_count = tool_events
+            .iter()
+            .filter_map(|event| event.payload.get("envelope"))
+            .filter_map(|envelope| envelope.get("raw_artifact_ref"))
+            .count();
+        let failure_summary = events
+            .iter()
+            .rev()
+            .find(|event| event.event_type == RuntimeEventType::LoopDecided)
+            .and_then(|event| {
+                event
+                    .payload
+                    .get("summary")
+                    .or_else(|| event.payload.get("error"))
+                    .and_then(Value::as_str)
+            })
+            .map(ToOwned::to_owned);
+        let latency_ms = events.first().zip(events.last()).and_then(|(first, last)| {
+            u64::try_from(
+                last.timestamp
+                    .signed_duration_since(first.timestamp)
+                    .num_milliseconds(),
+            )
+            .ok()
+        });
+        let provider_config_ref = token_usage.last().map_or_else(
+            || "runtime-active-profile".to_owned(),
+            |record| format!("{}:{}", record.provider_id, record.model_id),
+        );
+        let input = queued_input.unwrap_or(TaskEvaluationInput {
+            task_id: job.task_id,
+            objective,
+            task_status: status,
+            verification,
+            event_count: events.len(),
+            artifact_count,
+            tool_count: tool_events.len(),
+            latency_ms,
+            failure_summary,
+            token_usage,
+            provider_config_ref,
+            runtime_config_ref: format!("golutra-runtime:{}", env!("CARGO_PKG_VERSION")),
+            policy_violation_count: u32::try_from(policy_violation_count).unwrap_or(u32::MAX),
+        });
+        Ok((task, input))
+    }
+
+    pub(super) async fn wait_for_candidate_evaluation(&self, candidate_id: &str) {
+        let Some(task_id) = task_id_from_candidate_id(candidate_id) else {
+            return;
+        };
+        self.wait_for_deep_task_evaluation(task_id).await;
+    }
+
+    pub(super) async fn wait_for_deep_task_evaluation(&self, task_id: TaskId) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let job = self.repositories.jobs.get_for_task(task_id).await;
+            let terminal = match job {
+                Ok(Some(job)) => matches!(
+                    job.status,
+                    PostTaskJobStatus::Succeeded
+                        | PostTaskJobStatus::Failed
+                        | PostTaskJobStatus::Cancelled
+                ),
+                Ok(None) => true,
+                Err(_) => true,
+            };
+            if terminal || Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(POST_TASK_JOB_POLL_MILLIS)).await;
+        }
+    }
+
+    pub(super) async fn record_task_evaluation(
+        &self,
+        task: &HostedAgentTask,
+        bundle: TaskEvaluationBundle,
+    ) -> Result<bool, ClientError> {
+        let recorded = match self.governance.persist_evaluation(bundle).await {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                self.record_event(agent_event(
+                    self.next_sequence_no(),
+                    task,
+                    RuntimeEventType::EvaluationCompleted,
+                    RuntimeEventSource::Evaluator,
+                    json!({
+                        "summary": "durable task evaluation failed",
+                        "error": error.to_string(),
+                    }),
+                ))
+                .await?;
+                return Ok(false);
+            }
+        };
+        let result = recorded.result;
+        let review = recorded.review;
+        let improvement_candidate = recorded.improvement_candidate;
+        let automation_candidates = recorded.automation_candidates;
+        self.record_event(agent_event(
+            self.next_sequence_no(),
+            task,
+            RuntimeEventType::PostTaskReviewed,
+            RuntimeEventSource::Evaluator,
+            json!({
+                "summary": format!("{:?} post-task review outcome: {}", review.mode, review.outcome),
+                "record": review,
+            }),
+        ))
+        .await?;
+        self.record_event(agent_event(
+            self.next_sequence_no(),
+            task,
+            RuntimeEventType::EvaluationCompleted,
+            RuntimeEventSource::Evaluator,
+            json!({
+                "summary": format!("task evaluation verdict: {:?}", result.verdict),
+                "record": result,
+            }),
+        ))
+        .await?;
+        if let Some(candidate) = improvement_candidate {
+            self.record_event(agent_event(
+                self.next_sequence_no(),
+                task,
+                RuntimeEventType::ImprovementCandidateCreated,
+                RuntimeEventSource::Evaluator,
+                json!({
+                    "summary": format!("improvement candidate {} proposed", candidate.id),
+                    "record": candidate,
+                }),
+            ))
+            .await?;
+        }
+        if !automation_candidates.is_empty() {
+            self.record_event(agent_event(
+                self.next_sequence_no(),
+                task,
+                RuntimeEventType::AutomationCandidateCreated,
+                RuntimeEventSource::Evaluator,
+                json!({
+                    "summary": format!("{} governed automation candidates proposed", automation_candidates.len()),
+                    "records": automation_candidates,
+                }),
+            ))
+            .await?;
+        }
+        Ok(true)
+    }
+
+    pub(super) async fn promote_successful_task_memory(
+        &self,
+        task: &HostedAgentTask,
+        objective: &str,
+        outcome: &golutra_runtime::AgentLoopOutcome,
+        terminal_status: TaskStatus,
+    ) -> Result<(), ClientError> {
+        if terminal_status != TaskStatus::Completed || outcome.verification.evidence_refs.is_empty()
+        {
+            return Ok(());
+        }
+        let tool_facts = outcome
+            .tool_reports
+            .iter()
+            .map(|report| report.envelope.summary.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        let final_message = outcome
+            .final_message
+            .as_deref()
+            .unwrap_or("verified completion");
+        let promotion = self
+            .governance
+            .quarantine_verified_memory(
+                task.task_id,
+                objective,
+                final_message,
+                &tool_facts,
+                outcome.verification.evidence_refs.clone(),
+            )
+            .await?;
+        match promotion {
+            Ok(record) => {
+                self.record_event(agent_event(
+                    self.next_sequence_no(),
+                    task,
+                    RuntimeEventType::MemoryCandidateQuarantined,
+                    RuntimeEventSource::Memory,
+                    json!({
+                        "summary": format!("project memory {} quarantined", record.memory_id),
+                        "record": record,
+                    }),
+                ))
+                .await?;
+            }
+            Err(error) => {
+                self.record_event(agent_event(
+                    self.next_sequence_no(),
+                    task,
+                    RuntimeEventType::MemoryPromotionRejected,
+                    RuntimeEventSource::Memory,
+                    json!({
+                        "summary": "project memory promotion rejected",
+                        "reason": error.to_string(),
+                    }),
+                ))
+                .await?;
+            }
+        }
+        Ok(())
+    }
+}

@@ -90,6 +90,18 @@ pub enum RuntimeEventType {
     SkillRolledBack,
     GovernorDecided,
     StorageMaintenanceCompleted,
+    ContextSnapshotCreated,
+    PostTaskJobQueued,
+    PostTaskJobStarted,
+    PostTaskJobCompleted,
+    PostTaskJobFailed,
+    VerificationPlanned,
+    VerificationAssertionCompleted,
+    RegressionCampaignStarted,
+    RegressionExecutionCompleted,
+    MemoryCandidateQuarantined,
+    MemoryActivated,
+    MemoryInvalidated,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

@@ -461,6 +461,26 @@ impl RuntimeClient for UnixIpcTransport {
     }
 }
 
+#[async_trait]
+impl TaskTraceClient for UnixIpcTransport {
+    async fn task_trace(&self, request: TaskTraceRequest) -> Result<TaskTracePage, ClientError> {
+        self.attached_json("POST", "/traces", Some(serde_json::to_value(request)?))
+            .await
+    }
+
+    async fn read_artifact_chunk(
+        &self,
+        request: ArtifactReadRequest,
+    ) -> Result<Option<ArtifactChunk>, ClientError> {
+        self.attached_json(
+            "POST",
+            "/artifacts/chunk",
+            Some(serde_json::to_value(request)?),
+        )
+        .await
+    }
+}
+
 async fn exchange(
     socket_path: &Path,
     token: &SecretString,

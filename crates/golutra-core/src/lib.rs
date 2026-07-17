@@ -1,6 +1,7 @@
 pub mod approval;
 pub mod artifact;
 pub mod checkpoint;
+pub mod governance;
 pub mod ids;
 pub mod loop_control;
 pub mod policy;
@@ -13,6 +14,7 @@ pub mod verification;
 pub use approval::*;
 pub use artifact::*;
 pub use checkpoint::*;
+pub use governance::*;
 pub use ids::*;
 pub use loop_control::*;
 pub use policy::*;

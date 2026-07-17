@@ -1,8 +1,10 @@
 use golutra_core::{
-    BudgetOverflowAction, TaskId, TokenBudgetSnapshot, TokenBudgetSnapshotId, TokenUsageRecord,
-    ToolContract, TurnId,
+    BudgetOverflowAction, ContextContributorSnapshot, ContextMessageSnapshot, ContextSnapshot,
+    ContextSnapshotId, SessionId, TaskId, TokenBudgetSnapshot, TokenBudgetSnapshotId,
+    TokenUsageRecord, ToolContract, TurnId,
 };
 use golutra_llm::{ProviderMessage, ProviderRequest, ProviderRole, ProviderUsage};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -24,6 +26,7 @@ pub struct ContextContributor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextBuildPlan {
     pub contributors: Vec<String>,
+    pub contributor_manifest: Vec<ContextContributorSnapshot>,
     pub messages: Vec<ProviderMessage>,
     pub budget_snapshot: TokenBudgetSnapshot,
     pub original_planned_input_tokens: u64,
@@ -102,6 +105,22 @@ impl ContextBuilder {
             });
         }
 
+        let contributor_manifest = contributors
+            .iter()
+            .map(|contributor| ContextContributorSnapshot {
+                name: contributor.name.clone(),
+                role: format!("{:?}", contributor.role).to_lowercase(),
+                source_refs: Vec::new(),
+                included: true,
+                trimmed: trimmed_contributors
+                    .iter()
+                    .any(|name| name == &contributor.name),
+                estimated_tokens: estimate_tokens(&contributor.content),
+                content_digest: digest_bytes(contributor.content.as_bytes()),
+                redacted_content_ref: None,
+                invalidation_refs: Vec::new(),
+            })
+            .collect::<Vec<_>>();
         let messages = contributors
             .iter()
             .map(|contributor| ProviderMessage {
@@ -120,6 +139,7 @@ impl ContextBuilder {
 
         Ok(ContextBuildPlan {
             contributors: contributor_names,
+            contributor_manifest,
             messages,
             original_planned_input_tokens,
             trimmed_contributors,
@@ -225,6 +245,63 @@ pub fn provider_request_from_plan(
         messages: plan.messages.clone(),
         tools,
     }
+}
+
+#[must_use]
+pub fn context_snapshot_from_request(
+    session_id: SessionId,
+    plan: &ContextBuildPlan,
+    request: &ProviderRequest,
+) -> ContextSnapshot {
+    let message_manifest = request
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| ContextMessageSnapshot {
+            index: u32::try_from(index).unwrap_or(u32::MAX),
+            role: format!("{:?}", message.role).to_lowercase(),
+            content_digest: digest_bytes(message.content.as_bytes()),
+            estimated_tokens: estimate_tokens(&message.content),
+            tool_call_ids: message
+                .tool_calls
+                .iter()
+                .map(|call| call.tool_call_id.clone())
+                .collect(),
+        })
+        .collect();
+    let tool_schema_digests = request
+        .tools
+        .iter()
+        .filter_map(|tool| serde_json::to_vec(tool).ok())
+        .map(|bytes| digest_bytes(&bytes))
+        .collect();
+    let canonical_request_digest = serde_json::to_vec(request)
+        .map(|bytes| digest_bytes(&bytes))
+        .unwrap_or_else(|_| digest_bytes(request.provider_id.as_bytes()));
+    ContextSnapshot {
+        snapshot_id: ContextSnapshotId::new(),
+        session_id,
+        task_id: request.task_id,
+        turn_id: request.turn_id,
+        provider_request_id: request.request_id,
+        provider_id: request.provider_id.clone(),
+        model_id: request.model_id.clone(),
+        contributor_manifest: plan.contributor_manifest.clone(),
+        message_manifest,
+        tool_schema_digests,
+        generation_config_digest: None,
+        budget_snapshot: plan.budget_snapshot.clone(),
+        canonical_request_digest,
+        redacted_request_artifact_ref: None,
+        restricted_request_artifact_ref: None,
+        estimate_source: "character_div_4".to_owned(),
+        created_at: chrono::Utc::now(),
+    }
+}
+
+fn digest_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    format!("sha256:{:x}", digest)
 }
 
 #[must_use]

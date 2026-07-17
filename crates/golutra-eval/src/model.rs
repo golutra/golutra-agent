@@ -1,5 +1,8 @@
 use chrono::{DateTime, Utc};
-use golutra_core::{EvidenceId, TaskId, TaskStatus, TokenUsageRecord, VerificationRecord};
+use golutra_core::{
+    EvidenceId, RegressionCampaign, RegressionExecution, TaskId, TaskStatus, TokenUsageRecord,
+    VerificationRecord,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -309,6 +312,16 @@ pub struct PromotionDecision {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PromotionGateFacts {
+    pub trace_complete: bool,
+    pub unresolved_refs: Vec<String>,
+    pub verification: EvaluationVerdict,
+    pub paired_execution_refs: Vec<String>,
+    pub candidate_mutates_control_plane: bool,
+    pub mutation_reasons: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PromotionDecisionKind {
@@ -475,4 +488,8 @@ pub struct EvaluationState {
     pub regressions: Vec<RegressionResult>,
     pub promotion_decisions: Vec<PromotionDecision>,
     pub applied_candidates: Vec<AppliedCandidate>,
+    #[serde(default)]
+    pub regression_campaigns: Vec<RegressionCampaign>,
+    #[serde(default)]
+    pub regression_executions: Vec<RegressionExecution>,
 }

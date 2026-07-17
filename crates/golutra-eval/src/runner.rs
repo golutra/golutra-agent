@@ -7,8 +7,9 @@ use crate::{
     BenchmarkPromotion, BenchmarkRun, BenchmarkSuiteKind, CandidateRisk, CandidateStatus,
     CostRecord, EvaluationCase, EvaluationResult, EvaluationRun, EvaluationVerdict, GeneratedTask,
     ImprovementCandidate, PostTaskReview, PromotionDecision, PromotionDecisionKind,
-    PromotionReviewer, RegressionResult, RegressionVerdict, ReviewMode, SecurityUtilityResult,
-    SkillCandidate, TaskEvaluationBundle, TaskEvaluationInput, TrajectoryReplay,
+    PromotionGateFacts, PromotionReviewer, RegressionResult, RegressionVerdict, ReviewMode,
+    SecurityUtilityResult, SkillCandidate, TaskEvaluationBundle, TaskEvaluationInput,
+    TrajectoryReplay,
 };
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -590,6 +591,11 @@ pub fn decide_low_risk_promotion(
     let clean_regression = regression.verdict == RegressionVerdict::Pass
         && regression.failed_cases == 0
         && regression.regressions.is_empty();
+    let has_paired_execution_refs = regression.causal_comparison_refs.len() >= 2
+        && regression
+            .causal_comparison_refs
+            .iter()
+            .all(|reference| !reference.trim().is_empty());
     let (decision, reason) = if candidate.status != CandidateStatus::RegressionPassed {
         (
             PromotionDecisionKind::Reject,
@@ -599,6 +605,16 @@ pub fn decide_low_risk_promotion(
         (
             PromotionDecisionKind::Reject,
             "regression failed or reported regressions",
+        )
+    } else if !has_paired_execution_refs {
+        (
+            PromotionDecisionKind::NeedsHumanReview,
+            "regression has no paired baseline/candidate execution traces",
+        )
+    } else if candidate_mutates_control_plane(candidate) {
+        (
+            PromotionDecisionKind::Reject,
+            "candidate attempts to modify evaluator, sandbox, signer, or promotion control plane",
         )
     } else if candidate.risk_level != CandidateRisk::Low
         || candidate.kind != AutomationCandidateKind::Benchmark
@@ -630,6 +646,87 @@ pub fn decide_low_risk_promotion(
         expires_at: None,
         created_at: Utc::now(),
     }
+}
+
+#[must_use]
+pub fn decide_governed_promotion(
+    candidate: &AutomationCandidate,
+    regression: &RegressionResult,
+    facts: &PromotionGateFacts,
+) -> PromotionDecision {
+    if !facts.trace_complete || !facts.unresolved_refs.is_empty() {
+        return gated_decision(
+            candidate,
+            PromotionDecisionKind::NeedsHumanReview,
+            "trace bundle is incomplete or contains unresolved references",
+        );
+    }
+    if facts.verification != EvaluationVerdict::Pass {
+        return gated_decision(
+            candidate,
+            PromotionDecisionKind::NeedsHumanReview,
+            "candidate verification is not a passing objective result",
+        );
+    }
+    if facts.paired_execution_refs.len() < 2
+        || facts
+            .paired_execution_refs
+            .iter()
+            .any(|reference| reference.trim().is_empty())
+    {
+        return gated_decision(
+            candidate,
+            PromotionDecisionKind::NeedsHumanReview,
+            "paired baseline/candidate execution references are missing",
+        );
+    }
+    if facts.candidate_mutates_control_plane || !facts.mutation_reasons.is_empty() {
+        return gated_decision(
+            candidate,
+            PromotionDecisionKind::Reject,
+            "candidate is outside the sealed evaluator and deployment boundary",
+        );
+    }
+    decide_low_risk_promotion(candidate, regression)
+}
+
+fn gated_decision(
+    candidate: &AutomationCandidate,
+    decision: PromotionDecisionKind,
+    reason: &str,
+) -> PromotionDecision {
+    PromotionDecision {
+        decision_id: format!("promotion-{}", Uuid::now_v7()),
+        candidate_id: candidate.id.clone(),
+        decision,
+        reason: reason.to_owned(),
+        reviewer: PromotionReviewer::System,
+        applied_version: None,
+        rollback_ref: Some(candidate.rollback_ref.clone()),
+        expires_at: None,
+        created_at: Utc::now(),
+    }
+}
+
+#[must_use]
+pub fn candidate_mutates_control_plane(candidate: &AutomationCandidate) -> bool {
+    let text = format!(
+        "{} {} {}",
+        candidate.summary, candidate.regression_plan, candidate.rollback_ref
+    )
+    .to_ascii_lowercase();
+    [
+        "evaluator",
+        "hidden test",
+        "sandbox root",
+        "signer",
+        "stable pointer",
+        "promotion gate",
+        "disable verification",
+        "bypass verification",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
 }
 
 fn evaluation_verdict(

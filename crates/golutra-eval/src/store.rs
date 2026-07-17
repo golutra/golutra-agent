@@ -7,11 +7,15 @@ use std::{
 
 use chrono::Utc;
 use fs2::FileExt;
+use golutra_core::{
+    RegressionCampaign, RegressionExecution, RegressionExecutionRole, RegressionExecutionStatus,
+};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::runner::{
-    benchmark_check, benchmark_run_has_required_metadata, decide_low_risk_promotion, sanitize_text,
+    benchmark_check, benchmark_run_has_required_metadata, candidate_mutates_control_plane,
+    decide_governed_promotion, sanitize_text,
 };
 use crate::{
     AppliedCandidate, AutomationCandidate, AutomationCandidateKind, BenchmarkCheckStatus,
@@ -47,6 +51,8 @@ pub enum EvaluationError {
     CandidateNotFound(String),
     #[error("evaluation candidate requires a clean regression: {0}")]
     RegressionRequired(String),
+    #[error("evaluation candidate has no paired baseline/candidate execution: {0}")]
+    RegressionExecutionRequired(String),
     #[error("evaluation candidate requires an approving promotion decision: {0}")]
     PromotionRequired(String),
     #[error("evaluation candidate cannot be applied automatically: {0}")]
@@ -156,6 +162,64 @@ impl EvaluationStore {
         })
     }
 
+    pub fn record_regression_campaign(
+        &self,
+        campaign: RegressionCampaign,
+    ) -> Result<(), EvaluationError> {
+        if campaign.candidate_id.trim().is_empty()
+            || campaign.candidate_digest.trim().is_empty()
+            || campaign.case_refs.is_empty()
+        {
+            return Err(EvaluationError::InvalidBenchmark(
+                "regression campaign requires candidate digest and executable cases".to_owned(),
+            ));
+        }
+        self.update(|state| {
+            replace_by(&mut state.regression_campaigns, campaign, |value| {
+                value.campaign_id
+            });
+            Ok(())
+        })
+    }
+
+    pub fn record_regression_execution(
+        &self,
+        mut execution: RegressionExecution,
+    ) -> Result<(), EvaluationError> {
+        self.update(|state| {
+            let campaign = state
+                .regression_campaigns
+                .iter()
+                .find(|campaign| campaign.campaign_id == execution.campaign_id)
+                .ok_or_else(|| {
+                    EvaluationError::RegressionExecutionRequired(format!(
+                        "campaign {} is not recorded",
+                        execution.campaign_id
+                    ))
+                })?;
+            if execution.case_ref.trim().is_empty() && campaign.case_refs.len() == 1 {
+                execution.case_ref.clone_from(&campaign.case_refs[0]);
+            }
+            if !campaign.case_refs.contains(&execution.case_ref) {
+                return Err(EvaluationError::RegressionExecutionRequired(format!(
+                    "execution case `{}` is not part of campaign {}",
+                    execution.case_ref, execution.campaign_id
+                )));
+            }
+            if execution.status == RegressionExecutionStatus::Succeeded
+                && (execution.task_trace_ref.is_none() || execution.verification_ref.is_none())
+            {
+                return Err(EvaluationError::RegressionExecutionRequired(
+                    "execution must contain task trace and verification references".to_owned(),
+                ));
+            }
+            replace_by(&mut state.regression_executions, execution, |value| {
+                value.execution_id
+            });
+            Ok(())
+        })
+    }
+
     pub fn compare_counterfactual(
         &self,
         group_id: &str,
@@ -235,8 +299,66 @@ impl EvaluationStore {
                     action: "run regression".to_owned(),
                 });
             }
+            let campaign = state
+                .regression_campaigns
+                .iter()
+                .rev()
+                .find(|campaign| campaign.candidate_id == candidate_id)
+                .ok_or_else(|| {
+                    EvaluationError::RegressionExecutionRequired(candidate_id.to_owned())
+                })?;
+            let executions = state
+                .regression_executions
+                .iter()
+                .filter(|execution| execution.campaign_id == campaign.campaign_id)
+                .collect::<Vec<_>>();
+            let mut paired_execution_refs = Vec::new();
+            let mut execution_regressions = Vec::new();
+            let mut needs_review = false;
+            for case_ref in &campaign.case_refs {
+                let baseline_execution = executions.iter().rev().find(|execution| {
+                    execution.role == RegressionExecutionRole::Baseline
+                        && execution_matches_case(execution, case_ref, campaign.case_refs.len())
+                });
+                let candidate_execution = executions.iter().rev().find(|execution| {
+                    execution.role == RegressionExecutionRole::Candidate
+                        && execution_matches_case(execution, case_ref, campaign.case_refs.len())
+                });
+                let Some((baseline_trace_ref, candidate_trace_ref)) = baseline_execution
+                    .zip(candidate_execution)
+                    .filter(|(baseline, candidate)| {
+                        baseline.status == RegressionExecutionStatus::Succeeded
+                            && candidate.status == RegressionExecutionStatus::Succeeded
+                    })
+                    .and_then(|(baseline, candidate)| {
+                        baseline
+                            .task_trace_ref
+                            .as_ref()
+                            .zip(candidate.task_trace_ref.as_ref())
+                    })
+                else {
+                    needs_review = true;
+                    execution_regressions.push(format!(
+                        "regression case {case_ref} has no completed baseline/candidate pair"
+                    ));
+                    continue;
+                };
+                if baseline_trace_ref == candidate_trace_ref
+                    || !valid_execution_trace_ref(baseline_trace_ref)
+                    || !valid_execution_trace_ref(candidate_trace_ref)
+                {
+                    needs_review = true;
+                    execution_regressions.push(format!(
+                        "regression case {case_ref} has invalid paired execution trace references"
+                    ));
+                    continue;
+                }
+                paired_execution_refs
+                    .extend([baseline_trace_ref.clone(), candidate_trace_ref.clone()]);
+            }
             let (case_results, mut regressions) =
-                execute_durable_regression_suite(state, &candidate);
+                execute_durable_regression_suite(state, &candidate, campaign);
+            regressions.extend(execution_regressions);
             if candidate.evidence_refs.is_empty() {
                 regressions.push("candidate has no durable evidence".to_owned());
             }
@@ -246,21 +368,21 @@ impl EvaluationStore {
             if case_results.is_empty() {
                 regressions.push("candidate has no executable regression cases".to_owned());
             }
+            if case_results.len() != campaign.case_refs.len() {
+                needs_review = true;
+                regressions.push(
+                    "one or more campaign case refs have no durable evaluation definition"
+                        .to_owned(),
+                );
+            }
+            if candidate_mutates_control_plane(&candidate) {
+                regressions
+                    .push("candidate attempts to modify the sealed control plane".to_owned());
+            }
             let failed_cases = case_results
                 .iter()
                 .filter(|case_result| !case_result.passed)
                 .count();
-            let needs_review = candidate.kind == AutomationCandidateKind::RuntimeChange
-                && !state.benchmark_runs.iter().any(|run| {
-                    run.counterfactual_group_id.as_deref() == Some(candidate.id.as_str())
-                        && run.changed_layer.is_some()
-                });
-            if needs_review {
-                regressions.push(
-                    "runtime-change candidate has no controlled counterfactual benchmark"
-                        .to_owned(),
-                );
-            }
             regressions.sort();
             regressions.dedup();
             let passed = failed_cases == 0 && regressions.is_empty();
@@ -288,7 +410,7 @@ impl EvaluationStore {
                 latency_delta: comparison.as_ref().and_then(|value| value.latency_delta_ms),
                 quality_delta: comparison.as_ref().and_then(|value| value.quality_delta),
                 security_delta: comparison.as_ref().and_then(|value| value.security_delta),
-                causal_comparison_refs: vec![format!("replay-{}", candidate.source_task_id)],
+                causal_comparison_refs: paired_execution_refs,
                 suite_kind: BenchmarkSuiteKind::Regression,
                 case_results,
                 baseline_benchmark_refs: baseline
@@ -352,7 +474,18 @@ impl EvaluationStore {
                 .rev()
                 .find(|regression| regression.candidate_id == candidate_id)
                 .ok_or_else(|| EvaluationError::RegressionRequired(candidate_id.to_owned()))?;
-            let decision = decide_low_risk_promotion(&candidate, regression);
+            let decision = decide_governed_promotion(
+                &candidate,
+                regression,
+                &crate::PromotionGateFacts {
+                    trace_complete: regression.causal_comparison_refs.len() >= 2,
+                    unresolved_refs: Vec::new(),
+                    verification: EvaluationVerdict::Pass,
+                    paired_execution_refs: regression.causal_comparison_refs.clone(),
+                    candidate_mutates_control_plane: candidate_mutates_control_plane(&candidate),
+                    mutation_reasons: Vec::new(),
+                },
+            );
             let stored_candidate = state
                 .automation_candidates
                 .iter_mut()
@@ -372,6 +505,72 @@ impl EvaluationStore {
                 value.decision_id.clone()
             });
             Ok(decision)
+        })
+    }
+
+    /// 每次完成 regression 都形成显式治理结论；失败不能只靠 candidate status 隐式表达。
+    pub fn decide_after_regression(
+        &self,
+        candidate_id: &str,
+    ) -> Result<PromotionDecision, EvaluationError> {
+        let status = self
+            .snapshot()?
+            .automation_candidates
+            .into_iter()
+            .find(|candidate| candidate.id == candidate_id)
+            .map(|candidate| candidate.status)
+            .ok_or_else(|| EvaluationError::CandidateNotFound(candidate_id.to_owned()))?;
+        if status == CandidateStatus::RegressionPassed {
+            return self.decide_promotion(candidate_id);
+        }
+        self.update(|state| {
+            let candidate = state
+                .automation_candidates
+                .iter()
+                .find(|candidate| candidate.id == candidate_id)
+                .cloned()
+                .ok_or_else(|| EvaluationError::CandidateNotFound(candidate_id.to_owned()))?;
+            let regression = state
+                .regressions
+                .iter()
+                .rev()
+                .find(|regression| regression.candidate_id == candidate_id)
+                .ok_or_else(|| EvaluationError::RegressionRequired(candidate_id.to_owned()))?;
+            let (decision, reason) = match (candidate.status, regression.verdict) {
+                (CandidateStatus::Rejected, RegressionVerdict::Fail) => (
+                    PromotionDecisionKind::Reject,
+                    format!(
+                        "regression rejected candidate: {}",
+                        regression.regressions.join("; ")
+                    ),
+                ),
+                (CandidateStatus::NeedsHumanReview, RegressionVerdict::NeedsReview) => (
+                    PromotionDecisionKind::NeedsHumanReview,
+                    "regression requires explicit human review".to_owned(),
+                ),
+                (status, verdict) => {
+                    return Err(EvaluationError::InvalidCandidateState {
+                        candidate_id: candidate.id,
+                        status,
+                        action: format!("decide after {verdict:?} regression"),
+                    });
+                }
+            };
+            let promotion = PromotionDecision {
+                decision_id: format!("promotion-{}", Uuid::now_v7()),
+                candidate_id: candidate_id.to_owned(),
+                decision,
+                reason: sanitize_text(&reason),
+                reviewer: PromotionReviewer::System,
+                applied_version: None,
+                rollback_ref: Some(candidate.rollback_ref),
+                expires_at: None,
+                created_at: Utc::now(),
+            };
+            replace_by(&mut state.promotion_decisions, promotion.clone(), |value| {
+                value.decision_id.clone()
+            });
+            Ok(promotion)
         })
     }
 
@@ -414,6 +613,11 @@ impl EvaluationStore {
                     && regression.verdict == RegressionVerdict::Pass
                     && regression.failed_cases == 0
                     && regression.regressions.is_empty()
+                    && regression.causal_comparison_refs.len() >= 2
+                    && regression
+                        .causal_comparison_refs
+                        .iter()
+                        .all(|reference| !reference.trim().is_empty())
             });
             if decision == PromotionDecisionKind::Approve && !clean_regression {
                 return Err(EvaluationError::RegressionRequired(candidate_id.to_owned()));
@@ -672,11 +876,12 @@ fn read_bounded_evaluation_file(path: &Path) -> Result<Option<Vec<u8>>, Evaluati
 fn execute_durable_regression_suite(
     state: &EvaluationState,
     candidate: &AutomationCandidate,
+    campaign: &RegressionCampaign,
 ) -> (Vec<RegressionCaseResult>, Vec<String>) {
     let cases = state
         .cases
         .iter()
-        .filter(|case| case.source_task_id == Some(candidate.source_task_id))
+        .filter(|case| campaign.case_refs.contains(&case.case_id))
         .collect::<Vec<_>>();
     let mut suite_failures = Vec::new();
     let case_results = cases
@@ -813,6 +1018,20 @@ fn execute_durable_regression_suite(
     }
 
     (case_results, suite_failures)
+}
+
+fn execution_matches_case(
+    execution: &RegressionExecution,
+    case_ref: &str,
+    campaign_case_count: usize,
+) -> bool {
+    execution.case_ref == case_ref || (execution.case_ref.is_empty() && campaign_case_count == 1)
+}
+
+fn valid_execution_trace_ref(reference: &str) -> bool {
+    reference.starts_with("runtime://")
+        || reference.starts_with("execution://")
+        || reference.starts_with("artifact://regression-trace/")
 }
 
 fn pass_fail(passed: bool) -> BenchmarkCheckStatus {

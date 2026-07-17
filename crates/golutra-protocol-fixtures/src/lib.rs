@@ -1,7 +1,7 @@
 use chrono::Utc;
 use golutra_core::{
-    Actor, ActorKind, BudgetState, EvidenceId, LoopAction, LoopDecision, LoopDecisionId, SessionId,
-    TaskId, TaskStatus, TurnId, VerificationId,
+    Actor, ActorKind, BudgetState, EvidenceId, LoopAction, LoopDecision, LoopDecisionId,
+    RegressionCampaign, RegressionExecution, SessionId, TaskId, TaskStatus, TurnId, VerificationId,
 };
 use golutra_eval::{
     AppliedCandidate, AutomationCandidate, BenchmarkPromotion, BenchmarkRun, CausalComparison,
@@ -16,10 +16,11 @@ use golutra_evolution::{
 use golutra_governor::RuntimeGovernorDecision;
 use golutra_memory::MemoryRecord;
 use golutra_protocol::{
-    CommandAck, DebugProjection, EventFilter, EventPage, EventPageRequest, ProtocolHandshake,
+    ArtifactChunk, ArtifactReadRequest, CommandAck, ContextProjection, DebugProjection,
+    EvaluationProjection, EventFilter, EventPage, EventPageRequest, ProtocolHandshake,
     RuntimeEvent, RuntimeEventSource, RuntimeEventType, RuntimeQuery, SessionCommand,
-    SessionCommandKind, StateProjection, StorageMaintenanceReport, StorageStats, UserProjection,
-    VisibleStep,
+    SessionCommandKind, StateProjection, StorageMaintenanceReport, StorageStats, TaskTracePage,
+    TaskTraceRequest, UserProjection, VisibleStep,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -46,6 +47,12 @@ pub struct SdkProtocolBundle {
     pub state_projection: StateProjection,
     pub user_projection: UserProjection,
     pub debug_projection: DebugProjection,
+    pub context_projection: ContextProjection,
+    pub evaluation_projection: EvaluationProjection,
+    pub task_trace_request: TaskTraceRequest,
+    pub task_trace_page: TaskTracePage,
+    pub artifact_read_request: ArtifactReadRequest,
+    pub artifact_chunk: ArtifactChunk,
     pub memory_record: MemoryRecord,
     pub evaluation_result: EvaluationResult,
     pub evaluation_case: EvaluationCase,
@@ -62,6 +69,8 @@ pub struct SdkProtocolBundle {
     pub cost_record: CostRecord,
     pub security_utility_result: SecurityUtilityResult,
     pub regression_result: RegressionResult,
+    pub regression_campaign: RegressionCampaign,
+    pub regression_execution: RegressionExecution,
     pub promotion_decision: PromotionDecision,
     pub applied_candidate: AppliedCandidate,
     pub open_ended_budget: OpenEndedBudget,

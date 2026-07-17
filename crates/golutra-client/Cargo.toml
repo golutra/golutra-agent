@@ -36,6 +36,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true
+walkdir.workspace = true
 
 [dev-dependencies]
 golutra-auth = { path = "../golutra-auth" }

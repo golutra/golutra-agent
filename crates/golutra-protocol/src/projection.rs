@@ -1,6 +1,10 @@
 use golutra_core::{
-    ArtifactRecord, BusyPolicyDecision, EvidenceRecord, LoopDecision, RuntimeLane, SessionId,
-    TaskId, TaskStatus, ToolResultEnvelope, VerificationRecord,
+    ArtifactRecord, BusyPolicyDecision, ContextSnapshot, EvidenceRecord, LoopDecision, PostTaskJob,
+    RuntimeLane, SessionId, TaskId, TaskStatus, ToolResultEnvelope, VerificationRecord,
+};
+use golutra_eval::{
+    AutomationCandidate, EvaluationResult, ImprovementCandidate, PostTaskReview, PromotionDecision,
+    RegressionResult,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -59,4 +63,35 @@ pub struct DebugEventWindow {
     pub end_cursor: Option<u64>,
     pub has_more_before: bool,
     pub limit: u32,
+}
+
+/// 一个任务实际进入模型上下文的事实投影。
+///
+/// 该视图只暴露脱敏 manifest 和 digest；provider 原始请求仍受 artifact 权限控制。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ContextProjection {
+    pub session_id: SessionId,
+    pub task_id: TaskId,
+    pub snapshots: Vec<ContextSnapshot>,
+    pub latest: Option<ContextSnapshot>,
+    pub complete: bool,
+    pub integrity_warnings: Vec<String>,
+}
+
+/// 一个任务完成后治理生命周期的类型化读模型。
+///
+/// 开发工具无需解析事件文案即可区分 review、candidate、regression 和 promotion。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct EvaluationProjection {
+    pub session_id: SessionId,
+    pub task_id: TaskId,
+    pub reviews: Vec<PostTaskReview>,
+    pub results: Vec<EvaluationResult>,
+    pub improvement_candidates: Vec<ImprovementCandidate>,
+    pub automation_candidates: Vec<AutomationCandidate>,
+    pub regressions: Vec<RegressionResult>,
+    pub promotion_decisions: Vec<PromotionDecision>,
+    pub post_task_jobs: Vec<PostTaskJob>,
+    pub terminal: bool,
+    pub integrity_warnings: Vec<String>,
 }

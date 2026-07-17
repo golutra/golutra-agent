@@ -32,6 +32,19 @@ pub(crate) fn mock_provider_plan(
         .map_err(|error| ProviderError::NotConfigured {
             message: format!("provider configuration could not be loaded: {error}"),
         })?;
+    #[cfg(test)]
+    if payload
+        .get("mock_provider_failure")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return configured_provider_plan(
+            provider_env.as_ref(),
+            MockProvider::failure("forced mock provider failure"),
+            false,
+            prompt_requests_workspace_tools(payload, objective),
+        );
+    }
     let lower = objective.to_ascii_lowercase();
     if lower.contains("write") || lower.contains("create") || payload.get("content").is_some() {
         let write_args = mock_write_file_args(payload, objective);
@@ -201,7 +214,7 @@ fn context_builder_from_provider_env(
     Ok(ContextBuilder::new(policy))
 }
 
-fn prompt_requests_workspace_tools(payload: &Value, objective: &str) -> bool {
+pub(crate) fn prompt_requests_workspace_tools(payload: &Value, objective: &str) -> bool {
     if payload.get("path").is_some()
         || payload.get("content").is_some()
         || payload.get("command").is_some()

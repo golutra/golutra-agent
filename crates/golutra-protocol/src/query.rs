@@ -9,6 +9,8 @@ pub enum RuntimeQueryKind {
     TaskState,
     UserProjection,
     DebugProjection,
+    ContextProjection,
+    EvaluationProjection,
     ReplayCursor,
     MemoryList,
     EvaluationResults,
@@ -17,6 +19,9 @@ pub enum RuntimeQueryKind {
     EvolutionState,
     ProviderState,
     StorageStatus,
+    TaskTrace,
+    PostTaskJobs,
+    ArtifactChunk,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

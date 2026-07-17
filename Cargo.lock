@@ -1296,6 +1296,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]
@@ -1337,10 +1338,12 @@ dependencies = [
 name = "golutra-context"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "golutra-core",
  "golutra-llm",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
 ]
 
@@ -1503,6 +1506,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "golutra-core",
+ "golutra-eval",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -1641,6 +1645,7 @@ dependencies = [
 name = "golutra-verify"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "golutra-core",
 ]
 

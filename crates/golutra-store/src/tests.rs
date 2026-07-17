@@ -1,9 +1,10 @@
 use chrono::Utc;
 use golutra_core::{
     Actor, ActorKind, ArtifactId, BusyPolicy, CommandId, EvidenceId, EvidenceStrength, LaneId,
-    RedactionStatus, RuntimeLane, TaskStatus, ToolCallId, TurnId, WorkspaceId,
+    PostTaskJob, PostTaskJobId, PostTaskJobKind, PostTaskJobStatus, RedactionStatus, RuntimeLane,
+    TaskId, TaskStatus, ToolCallId, TurnId, WorkspaceId,
 };
-use golutra_protocol::{RuntimeEventSource, RuntimeEventType};
+use golutra_protocol::{ArtifactReadRequest, RuntimeEventSource, RuntimeEventType};
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -1043,4 +1044,427 @@ async fn legacy_projection_without_verification_check_kind_remains_readable() {
         restored.last_verification.expect("verification").checks[0].kind,
         golutra_core::VerificationCheckKind::AssistantResponse
     );
+}
+
+#[tokio::test]
+async fn post_task_job_queue_event_and_job_commit_atomically() {
+    let store = RuntimeStore::in_memory().await.expect("store");
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let job = PostTaskJob {
+        job_id: PostTaskJobId::new(),
+        kind: PostTaskJobKind::DeepEvaluation,
+        workspace_id: WorkspaceId::new().to_string(),
+        session_id: session_id.to_string(),
+        task_id,
+        input_refs: vec![format!("task:{task_id}")],
+        status: PostTaskJobStatus::Queued,
+        attempt: 0,
+        max_attempts: 3,
+        lease_owner: None,
+        lease_expires_at: None,
+        result_refs: Vec::new(),
+        last_error: None,
+        created_at: Utc::now(),
+        started_at: None,
+        completed_at: None,
+    };
+    let event = RuntimeEvent {
+        id: EventId::new(),
+        sequence_no: 0,
+        session_id,
+        turn_id: Some(TurnId::new()),
+        task_id: Some(task_id),
+        parent_event_id: None,
+        event_type: RuntimeEventType::PostTaskJobQueued,
+        timestamp: Utc::now(),
+        source: RuntimeEventSource::Evaluator,
+        payload: json!({"job_id": job.job_id}),
+        payload_ref: None,
+        durable: true,
+    };
+    let committed = store
+        .enqueue_post_task_job_with_event(&job, event)
+        .await
+        .expect("atomic queue");
+
+    assert_eq!(committed.sequence_no, 1);
+    assert_eq!(
+        store
+            .post_task_job(task_id)
+            .await
+            .expect("job")
+            .unwrap()
+            .job_id,
+        job.job_id
+    );
+    assert_eq!(
+        store
+            .load_events(session_id, None, None)
+            .await
+            .expect("events")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn expired_post_task_lease_is_requeued_and_retry_can_reset_terminal_job() {
+    let store = RuntimeStore::in_memory().await.expect("store");
+    let task_id = TaskId::new();
+    let now = Utc::now();
+    let workspace_id = WorkspaceId::new().to_string();
+    let job = PostTaskJob {
+        job_id: PostTaskJobId::new(),
+        kind: PostTaskJobKind::DeepEvaluation,
+        workspace_id: workspace_id.clone(),
+        session_id: SessionId::new().to_string(),
+        task_id,
+        input_refs: Vec::new(),
+        status: PostTaskJobStatus::Queued,
+        attempt: 0,
+        max_attempts: 2,
+        lease_owner: None,
+        lease_expires_at: None,
+        result_refs: Vec::new(),
+        last_error: None,
+        created_at: now,
+        started_at: None,
+        completed_at: None,
+    };
+    store.enqueue_post_task_job(&job).await.expect("enqueue");
+    let claimed = store
+        .claim_post_task_job("worker-a", now, chrono::Duration::seconds(-1))
+        .await
+        .expect("claim")
+        .expect("claimed job");
+    assert_eq!(claimed.status, PostTaskJobStatus::Leased);
+    assert_eq!(
+        store
+            .recover_expired_post_task_jobs(&workspace_id, now)
+            .await
+            .expect("recover"),
+        1
+    );
+    assert_eq!(
+        store
+            .post_task_job(task_id)
+            .await
+            .expect("job")
+            .unwrap()
+            .status,
+        PostTaskJobStatus::Queued
+    );
+
+    let claimed = store
+        .claim_post_task_job("worker-b", now, chrono::Duration::minutes(1))
+        .await
+        .expect("claim again")
+        .expect("claimed again");
+    store
+        .start_post_task_job(claimed.job_id, "worker-b", now)
+        .await
+        .expect("start");
+    store
+        .finish_post_task_job(
+            claimed.job_id,
+            "worker-b",
+            PostTaskJobStatus::Failed,
+            &[],
+            Some("failed"),
+            now,
+        )
+        .await
+        .expect("finish");
+    assert!(
+        store
+            .retry_post_task_job(claimed.job_id)
+            .await
+            .expect("retry")
+    );
+    assert_eq!(
+        store
+            .post_task_job(task_id)
+            .await
+            .expect("job")
+            .unwrap()
+            .attempt,
+        0
+    );
+}
+
+#[tokio::test]
+async fn post_task_claim_is_scoped_to_the_worker_workspace() {
+    let store = RuntimeStore::in_memory().await.expect("store");
+    let now = Utc::now();
+    let workspace_a = WorkspaceId::new().to_string();
+    let workspace_b = WorkspaceId::new().to_string();
+    let workspace_c = WorkspaceId::new().to_string();
+    let job_a = PostTaskJob {
+        job_id: PostTaskJobId::new(),
+        kind: PostTaskJobKind::DeepEvaluation,
+        workspace_id: workspace_a.clone(),
+        session_id: SessionId::new().to_string(),
+        task_id: TaskId::new(),
+        input_refs: Vec::new(),
+        status: PostTaskJobStatus::Queued,
+        attempt: 0,
+        max_attempts: 2,
+        lease_owner: None,
+        lease_expires_at: None,
+        result_refs: Vec::new(),
+        last_error: None,
+        created_at: now,
+        started_at: None,
+        completed_at: None,
+    };
+    let job_b = PostTaskJob {
+        job_id: PostTaskJobId::new(),
+        workspace_id: workspace_b.clone(),
+        session_id: SessionId::new().to_string(),
+        task_id: TaskId::new(),
+        ..job_a.clone()
+    };
+    store.enqueue_post_task_job(&job_a).await.expect("job a");
+    store.enqueue_post_task_job(&job_b).await.expect("job b");
+
+    let claimed_b = store
+        .claim_post_task_job_for_workspace(
+            "worker-b",
+            &workspace_b,
+            now,
+            chrono::Duration::minutes(1),
+        )
+        .await
+        .expect("workspace b claim")
+        .expect("workspace b job");
+    let unrelated = store
+        .claim_post_task_job_for_workspace(
+            "worker-c",
+            &workspace_c,
+            now,
+            chrono::Duration::minutes(1),
+        )
+        .await
+        .expect("unrelated workspace claim");
+    let claimed_a = store
+        .claim_post_task_job_for_workspace(
+            "worker-a",
+            &workspace_a,
+            now,
+            chrono::Duration::minutes(1),
+        )
+        .await
+        .expect("workspace a claim")
+        .expect("workspace a job");
+
+    assert_eq!(claimed_b.job_id, job_b.job_id);
+    assert_eq!(claimed_b.workspace_id, workspace_b);
+    assert!(unrelated.is_none());
+    assert_eq!(claimed_a.job_id, job_a.job_id);
+    assert_eq!(claimed_a.workspace_id, workspace_a);
+}
+
+#[tokio::test]
+async fn expired_post_task_recovery_does_not_mutate_another_workspace() {
+    let store = RuntimeStore::in_memory().await.expect("store");
+    let now = Utc::now();
+    let workspace_a = WorkspaceId::new().to_string();
+    let workspace_b = WorkspaceId::new().to_string();
+    let job_a = PostTaskJob {
+        job_id: PostTaskJobId::new(),
+        kind: PostTaskJobKind::DeepEvaluation,
+        workspace_id: workspace_a.clone(),
+        session_id: SessionId::new().to_string(),
+        task_id: TaskId::new(),
+        input_refs: Vec::new(),
+        status: PostTaskJobStatus::Queued,
+        attempt: 0,
+        max_attempts: 2,
+        lease_owner: None,
+        lease_expires_at: None,
+        result_refs: Vec::new(),
+        last_error: None,
+        created_at: now,
+        started_at: None,
+        completed_at: None,
+    };
+    let job_b = PostTaskJob {
+        job_id: PostTaskJobId::new(),
+        workspace_id: workspace_b.clone(),
+        session_id: SessionId::new().to_string(),
+        task_id: TaskId::new(),
+        ..job_a.clone()
+    };
+    store.enqueue_post_task_job(&job_a).await.expect("job a");
+    store.enqueue_post_task_job(&job_b).await.expect("job b");
+    for (worker, workspace) in [("worker-a", &workspace_a), ("worker-b", &workspace_b)] {
+        store
+            .claim_post_task_job_for_workspace(
+                worker,
+                workspace,
+                now,
+                chrono::Duration::seconds(-1),
+            )
+            .await
+            .expect("claim")
+            .expect("leased job");
+    }
+
+    assert_eq!(
+        store
+            .recover_expired_post_task_jobs(&workspace_a, now)
+            .await
+            .expect("recover workspace a"),
+        1
+    );
+    let recovered_a = store
+        .post_task_job(job_a.task_id)
+        .await
+        .expect("job a")
+        .expect("job a exists");
+    let untouched_b = store
+        .post_task_job(job_b.task_id)
+        .await
+        .expect("job b")
+        .expect("job b exists");
+    assert_eq!(recovered_a.status, PostTaskJobStatus::Queued);
+    assert_eq!(untouched_b.status, PostTaskJobStatus::Leased);
+    assert_eq!(untouched_b.attempt, 1);
+    assert_eq!(untouched_b.lease_owner.as_deref(), Some("worker-b"));
+}
+
+#[tokio::test]
+async fn expired_post_task_lease_is_failed_when_retry_budget_is_exhausted() {
+    let directory = tempdir().expect("directory");
+    let database_url = format!(
+        "sqlite://{}",
+        directory.path().join("runtime.sqlite").display()
+    );
+    let store = RuntimeStore::connect(&database_url).await.expect("store");
+    let task_id = TaskId::new();
+    let now = Utc::now();
+    let workspace_id = WorkspaceId::new().to_string();
+    let job = PostTaskJob {
+        job_id: PostTaskJobId::new(),
+        kind: PostTaskJobKind::DeepEvaluation,
+        workspace_id: workspace_id.clone(),
+        session_id: SessionId::new().to_string(),
+        task_id,
+        input_refs: vec![format!("task:{task_id}")],
+        status: PostTaskJobStatus::Queued,
+        attempt: 0,
+        max_attempts: 1,
+        lease_owner: None,
+        lease_expires_at: None,
+        result_refs: Vec::new(),
+        last_error: None,
+        created_at: now,
+        started_at: None,
+        completed_at: None,
+    };
+    store.enqueue_post_task_job(&job).await.expect("enqueue");
+    store
+        .claim_post_task_job("worker", now, chrono::Duration::seconds(-1))
+        .await
+        .expect("claim")
+        .expect("claimed");
+
+    assert_eq!(
+        store
+            .recover_expired_post_task_jobs(&workspace_id, now)
+            .await
+            .expect("recover"),
+        1
+    );
+    let failed = store
+        .post_task_job(task_id)
+        .await
+        .expect("job")
+        .expect("failed job");
+    assert_eq!(failed.status, PostTaskJobStatus::Failed);
+    assert!(failed.completed_at.is_some());
+    drop(store);
+
+    let reopened = RuntimeStore::connect(&database_url).await.expect("reopen");
+    let persisted = reopened
+        .post_task_job(task_id)
+        .await
+        .expect("persisted job")
+        .expect("persisted failed job");
+    assert_eq!(persisted.status, PostTaskJobStatus::Failed);
+    assert!(
+        reopened
+            .claim_post_task_job("other-worker", now, chrono::Duration::minutes(1))
+            .await
+            .expect("claim after exhaustion")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn artifact_range_reads_are_bounded_and_checksum_verified() {
+    let store = RuntimeStore::in_memory().await.expect("store");
+    let bytes = b"abcdef";
+    let artifact = ArtifactRecord {
+        artifact_id: ArtifactId::new(),
+        session_id: SessionId::new(),
+        turn_id: Some(TurnId::new()),
+        tool_call_id: Some(ToolCallId::new()),
+        artifact_type: "stdout".to_owned(),
+        uri: "artifact://fixture/range".to_owned(),
+        checksum: artifact_checksum(bytes),
+        size_bytes: bytes.len() as u64,
+        created_at: Utc::now(),
+        producer: "test".to_owned(),
+        redaction_status: RedactionStatus::NotRequired,
+        retention_policy: "test".to_owned(),
+        provenance_refs: Vec::new(),
+    };
+    store
+        .store_artifact(&artifact, bytes)
+        .await
+        .expect("artifact");
+
+    let range = store
+        .read_artifact_range(&ArtifactReadRequest {
+            artifact_id: artifact.artifact_id,
+            offset: 2,
+            length: 3,
+        })
+        .await
+        .expect("range")
+        .expect("range exists");
+    assert_eq!(range.bytes, b"cde");
+    assert_eq!(range.offset, 2);
+    assert_eq!(range.artifact.size_bytes, 6);
+    assert!(
+        store
+            .read_artifact_range(&ArtifactReadRequest {
+                artifact_id: artifact.artifact_id,
+                offset: 0,
+                length: 0,
+            })
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .read_artifact_range(&ArtifactReadRequest {
+                artifact_id: artifact.artifact_id,
+                offset: 0,
+                length: MAX_ARTIFACT_READ_BYTES.saturating_add(1),
+            })
+            .await
+            .is_err()
+    );
+
+    tokio::fs::write(store.artifact_blob_path(artifact.artifact_id), b"tampered")
+        .await
+        .expect("tamper fixture");
+    let error = store
+        .load_artifact_bytes(artifact.artifact_id)
+        .await
+        .expect_err("checksum mismatch");
+    assert!(error.to_string().contains("checksum"));
 }

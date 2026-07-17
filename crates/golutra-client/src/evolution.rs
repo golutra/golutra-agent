@@ -464,7 +464,11 @@ impl RuntimeHost {
                 execution.status = "cancelled".to_owned();
             }
         }
-        let state = child.store.query_state(child_session_id, None).await?;
+        let state = child
+            .repositories
+            .projections
+            .state(child_session_id, None)
+            .await?;
         execution.runtime_task_id = state.active_task_id;
         execution.verification_ref = state
             .last_verification

@@ -7,37 +7,43 @@ use std::{
 
 use async_trait::async_trait;
 use golutra_context::{
-    ContextBuilder, ContextContributor, ContextError, estimate_tokens, provider_request_from_plan,
-    token_usage_record,
+    ContextBuilder, ContextContributor, ContextError, context_snapshot_from_request,
+    estimate_tokens, provider_request_from_plan, token_usage_record,
 };
 use golutra_core::{
     ApprovalDecision, ApprovalId, ApprovalRequest, ApprovalResolution, BudgetState, CommandId,
-    LoopAction, LoopDecision, LoopDecisionId, PolicyDecision, PolicyId, SessionId, TaskId,
-    ToolResultStatus, TurnId, VerificationCheck, VerificationCheckKind, VerificationId,
-    VerificationRecord, VerificationResult,
+    LoopAction, LoopDecision, PolicyDecision, SessionId, TaskId, ToolResultStatus, TurnId,
+    VerificationCheck, VerificationCheckKind, VerificationPlan, VerificationRecord,
+    VerificationResult,
 };
 use golutra_governor::{
     GoalLedger, GovernorAction, GovernorObservation, GovernorPhase, RuntimeGovernor,
-    RuntimeGovernorDecision,
 };
 use golutra_llm::{
-    LlmProvider, ProviderError, ProviderFinishReason, ProviderMessage, ProviderRequest,
-    ProviderResponse, ProviderRole, ProviderStreamEvent,
+    LlmProvider, ProviderError, ProviderMessage, ProviderRequest, ProviderResponse, ProviderRole,
 };
 use golutra_tools::{
     BasicToolExecutor, FileBeforeImage, ToolError, ToolExecutionReport, ToolRequest,
 };
-use golutra_verify::{VerificationInput, VerificationRunner};
+use golutra_verify::VerificationInput;
+use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 mod checkpoint;
+mod completion;
+mod context_guard;
 mod lane;
+mod provider_retry;
+mod trace;
+mod verification;
 
 pub use checkpoint::{CheckpointError, WorkspaceCheckpointManager, checkpoint_fingerprint};
 pub use golutra_protocol::UserProjection;
 pub use lane::{RuntimeLaneError, RuntimeLaneManager, RuntimeTransition, is_active_status};
+pub use trace::AgentLoopTraceEvent;
+pub use verification::RuntimeVerificationService;
 
 #[derive(Debug, Error)]
 pub enum AgentLoopError {
@@ -72,6 +78,7 @@ pub struct AgentTaskRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentLoopOutcome {
     pub verification: VerificationRecord,
+    pub verification_plan: VerificationPlan,
     pub loop_decision: LoopDecision,
     pub tool_reports: Vec<ToolExecutionReport>,
     pub final_message: Option<String>,
@@ -232,70 +239,13 @@ pub fn agent_execution_channel(capacity: usize) -> (AgentExecutionHandle, AgentE
     )
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum AgentLoopTraceEvent {
-    ContextBuilt {
-        contributors: Vec<String>,
-        planned_input_tokens: u64,
-    },
-    ContextCompacted {
-        original_input_tokens: u64,
-        planned_input_tokens: u64,
-        trimmed_contributors: Vec<String>,
-    },
-    ProviderStarted {
-        provider_id: String,
-        model_id: String,
-    },
-    ProviderStreamed {
-        provider_id: String,
-        model_id: String,
-        event: ProviderStreamEvent,
-    },
-    ProviderCompleted {
-        provider_id: String,
-        model_id: String,
-        finish_reason: ProviderFinishReason,
-        tool_call_count: usize,
-        usage: golutra_core::ProviderUsage,
-        raw_metadata: serde_json::Value,
-    },
-    TokenUsageRecorded(golutra_core::TokenUsageRecord),
-    ToolStarted {
-        tool_name: String,
-    },
-    ToolCompleted(ToolExecutionReport),
-    PolicyEvaluated(golutra_core::PolicyEvaluation),
-    ApprovalRequested(ApprovalRequest),
-    ApprovalResolved(ApprovalResolution),
-    RetryScheduled {
-        attempt: u32,
-        reason: String,
-    },
-    ProviderFallback {
-        from_provider: String,
-        to_provider: String,
-        reason: String,
-    },
-    LoopGuardTriggered {
-        trigger: golutra_core::LoopGuardTrigger,
-        reason: String,
-    },
-    GovernorDecided(RuntimeGovernorDecision),
-    PendingTurnStarted(PendingAgentTurn),
-    AssistantMessage {
-        turn_id: TurnId,
-        content: String,
-    },
-}
-
 #[derive(Debug)]
 pub struct AgentLoop<P> {
     provider: P,
     fallback_provider: Option<P>,
     context_builder: ContextBuilder,
     tool_executor: BasicToolExecutor,
-    verifier: VerificationRunner,
+    verifier: RuntimeVerificationService,
     governor: RuntimeGovernor,
     before_side_effect_recorder: Option<Arc<dyn BeforeSideEffectRecorder>>,
     max_iterations: u32,
@@ -316,7 +266,7 @@ where
             fallback_provider: None,
             context_builder,
             tool_executor,
-            verifier: VerificationRunner,
+            verifier: RuntimeVerificationService::default(),
             governor: RuntimeGovernor::default(),
             before_side_effect_recorder: None,
             max_iterations: 4,
@@ -432,7 +382,7 @@ where
             request.contributors.clone(),
         ) {
             Ok(plan) => plan,
-            Err(error) => return Ok(context_guard_outcome(&request, error, &mut trace)),
+            Err(error) => return Ok(context_guard::outcome(&request, error, &mut trace)),
         };
         if !base_plan.trimmed_contributors.is_empty() {
             trace(AgentLoopTraceEvent::ContextCompacted {
@@ -537,6 +487,14 @@ where
                 provider_contract.model_id.clone(),
                 provider_tools.clone(),
             );
+            trace(AgentLoopTraceEvent::ContextSnapshotCaptured {
+                snapshot: context_snapshot_from_request(
+                    request.session_id,
+                    &plan,
+                    &provider_request,
+                ),
+                request: provider_request.clone(),
+            });
             trace(AgentLoopTraceEvent::ProviderStarted {
                 provider_id: provider_request.provider_id.clone(),
                 model_id: provider_request.model_id.clone(),
@@ -886,16 +844,23 @@ where
             .flat_map(|report| report.changed_files.iter())
             .collect::<Vec<_>>();
         if !changed_files.is_empty() {
+            let path_matches = changed_files
+                .iter()
+                .any(|path| objective_path_matches(&current_objective, path));
             command_checks.push(VerificationCheck {
                 kind: VerificationCheckKind::WorkspaceChange,
                 name: "workspace_diff".to_owned(),
                 command: None,
-                passed: true,
+                passed: path_matches || objective_path_hint(&current_objective).is_none(),
                 evidence_refs: tool_reports
                     .iter()
                     .flat_map(|report| report.envelope.evidence_refs.iter().copied())
                     .collect(),
-                message: format!("{} workspace file(s) changed", changed_files.len()),
+                message: if path_matches || objective_path_hint(&current_objective).is_none() {
+                    format!("{} workspace file(s) changed", changed_files.len())
+                } else {
+                    "workspace changed files do not match the requested path".to_owned()
+                },
             });
         }
         let code_files_changed = changed_files.iter().any(|path| is_code_file(path));
@@ -915,24 +880,102 @@ where
                     message: report.envelope.summary.clone(),
                 });
             }
+            if let Some(observed_path) = report
+                .envelope
+                .structured_facts
+                .get("path")
+                .and_then(Value::as_str)
+                && let Some(expected_path) = objective_path_hint(&current_objective)
+            {
+                let matches = observed_path.ends_with(&expected_path)
+                    || expected_path.ends_with(observed_path);
+                command_checks.push(VerificationCheck {
+                    kind: VerificationCheckKind::ObjectiveValidation,
+                    name: format!("objective:path:{}", report.envelope.tool_name),
+                    command: None,
+                    passed: matches,
+                    evidence_refs: report.envelope.evidence_refs.clone(),
+                    message: if matches {
+                        "tool path matches the requested path".to_owned()
+                    } else {
+                        format!(
+                            "tool path `{observed_path}` does not match requested `{expected_path}`"
+                        )
+                    },
+                });
+            }
+            if report.envelope.tool_name == "write_file"
+                && report.envelope.status == ToolResultStatus::Ok
+                && let Some(expected_content) = objective_content_hint(&current_objective)
+            {
+                // 写入成功只证明发生了副作用；这里重新读取最终文件，确认交付内容确实符合用户目标。
+                let mut content_matches = false;
+                for path in &report.changed_files {
+                    if tokio::fs::read(path)
+                        .await
+                        .is_ok_and(|content| content == expected_content.as_bytes())
+                    {
+                        content_matches = true;
+                        break;
+                    }
+                }
+                command_checks.push(VerificationCheck {
+                    kind: VerificationCheckKind::ObjectiveValidation,
+                    name: "objective:content:write_file".to_owned(),
+                    command: None,
+                    passed: content_matches,
+                    evidence_refs: report.envelope.evidence_refs.clone(),
+                    message: if content_matches {
+                        "written content matches the requested content".to_owned()
+                    } else {
+                        "written content does not match the requested content".to_owned()
+                    },
+                });
+            }
+        }
+        if last_assistant_message
+            .as_deref()
+            .is_some_and(|message| !message.trim().is_empty())
+            && (!objective_requires_workspace_evidence(&current_objective)
+                || !tool_reports.is_empty())
+        {
+            command_checks.push(VerificationCheck {
+                kind: VerificationCheckKind::AssistantResponse,
+                name: "assistant_response".to_owned(),
+                command: None,
+                passed: true,
+                evidence_refs: Vec::new(),
+                message: "assistant response produced after tool execution".to_owned(),
+            });
         }
         let requires_workspace_evidence = current_turn_touched_code
             || tool_reports
                 .iter()
                 .any(|report| !report.changed_files.is_empty());
-        let mut verification = if accepts_text_response_without_evidence(
+        let verification_input = if completion::accepts_text_response_without_evidence(
             &current_objective,
             requires_workspace_evidence,
             last_assistant_message.as_deref(),
             &tool_reports,
         ) {
-            text_response_verification(
-                request.task_id,
-                current_objective.clone(),
-                request.completion_criteria.clone(),
-            )
+            VerificationInput {
+                task_id: request.task_id,
+                objective: current_objective.clone(),
+                completion_criteria: request.completion_criteria.clone(),
+                evidence_refs: Vec::new(),
+                command_checks: vec![VerificationCheck {
+                    kind: VerificationCheckKind::AssistantResponse,
+                    name: "assistant_response".to_owned(),
+                    command: None,
+                    passed: true,
+                    evidence_refs: Vec::new(),
+                    message: "assistant response produced".to_owned(),
+                }],
+                requires_workspace_evidence: false,
+                code_files_changed: false,
+            }
         } else {
-            self.verifier.verify(VerificationInput {
+            VerificationInput {
                 task_id: request.task_id,
                 objective: current_objective.clone(),
                 completion_criteria: request.completion_criteria.clone(),
@@ -940,8 +983,23 @@ where
                 command_checks,
                 requires_workspace_evidence,
                 code_files_changed,
-            })
+            }
         };
+        let verification_plan = self.verifier.plan(&verification_input);
+        trace(AgentLoopTraceEvent::VerificationPlanned(
+            verification_plan.clone(),
+        ));
+        let (mut verification, verification_plan) =
+            self.verifier.verify(verification_input, verification_plan);
+        for assertion in verification_plan
+            .assertions
+            .iter()
+            .chain(verification_plan.policy_assertions.iter())
+        {
+            trace(AgentLoopTraceEvent::VerificationAssertionCompleted(
+                assertion.clone(),
+            ));
+        }
         let completion_governance = self.governor.evaluate(
             &goal_ledger,
             &GovernorObservation {
@@ -970,7 +1028,7 @@ where
             }
             verification.residual_risks.push(reason.clone());
         }
-        let mut loop_decision = loop_decision_from_verification(
+        let mut loop_decision = completion::loop_decision(
             request.task_id,
             current_turn_id,
             &verification,
@@ -990,7 +1048,7 @@ where
         }
 
         let final_message =
-            final_message_from_outcome(last_assistant_message, &tool_reports, &verification);
+            completion::final_message(last_assistant_message, &tool_reports, &verification);
         if let Some(content) = final_message.as_ref().filter(|content| {
             last_emitted_assistant_message.as_ref() != Some(&(current_turn_id, (*content).clone()))
         }) {
@@ -1003,6 +1061,7 @@ where
         Ok(AgentLoopOutcome {
             final_message,
             verification,
+            verification_plan,
             loop_decision,
             tool_reports,
             final_turn_id: current_turn_id,
@@ -1083,7 +1142,7 @@ where
             };
             match result {
                 Ok(response) => return Ok(response),
-                Err(error) if provider_error_is_retryable(&error) && attempt < MAX_ATTEMPTS => {
+                Err(error) if provider_retry::is_retryable(&error) && attempt < MAX_ATTEMPTS => {
                     trace(AgentLoopTraceEvent::RetryScheduled {
                         attempt,
                         reason: error.to_string(),
@@ -1145,193 +1204,9 @@ impl AgentExecutionControl {
     }
 }
 
-fn provider_error_is_retryable(error: &ProviderError) -> bool {
-    matches!(
-        error,
-        ProviderError::Unavailable { .. }
-            | ProviderError::RateLimited { .. }
-            | ProviderError::Timeout { .. }
-    )
-}
-
 #[must_use]
 pub fn runtime_boundary() -> &'static str {
     "SessionCommand -> RuntimeEvent -> StateProjection -> LoopDecision"
-}
-
-fn context_guard_outcome<F>(
-    request: &AgentTaskRequest,
-    error: ContextError,
-    trace: &mut F,
-) -> AgentLoopOutcome
-where
-    F: FnMut(AgentLoopTraceEvent) + Send,
-{
-    let (planned, limit, action) = match error {
-        ContextError::BudgetExceeded { planned, limit } => (planned, limit, LoopAction::Blocked),
-        ContextError::UserActionRequired { planned, limit } => {
-            (planned, limit, LoopAction::AskUser)
-        }
-    };
-    let reason = format!("context budget exceeded: planned {planned} > limit {limit}");
-    trace(AgentLoopTraceEvent::LoopGuardTriggered {
-        trigger: golutra_core::LoopGuardTrigger::ContextOverflow,
-        reason: reason.clone(),
-    });
-    let verification = VerificationRecord {
-        verification_id: VerificationId::new(),
-        task_id: request.task_id,
-        objective: request.objective.clone(),
-        completion_criteria: request.completion_criteria.clone(),
-        checks: Vec::new(),
-        evidence_refs: Vec::new(),
-        result: VerificationResult::Unknown,
-        policy_status: "context_guard_blocked".to_owned(),
-        residual_risks: vec![reason.clone()],
-    };
-    let final_message = format!(
-        "Cannot continue because the context budget is exhausted ({planned} > {limit}). Compact the conversation or reduce the request."
-    );
-    trace(AgentLoopTraceEvent::AssistantMessage {
-        turn_id: request.turn_id,
-        content: final_message.clone(),
-    });
-    AgentLoopOutcome {
-        loop_decision: LoopDecision {
-            decision_id: LoopDecisionId::new(),
-            task_id: request.task_id,
-            turn_id: request.turn_id,
-            action,
-            reason,
-            evidence_refs: Vec::new(),
-            verification_ref: Some(verification.verification_id),
-            policy_ref: None,
-            budget_state: BudgetState {
-                planned_input_tokens: Some(planned),
-                actual_input_tokens: None,
-                output_tokens: None,
-                total_tokens: None,
-                estimated_cost: None,
-                budget_remaining: Some(0),
-                compact_recommended: true,
-                cost_risk: "blocked".to_owned(),
-            },
-            tool_state: "not_started_context_guard".to_owned(),
-            model_state: "not_started_context_guard".to_owned(),
-            next_step: Some("compact context or reduce the request".to_owned()),
-        },
-        verification,
-        tool_reports: Vec::new(),
-        final_message: Some(final_message),
-        final_turn_id: request.turn_id,
-    }
-}
-
-fn loop_decision_from_verification(
-    task_id: TaskId,
-    turn_id: TurnId,
-    verification: &VerificationRecord,
-    budget_state: BudgetState,
-) -> LoopDecision {
-    let action = match verification.result {
-        VerificationResult::Pass => LoopAction::StopSuccess,
-        VerificationResult::Partial => LoopAction::StopPartial,
-        VerificationResult::Fail => LoopAction::StopFailed,
-        VerificationResult::Unknown => LoopAction::Blocked,
-    };
-
-    LoopDecision {
-        decision_id: LoopDecisionId::new(),
-        task_id,
-        turn_id,
-        action,
-        reason: format!("verification result: {:?}", verification.result),
-        evidence_refs: verification.evidence_refs.clone(),
-        verification_ref: Some(verification.verification_id),
-        policy_ref: Option::<PolicyId>::None,
-        budget_state,
-        tool_state: "p0_tool_reports_recorded".to_owned(),
-        model_state: "p0_provider_response_recorded".to_owned(),
-        next_step: None,
-    }
-}
-
-fn final_message_from_outcome(
-    assistant_message: Option<String>,
-    tool_reports: &[ToolExecutionReport],
-    verification: &VerificationRecord,
-) -> Option<String> {
-    let summaries = tool_reports
-        .iter()
-        .map(|report| report.envelope.summary.trim())
-        .filter(|summary| !summary.is_empty())
-        .collect::<Vec<_>>();
-
-    if verification.result == VerificationResult::Pass
-        && assistant_message
-            .as_ref()
-            .is_some_and(|message| !message.trim().is_empty())
-    {
-        return assistant_message;
-    }
-
-    if summaries.is_empty() {
-        return match verification.result {
-            VerificationResult::Pass => Some("Completed.".to_owned()),
-            VerificationResult::Partial
-            | VerificationResult::Fail
-            | VerificationResult::Unknown => {
-                Some("Task finished without enough evidence to verify completion.".to_owned())
-            }
-        };
-    }
-
-    match verification.result {
-        VerificationResult::Pass => Some(format!("Completed: {}", summaries.join("; "))),
-        VerificationResult::Partial | VerificationResult::Fail | VerificationResult::Unknown => {
-            Some(format!(
-                "Could not fully complete: {}",
-                summaries.join("; ")
-            ))
-        }
-    }
-}
-
-fn accepts_text_response_without_evidence(
-    objective: &str,
-    touched_code: bool,
-    assistant_message: Option<&str>,
-    tool_reports: &[ToolExecutionReport],
-) -> bool {
-    !touched_code
-        && tool_reports.is_empty()
-        && assistant_message.is_some_and(|message| !message.trim().is_empty())
-        && !objective_requires_workspace_evidence(objective)
-}
-
-fn text_response_verification(
-    task_id: TaskId,
-    objective: String,
-    completion_criteria: Vec<String>,
-) -> VerificationRecord {
-    VerificationRecord {
-        verification_id: VerificationId::new(),
-        task_id,
-        objective,
-        completion_criteria,
-        checks: vec![VerificationCheck {
-            kind: VerificationCheckKind::AssistantResponse,
-            name: "assistant_response".to_owned(),
-            command: None,
-            passed: true,
-            evidence_refs: Vec::new(),
-            message: "assistant response produced".to_owned(),
-        }],
-        evidence_refs: Vec::new(),
-        result: VerificationResult::Pass,
-        policy_status: "conversation_response".to_owned(),
-        residual_risks: Vec::new(),
-    }
 }
 
 fn is_code_file(path: &Path) -> bool {
@@ -1451,6 +1326,70 @@ fn objective_requires_workspace_evidence(objective: &str) -> bool {
 
     ENGLISH_MARKERS.iter().any(|marker| lower.contains(marker))
         || CJK_MARKERS.iter().any(|marker| objective.contains(marker))
+}
+
+fn objective_path_hint(objective: &str) -> Option<String> {
+    objective
+        .split_whitespace()
+        .map(|token| {
+            token.trim_matches(|character: char| {
+                matches!(
+                    character,
+                    '`' | '\'' | '"' | ',' | '.' | ':' | ';' | '(' | ')' | '[' | ']'
+                )
+            })
+        })
+        .filter(|token| {
+            !token.is_empty()
+                && (token.contains('/')
+                    || token.contains('\\')
+                    || token.rsplit_once('.').is_some_and(|(_, extension)| {
+                        !extension.is_empty()
+                            && extension
+                                .chars()
+                                .all(|character| character.is_ascii_alphanumeric())
+                    }))
+        })
+        .max_by_key(|token| token.len())
+        .map(ToOwned::to_owned)
+}
+
+fn objective_path_matches(objective: &str, path: &Path) -> bool {
+    let Some(expected) = objective_path_hint(objective) else {
+        return false;
+    };
+    let observed = path.to_string_lossy();
+    observed.ends_with(&expected) || expected.ends_with(observed.as_ref())
+}
+
+fn objective_content_hint(objective: &str) -> Option<String> {
+    let lower = objective.to_ascii_lowercase();
+    let english_markers = [" with content ", " content is "];
+    let english = english_markers.iter().find_map(|marker| {
+        lower
+            .find(marker)
+            .map(|start| &objective[start.saturating_add(marker.len())..])
+    });
+    let chinese_markers = ["内容为", "内容是", "内容：", "内容:"];
+    let chinese = chinese_markers.iter().find_map(|marker| {
+        objective
+            .find(marker)
+            .map(|start| &objective[start.saturating_add(marker.len())..])
+    });
+    english
+        .or(chinese)
+        .map(|value| {
+            value
+                .trim()
+                .trim_matches(|character: char| {
+                    matches!(
+                        character,
+                        '`' | '\'' | '"' | ',' | '.' | ':' | ';' | '，' | '。' | '：'
+                    )
+                })
+                .to_owned()
+        })
+        .filter(|value| !value.is_empty())
 }
 
 fn elapsed_millis(started_at: Instant) -> u64 {

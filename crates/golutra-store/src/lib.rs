@@ -1,10 +1,11 @@
 use golutra_core::{
-    ArtifactId, ArtifactRecord, BusyPolicyDecision, CommandId, EventId, EvidenceRecord, SessionId,
-    TaskId, ThreadId, Timestamp, ToolResultEnvelope, TurnId,
+    ArtifactId, ArtifactRecord, BusyPolicyDecision, CommandId, ContextSnapshot, EventId,
+    EvidenceRecord, PostTaskJob, PostTaskJobId, PostTaskJobKind, PostTaskJobStatus, SessionId,
+    TaskId, ThreadId, Timestamp, ToolResultEnvelope, TurnId, VerificationPlan,
 };
 use golutra_protocol::{
-    CommandAck, DebugEventWindow, DebugProjection, RuntimeEvent, RuntimeEventType, StateProjection,
-    StorageStats, UserProjection,
+    ArtifactReadRequest, CommandAck, DebugEventWindow, DebugProjection, RuntimeEvent,
+    RuntimeEventType, StateProjection, StorageStats, UserProjection,
 };
 use sha2::{Digest, Sha256};
 use sqlx::{
@@ -23,12 +24,19 @@ use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 
 mod projection;
+mod repositories;
+
+pub use repositories::{
+    ArtifactRepository, DurableJobRepository, EventRepository, ProjectionRepository,
+    RuntimeRepositories, ThreadRepository,
+};
 
 const DEBUG_PROJECTION_EVENT_LIMIT: u32 = 512;
 const DEBUG_ARTIFACT_RETENTION_DAYS: i64 = 30;
 const CHECKPOINT_ARTIFACT_RETENTION_DAYS: i64 = 30;
 const EPHEMERAL_ARTIFACT_RETENTION_DAYS: i64 = 1;
 const TEMPORARY_ARTIFACT_RETENTION_HOURS: u64 = 1;
+pub const MAX_ARTIFACT_READ_BYTES: u64 = 1024 * 1024;
 
 pub(crate) use projection::{
     apply_event_to_state, initial_projection, loop_decision_from_event, verification_from_event,
@@ -84,6 +92,21 @@ pub struct ArtifactMaintenanceReport {
     pub artifact_blobs_removed: u64,
     pub protected_artifacts_skipped: u64,
     pub temporary_artifacts_removed: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactRange {
+    pub artifact: ArtifactRecord,
+    pub offset: u64,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventIntegrity {
+    pub event_count: u64,
+    pub first_sequence: Option<u64>,
+    pub last_sequence: Option<u64>,
+    pub event_chain_digest: String,
 }
 
 #[derive(Debug, Clone)]
@@ -453,6 +476,40 @@ impl RuntimeStore {
                 Ok(serde_json::from_str(&event_json)?)
             })
             .collect()
+    }
+
+    pub async fn event_integrity(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+    ) -> StoreResult<EventIntegrity> {
+        let rows = sqlx::query(
+            "SELECT sequence_no, event_json FROM runtime_events
+             WHERE session_id = ? AND task_id = ? ORDER BY sequence_no ASC",
+        )
+        .bind(session_id.to_string())
+        .bind(task_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        let mut digest = Sha256::new();
+        let first_sequence = rows.first().map(|row| row.try_get::<i64, _>("sequence_no"));
+        let last_sequence = rows.last().map(|row| row.try_get::<i64, _>("sequence_no"));
+        for row in &rows {
+            let sequence_no: i64 = row.try_get("sequence_no")?;
+            let event_json: String = row.try_get("event_json")?;
+            digest.update(sequence_no.to_be_bytes());
+            digest.update(event_json.as_bytes());
+        }
+        Ok(EventIntegrity {
+            event_count: u64::try_from(rows.len()).unwrap_or(u64::MAX),
+            first_sequence: first_sequence
+                .transpose()?
+                .and_then(|value| u64::try_from(value).ok()),
+            last_sequence: last_sequence
+                .transpose()?
+                .and_then(|value| u64::try_from(value).ok()),
+            event_chain_digest: format!("sha256:{:x}", digest.finalize()),
+        })
     }
 
     pub async fn load_events_page(
@@ -886,6 +943,401 @@ impl RuntimeStore {
         Ok(Some(bytes))
     }
 
+    pub async fn read_artifact_range(
+        &self,
+        request: &ArtifactReadRequest,
+    ) -> StoreResult<Option<ArtifactRange>> {
+        if request.length == 0 || request.length > MAX_ARTIFACT_READ_BYTES {
+            return Err(StoreError::ArtifactIo(format!(
+                "artifact read length must be between 1 and {MAX_ARTIFACT_READ_BYTES} bytes"
+            )));
+        }
+        let Some(artifact) = self.load_artifact(request.artifact_id).await? else {
+            return Ok(None);
+        };
+        let Some(bytes) = self.load_artifact_bytes(request.artifact_id).await? else {
+            return Ok(None);
+        };
+        let offset = usize::try_from(request.offset).unwrap_or(usize::MAX);
+        if offset >= bytes.len() {
+            return Ok(Some(ArtifactRange {
+                artifact,
+                offset: request.offset,
+                bytes: Vec::new(),
+            }));
+        }
+        let end = offset.saturating_add(usize::try_from(request.length).unwrap_or(usize::MAX));
+        Ok(Some(ArtifactRange {
+            artifact,
+            offset: request.offset,
+            bytes: bytes[offset..end.min(bytes.len())].to_vec(),
+        }))
+    }
+
+    pub async fn store_context_snapshot(&self, snapshot: &ContextSnapshot) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO context_snapshots
+             (snapshot_id, session_id, task_id, turn_id, created_at, snapshot_json)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(snapshot.snapshot_id.to_string())
+        .bind(snapshot.session_id.to_string())
+        .bind(snapshot.task_id.to_string())
+        .bind(snapshot.turn_id.to_string())
+        .bind(snapshot.created_at.to_rfc3339())
+        .bind(serde_json::to_string(snapshot)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn load_context_snapshots(
+        &self,
+        task_id: TaskId,
+    ) -> StoreResult<Vec<ContextSnapshot>> {
+        let rows = sqlx::query(
+            "SELECT snapshot_json FROM context_snapshots
+             WHERE task_id = ? ORDER BY created_at ASC",
+        )
+        .bind(task_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let snapshot_json: String = row.try_get("snapshot_json")?;
+                Ok(serde_json::from_str(&snapshot_json)?)
+            })
+            .collect()
+    }
+
+    pub async fn store_verification_plan(&self, plan: &VerificationPlan) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO verification_plans
+             (plan_id, task_id, revision, created_at, plan_json)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(plan.plan_id.to_string())
+        .bind(plan.task_id.to_string())
+        .bind(i64::from(plan.revision))
+        .bind(plan.created_at.to_rfc3339())
+        .bind(serde_json::to_string(plan)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn load_verification_plan(
+        &self,
+        task_id: TaskId,
+    ) -> StoreResult<Option<VerificationPlan>> {
+        let row = sqlx::query(
+            "SELECT plan_json FROM verification_plans
+             WHERE task_id = ? ORDER BY revision DESC LIMIT 1",
+        )
+        .bind(task_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            let plan_json: String = row.try_get("plan_json")?;
+            Ok(serde_json::from_str(&plan_json)?)
+        })
+        .transpose()
+    }
+
+    pub async fn enqueue_post_task_job(&self, job: &PostTaskJob) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO post_task_jobs
+             (job_id, kind, workspace_id, session_id, task_id, input_refs_json, status,
+              attempt, max_attempts, lease_owner, lease_expires_at, result_refs_json,
+              last_error, created_at, started_at, completed_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(job.job_id.to_string())
+        .bind(enum_json(job.kind)?)
+        .bind(&job.workspace_id)
+        .bind(&job.session_id)
+        .bind(job.task_id.to_string())
+        .bind(serde_json::to_string(&job.input_refs)?)
+        .bind(enum_json(job.status)?)
+        .bind(i64::from(job.attempt))
+        .bind(i64::from(job.max_attempts))
+        .bind(&job.lease_owner)
+        .bind(job.lease_expires_at.map(|value| value.to_rfc3339()))
+        .bind(serde_json::to_string(&job.result_refs)?)
+        .bind(&job.last_error)
+        .bind(job.created_at.to_rfc3339())
+        .bind(job.started_at.map(|value| value.to_rfc3339()))
+        .bind(job.completed_at.map(|value| value.to_rfc3339()))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 在同一个 SQLite 事务中写入后台作业和排队事件，避免恢复时出现“有事件无作业”或反向的半状态。
+    pub async fn enqueue_post_task_job_with_event(
+        &self,
+        job: &PostTaskJob,
+        mut event: RuntimeEvent,
+    ) -> StoreResult<RuntimeEvent> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO post_task_jobs
+             (job_id, kind, workspace_id, session_id, task_id, input_refs_json, status,
+              attempt, max_attempts, lease_owner, lease_expires_at, result_refs_json,
+              last_error, created_at, started_at, completed_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(job.job_id.to_string())
+        .bind(enum_json(job.kind)?)
+        .bind(&job.workspace_id)
+        .bind(&job.session_id)
+        .bind(job.task_id.to_string())
+        .bind(serde_json::to_string(&job.input_refs)?)
+        .bind(enum_json(job.status)?)
+        .bind(i64::from(job.attempt))
+        .bind(i64::from(job.max_attempts))
+        .bind(&job.lease_owner)
+        .bind(job.lease_expires_at.map(|value| value.to_rfc3339()))
+        .bind(serde_json::to_string(&job.result_refs)?)
+        .bind(&job.last_error)
+        .bind(job.created_at.to_rfc3339())
+        .bind(job.started_at.map(|value| value.to_rfc3339()))
+        .bind(job.completed_at.map(|value| value.to_rfc3339()))
+        .execute(&mut *transaction)
+        .await?;
+        event.sequence_no = next_sequence_in_transaction(&mut transaction).await?;
+        append_event_in_transaction(&mut transaction, &event).await?;
+        transaction.commit().await?;
+        Ok(event)
+    }
+
+    pub async fn post_task_job(&self, task_id: TaskId) -> StoreResult<Option<PostTaskJob>> {
+        let row = sqlx::query(
+            "SELECT job_id, kind, workspace_id, session_id, task_id, input_refs_json, status,
+                    attempt, max_attempts, lease_owner, lease_expires_at, result_refs_json,
+                    last_error, created_at, started_at, completed_at
+             FROM post_task_jobs WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(task_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(post_task_job_from_row).transpose()
+    }
+
+    pub async fn post_task_job_by_id(
+        &self,
+        job_id: PostTaskJobId,
+    ) -> StoreResult<Option<PostTaskJob>> {
+        let row = sqlx::query(
+            "SELECT job_id, kind, workspace_id, session_id, task_id, input_refs_json, status,
+                    attempt, max_attempts, lease_owner, lease_expires_at, result_refs_json,
+                    last_error, created_at, started_at, completed_at
+             FROM post_task_jobs WHERE job_id = ?",
+        )
+        .bind(job_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(post_task_job_from_row).transpose()
+    }
+
+    pub async fn list_post_task_jobs(&self, task_id: TaskId) -> StoreResult<Vec<PostTaskJob>> {
+        let rows = sqlx::query(
+            "SELECT job_id, kind, workspace_id, session_id, task_id, input_refs_json, status,
+                    attempt, max_attempts, lease_owner, lease_expires_at, result_refs_json,
+                    last_error, created_at, started_at, completed_at
+             FROM post_task_jobs WHERE task_id = ? ORDER BY created_at ASC",
+        )
+        .bind(task_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(post_task_job_from_row).collect()
+    }
+
+    pub async fn recover_expired_post_task_jobs(
+        &self,
+        workspace_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<u64> {
+        let requeued = sqlx::query(
+            "UPDATE post_task_jobs SET status = 'queued', lease_owner = NULL,
+             lease_expires_at = NULL, last_error = 'worker lease expired'
+             WHERE workspace_id = ? AND status IN ('leased', 'running')
+             AND lease_expires_at IS NOT NULL
+             AND lease_expires_at <= ? AND attempt < max_attempts",
+        )
+        .bind(workspace_id)
+        .bind(now.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        let failed = sqlx::query(
+            "UPDATE post_task_jobs SET status = 'failed', lease_owner = NULL,
+             lease_expires_at = NULL, last_error = 'worker lease expired and retry budget exhausted',
+             completed_at = ?
+             WHERE workspace_id = ? AND status IN ('leased', 'running')
+             AND lease_expires_at IS NOT NULL
+             AND lease_expires_at <= ? AND attempt >= max_attempts",
+        )
+        .bind(now.to_rfc3339())
+        .bind(workspace_id)
+        .bind(now.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(requeued
+            .rows_affected()
+            .saturating_add(failed.rows_affected()))
+    }
+
+    pub async fn claim_post_task_job(
+        &self,
+        worker_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+        lease_for: chrono::Duration,
+    ) -> StoreResult<Option<PostTaskJob>> {
+        self.claim_post_task_job_matching(worker_id, None, now, lease_for)
+            .await
+    }
+
+    pub async fn claim_post_task_job_for_workspace(
+        &self,
+        worker_id: &str,
+        workspace_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+        lease_for: chrono::Duration,
+    ) -> StoreResult<Option<PostTaskJob>> {
+        self.claim_post_task_job_matching(worker_id, Some(workspace_id), now, lease_for)
+            .await
+    }
+
+    async fn claim_post_task_job_matching(
+        &self,
+        worker_id: &str,
+        workspace_id: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+        lease_for: chrono::Duration,
+    ) -> StoreResult<Option<PostTaskJob>> {
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT job_id FROM post_task_jobs
+             WHERE status = 'queued' AND attempt < max_attempts
+             AND (? IS NULL OR workspace_id = ?)
+             ORDER BY created_at ASC LIMIT 1",
+        )
+        .bind(workspace_id)
+        .bind(workspace_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(row) = row else {
+            transaction.commit().await?;
+            return Ok(None);
+        };
+        let job_id: String = row.try_get("job_id")?;
+        let expires_at = now
+            .checked_add_signed(lease_for)
+            .unwrap_or(now + chrono::Duration::minutes(5));
+        let updated = sqlx::query(
+            "UPDATE post_task_jobs SET status = 'leased', attempt = attempt + 1,
+             lease_owner = ?, lease_expires_at = ?
+             WHERE job_id = ? AND status = 'queued'",
+        )
+        .bind(worker_id)
+        .bind(expires_at.to_rfc3339())
+        .bind(&job_id)
+        .execute(&mut *transaction)
+        .await?;
+        if updated.rows_affected() == 0 {
+            transaction.commit().await?;
+            return Ok(None);
+        }
+        let row = sqlx::query(
+            "SELECT job_id, kind, workspace_id, session_id, task_id, input_refs_json, status,
+                    attempt, max_attempts, lease_owner, lease_expires_at, result_refs_json,
+                    last_error, created_at, started_at, completed_at
+             FROM post_task_jobs WHERE job_id = ?",
+        )
+        .bind(&job_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        let job = post_task_job_from_row(row)?;
+        transaction.commit().await?;
+        Ok(Some(job))
+    }
+
+    pub async fn start_post_task_job(
+        &self,
+        job_id: PostTaskJobId,
+        worker_id: &str,
+        started_at: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<bool> {
+        let result = sqlx::query(
+            "UPDATE post_task_jobs SET status = 'running', started_at = ?
+             WHERE job_id = ? AND status = 'leased' AND lease_owner = ?",
+        )
+        .bind(started_at.to_rfc3339())
+        .bind(job_id.to_string())
+        .bind(worker_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn requeue_post_task_job(
+        &self,
+        job_id: PostTaskJobId,
+        worker_id: &str,
+        error: &str,
+    ) -> StoreResult<bool> {
+        let result = sqlx::query(
+            "UPDATE post_task_jobs SET status = 'queued', last_error = ?,
+             lease_owner = NULL, lease_expires_at = NULL
+             WHERE job_id = ? AND lease_owner = ?
+             AND status IN ('leased', 'running') AND attempt < max_attempts",
+        )
+        .bind(error)
+        .bind(job_id.to_string())
+        .bind(worker_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn retry_post_task_job(&self, job_id: PostTaskJobId) -> StoreResult<bool> {
+        let result = sqlx::query(
+            "UPDATE post_task_jobs SET status = 'queued', attempt = 0,
+             lease_owner = NULL, lease_expires_at = NULL, last_error = NULL,
+             started_at = NULL, completed_at = NULL
+             WHERE job_id = ? AND status IN ('failed', 'cancelled')",
+        )
+        .bind(job_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn finish_post_task_job(
+        &self,
+        job_id: PostTaskJobId,
+        worker_id: &str,
+        status: PostTaskJobStatus,
+        result_refs: &[String],
+        error: Option<&str>,
+        completed_at: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<bool> {
+        let result = sqlx::query(
+            "UPDATE post_task_jobs SET status = ?, result_refs_json = ?, last_error = ?,
+             completed_at = ?, lease_owner = NULL, lease_expires_at = NULL
+             WHERE job_id = ? AND lease_owner = ? AND status IN ('leased', 'running')",
+        )
+        .bind(enum_json(status)?)
+        .bind(serde_json::to_string(result_refs)?)
+        .bind(error)
+        .bind(completed_at.to_rfc3339())
+        .bind(job_id.to_string())
+        .bind(worker_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     pub async fn storage_stats(&self) -> StoreResult<StorageStats> {
         let row = sqlx::query(
             r#"
@@ -1204,7 +1656,7 @@ impl RuntimeStore {
         rows.into_iter().map(thread_from_row).collect()
     }
 
-    async fn load_evidence_records(
+    pub async fn load_evidence_records(
         &self,
         artifact_ids: &HashSet<ArtifactId>,
     ) -> StoreResult<Vec<EvidenceRecord>> {
@@ -1233,6 +1685,29 @@ impl RuntimeStore {
                     .iter()
                     .any(|artifact_id| artifact_ids.contains(artifact_id))
             })
+            .collect())
+    }
+
+    pub async fn load_evidence_by_ids(
+        &self,
+        evidence_ids: &HashSet<golutra_core::EvidenceId>,
+    ) -> StoreResult<Vec<EvidenceRecord>> {
+        if evidence_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query("SELECT evidence_json FROM evidence_records")
+            .fetch_all(&self.pool)
+            .await?;
+        let records = rows
+            .into_iter()
+            .map(|row| {
+                let evidence_json: String = row.try_get("evidence_json")?;
+                Ok(serde_json::from_str::<EvidenceRecord>(&evidence_json)?)
+            })
+            .collect::<StoreResult<Vec<_>>>()?;
+        Ok(records
+            .into_iter()
+            .filter(|record| evidence_ids.contains(&record.evidence_id))
             .collect())
     }
 }
@@ -1640,6 +2115,61 @@ const MIGRATIONS: &[&str] = &[
     CREATE UNIQUE INDEX IF NOT EXISTS idx_threads_session_unique
     ON threads (session_id)
     "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS context_snapshots (
+        snapshot_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        turn_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        snapshot_json TEXT NOT NULL
+    )
+    "#,
+    r#"
+    CREATE INDEX IF NOT EXISTS idx_context_snapshots_task_created
+    ON context_snapshots (task_id, created_at ASC)
+    "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS verification_plans (
+        plan_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        plan_json TEXT NOT NULL
+    )
+    "#,
+    r#"
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_verification_plans_task_revision
+    ON verification_plans (task_id, revision)
+    "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS post_task_jobs (
+        job_id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        input_refs_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        attempt INTEGER NOT NULL,
+        max_attempts INTEGER NOT NULL,
+        lease_owner TEXT,
+        lease_expires_at TEXT,
+        result_refs_json TEXT NOT NULL,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        completed_at TEXT
+    )
+    "#,
+    r#"
+    CREATE INDEX IF NOT EXISTS idx_post_task_jobs_status_created
+    ON post_task_jobs (status, created_at ASC)
+    "#,
+    r#"
+    CREATE INDEX IF NOT EXISTS idx_post_task_jobs_task_created
+    ON post_task_jobs (task_id, created_at ASC)
+    "#,
 ];
 
 fn artifact_root_for_database_url(database_url: &str) -> PathBuf {
@@ -1685,6 +2215,73 @@ fn non_negative_database_count(row: &sqlx::sqlite::SqliteRow, column: &str) -> S
     let value: i64 = row.try_get(column)?;
     u64::try_from(value).map_err(|_| {
         StoreError::InvalidId(format!("database aggregate `{column}` cannot be negative"))
+    })
+}
+
+fn enum_json<T: serde::Serialize>(value: T) -> StoreResult<String> {
+    let value = serde_json::to_value(value)?;
+    value.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+        StoreError::Json(serde_json::Error::io(std::io::Error::other(
+            "enum is not a string",
+        )))
+    })
+}
+
+fn parse_timestamp(value: Option<String>) -> StoreResult<Option<chrono::DateTime<chrono::Utc>>> {
+    value
+        .map(|value| {
+            chrono::DateTime::parse_from_rfc3339(&value)
+                .map(|parsed| parsed.with_timezone(&chrono::Utc))
+                .map_err(|error| StoreError::InvalidId(error.to_string()))
+        })
+        .transpose()
+}
+
+fn parse_required_timestamp(value: String) -> StoreResult<chrono::DateTime<chrono::Utc>> {
+    parse_timestamp(Some(value))?
+        .ok_or_else(|| StoreError::InvalidId("required timestamp was empty".to_owned()))
+}
+
+fn post_task_job_from_row(row: sqlx::sqlite::SqliteRow) -> StoreResult<PostTaskJob> {
+    let job_id_text: String = row.try_get("job_id")?;
+    let task_id_text: String = row.try_get("task_id")?;
+    let kind_text: String = row.try_get("kind")?;
+    let status_text: String = row.try_get("status")?;
+    let input_refs_json: String = row.try_get("input_refs_json")?;
+    let result_refs_json: String = row.try_get("result_refs_json")?;
+    let attempt: i64 = row.try_get("attempt")?;
+    let max_attempts: i64 = row.try_get("max_attempts")?;
+    let parse_enum = |value: String| {
+        serde_json::from_value::<PostTaskJobKind>(serde_json::Value::String(value.clone()))
+            .map_err(|error| StoreError::InvalidId(error.to_string()))
+    };
+    let parse_status = |value: String| {
+        serde_json::from_value::<PostTaskJobStatus>(serde_json::Value::String(value.clone()))
+            .map_err(|error| StoreError::InvalidId(error.to_string()))
+    };
+    Ok(PostTaskJob {
+        job_id: job_id_text
+            .parse()
+            .map_err(|error: uuid::Error| StoreError::InvalidId(error.to_string()))?,
+        kind: parse_enum(kind_text)?,
+        workspace_id: row.try_get("workspace_id")?,
+        session_id: row.try_get("session_id")?,
+        task_id: task_id_text
+            .parse()
+            .map_err(|error: uuid::Error| StoreError::InvalidId(error.to_string()))?,
+        input_refs: serde_json::from_str(&input_refs_json)?,
+        status: parse_status(status_text)?,
+        attempt: u32::try_from(attempt)
+            .map_err(|_| StoreError::InvalidId("negative job attempt".to_owned()))?,
+        max_attempts: u32::try_from(max_attempts)
+            .map_err(|_| StoreError::InvalidId("negative job max_attempts".to_owned()))?,
+        lease_owner: row.try_get("lease_owner")?,
+        lease_expires_at: parse_timestamp(row.try_get("lease_expires_at")?)?,
+        result_refs: serde_json::from_str(&result_refs_json)?,
+        last_error: row.try_get("last_error")?,
+        created_at: parse_required_timestamp(row.try_get("created_at")?)?,
+        started_at: parse_timestamp(row.try_get("started_at")?)?,
+        completed_at: parse_timestamp(row.try_get("completed_at")?)?,
     })
 }
 

@@ -8,7 +8,7 @@ use golutra_core::{
     Actor, ActorKind, BudgetOverflowAction, BusyPolicy, TaskStatus, ToolCallId, WorkspaceId,
 };
 use golutra_governor::GovernorLimits;
-use golutra_llm::MockProvider;
+use golutra_llm::{MockProvider, ProviderStreamEvent};
 use golutra_policy::WorkspacePolicy;
 use golutra_protocol::RuntimeEventType;
 use golutra_tools::BasicToolExecutor;
@@ -587,7 +587,72 @@ fn verification_command_classifier_rejects_arbitrary_shell_success() {
     ));
     assert!(is_objective_validation_command("npm run typecheck"));
     assert!(!is_objective_validation_command("echo done"));
+    assert!(!is_objective_validation_command("echo tests passed"));
     assert!(!is_objective_validation_command("git status --short"));
+}
+
+#[tokio::test]
+async fn agent_loop_does_not_accept_a_write_to_the_wrong_requested_path() {
+    let workspace = tempdir().expect("workspace");
+    let provider = MockProvider::tool_call(
+        "write_file",
+        json!({"path": "wrong.txt", "content": "expected"}),
+    );
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor);
+
+    let outcome = agent_loop
+        .run(AgentTaskRequest {
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            turn_id: TurnId::new(),
+            objective: "write expected.txt with content expected".to_owned(),
+            completion_criteria: vec!["expected.txt contains expected".to_owned()],
+            touched_code: false,
+            contributors: Vec::new(),
+            tools: vec!["write_file".to_owned()],
+        })
+        .await
+        .expect("loop runs");
+
+    assert_ne!(outcome.loop_decision.action, LoopAction::StopSuccess);
+    assert!(outcome.verification.checks.iter().any(|check| {
+        check.kind == golutra_core::VerificationCheckKind::WorkspaceChange && !check.passed
+    }));
+}
+
+#[tokio::test]
+async fn agent_loop_does_not_accept_wrong_written_content() {
+    let workspace = tempdir().expect("workspace");
+    let provider = MockProvider::tool_call(
+        "write_file",
+        json!({"path": "expected.txt", "content": "wrong"}),
+    );
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor);
+
+    let outcome = agent_loop
+        .run(AgentTaskRequest {
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            turn_id: TurnId::new(),
+            objective: "write expected.txt with content expected".to_owned(),
+            completion_criteria: vec!["expected.txt contains expected".to_owned()],
+            touched_code: false,
+            contributors: Vec::new(),
+            tools: vec!["write_file".to_owned()],
+        })
+        .await
+        .expect("loop runs");
+
+    assert_ne!(outcome.loop_decision.action, LoopAction::StopSuccess);
+    assert!(
+        outcome
+            .verification
+            .checks
+            .iter()
+            .any(|check| { check.name == "objective:content:write_file" && !check.passed })
+    );
 }
 
 #[tokio::test]
@@ -775,7 +840,7 @@ async fn agent_loop_does_not_stop_success_when_tool_fails() {
         "{:?}",
         outcome.loop_decision
     );
-    assert_eq!(outcome.verification.result, VerificationResult::Partial);
+    assert_eq!(outcome.verification.result, VerificationResult::Fail);
 }
 
 #[tokio::test]

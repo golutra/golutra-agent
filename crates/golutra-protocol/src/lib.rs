@@ -4,6 +4,7 @@ pub mod ipc;
 pub mod projection;
 pub mod query;
 pub mod storage;
+pub mod trace;
 pub mod version;
 
 pub use command::*;
@@ -12,4 +13,5 @@ pub use ipc::*;
 pub use projection::*;
 pub use query::*;
 pub use storage::*;
+pub use trace::*;
 pub use version::*;

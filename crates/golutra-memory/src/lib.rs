@@ -8,7 +8,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
-use golutra_core::{EvidenceId, MemoryId, TaskId};
+use golutra_core::{EvidenceId, MemoryClaim, MemoryId, TaskId};
 use regex::Regex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -50,6 +50,8 @@ pub struct WorkingSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct MemoryCandidate {
+    #[serde(default)]
+    pub claim: Option<MemoryClaim>,
     pub source_task_id: TaskId,
     pub evidence_ids: Vec<EvidenceId>,
     pub proposed_scope: MemoryScope,
@@ -70,8 +72,12 @@ pub struct ContextProjectionCacheEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryStatus {
+    Proposed,
+    Quarantined,
     Active,
+    Deprecated,
     RolledBack,
+    Expired,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -88,6 +94,12 @@ pub struct MemoryRecord {
     pub version: u64,
     pub status: MemoryStatus,
     pub rollback_reason: Option<String>,
+    #[serde(default)]
+    pub supporting_task_ids: Vec<TaskId>,
+    #[serde(default)]
+    pub invalidation_refs: Vec<String>,
+    #[serde(default)]
+    pub claim: Option<MemoryClaim>,
     #[serde(default)]
     pub promotion_reviewer: Option<String>,
     #[serde(default)]
@@ -189,8 +201,6 @@ pub enum MemoryError {
     LockPoisoned,
     #[error("memory promotion rejected: {0}")]
     PromotionRejected(String),
-    #[error("memory duplicates active record: {0}")]
-    Duplicate(MemoryId),
     #[error("memory record not found: {0}")]
     NotFound(MemoryId),
     #[error("memory store limit exceeded: {0}")]
@@ -226,50 +236,25 @@ impl MemoryStore {
     pub fn list(&self) -> Result<Vec<MemoryRecord>, MemoryError> {
         let _guard = self.lock.lock().map_err(|_| MemoryError::LockPoisoned)?;
         let _file_lock = self.acquire_file_lock()?;
-        self.load_unlocked()
+        let mut records = self.load_unlocked()?;
+        if migrate_legacy_active_memory(&mut records) || mark_expired(&mut records) {
+            self.save_unlocked(&records)?;
+        }
+        Ok(records)
     }
 
-    pub fn promote(
+    /// 成功任务只进入隔离区；隔离记录可追溯但不会污染后续上下文检索。
+    pub fn quarantine(
         &self,
-        gate: &MemoryPromotionGate,
         candidate: &MemoryCandidate,
         content: impl Into<String>,
     ) -> Result<MemoryRecord, MemoryError> {
-        self.promote_internal(gate, candidate, content.into(), None)
-    }
-
-    pub fn promote_reviewed(
-        &self,
-        gate: &MemoryPromotionGate,
-        candidate: &MemoryCandidate,
-        content: impl Into<String>,
-        reviewer: &str,
-        approved: bool,
-    ) -> Result<MemoryRecord, MemoryError> {
-        if !approved {
-            return Err(MemoryError::PromotionRejected(
-                "memory candidate was rejected by the human reviewer".to_owned(),
-            ));
-        }
-        if reviewer.trim().is_empty() {
-            return Err(MemoryError::PromotionRejected(
-                "human reviewer id is required".to_owned(),
-            ));
-        }
-        self.promote_internal(gate, candidate, content.into(), Some(reviewer.to_owned()))
-    }
-
-    fn promote_internal(
-        &self,
-        gate: &MemoryPromotionGate,
-        candidate: &MemoryCandidate,
-        content: String,
-        human_reviewer: Option<String>,
-    ) -> Result<MemoryRecord, MemoryError> {
+        let content = content.into();
         let _guard = self.lock.lock().map_err(|_| MemoryError::LockPoisoned)?;
         let _file_lock = self.acquire_file_lock()?;
         let mut records = self.load_unlocked()?;
-        let now = Utc::now();
+        migrate_legacy_active_memory(&mut records);
+        mark_expired(&mut records);
         let mut checked_candidate = candidate.clone();
         checked_candidate
             .contradiction_ids
@@ -280,29 +265,36 @@ impl MemoryStore {
             ));
         checked_candidate.contradiction_ids.sort();
         checked_candidate.contradiction_ids.dedup();
-        let decision = gate.evaluate(&checked_candidate, &content);
-        match decision.decision {
-            MemoryPromotionDecisionKind::Approve => {}
-            MemoryPromotionDecisionKind::NeedsHumanReview if human_reviewer.is_some() => {}
-            MemoryPromotionDecisionKind::NeedsHumanReview | MemoryPromotionDecisionKind::Reject => {
-                return Err(MemoryError::PromotionRejected(decision.reason));
-            }
+        let decision = MemoryPromotionGate::default().evaluate(&checked_candidate, &content);
+        if matches!(decision.decision, MemoryPromotionDecisionKind::Reject) {
+            return Err(MemoryError::PromotionRejected(decision.reason));
         }
-        if let Some(existing) = records.iter().find(|record| {
-            record.status == MemoryStatus::Active
-                && record.scope == candidate.proposed_scope
-                && record.expires_at.is_none_or(|expiry| expiry > now)
-                && normalize_content(&record.content) == normalize_content(&content)
-        }) {
-            return Err(MemoryError::Duplicate(existing.memory_id));
-        }
-        let expires_at = candidate
-            .expiry
-            .as_deref()
-            .map(DateTime::parse_from_rfc3339)
-            .transpose()
-            .map_err(|error| MemoryError::Io(error.to_string()))?
-            .map(|value| value.with_timezone(&Utc));
+        let now = Utc::now();
+        let candidate_id = candidate
+            .claim
+            .as_ref()
+            .map(|claim| claim.candidate_id)
+            .unwrap_or_default();
+        let claim = candidate.claim.clone().or_else(|| {
+            Some(MemoryClaim {
+                candidate_id,
+                subject: format!("scope:{:?}", candidate.proposed_scope).to_lowercase(),
+                predicate: "verified_task_outcome".to_owned(),
+                object: normalize_content(&content),
+                scope: format!("{:?}", candidate.proposed_scope).to_lowercase(),
+                source_task_refs: vec![candidate.source_task_id],
+                evidence_refs: candidate.evidence_ids.clone(),
+                confidence: candidate.confidence,
+                valid_from: now,
+                expires_at: candidate
+                    .expiry
+                    .as_deref()
+                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                    .map(|value| value.with_timezone(&Utc)),
+                invalidation_refs: Vec::new(),
+            })
+        });
+        let expires_at = candidate_expiry(candidate, now)?;
         let record = MemoryRecord {
             memory_id: MemoryId::new(),
             content,
@@ -311,17 +303,15 @@ impl MemoryStore {
             source_task_id: candidate.source_task_id,
             evidence_ids: candidate.evidence_ids.clone(),
             contradiction_ids: checked_candidate.contradiction_ids,
-            created_at: Utc::now(),
+            created_at: now,
             expires_at,
-            version: records
-                .iter()
-                .map(|record| record.version)
-                .max()
-                .unwrap_or_default()
-                .saturating_add(1),
-            status: MemoryStatus::Active,
+            version: next_memory_version(&records),
+            status: MemoryStatus::Quarantined,
             rollback_reason: None,
-            promotion_reviewer: human_reviewer.or(decision.reviewer),
+            supporting_task_ids: vec![candidate.source_task_id],
+            invalidation_refs: Vec::new(),
+            claim,
+            promotion_reviewer: None,
             helpful_count: 0,
             irrelevant_count: 0,
             incorrect_count: 0,
@@ -331,6 +321,47 @@ impl MemoryStore {
         records.push(record.clone());
         self.save_unlocked(&records)?;
         Ok(record)
+    }
+
+    pub fn activate_quarantined(
+        &self,
+        memory_id: MemoryId,
+        supporting_task_ids: &[TaskId],
+        reviewer: Option<&str>,
+    ) -> Result<MemoryRecord, MemoryError> {
+        let _guard = self.lock.lock().map_err(|_| MemoryError::LockPoisoned)?;
+        let _file_lock = self.acquire_file_lock()?;
+        let mut records = self.load_unlocked()?;
+        migrate_legacy_active_memory(&mut records);
+        mark_expired(&mut records);
+        let record = records
+            .iter_mut()
+            .find(|record| record.memory_id == memory_id)
+            .ok_or(MemoryError::NotFound(memory_id))?;
+        if record.status != MemoryStatus::Quarantined {
+            return Err(MemoryError::PromotionRejected(format!(
+                "memory {memory_id} is not quarantined"
+            )));
+        }
+        let mut tasks = record.supporting_task_ids.clone();
+        tasks.extend(supporting_task_ids.iter().copied());
+        tasks.sort();
+        tasks.dedup();
+        let human_review = reviewer.is_some_and(|value| !value.trim().is_empty());
+        if tasks.len() < 2 && !human_review {
+            return Err(MemoryError::PromotionRejected(
+                "memory activation requires two independent task evidences or human review"
+                    .to_owned(),
+            ));
+        }
+        record.supporting_task_ids = tasks;
+        record.status = MemoryStatus::Active;
+        record.promotion_reviewer = reviewer
+            .map(ToOwned::to_owned)
+            .or_else(|| Some("independent-task-evidence".to_owned()));
+        let activated = record.clone();
+        self.save_unlocked(&records)?;
+        Ok(activated)
     }
 
     pub fn retrieve(
@@ -346,11 +377,14 @@ impl MemoryStore {
         let _guard = self.lock.lock().map_err(|_| MemoryError::LockPoisoned)?;
         let _file_lock = self.acquire_file_lock()?;
         let mut records = self.load_unlocked()?;
+        let expired_changed =
+            migrate_legacy_active_memory(&mut records) || mark_expired(&mut records);
         let now = Utc::now();
         let normalized_query = normalize_content(query);
         let mut retrieved = records
             .iter_mut()
             .filter(|record| record.status == MemoryStatus::Active)
+            .filter(|record| record.invalidation_refs.is_empty())
             .filter(|record| record.scope == scope)
             .filter(|record| record.expires_at.is_none_or(|expiry| expiry > now))
             .filter_map(|record| {
@@ -399,7 +433,7 @@ impl MemoryStore {
                 .then_with(|| right.record.created_at.cmp(&left.record.created_at))
         });
         retrieved.truncate(limit);
-        if !retrieved.is_empty() {
+        if !retrieved.is_empty() || expired_changed {
             self.save_unlocked(&records)?;
         }
         Ok(retrieved)
@@ -429,11 +463,13 @@ impl MemoryStore {
             MemoryFeedbackKind::Incorrect => {
                 record.incorrect_count = record.incorrect_count.saturating_add(1);
                 record.status = MemoryStatus::RolledBack;
-                record.rollback_reason = Some(if reason.trim().is_empty() {
+                let reason = if reason.trim().is_empty() {
                     "memory marked incorrect by retrieval feedback".to_owned()
                 } else {
                     reason
-                });
+                };
+                record.invalidation_refs.push(reason.clone());
+                record.rollback_reason = Some(reason);
             }
         }
         let updated = record.clone();
@@ -466,10 +502,29 @@ impl MemoryStore {
             .find(|record| record.memory_id == memory_id)
             .ok_or(MemoryError::NotFound(memory_id))?;
         record.status = MemoryStatus::RolledBack;
-        record.rollback_reason = Some(reason.into());
+        let reason = reason.into();
+        record.invalidation_refs.push(reason.clone());
+        record.rollback_reason = Some(reason);
         let rolled_back = record.clone();
         self.save_unlocked(&records)?;
         Ok(rolled_back)
+    }
+
+    pub fn expire(&self, memory_id: MemoryId) -> Result<MemoryRecord, MemoryError> {
+        let _guard = self.lock.lock().map_err(|_| MemoryError::LockPoisoned)?;
+        let _file_lock = self.acquire_file_lock()?;
+        let mut records = self.load_unlocked()?;
+        let record = records
+            .iter_mut()
+            .find(|record| record.memory_id == memory_id)
+            .ok_or(MemoryError::NotFound(memory_id))?;
+        record.status = MemoryStatus::Expired;
+        record
+            .invalidation_refs
+            .push("explicitly expired by runtime controller".to_owned());
+        let expired = record.clone();
+        self.save_unlocked(&records)?;
+        Ok(expired)
     }
 
     fn acquire_file_lock(&self) -> Result<Option<File>, MemoryError> {
@@ -584,13 +639,28 @@ pub fn propose_project_memory(
     source_task_id: TaskId,
     evidence_ids: Vec<EvidenceId>,
 ) -> MemoryCandidate {
+    let candidate_id = golutra_core::MemoryCandidateId::new();
+    let valid_from = Utc::now();
     MemoryCandidate {
+        claim: Some(MemoryClaim {
+            candidate_id,
+            subject: "project".to_owned(),
+            predicate: "verified_task_outcome".to_owned(),
+            object: format!("task:{source_task_id}"),
+            scope: "project".to_owned(),
+            source_task_refs: vec![source_task_id],
+            evidence_refs: evidence_ids.clone(),
+            confidence: 80,
+            valid_from,
+            expires_at: Some(valid_from + chrono::Duration::days(30)),
+            invalidation_refs: Vec::new(),
+        }),
         source_task_id,
         evidence_ids,
         proposed_scope: MemoryScope::Project,
         confidence: 80,
         contradiction_ids: Vec::new(),
-        expiry: None,
+        expiry: Some((valid_from + chrono::Duration::days(30)).to_rfc3339()),
         promotion_status: "proposed".to_owned(),
     }
 }
@@ -602,6 +672,73 @@ fn temporary_path(path: &Path) -> PathBuf {
         .map(|extension| format!("{extension}.tmp"))
         .unwrap_or_else(|| "tmp".to_owned());
     path.with_extension(extension)
+}
+
+fn candidate_expiry(
+    candidate: &MemoryCandidate,
+    now: DateTime<Utc>,
+) -> Result<Option<DateTime<Utc>>, MemoryError> {
+    let parsed = candidate
+        .expiry
+        .as_deref()
+        .map(DateTime::parse_from_rfc3339)
+        .transpose()
+        .map_err(|error| MemoryError::Io(error.to_string()))?
+        .map(|value| value.with_timezone(&Utc));
+    Ok(parsed.or_else(|| {
+        (candidate.proposed_scope == MemoryScope::Project).then(|| now + chrono::Duration::days(30))
+    }))
+}
+
+fn next_memory_version(records: &[MemoryRecord]) -> u64 {
+    records
+        .iter()
+        .map(|record| record.version)
+        .max()
+        .unwrap_or_default()
+        .saturating_add(1)
+}
+
+fn migrate_legacy_active_memory(records: &mut [MemoryRecord]) -> bool {
+    let mut changed = false;
+    for record in records {
+        let legacy_automatic = record.status == MemoryStatus::Active
+            && record.scope == MemoryScope::Project
+            && record.claim.is_none()
+            && record.supporting_task_ids.is_empty()
+            && record
+                .promotion_reviewer
+                .as_deref()
+                .is_none_or(|reviewer| reviewer == "system");
+        if legacy_automatic {
+            record.status = MemoryStatus::Quarantined;
+            record.invalidation_refs.push(
+                "legacy single-task project memory requires independent evidence or review"
+                    .to_owned(),
+            );
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn mark_expired(records: &mut [MemoryRecord]) -> bool {
+    let now = Utc::now();
+    let mut changed = false;
+    for record in records {
+        if record.status == MemoryStatus::Active
+            && record
+                .expires_at
+                .is_some_and(|expires_at| expires_at <= now)
+        {
+            record.status = MemoryStatus::Expired;
+            record
+                .invalidation_refs
+                .push("memory expiry reached".to_owned());
+            changed = true;
+        }
+    }
+    changed
 }
 
 #[cfg(unix)]
@@ -720,18 +857,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn promotes_retrieves_and_rolls_back_project_memory() {
+    fn activates_retrieves_and_rolls_back_project_memory() {
         let directory = tempdir().expect("directory");
         let store = MemoryStore::new(directory.path().join("memory.json"));
         let candidate = propose_project_memory(TaskId::new(), vec![EvidenceId::new()]);
 
-        let promoted = store
-            .promote(
-                &MemoryPromotionGate::default(),
-                &candidate,
-                "cargo test validates the runtime store",
-            )
-            .expect("promotion");
+        let promoted =
+            activate_project_memory(&store, &candidate, "cargo test validates the runtime store");
         let retrieved = store
             .retrieve("validate runtime with cargo test", MemoryScope::Project, 3)
             .expect("retrieval");
@@ -809,19 +941,18 @@ mod tests {
                 .decision,
             MemoryPromotionDecisionKind::NeedsHumanReview
         );
-        assert!(matches!(
-            store.promote(&gate, &candidate, "use cargo test for runtime changes"),
-            Err(MemoryError::PromotionRejected(_))
-        ));
+        let quarantined = store
+            .quarantine(&candidate, "use cargo test for runtime changes")
+            .expect("quarantine");
+        assert!(
+            store
+                .retrieve("cargo test runtime", MemoryScope::User, 3)
+                .expect("quarantine retrieval")
+                .is_empty()
+        );
         let record = store
-            .promote_reviewed(
-                &gate,
-                &candidate,
-                "use cargo test for runtime changes",
-                "maintainer-1",
-                true,
-            )
-            .expect("human promotion");
+            .activate_quarantined(quarantined.memory_id, &[], Some("maintainer-1"))
+            .expect("human activation");
         let helpful = store
             .record_feedback(record.memory_id, MemoryFeedbackKind::Helpful, "reused")
             .expect("helpful feedback");
@@ -856,13 +987,11 @@ mod tests {
     fn in_memory_store_shares_records_between_clones() {
         let store = MemoryStore::in_memory();
         let cloned = store.clone();
-        cloned
-            .promote(
-                &MemoryPromotionGate::default(),
-                &propose_project_memory(TaskId::new(), vec![EvidenceId::new()]),
-                "workspace tests use cargo test",
-            )
-            .expect("promotion");
+        activate_project_memory(
+            &cloned,
+            &propose_project_memory(TaskId::new(), vec![EvidenceId::new()]),
+            "workspace tests use cargo test",
+        );
 
         assert_eq!(store.list().expect("list").len(), 1);
     }
@@ -874,20 +1003,16 @@ mod tests {
         let first = MemoryStore::new(&path);
         let second = MemoryStore::new(&path);
 
-        first
-            .promote(
-                &MemoryPromotionGate::default(),
-                &propose_project_memory(TaskId::new(), vec![EvidenceId::new()]),
-                "first process validates cargo tests",
-            )
-            .expect("first promotion");
-        second
-            .promote(
-                &MemoryPromotionGate::default(),
-                &propose_project_memory(TaskId::new(), vec![EvidenceId::new()]),
-                "second process validates runtime events",
-            )
-            .expect("second promotion");
+        activate_project_memory(
+            &first,
+            &propose_project_memory(TaskId::new(), vec![EvidenceId::new()]),
+            "first process validates cargo tests",
+        );
+        activate_project_memory(
+            &second,
+            &propose_project_memory(TaskId::new(), vec![EvidenceId::new()]),
+            "second process validates runtime events",
+        );
 
         assert_eq!(first.list().expect("shared records").len(), 2);
         assert!(path.with_extension("lock").exists());
@@ -896,13 +1021,11 @@ mod tests {
     #[test]
     fn contradiction_check_flags_near_duplicate_facts() {
         let store = MemoryStore::in_memory();
-        store
-            .promote(
-                &MemoryPromotionGate::default(),
-                &propose_project_memory(TaskId::new(), vec![EvidenceId::new()]),
-                "runtime tests use cargo test and validate durable events",
-            )
-            .expect("promotion");
+        activate_project_memory(
+            &store,
+            &propose_project_memory(TaskId::new(), vec![EvidenceId::new()]),
+            "runtime tests use cargo test and validate durable events",
+        );
 
         let contradictions = store
             .contradiction_ids(
@@ -919,13 +1042,11 @@ mod tests {
         let store = MemoryStore::in_memory();
         let mut expired = propose_project_memory(TaskId::new(), vec![EvidenceId::new()]);
         expired.expiry = Some((Utc::now() - chrono::Duration::seconds(1)).to_rfc3339());
-        store
-            .promote(
-                &MemoryPromotionGate::default(),
-                &expired,
-                "runtime tests use cargo test and validate durable events",
-            )
-            .expect("expired record promotion");
+        activate_project_memory(
+            &store,
+            &expired,
+            "runtime tests use cargo test and validate durable events",
+        );
 
         assert!(
             store
@@ -936,13 +1057,106 @@ mod tests {
                 .expect("contradiction check")
                 .is_empty()
         );
-        store
-            .promote(
-                &MemoryPromotionGate::default(),
-                &propose_project_memory(TaskId::new(), vec![EvidenceId::new()]),
-                "runtime tests use cargo test and validate durable events",
-            )
-            .expect("expired duplicate does not block replacement");
+        activate_project_memory(
+            &store,
+            &propose_project_memory(TaskId::new(), vec![EvidenceId::new()]),
+            "runtime tests use cargo test and validate durable events",
+        );
         assert_eq!(store.list().expect("records").len(), 2);
+    }
+
+    #[test]
+    fn quarantine_requires_independent_task_evidence_before_activation() {
+        let store = MemoryStore::in_memory();
+        let candidate = propose_project_memory(TaskId::new(), vec![EvidenceId::new()]);
+        let record = store
+            .quarantine(&candidate, "runtime changes require cargo test")
+            .expect("quarantine");
+
+        assert!(
+            store
+                .retrieve("runtime cargo test", MemoryScope::Project, 3)
+                .expect("retrieve quarantine")
+                .is_empty()
+        );
+        assert!(matches!(
+            store.activate_quarantined(record.memory_id, &[], None),
+            Err(MemoryError::PromotionRejected(_))
+        ));
+        let active = store
+            .activate_quarantined(record.memory_id, &[TaskId::new()], None)
+            .expect("independent evidence activation");
+
+        assert_eq!(active.status, MemoryStatus::Active);
+        assert_eq!(active.supporting_task_ids.len(), 2);
+        assert_eq!(
+            store
+                .retrieve("runtime cargo test", MemoryScope::Project, 3)
+                .expect("retrieve active")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn legacy_single_task_active_memory_is_migrated_to_quarantine() {
+        let directory = tempdir().expect("directory");
+        let path = directory.path().join("memory.json");
+        let task_id = TaskId::new();
+        let legacy = MemoryRecord {
+            memory_id: MemoryId::new(),
+            content: "legacy runtime fact".to_owned(),
+            scope: MemoryScope::Project,
+            confidence: 80,
+            source_task_id: task_id,
+            evidence_ids: vec![EvidenceId::new()],
+            contradiction_ids: Vec::new(),
+            created_at: Utc::now(),
+            expires_at: None,
+            version: 1,
+            status: MemoryStatus::Active,
+            rollback_reason: None,
+            supporting_task_ids: Vec::new(),
+            invalidation_refs: Vec::new(),
+            claim: None,
+            promotion_reviewer: Some("system".to_owned()),
+            helpful_count: 0,
+            irrelevant_count: 0,
+            incorrect_count: 0,
+            access_count: 0,
+            last_accessed_at: None,
+        };
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&vec![legacy]).expect("legacy JSON"),
+        )
+        .expect("legacy state");
+
+        let migrated = MemoryStore::new(&path).list().expect("migrated state");
+
+        assert_eq!(migrated[0].status, MemoryStatus::Quarantined);
+        assert!(
+            migrated[0]
+                .invalidation_refs
+                .iter()
+                .any(|reason| reason.contains("independent evidence"))
+        );
+        let persisted: Vec<MemoryRecord> =
+            serde_json::from_slice(&fs::read(&path).expect("persisted state"))
+                .expect("persisted JSON");
+        assert_eq!(persisted[0].status, MemoryStatus::Quarantined);
+    }
+
+    fn activate_project_memory(
+        store: &MemoryStore,
+        candidate: &MemoryCandidate,
+        content: &str,
+    ) -> MemoryRecord {
+        let quarantined = store
+            .quarantine(candidate, content)
+            .expect("memory quarantine");
+        store
+            .activate_quarantined(quarantined.memory_id, &[TaskId::new()], None)
+            .expect("memory activation")
     }
 }

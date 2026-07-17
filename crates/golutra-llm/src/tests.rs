@@ -7,6 +7,30 @@ use tokio::{
 use super::*;
 
 #[tokio::test]
+async fn mock_provider_can_emit_a_deterministic_failure() {
+    let provider = MockProvider::failure("forced failure");
+    let error = provider
+        .complete(ProviderRequest {
+            request_id: ProviderRequestId::new(),
+            task_id: TaskId::new(),
+            turn_id: TurnId::new(),
+            provider_id: "mock".to_owned(),
+            model_id: "mock".to_owned(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+        })
+        .await
+        .expect_err("mock failure");
+
+    assert_eq!(
+        error,
+        ProviderError::Failed {
+            message: "forced failure".to_owned()
+        }
+    );
+}
+
+#[tokio::test]
 async fn mock_provider_returns_text_response() {
     let provider = MockProvider::text_response("done");
     let response = provider.complete(request()).await.expect("response");

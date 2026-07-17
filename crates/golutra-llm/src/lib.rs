@@ -430,7 +430,13 @@ pub trait LlmProvider: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct MockProvider {
     contract: ProviderContract,
-    response: ProviderResponse,
+    outcome: MockProviderOutcome,
+}
+
+#[derive(Debug, Clone)]
+enum MockProviderOutcome {
+    Response(Box<ProviderResponse>),
+    Error(ProviderError),
 }
 
 impl MockProvider {
@@ -438,7 +444,7 @@ impl MockProvider {
     pub fn text_response(content: impl Into<String>) -> Self {
         Self {
             contract: mock_contract(),
-            response: ProviderResponse {
+            outcome: MockProviderOutcome::Response(Box::new(ProviderResponse {
                 response_id: ProviderResponseId::new(),
                 message: Some(ProviderMessage {
                     role: ProviderRole::Assistant,
@@ -452,7 +458,7 @@ impl MockProvider {
                 usage: usage(128, 32),
                 finish_reason: ProviderFinishReason::Stop,
                 raw_metadata: serde_json::json!({"provider": "mock"}),
-            },
+            })),
         }
     }
 
@@ -461,7 +467,7 @@ impl MockProvider {
         let tool_name = tool_name.into();
         Self {
             contract: mock_contract(),
-            response: ProviderResponse {
+            outcome: MockProviderOutcome::Response(Box::new(ProviderResponse {
                 response_id: ProviderResponseId::new(),
                 message: None,
                 tool_calls: vec![ProviderToolCall {
@@ -472,7 +478,18 @@ impl MockProvider {
                 usage: usage(96, 16),
                 finish_reason: ProviderFinishReason::ToolCalls,
                 raw_metadata: serde_json::json!({"provider": "mock"}),
-            },
+            })),
+        }
+    }
+
+    /// 为 Runtime 失败链和重试策略提供确定性错误，不依赖外部网络夹具。
+    #[must_use]
+    pub fn failure(message: impl Into<String>) -> Self {
+        Self {
+            contract: mock_contract(),
+            outcome: MockProviderOutcome::Error(ProviderError::Failed {
+                message: message.into(),
+            }),
         }
     }
 }
@@ -480,7 +497,11 @@ impl MockProvider {
 #[async_trait]
 impl LlmProvider for MockProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
-        if !self.response.tool_calls.is_empty()
+        let response = match &self.outcome {
+            MockProviderOutcome::Response(response) => response.as_ref(),
+            MockProviderOutcome::Error(error) => return Err(error.clone()),
+        };
+        if !response.tool_calls.is_empty()
             && request
                 .messages
                 .iter()
@@ -515,7 +536,7 @@ impl LlmProvider for MockProvider {
                 raw_metadata: json!({"provider": "mock", "phase": "after_tool"}),
             });
         }
-        Ok(self.response.clone())
+        Ok(response.clone())
     }
 
     fn contract(&self) -> ProviderContract {
