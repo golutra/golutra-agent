@@ -11,9 +11,11 @@
 核心数据结构至少长什么样。
 ```
 
+P0-P2 骨架到 P3 自进化之间的治理可信性补全不在本文重复展开，统一见 `runtime-governance-completion-design.md`。
+
 ## 第一阶段目标
 
-第一阶段不追求复杂多 agent。目标是跑通单 agent、多入口、可恢复、可验证、可 debug 的核心 runtime；截至 2026-07-15，该阶段及其生产硬化已经完成。
+第一阶段不追求复杂多 agent。目标是跑通单 agent、多入口、可恢复、可验证、可 debug 的核心 runtime；截至 2026-07-16，该阶段及其生产硬化已经完成。
 
 主场景默认按 coding agent 收敛：
 
@@ -64,10 +66,12 @@ VerificationTier：以结构化 check kind 和任务分类进入主链，schema 
 EventSamplingPolicy / ContextProjectionCache：保留 schema，不启用无收益的派生索引/cache
 Plugin/MCP：已完成本地 reviewed package 与 sandboxed stdio 主链
 复杂 Multi-Agent Orchestration：非当前产品范围
-自动修改或部署 runtime 代码：当前 P0/P1/P2 明确禁止，P3 目标另见 `self-evolving-runtime-design.md`
+自动修改或部署 runtime 代码：普通 P0/P1/P2 Runtime 明确禁止；独立 P3 Supervisor 的本地受治理流程见 `self-evolving-runtime-design.md` 和 `supervisor-operations.md`
 ```
 
-`ImprovementCandidate`、Evaluation、counterfactual comparison、regression/promotion 和 Evolution 都在后台或显式命令中运行，不污染普通用户同步链路。当前自动 apply 只允许 clean regression 后的低风险 benchmark state；Skill 必须人工 review，runtime code/policy 放宽不会自动应用。未来 P3 即使加入代码候选和连续发布，也必须由独立 Supervisor 承担密封评测、不可变构建、canary 和 rollback，不能改变普通任务同步边界。
+P2 当前状态包含类型、持久状态和受控本地流程；P2.5 已在此基础上完成可信治理闭环：统一 `TaskTraceService`、实际 provider request 的 `ContextSnapshot`、SQLite durable post-task job、客观 assertion、真实 baseline/candidate execution 和 memory quarantine 均已接入。P3 本地 Supervisor 也已接入完整 trace、候选隔离、密封/新鲜门禁、可信构建、内容寻址 release、canary、launcher 和 rollback；远端 fleet 与 E5 meta-evolution 后置。
+
+`ImprovementCandidate`、Evaluation、counterfactual comparison、regression/promotion 和 Evolution 都在后台或显式命令中运行，不污染普通用户同步链路。普通 Runtime 的自动 apply 只允许 clean regression 后的低风险 benchmark state；Skill 必须人工 review，runtime code/policy 放宽不会自动应用。runtime code 候选和连续发布只由独立 Supervisor 承担密封评测、不可变构建、canary 和 rollback，不改变普通任务同步边界。
 
 ## 第一阶段吸收的架构启示
 
@@ -83,7 +87,7 @@ Plugin/MCP：已完成本地 reviewed package 与 sandboxed stdio 主链
 - `ArtifactRecord` / `EvidenceRecord` 是事实层，raw output 默认进 artifact，模型只读取受控摘要和 evidence refs。
 - `VerificationRecord` 决定任务是否完成，模型自然语言不能直接触发成功终止。
 - `PolicyEvaluation` 必须在执行层阻断高风险文件、进程、网络、secret 和外部副作用。
-- `MemoryCandidate` 只作为候选，长期 memory 不能从 transcript 自动晋升。
+- `MemoryCandidate` 不能从 transcript 直接晋升。当前 project candidate 先进入 quarantine，再由独立 evidence 或人工 review 激活；legacy active record 在读取时降级为 quarantine。
 - `RuntimeLane` 负责同一 task 的串行执行和运行中输入处理，入口层不能私自排队、注入或中断。
 - `LoopGuardRule` 把重复工具失败、空回复、context overflow、max iteration 等循环异常变成显式规则。
 - `WorkspaceCheckpoint` 在 coding agent 文件副作用前捕获并持久化 before-image、checksum 和恢复引用；不能污染用户自己的 `.git`。
@@ -108,7 +112,7 @@ ContextProjectionCache
 
 1. `GoalLedger + GoalAlignmentCheck + RuntimeGovernor` 已在 provider/tool/result/completion 边界执行，不调用额外 judge。
 2. 验证已按 plain conversation、workspace objective、workspace change 和 code change 分级，并用 `VerificationCheckKind` 记录客观来源。
-3. deep PostTaskReview/evaluation 在终态后后台运行，普通 TUI 不查询 debug/evaluation projection。
+3. deep PostTaskReview/evaluation 在终态前先持久 enqueue，之后由带 lease/retry/recovery 的 worker 执行；普通 TUI 不查询 debug/evaluation projection。
 4. `EventSamplingPolicy` 只保留配置模型；canonical RuntimeEvent 不能采样丢失，当前也没有独立高成本派生索引需要抽样。
 5. `ContextProjectionCache` 只保留带 invalidation refs 的模型；当前 ContextBuilder 成本未形成瓶颈，启用 cache 反而会引入 stale context 风险。
 
@@ -116,7 +120,7 @@ ContextProjectionCache
 
 - `LoopDecision.reason` 能记录目标偏移、预算超限、权限阻塞等原因。
 - `VerificationRecord` 能记录检查来源和残余风险。
-- `DebugProjection` 能展示 event、context、policy、verification。
+- `DebugProjection` 能展示有界 event 摘要、context、policy 和 verification；它不是完整 task trace，完整性和分页由已实现的 `TaskTraceService` 负责。
 - `PostTaskReview` 能把疑似 drift / cost / context 问题归入失败分类。
 
 ## Coding Agent 生命周期默认值
@@ -708,13 +712,15 @@ PromotionDecision
 
 ### Coding Agent 验证默认值
 
-coding agent 第一阶段默认采用强客观验证：
+coding agent 第一阶段默认采用基础客观 evidence gate：
 
 - 代码修改任务至少需要 `diff` 和一类客观验证证据。
 - 客观验证证据优先来自 `test`、`lint`、`typecheck`、`build`、`command exit code`。
 - 如果没有足够 evidence，任务不能 `stop_success`。
-- 无法完成强验证时，只能输出 `stop_partial`、`blocked` 或 `stop_failed`。
+- 无法完成要求的验证时，只能输出 `stop_partial`、`blocked` 或 `stop_failed`。
 - 文档/调研型 task 可以允许较弱验证，但 coding task 不应退化为模型自述完成。
+
+该门禁现在由 `VerificationPlan + VerificationAssertion + VerifierRegistry` 补齐当前支持的语义目标验证；无法由现有 verifier 客观证明的标准保持 Unknown/Partial，不会被模型自述强行改成 Pass。
 
 ### Coding Agent 记忆默认值
 
@@ -723,7 +729,7 @@ coding agent 第一阶段默认采用强客观验证：
 - `WorkingSummary`
 - `CompactionRecord`
 - evidence-backed `MemoryCandidate`
-- expiry/contradiction-aware project-scoped promotion、retrieval、feedback 和 rollback
+- project-scoped quarantine、retrieval、feedback 和 rollback；activation 需要独立 evidence 或 human review，并带 expiry/invalidation
 
 当前明确不自动执行：
 
@@ -743,6 +749,8 @@ coding agent 第一阶段默认采用强客观验证：
 - ImprovementCandidate 生成。
 - 从失败或高价值 trajectory 生成 EvaluationCase 候选。
 
+当前“后台可跑”同时具备退出恢复语义：deep evaluation 通过 durable `PostTaskJob` 把普通 task terminal 与 evaluation terminal 分开，新的 Host/daemon 可接管过期 lease。
+
 ### 后台或显式治理命令
 
 这些能力用于长期改进，不属于普通任务执行链路：
@@ -757,6 +765,20 @@ coding agent 第一阶段默认采用强客观验证：
 - runtime / prompt / tool schema 改进实验。
 - RegressionResult。
 - PromotionDecision。
+
+## P2.5 治理可信性阶段（已完成）
+
+P2.5 不再增加并列的治理名词，而是把现有事实和状态机补成可验收闭环：
+
+1. G0 固定 TaskTrace、ContextSnapshot、PostTaskJob、VerificationPlan、RegressionCampaign 和 MemoryClaim 协议，并修正文档能力声明。
+2. G1 由统一 `TaskTraceService` 分页关联 event、context、artifact/evidence、verification、evaluation 和 memory lifecycle。
+3. G2 将 deep evaluation 改为 SQLite durable job，支持 lease、retry、crash recovery 和显式等待。
+4. G3 把 completion criteria 映射为客观 assertion，并用 Evidence/Object/Policy 三维 hard gate 决定终态。
+5. G4 为冻结候选启动 baseline/candidate 隔离 RuntimeHost，生成 execution-backed RegressionResult。
+6. G5 将 project memory 改为 structured claim 和 quarantine 生命周期。
+7. G6 只把 complete TaskTraceBundle 与 execution-backed RegressionResult 接给 P3 Supervisor。
+
+字段、crate 映射和端到端验收以 `runtime-governance-completion-design.md` 为准。当前 gate 已禁止 projection-only、unknown verification、缺 paired execution 或控制面修改进入自动 promotion；可信输入由 P3 独立 Supervisor 消费，具体发布操作见 `supervisor-operations.md`。
 
 ## 任务类型验证策略
 
@@ -795,7 +817,8 @@ TUI、CLI、API 都从 `UserProjection` 展示，不直接读取 raw runtime eve
 DebugProjection
   session_id
   task_id
-  event_stream
+  recent_events
+  event_window_limit
   loop_decisions
   policy_evaluations
   evidence_records
@@ -806,7 +829,7 @@ DebugProjection
   tool_result_envelopes
 ```
 
-Debug Projection 只在 debug/audit/replay 模式启用。
+Debug Projection 只在 debug/audit/replay 模式启用，并且只承担有界摘要。完整、分页且带缺失原因的事实包由 P2.5 `TaskTraceService` 返回。
 
 ## P0 验收矩阵
 

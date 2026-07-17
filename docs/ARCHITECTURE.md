@@ -12,6 +12,7 @@ Golutra 的核心系统是什么，
 
 外部项目影响和调研结论保留在 `framework-comparison.md`。实现时优先以本文档作为架构真相。
 具体落地顺序、最小 schema 和同步/后台/离线边界见 `implementation-blueprint.md`。
+P0-P2 骨架到可信治理闭环之间的 P2.5 实施边界见 `runtime-governance-completion-design.md`。
 
 ## 核心结论
 
@@ -56,22 +57,24 @@ GoalLedger
 -> LoopDecision
 ```
 
-这些能力不属于第一阶段的最低门槛。当前实现已经在 P0 闭环稳定后接入轻量 `RuntimeGovernor`、project memory 和 evaluation/promotion guardrail，但没有把判断外包给额外模型，也没有开放高风险自动晋升。
+这些能力不属于第一阶段的最低门槛，但当前实现已经完成 P2.5 治理闭环：`TaskTraceService`、ContextSnapshot、durable post-task job、客观 verification、baseline/candidate execution-backed regression 和 memory quarantine 均已接入。普通运行仍只消费 UserProjection；P3 的 `golutra-supervisor`/`golutra-release` 是独立本地控制面，不进入普通 TUI 同步路径。
 
 ## 阶段分层
 
-为避免把目标态误读成第一阶段必做，Golutra 按三层理解：
+为避免把目标态误读成当前能力，Golutra 按阶段理解：
 
 | 层级 | 说明 | 当前状态 |
 | --- | --- | --- |
-| 目标态 | 完整 Runtime OS，包含多投影、多入口、改进闭环、回放与治理增强 | 架构方向 |
-| 第一阶段 | coding agent 主场景下的单 agent、单 active task、强 verification、可 replay 核心 runtime | 已完成并持续硬化 |
-| 后续增强 | GoalLedger、RuntimeGovernor、VerificationTier、EventSamplingPolicy、ContextProjectionCache、自动晋升等 | 已完成受控最小实现，完整自动化后置 |
+| P0/P1 | coding agent 主场景下的单 agent、单 active task、多入口、持久事实和基础 verification | 已完成并持续硬化 |
+| P2 | GoalLedger、RuntimeGovernor、memory/evaluation/evolution 和 promotion 类型及受控本地流程 | 已完成，并由 P2.5 门禁约束 |
+| P2.5 | 完整 TaskTrace、ContextSnapshot、durable post-task job、语义 verification、真实 regression、memory quarantine | 已完成当前范围，细节见 `runtime-governance-completion-design.md` |
+| P3 | 内部/外部代码候选、密封评测、OS-enforced build、不可变 release、canary、launcher 和 rollback | 本地受治理范围已实现；远端 fleet/E5 后置 |
 
 阅读原则：
 
 - `ARCHITECTURE.md` 描述目标态与稳定边界。
 - `implementation-blueprint.md` 决定第一阶段真正要做什么。
+- `runtime-governance-completion-design.md` 决定 P3 前必须补齐的治理可信性门禁。
 - 其他专题文档默认写目标态，但如果与第一阶段范围冲突，以 `implementation-blueprint.md` 为准。
 
 ## 主架构边界
@@ -81,9 +84,9 @@ GoalLedger
 - Agent 核心是 runtime，不是 prompt 包装器。CLI、TUI、API、SDK 都要进入同一套 runtime loop。
 - 任务完成必须由 `VerificationRecord` 判定，不能只看模型自然语言。
 - `ProviderContract`、`ToolContract`、`PolicyEvaluation`、`ArtifactRecord`、`EvidenceRecord` 属于支持层，细节见 `implementation-blueprint.md` 和观测/记忆专题文档。
-- `GoalLedger`、`RuntimeGovernor`、`VerificationTier`、`EventSamplingPolicy`、`ContextProjectionCache` 属于治理增强；当前只有轻量确定性 governor 进入 runtime loop，重型评估仍保持后台或离线。
+- `GoalLedger`、`RuntimeGovernor`、`VerificationTier`、`EventSamplingPolicy`、`ContextProjectionCache` 属于治理增强；当前轻量确定性 governor 进入 runtime loop，重型评估通过 durable post-task job 运行，ContextProjectionCache 仍因 stale-context 风险保持禁用。
 - 多入口只共享同一套 session protocol，入口层不能各自实现状态机。
-- 长期 memory 是受治理的 durable state，不是直接回灌完整历史。
+- 长期 memory 是受治理的 durable state，不是直接回灌完整历史；project memory 先 quarantine，只有独立任务证据或人工 review 才能激活，过期/错误反馈会停止检索。
 
 ## Runtime-First 多前端边界
 
@@ -176,7 +179,7 @@ Replay timeline
 - transcript 不是系统状态。
 - UI 展示事件和 durable runtime event 必须分离。
 - 大工具输出、diff、日志、网页内容默认进入 artifact，不直接进入 prompt。
-- 任意 turn 都应该能通过 event + state + artifact 恢复和 replay。
+- 任意 turn 都应该能通过 event + state + artifact 恢复和重建投影；只有重新启动隔离 RuntimeHost 执行 provider/tool 的流程才能称为 execution replay。
 - SQLite event 是 canonical facts；rollout JSONL 是带版本、checksum 和脱敏的可重建导出层，不能形成第二份主真相。
 
 ### Context & Memory
@@ -212,6 +215,7 @@ MemoryGovernance
 
 - `evaluation-observability.md`：观测、验证、复盘、EvaluationCase / EvaluationRun / Scorer / benchmark。
 - `agent-improvement-loop.md`：失败轨迹如何变成可验证、可回滚的 agent 改进。
+- `runtime-governance-completion-design.md`：完整任务事实、持久后台作业、语义验证、真实回归和 memory quarantine。
 - `agent-open-endedness-design.md`：开放式能力、技能晋升和 Promotion Gate。
 - `runtime-contracts.md`：tool/provider/terminal/cancel/retry/fallback 的硬契约。
 - `artifact-evidence-ledger.md`：artifact 与 evidence 的事实层。
@@ -225,7 +229,7 @@ MemoryGovernance
 3. Host Runtime 创建 Session / Turn / GoalState
 4. RuntimeLane 根据 busy policy 判断 append / inject / interrupt / reject
 5. Runtime 写入 input event 和 turn snapshot
-6. ContextBuilder 根据 state、summary、memory、evidence 构造模型输入，并生成 TokenBudgetSnapshot
+6. ContextBuilder 根据 state、summary、memory、evidence 构造模型输入，并在 adapter 调用前生成 TokenBudgetSnapshot 与不可变 ContextSnapshot
 7. Provider Router 根据 CapabilityMatrix 和预算选择模型
 8. Provider 返回 assistant message / tool calls / usage / raw events，ProviderContract 归一化为 TokenUsageRecord
 9. Tool System 校验 schema、权限、sandbox 和资源访问
@@ -233,8 +237,8 @@ MemoryGovernance
 11. Verification 判断任务是否达成、证据是否可靠、是否违反 policy
 12. LoopGuard 与 LoopDecision 判断 continue / compact / retry / fallback / ask_user / stop
 13. WorkspaceCheckpoint 在文件副作用前持久化 before-image、checksum、artifact ref 和 restore metadata，成功落盘后才允许工具修改文件
-14. 任务结束后按需生成 PostTaskReview 和可选 ImprovementCandidate
-15. Projection Layer 按用途生成 User / Runtime Control / Debug / Evaluation 四类投影
+14. 任务结束前 durable enqueue post-task job；worker 在 SQLite claim 时按 workspace 原子过滤并在执行前复核 partition，后台生成 PostTaskReview 和可选 ImprovementCandidate，任务终态与评估终态分别记录
+15. Projection Layer 按用途生成 State / User / Context / Debug / Evaluation 五类类型化投影；TaskTrace 再按引用闭包组合完整审计视图
 16. GoalLedger/RuntimeGovernor 已在 provider/tool/result/completion 边界同步运行；Verification 分级进入客观 check，EventSamplingPolicy/ContextProjectionCache 只在出现真实派生索引或构造瓶颈时启用
 ```
 
@@ -245,9 +249,9 @@ MemoryGovernance
 | `golutra-core` | 核心协议与状态类型 |
 | `golutra-runtime` | RuntimeLane、turn 状态机、loop 执行、LoopGuard、resume、compact、fallback |
 | `golutra-event` | Durable / live-only 事件协议 |
-| `golutra-context` | ContextBuilder、TokenBudgetTracker、TokenBudgetSnapshot、WorkingSummary、context projection |
-| `golutra-memory` | MemoryRetriever、MemoryGovernance、memory promotion/rollback |
-| `golutra-store` | SQLite、event log、artifact store、state snapshot、workspace checkpoint refs |
+| `golutra-context` | ContextBuilder、TokenBudgetTracker、TokenBudgetSnapshot、ContextSnapshot、WorkingSummary、context projection |
+| `golutra-memory` | MemoryRetriever、MemoryGovernance、memory quarantine/promotion/rollback |
+| `golutra-store` | SQLite、event log、artifact store、state snapshot、durable post-task job、workspace checkpoint refs |
 | `golutra-sandbox` | macOS Seatbelt、Linux bubblewrap 与 process-only launch plan；统一 workspace/network/env 边界 |
 | `golutra-code-intelligence` | tree-sitter symbol/reference/import graph、ignore-aware 索引和 owner-only snapshot |
 | `golutra-auth` | CredentialRef、owner-only disk/env SecretStore、OAuth PKCE/device/refresh/revoke 和非敏感 credential metadata |
@@ -256,9 +260,12 @@ MemoryGovernance
 | `golutra-tools` | ToolContract、tool registry、tool execution、ToolResultEnvelope |
 | `golutra-governor` | GoalLedger、RuntimeGovernor、GoalAlignment、budget/security/policy GovernanceDecision |
 | `golutra-policy` | PermissionPolicy、PolicyEvaluation、workspace isolation |
-| `golutra-verify` | verification runner、PASS/FAIL/PARTIAL、证据记录 |
+| `golutra-verify` | VerificationPlan/Assertion、VerifierRegistry、PASS/FAIL/PARTIAL、证据记录 |
 | `golutra-eval` | EvaluationCase、EvaluationRun、Scorer、TrajectoryReplay、CounterfactualReplay、CausalComparison、benchmark、regression |
+| `golutra-eval-worker` | sealed 版本评测入口；使用被测版本的 RuntimeApplication 运行单个 case 并输出完整 TaskTrace，不接收 assertion/holdout 答案 |
 | `golutra-evolution` | GeneratedTask、novelty/curriculum/frontier、隔离执行和 Skill stage/review/install/rollback |
+| `golutra-supervisor` | 独立 P3 opportunity/epoch/producer/archive/evaluation/deployment 控制面和 hash-chain log |
+| `golutra-release` | 只读 source 与独立 artifact staging 的 OS-enforced TrustedBuilder、内容寻址 source/bin、stable/preview/canary pointer、launcher 和 rollback |
 | `golutra-plugin` | 用户级插件 package、manifest、checksum 与 stage/review/enable/rollback 生命周期 |
 | `golutra-mcp` | 官方 rmcp stdio adapter、reviewed schema 对照、sandbox launch 和外部工具桥接 |
 | `golutra-tui` | 只展示 runtime projection 的 TUI |
@@ -266,18 +273,24 @@ MemoryGovernance
 | `golutra-app-server` | 同一 Axum Router 上的 Unix IPC 与 HTTP command/query + SSE 入口 |
 | `golutra-vis` | replay、audit、event 和 OpenTelemetry JSON 投影视图 |
 
+应用层不直接把这些 crate 暴露给前端。`golutra-client::RuntimeApplication`
+（别名 `GovernedRuntime`）是 command/query/session/trace/governance 的唯一
+in-process facade；`golutra-store::RuntimeRepositories` 是 event、projection、
+artifact、durable job、thread 五类事实访问边界。`EmbeddedTransport`、CLI、TUI
+和 daemon host 都必须沿这两个边界走，不能在入口自行拼装 trace 或读取 SQLite。
+
 ### 当前实现内部分层
 
 为避免 crate 根文件重新承担全部职责，当前实现进一步固定以下内部边界：
 
 | Crate | 内部模块 | 约束 |
 | --- | --- | --- |
-| `golutra-client` | `transport`、`transport::ipc`、`paths`、`rollout`、`provider_runtime`、`context`、`event_codec`、`evolution` | `RuntimeHost` 负责用例编排；IPC/HTTP/SSE、路径权限、rollout 格式、provider plan、上下文文本、事件 wire 和 Evolution 用例不得回流成单个巨型 host 方法 |
-| `golutra-runtime` | `lane`、`checkpoint` | lane 状态机与 checkpoint 文件事务独立于 `AgentLoop`；loop 不直接实现 session controller 转换或快照 IO |
+| `golutra-client` | `application`、`command`、`query`、`session`、`execution`、`execution_trace`、`task_governance`、`post_task`、`governance`、`governance_commands`、`regression`、`trace`、`transport`、`transport::ipc` | `RuntimeApplication` 是前端用例 facade；`RuntimeHost` 只拥有 lane/worker/EventBus/sequence 与生命周期；command、查询、执行、trace、后台治理和回归各自编排但共享同一事实与 owner |
+| `golutra-runtime` | `lane`、`checkpoint`、`completion`、`context_guard`、`provider_retry`、`trace`、`verification` | lane 状态机、checkpoint、终态策略、context guard、retry、trace adapter 和 verification service 独立于 loop orchestration；loop 不直接实现 session controller 转换或快照 IO |
 | `golutra-tui` | `auth_state`、`auth_flow`、`session`、`render` | 主文件只组装应用状态和事件循环；渲染不写 provider 配置，认证 flow 不编排 runtime task |
 | `golutra-config` | `provider_auth`、`provider_storage` | provider catalog 与凭据/配置事务分离；磁盘写入、锁、迁移、probe 和 rollback 统一由 storage 层负责 |
 | `golutra-llm` | `provider_config`、`openai_responses`、`genai_adapter` | 环境解析与 URL/错误处理不进入 adapter 执行循环；各协议 adapter 只处理自己的 wire contract |
-| `golutra-store` | `projection` | event reducer 保持纯函数；SQLite repository 只负责事实读写和持久化派生索引 |
+| `golutra-store` | `projection`、`repositories` | event reducer 保持纯函数；`RuntimeRepositories` 对 event/projection/artifact/job/thread 提供逻辑 seam；SQLite 只负责事实读写和持久化派生索引 |
 | `golutra-tools` | `process` | shell argv、进程组取消、timeout 和有界管道读取由单一模块维护 |
 
 每个大型入口的单元测试位于同目录 `tests.rs`；生产模块通过 `#[cfg(test)] mod tests;` 接入。测试可以验证 crate 内实现，但生产模块不能通过 test-only 重导出形成运行时依赖。
@@ -291,6 +304,8 @@ Frontend
   -> Frontend SDK
   -> RuntimeClient
   -> Transport Adapter
+  -> RuntimeApplication / GovernedRuntime
+  -> RuntimeCommandService / RuntimeQueryService / TaskTraceService
   -> RuntimeHost
   -> RuntimeCore
   -> RuntimeEvent / RuntimeQuery
@@ -325,7 +340,7 @@ CLI / TUI --connect <URL>
   -> 同一 attachment 协议
 ```
 
-cwd 只决定执行目录、工具权限、checkpoint/memory/evaluation/evolution/rollout 分区和 thread 过滤，不决定进程生命周期。所有 durable facts 位于 `$GOLUTRA_HOME/state`：全局 `runtime.sqlite`、`artifacts/` 以及 `workspaces/<cwd-hash>/`；项目 `.golutra` 不参与 runtime 持久化。provider selection 位于全局 `provider.json` v2，API key 与 OAuth token set 位于 owner-only `$GOLUTRA_HOME/credentials.json` 或只读进程 env；`provider.json`、runtime event 和 rollout 都不保存 secret。凭据文件使用跨进程锁、大小上限、临时文件 fsync 和原子替换，Unix 权限为目录 `0700`、凭据/锁文件 `0600`。OpenAI/xAI/Copilot 等 OAuth 只通过受审计 catalog 启用并固定绑定对应 request adapter，Custom endpoint 不推断 OAuth；`auth/refresh` 只保存 owner-only 跨进程锁。SQLite 在 event append 事务内分配全局 sequence；rollout 从 SQLite 物化，append 与原子重建共享跨进程锁。全局 session lease 防止多个 Embedded 进程同时控制同一会话，command lease 与 durable ack 提供幂等重试。owner 异常退出后，能够重新取得 lease 的 host 会取消孤儿 active task，并恢复尚未开始的 durable pending turn。用户级 app-server 用 `$GOLUTRA_HOME/app-server/daemon.lock` 保证单实例，并发布 owner-only `app-server.json` 与 Unix `app-server.sock`；cwd runtime registry 默认最多保留 128 个 attachment，初始化失败会释放槽位。IPC request 直接进入同一个 Router，HTTP/SSE 与 IPC 都执行 bearer/protocol version/attachment 校验。每次 cwd attachment 都从全局 thread index 刷新最近 session/thread，数据库以唯一索引保证一个 session 只绑定一个 thread。HTTP 未配置 transport auth 前仅允许 loopback，同时校验 Host/Origin；`HttpSseTransport` 始终使用调用方传入的连接 URL 发后续请求，服务端广告地址只作诊断，从而支持 SSH 端口转发和反向代理。
+cwd 只决定执行目录、工具权限、checkpoint/memory/evaluation/evolution/rollout 分区和 thread 过滤，不决定进程生命周期。所有 durable facts 位于 `$GOLUTRA_HOME/state`：全局 `runtime.sqlite`、`artifacts/` 以及 `workspaces/<cwd-hash>/`；项目 `.golutra` 不参与 runtime 持久化。provider selection 位于全局 `provider.json` v2，API key 与 OAuth token set 位于 owner-only `$GOLUTRA_HOME/credentials.json` 或只读进程 env；`provider.json`、runtime event 和 rollout 都不保存 secret。凭据文件使用跨进程锁、大小上限、临时文件 fsync 和原子替换，Unix 权限为目录 `0700`、凭据/锁文件 `0600`。OpenAI/xAI/Copilot 等 OAuth 只通过受审计 catalog 启用并固定绑定对应 request adapter，Custom endpoint 不推断 OAuth；`auth/refresh` 只保存 owner-only 跨进程锁。SQLite 在 event append 事务内分配全局 sequence；rollout 从 SQLite 物化，append 与原子重建共享跨进程锁。全局 session lease 防止多个 Embedded 进程同时控制同一会话，command lease 与 durable ack 提供幂等重试。owner 异常退出后，能够重新取得 lease 的 host 会取消孤儿 active task，并恢复尚未开始的 durable pending turn。用户级 app-server 用 `$GOLUTRA_HOME/app-server/daemon.lock` 保证单实例，并发布 owner-only `app-server.json` 与 Unix `app-server.sock`；cwd runtime registry 默认最多保留 128 个 attachment，初始化失败会释放槽位。IPC request 直接进入同一个 Router；认证后的 `/runtime/info` 用于协议协商，其余 HTTP/SSE 与 IPC 请求执行 bearer/protocol version/attachment 校验。每次 cwd attachment 都从全局 thread index 刷新最近 session/thread，数据库以唯一索引保证一个 session 只绑定一个 thread。HTTP 未配置 transport auth 前仅允许 loopback，同时校验 Host/Origin；`HttpSseTransport` 始终使用调用方传入的连接 URL 发后续请求，服务端广告地址只作诊断，从而支持 SSH 端口转发和反向代理。summary trace 只返回净化阶段摘要，full 返回脱敏 manifest，forensic 仅允许 owner-only Unix IPC/embedded；restricted capture 不存在时完整性明确为 false。
 
 ```text
 $GOLUTRA_HOME/
@@ -449,12 +464,12 @@ Debug / Audit / Replay 模式使用 `Debug / Audit Projection`：
 
 - 展示 runtime event、LoopDecision、PolicyEvaluation、EvidenceRecord、VerificationRecord、context projection、token budget、provider raw event。
 - 用于调试、复盘、benchmark 和回归验证。
-- TUI developer mode 提供同步运行时摘要和最近事件；完整历史、artifact/evidence 明细继续由 `golutra trace`、`golutra export` 或 SDK debug query 获取，避免把全量审计数据塞进终端主对话区。
+- TUI developer mode 继续只提供有界摘要和最近事件；统一 `TaskTraceService` 已分页提供完整历史、context snapshot、artifact/evidence 和完整性声明，Rust client、CLI 与 TypeScript/Python SDK 提供 bounded 全页聚合。不能让 TUI 把全量审计数据塞进终端主对话区。
 
 Evaluation / Improvement 模式使用 `Evaluation / Improvement Projection`：
 
 - 离线或后台读取 durable event、artifact、context projection、verification 和 post review。
-- 用于 replay 失败、生成 benchmark、比较 provider、验证 prompt/tool/schema/policy/runtime 修改。
+- projection replay 用于复盘失败；prompt/config 等任务级候选可由独立 RuntimeHost 重跑，runtime 源码候选必须由 Supervisor 分别启动 stable/candidate 两个不同 checksum 的 `golutra-eval-worker`，同一已编译 Host 的两次 replay 不构成版本证据。
 - 不应阻塞普通用户返回，除非当前任务明确要求同步验证。
 
 ## 能力分层
@@ -478,6 +493,7 @@ Evaluation / Improvement 模式使用 `Evaluation / Improvement Projection`：
 - Debug Mode
 - MemoryGovernance
 - Evaluation Harness / EvaluationCase / Regression / CounterfactualReplay
+- TaskTraceService / ContextSnapshot / Durable PostTaskJob / Memory Quarantine
 
 高级演进：
 
@@ -506,12 +522,14 @@ Evaluation / Improvement 模式使用 `Evaluation / Improvement Projection`：
 - `runtime-contracts.md`：runtime 硬契约。
 - `artifact-evidence-ledger.md`：artifact / evidence 事实层规格。
 - `benchmark-hardening.md`：benchmark 防污染与元数据规范。
+- `runtime-governance-completion-design.md`：P2.5 治理可感知与可信闭环实施记录。
 - `context-memory.md`：token、context、compact、memory 规格。
 - `evaluation-observability.md`：观测、验证、复盘、benchmark 规格。
 - `agent-improvement-loop.md`：失败轨迹如何变成可验证、可回滚的 agent 改进。
 - `implementation-blueprint.md`：第一阶段实现蓝图、最小 schema 和同步/后台边界。
 - `agent-open-endedness-design.md`：开放式能力和 Promotion Gate。
 - `self-evolving-runtime-design.md`：内部/外部代码自进化、密封评测、连续发布和回滚的 P3 目标架构。
+- `supervisor-operations.md`：P3 本地控制面的持久化、命令、构建、canary、launcher 和回滚操作。
 - `research-self-evolving-agent-systems.md`：自修改 agent、防过拟合和发布完整性的一手资料研究。
 - `extensions-sdk-delivery.md`：Plugin/MCP、IPC、TypeScript/Python SDK、安装与交付门禁。
 - `framework-comparison.md`：六个外部 agent 项目的架构影响。

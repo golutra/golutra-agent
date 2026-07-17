@@ -6,24 +6,23 @@
 
 主架构见 `ARCHITECTURE.md`。
 改进候选、回归验证和晋升决策见 `agent-improvement-loop.md`。
+完整 task trace、持久后台作业和真实 regression 的实施记录见 `runtime-governance-completion-design.md`。
 
 ## 当前实现状态
 
-截至 2026-07-15，runtime 已具备 durable evaluation 与可观察性闭环：
+截至 2026-07-16，runtime 已具备持久化 evaluation、完整 trace 和多投影观测；P2.5 当前范围已经形成可信闭环，并把完整事实交给独立 P3 本地 Supervisor：
 
-- 每个 terminal task 生成 `PostTaskReview`、`EvaluationCase`、`TrajectoryReplay`、`EvaluationRun` 和 `EvaluationResult`，并按 canonical cwd hash 持久化到 `$GOLUTRA_HOME/state/workspaces/<cwd-hash>/evaluation.json`；独立 runtime 进程通过文件锁串行更新并在写前刷新磁盘状态，同步文件 I/O 在 blocking pool 执行，Unix 文件权限为 `0600`。
-- pass/partial/fail、latency、evidence refs、residual risks 和 failure taxonomy 来自 runtime facts 与 verification，不从聊天文本反推。
-- 失败或 partial trajectory 会生成 benchmark 与 generated-task 候选；成功且有 durable evidence 的 trajectory 可生成 skill candidate。所有候选初始状态都是 `proposed`。
-- `run_regression` 生成 durable `RegressionResult`；没有 clean regression 的候选不能进入 promotion decision。
-- `PromotionGate` 只允许低风险 benchmark 由 system reviewer 自动 approve/apply；GeneratedTask、Skill 及中高风险候选保持 proposed 或 needs-human-review。
-- apply 会记录 applied version 与 rollback ref；rollback 保留原始 candidate、decision、regression 和 applied record，形成可审计状态转换。
-- CLI、IPC/HTTP transport、TypeScript SDK 和 Python SDK 已提供 results、improvements、candidates、regress、apply、rollback 查询/命令；daemon 重启后这些状态可恢复。
-- deep evaluation 在 task 终态后由 supervisor 后台执行，不阻塞普通用户返回；event writer 会在导出边界生成不可变 rollout snapshot，迟到的 evaluation event 不会污染 turn fork cutoff。
-- `EvaluationStore::compare_counterfactual` 已支持 baseline/variant、changed layer、controlled variables、quality/cost/latency/security delta 和 scaffold inflation 判定；它比较 durable run facts，不伪装成重新执行 provider 的 live replay。
-- `golutra-vis` 可从 RuntimeEvent/DebugProjection 导出 Audit、Events 和 OpenTelemetry JSON span；属性包含 session/task/turn、provider/model/tool、token/cost/latency 等有界脱敏字段，不创建第二份观测事实库。
-- TUI 只有显式 `--debug` 或 `/debug` 才查询开发者投影；普通启动不读取、不渲染治理噪声。
+- terminal task 可生成 `PostTaskReview`、`EvaluationCase`、`TrajectoryReplay`、`EvaluationRun` 和 `EvaluationResult`，并按 canonical cwd hash 持久化到 `$GOLUTRA_HOME/state/workspaces/<cwd-hash>/evaluation.json`；状态更新有文件锁、大小边界和 owner-only 权限。
+- pass/partial/fail、latency、evidence refs、residual risks 和 failure taxonomy 来自 runtime facts 与 verification plan/assertions，不从聊天文本反推；当前支持的路径、内容、命令和 policy assertion 会进入三维 hard gate，无法客观证明的标准保持 Unknown/Partial。
+- 失败或 partial trajectory 可生成 benchmark、generated-task 和 improvement 候选；CLI、transport 与双 SDK 可以查询候选、regression、apply 和 rollback 状态。
+- `TrajectoryReplay` 仍是 event/artifact 的 projection replay；候选 regression 由 `RuntimeHost::run_regression_campaign` 启动配对 baseline/candidate RuntimeHost，`run_regression` 对已记录 execution facts 做纯比较。
+- `EvaluationStore::compare_counterfactual` 能比较调用方提供的 baseline/variant durable run facts，但不会自行生成受控 paired execution；没有 execution refs 的结果不能作为未来代码晋升证据。
+- deep evaluation 在 TaskCompleted 前写入 SQLite `PostTaskJob`，worker 提供 lease/retry/recovery；Embedded one-shot 退出后新 Host/daemon 可继续完成 job。
+- event writer 可在导出边界生成不可变 rollout snapshot；TaskTrace 通过 cursor 分页和 integrity/disclosure 读取 canonical facts，迟到 evaluation event 不会改写已导出的边界。
+- `golutra-vis` 可从 RuntimeEvent/DebugProjection 导出 Audit、Events 和 OpenTelemetry JSON span；TUI 只有显式 `--debug` 或 `/debug` 才查询有界开发者摘要，普通启动不渲染治理噪声。
+- `golutra-supervisor` 只接收 complete TaskTrace，使用 paired execution、sealed/fresh/security/migration、holdout disclosure budget 和 OS-enforced TrustedBuilder 决定 runtime code release；普通 Runtime 无 stable pointer 写权限。
 
-当前 evaluation runner 使用 durable replay facts；隔离 GeneratedTask 由 `golutra-evolution` 通过独立 RuntimeHost 执行。外部 SaaS scorer、LLM judge、组织级 CI dataset 和长期线上版本监控不是当前本地 runtime 的完成条件。
+隔离 GeneratedTask 已能由 `golutra-evolution` 通过独立 fixture RuntimeHost 执行；任意冻结候选的 baseline/candidate regression 也已由 `golutra-client` 接入。完整 `TaskTrace`、SQLite durable job、语义 verification 和 execution-backed regression 属于已完成的 P2.5 当前范围。
 
 ## 核心原则
 
@@ -62,7 +61,7 @@ Evaluation / Improvement Projection
 | Event Sampling | 避免完整观测导致存储、索引、评估成本爆炸 | 加入 `EventSamplingPolicy` | raw event 仍需轻量保存，否则恢复和 replay 会断链 |
 | Context Projection Cache | 降低 token，并减少长上下文造成的漂移 | 加入 `ContextProjectionCache` | cache 失效规则必须严格，否则会引用过期状态 |
 
-这些补充有借鉴意义，但不能直接照搬成“每一步都评估、每个事件都索引、每个任务都深度审计”。当前同步主链保留基础 event、LoopDecision、VerificationRecord、Goal/Governor decision 和 minimal PostTaskReview；deep evaluation、candidate/evolution 在终态后后台或显式运行。Golutra 的设计原则是：
+这些补充有借鉴意义，但不能直接照搬成“每一步都评估、每个事件都索引、每个任务都深度审计”。当前同步主链保留基础 event、LoopDecision、VerificationRecord、Goal/Governor decision 和 minimal PostTaskReview；deep evaluation、candidate/evolution 在终态后由 durable worker 或显式命令运行。Golutra 的设计原则是：
 
 ```text
 运行时自用判断必须轻量同步；
@@ -192,6 +191,8 @@ TrajectoryReplay
 - 能定位当时的 event、artifact、context projection 和 verification。
 - provider 和 tool 可以用 fixture 回放，也可以在隔离环境中 live replay。
 - replay 结果必须声明确定性边界，不能把不可复现结果当稳定证据。
+
+当前实现仍将历史 `TrajectoryReplay` 明确标记为 projection replay；TaskTrace 已保存 `ContextSnapshot`，candidate regression 会重新调用隔离 RuntimeHost/provider/tool。只有引用隔离 execution run 的结果才能作为 promotion evidence。
 
 ### CounterfactualReplay
 
@@ -679,7 +680,7 @@ UI 只展示 runtime projection，不维护自己的任务真相。
 
 ## Event Sampling
 
-完整保存和完整分析是两回事。当前 canonical RuntimeEvent 轻量完整保存，deep evaluation 只在 terminal task 后后台运行，普通 TUI 不查询 DebugProjection。`EventSamplingPolicy` 保留为将来出现独立高成本索引时的配置模型；当前没有派生 event index，因此不会为了“实现采样”而丢弃 canonical facts。
+完整保存和完整分析是两回事。当前 canonical RuntimeEvent 轻量完整保存，deep evaluation 由 durable `PostTaskJob` worker 执行，普通 TUI 不查询 DebugProjection。`EventSamplingPolicy` 保留为将来出现独立高成本索引时的配置模型；当前没有派生 event index，因此不会为了“实现采样”而丢弃 canonical facts。
 
 若未来增加派生索引，必须采用三层事件策略：
 
@@ -736,7 +737,7 @@ RuntimeEvent
 
 ## Evaluation Harness
 
-Evaluation Harness 基于 durable event 和 artifact，而不是重新拼 prompt。
+Evaluation Harness 的输入是完整 `TaskTrace`，其中 event/artifact 是 canonical facts，带 redacted artifact ref 的 `ContextSnapshot` 证明当时实际送入 provider 的内容。当前 minimal runner 仍只把必要事实投影进 evaluation state，不会从摘要伪造精确 prompt，也不会把 projection replay 重命名为 execution replay。
 
 核心能力：
 
@@ -859,3 +860,5 @@ cost
 - 能把高质量经验转成受控 memory/skill/policy 候选。
 - 能把失败转成 ImprovementCandidate，并通过 regression 与 PromotionDecision 决定是否采用。
 - 普通用户不会被 debug 信息干扰。
+
+这些标准中，P2.5 G0-G6 已转成可执行门禁并有 unit/integration/cross-process 回归；P3 本地 Supervisor、不可变 source/bin、preview/canary、launcher 和 rollback 已接入。远端 fleet 与 E5 meta-evolution 仍独立后置。

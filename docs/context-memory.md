@@ -6,24 +6,26 @@
 
 阶段边界说明：
 
-- 本文档描述的是目标态的 Context & Memory 设计。
-- 第一阶段以 [implementation-blueprint.md](/Users/skyseek/Desktop/project/open/golutra-agent/golutra-agent/docs/implementation-blueprint.md) 为准，只默认实现 `WorkingSummary`、`CompactionRecord`、`MemoryCandidate` 和 `project-scoped retrieval`。
+- 本文档同时记录当前 Context & Memory 实现和仍保留的目标扩展。
+- 当前主链已实现 `WorkingSummary`、`CompactionRecord`、`ContextSnapshot`、工具输出边界、`MemoryCandidate` 和 `project-scoped retrieval`。
+- P2.5 的完整事实门禁与验收细节见 `runtime-governance-completion-design.md`。
 - `user/global` 长期 memory 晋升、复杂 memory promotion 和重型检索策略属于后续增强，不是第一阶段必做。
 
 ## 当前实现状态
 
-截至 2026-07-15，已落地以下受控闭环：
+截至 2026-07-16，已落地以下受控骨架：
 
-- `ContextBuilder` 按 contributor 构建 stable system prompt、canonical workspace environment context、会话摘要、project memory、evidence 和工具说明；provider request 前后分别记录 `TokenBudgetSnapshot` 与 `TokenUsageRecord`。
+- `ContextBuilder` 按 contributor 构建 stable system prompt、canonical workspace environment context、会话摘要、project memory、evidence 和工具说明；当前使用字符数近似 token、静态预算和按 contributor 截断，`TokenBudgetSnapshot` 的 policy 仍是 `p0_static_budget`。
+- provider response 后会记录 `TokenUsageRecord`；provider request 前会保存稳定 digest、redacted request artifact、message/tool schema manifest 和逐 contributor 内容引用，因此 developer trace 可以证明模型可见输入。没有 model-aware tokenizer 时，token 数仍标记为估算值。
 - compact 是 durable command/event；后续 turn 会复用 compact summary，同一 session 的历史不会作为完整 transcript 无界回灌。
 - `MemoryStore` 按 canonical cwd hash 持久化到 `$GOLUTRA_HOME/state/workspaces/<cwd-hash>/memory.json`，写入通过跨进程文件锁和临时文件原子替换；文件 I/O 使用 `spawn_blocking`，不会阻塞 async runtime worker。Unix runtime 目录为 `0700`、memory/lock 文件为 `0600`。
-- 成功任务只能从 durable evidence 生成 project-scoped `MemoryCandidate`；promotion gate 检查 evidence、confidence、scope、敏感内容和 contradiction，失败或不安全候选不会写入 active memory。
+- 成功任务可从 durable evidence 生成 project-scoped `MemoryCandidate`；RuntimeHost 只调用 quarantine，候选带 structured claim、默认 30 天 expiry 和 invalidation refs。单次成功不会进入 active memory。
 - 每轮 task 会记录 `MemoryRetrieved`，只有 active、未过期且与 query 相关的 project memory 才进入 context；完整 memory 记录不直接当作 prompt 历史。
 - memory list/feedback/rollback 已通过 CLI、IPC/HTTP transport、TypeScript/Python SDK 暴露；helpful/irrelevant/incorrect feedback 进入 durable lifecycle，incorrect 会阻止后续检索使用。
 - `golutra-code-intelligence` 以 tree-sitter 构造 Rust/Python/TypeScript symbol/reference/import graph，owner-only code index 有大小/版本边界；`symbol_search`、`find_references` 与 rg/file metadata 进入统一工具链。
 - reviewed/installed Skill 不直接改 system prompt；RuntimeHost 只按当前 objective 相关性选取最多 3 条 Skill manifest 作为独立 `ContextContributor`，rollback 后立即停止注入。
 
-当前不自动晋升 user/global memory，不使用向量数据库或 OS keychain，也不自动覆盖已有 memory。user/global scope 只保留 human-review 模型边界；这些是明确治理选择，不是 project memory 主链缺口。
+当前不自动晋升 user/global memory，不使用向量数据库或 OS keychain，也不自动覆盖已有 memory。user/global scope 只保留 human-review 模型边界。project memory 主链为 `proposed -> quarantined -> active`，至少需要独立任务 evidence 或显式 human review；legacy active 记录读取时降级为 quarantine。
 
 核心原则：
 
@@ -77,6 +79,8 @@ cold
 ## 核心组件
 
 ### TokenBudgetTracker
+
+下面是预算模型。当前实现按字符数估算 contributor token，并执行静态 trim/block/ask-user；真实 request snapshot 已持久化，`TokenUsageRecord` 会记录 provider 返回的实际 usage。没有专用 tokenizer 时 planned token 仍不是精确 token 数，但不再是模型可见内容的唯一审计依据。
 
 每轮计算：
 
@@ -395,6 +399,8 @@ MemoryPromotionRecord
 - 通过 contradiction check。
 - 高风险 memory 经过 human review 或 benchmark gate。
 
+P2.5 已禁止单次成功任务直接 active：所有 project candidate 先进入 quarantine，至少需要两个独立 task 的一致 evidence 或一次显式 human approval；检索默认排除 quarantined、expired、rolled_back 和 invalidated 记录。
+
 ## 六个项目带来的边界
 
 - Pi：compact boundary、recent tokens 保留、不能切断 tool result。
@@ -433,3 +439,5 @@ compact、memory retrieval 和 memory promotion 都必须产生 runtime event。
 - 关键 evidence 不会被 compact 丢失。
 - 长期 memory 有来源、有作用域、有过期、有回滚。
 - debug/replay 能解释某条上下文为什么进入模型。
+
+这些是当前验收边界。静态 contributor 列表与 token 估算只能解释构造来源；真正的模型可见输入由带 digest 和 redacted artifact ref 的 `ContextSnapshot` 证明。

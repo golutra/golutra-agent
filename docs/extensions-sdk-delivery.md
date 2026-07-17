@@ -2,7 +2,7 @@
 
 ## 当前状态
 
-截至 2026-07-15，Golutra 的扩展和交付层已经进入可运行主链：
+截至 2026-07-17，Golutra 的扩展和交付层已经进入可运行主链：
 
 - `golutra-plugin` 管理 owner-only 本地插件包，生命周期为 `stage -> review -> enable -> disable/rollback`。
 - `golutra-mcp` 使用官方 `rmcp 2.2.0` 适配 stdio MCP server；外部工具进入统一 `ToolRegistry`、PolicyEvaluation、approval、timeout/cancel、artifact/evidence 链路。
@@ -90,10 +90,10 @@ provider tool call
 
 | 场景 | Transport | 边界 |
 | --- | --- | --- |
-| CLI/TUI 默认 | `EmbeddedTransport` | 当前进程持有 RuntimeHost，共享全局 durable facts |
-| Unix 本地 daemon | `UnixIpcTransport` | owner-only socket，复用 Axum command/query/SSE Router |
+| CLI/TUI 默认 | `EmbeddedTransport` -> `RuntimeApplication` | 当前进程持有 RuntimeHost，共享全局 durable facts；command/query/session/trace 通过 facade，不直接拼装 store |
+| Unix 本地 daemon | `UnixIpcTransport` | owner-only socket，复用 Axum command/query/SSE Router；server-side IPC marker 可访问 forensic trace |
 | Windows 本地 daemon | `HttpSseTransport` | loopback + bearer token + protocol version |
-| 远端/端口转发 | `HttpSseTransport` | HTTPS 或 loopback HTTP，cursor replay + SSE live |
+| 远端/端口转发 | `HttpSseTransport` | HTTPS 或 loopback HTTP，cursor replay + SSE live；最多 full-redacted trace |
 
 IPC 不是第二套业务协议。它把受限 HTTP-like request 交给同一个 Router，并以有界 response frame 回传 body/SSE；attachment、认证、status code、event cursor 和错误语义与 HTTP 对拍。
 
@@ -104,7 +104,17 @@ IPC 不是第二套业务协议。它把受限 HTTP-like request 交给同一个
 - `sdk/typescript/src/generated.ts`
 - `sdk/python/src/golutra_sdk/generated.py`
 
-两个 SDK 都要求绝对 cwd 和 transport token，先执行 `/runtime/attach`，再访问 command/query/thread/event API；attachment 失效时只在服务端明确返回 `410 Gone` 后重新 attach。JSON response、SSE frame、timeout 和 cursor 去重都有固定上限。
+两个 SDK 都要求绝对 cwd 和 transport token，先读取认证后的 `/runtime/info` 验证 protocol v2，再执行 `/runtime/attach`，之后访问 command/query/thread/event API；attachment 失效时只在服务端明确返回 `410 Gone` 后重新 attach。JSON response、SSE frame、timeout 和 cursor 去重都有固定上限。
+
+治理读取使用同一份生成类型：
+
+- `contextProjection(sessionId, taskId)` 返回模型实际输入的脱敏 `ContextSnapshot` 投影。
+- `evaluationProjection(sessionId, taskId)` 返回 review/candidate/regression/promotion/job 生命周期。
+- `taskTrace(request)` / `task_trace(request)` 按 cursor 返回 `TaskTracePage` 和完整性原因。
+- `completeTaskTrace(request)` / `complete_task_trace(request)` bounded 聚合所有 page，校验 session/task/view、cursor 前进和 event-chain digest。
+- `readArtifactChunk(request)` 按范围读取带 checksum 的 artifact 内容。
+
+`summary` trace 省略 context/artifact/evidence 明细并净化事件 payload；`full` 返回脱敏 manifest；HTTP 客户端请求 `forensic` 会得到 `403 Forbidden`。浏览器 attach 页面同样先读取 runtime info，不再复制 Rust protocol 常量。
 
 验证命令：
 
@@ -141,4 +151,4 @@ just ts-check
 just py-check
 ```
 
-跨进程验收覆盖多 cwd、daemon 重启、HTTP/SSE、Unix IPC、command 幂等、thread fork/rebind 和 durable evaluation；稳定性 smoke 连续执行多轮 turn，验证 event sequence 单调、同一 thread 不分叉并能在 RuntimeHost 重启后恢复。
+跨进程验收覆盖多 cwd、daemon 重启、HTTP/SSE、Unix IPC、command 幂等、thread fork/rebind 和 durable post-task evaluation；稳定性 smoke 连续执行多轮 turn，验证 event sequence 单调、同一 thread 不分叉并能在 RuntimeHost 重启后恢复。`PostTaskJob` 与排队事件在任务终态前写入 SQLite，worker 通过 lease、retry 和 recovery 接管，Embedded one-shot 退出后可由下一 Host/daemon 继续执行。

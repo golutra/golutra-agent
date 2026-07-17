@@ -2,9 +2,9 @@
 
 ## 文档定位
 
-本文定义 Golutra 的 P3 目标架构：利用任务执行和开发者观察链路生成针对 agent 自身的代码改进，在隔离环境完成评估、构建、发布、监控和回滚，再由新版本承接下一轮任务。
+本文定义并记录 Golutra 的 P3 受治理执行面：利用任务执行和开发者观察链路生成针对 agent 自身的代码候选，在隔离环境完成评估、构建、发布、监控和回滚，再由新版本承接下一轮任务。具体命令和持久化边界见 `supervisor-operations.md`，外部研究证据见 `research-self-evolving-agent-systems.md`。
 
-本文是目标设计，不表示当前代码已经具备 runtime code 自动修改或自动部署。当前完成状态仍以 `initial-implementation-plan.md` 为准，外部研究证据见 `research-self-evolving-agent-systems.md`。
+截至 2026-07-17，P2.5 前置门禁和 P3 E0-E4 的本地控制面已经落地：`golutra-supervisor`、`golutra-release`、sealed `golutra-eval-worker`、internal/external command producer、完整 TaskTrace ingestion、候选冻结、stable/candidate 不同二进制的 paired execution、sealed/fresh disclosure gate、OS-enforced producer/TrustedBuilder、内容寻址 release、stable/preview/canary pointer、rollback 及 `golutra-launcher` 都有实现和回归测试。当前进程不会热替换自己；已有任务继续由旧版本完成，下一次 launcher 启动读取 stable pointer。复杂远端集群调度、签名/TUF 服务和 E5 meta-evolution 仍不是当前本地交付范围。
 
 目标闭环：
 
@@ -21,6 +21,24 @@
 -> 下一轮任务
 ```
 
+## 当前代码闭环
+
+```text
+golutra trace --full
+-> observation_from_trace
+-> EvolutionSupervisor::observe_trace
+-> start_epoch（预算 + deadline）
+-> InternalCommandProducer / ExternalCommandProducer
+-> register_candidate（worktree + allowlist + digest freeze）
+-> evaluate_suite（stable/candidate eval-worker + Supervisor 外部 assertion）
+-> TrustedBuilder（Seatbelt/bubblewrap，无网络）
+-> ReleaseStore::build_checked（source/binary checksum）
+-> preview -> canary -> promote / rollback
+-> golutra-launcher 读取 stable pointer 并 exec 下一版本
+```
+
+普通 RuntimeHost 不持有 stable pointer 写权限。Supervisor 也不读取 provider credential；command producer 子进程必须位于 OS-enforced sandbox，只有 candidate worktree 和独立 scratch 的写权限，没有网络，并使用清空敏感值后的环境，只能提交候选提案。版本评测同样不读取真实 provider credential：stable/candidate worker 使用 deterministic mock、独立 home/workspace 和外层断网 sandbox。assertion、sealed 答案、Supervisor state 与 release pointer 不挂载给 worker。process-only backend、越界 worktree、timeout 和超量输出都会失败。
+
 ## 对“自进化”的理解
 
 自进化不是一个永不返回的 AgentLoop，也不是让当前进程直接覆盖正在执行的二进制。它由四个不同时间尺度的循环组成：
@@ -32,13 +50,13 @@
 | Release Loop | 评估、构建、部署和回滚一个版本 | 分钟到天 |
 | Meta Loop | 改进候选生成和选择机制 | 多个 release epoch |
 
-“持续循环”应由持久化 scheduler 在新事实到达后创建有限 `EvolutionEpoch`。单个 epoch 必须有预算和终态，不能递归自调用直到资源耗尽。
+“持续循环”应由持久化 scheduler 在新事实到达后创建有限 `EvolutionEpoch`。单个 epoch 必须有预算和终态，不能递归自调用直到资源耗尽。`source_version` 是硬边界：failure cluster 不跨 release 混合计数；开始 epoch 时 opportunity 的 source release 必须仍是 stable pointer，否则旧 opportunity 失效并等待新版本上的独立观察。
 
 ## 最重要的架构约束
 
 ### 自修改与自部署必须分权
 
-当前 Runtime 可以成为内部 CandidateProducer，读取自身 source snapshot，并使用自己的 AgentLoop、provider 和工具修改 child checkout。这满足“内部自进化”。
+内部 CandidateProducer 有两种边界。当前已实现的是离线 `InternalCommandProducer`：它与 external command producer 一样没有网络或 credential。受信 RuntimeHost 持有 provider credential、只向模型暴露 child checkout 工具的在线 internal evolver 尚未接入 scheduler；接入后也只能返回 `CandidateProposal`，不能获得评测与发布权限。
 
 但是，当前候选不能同时拥有以下权限：
 
@@ -137,7 +155,7 @@ source snapshot + observation bundle + improvement hypothesis
 
 ### 输入事实
 
-ObservationIngestor 只消费已存在的结构化事实：
+ObservationIngestor 只消费已存在的结构化事实，并且输入必须来自完整 `TaskTraceBundle`：
 
 - `RuntimeEvent`
 - `ArtifactRecord` / `EvidenceRecord`
@@ -149,7 +167,7 @@ ObservationIngestor 只消费已存在的结构化事实：
 - provider/tool/token/cost/latency/security 投影
 - 人工纠正、回滚和失败恢复记录
 
-用户聊天文本和私有源码不能未经脱敏直接进入长期 evolution dataset。
+`RegressionResult` 还必须引用真实 baseline/candidate execution；projection replay summary 只能用于调试和机会发现，不能作为发布证据。用户聊天文本和私有源码不能未经脱敏直接进入长期 evolution dataset。
 
 ### Opportunity 生成
 
@@ -229,9 +247,11 @@ sealed holdout 的精确分数不能进入 parent fitness，只能提供晋升 v
 候选必须从已签名 parent source digest 创建独立 worktree：
 
 ```text
-$GOLUTRA_HOME/evolution/worktrees/<candidate_id>/
-$GOLUTRA_HOME/evolution/artifacts/<candidate_id>/
+$GOLUTRA_HOME/evolution/supervisor/worktrees/<candidate_id>/
+$GOLUTRA_HOME/evolution/supervisor/artifacts/<candidate_id>/
 ```
+
+worktree 只能由 Supervisor 从 epoch 绑定的 immutable stable release source 创建。冻结时不能信任 producer 声明的 `target_paths`：控制面会比较 parent/candidate 的完整文件集合和内容摘要，得到 canonical changed paths，再逐项应用 allowlist/denylist，并要求声明覆盖每一个真实变化。暗改或删除 sealed 文件即使未声明也会失败。
 
 初始 allowlist：
 
@@ -409,7 +429,7 @@ ReleaseManifest
   created_at
 ```
 
-TrustedBuilder 从只读 source commit 和 lockfile 构建，生成 SLSA-style provenance。TUF-style metadata 授权 artifact digest 并防止未授权回退、冻结和混搭。签名密钥不进入 Golutra provider credential store。
+TrustedBuilder 从只读 source commit 和 lockfile 构建，Cargo target 只进入临时 scratch，校验后的 binary 再由 Supervisor 写入 owner-only artifact staging；构建前后 source digest 必须与 frozen candidate 一致。它生成 SLSA-style provenance。TUF-style metadata 授权 artifact digest 并防止未授权回退、冻结和混搭。签名密钥不进入 Golutra provider credential store。
 
 ### 本地 blue-green
 
@@ -544,51 +564,64 @@ Supervisor 保留独立 append-only control log，并把脱敏摘要镜像为 Ru
 
 | 当前模块 | P3 扩展 |
 | --- | --- |
-| `golutra-eval` | dataset partitions、sealed broker、campaign、generalization gate、disclosure budget |
-| `golutra-evolution` | opportunity、internal/external producer、candidate archive、epoch state machine |
-| `golutra-client` | developer observation export、evolution commands、preview attachment |
+| `golutra-eval` | execution-backed regression 和 P2.5 promotion 输入 |
+| `golutra-evolution` | GeneratedTask、skill 和当前 Runtime 内受控探索 |
+| `golutra-client` | 完整 TaskTrace export 和实际 baseline/candidate RuntimeHost |
 | `golutra-store` | schema migration ledger、release/evolution refs；不保存 signer secret |
 | `golutra-sandbox` | candidate build/run profile 与 denylist |
 | `golutra-governor` | evolution budget、risk lane、kill switch |
-| `golutra-app-server` | drain、preview、canary attachment 和 version health |
+| `golutra-app-server` | 现有版本继续服务 active attachment；部署调用方负责 drain 后再切 pointer |
 | `golutra-vis` | lineage、campaign、deployment、rollback 投影 |
-| 新增 `golutra-supervisor` | 不可由候选写入的控制面与 scheduler |
-| 新增 `golutra-release` | manifest、provenance、versioned install、stable pointer、rollback |
+| `golutra-supervisor` | opportunity、有限 epoch、internal/external producer、archive、sealed/fresh gate、CLI 和 append-only control log |
+| `golutra-release` | TrustedBuilder、manifest、不可变 source/bin、stable/preview/canary pointer、launcher 和 rollback |
 
 ## 分阶段实施
 
-### E0：契约和控制面骨架
+### E-1：P2.5 前置门禁
+
+- `TaskTraceBundle.complete=true`，所有缺失、redaction 和 retention loss 可解释。
+- deep evaluation 使用 durable `PostTaskJob`，进程退出后可恢复。
+- completion criteria 由客观 assertion 验证，不能只依赖“有工具 evidence”。
+- RegressionResult 引用配对 baseline/candidate execution。
+- project memory 默认 quarantine，不把单次成功直接注入后续候选上下文。
+
+任一条件未满足时，Supervisor 只能观察和生成待人工研究的 opportunity，不能自动评测、构建或发布 runtime code candidate。
+
+### E0：契约和控制面骨架（已完成）
 
 - 固定 EvolutionCandidate、Campaign、ReleaseManifest、DeploymentObservation schema。
 - 新增 Supervisor 与 append-only control log。
 - 建立正式 state schema version/migration ledger。
 - 所有部署仍人工执行。
 
-### E1：外部候选闭环
+### E1：外部候选闭环（已完成 OS 隔离的本地命令 producer 范围）
 
 - External Evolver 从 developer observation bundle 生成隔离 patch。
 - 自动运行 L0/L1，人工批准 sealed evaluation 和 release。
 - Candidate archive 保存 lineage 和多目标指标。
 
-### E2：密封评测与不可变 release
+### E2：密封评测与不可变 release（已完成本地范围）
 
-- HoldoutVault、threshold-only API 和 disclosure budget。
+- RuntimeEvaluationSuite、五类 partition、threshold-only result 和 disclosure budget。
+- stable release 与 candidate evaluation build 分别运行 sealed eval-worker；Supervisor 外部验证 workspace/trace/verification/artifact blob，手工 EvaluationInput 不构成入口。
 - TrustedBuilder、provenance、release digest、stable/preview 目录。
 - migration clone 与 rollback artifact。
 
-### E3：自动 preview/canary/rollback
+### E3：preview/canary/rollback（已完成稳定指针与 launcher 范围）
 
-- 本地 blue-green daemon。
-- shadow tasks、canary cohort、drain 和自动回滚。
+- 本地 blue-green release pointer 与 checksum-validating launcher；不包含常驻部署编排 daemon。
+- shadow/canary observation contract、手工 promote/rollback；active-process drain、指标采集和自动回滚 scheduler 由部署调用方负责，当前 Supervisor 不伪造这些能力。
 - 只允许无不可逆 migration 的低/中风险 allowlist 代码自动发布。
+- promotion 至少需要一条当前 release 健康样本且所有 hard health gate 健康；rollback 校验 active pointer 所有权。
 
-### E4：内部 CandidateProducer
+### E4：离线内部 CandidateProducer（已完成统一 trait、命令协议与隔离边界）
 
 - Runtime Vn 在 child worktree 修改自身。
 - 与 external candidates 同门禁竞争或合并。
 - producer 本身的效果进入 archive，但无部署权限。
+- 持有 provider credential 的 RuntimeHost internal evolver 和自动 scheduler 仍是后续产品层，不属于当前离线 command adapter。
 
-### E5：开放式 archive 与 meta-evolution
+### E5：开放式 archive 与 meta-evolution（后续研究范围）
 
 - Pareto + diversity + metaproductivity parent selection。
 - 候选生成器/meta-agent 可以作为独立候选演化。

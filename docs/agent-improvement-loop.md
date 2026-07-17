@@ -5,12 +5,13 @@
 本文档定义 Golutra 如何从一次任务失败或低质量轨迹中产生可验证的 agent 改进。
 
 runtime code 自动修改、密封评测、不可变 release、canary 和下一版本接管任务的 P3 目标见 `self-evolving-runtime-design.md`；外部研究依据见 `research-self-evolving-agent-systems.md`。
+execution-backed regression 和可信晋升输入的 P2.5 实施记录见 `runtime-governance-completion-design.md`。
 
 阶段边界说明：
 
-- 本文档描述的是完整改进闭环的目标态。
-- 当前已做到 `deep PostTaskReview -> candidate -> durable replay/counterfactual comparison -> regression -> PromotionDecision -> apply/rollback` 的受控闭环。
-- 当前 replay 复用 event/artifact facts；GeneratedTask 可以在独立 fixture RuntimeHost 中执行，但不会用真实用户 provider 或主 workspace 伪装成 deterministic replay。
+- 本文档描述当前改进闭环和仍保留的 P3 目标态。
+- 当前已做到 `PostTaskReview -> candidate -> isolated baseline/candidate execution -> paired RegressionResult -> PromotionDecision -> 受限 benchmark apply/rollback` 的受控状态机。
+- projection replay 仍只复用 event/artifact facts；需要晋升的候选由 `golutra-client` 启动独立 baseline/candidate RuntimeHost，二者不共享 workspace、home 或 trace。
 - “可自动晋升”是长期能力预留，不代表当前默认实现会自动 redeploy 或自动替换线上执行版本。
 
 ## 当前实现边界
@@ -24,6 +25,7 @@ runtime code 自动修改、密封评测、不可变 release、canary 和下一�
 - 只有低风险 benchmark candidate 在 clean regression 后可由 system reviewer approve；apply 只更新 workspace evaluation dataset 状态，不执行任意代码。
 - candidate 状态转换受约束，不能跳过 regression/promotion gate；apply 后可 rollback，原因和 applied version 会持久化。
 - `RuntimeGovernor` 在 provider/tool/result/completion 阶段执行确定性 token/cost/tool/time budget、policy/security risk 和目标对齐检查，但不自动生成或部署改动。
+- deep review 通过 TaskCompleted 前写入的 durable PostTaskJob 执行；worker 使用 lease/retry/recovery，Embedded one-shot 退出后由下一 Host/daemon 接管。
 
 核心原则：
 
@@ -100,7 +102,7 @@ CounterfactualReplay
 - 修改工具输出策略前后，对同一批 case 比较 token、证据质量和任务通过率。
 - 修改 provider route 前后，对同一批 case 比较质量、延迟、成本和 tool calling 稳定性。
 
-当前 `compare_counterfactual` 会从 baseline/variant durable run 生成 CausalComparison；无法控制变量或没有 paired run 时保持 inconclusive。只有通过反事实对照或 clean regression 的 candidate，才适合进入 PromotionDecision。
+当前 `compare_counterfactual` 仍只对调用方提供的 baseline/variant durable facts 做 projection comparison，不声称自行重跑；真正的 candidate regression 由 `run_regression_campaign` 启动 paired RuntimeHost。无法控制变量或没有 paired execution 时必须保持 inconclusive，只有引用真实 execution run 的结果才能进入 PromotionDecision。
 
 ## RegressionResult
 
@@ -130,6 +132,8 @@ RegressionResult
 - 改 prompt、tool schema、policy、provider routing 时必须记录成本和失败回归。
 - 涉及 context、memory、tool policy、provider route、prompt 或 security policy 的候选，优先使用 CounterfactualReplay 做对照。
 - 不能用同一个模型 judge 的一句话作为唯一判断。
+
+`run_regression` 只负责对已记录 execution facts 做纯比较；冻结候选的“跑”语义由 `RuntimeHost::run_regression_campaign` 提供。campaign 的每个 durable `case_ref` 都使用同 fixture、同预算、同 verifier version 建立独立 baseline/candidate workspace 与 RuntimeHost；complete trace 和引用 blob 在临时 home 删除前打包进父 workspace governance artifact，再把带 `case_ref` 的 paired refs 写入 evaluation store。任一 case 缺完整、可持久读取的 pair 时 verdict 为 `NeedsReview`，并继续产生显式 `PromotionDecision`。
 
 ## PromotionDecision
 
@@ -181,12 +185,22 @@ PromotionDecision
 -> 人工查看
 ```
 
-已完成的受控最小阶段：
+已完成的受控状态机骨架：
 
 ```text
 ImprovementCandidate
--> replay / regression
+-> projection replay / durable fact gate
 -> RegressionResult
+-> PromotionDecision
+```
+
+P2.5 可信闭环已完成：
+
+```text
+ImprovementCandidate + candidate digest
+-> baseline/candidate isolated execution
+-> paired trace / verification refs
+-> execution-backed RegressionResult
 -> PromotionDecision
 ```
 
@@ -197,7 +211,7 @@ GeneratedTask -> isolated RuntimeHost -> Verification
 SkillCandidate -> stage -> regression-backed human review -> install/rollback
 ```
 
-组织级持续监控和自动 runtime redeploy 尚未实现；它们已进入 `self-evolving-runtime-design.md` 的 P3 目标，但不能因为目标已设计就被解释为当前可自动晋升。
+本地 P3 Supervisor 已能对低/中风险 runtime candidate 做密封评测、可信构建、canary、stable pointer 切换和 rollback；组织级远端 fleet 监控、签名服务与跨主机自动 redeploy 仍不在当前范围，不能被解释为已经具备。
 
 ## 与其他系统的关系
 
@@ -224,3 +238,5 @@ SkillCandidate -> stage -> regression-backed human review -> install/rollback
 - 能决定晋升、拒绝或人审。
 - 能回滚已晋升改动。
 - 能区分低风险自动晋升和高风险人审。
+
+这些验收标准的 P2.5 当前范围已经通过：真实 regression、durable deep job、完整 task facts、verification gate 和 memory quarantine 均有实现与回归测试。P3 本地 Supervisor 已在此基础上实现双 producer contract、密封/新鲜评测、可信构建、不可变 release、canary、launcher 和 rollback；普通 Runtime 仍不能自行发布代码。
