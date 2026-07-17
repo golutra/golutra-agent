@@ -19,6 +19,8 @@ from golutra_sdk import GolutraClient
 TOKEN = "python-sdk-test-token-000000000000000000000000000000000000000000"
 SESSION_ID = "01900000-0000-7000-8000-000000000001"
 THREAD_ID = "01900000-0000-7000-8000-000000000002"
+TASK_ID = "01900000-0000-7000-8000-000000000005"
+ARTIFACT_ID = "01900000-0000-7000-8000-000000000006"
 
 
 class RuntimeHandler(BaseHTTPRequestHandler):
@@ -36,7 +38,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     "instance_id": "server-1",
                     "pid": 1,
                     "base_url": self.server.base_url,
-                    "protocol_versions": {"minimum": 1, "current": 1},
+                    "protocol_versions": {"minimum": 2, "current": 2},
                     "started_at": "2026-01-01T00:00:00Z",
                 }
             )
@@ -87,7 +89,23 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 }
             )
         elif path == "/queries":
-            self._json({"kind": body["kind"], "session_id": body["session_id"]})
+            self._json(
+                {
+                    "kind": body["kind"],
+                    "session_id": body["session_id"],
+                    "task_id": body.get("task_id"),
+                }
+            )
+        elif path == "/traces":
+            self._json(self._trace(body))
+        elif path == "/artifacts/chunk":
+            self._json(
+                {
+                    "artifact_id": body["artifact_id"],
+                    "offset": body["offset"],
+                    "length": body["length"],
+                }
+            )
         else:
             self._json({"error": "not found"}, 404)
 
@@ -100,7 +118,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         )
         valid = (
             self.headers.get("authorization") == f"Bearer {TOKEN}"
-            and self.headers.get("x-golutra-protocol-version") == "1"
+            and self.headers.get("x-golutra-protocol-version") == "2"
         )
         if not valid:
             self._json({"error": "unauthorized"}, 401)
@@ -136,6 +154,42 @@ class RuntimeHandler(BaseHTTPRequestHandler):
     def _thread() -> dict:
         return {"thread_id": THREAD_ID, "session_id": SESSION_ID, "title": "fixture"}
 
+    @staticmethod
+    def _trace(request: dict) -> dict:
+        sequence_no = 1 if request.get("cursor") is None else 2
+        has_more = sequence_no == 1
+        return {
+            "session_id": request["session_id"],
+            "task_id": request["task_id"],
+            "view": request["view"],
+            "events": [
+                {
+                    "id": f"01900000-0000-7000-8000-{sequence_no:012d}",
+                    "sequence_no": sequence_no,
+                }
+            ],
+            "context_snapshots": [],
+            "artifacts": [],
+            "evidence": [],
+            "verification_plan": None,
+            "verification": None,
+            "post_task_jobs": [],
+            "evaluation": {"terminal": True},
+            "integrity": {
+                "event_count": 2,
+                "first_sequence": 1,
+                "last_sequence": 2,
+                "event_chain_digest": "sha256:stable",
+                "unresolved_refs": [],
+                "missing_sections": [],
+                "retention_losses": [],
+                "redacted_fields": ["provider_credentials"],
+                "complete": not has_more,
+            },
+            "next_cursor": sequence_no if has_more else None,
+            "has_more": has_more,
+        }
+
 
 class ClientTest(unittest.TestCase):
     @classmethod
@@ -164,6 +218,43 @@ class ClientTest(unittest.TestCase):
         ack = self.client.prompt(SESSION_ID, "hello")
         self.assertTrue(ack["accepted"])
         self.assertEqual(self.client.storage_status(SESSION_ID)["kind"], "storage_status")
+        self.assertEqual(
+            self.client.context_projection(SESSION_ID, TASK_ID)["task_id"], TASK_ID
+        )
+        self.assertEqual(
+            self.client.evaluation_projection(SESSION_ID, TASK_ID)["task_id"], TASK_ID
+        )
+        self.assertTrue(
+            self.client.task_trace(
+                {
+                    "session_id": SESSION_ID,
+                    "task_id": TASK_ID,
+                    "view": "full",
+                    "cursor": None,
+                    "limit": 128,
+                    "wait_for_evaluation": True,
+                }
+            )["evaluation"]["terminal"]
+        )
+        complete_trace = self.client.complete_task_trace(
+            {
+                "session_id": SESSION_ID,
+                "task_id": TASK_ID,
+                "view": "full",
+                "cursor": None,
+                "limit": 128,
+                "wait_for_evaluation": True,
+            }
+        )
+        self.assertEqual(len(complete_trace["events"]), 2)
+        self.assertFalse(complete_trace["has_more"])
+        self.assertTrue(complete_trace["integrity"]["complete"])
+        self.assertEqual(
+            self.client.read_artifact_chunk(
+                {"artifact_id": ARTIFACT_ID, "offset": 0, "length": 64}
+            )["artifact_id"],
+            ARTIFACT_ID,
+        )
         self.assertEqual(len(self.client.replay_events({"session_id": SESSION_ID})), 1)
         self.assertEqual(len(self.client.list_threads()), 1)
         subscription = self.client.subscribe({"session_id": SESSION_ID})

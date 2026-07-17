@@ -10,7 +10,7 @@ use std::{
 };
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path as AxumPath, Query, Request, State},
     http::{HeaderMap, StatusCode, header, uri::Authority},
     middleware::{self, Next},
@@ -23,12 +23,13 @@ use axum::{
 use fs2::FileExt;
 use golutra_client::{
     APP_SERVER_ATTACHMENT_HEADER, APP_SERVER_PROTOCOL_HEADER, AppServerInfo, AppServerPaths,
-    ClientError, EmbeddedTransport, RuntimeAttachment, RuntimeClient,
+    ClientError, EmbeddedTransport, RuntimeAttachment, RuntimeClient, TaskTraceClient,
 };
-use golutra_core::{SessionId, TaskId, ThreadId};
+use golutra_core::{SessionId, TaskId, ThreadId, TraceView};
 use golutra_protocol::{
-    CommandAck, EventFilter, EventPage, EventPageRequest, ProtocolVersionRange,
-    RUNTIME_PROTOCOL_VERSION, RuntimeQuery, SessionCommand,
+    ArtifactChunk, ArtifactReadRequest, CommandAck, EventFilter, EventPage, EventPageRequest,
+    ProtocolVersionRange, RUNTIME_PROTOCOL_VERSION, RuntimeQuery, SessionCommand, TaskTracePage,
+    TaskTraceRequest,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -182,6 +183,8 @@ pub fn router(state: AppState) -> Router {
         .route("/attach", get(attach_page))
         .route("/commands", post(send_command))
         .route("/queries", post(query_runtime))
+        .route("/traces", post(task_trace))
+        .route("/artifacts/chunk", post(read_artifact_chunk))
         .route("/events", get(events))
         .route("/events/page", get(event_page))
         .route("/events/replay", get(replay_events))
@@ -331,6 +334,11 @@ async fn enforce_http_boundary(
     if !state.inner.transport_auth.authorizes(request.headers()) {
         return Err(StatusCode::UNAUTHORIZED);
     }
+    // Runtime info is the authenticated protocol-negotiation endpoint.  It
+    // must be readable before a client knows which protocol header to send.
+    if request.uri().path() == "/runtime/info" {
+        return Ok(next.run(request).await);
+    }
     let protocol_version = request
         .headers()
         .get(APP_SERVER_PROTOCOL_HEADER)
@@ -421,6 +429,30 @@ async fn query_runtime(
 ) -> Result<Json<Value>, AppError> {
     let transport = state.attached_transport(&headers).await?;
     Ok(Json(transport.query(query).await?))
+}
+
+async fn task_trace(
+    State(state): State<AppState>,
+    local_ipc: Option<Extension<ipc::LocalIpcRequest>>,
+    headers: HeaderMap,
+    Json(request): Json<TaskTraceRequest>,
+) -> Result<Json<TaskTracePage>, AppError> {
+    if request.view == TraceView::Forensic && local_ipc.is_none() {
+        return Err(AppError::Disclosure(
+            "forensic trace access requires the owner-only local IPC transport".to_owned(),
+        ));
+    }
+    let transport = state.attached_transport(&headers).await?;
+    Ok(Json(transport.task_trace(request).await?))
+}
+
+async fn read_artifact_chunk(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ArtifactReadRequest>,
+) -> Result<Json<Option<ArtifactChunk>>, AppError> {
+    let transport = state.attached_transport(&headers).await?;
+    Ok(Json(transport.read_artifact_chunk(request).await?))
 }
 
 async fn attach_page() -> Html<&'static str> {
@@ -624,6 +656,7 @@ enum AppError {
     InvalidId(String),
     Attachment(String),
     Protocol(String),
+    Disclosure(String),
 }
 
 impl From<ClientError> for AppError {
@@ -640,6 +673,7 @@ impl IntoResponse for AppError {
             Self::InvalidId(error) => (StatusCode::BAD_REQUEST, error),
             Self::Attachment(error) => (StatusCode::GONE, error),
             Self::Protocol(error) => (StatusCode::UPGRADE_REQUIRED, error),
+            Self::Disclosure(error) => (StatusCode::FORBIDDEN, error),
         };
         (status, Json(json!({ "error": message }))).into_response()
     }
@@ -808,14 +842,26 @@ const ATTACH_PAGE: &str = r#"<!doctype html>
         const cwd = document.getElementById("cwd").value.trim();
         const sessionId = document.getElementById("session-id").value.trim();
         const transportToken = document.getElementById("transport-token").value.trim();
+        const authHeaders = { "authorization": `Bearer ${transportToken}` };
+        const infoResponse = await fetch("/runtime/info", { headers: authHeaders });
+        if (!infoResponse.ok) {
+          output.textContent = `runtime discovery failed: ${infoResponse.status} ${await infoResponse.text()}`;
+          return;
+        }
+        const runtimeInfo = await infoResponse.json();
+        const protocolVersion = runtimeInfo.protocol_versions?.current;
+        if (!Number.isInteger(protocolVersion)) {
+          output.textContent = "runtime discovery returned an invalid protocol version";
+          return;
+        }
         const transportHeaders = {
-          "authorization": `Bearer ${transportToken}`,
-          "x-golutra-protocol-version": "1"
+          ...authHeaders,
+          "x-golutra-protocol-version": String(protocolVersion)
         };
         const attached = await fetch("/runtime/attach", {
           method: "POST",
           headers: { ...transportHeaders, "content-type": "application/json" },
-          body: JSON.stringify({ cwd, protocol_version: 1 })
+          body: JSON.stringify({ cwd, protocol_version: protocolVersion })
         });
         if (!attached.ok) {
           output.textContent = `attach failed: ${attached.status} ${await attached.text()}`;
@@ -1029,7 +1075,8 @@ mod tests {
         let missing_version = app
             .oneshot(
                 Request::builder()
-                    .uri("/runtime/info")
+                    .method("POST")
+                    .uri("/runtime/attach")
                     .header(
                         header::AUTHORIZATION,
                         format!("Bearer {TEST_TRANSPORT_TOKEN}"),
@@ -1040,6 +1087,54 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(missing_version.status(), StatusCode::UPGRADE_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn authenticated_runtime_info_supports_protocol_discovery() {
+        let app = router(AppState::new(server_info(), TEST_TRANSPORT_TOKEN).expect("app state"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/runtime/info")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {TEST_TRANSPORT_TOKEN}"),
+                    )
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn remote_http_rejects_forensic_trace_disclosure() {
+        let app = router(AppState::new(server_info(), TEST_TRANSPORT_TOKEN).expect("app state"));
+        let request = TaskTraceRequest {
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            view: TraceView::Forensic,
+            cursor: None,
+            limit: 64,
+            wait_for_evaluation: false,
+        };
+        let response = app
+            .oneshot(
+                authorized_request(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/traces")
+                        .header(header::CONTENT_TYPE, "application/json"),
+                )
+                .body(Body::from(serde_json::to_vec(&request).expect("json")))
+                .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -1107,6 +1202,9 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("body");
-        assert!(String::from_utf8_lossy(&body).contains("x-golutra-attachment"));
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("x-golutra-attachment"));
+        assert!(body.contains("runtimeInfo.protocol_versions?.current"));
+        assert!(!body.contains("\"x-golutra-protocol-version\": \"2\""));
     }
 }

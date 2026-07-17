@@ -6,6 +6,12 @@
     "applied_candidate": {
       "$ref": "#/$defs/AppliedCandidate"
     },
+    "artifact_chunk": {
+      "$ref": "#/$defs/ArtifactChunk"
+    },
+    "artifact_read_request": {
+      "$ref": "#/$defs/ArtifactReadRequest"
+    },
     "automation_candidate": {
       "$ref": "#/$defs/AutomationCandidate"
     },
@@ -24,6 +30,9 @@
     "command_ack": {
       "$ref": "#/$defs/CommandAck"
     },
+    "context_projection": {
+      "$ref": "#/$defs/ContextProjection"
+    },
     "cost_record": {
       "$ref": "#/$defs/CostRecord"
     },
@@ -38,6 +47,9 @@
     },
     "evaluation_case": {
       "$ref": "#/$defs/EvaluationCase"
+    },
+    "evaluation_projection": {
+      "$ref": "#/$defs/EvaluationProjection"
     },
     "evaluation_result": {
       "$ref": "#/$defs/EvaluationResult"
@@ -96,6 +108,12 @@
     "query": {
       "$ref": "#/$defs/RuntimeQuery"
     },
+    "regression_campaign": {
+      "$ref": "#/$defs/RegressionCampaign"
+    },
+    "regression_execution": {
+      "$ref": "#/$defs/RegressionExecution"
+    },
     "regression_result": {
       "$ref": "#/$defs/RegressionResult"
     },
@@ -120,6 +138,12 @@
     "storage_stats": {
       "$ref": "#/$defs/StorageStats"
     },
+    "task_trace_page": {
+      "$ref": "#/$defs/TaskTracePage"
+    },
+    "task_trace_request": {
+      "$ref": "#/$defs/TaskTraceRequest"
+    },
     "user_projection": {
       "$ref": "#/$defs/UserProjection"
     }
@@ -135,6 +159,12 @@
     "state_projection",
     "user_projection",
     "debug_projection",
+    "context_projection",
+    "evaluation_projection",
+    "task_trace_request",
+    "task_trace_page",
+    "artifact_read_request",
+    "artifact_chunk",
     "memory_record",
     "evaluation_result",
     "evaluation_case",
@@ -151,6 +181,8 @@
     "cost_record",
     "security_utility_result",
     "regression_result",
+    "regression_campaign",
+    "regression_execution",
     "promotion_decision",
     "applied_candidate",
     "open_ended_budget",
@@ -230,6 +262,72 @@
         "applied_version",
         "rollback_ref",
         "applied_at"
+      ]
+    },
+    "ArtifactChunk": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "checksum": {
+          "type": "string"
+        },
+        "content_base64": {
+          "type": "string"
+        },
+        "eof": {
+          "type": "boolean"
+        },
+        "length": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "offset": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "total_size": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "artifact_id",
+        "offset",
+        "length",
+        "total_size",
+        "checksum",
+        "content_base64",
+        "eof"
+      ]
+    },
+    "ArtifactReadRequest": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "length": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "offset": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "artifact_id",
+        "offset",
+        "length"
       ]
     },
     "ArtifactRecord": {
@@ -628,6 +726,15 @@
         "counterfactual"
       ]
     },
+    "BudgetOverflowAction": {
+      "type": "string",
+      "enum": [
+        "trim",
+        "compact",
+        "ask_user",
+        "block"
+      ]
+    },
     "BudgetState": {
       "type": "object",
       "properties": {
@@ -898,6 +1005,238 @@
       "required": [
         "command_id",
         "accepted"
+      ]
+    },
+    "ContextContributorSnapshot": {
+      "type": "object",
+      "properties": {
+        "content_digest": {
+          "type": "string"
+        },
+        "estimated_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "included": {
+          "type": "boolean"
+        },
+        "invalidation_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "name": {
+          "type": "string"
+        },
+        "redacted_content_ref": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "role": {
+          "type": "string"
+        },
+        "source_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "trimmed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "role",
+        "source_refs",
+        "included",
+        "trimmed",
+        "estimated_tokens",
+        "content_digest",
+        "invalidation_refs"
+      ]
+    },
+    "ContextMessageSnapshot": {
+      "type": "object",
+      "properties": {
+        "content_digest": {
+          "type": "string"
+        },
+        "estimated_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "index": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "role": {
+          "type": "string"
+        },
+        "tool_call_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "index",
+        "role",
+        "content_digest",
+        "estimated_tokens",
+        "tool_call_ids"
+      ]
+    },
+    "ContextProjection": {
+      "description": "一个任务实际进入模型上下文的事实投影。\n\n该视图只暴露脱敏 manifest 和 digest；provider 原始请求仍受 artifact 权限控制。",
+      "type": "object",
+      "properties": {
+        "complete": {
+          "type": "boolean"
+        },
+        "integrity_warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "latest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ContextSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "snapshots": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ContextSnapshot"
+          }
+        },
+        "task_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "session_id",
+        "task_id",
+        "snapshots",
+        "complete",
+        "integrity_warnings"
+      ]
+    },
+    "ContextSnapshot": {
+      "type": "object",
+      "properties": {
+        "budget_snapshot": {
+          "$ref": "#/$defs/TokenBudgetSnapshot"
+        },
+        "canonical_request_digest": {
+          "type": "string"
+        },
+        "contributor_manifest": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ContextContributorSnapshot"
+          }
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "estimate_source": {
+          "type": "string"
+        },
+        "generation_config_digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message_manifest": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ContextMessageSnapshot"
+          }
+        },
+        "model_id": {
+          "type": "string"
+        },
+        "provider_id": {
+          "type": "string"
+        },
+        "provider_request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "redacted_request_artifact_ref": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "restricted_request_artifact_ref": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "snapshot_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "task_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "tool_schema_digests": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "turn_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "snapshot_id",
+        "session_id",
+        "task_id",
+        "turn_id",
+        "provider_request_id",
+        "provider_id",
+        "model_id",
+        "contributor_manifest",
+        "message_manifest",
+        "tool_schema_digests",
+        "budget_snapshot",
+        "canonical_request_digest",
+        "estimate_source",
+        "created_at"
       ]
     },
     "CostRecord": {
@@ -1253,6 +1592,84 @@
         "policy_constraints",
         "fixture_refs",
         "tags"
+      ]
+    },
+    "EvaluationProjection": {
+      "description": "一个任务完成后治理生命周期的类型化读模型。\n\n开发工具无需解析事件文案即可区分 review、candidate、regression 和 promotion。",
+      "type": "object",
+      "properties": {
+        "automation_candidates": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AutomationCandidate"
+          }
+        },
+        "improvement_candidates": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ImprovementCandidate"
+          }
+        },
+        "integrity_warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "post_task_jobs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PostTaskJob"
+          }
+        },
+        "promotion_decisions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PromotionDecision"
+          }
+        },
+        "regressions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RegressionResult"
+          }
+        },
+        "results": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EvaluationResult"
+          }
+        },
+        "reviews": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PostTaskReview"
+          }
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "task_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "terminal": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "session_id",
+        "task_id",
+        "reviews",
+        "results",
+        "improvement_candidates",
+        "automation_candidates",
+        "regressions",
+        "promotion_decisions",
+        "post_task_jobs",
+        "terminal",
+        "integrity_warnings"
       ]
     },
     "EvaluationResult": {
@@ -2025,6 +2442,76 @@
         "model_state"
       ]
     },
+    "MemoryClaim": {
+      "type": "object",
+      "properties": {
+        "candidate_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "confidence": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "expires_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "invalidation_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "object": {
+          "type": "string"
+        },
+        "predicate": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "string"
+        },
+        "source_task_refs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "subject": {
+          "type": "string"
+        },
+        "valid_from": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "candidate_id",
+        "subject",
+        "predicate",
+        "object",
+        "scope",
+        "source_task_refs",
+        "evidence_refs",
+        "confidence",
+        "valid_from",
+        "invalidation_refs"
+      ]
+    },
     "MemoryRecord": {
       "type": "object",
       "properties": {
@@ -2033,6 +2520,17 @@
           "format": "uint64",
           "default": 0,
           "minimum": 0
+        },
+        "claim": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemoryClaim"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "confidence": {
           "type": "integer",
@@ -2079,6 +2577,13 @@
           "default": 0,
           "minimum": 0
         },
+        "invalidation_refs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
         "irrelevant_count": {
           "type": "integer",
           "format": "uint32",
@@ -2120,6 +2625,14 @@
         "status": {
           "$ref": "#/$defs/MemoryStatus"
         },
+        "supporting_task_ids": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
         "version": {
           "type": "integer",
           "format": "uint64",
@@ -2150,8 +2663,12 @@
     "MemoryStatus": {
       "type": "string",
       "enum": [
+        "proposed",
+        "quarantined",
         "active",
-        "rolled_back"
+        "deprecated",
+        "rolled_back",
+        "expired"
       ]
     },
     "NoveltyRecord": {
@@ -2298,6 +2815,122 @@
         "running",
         "completed",
         "blocked"
+      ]
+    },
+    "PostTaskJob": {
+      "type": "object",
+      "properties": {
+        "attempt": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "completed_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "input_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "job_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "kind": {
+          "$ref": "#/$defs/PostTaskJobKind"
+        },
+        "last_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lease_expires_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "lease_owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_attempts": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "result_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "started_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "status": {
+          "$ref": "#/$defs/PostTaskJobStatus"
+        },
+        "task_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "job_id",
+        "kind",
+        "workspace_id",
+        "session_id",
+        "task_id",
+        "input_refs",
+        "status",
+        "attempt",
+        "max_attempts",
+        "result_refs",
+        "created_at"
+      ]
+    },
+    "PostTaskJobKind": {
+      "type": "string",
+      "enum": [
+        "deep_evaluation",
+        "candidate_generation",
+        "regression_execution"
+      ]
+    },
+    "PostTaskJobStatus": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "leased",
+        "running",
+        "succeeded",
+        "failed",
+        "cancelled"
       ]
     },
     "PostTaskReview": {
@@ -2488,6 +3121,94 @@
         "not_required"
       ]
     },
+    "RegressionCampaign": {
+      "type": "object",
+      "properties": {
+        "baseline_version": {
+          "type": "string"
+        },
+        "campaign_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "candidate_digest": {
+          "type": "string"
+        },
+        "candidate_id": {
+          "type": "string"
+        },
+        "case_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "completed_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "environment_recipe": {
+          "type": "string"
+        },
+        "hard_gates": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "provider_matrix": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "replay_modes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "resource_budget": {
+          "type": "string"
+        },
+        "seeds": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        },
+        "started_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "campaign_id",
+        "candidate_id",
+        "candidate_digest",
+        "baseline_version",
+        "environment_recipe",
+        "case_refs",
+        "replay_modes",
+        "provider_matrix",
+        "seeds",
+        "resource_budget",
+        "hard_gates",
+        "created_at"
+      ]
+    },
     "RegressionCaseResult": {
       "type": "object",
       "properties": {
@@ -2527,6 +3248,79 @@
         "observed_verdict",
         "evidence_checks",
         "failure_taxonomy"
+      ]
+    },
+    "RegressionExecution": {
+      "type": "object",
+      "properties": {
+        "campaign_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "case_ref": {
+          "type": "string",
+          "default": ""
+        },
+        "cost_latency_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "execution_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "role": {
+          "$ref": "#/$defs/RegressionExecutionRole"
+        },
+        "runtime_version": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/RegressionExecutionStatus"
+        },
+        "task_trace_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "verification_ref": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "workspace_snapshot_digest": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "execution_id",
+        "campaign_id",
+        "role",
+        "runtime_version",
+        "workspace_snapshot_digest",
+        "status"
+      ]
+    },
+    "RegressionExecutionRole": {
+      "type": "string",
+      "enum": [
+        "baseline",
+        "candidate"
+      ]
+    },
+    "RegressionExecutionStatus": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "running",
+        "succeeded",
+        "failed",
+        "inconclusive"
       ]
     },
     "RegressionResult": {
@@ -2817,7 +3611,19 @@
         "skill_installed",
         "skill_rolled_back",
         "governor_decided",
-        "storage_maintenance_completed"
+        "storage_maintenance_completed",
+        "context_snapshot_created",
+        "post_task_job_queued",
+        "post_task_job_started",
+        "post_task_job_completed",
+        "post_task_job_failed",
+        "verification_planned",
+        "verification_assertion_completed",
+        "regression_campaign_started",
+        "regression_execution_completed",
+        "memory_candidate_quarantined",
+        "memory_activated",
+        "memory_invalidated"
       ]
     },
     "RuntimeGovernorDecision": {
@@ -2988,6 +3794,8 @@
         "task_state",
         "user_projection",
         "debug_projection",
+        "context_projection",
+        "evaluation_projection",
         "replay_cursor",
         "memory_list",
         "evaluation_results",
@@ -2995,7 +3803,10 @@
         "automation_candidates",
         "evolution_state",
         "provider_state",
-        "storage_status"
+        "storage_status",
+        "task_trace",
+        "post_task_jobs",
+        "artifact_chunk"
       ]
     },
     "SecurityUtilityResult": {
@@ -3105,6 +3916,11 @@
         "provider_auth_submitted",
         "provider_auth_cancelled",
         "run_storage_maintenance",
+        "wait_post_task_job",
+        "retry_post_task_job",
+        "run_regression_campaign",
+        "review_memory_candidate",
+        "expire_memory",
         "verify",
         "replay",
         "export"
@@ -3477,6 +4293,15 @@
         "rollout_files"
       ]
     },
+    "TaskClass": {
+      "type": "string",
+      "enum": [
+        "plain_conversation",
+        "read_only_analysis",
+        "workspace_change",
+        "code_change"
+      ]
+    },
     "TaskStatus": {
       "type": "string",
       "enum": [
@@ -3492,6 +4317,217 @@
         "failed",
         "blocked",
         "cancelled"
+      ]
+    },
+    "TaskTracePage": {
+      "type": "object",
+      "properties": {
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArtifactRecord"
+          }
+        },
+        "context_snapshots": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ContextSnapshot"
+          }
+        },
+        "evaluation": {
+          "$ref": "#/$defs/EvaluationProjection"
+        },
+        "events": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RuntimeEvent"
+          }
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EvidenceRecord"
+          }
+        },
+        "has_more": {
+          "type": "boolean"
+        },
+        "integrity": {
+          "$ref": "#/$defs/TraceIntegrity"
+        },
+        "next_cursor": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "post_task_jobs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PostTaskJob"
+          }
+        },
+        "runtime_identity": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "task_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "verification": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VerificationRecord"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "verification_plan": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VerificationPlan"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "view": {
+          "$ref": "#/$defs/TraceView"
+        }
+      },
+      "required": [
+        "session_id",
+        "task_id",
+        "runtime_identity",
+        "view",
+        "events",
+        "context_snapshots",
+        "artifacts",
+        "evidence",
+        "post_task_jobs",
+        "evaluation",
+        "integrity",
+        "has_more"
+      ]
+    },
+    "TaskTraceRequest": {
+      "type": "object",
+      "properties": {
+        "cursor": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "limit": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "task_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "view": {
+          "$ref": "#/$defs/TraceView"
+        },
+        "wait_for_evaluation": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "session_id",
+        "task_id",
+        "view",
+        "limit",
+        "wait_for_evaluation"
+      ]
+    },
+    "TokenBudgetSnapshot": {
+      "type": "object",
+      "properties": {
+        "action_if_exceeded": {
+          "$ref": "#/$defs/BudgetOverflowAction"
+        },
+        "budget_limit": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "budget_policy": {
+          "type": "string"
+        },
+        "context_window": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_output": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "planned_input_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "planned_summary_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "planned_tool_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "reserved_output_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "snapshot_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "task_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "turn_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "snapshot_id",
+        "task_id",
+        "turn_id",
+        "context_window",
+        "max_output",
+        "reserved_output_tokens",
+        "planned_input_tokens",
+        "planned_tool_tokens",
+        "planned_summary_tokens",
+        "budget_limit",
+        "budget_policy",
+        "action_if_exceeded"
       ]
     },
     "ToolResultEnvelope": {
@@ -3561,6 +4597,79 @@
         "timeout"
       ]
     },
+    "TraceIntegrity": {
+      "type": "object",
+      "properties": {
+        "complete": {
+          "type": "boolean"
+        },
+        "event_chain_digest": {
+          "type": "string"
+        },
+        "event_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "first_sequence": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "last_sequence": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "missing_sections": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "redacted_fields": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "retention_losses": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "unresolved_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "event_count",
+        "event_chain_digest",
+        "unresolved_refs",
+        "missing_sections",
+        "retention_losses",
+        "redacted_fields",
+        "complete"
+      ]
+    },
+    "TraceView": {
+      "type": "string",
+      "enum": [
+        "summary",
+        "full",
+        "forensic"
+      ]
+    },
     "UserProjection": {
       "type": "object",
       "properties": {
@@ -3610,6 +4719,86 @@
         "residual_risks"
       ]
     },
+    "VerificationAssertion": {
+      "type": "object",
+      "properties": {
+        "assertion_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "blocking": {
+          "type": "boolean"
+        },
+        "criterion_id": {
+          "type": "string"
+        },
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "expected": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/VerificationAssertionKind"
+        },
+        "message": {
+          "type": "string"
+        },
+        "required_evidence_strength": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/VerificationAssertionStatus"
+        },
+        "subject": {
+          "type": "string"
+        },
+        "verifier_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "assertion_id",
+        "criterion_id",
+        "kind",
+        "subject",
+        "expected",
+        "verifier_id",
+        "required_evidence_strength",
+        "blocking",
+        "status",
+        "evidence_refs",
+        "message"
+      ]
+    },
+    "VerificationAssertionKind": {
+      "type": "string",
+      "enum": [
+        "file_state",
+        "diff",
+        "command_exit",
+        "test",
+        "diagnostic",
+        "schema",
+        "policy",
+        "delivery",
+        "assistant_response"
+      ]
+    },
+    "VerificationAssertionStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "pass",
+        "fail",
+        "unknown",
+        "not_applicable"
+      ]
+    },
     "VerificationCheck": {
       "type": "object",
       "properties": {
@@ -3654,6 +4843,113 @@
         "workspace_change",
         "objective_validation",
         "assistant_response"
+      ]
+    },
+    "VerificationDimensionStatus": {
+      "type": "string",
+      "enum": [
+        "pass",
+        "fail",
+        "partial",
+        "unknown"
+      ]
+    },
+    "VerificationDimensions": {
+      "type": "object",
+      "properties": {
+        "evidence_status": {
+          "$ref": "#/$defs/VerificationDimensionStatus"
+        },
+        "objective_status": {
+          "$ref": "#/$defs/VerificationDimensionStatus"
+        },
+        "policy_status": {
+          "$ref": "#/$defs/VerificationDimensionStatus"
+        }
+      },
+      "required": [
+        "evidence_status",
+        "objective_status",
+        "policy_status"
+      ]
+    },
+    "VerificationPlan": {
+      "type": "object",
+      "properties": {
+        "assertions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/VerificationAssertion"
+          }
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "criteria": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dimensions": {
+          "$ref": "#/$defs/VerificationDimensions",
+          "default": {
+            "evidence_status": "unknown",
+            "objective_status": "unknown",
+            "policy_status": "unknown"
+          }
+        },
+        "generated_by": {
+          "type": "string"
+        },
+        "plan_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "policy_assertions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/VerificationAssertion"
+          }
+        },
+        "required_artifact_types": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "revision": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "task_class": {
+          "$ref": "#/$defs/TaskClass"
+        },
+        "task_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "verifier_versions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "plan_id",
+        "task_id",
+        "task_class",
+        "criteria",
+        "assertions",
+        "policy_assertions",
+        "required_artifact_types",
+        "generated_by",
+        "verifier_versions",
+        "revision",
+        "created_at"
       ]
     },
     "VerificationRecord": {

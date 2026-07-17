@@ -2,15 +2,19 @@ import { createParser } from "eventsource-parser";
 
 import type {
   AppliedCandidate,
+  ArtifactChunk,
+  ArtifactReadRequest,
   AutomationCandidate,
   BenchmarkRun,
   BenchmarkPromotion,
   CausalComparison,
   CommandAck,
+  ContextProjection,
   CounterfactualReplay,
   EvaluationCase,
   EvaluationResult,
   EvaluationRun,
+  EvaluationProjection,
   EvolutionState,
   EventFilter,
   EventPage,
@@ -29,11 +33,14 @@ import type {
   SessionCommandKind,
   SkillCandidate,
   StorageStats,
+  TaskTracePage,
+  TaskTraceRequest,
 } from "./generated.js";
 
 const JSON_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024;
-export const RUNTIME_PROTOCOL_VERSION = 1;
+const MAX_COMPLETE_TRACE_PAGES = 4096;
+export const RUNTIME_PROTOCOL_VERSION = 2;
 
 export * from "./generated.js";
 
@@ -195,6 +202,56 @@ export class GolutraClient {
     url.searchParams.set("direction", request.direction);
     url.searchParams.set("limit", String(request.limit));
     return this.getJson<EventPage>(url);
+  }
+
+  async contextProjection(sessionId: string, taskId: string): Promise<ContextProjection> {
+    return this.query<ContextProjection>(
+      this.runtimeQuery(sessionId, "context_projection", taskId),
+    );
+  }
+
+  async evaluationProjection(
+    sessionId: string,
+    taskId: string,
+  ): Promise<EvaluationProjection> {
+    return this.query<EvaluationProjection>(
+      this.runtimeQuery(sessionId, "evaluation_projection", taskId),
+    );
+  }
+
+  async taskTrace(request: TaskTraceRequest): Promise<TaskTracePage> {
+    return this.postJson<TaskTracePage>("/traces", request);
+  }
+
+  async completeTaskTrace(request: TaskTraceRequest): Promise<TaskTracePage> {
+    let nextRequest = { ...request };
+    const trace = await this.taskTrace(nextRequest);
+    for (let pageCount = 1; pageCount < MAX_COMPLETE_TRACE_PAGES; pageCount += 1) {
+      if (!trace.has_more) {
+        return trace;
+      }
+      const nextCursor = trace.next_cursor;
+      if (nextCursor === undefined || nextCursor === null) {
+        throw new Error("task trace page has_more without a next cursor");
+      }
+      if (nextRequest.cursor === nextCursor) {
+        throw new Error("task trace cursor did not advance");
+      }
+      nextRequest = {
+        ...nextRequest,
+        cursor: nextCursor,
+        wait_for_evaluation: false,
+      };
+      mergeTaskTracePage(trace, await this.taskTrace(nextRequest));
+    }
+    if (!trace.has_more) {
+      return trace;
+    }
+    throw new Error(`task trace exceeds ${MAX_COMPLETE_TRACE_PAGES} pages`);
+  }
+
+  async readArtifactChunk(request: ArtifactReadRequest): Promise<ArtifactChunk | null> {
+    return this.postJson<ArtifactChunk | null>("/artifacts/chunk", request);
   }
 
   async storageStatus(sessionId: string): Promise<StorageStats> {
@@ -589,11 +646,15 @@ export class GolutraClient {
     return url;
   }
 
-  private runtimeQuery(sessionId: string, kind: RuntimeQueryKind): RuntimeQuery {
+  private runtimeQuery(
+    sessionId: string,
+    kind: RuntimeQueryKind,
+    taskId?: string,
+  ): RuntimeQuery {
     return {
       query_id: globalThis.crypto.randomUUID(),
       session_id: sessionId,
-      task_id: null,
+      task_id: taskId ?? null,
       kind,
       requester: "sdk",
       cursor: null,
@@ -707,6 +768,114 @@ export class GolutraClient {
     headers.set("x-golutra-protocol-version", String(RUNTIME_PROTOCOL_VERSION));
     return headers;
   }
+}
+
+export function mergeTaskTracePage(target: TaskTracePage, page: TaskTracePage): void {
+  if (
+    target.session_id !== page.session_id ||
+    target.task_id !== page.task_id ||
+    target.view !== page.view
+  ) {
+    throw new Error("cannot merge task trace pages from different requests");
+  }
+  if (target.integrity.event_chain_digest !== page.integrity.event_chain_digest) {
+    target.integrity.unresolved_refs.push("integrity:event_chain_digest_mismatch");
+  }
+  target.integrity.event_count = Math.max(
+    target.integrity.event_count,
+    page.integrity.event_count,
+  );
+  target.integrity.first_sequence = optionalMin(
+    target.integrity.first_sequence,
+    page.integrity.first_sequence,
+  );
+  target.integrity.last_sequence = optionalMax(
+    target.integrity.last_sequence,
+    page.integrity.last_sequence,
+  );
+  target.integrity.unresolved_refs.push(...page.integrity.unresolved_refs);
+  target.integrity.missing_sections.push(...page.integrity.missing_sections);
+  target.integrity.retention_losses.push(...page.integrity.retention_losses);
+  target.integrity.redacted_fields.push(...page.integrity.redacted_fields);
+  target.events = dedupeBy([...target.events, ...page.events], (event) => event.id).sort(
+    (left, right) => left.sequence_no - right.sequence_no,
+  );
+  target.context_snapshots = dedupeBy(
+    [...target.context_snapshots, ...page.context_snapshots],
+    (snapshot) => snapshot.snapshot_id,
+  );
+  target.artifacts = dedupeBy(
+    [...target.artifacts, ...page.artifacts],
+    (artifact) => artifact.artifact_id,
+  );
+  target.evidence = dedupeBy(
+    [...target.evidence, ...page.evidence],
+    (record) => record.evidence_id,
+  );
+  if (page.verification_plan !== undefined && page.verification_plan !== null) {
+    target.verification_plan = page.verification_plan;
+  }
+  if (page.verification !== undefined && page.verification !== null) {
+    target.verification = page.verification;
+  }
+  target.post_task_jobs = dedupeBy(
+    [...target.post_task_jobs, ...page.post_task_jobs],
+    (job) => job.job_id,
+  );
+  target.evaluation = page.evaluation;
+  target.next_cursor = page.next_cursor ?? null;
+  target.has_more = page.has_more;
+  target.integrity.unresolved_refs = sortedUnique(target.integrity.unresolved_refs);
+  target.integrity.missing_sections = sortedUnique(target.integrity.missing_sections);
+  target.integrity.retention_losses = sortedUnique(target.integrity.retention_losses);
+  target.integrity.redacted_fields = sortedUnique(target.integrity.redacted_fields);
+  target.integrity.complete =
+    !target.has_more &&
+    target.integrity.unresolved_refs.length === 0 &&
+    target.integrity.missing_sections.length === 0 &&
+    target.integrity.retention_losses.length === 0;
+}
+
+function dedupeBy<T>(values: T[], key: (value: T) => string): T[] {
+  const seen = new Set<string>();
+  return values.filter((value) => {
+    const identifier = key(value);
+    if (seen.has(identifier)) {
+      return false;
+    }
+    seen.add(identifier);
+    return true;
+  });
+}
+
+function sortedUnique(values: string[]): string[] {
+  return [...new Set(values)].sort();
+}
+
+function optionalMin(
+  left: number | null | undefined,
+  right: number | null | undefined,
+): number | null {
+  if (left === undefined || left === null) {
+    return right ?? null;
+  }
+  if (right === undefined || right === null) {
+    return left;
+  }
+  return Math.min(left, right);
+}
+
+function optionalMax(
+  left: number | null | undefined,
+  right: number | null | undefined,
+): number | null {
+  if (left === undefined || left === null) {
+    return right ?? null;
+  }
+  if (right === undefined || right === null) {
+    return left;
+  }
+  return Math.max(left, right);
 }
 
 async function decodeJson<T>(response: Response): Promise<T> {

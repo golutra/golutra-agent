@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use golutra_auth::{
     CredentialRef, CredentialSource, OAuthFlow, OAuthProviderDescriptor, SecretKind,
 };
-use golutra_client::{RuntimeClient, RuntimeTransport};
+use golutra_client::{RuntimeClient, RuntimeTransport, TaskTraceClient};
 use golutra_config::{
     BuiltinOAuthMethod, ProviderConfigPaths, ProviderConfigScope, ProviderInstallPlan,
     ProviderProfile, apply_oauth_provider_install_plan_verified,
@@ -12,7 +12,9 @@ use golutra_config::{
     provider_onboarding_state, replace_provider_credential_verified,
     update_provider_settings_verified, validate_provider_protocol_runtime_supported,
 };
-use golutra_core::{Actor, ActorKind, CommandId, SessionId, TaskStatus, ThreadId, TurnId};
+use golutra_core::{
+    Actor, ActorKind, CommandId, SessionId, TaskId, TaskStatus, ThreadId, TraceView, TurnId,
+};
 use golutra_llm::{
     ConfiguredProvider, ProviderGenerationConfig, ProviderHeaderConfig, ProviderHeaderValue,
     ProviderProtocol, ProviderReasoningEffort, provider_protocol_catalog,
@@ -20,7 +22,7 @@ use golutra_llm::{
 use golutra_plugin::PluginStore;
 use golutra_protocol::{
     EventFilter, RuntimeEvent, RuntimeEventType, RuntimeQuery, RuntimeQueryKind, SessionCommand,
-    SessionCommandKind,
+    SessionCommandKind, TaskTraceRequest,
 };
 use secrecy::SecretString;
 use std::io::{IsTerminal, Write};
@@ -74,7 +76,14 @@ enum Command {
         approval_id: Option<String>,
     },
     Compact,
-    Trace,
+    Trace {
+        #[arg(long)]
+        task_id: Option<String>,
+        #[arg(long)]
+        full: bool,
+        #[arg(long)]
+        wait_evaluation: bool,
+    },
     Export,
     Thread {
         #[command(subcommand)]
@@ -623,19 +632,56 @@ async fn main() -> miette::Result<()> {
                 .map_err(|error| miette::miette!("{error}"))?;
             println!("{}", serde_json::to_string_pretty(&ack).unwrap_or_default());
         }
-        Command::Trace => {
-            let trace = transport
-                .query(RuntimeQuery {
-                    query_id: golutra_core::QueryId::new(),
-                    session_id,
-                    task_id: None,
-                    kind: RuntimeQueryKind::DebugProjection,
-                    requester: ActorKind::Cli,
-                    cursor: None,
-                    timestamp: chrono::Utc::now(),
-                })
-                .await
-                .map_err(|error| miette::miette!("{error}"))?;
+        Command::Trace {
+            task_id,
+            full,
+            wait_evaluation,
+        } => {
+            let task_id = match task_id.as_deref() {
+                Some(task_id) => parse_task_id(task_id)?,
+                None => {
+                    let state = transport
+                        .query(RuntimeQuery {
+                            query_id: golutra_core::QueryId::new(),
+                            session_id,
+                            task_id: None,
+                            kind: RuntimeQueryKind::SessionState,
+                            requester: ActorKind::Cli,
+                            cursor: None,
+                            timestamp: chrono::Utc::now(),
+                        })
+                        .await
+                        .map_err(|error| miette::miette!("{error}"))?;
+                    state
+                        .get("active_task_id")
+                        .and_then(|value| value.as_str())
+                        .map(parse_task_id)
+                        .transpose()?
+                        .ok_or_else(|| {
+                            miette::miette!("trace requires an active or explicit task_id")
+                        })?
+                }
+            };
+            let view = if full {
+                TraceView::Full
+            } else {
+                TraceView::Summary
+            };
+            let limit = if full { 512 } else { 64 };
+            let request = TaskTraceRequest {
+                session_id,
+                task_id,
+                view,
+                cursor: None,
+                limit,
+                wait_for_evaluation: wait_evaluation,
+            };
+            let trace = if full {
+                transport.complete_task_trace(request).await
+            } else {
+                transport.task_trace(request).await
+            }
+            .map_err(|error| miette::miette!("{error}"))?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&trace).unwrap_or_default()
@@ -1737,6 +1783,12 @@ fn parse_turn_id(value: &str) -> miette::Result<TurnId> {
     value
         .parse()
         .map_err(|error: uuid::Error| miette::miette!("invalid turn id: {error}"))
+}
+
+fn parse_task_id(value: &str) -> miette::Result<TaskId> {
+    value
+        .parse::<TaskId>()
+        .map_err(|error| miette::miette!("invalid task id `{value}`: {error}"))
 }
 
 fn resolve_session_id(

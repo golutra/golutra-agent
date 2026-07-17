@@ -14,10 +14,11 @@ from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 
-RUNTIME_PROTOCOL_VERSION = 1
+RUNTIME_PROTOCOL_VERSION = 2
 JSON_REQUEST_TIMEOUT_SECONDS = 30
 MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_SSE_EVENT_BYTES = 1024 * 1024
+MAX_COMPLETE_TRACE_PAGES = 4096
 T = TypeVar("T")
 
 
@@ -80,6 +81,36 @@ class GolutraClient:
             if value is not None and key in {"session_id", "task_id", "cursor", "direction", "limit"}
         }
         return self._request_json("GET", f"/events/page?{urlencode(parameters)}")
+
+    def context_projection(self, session_id: str, task_id: str) -> dict[str, Any]:
+        return self.query(self.runtime_query(session_id, "context_projection", task_id))
+
+    def evaluation_projection(self, session_id: str, task_id: str) -> dict[str, Any]:
+        return self.query(self.runtime_query(session_id, "evaluation_projection", task_id))
+
+    def task_trace(self, request: dict[str, Any]) -> dict[str, Any]:
+        return self._request_json("POST", "/traces", body=request)
+
+    def complete_task_trace(self, request: dict[str, Any]) -> dict[str, Any]:
+        next_request = dict(request)
+        trace = self.task_trace(next_request)
+        for _ in range(1, MAX_COMPLETE_TRACE_PAGES):
+            if not trace.get("has_more", False):
+                return trace
+            next_cursor = trace.get("next_cursor")
+            if not isinstance(next_cursor, int):
+                raise GolutraError("task trace page has_more without a next cursor")
+            if next_request.get("cursor") == next_cursor:
+                raise GolutraError("task trace cursor did not advance")
+            next_request["cursor"] = next_cursor
+            next_request["wait_for_evaluation"] = False
+            _merge_task_trace_page(trace, self.task_trace(next_request))
+        if not trace.get("has_more", False):
+            return trace
+        raise GolutraError(f"task trace exceeds {MAX_COMPLETE_TRACE_PAGES} pages")
+
+    def read_artifact_chunk(self, request: dict[str, Any]) -> dict[str, Any] | None:
+        return self._request_json("POST", "/artifacts/chunk", body=request)
 
     def replay_events(self, event_filter: dict[str, Any]) -> list[dict[str, Any]]:
         parameters = _event_parameters(event_filter)
@@ -406,11 +437,13 @@ class GolutraClient:
         }
 
     @staticmethod
-    def runtime_query(session_id: str, kind: str) -> dict[str, Any]:
+    def runtime_query(
+        session_id: str, kind: str, task_id: str | None = None
+    ) -> dict[str, Any]:
         return {
             "query_id": str(uuid.uuid4()),
             "session_id": session_id,
-            "task_id": None,
+            "task_id": task_id,
             "kind": kind,
             "requester": "sdk",
             "cursor": None,
@@ -513,6 +546,88 @@ class GolutraClient:
         except json.JSONDecodeError:
             message = body.decode("utf-8", errors="replace")
         return GolutraError(f"HTTP {status}: {message}")
+
+
+def _merge_task_trace_page(target: dict[str, Any], page: dict[str, Any]) -> None:
+    if any(target.get(field) != page.get(field) for field in ("session_id", "task_id", "view")):
+        raise GolutraError("cannot merge task trace pages from different requests")
+    target_integrity = target["integrity"]
+    page_integrity = page["integrity"]
+    if target_integrity["event_chain_digest"] != page_integrity["event_chain_digest"]:
+        target_integrity["unresolved_refs"].append("integrity:event_chain_digest_mismatch")
+    target_integrity["event_count"] = max(
+        target_integrity["event_count"], page_integrity["event_count"]
+    )
+    target_integrity["first_sequence"] = _optional_min(
+        target_integrity.get("first_sequence"), page_integrity.get("first_sequence")
+    )
+    target_integrity["last_sequence"] = _optional_max(
+        target_integrity.get("last_sequence"), page_integrity.get("last_sequence")
+    )
+    for field in (
+        "unresolved_refs",
+        "missing_sections",
+        "retention_losses",
+        "redacted_fields",
+    ):
+        target_integrity[field] = sorted(set(target_integrity[field] + page_integrity[field]))
+    target["events"] = sorted(
+        _dedupe_by(target["events"] + page["events"], "id"),
+        key=lambda event: event["sequence_no"],
+    )
+    target["context_snapshots"] = _dedupe_by(
+        target["context_snapshots"] + page["context_snapshots"], "snapshot_id"
+    )
+    target["artifacts"] = _dedupe_by(
+        target["artifacts"] + page["artifacts"], "artifact_id"
+    )
+    target["evidence"] = _dedupe_by(
+        target["evidence"] + page["evidence"], "evidence_id"
+    )
+    if page.get("verification_plan") is not None:
+        target["verification_plan"] = page["verification_plan"]
+    if page.get("verification") is not None:
+        target["verification"] = page["verification"]
+    target["post_task_jobs"] = _dedupe_by(
+        target["post_task_jobs"] + page["post_task_jobs"], "job_id"
+    )
+    target["evaluation"] = page["evaluation"]
+    target["next_cursor"] = page.get("next_cursor")
+    target["has_more"] = page["has_more"]
+    target_integrity["complete"] = (
+        not target["has_more"]
+        and not target_integrity["unresolved_refs"]
+        and not target_integrity["missing_sections"]
+        and not target_integrity["retention_losses"]
+    )
+
+
+def _dedupe_by(values: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
+    seen: set[Any] = set()
+    result: list[dict[str, Any]] = []
+    for value in values:
+        identifier = value.get(key)
+        if identifier in seen:
+            continue
+        seen.add(identifier)
+        result.append(value)
+    return result
+
+
+def _optional_min(left: int | None, right: int | None) -> int | None:
+    if left is None:
+        return right
+    if right is None:
+        return left
+    return min(left, right)
+
+
+def _optional_max(left: int | None, right: int | None) -> int | None:
+    if left is None:
+        return right
+    if right is None:
+        return left
+    return max(left, right)
 
 
 def _event_parameters(event_filter: dict[str, Any], cursor: int | None = None) -> dict[str, Any]:

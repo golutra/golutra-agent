@@ -2,9 +2,11 @@ use std::{fs, path::Path, process::Stdio, time::Duration};
 
 #[cfg(unix)]
 use golutra_client::UnixIpcTransport;
-use golutra_client::{AppServerInfo, HttpSseTransport, RuntimeClient};
-use golutra_core::{Actor, ActorKind, CommandId, SessionId, ThreadId};
-use golutra_protocol::{EventFilter, RuntimeEventType, SessionCommand, SessionCommandKind};
+use golutra_client::{AppServerInfo, HttpSseTransport, RuntimeClient, TaskTraceClient};
+use golutra_core::{Actor, ActorKind, CommandId, SessionId, TaskId, ThreadId, TraceView};
+use golutra_protocol::{
+    EventFilter, RuntimeEventType, SessionCommand, SessionCommandKind, TaskTraceRequest,
+};
 use secrecy::SecretString;
 use tempfile::tempdir;
 use tokio::process::{Child, Command};
@@ -56,6 +58,48 @@ async fn unix_ipc_and_http_share_commands_history_and_event_streams() {
     let http_events = http.replay_events(filter).await.expect("HTTP replay");
     assert_eq!(ipc_events, http_events);
     assert_eq!(ipc.list_threads(20).await.expect("IPC threads").len(), 1);
+
+    let task_id = ipc_events
+        .iter()
+        .find(|event| event["event_type"] == "task_created")
+        .and_then(|event| event["task_id"].as_str())
+        .and_then(|value| value.parse::<TaskId>().ok())
+        .expect("task id");
+    let trace_request = TaskTraceRequest {
+        session_id,
+        task_id,
+        view: TraceView::Full,
+        cursor: None,
+        limit: 512,
+        wait_for_evaluation: true,
+    };
+    let ipc_trace = ipc
+        .task_trace(trace_request.clone())
+        .await
+        .expect("IPC trace");
+    let http_trace = http.task_trace(trace_request).await.expect("HTTP trace");
+    assert_eq!(ipc_trace.events, http_trace.events);
+    assert_eq!(
+        ipc_trace.integrity.event_chain_digest,
+        http_trace.integrity.event_chain_digest
+    );
+    assert!(ipc_trace.integrity.complete);
+    assert!(ipc_trace.integrity.unresolved_refs.is_empty());
+    assert_eq!(ipc_trace.verification, http_trace.verification);
+    assert_eq!(ipc_trace.verification_plan, http_trace.verification_plan);
+    assert_eq!(ipc_trace.post_task_jobs, http_trace.post_task_jobs);
+    assert_eq!(
+        ipc_trace
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.artifact_id)
+            .collect::<std::collections::HashSet<_>>(),
+        http_trace
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.artifact_id)
+            .collect::<std::collections::HashSet<_>>()
+    );
 }
 
 struct ChildGuard(Child);

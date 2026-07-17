@@ -22,6 +22,13 @@ use tokio::{
 #[cfg(unix)]
 use tower::ServiceExt;
 
+/// Marks requests that arrived over the owner-only Unix socket.
+///
+/// The HTTP and IPC servers share one Axum router, so disclosure-sensitive
+/// handlers use this extension instead of trusting a spoofable request header.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LocalIpcRequest;
+
 #[cfg(unix)]
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 #[cfg(unix)]
@@ -184,9 +191,11 @@ fn axum_request(request: IpcHttpRequest) -> Result<Request<Body>, String> {
     if !body.is_empty() {
         builder = builder.header(header::CONTENT_TYPE, "application/json");
     }
-    builder
+    let mut request = builder
         .body(Body::from(body))
-        .map_err(|error| format!("IPC request could not be built: {error}"))
+        .map_err(|error| format!("IPC request could not be built: {error}"))?;
+    request.extensions_mut().insert(LocalIpcRequest);
+    Ok(request)
 }
 
 #[cfg(unix)]
