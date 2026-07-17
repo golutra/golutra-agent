@@ -202,6 +202,7 @@ impl McpToolBackend {
                 cwd: plugin.package_root.clone(),
                 workspace_root: self.workspace_root.clone(),
                 scratch_dir: scratch_dir.to_path_buf(),
+                read_only_roots: Vec::new(),
                 workspace_access,
                 allow_network: plugin.manifest.permissions.allow_network,
             })

@@ -9,6 +9,7 @@ members = [
   "crates/golutra-context",
   "crates/golutra-core",
   "crates/golutra-eval",
+  "crates/golutra-eval-worker",
   "crates/golutra-evolution",
   "crates/golutra-event",
   "crates/golutra-file-search",
@@ -21,8 +22,10 @@ members = [
   "crates/golutra-protocol",
   "crates/golutra-protocol-fixtures",
   "crates/golutra-runtime",
+  "crates/golutra-release",
   "crates/golutra-sandbox",
   "crates/golutra-store",
+  "crates/golutra-supervisor",
   "crates/golutra-test-client",
   "crates/golutra-tools",
   "crates/golutra-tui",
@@ -82,6 +85,9 @@ unicode-segmentation = "1.13"
 unicode-width = "0.1.14"
 webbrowser = "1.0"
 walkdir = "2.5"
+
+golutra-release = { path = "crates/golutra-release" }
+golutra-supervisor = { path = "crates/golutra-supervisor" }
 
 golutra-core = { path = "crates/golutra-core" }
 golutra-protocol = { path = "crates/golutra-protocol" }

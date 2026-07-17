@@ -69,6 +69,7 @@ pub(crate) async fn run_process(
             cwd: cwd.to_path_buf(),
             workspace_root: cwd.to_path_buf(),
             scratch_dir: scratch.path().to_path_buf(),
+            read_only_roots: Vec::new(),
             workspace_access,
             allow_network: false,
         })

@@ -31,6 +31,7 @@ pub struct SandboxRequest {
     pub cwd: PathBuf,
     pub workspace_root: PathBuf,
     pub scratch_dir: PathBuf,
+    pub read_only_roots: Vec<PathBuf>,
     pub workspace_access: WorkspaceAccess,
     pub allow_network: bool,
 }
@@ -108,6 +109,11 @@ impl SystemSandbox {
         request.cwd = canonical_directory(&request.cwd, true)?;
         request.workspace_root = canonical_directory(&request.workspace_root, true)?;
         request.scratch_dir = canonical_directory(&request.scratch_dir, false)?;
+        request.read_only_roots = request
+            .read_only_roots
+            .iter()
+            .map(|path| canonical_directory(path, false))
+            .collect::<Result<Vec<_>, _>>()?;
         let environment = sanitized_environment(&request.scratch_dir);
         match self.backend {
             SandboxBackendKind::MacOsSeatbelt => self.plan_macos(&request, environment),
@@ -154,7 +160,10 @@ impl SystemSandbox {
     ) -> Result<SandboxLaunch, SandboxError> {
         let read_roots = readable_roots(&request.cwd)
             .into_iter()
+            .chain(request.read_only_roots.iter().cloned())
             .filter(|root| root != &request.cwd && root != &request.workspace_root)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect::<Vec<_>>();
         let mut args = vec![
             "--die-with-parent".into(),
@@ -341,6 +350,7 @@ fn readable_roots(cwd: &Path) -> Vec<PathBuf> {
 fn macos_profile(request: &SandboxRequest) -> Result<String, SandboxError> {
     let read_roots = readable_roots(&request.cwd)
         .into_iter()
+        .chain(request.read_only_roots.iter().cloned())
         .chain(std::iter::once(request.cwd.clone()))
         .chain(std::iter::once(request.workspace_root.clone()))
         .chain(std::iter::once(request.scratch_dir.clone()))
@@ -446,6 +456,7 @@ mod tests {
                 cwd: cwd.path().to_path_buf(),
                 workspace_root: cwd.path().to_path_buf(),
                 scratch_dir: scratch.path().to_path_buf(),
+                read_only_roots: Vec::new(),
                 workspace_access: WorkspaceAccess::ReadOnly,
                 allow_network: false,
             })
@@ -492,6 +503,7 @@ mod tests {
                 cwd: workspace.path().to_path_buf(),
                 workspace_root: workspace.path().to_path_buf(),
                 scratch_dir: scratch.path().to_path_buf(),
+                read_only_roots: Vec::new(),
                 workspace_access: WorkspaceAccess::ReadWrite,
                 allow_network: false,
             })
@@ -499,6 +511,22 @@ mod tests {
         let output = execute(read_outside, workspace.path());
         assert!(!output.status.success());
         assert!(!String::from_utf8_lossy(&output.stdout).contains("outside-secret"));
+
+        let read_declared_root = sandbox
+            .plan(&SandboxRequest {
+                program: "/bin/cat".into(),
+                args: vec![outside_file.as_os_str().to_owned()],
+                cwd: workspace.path().to_path_buf(),
+                workspace_root: workspace.path().to_path_buf(),
+                scratch_dir: scratch.path().to_path_buf(),
+                read_only_roots: vec![outside.path().to_path_buf()],
+                workspace_access: WorkspaceAccess::ReadWrite,
+                allow_network: false,
+            })
+            .expect("declared read root plan");
+        let output = execute(read_declared_root, workspace.path());
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "outside-secret");
 
         let inside_file = workspace.path().join("inside.txt");
         let write_inside = sandbox
@@ -511,6 +539,7 @@ mod tests {
                 cwd: workspace.path().to_path_buf(),
                 workspace_root: workspace.path().to_path_buf(),
                 scratch_dir: scratch.path().to_path_buf(),
+                read_only_roots: Vec::new(),
                 workspace_access: WorkspaceAccess::ReadWrite,
                 allow_network: false,
             })
@@ -532,6 +561,7 @@ mod tests {
                 cwd: workspace.path().to_path_buf(),
                 workspace_root: workspace.path().to_path_buf(),
                 scratch_dir: scratch.path().to_path_buf(),
+                read_only_roots: Vec::new(),
                 workspace_access: WorkspaceAccess::ReadOnly,
                 allow_network: false,
             })
@@ -577,6 +607,7 @@ mod tests {
                 cwd: workspace.path().to_path_buf(),
                 workspace_root: workspace.path().to_path_buf(),
                 scratch_dir: scratch.path().to_path_buf(),
+                read_only_roots: Vec::new(),
                 workspace_access: WorkspaceAccess::ReadOnly,
                 allow_network: false,
             })
@@ -590,6 +621,7 @@ mod tests {
     fn linux_bubblewrap_plan_isolated_mounts_and_network() {
         let workspace = tempfile::tempdir().expect("workspace");
         let scratch = tempfile::tempdir().expect("scratch");
+        let read_only = tempfile::tempdir().expect("read only root");
         let sandbox = SystemSandbox {
             backend: SandboxBackendKind::LinuxBubblewrap,
             launcher: Some(PathBuf::from("/usr/bin/bwrap")),
@@ -601,6 +633,7 @@ mod tests {
                 cwd: workspace.path().to_path_buf(),
                 workspace_root: workspace.path().to_path_buf(),
                 scratch_dir: scratch.path().to_path_buf(),
+                read_only_roots: vec![read_only.path().to_path_buf()],
                 workspace_access: WorkspaceAccess::ReadWrite,
                 allow_network: false,
             })
@@ -615,6 +648,10 @@ mod tests {
         assert!(args.iter().any(|value| value == "--unshare-net"));
         assert!(args.iter().any(|value| value == "--bind"));
         assert!(args.iter().any(|value| value == "--ro-bind"));
+        assert!(
+            args.iter()
+                .any(|value| value == &read_only.path().to_string_lossy())
+        );
         assert!(args.iter().any(|value| value == "--chdir"));
         assert!(args.iter().any(|value| value == "--"));
     }

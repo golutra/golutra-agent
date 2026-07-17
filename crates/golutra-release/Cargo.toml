@@ -1,0 +1,22 @@
+[package]
+name = "golutra-release"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+fs2.workspace = true
+golutra-sandbox.workspace = true
+nix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+walkdir.workspace = true
