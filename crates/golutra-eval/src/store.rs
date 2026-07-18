@@ -357,7 +357,7 @@ impl EvaluationStore {
                     .extend([baseline_trace_ref.clone(), candidate_trace_ref.clone()]);
             }
             let (case_results, mut regressions) =
-                execute_durable_regression_suite(state, &candidate, campaign);
+                execute_durable_regression_suite(state, &candidate, campaign, &executions);
             regressions.extend(execution_regressions);
             if candidate.evidence_refs.is_empty() {
                 regressions.push("candidate has no durable evidence".to_owned());
@@ -877,6 +877,7 @@ fn execute_durable_regression_suite(
     state: &EvaluationState,
     candidate: &AutomationCandidate,
     campaign: &RegressionCampaign,
+    executions: &[&RegressionExecution],
 ) -> (Vec<RegressionCaseResult>, Vec<String>) {
     let cases = state
         .cases
@@ -887,6 +888,14 @@ fn execute_durable_regression_suite(
     let case_results = cases
         .into_iter()
         .map(|case| {
+            let baseline_execution = executions.iter().rev().copied().find(|execution| {
+                execution.role == RegressionExecutionRole::Baseline
+                    && execution_matches_case(execution, &case.case_id, campaign.case_refs.len())
+            });
+            let candidate_execution = executions.iter().rev().copied().find(|execution| {
+                execution.role == RegressionExecutionRole::Candidate
+                    && execution_matches_case(execution, &case.case_id, campaign.case_refs.len())
+            });
             let result = state
                 .results
                 .iter()
@@ -897,17 +906,8 @@ fn execute_durable_regression_suite(
                 .iter()
                 .rev()
                 .find(|replay| replay.source_task_id == candidate.source_task_id);
-            let expected_verdict = match candidate.kind {
-                AutomationCandidateKind::Skill => EvaluationVerdict::Pass,
-                AutomationCandidateKind::Benchmark
-                | AutomationCandidateKind::GeneratedTask
-                | AutomationCandidateKind::RuntimeChange => result
-                    .map(|result| result.verdict)
-                    .unwrap_or(EvaluationVerdict::Unknown),
-            };
-            let observed_verdict = result
-                .map(|result| result.verdict)
-                .unwrap_or(EvaluationVerdict::Unknown);
+            let expected_verdict = execution_verdict(baseline_execution);
+            let observed_verdict = execution_verdict(candidate_execution);
             let result_evidence = result
                 .map(|result| {
                     result
@@ -929,7 +929,46 @@ fn execute_durable_regression_suite(
             let security_check = result
                 .and_then(|result| result.security_utility.as_ref())
                 .is_none_or(|security| security.policy_violations == 0);
+            let paired_traces = baseline_execution
+                .and_then(|execution| execution.task_trace_ref.as_ref())
+                .zip(candidate_execution.and_then(|execution| execution.task_trace_ref.as_ref()))
+                .filter(|(baseline, candidate)| {
+                    baseline != candidate
+                        && valid_execution_trace_ref(baseline)
+                        && valid_execution_trace_ref(candidate)
+                });
+            let workspace_changed =
+                baseline_execution
+                    .zip(candidate_execution)
+                    .is_some_and(|(baseline, candidate)| {
+                        baseline.workspace_snapshot_digest != candidate.workspace_snapshot_digest
+                    });
             let evidence_checks = vec![
+                benchmark_check(
+                    "paired_execution_traces",
+                    pass_fail(paired_traces.is_some()),
+                    if paired_traces.is_some() {
+                        "baseline and candidate have distinct durable execution traces"
+                    } else {
+                        "baseline/candidate durable execution traces are missing or invalid"
+                    },
+                    paired_traces
+                        .into_iter()
+                        .flat_map(|(baseline, candidate)| [baseline.clone(), candidate.clone()])
+                        .collect(),
+                ),
+                benchmark_check(
+                    "candidate_workspace_delta",
+                    pass_fail(workspace_changed),
+                    if workspace_changed {
+                        "candidate execution used a changed workspace snapshot"
+                    } else {
+                        "candidate execution workspace is identical to baseline"
+                    },
+                    candidate_execution
+                        .map(|execution| vec![execution.workspace_snapshot_digest.clone()])
+                        .unwrap_or_default(),
+                ),
                 benchmark_check(
                     "durable_replay_facts",
                     pass_fail(replay_has_facts),
@@ -974,7 +1013,8 @@ fn execute_durable_regression_suite(
                         .collect(),
                 ),
             ];
-            let passed = observed_verdict == expected_verdict
+            let passed = expected_verdict == EvaluationVerdict::Pass
+                && observed_verdict == EvaluationVerdict::Pass
                 && evidence_checks
                     .iter()
                     .all(|check| check.status == BenchmarkCheckStatus::Pass);
@@ -1026,6 +1066,19 @@ fn execution_matches_case(
     campaign_case_count: usize,
 ) -> bool {
     execution.case_ref == case_ref || (execution.case_ref.is_empty() && campaign_case_count == 1)
+}
+
+fn execution_verdict(execution: Option<&RegressionExecution>) -> EvaluationVerdict {
+    match execution.map(|execution| execution.status) {
+        Some(RegressionExecutionStatus::Succeeded) => EvaluationVerdict::Pass,
+        Some(RegressionExecutionStatus::Failed) => EvaluationVerdict::Fail,
+        Some(
+            RegressionExecutionStatus::Queued
+            | RegressionExecutionStatus::Running
+            | RegressionExecutionStatus::Inconclusive,
+        )
+        | None => EvaluationVerdict::Unknown,
+    }
 }
 
 fn valid_execution_trace_ref(reference: &str) -> bool {

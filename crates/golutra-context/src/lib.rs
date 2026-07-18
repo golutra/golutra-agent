@@ -21,6 +21,7 @@ pub struct ContextContributor {
     pub role: ProviderRole,
     pub content: String,
     pub token_budget_hint: u64,
+    pub source_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +70,10 @@ impl ContextBuilder {
         turn_id: TurnId,
         mut contributors: Vec<ContextContributor>,
     ) -> Result<ContextBuildPlan, ContextError> {
+        let original_contributor_tokens = contributors
+            .iter()
+            .map(|contributor| estimate_tokens(&contributor.content))
+            .collect::<Vec<_>>();
         let original_planned_input_tokens = contributors
             .iter()
             .map(|contributor| estimate_tokens(&contributor.content))
@@ -107,18 +112,38 @@ impl ContextBuilder {
 
         let contributor_manifest = contributors
             .iter()
-            .map(|contributor| ContextContributorSnapshot {
-                name: contributor.name.clone(),
-                role: format!("{:?}", contributor.role).to_lowercase(),
-                source_refs: Vec::new(),
-                included: true,
-                trimmed: trimmed_contributors
+            .enumerate()
+            .map(|(index, contributor)| {
+                let retained_estimated_tokens = estimate_tokens(&contributor.content);
+                let trimmed = trimmed_contributors
                     .iter()
-                    .any(|name| name == &contributor.name),
-                estimated_tokens: estimate_tokens(&contributor.content),
-                content_digest: digest_bytes(contributor.content.as_bytes()),
-                redacted_content_ref: None,
-                invalidation_refs: Vec::new(),
+                    .any(|name| name == &contributor.name);
+                ContextContributorSnapshot {
+                    name: contributor.name.clone(),
+                    role: format!("{:?}", contributor.role).to_lowercase(),
+                    source_refs: if contributor.source_refs.is_empty() {
+                        vec![format!("contributor:{}", contributor.name)]
+                    } else {
+                        contributor.source_refs.clone()
+                    },
+                    included: true,
+                    trimmed,
+                    original_estimated_tokens: original_contributor_tokens[index],
+                    retained_estimated_tokens,
+                    strategy: if trimmed {
+                        if matches!(contributor.name.as_str(), "conversation_history" | "memory") {
+                            "retain_tail".to_owned()
+                        } else {
+                            "retain_head".to_owned()
+                        }
+                    } else {
+                        "include_full".to_owned()
+                    },
+                    estimated_tokens: retained_estimated_tokens,
+                    content_digest: digest_bytes(contributor.content.as_bytes()),
+                    redacted_content_ref: None,
+                    invalidation_refs: Vec::new(),
+                }
             })
             .collect::<Vec<_>>();
         let messages = contributors
@@ -401,6 +426,7 @@ mod tests {
                     role: ProviderRole::User,
                     content: "summarize repository".to_owned(),
                     token_budget_hint: 16,
+                    source_refs: Vec::new(),
                 }],
             )
             .expect("context builds");
@@ -467,6 +493,7 @@ mod tests {
                 role: ProviderRole::System,
                 content: format!("old {} latest", "history ".repeat(80)),
                 token_budget_hint: 24,
+                source_refs: Vec::new(),
             }],
         )
         .expect("context trims");
@@ -493,6 +520,7 @@ mod tests {
                 role: ProviderRole::User,
                 content: "a deliberately oversized objective".repeat(20),
                 token_budget_hint: 16,
+                source_refs: Vec::new(),
             }],
         );
 

@@ -829,7 +829,7 @@ DebugProjection
   tool_result_envelopes
 ```
 
-Debug Projection 只在 debug/audit/replay 模式启用，并且只承担有界摘要。完整、分页且带缺失原因的事实包由 P2.5 `TaskTraceService` 返回。
+Debug Projection 只在 debug/audit/replay 模式启用，并且只承担治理摘要与当前事件窗口；typed projection 同时携带 post-task jobs、trace completeness、missing sections 和 retention losses，TUI developer mode 通过 `EventPage` cursor 按需加载更早事件。完整、分页且带缺失原因的事实包由 P2.5 `TaskTraceService` 返回，调用方本地 `DebugExportCoordinator` 再将选定 SessionWindow 按 high-watermark 物化为 `full-redacted` bundle；期间发生新事件时必须标记 incomplete。
 
 ## P0 验收矩阵
 

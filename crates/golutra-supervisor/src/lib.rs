@@ -27,7 +27,7 @@ use std::{
 
 use chrono::Utc;
 use golutra_core::TraceView;
-use golutra_protocol::TaskTracePage;
+use golutra_protocol::{MINIMUM_RUNTIME_PROTOCOL_VERSION, RUNTIME_PROTOCOL_VERSION, TaskTracePage};
 use golutra_release::{
     BuildReport, DeploymentPhase, ReleaseBuildRequest, ReleaseManifest, ReleasePointer,
     ReleaseStore, TrustedBuilder,
@@ -40,6 +40,10 @@ use uuid::Uuid;
 const MAX_TEXT: usize = 2_048;
 const MAX_OBSERVATION_REFS: usize = 128;
 const MAX_PROVENANCE_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+fn runtime_protocol_version_range() -> String {
+    format!("{MINIMUM_RUNTIME_PROTOCOL_VERSION}..={RUNTIME_PROTOCOL_VERSION}")
+}
 
 #[derive(Debug, Clone)]
 pub struct EvolutionSupervisor {
@@ -853,7 +857,7 @@ impl EvolutionSupervisor {
                 "candidate_id": bootstrap_id,
                 "source_digest": report.source_digest,
                 "parent_release_id": null,
-                "protocol_version_range": "2..=2",
+                "protocol_version_range": runtime_protocol_version_range(),
                 "state_schema_version_range": "1..=2",
             }))?,
         )?;
@@ -865,7 +869,7 @@ impl EvolutionSupervisor {
                 source_commit: "bootstrap-local-source".to_owned(),
                 dependency_lock_digest,
                 toolchain_digest,
-                protocol_version_range: "2..=2".to_owned(),
+                protocol_version_range: runtime_protocol_version_range(),
                 state_schema_version_range: "1..=2".to_owned(),
                 migration_plan_ref: None,
                 provenance_ref,
@@ -962,7 +966,7 @@ impl EvolutionSupervisor {
                 "candidate_id": candidate.candidate_id,
                 "source_digest": report.source_digest,
                 "parent_release_id": parent_release_id,
-                "protocol_version_range": "2..=2",
+                "protocol_version_range": runtime_protocol_version_range(),
                 "state_schema_version_range": "1..=2",
             }))?,
         )?;
@@ -974,7 +978,7 @@ impl EvolutionSupervisor {
                 source_commit: candidate.source_commit.clone(),
                 dependency_lock_digest,
                 toolchain_digest,
-                protocol_version_range: "2..=2".to_owned(),
+                protocol_version_range: runtime_protocol_version_range(),
                 state_schema_version_range: "1..=2".to_owned(),
                 migration_plan_ref: candidate.state_migration_ref.clone(),
                 provenance_ref,
@@ -1903,7 +1907,7 @@ mod tests {
                 source_commit: "bootstrap-test".to_owned(),
                 dependency_lock_digest: "sha256:fixture-lock".to_owned(),
                 toolchain_digest: "sha256:fixture-toolchain".to_owned(),
-                protocol_version_range: "2..=2".to_owned(),
+                protocol_version_range: runtime_protocol_version_range(),
                 state_schema_version_range: "1..=2".to_owned(),
                 migration_plan_ref: None,
                 provenance_ref: "supervisor://provenance/bootstrap-test".to_owned(),
@@ -2322,7 +2326,7 @@ mod tests {
                 source_commit: "commit-digest".to_owned(),
                 dependency_lock_digest: "sha256:lock".to_owned(),
                 toolchain_digest: "sha256:toolchain".to_owned(),
-                protocol_version_range: "2..=2".to_owned(),
+                protocol_version_range: runtime_protocol_version_range(),
                 state_schema_version_range: "1..=2".to_owned(),
                 migration_plan_ref: None,
                 provenance_ref: "supervisor://provenance/candidate-digest".to_owned(),

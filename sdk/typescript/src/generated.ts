@@ -156,13 +156,13 @@ export type LoopAction =
   | "stop_partial"
   | "stop_failed"
   | "blocked";
+export type PostTaskJobKind = "deep_evaluation" | "candidate_generation" | "regression_execution";
+export type PostTaskJobStatus =
+  "queued" | "leased" | "running" | "succeeded" | "failed" | "cancelled";
 export type ToolResultStatus = "ok" | "error" | "blocked" | "cancelled" | "timeout";
 export type VerificationCheckKind =
   "tool_execution" | "workspace_change" | "objective_validation" | "assistant_response";
 export type VerificationResult = "pass" | "fail" | "partial" | "unknown";
-export type PostTaskJobKind = "deep_evaluation" | "candidate_generation" | "regression_execution";
-export type PostTaskJobStatus =
-  "queued" | "leased" | "running" | "succeeded" | "failed" | "cancelled";
 export type PromotionDecisionKind = "approve" | "reject" | "needs_human_review";
 export type PromotionReviewer = "system" | "human" | "agent";
 export type EvaluationVerdict = "pass" | "fail" | "partial" | "unknown";
@@ -300,6 +300,7 @@ export interface ArtifactChunk {
   eof: boolean;
   length: number;
   offset: number;
+  redaction_status?: "raw" | "redacted" | "not_required";
   total_size: number;
   [k: string]: unknown;
 }
@@ -459,9 +460,12 @@ export interface ContextContributorSnapshot {
   included: boolean;
   invalidation_refs: string[];
   name: string;
+  original_estimated_tokens?: number;
   redacted_content_ref?: string | null;
+  retained_estimated_tokens?: number;
   role: string;
   source_refs: string[];
+  strategy?: string;
   trimmed: boolean;
   [k: string]: unknown;
 }
@@ -502,9 +506,13 @@ export interface DebugProjection {
   events: RuntimeEvent[];
   evidence: EvidenceRecord[];
   loop_decisions: LoopDecision[];
+  missing_sections?: string[];
+  post_task_jobs?: PostTaskJob[];
+  retention_losses?: string[];
   session_id: string;
   task_id?: string | null;
   tool_results: ToolResultEnvelope[];
+  trace_complete?: boolean;
   verification?: VerificationRecord | null;
   [k: string]: unknown;
 }
@@ -592,6 +600,25 @@ export interface BudgetState {
   output_tokens?: number | null;
   planned_input_tokens?: number | null;
   total_tokens?: number | null;
+  [k: string]: unknown;
+}
+export interface PostTaskJob {
+  attempt: number;
+  completed_at?: string | null;
+  created_at: string;
+  input_refs: string[];
+  job_id: string;
+  kind: PostTaskJobKind;
+  last_error?: string | null;
+  lease_expires_at?: string | null;
+  lease_owner?: string | null;
+  max_attempts: number;
+  result_refs: string[];
+  session_id: string;
+  started_at?: string | null;
+  status: PostTaskJobStatus;
+  task_id: string;
+  workspace_id: string;
   [k: string]: unknown;
 }
 export interface ToolResultEnvelope {
@@ -686,25 +713,6 @@ export interface ImprovementCandidate {
   status: CandidateStatus;
   target_id?: string | null;
   target_type: string;
-  [k: string]: unknown;
-}
-export interface PostTaskJob {
-  attempt: number;
-  completed_at?: string | null;
-  created_at: string;
-  input_refs: string[];
-  job_id: string;
-  kind: PostTaskJobKind;
-  last_error?: string | null;
-  lease_expires_at?: string | null;
-  lease_owner?: string | null;
-  max_attempts: number;
-  result_refs: string[];
-  session_id: string;
-  started_at?: string | null;
-  status: PostTaskJobStatus;
-  task_id: string;
-  workspace_id: string;
   [k: string]: unknown;
 }
 export interface PromotionDecision {

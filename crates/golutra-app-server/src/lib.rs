@@ -451,11 +451,28 @@ async fn task_trace(
 
 async fn read_artifact_chunk(
     State(state): State<AppState>,
+    local_ipc: Option<Extension<ipc::LocalIpcRequest>>,
     headers: HeaderMap,
     Json(request): Json<ArtifactReadRequest>,
 ) -> Result<Json<Option<ArtifactChunk>>, AppError> {
     let transport = state.attached_transport(&headers).await?;
-    Ok(Json(transport.read_artifact_chunk(request).await?))
+    let chunk = transport.read_artifact_chunk(request).await?;
+    enforce_artifact_disclosure(local_ipc.is_some(), chunk.as_ref())?;
+    Ok(Json(chunk))
+}
+
+fn enforce_artifact_disclosure(
+    local_ipc: bool,
+    chunk: Option<&ArtifactChunk>,
+) -> Result<(), AppError> {
+    if !local_ipc
+        && chunk.is_some_and(|chunk| chunk.redaction_status == golutra_core::RedactionStatus::Raw)
+    {
+        return Err(AppError::Disclosure(
+            "raw artifact access requires the owner-only local IPC transport".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 async fn attach_page() -> Html<&'static str> {
@@ -927,7 +944,7 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
-    use golutra_core::{Actor, ActorKind, CommandId};
+    use golutra_core::{Actor, ActorKind, ArtifactId, CommandId, RedactionStatus};
     use golutra_protocol::{RUNTIME_PROTOCOL_VERSION, SessionCommandKind};
     use tower::ServiceExt;
 
@@ -1156,6 +1173,28 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn remote_artifact_reads_reject_raw_blobs_but_allow_redacted_chunks() {
+        let raw = ArtifactChunk {
+            artifact_id: ArtifactId::new(),
+            offset: 0,
+            length: 1,
+            total_size: 1,
+            checksum: "sha256:raw".to_owned(),
+            redaction_status: RedactionStatus::Raw,
+            content_base64: "eA==".to_owned(),
+            eof: true,
+        };
+        assert!(matches!(
+            enforce_artifact_disclosure(false, Some(&raw)),
+            Err(AppError::Disclosure(_))
+        ));
+        let mut redacted = raw.clone();
+        redacted.redaction_status = RedactionStatus::Redacted;
+        assert!(enforce_artifact_disclosure(false, Some(&redacted)).is_ok());
+        assert!(enforce_artifact_disclosure(true, Some(&raw)).is_ok());
     }
 
     #[tokio::test]

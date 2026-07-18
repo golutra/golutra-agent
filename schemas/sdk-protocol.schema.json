@@ -306,6 +306,10 @@
           "format": "uint64",
           "minimum": 0
         },
+        "redaction_status": {
+          "$ref": "#/$defs/RedactionStatus",
+          "default": "raw"
+        },
         "total_size": {
           "type": "integer",
           "format": "uint64",
@@ -1046,12 +1050,24 @@
         "name": {
           "type": "string"
         },
+        "original_estimated_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
         "redacted_content_ref": {
           "type": [
             "string",
             "null"
           ],
           "format": "uuid"
+        },
+        "retained_estimated_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
         },
         "role": {
           "type": "string"
@@ -1061,6 +1077,10 @@
           "items": {
             "type": "string"
           }
+        },
+        "strategy": {
+          "type": "string",
+          "default": ""
         },
         "trimmed": {
           "type": "boolean"
@@ -1460,6 +1480,27 @@
             "$ref": "#/$defs/LoopDecision"
           }
         },
+        "missing_sections": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "post_task_jobs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/PostTaskJob"
+          }
+        },
+        "retention_losses": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
         "session_id": {
           "type": "string",
           "format": "uuid"
@@ -1476,6 +1517,10 @@
           "items": {
             "$ref": "#/$defs/ToolResultEnvelope"
           }
+        },
+        "trace_complete": {
+          "type": "boolean",
+          "default": false
         },
         "verification": {
           "anyOf": [

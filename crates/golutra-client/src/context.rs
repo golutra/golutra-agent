@@ -181,6 +181,25 @@ pub(crate) fn prompt_from_payload(payload: &Value) -> String {
         .to_owned()
 }
 
+pub(crate) fn completion_criteria_from_payload(payload: &Value) -> Vec<String> {
+    let values = match payload.get("completion_criteria") {
+        Some(Value::Array(values)) => values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>(),
+        Some(Value::String(value)) => vec![value.clone()],
+        _ => Vec::new(),
+    };
+    values
+        .into_iter()
+        .map(|criterion| criterion.trim().to_owned())
+        .filter(|criterion| !criterion.is_empty())
+        .map(|criterion| criterion.chars().take(512).collect::<String>())
+        .take(16)
+        .collect()
+}
+
 pub(crate) fn title_from_payload(payload: &Value) -> String {
     let compact = compact_prompt(payload);
     if compact.is_empty() {

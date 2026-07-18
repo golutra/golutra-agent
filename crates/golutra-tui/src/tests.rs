@@ -1415,6 +1415,10 @@ fn developer_panel_exposes_governance_without_leaking_into_normal_view() {
         evidence: Vec::new(),
         verification: Some(verification),
         loop_decisions: Vec::new(),
+        post_task_jobs: Vec::new(),
+        trace_complete: true,
+        missing_sections: Vec::new(),
+        retention_losses: Vec::new(),
     };
 
     let rows = developer_panel_rows(&debug_projection, 2);
@@ -1968,6 +1972,10 @@ fn mouse_wheel_routes_to_the_pane_under_the_pointer() {
         evidence: Vec::new(),
         verification: None,
         loop_decisions: Vec::new(),
+        post_task_jobs: Vec::new(),
+        trace_complete: true,
+        missing_sections: Vec::new(),
+        retention_losses: Vec::new(),
     });
     let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
     terminal
@@ -2000,6 +2008,19 @@ fn mouse_wheel_routes_to_the_pane_under_the_pointer() {
     );
     assert!(app.transcript_scroll.offset_from_bottom > 0);
     assert!(app.developer_scroll.offset_from_bottom > 0);
+
+    let developer_area = layout.developer.expect("developer area");
+    let event_rows = developer_event_page_rows(&app, developer_area);
+    app.scroll_developer(TranscriptScrollAction::Top, event_rows);
+    assert_eq!(
+        transcript_visible_window(
+            app.developer_scroll.row_count,
+            event_rows,
+            app.developer_scroll.offset_from_bottom,
+        )
+        .start,
+        0
+    );
 }
 
 #[tokio::test]
@@ -2070,6 +2091,105 @@ async fn resume_thread_clears_previous_visible_transcript_state() {
     assert!(app.input.is_empty());
     assert_eq!(app.slash_selected, 0);
     assert_eq!(app.transcript_scroll.offset_from_bottom, 0);
+}
+
+#[tokio::test]
+async fn export_enters_running_before_poll_and_finishes_asynchronously() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let session_id = SessionId::new();
+    let thread_id = ThreadId::new();
+    transport
+        .send_command(session_command(
+            session_id,
+            SessionCommandKind::Prompt,
+            json!({
+                "prompt": "export this session",
+                "_thread_id": thread_id.to_string(),
+            }),
+        ))
+        .await
+        .expect("start export fixture task");
+
+    let completed = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let projection = transport
+                .query(RuntimeQuery {
+                    query_id: QueryId::new(),
+                    session_id,
+                    task_id: None,
+                    kind: RuntimeQueryKind::UserProjection,
+                    requester: ActorKind::Tui,
+                    cursor: None,
+                    timestamp: chrono::Utc::now(),
+                })
+                .await
+                .expect("projection");
+            if golutra_client::projection_status(&projection)
+                == Some(golutra_core::TaskStatus::Completed)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(completed.is_ok(), "runtime task should complete");
+
+    let parent = tempfile::tempdir().expect("export parent");
+    let destination = parent.path().join("bundle");
+    let mut app = TuiApp::new(
+        thread_id,
+        session_id,
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.export_flow = Some(ExportFlowState {
+        picker: ResumePickerState {
+            items: vec![ResumeThreadItem {
+                thread_id,
+                session_id,
+                title: "export fixture".to_owned(),
+                preview: "export this session".to_owned(),
+            }],
+            selected: 0,
+        },
+        step: ExportFlowStep::Review,
+        range_input: "1".to_owned(),
+        destination_input: destination.display().to_string(),
+        error: None,
+        receipt: None,
+    });
+
+    app.handle_export_enter(&transport)
+        .await
+        .expect("start export");
+    assert_eq!(
+        app.export_flow.as_ref().map(|flow| flow.step),
+        Some(ExportFlowStep::Running)
+    );
+    assert!(app.export_operation.is_some());
+    assert_eq!(app.status_message, "export running");
+
+    let finished = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            app.poll_export_operation().await;
+            if app
+                .export_flow
+                .as_ref()
+                .is_some_and(|flow| flow.step == ExportFlowStep::Completed)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(finished.is_ok(), "export operation should finish");
+    assert!(app.export_operation.is_none());
+    assert!(destination.join("manifest.json").is_file());
+    assert_eq!(app.status_message, "export complete");
 }
 
 #[test]

@@ -25,8 +25,31 @@ use tokio::{
 };
 
 use crate::event_codec::{ObservationIntegrityClass, observation_descriptor};
+use crate::governance_commands::memory_support_matches;
 
 use super::*;
+
+#[test]
+fn hosted_tasks_use_only_explicit_completion_criteria() {
+    assert!(completion_criteria_from_payload(&json!({"prompt": "hello"})).is_empty());
+    assert_eq!(
+        completion_criteria_from_payload(&json!({
+            "prompt": "change code",
+            "completion_criteria": [" tests pass ", "", 7, "diff matches request"]
+        })),
+        vec!["tests pass".to_owned(), "diff matches request".to_owned()]
+    );
+}
+
+#[test]
+fn memory_support_requires_a_claim_related_objective() {
+    let memory = "Objective: list workspace files\nVerified outcome: files listed";
+    assert!(memory_support_matches("list workspace files again", memory));
+    assert!(!memory_support_matches(
+        "rotate provider credentials",
+        memory
+    ));
+}
 
 #[test]
 fn observation_catalog_classifies_loop_facts_before_persistence() {
@@ -1226,7 +1249,12 @@ async fn successful_task_quarantines_reviews_retrieves_and_rolls_back_project_me
                 kind: ActorKind::Cli,
                 id: "test-reviewer".to_owned(),
             },
-            payload: json!({"memory_id": memory_id, "decision": "approve"}),
+            payload: json!({
+                "memory_id": memory_id,
+                "decision": "approve",
+                "human_approval": true,
+                "reason": "reviewed the durable task result"
+            }),
             timestamp: chrono::Utc::now(),
         })
         .await
@@ -3782,6 +3810,7 @@ fn context_request_artifact_redacts_secrets_inside_model_visible_messages() {
                 role: ProviderRole::User,
                 content: "API_KEY=plain-secret-value".to_owned(),
                 token_budget_hint: 32,
+                source_refs: vec!["fixture:objective".to_owned()],
             }],
         )
         .expect("context plan");

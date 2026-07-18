@@ -1,5 +1,7 @@
 //! Memory、post-task、regression 与 promotion 治理命令。
 
+use golutra_core::{ActorKind, VerificationRecord, VerificationResult};
+
 use super::*;
 
 impl RuntimeHost {
@@ -161,9 +163,76 @@ impl RuntimeHost {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let reviewer = command.actor.id.clone();
+        let approval_reason = command
+            .payload
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty());
+        let human_approved = command
+            .payload
+            .get("human_approval")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            && approval_reason.is_some()
+            && matches!(
+                command.actor.kind,
+                ActorKind::User | ActorKind::Cli | ActorKind::Tui
+            );
+        if !human_approved {
+            let records = self.memory_store.clone();
+            let record = run_blocking(move || records.list())
+                .await??
+                .into_iter()
+                .find(|record| record.memory_id == memory_id)
+                .ok_or_else(|| {
+                    ClientError::InvalidSession(format!("memory {memory_id} not found"))
+                })?;
+            let memory_content = record.content.clone();
+            let mut tasks = record.supporting_task_ids.clone();
+            tasks.extend(supporting_task_ids.iter().copied());
+            tasks.sort();
+            tasks.dedup();
+            if tasks.len() < 2 {
+                return Err(ClientError::TaskExecution(
+                    "memory activation requires two independent verified task evidences or explicit human approval".to_owned(),
+                ));
+            }
+            for task_id in &tasks {
+                let events = self
+                    .repositories
+                    .events
+                    .load(session_id, Some(*task_id), None)
+                    .await?;
+                let verified = events.iter().any(|event| {
+                    event.event_type == RuntimeEventType::VerificationCompleted
+                        && event
+                            .payload
+                            .get("record")
+                            .and_then(|record| {
+                                serde_json::from_value::<VerificationRecord>(record.clone()).ok()
+                            })
+                            .is_some_and(|record| {
+                                record.result == VerificationResult::Pass
+                                    && !record.evidence_refs.is_empty()
+                                    && memory_support_matches(&record.objective, &memory_content)
+                            })
+                });
+                if !verified {
+                    return Err(ClientError::TaskExecution(format!(
+                        "supporting task {task_id} has no durable passing verification evidence"
+                    )));
+                }
+            }
+        }
+        let reviewer = human_approved.then(|| command.actor.id.clone());
         let record = run_blocking(move || {
-            memory_store.activate_quarantined(memory_id, &supporting_task_ids, Some(&reviewer))
+            memory_store.activate_quarantined_with_authority(
+                memory_id,
+                &supporting_task_ids,
+                reviewer.as_deref(),
+                human_approved,
+            )
         })
         .await??;
         self.record_event(host_event(
@@ -649,4 +718,25 @@ impl RuntimeHost {
             reason: Some(format!("candidate {candidate_id} rolled back")),
         })
     }
+}
+
+pub(crate) fn memory_support_matches(objective: &str, memory_content: &str) -> bool {
+    let objective = objective.to_ascii_lowercase();
+    let memory_content = memory_content.to_ascii_lowercase();
+    let objective_terms = objective
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|term| term.chars().count() >= 3)
+        .filter(|term| !matches!(*term, "the" | "and" | "for" | "with" | "from"))
+        .collect::<Vec<_>>();
+    if objective_terms
+        .iter()
+        .any(|term| memory_content.contains(term))
+    {
+        return true;
+    }
+    let objective_chars = objective.chars().collect::<Vec<_>>();
+    objective_chars
+        .windows(4)
+        .map(|window| window.iter().collect::<String>())
+        .any(|fragment| memory_content.contains(&fragment))
 }

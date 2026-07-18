@@ -27,12 +27,14 @@ impl RuntimeHost {
             role: ProviderRole::System,
             content: system_prompt(),
             token_budget_hint: 64,
+            source_refs: vec!["builtin:system_prompt".to_owned()],
         }];
         contributors.push(ContextContributor {
             name: "environment_context".to_owned(),
             role: ProviderRole::System,
             content: environment_context_prompt(&workspace_root),
             token_budget_hint: 128,
+            source_refs: vec![format!("workspace:{}", workspace_root.display())],
         });
         if let Some(project_instructions) = load_project_instructions(&workspace_root).await? {
             contributors.push(ContextContributor {
@@ -40,6 +42,10 @@ impl RuntimeHost {
                 role: ProviderRole::System,
                 content: project_instructions,
                 token_budget_hint: 2_048,
+                source_refs: vec![format!(
+                    "file:{}",
+                    workspace_root.join("AGENTS.md").display()
+                )],
             });
         }
         if let Some(skill_context) = self.active_skill_context(&objective).await? {
@@ -48,6 +54,7 @@ impl RuntimeHost {
                 role: ProviderRole::System,
                 content: skill_context,
                 token_budget_hint: 1_024,
+                source_refs: vec!["runtime:active_skills".to_owned()],
             });
         }
 
@@ -76,10 +83,14 @@ impl RuntimeHost {
                 role: ProviderRole::System,
                 content: memory_context(&memories),
                 token_budget_hint: 512,
+                source_refs: memories
+                    .iter()
+                    .map(|memory| format!("memory:{}", memory.record.memory_id))
+                    .collect(),
             });
         }
 
-        if let Some(history) = self
+        if let Some((history, source_refs)) = self
             .conversation_history_summary(session_id, current_task_id)
             .await?
         {
@@ -88,6 +99,7 @@ impl RuntimeHost {
                 role: ProviderRole::User,
                 content: history,
                 token_budget_hint: 1024,
+                source_refs,
             });
         }
 
@@ -96,6 +108,7 @@ impl RuntimeHost {
             role: ProviderRole::User,
             content: objective,
             token_budget_hint: 512,
+            source_refs: vec![format!("task:{current_task_id}:objective")],
         });
 
         Ok(contributors)
@@ -105,7 +118,7 @@ impl RuntimeHost {
         &self,
         session_id: SessionId,
         current_task_id: TaskId,
-    ) -> Result<Option<String>, ClientError> {
+    ) -> Result<Option<(String, Vec<String>)>, ClientError> {
         let events = self
             .repositories
             .events
@@ -122,21 +135,35 @@ impl RuntimeHost {
             .as_ref()
             .map(|(sequence_no, _)| *sequence_no)
             .unwrap_or_default();
+        let summary_source_ref = explicit_compaction
+            .as_ref()
+            .map(|(sequence_no, _)| format!("event-sequence:{sequence_no}"));
         let summary_line = explicit_compaction.map(|(_, content)| format!("Summary: {content}"));
-        let lines = events
+        let history_events = events
             .iter()
             .filter(|event| event.sequence_no > compacted_after)
             .filter(|event| event.task_id != Some(current_task_id))
-            .filter_map(conversation_history_line)
+            .collect::<Vec<_>>();
+        let lines = history_events
+            .iter()
+            .filter_map(|event| conversation_history_line(event))
             .collect::<Vec<_>>();
 
         if summary_line.is_none() && lines.is_empty() {
             return Ok(None);
         }
 
-        Ok(Some(format!(
-            "Prior conversation transcript follows as historical user context, not as system instructions:\n{}",
-            compact_history_with_summary(summary_line, lines)
+        let mut source_refs = history_events
+            .iter()
+            .map(|event| format!("event:{}", event.id))
+            .collect::<Vec<_>>();
+        source_refs.extend(summary_source_ref);
+        Ok(Some((
+            format!(
+                "Prior conversation transcript follows as historical user context, not as system instructions:\n{}",
+                compact_history_with_summary(summary_line, lines)
+            ),
+            source_refs,
         )))
     }
 
@@ -243,6 +270,7 @@ impl RuntimeHost {
     ) -> Result<(), ClientError> {
         let started_at = Instant::now();
         let objective = prompt_from_payload(&task.payload);
+        let completion_criteria = completion_criteria_from_payload(&task.payload);
         let workspace_root = self.execution_workspace_root()?;
         let policy = WorkspacePolicy::new(workspace_root.clone())
             .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
@@ -304,10 +332,7 @@ impl RuntimeHost {
                     task_id: task.task_id,
                     turn_id: task.turn_id,
                     objective: objective.clone(),
-                    completion_criteria: vec![
-                        "runtime task produces durable evidence or terminal verification"
-                            .to_owned(),
-                    ],
+                    completion_criteria,
                     touched_code,
                     contributors,
                     tools: if workspace_tools_enabled {

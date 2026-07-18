@@ -340,7 +340,7 @@ CLI / TUI --connect <URL>
   -> 同一 attachment 协议
 ```
 
-cwd 只决定执行目录、工具权限、checkpoint/memory/evaluation/evolution/rollout 分区和 thread 过滤，不决定进程生命周期。所有 durable facts 位于 `$GOLUTRA_HOME/state`：全局 `runtime.sqlite`、`artifacts/` 以及 `workspaces/<cwd-hash>/`；项目 `.golutra` 不参与 runtime 持久化。provider selection 位于全局 `provider.json` v2，API key 与 OAuth token set 位于 owner-only `$GOLUTRA_HOME/credentials.json` 或只读进程 env；`provider.json`、runtime event 和 rollout 都不保存 secret。凭据文件使用跨进程锁、大小上限、临时文件 fsync 和原子替换，Unix 权限为目录 `0700`、凭据/锁文件 `0600`。OpenAI/xAI/Copilot 等 OAuth 只通过受审计 catalog 启用并固定绑定对应 request adapter，Custom endpoint 不推断 OAuth；`auth/refresh` 只保存 owner-only 跨进程锁。SQLite 在 event append 事务内分配全局 sequence；rollout 从 SQLite 物化，append 与原子重建共享跨进程锁。全局 session lease 防止多个 Embedded 进程同时控制同一会话，command lease 与 durable ack 提供幂等重试。owner 异常退出后，能够重新取得 lease 的 host 会取消孤儿 active task，并恢复尚未开始的 durable pending turn。用户级 app-server 用 `$GOLUTRA_HOME/app-server/daemon.lock` 保证单实例，并发布 owner-only `app-server.json` 与 Unix `app-server.sock`；cwd runtime registry 默认最多保留 128 个 attachment，初始化失败会释放槽位。IPC request 直接进入同一个 Router；认证后的 `/runtime/info` 用于协议协商，其余 HTTP/SSE 与 IPC 请求执行 bearer/protocol version/attachment 校验。每次 cwd attachment 都从全局 thread index 刷新最近 session/thread，数据库以唯一索引保证一个 session 只绑定一个 thread。HTTP 未配置 transport auth 前仅允许 loopback，同时校验 Host/Origin；`HttpSseTransport` 始终使用调用方传入的连接 URL 发后续请求，服务端广告地址只作诊断，从而支持 SSH 端口转发和反向代理。summary trace 只返回净化阶段摘要，full 返回脱敏 manifest，forensic 仅允许 owner-only Unix IPC/embedded；restricted capture 不存在时完整性明确为 false。
+cwd 只决定执行目录、工具权限、checkpoint/memory/evaluation/evolution/rollout 分区和 thread 过滤，不决定进程生命周期。所有 durable facts 位于 `$GOLUTRA_HOME/state`：全局 `runtime.sqlite`、`artifacts/` 以及 `workspaces/<cwd-hash>/`；项目 `.golutra` 不参与 runtime 持久化。provider selection 位于全局 `provider.json` v2，API key 与 OAuth token set 位于 owner-only `$GOLUTRA_HOME/credentials.json` 或只读进程 env；`provider.json`、runtime event 和 rollout 都不保存 secret。凭据文件使用跨进程锁、大小上限、临时文件 fsync 和原子替换，Unix 权限为目录 `0700`、凭据/锁文件 `0600`。OpenAI/xAI/Copilot 等 OAuth 只通过受审计 catalog 启用并固定绑定对应 request adapter，Custom endpoint 不推断 OAuth；`auth/refresh` 只保存 owner-only 跨进程锁。SQLite 在 event append 事务内分配全局 sequence；rollout 从 SQLite 物化，append 与原子重建共享跨进程锁。全局 session lease 防止多个 Embedded 进程同时控制同一会话，command lease 与 durable ack 提供幂等重试。owner 异常退出后，能够重新取得 lease 的 host 会取消孤儿 active task，并恢复尚未开始的 durable pending turn。用户级 app-server 用 `$GOLUTRA_HOME/app-server/daemon.lock` 保证单实例，并发布 owner-only `app-server.json` 与 Unix `app-server.sock`；cwd runtime registry 默认最多保留 128 个 attachment，初始化失败会释放槽位。IPC request 直接进入同一个 Router；认证后的 `/runtime/info` 用于协议协商，其余 HTTP/SSE 与 IPC 请求执行 bearer/protocol version/attachment 校验。每次 cwd attachment 都从全局 thread index 刷新最近 session/thread，数据库以唯一索引保证一个 session 只绑定一个 thread。HTTP 未配置 transport auth 前仅允许 loopback，同时校验 Host/Origin；`HttpSseTransport` 始终使用调用方传入的连接 URL 发后续请求，服务端广告地址只作诊断，从而支持 SSH 端口转发和反向代理。summary trace 只返回净化阶段摘要，full 返回脱敏 manifest，forensic 仅允许 owner-only Unix IPC/embedded；HTTP artifact chunk 同样拒绝 `RedactionStatus::Raw`，restricted capture 不存在时完整性明确为 false。
 
 ```text
 $GOLUTRA_HOME/
@@ -425,7 +425,7 @@ golutra-tui
 - fork 必须复制完整 history 或明确的 turn boundary、重新生成 runtime IDs 并保留 immutable artifact lineage；普通 resume/fork 不能跨 canonical cwd。
 - cwd 迁移只能通过显式 rebind，要求 inactive/unowned thread 和精确旧路径；checkpoint、memory、evaluation 不能被无条件解释为新 cwd 事实。
 
-当前这些边界已经落地：TUI 默认创建新的本地 thread/session，首个 prompt 才持久化；`/resume` 按当前 canonical cwd 过滤全局历史；`/fork --from-turn`、rollout export 和 thread rebind 通过同一 transport/API；普通 transcript 只渲染用户可见事件，也不查询开发者投影。只有显式 `--debug` 或 `/debug` 才启用 developer mode，按事件刷新 `DebugProjection` 并展示事实、verification、LoopDecision、evaluation/improvement 阶段计数和最近 runtime event。
+当前这些边界已经落地：TUI 默认创建新的本地 thread/session，首个 prompt 才持久化；`/resume` 按当前 canonical cwd 过滤全局历史；`/fork --from-turn`、rollout export、`/export` 和 thread rebind 通过同一 transport/API；普通 transcript 只渲染用户可见事件，也不查询开发者投影。只有显式 `--debug` 或 `/debug` 才启用 developer mode，按事件分页刷新 `DebugProjection` 并展示事实、verification、LoopDecision、post-task job、trace completeness、evaluation/improvement 阶段计数和事件历史；鼠标滚轮按 pane 命中区域独立滚动，`/new`/`/resume` 保留 debug 偏好。`/export` 固定每个 session 的 event high-watermark，后台异步写 owner-only 临时目录；导出期间 session 变化会显式降级为 incomplete。
 
 daemon/remote 模式的最低可用目标不是“界面完整”，而是：
 
@@ -464,7 +464,7 @@ Debug / Audit / Replay 模式使用 `Debug / Audit Projection`：
 
 - 展示 runtime event、LoopDecision、PolicyEvaluation、EvidenceRecord、VerificationRecord、context projection、token budget、provider raw event。
 - 用于调试、复盘、benchmark 和回归验证。
-- TUI developer mode 继续只提供有界摘要和最近事件；统一 `TaskTraceService` 已分页提供完整历史、context snapshot、artifact/evidence 和完整性声明，Rust client、CLI 与 TypeScript/Python SDK 提供 bounded 全页聚合。不能让 TUI 把全量审计数据塞进终端主对话区。
+- TUI developer mode 保留固定治理摘要，并通过 `EventPage` cursor 按需加载更早事件；对话区与 developer 区有独立 follow-tail/scroll 状态，不能让全量审计 JSON 污染普通 transcript。统一 `TaskTraceService` 仍负责完整历史、context snapshot、artifact/evidence 和完整性声明，Rust client、CLI 与 TypeScript/Python SDK 提供 bounded 全页聚合；`DebugExportCoordinator` 负责调用方本地的原子 `full-redacted` bundle。
 
 Evaluation / Improvement 模式使用 `Evaluation / Improvement Projection`：
 

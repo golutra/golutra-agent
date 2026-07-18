@@ -51,6 +51,7 @@ pub(crate) async fn load_debug_projection(
     projection.event_window.end_cursor = page.end_cursor;
     projection.event_window.has_more_before = page.has_more;
     projection.event_window.limit = 256;
+    refresh_debug_completeness(&mut projection);
     Ok(projection)
 }
 
@@ -74,7 +75,7 @@ pub(crate) fn merge_debug_projection(
         .chain(latest.event_window.end_cursor)
         .max();
     previous.event_window.has_more_before =
-        previous.event_window.has_more_before || latest.event_window.has_more_before;
+        previous.event_window.has_more_before && latest.event_window.has_more_before;
     previous.event_window.limit = latest.event_window.limit;
     previous
         .busy_policy_decisions
@@ -107,6 +108,13 @@ pub(crate) fn merge_debug_projection(
     previous
         .loop_decisions
         .dedup_by_key(|decision| decision.decision_id);
+    previous.post_task_jobs.extend(latest.post_task_jobs);
+    previous.post_task_jobs.sort_by_key(|job| job.created_at);
+    previous.post_task_jobs.dedup_by_key(|job| job.job_id);
+    previous.trace_complete = latest.trace_complete;
+    previous.missing_sections = latest.missing_sections;
+    previous.retention_losses = latest.retention_losses;
+    refresh_debug_completeness(&mut previous);
     previous
 }
 
@@ -138,7 +146,29 @@ pub(crate) async fn load_older_debug_events(
     projection.events = older;
     projection.event_window.start_cursor = page.start_cursor;
     projection.event_window.has_more_before = page.has_more;
+    refresh_debug_completeness(projection);
     Ok(true)
+}
+
+fn refresh_debug_completeness(projection: &mut DebugProjection) {
+    projection
+        .missing_sections
+        .retain(|section| section != "event_window");
+    if projection.event_window.has_more_before {
+        projection.missing_sections.push("event_window".to_owned());
+    }
+    projection.missing_sections.sort();
+    projection.missing_sections.dedup();
+    projection.trace_complete = projection.missing_sections.is_empty()
+        && projection.retention_losses.is_empty()
+        && projection.post_task_jobs.iter().all(|job| {
+            matches!(
+                job.status,
+                golutra_core::PostTaskJobStatus::Succeeded
+                    | golutra_core::PostTaskJobStatus::Failed
+                    | golutra_core::PostTaskJobStatus::Cancelled
+            )
+        });
 }
 
 pub(crate) fn developer_panel_rows(
@@ -208,6 +238,18 @@ pub(crate) fn developer_panel_rows(
             count_events(&projection.events, RuntimeEventType::CandidateApplied),
         ),
     ];
+    let terminal_jobs = projection
+        .post_task_jobs
+        .iter()
+        .filter(|job| {
+            matches!(
+                job.status,
+                golutra_core::PostTaskJobStatus::Succeeded
+                    | golutra_core::PostTaskJobStatus::Failed
+                    | golutra_core::PostTaskJobStatus::Cancelled
+            )
+        })
+        .count();
 
     let mut rows = vec![
         DeveloperPanelRow::Summary(format!(
@@ -232,6 +274,16 @@ pub(crate) fn developer_panel_rows(
                 .collect::<Vec<_>>()
                 .join(" "),
         ),
+        DeveloperPanelRow::Summary(format!(
+            "jobs terminal={terminal_jobs}/{}",
+            projection.post_task_jobs.len()
+        )),
+        DeveloperPanelRow::Summary(format!(
+            "trace complete={} missing={} retention_losses={}",
+            projection.trace_complete,
+            projection.missing_sections.len(),
+            projection.retention_losses.len()
+        )),
     ];
 
     let start = projection.events.len().saturating_sub(recent_event_limit);

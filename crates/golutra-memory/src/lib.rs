@@ -329,6 +329,16 @@ impl MemoryStore {
         supporting_task_ids: &[TaskId],
         reviewer: Option<&str>,
     ) -> Result<MemoryRecord, MemoryError> {
+        self.activate_quarantined_with_authority(memory_id, supporting_task_ids, reviewer, false)
+    }
+
+    pub fn activate_quarantined_with_authority(
+        &self,
+        memory_id: MemoryId,
+        supporting_task_ids: &[TaskId],
+        reviewer: Option<&str>,
+        human_approved: bool,
+    ) -> Result<MemoryRecord, MemoryError> {
         let _guard = self.lock.lock().map_err(|_| MemoryError::LockPoisoned)?;
         let _file_lock = self.acquire_file_lock()?;
         let mut records = self.load_unlocked()?;
@@ -347,8 +357,7 @@ impl MemoryStore {
         tasks.extend(supporting_task_ids.iter().copied());
         tasks.sort();
         tasks.dedup();
-        let human_review = reviewer.is_some_and(|value| !value.trim().is_empty());
-        if tasks.len() < 2 && !human_review {
+        if tasks.len() < 2 && !human_approved {
             return Err(MemoryError::PromotionRejected(
                 "memory activation requires two independent task evidences or human review"
                     .to_owned(),
@@ -951,7 +960,12 @@ mod tests {
                 .is_empty()
         );
         let record = store
-            .activate_quarantined(quarantined.memory_id, &[], Some("maintainer-1"))
+            .activate_quarantined_with_authority(
+                quarantined.memory_id,
+                &[],
+                Some("maintainer-1"),
+                true,
+            )
             .expect("human activation");
         let helpful = store
             .record_feedback(record.memory_id, MemoryFeedbackKind::Helpful, "reused")

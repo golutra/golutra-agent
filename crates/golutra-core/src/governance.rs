@@ -32,6 +32,12 @@ pub struct ContextContributorSnapshot {
     pub source_refs: Vec<String>,
     pub included: bool,
     pub trimmed: bool,
+    #[serde(default)]
+    pub original_estimated_tokens: u64,
+    #[serde(default)]
+    pub retained_estimated_tokens: u64,
+    #[serde(default)]
+    pub strategy: String,
     pub estimated_tokens: u64,
     pub content_digest: String,
     pub redacted_content_ref: Option<ArtifactId>,

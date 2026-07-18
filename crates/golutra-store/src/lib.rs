@@ -22,7 +22,7 @@ use std::{
     time::Duration,
 };
 use thiserror::Error;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 mod projection;
 mod repositories;
@@ -797,6 +797,31 @@ impl RuntimeStore {
                     .and_then(|value| serde_json::from_value::<BusyPolicyDecision>(value).ok())
             })
             .collect();
+        let post_task_jobs = match task_id {
+            Some(task_id) => self.list_post_task_jobs(task_id).await?,
+            None => Vec::new(),
+        };
+        let mut missing_sections = Vec::new();
+        if task_id.is_some() && verification.is_none() {
+            missing_sections.push("verification_record".to_owned());
+        }
+        if task_id.is_some() && post_task_jobs.is_empty() {
+            missing_sections.push("post_task_job".to_owned());
+        }
+        if post_task_jobs.iter().any(|job| {
+            !matches!(
+                job.status,
+                PostTaskJobStatus::Succeeded
+                    | PostTaskJobStatus::Failed
+                    | PostTaskJobStatus::Cancelled
+            )
+        }) {
+            missing_sections.push("post_task_job_terminal".to_owned());
+        }
+        if has_more_before {
+            missing_sections.push("event_window".to_owned());
+        }
+        let trace_complete = missing_sections.is_empty();
         Ok(DebugProjection {
             session_id,
             task_id,
@@ -813,6 +838,10 @@ impl RuntimeStore {
             evidence,
             verification,
             loop_decisions,
+            post_task_jobs,
+            trace_complete,
+            missing_sections,
+            retention_losses: Vec::new(),
         })
     }
 
@@ -956,22 +985,51 @@ impl RuntimeStore {
         let Some(artifact) = self.load_artifact(request.artifact_id).await? else {
             return Ok(None);
         };
-        let Some(bytes) = self.load_artifact_bytes(request.artifact_id).await? else {
+        let blob_deleted_at: Option<String> = sqlx::query_scalar(
+            "SELECT blob_deleted_at FROM artifact_records WHERE artifact_id = ?",
+        )
+        .bind(request.artifact_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        if blob_deleted_at.is_some() {
             return Ok(None);
-        };
-        let offset = usize::try_from(request.offset).unwrap_or(usize::MAX);
-        if offset >= bytes.len() {
+        }
+        let path = self.artifact_blob_path(request.artifact_id);
+        let mut file = tokio::fs::File::open(&path)
+            .await
+            .map_err(|error| StoreError::ArtifactIo(format!("{}: {error}", path.display())))?;
+        let actual_size = file
+            .metadata()
+            .await
+            .map_err(|error| StoreError::ArtifactIo(format!("{}: {error}", path.display())))?
+            .len();
+        if actual_size != artifact.size_bytes {
+            return Err(StoreError::ArtifactIo(format!(
+                "artifact {} size mismatch: metadata={} recorded={}",
+                request.artifact_id, actual_size, artifact.size_bytes
+            )));
+        }
+        if request.offset >= artifact.size_bytes {
             return Ok(Some(ArtifactRange {
                 artifact,
                 offset: request.offset,
                 bytes: Vec::new(),
             }));
         }
-        let end = offset.saturating_add(usize::try_from(request.length).unwrap_or(usize::MAX));
+        file.seek(std::io::SeekFrom::Start(request.offset))
+            .await
+            .map_err(|error| StoreError::ArtifactIo(format!("{}: {error}", path.display())))?;
+        let length = request
+            .length
+            .min(artifact.size_bytes.saturating_sub(request.offset));
+        let mut bytes = vec![0_u8; usize::try_from(length).unwrap_or(usize::MAX)];
+        file.read_exact(&mut bytes)
+            .await
+            .map_err(|error| StoreError::ArtifactIo(format!("{}: {error}", path.display())))?;
         Ok(Some(ArtifactRange {
             artifact,
             offset: request.offset,
-            bytes: bytes[offset..end.min(bytes.len())].to_vec(),
+            bytes,
         }))
     }
 

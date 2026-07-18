@@ -304,6 +304,7 @@ TUI 输入框现在先经过 slash command parser：
 | `/auth oauth-login --descriptor <json> --flow browser\|device --base-url <url> --model <model> [--profile <name>] [--protocol <protocol>]` | 在后台执行 PKCE/device OAuth、保存安全 token set并 probe 后激活 profile |
 | `/auth logout [profile]` | revoke（provider 支持时）并删除本地 credential，禁用 profile；省略 profile 时退出 active profile |
 | `/auth use <profile> [user]` | 激活已保存的全局 provider profile |
+| `/export` | 按 `/resume` 风格选择当前 cwd 的 anchor session，输入 `1`、`+N` 或 `-N`，再输入绝对目录，导出对话和治理事实 |
 | `/status`、`/debug`、`/abort`、`/clear`、`/quit` | 本地状态、debug、abort 和退出控制 |
 
 输入体验对齐 Codex：
@@ -311,7 +312,9 @@ TUI 输入框现在先经过 slash command parser：
 - 输入 `/` 或 `/auth ` 时，底部输入框下方显示候选命令列表，而不是只显示一行 help 文案。
 - Up/Down 或 Tab 可移动候选，Enter 会启动可直接执行的命令；需要参数的命令会先补全命令文本并等待用户继续输入。
 - `/resume` 选择 session 后会清空当前 TUI 的本地 command messages、event cursor、输入框和 transcript scroll 状态，再 replay 目标 session 的历史；这样不会把旧 session 的提示或历史混到新 session。
-- 普通 transcript 默认跟随最新内容；PageUp/PageDown 按页翻历史，输入框有草稿时 Home/End 移动编辑光标，草稿为空时 Home/End 才跳到最旧/最新。TUI 默认不捕获鼠标，优先保留终端选择复制能力。
+- 普通 transcript 默认跟随最新内容；PageUp/PageDown 按页翻历史，输入框有草稿时 Home/End 移动编辑光标，草稿为空时 Home/End 才跳到最旧/最新。TUI 捕获鼠标滚轮并按命中区域路由：对话区和 developer 区独立滚动；文本复制使用终端的修饰键选择模式（通常为 Shift+拖动）。
+- `--debug` 或 `/debug` 打开的 developer 区固定保留治理摘要，事件行按 cursor 向更早历史分页；滚轮离开尾部后新事件不会把视图强行跳回底部，回到底部才恢复 follow-tail。
+- `/export` 不切换当前 session：先选择 anchor，再输入范围（空/`1` 只导出 anchor，`+N` 包含 anchor 及其前 N-1 个更新 session，`-N` 包含 anchor 及其后 N-1 个更旧 session），最后 review 绝对目的地。导出目录使用同文件系统临时目录、owner-only 权限、校验后原子 rename；默认 `full-redacted`，Raw checkpoint blob 只在 manifest 标记为省略。
 - 普通 `q` 是文本输入，不作为全局退出键。
 - Ctrl+C 第一按用于中断当前运行任务并展示退出提示；在短时间内第二次按 Ctrl+C 才退出 TUI。
 - Esc 用于关闭局部 picker/dialog 或清空当前输入，不作为常规退出路径。
@@ -322,11 +325,11 @@ TUI 输入框现在先经过 slash command parser：
 
 - 当前 TUI 已有 qwen-code 风格 provider setup：Golutra API、Third-party Providers、Custom Provider、mock 分组选择；第三方内置 OpenAI、OpenRouter、DeepSeek、Qwen/DashScope compatible、xAI、GitHub Copilot 和本地 OpenAI-compatible preset；OpenAI 展示 ChatGPT browser/headless OAuth/API key，xAI 展示 browser/device OAuth/API key，GitHub Copilot 只展示 device OAuth。Custom Provider 可选 OpenAI-compatible、Anthropic、Gemini、Vertex AI、genai，但不自动获得 OAuth。setup 的 API key 路径按 protocol/baseUrl -> credential storage/API key 或 envKey -> model -> advanced config -> review -> install 执行；OAuth 路径直接启动后台授权并在成功后 verified probe/install。review 展示脱敏 `ProviderInstallPlan`、保存路径和同名 profile 覆盖提示；secret/config/probe 失败自动 rollback，成功覆盖会删除旧 credential。
 - 当前 provider/auth 持久化已收敛为全局用户级 `$GOLUTRA_HOME/provider.json` v2和 disk/env SecretRef；磁盘 secret 位于 `$GOLUTRA_HOME/credentials.json`，OAuth browser/device、refresh、revoke/logout 已接通。项目 `.golutra` 不参与 provider 或 runtime 持久化。
-- 当前全局 `threads` 表、`golutra thread list`、`golutra resume [THREAD_ID]`、`golutra fork THREAD_ID [--from-turn TURN_ID]`、`golutra thread export` 和 `golutra thread rebind --from` 已可用；默认按当前 canonical cwd 过滤，每个显式新 session 使用独立 thread 主键，daemon 重新 attach 会刷新最近 thread/session。
+- 当前全局 `threads` 表、`golutra thread list`、`golutra resume [THREAD_ID]`、`golutra fork THREAD_ID [--from-turn TURN_ID]`、`golutra thread export`、`golutra export <ABSOLUTE_DIR> [--thread-id ID] [--range 1|+N|-N]` 和 `golutra thread rebind --from` 已可用；默认按当前 canonical cwd 过滤，每个显式新 session 使用独立 thread 主键，daemon 重新 attach 会刷新最近 thread/session。Session page/window 通过 Embedded、HTTP 和 Unix IPC 使用同一稳定 cursor/anchor 语义。
 - 当前完成任务会写入 `AssistantMessage`，`UserProjection.final_message` 和 TUI transcript 可在 resume 后恢复最终回复；下一轮 prompt 会携带当前 session 的压缩历史摘要。
 - 当前全局 SQLite 已覆盖多 cwd 事实与索引；TUI 按产品边界只展示当前 canonical cwd 的 session。
 - TUI/CLI 的 provider install 由 `golutra-config` 事务服务执行 SecretStore/config/probe/rollback，成功后发送 `ProviderConfigured` 或 `ProviderAuthSubmitted` 给 RuntimeHost；runtime 统一产生 `ProviderConfigured`、`ProviderProbeCompleted`、`ProviderAuthFailed` 等 durable event，TUI 不维护任务认证状态机。
 - 当前受审计 OAuth catalog 已内置 OpenAI ChatGPT browser/headless、xAI browser/device、GitHub Copilot device，并绑定各自实际模型 adapter；其他 provider 仍需要显式 descriptor/registry 扩展。运行中跨客户端 `ProviderAuthRequired`、verified reload/resume 和 cancel 已完成；Web 首次 provider onboarding不在范围内。
-- 当前 session 事实位于全局 SQLite，rollout/fork/rebind、向前/向后 event page 和 code index 已闭环。显式全量 debug/export 仍会物化所选范围；超长历史 UI 虚拟化属于性能优化，不改变 session 正确性。
+- 当前 session 事实位于全局 SQLite，rollout/fork/rebind、向前/向后 event page、稳定 session window、developer event pagination、独立 pane scroll 和 code index 已闭环。显式 debug/export 会物化所选范围；导出 manifest 会声明 missing/retention/redaction 状态，超长历史 UI 只按页加载，不改变 session 正确性。
 
 这些边界不影响当前 mock/live provider、动态认证、历史恢复、fork 和项目路径迁移主链。

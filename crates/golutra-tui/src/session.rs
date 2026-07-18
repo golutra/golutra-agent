@@ -4,6 +4,7 @@ use golutra_client::{DebugExportReceipt, RuntimeTransport};
 use golutra_core::{Actor, ActorKind, CommandId, SessionId, TaskId, ThreadId, TurnId};
 use golutra_protocol::{SessionCommand, SessionCommandKind};
 use serde_json::Value;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use super::TUI_ACTOR_ID;
@@ -41,6 +42,11 @@ pub(crate) struct ExportFlowState {
     pub(crate) destination_input: String,
     pub(crate) error: Option<String>,
     pub(crate) receipt: Option<DebugExportReceipt>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PendingExportOperation {
+    pub(crate) task: JoinHandle<Result<DebugExportReceipt, String>>,
 }
 
 impl ExportFlowState {

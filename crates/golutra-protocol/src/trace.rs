@@ -1,6 +1,6 @@
 use golutra_core::{
-    ArtifactId, ArtifactRecord, ContextSnapshot, EvidenceRecord, PostTaskJob, SessionId, TaskId,
-    TraceIntegrity, TraceView, VerificationPlan, VerificationRecord,
+    ArtifactId, ArtifactRecord, ContextSnapshot, EvidenceRecord, PostTaskJob, RedactionStatus,
+    SessionId, TaskId, TraceIntegrity, TraceView, VerificationPlan, VerificationRecord,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -68,6 +68,12 @@ pub struct ArtifactChunk {
     pub length: u64,
     pub total_size: u64,
     pub checksum: String,
+    #[serde(default = "raw_redaction_status")]
+    pub redaction_status: RedactionStatus,
     pub content_base64: String,
     pub eof: bool,
+}
+
+fn raw_redaction_status() -> RedactionStatus {
+    RedactionStatus::Raw
 }

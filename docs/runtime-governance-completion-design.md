@@ -73,7 +73,22 @@ golutra trace --task <task-id> --full --wait-evaluation
 9. 哪些 memory 仍在 quarantine，哪些已激活、过期或回滚。
 10. 哪些事实因 redaction、retention 或权限不可见，不能静默缺失。
 
-普通 TUI 继续只显示 UserProjection。完整事实只在显式 developer/debug/trace 入口提供。
+普通 TUI 继续只显示 UserProjection。完整事实只在显式 developer/debug/trace/export 入口提供；`/export` 会在调用方本地生成可移交给其他 agent 的脱敏事实包。
+
+### 调试导出与会话窗口（当前实现）
+
+`golutra export <ABSOLUTE_DIR> [--thread-id ID] [--range 1|+N|-N]` 与 TUI `/export` 共用 `DebugExportCoordinator`。它先通过 `SessionWindowRequest` 解析当前 canonical cwd 的 anchor 范围，再读取：
+
+- `manifest.json`：格式版本、选择范围、完整性、redaction、missing、retention loss 和每个 task 的 trace 状态。
+- `conversation.md` 与每个 session 的 `conversation.jsonl`：用户/assistant 对话，不包含运行时治理噪声。
+- 每个 session 的 `events.jsonl`、`thread.json` 和每个 task 的 `tasks/<task-id>/trace.json`。
+- `artifacts/sha256/<digest>`：按 checksum 去重、分块读取、重新计算 SHA-256；`RedactionStatus::Raw` 的 checkpoint 等 blob 不写入，只在 manifest 留下 `omitted_raw` 记录。
+
+目的地必须是调用方机器上的绝对、尚不存在的目录。写入在同文件系统 owner-only 临时目录完成，文件和目录同步后原子 rename；导出失败或保留策略造成的缺失不会被静默伪装成 complete。
+
+每个 session 在读取前固定 event high-watermark，只导出该边界内的事件；task trace/artifact 完成后再次读取 watermark。期间有新 turn/event 时 bundle 仍可落盘，但 `events_complete=false`、`manifest.complete=false`，并在 `missing_data` 记录 moving session，避免把非原子视图误报为完整快照。
+
+Session protocol v3 增加稳定的 `(recency_at, thread_id)` cursor page 与 anchor window：`1` 为单 session，`+N` 为 anchor 加 N-1 个更新 session，`-N` 为 anchor 加 N-1 个更旧 session。Embedded、HTTP/SSE、Unix IPC 和 TypeScript/Python SDK 共用同一请求/响应类型。
 
 ## 目标架构
 
@@ -242,6 +257,8 @@ TraceIntegrity
 
 remote HTTP 默认最多返回 full-redacted；forensic 需要本地 owner transport 或显式独立授权，不能复用 provider bearer。
 
+当前实现把 artifact chunk 的 `redaction_status` 纳入协议：HTTP handler 在返回内容前拒绝 `Raw`，只有 owner-only Unix IPC 可读取；range read 使用 seek + 有界 buffer，不再为了一个 chunk 先加载整个 blob。完整导出仍对所有 chunk 重新计算 SHA-256。
+
 ## ContextSnapshot
 
 每次 provider request 在发送前生成不可变 snapshot：
@@ -273,6 +290,9 @@ role
 source_refs
 included
 trimmed
+original_estimated_tokens
+retained_estimated_tokens
+strategy
 estimated_tokens
 content_digest
 redacted_content_ref
@@ -291,7 +311,7 @@ invalidation_refs
 
 `ContextSnapshot` 不能只用于事后观察，还要驱动可验证的输入预算：
 
-1. 从已 probe 的 provider capability 读取 context window/max output；未知值使用保守上限，不能沿用固定 8192 假装模型能力。
+1. 从已 probe/声明的 provider capability 读取 context window/max output；未知值必须显式配置，不能沿用固定 8192 假装模型能力。
 2. 优先使用 model-aware tokenizer；没有 tokenizer 时使用带误差边界的保守估算，并在 snapshot 标记 estimate source。
 3. 先预留 output、reasoning 和下一轮 tool-call budget，再给 system/objective/recent turn/evidence/memory/tool excerpt 分配独立预算。
 4. 超限时按稳定顺序执行：移除 invalid/低相关 memory、用 durable summary 替换旧对话、缩减 tool excerpt、触发 compact、最后 AskUser/Block。
@@ -299,6 +319,8 @@ invalidation_refs
 6. provider 返回 actual usage 后生成 attribution delta，用于校准估算和发现 system/context/tool/retry 哪一层持续膨胀。
 
 验收要求：同一长 session 连续运行时，provider request 不随 transcript 线性增长；任何被删除或截断的内容仍可通过 artifact/trace 定位，但不会自动重新注入模型。
+
+当前 provider runtime 在 generation config 缺省时使用 protocol capability；无法声明窗口的协议会要求 `context_window_size`。每个 contributor manifest 记录 original/retained token、`include_full`/`retain_head`/`retain_tail` 策略和稳定 source ref。
 
 ## Tool 输出与 Artifact 按需读取
 
@@ -444,6 +466,8 @@ PolicyStatus
 - 不能把模型最终文字作为 coding task 的唯一 assertion。
 - 无法构造可靠 assertion 时必须 AskUser 或保留 residual risk，不能伪造 Pass。
 
+当前 hosted task 只采用 payload 中显式 `completion_criteria`，不再注入“有任意 evidence 即完成”的固定条件。Delivery assertion 要求关联到通过的 matching check；Test criterion 只接受 `objective:test:*`，shell test 还必须同时满足 exit code、timeout/cancel 和“至少执行了一个测试”的输出解析。普通对话仍可只凭非空 assistant response 完成。
+
 ## 真实 Regression Execution
 
 ### Replay 模式分级
@@ -501,6 +525,8 @@ RegressionExecution
 5. event-only replay、单次 LLM judge 和来源 case 通过都不能单独晋升。
 6. runtime code candidate 在 P3 前保持 human review，不自动 apply。
 
+当前 campaign 要求非空 `candidate_files`，按排序后的路径/内容计算 canonical SHA-256，并拒绝调用方声明 digest 不一致或应用后 workspace digest 未变化的 no-op。CLI 使用 `golutra eval regress <candidate-id> --candidate-files <JSON_FILE> [--candidate-digest sha256:...]` 提交路径到内容的 JSON map。每个 case 的 expected/observed verdict 来自 baseline/candidate `RegressionExecution.status`，case hard gate 同时验证不同的持久 trace ref 和 workspace delta；旧 durable evaluation result 只保留 fixture/security 辅助检查，不再充当 observed verdict。
+
 ## Memory Quarantine
 
 ### 生命周期
@@ -520,6 +546,8 @@ proposed
 - observation 类 memory 默认 30 天 expiry；配置/代码事实绑定 file、lockfile 或 config digest 作为 invalidation refs。
 - user/global scope 永远显式人审。
 - contradiction 不能只按文本高相似度判断；先比较结构化 subject/predicate/object 和有效期，再用语义检索辅助。
+
+当前 runtime 的显式 human activation 要求交互 actor、`human_approval=true` 和非空 reason；自动路径会验证至少两个真实、不同 task 的 Pass verification、非空 evidence，并要求 supporting objective 与 memory claim 内容相关。MemoryStore 不再把任意非空 reviewer 字符串自动视为人审。
 - retrieval 默认排除 quarantined、expired、rolled_back 和 invalidated memory。
 
 ### MemoryClaim
@@ -558,6 +586,8 @@ MemoryClaim
 - provider、token、tool、verification 和 LoopDecision 摘要。
 - post-task job 状态和 trace completeness。
 - 最近事件。
+
+当前 `DebugProjection` 还包含 typed `post_task_jobs`、`trace_complete`、`missing_sections` 和 `retention_losses`。TUI 固定摘要显示 terminal jobs 与 completeness；event window 尚未分页完成时显式记为 `event_window` missing，而不是显示假 complete。
 
 它不是完整数据容器。选择详情时通过 TaskTraceService 分页读取，不把全量 JSON 塞进 TUI state。
 

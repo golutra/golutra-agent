@@ -433,6 +433,7 @@ async fn initial_context_overflow_returns_a_structured_blocked_outcome() {
                     role: ProviderRole::User,
                     content: "large context ".repeat(20),
                     token_budget_hint: 0,
+                    source_refs: Vec::new(),
                 }],
                 tools: Vec::new(),
             },
@@ -468,6 +469,7 @@ async fn accumulated_tool_messages_return_an_ask_user_context_outcome() {
         role: ProviderRole::User,
         content: "read large.txt".to_owned(),
         token_budget_hint: 0,
+        source_refs: Vec::new(),
     };
     let tool_tokens = executor
         .registry()
@@ -607,6 +609,19 @@ fn verification_command_classifier_rejects_arbitrary_shell_success() {
     assert!(!is_objective_validation_command("echo done"));
     assert!(!is_objective_validation_command("echo tests passed"));
     assert!(!is_objective_validation_command("git status --short"));
+    assert!(!is_objective_validation_command("go version"));
+}
+
+#[test]
+fn test_output_classifier_requires_an_executed_test() {
+    assert!(line_reports_executed_tests(
+        "test result: ok. 3 passed; 0 failed; 0 ignored"
+    ));
+    assert!(line_reports_executed_tests("running 1 test"));
+    assert!(!line_reports_executed_tests(
+        "test result: ok. 0 passed; 0 failed; 0 ignored"
+    ));
+    assert!(!line_reports_executed_tests("running 0 tests"));
 }
 
 #[tokio::test]

@@ -1005,6 +1005,17 @@ pub(crate) fn resume_picker_offset(
         .min(last_window_start)
 }
 
+pub(crate) fn developer_event_page_rows(app: &TuiApp, area: Rect) -> usize {
+    let visible_rows = area.height.saturating_sub(1) as usize;
+    let summary_rows = app.developer_projection.as_ref().map_or(1, |projection| {
+        developer_panel_rows(projection, 0)
+            .into_iter()
+            .filter(|row| matches!(row, DeveloperPanelRow::Summary(_)))
+            .count()
+    });
+    visible_rows.saturating_sub(summary_rows)
+}
+
 pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let content_width = usize::from(area.width.saturating_sub(2));
     let rows = if let Some(error) = &app.developer_error {
@@ -1021,7 +1032,7 @@ pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiA
         .partition(|row| matches!(row, DeveloperPanelRow::Summary(_)));
     let visible_rows = area.height.saturating_sub(1) as usize;
     let visible_summaries = summaries.into_iter().take(visible_rows).collect::<Vec<_>>();
-    let event_rows = visible_rows.saturating_sub(visible_summaries.len());
+    let event_rows = developer_event_page_rows(app, area);
     let window = transcript_visible_window(
         events.len(),
         event_rows,
@@ -1506,17 +1517,21 @@ pub(crate) fn transcript_page_rows(app: &TuiApp) -> usize {
     )
 }
 
-pub(crate) fn transcript_scroll_status(scroll_offset: usize) -> String {
+pub(crate) fn transcript_scroll_status(scroll_offset: usize, unseen_rows: usize) -> String {
     if scroll_offset == 0 {
         "history at latest".to_owned()
+    } else if unseen_rows > 0 {
+        format!("history offset {scroll_offset} rows from latest · {unseen_rows} new")
     } else {
         format!("history offset {scroll_offset} rows from latest")
     }
 }
 
-pub(crate) fn developer_scroll_status(scroll_offset: usize) -> String {
+pub(crate) fn developer_scroll_status(scroll_offset: usize, unseen_rows: usize) -> String {
     if scroll_offset == 0 {
         "developer facts at latest".to_owned()
+    } else if unseen_rows > 0 {
+        format!("developer facts offset {scroll_offset} rows from latest · {unseen_rows} new")
     } else {
         format!("developer facts offset {scroll_offset} rows from latest")
     }

@@ -25,6 +25,7 @@ class ArtifactChunk(TypedDict, total=False):
     eof: Required[bool]
     length: Required[int]
     offset: Required[int]
+    redaction_status: NotRequired[RedactionStatus]
     total_size: Required[int]
 
 class ArtifactReadRequest(TypedDict, total=False):
@@ -169,9 +170,12 @@ class ContextContributorSnapshot(TypedDict, total=False):
     included: Required[bool]
     invalidation_refs: Required[list[str]]
     name: Required[str]
+    original_estimated_tokens: NotRequired[int]
     redacted_content_ref: NotRequired[str | None]
+    retained_estimated_tokens: NotRequired[int]
     role: Required[str]
     source_refs: Required[list[str]]
+    strategy: NotRequired[str]
     trimmed: Required[bool]
 
 class ContextMessageSnapshot(TypedDict, total=False):
@@ -248,9 +252,13 @@ class DebugProjection(TypedDict, total=False):
     events: Required[list[RuntimeEvent]]
     evidence: Required[list[EvidenceRecord]]
     loop_decisions: Required[list[LoopDecision]]
+    missing_sections: NotRequired[list[str]]
+    post_task_jobs: NotRequired[list[PostTaskJob]]
+    retention_losses: NotRequired[list[str]]
     session_id: Required[str]
     task_id: NotRequired[str | None]
     tool_results: Required[list[ToolResultEnvelope]]
+    trace_complete: NotRequired[bool]
     verification: NotRequired[VerificationRecord | None]
 
 class EnvironmentRecipe(TypedDict, total=False):

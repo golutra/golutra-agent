@@ -480,6 +480,7 @@ pub(crate) async fn read_artifact_chunk(
         length,
         total_size: range.artifact.size_bytes,
         checksum: range.artifact.checksum,
+        redaction_status: range.artifact.redaction_status,
         content_base64: base64::engine::general_purpose::STANDARD.encode(range.bytes),
         eof: end >= range.artifact.size_bytes,
     }))

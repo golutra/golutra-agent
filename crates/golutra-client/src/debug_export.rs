@@ -309,7 +309,10 @@ impl<'a> DebugExportCoordinator<'a> {
             })?;
         write_json(&session_root.join("thread.json"), &thread, true)?;
 
-        let events = self.load_all_events(summary.session_id).await?;
+        let snapshot_end_sequence = self.latest_event_sequence(summary.session_id).await?;
+        let events = self
+            .load_all_events(summary.session_id, snapshot_end_sequence)
+            .await?;
         write_json_lines(&session_root.join("events.jsonl"), &events)?;
         let conversation = conversation_entries(&events);
         write_json_lines(&session_root.join("conversation.jsonl"), &conversation)?;
@@ -379,19 +382,48 @@ impl<'a> DebugExportCoordinator<'a> {
             });
         }
 
+        let events_complete = event_snapshot_is_stable(
+            snapshot_end_sequence,
+            self.latest_event_sequence(summary.session_id).await?,
+        );
+        if !events_complete {
+            missing_data.push(format!(
+                "session:{}:events changed during export",
+                summary.session_id
+            ));
+        }
+
         Ok(ExportedSessionManifest {
             thread_id: summary.thread_id.to_string(),
             session_id: summary.session_id,
             path: relative_root,
             event_count: events.len(),
-            events_complete: true,
+            events_complete,
             tasks,
         })
+    }
+
+    async fn latest_event_sequence(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<u64>, ClientError> {
+        let page = self
+            .transport
+            .event_page(EventPageRequest {
+                session_id,
+                task_id: None,
+                cursor: None,
+                direction: EventPageDirection::Backward,
+                limit: 1,
+            })
+            .await?;
+        Ok(page.events.last().map(|event| event.sequence_no))
     }
 
     async fn load_all_events(
         &self,
         session_id: SessionId,
+        upper_bound: Option<u64>,
     ) -> Result<Vec<RuntimeEvent>, ClientError> {
         let mut cursor = None;
         let mut events = Vec::new();
@@ -423,7 +455,17 @@ impl<'a> DebugExportCoordinator<'a> {
                 ));
             }
             cursor = Some(next);
-            events.extend(page.events);
+            let reached_upper_bound = upper_bound.is_some_and(|upper_bound| {
+                page.events
+                    .iter()
+                    .any(|event| event.sequence_no >= upper_bound)
+            });
+            events.extend(page.events.into_iter().filter(|event| {
+                upper_bound.is_none_or(|upper_bound| event.sequence_no <= upper_bound)
+            }));
+            if reached_upper_bound {
+                return Ok(events);
+            }
             if !page.has_more {
                 return Ok(events);
             }
@@ -790,6 +832,10 @@ fn sha256_checksum_hex(checksum: &str) -> Option<String> {
     (value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(value)
 }
 
+fn event_snapshot_is_stable(before: Option<u64>, after: Option<u64>) -> bool {
+    before == after
+}
+
 #[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<(), ClientError> {
     File::open(path)
@@ -859,5 +905,13 @@ mod tests {
         for invalid in ["0", "50", "+0", "-501", "+nope"] {
             assert!(parse_session_range(invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn event_snapshot_detects_concurrent_session_growth() {
+        assert!(event_snapshot_is_stable(Some(10), Some(10)));
+        assert!(event_snapshot_is_stable(None, None));
+        assert!(!event_snapshot_is_stable(Some(10), Some(11)));
+        assert!(!event_snapshot_is_stable(None, Some(1)));
     }
 }

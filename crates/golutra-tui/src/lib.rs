@@ -22,6 +22,7 @@ pub struct PaneScrollState {
     pub offset_from_bottom: usize,
     pub row_count: usize,
     pub follow_tail: bool,
+    pub unseen_rows: usize,
 }
 
 impl PaneScrollState {
@@ -29,6 +30,17 @@ impl PaneScrollState {
         if self.follow_tail {
             self.offset_from_bottom = 0;
         } else if row_count > self.row_count {
+            let added = row_count.saturating_sub(self.row_count);
+            self.offset_from_bottom = self.offset_from_bottom.saturating_add(added);
+            self.unseen_rows = self.unseen_rows.saturating_add(added);
+        }
+        self.row_count = row_count;
+        self.clamp(usize::MAX);
+    }
+
+    /// Add rows before the currently loaded window without treating them as new tail content.
+    pub fn set_row_count_after_prepend(&mut self, row_count: usize) {
+        if !self.follow_tail && row_count > self.row_count {
             self.offset_from_bottom = self
                 .offset_from_bottom
                 .saturating_add(row_count.saturating_sub(self.row_count));
@@ -41,6 +53,7 @@ impl PaneScrollState {
         self.offset_from_bottom = 0;
         self.row_count = row_count;
         self.follow_tail = true;
+        self.unseen_rows = 0;
     }
 
     pub fn max_offset(&self, visible_rows: usize) -> usize {
@@ -56,6 +69,7 @@ impl PaneScrollState {
         self.offset_from_bottom = self.offset_from_bottom.min(max);
         if self.offset_from_bottom == 0 {
             self.follow_tail = true;
+            self.unseen_rows = 0;
         }
     }
 
@@ -83,6 +97,7 @@ impl PaneScrollState {
             TranscriptScrollAction::Bottom => {
                 self.offset_from_bottom = 0;
                 self.follow_tail = true;
+                self.unseen_rows = 0;
             }
         }
         self.clamp(visible_rows);
@@ -990,6 +1005,27 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].sequence_no, 7);
         assert_eq!(lines[0].summary, "accepted prompt");
+    }
+
+    #[test]
+    fn pane_scroll_distinguishes_new_tail_rows_from_prepended_history() {
+        let mut scroll = PaneScrollState::default();
+        scroll.reset(20);
+        scroll.scroll(TranscriptScrollAction::PageUp, 5);
+
+        scroll.set_row_count(23);
+        assert_eq!(scroll.offset_from_bottom, 8);
+        assert_eq!(scroll.unseen_rows, 3);
+
+        scroll.set_row_count_after_prepend(25);
+        assert_eq!(scroll.offset_from_bottom, 10);
+        assert_eq!(scroll.unseen_rows, 3);
+
+        scroll.scroll(TranscriptScrollAction::Bottom, 5);
+        assert_eq!(scroll.offset_from_bottom, 0);
+        assert_eq!(scroll.unseen_rows, 0);
+        scroll.set_row_count(27);
+        assert_eq!(scroll.unseen_rows, 0);
     }
 
     #[test]

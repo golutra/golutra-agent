@@ -893,19 +893,23 @@ where
         }
         let code_files_changed = changed_files.iter().any(|path| is_code_file(path));
         for report in &tool_reports {
-            if is_objective_validation_report(report, code_files_changed) {
+            if let Some(validation) = objective_validation_report(report, code_files_changed) {
                 command_checks.push(VerificationCheck {
                     kind: VerificationCheckKind::ObjectiveValidation,
-                    name: format!("objective:{}", report.envelope.tool_name),
+                    name: format!(
+                        "objective:{}:{}",
+                        validation.kind.label(),
+                        report.envelope.tool_name
+                    ),
                     command: report
                         .envelope
                         .structured_facts
                         .get("command")
                         .and_then(serde_json::Value::as_str)
                         .map(ToOwned::to_owned),
-                    passed: true,
+                    passed: validation.passed,
                     evidence_refs: report.envelope.evidence_refs.clone(),
-                    message: report.envelope.summary.clone(),
+                    message: validation.message,
                 });
             }
             if let Some(observed_path) = report
@@ -1263,43 +1267,166 @@ fn is_code_file(path: &Path) -> bool {
     )
 }
 
-fn is_objective_validation_report(report: &ToolExecutionReport, code_files_changed: bool) -> bool {
-    if report.envelope.status != ToolResultStatus::Ok {
-        return false;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObjectiveValidationKind {
+    Test,
+    Diagnostic,
+    Delivery,
+}
+
+impl ObjectiveValidationKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Test => "test",
+            Self::Diagnostic => "diagnostic",
+            Self::Delivery => "delivery",
+        }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObjectiveValidationOutcome {
+    kind: ObjectiveValidationKind,
+    passed: bool,
+    message: String,
+}
+
+fn objective_validation_report(
+    report: &ToolExecutionReport,
+    code_files_changed: bool,
+) -> Option<ObjectiveValidationOutcome> {
     if report.envelope.tool_name == "shell" {
-        return report
+        let command = report
             .envelope
             .structured_facts
             .get("command")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(is_objective_validation_command);
+            .and_then(serde_json::Value::as_str)?;
+        let kind = objective_validation_command_kind(command)?;
+        let exited_cleanly = report.envelope.status == ToolResultStatus::Ok
+            && report
+                .envelope
+                .structured_facts
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                == Some(0)
+            && !report
+                .envelope
+                .structured_facts
+                .get("timed_out")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            && !report
+                .envelope
+                .structured_facts
+                .get("cancelled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        let passed = exited_cleanly
+            && (kind != ObjectiveValidationKind::Test || test_report_executed_tests(report));
+        let message = match (kind, exited_cleanly, passed) {
+            (_, false, _) => "validation command did not exit successfully".to_owned(),
+            (ObjectiveValidationKind::Test, true, false) => {
+                "test command exited successfully but no executed test was observed".to_owned()
+            }
+            (ObjectiveValidationKind::Test, true, true) => {
+                "test command passed with executed tests".to_owned()
+            }
+            (_, true, true) => "diagnostic command passed".to_owned(),
+            _ => "objective validation is unresolved".to_owned(),
+        };
+        return Some(ObjectiveValidationOutcome {
+            kind,
+            passed,
+            message,
+        });
     }
-    !code_files_changed
+    let is_delivery = !code_files_changed
         && report.changed_files.iter().any(|path| !is_code_file(path))
         && matches!(
             report.envelope.tool_name.as_str(),
             "write_file" | "edit_file"
-        )
+        );
+    is_delivery.then(|| ObjectiveValidationOutcome {
+        kind: ObjectiveValidationKind::Delivery,
+        passed: report.envelope.status == ToolResultStatus::Ok,
+        message: report.envelope.summary.clone(),
+    })
 }
 
+#[cfg(test)]
 fn is_objective_validation_command(command: &str) -> bool {
-    let Some(parts) = shlex::split(command) else {
-        return false;
-    };
-    let Some(program) = parts.first().map(String::as_str) else {
-        return false;
-    };
+    objective_validation_command_kind(command).is_some()
+}
+
+fn objective_validation_command_kind(command: &str) -> Option<ObjectiveValidationKind> {
+    let parts = shlex::split(command)?;
+    let program = parts.first().map(String::as_str)?;
     match program {
-        "cargo" => parts
-            .iter()
-            .any(|part| matches!(part.as_str(), "test" | "check" | "clippy" | "build" | "fmt")),
-        "npm" | "pnpm" | "yarn" | "bun" => parts
-            .iter()
-            .any(|part| matches!(part.as_str(), "test" | "check" | "typecheck" | "build")),
-        "pytest" | "go" | "make" | "mvn" | "gradle" | "swift" => true,
-        _ => false,
+        "cargo" if parts.iter().any(|part| part == "test") => Some(ObjectiveValidationKind::Test),
+        "cargo"
+            if parts
+                .iter()
+                .any(|part| matches!(part.as_str(), "check" | "clippy" | "build" | "fmt")) =>
+        {
+            Some(ObjectiveValidationKind::Diagnostic)
+        }
+        "npm" | "pnpm" | "yarn" | "bun" if parts.iter().any(|part| part == "test") => {
+            Some(ObjectiveValidationKind::Test)
+        }
+        "npm" | "pnpm" | "yarn" | "bun"
+            if parts
+                .iter()
+                .any(|part| matches!(part.as_str(), "check" | "typecheck" | "build" | "lint")) =>
+        {
+            Some(ObjectiveValidationKind::Diagnostic)
+        }
+        "pytest" => Some(ObjectiveValidationKind::Test),
+        "go" if parts.get(1).is_some_and(|part| part == "test") => {
+            Some(ObjectiveValidationKind::Test)
+        }
+        "make" | "mvn" | "gradle" | "swift"
+            if parts.iter().skip(1).any(|part| {
+                let part = part.to_ascii_lowercase();
+                ["test", "check", "build", "verify", "lint"]
+                    .iter()
+                    .any(|marker| part.contains(marker))
+            }) =>
+        {
+            if parts
+                .iter()
+                .any(|part| part.to_ascii_lowercase().contains("test"))
+            {
+                Some(ObjectiveValidationKind::Test)
+            } else {
+                Some(ObjectiveValidationKind::Diagnostic)
+            }
+        }
+        _ => None,
     }
+}
+
+fn test_report_executed_tests(report: &ToolExecutionReport) -> bool {
+    report.artifact_contents.iter().any(|artifact| {
+        let output = String::from_utf8_lossy(&artifact.bytes).to_ascii_lowercase();
+        output.lines().any(line_reports_executed_tests)
+    })
+}
+
+fn line_reports_executed_tests(line: &str) -> bool {
+    let line = line.trim();
+    if line.starts_with("ok ") || line.starts_with("ok\t") {
+        return true;
+    }
+    [" passed", " tests", " test", " tests run:"]
+        .iter()
+        .filter_map(|marker| line.find(marker).map(|index| &line[..index]))
+        .any(|prefix| {
+            prefix
+                .split(|character: char| !character.is_ascii_digit())
+                .rfind(|value| !value.is_empty())
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|count| count > 0)
+        })
 }
 
 fn objective_requires_workspace_evidence(objective: &str) -> bool {

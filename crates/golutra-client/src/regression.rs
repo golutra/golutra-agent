@@ -1,6 +1,9 @@
 //! Baseline/candidate 隔离执行编排；`golutra-eval` 只保存事实和执行纯比较。
 
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use base64::Engine;
 use golutra_core::{
@@ -24,6 +27,12 @@ const MAX_CANDIDATE_FILE_BYTES: usize = 1024 * 1024;
 struct RegressionCaseInput {
     case_ref: String,
     objective: String,
+}
+
+#[derive(Debug, Clone)]
+struct CandidateFile {
+    relative_path: PathBuf,
+    content: String,
 }
 
 struct RegressionRoleInput<'a> {
@@ -60,20 +69,25 @@ impl RuntimeHost {
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
             .map(ToOwned::to_owned);
-        let candidate_digest = command
+        let candidate_files = candidate_files_from_payload(&command.payload)?;
+        if candidate_files.is_empty() {
+            return Err(ClientError::TaskExecution(
+                "regression candidate must include at least one candidate_files patch artifact"
+                    .to_owned(),
+            ));
+        }
+        let candidate_digest = candidate_files_digest(&candidate_files);
+        if let Some(declared_digest) = command
             .payload
             .get("candidate_digest")
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| {
-                let bytes = serde_json::to_vec(&json!({
-                    "candidate_id": candidate_id,
-                    "payload": command.payload,
-                }))
-                .unwrap_or_else(|_| candidate_id.as_bytes().to_vec());
-                format!("sha256:{:x}", Sha256::digest(bytes))
-            });
+            && declared_digest != candidate_digest
+        {
+            return Err(ClientError::TaskExecution(
+                "declared candidate_digest does not match candidate_files".to_owned(),
+            ));
+        }
         let mut case_refs = command
             .payload
             .get("case_refs")
@@ -179,7 +193,13 @@ impl RuntimeHost {
                 copy_workspace_snapshot(source, &baseline_workspace)?;
                 copy_workspace_snapshot(source, &candidate_workspace)?;
             }
-            apply_candidate_files(&candidate_workspace, &command.payload)?;
+            apply_candidate_file_set(&candidate_workspace, &candidate_files)?;
+            if workspace_digest(&baseline_workspace)? == workspace_digest(&candidate_workspace)? {
+                return Err(ClientError::TaskExecution(format!(
+                    "candidate patch is a no-op for regression case {}",
+                    case.case_ref
+                )));
+            }
 
             let baseline_home = case_root.join("baseline-home");
             let candidate_home = case_root.join("candidate-home");
@@ -472,17 +492,18 @@ fn included_snapshot_entry(entry: &DirEntry) -> bool {
     )
 }
 
-fn apply_candidate_files(workspace: &Path, payload: &Value) -> Result<(), ClientError> {
+fn candidate_files_from_payload(payload: &Value) -> Result<Vec<CandidateFile>, ClientError> {
     let Some(files) = payload.get("candidate_files").and_then(Value::as_object) else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     if files.len() > MAX_CANDIDATE_FILES {
         return Err(ClientError::TaskExecution(format!(
             "candidate_files exceeds {MAX_CANDIDATE_FILES} entries"
         )));
     }
+    let mut candidate_files = Vec::with_capacity(files.len());
     for (relative, content) in files {
-        let relative = Path::new(relative);
+        let relative = PathBuf::from(relative);
         if relative.is_absolute()
             || relative
                 .components()
@@ -492,7 +513,7 @@ fn apply_candidate_files(workspace: &Path, payload: &Value) -> Result<(), Client
                 "candidate_files paths must stay inside the isolated workspace".to_owned(),
             ));
         }
-        if let Some(reason) = sealed_candidate_path_reason(relative) {
+        if let Some(reason) = sealed_candidate_path_reason(&relative) {
             return Err(ClientError::TaskExecution(format!(
                 "candidate file `{}` modifies sealed control-plane state: {reason}",
                 relative.display()
@@ -506,13 +527,50 @@ fn apply_candidate_files(workspace: &Path, payload: &Value) -> Result<(), Client
                 "candidate file exceeds {MAX_CANDIDATE_FILE_BYTES} bytes"
             )));
         }
-        let target = workspace.join(relative);
+        candidate_files.push(CandidateFile {
+            relative_path: relative,
+            content: content.to_owned(),
+        });
+    }
+    candidate_files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok(candidate_files)
+}
+
+fn candidate_files_digest(files: &[CandidateFile]) -> String {
+    let mut hasher = Sha256::new();
+    for file in files {
+        let relative = file.relative_path.to_string_lossy();
+        hasher.update(
+            u64::try_from(relative.len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        hasher.update(relative.as_bytes());
+        hasher.update(
+            u64::try_from(file.content.len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        hasher.update(file.content.as_bytes());
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn apply_candidate_file_set(workspace: &Path, files: &[CandidateFile]) -> Result<(), ClientError> {
+    for file in files {
+        let target = workspace.join(&file.relative_path);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(|error| ClientError::Io(error.to_string()))?;
         }
-        fs::write(target, content).map_err(|error| ClientError::Io(error.to_string()))?;
+        fs::write(target, &file.content).map_err(|error| ClientError::Io(error.to_string()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn apply_candidate_files(workspace: &Path, payload: &Value) -> Result<(), ClientError> {
+    let files = candidate_files_from_payload(payload)?;
+    apply_candidate_file_set(workspace, &files)
 }
 
 fn sealed_candidate_path_reason(relative: &Path) -> Option<&'static str> {
@@ -625,6 +683,31 @@ mod tests {
         assert_eq!(
             fs::read_to_string(workspace.path().join("src/feature.rs")).expect("candidate file"),
             "pub fn feature() {}"
+        );
+    }
+
+    #[test]
+    fn candidate_file_digest_is_canonical_and_content_sensitive() {
+        let first = candidate_files_from_payload(&json!({
+            "candidate_files": {"b.txt": "two", "a.txt": "one"}
+        }))
+        .expect("candidate files");
+        let reordered = candidate_files_from_payload(&json!({
+            "candidate_files": {"a.txt": "one", "b.txt": "two"}
+        }))
+        .expect("candidate files");
+        let changed = candidate_files_from_payload(&json!({
+            "candidate_files": {"a.txt": "changed", "b.txt": "two"}
+        }))
+        .expect("candidate files");
+
+        assert_eq!(
+            candidate_files_digest(&first),
+            candidate_files_digest(&reordered)
+        );
+        assert_ne!(
+            candidate_files_digest(&first),
+            candidate_files_digest(&changed)
         );
     }
 }

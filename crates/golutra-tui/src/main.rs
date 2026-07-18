@@ -98,6 +98,7 @@ struct TuiApp {
     command_messages: Vec<TranscriptItem>,
     resume_picker: Option<ResumePickerState>,
     export_flow: Option<ExportFlowState>,
+    export_operation: Option<PendingExportOperation>,
     auth_dialog: Option<AuthDialogState>,
     auth_operation: Option<PendingAuthOperation>,
     input: ComposerInput,
@@ -161,6 +162,7 @@ impl TuiApp {
             command_messages: Vec::new(),
             resume_picker: None,
             export_flow: None,
+            export_operation: None,
             auth_dialog,
             auth_operation: None,
             input: ComposerInput::default(),
@@ -226,6 +228,8 @@ impl TuiApp {
             projection.status == golutra_core::TaskStatus::WaitingAuthentication
         }) && self.auth_dialog.is_none()
             && self.auth_operation.is_none()
+            && self.resume_picker.is_none()
+            && self.export_flow.is_none()
         {
             self.auth_dialog = Some(AuthDialogState::new());
             self.status_message = "provider authentication required".to_owned();
@@ -286,7 +290,6 @@ impl TuiApp {
         if !self.history_has_more_before {
             return Ok(());
         }
-        let previous_rows = transcript_rows(self).len();
         let page = transport
             .event_page(EventPageRequest {
                 session_id: self.session_id,
@@ -312,13 +315,8 @@ impl TuiApp {
         self.history_start_cursor = page.start_cursor;
         self.history_has_more_before = page.has_more;
         let current_rows = transcript_rows(self).len();
-        if !self.transcript_scroll.follow_tail && current_rows > previous_rows {
-            self.transcript_scroll.offset_from_bottom = self
-                .transcript_scroll
-                .offset_from_bottom
-                .saturating_add(current_rows.saturating_sub(previous_rows));
-        }
-        self.transcript_scroll.row_count = current_rows;
+        self.transcript_scroll
+            .set_row_count_after_prepend(current_rows);
         self.clamp_transcript_scroll();
         Ok(())
     }
@@ -463,10 +461,13 @@ impl TuiApp {
     fn sync_transcript_row_count(&mut self, previous_row_count: usize) {
         let current_row_count = transcript_rows(self).len();
         if !self.transcript_scroll.follow_tail && current_row_count > previous_row_count {
+            let added = current_row_count - previous_row_count;
             self.transcript_scroll.offset_from_bottom = self
                 .transcript_scroll
                 .offset_from_bottom
-                .saturating_add(current_row_count - previous_row_count);
+                .saturating_add(added);
+            self.transcript_scroll.unseen_rows =
+                self.transcript_scroll.unseen_rows.saturating_add(added);
         }
         self.transcript_scroll.row_count = current_row_count;
         self.clamp_transcript_scroll();
@@ -496,7 +497,10 @@ impl TuiApp {
         {
             self.history_load_requested = true;
         }
-        self.status_message = transcript_scroll_status(self.transcript_scroll.offset_from_bottom);
+        self.status_message = transcript_scroll_status(
+            self.transcript_scroll.offset_from_bottom,
+            self.transcript_scroll.unseen_rows,
+        );
     }
 
     fn clamp_transcript_scroll(&mut self) {
@@ -541,7 +545,10 @@ impl TuiApp {
         {
             self.developer_load_requested = true;
         }
-        self.status_message = developer_scroll_status(self.developer_scroll.offset_from_bottom);
+        self.status_message = developer_scroll_status(
+            self.developer_scroll.offset_from_bottom,
+            self.developer_scroll.unseen_rows,
+        );
     }
 
     async fn load_older_debug_history(
@@ -552,7 +559,6 @@ impl TuiApp {
         let Some(projection) = &mut self.developer_projection else {
             return Ok(());
         };
-        let previous_rows = self.developer_scroll.row_count;
         load_older_debug_events(transport, projection)
             .await
             .map_err(|error| miette::miette!("{error}"))?;
@@ -560,14 +566,8 @@ impl TuiApp {
             .into_iter()
             .filter(|row| matches!(row, DeveloperPanelRow::Event { .. }))
             .count();
-        if !self.developer_scroll.follow_tail && current_rows > previous_rows {
-            self.developer_scroll.offset_from_bottom = self
-                .developer_scroll
-                .offset_from_bottom
-                .saturating_add(current_rows - previous_rows);
-        }
-        self.developer_scroll.row_count = current_rows;
-        self.developer_scroll.clamp(usize::MAX);
+        self.developer_scroll
+            .set_row_count_after_prepend(current_rows);
         Ok(())
     }
 
@@ -884,29 +884,21 @@ impl TuiApp {
                 let destination = PathBuf::from(&flow.destination_input);
                 flow.step = ExportFlowStep::Running;
                 flow.error = None;
-                let result = DebugExportCoordinator::new(transport)
-                    .export(DebugExportRequest {
-                        selection: golutra_protocol::SessionWindowRequest {
-                            anchor_thread_id: thread_id,
-                            range,
-                        },
-                        destination,
-                    })
-                    .await;
-                if let Some(flow) = self.export_flow.as_mut() {
-                    match result {
-                        Ok(receipt) => {
-                            self.status_message = "export complete".to_owned();
-                            flow.receipt = Some(receipt);
-                            flow.step = ExportFlowStep::Completed;
-                        }
-                        Err(error) => {
-                            self.status_message = "export failed".to_owned();
-                            flow.error = Some(error.to_string());
-                            flow.step = ExportFlowStep::Error;
-                        }
-                    }
-                }
+                let transport = transport.clone();
+                let task = tokio::spawn(async move {
+                    DebugExportCoordinator::new(&transport)
+                        .export(DebugExportRequest {
+                            selection: golutra_protocol::SessionWindowRequest {
+                                anchor_thread_id: thread_id,
+                                range,
+                            },
+                            destination,
+                        })
+                        .await
+                        .map_err(|error| error.to_string())
+                });
+                self.export_operation = Some(PendingExportOperation { task });
+                self.status_message = "export running".to_owned();
             }
             ExportFlowStep::Completed | ExportFlowStep::Error => {
                 self.export_flow = None;
@@ -917,6 +909,38 @@ impl TuiApp {
             }
         }
         Ok(())
+    }
+
+    async fn poll_export_operation(&mut self) {
+        if !self
+            .export_operation
+            .as_ref()
+            .is_some_and(|operation| operation.task.is_finished())
+        {
+            return;
+        }
+        let Some(operation) = self.export_operation.take() else {
+            return;
+        };
+        let result = match operation.task.await {
+            Ok(result) => result,
+            Err(error) => Err(format!("export task failed: {error}")),
+        };
+        let Some(flow) = self.export_flow.as_mut() else {
+            return;
+        };
+        match result {
+            Ok(receipt) => {
+                self.status_message = "export complete".to_owned();
+                flow.receipt = Some(receipt);
+                flow.step = ExportFlowStep::Completed;
+            }
+            Err(error) => {
+                self.status_message = "export failed".to_owned();
+                flow.error = Some(error);
+                flow.step = ExportFlowStep::Error;
+            }
+        }
     }
 
     fn start_new_session(&mut self) {
@@ -1465,6 +1489,7 @@ async fn run_app(
             app.refresh(&transport).await?;
         }
         app.poll_auth_operation(&transport).await;
+        app.poll_export_operation().await;
     }
 
     Ok(())
@@ -1724,7 +1749,7 @@ fn handle_mouse(mouse: MouseEvent, app: &mut TuiApp) {
                 let rows = app
                     .layout
                     .developer
-                    .map(|area| area.height.saturating_sub(1) as usize)
+                    .map(|area| developer_event_page_rows(app, area))
                     .unwrap_or(1);
                 app.scroll_developer(TranscriptScrollAction::LineUp, rows);
             }
@@ -1739,7 +1764,7 @@ fn handle_mouse(mouse: MouseEvent, app: &mut TuiApp) {
                 let rows = app
                     .layout
                     .developer
-                    .map(|area| area.height.saturating_sub(1) as usize)
+                    .map(|area| developer_event_page_rows(app, area))
                     .unwrap_or(1);
                 app.scroll_developer(TranscriptScrollAction::LineDown, rows);
             }

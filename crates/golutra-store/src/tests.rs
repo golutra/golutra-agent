@@ -1403,7 +1403,7 @@ async fn expired_post_task_lease_is_failed_when_retry_budget_is_exhausted() {
 }
 
 #[tokio::test]
-async fn artifact_range_reads_are_bounded_and_checksum_verified() {
+async fn artifact_range_reads_are_bounded_and_full_reads_verify_checksums() {
     let store = RuntimeStore::in_memory().await.expect("store");
     let bytes = b"abcdef";
     let artifact = ArtifactRecord {
@@ -1462,6 +1462,15 @@ async fn artifact_range_reads_are_bounded_and_checksum_verified() {
     tokio::fs::write(store.artifact_blob_path(artifact.artifact_id), b"tampered")
         .await
         .expect("tamper fixture");
+    let range_error = store
+        .read_artifact_range(&ArtifactReadRequest {
+            artifact_id: artifact.artifact_id,
+            offset: 0,
+            length: 3,
+        })
+        .await
+        .expect_err("range size mismatch");
+    assert!(range_error.to_string().contains("size mismatch"));
     let error = store
         .load_artifact_bytes(artifact.artifact_id)
         .await

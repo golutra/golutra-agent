@@ -342,8 +342,16 @@ fn criterion_assertion_kind(task_class: TaskClass, criterion: &str) -> Verificat
         return VerificationAssertionKind::AssistantResponse;
     }
     let lower = criterion.to_ascii_lowercase();
+    if ["test", "fixture"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+        || ["测试", "用例"]
+            .iter()
+            .any(|marker| criterion.contains(marker))
+    {
+        return VerificationAssertionKind::Test;
+    }
     if [
-        "test",
         "check",
         "build",
         "compile",
@@ -351,11 +359,10 @@ fn criterion_assertion_kind(task_class: TaskClass, criterion: &str) -> Verificat
         "typecheck",
         "diagnostic",
         "schema",
-        "fixture",
     ]
     .iter()
     .any(|marker| lower.contains(marker))
-        || ["测试", "检查", "构建", "编译", "诊断", "协议"]
+        || ["检查", "构建", "编译", "诊断", "协议"]
             .iter()
             .any(|marker| criterion.contains(marker))
     {
@@ -467,7 +474,21 @@ fn assertion_status(
             }
         }
         VerificationAssertionKind::Test | VerificationAssertionKind::Diagnostic => {
-            let checks = matching_checks(&[VerificationCheckKind::ObjectiveValidation]);
+            let checks = matching_checks(&[VerificationCheckKind::ObjectiveValidation])
+                .into_iter()
+                .filter(|check| {
+                    assertion.criterion_id == "tests_or_diagnostics"
+                        || match assertion.kind {
+                            VerificationAssertionKind::Test => {
+                                check.name.starts_with("objective:test:")
+                            }
+                            VerificationAssertionKind::Diagnostic => {
+                                !check.name.starts_with("objective:test:")
+                            }
+                            _ => false,
+                        }
+                })
+                .collect::<Vec<_>>();
             if checks.iter().any(|check| !check.passed) {
                 (
                     VerificationAssertionStatus::Fail,
@@ -492,16 +513,28 @@ fn assertion_status(
             }
         }
         VerificationAssertionKind::Delivery => {
-            if has_evidence {
+            let matching_delivery_checks = input
+                .command_checks
+                .iter()
+                .filter(|check| {
+                    check.passed
+                        && !check.evidence_refs.is_empty()
+                        && delivery_check_matches(assertion, check)
+                })
+                .collect::<Vec<_>>();
+            if has_evidence && !matching_delivery_checks.is_empty() {
                 (
                     VerificationAssertionStatus::Pass,
-                    "durable evidence is available".to_owned(),
-                    refs,
+                    "matching delivered evidence is available".to_owned(),
+                    matching_delivery_checks
+                        .iter()
+                        .flat_map(|check| check.evidence_refs.iter().copied())
+                        .collect(),
                 )
             } else {
                 (
                     VerificationAssertionStatus::Unknown,
-                    "durable evidence is unavailable".to_owned(),
+                    "no matching delivered evidence is available".to_owned(),
                     refs,
                 )
             }
@@ -531,6 +564,51 @@ fn assertion_status(
             refs,
         ),
     }
+}
+
+fn delivery_check_matches(assertion: &VerificationAssertion, check: &VerificationCheck) -> bool {
+    if assertion.criterion_id == "analysis_evidence" {
+        return true;
+    }
+    let criterion = assertion.expected.trim().to_ascii_lowercase();
+    let check_text = format!(
+        "{} {} {}",
+        check.name.to_ascii_lowercase(),
+        check.message.to_ascii_lowercase(),
+        check
+            .command
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+    );
+    let tokens = criterion
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .filter(|token| token.len() >= 3)
+        .filter(|token| {
+            !matches!(
+                *token,
+                "the"
+                    | "and"
+                    | "for"
+                    | "with"
+                    | "from"
+                    | "that"
+                    | "this"
+                    | "exists"
+                    | "available"
+                    | "returned"
+            )
+        })
+        .collect::<Vec<_>>();
+    if tokens.is_empty()
+        || tokens
+            .iter()
+            .all(|token| matches!(*token, "evidence" | "artifact" | "output" | "delivery"))
+    {
+        return true;
+    }
+    tokens.iter().any(|token| check_text.contains(token))
+        || (!criterion.is_ascii() && check_text.contains(&criterion))
 }
 
 fn passed_check(checks: &[VerificationCheck], kind: VerificationCheckKind) -> bool {
@@ -574,24 +652,95 @@ mod tests {
 
     #[test]
     fn evidence_with_passing_checks_passes() {
-        let record = VerificationRunner.verify(VerificationInput {
+        let evidence = EvidenceId::new();
+        let input = VerificationInput {
             task_id: TaskId::new(),
             objective: "read file".to_owned(),
             completion_criteria: vec!["evidence exists".to_owned()],
-            evidence_refs: vec![EvidenceId::new()],
+            evidence_refs: vec![evidence],
             command_checks: vec![VerificationCheck {
                 kind: VerificationCheckKind::ToolExecution,
                 name: "command".to_owned(),
                 command: Some("true".to_owned()),
                 passed: true,
-                evidence_refs: Vec::new(),
+                evidence_refs: vec![evidence],
                 message: "ok".to_owned(),
             }],
             requires_workspace_evidence: false,
             code_files_changed: false,
-        });
+        };
+        let record = VerificationRunner.verify(input);
 
         assert_eq!(record.result, VerificationResult::Pass);
+    }
+
+    #[test]
+    fn unrelated_evidence_does_not_satisfy_a_delivery_criterion() {
+        let evidence = EvidenceId::new();
+        let input = VerificationInput {
+            task_id: TaskId::new(),
+            objective: "verify the provider succeeds".to_owned(),
+            completion_criteria: vec!["provider succeeds".to_owned()],
+            evidence_refs: vec![evidence],
+            command_checks: vec![VerificationCheck {
+                kind: VerificationCheckKind::ToolExecution,
+                name: "tool:read_file".to_owned(),
+                command: None,
+                passed: true,
+                evidence_refs: vec![evidence],
+                message: "README.md was read".to_owned(),
+            }],
+            requires_workspace_evidence: false,
+            code_files_changed: false,
+        };
+        let plan = VerificationRunner.plan(&input);
+        let (record, plan) = VerificationRunner.verify_with_plan(input, plan);
+
+        assert_eq!(record.result, VerificationResult::Partial);
+        assert!(plan.assertions.iter().any(|assertion| {
+            assertion.criterion_id == "criterion-1"
+                && assertion.status == VerificationAssertionStatus::Unknown
+        }));
+    }
+
+    #[test]
+    fn a_diagnostic_check_does_not_satisfy_an_explicit_test_criterion() {
+        let evidence = EvidenceId::new();
+        let input = VerificationInput {
+            task_id: TaskId::new(),
+            objective: "change code and run tests".to_owned(),
+            completion_criteria: vec!["tests pass".to_owned()],
+            evidence_refs: vec![evidence],
+            command_checks: vec![
+                VerificationCheck {
+                    kind: VerificationCheckKind::WorkspaceChange,
+                    name: "workspace_diff".to_owned(),
+                    command: None,
+                    passed: true,
+                    evidence_refs: vec![evidence],
+                    message: "code changed".to_owned(),
+                },
+                VerificationCheck {
+                    kind: VerificationCheckKind::ObjectiveValidation,
+                    name: "objective:diagnostic:shell".to_owned(),
+                    command: Some("cargo check".to_owned()),
+                    passed: true,
+                    evidence_refs: vec![evidence],
+                    message: "diagnostic command passed".to_owned(),
+                },
+            ],
+            requires_workspace_evidence: true,
+            code_files_changed: true,
+        };
+        let plan = VerificationRunner.plan(&input);
+        let (record, plan) = VerificationRunner.verify_with_plan(input, plan);
+
+        assert_eq!(record.result, VerificationResult::Partial);
+        assert!(plan.assertions.iter().any(|assertion| {
+            assertion.criterion_id == "criterion-1"
+                && assertion.kind == VerificationAssertionKind::Test
+                && assertion.status == VerificationAssertionStatus::Unknown
+        }));
     }
 
     #[test]

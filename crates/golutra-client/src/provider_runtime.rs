@@ -4,7 +4,9 @@ use golutra_config::{
     ProviderConfigPaths, ProviderRuntimeEnv, load_provider_runtime_env_from_paths,
 };
 use golutra_context::{ContextBudgetPolicy, ContextBuilder};
-use golutra_llm::{ConfiguredProvider, MockProvider, ProviderError};
+use golutra_llm::{
+    ConfiguredProvider, MockProvider, ProviderError, ProviderProtocol, protocol_capabilities,
+};
 use serde_json::{Value, json};
 
 use super::RuntimePaths;
@@ -182,12 +184,40 @@ pub(crate) fn configured_provider_plan(
 fn context_builder_from_provider_env(
     provider_env: Option<&golutra_config::ProviderRuntimeEnv>,
 ) -> Result<ContextBuilder, ProviderError> {
+    let protocol = provider_env
+        .and_then(|environment| environment.get("GOLUTRA_PROVIDER_PROTOCOL"))
+        .and_then(|value| ProviderProtocol::from_config_value(&value))
+        .or_else(|| {
+            std::env::var("GOLUTRA_PROVIDER_PROTOCOL")
+                .ok()
+                .and_then(|value| ProviderProtocol::from_config_value(&value))
+        });
+    let declared_capabilities = protocol.map(protocol_capabilities);
     let Some(raw_config) = provider_env
         .and_then(|environment| environment.get("GOLUTRA_PROVIDER_GENERATION_CONFIG"))
         .or_else(|| std::env::var("GOLUTRA_PROVIDER_GENERATION_CONFIG").ok())
         .filter(|value| !value.trim().is_empty())
     else {
-        return Ok(ContextBuilder::default());
+        let Some(capabilities) = declared_capabilities else {
+            return Ok(ContextBuilder::default());
+        };
+        let context_window = capabilities
+            .context_window
+            .ok_or_else(missing_context_window_error)?;
+        let max_output = capabilities.max_output_tokens.unwrap_or(1_024);
+        let budget_limit = context_window
+            .checked_sub(max_output)
+            .filter(|budget| *budget > 0)
+            .ok_or_else(|| ProviderError::NotConfigured {
+                message: "provider context window cannot retain the configured output budget"
+                    .to_owned(),
+            })?;
+        return Ok(ContextBuilder::new(ContextBudgetPolicy {
+            context_window,
+            max_output,
+            budget_limit,
+            ..ContextBudgetPolicy::default()
+        }));
     };
     let config: golutra_llm::ProviderGenerationConfig =
         serde_json::from_str(&raw_config).map_err(|error| ProviderError::NotConfigured {
@@ -197,12 +227,22 @@ fn context_builder_from_provider_env(
         .validate()
         .map_err(|message| ProviderError::NotConfigured { message })?;
     let mut policy = ContextBudgetPolicy::default();
-    if let Some(context_window) = config.context_window_size {
-        policy.context_window = context_window;
-    }
-    if let Some(max_output) = config.max_tokens {
-        policy.max_output = max_output;
-    }
+    policy.context_window = config
+        .context_window_size
+        .or_else(|| {
+            declared_capabilities
+                .as_ref()
+                .and_then(|capabilities| capabilities.context_window)
+        })
+        .ok_or_else(missing_context_window_error)?;
+    policy.max_output = config
+        .max_tokens
+        .or_else(|| {
+            declared_capabilities
+                .as_ref()
+                .and_then(|capabilities| capabilities.max_output_tokens)
+        })
+        .unwrap_or(1_024);
     policy.budget_limit = policy
         .context_window
         .checked_sub(policy.max_output)
@@ -212,6 +252,13 @@ fn context_builder_from_provider_env(
                 .to_owned(),
         })?;
     Ok(ContextBuilder::new(policy))
+}
+
+fn missing_context_window_error() -> ProviderError {
+    ProviderError::NotConfigured {
+        message: "provider context window is unknown; configure context_window_size explicitly"
+            .to_owned(),
+    }
 }
 
 pub(crate) fn prompt_requests_workspace_tools(payload: &Value, objective: &str) -> bool {

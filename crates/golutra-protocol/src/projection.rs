@@ -55,6 +55,14 @@ pub struct DebugProjection {
     pub evidence: Vec<EvidenceRecord>,
     pub verification: Option<VerificationRecord>,
     pub loop_decisions: Vec<LoopDecision>,
+    #[serde(default)]
+    pub post_task_jobs: Vec<PostTaskJob>,
+    #[serde(default)]
+    pub trace_complete: bool,
+    #[serde(default)]
+    pub missing_sections: Vec<String>,
+    #[serde(default)]
+    pub retention_losses: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

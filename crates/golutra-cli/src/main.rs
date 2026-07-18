@@ -378,6 +378,10 @@ enum EvalCommand {
     Candidates,
     Regress {
         candidate_id: String,
+        #[arg(long, value_name = "JSON_FILE")]
+        candidate_files: std::path::PathBuf,
+        #[arg(long)]
+        candidate_digest: Option<String>,
     },
     Review {
         candidate_id: String,
@@ -1217,13 +1221,31 @@ async fn main() -> miette::Result<()> {
                 )
                 .await?;
             }
-            EvalCommand::Regress { candidate_id } => {
+            EvalCommand::Regress {
+                candidate_id,
+                candidate_files,
+                candidate_digest,
+            } => {
+                let content = std::fs::read_to_string(&candidate_files).map_err(|error| {
+                    miette::miette!(
+                        "failed to read candidate files {}: {error}",
+                        candidate_files.display()
+                    )
+                })?;
+                let files: serde_json::Map<String, serde_json::Value> =
+                    serde_json::from_str(&content).map_err(|error| {
+                        miette::miette!("candidate files JSON is invalid: {error}")
+                    })?;
                 print_command_ack(
                     &transport,
                     command(
                         session_id,
                         SessionCommandKind::RunRegression,
-                        serde_json::json!({"candidate_id": candidate_id}),
+                        serde_json::json!({
+                            "candidate_id": candidate_id,
+                            "candidate_files": files,
+                            "candidate_digest": candidate_digest,
+                        }),
                     ),
                 )
                 .await?;

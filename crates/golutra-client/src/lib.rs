@@ -117,9 +117,9 @@ pub use application::{
 };
 pub(crate) use context::{
     compact_event_summary, compact_history_text, compact_history_with_summary,
-    conversation_history_line, environment_context_prompt, explicit_compaction_from_event,
-    load_project_instructions, memory_context, preview_from_payload, prompt_from_payload,
-    system_prompt, title_from_payload,
+    completion_criteria_from_payload, conversation_history_line, environment_context_prompt,
+    explicit_compaction_from_event, load_project_instructions, memory_context,
+    preview_from_payload, prompt_from_payload, system_prompt, title_from_payload,
 };
 pub use debug_export::{
     DebugExportCoordinator, DebugExportManifest, DebugExportReceipt, DebugExportRequest,
