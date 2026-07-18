@@ -38,7 +38,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     "instance_id": "server-1",
                     "pid": 1,
                     "base_url": self.server.base_url,
-                    "protocol_versions": {"minimum": 2, "current": 2},
+                    "protocol_versions": {"minimum": 2, "current": 3},
                     "started_at": "2026-01-01T00:00:00Z",
                 }
             )
@@ -98,6 +98,23 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             )
         elif path == "/traces":
             self._json(self._trace(body))
+        elif path == "/sessions/page":
+            self._json(
+                {
+                    "sessions": [self._session_summary()],
+                    "next_cursor": None,
+                    "has_more": False,
+                }
+            )
+        elif path == "/sessions/window":
+            self._json(
+                {
+                    "anchor_thread_id": body["anchor_thread_id"],
+                    "range": body["range"],
+                    "sessions": [self._session_summary()],
+                    "reached_boundary": True,
+                }
+            )
         elif path == "/artifacts/chunk":
             self._json(
                 {
@@ -118,7 +135,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         )
         valid = (
             self.headers.get("authorization") == f"Bearer {TOKEN}"
-            and self.headers.get("x-golutra-protocol-version") == "2"
+            and self.headers.get("x-golutra-protocol-version") == "3"
         )
         if not valid:
             self._json({"error": "unauthorized"}, 401)
@@ -153,6 +170,20 @@ class RuntimeHandler(BaseHTTPRequestHandler):
     @staticmethod
     def _thread() -> dict:
         return {"thread_id": THREAD_ID, "session_id": SESSION_ID, "title": "fixture"}
+
+    @staticmethod
+    def _session_summary() -> dict:
+        return {
+            "thread_id": THREAD_ID,
+            "session_id": SESSION_ID,
+            "parent_thread_id": None,
+            "forked_from_turn_id": None,
+            "title": "fixture",
+            "preview": "fixture preview",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "recency_at": "2026-01-01T00:00:00Z",
+        }
 
     @staticmethod
     def _trace(request: dict) -> dict:
@@ -257,6 +288,21 @@ class ClientTest(unittest.TestCase):
         )
         self.assertEqual(len(self.client.replay_events({"session_id": SESSION_ID})), 1)
         self.assertEqual(len(self.client.list_threads()), 1)
+        self.assertEqual(
+            self.client.session_page({"cursor": None, "limit": 20})["sessions"][0][
+                "thread_id"
+            ],
+            THREAD_ID,
+        )
+        self.assertEqual(
+            self.client.session_window(
+                {
+                    "anchor_thread_id": THREAD_ID,
+                    "range": {"direction": "single", "count": 1},
+                }
+            )["anchor_thread_id"],
+            THREAD_ID,
+        )
         subscription = self.client.subscribe({"session_id": SESSION_ID})
         self.assertEqual(next(subscription)["event_type"], "task_completed")
         subscription.close()

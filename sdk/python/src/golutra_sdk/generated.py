@@ -701,6 +701,46 @@ class SessionCommand(TypedDict, total=False):
 
 SessionCommandKind: TypeAlias = Literal['create', 'prompt', 'approve', 'deny', 'pause', 'resume', 'abort', 'takeover', 'compact', 'memory_rollback', 'memory_feedback', 'run_regression', 'review_candidate', 'apply_candidate', 'rollback_candidate', 'record_benchmark', 'compare_counterfactual', 'plan_evolution', 'run_evolution', 'stage_skill', 'review_skill', 'install_skill', 'rollback_skill', 'provider_configured', 'provider_auth_submitted', 'provider_auth_cancelled', 'run_storage_maintenance', 'wait_post_task_job', 'retry_post_task_job', 'run_regression_campaign', 'review_memory_candidate', 'expire_memory', 'verify', 'replay', 'export']
 
+class SessionCursor(TypedDict, total=False):
+    recency_at: Required[str]
+    thread_id: Required[str]
+
+class SessionPage(TypedDict, total=False):
+    has_more: Required[bool]
+    next_cursor: NotRequired[SessionCursor | None]
+    sessions: Required[list[SessionSummary]]
+
+class SessionPageRequest(TypedDict, total=False):
+    cursor: NotRequired[SessionCursor | None]
+    limit: Required[int]
+
+SessionRangeDirection: TypeAlias = Literal['single', 'newer', 'older']
+
+class SessionRangeSpec(TypedDict, total=False):
+    count: Required[int]
+    direction: Required[SessionRangeDirection]
+
+class SessionSummary(TypedDict, total=False):
+    created_at: Required[str]
+    forked_from_turn_id: NotRequired[str | None]
+    parent_thread_id: NotRequired[str | None]
+    preview: Required[str]
+    recency_at: Required[str]
+    session_id: Required[str]
+    thread_id: Required[str]
+    title: Required[str]
+    updated_at: Required[str]
+
+class SessionWindow(TypedDict, total=False):
+    anchor_thread_id: Required[str]
+    range: Required[SessionRangeSpec]
+    reached_boundary: Required[bool]
+    sessions: Required[list[SessionSummary]]
+
+class SessionWindowRequest(TypedDict, total=False):
+    anchor_thread_id: Required[str]
+    range: Required[SessionRangeSpec]
+
 class SkillCandidate(TypedDict, total=False):
     evidence_refs: Required[list[str]]
     id: Required[str]
@@ -1004,6 +1044,14 @@ __all__ = [
     "SecurityUtilityResult",
     "SessionCommand",
     "SessionCommandKind",
+    "SessionCursor",
+    "SessionPage",
+    "SessionPageRequest",
+    "SessionRangeDirection",
+    "SessionRangeSpec",
+    "SessionSummary",
+    "SessionWindow",
+    "SessionWindowRequest",
     "SkillCandidate",
     "SkillLifecycleRecord",
     "SkillLifecycleStatus",

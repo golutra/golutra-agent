@@ -11,8 +11,9 @@ use std::sync::Arc;
 pub use super::trace::TaskTraceService;
 use super::{
     ClientError, EventFilter, EventPage, EventPageRequest, PostTaskCoordinator, RuntimeEvent,
-    RuntimeEventStream, RuntimeHost, RuntimeHostInfo, RuntimeQuery, SessionCommand, TaskTracePage,
-    TaskTraceRequest, ThreadId, ThreadRebindResult, ThreadRecord, TurnId, Value,
+    RuntimeEventStream, RuntimeHost, RuntimeHostInfo, RuntimeQuery, SessionCommand, SessionPage,
+    SessionPageRequest, SessionWindow, SessionWindowRequest, TaskTracePage, TaskTraceRequest,
+    ThreadId, ThreadRebindResult, ThreadRecord, TurnId, Value,
 };
 use golutra_core::{PostTaskJob, SessionId, TaskId, WorkspaceId};
 use golutra_protocol::{
@@ -232,6 +233,20 @@ impl RuntimeSessionService {
 
     pub async fn list_threads(&self, limit: u32) -> Result<Vec<ThreadRecord>, ClientError> {
         self.host.list_threads(limit).await
+    }
+
+    pub async fn session_page(
+        &self,
+        request: SessionPageRequest,
+    ) -> Result<SessionPage, ClientError> {
+        self.host.session_page(request).await
+    }
+
+    pub async fn session_window(
+        &self,
+        request: SessionWindowRequest,
+    ) -> Result<SessionWindow, ClientError> {
+        self.host.session_window(request).await
     }
 
     pub async fn thread_for_session(

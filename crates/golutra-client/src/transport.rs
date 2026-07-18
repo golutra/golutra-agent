@@ -131,6 +131,26 @@ impl EmbeddedTransport {
         self.application.session_service().list_threads(limit).await
     }
 
+    pub async fn session_page(
+        &self,
+        request: SessionPageRequest,
+    ) -> Result<SessionPage, ClientError> {
+        self.application
+            .session_service()
+            .session_page(request)
+            .await
+    }
+
+    pub async fn session_window(
+        &self,
+        request: SessionWindowRequest,
+    ) -> Result<SessionWindow, ClientError> {
+        self.application
+            .session_service()
+            .session_window(request)
+            .await
+    }
+
     pub async fn thread_for_session(
         &self,
         session_id: SessionId,
@@ -400,6 +420,36 @@ impl HttpSseTransport {
                 self.authenticated(self.client.get(self.url("/threads")))
                     .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id)
                     .query(&[("limit", limit)])
+                    .timeout(Duration::from_secs(30))
+            })
+            .await?;
+        decode_http_response(response).await
+    }
+
+    pub async fn session_page(
+        &self,
+        request: SessionPageRequest,
+    ) -> Result<SessionPage, ClientError> {
+        let response = self
+            .send_attached(|attachment_id| {
+                self.authenticated(self.client.post(self.url("/sessions/page")))
+                    .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id)
+                    .json(&request)
+                    .timeout(Duration::from_secs(30))
+            })
+            .await?;
+        decode_http_response(response).await
+    }
+
+    pub async fn session_window(
+        &self,
+        request: SessionWindowRequest,
+    ) -> Result<SessionWindow, ClientError> {
+        let response = self
+            .send_attached(|attachment_id| {
+                self.authenticated(self.client.post(self.url("/sessions/window")))
+                    .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id)
+                    .json(&request)
                     .timeout(Duration::from_secs(30))
             })
             .await?;
@@ -1008,6 +1058,34 @@ impl RuntimeTransport {
             Self::LocalIpc(transport) => transport.list_threads(limit).await,
             Self::LocalDaemon(transport) | Self::Remote(transport) => {
                 transport.list_threads(limit).await
+            }
+        }
+    }
+
+    pub async fn session_page(
+        &self,
+        request: SessionPageRequest,
+    ) -> Result<SessionPage, ClientError> {
+        match self {
+            Self::Embedded(transport) => transport.session_page(request).await,
+            #[cfg(unix)]
+            Self::LocalIpc(transport) => transport.session_page(request).await,
+            Self::LocalDaemon(transport) | Self::Remote(transport) => {
+                transport.session_page(request).await
+            }
+        }
+    }
+
+    pub async fn session_window(
+        &self,
+        request: SessionWindowRequest,
+    ) -> Result<SessionWindow, ClientError> {
+        match self {
+            Self::Embedded(transport) => transport.session_window(request).await,
+            #[cfg(unix)]
+            Self::LocalIpc(transport) => transport.session_window(request).await,
+            Self::LocalDaemon(transport) | Self::Remote(transport) => {
+                transport.session_window(request).await
             }
         }
     }

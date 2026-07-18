@@ -2,6 +2,22 @@
 
 use super::*;
 
+const MAX_SESSION_WINDOW_COUNT: u32 = 500;
+
+fn session_summary(thread: ThreadRecord) -> SessionSummary {
+    SessionSummary {
+        thread_id: thread.thread_id,
+        session_id: thread.session_id,
+        parent_thread_id: thread.parent_thread_id,
+        forked_from_turn_id: thread.forked_from_turn_id,
+        title: thread.title,
+        preview: thread.preview,
+        created_at: thread.created_at,
+        updated_at: thread.updated_at,
+        recency_at: thread.recency_at,
+    }
+}
+
 impl RuntimeHost {
     pub async fn list_threads(&self, limit: u32) -> Result<Vec<ThreadRecord>, ClientError> {
         if limit == 0 {
@@ -17,6 +33,93 @@ impl RuntimeHost {
             .take(limit as usize)
             .collect();
         Ok(threads)
+    }
+
+    pub async fn session_page(
+        &self,
+        request: SessionPageRequest,
+    ) -> Result<SessionPage, ClientError> {
+        if request.limit == 0 || request.limit > MAX_SESSION_WINDOW_COUNT {
+            return Err(ClientError::InvalidSession(format!(
+                "session page limit must be between 1 and {MAX_SESSION_WINDOW_COUNT}"
+            )));
+        }
+        let workspace_root = self.workspace_root_string();
+        let mut records = self
+            .repositories
+            .threads
+            .page(
+                workspace_root.as_deref(),
+                request.cursor.as_ref(),
+                request.limit.saturating_add(1),
+            )
+            .await?;
+        let has_more = records.len() > request.limit as usize;
+        if has_more {
+            records.truncate(request.limit as usize);
+        }
+        let next_cursor = has_more.then(|| {
+            records.last().map(|thread| SessionCursor {
+                recency_at: thread.recency_at,
+                thread_id: thread.thread_id,
+            })
+        });
+        Ok(SessionPage {
+            sessions: records.into_iter().map(session_summary).collect(),
+            next_cursor: next_cursor.flatten(),
+            has_more,
+        })
+    }
+
+    pub async fn session_window(
+        &self,
+        request: SessionWindowRequest,
+    ) -> Result<SessionWindow, ClientError> {
+        if request.range.count == 0 || request.range.count > MAX_SESSION_WINDOW_COUNT {
+            return Err(ClientError::InvalidSession(format!(
+                "session window count must be between 1 and {MAX_SESSION_WINDOW_COUNT}"
+            )));
+        }
+        if request.range.direction == SessionRangeDirection::Single && request.range.count != 1 {
+            return Err(ClientError::InvalidSession(
+                "single session window must have count 1".to_owned(),
+            ));
+        }
+        let anchor = self
+            .repositories
+            .threads
+            .by_id(request.anchor_thread_id)
+            .await?
+            .ok_or_else(|| {
+                ClientError::InvalidSession(format!(
+                    "thread `{}` not found",
+                    request.anchor_thread_id
+                ))
+            })?;
+        self.ensure_thread_in_workspace(&anchor)?;
+        if anchor.archived {
+            return Err(ClientError::InvalidSession(format!(
+                "thread `{}` is archived",
+                request.anchor_thread_id
+            )));
+        }
+        let workspace_root = self.workspace_root_string();
+        let records = self
+            .repositories
+            .threads
+            .window(
+                workspace_root.as_deref(),
+                &anchor,
+                request.range.direction,
+                request.range.count,
+            )
+            .await?;
+        Ok(SessionWindow {
+            anchor_thread_id: request.anchor_thread_id,
+            range: request.range,
+            reached_boundary: records.len() < request.range.count as usize,
+            sessions: records.into_iter().map(session_summary).collect(),
+        })
     }
 
     pub async fn thread_for_session(

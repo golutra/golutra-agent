@@ -146,6 +146,30 @@ impl UnixIpcTransport {
         .await
     }
 
+    pub async fn session_page(
+        &self,
+        request: SessionPageRequest,
+    ) -> Result<SessionPage, ClientError> {
+        self.attached_json(
+            "POST",
+            "/sessions/page",
+            Some(serde_json::to_value(request)?),
+        )
+        .await
+    }
+
+    pub async fn session_window(
+        &self,
+        request: SessionWindowRequest,
+    ) -> Result<SessionWindow, ClientError> {
+        self.attached_json(
+            "POST",
+            "/sessions/window",
+            Some(serde_json::to_value(request)?),
+        )
+        .await
+    }
+
     pub async fn thread_for_session(
         &self,
         session_id: SessionId,

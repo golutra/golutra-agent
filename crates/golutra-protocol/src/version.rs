@@ -2,7 +2,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub const RUNTIME_PROTOCOL_NAME: &str = "golutra-runtime";
-pub const RUNTIME_PROTOCOL_VERSION: u32 = 2;
+pub const RUNTIME_PROTOCOL_VERSION: u32 = 3;
 pub const MINIMUM_RUNTIME_PROTOCOL_VERSION: u32 = 2;
 pub const RUNTIME_STATE_SCHEMA_VERSION: u32 = 2;
 

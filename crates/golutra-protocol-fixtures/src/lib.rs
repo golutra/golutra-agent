@@ -19,8 +19,9 @@ use golutra_protocol::{
     ArtifactChunk, ArtifactReadRequest, CommandAck, ContextProjection, DebugProjection,
     EvaluationProjection, EventFilter, EventPage, EventPageRequest, ProtocolHandshake,
     RuntimeEvent, RuntimeEventSource, RuntimeEventType, RuntimeQuery, SessionCommand,
-    SessionCommandKind, StateProjection, StorageMaintenanceReport, StorageStats, TaskTracePage,
-    TaskTraceRequest, UserProjection, VisibleStep,
+    SessionCommandKind, SessionPage, SessionPageRequest, SessionWindow, SessionWindowRequest,
+    StateProjection, StorageMaintenanceReport, StorageStats, TaskTracePage, TaskTraceRequest,
+    UserProjection, VisibleStep,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -43,6 +44,10 @@ pub struct SdkProtocolBundle {
     pub event_filter: EventFilter,
     pub event_page_request: EventPageRequest,
     pub event_page: EventPage,
+    pub session_page_request: SessionPageRequest,
+    pub session_page: SessionPage,
+    pub session_window_request: SessionWindowRequest,
+    pub session_window: SessionWindow,
     pub event: RuntimeEvent,
     pub state_projection: StateProjection,
     pub user_projection: UserProjection,

@@ -120,6 +120,18 @@
     "security_utility_result": {
       "$ref": "#/$defs/SecurityUtilityResult"
     },
+    "session_page": {
+      "$ref": "#/$defs/SessionPage"
+    },
+    "session_page_request": {
+      "$ref": "#/$defs/SessionPageRequest"
+    },
+    "session_window": {
+      "$ref": "#/$defs/SessionWindow"
+    },
+    "session_window_request": {
+      "$ref": "#/$defs/SessionWindowRequest"
+    },
     "skill_candidate": {
       "$ref": "#/$defs/SkillCandidate"
     },
@@ -155,6 +167,10 @@
     "event_filter",
     "event_page_request",
     "event_page",
+    "session_page_request",
+    "session_page",
+    "session_window_request",
+    "session_window",
     "event",
     "state_projection",
     "user_projection",
@@ -3924,6 +3940,196 @@
         "verify",
         "replay",
         "export"
+      ]
+    },
+    "SessionCursor": {
+      "type": "object",
+      "properties": {
+        "recency_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "thread_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "recency_at",
+        "thread_id"
+      ]
+    },
+    "SessionPage": {
+      "type": "object",
+      "properties": {
+        "has_more": {
+          "type": "boolean"
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionCursor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sessions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SessionSummary"
+          }
+        }
+      },
+      "required": [
+        "sessions",
+        "has_more"
+      ]
+    },
+    "SessionPageRequest": {
+      "type": "object",
+      "properties": {
+        "cursor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionCursor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "limit": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "limit"
+      ]
+    },
+    "SessionRangeDirection": {
+      "type": "string",
+      "enum": [
+        "single",
+        "newer",
+        "older"
+      ]
+    },
+    "SessionRangeSpec": {
+      "type": "object",
+      "properties": {
+        "count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "direction": {
+          "$ref": "#/$defs/SessionRangeDirection"
+        }
+      },
+      "required": [
+        "direction",
+        "count"
+      ]
+    },
+    "SessionSummary": {
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "forked_from_turn_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "parent_thread_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "preview": {
+          "type": "string"
+        },
+        "recency_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "thread_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "title": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "thread_id",
+        "session_id",
+        "title",
+        "preview",
+        "created_at",
+        "updated_at",
+        "recency_at"
+      ]
+    },
+    "SessionWindow": {
+      "type": "object",
+      "properties": {
+        "anchor_thread_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "range": {
+          "$ref": "#/$defs/SessionRangeSpec"
+        },
+        "reached_boundary": {
+          "type": "boolean"
+        },
+        "sessions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SessionSummary"
+          }
+        }
+      },
+      "required": [
+        "anchor_thread_id",
+        "range",
+        "sessions",
+        "reached_boundary"
+      ]
+    },
+    "SessionWindowRequest": {
+      "type": "object",
+      "properties": {
+        "anchor_thread_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "range": {
+          "$ref": "#/$defs/SessionRangeSpec"
+        }
+      },
+      "required": [
+        "anchor_thread_id",
+        "range"
       ]
     },
     "SkillCandidate": {

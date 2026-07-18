@@ -5,7 +5,8 @@ use golutra_client::UnixIpcTransport;
 use golutra_client::{AppServerInfo, HttpSseTransport, RuntimeClient, TaskTraceClient};
 use golutra_core::{Actor, ActorKind, CommandId, SessionId, TaskId, ThreadId, TraceView};
 use golutra_protocol::{
-    EventFilter, RuntimeEventType, SessionCommand, SessionCommandKind, TaskTraceRequest,
+    EventFilter, RuntimeEventType, SessionCommand, SessionCommandKind, SessionPageRequest,
+    SessionRangeDirection, SessionRangeSpec, SessionWindowRequest, TaskTraceRequest,
 };
 use secrecy::SecretString;
 use tempfile::tempdir;
@@ -58,6 +59,37 @@ async fn unix_ipc_and_http_share_commands_history_and_event_streams() {
     let http_events = http.replay_events(filter).await.expect("HTTP replay");
     assert_eq!(ipc_events, http_events);
     assert_eq!(ipc.list_threads(20).await.expect("IPC threads").len(), 1);
+    let ipc_page = ipc
+        .session_page(SessionPageRequest {
+            cursor: None,
+            limit: 10,
+        })
+        .await
+        .expect("IPC session page");
+    let http_page = http
+        .session_page(SessionPageRequest {
+            cursor: None,
+            limit: 10,
+        })
+        .await
+        .expect("HTTP session page");
+    assert_eq!(ipc_page, http_page);
+    let anchor = ipc_page.sessions[0].thread_id;
+    let request = SessionWindowRequest {
+        anchor_thread_id: anchor,
+        range: SessionRangeSpec {
+            direction: SessionRangeDirection::Single,
+            count: 1,
+        },
+    };
+    assert_eq!(
+        ipc.session_window(request.clone())
+            .await
+            .expect("IPC session window"),
+        http.session_window(request)
+            .await
+            .expect("HTTP session window")
+    );
 
     let task_id = ipc_events
         .iter()

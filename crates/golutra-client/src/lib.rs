@@ -130,6 +130,10 @@ pub(crate) use event_codec::{
 };
 pub use event_codec::{event_sequence_no, projection_status};
 pub(crate) use execution_trace::CanonicalFactRecorder;
+pub use golutra_protocol::{
+    SessionCursor, SessionPage, SessionPageRequest, SessionRangeDirection, SessionRangeSpec,
+    SessionSummary, SessionWindow, SessionWindowRequest,
+};
 pub use paths::{AppServerPaths, RuntimePaths};
 pub(crate) use paths::{ensure_private_dir, set_owner_only_file, workspace_hash};
 pub use post_task::PostTaskCoordinator;

@@ -1914,6 +1914,323 @@ async fn global_store_filters_latest_threads_by_cwd() {
 }
 
 #[tokio::test]
+async fn session_window_selects_adjacent_newer_and_older_threads_from_an_anchor() {
+    let home = tempdir().expect("home");
+    let cwd = tempdir().expect("cwd");
+    let transport = EmbeddedTransport::from_home_and_cwd(home.path(), cwd.path())
+        .await
+        .expect("transport");
+    let workspace_root = cwd.path().canonicalize().expect("canonical cwd");
+    let base = chrono::Utc::now() - chrono::Duration::minutes(10);
+    let mut threads = Vec::new();
+    for index in 0..5 {
+        let at = base + chrono::Duration::minutes(index);
+        let thread = ThreadRecord {
+            thread_id: ThreadId::new(),
+            session_id: SessionId::new(),
+            parent_thread_id: None,
+            forked_from_turn_id: None,
+            forked_from_sequence_no: None,
+            workspace_root: Some(workspace_root.display().to_string()),
+            rebound_from_workspace_root: None,
+            rollout_path: None,
+            title: format!("thread-{index}"),
+            preview: format!("preview-{index}"),
+            created_at: at,
+            updated_at: at,
+            recency_at: at,
+            archived: false,
+        };
+        transport
+            .host
+            .repositories
+            .threads
+            .upsert(&thread)
+            .await
+            .expect("thread");
+        threads.push(thread);
+    }
+
+    let newer = transport
+        .session_window(SessionWindowRequest {
+            anchor_thread_id: threads[2].thread_id,
+            range: SessionRangeSpec {
+                direction: SessionRangeDirection::Newer,
+                count: 3,
+            },
+        })
+        .await
+        .expect("newer window");
+    assert_eq!(
+        newer
+            .sessions
+            .iter()
+            .map(|session| session.title.as_str())
+            .collect::<Vec<_>>(),
+        vec!["thread-4", "thread-3", "thread-2"]
+    );
+
+    let older = transport
+        .session_window(SessionWindowRequest {
+            anchor_thread_id: threads[2].thread_id,
+            range: SessionRangeSpec {
+                direction: SessionRangeDirection::Older,
+                count: 3,
+            },
+        })
+        .await
+        .expect("older window");
+    assert_eq!(
+        older
+            .sessions
+            .iter()
+            .map(|session| session.title.as_str())
+            .collect::<Vec<_>>(),
+        vec!["thread-2", "thread-1", "thread-0"]
+    );
+
+    let first_page = transport
+        .session_page(SessionPageRequest {
+            cursor: None,
+            limit: 2,
+        })
+        .await
+        .expect("first page");
+    assert!(first_page.has_more);
+    assert_eq!(
+        first_page
+            .sessions
+            .iter()
+            .map(|session| session.title.as_str())
+            .collect::<Vec<_>>(),
+        vec!["thread-4", "thread-3"]
+    );
+    let second_page = transport
+        .session_page(SessionPageRequest {
+            cursor: first_page.next_cursor,
+            limit: 2,
+        })
+        .await
+        .expect("second page");
+    assert_eq!(
+        second_page
+            .sessions
+            .iter()
+            .map(|session| session.title.as_str())
+            .collect::<Vec<_>>(),
+        vec!["thread-2", "thread-1"]
+    );
+    assert!(
+        first_page
+            .sessions
+            .iter()
+            .all(|session| !second_page.sessions.contains(session))
+    );
+
+    let last_page = transport
+        .session_page(SessionPageRequest {
+            cursor: second_page.next_cursor,
+            limit: 2,
+        })
+        .await
+        .expect("last page");
+    assert_eq!(
+        last_page
+            .sessions
+            .iter()
+            .map(|session| session.title.as_str())
+            .collect::<Vec<_>>(),
+        vec!["thread-0"]
+    );
+    assert!(!last_page.has_more);
+    assert!(last_page.next_cursor.is_none());
+}
+
+#[tokio::test]
+async fn session_window_validates_ranges_workspace_and_archived_anchors() {
+    let home = tempdir().expect("home");
+    let cwd_a = tempdir().expect("cwd a");
+    let cwd_b = tempdir().expect("cwd b");
+    let transport_a = EmbeddedTransport::from_home_and_cwd(home.path(), cwd_a.path())
+        .await
+        .expect("transport a");
+    let transport_b = EmbeddedTransport::from_home_and_cwd(home.path(), cwd_b.path())
+        .await
+        .expect("transport b");
+    let at = chrono::Utc::now();
+    let thread = ThreadRecord {
+        thread_id: ThreadId::new(),
+        session_id: SessionId::new(),
+        parent_thread_id: None,
+        forked_from_turn_id: None,
+        forked_from_sequence_no: None,
+        workspace_root: Some(
+            cwd_a
+                .path()
+                .canonicalize()
+                .expect("canonical cwd a")
+                .display()
+                .to_string(),
+        ),
+        rebound_from_workspace_root: None,
+        rollout_path: None,
+        title: "validation-anchor".to_owned(),
+        preview: String::new(),
+        created_at: at,
+        updated_at: at,
+        recency_at: at,
+        archived: false,
+    };
+    transport_a
+        .host
+        .repositories
+        .threads
+        .upsert(&thread)
+        .await
+        .expect("thread");
+
+    for count in [0, 501] {
+        let error = transport_a
+            .session_window(SessionWindowRequest {
+                anchor_thread_id: thread.thread_id,
+                range: SessionRangeSpec {
+                    direction: SessionRangeDirection::Older,
+                    count,
+                },
+            })
+            .await
+            .expect_err("invalid count must be rejected");
+        assert!(error.to_string().contains("between 1 and 500"));
+    }
+    for limit in [0, 501] {
+        let error = transport_a
+            .session_page(SessionPageRequest {
+                cursor: None,
+                limit,
+            })
+            .await
+            .expect_err("invalid page limit must be rejected");
+        assert!(error.to_string().contains("between 1 and 500"));
+    }
+    let error = transport_a
+        .session_window(SessionWindowRequest {
+            anchor_thread_id: thread.thread_id,
+            range: SessionRangeSpec {
+                direction: SessionRangeDirection::Single,
+                count: 2,
+            },
+        })
+        .await
+        .expect_err("single range must contain one session");
+    assert!(error.to_string().contains("must have count 1"));
+
+    let error = transport_b
+        .session_window(SessionWindowRequest {
+            anchor_thread_id: thread.thread_id,
+            range: SessionRangeSpec {
+                direction: SessionRangeDirection::Single,
+                count: 1,
+            },
+        })
+        .await
+        .expect_err("foreign workspace anchor must be rejected");
+    assert!(error.to_string().contains("does not belong to workspace"));
+
+    let mut archived = thread;
+    archived.archived = true;
+    transport_a
+        .host
+        .repositories
+        .threads
+        .upsert(&archived)
+        .await
+        .expect("archive thread");
+    let error = transport_a
+        .session_window(SessionWindowRequest {
+            anchor_thread_id: archived.thread_id,
+            range: SessionRangeSpec {
+                direction: SessionRangeDirection::Single,
+                count: 1,
+            },
+        })
+        .await
+        .expect_err("archived anchor must be rejected");
+    assert!(error.to_string().contains("is archived"));
+}
+
+#[tokio::test]
+async fn session_page_uses_thread_id_as_a_stable_cursor_tiebreaker() {
+    let home = tempdir().expect("home");
+    let cwd = tempdir().expect("cwd");
+    let transport = EmbeddedTransport::from_home_and_cwd(home.path(), cwd.path())
+        .await
+        .expect("transport");
+    let workspace_root = cwd
+        .path()
+        .canonicalize()
+        .expect("canonical cwd")
+        .display()
+        .to_string();
+    let at = chrono::Utc::now();
+    let mut threads = Vec::new();
+    for index in 0..4 {
+        let thread = ThreadRecord {
+            thread_id: ThreadId::new(),
+            session_id: SessionId::new(),
+            parent_thread_id: None,
+            forked_from_turn_id: None,
+            forked_from_sequence_no: None,
+            workspace_root: Some(workspace_root.clone()),
+            rebound_from_workspace_root: None,
+            rollout_path: None,
+            title: format!("same-time-{index}"),
+            preview: String::new(),
+            created_at: at,
+            updated_at: at,
+            recency_at: at,
+            archived: false,
+        };
+        transport
+            .host
+            .repositories
+            .threads
+            .upsert(&thread)
+            .await
+            .expect("thread");
+        threads.push(thread);
+    }
+    threads.sort_by_key(|thread| std::cmp::Reverse(thread.thread_id));
+
+    let first_page = transport
+        .session_page(SessionPageRequest {
+            cursor: None,
+            limit: 2,
+        })
+        .await
+        .expect("first page");
+    let second_page = transport
+        .session_page(SessionPageRequest {
+            cursor: first_page.next_cursor,
+            limit: 2,
+        })
+        .await
+        .expect("second page");
+    let actual = first_page
+        .sessions
+        .into_iter()
+        .chain(second_page.sessions)
+        .map(|session| session.thread_id)
+        .collect::<Vec<_>>();
+    let expected = threads
+        .into_iter()
+        .map(|thread| thread.thread_id)
+        .collect::<Vec<_>>();
+
+    assert_eq!(actual, expected);
+    assert!(!second_page.has_more);
+}
+
+#[tokio::test]
 async fn cwd_attachment_rejects_foreign_session_access() {
     let cwd_a = tempdir().expect("cwd a");
     let cwd_b = tempdir().expect("cwd b");

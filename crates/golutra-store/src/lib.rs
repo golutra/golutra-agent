@@ -5,7 +5,8 @@ use golutra_core::{
 };
 use golutra_protocol::{
     ArtifactReadRequest, CommandAck, DebugEventWindow, DebugProjection, RuntimeEvent,
-    RuntimeEventType, StateProjection, StorageStats, UserProjection,
+    RuntimeEventType, SessionCursor, SessionRangeDirection, StateProjection, StorageStats,
+    UserProjection,
 };
 use sha2::{Digest, Sha256};
 use sqlx::{
@@ -1654,6 +1655,107 @@ impl RuntimeStore {
         .await?;
 
         rows.into_iter().map(thread_from_row).collect()
+    }
+
+    pub async fn list_threads_page(
+        &self,
+        workspace_root: Option<&str>,
+        cursor: Option<&SessionCursor>,
+        limit: u32,
+    ) -> StoreResult<Vec<ThreadRecord>> {
+        let cursor_at = cursor.map(|cursor| cursor.recency_at.to_rfc3339());
+        let cursor_thread = cursor.map(|cursor| cursor.thread_id.to_string());
+        let rows = sqlx::query(
+            r#"
+            SELECT thread_id, session_id, parent_thread_id, forked_from_turn_id,
+                   forked_from_sequence_no, workspace_root, rebound_from_workspace_root,
+                   rollout_path, title, preview, created_at, updated_at, recency_at, archived
+            FROM threads
+            WHERE archived = 0
+              AND (? IS NULL OR workspace_root = ?)
+              AND (
+                    ? IS NULL
+                    OR recency_at < ?
+                    OR (recency_at = ? AND thread_id < ?)
+              )
+            ORDER BY recency_at DESC, thread_id DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(workspace_root)
+        .bind(workspace_root)
+        .bind(cursor_at.as_deref())
+        .bind(cursor_at.as_deref())
+        .bind(cursor_at.as_deref())
+        .bind(cursor_thread.as_deref())
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(thread_from_row).collect()
+    }
+
+    pub async fn thread_window(
+        &self,
+        workspace_root: Option<&str>,
+        anchor: &ThreadRecord,
+        direction: SessionRangeDirection,
+        count: u32,
+    ) -> StoreResult<Vec<ThreadRecord>> {
+        if count <= 1 || direction == SessionRangeDirection::Single {
+            return Ok(vec![anchor.clone()]);
+        }
+        let adjacent_count = count.saturating_sub(1);
+        let anchor_at = anchor.recency_at.to_rfc3339();
+        let anchor_thread = anchor.thread_id.to_string();
+        let (comparison, order) = match direction {
+            SessionRangeDirection::Newer => (">", "ASC"),
+            SessionRangeDirection::Older => ("<", "DESC"),
+            SessionRangeDirection::Single => unreachable!("single returned above"),
+        };
+        let sql = format!(
+            r#"
+            SELECT thread_id, session_id, parent_thread_id, forked_from_turn_id,
+                   forked_from_sequence_no, workspace_root, rebound_from_workspace_root,
+                   rollout_path, title, preview, created_at, updated_at, recency_at, archived
+            FROM threads
+            WHERE archived = 0
+              AND (? IS NULL OR workspace_root = ?)
+              AND (
+                    recency_at {comparison} ?
+                    OR (recency_at = ? AND thread_id {comparison} ?)
+              )
+            ORDER BY recency_at {order}, thread_id {order}
+            LIMIT ?
+            "#
+        );
+        let rows = sqlx::query(&sql)
+            .bind(workspace_root)
+            .bind(workspace_root)
+            .bind(&anchor_at)
+            .bind(&anchor_at)
+            .bind(&anchor_thread)
+            .bind(i64::from(adjacent_count))
+            .fetch_all(&self.pool)
+            .await?;
+        let mut adjacent = rows
+            .into_iter()
+            .map(thread_from_row)
+            .collect::<StoreResult<Vec<_>>>()?;
+        match direction {
+            SessionRangeDirection::Newer => {
+                adjacent.reverse();
+                adjacent.push(anchor.clone());
+                Ok(adjacent)
+            }
+            SessionRangeDirection::Older => {
+                let mut records = Vec::with_capacity(adjacent.len().saturating_add(1));
+                records.push(anchor.clone());
+                records.extend(adjacent);
+                Ok(records)
+            }
+            SessionRangeDirection::Single => unreachable!("single returned above"),
+        }
     }
 
     pub async fn load_evidence_records(

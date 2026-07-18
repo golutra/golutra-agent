@@ -198,6 +198,7 @@ export type RuntimeQueryKind =
 export type RegressionExecutionRole = "baseline" | "candidate";
 export type RegressionExecutionStatus =
   "queued" | "running" | "succeeded" | "failed" | "inconclusive";
+export type SessionRangeDirection = "single" | "newer" | "older";
 export type TaskStatus =
   | "idle"
   | "running"
@@ -268,6 +269,10 @@ export interface SdkProtocolBundle {
   regression_execution: RegressionExecution;
   regression_result: RegressionResult;
   security_utility_result: SecurityUtilityResult;
+  session_page: SessionPage;
+  session_page_request: SessionPageRequest;
+  session_window: SessionWindow;
+  session_window_request: SessionWindowRequest;
   skill_candidate: SkillCandidate;
   skill_lifecycle_record: SkillLifecycleRecord;
   skill_manifest: SkillManifest;
@@ -1048,6 +1053,51 @@ export interface RegressionExecution {
   task_trace_ref?: string | null;
   verification_ref?: string | null;
   workspace_snapshot_digest: string;
+  [k: string]: unknown;
+}
+export interface SessionPage {
+  has_more: boolean;
+  next_cursor?: SessionCursor | null;
+  sessions: SessionSummary[];
+  [k: string]: unknown;
+}
+export interface SessionCursor {
+  recency_at: string;
+  thread_id: string;
+  [k: string]: unknown;
+}
+export interface SessionSummary {
+  created_at: string;
+  forked_from_turn_id?: string | null;
+  parent_thread_id?: string | null;
+  preview: string;
+  recency_at: string;
+  session_id: string;
+  thread_id: string;
+  title: string;
+  updated_at: string;
+  [k: string]: unknown;
+}
+export interface SessionPageRequest {
+  cursor?: SessionCursor | null;
+  limit: number;
+  [k: string]: unknown;
+}
+export interface SessionWindow {
+  anchor_thread_id: string;
+  range: SessionRangeSpec;
+  reached_boundary: boolean;
+  sessions: SessionSummary[];
+  [k: string]: unknown;
+}
+export interface SessionRangeSpec {
+  count: number;
+  direction: SessionRangeDirection;
+  [k: string]: unknown;
+}
+export interface SessionWindowRequest {
+  anchor_thread_id: string;
+  range: SessionRangeSpec;
   [k: string]: unknown;
 }
 export interface SkillCandidate {

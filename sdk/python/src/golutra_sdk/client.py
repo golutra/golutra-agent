@@ -14,7 +14,7 @@ from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 
-RUNTIME_PROTOCOL_VERSION = 2
+RUNTIME_PROTOCOL_VERSION = 3
 JSON_REQUEST_TIMEOUT_SECONDS = 30
 MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_SSE_EVENT_BYTES = 1024 * 1024
@@ -179,6 +179,12 @@ class GolutraClient:
 
     def list_threads(self, limit: int = 20) -> list[dict[str, Any]]:
         return self._request_json("GET", f"/threads?{urlencode({'limit': limit})}")
+
+    def session_page(self, request: dict[str, Any]) -> dict[str, Any]:
+        return self._request_json("POST", "/sessions/page", body=request)
+
+    def session_window(self, request: dict[str, Any]) -> dict[str, Any]:
+        return self._request_json("POST", "/sessions/window", body=request)
 
     def thread_for_session(self, session_id: str) -> dict[str, Any] | None:
         return self._request_json("GET", f"/sessions/{quote(session_id, safe='')}/thread")

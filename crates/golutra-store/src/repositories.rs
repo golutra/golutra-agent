@@ -11,7 +11,9 @@ use golutra_core::{
     ArtifactId, ArtifactRecord, CommandId, ContextSnapshot, EvidenceId, EvidenceRecord,
     PostTaskJob, PostTaskJobId, PostTaskJobStatus, SessionId, TaskId, ThreadId, VerificationPlan,
 };
-use golutra_protocol::{ArtifactReadRequest, CommandAck, RuntimeEvent};
+use golutra_protocol::{
+    ArtifactReadRequest, CommandAck, RuntimeEvent, SessionCursor, SessionRangeDirection,
+};
 
 use super::{
     ArtifactRange, CommandClaim, EventIntegrity, RuntimeStore, StateProjection, StoreResult,
@@ -368,6 +370,29 @@ impl ThreadRepository {
 
     pub async fn by_id(&self, thread_id: ThreadId) -> StoreResult<Option<ThreadRecord>> {
         self.store.thread_by_id(thread_id).await
+    }
+
+    pub async fn page(
+        &self,
+        workspace_root: Option<&str>,
+        cursor: Option<&SessionCursor>,
+        limit: u32,
+    ) -> StoreResult<Vec<ThreadRecord>> {
+        self.store
+            .list_threads_page(workspace_root, cursor, limit)
+            .await
+    }
+
+    pub async fn window(
+        &self,
+        workspace_root: Option<&str>,
+        anchor: &ThreadRecord,
+        direction: SessionRangeDirection,
+        count: u32,
+    ) -> StoreResult<Vec<ThreadRecord>> {
+        self.store
+            .thread_window(workspace_root, anchor, direction, count)
+            .await
     }
 
     pub async fn by_session(&self, session_id: SessionId) -> StoreResult<Option<ThreadRecord>> {

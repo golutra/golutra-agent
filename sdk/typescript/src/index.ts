@@ -31,6 +31,10 @@ import type {
   RuntimeQueryKind,
   SessionCommand,
   SessionCommandKind,
+  SessionPage,
+  SessionPageRequest,
+  SessionWindow,
+  SessionWindowRequest,
   SkillCandidate,
   StorageStats,
   TaskTracePage,
@@ -40,7 +44,7 @@ import type {
 const JSON_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024;
 const MAX_COMPLETE_TRACE_PAGES = 4096;
-export const RUNTIME_PROTOCOL_VERSION = 2;
+export const RUNTIME_PROTOCOL_VERSION = 3;
 
 export * from "./generated.js";
 
@@ -512,6 +516,14 @@ export class GolutraClient {
     const url = new URL("/threads", this.baseUrl);
     url.searchParams.set("limit", String(limit));
     return this.getJson<ThreadRecord[]>(url);
+  }
+
+  async sessionPage(request: SessionPageRequest): Promise<SessionPage> {
+    return this.postJson<SessionPage>("/sessions/page", request);
+  }
+
+  async sessionWindow(request: SessionWindowRequest): Promise<SessionWindow> {
+    return this.postJson<SessionWindow>("/sessions/window", request);
   }
 
   async threadForSession(sessionId: string): Promise<ThreadRecord | null> {

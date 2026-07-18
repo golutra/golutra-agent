@@ -28,8 +28,8 @@ use golutra_client::{
 use golutra_core::{SessionId, TaskId, ThreadId, TraceView};
 use golutra_protocol::{
     ArtifactChunk, ArtifactReadRequest, CommandAck, EventFilter, EventPage, EventPageRequest,
-    ProtocolVersionRange, RUNTIME_PROTOCOL_VERSION, RuntimeQuery, SessionCommand, TaskTracePage,
-    TaskTraceRequest,
+    ProtocolVersionRange, RuntimeQuery, SessionCommand, SessionPage, SessionPageRequest,
+    SessionWindow, SessionWindowRequest, TaskTracePage, TaskTraceRequest,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -189,6 +189,8 @@ pub fn router(state: AppState) -> Router {
         .route("/events/page", get(event_page))
         .route("/events/replay", get(replay_events))
         .route("/threads", get(list_threads))
+        .route("/sessions/page", post(session_page))
+        .route("/sessions/window", post(session_window))
         .route("/sessions/{session_id}/thread", get(thread_for_session))
         .route("/threads/{thread_id}/resume", post(resume_thread))
         .route("/threads/{thread_id}/fork", post(fork_thread))
@@ -404,10 +406,11 @@ async fn attach_runtime(
     State(state): State<AppState>,
     Json(request): Json<AttachRequest>,
 ) -> Result<Json<RuntimeAttachment>, AppError> {
-    if request.protocol_version != RUNTIME_PROTOCOL_VERSION {
+    let supported_versions = ProtocolVersionRange::runtime();
+    if !supported_versions.accepts(request.protocol_version) {
         return Err(AppError::Protocol(format!(
-            "client runtime protocol {} is incompatible with server protocol {}",
-            request.protocol_version, RUNTIME_PROTOCOL_VERSION
+            "client runtime protocol {} is incompatible with server range {}..={}",
+            request.protocol_version, supported_versions.minimum, supported_versions.current
         )));
     }
     Ok(Json(state.attach_cwd(request.cwd).await?))
@@ -556,6 +559,24 @@ async fn list_threads(
     Ok(Json(
         transport.list_threads(query.limit.unwrap_or(20)).await?,
     ))
+}
+
+async fn session_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<SessionPageRequest>,
+) -> Result<Json<SessionPage>, AppError> {
+    let transport = state.attached_transport(&headers).await?;
+    Ok(Json(transport.session_page(request).await?))
+}
+
+async fn session_window(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<SessionWindowRequest>,
+) -> Result<Json<SessionWindow>, AppError> {
+    let transport = state.attached_transport(&headers).await?;
+    Ok(Json(transport.session_window(request).await?))
 }
 
 async fn thread_for_session(
@@ -907,7 +928,7 @@ mod tests {
         http::{Request, StatusCode},
     };
     use golutra_core::{Actor, ActorKind, CommandId};
-    use golutra_protocol::SessionCommandKind;
+    use golutra_protocol::{RUNTIME_PROTOCOL_VERSION, SessionCommandKind};
     use tower::ServiceExt;
 
     use super::*;
