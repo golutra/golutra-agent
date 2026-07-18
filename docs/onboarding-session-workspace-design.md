@@ -313,7 +313,7 @@ TUI 输入框现在先经过 slash command parser：
 - Up/Down 或 Tab 可移动候选，Enter 会启动可直接执行的命令；需要参数的命令会先补全命令文本并等待用户继续输入。
 - `/resume` 选择 session 后会清空当前 TUI 的本地 command messages、event cursor、输入框和 transcript scroll 状态，再 replay 目标 session 的历史；这样不会把旧 session 的提示或历史混到新 session。
 - 普通 transcript 默认跟随最新内容；PageUp/PageDown 按页翻历史，输入框有草稿时 Home/End 移动编辑光标，草稿为空时 Home/End 才跳到最旧/最新。TUI 捕获鼠标滚轮并按命中区域路由：对话区和 developer 区独立滚动；文本复制使用终端的修饰键选择模式（通常为 Shift+拖动）。
-- `--debug` 或 `/debug` 打开的 developer 区固定保留治理摘要，事件行按 cursor 向更早历史分页；滚轮离开尾部后新事件不会把视图强行跳回底部，回到底部才恢复 follow-tail。
+- `--debug` 或 `/debug` 将主体区按左右 1:1 分为 transcript 和右侧 Developer runtime。治理摘要默认收在标题的 `▸ facts` 后，左键点击切换 `▸/▾`；事件行按 cursor 向更早历史分页。两个 pane 的滚轮相互独立，离开尾部后新事件不会把视图强行跳回底部，回到底部才恢复 follow-tail。
 - `/export` 不切换当前 session：先选择 anchor，再输入范围（空/`1` 只导出 anchor，`+N` 包含 anchor 及其前 N-1 个更新 session，`-N` 包含 anchor 及其后 N-1 个更旧 session），最后 review 绝对目的地。导出目录使用同文件系统临时目录、owner-only 权限、校验后原子 rename；默认 `full-redacted`，Raw checkpoint blob 只在 manifest 标记为省略。
 - 普通 `q` 是文本输入，不作为全局退出键。
 - Ctrl+C 第一按用于中断当前运行任务并展示退出提示；在短时间内第二次按 Ctrl+C 才退出 TUI。

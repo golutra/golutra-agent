@@ -10,7 +10,7 @@ use crossterm::{
     cursor::SetCursorStyle,
     event::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event as CrosstermEvent, KeyCode,
-        KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+        KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -108,6 +108,7 @@ struct TuiApp {
     provider_model: String,
     workspace_path: PathBuf,
     debug_mode: bool,
+    developer_facts_expanded: bool,
     transcript_scroll: PaneScrollState,
     developer_scroll: PaneScrollState,
     developer_load_requested: bool,
@@ -172,6 +173,7 @@ impl TuiApp {
             provider_model,
             workspace_path,
             debug_mode,
+            developer_facts_expanded: false,
             transcript_scroll: PaneScrollState {
                 follow_tail: true,
                 ..PaneScrollState::default()
@@ -549,6 +551,20 @@ impl TuiApp {
             self.developer_scroll.offset_from_bottom,
             self.developer_scroll.unseen_rows,
         );
+    }
+
+    fn toggle_developer_facts(&mut self) {
+        self.developer_facts_expanded = !self.developer_facts_expanded;
+        if let Some(area) = self.layout.developer {
+            self.developer_scroll
+                .clamp(developer_event_page_rows(self, area));
+        }
+        self.status_message = if self.developer_facts_expanded {
+            "developer facts expanded"
+        } else {
+            "developer facts collapsed"
+        }
+        .to_owned();
     }
 
     async fn load_older_debug_history(
@@ -1744,6 +1760,13 @@ fn handle_paste(pasted: &str, app: &mut TuiApp) {
 fn handle_mouse(mouse: MouseEvent, app: &mut TuiApp) {
     let target = app.layout.hit_test(mouse.column, mouse.row, app);
     match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left)
+            if app
+                .layout
+                .developer_facts_toggle_hit(mouse.column, mouse.row) =>
+        {
+            app.toggle_developer_facts();
+        }
         MouseEventKind::ScrollUp => match target {
             UiHitTarget::Developer => {
                 let rows = app

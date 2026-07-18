@@ -17,6 +17,9 @@ use super::*;
 const COMPOSER_PREFIX: &str = "› ";
 const COMPOSER_PREFIX_WIDTH: u16 = 2;
 const MAX_COMPOSER_ROWS: u16 = 5;
+const DEVELOPER_TITLE_PREFIX: &str = "Developer runtime  ";
+const DEVELOPER_FACTS_COLLAPSED: &str = "▸ facts";
+const DEVELOPER_FACTS_EXPANDED: &str = "▾ facts";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct UiLayoutSnapshot {
@@ -53,6 +56,12 @@ impl UiLayoutSnapshot {
             UiHitTarget::None
         }
     }
+
+    pub(crate) fn developer_facts_toggle_hit(self, x: u16, y: u16) -> bool {
+        self.developer
+            .map(developer_facts_toggle_rect)
+            .is_some_and(|area| rect_contains(area, x, y))
+    }
 }
 
 fn rect_contains(area: Rect, x: u16, y: u16) -> bool {
@@ -64,29 +73,28 @@ fn rect_contains(area: Rect, x: u16, y: u16) -> bool {
 
 pub(crate) fn ui_layout(area: Rect, app: &TuiApp) -> UiLayoutSnapshot {
     let bottom_height = bottom_pane_height_for_width(app, area.width);
-    let constraints = if app.debug_mode {
-        vec![
-            Constraint::Length(1),
-            Constraint::Min(8),
-            Constraint::Length(10),
-            Constraint::Length(bottom_height),
-        ]
-    } else {
-        vec![
-            Constraint::Length(1),
-            Constraint::Min(8),
-            Constraint::Length(bottom_height),
-        ]
-    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(constraints)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(8),
+            Constraint::Length(bottom_height),
+        ])
         .split(area);
+    let (transcript, developer) = if app.debug_mode {
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(chunks[1]);
+        (body[0], Some(body[1]))
+    } else {
+        (chunks[1], None)
+    };
     UiLayoutSnapshot {
         header: chunks[0],
-        transcript: chunks[1],
-        developer: app.debug_mode.then_some(chunks[2]),
-        bottom: if app.debug_mode { chunks[3] } else { chunks[2] },
+        transcript,
+        developer,
+        bottom: chunks[2],
     }
 }
 
@@ -1007,13 +1015,31 @@ pub(crate) fn resume_picker_offset(
 
 pub(crate) fn developer_event_page_rows(app: &TuiApp, area: Rect) -> usize {
     let visible_rows = area.height.saturating_sub(1) as usize;
-    let summary_rows = app.developer_projection.as_ref().map_or(1, |projection| {
-        developer_panel_rows(projection, 0)
-            .into_iter()
-            .filter(|row| matches!(row, DeveloperPanelRow::Summary(_)))
-            .count()
-    });
+    let summary_rows = if app.developer_facts_expanded {
+        app.developer_projection.as_ref().map_or(1, |projection| {
+            developer_panel_rows(projection, 0)
+                .into_iter()
+                .filter(|row| matches!(row, DeveloperPanelRow::Summary(_)))
+                .count()
+        })
+    } else {
+        0
+    };
     visible_rows.saturating_sub(summary_rows)
+}
+
+pub(crate) fn developer_facts_toggle_rect(area: Rect) -> Rect {
+    let toggle_x = area
+        .x
+        .saturating_add(1)
+        .saturating_add(u16::try_from(display_width(DEVELOPER_TITLE_PREFIX)).unwrap_or(u16::MAX));
+    let right = area.x.saturating_add(area.width);
+    Rect::new(
+        toggle_x,
+        area.y,
+        right.saturating_sub(toggle_x).min(7),
+        u16::from(area.height > 0),
+    )
 }
 
 pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
@@ -1031,7 +1057,11 @@ pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiA
         .into_iter()
         .partition(|row| matches!(row, DeveloperPanelRow::Summary(_)));
     let visible_rows = area.height.saturating_sub(1) as usize;
-    let visible_summaries = summaries.into_iter().take(visible_rows).collect::<Vec<_>>();
+    let visible_summaries = if app.developer_facts_expanded {
+        summaries.into_iter().take(visible_rows).collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let event_rows = developer_event_page_rows(app, area);
     let window = transcript_visible_window(
         events.len(),
@@ -1069,10 +1099,29 @@ pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiA
             }
         })
         .collect::<Vec<_>>();
+    let facts_toggle = if app.developer_facts_expanded {
+        DEVELOPER_FACTS_EXPANDED
+    } else {
+        DEVELOPER_FACTS_COLLAPSED
+    };
+    let title = Line::from(vec![
+        Span::styled(
+            DEVELOPER_TITLE_PREFIX,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            facts_toggle,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
     let list = List::new(items).block(
         Block::default()
-            .title("Developer runtime")
-            .borders(Borders::TOP),
+            .title(title)
+            .borders(Borders::TOP | Borders::LEFT),
     );
     frame.render_widget(list, area);
 }

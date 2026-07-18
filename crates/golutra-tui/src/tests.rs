@@ -1473,7 +1473,69 @@ fn developer_panel_exposes_governance_without_leaking_into_normal_view() {
         .map(|cell| cell.symbol())
         .collect::<String>();
     assert!(developer_text.contains("Developer runtime"));
-    assert!(developer_text.contains("verify Pass"));
+    assert!(developer_text.contains("▸ facts"));
+    assert!(!developer_text.contains("verify Pass"));
+
+    let layout = app.layout;
+    let developer_area = layout.developer.expect("developer area");
+    assert_eq!(layout.transcript.y, developer_area.y);
+    assert_eq!(layout.transcript.height, developer_area.height);
+    assert_eq!(layout.transcript.width, developer_area.width);
+    assert_eq!(
+        developer_area.x,
+        layout.transcript.x + layout.transcript.width
+    );
+
+    let toggle = developer_facts_toggle_rect(developer_area);
+    assert_eq!(
+        developer_terminal
+            .backend()
+            .buffer()
+            .cell((toggle.x, toggle.y))
+            .map(|cell| cell.symbol()),
+        Some("▸")
+    );
+    handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: toggle.x,
+            row: toggle.y,
+            modifiers: KeyModifiers::NONE,
+        },
+        &mut app,
+    );
+    assert!(app.developer_facts_expanded);
+    developer_terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw expanded developer facts");
+    let expanded_text = developer_terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(expanded_text.contains("▾ facts"));
+    assert!(expanded_text.contains("verify Pass"));
+    assert_eq!(
+        developer_terminal
+            .backend()
+            .buffer()
+            .cell((toggle.x, toggle.y))
+            .map(|cell| cell.symbol()),
+        Some("▾")
+    );
+
+    handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: toggle.x,
+            row: toggle.y,
+            modifiers: KeyModifiers::NONE,
+        },
+        &mut app,
+    );
+    assert!(!app.developer_facts_expanded);
 }
 
 #[tokio::test]
@@ -1982,13 +2044,14 @@ fn mouse_wheel_routes_to_the_pane_under_the_pointer() {
         .draw(|frame| draw_ui(frame, &mut app))
         .expect("draw");
     let layout = app.layout;
-    let developer_y = layout.developer.expect("developer area").y + 1;
+    let developer_area = layout.developer.expect("developer area");
+    let developer_y = developer_area.y + 1;
     let transcript_y = layout.transcript.y + 1;
 
     handle_mouse(
         MouseEvent {
             kind: MouseEventKind::ScrollUp,
-            column: 2,
+            column: developer_area.x + 1,
             row: developer_y,
             modifiers: KeyModifiers::NONE,
         },
@@ -2000,7 +2063,7 @@ fn mouse_wheel_routes_to_the_pane_under_the_pointer() {
     handle_mouse(
         MouseEvent {
             kind: MouseEventKind::ScrollUp,
-            column: 2,
+            column: layout.transcript.x + 1,
             row: transcript_y,
             modifiers: KeyModifiers::NONE,
         },
@@ -2009,7 +2072,6 @@ fn mouse_wheel_routes_to_the_pane_under_the_pointer() {
     assert!(app.transcript_scroll.offset_from_bottom > 0);
     assert!(app.developer_scroll.offset_from_bottom > 0);
 
-    let developer_area = layout.developer.expect("developer area");
     let event_rows = developer_event_page_rows(&app, developer_area);
     app.scroll_developer(TranscriptScrollAction::Top, event_rows);
     assert_eq!(

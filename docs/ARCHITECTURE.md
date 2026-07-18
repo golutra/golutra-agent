@@ -425,7 +425,7 @@ golutra-tui
 - fork 必须复制完整 history 或明确的 turn boundary、重新生成 runtime IDs 并保留 immutable artifact lineage；普通 resume/fork 不能跨 canonical cwd。
 - cwd 迁移只能通过显式 rebind，要求 inactive/unowned thread 和精确旧路径；checkpoint、memory、evaluation 不能被无条件解释为新 cwd 事实。
 
-当前这些边界已经落地：TUI 默认创建新的本地 thread/session，首个 prompt 才持久化；`/resume` 按当前 canonical cwd 过滤全局历史；`/fork --from-turn`、rollout export、`/export` 和 thread rebind 通过同一 transport/API；普通 transcript 只渲染用户可见事件，也不查询开发者投影。只有显式 `--debug` 或 `/debug` 才启用 developer mode，按事件分页刷新 `DebugProjection` 并展示事实、verification、LoopDecision、post-task job、trace completeness、evaluation/improvement 阶段计数和事件历史；鼠标滚轮按 pane 命中区域独立滚动，`/new`/`/resume` 保留 debug 偏好。`/export` 固定每个 session 的 event high-watermark，后台异步写 owner-only 临时目录；导出期间 session 变化会显式降级为 incomplete。
+当前这些边界已经落地：TUI 默认创建新的本地 thread/session，首个 prompt 才持久化；`/resume` 按当前 canonical cwd 过滤全局历史；`/fork --from-turn`、rollout export、`/export` 和 thread rebind 通过同一 transport/API；普通 transcript 只渲染用户可见事件，也不查询开发者投影。只有显式 `--debug` 或 `/debug` 才启用 developer mode；主体区按左右 1:1 展示 transcript 与 Developer runtime，按事件分页刷新 `DebugProjection`。治理 facts 默认收起在标题的 `▸ facts` 后，可用鼠标左键展开或收回；对话和事件列表的鼠标滚轮按 pane 命中区域独立滚动，`/new`/`/resume` 保留 debug 偏好。`/export` 固定每个 session 的 event high-watermark，后台异步写 owner-only 临时目录；导出期间 session 变化会显式降级为 incomplete。
 
 daemon/remote 模式的最低可用目标不是“界面完整”，而是：
 
@@ -464,7 +464,7 @@ Debug / Audit / Replay 模式使用 `Debug / Audit Projection`：
 
 - 展示 runtime event、LoopDecision、PolicyEvaluation、EvidenceRecord、VerificationRecord、context projection、token budget、provider raw event。
 - 用于调试、复盘、benchmark 和回归验证。
-- TUI developer mode 保留固定治理摘要，并通过 `EventPage` cursor 按需加载更早事件；对话区与 developer 区有独立 follow-tail/scroll 状态，不能让全量审计 JSON 污染普通 transcript。统一 `TaskTraceService` 仍负责完整历史、context snapshot、artifact/evidence 和完整性声明，Rust client、CLI 与 TypeScript/Python SDK 提供 bounded 全页聚合；`DebugExportCoordinator` 负责调用方本地的原子 `full-redacted` bundle。
+- TUI developer mode 在右侧 50% pane 保留可折叠治理摘要，并通过 `EventPage` cursor 按需加载更早事件；对话区与 developer 区有独立 follow-tail/scroll 状态，不能让全量审计 JSON 污染普通 transcript。统一 `TaskTraceService` 仍负责完整历史、context snapshot、artifact/evidence 和完整性声明，Rust client、CLI 与 TypeScript/Python SDK 提供 bounded 全页聚合；`DebugExportCoordinator` 负责调用方本地的原子 `full-redacted` bundle。
 
 Evaluation / Improvement 模式使用 `Evaluation / Improvement Projection`：
 
