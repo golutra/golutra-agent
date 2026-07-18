@@ -2,7 +2,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use golutra_auth::{
     CredentialRef, CredentialSource, OAuthFlow, OAuthProviderDescriptor, SecretKind,
 };
-use golutra_client::{RuntimeClient, RuntimeTransport, TaskTraceClient};
+use golutra_client::{
+    DebugExportCoordinator, DebugExportRequest, RuntimeClient, RuntimeTransport, TaskTraceClient,
+    parse_session_range,
+};
 use golutra_config::{
     BuiltinOAuthMethod, ProviderConfigPaths, ProviderConfigScope, ProviderInstallPlan,
     ProviderProfile, apply_oauth_provider_install_plan_verified,
@@ -84,7 +87,14 @@ enum Command {
         #[arg(long)]
         wait_evaluation: bool,
     },
-    Export,
+    Export {
+        #[arg(value_name = "DESTINATION")]
+        destination: std::path::PathBuf,
+        #[arg(long)]
+        thread_id: Option<String>,
+        #[arg(long, default_value = "1")]
+        range: String,
+    },
     Thread {
         #[command(subcommand)]
         command: ThreadCommand,
@@ -687,26 +697,26 @@ async fn main() -> miette::Result<()> {
                 serde_json::to_string_pretty(&trace).unwrap_or_default()
             );
         }
-        Command::Export => {
-            let debug = transport
-                .query(RuntimeQuery {
-                    query_id: golutra_core::QueryId::new(),
-                    session_id,
-                    task_id: None,
-                    kind: RuntimeQueryKind::DebugProjection,
-                    requester: ActorKind::Cli,
-                    cursor: None,
-                    timestamp: chrono::Utc::now(),
+        Command::Export {
+            destination,
+            thread_id,
+            range,
+        } => {
+            let anchor_thread_id = parse_optional_thread_id(thread_id.as_deref(), &transport)?;
+            let range = parse_session_range(&range).map_err(|error| miette::miette!("{error}"))?;
+            let receipt = DebugExportCoordinator::new(&transport)
+                .export(DebugExportRequest {
+                    selection: golutra_protocol::SessionWindowRequest {
+                        anchor_thread_id,
+                        range,
+                    },
+                    destination,
                 })
                 .await
                 .map_err(|error| miette::miette!("{error}"))?;
-            let artifacts = debug
-                .get("artifacts")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!([]));
             println!(
                 "{}",
-                serde_json::to_string_pretty(&artifacts).unwrap_or_default()
+                serde_json::to_string_pretty(&receipt).unwrap_or_default()
             );
         }
         Command::Thread { command } => match command {

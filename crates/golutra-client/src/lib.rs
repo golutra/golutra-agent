@@ -93,6 +93,7 @@ pub(crate) fn runtime_identity() -> String {
 mod application;
 mod command;
 mod context;
+mod debug_export;
 mod event_codec;
 mod evolution;
 mod execution;
@@ -120,7 +121,11 @@ pub(crate) use context::{
     load_project_instructions, memory_context, preview_from_payload, prompt_from_payload,
     system_prompt, title_from_payload,
 };
-#[cfg(test)]
+pub use debug_export::{
+    DebugExportCoordinator, DebugExportManifest, DebugExportReceipt, DebugExportRequest,
+    ExportedArtifactManifest, ExportedArtifactState, ExportedSessionManifest, ExportedTaskManifest,
+    parse_session_range,
+};
 pub(crate) use event_codec::redact_provider_json;
 pub(crate) use event_codec::{
     agent_event, agent_event_for_turn, candidate_id_from_payload, context_request_artifact,

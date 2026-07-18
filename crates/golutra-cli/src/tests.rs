@@ -87,6 +87,28 @@ fn plugin_commands_parse_explicit_review_and_enable_steps() {
 }
 
 #[test]
+fn export_command_requires_destination_and_accepts_anchor_range() {
+    let cli = Cli::try_parse_from([
+        "golutra",
+        "export",
+        "/tmp/golutra-export",
+        "--thread-id",
+        "01900000-0000-7000-8000-000000000001",
+        "--range",
+        "+50",
+    ])
+    .expect("export args");
+    assert!(matches!(
+        cli.command,
+        Command::Export {
+            range,
+            destination,
+            thread_id: Some(_),
+        } if range == "+50" && destination == std::path::Path::new("/tmp/golutra-export")
+    ));
+}
+
+#[test]
 fn provider_set_key_accepts_disk_or_environment_reference() {
     let disk = Cli::try_parse_from([
         "golutra",

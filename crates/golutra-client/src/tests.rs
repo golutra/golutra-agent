@@ -2231,6 +2231,107 @@ async fn session_page_uses_thread_id_as_a_stable_cursor_tiebreaker() {
 }
 
 #[tokio::test]
+async fn debug_export_writes_redacted_session_bundle_atomically() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let session_id = SessionId::new();
+    let thread_id = ThreadId::new();
+    let task_id = TaskId::new();
+    let at = chrono::Utc::now();
+    host.repositories
+        .threads
+        .upsert(&ThreadRecord {
+            thread_id,
+            session_id,
+            parent_thread_id: None,
+            forked_from_turn_id: None,
+            forked_from_sequence_no: None,
+            workspace_root: None,
+            rebound_from_workspace_root: None,
+            rollout_path: None,
+            title: "export fixture".to_owned(),
+            preview: "hello".to_owned(),
+            created_at: at,
+            updated_at: at,
+            recency_at: at,
+            archived: false,
+        })
+        .await
+        .expect("thread");
+    for (event_type, payload) in [
+        (
+            RuntimeEventType::TaskCreated,
+            json!({"payload": {"prompt": "hello export"}}),
+        ),
+        (
+            RuntimeEventType::AssistantMessage,
+            json!({"content": "export response"}),
+        ),
+        (
+            RuntimeEventType::TaskCompleted,
+            json!({"status": "completed"}),
+        ),
+    ] {
+        host.record_event(host_event(
+            0,
+            session_id,
+            Some(task_id),
+            event_type,
+            RuntimeEventSource::Runtime,
+            payload,
+        ))
+        .await
+        .expect("event");
+    }
+    let parent = tempdir().expect("export parent");
+    let destination = parent.path().join("bundle");
+    let transport = RuntimeTransport::Embedded(EmbeddedTransport::new(host));
+    let receipt = DebugExportCoordinator::new(&transport)
+        .export(DebugExportRequest {
+            selection: SessionWindowRequest {
+                anchor_thread_id: thread_id,
+                range: SessionRangeSpec {
+                    direction: SessionRangeDirection::Single,
+                    count: 1,
+                },
+            },
+            destination: destination.clone(),
+        })
+        .await
+        .expect("export");
+
+    assert_eq!(receipt.session_count, 1);
+    assert_eq!(receipt.task_count, 1);
+    assert!(destination.join("manifest.json").is_file());
+    assert!(destination.join("conversation.md").is_file());
+    assert!(
+        destination
+            .join(format!("sessions/{session_id}/events.jsonl"))
+            .is_file()
+    );
+    assert!(
+        destination
+            .join(format!("sessions/{session_id}/conversation.jsonl"))
+            .is_file()
+    );
+    assert!(
+        destination
+            .join(format!("sessions/{session_id}/tasks/{task_id}/trace.json"))
+            .is_file()
+    );
+    let conversation =
+        fs::read_to_string(destination.join(format!("sessions/{session_id}/conversation.jsonl")))
+            .expect("conversation");
+    assert!(conversation.contains("hello export"));
+    assert!(conversation.contains("export response"));
+    let manifest: DebugExportManifest =
+        serde_json::from_slice(&fs::read(destination.join("manifest.json")).expect("manifest"))
+            .expect("manifest json");
+    assert_eq!(manifest.mode, "full-redacted");
+    assert!(manifest.redacted);
+    assert_eq!(manifest.sessions.len(), 1);
+}
+
+#[tokio::test]
 async fn cwd_attachment_rejects_foreign_session_access() {
     let cwd_a = tempdir().expect("cwd a");
     let cwd_b = tempdir().expect("cwd b");
