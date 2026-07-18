@@ -2,6 +2,18 @@
 
 use super::*;
 
+struct ChannelObservationSink {
+    sender: mpsc::UnboundedSender<HostedTraceCommand>,
+}
+
+impl RuntimeObservationSink for ChannelObservationSink {
+    fn emit(&mut self, observation: RuntimeObservation) {
+        let _ = self
+            .sender
+            .send(HostedTraceCommand::Event(Box::new(observation)));
+    }
+}
+
 impl RuntimeHost {
     pub(super) async fn context_contributors_for_task(
         &self,
@@ -262,13 +274,12 @@ impl RuntimeHost {
             .context_contributors_for_task(task.session_id, task.task_id, objective.clone())
             .await?;
         let (trace_tx, mut trace_rx) = mpsc::unbounded_channel::<HostedTraceCommand>();
-        let trace_host = self.clone();
-        let trace_task = task.clone();
+        let fact_recorder = CanonicalFactRecorder::new(self.clone(), task.clone());
         let trace_recorder = tokio::spawn(async move {
             while let Some(command) = trace_rx.recv().await {
                 match command {
                     HostedTraceCommand::Event(event) => {
-                        trace_host.record_trace_event(&trace_task, *event).await?;
+                        fact_recorder.commit(*event).await?;
                     }
                     HostedTraceCommand::Flush(sender) => {
                         let _ = sender.send(Ok(()));
@@ -286,9 +297,8 @@ impl RuntimeHost {
         } else {
             agent_loop
         };
-        let trace_sender = trace_tx.clone();
         let outcome = agent_loop
-            .run_with_control_and_trace(
+            .run_with_control_and_observation_sink(
                 AgentTaskRequest {
                     session_id: task.session_id,
                     task_id: task.task_id,
@@ -307,8 +317,8 @@ impl RuntimeHost {
                     },
                 },
                 control,
-                move |event| {
-                    let _ = trace_sender.send(HostedTraceCommand::Event(Box::new(event)));
+                ChannelObservationSink {
+                    sender: trace_tx.clone(),
                 },
             )
             .await

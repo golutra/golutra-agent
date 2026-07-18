@@ -40,8 +40,8 @@ use golutra_protocol::{
 use golutra_runtime::{
     AgentExecutionControl, AgentExecutionHandle, AgentLoop, AgentLoopError, AgentLoopTraceEvent,
     AgentTaskRequest, BeforeSideEffectRecorder, PendingAgentTurn, RuntimeLaneError,
-    RuntimeLaneManager, RuntimeVerificationService, WorkspaceCheckpointManager,
-    agent_execution_channel, is_active_status,
+    RuntimeLaneManager, RuntimeObservation, RuntimeObservationSink, RuntimeVerificationService,
+    WorkspaceCheckpointManager, agent_execution_channel, is_active_status,
 };
 use golutra_store::{CommandClaim, RuntimeRepositories, RuntimeStore, StoreError, ThreadRecord};
 use golutra_tools::{BasicToolExecutor, FileBeforeImage, ToolRequest};
@@ -129,6 +129,7 @@ pub(crate) use event_codec::{
     trace_event_payload, with_command_payload,
 };
 pub use event_codec::{event_sequence_no, projection_status};
+pub(crate) use execution_trace::CanonicalFactRecorder;
 pub use paths::{AppServerPaths, RuntimePaths};
 pub(crate) use paths::{ensure_private_dir, set_owner_only_file, workspace_hash};
 pub use post_task::PostTaskCoordinator;
@@ -255,7 +256,7 @@ enum SessionLeaseAttempt {
 }
 
 enum HostedTraceCommand {
-    Event(Box<AgentLoopTraceEvent>),
+    Event(Box<RuntimeObservation>),
     Flush(oneshot::Sender<Result<(), ClientError>>),
 }
 

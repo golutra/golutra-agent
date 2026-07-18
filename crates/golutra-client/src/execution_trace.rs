@@ -2,11 +2,29 @@
 
 use super::*;
 
+#[derive(Clone)]
+pub(crate) struct CanonicalFactRecorder {
+    host: Arc<RuntimeHost>,
+    task: HostedAgentTask,
+}
+
+impl CanonicalFactRecorder {
+    pub(super) fn new(host: Arc<RuntimeHost>, task: HostedAgentTask) -> Self {
+        Self { host, task }
+    }
+
+    pub(super) async fn commit(&self, observation: RuntimeObservation) -> Result<(), ClientError> {
+        self.host
+            .record_trace_observation(&self.task, observation)
+            .await
+    }
+}
+
 impl RuntimeHost {
-    pub(super) async fn record_trace_event(
+    async fn record_trace_observation(
         &self,
         task: &HostedAgentTask,
-        trace_event: AgentLoopTraceEvent,
+        trace_event: RuntimeObservation,
     ) -> Result<(), ClientError> {
         let (trace_event, context_artifact) = match trace_event {
             AgentLoopTraceEvent::ContextSnapshotCaptured {

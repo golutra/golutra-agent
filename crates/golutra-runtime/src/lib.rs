@@ -42,7 +42,7 @@ mod verification;
 pub use checkpoint::{CheckpointError, WorkspaceCheckpointManager, checkpoint_fingerprint};
 pub use golutra_protocol::UserProjection;
 pub use lane::{RuntimeLaneError, RuntimeLaneManager, RuntimeTransition, is_active_status};
-pub use trace::AgentLoopTraceEvent;
+pub use trace::{AgentLoopTraceEvent, RuntimeObservation, RuntimeObservationSink};
 pub use verification::RuntimeVerificationService;
 
 #[derive(Debug, Error)]
@@ -312,6 +312,34 @@ where
         let (_handle, control) = agent_execution_channel(1);
         self.run_with_control_and_trace(request, control, trace)
             .await
+    }
+
+    pub async fn run_with_observation_sink<S>(
+        &self,
+        request: AgentTaskRequest,
+        sink: S,
+    ) -> Result<AgentLoopOutcome, AgentLoopError>
+    where
+        S: RuntimeObservationSink,
+    {
+        let (_handle, control) = agent_execution_channel(1);
+        self.run_with_control_and_observation_sink(request, control, sink)
+            .await
+    }
+
+    pub async fn run_with_control_and_observation_sink<S>(
+        &self,
+        request: AgentTaskRequest,
+        control: AgentExecutionControl,
+        mut sink: S,
+    ) -> Result<AgentLoopOutcome, AgentLoopError>
+    where
+        S: RuntimeObservationSink,
+    {
+        self.run_with_control_and_trace(request, control, move |observation| {
+            sink.emit(observation);
+        })
+        .await
     }
 
     pub async fn run_with_control_and_trace<F>(

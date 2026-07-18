@@ -24,7 +24,29 @@ use tokio::{
     time::{Duration, sleep},
 };
 
+use crate::event_codec::{ObservationIntegrityClass, observation_descriptor};
+
 use super::*;
+
+#[test]
+fn observation_catalog_classifies_loop_facts_before_persistence() {
+    let required = observation_descriptor(&RuntimeObservation::ToolStarted {
+        tool_name: "read_file".to_owned(),
+    });
+    assert_eq!(required.event_type, RuntimeEventType::ToolStarted);
+    assert_eq!(required.source, RuntimeEventSource::Tool);
+    assert_eq!(required.integrity, ObservationIntegrityClass::Supporting);
+
+    let diagnostic = observation_descriptor(&RuntimeObservation::ProviderStreamed {
+        provider_id: "provider".to_owned(),
+        model_id: "model".to_owned(),
+        event: golutra_llm::ProviderStreamEvent::TextDelta {
+            text: "delta".to_owned(),
+        },
+    });
+    assert_eq!(diagnostic.event_type, RuntimeEventType::ProviderStreamed);
+    assert_eq!(diagnostic.integrity, ObservationIntegrityClass::Diagnostic);
+}
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 

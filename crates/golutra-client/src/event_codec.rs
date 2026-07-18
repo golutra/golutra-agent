@@ -6,7 +6,7 @@ use golutra_core::{
 };
 use golutra_llm::{ProviderRequest, ProviderStreamEvent};
 use golutra_protocol::{EventFilter, RuntimeEvent, RuntimeEventSource, RuntimeEventType};
-use golutra_runtime::{AgentLoopTraceEvent, PendingAgentTurn};
+use golutra_runtime::{AgentLoopTraceEvent, PendingAgentTurn, RuntimeObservation};
 use golutra_store::ThreadRecord;
 use golutra_tools::redact_sensitive_text;
 use serde_json::{Value, json};
@@ -232,10 +232,138 @@ pub(crate) fn task_status_from_loop_action(action: LoopAction) -> TaskStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObservationIntegrityClass {
+    Required,
+    Supporting,
+    Diagnostic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ObservationDescriptor {
+    pub(crate) event_type: RuntimeEventType,
+    pub(crate) source: RuntimeEventSource,
+    pub(crate) integrity: ObservationIntegrityClass,
+}
+
+/// Exhaustive catalog for execution observations. Adding a new observation
+/// variant requires an explicit disclosure and integrity decision here.
+pub(crate) fn observation_descriptor(observation: &RuntimeObservation) -> ObservationDescriptor {
+    let (event_type, source, integrity) = match observation {
+        RuntimeObservation::ContextBuilt { .. } => (
+            RuntimeEventType::ContextBuilt,
+            RuntimeEventSource::Runtime,
+            ObservationIntegrityClass::Supporting,
+        ),
+        RuntimeObservation::ContextCompacted { .. } => (
+            RuntimeEventType::CompactionCompleted,
+            RuntimeEventSource::Runtime,
+            ObservationIntegrityClass::Supporting,
+        ),
+        RuntimeObservation::ContextSnapshot(_)
+        | RuntimeObservation::ContextSnapshotCaptured { .. } => (
+            RuntimeEventType::ContextSnapshotCreated,
+            RuntimeEventSource::Runtime,
+            ObservationIntegrityClass::Required,
+        ),
+        RuntimeObservation::VerificationPlanned(_) => (
+            RuntimeEventType::VerificationPlanned,
+            RuntimeEventSource::Verifier,
+            ObservationIntegrityClass::Required,
+        ),
+        RuntimeObservation::VerificationAssertionCompleted(_) => (
+            RuntimeEventType::VerificationAssertionCompleted,
+            RuntimeEventSource::Verifier,
+            ObservationIntegrityClass::Required,
+        ),
+        RuntimeObservation::ProviderStarted { .. } => (
+            RuntimeEventType::ProviderStarted,
+            RuntimeEventSource::Provider,
+            ObservationIntegrityClass::Supporting,
+        ),
+        RuntimeObservation::ProviderStreamed { .. } => (
+            RuntimeEventType::ProviderStreamed,
+            RuntimeEventSource::Provider,
+            ObservationIntegrityClass::Diagnostic,
+        ),
+        RuntimeObservation::ProviderCompleted { .. } => (
+            RuntimeEventType::ProviderCompleted,
+            RuntimeEventSource::Provider,
+            ObservationIntegrityClass::Supporting,
+        ),
+        RuntimeObservation::TokenUsageRecorded(_) => (
+            RuntimeEventType::TokenUsageRecorded,
+            RuntimeEventSource::Provider,
+            ObservationIntegrityClass::Supporting,
+        ),
+        RuntimeObservation::ToolStarted { .. } => (
+            RuntimeEventType::ToolStarted,
+            RuntimeEventSource::Tool,
+            ObservationIntegrityClass::Supporting,
+        ),
+        RuntimeObservation::ToolCompleted(_) => (
+            RuntimeEventType::ToolCompleted,
+            RuntimeEventSource::Tool,
+            ObservationIntegrityClass::Required,
+        ),
+        RuntimeObservation::PolicyEvaluated(_) => (
+            RuntimeEventType::PolicyEvaluated,
+            RuntimeEventSource::Policy,
+            ObservationIntegrityClass::Required,
+        ),
+        RuntimeObservation::ApprovalRequested(_) => (
+            RuntimeEventType::ApprovalRequested,
+            RuntimeEventSource::Policy,
+            ObservationIntegrityClass::Required,
+        ),
+        RuntimeObservation::ApprovalResolved(_) => (
+            RuntimeEventType::ApprovalResolved,
+            RuntimeEventSource::User,
+            ObservationIntegrityClass::Required,
+        ),
+        RuntimeObservation::RetryScheduled { .. } => (
+            RuntimeEventType::RetryScheduled,
+            RuntimeEventSource::Runtime,
+            ObservationIntegrityClass::Supporting,
+        ),
+        RuntimeObservation::ProviderFallback { .. } => (
+            RuntimeEventType::ProviderFallback,
+            RuntimeEventSource::Runtime,
+            ObservationIntegrityClass::Supporting,
+        ),
+        RuntimeObservation::LoopGuardTriggered { .. } => (
+            RuntimeEventType::LoopGuardTriggered,
+            RuntimeEventSource::Runtime,
+            ObservationIntegrityClass::Required,
+        ),
+        RuntimeObservation::GovernorDecided(_) => (
+            RuntimeEventType::GovernorDecided,
+            RuntimeEventSource::Governor,
+            ObservationIntegrityClass::Required,
+        ),
+        RuntimeObservation::PendingTurnStarted(_) => (
+            RuntimeEventType::TurnStarted,
+            RuntimeEventSource::User,
+            ObservationIntegrityClass::Required,
+        ),
+        RuntimeObservation::AssistantMessage { .. } => (
+            RuntimeEventType::AssistantMessage,
+            RuntimeEventSource::Runtime,
+            ObservationIntegrityClass::Supporting,
+        ),
+    };
+    ObservationDescriptor {
+        event_type,
+        source,
+        integrity,
+    }
+}
+
 pub(crate) fn trace_event_payload(
     trace_event: AgentLoopTraceEvent,
 ) -> Option<(RuntimeEventType, RuntimeEventSource, Value)> {
-    match trace_event {
+    let descriptor = observation_descriptor(&trace_event);
+    let mapped = match trace_event {
         AgentLoopTraceEvent::ContextBuilt {
             contributors,
             planned_input_tokens,
@@ -453,7 +581,12 @@ pub(crate) fn trace_event_payload(
                 "content": content,
             }),
         )),
+    };
+    if let Some((event_type, source, _)) = &mapped {
+        debug_assert_eq!(*event_type, descriptor.event_type);
+        debug_assert_eq!(*source, descriptor.source);
     }
+    mapped
 }
 
 pub(crate) fn host_event(

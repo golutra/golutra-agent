@@ -17,6 +17,24 @@ use tempfile::tempdir;
 
 use super::*;
 
+#[test]
+fn runtime_observation_sink_accepts_a_function_adapter() {
+    let mut observed = Vec::new();
+    let mut sink = |observation| observed.push(observation);
+
+    RuntimeObservationSink::emit(
+        &mut sink,
+        RuntimeObservation::ToolStarted {
+            tool_name: "read_file".to_owned(),
+        },
+    );
+
+    assert!(matches!(
+        observed.as_slice(),
+        [RuntimeObservation::ToolStarted { tool_name }] if tool_name == "read_file"
+    ));
+}
+
 #[derive(Debug, Clone)]
 enum FallbackTestProvider {
     Failing(Box<golutra_core::ProviderContract>),

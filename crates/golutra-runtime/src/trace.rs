@@ -77,3 +77,26 @@ pub enum AgentLoopTraceEvent {
         content: String,
     },
 }
+
+/// A typed execution fact emitted by `AgentLoop` before it is translated into
+/// a canonical runtime event. The alias keeps the execution layer independent
+/// from persistence and projection concerns.
+pub type RuntimeObservation = AgentLoopTraceEvent;
+
+/// The observation seam used by the loop and by deterministic test adapters.
+///
+/// Runtime hosts normally provide a channel-backed adapter while tests may use
+/// a closure or an in-memory collector. Implementations must preserve emission
+/// order and must not perform blocking IO in `emit`.
+pub trait RuntimeObservationSink: Send {
+    fn emit(&mut self, observation: RuntimeObservation);
+}
+
+impl<F> RuntimeObservationSink for F
+where
+    F: FnMut(RuntimeObservation) + Send,
+{
+    fn emit(&mut self, observation: RuntimeObservation) {
+        self(observation);
+    }
+}
