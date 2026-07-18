@@ -18,7 +18,10 @@ use crossterm::{
 use golutra_auth::{
     CredentialRef, CredentialSource, OAuthFlow, OAuthProviderDescriptor, SecretKind,
 };
-use golutra_client::{RuntimeClient, RuntimeTransport};
+use golutra_client::{
+    DebugExportCoordinator, DebugExportRequest, RuntimeClient, RuntimeTransport,
+    parse_session_range,
+};
 use golutra_config::{
     BuiltinOAuthMethod, ProviderConfigPaths, ProviderConfigScope, ProviderInstallPlan,
     ProviderProfile, apply_oauth_provider_install_plan_verified,
@@ -38,8 +41,8 @@ use golutra_protocol::{
 };
 use golutra_tui::{
     AuthConfigScope, AuthCredentialStore, OAuthLoginCommand, OpenAiCompatibleLogin,
-    SlashAuthCommand, SlashCommand, SlashCommandCandidate, SlashInput, parse_slash_input,
-    slash_command_candidates,
+    PaneScrollState, SlashAuthCommand, SlashCommand, SlashCommandCandidate, SlashInput,
+    TranscriptScrollAction, parse_slash_input, slash_command_candidates,
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use secrecy::SecretString;
@@ -94,6 +97,7 @@ struct TuiApp {
     events: Vec<Value>,
     command_messages: Vec<TranscriptItem>,
     resume_picker: Option<ResumePickerState>,
+    export_flow: Option<ExportFlowState>,
     auth_dialog: Option<AuthDialogState>,
     auth_operation: Option<PendingAuthOperation>,
     input: ComposerInput,
@@ -103,12 +107,14 @@ struct TuiApp {
     provider_model: String,
     workspace_path: PathBuf,
     debug_mode: bool,
+    transcript_scroll: PaneScrollState,
+    developer_scroll: PaneScrollState,
+    developer_load_requested: bool,
+    layout: UiLayoutSnapshot,
     cursor: Option<u64>,
     history_start_cursor: Option<u64>,
     history_has_more_before: bool,
     history_load_requested: bool,
-    transcript_scroll_offset: usize,
-    transcript_row_count: usize,
     quit_shortcut_expires_at: Option<Instant>,
     should_quit: bool,
 }
@@ -154,6 +160,7 @@ impl TuiApp {
             events: Vec::new(),
             command_messages: Vec::new(),
             resume_picker: None,
+            export_flow: None,
             auth_dialog,
             auth_operation: None,
             input: ComposerInput::default(),
@@ -163,12 +170,20 @@ impl TuiApp {
             provider_model,
             workspace_path,
             debug_mode,
+            transcript_scroll: PaneScrollState {
+                follow_tail: true,
+                ..PaneScrollState::default()
+            },
+            developer_scroll: PaneScrollState {
+                follow_tail: true,
+                ..PaneScrollState::default()
+            },
+            developer_load_requested: false,
+            layout: UiLayoutSnapshot::default(),
             cursor: None,
             history_start_cursor: None,
             history_has_more_before: false,
             history_load_requested: false,
-            transcript_scroll_offset: 0,
-            transcript_row_count: 0,
             quit_shortcut_expires_at: None,
             should_quit: false,
         }
@@ -191,7 +206,7 @@ impl TuiApp {
     }
 
     async fn refresh(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
-        let previous_row_count = self.transcript_row_count;
+        let previous_row_count = self.transcript_scroll.row_count;
         let projection = transport
             .query(RuntimeQuery {
                 query_id: QueryId::new(),
@@ -218,7 +233,10 @@ impl TuiApp {
         if self.debug_mode {
             match load_debug_projection(transport, self.session_id, self.task_id).await {
                 Ok(projection) => {
-                    self.developer_projection = Some(projection);
+                    self.developer_projection = Some(match self.developer_projection.take() {
+                        Some(previous) => merge_debug_projection(previous, projection),
+                        None => projection,
+                    });
                     self.developer_error = None;
                 }
                 Err(error) => {
@@ -229,8 +247,11 @@ impl TuiApp {
         } else {
             self.developer_projection = None;
             self.developer_error = None;
+            self.developer_scroll.reset(0);
+            self.developer_load_requested = false;
         }
         self.sync_transcript_row_count(previous_row_count);
+        self.sync_developer_row_count();
         Ok(())
     }
 
@@ -255,7 +276,7 @@ impl TuiApp {
         self.cursor = page.end_cursor;
         self.history_has_more_before = page.has_more;
         self.history_load_requested = false;
-        self.transcript_row_count = transcript_rows(self).len();
+        self.sync_transcript_row_count(0);
         self.clamp_transcript_scroll();
         Ok(())
     }
@@ -291,10 +312,13 @@ impl TuiApp {
         self.history_start_cursor = page.start_cursor;
         self.history_has_more_before = page.has_more;
         let current_rows = transcript_rows(self).len();
-        self.transcript_scroll_offset = self
-            .transcript_scroll_offset
-            .saturating_add(current_rows.saturating_sub(previous_rows));
-        self.transcript_row_count = current_rows;
+        if !self.transcript_scroll.follow_tail && current_rows > previous_rows {
+            self.transcript_scroll.offset_from_bottom = self
+                .transcript_scroll
+                .offset_from_bottom
+                .saturating_add(current_rows.saturating_sub(previous_rows));
+        }
+        self.transcript_scroll.row_count = current_rows;
         self.clamp_transcript_scroll();
         Ok(())
     }
@@ -311,6 +335,8 @@ impl TuiApp {
         } else {
             self.developer_projection = None;
             self.developer_error = None;
+            self.developer_scroll.reset(0);
+            self.developer_load_requested = false;
             self.status_message = "developer runtime view hidden".to_owned();
         }
         Ok(())
@@ -341,7 +367,7 @@ impl TuiApp {
             self.input.clear();
             return Ok(());
         }
-        if self.resume_picker.is_some() {
+        if self.resume_picker.is_some() || self.export_flow.is_some() {
             self.status_message = "select a session with arrow keys or Esc".to_owned();
             self.input.clear();
             return Ok(());
@@ -396,6 +422,7 @@ impl TuiApp {
         if self.auth_operation.is_some()
             || self.auth_dialog.is_some()
             || self.resume_picker.is_some()
+            || self.export_flow.is_some()
         {
             return Vec::new();
         }
@@ -423,8 +450,7 @@ impl TuiApp {
     }
 
     fn reset_transcript_view(&mut self) {
-        self.transcript_scroll_offset = 0;
-        self.transcript_row_count = transcript_rows(self).len();
+        self.transcript_scroll.reset(transcript_rows(self).len());
     }
 
     fn reset_history_window(&mut self) {
@@ -436,41 +462,21 @@ impl TuiApp {
 
     fn sync_transcript_row_count(&mut self, previous_row_count: usize) {
         let current_row_count = transcript_rows(self).len();
-        if self.transcript_scroll_offset > 0 && current_row_count > previous_row_count {
-            self.transcript_scroll_offset = self
-                .transcript_scroll_offset
+        if !self.transcript_scroll.follow_tail && current_row_count > previous_row_count {
+            self.transcript_scroll.offset_from_bottom = self
+                .transcript_scroll
+                .offset_from_bottom
                 .saturating_add(current_row_count - previous_row_count);
         }
-        self.transcript_row_count = current_row_count;
+        self.transcript_scroll.row_count = current_row_count;
         self.clamp_transcript_scroll();
     }
 
     fn scroll_transcript(&mut self, action: TranscriptScrollAction, visible_rows: usize) {
-        if self.auth_dialog.is_some() || self.resume_picker.is_some() || self.debug_mode {
+        if self.auth_dialog.is_some() || self.resume_picker.is_some() {
             return;
         }
-        let page = visible_rows.max(1);
-        match action {
-            TranscriptScrollAction::LineUp => {
-                self.transcript_scroll_offset = self.transcript_scroll_offset.saturating_add(1);
-            }
-            TranscriptScrollAction::LineDown => {
-                self.transcript_scroll_offset = self.transcript_scroll_offset.saturating_sub(1);
-            }
-            TranscriptScrollAction::PageUp => {
-                self.transcript_scroll_offset = self.transcript_scroll_offset.saturating_add(page);
-            }
-            TranscriptScrollAction::PageDown => {
-                self.transcript_scroll_offset = self.transcript_scroll_offset.saturating_sub(page);
-            }
-            TranscriptScrollAction::Top => {
-                self.transcript_scroll_offset = self.max_transcript_scroll_offset(visible_rows);
-            }
-            TranscriptScrollAction::Bottom => {
-                self.transcript_scroll_offset = 0;
-            }
-        }
-        self.clamp_transcript_scroll_for_rows(visible_rows);
+        self.transcript_scroll.scroll(action, visible_rows);
         if matches!(
             action,
             TranscriptScrollAction::LineDown
@@ -485,28 +491,84 @@ impl TuiApp {
                     | TranscriptScrollAction::PageUp
                     | TranscriptScrollAction::Top
             )
-            && self.transcript_scroll_offset == self.max_transcript_scroll_offset(visible_rows)
+            && self.transcript_scroll.offset_from_bottom
+                == self.max_transcript_scroll_offset(visible_rows)
         {
             self.history_load_requested = true;
         }
-        self.status_message = transcript_scroll_status(self.transcript_scroll_offset);
+        self.status_message = transcript_scroll_status(self.transcript_scroll.offset_from_bottom);
     }
 
     fn clamp_transcript_scroll(&mut self) {
-        self.transcript_scroll_offset = self
-            .transcript_scroll_offset
-            .min(self.transcript_row_count.saturating_sub(1));
-    }
-
-    fn clamp_transcript_scroll_for_rows(&mut self, visible_rows: usize) {
-        self.transcript_scroll_offset = self
-            .transcript_scroll_offset
-            .min(self.max_transcript_scroll_offset(visible_rows));
+        self.transcript_scroll.clamp(usize::MAX);
     }
 
     fn max_transcript_scroll_offset(&self, visible_rows: usize) -> usize {
-        self.transcript_row_count
-            .saturating_sub(visible_rows.max(1))
+        self.transcript_scroll.max_offset(visible_rows)
+    }
+
+    fn sync_developer_row_count(&mut self) {
+        let row_count = self
+            .developer_projection
+            .as_ref()
+            .map(|projection| {
+                developer_panel_rows(projection, usize::MAX)
+                    .into_iter()
+                    .filter(|row| matches!(row, DeveloperPanelRow::Event { .. }))
+                    .count()
+            })
+            .unwrap_or(0);
+        self.developer_scroll.set_row_count(row_count);
+    }
+
+    fn scroll_developer(&mut self, action: TranscriptScrollAction, visible_rows: usize) {
+        if self.auth_dialog.is_some() || self.resume_picker.is_some() {
+            return;
+        }
+        self.developer_scroll.scroll(action, visible_rows);
+        if self.developer_scroll.offset_from_bottom
+            == self.developer_scroll.max_offset(visible_rows)
+            && self
+                .developer_projection
+                .as_ref()
+                .is_some_and(|projection| projection.event_window.has_more_before)
+            && matches!(
+                action,
+                TranscriptScrollAction::LineUp
+                    | TranscriptScrollAction::PageUp
+                    | TranscriptScrollAction::Top
+            )
+        {
+            self.developer_load_requested = true;
+        }
+        self.status_message = developer_scroll_status(self.developer_scroll.offset_from_bottom);
+    }
+
+    async fn load_older_debug_history(
+        &mut self,
+        transport: &RuntimeTransport,
+    ) -> miette::Result<()> {
+        self.developer_load_requested = false;
+        let Some(projection) = &mut self.developer_projection else {
+            return Ok(());
+        };
+        let previous_rows = self.developer_scroll.row_count;
+        load_older_debug_events(transport, projection)
+            .await
+            .map_err(|error| miette::miette!("{error}"))?;
+        let current_rows = developer_panel_rows(projection, usize::MAX)
+            .into_iter()
+            .filter(|row| matches!(row, DeveloperPanelRow::Event { .. }))
+            .count();
+        if !self.developer_scroll.follow_tail && current_rows > previous_rows {
+            self.developer_scroll.offset_from_bottom = self
+                .developer_scroll
+                .offset_from_bottom
+                .saturating_add(current_rows - previous_rows);
+        }
+        self.developer_scroll.row_count = current_rows;
+        self.developer_scroll.clamp(usize::MAX);
+        Ok(())
     }
 
     async fn send_runtime_prompt(
@@ -571,6 +633,9 @@ impl TuiApp {
                     self.open_resume_picker(transport).await?;
                 }
             }
+            SlashCommand::Export => {
+                self.open_export_flow(transport).await?;
+            }
             SlashCommand::Threads { limit } => {
                 let threads = transport
                     .list_threads(limit)
@@ -609,9 +674,12 @@ impl TuiApp {
                 self.projection = None;
                 self.developer_projection = None;
                 self.developer_error = None;
+                self.developer_scroll.reset(0);
+                self.developer_load_requested = false;
                 self.events.clear();
                 self.command_messages.clear();
                 self.input.clear();
+                self.export_flow = None;
                 self.reset_slash_selection();
                 self.reset_history_window();
                 self.reset_transcript_view();
@@ -724,6 +792,133 @@ impl TuiApp {
         Ok(())
     }
 
+    async fn open_export_flow(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
+        let threads = transport
+            .list_threads(50)
+            .await
+            .map_err(|error| miette::miette!("{error}"))?;
+        let items = threads
+            .into_iter()
+            .map(|thread| ResumeThreadItem {
+                thread_id: thread.thread_id,
+                session_id: thread.session_id,
+                title: thread.title,
+                preview: thread.preview,
+            })
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            self.push_system_message("Export", vec!["no sessions in this cwd yet".to_owned()]);
+            return Ok(());
+        }
+        self.input.clear();
+        self.resume_picker = None;
+        self.export_flow = Some(ExportFlowState {
+            picker: ResumePickerState { items, selected: 0 },
+            step: ExportFlowStep::SelectSession,
+            range_input: "1".to_owned(),
+            destination_input: String::new(),
+            error: None,
+            receipt: None,
+        });
+        self.status_message = "select a session to export".to_owned();
+        Ok(())
+    }
+
+    fn close_export_flow(&mut self) {
+        self.export_flow = None;
+        self.status_message = "export cancelled".to_owned();
+    }
+
+    fn export_input_mut(&mut self) -> Option<&mut String> {
+        let flow = self.export_flow.as_mut()?;
+        match flow.step {
+            ExportFlowStep::Range => Some(&mut flow.range_input),
+            ExportFlowStep::Destination => Some(&mut flow.destination_input),
+            _ => None,
+        }
+    }
+
+    async fn handle_export_enter(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
+        let Some(flow) = self.export_flow.as_mut() else {
+            return Ok(());
+        };
+        match flow.step {
+            ExportFlowStep::SelectSession => {
+                flow.step = ExportFlowStep::Range;
+                self.status_message = "enter 1, +N, or -N for the session window".to_owned();
+            }
+            ExportFlowStep::Range => {
+                if let Err(error) = parse_session_range(&flow.range_input) {
+                    flow.error = Some(error.to_string());
+                    self.status_message = "invalid export range".to_owned();
+                } else {
+                    flow.step = ExportFlowStep::Destination;
+                    self.status_message = "enter an absolute export directory".to_owned();
+                }
+            }
+            ExportFlowStep::Destination => {
+                if !Path::new(&flow.destination_input).is_absolute() {
+                    flow.error = Some("destination must be an absolute path".to_owned());
+                    self.status_message = "absolute path required".to_owned();
+                } else if flow.destination_input.trim().is_empty() {
+                    flow.error = Some("destination must not be empty".to_owned());
+                } else {
+                    flow.step = ExportFlowStep::Review;
+                    self.status_message = "review export".to_owned();
+                }
+            }
+            ExportFlowStep::Review => {
+                let Some(thread_id) = flow.selected_thread_id() else {
+                    flow.error = Some("select a session first".to_owned());
+                    flow.step = ExportFlowStep::Error;
+                    return Ok(());
+                };
+                let range = match parse_session_range(&flow.range_input) {
+                    Ok(range) => range,
+                    Err(error) => {
+                        flow.error = Some(error.to_string());
+                        flow.step = ExportFlowStep::Error;
+                        return Ok(());
+                    }
+                };
+                let destination = PathBuf::from(&flow.destination_input);
+                flow.step = ExportFlowStep::Running;
+                flow.error = None;
+                let result = DebugExportCoordinator::new(transport)
+                    .export(DebugExportRequest {
+                        selection: golutra_protocol::SessionWindowRequest {
+                            anchor_thread_id: thread_id,
+                            range,
+                        },
+                        destination,
+                    })
+                    .await;
+                if let Some(flow) = self.export_flow.as_mut() {
+                    match result {
+                        Ok(receipt) => {
+                            self.status_message = "export complete".to_owned();
+                            flow.receipt = Some(receipt);
+                            flow.step = ExportFlowStep::Completed;
+                        }
+                        Err(error) => {
+                            self.status_message = "export failed".to_owned();
+                            flow.error = Some(error.to_string());
+                            flow.step = ExportFlowStep::Error;
+                        }
+                    }
+                }
+            }
+            ExportFlowStep::Completed | ExportFlowStep::Error => {
+                self.export_flow = None;
+                self.status_message = "export closed".to_owned();
+            }
+            ExportFlowStep::Running => {
+                self.status_message = "export is still running".to_owned();
+            }
+        }
+        Ok(())
+    }
+
     fn start_new_session(&mut self) {
         self.thread_id = ThreadId::new();
         self.session_id = SessionId::new();
@@ -731,13 +926,15 @@ impl TuiApp {
         self.projection = None;
         self.developer_projection = None;
         self.developer_error = None;
+        self.developer_scroll.reset(0);
+        self.developer_load_requested = false;
         self.events.clear();
         self.command_messages.clear();
         self.input.clear();
+        self.export_flow = None;
         self.reset_slash_selection();
         self.reset_history_window();
         self.resume_picker = None;
-        self.debug_mode = false;
         self.status_message = "new session".to_owned();
         self.reset_transcript_view();
     }
@@ -757,9 +954,12 @@ impl TuiApp {
         self.projection = None;
         self.developer_projection = None;
         self.developer_error = None;
+        self.developer_scroll.reset(0);
+        self.developer_load_requested = false;
         self.events.clear();
         self.command_messages.clear();
         self.input.clear();
+        self.export_flow = None;
         self.reset_slash_selection();
         self.reset_history_window();
         self.resume_picker = None;
@@ -1141,7 +1341,7 @@ impl TuiApp {
             self.command_messages
                 .drain(0..self.command_messages.len().saturating_sub(12));
         }
-        self.transcript_row_count = transcript_rows(self).len();
+        self.sync_transcript_row_count(self.transcript_scroll.row_count);
         self.clamp_transcript_scroll();
     }
 }
@@ -1203,7 +1403,7 @@ async fn run_app(
 
     while !app.should_quit {
         terminal
-            .draw(|frame| draw_ui(frame, &app))
+            .draw(|frame| draw_ui(frame, &mut app))
             .map_err(|error| miette::miette!("{error}"))?;
 
         if event::poll(tick_rate).map_err(|error| miette::miette!("{error}"))? {
@@ -1224,6 +1424,9 @@ async fn run_app(
 
         if app.history_load_requested {
             app.load_older_history(&transport).await?;
+        }
+        if app.developer_load_requested {
+            app.load_older_debug_history(&transport).await?;
         }
 
         if app.session_id != subscribed_session || app.task_id != subscribed_task {
@@ -1277,6 +1480,9 @@ async fn handle_key(
     }
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return app.interrupt_or_quit(transport).await;
+    }
+    if app.export_flow.is_some() {
+        return handle_export_key(key, app, transport).await;
     }
     if app.resume_picker.is_some() {
         return handle_resume_picker_key(key, app, transport).await;
@@ -1403,8 +1609,97 @@ async fn handle_key(
     Ok(())
 }
 
+async fn handle_export_key(
+    key: KeyEvent,
+    app: &mut TuiApp,
+    transport: &RuntimeTransport,
+) -> miette::Result<()> {
+    let step = app.export_flow.as_ref().map(|flow| flow.step);
+    match step {
+        Some(ExportFlowStep::SelectSession) => match key.code {
+            KeyCode::Esc => app.close_export_flow(),
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(flow) = &mut app.export_flow {
+                    flow.picker
+                        .move_selection(ResumeSelectionDirection::Previous);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(flow) = &mut app.export_flow {
+                    flow.picker.move_selection(ResumeSelectionDirection::Next);
+                }
+            }
+            KeyCode::Enter => app.handle_export_enter(transport).await?,
+            KeyCode::Char(character) if character.is_ascii_digit() => {
+                if let Some(index) = character
+                    .to_digit(10)
+                    .and_then(|digit| digit.checked_sub(1))
+                    && let Some(flow) = &mut app.export_flow
+                    && (index as usize) < flow.picker.items.len()
+                {
+                    flow.picker.selected = index as usize;
+                    app.handle_export_enter(transport).await?;
+                }
+            }
+            _ => {}
+        },
+        Some(ExportFlowStep::Range | ExportFlowStep::Destination) => match key.code {
+            KeyCode::Esc => {
+                if let Some(flow) = &mut app.export_flow {
+                    flow.step = if flow.step == ExportFlowStep::Range {
+                        ExportFlowStep::SelectSession
+                    } else {
+                        ExportFlowStep::Range
+                    };
+                    flow.error = None;
+                }
+            }
+            KeyCode::Enter => app.handle_export_enter(transport).await?,
+            KeyCode::Backspace => {
+                if let Some(input) = app.export_input_mut() {
+                    input.pop();
+                }
+            }
+            KeyCode::Char(character)
+                if !key.modifiers.intersects(
+                    KeyModifiers::CONTROL
+                        | KeyModifiers::ALT
+                        | KeyModifiers::SUPER
+                        | KeyModifiers::HYPER
+                        | KeyModifiers::META,
+                ) =>
+            {
+                if let Some(input) = app.export_input_mut() {
+                    input.push(character);
+                }
+            }
+            _ => {}
+        },
+        Some(ExportFlowStep::Review)
+        | Some(ExportFlowStep::Completed)
+        | Some(ExportFlowStep::Error) => match key.code {
+            KeyCode::Esc | KeyCode::Enter => app.handle_export_enter(transport).await?,
+            _ => {}
+        },
+        Some(ExportFlowStep::Running) => {
+            if key.code == KeyCode::Esc {
+                app.status_message = "export cannot be cancelled after writing started".to_owned();
+            }
+        }
+        None => {}
+    }
+    Ok(())
+}
+
 fn handle_paste(pasted: &str, app: &mut TuiApp) {
     if app.resume_picker.is_some() {
+        return;
+    }
+
+    if app.export_flow.is_some() {
+        if let Some(input) = app.export_input_mut() {
+            input.push_str(&pasted.replace("\r\n", "\n").replace('\r', "\n"));
+        }
         return;
     }
 
@@ -1422,13 +1717,38 @@ fn handle_paste(pasted: &str, app: &mut TuiApp) {
 }
 
 fn handle_mouse(mouse: MouseEvent, app: &mut TuiApp) {
+    let target = app.layout.hit_test(mouse.column, mouse.row, app);
     match mouse.kind {
-        MouseEventKind::ScrollUp => {
-            app.scroll_transcript(TranscriptScrollAction::LineUp, transcript_page_rows(app));
-        }
-        MouseEventKind::ScrollDown => {
-            app.scroll_transcript(TranscriptScrollAction::LineDown, transcript_page_rows(app));
-        }
+        MouseEventKind::ScrollUp => match target {
+            UiHitTarget::Developer => {
+                let rows = app
+                    .layout
+                    .developer
+                    .map(|area| area.height.saturating_sub(1) as usize)
+                    .unwrap_or(1);
+                app.scroll_developer(TranscriptScrollAction::LineUp, rows);
+            }
+            UiHitTarget::Transcript => {
+                let rows = app.layout.transcript.height.saturating_sub(1) as usize;
+                app.scroll_transcript(TranscriptScrollAction::LineUp, rows);
+            }
+            _ => {}
+        },
+        MouseEventKind::ScrollDown => match target {
+            UiHitTarget::Developer => {
+                let rows = app
+                    .layout
+                    .developer
+                    .map(|area| area.height.saturating_sub(1) as usize)
+                    .unwrap_or(1);
+                app.scroll_developer(TranscriptScrollAction::LineDown, rows);
+            }
+            UiHitTarget::Transcript => {
+                let rows = app.layout.transcript.height.saturating_sub(1) as usize;
+                app.scroll_transcript(TranscriptScrollAction::LineDown, rows);
+            }
+            _ => {}
+        },
         _ => {}
     }
 }
@@ -1468,7 +1788,8 @@ async fn handle_resume_picker_key(
 fn setup_terminal() -> miette::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode().map_err(|error| miette::miette!("{error}"))?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).map_err(|error| miette::miette!("{error}"))?;
+    execute!(stdout, EnterAlternateScreen, event::EnableMouseCapture)
+        .map_err(|error| miette::miette!("{error}"))?;
     let _ = execute!(stdout, EnableBracketedPaste, SetCursorStyle::SteadyBar);
     Terminal::new(CrosstermBackend::new(stdout)).map_err(|error| miette::miette!("{error}"))
 }
@@ -1478,6 +1799,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> miette
     execute!(
         terminal.backend_mut(),
         DisableBracketedPaste,
+        event::DisableMouseCapture,
         SetCursorStyle::DefaultUserShape,
         LeaveAlternateScreen
     )
@@ -1492,6 +1814,7 @@ fn slash_help_lines() -> Vec<String> {
         "/new  start a new session".to_owned(),
         "/resume  open current cwd session list".to_owned(),
         "/resume <thread-id>  resume a specific current-cwd thread".to_owned(),
+        "/export  export selected sessions and governed runtime facts".to_owned(),
         "/threads [limit]  list recent threads for this cwd".to_owned(),
         "/fork <thread-id> [--from-turn <turn-id>]  fork history and switch to it".to_owned(),
         "/auth status  show provider onboarding state".to_owned(),

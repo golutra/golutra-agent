@@ -7,6 +7,88 @@ use serde_json::Value;
 
 pub use golutra_protocol::{DebugProjection, RuntimeEvent, UserProjection};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptScrollAction {
+    LineUp,
+    LineDown,
+    PageUp,
+    PageDown,
+    Top,
+    Bottom,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PaneScrollState {
+    pub offset_from_bottom: usize,
+    pub row_count: usize,
+    pub follow_tail: bool,
+}
+
+impl PaneScrollState {
+    pub fn set_row_count(&mut self, row_count: usize) {
+        if self.follow_tail {
+            self.offset_from_bottom = 0;
+        } else if row_count > self.row_count {
+            self.offset_from_bottom = self
+                .offset_from_bottom
+                .saturating_add(row_count.saturating_sub(self.row_count));
+        }
+        self.row_count = row_count;
+        self.clamp(usize::MAX);
+    }
+
+    pub fn reset(&mut self, row_count: usize) {
+        self.offset_from_bottom = 0;
+        self.row_count = row_count;
+        self.follow_tail = true;
+    }
+
+    pub fn max_offset(&self, visible_rows: usize) -> usize {
+        self.row_count.saturating_sub(visible_rows.max(1))
+    }
+
+    pub fn clamp(&mut self, visible_rows: usize) {
+        let max = if visible_rows == usize::MAX {
+            self.row_count.saturating_sub(1)
+        } else {
+            self.max_offset(visible_rows)
+        };
+        self.offset_from_bottom = self.offset_from_bottom.min(max);
+        if self.offset_from_bottom == 0 {
+            self.follow_tail = true;
+        }
+    }
+
+    pub fn scroll(&mut self, action: TranscriptScrollAction, visible_rows: usize) {
+        let page = visible_rows.max(1);
+        match action {
+            TranscriptScrollAction::LineUp => {
+                self.offset_from_bottom = self.offset_from_bottom.saturating_add(1);
+                self.follow_tail = false;
+            }
+            TranscriptScrollAction::LineDown => {
+                self.offset_from_bottom = self.offset_from_bottom.saturating_sub(1);
+            }
+            TranscriptScrollAction::PageUp => {
+                self.offset_from_bottom = self.offset_from_bottom.saturating_add(page);
+                self.follow_tail = false;
+            }
+            TranscriptScrollAction::PageDown => {
+                self.offset_from_bottom = self.offset_from_bottom.saturating_sub(page);
+            }
+            TranscriptScrollAction::Top => {
+                self.offset_from_bottom = self.max_offset(visible_rows);
+                self.follow_tail = false;
+            }
+            TranscriptScrollAction::Bottom => {
+                self.offset_from_bottom = 0;
+                self.follow_tail = true;
+            }
+        }
+        self.clamp(visible_rows);
+    }
+}
+
 #[must_use]
 pub fn tui_boundary() -> &'static str {
     "projection-only terminal UI"
@@ -56,6 +138,7 @@ pub enum SlashCommand {
     Resume {
         thread_id: Option<String>,
     },
+    Export,
     Threads {
         limit: u32,
     },
@@ -171,6 +254,11 @@ const TOP_LEVEL_SLASH_HINTS: &[SlashCommandHint] = &[
     SlashCommandHint {
         command: "/resume",
         description: "open sessions",
+        selection: SlashCommandSelection::Execute,
+    },
+    SlashCommandHint {
+        command: "/export",
+        description: "export session history and runtime facts",
         selection: SlashCommandSelection::Execute,
     },
     SlashCommandHint {
@@ -364,6 +452,10 @@ pub fn parse_slash_input(input: &str) -> SlashInput {
         "/resume" => SlashInput::Command(SlashCommand::Resume {
             thread_id: tokens.get(1).cloned(),
         }),
+        "/export" if tokens.len() == 1 => SlashInput::Command(SlashCommand::Export),
+        "/export" => {
+            SlashInput::Error("/export does not take arguments; select a session first".to_owned())
+        }
         "/threads" | "/thread" => parse_threads_command(&tokens),
         "/fork" => parse_fork_command(&tokens),
         "/auth" => parse_auth_command(&tokens),
@@ -915,6 +1007,10 @@ mod tests {
             SlashInput::Command(SlashCommand::New)
         );
         assert_eq!(
+            parse_slash_input("/export"),
+            SlashInput::Command(SlashCommand::Export)
+        );
+        assert_eq!(
             parse_slash_input("/resume 019f"),
             SlashInput::Command(SlashCommand::Resume {
                 thread_id: Some("019f".to_owned())
@@ -1069,9 +1165,9 @@ mod tests {
             vec![
                 "/new - start a new session".to_owned(),
                 "/resume - open sessions".to_owned(),
+                "/export - export session history and runtime facts".to_owned(),
                 "/threads - list threads".to_owned(),
                 "/fork - fork a thread".to_owned(),
-                "/auth - provider setup".to_owned(),
             ]
         );
         assert_eq!(

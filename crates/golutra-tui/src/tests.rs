@@ -524,7 +524,7 @@ fn slash_candidates_render_below_composer_with_selection() {
         None,
     );
     app.input.set_text("/");
-    app.slash_selected = 2;
+    app.slash_selected = 3;
     let candidates = app.slash_candidates();
     let lines = slash_candidate_lines(&app, &candidates)
         .into_iter()
@@ -1445,7 +1445,7 @@ fn developer_panel_exposes_governance_without_leaking_into_normal_view() {
     app.developer_projection = Some(debug_projection);
     let mut normal_terminal = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
     normal_terminal
-        .draw(|frame| draw_ui(frame, &app))
+        .draw(|frame| draw_ui(frame, &mut app))
         .expect("draw normal view");
     let normal_text = normal_terminal
         .backend()
@@ -1459,7 +1459,7 @@ fn developer_panel_exposes_governance_without_leaking_into_normal_view() {
     app.debug_mode = true;
     let mut developer_terminal = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
     developer_terminal
-        .draw(|frame| draw_ui(frame, &app))
+        .draw(|frame| draw_ui(frame, &mut app))
         .expect("draw developer view");
     let developer_text = developer_terminal
         .backend()
@@ -1903,19 +1903,103 @@ fn transcript_visible_window_pages_from_bottom_and_round_trips() {
         "ready (mock)".to_owned(),
         None,
     );
-    app.transcript_row_count = 50;
+    app.transcript_scroll.row_count = 50;
+    app.transcript_scroll.follow_tail = true;
 
     app.scroll_transcript(TranscriptScrollAction::PageUp, 10);
-    assert_eq!(app.transcript_scroll_offset, 10);
+    assert_eq!(app.transcript_scroll.offset_from_bottom, 10);
     app.scroll_transcript(TranscriptScrollAction::PageDown, 10);
-    assert_eq!(app.transcript_scroll_offset, 0);
+    assert_eq!(app.transcript_scroll.offset_from_bottom, 0);
     app.history_has_more_before = true;
     app.scroll_transcript(TranscriptScrollAction::Top, 10);
-    assert_eq!(app.transcript_scroll_offset, 40);
+    assert_eq!(app.transcript_scroll.offset_from_bottom, 40);
     assert!(app.history_load_requested);
     app.scroll_transcript(TranscriptScrollAction::Bottom, 10);
-    assert_eq!(app.transcript_scroll_offset, 0);
+    assert_eq!(app.transcript_scroll.offset_from_bottom, 0);
     assert!(!app.history_load_requested);
+}
+
+#[test]
+fn mouse_wheel_routes_to_the_pane_under_the_pointer() {
+    let session_id = SessionId::new();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        None,
+        true,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.command_messages = (0..40)
+        .map(|index| TranscriptItem {
+            role: TranscriptRole::System,
+            title: format!("message-{index}"),
+            body: vec!["history".to_owned()],
+        })
+        .collect();
+    app.developer_projection = Some(golutra_protocol::DebugProjection {
+        session_id,
+        task_id: None,
+        events: (0..40)
+            .map(|sequence_no| RuntimeEvent {
+                id: golutra_core::EventId::new(),
+                sequence_no,
+                session_id,
+                turn_id: None,
+                task_id: None,
+                parent_event_id: None,
+                event_type: RuntimeEventType::CommandAccepted,
+                timestamp: chrono::Utc::now(),
+                source: golutra_protocol::RuntimeEventSource::Runtime,
+                payload: json!({"summary": "fact"}),
+                payload_ref: None,
+                durable: true,
+            })
+            .collect(),
+        event_window: golutra_protocol::DebugEventWindow {
+            start_cursor: Some(1),
+            end_cursor: Some(40),
+            has_more_before: false,
+            limit: 256,
+        },
+        busy_policy_decisions: Vec::new(),
+        tool_results: Vec::new(),
+        artifacts: Vec::new(),
+        evidence: Vec::new(),
+        verification: None,
+        loop_decisions: Vec::new(),
+    });
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw");
+    let layout = app.layout;
+    let developer_y = layout.developer.expect("developer area").y + 1;
+    let transcript_y = layout.transcript.y + 1;
+
+    handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 2,
+            row: developer_y,
+            modifiers: KeyModifiers::NONE,
+        },
+        &mut app,
+    );
+    assert!(app.developer_scroll.offset_from_bottom > 0);
+    assert_eq!(app.transcript_scroll.offset_from_bottom, 0);
+
+    handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 2,
+            row: transcript_y,
+            modifiers: KeyModifiers::NONE,
+        },
+        &mut app,
+    );
+    assert!(app.transcript_scroll.offset_from_bottom > 0);
+    assert!(app.developer_scroll.offset_from_bottom > 0);
 }
 
 #[tokio::test]
@@ -1973,8 +2057,9 @@ async fn resume_thread_clears_previous_visible_transcript_state() {
     app.events.push(json!({"old": true}));
     app.input.set_text("/resume");
     app.slash_selected = 2;
-    app.transcript_scroll_offset = 12;
-    app.transcript_row_count = 30;
+    app.transcript_scroll.offset_from_bottom = 12;
+    app.transcript_scroll.row_count = 30;
+    app.transcript_scroll.follow_tail = false;
 
     app.resume_thread(&transport, target_thread_id)
         .await
@@ -1984,7 +2069,7 @@ async fn resume_thread_clears_previous_visible_transcript_state() {
     assert!(app.events.is_empty());
     assert!(app.input.is_empty());
     assert_eq!(app.slash_selected, 0);
-    assert_eq!(app.transcript_scroll_offset, 0);
+    assert_eq!(app.transcript_scroll.offset_from_bottom, 0);
 }
 
 #[test]
@@ -2023,8 +2108,9 @@ fn start_new_session_resets_visible_tui_state() {
         items: Vec::new(),
         selected: 0,
     });
-    app.transcript_scroll_offset = 7;
-    app.transcript_row_count = 20;
+    app.transcript_scroll.offset_from_bottom = 7;
+    app.transcript_scroll.row_count = 20;
+    app.transcript_scroll.follow_tail = false;
 
     app.start_new_session();
 
@@ -2040,8 +2126,8 @@ fn start_new_session_resets_visible_tui_state() {
     assert_eq!(app.slash_selected, 0);
     assert!(app.cursor.is_none());
     assert!(app.resume_picker.is_none());
-    assert!(!app.debug_mode);
-    assert_eq!(app.transcript_scroll_offset, 0);
+    assert!(app.debug_mode);
+    assert_eq!(app.transcript_scroll.offset_from_bottom, 0);
     assert_eq!(app.status_message, "new session");
 }
 

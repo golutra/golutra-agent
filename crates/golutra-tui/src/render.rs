@@ -18,8 +18,52 @@ const COMPOSER_PREFIX: &str = "› ";
 const COMPOSER_PREFIX_WIDTH: u16 = 2;
 const MAX_COMPOSER_ROWS: u16 = 5;
 
-pub(crate) fn draw_ui(frame: &mut Frame<'_>, app: &TuiApp) {
-    let bottom_height = bottom_pane_height_for_width(app, frame.area().width);
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct UiLayoutSnapshot {
+    pub(crate) header: Rect,
+    pub(crate) transcript: Rect,
+    pub(crate) developer: Option<Rect>,
+    pub(crate) bottom: Rect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UiHitTarget {
+    Transcript,
+    Developer,
+    Bottom,
+    Overlay,
+    None,
+}
+
+impl UiLayoutSnapshot {
+    pub(crate) fn hit_test(self, x: u16, y: u16, app: &TuiApp) -> UiHitTarget {
+        if app.auth_dialog.is_some() || app.resume_picker.is_some() {
+            if rect_contains(self.transcript, x, y) || rect_contains(self.bottom, x, y) {
+                return UiHitTarget::Overlay;
+            }
+            return UiHitTarget::None;
+        }
+        if self.developer.is_some_and(|area| rect_contains(area, x, y)) {
+            UiHitTarget::Developer
+        } else if rect_contains(self.transcript, x, y) {
+            UiHitTarget::Transcript
+        } else if rect_contains(self.bottom, x, y) {
+            UiHitTarget::Bottom
+        } else {
+            UiHitTarget::None
+        }
+    }
+}
+
+fn rect_contains(area: Rect, x: u16, y: u16) -> bool {
+    x >= area.x
+        && x < area.x.saturating_add(area.width)
+        && y >= area.y
+        && y < area.y.saturating_add(area.height)
+}
+
+pub(crate) fn ui_layout(area: Rect, app: &TuiApp) -> UiLayoutSnapshot {
+    let bottom_height = bottom_pane_height_for_width(app, area.width);
     let constraints = if app.debug_mode {
         vec![
             Constraint::Length(1),
@@ -37,15 +81,27 @@ pub(crate) fn draw_ui(frame: &mut Frame<'_>, app: &TuiApp) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
-        .split(frame.area());
+        .split(area);
+    UiLayoutSnapshot {
+        header: chunks[0],
+        transcript: chunks[1],
+        developer: app.debug_mode.then_some(chunks[2]),
+        bottom: if app.debug_mode { chunks[3] } else { chunks[2] },
+    }
+}
 
-    draw_header(frame, chunks[0], app);
-    draw_transcript(frame, chunks[1], app);
-    if app.debug_mode {
-        draw_developer_panel(frame, chunks[2], app);
-        draw_bottom_pane(frame, chunks[3], app);
+pub(crate) fn draw_ui(frame: &mut Frame<'_>, app: &mut TuiApp) {
+    app.sync_transcript_row_count(app.transcript_scroll.row_count);
+    app.sync_developer_row_count();
+    app.layout = ui_layout(frame.area(), app);
+    let layout = app.layout;
+    draw_header(frame, layout.header, app);
+    draw_transcript(frame, layout.transcript, app);
+    if let Some(developer) = layout.developer {
+        draw_developer_panel(frame, developer, app);
+        draw_bottom_pane(frame, layout.bottom, app);
     } else {
-        draw_bottom_pane(frame, chunks[2], app);
+        draw_bottom_pane(frame, layout.bottom, app);
     }
 }
 
@@ -57,21 +113,24 @@ pub(crate) fn bottom_pane_height(app: &TuiApp) -> u16 {
 
 pub(crate) fn bottom_pane_height_for_width(app: &TuiApp, width: u16) -> u16 {
     let slash_rows = app.slash_candidates().len() as u16;
-    let overlay_rows = u16::from(app.auth_dialog.is_some() || app.resume_picker.is_some());
+    let overlay_rows = u16::from(
+        app.auth_dialog.is_some() || app.resume_picker.is_some() || app.export_flow.is_some(),
+    );
     let provider_rows = u16::from(provider_footer_line(app).is_some());
-    let composer_rows = if app.auth_dialog.is_some() || app.resume_picker.is_some() {
-        1
-    } else {
-        app.input
-            .viewport(
-                width.saturating_sub(COMPOSER_PREFIX_WIDTH).max(1),
-                MAX_COMPOSER_ROWS,
-            )
-            .lines
-            .len()
-            .try_into()
-            .unwrap_or(MAX_COMPOSER_ROWS)
-    };
+    let composer_rows =
+        if app.auth_dialog.is_some() || app.resume_picker.is_some() || app.export_flow.is_some() {
+            1
+        } else {
+            app.input
+                .viewport(
+                    width.saturating_sub(COMPOSER_PREFIX_WIDTH).max(1),
+                    MAX_COMPOSER_ROWS,
+                )
+                .lines
+                .len()
+                .try_into()
+                .unwrap_or(MAX_COMPOSER_ROWS)
+        };
     2 + composer_rows + slash_rows + overlay_rows + provider_rows
 }
 
@@ -97,6 +156,9 @@ pub(crate) fn header_mode(app: &TuiApp) -> String {
     if app.resume_picker.is_some() {
         return "  resume".to_owned();
     }
+    if app.export_flow.is_some() {
+        return "  export".to_owned();
+    }
     if app.debug_mode {
         return "  developer".to_owned();
     }
@@ -120,13 +182,21 @@ pub(crate) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         draw_resume_picker(frame, area, picker, app.thread_id);
         return;
     }
+    if let Some(flow) = &app.export_flow {
+        draw_export_flow(frame, area, flow, app.thread_id);
+        return;
+    }
 
     let mut items = transcript_rows(app);
     if items.is_empty() {
         return;
     }
     let visible_rows = area.height.saturating_sub(1) as usize;
-    let window = transcript_visible_window(items.len(), visible_rows, app.transcript_scroll_offset);
+    let window = transcript_visible_window(
+        items.len(),
+        visible_rows,
+        app.transcript_scroll.offset_from_bottom,
+    );
     if window.end < items.len() {
         items.drain(window.end..);
     }
@@ -728,6 +798,198 @@ pub(crate) fn draw_resume_picker(
     frame.render_widget(list, area);
 }
 
+pub(crate) fn draw_export_flow(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    flow: &ExportFlowState,
+    current_thread_id: ThreadId,
+) {
+    match flow.step {
+        ExportFlowStep::SelectSession => {
+            draw_resume_picker_with_title(
+                frame,
+                area,
+                &flow.picker,
+                current_thread_id,
+                "Export session",
+            );
+        }
+        ExportFlowStep::Range => {
+            let selected = flow
+                .selected_item()
+                .map(|item| {
+                    format!(
+                        "{} ({})",
+                        item.title,
+                        short_id(&item.session_id.to_string())
+                    )
+                })
+                .unwrap_or_else(|| "session".to_owned());
+            let lines = vec![
+                Line::from("Export selected session"),
+                Line::from(format!("Anchor: {selected}")),
+                Line::from(""),
+                Line::from(format!("Range: {}", flow.range_input)),
+                Line::from(""),
+                Line::from("1 = anchor only   +N = newer   -N = older"),
+                Line::from("Enter continue   Esc back"),
+            ];
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .block(Block::default().title("Export range").borders(Borders::TOP)),
+                area,
+            );
+        }
+        ExportFlowStep::Destination => {
+            let lines = vec![
+                Line::from("Choose an absolute destination directory"),
+                Line::from(""),
+                Line::from(format!("Path: {}", flow.destination_input)),
+                Line::from(""),
+                Line::from("The directory must not already exist"),
+                Line::from("Enter review   Esc back"),
+            ];
+            frame.render_widget(
+                Paragraph::new(lines).block(
+                    Block::default()
+                        .title("Export destination")
+                        .borders(Borders::TOP),
+                ),
+                area,
+            );
+        }
+        ExportFlowStep::Review => {
+            let selected = flow
+                .selected_item()
+                .map(|item| item.title.clone())
+                .unwrap_or_else(|| "session".to_owned());
+            let lines = vec![
+                Line::from("Review export"),
+                Line::from(format!("Session: {selected}")),
+                Line::from(format!("Range: {}", flow.range_input)),
+                Line::from(format!("Destination: {}", flow.destination_input)),
+                Line::from("Mode: full-redacted"),
+                Line::from("Enter export   Esc back"),
+            ];
+            frame.render_widget(
+                Paragraph::new(lines).block(
+                    Block::default()
+                        .title("Export review")
+                        .borders(Borders::TOP),
+                ),
+                area,
+            );
+        }
+        ExportFlowStep::Running => {
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from("Writing export bundle..."),
+                    Line::from("Please wait"),
+                ])
+                .block(Block::default().title("Export").borders(Borders::TOP)),
+                area,
+            );
+        }
+        ExportFlowStep::Completed => {
+            let receipt = flow.receipt.as_ref();
+            let lines = vec![
+                Line::from("Export complete"),
+                Line::from(
+                    receipt
+                        .map(|receipt| format!("{}", receipt.destination.display()))
+                        .unwrap_or_else(|| flow.destination_input.clone()),
+                ),
+                Line::from("Enter or Esc close"),
+            ];
+            frame.render_widget(
+                Paragraph::new(lines).block(Block::default().title("Export").borders(Borders::TOP)),
+                area,
+            );
+        }
+        ExportFlowStep::Error => {
+            let lines = vec![
+                Line::from("Export failed"),
+                Line::from(
+                    flow.error
+                        .clone()
+                        .unwrap_or_else(|| "unknown error".to_owned()),
+                ),
+                Line::from("Enter or Esc close"),
+            ];
+            frame.render_widget(
+                Paragraph::new(lines).block(Block::default().title("Export").borders(Borders::TOP)),
+                area,
+            );
+        }
+    }
+}
+
+fn draw_resume_picker_with_title(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    picker: &ResumePickerState,
+    current_thread_id: ThreadId,
+    title: &str,
+) {
+    let visible_rows = area.height.saturating_sub(1) as usize;
+    let visible_count = visible_rows.max(1);
+    let offset = resume_picker_offset(picker.selected, visible_count, picker.items.len());
+    let items = picker
+        .items
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(visible_count)
+        .map(|(index, item)| {
+            let selected = index == picker.selected;
+            let current = item.thread_id == current_thread_id;
+            let marker = if selected { "> " } else { "  " };
+            let current_marker = if current { "current" } else { "" };
+            ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled(
+                        marker,
+                        Style::default().fg(if selected {
+                            Color::Cyan
+                        } else {
+                            Color::DarkGray
+                        }),
+                    ),
+                    Span::styled(
+                        format!("{} ", index + 1),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        item.title.clone(),
+                        Style::default()
+                            .fg(if selected { Color::White } else { Color::Gray })
+                            .add_modifier(if selected {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(current_marker, Style::default().fg(Color::Green)),
+                ]),
+                Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(
+                        short_id(&item.session_id.to_string()),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(item.preview.clone(), Style::default().fg(Color::DarkGray)),
+                ]),
+            ])
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        List::new(items).block(Block::default().title(title).borders(Borders::TOP)),
+        area,
+    );
+}
+
 pub(crate) fn resume_picker_offset(
     selected: usize,
     visible_count: usize,
@@ -748,14 +1010,30 @@ pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiA
     let rows = if let Some(error) = &app.developer_error {
         vec![DeveloperPanelRow::Summary(format!("error {}", error))]
     } else if let Some(projection) = &app.developer_projection {
-        developer_panel_rows(projection, 4)
+        developer_panel_rows(projection, usize::MAX)
     } else {
         vec![DeveloperPanelRow::Summary(
             "loading developer projection".to_owned(),
         )]
     };
-    let items = rows
+    let (summaries, events): (Vec<_>, Vec<_>) = rows
         .into_iter()
+        .partition(|row| matches!(row, DeveloperPanelRow::Summary(_)));
+    let visible_rows = area.height.saturating_sub(1) as usize;
+    let visible_summaries = summaries.into_iter().take(visible_rows).collect::<Vec<_>>();
+    let event_rows = visible_rows.saturating_sub(visible_summaries.len());
+    let window = transcript_visible_window(
+        events.len(),
+        event_rows,
+        app.developer_scroll.offset_from_bottom,
+    );
+    let rows = visible_summaries.into_iter().chain(
+        events
+            .into_iter()
+            .skip(window.start)
+            .take(window.end.saturating_sub(window.start)),
+    );
+    let items = rows
         .map(|row| match row {
             DeveloperPanelRow::Summary(summary) => ListItem::new(Line::from(Span::styled(
                 truncate_end_to_width(&summary, content_width),
@@ -793,6 +1071,8 @@ pub(crate) fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
         Some("Provider setup   Enter continue   Esc back   Ctrl+C twice quit")
     } else if app.resume_picker.is_some() {
         Some("Enter resume   Up/Down select   Esc cancel   Ctrl+C twice quit")
+    } else if app.export_flow.is_some() {
+        Some("Enter continue   Esc cancel   Ctrl+C twice quit")
     } else {
         None
     };
@@ -806,6 +1086,11 @@ pub(crate) fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
         vec![Line::from(vec![
             Span::styled(COMPOSER_PREFIX, Style::default().fg(Color::Cyan)),
             Span::styled("Select a session to resume", composer_style(app)),
+        ])]
+    } else if app.export_flow.is_some() {
+        vec![Line::from(vec![
+            Span::styled(COMPOSER_PREFIX, Style::default().fg(Color::Cyan)),
+            Span::styled("Export session history", composer_style(app)),
         ])]
     } else {
         let text_width = area.width.saturating_sub(COMPOSER_PREFIX_WIDTH).max(1);
@@ -1226,6 +1511,14 @@ pub(crate) fn transcript_scroll_status(scroll_offset: usize) -> String {
         "history at latest".to_owned()
     } else {
         format!("history offset {scroll_offset} rows from latest")
+    }
+}
+
+pub(crate) fn developer_scroll_status(scroll_offset: usize) -> String {
+    if scroll_offset == 0 {
+        "developer facts at latest".to_owned()
+    } else {
+        format!("developer facts offset {scroll_offset} rows from latest")
     }
 }
 

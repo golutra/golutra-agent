@@ -1,6 +1,6 @@
 //! TUI 会话选择、命令构造与 ID 解析。
 
-use golutra_client::RuntimeTransport;
+use golutra_client::{DebugExportReceipt, RuntimeTransport};
 use golutra_core::{Actor, ActorKind, CommandId, SessionId, TaskId, ThreadId, TurnId};
 use golutra_protocol::{SessionCommand, SessionCommandKind};
 use serde_json::Value;
@@ -22,20 +22,41 @@ pub(crate) struct ResumeThreadItem {
     pub(crate) preview: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExportFlowStep {
+    SelectSession,
+    Range,
+    Destination,
+    Review,
+    Running,
+    Completed,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ExportFlowState {
+    pub(crate) picker: ResumePickerState,
+    pub(crate) step: ExportFlowStep,
+    pub(crate) range_input: String,
+    pub(crate) destination_input: String,
+    pub(crate) error: Option<String>,
+    pub(crate) receipt: Option<DebugExportReceipt>,
+}
+
+impl ExportFlowState {
+    pub(crate) fn selected_thread_id(&self) -> Option<ThreadId> {
+        self.picker.selected_thread_id()
+    }
+
+    pub(crate) fn selected_item(&self) -> Option<&ResumeThreadItem> {
+        self.picker.items.get(self.picker.selected)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ResumeSelectionDirection {
     Previous,
     Next,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TranscriptScrollAction {
-    LineUp,
-    LineDown,
-    PageUp,
-    PageDown,
-    Top,
-    Bottom,
 }
 
 impl ResumePickerState {
