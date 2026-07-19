@@ -228,6 +228,267 @@ export type VerificationDimensionStatus = "pass" | "fail" | "partial" | "unknown
 export type TaskClass =
   "plain_conversation" | "read_only_analysis" | "workspace_change" | "code_change";
 export type TraceView = "summary" | "full" | "forensic";
+export type DriverEnvelope = {
+  request_id: string;
+  [k: string]: unknown;
+} & DriverEnvelope1;
+export type DriverEnvelope1 =
+  | {
+      protocol_version?: number | null;
+      type: "hello";
+      [k: string]: unknown;
+    }
+  | {
+      type: "capabilities";
+      [k: string]: unknown;
+    }
+  | {
+      type: "state";
+      [k: string]: unknown;
+    }
+  | {
+      type: "ping";
+      [k: string]: unknown;
+    }
+  | {
+      text: string;
+      type: "input_prompt";
+      [k: string]: unknown;
+    }
+  | {
+      text: string;
+      type: "input_slash";
+      [k: string]: unknown;
+    }
+  | {
+      key: DriverKey;
+      type: "input_key";
+      [k: string]: unknown;
+    }
+  | {
+      text: string;
+      type: "input_paste";
+      [k: string]: unknown;
+    }
+  | {
+      event: DriverMouseEvent;
+      type: "input_mouse";
+      [k: string]: unknown;
+    }
+  | {
+      height: number;
+      type: "resize";
+      width: number;
+      [k: string]: unknown;
+    }
+  | {
+      timeout_ms?: number | null;
+      type: "wait";
+      until: WaitCondition;
+      [k: string]: unknown;
+    }
+  | {
+      detail?: "text" | "cells";
+      frame_id?: string | null;
+      height: number;
+      panes?: "transcript" | "developer" | "response_and_developer" | "full_screen";
+      rows?: RowRange | null;
+      scope?: "current_turn" | "task" | "session" | "screen";
+      type: "snapshot";
+      width: number;
+      [k: string]: unknown;
+    }
+  | {
+      type: "takeover";
+      [k: string]: unknown;
+    }
+  | {
+      type: "abort";
+      [k: string]: unknown;
+    }
+  | {
+      abort_active_task?: boolean;
+      type: "close";
+      [k: string]: unknown;
+    };
+export type DriverKey =
+  | (
+      | "enter"
+      | "escape"
+      | "up"
+      | "down"
+      | "left"
+      | "right"
+      | "page_up"
+      | "page_down"
+      | "home"
+      | "end"
+      | "backspace"
+      | "delete"
+      | "tab"
+      | "ctrl_c"
+    )
+  | {
+      char: string;
+    };
+export type DriverMouseKind = "left_click" | "scroll_up" | "scroll_down";
+export type WaitCondition =
+  | {
+      kind: "ready";
+      [k: string]: unknown;
+    }
+  | {
+      kind: "idle";
+      [k: string]: unknown;
+    }
+  | {
+      kind: "task_started";
+      [k: string]: unknown;
+    }
+  | {
+      kind: "task_terminal";
+      [k: string]: unknown;
+    }
+  | {
+      kind: "turn_terminal";
+      [k: string]: unknown;
+    }
+  | {
+      kind: "approval_required";
+      [k: string]: unknown;
+    }
+  | {
+      kind: "authentication_required";
+      [k: string]: unknown;
+    }
+  | {
+      kind: "evaluation_terminal";
+      [k: string]: unknown;
+    }
+  | {
+      event_type: string;
+      kind: "event";
+      sequence_at_least?: number | null;
+      [k: string]: unknown;
+    };
+export type DriverResponseEnvelope = {
+  request_id: string;
+  [k: string]: unknown;
+} & DriverResponseEnvelope1;
+export type DriverResponseEnvelope1 =
+  | {
+      controller_mode: DriverControllerMode;
+      instance_id: string;
+      minimum_protocol_version: number;
+      protocol_version: number;
+      session_id: string;
+      thread_id: string;
+      type: "ready";
+      workspace_id: string;
+      workspace_path: string;
+      [k: string]: unknown;
+    }
+  | {
+      capabilities: string[];
+      type: "capabilities";
+      [k: string]: unknown;
+    }
+  | {
+      closed: boolean;
+      controller_mode: DriverControllerMode;
+      facts_expanded: boolean;
+      height: number;
+      instance_id: string;
+      session_id: string;
+      status: DriverTaskStatus;
+      task_id?: string | null;
+      thread_id: string;
+      turn_id?: string | null;
+      type: "state";
+      width: number;
+      [k: string]: unknown;
+    }
+  | {
+      type: "pong";
+      [k: string]: unknown;
+    }
+  | {
+      cells?: TuiFrameCell[] | null;
+      complete: boolean;
+      event_high_watermark?: number | null;
+      frame_id: string;
+      height: number;
+      hit_regions?: TuiHitRegion[];
+      instance_id: string;
+      lines: TuiFrameLine[];
+      missing_sections: string[];
+      next_range?: RowRange | null;
+      panes: SnapshotPanes;
+      redaction_status: RedactionStatus;
+      returned_range: RowRange;
+      scope: SnapshotScope;
+      session_id: string;
+      task_id?: string | null;
+      total_rows: number;
+      turn_id?: string | null;
+      type: "snapshot";
+      width: number;
+      workspace_id: string;
+      [k: string]: unknown;
+    }
+  | {
+      message: string;
+      type: "accepted";
+      [k: string]: unknown;
+    }
+  | {
+      condition: WaitCondition;
+      state: DriverState;
+      type: "wait_result";
+      [k: string]: unknown;
+    }
+  | {
+      condition: WaitCondition;
+      state: DriverState;
+      type: "wait_timeout";
+      [k: string]: unknown;
+    }
+  | {
+      event: DriverNotification;
+      type: "event";
+      [k: string]: unknown;
+    }
+  | {
+      type: "closed";
+      [k: string]: unknown;
+    }
+  | {
+      code: string;
+      message: string;
+      type: "error";
+      [k: string]: unknown;
+    };
+export type DriverControllerMode = "controller" | "observer";
+export type DriverTaskStatus =
+  | "connecting"
+  | "idle"
+  | "running"
+  | "waiting_approval"
+  | "waiting_authentication"
+  | "pausing"
+  | "paused"
+  | "aborting"
+  | "completed"
+  | "partial"
+  | "failed"
+  | "blocked"
+  | "cancelled";
+export type TuiFramePane = "transcript" | "developer" | "response_and_developer" | "screen";
+export type TuiHitPane = "transcript" | "bottom" | "developer";
+export type SnapshotPanes = "transcript" | "developer" | "response_and_developer" | "full_screen";
+export type SnapshotScope = "current_turn" | "task" | "session" | "screen";
+export type DriverNotificationKind =
+  "heartbeat" | "runtime_event_available" | "state_changed" | "task_terminal";
 
 export interface SdkProtocolBundle {
   applied_candidate: AppliedCandidate;
@@ -281,6 +542,7 @@ export interface SdkProtocolBundle {
   storage_stats: StorageStats;
   task_trace_page: TaskTracePage;
   task_trace_request: TaskTraceRequest;
+  tui_driver: TuiDriverProtocolBundle;
   user_projection: UserProjection;
   [k: string]: unknown;
 }
@@ -1242,6 +1504,97 @@ export interface TaskTraceRequest {
   task_id: string;
   view: TraceView;
   wait_for_evaluation: boolean;
+  [k: string]: unknown;
+}
+/**
+ * Schema root for generated clients. The values are never instantiated at
+ * runtime; grouping them keeps the versioned request and response contract in
+ * one generated SDK namespace.
+ */
+export interface TuiDriverProtocolBundle {
+  request: DriverEnvelope;
+  response: DriverResponseEnvelope;
+  snapshot: TuiFrame;
+  [k: string]: unknown;
+}
+export interface DriverMouseEvent {
+  column: number;
+  kind: DriverMouseKind;
+  row: number;
+  [k: string]: unknown;
+}
+export interface RowRange {
+  end: number;
+  start: number;
+  [k: string]: unknown;
+}
+export interface TuiFrameCell {
+  background: string;
+  column: number;
+  foreground: string;
+  modifiers: string;
+  pane: TuiFramePane;
+  row: number;
+  symbol: string;
+  [k: string]: unknown;
+}
+export interface TuiHitRegion {
+  height: number;
+  id: string;
+  pane: TuiHitPane;
+  width: number;
+  x: number;
+  y: number;
+  [k: string]: unknown;
+}
+export interface TuiFrameLine {
+  display_width: number;
+  pane: TuiFramePane;
+  row: number;
+  text: string;
+  [k: string]: unknown;
+}
+export interface DriverState {
+  closed: boolean;
+  controller_mode: DriverControllerMode;
+  facts_expanded: boolean;
+  height: number;
+  instance_id: string;
+  session_id: string;
+  status: DriverTaskStatus;
+  task_id?: string | null;
+  thread_id: string;
+  turn_id?: string | null;
+  width: number;
+  [k: string]: unknown;
+}
+export interface DriverNotification {
+  kind: DriverNotificationKind;
+  sequence_no?: number | null;
+  status?: DriverTaskStatus | null;
+  [k: string]: unknown;
+}
+export interface TuiFrame {
+  cells?: TuiFrameCell[] | null;
+  complete: boolean;
+  event_high_watermark?: number | null;
+  frame_id: string;
+  height: number;
+  hit_regions?: TuiHitRegion[];
+  instance_id: string;
+  lines: TuiFrameLine[];
+  missing_sections: string[];
+  next_range?: RowRange | null;
+  panes: SnapshotPanes;
+  redaction_status: RedactionStatus;
+  returned_range: RowRange;
+  scope: SnapshotScope;
+  session_id: string;
+  task_id?: string | null;
+  total_rows: number;
+  turn_id?: string | null;
+  width: number;
+  workspace_id: string;
   [k: string]: unknown;
 }
 export interface UserProjection {

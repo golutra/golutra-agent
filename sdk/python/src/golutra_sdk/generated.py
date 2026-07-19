@@ -261,6 +261,216 @@ class DebugProjection(TypedDict, total=False):
     trace_complete: NotRequired[bool]
     verification: NotRequired[VerificationRecord | None]
 
+DriverControllerMode: TypeAlias = Literal['controller', 'observer']
+
+class DriverEnvelopeHello(TypedDict, total=False):
+    request_id: Required[str]
+    protocol_version: NotRequired[int | None]
+    type: Required[Literal['hello']]
+
+class DriverEnvelopeCapabilities(TypedDict, total=False):
+    request_id: Required[str]
+    type: Required[Literal['capabilities']]
+
+class DriverEnvelopeState(TypedDict, total=False):
+    request_id: Required[str]
+    type: Required[Literal['state']]
+
+class DriverEnvelopePing(TypedDict, total=False):
+    request_id: Required[str]
+    type: Required[Literal['ping']]
+
+class DriverEnvelopeInputPrompt(TypedDict, total=False):
+    request_id: Required[str]
+    text: Required[str]
+    type: Required[Literal['input_prompt']]
+
+class DriverEnvelopeInputSlash(TypedDict, total=False):
+    request_id: Required[str]
+    text: Required[str]
+    type: Required[Literal['input_slash']]
+
+class DriverEnvelopeInputKey(TypedDict, total=False):
+    request_id: Required[str]
+    key: Required[DriverKey]
+    type: Required[Literal['input_key']]
+
+class DriverEnvelopeInputPaste(TypedDict, total=False):
+    request_id: Required[str]
+    text: Required[str]
+    type: Required[Literal['input_paste']]
+
+class DriverEnvelopeInputMouse(TypedDict, total=False):
+    request_id: Required[str]
+    event: Required[DriverMouseEvent]
+    type: Required[Literal['input_mouse']]
+
+class DriverEnvelopeResize(TypedDict, total=False):
+    request_id: Required[str]
+    height: Required[int]
+    type: Required[Literal['resize']]
+    width: Required[int]
+
+class DriverEnvelopeWait(TypedDict, total=False):
+    request_id: Required[str]
+    timeout_ms: NotRequired[int | None]
+    type: Required[Literal['wait']]
+    until: Required[WaitCondition]
+
+class DriverEnvelopeSnapshot(TypedDict, total=False):
+    request_id: Required[str]
+    detail: NotRequired[SnapshotDetail]
+    frame_id: NotRequired[str | None]
+    height: Required[int]
+    panes: NotRequired[SnapshotPanes]
+    rows: NotRequired[RowRange | None]
+    scope: NotRequired[SnapshotScope]
+    type: Required[Literal['snapshot']]
+    width: Required[int]
+
+class DriverEnvelopeTakeover(TypedDict, total=False):
+    request_id: Required[str]
+    type: Required[Literal['takeover']]
+
+class DriverEnvelopeAbort(TypedDict, total=False):
+    request_id: Required[str]
+    type: Required[Literal['abort']]
+
+class DriverEnvelopeClose(TypedDict, total=False):
+    request_id: Required[str]
+    abort_active_task: NotRequired[bool]
+    type: Required[Literal['close']]
+
+DriverEnvelope: TypeAlias = DriverEnvelopeHello | DriverEnvelopeCapabilities | DriverEnvelopeState | DriverEnvelopePing | DriverEnvelopeInputPrompt | DriverEnvelopeInputSlash | DriverEnvelopeInputKey | DriverEnvelopeInputPaste | DriverEnvelopeInputMouse | DriverEnvelopeResize | DriverEnvelopeWait | DriverEnvelopeSnapshot | DriverEnvelopeTakeover | DriverEnvelopeAbort | DriverEnvelopeClose
+
+class DriverKeyChar(TypedDict, total=False):
+    char: Required[str]
+
+DriverKey: TypeAlias = Literal['enter', 'escape', 'up', 'down', 'left', 'right', 'page_up', 'page_down', 'home', 'end', 'backspace', 'delete', 'tab', 'ctrl_c'] | DriverKeyChar
+
+class DriverMouseEvent(TypedDict, total=False):
+    column: Required[int]
+    kind: Required[DriverMouseKind]
+    row: Required[int]
+
+DriverMouseKind: TypeAlias = Literal['left_click', 'scroll_up', 'scroll_down']
+
+class DriverNotification(TypedDict, total=False):
+    kind: Required[DriverNotificationKind]
+    sequence_no: NotRequired[int | None]
+    status: NotRequired[DriverTaskStatus | None]
+
+DriverNotificationKind: TypeAlias = Literal['heartbeat', 'runtime_event_available', 'state_changed', 'task_terminal']
+
+class DriverResponseEnvelopeReady(TypedDict, total=False):
+    request_id: Required[str]
+    controller_mode: Required[DriverControllerMode]
+    instance_id: Required[str]
+    minimum_protocol_version: Required[int]
+    protocol_version: Required[int]
+    session_id: Required[str]
+    thread_id: Required[str]
+    type: Required[Literal['ready']]
+    workspace_id: Required[str]
+    workspace_path: Required[str]
+
+class DriverResponseEnvelopeCapabilities(TypedDict, total=False):
+    request_id: Required[str]
+    capabilities: Required[list[str]]
+    type: Required[Literal['capabilities']]
+
+class DriverResponseEnvelopeState(TypedDict, total=False):
+    request_id: Required[str]
+    closed: Required[bool]
+    controller_mode: Required[DriverControllerMode]
+    facts_expanded: Required[bool]
+    height: Required[int]
+    instance_id: Required[str]
+    session_id: Required[str]
+    status: Required[DriverTaskStatus]
+    task_id: NotRequired[str | None]
+    thread_id: Required[str]
+    turn_id: NotRequired[str | None]
+    type: Required[Literal['state']]
+    width: Required[int]
+
+class DriverResponseEnvelopePong(TypedDict, total=False):
+    request_id: Required[str]
+    type: Required[Literal['pong']]
+
+class DriverResponseEnvelopeSnapshot(TypedDict, total=False):
+    request_id: Required[str]
+    cells: NotRequired[list[TuiFrameCell] | None]
+    complete: Required[bool]
+    event_high_watermark: NotRequired[int | None]
+    frame_id: Required[str]
+    height: Required[int]
+    hit_regions: NotRequired[list[TuiHitRegion]]
+    instance_id: Required[str]
+    lines: Required[list[TuiFrameLine]]
+    missing_sections: Required[list[str]]
+    next_range: NotRequired[RowRange | None]
+    panes: Required[SnapshotPanes]
+    redaction_status: Required[RedactionStatus]
+    returned_range: Required[RowRange]
+    scope: Required[SnapshotScope]
+    session_id: Required[str]
+    task_id: NotRequired[str | None]
+    total_rows: Required[int]
+    turn_id: NotRequired[str | None]
+    type: Required[Literal['snapshot']]
+    width: Required[int]
+    workspace_id: Required[str]
+
+class DriverResponseEnvelopeAccepted(TypedDict, total=False):
+    request_id: Required[str]
+    message: Required[str]
+    type: Required[Literal['accepted']]
+
+class DriverResponseEnvelopeWaitResult(TypedDict, total=False):
+    request_id: Required[str]
+    condition: Required[WaitCondition]
+    state: Required[DriverState]
+    type: Required[Literal['wait_result']]
+
+class DriverResponseEnvelopeWaitTimeout(TypedDict, total=False):
+    request_id: Required[str]
+    condition: Required[WaitCondition]
+    state: Required[DriverState]
+    type: Required[Literal['wait_timeout']]
+
+class DriverResponseEnvelopeEvent(TypedDict, total=False):
+    request_id: Required[str]
+    event: Required[DriverNotification]
+    type: Required[Literal['event']]
+
+class DriverResponseEnvelopeClosed(TypedDict, total=False):
+    request_id: Required[str]
+    type: Required[Literal['closed']]
+
+class DriverResponseEnvelopeError(TypedDict, total=False):
+    request_id: Required[str]
+    code: Required[str]
+    message: Required[str]
+    type: Required[Literal['error']]
+
+DriverResponseEnvelope: TypeAlias = DriverResponseEnvelopeReady | DriverResponseEnvelopeCapabilities | DriverResponseEnvelopeState | DriverResponseEnvelopePong | DriverResponseEnvelopeSnapshot | DriverResponseEnvelopeAccepted | DriverResponseEnvelopeWaitResult | DriverResponseEnvelopeWaitTimeout | DriverResponseEnvelopeEvent | DriverResponseEnvelopeClosed | DriverResponseEnvelopeError
+
+class DriverState(TypedDict, total=False):
+    closed: Required[bool]
+    controller_mode: Required[DriverControllerMode]
+    facts_expanded: Required[bool]
+    height: Required[int]
+    instance_id: Required[str]
+    session_id: Required[str]
+    status: Required[DriverTaskStatus]
+    task_id: NotRequired[str | None]
+    thread_id: Required[str]
+    turn_id: NotRequired[str | None]
+    width: Required[int]
+
+DriverTaskStatus: TypeAlias = Literal['connecting', 'idle', 'running', 'waiting_approval', 'waiting_authentication', 'pausing', 'paused', 'aborting', 'completed', 'partial', 'failed', 'blocked', 'cancelled']
+
 class EnvironmentRecipe(TypedDict, total=False):
     dependency_snapshot: Required[str]
     fixture_refs: Required[list[str]]
@@ -638,6 +848,10 @@ RegressionVerdict: TypeAlias = Literal['pass', 'fail', 'needs_review']
 
 ReviewMode: TypeAlias = Literal['minimal', 'deep']
 
+class RowRange(TypedDict, total=False):
+    end: Required[int]
+    start: Required[int]
+
 class RuntimeEvent(TypedDict, total=False):
     durable: Required[bool]
     event_type: Required[RuntimeEventType]
@@ -790,6 +1004,12 @@ class SkillManifest(TypedDict, total=False):
     source_trajectory: Required[str]
     steps: Required[list[str]]
 
+SnapshotDetail: TypeAlias = Literal['text', 'cells']
+
+SnapshotPanes: TypeAlias = Literal['transcript', 'developer', 'response_and_developer', 'full_screen']
+
+SnapshotScope: TypeAlias = Literal['current_turn', 'task', 'session', 'screen']
+
 class StateProjection(TypedDict, total=False):
     active_task_id: NotRequired[str | None]
     final_message: NotRequired[str | None]
@@ -888,6 +1108,60 @@ class TraceIntegrity(TypedDict, total=False):
 
 TraceView: TypeAlias = Literal['summary', 'full', 'forensic']
 
+class TuiDriverProtocolBundle(TypedDict, total=False):
+    request: Required[DriverEnvelope]
+    response: Required[DriverResponseEnvelope]
+    snapshot: Required[TuiFrame]
+
+class TuiFrame(TypedDict, total=False):
+    cells: NotRequired[list[TuiFrameCell] | None]
+    complete: Required[bool]
+    event_high_watermark: NotRequired[int | None]
+    frame_id: Required[str]
+    height: Required[int]
+    hit_regions: NotRequired[list[TuiHitRegion]]
+    instance_id: Required[str]
+    lines: Required[list[TuiFrameLine]]
+    missing_sections: Required[list[str]]
+    next_range: NotRequired[RowRange | None]
+    panes: Required[SnapshotPanes]
+    redaction_status: Required[RedactionStatus]
+    returned_range: Required[RowRange]
+    scope: Required[SnapshotScope]
+    session_id: Required[str]
+    task_id: NotRequired[str | None]
+    total_rows: Required[int]
+    turn_id: NotRequired[str | None]
+    width: Required[int]
+    workspace_id: Required[str]
+
+class TuiFrameCell(TypedDict, total=False):
+    background: Required[str]
+    column: Required[int]
+    foreground: Required[str]
+    modifiers: Required[str]
+    pane: Required[TuiFramePane]
+    row: Required[int]
+    symbol: Required[str]
+
+class TuiFrameLine(TypedDict, total=False):
+    display_width: Required[int]
+    pane: Required[TuiFramePane]
+    row: Required[int]
+    text: Required[str]
+
+TuiFramePane: TypeAlias = Literal['transcript', 'developer', 'response_and_developer', 'screen']
+
+TuiHitPane: TypeAlias = Literal['transcript', 'bottom', 'developer']
+
+class TuiHitRegion(TypedDict, total=False):
+    height: Required[int]
+    id: Required[str]
+    pane: Required[TuiHitPane]
+    width: Required[int]
+    x: Required[int]
+    y: Required[int]
+
 class UserProjection(TypedDict, total=False):
     final_message: NotRequired[str | None]
     pending_approval: NotRequired[str | None]
@@ -963,6 +1237,37 @@ class VisibleStep(TypedDict, total=False):
     status: Required[str]
     summary: Required[str]
 
+class WaitConditionReady(TypedDict, total=False):
+    kind: Required[Literal['ready']]
+
+class WaitConditionIdle(TypedDict, total=False):
+    kind: Required[Literal['idle']]
+
+class WaitConditionTaskStarted(TypedDict, total=False):
+    kind: Required[Literal['task_started']]
+
+class WaitConditionTaskTerminal(TypedDict, total=False):
+    kind: Required[Literal['task_terminal']]
+
+class WaitConditionTurnTerminal(TypedDict, total=False):
+    kind: Required[Literal['turn_terminal']]
+
+class WaitConditionApprovalRequired(TypedDict, total=False):
+    kind: Required[Literal['approval_required']]
+
+class WaitConditionAuthenticationRequired(TypedDict, total=False):
+    kind: Required[Literal['authentication_required']]
+
+class WaitConditionEvaluationTerminal(TypedDict, total=False):
+    kind: Required[Literal['evaluation_terminal']]
+
+class WaitConditionEvent(TypedDict, total=False):
+    event_type: Required[str]
+    kind: Required[Literal['event']]
+    sequence_at_least: NotRequired[int | None]
+
+WaitCondition: TypeAlias = WaitConditionReady | WaitConditionIdle | WaitConditionTaskStarted | WaitConditionTaskTerminal | WaitConditionTurnTerminal | WaitConditionApprovalRequired | WaitConditionAuthenticationRequired | WaitConditionEvaluationTerminal | WaitConditionEvent
+
 __all__ = [
     "Actor",
     "ActorKind",
@@ -995,6 +1300,43 @@ __all__ = [
     "CurriculumItem",
     "DebugEventWindow",
     "DebugProjection",
+    "DriverControllerMode",
+    "DriverEnvelope",
+    "DriverEnvelopeAbort",
+    "DriverEnvelopeCapabilities",
+    "DriverEnvelopeClose",
+    "DriverEnvelopeHello",
+    "DriverEnvelopeInputKey",
+    "DriverEnvelopeInputMouse",
+    "DriverEnvelopeInputPaste",
+    "DriverEnvelopeInputPrompt",
+    "DriverEnvelopeInputSlash",
+    "DriverEnvelopePing",
+    "DriverEnvelopeResize",
+    "DriverEnvelopeSnapshot",
+    "DriverEnvelopeState",
+    "DriverEnvelopeTakeover",
+    "DriverEnvelopeWait",
+    "DriverKey",
+    "DriverKeyChar",
+    "DriverMouseEvent",
+    "DriverMouseKind",
+    "DriverNotification",
+    "DriverNotificationKind",
+    "DriverResponseEnvelope",
+    "DriverResponseEnvelopeAccepted",
+    "DriverResponseEnvelopeCapabilities",
+    "DriverResponseEnvelopeClosed",
+    "DriverResponseEnvelopeError",
+    "DriverResponseEnvelopeEvent",
+    "DriverResponseEnvelopePong",
+    "DriverResponseEnvelopeReady",
+    "DriverResponseEnvelopeSnapshot",
+    "DriverResponseEnvelopeState",
+    "DriverResponseEnvelopeWaitResult",
+    "DriverResponseEnvelopeWaitTimeout",
+    "DriverState",
+    "DriverTaskStatus",
     "EnvironmentRecipe",
     "EvaluationCase",
     "EvaluationProjection",
@@ -1042,6 +1384,7 @@ __all__ = [
     "RegressionResult",
     "RegressionVerdict",
     "ReviewMode",
+    "RowRange",
     "RuntimeEvent",
     "RuntimeEventSource",
     "RuntimeEventType",
@@ -1064,6 +1407,9 @@ __all__ = [
     "SkillLifecycleRecord",
     "SkillLifecycleStatus",
     "SkillManifest",
+    "SnapshotDetail",
+    "SnapshotPanes",
+    "SnapshotScope",
     "StateProjection",
     "StorageMaintenanceReport",
     "StorageStats",
@@ -1076,6 +1422,13 @@ __all__ = [
     "ToolResultStatus",
     "TraceIntegrity",
     "TraceView",
+    "TuiDriverProtocolBundle",
+    "TuiFrame",
+    "TuiFrameCell",
+    "TuiFrameLine",
+    "TuiFramePane",
+    "TuiHitPane",
+    "TuiHitRegion",
     "UserProjection",
     "VerificationAssertion",
     "VerificationAssertionKind",
@@ -1088,4 +1441,14 @@ __all__ = [
     "VerificationRecord",
     "VerificationResult",
     "VisibleStep",
+    "WaitCondition",
+    "WaitConditionApprovalRequired",
+    "WaitConditionAuthenticationRequired",
+    "WaitConditionEvaluationTerminal",
+    "WaitConditionEvent",
+    "WaitConditionIdle",
+    "WaitConditionReady",
+    "WaitConditionTaskStarted",
+    "WaitConditionTaskTerminal",
+    "WaitConditionTurnTerminal",
 ]

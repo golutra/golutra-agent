@@ -21,7 +21,7 @@ use golutra_protocol::{
     RuntimeEvent, RuntimeEventSource, RuntimeEventType, RuntimeQuery, SessionCommand,
     SessionCommandKind, SessionPage, SessionPageRequest, SessionWindow, SessionWindowRequest,
     StateProjection, StorageMaintenanceReport, StorageStats, TaskTracePage, TaskTraceRequest,
-    UserProjection, VisibleStep,
+    TuiDriverProtocolBundle, UserProjection, VisibleStep,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -90,6 +90,7 @@ pub struct SdkProtocolBundle {
     pub storage_stats: StorageStats,
     pub storage_maintenance_report: StorageMaintenanceReport,
     pub protocol_handshake: ProtocolHandshake,
+    pub tui_driver: TuiDriverProtocolBundle,
 }
 
 #[must_use]
@@ -262,6 +263,7 @@ pub fn protocol_schema_names() -> Vec<&'static str> {
         "StateProjection",
         "UserProjection",
         "SdkProtocolBundle",
+        "TuiDriverProtocolBundle",
     ]
 }
 
@@ -303,6 +305,6 @@ mod tests {
         assert!(scenario_json.is_object());
         assert!(command_json.is_object());
         assert!(event_json.is_object());
-        assert_eq!(protocol_schema_names().len(), 6);
+        assert_eq!(protocol_schema_names().len(), 7);
     }
 }

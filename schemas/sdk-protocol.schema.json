@@ -156,6 +156,9 @@
     "task_trace_request": {
       "$ref": "#/$defs/TaskTraceRequest"
     },
+    "tui_driver": {
+      "$ref": "#/$defs/TuiDriverProtocolBundle"
+    },
     "user_projection": {
       "$ref": "#/$defs/UserProjection"
     }
@@ -212,7 +215,8 @@
     "governor_decision",
     "storage_stats",
     "storage_maintenance_report",
-    "protocol_handshake"
+    "protocol_handshake",
+    "tui_driver"
   ],
   "$defs": {
     "Actor": {
@@ -1542,6 +1546,886 @@
         "artifacts",
         "evidence",
         "loop_decisions"
+      ]
+    },
+    "DriverControllerMode": {
+      "type": "string",
+      "enum": [
+        "controller",
+        "observer"
+      ]
+    },
+    "DriverEnvelope": {
+      "type": "object",
+      "properties": {
+        "request_id": {
+          "type": "string"
+        }
+      },
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "protocol_version": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "default": null,
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "hello"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "capabilities"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "state"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "ping"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "input_prompt"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "input_slash"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "key": {
+              "$ref": "#/$defs/DriverKey"
+            },
+            "type": {
+              "type": "string",
+              "const": "input_key"
+            }
+          },
+          "required": [
+            "type",
+            "key"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "input_paste"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "$ref": "#/$defs/DriverMouseEvent"
+            },
+            "type": {
+              "type": "string",
+              "const": "input_mouse"
+            }
+          },
+          "required": [
+            "type",
+            "event"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "height": {
+              "type": "integer",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "resize"
+            },
+            "width": {
+              "type": "integer",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0
+            }
+          },
+          "required": [
+            "type",
+            "width",
+            "height"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "timeout_ms": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "default": null,
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "wait"
+            },
+            "until": {
+              "$ref": "#/$defs/WaitCondition"
+            }
+          },
+          "required": [
+            "type",
+            "until"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "detail": {
+              "$ref": "#/$defs/SnapshotDetail",
+              "default": "text"
+            },
+            "frame_id": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "height": {
+              "type": "integer",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0
+            },
+            "panes": {
+              "$ref": "#/$defs/SnapshotPanes",
+              "default": "transcript"
+            },
+            "rows": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/RowRange"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "scope": {
+              "$ref": "#/$defs/SnapshotScope",
+              "default": "current_turn"
+            },
+            "type": {
+              "type": "string",
+              "const": "snapshot"
+            },
+            "width": {
+              "type": "integer",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0
+            }
+          },
+          "required": [
+            "type",
+            "width",
+            "height"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "takeover"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "abort"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "abort_active_task": {
+              "type": "boolean",
+              "default": false
+            },
+            "type": {
+              "type": "string",
+              "const": "close"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        }
+      ],
+      "required": [
+        "request_id"
+      ]
+    },
+    "DriverKey": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "enter",
+            "escape",
+            "up",
+            "down",
+            "left",
+            "right",
+            "page_up",
+            "page_down",
+            "home",
+            "end",
+            "backspace",
+            "delete",
+            "tab",
+            "ctrl_c"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "char": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "char"
+          ]
+        }
+      ]
+    },
+    "DriverMouseEvent": {
+      "type": "object",
+      "properties": {
+        "column": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "kind": {
+          "$ref": "#/$defs/DriverMouseKind"
+        },
+        "row": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "kind",
+        "column",
+        "row"
+      ]
+    },
+    "DriverMouseKind": {
+      "type": "string",
+      "enum": [
+        "left_click",
+        "scroll_up",
+        "scroll_down"
+      ]
+    },
+    "DriverNotification": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/DriverNotificationKind"
+        },
+        "sequence_no": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "status": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DriverTaskStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    "DriverNotificationKind": {
+      "type": "string",
+      "enum": [
+        "heartbeat",
+        "runtime_event_available",
+        "state_changed",
+        "task_terminal"
+      ]
+    },
+    "DriverResponseEnvelope": {
+      "type": "object",
+      "properties": {
+        "request_id": {
+          "type": "string"
+        }
+      },
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "controller_mode": {
+              "$ref": "#/$defs/DriverControllerMode"
+            },
+            "instance_id": {
+              "type": "string"
+            },
+            "minimum_protocol_version": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "protocol_version": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "thread_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "ready"
+            },
+            "workspace_id": {
+              "type": "string"
+            },
+            "workspace_path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "protocol_version",
+            "minimum_protocol_version",
+            "instance_id",
+            "workspace_id",
+            "workspace_path",
+            "thread_id",
+            "session_id",
+            "controller_mode"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capabilities": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "capabilities"
+            }
+          },
+          "required": [
+            "type",
+            "capabilities"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "closed": {
+              "type": "boolean"
+            },
+            "controller_mode": {
+              "$ref": "#/$defs/DriverControllerMode"
+            },
+            "facts_expanded": {
+              "type": "boolean"
+            },
+            "height": {
+              "type": "integer",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0
+            },
+            "instance_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/$defs/DriverTaskStatus"
+            },
+            "task_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "thread_id": {
+              "type": "string"
+            },
+            "turn_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "state"
+            },
+            "width": {
+              "type": "integer",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0
+            }
+          },
+          "required": [
+            "type",
+            "instance_id",
+            "thread_id",
+            "session_id",
+            "status",
+            "width",
+            "height",
+            "facts_expanded",
+            "controller_mode",
+            "closed"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "pong"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "cells": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "default": null,
+              "items": {
+                "$ref": "#/$defs/TuiFrameCell"
+              }
+            },
+            "complete": {
+              "type": "boolean"
+            },
+            "event_high_watermark": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
+            "frame_id": {
+              "type": "string"
+            },
+            "height": {
+              "type": "integer",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0
+            },
+            "hit_regions": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/TuiHitRegion"
+              }
+            },
+            "instance_id": {
+              "type": "string"
+            },
+            "lines": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/TuiFrameLine"
+              }
+            },
+            "missing_sections": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "next_range": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/RowRange"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "panes": {
+              "$ref": "#/$defs/SnapshotPanes"
+            },
+            "redaction_status": {
+              "$ref": "#/$defs/RedactionStatus"
+            },
+            "returned_range": {
+              "$ref": "#/$defs/RowRange"
+            },
+            "scope": {
+              "$ref": "#/$defs/SnapshotScope"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "task_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "total_rows": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "turn_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "snapshot"
+            },
+            "width": {
+              "type": "integer",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "frame_id",
+            "instance_id",
+            "workspace_id",
+            "session_id",
+            "width",
+            "height",
+            "scope",
+            "panes",
+            "total_rows",
+            "returned_range",
+            "lines",
+            "complete",
+            "missing_sections",
+            "redaction_status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "accepted"
+            }
+          },
+          "required": [
+            "type",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "condition": {
+              "$ref": "#/$defs/WaitCondition"
+            },
+            "state": {
+              "$ref": "#/$defs/DriverState"
+            },
+            "type": {
+              "type": "string",
+              "const": "wait_result"
+            }
+          },
+          "required": [
+            "type",
+            "condition",
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "condition": {
+              "$ref": "#/$defs/WaitCondition"
+            },
+            "state": {
+              "$ref": "#/$defs/DriverState"
+            },
+            "type": {
+              "type": "string",
+              "const": "wait_timeout"
+            }
+          },
+          "required": [
+            "type",
+            "condition",
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "$ref": "#/$defs/DriverNotification"
+            },
+            "type": {
+              "type": "string",
+              "const": "event"
+            }
+          },
+          "required": [
+            "type",
+            "event"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "closed"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "error"
+            }
+          },
+          "required": [
+            "type",
+            "code",
+            "message"
+          ]
+        }
+      ],
+      "required": [
+        "request_id"
+      ]
+    },
+    "DriverState": {
+      "type": "object",
+      "properties": {
+        "closed": {
+          "type": "boolean"
+        },
+        "controller_mode": {
+          "$ref": "#/$defs/DriverControllerMode"
+        },
+        "facts_expanded": {
+          "type": "boolean"
+        },
+        "height": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "instance_id": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/DriverTaskStatus"
+        },
+        "task_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "width": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "instance_id",
+        "thread_id",
+        "session_id",
+        "status",
+        "width",
+        "height",
+        "facts_expanded",
+        "controller_mode",
+        "closed"
+      ]
+    },
+    "DriverTaskStatus": {
+      "type": "string",
+      "enum": [
+        "connecting",
+        "idle",
+        "running",
+        "waiting_approval",
+        "waiting_authentication",
+        "pausing",
+        "paused",
+        "aborting",
+        "completed",
+        "partial",
+        "failed",
+        "blocked",
+        "cancelled"
       ]
     },
     "EnvironmentRecipe": {
@@ -3516,6 +4400,25 @@
         "deep"
       ]
     },
+    "RowRange": {
+      "type": "object",
+      "properties": {
+        "end": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "start": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "start",
+        "end"
+      ]
+    },
     "RuntimeEvent": {
       "type": "object",
       "properties": {
@@ -4383,6 +5286,31 @@
         "rollback_ref"
       ]
     },
+    "SnapshotDetail": {
+      "type": "string",
+      "enum": [
+        "text",
+        "cells"
+      ]
+    },
+    "SnapshotPanes": {
+      "type": "string",
+      "enum": [
+        "transcript",
+        "developer",
+        "response_and_developer",
+        "full_screen"
+      ]
+    },
+    "SnapshotScope": {
+      "type": "string",
+      "enum": [
+        "current_turn",
+        "task",
+        "session",
+        "screen"
+      ]
+    },
     "StateProjection": {
       "type": "object",
       "properties": {
@@ -4921,6 +5849,279 @@
         "forensic"
       ]
     },
+    "TuiDriverProtocolBundle": {
+      "description": "Schema root for generated clients. The values are never instantiated at\nruntime; grouping them keeps the versioned request and response contract in\none generated SDK namespace.",
+      "type": "object",
+      "properties": {
+        "request": {
+          "$ref": "#/$defs/DriverEnvelope"
+        },
+        "response": {
+          "$ref": "#/$defs/DriverResponseEnvelope"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/TuiFrame"
+        }
+      },
+      "required": [
+        "request",
+        "response",
+        "snapshot"
+      ]
+    },
+    "TuiFrame": {
+      "type": "object",
+      "properties": {
+        "cells": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "$ref": "#/$defs/TuiFrameCell"
+          }
+        },
+        "complete": {
+          "type": "boolean"
+        },
+        "event_high_watermark": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "frame_id": {
+          "type": "string"
+        },
+        "height": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "hit_regions": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TuiHitRegion"
+          }
+        },
+        "instance_id": {
+          "type": "string"
+        },
+        "lines": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TuiFrameLine"
+          }
+        },
+        "missing_sections": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "next_range": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RowRange"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "panes": {
+          "$ref": "#/$defs/SnapshotPanes"
+        },
+        "redaction_status": {
+          "$ref": "#/$defs/RedactionStatus"
+        },
+        "returned_range": {
+          "$ref": "#/$defs/RowRange"
+        },
+        "scope": {
+          "$ref": "#/$defs/SnapshotScope"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_rows": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "width": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "frame_id",
+        "instance_id",
+        "workspace_id",
+        "session_id",
+        "width",
+        "height",
+        "scope",
+        "panes",
+        "total_rows",
+        "returned_range",
+        "lines",
+        "complete",
+        "missing_sections",
+        "redaction_status"
+      ]
+    },
+    "TuiFrameCell": {
+      "type": "object",
+      "properties": {
+        "background": {
+          "type": "string"
+        },
+        "column": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "foreground": {
+          "type": "string"
+        },
+        "modifiers": {
+          "type": "string"
+        },
+        "pane": {
+          "$ref": "#/$defs/TuiFramePane"
+        },
+        "row": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "symbol": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "row",
+        "column",
+        "symbol",
+        "pane",
+        "foreground",
+        "background",
+        "modifiers"
+      ]
+    },
+    "TuiFrameLine": {
+      "type": "object",
+      "properties": {
+        "display_width": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "pane": {
+          "$ref": "#/$defs/TuiFramePane"
+        },
+        "row": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "row",
+        "text",
+        "display_width",
+        "pane"
+      ]
+    },
+    "TuiFramePane": {
+      "type": "string",
+      "enum": [
+        "transcript",
+        "developer",
+        "response_and_developer",
+        "screen"
+      ]
+    },
+    "TuiHitPane": {
+      "type": "string",
+      "enum": [
+        "transcript",
+        "bottom",
+        "developer"
+      ]
+    },
+    "TuiHitRegion": {
+      "type": "object",
+      "properties": {
+        "height": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "id": {
+          "type": "string"
+        },
+        "pane": {
+          "$ref": "#/$defs/TuiHitPane"
+        },
+        "width": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "x": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "y": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "pane",
+        "x",
+        "y",
+        "width",
+        "height"
+      ]
+    },
     "UserProjection": {
       "type": "object",
       "properties": {
@@ -5287,6 +6488,131 @@
         "label",
         "status",
         "summary"
+      ]
+    },
+    "WaitCondition": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "ready"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "idle"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "task_started"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "task_terminal"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "turn_terminal"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "approval_required"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "authentication_required"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "evaluation_terminal"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event_type": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "event"
+            },
+            "sequence_at_least": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "default": null,
+              "minimum": 0
+            }
+          },
+          "required": [
+            "kind",
+            "event_type"
+          ]
+        }
       ]
     }
   }
