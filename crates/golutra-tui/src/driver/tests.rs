@@ -1,6 +1,6 @@
 use chrono::Utc;
 use golutra_core::{EventId, SessionId, ThreadId};
-use golutra_protocol::{RuntimeEvent, RuntimeEventSource, RuntimeEventType};
+use golutra_protocol::{RuntimeEvent, RuntimeEventSource, RuntimeEventType, VisibleStep};
 use serde_json::json;
 
 use super::*;
@@ -236,6 +236,19 @@ fn terminal_evaluation_is_derived_from_runtime_events() {
 fn snapshot_state_redacts_transient_secrets() {
     let secret = "sk-driver-command-secret";
     let mut app = test_app(None, Some(AuthDialogState::new()));
+    app.projection = Some(UserProjection {
+        session_id: app.session_id,
+        task_id: None,
+        status: TaskStatus::Running,
+        visible_steps: vec![VisibleStep {
+            label: format!("token={secret}"),
+            status: format!("Authorization: Bearer {secret}"),
+            summary: format!("api_key={secret}"),
+        }],
+        pending_approval: Some(format!("token={secret}")),
+        final_message: Some(format!("Authorization: Bearer {secret}")),
+        residual_risks: vec![format!("api_key={secret}")],
+    });
     app.command_messages.push(TranscriptItem {
         role: TranscriptRole::System,
         title: "Provider error".to_owned(),

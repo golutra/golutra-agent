@@ -650,6 +650,7 @@ impl TuiDriver {
 
     fn render_frame(&mut self, request: &SnapshotRequest) -> miette::Result<TuiFrame> {
         let saved_events = self.app.events.clone();
+        let saved_projection = self.app.projection.clone();
         let saved_developer = self.app.developer_projection.clone();
         let saved_commands = self.app.command_messages.clone();
         let saved_auth_dialog = self.app.auth_dialog.clone();
@@ -715,6 +716,7 @@ impl TuiDriver {
         })();
 
         self.app.events = saved_events;
+        self.app.projection = saved_projection;
         self.app.developer_projection = saved_developer;
         self.app.command_messages = saved_commands;
         self.app.auth_dialog = saved_auth_dialog;
@@ -1013,6 +1015,9 @@ fn driver_input_state_bytes(app: &TuiApp) -> usize {
 }
 
 fn redact_snapshot_ui_state(app: &mut TuiApp) {
+    if let Some(projection) = &mut app.projection {
+        redact_user_projection(projection);
+    }
     for item in &mut app.command_messages {
         item.title = redacted_ui_text(&item.title);
         for line in &mut item.body {
@@ -1052,6 +1057,19 @@ fn redact_snapshot_ui_state(app: &mut TuiApp) {
             receipt.destination =
                 redacted_ui_text(&receipt.destination.display().to_string()).into();
         }
+    }
+}
+
+fn redact_user_projection(projection: &mut UserProjection) {
+    for step in &mut projection.visible_steps {
+        step.label = redacted_ui_text(&step.label);
+        step.status = redacted_ui_text(&step.status);
+        step.summary = redacted_ui_text(&step.summary);
+    }
+    projection.pending_approval = projection.pending_approval.as_deref().map(redacted_ui_text);
+    projection.final_message = projection.final_message.as_deref().map(redacted_ui_text);
+    for risk in &mut projection.residual_risks {
+        *risk = redacted_ui_text(risk);
     }
 }
 
