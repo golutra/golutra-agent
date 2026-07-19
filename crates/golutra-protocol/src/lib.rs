@@ -6,6 +6,7 @@ pub mod query;
 pub mod session;
 pub mod storage;
 pub mod trace;
+pub mod tui_driver;
 pub mod version;
 
 pub use command::*;
@@ -16,4 +17,5 @@ pub use query::*;
 pub use session::*;
 pub use storage::*;
 pub use trace::*;
+pub use tui_driver::*;
 pub use version::*;
