@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use clap::Parser;
+use clap::{Args as ClapArgs, Parser, Subcommand};
 use crossterm::{
     cursor::SetCursorStyle,
     event::{
@@ -36,8 +36,8 @@ use golutra_llm::{
     provider_protocol_catalog,
 };
 use golutra_protocol::{
-    EventFilter, EventPageDirection, EventPageRequest, RuntimeEvent, RuntimeEventType,
-    RuntimeQuery, RuntimeQueryKind, SessionCommandKind, UserProjection,
+    CommandAck, EventPageDirection, EventPageRequest, RuntimeEvent, RuntimeEventType, RuntimeQuery,
+    RuntimeQueryKind, SessionCommandKind, UserProjection,
 };
 use golutra_tui::{
     AuthConfigScope, AuthCredentialStore, OAuthLoginCommand, OpenAiCompatibleLogin,
@@ -59,31 +59,90 @@ mod auth_flow;
 mod auth_state;
 mod composer_input;
 mod developer;
+mod driver;
 mod render;
+mod runtime_controller;
 mod session;
 pub(crate) use auth_flow::*;
 pub(crate) use auth_state::*;
 pub(crate) use composer_input::*;
 pub(crate) use developer::*;
 pub(crate) use render::*;
+pub(crate) use runtime_controller::*;
 pub(crate) use session::*;
 
 #[derive(Debug, Parser)]
 #[command(name = "golutra-tui")]
 #[command(about = "Golutra terminal chat UI")]
 struct Args {
-    #[arg(long)]
+    #[arg(long, global = true)]
     cwd: Option<std::path::PathBuf>,
-    #[arg(long, conflicts_with = "connect")]
+    #[arg(long, global = true, conflicts_with = "connect")]
     daemon: bool,
-    #[arg(long, value_name = "URL", conflicts_with = "daemon")]
+    #[arg(long, global = true, value_name = "URL", conflicts_with = "daemon")]
     connect: Option<String>,
-    #[arg(long, value_name = "UUID")]
+    #[arg(long, global = true, value_name = "UUID")]
     session_id: Option<String>,
-    #[arg(long, value_name = "UUID")]
+    #[arg(long, global = true, value_name = "UUID")]
     task_id: Option<String>,
-    #[arg(long)]
+    #[arg(long, global = true)]
     debug: bool,
+    #[command(subcommand)]
+    command: Option<TuiCommand>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum TuiCommand {
+    /// Render one deterministic offscreen frame and exit.
+    Inspect(InspectArgs),
+    /// Run a long-lived NDJSON TUI controller over stdin/stdout.
+    Driver(DriverArgs),
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+struct InspectArgs {
+    #[arg(long)]
+    embedded: bool,
+    #[arg(long)]
+    session: Option<String>,
+    #[arg(long)]
+    prompt: Option<String>,
+    #[arg(long)]
+    wait: Option<String>,
+    #[arg(long, default_value_t = 120_000)]
+    timeout_ms: u64,
+    #[arg(long, default_value_t = 160)]
+    width: u16,
+    #[arg(long, default_value_t = 40)]
+    height: u16,
+    #[arg(long)]
+    rows: Option<String>,
+    #[arg(long, default_value = "response")]
+    view: String,
+    #[arg(long, default_value = "text")]
+    detail: String,
+    #[arg(long, default_value = "json")]
+    format: String,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+struct DriverArgs {
+    #[arg(long, conflicts_with = "socket")]
+    stdio: bool,
+    #[arg(long, value_name = "PATH", conflicts_with = "stdio")]
+    socket: Option<PathBuf>,
+    #[arg(long)]
+    embedded: bool,
+    #[arg(long)]
+    session: Option<String>,
+    #[arg(long, default_value_t = 160)]
+    width: u16,
+    #[arg(long, default_value_t = 40)]
+    height: u16,
+    #[arg(long, default_value_t = 900)]
+    idle_timeout_secs: u64,
+    #[arg(long, default_value_t = 30)]
+    heartbeat_secs: u64,
 }
 
 #[derive(Debug)]
@@ -119,6 +178,8 @@ struct TuiApp {
     history_load_requested: bool,
     quit_shortcut_expires_at: Option<Instant>,
     should_quit: bool,
+    last_prompt_ack: Option<CommandAck>,
+    last_control_ack: Option<CommandAck>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,6 +251,8 @@ impl TuiApp {
             history_load_requested: false,
             quit_shortcut_expires_at: None,
             should_quit: false,
+            last_prompt_ack: None,
+            last_control_ack: None,
         }
     }
 
@@ -288,8 +351,8 @@ impl TuiApp {
     }
 
     async fn load_older_history(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
-        self.history_load_requested = false;
         if !self.history_has_more_before {
+            self.history_load_requested = false;
             return Ok(());
         }
         let page = transport
@@ -308,6 +371,7 @@ impl TuiApp {
             .map(serde_json::to_value)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| miette::miette!("{error}"))?;
+        self.history_load_requested = false;
         if older.is_empty() {
             self.history_has_more_before = false;
             return Ok(());
@@ -571,13 +635,14 @@ impl TuiApp {
         &mut self,
         transport: &RuntimeTransport,
     ) -> miette::Result<()> {
-        self.developer_load_requested = false;
         let Some(projection) = &mut self.developer_projection else {
+            self.developer_load_requested = false;
             return Ok(());
         };
         load_older_debug_events(transport, projection)
             .await
             .map_err(|error| miette::miette!("{error}"))?;
+        self.developer_load_requested = false;
         let current_rows = developer_panel_rows(projection, usize::MAX)
             .into_iter()
             .filter(|row| matches!(row, DeveloperPanelRow::Event { .. }))
@@ -592,9 +657,20 @@ impl TuiApp {
         transport: &RuntimeTransport,
         prompt: String,
     ) -> miette::Result<()> {
+        self.submit_runtime_prompt(transport, prompt)
+            .await
+            .map(drop)
+    }
+
+    async fn submit_runtime_prompt(
+        &mut self,
+        transport: &RuntimeTransport,
+        prompt: String,
+    ) -> miette::Result<Option<CommandAck>> {
+        self.last_prompt_ack = None;
         if prompt.trim().is_empty() {
             self.status_message = "prompt is empty".to_owned();
-            return Ok(());
+            return Ok(None);
         }
 
         let ack = transport
@@ -608,10 +684,25 @@ impl TuiApp {
             ))
             .await
             .map_err(|error| miette::miette!("{error}"))?;
+        if !ack.accepted {
+            self.status_message = compact_ack_reason(&ack.reason);
+            self.last_prompt_ack = Some(ack.clone());
+            return Ok(Some(ack));
+        }
         self.input.clear();
         self.status_message = compact_ack_reason(&ack.reason);
         self.reset_transcript_view();
-        self.refresh(transport).await
+        self.refresh(transport).await?;
+        self.last_prompt_ack = Some(ack.clone());
+        Ok(Some(ack))
+    }
+
+    fn take_last_prompt_ack(&mut self) -> Option<CommandAck> {
+        self.last_prompt_ack.take()
+    }
+
+    fn take_last_control_ack(&mut self) -> Option<CommandAck> {
+        self.last_control_ack.take()
     }
 
     async fn execute_slash_command(
@@ -619,6 +710,7 @@ impl TuiApp {
         transport: &RuntimeTransport,
         command: SlashCommand,
     ) -> miette::Result<()> {
+        self.last_control_ack = None;
         if has_active_task(self)
             && matches!(
                 &command,
@@ -744,31 +836,44 @@ impl TuiApp {
                 self.set_debug_mode(transport, !self.debug_mode).await?;
             }
             SlashCommand::Takeover => {
-                self.send_control_command(transport, SessionCommandKind::Takeover)
+                let ack = self
+                    .send_control_command(transport, SessionCommandKind::Takeover)
                     .await?;
+                self.last_control_ack = Some(ack);
             }
             SlashCommand::Abort => {
-                self.abort(transport).await?;
+                let ack = self.abort(transport).await?;
+                self.last_control_ack = Some(ack);
             }
             SlashCommand::Pause => {
-                self.send_control_command(transport, SessionCommandKind::Pause)
+                let ack = self
+                    .send_control_command(transport, SessionCommandKind::Pause)
                     .await?;
+                self.last_control_ack = Some(ack);
             }
             SlashCommand::Continue => {
-                self.send_control_command(transport, SessionCommandKind::Resume)
+                let ack = self
+                    .send_control_command(transport, SessionCommandKind::Resume)
                     .await?;
+                self.last_control_ack = Some(ack);
             }
             SlashCommand::Approve => {
-                self.resolve_pending_approval(transport, SessionCommandKind::Approve)
+                let ack = self
+                    .resolve_pending_approval(transport, SessionCommandKind::Approve)
                     .await?;
+                self.last_control_ack = Some(ack);
             }
             SlashCommand::Deny => {
-                self.resolve_pending_approval(transport, SessionCommandKind::Deny)
+                let ack = self
+                    .resolve_pending_approval(transport, SessionCommandKind::Deny)
                     .await?;
+                self.last_control_ack = Some(ack);
             }
             SlashCommand::Compact => {
-                self.send_control_command(transport, SessionCommandKind::Compact)
+                let ack = self
+                    .send_control_command(transport, SessionCommandKind::Compact)
                     .await?;
+                self.last_control_ack = Some(ack);
             }
             SlashCommand::Clear => {
                 self.command_messages.clear();
@@ -1295,7 +1400,7 @@ impl TuiApp {
         }
     }
 
-    async fn abort(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
+    async fn abort(&mut self, transport: &RuntimeTransport) -> miette::Result<CommandAck> {
         let ack = transport
             .send_command(session_command(
                 self.session_id,
@@ -1304,28 +1409,33 @@ impl TuiApp {
             ))
             .await
             .map_err(|error| miette::miette!("{error}"))?;
-        self.status_message = ack.reason.unwrap_or_else(|| "abort accepted".to_owned());
-        self.refresh(transport).await
+        self.status_message = ack
+            .reason
+            .clone()
+            .unwrap_or_else(|| "abort accepted".to_owned());
+        self.refresh(transport).await?;
+        Ok(ack)
     }
 
     async fn send_control_command(
         &mut self,
         transport: &RuntimeTransport,
         kind: SessionCommandKind,
-    ) -> miette::Result<()> {
+    ) -> miette::Result<CommandAck> {
         let ack = transport
             .send_command(session_command(self.session_id, kind, json!({})))
             .await
             .map_err(|error| miette::miette!("{error}"))?;
         self.status_message = compact_ack_reason(&ack.reason);
-        self.refresh(transport).await
+        self.refresh(transport).await?;
+        Ok(ack)
     }
 
     async fn resolve_pending_approval(
         &mut self,
         transport: &RuntimeTransport,
         kind: SessionCommandKind,
-    ) -> miette::Result<()> {
+    ) -> miette::Result<CommandAck> {
         let approval_id = self
             .projection
             .as_ref()
@@ -1339,7 +1449,8 @@ impl TuiApp {
             .await
             .map_err(|error| miette::miette!("{error}"))?;
         self.status_message = compact_ack_reason(&ack.reason);
-        self.refresh(transport).await
+        self.refresh(transport).await?;
+        Ok(ack)
     }
 
     async fn interrupt_or_quit(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
@@ -1353,8 +1464,16 @@ impl TuiApp {
             self.status_message =
                 "auth cancellation requested; press Ctrl+C again to quit".to_owned();
         } else if has_active_task(self) {
-            self.abort(transport).await?;
-            self.status_message = "interrupt requested; press Ctrl+C again to quit".to_owned();
+            let ack = self.abort(transport).await?;
+            self.last_control_ack = Some(ack.clone());
+            if ack.accepted {
+                self.status_message = "interrupt requested; press Ctrl+C again to quit".to_owned();
+            } else {
+                self.status_message = format!(
+                    "{}; press Ctrl+C again to quit",
+                    compact_ack_reason(&ack.reason)
+                );
+            }
         } else {
             self.status_message = "press Ctrl+C again to quit".to_owned();
         }
@@ -1386,9 +1505,30 @@ impl TuiApp {
     }
 }
 
-#[tokio::main]
-async fn main() -> miette::Result<()> {
+fn main() -> miette::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| miette::miette!("initialize Tokio runtime: {error}"))?;
+    let result = runtime.block_on(async_main());
+    // Tokio's portable stdin uses a blocking reader. A bounded shutdown keeps
+    // the NDJSON `close` request authoritative even if the parent retains the
+    // write end of the stdin pipe.
+    runtime.shutdown_timeout(Duration::from_millis(250));
+    result
+}
+
+async fn async_main() -> miette::Result<()> {
     let args = Args::parse();
+    match args.command.clone() {
+        Some(TuiCommand::Inspect(command)) => {
+            return driver::run_inspect_command(&args, command).await;
+        }
+        Some(TuiCommand::Driver(command)) => {
+            return driver::run_driver_command(&args, command).await;
+        }
+        None => {}
+    }
     let task_id = parse_task_id(args.task_id.as_deref())?;
     let cwd = args
         .cwd
@@ -1427,18 +1567,7 @@ async fn run_app(
     mut app: TuiApp,
     transport: RuntimeTransport,
 ) -> miette::Result<()> {
-    let mut subscribed_session = app.session_id;
-    let mut subscribed_task = app.task_id;
-    app.load_recent_history(&transport).await?;
-    let mut subscription = transport
-        .subscribe(EventFilter {
-            session_id: subscribed_session,
-            task_id: subscribed_task,
-            after_sequence_no: app.cursor,
-        })
-        .await
-        .map_err(|error| miette::miette!("{error}"))?;
-    app.refresh(&transport).await?;
+    let mut controller = TuiRuntimeController::attach(&mut app, transport).await?;
     let tick_rate = Duration::from_millis(250);
 
     while !app.should_quit {
@@ -1450,7 +1579,11 @@ async fn run_app(
             let event = event::read().map_err(|error| miette::miette!("{error}"))?;
             match event {
                 CrosstermEvent::Key(key) => {
-                    handle_key(key, &mut app, &transport).await?;
+                    handle_key(key, &mut app, controller.transport()).await?;
+                    if app.last_prompt_ack.as_ref().is_some_and(|ack| ack.accepted) {
+                        controller.replay_from_cursor(&app).await?;
+                        app.take_last_prompt_ack();
+                    }
                 }
                 CrosstermEvent::Mouse(mouse) => {
                     handle_mouse(mouse, &mut app);
@@ -1462,50 +1595,7 @@ async fn run_app(
             }
         }
 
-        if app.history_load_requested {
-            app.load_older_history(&transport).await?;
-        }
-        if app.developer_load_requested {
-            app.load_older_debug_history(&transport).await?;
-        }
-
-        if app.session_id != subscribed_session || app.task_id != subscribed_task {
-            subscribed_session = app.session_id;
-            subscribed_task = app.task_id;
-            app.load_recent_history(&transport).await?;
-            subscription = transport
-                .subscribe(EventFilter {
-                    session_id: subscribed_session,
-                    task_id: subscribed_task,
-                    after_sequence_no: app.cursor,
-                })
-                .await
-                .map_err(|error| miette::miette!("{error}"))?;
-            app.refresh(&transport).await?;
-        }
-
-        let mut received_event = false;
-        loop {
-            match subscription.try_recv() {
-                Ok(Ok(event)) => {
-                    app.apply_runtime_event(event);
-                    received_event = true;
-                }
-                Ok(Err(error)) => {
-                    app.status_message = format!("event stream reconnecting: {error}");
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    app.status_message = "event stream disconnected".to_owned();
-                    break;
-                }
-            }
-        }
-        if received_event {
-            app.refresh(&transport).await?;
-        }
-        app.poll_auth_operation(&transport).await;
-        app.poll_export_operation().await;
+        controller.sync(&mut app).await?;
     }
 
     Ok(())
@@ -1540,14 +1630,18 @@ async fn handle_key(
     {
         match key.code {
             KeyCode::Char('y') if key.modifiers.is_empty() => {
-                return app
+                let ack = app
                     .resolve_pending_approval(transport, SessionCommandKind::Approve)
-                    .await;
+                    .await?;
+                app.last_control_ack = Some(ack);
+                return Ok(());
             }
             KeyCode::Char('n') if key.modifiers.is_empty() => {
-                return app
+                let ack = app
                     .resolve_pending_approval(transport, SessionCommandKind::Deny)
-                    .await;
+                    .await?;
+                app.last_control_ack = Some(ack);
+                return Ok(());
             }
             _ => {}
         }

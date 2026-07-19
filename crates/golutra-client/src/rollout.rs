@@ -96,6 +96,12 @@ pub(crate) fn redact_rollout_value(value: &mut Value, key: Option<&str>) {
     }
 }
 
+/// Apply the canonical rollout redaction policy to a value exposed through a
+/// developer-facing projection.
+pub fn redact_runtime_value(value: &mut Value) {
+    redact_rollout_value(value, None);
+}
+
 pub(crate) fn is_sensitive_rollout_key(key: &str) -> bool {
     let normalized = key.to_ascii_lowercase().replace('-', "_");
     matches!(

@@ -149,7 +149,7 @@ pub(crate) use provider_runtime::{
 pub(crate) use provider_runtime::{
     MockWriteFileArgs, configured_provider_plan, mock_write_file_args,
 };
-pub use rollout::{RolloutEnvelope, RolloutExport, ThreadRebindResult};
+pub use rollout::{RolloutEnvelope, RolloutExport, ThreadRebindResult, redact_runtime_value};
 pub(crate) use rollout::{
     append_rollout_line, normalize_rebind_source, rebuild_rollout_file, rollout_line,
     rollout_path_for_workspace,
