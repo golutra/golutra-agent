@@ -1271,6 +1271,16 @@ fn new_idle_session_has_empty_transcript() {
     assert!(transcript_items(&app).is_empty());
     assert_eq!(bottom_pane_height(&app), 3);
     assert!(provider_footer_line(&app).is_none());
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("terminal");
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw empty session");
+    let separator = (0..80)
+        .filter_map(|x| terminal.backend().buffer().cell((x, 1)))
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert_eq!(separator, "─".repeat(80));
 }
 
 #[test]

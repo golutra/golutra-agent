@@ -196,9 +196,6 @@ pub(crate) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     }
 
     let mut items = transcript_rows(app);
-    if items.is_empty() {
-        return;
-    }
     let visible_rows = area.height.saturating_sub(1) as usize;
     let window = transcript_visible_window(
         items.len(),
