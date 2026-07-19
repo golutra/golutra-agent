@@ -287,7 +287,7 @@ artifact、durable job、thread 五类事实访问边界。`EmbeddedTransport`�
 | --- | --- | --- |
 | `golutra-client` | `application`、`command`、`query`、`session`、`execution`、`execution_trace`、`task_governance`、`post_task`、`governance`、`governance_commands`、`regression`、`trace`、`transport`、`transport::ipc` | `RuntimeApplication` 是前端用例 facade；`RuntimeHost` 只拥有 lane/worker/EventBus/sequence 与生命周期；command、查询、执行、trace、后台治理和回归各自编排但共享同一事实与 owner |
 | `golutra-runtime` | `lane`、`checkpoint`、`completion`、`context_guard`、`provider_retry`、`trace`、`verification` | lane 状态机、checkpoint、终态策略、context guard、retry、trace adapter 和 verification service 独立于 loop orchestration；loop 不直接实现 session controller 转换或快照 IO |
-| `golutra-tui` | `auth_state`、`auth_flow`、`session`、`render` | 主文件只组装应用状态和事件循环；渲染不写 provider 配置，认证 flow 不编排 runtime task |
+| `golutra-tui` | `auth_state`、`auth_flow`、`session`、`render`、`runtime_controller`、`driver::{frame,io,session,wait}` | 主文件只组装应用状态和事件循环；交互 TUI 与离屏 Driver 共用 controller/render，协议 IO、frame 投影、session 绑定和 wait 事件索引分层；渲染不写 provider 配置，认证 flow 不编排 runtime task |
 | `golutra-config` | `provider_auth`、`provider_storage` | provider catalog 与凭据/配置事务分离；磁盘写入、锁、迁移、probe 和 rollback 统一由 storage 层负责 |
 | `golutra-llm` | `provider_config`、`openai_responses`、`genai_adapter` | 环境解析与 URL/错误处理不进入 adapter 执行循环；各协议 adapter 只处理自己的 wire contract |
 | `golutra-store` | `projection`、`repositories` | event reducer 保持纯函数；`RuntimeRepositories` 对 event/projection/artifact/job/thread 提供逻辑 seam；SQLite 只负责事实读写和持久化派生索引 |
@@ -426,6 +426,8 @@ golutra-tui
 - cwd 迁移只能通过显式 rebind，要求 inactive/unowned thread 和精确旧路径；checkpoint、memory、evaluation 不能被无条件解释为新 cwd 事实。
 
 当前这些边界已经落地：TUI 默认创建新的本地 thread/session，首个 prompt 才持久化；`/resume` 按当前 canonical cwd 过滤全局历史；`/fork --from-turn`、rollout export、`/export` 和 thread rebind 通过同一 transport/API；普通 transcript 只渲染用户可见事件，也不查询开发者投影。只有显式 `--debug` 或 `/debug` 才启用 developer mode；主体区按左右 1:1 展示 transcript 与 Developer runtime，按事件分页刷新 `DebugProjection`。治理 facts 默认收起在标题的 `▸ facts` 后，可用鼠标左键展开或收回；对话和事件列表的鼠标滚轮按 pane 命中区域独立滚动，`/new`/`/resume` 保留 debug 偏好。`/export` 固定每个 session 的 event high-watermark，后台异步写 owner-only 临时目录；导出期间 session 变化会显式降级为 incomplete。
+
+原生 TUI Driver 复用同一个 `TuiApp + TuiRuntimeController + draw_ui`，通过 `ratatui::TestBackend` 提供 one-shot `inspect` 和长期 NDJSON `driver`，不复制 headless render/state machine。一个 Driver 固定绑定 canonical cwd/session，可选严格只读 task；stdio 或 owner-only Unix socket 只控制 UI 和 runtime command，RuntimeEvent 仍是唯一事实源。长 wait 与 heartbeat/control 多路复用，每次 accepted prompt 从 cursor 重建订阅并 replay，从而跨 daemon 重启补齐事件。快照按 current turn/task/session/screen 过滤并使用 SHA-256 frame ID 冻结分页；Developer pane 和 debug full screen 使用 canonical rollout redaction，返回 `complete/missing_sections` 而不暴露 raw artifact/credential。socket disconnect 保留 Driver instance，daemon task 不随客户端退出而取消；完整协议与验收见 `tui-driver.md`。
 
 daemon/remote 模式的最低可用目标不是“界面完整”，而是：
 

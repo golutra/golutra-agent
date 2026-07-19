@@ -12,6 +12,15 @@ cargo run -p golutra-cli -- chat "inspect this workspace"
 cargo run -p golutra-app-server -- --addr 127.0.0.1:47831
 ```
 
+Agent 或自动化测试可以直接驱动真实离屏 TUI：
+
+```bash
+cargo run -p golutra-tui -- --cwd "$PWD" inspect --embedded --session new --prompt "hello" --view response+developer
+cargo run -p golutra-tui -- --cwd "$PWD" driver --embedded --stdio --session new
+```
+
+协议、冻结快照、Unix socket 和安全边界见 [docs/tui-driver.md](docs/tui-driver.md)。
+
 TUI/CLI 默认使用当前进程内的 durable RuntimeHost。显式传入 `--daemon` 时，Unix 本地客户端使用 owner-only Unix socket；Windows 或远程客户端使用经过认证的 HTTP/SSE。
 
 首次没有 live provider 时，TUI 会进入 provider setup。也可以显式配置：
