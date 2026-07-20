@@ -1,6 +1,7 @@
 .DS_Store
 target/
 node_modules/
+sdk/typescript/.test-dist/
 __pycache__/
 *.py[cod]
 .venv/

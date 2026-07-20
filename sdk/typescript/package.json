@@ -4,16 +4,19 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./tui-driver": "./src/tui-driver.ts"
   },
   "scripts": {
     "generate": "node scripts/generate.mjs",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "rm -rf .test-dist && tsc --outDir .test-dist --module NodeNext --moduleResolution NodeNext && node --test tests/*.test.mjs"
   },
   "dependencies": {
     "eventsource-parser": "^3.1.0"
   },
   "devDependencies": {
+    "@types/node": "^22.0.0",
     "json-schema-to-typescript": "^15.0.4",
     "typescript": "^5.5.0"
   }

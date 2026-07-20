@@ -1,5 +1,19 @@
 from . import generated as _generated
 from .client import GolutraClient, GolutraError
 from .generated import *
+from .tui_driver import (
+    TUI_DRIVER_PROTOCOL_VERSION,
+    TuiDriverClient,
+    TuiDriverDisconnectedError,
+    TuiDriverError,
+)
 
-__all__ = ["GolutraClient", "GolutraError", *_generated.__all__]
+__all__ = [
+    "GolutraClient",
+    "GolutraError",
+    "TUI_DRIVER_PROTOCOL_VERSION",
+    "TuiDriverClient",
+    "TuiDriverDisconnectedError",
+    "TuiDriverError",
+    *_generated.__all__,
+]
