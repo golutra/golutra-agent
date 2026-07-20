@@ -910,6 +910,174 @@ async fn unix_socket_is_owner_only_locked_and_reconnectable() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn driver_metrics_are_redacted_and_survive_socket_reconnect() {
+    let (_lock, home, workspace, _env) = process_test_context().await;
+    let socket_dir = home.path().join("tui-driver-metrics");
+    fs::create_dir(&socket_dir).expect("metrics socket dir");
+    fs::set_permissions(&socket_dir, fs::Permissions::from_mode(0o700))
+        .expect("metrics socket dir mode");
+    let socket = socket_dir.join("driver.sock");
+    let mut child = spawn_socket_driver(home.path(), workspace.path(), &socket, true, "new");
+    wait_for_socket(&socket).await;
+
+    let mut first = SocketConnection::connect(&socket).await;
+    assert_eq!(first.receive("ready").await["type"], "ready");
+    first
+        .send(json!({"request_id": "metrics-1", "type": "metrics"}))
+        .await;
+    let initial = first.receive("metrics-1").await;
+    assert_eq!(initial["type"], "metrics");
+    assert_eq!(initial["metrics"]["connections"], 1);
+    assert_eq!(initial["metrics"]["reconnects"], 0);
+
+    first
+        .send(json!({"request_id": "capabilities", "type": "capabilities"}))
+        .await;
+    let capabilities = first.receive("capabilities").await;
+    assert!(
+        capabilities["capabilities"]
+            .as_array()
+            .is_some_and(|values| values.iter().any(|value| value == "diagnostics.metrics"))
+    );
+
+    first
+        .send(json!({
+            "request_id": "metrics-prompt",
+            "type": "input_prompt",
+            "text": "metrics secret prompt"
+        }))
+        .await;
+    assert_eq!(first.receive("metrics-prompt").await["type"], "accepted");
+    first
+        .send(json!({
+            "request_id": "metrics-terminal",
+            "type": "wait",
+            "until": {"kind": "task_terminal"},
+            "timeout_ms": 15000
+        }))
+        .await;
+    assert_eq!(
+        first.receive("metrics-terminal").await["type"],
+        "wait_result"
+    );
+    first
+        .send(json!({
+            "request_id": "metrics-timeout",
+            "type": "wait",
+            "until": {"kind": "event", "event_type": "never_happens"},
+            "timeout_ms": 0
+        }))
+        .await;
+    assert_eq!(
+        first.receive("metrics-timeout").await["type"],
+        "wait_timeout"
+    );
+    first
+        .send(json!({
+            "request_id": "metrics-error",
+            "type": "input_slash",
+            "text": "/does-not-exist"
+        }))
+        .await;
+    assert_eq!(first.receive("metrics-error").await["type"], "error");
+
+    first
+        .send(json!({
+            "request_id": "snapshot-1",
+            "type": "snapshot",
+            "scope": "session",
+            "panes": "transcript",
+            "width": 160,
+            "height": 40
+        }))
+        .await;
+    let snapshot = first.receive("snapshot-1").await;
+    assert_eq!(snapshot["type"], "snapshot");
+    let frame_id = snapshot["frame_id"].as_str().expect("frame id");
+    first
+        .send(json!({
+            "request_id": "snapshot-frozen",
+            "type": "snapshot",
+            "scope": "session",
+            "panes": "transcript",
+            "width": 160,
+            "height": 40,
+            "frame_id": frame_id
+        }))
+        .await;
+    assert_eq!(first.receive("snapshot-frozen").await["type"], "snapshot");
+    first
+        .send(json!({
+            "request_id": "snapshot-miss",
+            "type": "snapshot",
+            "scope": "session",
+            "panes": "transcript",
+            "width": 160,
+            "height": 40,
+            "frame_id": "missing-frame"
+        }))
+        .await;
+    assert_eq!(
+        first.receive("snapshot-miss").await["code"],
+        "frame_expired"
+    );
+    first
+        .send(json!({
+            "request_id": "pending-wait",
+            "type": "wait",
+            "until": {"kind": "event", "event_type": "never_happens"},
+            "timeout_ms": 15000
+        }))
+        .await;
+    first
+        .send(json!({"request_id": "metrics-pending", "type": "metrics"}))
+        .await;
+    let pending_metrics = first.receive("metrics-pending").await;
+    assert_eq!(pending_metrics["metrics"]["pending_waits"], 1);
+    drop(first);
+
+    let mut second = SocketConnection::connect(&socket).await;
+    assert_eq!(second.receive("ready").await["type"], "ready");
+    second
+        .send(json!({"request_id": "metrics-2", "type": "metrics"}))
+        .await;
+    let metrics = second.receive("metrics-2").await;
+    assert_eq!(metrics["metrics"]["connections"], 2);
+    assert_eq!(metrics["metrics"]["reconnects"], 1);
+    assert_eq!(metrics["metrics"]["snapshot_requests"], 3);
+    assert_eq!(metrics["metrics"]["snapshot_renders"], 1);
+    assert_eq!(metrics["metrics"]["frozen_frame_hits"], 1);
+    assert_eq!(metrics["metrics"]["frozen_frame_misses"], 1);
+    assert_eq!(metrics["metrics"]["frame_cache_entries"], 1);
+    assert_eq!(metrics["metrics"]["wait_requests"], 3);
+    assert_eq!(metrics["metrics"]["wait_results"], 1);
+    assert_eq!(metrics["metrics"]["wait_timeouts"], 1);
+    assert_eq!(metrics["metrics"]["wait_cancelled"], 1);
+    assert_eq!(metrics["metrics"]["pending_waits"], 0);
+    assert!(
+        metrics["metrics"]["request_errors"]
+            .as_u64()
+            .is_some_and(|errors| errors >= 1)
+    );
+    assert!(
+        metrics["metrics"]["snapshot_latency"]["samples"]
+            .as_u64()
+            .is_some_and(|samples| samples >= 3)
+    );
+    assert!(
+        metrics["metrics"]["sync_latency"]["samples"]
+            .as_u64()
+            .is_some_and(|samples| samples >= 1)
+    );
+    let metrics_json = serde_json::to_string(&metrics).expect("metrics JSON");
+    assert!(!metrics_json.contains("workspace_path"));
+    assert!(!metrics_json.contains("prompt"));
+    assert!(!metrics_json.contains("secret"));
+
+    close_socket_driver(&mut second, &mut child, "close-metrics").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stdio_driver_emits_heartbeat_and_honors_idle_timeout() {
     let (_lock, home, workspace, _env) = process_test_context().await;
     let mut driver = StdioDriver::spawn(

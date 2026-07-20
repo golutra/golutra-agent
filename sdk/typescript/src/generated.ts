@@ -299,6 +299,10 @@ export type DriverEnvelope1 =
       [k: string]: unknown;
     }
   | {
+      type: "metrics";
+      [k: string]: unknown;
+    }
+  | {
       type: "takeover";
       [k: string]: unknown;
     }
@@ -434,6 +438,11 @@ export type DriverResponseEnvelope1 =
       type: "snapshot";
       width: number;
       workspace_id: string;
+      [k: string]: unknown;
+    }
+  | {
+      metrics: DriverMetrics;
+      type: "metrics";
       [k: string]: unknown;
     }
   | {
@@ -1552,6 +1561,49 @@ export interface TuiFrameLine {
   pane: TuiFramePane;
   row: number;
   text: string;
+  [k: string]: unknown;
+}
+/**
+ * Operational counters for diagnosing a long-lived Driver instance.
+ *
+ * The values are process-local and cumulative until the Driver exits. The
+ * `pending_waits` and `frame_cache_entries` fields are live gauges.
+ */
+export interface DriverMetrics {
+  connections: number;
+  frame_cache_entries: number;
+  frozen_frame_hits: number;
+  frozen_frame_misses: number;
+  instance_id: string;
+  pending_waits: number;
+  reconnects: number;
+  rejected_connections: number;
+  request_errors: number;
+  requests: number;
+  snapshot_latency: DriverLatencyMetrics;
+  snapshot_renders: number;
+  snapshot_requests: number;
+  sync_attempts: number;
+  sync_errors: number;
+  sync_latency: DriverLatencyMetrics;
+  wait_cancelled: number;
+  wait_latency: DriverLatencyMetrics;
+  wait_requests: number;
+  wait_results: number;
+  wait_timeouts: number;
+  [k: string]: unknown;
+}
+/**
+ * Redacted, low-cardinality timing aggregates exposed by the native Driver.
+ *
+ * This deliberately contains no request payloads, rendered text, workspace
+ * paths, provider identifiers, or credential material.
+ */
+export interface DriverLatencyMetrics {
+  last_ms: number;
+  max_ms: number;
+  samples: number;
+  total_ms: number;
   [k: string]: unknown;
 }
 export interface DriverState {

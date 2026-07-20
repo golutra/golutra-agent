@@ -58,6 +58,7 @@ pub enum DriverRequest {
         #[serde(flatten)]
         request: SnapshotRequest,
     },
+    Metrics,
     Takeover,
     Abort,
     Close {
@@ -195,6 +196,9 @@ pub enum DriverResponse {
         #[serde(flatten)]
         frame: TuiFrame,
     },
+    Metrics {
+        metrics: DriverMetrics,
+    },
     Accepted {
         message: String,
     },
@@ -292,6 +296,47 @@ pub struct DriverState {
     pub facts_expanded: bool,
     pub controller_mode: DriverControllerMode,
     pub closed: bool,
+}
+
+/// Redacted, low-cardinality timing aggregates exposed by the native Driver.
+///
+/// This deliberately contains no request payloads, rendered text, workspace
+/// paths, provider identifiers, or credential material.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DriverLatencyMetrics {
+    pub samples: u64,
+    pub total_ms: u64,
+    pub max_ms: u64,
+    pub last_ms: u64,
+}
+
+/// Operational counters for diagnosing a long-lived Driver instance.
+///
+/// The values are process-local and cumulative until the Driver exits. The
+/// `pending_waits` and `frame_cache_entries` fields are live gauges.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DriverMetrics {
+    pub instance_id: String,
+    pub connections: u64,
+    pub reconnects: u64,
+    pub rejected_connections: u64,
+    pub requests: u64,
+    pub request_errors: u64,
+    pub snapshot_requests: u64,
+    pub snapshot_renders: u64,
+    pub frozen_frame_hits: u64,
+    pub frozen_frame_misses: u64,
+    pub snapshot_latency: DriverLatencyMetrics,
+    pub wait_requests: u64,
+    pub wait_results: u64,
+    pub wait_timeouts: u64,
+    pub wait_cancelled: u64,
+    pub pending_waits: u64,
+    pub wait_latency: DriverLatencyMetrics,
+    pub sync_attempts: u64,
+    pub sync_errors: u64,
+    pub sync_latency: DriverLatencyMetrics,
+    pub frame_cache_entries: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -497,6 +542,10 @@ mod tests {
                 "type": "close",
                 "abort_active_task": false
             }),
+            serde_json::json!({
+                "request_id": "metrics",
+                "type": "metrics"
+            }),
         ];
         for request in requests {
             let decoded: DriverEnvelope =
@@ -528,5 +577,47 @@ mod tests {
         let decoded: DriverResponseEnvelope =
             serde_json::from_slice(&encoded).expect("response roundtrip");
         assert_eq!(decoded, response);
+
+        let metrics = super::response(
+            "metrics",
+            DriverResponse::Metrics {
+                metrics: DriverMetrics {
+                    instance_id: "instance".to_owned(),
+                    connections: 2,
+                    reconnects: 1,
+                    rejected_connections: 1,
+                    requests: 9,
+                    request_errors: 1,
+                    snapshot_requests: 2,
+                    snapshot_renders: 1,
+                    frozen_frame_hits: 1,
+                    frozen_frame_misses: 0,
+                    snapshot_latency: DriverLatencyMetrics {
+                        samples: 2,
+                        total_ms: 12,
+                        max_ms: 8,
+                        last_ms: 8,
+                    },
+                    wait_requests: 3,
+                    wait_results: 1,
+                    wait_timeouts: 1,
+                    wait_cancelled: 1,
+                    pending_waits: 0,
+                    wait_latency: DriverLatencyMetrics::default(),
+                    sync_attempts: 4,
+                    sync_errors: 0,
+                    sync_latency: DriverLatencyMetrics::default(),
+                    frame_cache_entries: 1,
+                },
+            },
+        );
+        let encoded = serde_json::to_vec(&metrics).expect("metrics JSON");
+        let decoded: DriverResponseEnvelope =
+            serde_json::from_slice(&encoded).expect("metrics roundtrip");
+        assert_eq!(decoded, metrics);
+        let encoded = String::from_utf8(encoded).expect("metrics UTF-8");
+        assert!(!encoded.contains("workspace_path"));
+        assert!(!encoded.contains("prompt"));
+        assert!(!encoded.contains("secret"));
     }
 }

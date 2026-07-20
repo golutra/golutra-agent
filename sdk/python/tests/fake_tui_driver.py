@@ -42,6 +42,33 @@ def state() -> dict:
     }
 
 
+def metrics() -> dict:
+    latency = {"samples": 1, "total_ms": 4, "max_ms": 4, "last_ms": 4}
+    return {
+        "instance_id": "fake-driver",
+        "connections": 1,
+        "reconnects": 0,
+        "rejected_connections": 0,
+        "requests": 2,
+        "request_errors": 0,
+        "snapshot_requests": 0,
+        "snapshot_renders": 0,
+        "frozen_frame_hits": 0,
+        "frozen_frame_misses": 0,
+        "snapshot_latency": latency,
+        "wait_requests": 0,
+        "wait_results": 0,
+        "wait_timeouts": 0,
+        "wait_cancelled": 0,
+        "pending_waits": 0,
+        "wait_latency": latency,
+        "sync_attempts": 1,
+        "sync_errors": 0,
+        "sync_latency": latency,
+        "frame_cache_entries": 0,
+    }
+
+
 def delayed_wait(request: dict) -> None:
     delay = 0.04 if request["until"]["kind"] == "idle" else 0.005
     time.sleep(delay)
@@ -123,6 +150,14 @@ for raw_line in sys.stdin:
         write({"request_id": request["request_id"], "type": "state", **state()})
     elif request_type == "ping":
         write({"request_id": request["request_id"], "type": "pong"})
+    elif request_type == "metrics":
+        write(
+            {
+                "request_id": request["request_id"],
+                "type": "metrics",
+                "metrics": metrics(),
+            }
+        )
     elif request_type == "wait":
         if request["until"].get("event_type") != "never":
             threading.Thread(target=delayed_wait, args=(request,), daemon=True).start()

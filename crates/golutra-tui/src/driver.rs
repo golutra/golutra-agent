@@ -1,16 +1,22 @@
 //! Agent-facing offscreen TUI driver.
 
-use std::{collections::VecDeque, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use golutra_client::{RuntimeClient, RuntimeTransport};
 use golutra_core::{ActorKind, CommandId, QueryId, RedactionStatus, TaskId, TaskStatus, TurnId};
 use golutra_protocol::{
-    CommandAck, DriverControllerMode, DriverKey, DriverNotification, DriverNotificationKind,
-    DriverRequest, DriverResponse, DriverResponseEnvelope, DriverState, DriverTaskStatus,
-    ReadyResponse, RowRange, RuntimeQuery, RuntimeQueryKind, SnapshotDetail, SnapshotPanes,
-    SnapshotRequest, SnapshotScope, StateProjection, TUI_DRIVER_MIN_PROTOCOL_VERSION,
-    TUI_DRIVER_PROTOCOL_VERSION, TuiFrame, WaitCondition, response,
+    CommandAck, DriverControllerMode, DriverKey, DriverMetrics, DriverNotification,
+    DriverNotificationKind, DriverRequest, DriverResponse, DriverResponseEnvelope, DriverState,
+    DriverTaskStatus, ReadyResponse, RowRange, RuntimeQuery, RuntimeQueryKind, SnapshotDetail,
+    SnapshotPanes, SnapshotRequest, SnapshotScope, StateProjection,
+    TUI_DRIVER_MIN_PROTOCOL_VERSION, TUI_DRIVER_PROTOCOL_VERSION, TuiFrame, WaitCondition,
+    response,
 };
 use ratatui::{Terminal, backend::TestBackend};
 use uuid::Uuid;
@@ -19,11 +25,13 @@ use super::*;
 
 mod frame;
 mod io;
+mod metrics;
 mod session;
 mod wait;
 
 use frame::*;
 pub(crate) use io::{run_driver_command, run_inspect_command};
+use metrics::DriverMetricsAccumulator;
 use session::*;
 use wait::*;
 
@@ -75,6 +83,7 @@ pub(crate) struct TuiDriver {
     submission: Option<SubmissionAnchor>,
     last_controller_mode: DriverControllerMode,
     wait_facts_cache: Option<CachedWaitFacts>,
+    metrics: DriverMetricsAccumulator,
 }
 
 impl TuiDriver {
@@ -125,6 +134,7 @@ impl TuiDriver {
             submission: None,
             last_controller_mode: DriverControllerMode::Controller,
             wait_facts_cache: None,
+            metrics: DriverMetricsAccumulator::default(),
         };
         driver.last_controller_mode = driver.controller_mode().await?;
         driver.refresh_active_layout()?;
@@ -214,7 +224,48 @@ impl TuiDriver {
     }
 
     async fn sync(&mut self) -> miette::Result<()> {
-        self.controller.sync(&mut self.app).await
+        let started_at = self.metrics.start_sync();
+        let result = self.controller.sync(&mut self.app).await;
+        self.metrics.finish_sync(started_at, result.is_ok());
+        result
+    }
+
+    fn metrics(&mut self, pending_waits: usize) -> DriverMetrics {
+        self.prune_frames();
+        self.metrics
+            .snapshot(&self.instance_id, pending_waits, self.frame_cache.len())
+    }
+
+    fn record_connection(&mut self) {
+        self.metrics.record_connection();
+    }
+
+    fn record_rejected_connection(&mut self) {
+        self.metrics.record_rejected_connection();
+    }
+
+    fn record_request(&mut self) {
+        self.metrics.record_request();
+    }
+
+    fn record_request_error(&mut self) {
+        self.metrics.record_request_error();
+    }
+
+    fn start_wait_metrics(&mut self) -> Instant {
+        self.metrics.start_wait()
+    }
+
+    fn finish_wait_metrics(&mut self, started_at: Instant, timed_out: bool) {
+        if timed_out {
+            self.metrics.finish_wait_timeout(started_at);
+        } else {
+            self.metrics.finish_wait_result(started_at);
+        }
+    }
+
+    fn cancel_wait_metrics(&mut self, started_at: Instant) {
+        self.metrics.cancel_wait(started_at);
     }
 
     async fn handle(&mut self, request: DriverRequest) -> DriverResponse {
@@ -258,6 +309,9 @@ impl TuiDriver {
                 state: self.state().await?,
             }),
             DriverRequest::Ping => Ok(DriverResponse::Pong),
+            DriverRequest::Metrics => Ok(DriverResponse::Metrics {
+                metrics: self.metrics(0),
+            }),
             DriverRequest::InputPrompt { text } => {
                 validate_input(&text)?;
                 ensure_task_binding_accepts_no_prompt(self.app.task_id)?;
@@ -493,6 +547,25 @@ impl TuiDriver {
         until: WaitCondition,
         timeout_ms: Option<u64>,
     ) -> miette::Result<DriverResponse> {
+        let started_at = self.start_wait_metrics();
+        let result = self.wait_for_inner(until, timeout_ms).await;
+        match &result {
+            Ok(DriverResponse::WaitResult { .. }) => {
+                self.finish_wait_metrics(started_at, false);
+            }
+            Ok(DriverResponse::WaitTimeout { .. }) => {
+                self.finish_wait_metrics(started_at, true);
+            }
+            _ => self.cancel_wait_metrics(started_at),
+        }
+        result
+    }
+
+    async fn wait_for_inner(
+        &mut self,
+        until: WaitCondition,
+        timeout_ms: Option<u64>,
+    ) -> miette::Result<DriverResponse> {
         let timeout_ms = timeout_ms
             .unwrap_or(DEFAULT_WAIT_MILLIS)
             .min(MAX_WAIT_MILLIS);
@@ -577,6 +650,13 @@ impl TuiDriver {
     }
 
     async fn snapshot(&mut self, request: SnapshotRequest) -> miette::Result<TuiFrame> {
+        let started_at = self.metrics.record_snapshot_request();
+        let result = self.snapshot_inner(request).await;
+        self.metrics.finish_snapshot(started_at);
+        result
+    }
+
+    async fn snapshot_inner(&mut self, request: SnapshotRequest) -> miette::Result<TuiFrame> {
         request
             .validate()
             .map_err(|error| miette::miette!("invalid_snapshot: {error}"))?;
@@ -589,7 +669,9 @@ impl TuiDriver {
         }
         self.prune_frames();
         if let Some(frame_id) = request.frame_id.as_deref() {
-            return self.frozen_frame(frame_id, &request);
+            let result = self.frozen_frame(frame_id, &request);
+            self.metrics.record_frozen_frame_lookup(result.is_ok());
+            return result;
         }
         self.sync().await?;
         if panes_include_developer(request.panes, self.app.debug_mode) {
@@ -613,6 +695,7 @@ impl TuiDriver {
             self.app.developer_error = None;
         }
         let full_frame = self.render_frame(&request)?;
+        self.metrics.record_snapshot_render();
         cache_frame(
             &mut self.frame_cache,
             full_frame.clone(),

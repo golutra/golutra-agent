@@ -35,6 +35,13 @@ input.on("line", (line) => {
     case "ping":
       write({ request_id: request.request_id, type: "pong" });
       break;
+    case "metrics":
+      write({
+        request_id: request.request_id,
+        type: "metrics",
+        metrics: metrics(),
+      });
+      break;
     case "wait": {
       if (
         request.until.kind === "event" &&
@@ -110,6 +117,33 @@ function state() {
     facts_expanded: false,
     controller_mode: "controller",
     closed: false,
+  };
+}
+
+function metrics() {
+  const latency = { samples: 1, total_ms: 4, max_ms: 4, last_ms: 4 };
+  return {
+    instance_id: "fake-driver",
+    connections: 1,
+    reconnects: 0,
+    rejected_connections: 0,
+    requests: 2,
+    request_errors: 0,
+    snapshot_requests: 0,
+    snapshot_renders: 0,
+    frozen_frame_hits: 0,
+    frozen_frame_misses: 0,
+    snapshot_latency: latency,
+    wait_requests: 0,
+    wait_results: 0,
+    wait_timeouts: 0,
+    wait_cancelled: 0,
+    pending_waits: 0,
+    wait_latency: latency,
+    sync_attempts: 1,
+    sync_errors: 0,
+    sync_latency: latency,
+    frame_cache_entries: 0,
   };
 }
 

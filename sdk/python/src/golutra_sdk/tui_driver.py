@@ -14,7 +14,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from .generated import DriverNotification, DriverResponseEnvelope, DriverState, TuiFrame
+from .generated import (
+    DriverMetrics,
+    DriverNotification,
+    DriverResponseEnvelope,
+    DriverState,
+    TuiFrame,
+)
 
 
 TUI_DRIVER_PROTOCOL_VERSION = 1
@@ -367,6 +373,10 @@ class TuiDriverClient:
 
     def ping(self) -> None:
         _expect_response(self.request({"type": "ping"}), "pong")
+
+    def metrics(self) -> DriverMetrics:
+        response = _expect_response(self.request({"type": "metrics"}), "metrics")
+        return response["metrics"]  # type: ignore[return-value]
 
     def prompt(self, text: str, *, timeout: float | None = None) -> None:
         _expect_response(

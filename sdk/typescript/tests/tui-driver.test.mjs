@@ -28,6 +28,10 @@ test("stdio client routes concurrent waits, notifications, and frozen pages", as
   );
   assert.equal(client.ready.instance_id, "fake-driver");
   assert.deepEqual(await client.capabilities(), ["fake"]);
+  const metrics = await client.metrics();
+  assert.equal(metrics.instance_id, "fake-driver");
+  assert.equal(metrics.snapshot_latency.samples, 1);
+  assert.equal(metrics.pending_waits, 0);
 
   const [slow, fast] = await Promise.all([
     client.wait({ kind: "idle" }, 200),

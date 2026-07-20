@@ -1812,6 +1812,18 @@
           "properties": {
             "type": {
               "type": "string",
+              "const": "metrics"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
               "const": "takeover"
             }
           },
@@ -1885,6 +1897,164 @@
             "char"
           ]
         }
+      ]
+    },
+    "DriverLatencyMetrics": {
+      "description": "Redacted, low-cardinality timing aggregates exposed by the native Driver.\n\nThis deliberately contains no request payloads, rendered text, workspace\npaths, provider identifiers, or credential material.",
+      "type": "object",
+      "properties": {
+        "last_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "samples": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "total_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "samples",
+        "total_ms",
+        "max_ms",
+        "last_ms"
+      ]
+    },
+    "DriverMetrics": {
+      "description": "Operational counters for diagnosing a long-lived Driver instance.\n\nThe values are process-local and cumulative until the Driver exits. The\n`pending_waits` and `frame_cache_entries` fields are live gauges.",
+      "type": "object",
+      "properties": {
+        "connections": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "frame_cache_entries": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "frozen_frame_hits": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "frozen_frame_misses": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "instance_id": {
+          "type": "string"
+        },
+        "pending_waits": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "reconnects": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "rejected_connections": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "request_errors": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "requests": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "snapshot_latency": {
+          "$ref": "#/$defs/DriverLatencyMetrics"
+        },
+        "snapshot_renders": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "snapshot_requests": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "sync_attempts": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "sync_errors": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "sync_latency": {
+          "$ref": "#/$defs/DriverLatencyMetrics"
+        },
+        "wait_cancelled": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "wait_latency": {
+          "$ref": "#/$defs/DriverLatencyMetrics"
+        },
+        "wait_requests": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "wait_results": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "wait_timeouts": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "instance_id",
+        "connections",
+        "reconnects",
+        "rejected_connections",
+        "requests",
+        "request_errors",
+        "snapshot_requests",
+        "snapshot_renders",
+        "frozen_frame_hits",
+        "frozen_frame_misses",
+        "snapshot_latency",
+        "wait_requests",
+        "wait_results",
+        "wait_timeouts",
+        "wait_cancelled",
+        "pending_waits",
+        "wait_latency",
+        "sync_attempts",
+        "sync_errors",
+        "sync_latency",
+        "frame_cache_entries"
       ]
     },
     "DriverMouseEvent": {
@@ -2238,6 +2408,22 @@
             "complete",
             "missing_sections",
             "redaction_status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "metrics": {
+              "$ref": "#/$defs/DriverMetrics"
+            },
+            "type": {
+              "type": "string",
+              "const": "metrics"
+            }
+          },
+          "required": [
+            "type",
+            "metrics"
           ]
         },
         {

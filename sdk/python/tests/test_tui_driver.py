@@ -42,6 +42,10 @@ class TuiDriverClientTest(unittest.TestCase):
         )
         self.assertEqual(client.ready["instance_id"], "fake-driver")
         self.assertEqual(client.capabilities(), ["fake"])
+        metrics = client.metrics()
+        self.assertEqual(metrics["instance_id"], "fake-driver")
+        self.assertEqual(metrics["snapshot_latency"]["samples"], 1)
+        self.assertEqual(metrics["pending_waits"], 0)
         with ThreadPoolExecutor(max_workers=2) as executor:
             slow = executor.submit(client.wait, {"kind": "idle"}, 200)
             fast = executor.submit(client.wait, {"kind": "task_terminal"}, 200)

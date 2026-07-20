@@ -1,7 +1,7 @@
 use std::{
     fs::{File, OpenOptions},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use fs2::FileExt;
@@ -205,6 +205,7 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin,
 {
+    driver.record_connection();
     write_response(
         &mut writer,
         response(
@@ -226,8 +227,9 @@ where
     let mut last_sync_error = None;
     let mut pending_waits = Vec::new();
 
-    loop {
-        tokio::select! {
+    let protocol_result: miette::Result<()> = async {
+        loop {
+            tokio::select! {
             incoming = incoming.recv() => {
                 let Some(incoming) = incoming else {
                     break;
@@ -235,7 +237,9 @@ where
                 idle_deadline = idle_timeout.map(|duration| tokio::time::Instant::now() + duration);
                 match incoming {
                     Incoming::Envelope(envelope) => {
+                        driver.record_request();
                         if envelope.request_id.trim().is_empty() || envelope.request_id.len() > 128 {
+                            driver.record_request_error();
                             write_response(
                                 &mut writer,
                                 response(
@@ -253,6 +257,7 @@ where
                             .iter()
                             .any(|pending: &PendingWait| pending.request_id == envelope.request_id)
                         {
+                            driver.record_request_error();
                             write_response(
                                 &mut writer,
                                 response(
@@ -276,6 +281,8 @@ where
                                 let submission = driver.resolved_submission();
                                 match driver.condition_met_for(&until, submission) {
                                     true => {
+                                        let started_at = driver.start_wait_metrics();
+                                        driver.finish_wait_metrics(started_at, false);
                                         write_response(
                                             &mut writer,
                                             response(
@@ -286,6 +293,8 @@ where
                                         .await?;
                                     }
                                     false if timeout_ms == 0 => {
+                                        let started_at = driver.start_wait_metrics();
+                                        driver.finish_wait_metrics(started_at, true);
                                         write_response(
                                             &mut writer,
                                             response(
@@ -296,6 +305,7 @@ where
                                         .await?;
                                     }
                                     false if pending_waits.len() >= MAX_PENDING_WAITS => {
+                                        driver.record_request_error();
                                         write_response(
                                             &mut writer,
                                             response(
@@ -310,18 +320,37 @@ where
                                         )
                                         .await?;
                                     }
-                                    false => pending_waits.push(PendingWait {
-                                        request_id,
-                                        condition: until,
-                                        submission,
-                                        deadline: tokio::time::Instant::now()
-                                            + Duration::from_millis(timeout_ms),
-                                    }),
+                                    false => {
+                                        let started_at = driver.start_wait_metrics();
+                                        pending_waits.push(PendingWait {
+                                            request_id,
+                                            condition: until,
+                                            submission,
+                                            deadline: tokio::time::Instant::now()
+                                                + Duration::from_millis(timeout_ms),
+                                            started_at,
+                                        });
+                                    }
                                 }
+                            }
+                            DriverRequest::Metrics => {
+                                write_response(
+                                    &mut writer,
+                                    response(
+                                        request_id,
+                                        DriverResponse::Metrics {
+                                            metrics: driver.metrics(pending_waits.len()),
+                                        },
+                                    ),
+                                )
+                                .await?;
                             }
                             request => {
                                 let response_value = driver.handle(request).await;
                                 let closed = matches!(response_value, DriverResponse::Closed);
+                                if matches!(response_value, DriverResponse::Error { .. }) {
+                                    driver.record_request_error();
+                                }
                                 write_response(
                                     &mut writer,
                                     response(request_id, response_value),
@@ -337,6 +366,8 @@ where
                         }
                     }
                     Incoming::Invalid(message) => {
+                        driver.record_request();
+                        driver.record_request_error();
                         write_response(
                             &mut writer,
                             response(
@@ -390,6 +421,7 @@ where
                         );
                         if met || timed_out {
                             let pending = pending_waits.remove(index);
+                            driver.finish_wait_metrics(pending.started_at, !met);
                             write_response(
                                 &mut writer,
                                 response(
@@ -437,9 +469,15 @@ where
                 }
             }
         }
+        }
+        Ok(())
+    }
+    .await;
+    for pending in pending_waits.drain(..) {
+        driver.cancel_wait_metrics(pending.started_at);
     }
     reader_task.abort();
-    Ok(())
+    protocol_result
 }
 
 struct PendingWait {
@@ -447,6 +485,7 @@ struct PendingWait {
     condition: WaitCondition,
     submission: Option<super::SubmissionAnchor>,
     deadline: tokio::time::Instant,
+    started_at: Instant,
 }
 
 fn wait_response(
@@ -749,6 +788,7 @@ async fn run_socket_driver(
                     miette::miette!("accept driver socket {}: {error}", socket_path.display())
                 })?;
                 if let Err(error) = authenticate_socket_peer(&stream) {
+                    driver.record_rejected_connection();
                     eprintln!(
                         "golutra-tui driver rejected a socket peer: {}",
                         bounded_error(&error.to_string())

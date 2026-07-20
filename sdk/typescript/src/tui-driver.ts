@@ -10,6 +10,7 @@ import { StringDecoder } from "node:string_decoder";
 
 import type {
   DriverEnvelope,
+  DriverMetrics,
   DriverNotification,
   DriverResponseEnvelope,
   DriverState,
@@ -378,6 +379,14 @@ export class TuiDriverClient {
 
   async ping(): Promise<void> {
     expectResponse(await this.request({ type: "ping" }), "pong");
+  }
+
+  async metrics(): Promise<DriverMetrics> {
+    const response = expectResponse(
+      await this.request({ type: "metrics" }),
+      "metrics",
+    );
+    return response.metrics;
   }
 
   async prompt(text: string, options?: TuiDriverRequestOptions): Promise<void> {
@@ -841,4 +850,4 @@ function asError(cause: unknown): Error {
   return cause instanceof Error ? cause : new Error(String(cause));
 }
 
-export type { RowRange };
+export type { DriverMetrics, RowRange };

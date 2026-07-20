@@ -328,6 +328,10 @@ class DriverEnvelopeSnapshot(TypedDict, total=False):
     type: Required[Literal['snapshot']]
     width: Required[int]
 
+class DriverEnvelopeMetrics(TypedDict, total=False):
+    request_id: Required[str]
+    type: Required[Literal['metrics']]
+
 class DriverEnvelopeTakeover(TypedDict, total=False):
     request_id: Required[str]
     type: Required[Literal['takeover']]
@@ -341,12 +345,41 @@ class DriverEnvelopeClose(TypedDict, total=False):
     abort_active_task: NotRequired[bool]
     type: Required[Literal['close']]
 
-DriverEnvelope: TypeAlias = DriverEnvelopeHello | DriverEnvelopeCapabilities | DriverEnvelopeState | DriverEnvelopePing | DriverEnvelopeInputPrompt | DriverEnvelopeInputSlash | DriverEnvelopeInputKey | DriverEnvelopeInputPaste | DriverEnvelopeInputMouse | DriverEnvelopeResize | DriverEnvelopeWait | DriverEnvelopeSnapshot | DriverEnvelopeTakeover | DriverEnvelopeAbort | DriverEnvelopeClose
+DriverEnvelope: TypeAlias = DriverEnvelopeHello | DriverEnvelopeCapabilities | DriverEnvelopeState | DriverEnvelopePing | DriverEnvelopeInputPrompt | DriverEnvelopeInputSlash | DriverEnvelopeInputKey | DriverEnvelopeInputPaste | DriverEnvelopeInputMouse | DriverEnvelopeResize | DriverEnvelopeWait | DriverEnvelopeSnapshot | DriverEnvelopeMetrics | DriverEnvelopeTakeover | DriverEnvelopeAbort | DriverEnvelopeClose
 
 class DriverKeyChar(TypedDict, total=False):
     char: Required[str]
 
 DriverKey: TypeAlias = Literal['enter', 'escape', 'up', 'down', 'left', 'right', 'page_up', 'page_down', 'home', 'end', 'backspace', 'delete', 'tab', 'ctrl_c'] | DriverKeyChar
+
+class DriverLatencyMetrics(TypedDict, total=False):
+    last_ms: Required[int]
+    max_ms: Required[int]
+    samples: Required[int]
+    total_ms: Required[int]
+
+class DriverMetrics(TypedDict, total=False):
+    connections: Required[int]
+    frame_cache_entries: Required[int]
+    frozen_frame_hits: Required[int]
+    frozen_frame_misses: Required[int]
+    instance_id: Required[str]
+    pending_waits: Required[int]
+    reconnects: Required[int]
+    rejected_connections: Required[int]
+    request_errors: Required[int]
+    requests: Required[int]
+    snapshot_latency: Required[DriverLatencyMetrics]
+    snapshot_renders: Required[int]
+    snapshot_requests: Required[int]
+    sync_attempts: Required[int]
+    sync_errors: Required[int]
+    sync_latency: Required[DriverLatencyMetrics]
+    wait_cancelled: Required[int]
+    wait_latency: Required[DriverLatencyMetrics]
+    wait_requests: Required[int]
+    wait_results: Required[int]
+    wait_timeouts: Required[int]
 
 class DriverMouseEvent(TypedDict, total=False):
     column: Required[int]
@@ -422,6 +455,11 @@ class DriverResponseEnvelopeSnapshot(TypedDict, total=False):
     width: Required[int]
     workspace_id: Required[str]
 
+class DriverResponseEnvelopeMetrics(TypedDict, total=False):
+    request_id: Required[str]
+    metrics: Required[DriverMetrics]
+    type: Required[Literal['metrics']]
+
 class DriverResponseEnvelopeAccepted(TypedDict, total=False):
     request_id: Required[str]
     message: Required[str]
@@ -454,7 +492,7 @@ class DriverResponseEnvelopeError(TypedDict, total=False):
     message: Required[str]
     type: Required[Literal['error']]
 
-DriverResponseEnvelope: TypeAlias = DriverResponseEnvelopeReady | DriverResponseEnvelopeCapabilities | DriverResponseEnvelopeState | DriverResponseEnvelopePong | DriverResponseEnvelopeSnapshot | DriverResponseEnvelopeAccepted | DriverResponseEnvelopeWaitResult | DriverResponseEnvelopeWaitTimeout | DriverResponseEnvelopeEvent | DriverResponseEnvelopeClosed | DriverResponseEnvelopeError
+DriverResponseEnvelope: TypeAlias = DriverResponseEnvelopeReady | DriverResponseEnvelopeCapabilities | DriverResponseEnvelopeState | DriverResponseEnvelopePong | DriverResponseEnvelopeSnapshot | DriverResponseEnvelopeMetrics | DriverResponseEnvelopeAccepted | DriverResponseEnvelopeWaitResult | DriverResponseEnvelopeWaitTimeout | DriverResponseEnvelopeEvent | DriverResponseEnvelopeClosed | DriverResponseEnvelopeError
 
 class DriverState(TypedDict, total=False):
     closed: Required[bool]
@@ -1311,6 +1349,7 @@ __all__ = [
     "DriverEnvelopeInputPaste",
     "DriverEnvelopeInputPrompt",
     "DriverEnvelopeInputSlash",
+    "DriverEnvelopeMetrics",
     "DriverEnvelopePing",
     "DriverEnvelopeResize",
     "DriverEnvelopeSnapshot",
@@ -1319,6 +1358,8 @@ __all__ = [
     "DriverEnvelopeWait",
     "DriverKey",
     "DriverKeyChar",
+    "DriverLatencyMetrics",
+    "DriverMetrics",
     "DriverMouseEvent",
     "DriverMouseKind",
     "DriverNotification",
@@ -1329,6 +1370,7 @@ __all__ = [
     "DriverResponseEnvelopeClosed",
     "DriverResponseEnvelopeError",
     "DriverResponseEnvelopeEvent",
+    "DriverResponseEnvelopeMetrics",
     "DriverResponseEnvelopePong",
     "DriverResponseEnvelopeReady",
     "DriverResponseEnvelopeSnapshot",

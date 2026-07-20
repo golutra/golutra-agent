@@ -94,6 +94,7 @@ Driver 默认连接用户级 `golutra-app-server`。`--embedded` 创建仅供隔
 {"request_id":"prompt-1","type":"input_prompt","text":"你好"}
 {"request_id":"wait-1","type":"wait","until":{"kind":"task_terminal"},"timeout_ms":120000}
 {"request_id":"frame-1","type":"snapshot","scope":"current_turn","panes":"response_and_developer","width":160,"height":40,"rows":{"start":1,"end":40},"detail":"text"}
+{"request_id":"metrics-1","type":"metrics"}
 {"request_id":"close-1","type":"close","abort_active_task":false}
 ```
 
@@ -105,9 +106,23 @@ Driver 默认连接用户级 `golutra-app-server`。`--embedded` 创建仅供隔
 - `input_mouse`：左键、滚轮上移和滚轮下移。
 - `resize`：改变 active viewport，并清空旧冻结帧。
 - `wait`：等待 ready、idle、task/turn terminal、approval/auth、evaluation 或指定 RuntimeEvent。
-- `state`、`capabilities`、`ping`、`takeover`、`abort`、`close`。
+- `state`、`capabilities`、`ping`、`metrics`、`takeover`、`abort`、`close`。
 
 Driver 会推送轻量 `event` 和 heartbeat 通知，但不会主动推送完整 frame。调用方始终通过 `snapshot` 拉取确定的 UI 状态。stdio 模式 stdout 只写 NDJSON；诊断只写 stderr。
+
+### Driver metrics
+
+`metrics` 是进程本地、只读的低基数诊断快照。累计字段在 socket 客户端断开和重连后保留，直到
+Driver 进程退出；`pending_waits` 和 `frame_cache_entries` 是当前连接/缓存的实时 gauge。指标包含：
+
+- 连接、重连、被 UID 校验拒绝的连接，以及收到的请求和请求错误数。
+- snapshot 请求、实际渲染、冻结帧 hit/miss 和 snapshot 延迟的 samples/total/max/last 毫秒聚合。
+- wait 请求、result、timeout、连接断开取消、当前 pending 数和 wait 延迟聚合。
+- runtime sync 尝试、错误和延迟聚合，以及当前冻结帧缓存条目数。
+
+指标合同不会记录 prompt、按键/粘贴内容、frame 文本、workspace 路径、provider/model、原始错误或任何
+credential/token。它适合被 SDK、CI 或 developer/debug 面板轮询；需要完整执行事实时仍应读取
+`snapshot` 或 Runtime trace，而不是把 metrics 当作事件日志。
 
 `wait` 会注册为挂起条件，由协议循环在同步 tick 上判定，而不会独占请求处理器。注册时冻结当前 command ID 和 event cursor，task/turn 可由随后到达的同 command 事件补全，因此后续 prompt 不会把旧 wait 改绑。每个 tick 只遍历事件一次并构建不可变 `WaitFacts` 索引，所有 pending wait 共享 command anchor、task/turn terminal、approval/auth、event watermark 和 evaluation job 集合。等待期间同一连接仍可处理 `ping`、输入、`abort`、`takeover` 和 `close`，heartbeat 也会继续发送；最多 64 个 wait 可按各自唯一的 `request_id` 和 deadline 并存。复用挂起 ID 返回 `duplicate_request_id`，超限返回 `too_many_pending_waits`。
 
@@ -179,6 +194,7 @@ const driver = await TuiDriverClient.spawn({
 });
 await driver.prompt("inspect this workspace");
 await driver.wait({ kind: "evaluation_terminal" }, 120_000);
+const metrics = await driver.metrics();
 const frame = await driver.completeSnapshot({
   width: 160,
   height: 40,
@@ -197,6 +213,7 @@ driver = TuiDriverClient.spawn(
 )
 driver.prompt("inspect this workspace")
 driver.wait({"kind": "evaluation_terminal"}, 120_000)
+metrics = driver.metrics()
 frame = driver.complete_snapshot(
     {"width": 160, "height": 40, "panes": "response_and_developer"}
 )
@@ -223,6 +240,7 @@ just py-check
 - strict session/task/workspace binding，包括 session 切换拒绝和显式 task 只读约束。
 - 挂起 wait 的 submission anchor、数量/ID 上限，以及期间 ping、abort 和 heartbeat/control 继续响应。
 - 冻结帧分页稳定性、overlay 脱敏和 CJK continuation cell。
+- stdio/socket metrics 请求、重连累计、冻结帧 hit/render 计数、延迟聚合、pending gauge 和指标脱敏。
 - app-server 停机时 cached ready/frozen frame、重启后 transport reattach、prompt/event replay 和 Driver instance 保持。
 
 ```bash
