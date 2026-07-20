@@ -46,7 +46,34 @@ Windows PowerShell：
 ./scripts/install.ps1 -Prefix "$HOME/.local"
 ```
 
-安装产物包括 `golutra`、`golutra-tui`、`golutra-app-server` 和 `golutra-vis`。
+安装产物包括 `golutra`、`golutra-tui`、`golutra-app-server`、`golutra-vis`、
+`golutra-supervisor`、`golutra-launcher` 和 `golutra-eval-worker`。
+
+构建可分发归档：
+
+```bash
+python3 scripts/package_release.py --output-dir dist
+python3 scripts/package_release.py --verify dist/golutra-agent-v*-*.tar.gz
+```
+
+Windows 目标生成 `.zip`，Unix 目标生成可复现的 `.tar.gz`。每个归档旁都有
+`.sha256` 和 `.manifest.json`；manifest 逐个记录 binary 的来源、大小、mode 和 SHA-256。
+tag `v*` 会由独立 Release workflow 在 Linux、macOS、Windows 构建并发布这三类文件，
+tag 必须与 `workspace.package.version` 完全一致。本仓库不会打包或安装其他桌面 App。
+
+下载 Unix release 后，在归档所在目录校验并安装：
+
+```bash
+ARCHIVE="golutra-agent-v0.1.0-aarch64-apple-darwin.tar.gz"
+shasum -a 256 -c "$ARCHIVE.sha256"
+tar -xzf "$ARCHIVE"
+install -d -m 755 "$HOME/.local/bin"
+install -m 755 "${ARCHIVE%.tar.gz}/bin/"* "$HOME/.local/bin/"
+```
+
+Linux 可将 `shasum -a 256` 换成 `sha256sum`。Windows 先用 `Get-FileHash -Algorithm SHA256`
+与 `.sha256` 第一列核对，再 `Expand-Archive` 并把解压目录的 `bin/*.exe` 放入 PATH。
+仓库内还可运行 `package_release.py --verify` 做 manifest 级完整校验。
 
 ## 验证
 
@@ -57,6 +84,7 @@ just test
 just schema
 just ts-check
 just py-check
+just release-package-smoke
 ```
 
 架构入口见 [docs/README.md](docs/README.md)，当前实施状态见 [docs/initial-implementation-plan.md](docs/initial-implementation-plan.md)。

@@ -1,5 +1,6 @@
 .DS_Store
 target/
+dist/
 node_modules/
 sdk/typescript/.test-dist/
 __pycache__/

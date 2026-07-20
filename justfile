@@ -49,3 +49,9 @@ py-check:
     python3 sdk/python/scripts/generate.py
     python3 -m compileall -q sdk/python/src sdk/python/tests
     PYTHONPATH=sdk/python/src python3 -m unittest discover -s sdk/python/tests -v
+
+release-package:
+    python3 scripts/package_release.py
+
+release-package-smoke:
+    python3 -m unittest discover -s scripts/tests -v

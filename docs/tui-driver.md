@@ -165,6 +165,47 @@ daemon 暂时不可用时，Driver 保持 UI 实例并报告有界 sync error；
 
 `TuiDriverProtocolBundle` 已包含在 `SdkProtocolBundle`。请求、响应、wait、状态、controller、notification、pane 和 redaction 字段在生成 SDK 中保留为判别联合或枚举；Python 不会退化成 `dict[str, Any]`。以下命令生成 JSON Schema、TypeScript 和 Python 类型：
 
+TypeScript 使用独立 Node.js 入口，避免 HTTP/browser client 隐式引入进程 API：
+
+```ts
+import { TuiDriverClient } from "@golutra/agent-sdk/tui-driver";
+
+const driver = await TuiDriverClient.spawn({
+  workspacePath: "/absolute/workspace",
+  session: "new",
+  embedded: true,
+  debug: true,
+});
+await driver.prompt("inspect this workspace");
+await driver.wait({ kind: "evaluation_terminal" }, 120_000);
+const frame = await driver.completeSnapshot({
+  width: 160,
+  height: 40,
+  panes: "response_and_developer",
+});
+await driver.close();
+```
+
+Python 提供线程安全的同步接口；多个业务线程可同时挂起 `wait`：
+
+```python
+from golutra_sdk import TuiDriverClient
+
+driver = TuiDriverClient.spawn(
+    "/absolute/workspace", session="new", embedded=True, debug=True
+)
+driver.prompt("inspect this workspace")
+driver.wait({"kind": "evaluation_terminal"}, 120_000)
+frame = driver.complete_snapshot(
+    {"width": 160, "height": 40, "panes": "response_and_developer"}
+)
+driver.close()
+```
+
+`connectSocket` / `connect_socket` 只做显式重连。断线时所有 pending request 立即失败；客户端不会猜测请求是否到达 Driver，也不会重放 prompt、key、paste、mouse、takeover、abort 或 close。调用方确认业务状态后才能主动 `reconnect()`。
+
+以下命令生成 JSON Schema、TypeScript 和 Python 类型并运行客户端 fake Driver 测试：
+
 ```bash
 just schema
 just ts-check

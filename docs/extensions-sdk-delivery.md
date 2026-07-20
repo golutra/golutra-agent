@@ -104,7 +104,9 @@ IPC 不是第二套业务协议。它把受限 HTTP-like request 交给同一个
 - `sdk/typescript/src/generated.ts`
 - `sdk/python/src/golutra_sdk/generated.py`
 
-两个 SDK 都要求绝对 cwd 和 transport token，先读取认证后的 `/runtime/info` 验证 protocol v2，再执行 `/runtime/attach`，之后访问 command/query/thread/event API；attachment 失效时只在服务端明确返回 `410 Gone` 后重新 attach。JSON response、SSE frame、timeout 和 cursor 去重都有固定上限。
+两个 HTTP SDK 都要求绝对 cwd 和 transport token，先读取认证后的 `/runtime/info` 验证 runtime protocol range，再执行 `/runtime/attach`，之后访问 command/query/thread/event API；attachment 失效时只在服务端明确返回 `410 Gone` 后重新 attach。JSON response、SSE frame、timeout 和 cursor 去重都有固定上限。
+
+TypeScript 的 `@golutra/agent-sdk/tui-driver` 和 Python 的 `TuiDriverClient` 直接消费 Native TUI Driver。两者都支持启动 stdio 子进程、连接 owner-only Unix socket、并发 `request_id` 路由、notification/diagnostic 分流、请求超时、冻结 frame 聚合和显式 socket reconnect。连接中断会拒绝全部 pending request；prompt/key/paste 等非幂等输入永远不会在重连后自动重放。SDK socket 客户端在连接前还会校验真实 socket、owner UID 和 `0600` 权限。
 
 治理读取使用同一份生成类型：
 
@@ -132,6 +134,13 @@ Unix 使用 `scripts/install.sh`，Windows 使用 `scripts/install.ps1`。脚本
 - `golutra-tui`
 - `golutra-app-server`
 - `golutra-vis`
+- `golutra-supervisor`
+- `golutra-launcher`
+- `golutra-eval-worker`
+
+`python3 scripts/package_release.py` 使用相同 binary 集合生成版本化 `.tar.gz` 或 `.zip`，并同时生成外置 manifest 与 SHA-256 sidecar。manifest 也内嵌在归档中；`--verify ARCHIVE` 会复验 sidecar、归档路径、文件类型、执行位、逐文件 size/hash 和内外 manifest 一致性。归档拒绝 symlink、special file、路径穿越、空 binary 和未声明文件。`SOURCE_DATE_EPOCH` 可固定时间戳；默认使用当前 Git commit 时间，因此相同输入得到相同归档。
+
+`.github/workflows/release.yml` 是本仓库独立交付面：tag 或手动触发后分别在 Linux、macOS、Windows 构建，tag 构建只有在 `v<workspace-version>` 完全匹配时才发布。它只交付 Golutra Agent 的 7 个 Rust 入口，不包含 `/Applications/Golutra.app` 或任何外部桌面应用。
 
 升级不会写项目目录。SQLite 使用幂等 migration 和 legacy column backfill；provider v1 明文 env map 只在 provider settings lock 内迁移到 disk SecretRef。rollout 可从 SQLite 重建，未开始 pending turn 可在 owner 重启后恢复，已开始 turn 不做不安全重放。
 
@@ -149,6 +158,7 @@ just schema
 just fixture
 just ts-check
 just py-check
+just release-package-smoke
 ```
 
 跨进程验收覆盖多 cwd、daemon 重启、HTTP/SSE、Unix IPC、command 幂等、thread fork/rebind 和 durable post-task evaluation；稳定性 smoke 连续执行多轮 turn，验证 event sequence 单调、同一 thread 不分叉并能在 RuntimeHost 重启后恢复。`PostTaskJob` 与排队事件在任务终态前写入 SQLite，worker 通过 lease、retry 和 recovery 接管，Embedded one-shot 退出后可由下一 Host/daemon 继续执行。
