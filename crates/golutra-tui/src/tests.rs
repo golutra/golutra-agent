@@ -464,6 +464,105 @@ fn composer_hides_cursor_when_the_terminal_is_too_narrow_for_input() {
     assert_eq!(composer_cursor_position(Rect::new(0, 0, 2, 3), &app), None);
 }
 
+#[test]
+fn active_task_renders_ephemeral_status_above_composer() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.projection = Some(UserProjection {
+        session_id,
+        task_id: Some(task_id),
+        status: golutra_core::TaskStatus::Running,
+        visible_steps: Vec::new(),
+        pending_approval: None,
+        final_message: None,
+        residual_risks: Vec::new(),
+    });
+    app.apply_runtime_event(
+        serde_json::from_value(transcript_event(
+            1,
+            session_id,
+            task_id,
+            RuntimeEventType::TaskCreated,
+            json!({"payload": {"prompt": "work"}}),
+        ))
+        .expect("task event"),
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 6)).expect("terminal");
+    terminal
+        .draw(|frame| draw_bottom_pane(frame, frame.area(), &app))
+        .expect("draw active status");
+    let buffer = terminal.backend().buffer();
+    let mut rendered = String::new();
+    for row in 0..6 {
+        for column in 0..100 {
+            if let Some(cell) = buffer.cell((column, row)) {
+                rendered.push_str(cell.symbol());
+            }
+        }
+    }
+
+    assert!(rendered.contains("• -- tokens/s"));
+    assert!(!rendered.contains("Working"));
+    assert!(rendered.contains("esc to interrupt"));
+    let status_row = (0..100)
+        .filter_map(|column| terminal.backend().buffer().cell((column, 0)))
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(status_row.contains("• -- tokens/s"));
+    let separator_row = (0..100)
+        .filter_map(|column| terminal.backend().buffer().cell((column, 1)))
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert_eq!(separator_row, "─".repeat(100));
+    assert_eq!(bottom_pane_height(&app), 4);
+}
+
+#[tokio::test]
+async fn escape_interrupts_an_active_task_without_discarding_draft_input() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let session_id = transport.default_session_id();
+    let task_id = TaskId::new();
+    let mut app = TuiApp::new(
+        transport.default_thread_id(),
+        session_id,
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.input.set_text("draft prompt");
+    app.projection = Some(UserProjection {
+        session_id,
+        task_id: Some(task_id),
+        status: golutra_core::TaskStatus::Running,
+        visible_steps: Vec::new(),
+        pending_approval: None,
+        final_message: None,
+        residual_risks: Vec::new(),
+    });
+
+    handle_key(
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("interrupt active task");
+
+    assert_eq!(app.input.text(), "draft prompt");
+    assert!(app.last_control_ack.is_some());
+    assert_ne!(app.status_message, "input cleared");
+}
+
 #[tokio::test]
 async fn tab_without_slash_candidates_does_not_enable_developer_mode() {
     let transport = RuntimeTransport::in_memory().await.expect("transport");

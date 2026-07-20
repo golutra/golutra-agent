@@ -125,6 +125,7 @@ pub(crate) fn bottom_pane_height_for_width(app: &TuiApp, width: u16) -> u16 {
         app.auth_dialog.is_some() || app.resume_picker.is_some() || app.export_flow.is_some(),
     );
     let provider_rows = u16::from(provider_footer_line(app).is_some());
+    let activity_rows = u16::from(live_status_text(app, usize::from(width)).is_some());
     let composer_rows =
         if app.auth_dialog.is_some() || app.resume_picker.is_some() || app.export_flow.is_some() {
             1
@@ -139,7 +140,7 @@ pub(crate) fn bottom_pane_height_for_width(app: &TuiApp, width: u16) -> u16 {
                 .try_into()
                 .unwrap_or(MAX_COMPOSER_ROWS)
         };
-    2 + composer_rows + slash_rows + overlay_rows + provider_rows
+    2 + composer_rows + slash_rows + overlay_rows + provider_rows + activity_rows
 }
 
 pub(crate) fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
@@ -1188,8 +1189,25 @@ pub(crate) fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
             Style::default().fg(Color::DarkGray),
         )));
     }
+    let status = live_status_line(app, usize::from(area.width));
+    let composer_area = if let Some(status) = status {
+        if area.height > 0 {
+            let status_area = Rect::new(area.x, area.y, area.width, 1);
+            frame.render_widget(Paragraph::new(status), status_area);
+            Rect::new(
+                area.x,
+                area.y.saturating_add(1),
+                area.width,
+                area.height.saturating_sub(1),
+            )
+        } else {
+            area
+        }
+    } else {
+        area
+    };
     let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::TOP));
-    frame.render_widget(paragraph, area);
+    frame.render_widget(paragraph, composer_area);
     if let Some((x, y)) = composer_cursor_position(area, app) {
         frame.set_cursor_position((x, y));
     }
@@ -1202,6 +1220,7 @@ pub(crate) fn composer_cursor_position(area: Rect, app: &TuiApp) -> Option<(u16,
 
     let text_x = area.x.saturating_add(COMPOSER_PREFIX_WIDTH);
     let text_width = area.width.saturating_sub(COMPOSER_PREFIX_WIDTH).max(1);
+    let activity_rows = u16::from(live_status_text(app, usize::from(area.width)).is_some());
     let cursor = if app.auth_dialog.is_some() {
         auth_cursor_column(app.auth_dialog.as_ref()?)?
     } else {
@@ -1210,6 +1229,7 @@ pub(crate) fn composer_cursor_position(area: Rect, app: &TuiApp) -> Option<(u16,
             text_x.saturating_add(viewport.cursor.0),
             area.y
                 .saturating_add(1)
+                .saturating_add(activity_rows)
                 .saturating_add(viewport.cursor.1)
                 .min(area.bottom().saturating_sub(1)),
         ));
@@ -1219,6 +1239,26 @@ pub(crate) fn composer_cursor_position(area: Rect, app: &TuiApp) -> Option<(u16,
         text_x.saturating_add(cursor.min(text_width.saturating_sub(1))),
         area.y.saturating_add(1),
     ))
+}
+
+fn live_status_text(app: &TuiApp, width: usize) -> Option<String> {
+    if app.auth_dialog.is_some() || app.resume_picker.is_some() || app.export_flow.is_some() {
+        return None;
+    }
+    app.live_status.display(
+        app.projection.as_ref().map(|projection| projection.status),
+        chrono::Utc::now(),
+        width,
+    )
+}
+
+fn live_status_line(app: &TuiApp, width: usize) -> Option<Line<'static>> {
+    let text = live_status_text(app, width)?;
+    let rest = text.strip_prefix("• ").unwrap_or(&text).to_owned();
+    Some(Line::from(vec![
+        Span::styled("• ", Style::default().fg(Color::Cyan)),
+        Span::styled(rest, Style::default().fg(Color::DarkGray)),
+    ]))
 }
 
 fn auth_cursor_column(dialog: &AuthDialogState) -> Option<u16> {

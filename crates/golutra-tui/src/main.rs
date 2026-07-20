@@ -60,6 +60,7 @@ mod auth_state;
 mod composer_input;
 mod developer;
 mod driver;
+mod live_status;
 mod render;
 mod runtime_controller;
 mod session;
@@ -67,6 +68,7 @@ pub(crate) use auth_flow::*;
 pub(crate) use auth_state::*;
 pub(crate) use composer_input::*;
 pub(crate) use developer::*;
+pub(crate) use live_status::*;
 pub(crate) use render::*;
 pub(crate) use runtime_controller::*;
 pub(crate) use session::*;
@@ -167,6 +169,7 @@ struct TuiApp {
     provider_model: String,
     workspace_path: PathBuf,
     debug_mode: bool,
+    live_status: LiveTaskStatus,
     developer_facts_expanded: bool,
     transcript_scroll: PaneScrollState,
     developer_scroll: PaneScrollState,
@@ -234,6 +237,7 @@ impl TuiApp {
             provider_model,
             workspace_path,
             debug_mode,
+            live_status: LiveTaskStatus::default(),
             developer_facts_expanded: false,
             transcript_scroll: PaneScrollState {
                 follow_tail: true,
@@ -341,6 +345,7 @@ impl TuiApp {
             .map(serde_json::to_value)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| miette::miette!("{error}"))?;
+        self.rebuild_live_status();
         self.history_start_cursor = page.start_cursor;
         self.cursor = page.end_cursor;
         self.history_has_more_before = page.has_more;
@@ -378,6 +383,7 @@ impl TuiApp {
         }
         older.append(&mut self.events);
         self.events = older;
+        self.rebuild_live_status();
         self.history_start_cursor = page.start_cursor;
         self.history_has_more_before = page.has_more;
         let current_rows = transcript_rows(self).len();
@@ -415,9 +421,19 @@ impl TuiApp {
         }
         self.history_start_cursor = self.history_start_cursor.or(Some(event.sequence_no));
         self.cursor = Some(event.sequence_no);
+        self.live_status.apply(&event);
         if let Ok(value) = serde_json::to_value(event) {
             self.events.push(value);
         }
+    }
+
+    fn rebuild_live_status(&mut self) {
+        let events = self
+            .events
+            .iter()
+            .filter_map(|value| serde_json::from_value::<RuntimeEvent>(value.clone()).ok())
+            .collect::<Vec<_>>();
+        self.live_status.rebuild(&events);
     }
 
     async fn send_prompt(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
@@ -785,6 +801,7 @@ impl TuiApp {
                 self.developer_scroll.reset(0);
                 self.developer_load_requested = false;
                 self.events.clear();
+                self.live_status = LiveTaskStatus::default();
                 self.command_messages.clear();
                 self.input.clear();
                 self.export_flow = None;
@@ -1074,6 +1091,7 @@ impl TuiApp {
         self.developer_scroll.reset(0);
         self.developer_load_requested = false;
         self.events.clear();
+        self.live_status = LiveTaskStatus::default();
         self.command_messages.clear();
         self.input.clear();
         self.export_flow = None;
@@ -1102,6 +1120,7 @@ impl TuiApp {
         self.developer_scroll.reset(0);
         self.developer_load_requested = false;
         self.events.clear();
+        self.live_status = LiveTaskStatus::default();
         self.command_messages.clear();
         self.input.clear();
         self.export_flow = None;
@@ -1649,7 +1668,15 @@ async fn handle_key(
 
     match key.code {
         KeyCode::Esc => {
-            if !app.input.is_empty() {
+            if has_active_task(app) {
+                let ack = app.abort(transport).await?;
+                app.last_control_ack = Some(ack.clone());
+                app.status_message = if ack.accepted {
+                    "interrupt requested".to_owned()
+                } else {
+                    compact_ack_reason(&ack.reason)
+                };
+            } else if !app.input.is_empty() {
                 app.input.clear();
                 app.reset_slash_selection();
                 app.status_message = "input cleared".to_owned();
