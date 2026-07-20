@@ -36,6 +36,9 @@ transport-smoke:
 tui-driver-process-smoke:
     cargo test -p golutra-tui --test tui_driver_process -- --test-threads=1
 
+tui-driver-live-smoke:
+    cargo test -p golutra-tui --test tui_driver_process live_provider_driver_smoke_is_isolated_and_opt_in -- --ignored --nocapture --test-threads=1
+
 provider-golden:
     cargo test -p golutra-llm --test provider_golden -- --skip live_provider_smoke_is_opt_in_and_never_reads_normal_user_credentials
 

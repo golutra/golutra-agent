@@ -228,4 +228,20 @@ just py-check
 cargo test -p golutra-tui --test tui_driver_process -- --test-threads=1
 ```
 
+真实 provider smoke 默认 ignored，并且只读取独立测试变量；它不会读取普通 provider env、用户
+`provider.json`、`credentials.json` 或 OS keychain：
+
+```bash
+export GOLUTRA_TUI_DRIVER_LIVE=1
+export GOLUTRA_TUI_DRIVER_LIVE_API_KEY="...dedicated test key..."
+export GOLUTRA_TUI_DRIVER_LIVE_BASE_URL="https://provider.example/v1"
+export GOLUTRA_TUI_DRIVER_LIVE_MODEL="model-id"
+just tui-driver-live-smoke
+```
+
+缺少开关或任一专用变量时测试明确 skip。启用后它在临时 `GOLUTRA_HOME` 和 workspace 中写入只引用
+`GOLUTRA_TUI_DRIVER_LIVE_API_KEY` 的 profile，执行真实 prompt，等待 task 与 evaluation 终态，拉取
+complete `response_and_developer` frame，并检查模型回复、Developer pane、API key/合成 credential 脱敏和
+未生成 disk credential。普通 CI 永远不会注入或读取这些变量。
+
 8 帧 cache capacity 和 60 秒 TTL 使用 Tokio instant 的确定性单元测试覆盖，避免进程验收固定等待一分钟。

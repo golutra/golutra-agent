@@ -10,8 +10,11 @@ use std::{
     time::Duration,
 };
 
+use golutra_auth::{CredentialRef, SecretKind};
 use golutra_client::{RuntimeClient, RuntimeTransport};
+use golutra_config::{ProviderConfigPaths, ProviderProfile, ProviderSettings};
 use golutra_core::{ActorKind, QueryId, RedactionStatus, SessionId, TaskStatus};
+use golutra_llm::ProviderGenerationConfig;
 use golutra_protocol::{RuntimeQuery, RuntimeQueryKind, TuiFrame, UserProjection};
 use serde_json::{Value, json};
 use tempfile::tempdir;
@@ -987,6 +990,168 @@ async fn direct_quit_closes_an_initial_provider_setup_modal() {
     driver.wait_for_exit().await;
     drop(env);
     drop(lock);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires explicit GOLUTRA_TUI_DRIVER_LIVE provider credentials"]
+async fn live_provider_driver_smoke_is_isolated_and_opt_in() {
+    const ENABLE_ENV: &str = "GOLUTRA_TUI_DRIVER_LIVE";
+    const API_KEY_ENV: &str = "GOLUTRA_TUI_DRIVER_LIVE_API_KEY";
+    const BASE_URL_ENV: &str = "GOLUTRA_TUI_DRIVER_LIVE_BASE_URL";
+    const MODEL_ENV: &str = "GOLUTRA_TUI_DRIVER_LIVE_MODEL";
+    const EXPECTED_RESPONSE: &str = "GOLUTRA_DRIVER_LIVE_OK";
+    const SYNTHETIC_SECRET: &str = "sk-golutra-live-redaction-marker-1234567890";
+
+    if std::env::var(ENABLE_ENV).as_deref() != Ok("1") {
+        eprintln!("skipping live TUI Driver smoke: set {ENABLE_ENV}=1 to opt in");
+        return;
+    }
+    let (Ok(api_key), Ok(base_url), Ok(model)) = (
+        std::env::var(API_KEY_ENV),
+        std::env::var(BASE_URL_ENV),
+        std::env::var(MODEL_ENV),
+    ) else {
+        eprintln!(
+            "skipping live TUI Driver smoke: {API_KEY_ENV}, {BASE_URL_ENV}, and {MODEL_ENV} must all be set"
+        );
+        return;
+    };
+    assert!(
+        api_key.trim().len() >= 16,
+        "{API_KEY_ENV} must contain a real dedicated test credential"
+    );
+    assert!(!base_url.trim().is_empty(), "{BASE_URL_ENV} is empty");
+    assert!(!model.trim().is_empty(), "{MODEL_ENV} is empty");
+
+    let home = tempdir().expect("isolated live home");
+    let workspace = tempdir().expect("isolated live workspace");
+    fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).expect("live home mode");
+    let credential =
+        CredentialRef::environment(API_KEY_ENV, SecretKind::ApiKey).expect("live credential ref");
+    let mut profile =
+        ProviderProfile::openai_compatible("tui-driver-live", base_url, model, credential)
+            .expect("live provider profile");
+    profile.generation_config = Some(ProviderGenerationConfig {
+        max_tokens: Some(64),
+        ..ProviderGenerationConfig::default()
+    });
+    let mut settings = ProviderSettings::default();
+    settings.upsert_profile(profile, true);
+    let paths = ProviderConfigPaths::from_home(home.path()).expect("live provider paths");
+    settings
+        .save(&paths.user_config)
+        .expect("write isolated provider profile");
+
+    let mut command = tui_command(home.path(), workspace.path());
+    command
+        .env(API_KEY_ENV, &api_key)
+        .arg("--debug")
+        .arg("driver")
+        .args([
+            "--embedded",
+            "--stdio",
+            "--session",
+            "new",
+            "--width",
+            "160",
+            "--height",
+            "40",
+            "--heartbeat-secs",
+            "0",
+            "--idle-timeout-secs",
+            "0",
+        ]);
+    let mut driver = StdioDriver::spawn_command(command).await;
+    assert_eq!(driver.receive("ready").await["type"], "ready");
+    driver
+        .send(json!({
+            "request_id": "live-prompt",
+            "type": "input_prompt",
+            "text": format!(
+                "Reply with exactly {EXPECTED_RESPONSE}. Do not repeat this synthetic credential: Authorization: Bearer {SYNTHETIC_SECRET}"
+            )
+        }))
+        .await;
+    assert_eq!(driver.receive("live-prompt").await["type"], "accepted");
+    driver
+        .send(json!({
+            "request_id": "live-evaluation",
+            "type": "wait",
+            "until": {"kind": "evaluation_terminal"},
+            "timeout_ms": 180000
+        }))
+        .await;
+    let terminal = driver.receive("live-evaluation").await;
+    assert_eq!(
+        terminal["type"], "wait_result",
+        "live provider did not reach evaluation terminal: {terminal}"
+    );
+    assert!(
+        matches!(
+            terminal["state"]["status"].as_str(),
+            Some("completed" | "partial")
+        ),
+        "unexpected live terminal state: {terminal}"
+    );
+
+    driver
+        .send(json!({
+            "request_id": "live-frame",
+            "type": "snapshot",
+            "scope": "current_turn",
+            "panes": "response_and_developer",
+            "width": 160,
+            "height": 40,
+            "detail": "text"
+        }))
+        .await;
+    let frame = driver.receive("live-frame").await;
+    assert_eq!(frame["type"], "snapshot");
+    assert_eq!(frame["complete"], true, "incomplete live frame: {frame}");
+    let frame_json = serde_json::to_string(&frame).expect("live frame JSON");
+    assert!(
+        frame_json.contains(EXPECTED_RESPONSE),
+        "provider reply missing: {frame}"
+    );
+    assert!(
+        frame_json.contains("Developer runtime"),
+        "developer pane missing: {frame}"
+    );
+    assert!(
+        !frame_json.contains(&api_key),
+        "live API key leaked into frame"
+    );
+    assert!(
+        !frame_json.contains(SYNTHETIC_SECRET),
+        "synthetic credential leaked into frame"
+    );
+    assert!(
+        frame_json.contains("redacted-secret"),
+        "synthetic credential was not visibly redacted"
+    );
+
+    driver
+        .send(json!({
+            "request_id": "live-close",
+            "type": "close",
+            "abort_active_task": false
+        }))
+        .await;
+    assert_eq!(driver.receive("live-close").await["type"], "closed");
+    driver.wait_for_exit().await;
+    let stderr = driver
+        .stderr
+        .lock()
+        .map(|value| value.clone())
+        .unwrap_or_default();
+    assert!(
+        !stderr.contains(&api_key),
+        "live API key leaked into stderr"
+    );
+    assert!(
+        !home.path().join("credentials.json").exists(),
+        "live smoke copied its environment credential to disk"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
