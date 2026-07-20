@@ -29,7 +29,7 @@ jobs:
       - name: TypeScript SDK
         run: |
           npm ci --prefix sdk/typescript
-          npm run --prefix sdk/typescript typecheck
+          npm test --prefix sdk/typescript
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -40,7 +40,29 @@ jobs:
           python3 sdk/python/scripts/generate.py
           python3 -m compileall -q sdk/python/src sdk/python/tests
           PYTHONPATH=sdk/python/src python3 -m unittest discover -s sdk/python/tests -v
-          git diff --exit-code
+          git diff --exit-code -- \
+            schemas/sdk-protocol.schema.json \
+            sdk/typescript/src/generated.ts \
+            sdk/python/src/golutra_sdk/generated.py
+          test -z "$(git status --porcelain --untracked-files=all -- \
+            schemas/sdk-protocol.schema.json \
+            sdk/typescript/src/generated.ts \
+            sdk/python/src/golutra_sdk/generated.py)"
+
+  tui-driver-process:
+    name: TUI Driver process (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+      - name: Cross-process Driver lifecycle
+        run: cargo test -p golutra-tui --test tui_driver_process -- --test-threads=1
 
   portable-check:
     strategy:

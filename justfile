@@ -33,6 +33,9 @@ replay-smoke:
 transport-smoke:
     cargo test -p golutra-client
 
+tui-driver-process-smoke:
+    cargo test -p golutra-tui --test tui_driver_process -- --test-threads=1
+
 provider-golden:
     cargo test -p golutra-llm --test provider_golden -- --skip live_provider_smoke_is_opt_in_and_never_reads_normal_user_credentials
 
@@ -40,7 +43,7 @@ provider-live-smoke:
     cargo test -p golutra-llm --test provider_golden live_provider_smoke_is_opt_in_and_never_reads_normal_user_credentials -- --nocapture
 
 ts-check:
-    npm run --prefix sdk/typescript typecheck
+    npm test --prefix sdk/typescript
 
 py-check:
     python3 sdk/python/scripts/generate.py
