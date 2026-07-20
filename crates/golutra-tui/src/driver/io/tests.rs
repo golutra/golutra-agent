@@ -39,6 +39,14 @@ fn row_ranges_and_views_are_strict() {
     assert!(parse_view("unknown").is_err());
 }
 
+#[cfg(unix)]
+#[test]
+fn socket_peer_uid_must_match_driver_effective_uid() {
+    assert!(validate_peer_uid(501, 501).is_ok());
+    let error = validate_peer_uid(502, 501).expect_err("mismatched peer UID");
+    assert!(error.to_string().contains("peer_uid_mismatch"));
+}
+
 #[tokio::test]
 async fn oversized_ndjson_line_is_drained_before_the_next_request() {
     let mut bytes = vec![b'x'; MAX_DRIVER_LINE_BYTES + 1];

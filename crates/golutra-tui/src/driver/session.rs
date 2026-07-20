@@ -173,6 +173,7 @@ pub(super) fn capabilities() -> Vec<String> {
         "snapshot.text",
         "snapshot.cells",
         "snapshot.frozen-pagination",
+        "transport.socket.peer-uid",
         "controller.takeover",
         "task.abort",
         "heartbeat",

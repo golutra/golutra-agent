@@ -748,6 +748,13 @@ async fn run_socket_driver(
                 let (stream, _) = accepted.map_err(|error| {
                     miette::miette!("accept driver socket {}: {error}", socket_path.display())
                 })?;
+                if let Err(error) = authenticate_socket_peer(&stream) {
+                    eprintln!(
+                        "golutra-tui driver rejected a socket peer: {}",
+                        bounded_error(&error.to_string())
+                    );
+                    continue;
+                }
                 let (reader, writer) = stream.into_split();
                 if let Err(error) = serve_protocol(driver, reader, writer, heartbeat, idle_timeout).await {
                     eprintln!(
@@ -776,6 +783,25 @@ async fn run_socket_driver(
                 }
             }
         }
+    }
+}
+
+#[cfg(unix)]
+fn authenticate_socket_peer(stream: &tokio::net::UnixStream) -> miette::Result<()> {
+    let credentials = stream
+        .peer_cred()
+        .map_err(|error| miette::miette!("peer_credential_failed: {error}"))?;
+    validate_peer_uid(credentials.uid(), nix::unistd::geteuid().as_raw())
+}
+
+#[cfg(unix)]
+fn validate_peer_uid(peer_uid: u32, expected_uid: u32) -> miette::Result<()> {
+    if peer_uid == expected_uid {
+        Ok(())
+    } else {
+        Err(miette::miette!(
+            "peer_uid_mismatch: peer UID {peer_uid} does not match Driver UID {expected_uid}"
+        ))
     }
 }
 

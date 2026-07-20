@@ -157,6 +157,7 @@ Unix socket 模式执行以下边界：
 - socket 与 lock file 权限为 `0600`。
 - exclusive lock lease 防止并发 Driver 抢占同一路径，也防止未持锁进程删除 stale socket。
 - socket 和 lock path 拒绝 symlink 或错误文件类型。
+- 每次 `accept` 后、发送 `ready` 前读取内核 peer credentials；peer UID 必须与 Driver 进程 effective UID 相同。无法读取凭据或 UID 不匹配时只关闭该连接并写有界 stderr 诊断，不会让未认证客户端接触协议，也不会终止长期 Driver。
 - 客户端断开后 TuiDriver、滚动状态、冻结帧和 `instance_id` 保留；下一个客户端收到同一个实例。
 
 daemon 暂时不可用时，Driver 保持 UI 实例并报告有界 sync error；后台 sync 最长占用协议循环 1 秒。socket 客户端仍会得到缓存的 `ready` 和 `state`，并可按 `frame_id` 读取重启前的 frozen frame。app-server 使用同一 home 重启后，transport 会重新 attach workspace；每次 accepted prompt 都从当前 event cursor 重建订阅并 replay，避免仍连接旧 RuntimeHost 的 stale SSE 漏掉新任务事件。socket 客户端重连始终得到原 Driver `instance_id`。

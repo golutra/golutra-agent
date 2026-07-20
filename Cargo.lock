@@ -1692,6 +1692,7 @@ dependencies = [
  "golutra-llm",
  "golutra-protocol",
  "miette",
+ "nix 0.30.1",
  "ratatui",
  "secrecy",
  "serde",
