@@ -107,6 +107,10 @@ async fn external_tools_require_approval_and_redact_output() {
         .expect("approved call runs");
     assert_eq!(approved.envelope.status, ToolResultStatus::Ok);
     assert_eq!(approved.envelope.risk, "external_mcp_tool");
+    assert_eq!(
+        approved.envelope.structured_facts["workspace_changes_known"],
+        false
+    );
     assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         approved.envelope.structured_facts["api_key"],
@@ -185,6 +189,59 @@ fn redaction_covers_json_assignments_headers_and_prefixed_tokens() {
     assert_eq!(redacted.matches("<redacted-secret>").count(), 4);
     assert!(!redacted.contains("plain-secret-value"));
     assert!(!redacted.contains("sk-1234567890abcdef"));
+}
+
+#[test]
+fn tool_started_arguments_preserve_invocation_fields_and_redact_secrets() {
+    let projected = redact_tool_arguments(&json!({
+        "path": "src/runtime.rs",
+        "command": "printf API_KEY=plain-secret-value",
+        "pattern": "RuntimeHost",
+        "query": "runtime host",
+        "symbol": "RuntimeHost::run",
+        "timeout_ms": 5_000,
+        "api_key": "plain-secret-value",
+    }));
+
+    assert_eq!(projected["path"], "src/runtime.rs");
+    assert_eq!(projected["pattern"], "RuntimeHost");
+    assert_eq!(projected["query"], "runtime host");
+    assert_eq!(projected["symbol"], "RuntimeHost::run");
+    assert_eq!(projected["timeout_ms"], 5_000);
+    assert_eq!(projected["api_key"], "<redacted-secret>");
+    let serialized = serde_json::to_string(&projected).expect("serialize projected arguments");
+    assert!(!serialized.contains("plain-secret-value"));
+}
+
+#[test]
+fn tool_started_arguments_summarize_payloads_and_enforce_a_hard_limit() {
+    let projected = redact_tool_arguments(&json!({
+        "path": "src/runtime.rs",
+        "content": "x".repeat(MAX_TOOL_ARGUMENT_DISPLAY_BYTES * 8),
+        "search": "old".repeat(MAX_TOOL_ARGUMENT_DISPLAY_BYTES),
+        "replace": "new".repeat(MAX_TOOL_ARGUMENT_DISPLAY_BYTES),
+        "metadata": (0..256)
+            .map(|index| {
+                (
+                    format!("key-{index}"),
+                    Value::String("value".repeat(512)),
+                )
+            })
+            .collect::<serde_json::Map<String, Value>>(),
+    }));
+
+    assert_eq!(projected["path"], "src/runtime.rs");
+    assert!(
+        projected["content"]
+            .as_str()
+            .is_some_and(|value| value.contains("omitted"))
+    );
+    assert!(
+        serde_json::to_vec(&projected)
+            .expect("serialize projected arguments")
+            .len()
+            <= MAX_TOOL_ARGUMENT_DISPLAY_BYTES
+    );
 }
 
 #[tokio::test]
@@ -554,6 +611,146 @@ async fn shell_timeout_and_cancellation_have_distinct_statuses() {
     )
     .await;
     assert_eq!(cancelled.envelope.status, ToolResultStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn shell_progress_and_terminal_metrics_share_one_tool_call() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(
+        workspace.path().join("progress.sh"),
+        "printf one\nsleep 0.06\nprintf two >&2\nsleep 0.06\nprintf three\n",
+    )
+    .expect("progress script writes");
+    let executor = executor(workspace.path());
+    let request = request("shell", json!({"command": "sh progress.sh"}));
+    let tool_call_id = request.tool_call_id;
+    let policy = executor.evaluate(&request).expect("policy evaluates");
+    let mut progress = Vec::new();
+
+    let report = executor
+        .execute_with_policy_and_before_images_with_progress(
+            request,
+            policy,
+            true,
+            CancellationToken::new(),
+            Vec::new(),
+            Some(&mut |event| progress.push(event)),
+        )
+        .await
+        .expect("shell executes");
+
+    assert_eq!(report.envelope.tool_call_id, tool_call_id);
+    assert_eq!(report.metrics.exit_code, Some(0));
+    assert_eq!(report.metrics.output_bytes, 11);
+    assert_eq!(report.metrics.output_lines, 2);
+    assert!(!report.metrics.output_truncated);
+    assert_eq!(
+        progress.first().map(|event| event.phase),
+        Some(ToolProgressPhase::Started)
+    );
+    assert_eq!(
+        progress.last().map(|event| event.phase),
+        Some(ToolProgressPhase::Completed)
+    );
+    assert!(
+        progress
+            .iter()
+            .all(|event| event.tool_call_id == tool_call_id)
+    );
+    let output_samples = progress
+        .iter()
+        .filter(|event| event.phase == ToolProgressPhase::Output)
+        .collect::<Vec<_>>();
+    assert!(output_samples.len() >= 2);
+    assert!(output_samples.windows(2).all(|samples| {
+        samples[0].output_bytes <= samples[1].output_bytes
+            && samples[0].output_lines <= samples[1].output_lines
+    }));
+    let final_sample = output_samples.last().expect("terminal output sample");
+    assert_eq!(final_sample.output_bytes, report.metrics.output_bytes);
+    assert_eq!(final_sample.output_lines, report.metrics.output_lines);
+}
+
+#[tokio::test]
+async fn shell_reports_workspace_file_side_effects_from_a_bounded_scan() {
+    let workspace = tempdir().expect("workspace");
+    let executor = executor(workspace.path());
+
+    let report = execute_approved(
+        &executor,
+        request("shell", json!({"command": "touch created.txt"})),
+        CancellationToken::new(),
+    )
+    .await;
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+    assert_eq!(
+        report.changed_files,
+        vec![
+            workspace
+                .path()
+                .canonicalize()
+                .expect("canonical workspace")
+                .join("created.txt")
+        ]
+    );
+    assert!(
+        report
+            .before_images
+            .iter()
+            .any(|image| image.path.ends_with("created.txt") && image.content.is_none())
+    );
+    assert_eq!(
+        report.envelope.structured_facts["workspace_changes_known"],
+        true
+    );
+    assert!(report.after_images.iter().any(|image| {
+        image.path.ends_with("created.txt") && image.content.as_deref() == Some(b"".as_slice())
+    }));
+}
+
+#[tokio::test]
+async fn shell_reuses_the_persisted_preparation_as_its_diff_baseline() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("tracked.txt"), "before").expect("tracked fixture");
+    fs::write(
+        workspace.path().join("mutate.sh"),
+        "printf after > tracked.txt\n",
+    )
+    .expect("mutation script");
+    let executor = executor(workspace.path());
+    let request = request("shell", json!({"command": "sh mutate.sh"}));
+    let policy = executor.evaluate(&request).expect("policy evaluates");
+    let preparation = executor
+        .prepare_side_effect_snapshot(&request)
+        .await
+        .expect("preparation snapshot");
+
+    fs::write(workspace.path().join("tracked.txt"), "between").expect("concurrent mutation");
+    let report = executor
+        .execute_with_policy_and_preparation_with_progress(
+            request,
+            policy,
+            true,
+            CancellationToken::new(),
+            preparation,
+            None,
+        )
+        .await
+        .expect("shell executes");
+
+    let before = report
+        .before_images
+        .iter()
+        .find(|image| image.path.ends_with("tracked.txt"))
+        .expect("tracked before-image");
+    let after = report
+        .after_images
+        .iter()
+        .find(|image| image.path.ends_with("tracked.txt"))
+        .expect("tracked after-image");
+    assert_eq!(before.content.as_deref(), Some(b"before".as_slice()));
+    assert_eq!(after.content.as_deref(), Some(b"after".as_slice()));
 }
 
 #[cfg(unix)]

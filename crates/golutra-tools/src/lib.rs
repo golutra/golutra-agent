@@ -2,14 +2,14 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
 use golutra_core::{
     ArtifactId, ArtifactRecord, EvidenceRecord, EvidenceStrength, PolicyDecision, PolicyEvaluation,
-    RedactionStatus, SessionId, SideEffectType, ToolCallId, ToolContract, ToolResultEnvelope,
-    ToolResultStatus, TurnId,
+    RedactionStatus, SessionId, SideEffectType, ToolCallId, ToolContract, ToolExecutionMetrics,
+    ToolProgress, ToolProgressPhase, ToolResultEnvelope, ToolResultStatus, TurnId,
 };
 use golutra_policy::WorkspacePolicy;
 use golutra_sandbox::{SystemSandbox, WorkspaceAccess};
@@ -30,13 +30,21 @@ const MAX_PATTERN_ARGUMENT_CHARS: usize = 64 * 1024;
 const MAX_SHELL_COMMAND_CHARS: usize = 64 * 1024;
 const MAX_TOOL_ERROR_CHARS: usize = 4 * 1024;
 const MAX_AUDIT_RESOURCE_CHARS: usize = 64 * 1024;
+pub const MAX_TOOL_ARGUMENT_DISPLAY_BYTES: usize = 8 * 1024;
+const MAX_TOOL_ARGUMENT_DISPLAY_STRING_BYTES: usize = 1024;
+const MAX_TOOL_ARGUMENT_COMPACT_STRING_BYTES: usize = 96;
+const MAX_TOOL_ARGUMENT_DISPLAY_ITEMS: usize = 24;
+const MAX_TOOL_ARGUMENT_DISPLAY_DEPTH: usize = 4;
 const EXTERNAL_TOOL_TIMEOUT_MS: u64 = if cfg!(test) { 100 } else { 30_000 };
 
 mod process;
+mod workspace_scan;
 
-pub(crate) use process::{CommandLine, run_process};
+pub(crate) use process::{
+    CommandLine, ProcessExecutionRequest, ProcessProgress, ProcessStream, run_process_with_progress,
+};
 #[cfg(test)]
-pub(crate) use process::{MAX_PIPE_OUTPUT_BYTES, join_pipe_reader, spawn_pipe_reader};
+pub(crate) use process::{MAX_PIPE_OUTPUT_BYTES, join_pipe_reader, run_process, spawn_pipe_reader};
 
 #[derive(Debug, Error)]
 pub enum ToolError {
@@ -68,6 +76,8 @@ pub struct ToolExecutionReport {
     pub policy_evaluation: PolicyEvaluation,
     pub artifact_contents: Vec<ArtifactContent>,
     pub before_images: Vec<FileBeforeImage>,
+    pub after_images: Vec<FileBeforeImage>,
+    pub metrics: ToolExecutionMetrics,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +91,13 @@ pub struct FileBeforeImage {
     pub path: PathBuf,
     pub content: Option<Vec<u8>>,
     pub unix_mode: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SideEffectPreparation {
+    pub before_images: Vec<FileBeforeImage>,
+    pub complete: bool,
+    workspace_snapshot: Option<workspace_scan::WorkspaceSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -271,6 +288,16 @@ impl BasicToolExecutor {
         &self,
         request: &ToolRequest,
     ) -> Result<Vec<FileBeforeImage>, ToolError> {
+        Ok(self
+            .prepare_side_effect_snapshot(request)
+            .await?
+            .before_images)
+    }
+
+    pub async fn prepare_side_effect_snapshot(
+        &self,
+        request: &ToolRequest,
+    ) -> Result<SideEffectPreparation, ToolError> {
         let contract = self
             .registry
             .contract(&request.tool_name)
@@ -281,7 +308,11 @@ impl BasicToolExecutor {
             "write_file" => {
                 let path = string_arg(&request.arguments, "path")?;
                 let resolved_path = self.resolve_tool_path("write_file", &path, false)?;
-                Ok(vec![read_optional_file(&resolved_path).await?])
+                Ok(SideEffectPreparation {
+                    before_images: vec![read_optional_file(&resolved_path).await?],
+                    complete: true,
+                    workspace_snapshot: None,
+                })
             }
             "edit_file" => {
                 let path = string_arg(&request.arguments, "path")?;
@@ -292,9 +323,32 @@ impl BasicToolExecutor {
                         "edit target does not exist".to_owned(),
                     ));
                 }
-                Ok(vec![before_image])
+                Ok(SideEffectPreparation {
+                    before_images: vec![before_image],
+                    complete: true,
+                    workspace_snapshot: None,
+                })
             }
-            _ => Ok(Vec::new()),
+            "shell" => {
+                let snapshot = workspace_scan::capture(self.policy.workspace_root()).await;
+                Ok(SideEffectPreparation {
+                    before_images: snapshot.before_images(),
+                    complete: snapshot.is_complete(),
+                    workspace_snapshot: Some(snapshot),
+                })
+            }
+            _ if matches!(
+                contract.side_effect_type,
+                SideEffectType::ExternalSystem | SideEffectType::Network
+            ) =>
+            {
+                Ok(SideEffectPreparation::default())
+            }
+            _ => Ok(SideEffectPreparation {
+                before_images: Vec::new(),
+                complete: true,
+                workspace_snapshot: None,
+            }),
         }
     }
 
@@ -311,17 +365,18 @@ impl BasicToolExecutor {
                 PolicyDecision::Ask => approved,
                 PolicyDecision::Deny | PolicyDecision::Block => false,
             };
-        let before_images = if may_execute {
-            self.prepare_side_effect(&request).await?
+        let preparation = if may_execute {
+            self.prepare_side_effect_snapshot(&request).await?
         } else {
-            Vec::new()
+            SideEffectPreparation::default()
         };
-        self.execute_with_policy_and_before_images(
+        self.execute_with_policy_and_preparation_with_progress(
             request,
             policy,
             approved,
             cancellation,
-            before_images,
+            preparation,
+            None,
         )
         .await
     }
@@ -334,42 +389,155 @@ impl BasicToolExecutor {
         cancellation: CancellationToken,
         before_images: Vec<FileBeforeImage>,
     ) -> Result<ToolExecutionReport, ToolError> {
-        let contract = self
-            .registry
-            .contract(&request.tool_name)
-            .ok_or_else(|| ToolError::UnknownTool(request.tool_name.clone()))?;
-        validate_tool_arguments(contract, &request.arguments)?;
-        if cancellation.is_cancelled() {
-            return Ok(cancelled_report(
-                request,
-                "tool call cancelled before execution",
-            ));
-        }
-        match policy.decision {
-            PolicyDecision::Allow => {}
-            PolicyDecision::Ask if approved => {}
-            PolicyDecision::Ask => {
-                return Ok(denied_report(
+        self.execute_with_policy_and_before_images_with_progress(
+            request,
+            policy,
+            approved,
+            cancellation,
+            before_images,
+            None,
+        )
+        .await
+    }
+
+    pub async fn execute_with_policy_and_before_images_with_progress(
+        &self,
+        request: ToolRequest,
+        policy: PolicyEvaluation,
+        approved: bool,
+        cancellation: CancellationToken,
+        before_images: Vec<FileBeforeImage>,
+        progress: Option<&mut (dyn FnMut(ToolProgress) + Send)>,
+    ) -> Result<ToolExecutionReport, ToolError> {
+        self.execute_with_policy_and_preparation_with_progress(
+            request,
+            policy,
+            approved,
+            cancellation,
+            SideEffectPreparation {
+                before_images,
+                complete: true,
+                workspace_snapshot: None,
+            },
+            progress,
+        )
+        .await
+    }
+
+    pub async fn execute_with_policy_and_preparation_with_progress(
+        &self,
+        request: ToolRequest,
+        policy: PolicyEvaluation,
+        approved: bool,
+        cancellation: CancellationToken,
+        preparation: SideEffectPreparation,
+        mut progress: Option<&mut (dyn FnMut(ToolProgress) + Send)>,
+    ) -> Result<ToolExecutionReport, ToolError> {
+        let started_at = Instant::now();
+        let tool_call_id = request.tool_call_id;
+        let tool_name = request.tool_name.clone();
+        let SideEffectPreparation {
+            before_images,
+            workspace_snapshot,
+            ..
+        } = preparation;
+        emit_tool_progress(
+            &mut progress,
+            ToolProgress {
+                tool_call_id,
+                tool_name: tool_name.clone(),
+                phase: ToolProgressPhase::Started,
+                elapsed_ms: 0,
+                output_bytes: 0,
+                output_lines: 0,
+                detail: None,
+            },
+        );
+        let result = async {
+            let contract = self
+                .registry
+                .contract(&request.tool_name)
+                .ok_or_else(|| ToolError::UnknownTool(request.tool_name.clone()))?;
+            validate_tool_arguments(contract, &request.arguments)?;
+            if cancellation.is_cancelled() {
+                return Ok(cancelled_report(
                     request,
-                    policy,
-                    "tool execution requires approval",
+                    "tool call cancelled before execution",
                 ));
             }
-            PolicyDecision::Deny | PolicyDecision::Block => {
-                return Ok(blocked_report(request, policy));
+            match policy.decision {
+                PolicyDecision::Allow => {}
+                PolicyDecision::Ask if approved => {}
+                PolicyDecision::Ask => {
+                    return Ok(denied_report(
+                        request,
+                        policy,
+                        "tool execution requires approval",
+                    ));
+                }
+                PolicyDecision::Deny | PolicyDecision::Block => {
+                    return Ok(blocked_report(request, policy));
+                }
+            }
+
+            match request.tool_name.as_str() {
+                "read_file" => self.read_file(request, policy).await,
+                "write_file" => self.write_file(request, policy, before_images).await,
+                "edit_file" => self.edit_file(request, policy, before_images).await,
+                "list_dir" => self.list_dir(request, policy).await,
+                "rg_search" => {
+                    self.rg_search(request, policy, cancellation, started_at, &mut progress)
+                        .await
+                }
+                "symbol_search" => self.symbol_search(request, policy, cancellation).await,
+                "find_references" => self.find_references(request, policy, cancellation).await,
+                "shell" => {
+                    self.shell(
+                        request,
+                        policy,
+                        cancellation,
+                        workspace_snapshot,
+                        started_at,
+                        &mut progress,
+                    )
+                    .await
+                }
+                _ => self.execute_external(request, policy, cancellation).await,
             }
         }
-
-        match request.tool_name.as_str() {
-            "read_file" => self.read_file(request, policy).await,
-            "write_file" => self.write_file(request, policy, before_images).await,
-            "edit_file" => self.edit_file(request, policy, before_images).await,
-            "list_dir" => self.list_dir(request, policy).await,
-            "rg_search" => self.rg_search(request, policy, cancellation).await,
-            "symbol_search" => self.symbol_search(request, policy, cancellation).await,
-            "find_references" => self.find_references(request, policy, cancellation).await,
-            "shell" => self.shell(request, policy, cancellation).await,
-            _ => self.execute_external(request, policy, cancellation).await,
+        .await;
+        match result {
+            Ok(mut report) => {
+                report.metrics.duration_ms = elapsed_millis(started_at);
+                emit_tool_progress(
+                    &mut progress,
+                    ToolProgress {
+                        tool_call_id,
+                        tool_name,
+                        phase: ToolProgressPhase::Completed,
+                        elapsed_ms: report.metrics.duration_ms,
+                        output_bytes: report.metrics.output_bytes,
+                        output_lines: report.metrics.output_lines,
+                        detail: Some(format!("{:?}", report.envelope.status).to_ascii_lowercase()),
+                    },
+                );
+                Ok(report)
+            }
+            Err(error) => {
+                emit_tool_progress(
+                    &mut progress,
+                    ToolProgress {
+                        tool_call_id,
+                        tool_name,
+                        phase: ToolProgressPhase::Completed,
+                        elapsed_ms: elapsed_millis(started_at),
+                        output_bytes: 0,
+                        output_lines: 0,
+                        detail: Some("error".to_owned()),
+                    },
+                );
+                Err(error)
+            }
         }
     }
 
@@ -384,6 +552,23 @@ impl BasicToolExecutor {
         error_report(
             request,
             "tool request is invalid",
+            json!({"error": reason}),
+            reason,
+            policy,
+        )
+    }
+
+    #[must_use]
+    pub fn execution_error_report(
+        &self,
+        request: ToolRequest,
+        policy: PolicyEvaluation,
+        error: impl Into<String>,
+    ) -> ToolExecutionReport {
+        let reason = bounded_text(&error.into(), MAX_TOOL_ERROR_CHARS);
+        error_report(
+            request,
+            "tool execution failed",
             json!({"error": reason}),
             reason,
             policy,
@@ -408,13 +593,17 @@ impl BasicToolExecutor {
             .ok_or_else(|| ToolError::Execution("read target does not exist".to_owned()))?;
         let content =
             String::from_utf8(content).map_err(|error| ToolError::Execution(error.to_string()))?;
-        Ok(success_report(
-            request,
-            "file read",
-            json!({"path": resolved_path, "bytes": content.len()}),
-            content,
-            Vec::new(),
-            policy,
+        let lines = output_line_count(&content);
+        Ok(with_item_count(
+            success_report(
+                request,
+                "file read",
+                json!({"path": resolved_path, "bytes": content.len(), "lines": lines}),
+                content,
+                Vec::new(),
+                policy,
+            ),
+            1,
         ))
     }
 
@@ -448,11 +637,20 @@ impl BasicToolExecutor {
             request,
             "file written",
             json!({"path": resolved_path, "bytes": content.len()}),
-            content,
-            vec![resolved_path],
+            content.clone(),
+            vec![resolved_path.clone()],
             policy,
         );
         report.before_images = before_images;
+        report.after_images = vec![FileBeforeImage {
+            path: resolved_path.clone(),
+            content: Some(content.as_bytes().to_vec()),
+            unix_mode: report
+                .before_images
+                .first()
+                .and_then(|image| image.unix_mode),
+        }];
+        report.metrics.item_count = Some(1);
         Ok(report)
     }
 
@@ -516,11 +714,20 @@ impl BasicToolExecutor {
             request,
             "file edited",
             json!({"path": resolved_path, "replacements": 1}),
-            edited,
-            vec![resolved_path],
+            edited.clone(),
+            vec![resolved_path.clone()],
             policy,
         );
         report.before_images = before_images;
+        report.after_images = vec![FileBeforeImage {
+            path: resolved_path.clone(),
+            content: Some(edited.as_bytes().to_vec()),
+            unix_mode: report
+                .before_images
+                .first()
+                .and_then(|image| image.unix_mode),
+        }];
+        report.metrics.item_count = Some(1);
         Ok(report)
     }
 
@@ -533,13 +740,17 @@ impl BasicToolExecutor {
             optional_string_arg(&request.arguments, "path").unwrap_or_else(|| ".".to_owned());
         let resolved_path = self.resolve_tool_path("list_dir", &path, true)?;
         let entries = directory_entries(&resolved_path).await?;
-        Ok(success_report(
-            request,
-            "directory listed",
-            json!({"path": resolved_path, "entries": entries}),
-            entries.join("\n"),
-            Vec::new(),
-            policy,
+        let entry_count = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+        Ok(with_item_count(
+            success_report(
+                request,
+                "directory listed",
+                json!({"path": resolved_path, "entries": entries, "entry_count": entry_count}),
+                entries.join("\n"),
+                Vec::new(),
+                policy,
+            ),
+            entry_count,
         ))
     }
 
@@ -548,25 +759,35 @@ impl BasicToolExecutor {
         request: ToolRequest,
         policy: PolicyEvaluation,
         cancellation: CancellationToken,
+        started_at: Instant,
+        progress: &mut Option<&mut (dyn FnMut(ToolProgress) + Send)>,
     ) -> Result<ToolExecutionReport, ToolError> {
         let pattern = string_arg(&request.arguments, "pattern")?;
         let path =
             optional_string_arg(&request.arguments, "path").unwrap_or_else(|| ".".to_owned());
         let resolved_path = self.resolve_tool_path("rg_search", &path, true)?;
-        let output = run_process(
-            "rg",
-            &[
-                "--line-number".to_owned(),
-                "--no-heading".to_owned(),
-                "--".to_owned(),
-                pattern.clone(),
-                resolved_path.display().to_string(),
-            ],
-            self.policy.workspace_root(),
-            DEFAULT_TIMEOUT_MS,
-            cancellation,
-            &self.sandbox,
-            WorkspaceAccess::ReadOnly,
+        let tool_call_id = request.tool_call_id;
+        let tool_name = request.tool_name.clone();
+        let mut process_progress = |process: ProcessProgress| {
+            emit_process_progress(progress, tool_call_id, &tool_name, started_at, process);
+        };
+        let output = run_process_with_progress(
+            ProcessExecutionRequest {
+                program: "rg",
+                args: &[
+                    "--line-number".to_owned(),
+                    "--no-heading".to_owned(),
+                    "--".to_owned(),
+                    pattern.clone(),
+                    resolved_path.display().to_string(),
+                ],
+                cwd: self.policy.workspace_root(),
+                timeout_ms: DEFAULT_TIMEOUT_MS,
+                cancellation,
+                sandbox: &self.sandbox,
+                workspace_access: WorkspaceAccess::ReadOnly,
+            },
+            Some(&mut process_progress),
         )
         .await?;
         let redacted_pattern = redact_sensitive_text(&pattern).0;
@@ -579,20 +800,31 @@ impl BasicToolExecutor {
         } else {
             ToolResultStatus::Error
         };
-        Ok(report(
-            request,
-            status,
-            "rg search completed",
-            json!({
-                "path": resolved_path,
-                "pattern": redacted_pattern,
-                "exit_code": output.exit_code,
-                "sandbox_backend": output.sandbox_backend,
-                "sandbox_os_enforced": output.sandbox_os_enforced,
-            }),
-            output.raw_output,
-            Vec::new(),
-            policy,
+        let mut metrics = process_metrics(&output);
+        metrics.match_count = Some(output.output_lines);
+        Ok(with_metrics(
+            report(
+                request,
+                status,
+                "rg search completed",
+                json!({
+                    "path": resolved_path,
+                    "pattern": redacted_pattern,
+                    "exit_code": output.exit_code,
+                    "matches": output.output_lines,
+                    "output_bytes": output.output_bytes,
+                    "output_lines": output.output_lines,
+                    "output_truncated": output.output_truncated,
+                    "timed_out": output.timed_out,
+                    "cancelled": output.cancelled,
+                    "sandbox_backend": output.sandbox_backend,
+                    "sandbox_os_enforced": output.sandbox_os_enforced,
+                }),
+                output.raw_output,
+                Vec::new(),
+                policy,
+            ),
+            metrics,
         ))
     }
 
@@ -607,15 +839,19 @@ impl BasicToolExecutor {
         let graph = self.build_code_graph(cancellation).await?;
         let result =
             golutra_code_intelligence::CodeIntelligence::query_symbols(&graph, &query, limit);
+        let match_count = u64::try_from(result.matches.len()).unwrap_or(u64::MAX);
         let output = serde_json::to_string_pretty(&result)
             .map_err(|error| ToolError::Execution(error.to_string()))?;
-        Ok(success_report(
-            request,
-            "symbol search completed",
-            json!({"query": query, "matches": result.matches.len()}),
-            output,
-            Vec::new(),
-            policy,
+        Ok(with_match_count(
+            success_report(
+                request,
+                "symbol search completed",
+                json!({"query": query, "matches": result.matches.len()}),
+                output,
+                Vec::new(),
+                policy,
+            ),
+            match_count,
         ))
     }
 
@@ -633,15 +869,19 @@ impl BasicToolExecutor {
             &symbol_name,
             limit,
         );
+        let reference_count = u64::try_from(result.references.len()).unwrap_or(u64::MAX);
         let output = serde_json::to_string_pretty(&result)
             .map_err(|error| ToolError::Execution(error.to_string()))?;
-        Ok(success_report(
-            request,
-            "reference search completed",
-            json!({"symbol": symbol_name, "references": result.references.len()}),
-            output,
-            Vec::new(),
-            policy,
+        Ok(with_match_count(
+            success_report(
+                request,
+                "reference search completed",
+                json!({"symbol": symbol_name, "references": result.references.len()}),
+                output,
+                Vec::new(),
+                policy,
+            ),
+            reference_count,
         ))
     }
 
@@ -674,6 +914,9 @@ impl BasicToolExecutor {
         request: ToolRequest,
         policy: PolicyEvaluation,
         cancellation: CancellationToken,
+        workspace_before: Option<workspace_scan::WorkspaceSnapshot>,
+        started_at: Instant,
+        progress: &mut Option<&mut (dyn FnMut(ToolProgress) + Send)>,
     ) -> Result<ToolExecutionReport, ToolError> {
         let command = string_arg(&request.arguments, "command")?;
         let timeout_ms = request
@@ -682,16 +925,32 @@ impl BasicToolExecutor {
             .and_then(Value::as_u64)
             .unwrap_or(DEFAULT_TIMEOUT_MS);
         let command_line = CommandLine::parse(&command)?;
-        let shell_output = run_process(
-            &command_line.program,
-            &command_line.args,
-            self.policy.workspace_root(),
-            timeout_ms.min(30_000),
-            cancellation,
-            &self.sandbox,
-            WorkspaceAccess::ReadWrite,
-        )
-        .await?;
+        let workspace_before = match workspace_before {
+            Some(snapshot) => snapshot,
+            None => workspace_scan::capture(self.policy.workspace_root()).await,
+        };
+        let tool_call_id = request.tool_call_id;
+        let tool_name = request.tool_name.clone();
+        let shell_output = {
+            let mut process_progress = |process: ProcessProgress| {
+                emit_process_progress(progress, tool_call_id, &tool_name, started_at, process);
+            };
+            run_process_with_progress(
+                ProcessExecutionRequest {
+                    program: &command_line.program,
+                    args: &command_line.args,
+                    cwd: self.policy.workspace_root(),
+                    timeout_ms: timeout_ms.min(30_000),
+                    cancellation,
+                    sandbox: &self.sandbox,
+                    workspace_access: WorkspaceAccess::ReadWrite,
+                },
+                Some(&mut process_progress),
+            )
+            .await?
+        };
+        let workspace_changes =
+            workspace_scan::compare(self.policy.workspace_root(), workspace_before).await;
         let status = if shell_output.cancelled {
             ToolResultStatus::Cancelled
         } else if shell_output.timed_out {
@@ -702,22 +961,34 @@ impl BasicToolExecutor {
             ToolResultStatus::Error
         };
         let redacted_command = redact_sensitive_text(&command).0;
-        Ok(report(
-            request,
-            status,
-            "shell command completed",
-            json!({
-                "command": redacted_command,
-                "exit_code": shell_output.exit_code,
-                "timed_out": shell_output.timed_out,
-                "cancelled": shell_output.cancelled,
-                "sandbox_backend": shell_output.sandbox_backend,
-                "sandbox_os_enforced": shell_output.sandbox_os_enforced,
-            }),
-            shell_output.raw_output,
-            Vec::new(),
-            policy,
-        ))
+        let metrics = process_metrics(&shell_output);
+        let mut report = with_metrics(
+            report(
+                request,
+                status,
+                "shell command completed",
+                json!({
+                    "command": redacted_command,
+                    "exit_code": shell_output.exit_code,
+                    "timed_out": shell_output.timed_out,
+                    "cancelled": shell_output.cancelled,
+                    "output_bytes": shell_output.output_bytes,
+                    "output_lines": shell_output.output_lines,
+                    "output_truncated": shell_output.output_truncated,
+                    "workspace_changes_known": workspace_changes.complete,
+                    "workspace_change_count": workspace_changes.changed_files.len(),
+                    "sandbox_backend": shell_output.sandbox_backend,
+                    "sandbox_os_enforced": shell_output.sandbox_os_enforced,
+                }),
+                shell_output.raw_output,
+                workspace_changes.changed_files.clone(),
+                policy,
+            ),
+            metrics,
+        );
+        report.before_images = workspace_changes.before_images;
+        report.after_images = workspace_changes.after_images;
+        Ok(report)
     }
 
     async fn execute_external(
@@ -737,7 +1008,7 @@ impl BasicToolExecutor {
                     request,
                     ToolResultStatus::Cancelled,
                     "external tool call cancelled",
-                    json!({"cancelled": true}),
+                    json!({"cancelled": true, "workspace_changes_known": false}),
                     String::new(),
                     policy,
                 ));
@@ -757,7 +1028,7 @@ impl BasicToolExecutor {
                     ToolResultStatus::Ok
                 },
                 &output.summary,
-                output.structured_facts,
+                mark_workspace_changes_unknown(output.structured_facts),
                 output.content,
                 policy,
             )),
@@ -767,7 +1038,7 @@ impl BasicToolExecutor {
                     request,
                     ToolResultStatus::Error,
                     "external tool execution failed",
-                    json!({"error": error}),
+                    json!({"error": error, "workspace_changes_known": false}),
                     error,
                     policy,
                 ))
@@ -776,7 +1047,11 @@ impl BasicToolExecutor {
                 request,
                 ToolResultStatus::Timeout,
                 "external tool call timed out",
-                json!({"timed_out": true, "timeout_ms": EXTERNAL_TOOL_TIMEOUT_MS}),
+                json!({
+                    "timed_out": true,
+                    "timeout_ms": EXTERNAL_TOOL_TIMEOUT_MS,
+                    "workspace_changes_known": false
+                }),
                 String::new(),
                 policy,
             )),
@@ -1132,6 +1407,8 @@ fn report(
         verification_hint: Some("use artifact/evidence refs for verification".to_owned()),
     };
     let artifact_id = artifact.artifact_id;
+    let output_bytes = u64::try_from(redacted_output.len()).unwrap_or(u64::MAX);
+    let output_lines = output_line_count(&redacted_output);
 
     ToolExecutionReport {
         envelope,
@@ -1144,12 +1421,280 @@ fn report(
             bytes: redacted_output.into_bytes(),
         }],
         before_images: Vec::new(),
+        after_images: Vec::new(),
+        metrics: ToolExecutionMetrics {
+            output_bytes,
+            output_lines,
+            ..ToolExecutionMetrics::default()
+        },
     }
+}
+
+fn with_metrics(
+    mut report: ToolExecutionReport,
+    mut metrics: ToolExecutionMetrics,
+) -> ToolExecutionReport {
+    metrics.duration_ms = report.metrics.duration_ms;
+    report.metrics = metrics;
+    report
+}
+
+fn with_item_count(mut report: ToolExecutionReport, item_count: u64) -> ToolExecutionReport {
+    report.metrics.item_count = Some(item_count);
+    report
+}
+
+fn with_match_count(mut report: ToolExecutionReport, match_count: u64) -> ToolExecutionReport {
+    report.metrics.match_count = Some(match_count);
+    report
+}
+
+fn process_metrics(output: &process::ShellOutput) -> ToolExecutionMetrics {
+    ToolExecutionMetrics {
+        output_bytes: output.output_bytes,
+        output_lines: output.output_lines,
+        output_truncated: output.output_truncated,
+        exit_code: output.exit_code,
+        ..ToolExecutionMetrics::default()
+    }
+}
+
+fn emit_tool_progress(
+    progress: &mut Option<&mut (dyn FnMut(ToolProgress) + Send)>,
+    value: ToolProgress,
+) {
+    if let Some(sink) = progress.as_mut() {
+        sink(value);
+    }
+}
+
+fn emit_process_progress(
+    progress: &mut Option<&mut (dyn FnMut(ToolProgress) + Send)>,
+    tool_call_id: ToolCallId,
+    tool_name: &str,
+    started_at: Instant,
+    process: ProcessProgress,
+) {
+    let stream = match process.stream {
+        ProcessStream::Stdout => "stdout",
+        ProcessStream::Stderr => "stderr",
+    };
+    emit_tool_progress(
+        progress,
+        ToolProgress {
+            tool_call_id,
+            tool_name: tool_name.to_owned(),
+            phase: ToolProgressPhase::Output,
+            elapsed_ms: elapsed_millis(started_at),
+            output_bytes: process.output_bytes,
+            output_lines: process.output_lines,
+            detail: Some(if process.truncated {
+                format!(
+                    "{stream} (truncated, {} bytes retained)",
+                    process.retained_bytes
+                )
+            } else {
+                stream.to_owned()
+            }),
+        },
+    );
+}
+
+fn elapsed_millis(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn output_line_count(output: &str) -> u64 {
+    if output.is_empty() {
+        return 0;
+    }
+    let newlines =
+        u64::try_from(output.bytes().filter(|byte| *byte == b'\n').count()).unwrap_or(u64::MAX);
+    newlines.saturating_add(u64::from(!output.ends_with('\n')))
 }
 
 fn redact_sensitive_value(mut value: Value) -> Value {
     redact_sensitive_value_in_place(&mut value, false);
     value
+}
+
+fn mark_workspace_changes_unknown(mut facts: Value) -> Value {
+    if let Some(object) = facts.as_object_mut() {
+        object.insert("workspace_changes_known".to_owned(), Value::Bool(false));
+        facts
+    } else {
+        json!({
+            "result": facts,
+            "workspace_changes_known": false,
+        })
+    }
+}
+
+/// Redacts tool arguments before they are copied into user-visible lifecycle
+/// events. The returned value is detached from the provider request and has a
+/// hard serialized-size limit.
+#[must_use]
+pub fn redact_tool_arguments(arguments: &Value) -> Value {
+    let redacted = redact_sensitive_value(arguments.clone());
+    let projected = project_tool_argument_value(&redacted, None, 0);
+    if serialized_value_len(&projected) <= MAX_TOOL_ARGUMENT_DISPLAY_BYTES {
+        return projected;
+    }
+
+    let compact = compact_tool_argument_projection(&redacted);
+    if serialized_value_len(&compact) <= MAX_TOOL_ARGUMENT_DISPLAY_BYTES {
+        compact
+    } else {
+        json!({"_golutra_truncated": true})
+    }
+}
+
+const PREFERRED_TOOL_ARGUMENT_KEYS: &[&str] = &[
+    "path",
+    "command",
+    "pattern",
+    "query",
+    "symbol",
+    "timeout_ms",
+    "cwd",
+    "glob",
+    "url",
+    "method",
+    "search",
+    "replace",
+    "content",
+];
+
+fn project_tool_argument_value(value: &Value, key: Option<&str>, depth: usize) -> Value {
+    if key.is_some_and(payload_argument_key) {
+        return omitted_argument_summary(value);
+    }
+    if depth >= MAX_TOOL_ARGUMENT_DISPLAY_DEPTH {
+        return omitted_argument_summary(value);
+    }
+    match value {
+        Value::Object(object) => {
+            let mut projected = serde_json::Map::new();
+            for preferred in PREFERRED_TOOL_ARGUMENT_KEYS {
+                if let Some(value) = object.get(*preferred) {
+                    projected.insert(
+                        (*preferred).to_owned(),
+                        project_tool_argument_value(value, Some(preferred), depth + 1),
+                    );
+                }
+            }
+            for (key, value) in object {
+                if projected.len() >= MAX_TOOL_ARGUMENT_DISPLAY_ITEMS {
+                    projected.insert("_golutra_truncated".to_owned(), Value::Bool(true));
+                    break;
+                }
+                if projected.contains_key(key) {
+                    continue;
+                }
+                projected.insert(
+                    key.clone(),
+                    project_tool_argument_value(value, Some(key), depth + 1),
+                );
+            }
+            Value::Object(projected)
+        }
+        Value::Array(values) => {
+            let mut projected = values
+                .iter()
+                .take(MAX_TOOL_ARGUMENT_DISPLAY_ITEMS)
+                .map(|value| project_tool_argument_value(value, None, depth + 1))
+                .collect::<Vec<_>>();
+            if values.len() > MAX_TOOL_ARGUMENT_DISPLAY_ITEMS {
+                projected.push(Value::String(format!(
+                    "<omitted {} additional items>",
+                    values.len() - MAX_TOOL_ARGUMENT_DISPLAY_ITEMS
+                )));
+            }
+            Value::Array(projected)
+        }
+        Value::String(text) => Value::String(bounded_argument_string(
+            text,
+            MAX_TOOL_ARGUMENT_DISPLAY_STRING_BYTES,
+        )),
+        Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
+    }
+}
+
+fn compact_tool_argument_projection(value: &Value) -> Value {
+    let Value::Object(object) = value else {
+        return compact_tool_argument_value(value, None);
+    };
+    let mut projected = serde_json::Map::new();
+    for key in PREFERRED_TOOL_ARGUMENT_KEYS {
+        if let Some(value) = object.get(*key) {
+            projected.insert(
+                (*key).to_owned(),
+                compact_tool_argument_value(value, Some(key)),
+            );
+        }
+    }
+    projected.insert("_golutra_truncated".to_owned(), Value::Bool(true));
+    Value::Object(projected)
+}
+
+fn compact_tool_argument_value(value: &Value, key: Option<&str>) -> Value {
+    if key.is_some_and(payload_argument_key) {
+        return omitted_argument_summary(value);
+    }
+    match value {
+        Value::String(text) => Value::String(bounded_argument_string(
+            text,
+            MAX_TOOL_ARGUMENT_COMPACT_STRING_BYTES,
+        )),
+        Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
+        Value::Array(_) | Value::Object(_) => omitted_argument_summary(value),
+    }
+}
+
+fn omitted_argument_summary(value: &Value) -> Value {
+    let summary = match value {
+        Value::String(text) => format!("<omitted {} bytes>", text.len()),
+        Value::Array(values) => format!("<omitted array with {} items>", values.len()),
+        Value::Object(values) => format!("<omitted object with {} fields>", values.len()),
+        Value::Null | Value::Bool(_) | Value::Number(_) => "<omitted value>".to_owned(),
+    };
+    Value::String(summary)
+}
+
+fn payload_argument_key(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().replace('-', "_").as_str(),
+        "body"
+            | "content"
+            | "data"
+            | "input"
+            | "new_text"
+            | "old_text"
+            | "patch"
+            | "payload"
+            | "replace"
+            | "replacement"
+            | "search"
+    )
+}
+
+fn bounded_argument_string(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut boundary = max_bytes.min(value.len());
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    format!(
+        "{}<truncated {} bytes>",
+        &value[..boundary],
+        value.len().saturating_sub(boundary)
+    )
+}
+
+fn serialized_value_len(value: &Value) -> usize {
+    serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
 }
 
 fn redact_sensitive_value_in_place(value: &mut Value, parent_is_sensitive: bool) {
