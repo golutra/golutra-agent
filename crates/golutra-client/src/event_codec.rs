@@ -301,6 +301,11 @@ pub(crate) fn observation_descriptor(observation: &RuntimeObservation) -> Observ
             RuntimeEventSource::Tool,
             ObservationIntegrityClass::Supporting,
         ),
+        RuntimeObservation::ToolProgress(_) => (
+            RuntimeEventType::ToolProgress,
+            RuntimeEventSource::Tool,
+            ObservationIntegrityClass::Diagnostic,
+        ),
         RuntimeObservation::ToolCompleted(_) => (
             RuntimeEventType::ToolCompleted,
             RuntimeEventSource::Tool,
@@ -489,12 +494,28 @@ pub(crate) fn trace_event_payload(
                 "record": record,
             }),
         )),
-        AgentLoopTraceEvent::ToolStarted { tool_name } => Some((
+        AgentLoopTraceEvent::ToolStarted {
+            tool_call_id,
+            tool_name,
+            display_arguments,
+        } => Some((
             RuntimeEventType::ToolStarted,
             RuntimeEventSource::Tool,
             json!({
                 "summary": format!("tool {tool_name} started"),
+                "tool_call_id": tool_call_id,
                 "tool_name": tool_name,
+                "arguments": display_arguments,
+            }),
+        )),
+        AgentLoopTraceEvent::ToolProgress(progress) => Some((
+            RuntimeEventType::ToolProgress,
+            RuntimeEventSource::Tool,
+            json!({
+                "summary": format!("tool {} {:?}", progress.tool_name, progress.phase),
+                "tool_call_id": progress.tool_call_id,
+                "tool_name": progress.tool_name.clone(),
+                "progress": progress,
             }),
         )),
         AgentLoopTraceEvent::ToolCompleted(_) => None,

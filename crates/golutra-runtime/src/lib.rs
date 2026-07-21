@@ -12,9 +12,9 @@ use golutra_context::{
 };
 use golutra_core::{
     ApprovalDecision, ApprovalId, ApprovalRequest, ApprovalResolution, BudgetState, CommandId,
-    LoopAction, LoopDecision, PolicyDecision, SessionId, TaskId, ToolResultStatus, TurnId,
-    VerificationCheck, VerificationCheckKind, VerificationPlan, VerificationRecord,
-    VerificationResult,
+    LoopAction, LoopDecision, PolicyDecision, SessionId, TaskId, ToolProgress, ToolProgressPhase,
+    ToolResultStatus, TurnId, VerificationCheck, VerificationCheckKind, VerificationPlan,
+    VerificationRecord, VerificationResult,
 };
 use golutra_governor::{
     GoalLedger, GovernorAction, GovernorObservation, GovernorPhase, RuntimeGovernor,
@@ -24,6 +24,7 @@ use golutra_llm::{
 };
 use golutra_tools::{
     BasicToolExecutor, FileBeforeImage, ToolError, ToolExecutionReport, ToolRequest,
+    redact_tool_arguments,
 };
 use golutra_verify::VerificationInput;
 use serde_json::Value;
@@ -214,6 +215,7 @@ pub trait BeforeSideEffectRecorder: std::fmt::Debug + Send + Sync {
         &self,
         request: &ToolRequest,
         before_images: &[FileBeforeImage],
+        complete: bool,
     ) -> Result<(), AgentLoopError>;
 }
 
@@ -709,9 +711,6 @@ where
                     break 'agent_loop;
                 }
                 tool_call_count = tool_call_count.saturating_add(1);
-                trace(AgentLoopTraceEvent::ToolStarted {
-                    tool_name: tool_call.tool_name.clone(),
-                });
                 let provider_tool_call_id = tool_call.tool_call_id.clone();
                 let failure_signature = format!("{}:{}", tool_call.tool_name, tool_call.arguments);
                 let tool_request = ToolRequest {
@@ -721,6 +720,11 @@ where
                     tool_name: tool_call.tool_name,
                     arguments: tool_call.arguments,
                 };
+                trace(AgentLoopTraceEvent::ToolStarted {
+                    tool_call_id: tool_request.tool_call_id,
+                    tool_name: tool_request.tool_name.clone(),
+                    display_arguments: redact_tool_arguments(&tool_request.arguments),
+                });
                 let report = match self.tool_executor.evaluate(&tool_request) {
                     Ok(policy) => {
                         trace(AgentLoopTraceEvent::PolicyEvaluated(policy.clone()));
@@ -749,30 +753,72 @@ where
                             PolicyDecision::Ask => approved,
                             PolicyDecision::Deny | PolicyDecision::Block => false,
                         };
-                        let before_images = if may_execute {
+                        let preparation = if may_execute {
                             self.tool_executor
-                                .prepare_side_effect(&tool_request)
-                                .await?
+                                .prepare_side_effect_snapshot(&tool_request)
+                                .await
                         } else {
-                            Vec::new()
+                            Ok(golutra_tools::SideEffectPreparation::default())
                         };
-                        if !before_images.is_empty()
-                            && let Some(recorder) = &self.before_side_effect_recorder
-                        {
-                            recorder
-                                .persist_before_side_effect(&tool_request, &before_images)
-                                .await?;
+                        match preparation {
+                            Err(error) => {
+                                let report = self.tool_executor.execution_error_report(
+                                    tool_request,
+                                    policy,
+                                    error.to_string(),
+                                );
+                                trace(AgentLoopTraceEvent::ToolProgress(ToolProgress {
+                                    tool_call_id: report.envelope.tool_call_id,
+                                    tool_name: report.envelope.tool_name.clone(),
+                                    phase: ToolProgressPhase::Completed,
+                                    elapsed_ms: report.metrics.duration_ms,
+                                    output_bytes: report.metrics.output_bytes,
+                                    output_lines: report.metrics.output_lines,
+                                    detail: Some("error".to_owned()),
+                                }));
+                                report
+                            }
+                            Ok(preparation) => {
+                                if may_execute
+                                    && (tool_request.tool_name == "shell"
+                                        || !preparation.before_images.is_empty())
+                                    && let Some(recorder) = &self.before_side_effect_recorder
+                                {
+                                    recorder
+                                        .persist_before_side_effect(
+                                            &tool_request,
+                                            &preparation.before_images,
+                                            preparation.complete,
+                                        )
+                                        .await?;
+                                }
+                                control.wait_until_runnable().await?;
+                                let mut progress = |progress| {
+                                    trace(AgentLoopTraceEvent::ToolProgress(progress));
+                                };
+                                let error_request = tool_request.clone();
+                                let error_policy = policy.clone();
+                                match self
+                                    .tool_executor
+                                    .execute_with_policy_and_preparation_with_progress(
+                                        tool_request,
+                                        policy,
+                                        approved,
+                                        control.cancellation.clone(),
+                                        preparation,
+                                        Some(&mut progress),
+                                    )
+                                    .await
+                                {
+                                    Ok(report) => report,
+                                    Err(error) => self.tool_executor.execution_error_report(
+                                        error_request,
+                                        error_policy,
+                                        error.to_string(),
+                                    ),
+                                }
+                            }
                         }
-                        control.wait_until_runnable().await?;
-                        self.tool_executor
-                            .execute_with_policy_and_before_images(
-                                tool_request,
-                                policy,
-                                approved,
-                                control.cancellation.clone(),
-                                before_images,
-                            )
-                            .await?
                     }
                     Err(error) => {
                         let report = self
@@ -781,6 +827,15 @@ where
                         trace(AgentLoopTraceEvent::PolicyEvaluated(
                             report.policy_evaluation.clone(),
                         ));
+                        trace(AgentLoopTraceEvent::ToolProgress(ToolProgress {
+                            tool_call_id: report.envelope.tool_call_id,
+                            tool_name: report.envelope.tool_name.clone(),
+                            phase: ToolProgressPhase::Completed,
+                            elapsed_ms: report.metrics.duration_ms,
+                            output_bytes: report.metrics.output_bytes,
+                            output_lines: report.metrics.output_lines,
+                            detail: Some("error".to_owned()),
+                        }));
                         report
                     }
                 };

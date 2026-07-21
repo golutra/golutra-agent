@@ -11,8 +11,8 @@ use golutra_context::{
 use golutra_core::{
     Actor, ActorKind, ArtifactId, ArtifactRecord, CommandId, EvidenceId, FileChangeKind,
     FileChangeSummary, PostTaskJob, PostTaskJobId, PostTaskJobKind, PostTaskJobStatus, QueryId,
-    RedactionStatus, TaskId, TaskStatus, TraceView, TurnChangeSummary, TurnId, VerificationId,
-    VerificationRecord, VerificationResult, WorkspaceId,
+    RedactionStatus, TaskId, TaskStatus, ToolCallId, TraceView, TurnChangeSummary, TurnId,
+    VerificationId, VerificationRecord, VerificationResult, WorkspaceId,
 };
 use golutra_llm::{ConfiguredProvider, MockProvider, ProviderError, ProviderRole};
 use golutra_protocol::{
@@ -54,7 +54,9 @@ fn memory_support_requires_a_claim_related_objective() {
 #[test]
 fn observation_catalog_classifies_loop_facts_before_persistence() {
     let required = observation_descriptor(&RuntimeObservation::ToolStarted {
+        tool_call_id: ToolCallId::new(),
         tool_name: "read_file".to_owned(),
+        display_arguments: json!({"path": "README.md"}),
     });
     assert_eq!(required.event_type, RuntimeEventType::ToolStarted);
     assert_eq!(required.source, RuntimeEventSource::Tool);
@@ -3288,6 +3290,10 @@ async fn prompt_runs_mock_agent_loop_and_writes_file() {
         .iter()
         .position(|event| event["event_type"] == json!(RuntimeEventType::ToolCompleted))
         .expect("tool completed event");
+    let tool_progress = events
+        .iter()
+        .filter(|event| event["event_type"] == json!(RuntimeEventType::ToolProgress))
+        .collect::<Vec<_>>();
     let tool_payload = &events[tool_completed_index]["payload"];
     let operation_changes: Vec<FileChangeSummary> =
         serde_json::from_value(tool_payload["file_changes"].clone())
@@ -3298,6 +3304,16 @@ async fn prompt_runs_mock_agent_loop_and_writes_file() {
     assert!(tool_started_index < checkpoint_index);
     assert!(policy_index < checkpoint_index);
     assert!(checkpoint_index < tool_completed_index);
+    assert_eq!(
+        events[tool_started_index]["payload"]["tool_call_id"],
+        tool_payload["envelope"]["tool_call_id"]
+    );
+    assert!(!tool_progress.is_empty());
+    assert!(tool_progress.iter().all(|event| {
+        event["payload"]["tool_call_id"] == tool_payload["envelope"]["tool_call_id"]
+    }));
+    assert_eq!(tool_payload["metrics"]["item_count"], 1);
+    assert!(tool_payload["metrics"]["duration_ms"].is_u64());
     assert_eq!(
         operation_changes,
         vec![FileChangeSummary {
@@ -3311,6 +3327,23 @@ async fn prompt_runs_mock_agent_loop_and_writes_file() {
     assert_eq!(turn_changes.added_lines, Some(1));
     assert_eq!(turn_changes.removed_lines, Some(1));
     assert!(turn_changes.stats_complete);
+    assert!(
+        tool_payload["diff_previews"]
+            .as_array()
+            .is_some_and(|previews| !previews.is_empty())
+    );
+    let diff_artifact_ref = tool_payload["diff_artifact_ref"]
+        .as_str()
+        .expect("workspace diff artifact ref");
+    assert!(debug["artifacts"].as_array().is_some_and(|artifacts| {
+        artifacts.iter().any(|artifact| {
+            artifact["artifact_id"] == diff_artifact_ref
+                && artifact["artifact_type"] == "workspace_diff"
+                && artifact["checksum"]
+                    .as_str()
+                    .is_some_and(|checksum| checksum.starts_with("sha256:"))
+        })
+    }));
     assert!(
         events[checkpoint_index]["payload"]["checkpoint"]["artifact_refs"]
             .as_array()

@@ -5,8 +5,8 @@
 //! these facts into canonical `RuntimeEvent` and artifact records.
 
 use golutra_core::{
-    ApprovalRequest, ApprovalResolution, ContextSnapshot, TurnId, VerificationAssertion,
-    VerificationPlan,
+    ApprovalRequest, ApprovalResolution, ContextSnapshot, ToolCallId, ToolProgress, TurnId,
+    VerificationAssertion, VerificationPlan,
 };
 use golutra_governor::RuntimeGovernorDecision;
 use golutra_llm::{ProviderFinishReason, ProviderRequest, ProviderStreamEvent};
@@ -51,8 +51,11 @@ pub enum AgentLoopTraceEvent {
     },
     TokenUsageRecorded(golutra_core::TokenUsageRecord),
     ToolStarted {
+        tool_call_id: ToolCallId,
         tool_name: String,
+        display_arguments: serde_json::Value,
     },
+    ToolProgress(ToolProgress),
     ToolCompleted(ToolExecutionReport),
     PolicyEvaluated(golutra_core::PolicyEvaluation),
     ApprovalRequested(ApprovalRequest),

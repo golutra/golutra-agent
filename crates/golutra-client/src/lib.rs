@@ -296,6 +296,7 @@ impl BeforeSideEffectRecorder for HostedCheckpointRecorder {
         &self,
         request: &ToolRequest,
         before_images: &[FileBeforeImage],
+        complete: bool,
     ) -> Result<(), AgentLoopError> {
         let (flush_sender, flush_receiver) = oneshot::channel();
         self.trace_sender
@@ -306,7 +307,7 @@ impl BeforeSideEffectRecorder for HostedCheckpointRecorder {
             .map_err(|_| AgentLoopError::Checkpoint("trace recorder stopped".to_owned()))?
             .map_err(|error| AgentLoopError::Checkpoint(error.to_string()))?;
         self.host
-            .persist_checkpoint_before_side_effect(&self.task, request, before_images)
+            .persist_checkpoint_before_side_effect(&self.task, request, before_images, complete)
             .await
             .map_err(|error| AgentLoopError::Checkpoint(error.to_string()))
     }

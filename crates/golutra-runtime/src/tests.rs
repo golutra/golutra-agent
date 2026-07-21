@@ -25,13 +25,15 @@ fn runtime_observation_sink_accepts_a_function_adapter() {
     RuntimeObservationSink::emit(
         &mut sink,
         RuntimeObservation::ToolStarted {
+            tool_call_id: ToolCallId::new(),
             tool_name: "read_file".to_owned(),
+            display_arguments: json!({"path": "README.md"}),
         },
     );
 
     assert!(matches!(
         observed.as_slice(),
-        [RuntimeObservation::ToolStarted { tool_name }] if tool_name == "read_file"
+        [RuntimeObservation::ToolStarted { tool_name, .. }] if tool_name == "read_file"
     ));
 }
 
@@ -874,6 +876,48 @@ async fn agent_loop_does_not_stop_success_when_tool_fails() {
         outcome.loop_decision
     );
     assert_eq!(outcome.verification.result, VerificationResult::Fail);
+}
+
+#[tokio::test]
+async fn hard_tool_execution_errors_still_emit_a_terminal_report() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("binary.txt"), [0xff]).expect("binary fixture");
+    let provider = MockProvider::tool_call("read_file", json!({"path": "binary.txt"}));
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor);
+    let mut trace = Vec::new();
+
+    let outcome = agent_loop
+        .run_with_trace(
+            AgentTaskRequest {
+                session_id: SessionId::new(),
+                task_id: TaskId::new(),
+                turn_id: TurnId::new(),
+                objective: "read binary.txt".to_owned(),
+                completion_criteria: vec!["file read evidence".to_owned()],
+                touched_code: false,
+                contributors: Vec::new(),
+                tools: vec!["read_file".to_owned()],
+            },
+            |event| trace.push(event),
+        )
+        .await
+        .expect("execution error becomes a terminal report");
+
+    assert_eq!(outcome.tool_reports.len(), 1);
+    assert_eq!(
+        outcome.tool_reports[0].envelope.status,
+        ToolResultStatus::Error
+    );
+    assert_eq!(
+        outcome.tool_reports[0].envelope.summary,
+        "tool execution failed"
+    );
+    assert!(trace.iter().any(|event| matches!(
+        event,
+        AgentLoopTraceEvent::ToolCompleted(report)
+            if report.envelope.status == ToolResultStatus::Error
+    )));
 }
 
 #[tokio::test]

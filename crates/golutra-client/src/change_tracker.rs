@@ -3,12 +3,19 @@ use std::{
     path::Path,
 };
 
-use golutra_core::{FileChangeKind, FileChangeSummary, TaskId, TurnChangeSummary, TurnId};
-use golutra_tools::{FileBeforeImage, ToolExecutionReport};
+use golutra_core::{
+    FileChangeKind, FileChangeSummary, FileDiffPreview, TaskId, TurnChangeSummary, TurnId,
+};
+use golutra_tools::{FileBeforeImage, ToolExecutionReport, redact_sensitive_text};
 use similar::{ChangeTag, TextDiff};
 
 const MAX_DIFF_FILE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TURN_CONTENT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_DIFF_PREVIEW_LINES: usize = 80;
+const MAX_DIFF_PREVIEW_BYTES: usize = 24 * 1024;
+const MAX_DIFF_PREVIEW_TOTAL_BYTES: usize = 256 * 1024;
+const MAX_DIFF_ARTIFACT_BYTES: usize = 2 * 1024 * 1024;
+const DIFF_ARTIFACT_TRUNCATION_MARKER: &str = "\n[diff artifact truncated]\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FileContent {
@@ -53,7 +60,15 @@ pub(crate) struct WorkspaceChangeTracker {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ToolChangeFacts {
     pub(crate) operation_changes: Vec<FileChangeSummary>,
+    pub(crate) diff_previews: Vec<FileDiffPreview>,
+    pub(crate) diff_artifact: Option<DiffArtifact>,
     pub(crate) turn_summary: TurnChangeSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiffArtifact {
+    pub(crate) content: String,
+    pub(crate) truncated: bool,
 }
 
 impl WorkspaceChangeTracker {
@@ -67,6 +82,8 @@ impl WorkspaceChangeTracker {
             .iter()
             .filter_map(sample_summary)
             .collect::<Vec<_>>();
+        let diff_previews = bounded_diff_previews(&samples);
+        let diff_artifact = build_diff_artifact(&samples);
         let turn = self.turns.entry((task_id, turn_id)).or_default();
         for sample in samples {
             if let Some(tracked) = turn.files.get_mut(&sample.path) {
@@ -96,6 +113,8 @@ impl WorkspaceChangeTracker {
 
         ToolChangeFacts {
             operation_changes,
+            diff_previews,
+            diff_artifact,
             turn_summary: turn_summary(turn),
         }
     }
@@ -131,7 +150,12 @@ pub(crate) async fn capture_change_samples(
             .find(|image| image.path == *path)
             .map(file_content_from_before_image)
             .unwrap_or(FileContent::Unavailable);
-        let after = read_after_content(workspace_root, report, path).await;
+        let after =
+            if let Some(image) = report.after_images.iter().find(|image| image.path == *path) {
+                file_content_from_before_image(image)
+            } else {
+                read_after_content(workspace_root, report, path).await
+            };
         samples.push(ChangeSample {
             path: display_path(workspace_root, path),
             before,
@@ -251,16 +275,8 @@ fn change_summary(path: &str, before: &FileContent, after: &FileContent) -> File
 }
 
 fn line_changes(before: &FileContent, after: &FileContent) -> Option<(u64, u64)> {
-    let before = match before {
-        FileContent::Missing => "",
-        FileContent::Text(bytes) => std::str::from_utf8(bytes).ok()?,
-        FileContent::Unavailable => return None,
-    };
-    let after = match after {
-        FileContent::Missing => "",
-        FileContent::Text(bytes) => std::str::from_utf8(bytes).ok()?,
-        FileContent::Unavailable => return None,
-    };
+    let before = text_content(before)?;
+    let after = text_content(after)?;
     let mut added = 0_u64;
     let mut removed = 0_u64;
     for change in TextDiff::from_lines(before, after).iter_all_changes() {
@@ -273,8 +289,155 @@ fn line_changes(before: &FileContent, after: &FileContent) -> Option<(u64, u64)>
     Some((added, removed))
 }
 
+fn diff_preview(sample: &ChangeSample) -> Option<FileDiffPreview> {
+    if known_unchanged(&sample.before, &sample.after) {
+        return None;
+    }
+    let before = text_content(&sample.before)?;
+    let after = text_content(&sample.after)?;
+    let mut lines = Vec::new();
+    let mut retained_bytes = 0_usize;
+    let mut truncated = false;
+    for change in TextDiff::from_lines(before, after).iter_all_changes() {
+        if change.tag() == ChangeTag::Equal {
+            continue;
+        }
+        let prefix = match change.tag() {
+            ChangeTag::Insert => '+',
+            ChangeTag::Delete => '-',
+            ChangeTag::Equal => ' ',
+        };
+        let value = change.value().trim_end_matches(['\r', '\n']);
+        let (line, _) = redact_sensitive_text(&format!("{prefix}{value}"));
+        let line_bytes = line.len().saturating_add(1);
+        if lines.len() >= MAX_DIFF_PREVIEW_LINES
+            || retained_bytes.saturating_add(line_bytes) > MAX_DIFF_PREVIEW_BYTES
+        {
+            truncated = true;
+            break;
+        }
+        retained_bytes = retained_bytes.saturating_add(line_bytes);
+        lines.push(line);
+    }
+    (!lines.is_empty()).then(|| FileDiffPreview {
+        path: sample.path.clone(),
+        lines,
+        truncated,
+    })
+}
+
+fn bounded_diff_previews(samples: &[ChangeSample]) -> Vec<FileDiffPreview> {
+    let mut previews = Vec::new();
+    let mut retained_bytes = 0_usize;
+    for sample in samples {
+        let Some(mut preview) = diff_preview(sample) else {
+            continue;
+        };
+        let path_overhead = preview.path.len().saturating_add(64);
+        let available = MAX_DIFF_PREVIEW_TOTAL_BYTES.saturating_sub(retained_bytes);
+        if available <= path_overhead {
+            break;
+        }
+        let line_budget = available - path_overhead;
+        let mut lines = Vec::new();
+        let mut line_bytes = 0_usize;
+        let mut globally_truncated = false;
+        for line in preview.lines {
+            let cost = line.len().saturating_add(1);
+            if line_bytes.saturating_add(cost) > line_budget {
+                globally_truncated = true;
+                break;
+            }
+            line_bytes = line_bytes.saturating_add(cost);
+            lines.push(line);
+        }
+        if lines.is_empty() {
+            break;
+        }
+        preview.lines = lines;
+        preview.truncated |= globally_truncated;
+        retained_bytes = retained_bytes
+            .saturating_add(path_overhead)
+            .saturating_add(line_bytes);
+        previews.push(preview);
+        if globally_truncated {
+            break;
+        }
+    }
+    previews
+}
+
+fn build_diff_artifact(samples: &[ChangeSample]) -> Option<DiffArtifact> {
+    let mut content = String::new();
+    let mut truncated = false;
+    for sample in samples {
+        if known_unchanged(&sample.before, &sample.after) {
+            continue;
+        }
+        let Some(before) = text_content(&sample.before) else {
+            continue;
+        };
+        let Some(after) = text_content(&sample.after) else {
+            continue;
+        };
+        let diff = TextDiff::from_lines(before, after);
+        let old_path = format!("a/{}", sample.path);
+        let new_path = format!("b/{}", sample.path);
+        let patch = diff
+            .unified_diff()
+            .context_radius(3)
+            .header(&old_path, &new_path)
+            .to_string();
+        let patch = redact_sensitive_text(&patch).0;
+        if patch.is_empty() {
+            continue;
+        }
+        let content_limit =
+            MAX_DIFF_ARTIFACT_BYTES.saturating_sub(DIFF_ARTIFACT_TRUNCATION_MARKER.len());
+        let remaining = content_limit.saturating_sub(content.len());
+        if patch.len() <= remaining {
+            content.push_str(&patch);
+            continue;
+        }
+        content.push_str(utf8_prefix(&patch, remaining));
+        content.push_str(DIFF_ARTIFACT_TRUNCATION_MARKER);
+        truncated = true;
+        break;
+    }
+    if content.is_empty() {
+        return None;
+    }
+    Some(DiffArtifact { content, truncated })
+}
+
+fn utf8_prefix(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn text_content(content: &FileContent) -> Option<&str> {
+    match content {
+        FileContent::Missing => Some(""),
+        FileContent::Text(bytes) => std::str::from_utf8(bytes).ok(),
+        FileContent::Unavailable => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use golutra_core::{SessionId, ToolCallId};
+    use golutra_policy::WorkspacePolicy;
+    use golutra_tools::{BasicToolExecutor, ToolRequest};
+    use serde_json::json;
+    use tempfile::tempdir;
+    use tokio_util::sync::CancellationToken;
+
     use super::*;
 
     #[test]
@@ -329,6 +492,147 @@ mod tests {
 
         assert!(facts.operation_changes.is_empty());
         assert!(facts.turn_summary.files.is_empty());
+    }
+
+    #[test]
+    fn changed_text_emits_a_bounded_structured_diff_preview() {
+        let task = TaskId::new();
+        let turn = TurnId::new();
+        let mut tracker = WorkspaceChangeTracker::default();
+
+        let facts = tracker.record(
+            task,
+            turn,
+            vec![ChangeSample {
+                path: "src/lib.rs".to_owned(),
+                before: FileContent::Text(b"one\ntwo\n".to_vec()),
+                after: FileContent::Text(b"one\nthree\nfour\n".to_vec()),
+            }],
+        );
+
+        assert_eq!(facts.diff_previews.len(), 1);
+        assert_eq!(facts.diff_previews[0].path, "src/lib.rs");
+        assert_eq!(
+            facts.diff_previews[0].lines,
+            vec!["-two", "+three", "+four"]
+        );
+        assert!(!facts.diff_previews[0].truncated);
+    }
+
+    #[test]
+    fn diff_previews_are_redacted_before_they_enter_runtime_facts() {
+        let task = TaskId::new();
+        let turn = TurnId::new();
+        let mut tracker = WorkspaceChangeTracker::default();
+
+        let facts = tracker.record(
+            task,
+            turn,
+            vec![ChangeSample {
+                path: "config.txt".to_owned(),
+                before: FileContent::Text(b"old\n".to_vec()),
+                after: FileContent::Text(b"api_key=super-secret-value\n".to_vec()),
+            }],
+        );
+
+        let rendered = facts.diff_previews[0].lines.join("\n");
+        assert!(rendered.contains("<redacted-secret>"));
+        assert!(!rendered.contains("super-secret-value"));
+    }
+
+    #[test]
+    fn diff_previews_have_an_aggregate_budget_across_files() {
+        let task = TaskId::new();
+        let turn = TurnId::new();
+        let mut tracker = WorkspaceChangeTracker::default();
+        let samples = (0..512)
+            .map(|index| ChangeSample {
+                path: format!("src/file-{index}.txt"),
+                before: FileContent::Text(b"old\n".to_vec()),
+                after: FileContent::Text(
+                    (0..80)
+                        .map(|line| format!("new-{line}\n"))
+                        .collect::<String>()
+                        .into_bytes(),
+                ),
+            })
+            .collect::<Vec<_>>();
+
+        let facts = tracker.record(task, turn, samples);
+        let total_bytes = facts
+            .diff_previews
+            .iter()
+            .map(|preview| {
+                preview.path.len()
+                    + preview
+                        .lines
+                        .iter()
+                        .map(|line| line.len().saturating_add(1))
+                        .sum::<usize>()
+                    + 64
+            })
+            .sum::<usize>();
+
+        assert!(total_bytes <= MAX_DIFF_PREVIEW_TOTAL_BYTES);
+        assert!(
+            facts
+                .diff_previews
+                .last()
+                .is_some_and(|preview| preview.truncated)
+        );
+    }
+
+    #[test]
+    fn diff_artifact_reserves_space_for_its_truncation_marker() {
+        let sample = ChangeSample {
+            path: "large.txt".to_owned(),
+            before: FileContent::Text(Vec::new()),
+            after: FileContent::Text(vec![b'x'; MAX_DIFF_ARTIFACT_BYTES + 1024]),
+        };
+
+        let artifact = build_diff_artifact(&[sample]).expect("diff artifact");
+
+        assert!(artifact.truncated);
+        assert!(artifact.content.len() <= MAX_DIFF_ARTIFACT_BYTES);
+        assert!(artifact.content.ends_with(DIFF_ARTIFACT_TRUNCATION_MARKER));
+    }
+
+    #[tokio::test]
+    async fn operation_after_images_prevent_later_tools_from_rewriting_the_diff() {
+        let workspace = tempdir().expect("workspace");
+        let path = workspace.path().join("result.txt");
+        std::fs::write(&path, "before\n").expect("before");
+        let executor = BasicToolExecutor::new(
+            WorkspacePolicy::new(workspace.path()).expect("workspace policy"),
+        );
+        let request = ToolRequest {
+            tool_call_id: ToolCallId::new(),
+            session_id: SessionId::new(),
+            turn_id: Some(TurnId::new()),
+            tool_name: "write_file".to_owned(),
+            arguments: json!({"path": "result.txt", "content": "operation\n"}),
+        };
+        let policy = executor.evaluate(&request).expect("policy");
+        let before_images = executor
+            .prepare_side_effect(&request)
+            .await
+            .expect("before image");
+        let report = executor
+            .execute_with_policy_and_before_images(
+                request,
+                policy,
+                true,
+                CancellationToken::new(),
+                before_images,
+            )
+            .await
+            .expect("write report");
+        std::fs::write(&path, "later tool\n").expect("later write");
+
+        let samples = capture_change_samples(Some(workspace.path()), &report).await;
+
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].after, FileContent::Text(b"operation\n".to_vec()));
     }
 
     #[test]

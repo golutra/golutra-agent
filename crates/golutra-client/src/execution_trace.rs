@@ -108,6 +108,7 @@ impl RuntimeHost {
         task: &HostedAgentTask,
         request: &ToolRequest,
         before_images: &[FileBeforeImage],
+        complete: bool,
     ) -> Result<(), ClientError> {
         let workspace_root = self.execution_workspace_root()?;
         let checkpoint_root = self
@@ -174,6 +175,7 @@ impl RuntimeHost {
             RuntimeEventSource::Runtime,
             json!({
                 "summary": "workspace before-image persisted before tool side effect",
+                "before_image_complete": complete,
                 "checkpoint": checkpoint,
             }),
         );
@@ -200,6 +202,31 @@ impl RuntimeHost {
             event_turn_id,
             change_samples,
         );
+        let diff_artifact = change_facts.diff_artifact.as_ref().map(|diff| {
+            let (content, redaction_status) = golutra_tools::redact_sensitive_text(&diff.content);
+            let bytes = content.into_bytes();
+            let artifact_id = ArtifactId::new();
+            let checksum = Sha256::digest(&bytes);
+            let artifact = ArtifactRecord {
+                artifact_id,
+                session_id: task.session_id,
+                turn_id: Some(event_turn_id),
+                tool_call_id: Some(report.envelope.tool_call_id),
+                artifact_type: "workspace_diff".to_owned(),
+                uri: format!(
+                    "artifact://tool/{}/diff/{artifact_id}",
+                    report.envelope.tool_call_id
+                ),
+                checksum: format!("sha256:{checksum:x}"),
+                size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                created_at: chrono::Utc::now(),
+                producer: "workspace-change-tracker".to_owned(),
+                redaction_status,
+                retention_policy: "debug_default".to_owned(),
+                provenance_refs: Vec::new(),
+            };
+            (artifact, bytes)
+        });
         let mut event = agent_event(
             self.next_sequence_no(),
             task,
@@ -208,13 +235,25 @@ impl RuntimeHost {
             json!({
                 "summary": report.envelope.summary,
                 "envelope": report.envelope,
+                "metrics": report.metrics,
                 "changed_files": report.changed_files,
                 "file_changes": change_facts.operation_changes,
+                "diff_previews": change_facts.diff_previews,
+                "diff_artifact_truncated": change_facts
+                    .diff_artifact
+                    .as_ref()
+                    .is_some_and(|diff| diff.truncated),
                 "turn_change_summary": change_facts.turn_summary,
             }),
         );
         event.turn_id = Some(event_turn_id);
         let tool_event_id = event.id;
+        if let Some((mut artifact, bytes)) = diff_artifact {
+            artifact.provenance_refs.push(tool_event_id);
+            event.payload_ref = Some(artifact.artifact_id);
+            event.payload["diff_artifact_ref"] = Value::String(artifact.artifact_id.to_string());
+            self.repositories.artifacts.store(&artifact, &bytes).await?;
+        }
         for artifact in &report.artifacts {
             let content = report
                 .artifact_contents
