@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use golutra_core::{TaskId, TaskStatus, TurnId};
 use golutra_protocol::{RuntimeEvent, RuntimeEventType, WaitCondition};
 
-use super::session::{event_type_name, is_terminal_status, typed_events};
+use super::session::{event_type_name, is_terminal_status, runtime_events};
 use super::{SubmissionAnchor, TuiApp};
 
 #[derive(Debug, Clone, Copy)]
@@ -85,7 +85,7 @@ pub(super) struct WaitFacts {
 
 impl WaitFacts {
     pub(super) fn from_app(app: &TuiApp) -> Self {
-        let events = typed_events(app);
+        let events = runtime_events(app);
         let current_task_id = app
             .task_id
             .or_else(|| {
@@ -116,7 +116,7 @@ impl WaitFacts {
             event_high_watermarks: HashMap::new(),
             evaluation_jobs: HashMap::new(),
         };
-        for event in &events {
+        for event in events {
             facts.record(event);
         }
         facts

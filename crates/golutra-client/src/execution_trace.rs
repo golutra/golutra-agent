@@ -188,6 +188,18 @@ impl RuntimeHost {
         task: &HostedAgentTask,
         report: &golutra_tools::ToolExecutionReport,
     ) -> Result<(), ClientError> {
+        let event_turn_id = report
+            .artifacts
+            .iter()
+            .find_map(|artifact| artifact.turn_id)
+            .unwrap_or(task.turn_id);
+        let change_samples =
+            change_tracker::capture_change_samples(self.workspace_root.as_deref(), report).await;
+        let change_facts = self.workspace_change_tracker.lock().await.record(
+            task.task_id,
+            event_turn_id,
+            change_samples,
+        );
         let mut event = agent_event(
             self.next_sequence_no(),
             task,
@@ -197,15 +209,11 @@ impl RuntimeHost {
                 "summary": report.envelope.summary,
                 "envelope": report.envelope,
                 "changed_files": report.changed_files,
+                "file_changes": change_facts.operation_changes,
+                "turn_change_summary": change_facts.turn_summary,
             }),
         );
-        if let Some(turn_id) = report
-            .artifacts
-            .iter()
-            .find_map(|artifact| artifact.turn_id)
-        {
-            event.turn_id = Some(turn_id);
-        }
+        event.turn_id = Some(event_turn_id);
         let tool_event_id = event.id;
         for artifact in &report.artifacts {
             let content = report
@@ -245,6 +253,10 @@ impl RuntimeHost {
         task: &HostedAgentTask,
         status: TaskStatus,
     ) -> Result<(), ClientError> {
+        self.workspace_change_tracker
+            .lock()
+            .await
+            .remove_task(task.task_id);
         let mut lane_manager = self.lane_manager.lock().await;
         let transition = lane_manager.finish_task(task.session_id, status, self.next_sequence_no());
         drop(lane_manager);

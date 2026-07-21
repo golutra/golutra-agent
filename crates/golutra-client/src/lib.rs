@@ -91,6 +91,7 @@ pub(crate) fn runtime_identity() -> String {
 }
 
 mod application;
+mod change_tracker;
 mod command;
 mod context;
 mod debug_export;
@@ -220,6 +221,7 @@ pub struct RuntimeHost {
     command_mutex: Mutex<()>,
     task_controls: Mutex<HashMap<SessionId, HostedTaskControl>>,
     provider_auth_waiters: Mutex<HashMap<SessionId, PendingProviderAuth>>,
+    workspace_change_tracker: Mutex<change_tracker::WorkspaceChangeTracker>,
     deep_evaluation_inputs: Mutex<HashMap<PostTaskJobId, TaskEvaluationInput>>,
     force_mock_provider: bool,
     _evolution_temp_root: Option<Arc<tempfile::TempDir>>,
@@ -438,6 +440,7 @@ impl RuntimeHost {
             command_mutex: Mutex::new(()),
             task_controls: Mutex::new(HashMap::new()),
             provider_auth_waiters: Mutex::new(HashMap::new()),
+            workspace_change_tracker: Mutex::new(change_tracker::WorkspaceChangeTracker::default()),
             deep_evaluation_inputs: Mutex::new(HashMap::new()),
             force_mock_provider,
             _evolution_temp_root: evolution_temp_root,

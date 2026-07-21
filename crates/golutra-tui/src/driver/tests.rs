@@ -49,19 +49,17 @@ fn submission_anchor_excludes_previous_and_foreign_terminal_events() {
         terminal_event(10, task_id, turn_id),
         terminal_event(11, TaskId::new(), turn_id),
     ] {
-        app.events.push(serde_json::to_value(event).expect("event"));
+        app.events.push(event);
     }
     let facts = WaitFacts::from_app(&app);
     assert!(!facts.condition_met(&WaitCondition::TaskTerminal, Some(anchor)));
 
-    app.events
-        .push(serde_json::to_value(terminal_event(12, task_id, TurnId::new())).expect("event"));
+    app.events.push(terminal_event(12, task_id, TurnId::new()));
     let facts = WaitFacts::from_app(&app);
     assert!(facts.condition_met(&WaitCondition::TaskTerminal, Some(anchor)));
     assert!(!facts.condition_met(&WaitCondition::TurnTerminal, Some(anchor)));
 
-    app.events
-        .push(serde_json::to_value(terminal_event(13, task_id, turn_id)).expect("event"));
+    app.events.push(terminal_event(13, task_id, turn_id));
     assert!(WaitFacts::from_app(&app).condition_met(&WaitCondition::TurnTerminal, Some(anchor)));
 }
 
@@ -87,10 +85,7 @@ fn submission_anchor_resolves_only_its_own_command() {
     };
 
     let mut app = test_app(None, None);
-    app.events = vec![
-        serde_json::to_value(first).expect("first event"),
-        serde_json::to_value(second).expect("second event"),
-    ];
+    app.events = vec![first, second];
     let resolved = WaitFacts::from_app(&app).resolve_anchor(anchor);
     assert_eq!(resolved.task_id, Some(first_task));
     assert_eq!(resolved.turn_id, Some(first_turn));
@@ -213,20 +208,18 @@ fn terminal_evaluation_is_derived_from_runtime_events() {
         let mut event = terminal_event(sequence_no, task_id, turn_id);
         event.event_type = RuntimeEventType::PostTaskJobQueued;
         event.payload = json!({"job": {"job_id": job_id}});
-        app.events.push(serde_json::to_value(event).expect("event"));
+        app.events.push(event);
     }
     let mut completed = terminal_event(3, task_id, turn_id);
     completed.event_type = RuntimeEventType::PostTaskJobCompleted;
     completed.payload = json!({"job_id": first_job});
-    app.events
-        .push(serde_json::to_value(completed).expect("event"));
+    app.events.push(completed);
     assert!(!WaitFacts::from_app(&app).evaluation_terminal(task_id));
 
     let mut failed = terminal_event(4, task_id, turn_id);
     failed.event_type = RuntimeEventType::PostTaskJobFailed;
     failed.payload = json!({"job_id": second_job});
-    app.events
-        .push(serde_json::to_value(failed).expect("event"));
+    app.events.push(failed);
     let facts = WaitFacts::from_app(&app);
     assert!(facts.evaluation_terminal(task_id));
     assert!(!facts.evaluation_terminal(TaskId::new()));

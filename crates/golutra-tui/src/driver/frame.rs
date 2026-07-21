@@ -13,18 +13,18 @@ use sha2::{Digest, Sha256};
 
 use super::super::{TuiApp, UiLayoutSnapshot, developer_facts_toggle_rect, display_width};
 
-pub(super) fn scoped_event_values(events: &[Value], scope: SnapshotScope) -> Vec<Value> {
-    let typed = events
+pub(super) fn scoped_runtime_events(
+    events: &[RuntimeEvent],
+    scope: SnapshotScope,
+) -> Vec<RuntimeEvent> {
+    let (task_id, turn_id) = latest_task_and_turn(events);
+    events
         .iter()
-        .filter_map(|value| serde_json::from_value::<RuntimeEvent>(value.clone()).ok())
-        .collect::<Vec<_>>();
-    let (task_id, turn_id) = latest_task_and_turn(&typed);
-    typed
-        .into_iter()
         .filter(|event| event_in_scope(event, scope, task_id, turn_id))
-        .filter_map(|mut event| {
+        .cloned()
+        .map(|mut event| {
             redact_runtime_value(&mut event.payload);
-            serde_json::to_value(event).ok()
+            event
         })
         .collect()
 }
@@ -359,17 +359,12 @@ fn truncated_history_section(app: &TuiApp, scope: SnapshotScope) -> Option<&'sta
         return None;
     }
 
-    let events = app
-        .events
-        .iter()
-        .filter_map(|value| serde_json::from_value::<RuntimeEvent>(value.clone()).ok())
-        .collect::<Vec<_>>();
-    let (latest_task_id, latest_turn_id) = latest_task_and_turn(&events);
+    let (latest_task_id, latest_turn_id) = latest_task_and_turn(&app.events);
     match scope {
         SnapshotScope::Task => {
             let task_id = app.task_id.or(latest_task_id);
             let has_boundary = task_id.is_some_and(|task_id| {
-                events.iter().any(|event| {
+                app.events.iter().any(|event| {
                     event.task_id == Some(task_id)
                         && event.event_type == RuntimeEventType::TaskCreated
                 })
@@ -378,7 +373,7 @@ fn truncated_history_section(app: &TuiApp, scope: SnapshotScope) -> Option<&'sta
         }
         SnapshotScope::CurrentTurn => {
             let has_boundary = latest_turn_id.is_some_and(|turn_id| {
-                events.iter().any(|event| {
+                app.events.iter().any(|event| {
                     event.turn_id == Some(turn_id)
                         && matches!(
                             event.event_type,

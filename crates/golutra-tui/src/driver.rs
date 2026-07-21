@@ -13,8 +13,8 @@ use golutra_core::{ActorKind, CommandId, QueryId, RedactionStatus, TaskId, TaskS
 use golutra_protocol::{
     CommandAck, DriverControllerMode, DriverKey, DriverMetrics, DriverNotification,
     DriverNotificationKind, DriverRequest, DriverResponse, DriverResponseEnvelope, DriverState,
-    DriverTaskStatus, ReadyResponse, RowRange, RuntimeEvent, RuntimeQuery, RuntimeQueryKind,
-    SnapshotDetail, SnapshotPanes, SnapshotRequest, SnapshotScope, StateProjection,
+    DriverTaskStatus, ReadyResponse, RowRange, RuntimeQuery, RuntimeQueryKind, SnapshotDetail,
+    SnapshotPanes, SnapshotRequest, SnapshotScope, StateProjection,
     TUI_DRIVER_MIN_PROTOCOL_VERSION, TUI_DRIVER_PROTOCOL_VERSION, TuiFrame, WaitCondition,
     response,
 };
@@ -747,20 +747,18 @@ impl TuiDriver {
         let saved_developer_scroll = self.app.developer_scroll;
         let saved_layout = self.app.layout;
         let saved_input = self.app.input.clone();
-        let saved_live_status = self.app.live_status.clone();
+        let saved_activity_projection = self.app.activity_projection.clone();
+        let saved_change_projection = self.app.change_projection.clone();
 
-        let scoped_events = scoped_event_values(&saved_events, request.scope);
-        let scoped_runtime_events = scoped_events
-            .iter()
-            .filter_map(|value| serde_json::from_value::<RuntimeEvent>(value.clone()).ok())
-            .collect::<Vec<_>>();
+        let scoped_events = scoped_runtime_events(&saved_events, request.scope);
         let scoped_developer = saved_developer
             .as_ref()
             .cloned()
             .map(|projection| scoped_debug_projection(projection, request.scope))
             .transpose()?;
+        self.app.activity_projection.rebuild(&scoped_events);
+        self.app.change_projection.rebuild(&scoped_events);
         self.app.events = scoped_events;
-        self.app.live_status.rebuild(&scoped_runtime_events);
         self.app.developer_projection = scoped_developer;
         if matches!(
             request.scope,
@@ -819,7 +817,8 @@ impl TuiDriver {
         self.app.debug_mode = saved_debug;
         self.app.layout = saved_layout;
         self.app.input = saved_input;
-        self.app.live_status = saved_live_status;
+        self.app.activity_projection = saved_activity_projection;
+        self.app.change_projection = saved_change_projection;
 
         let (
             lines,

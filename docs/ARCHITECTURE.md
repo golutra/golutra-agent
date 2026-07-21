@@ -285,9 +285,9 @@ artifact、durable job、thread 五类事实访问边界。`EmbeddedTransport`�
 
 | Crate | 内部模块 | 约束 |
 | --- | --- | --- |
-| `golutra-client` | `application`、`command`、`query`、`session`、`execution`、`execution_trace`、`task_governance`、`post_task`、`governance`、`governance_commands`、`regression`、`trace`、`transport`、`transport::ipc` | `RuntimeApplication` 是前端用例 facade；`RuntimeHost` 只拥有 lane/worker/EventBus/sequence 与生命周期；command、查询、执行、trace、后台治理和回归各自编排但共享同一事实与 owner |
+| `golutra-client` | `application`、`command`、`query`、`session`、`execution`、`execution_trace`、`change_tracker`、`task_governance`、`post_task`、`governance`、`governance_commands`、`regression`、`trace`、`transport`、`transport::ipc` | `RuntimeApplication` 是前端用例 facade；`RuntimeHost` 只拥有 lane/worker/EventBus/sequence 与生命周期；文件副作用由 `change_tracker` 从工具 before-image 生成 operation 与 turn net change facts；command、查询、执行、trace、后台治理和回归共享同一事实与 owner |
 | `golutra-runtime` | `lane`、`checkpoint`、`completion`、`context_guard`、`provider_retry`、`trace`、`verification` | lane 状态机、checkpoint、终态策略、context guard、retry、trace adapter 和 verification service 独立于 loop orchestration；loop 不直接实现 session controller 转换或快照 IO |
-| `golutra-tui` | `auth_state`、`auth_flow`、`session`、`render`、`runtime_controller`、`driver::{frame,io,session,wait}` | 主文件只组装应用状态和事件循环；交互 TUI 与离屏 Driver 共用 controller/render，协议 IO、frame 投影、session 绑定和 wait 事件索引分层；渲染不写 provider 配置，认证 flow 不编排 runtime task |
+| `golutra-tui` | `live_status`、`change_projection`、`developer_projection`、`developer_query`、`activity_view`、`transcript_view`、`developer_view`、`activity_widget`、`transcript_widget`、`developer_widget`、`auth_state`、`auth_flow`、`session`、`render`、`runtime_controller`、`driver::{frame,io,session,wait}` | Runtime facts、replayable projection、terminal-neutral view model、Ratatui widget 和 controller 五层分离；developer transport 查询与纯 projection reducer 分离；交互 TUI 与离屏 Driver 共用同一投影和 widget；渲染不查询 SQLite、不写 provider 配置，认证 flow 不编排 runtime task |
 | `golutra-config` | `provider_auth`、`provider_storage` | provider catalog 与凭据/配置事务分离；磁盘写入、锁、迁移、probe 和 rollback 统一由 storage 层负责 |
 | `golutra-llm` | `provider_config`、`openai_responses`、`genai_adapter` | 环境解析与 URL/错误处理不进入 adapter 执行循环；各协议 adapter 只处理自己的 wire contract |
 | `golutra-store` | `projection`、`repositories` | event reducer 保持纯函数；`RuntimeRepositories` 对 event/projection/artifact/job/thread 提供逻辑 seam；SQLite 只负责事实读写和持久化派生索引 |
@@ -424,6 +424,25 @@ golutra-tui
 - TUI 复杂组件必须建立在 `RuntimeHost + EventBus + cwd thread resolver` 之上，不能复制 runtime 状态机。
 - fork 必须复制完整 history 或明确的 turn boundary、重新生成 runtime IDs 并保留 immutable artifact lineage；普通 resume/fork 不能跨 canonical cwd。
 - cwd 迁移只能通过显式 rebind，要求 inactive/unowned thread 和精确旧路径；checkpoint、memory、evaluation 不能被无条件解释为新 cwd 事实。
+
+运行中信息的 TUI 链路固定为五层，新增一种显示不能跳层读取 runtime 内部状态：
+
+```text
+1. Runtime facts
+   RuntimeEvent + typed payload（包括 FileChangeSummary / TurnChangeSummary）
+2. Typed projections
+   ActivityProjection / ChangeProjection / DeveloperFactsProjection
+3. View models
+   activity text / TranscriptItem / DeveloperPanelRow
+4. Ratatui widgets
+   activity_widget / transcript_widget / developer_widget
+5. Controller and interaction
+   TuiApp / runtime_controller / render / Driver input and scrolling
+```
+
+`TuiApp` 内的历史窗口保持 `Vec<RuntimeEvent>`，不降级成 `serde_json::Value` 再容错反序列化。projection 必须可以只靠有序 event replay 重建；view model 不执行 transport 查询；widget 不解析 runtime payload；controller 只负责查询、订阅、分页、滚动和 modal 交互。这样普通交互 TUI 与 TestBackend/Driver 不会形成两套展示语义。
+
+文件修改采用同一事实的两种投影：每个 `ToolCompleted.payload.file_changes` 表示该次工具操作，`turn_change_summary` 表示从本轮第一份 before-image 到当前文件状态的净变化。路径相对 canonical workspace；文本文件提供 `+/-` 行数，二进制、越界或超过预算时为 `None`，前端不得伪装成零。普通 transcript 只显示 `Edited N files (+A -D)`、`Ran`、`Explored`；developer facts 展示本轮文件总数、净行数和统计完整性。输出速率同样来自 provider stream/usage event：字符估算值带 `~`，provider usage 的精确 token 数不带估算标记。
 
 当前这些边界已经落地：TUI 默认创建新的本地 thread/session，首个 prompt 才持久化；`/resume` 按当前 canonical cwd 过滤全局历史；`/fork --from-turn`、rollout export、`/export` 和 thread rebind 通过同一 transport/API；普通 transcript 只渲染用户可见事件，也不查询开发者投影。只有显式 `--debug` 或 `/debug` 才启用 developer mode；主体区按左右 1:1 展示 transcript 与 Developer runtime，按事件分页刷新 `DebugProjection`。治理 facts 默认收起在标题的 `▸ facts` 后，可用鼠标左键展开或收回；对话和事件列表的鼠标滚轮按 pane 命中区域独立滚动，`/new`/`/resume` 保留 debug 偏好。`/export` 固定每个 session 的 event high-watermark，后台异步写 owner-only 临时目录；导出期间 session 变化会显式降级为 incomplete。
 

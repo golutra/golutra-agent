@@ -1,7 +1,7 @@
 use golutra_auth::{CredentialSource, OpenAiDeviceAuthorizationDescriptor};
 use golutra_config::ProviderSettings;
 use golutra_llm::ProviderReasoningEffort;
-use golutra_protocol::VisibleStep;
+use golutra_protocol::{RuntimeEventType, VisibleStep};
 use ratatui::backend::TestBackend;
 use ratatui::layout::{Position, Rect};
 use tokio::{
@@ -485,16 +485,13 @@ fn active_task_renders_ephemeral_status_above_composer() {
         final_message: None,
         residual_risks: Vec::new(),
     });
-    app.apply_runtime_event(
-        serde_json::from_value(transcript_event(
-            1,
-            session_id,
-            task_id,
-            RuntimeEventType::TaskCreated,
-            json!({"payload": {"prompt": "work"}}),
-        ))
-        .expect("task event"),
-    );
+    app.apply_runtime_event(transcript_event(
+        1,
+        session_id,
+        task_id,
+        RuntimeEventType::TaskCreated,
+        json!({"payload": {"prompt": "work"}}),
+    ));
 
     let mut terminal = Terminal::new(TestBackend::new(100, 6)).expect("terminal");
     terminal
@@ -1507,11 +1504,7 @@ fn developer_panel_exposes_governance_without_leaking_into_normal_view() {
     let debug_projection = golutra_protocol::DebugProjection {
         session_id,
         task_id: Some(task_id),
-        events: events
-            .clone()
-            .into_iter()
-            .map(|value| serde_json::from_value(value).expect("runtime event"))
-            .collect(),
+        events: events.clone(),
         event_window: golutra_protocol::DebugEventWindow {
             start_cursor: Some(1),
             end_cursor: Some(2),
@@ -1802,14 +1795,116 @@ fn approval_transcript_shows_tool_resource_and_reason() {
     assert!(items[0].body[1].contains("explicit user approval"));
 }
 
+#[test]
+fn file_changes_are_compact_in_normal_mode_and_detailed_in_developer_mode() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let event = transcript_event(
+        1,
+        session_id,
+        task_id,
+        RuntimeEventType::ToolCompleted,
+        json!({
+            "summary": "file edited",
+            "file_changes": [{
+                "path": "src/lib.rs",
+                "kind": "modified",
+                "added_lines": 2,
+                "removed_lines": 1
+            }],
+            "turn_change_summary": {
+                "files": [{
+                    "path": "src/lib.rs",
+                    "kind": "modified",
+                    "added_lines": 2,
+                    "removed_lines": 1
+                }],
+                "added_lines": 2,
+                "removed_lines": 1,
+                "stats_complete": true
+            }
+        }),
+    );
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.events = vec![event.clone()];
+    app.rebuild_event_projections();
+    app.projection = Some(UserProjection {
+        session_id,
+        task_id: Some(task_id),
+        status: golutra_core::TaskStatus::Completed,
+        visible_steps: Vec::new(),
+        pending_approval: None,
+        final_message: None,
+        residual_risks: Vec::new(),
+    });
+
+    let mut normal_terminal = Terminal::new(TestBackend::new(160, 24)).expect("terminal");
+    normal_terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw normal changes");
+    let normal_text = normal_terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(normal_text.contains("Edited 1 file (+2 -1)"));
+    assert!(normal_text.contains("src/lib.rs  +2 -1"));
+    assert!(!normal_text.contains("changes files="));
+
+    app.debug_mode = true;
+    app.developer_facts_expanded = true;
+    app.developer_projection = Some(golutra_protocol::DebugProjection {
+        session_id,
+        task_id: Some(task_id),
+        events: vec![event],
+        event_window: golutra_protocol::DebugEventWindow {
+            start_cursor: Some(1),
+            end_cursor: Some(1),
+            has_more_before: false,
+            limit: 256,
+        },
+        busy_policy_decisions: Vec::new(),
+        tool_results: Vec::new(),
+        artifacts: Vec::new(),
+        evidence: Vec::new(),
+        verification: None,
+        loop_decisions: Vec::new(),
+        post_task_jobs: Vec::new(),
+        trace_complete: true,
+        missing_sections: Vec::new(),
+        retention_losses: Vec::new(),
+    });
+    let mut developer_terminal = Terminal::new(TestBackend::new(160, 24)).expect("terminal");
+    developer_terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw developer changes");
+    let developer_text = developer_terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(developer_text.contains("changes files=1 +2 -1 complete=true"));
+}
+
 fn transcript_event(
     sequence_no: u64,
     session_id: SessionId,
     task_id: TaskId,
     event_type: RuntimeEventType,
-    payload: Value,
-) -> Value {
-    serde_json::to_value(RuntimeEvent {
+    payload: serde_json::Value,
+) -> RuntimeEvent {
+    RuntimeEvent {
         id: golutra_core::EventId::new(),
         sequence_no,
         session_id,
@@ -1822,8 +1917,7 @@ fn transcript_event(
         payload,
         payload_ref: None,
         durable: true,
-    })
-    .expect("event serializes")
+    }
 }
 
 #[test]
@@ -2026,7 +2120,7 @@ fn transcript_coalesces_provider_deltas_and_replaces_them_with_final_message() {
         RuntimeEventType::ProviderStreamed,
         json!({"delta": {"kind": "text_delta", "text": "Hello "}}),
     );
-    first_delta["turn_id"] = json!(turn_id);
+    first_delta.turn_id = Some(turn_id);
     let mut second_delta = transcript_event(
         2,
         session_id,
@@ -2034,7 +2128,7 @@ fn transcript_coalesces_provider_deltas_and_replaces_them_with_final_message() {
         RuntimeEventType::ProviderStreamed,
         json!({"delta": {"kind": "text_delta", "text": "world"}}),
     );
-    second_delta["turn_id"] = json!(turn_id);
+    second_delta.turn_id = Some(turn_id);
     let mut app = TuiApp::new(
         ThreadId::new(),
         session_id,
@@ -2056,7 +2150,7 @@ fn transcript_coalesces_provider_deltas_and_replaces_them_with_final_message() {
         RuntimeEventType::AssistantMessage,
         json!({"content": "Hello world."}),
     );
-    completed["turn_id"] = json!(turn_id);
+    completed.turn_id = Some(turn_id);
     app.events.push(completed);
     let final_items = event_transcript_items(&app.events);
 
@@ -2246,7 +2340,13 @@ async fn resume_thread_clears_previous_visible_transcript_state() {
         title: "Old".to_owned(),
         body: vec!["old session only".to_owned()],
     });
-    app.events.push(json!({"old": true}));
+    app.events.push(transcript_event(
+        1,
+        app.session_id,
+        TaskId::new(),
+        RuntimeEventType::TaskCreated,
+        json!({}),
+    ));
     app.input.set_text("/resume");
     app.slash_selected = 2;
     app.transcript_scroll.offset_from_bottom = 12;
@@ -2391,7 +2491,13 @@ fn start_new_session_resets_visible_tui_state() {
         title: "Old".to_owned(),
         body: vec!["old session only".to_owned()],
     });
-    app.events.push(json!({"old": true}));
+    app.events.push(transcript_event(
+        1,
+        app.session_id,
+        TaskId::new(),
+        RuntimeEventType::TaskCreated,
+        json!({}),
+    ));
     app.input.set_text("/new");
     app.slash_selected = 2;
     app.cursor = Some(9);

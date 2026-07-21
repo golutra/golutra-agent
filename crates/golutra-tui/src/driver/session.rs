@@ -115,7 +115,7 @@ pub(super) async fn validate_task_id(
 }
 
 pub(super) fn current_task_and_turn(app: &TuiApp) -> (Option<TaskId>, Option<TurnId>) {
-    let events = typed_events(app);
+    let events = runtime_events(app);
     let task_id = app
         .task_id
         .or_else(|| {
@@ -136,11 +136,8 @@ pub(super) fn current_task_and_turn(app: &TuiApp) -> (Option<TaskId>, Option<Tur
     (task_id, turn_id)
 }
 
-pub(super) fn typed_events(app: &TuiApp) -> Vec<RuntimeEvent> {
-    app.events
-        .iter()
-        .filter_map(|value| serde_json::from_value(value.clone()).ok())
-        .collect()
+pub(super) fn runtime_events(app: &TuiApp) -> &[RuntimeEvent] {
+    &app.events
 }
 
 pub(super) fn event_type_name(event_type: golutra_protocol::RuntimeEventType) -> String {

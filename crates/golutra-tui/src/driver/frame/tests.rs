@@ -40,16 +40,15 @@ fn current_turn_events_are_scoped_and_redacted() {
     let old_turn = TurnId::new();
     let current_turn = TurnId::new();
     let values = vec![
-        serde_json::to_value(event(
+        event(
             1,
             session_id,
             task_id,
             old_turn,
             RuntimeEventType::AssistantMessage,
             json!({"summary": "old"}),
-        ))
-        .expect("old event"),
-        serde_json::to_value(event(
+        ),
+        event(
             2,
             session_id,
             task_id,
@@ -59,11 +58,10 @@ fn current_turn_events_are_scoped_and_redacted() {
                 "api_key": "must-not-leak",
                 "summary": "Authorization: Bearer sk-secret-value"
             }),
-        ))
-        .expect("current event"),
+        ),
     ];
 
-    let scoped = scoped_event_values(&values, SnapshotScope::CurrentTurn);
+    let scoped = scoped_runtime_events(&values, SnapshotScope::CurrentTurn);
     assert_eq!(scoped.len(), 1);
     let encoded = serde_json::to_string(&scoped).expect("scoped JSON");
     assert!(!encoded.contains("must-not-leak"));
@@ -248,17 +246,14 @@ fn scoped_completeness_requires_a_loaded_task_or_turn_boundary() {
         None,
     );
     app.history_has_more_before = true;
-    app.events.push(
-        serde_json::to_value(event(
-            300,
-            session_id,
-            task_id,
-            turn_id,
-            RuntimeEventType::AssistantMessage,
-            json!({"summary": "tail only"}),
-        ))
-        .expect("event"),
-    );
+    app.events.push(event(
+        300,
+        session_id,
+        task_id,
+        turn_id,
+        RuntimeEventType::AssistantMessage,
+        json!({"summary": "tail only"}),
+    ));
 
     let (_, task_missing) =
         snapshot_completeness(&app, SnapshotScope::Task, SnapshotPanes::Transcript);
@@ -276,8 +271,7 @@ fn scoped_completeness_requires_a_loaded_task_or_turn_boundary() {
         json!({}),
     );
     boundary.sequence_no = 299;
-    app.events
-        .insert(0, serde_json::to_value(boundary).expect("boundary"));
+    app.events.insert(0, boundary);
     assert_eq!(truncated_history_section(&app, SnapshotScope::Task), None);
     assert_eq!(
         truncated_history_section(&app, SnapshotScope::CurrentTurn),

@@ -10,8 +10,6 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use golutra_core::{TaskId, TaskStatus, TurnId};
 use golutra_protocol::{RuntimeEvent, RuntimeEventType};
-use unicode_width::UnicodeWidthStr;
-
 const ESTIMATED_CHARS_PER_TOKEN: u64 = 4;
 const MIN_RATE_SAMPLE_MILLIS: i64 = 250;
 
@@ -57,7 +55,7 @@ impl ProviderActivity {
         })
     }
 
-    fn rate(&self, now: DateTime<Utc>) -> Option<f64> {
+    fn rate(&self, now: DateTime<Utc>) -> Option<OutputRate> {
         let first = self.first_output_at?;
         let last = self.last_output_at?;
         let end = if self.completed { last } else { now };
@@ -65,13 +63,29 @@ impl ProviderActivity {
         if elapsed_ms < MIN_RATE_SAMPLE_MILLIS || self.output_tokens() == 0 {
             return None;
         }
-        Some(self.output_tokens() as f64 / (elapsed_ms as f64 / 1_000.0))
+        Some(OutputRate {
+            tokens_per_second: self.output_tokens() as f64 / (elapsed_ms as f64 / 1_000.0),
+            estimated: self.exact_output_tokens.is_none(),
+        })
     }
 }
 
-/// The state needed to render one ephemeral activity row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct OutputRate {
+    pub(crate) tokens_per_second: f64,
+    pub(crate) estimated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ActivitySnapshot {
+    pub(crate) elapsed: Duration,
+    pub(crate) output_rate: Option<OutputRate>,
+    pub(crate) can_interrupt: bool,
+}
+
+/// A replayable reducer for the current turn's ephemeral activity.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct LiveTaskStatus {
+pub(crate) struct ActivityProjection {
     task_id: Option<TaskId>,
     turn_id: Option<TurnId>,
     active_elapsed: Duration,
@@ -80,7 +94,7 @@ pub(crate) struct LiveTaskStatus {
     provider_calls: Vec<ProviderActivity>,
 }
 
-impl LiveTaskStatus {
+impl ActivityProjection {
     pub(crate) fn rebuild(&mut self, events: &[RuntimeEvent]) {
         *self = Self::default();
         let mut sorted = events.to_vec();
@@ -243,7 +257,7 @@ impl LiveTaskStatus {
     // A turn may contain several provider requests because of tool loops,
     // retries, or fallback. Use the median request rate so one slow/fast
     // request does not make the live indicator misleading.
-    fn output_rate(&self, now: DateTime<Utc>) -> Option<f64> {
+    fn output_rate(&self, now: DateTime<Utc>) -> Option<OutputRate> {
         let mut rates = self
             .provider_calls
             .iter()
@@ -252,26 +266,25 @@ impl LiveTaskStatus {
         if rates.is_empty() {
             return None;
         }
-        rates.sort_by(f64::total_cmp);
+        rates.sort_by(|left, right| left.tokens_per_second.total_cmp(&right.tokens_per_second));
         let middle = rates.len() / 2;
         Some(if rates.len() % 2 == 0 {
-            (rates[middle - 1] + rates[middle]) / 2.0
+            OutputRate {
+                tokens_per_second: (rates[middle - 1].tokens_per_second
+                    + rates[middle].tokens_per_second)
+                    / 2.0,
+                estimated: rates[middle - 1].estimated || rates[middle].estimated,
+            }
         } else {
             rates[middle]
         })
     }
 
-    /// Build the single-line status text for the current task.
-    ///
-    /// The candidates are ordered from information-rich to compact so narrow
-    /// terminals retain the rate and interrupt affordance before less critical
-    /// decoration. `None` means the task is not in an active state.
-    pub(crate) fn display(
+    pub(crate) fn snapshot(
         &self,
         status: Option<TaskStatus>,
         now: DateTime<Utc>,
-        width: usize,
-    ) -> Option<String> {
+    ) -> Option<ActivitySnapshot> {
         let status = status?;
         if !matches!(
             status,
@@ -284,28 +297,11 @@ impl LiveTaskStatus {
         ) {
             return None;
         }
-        let elapsed = format_elapsed(self.elapsed_at(now).as_secs());
-        let rate = self
-            .output_rate(now)
-            .map(format_rate)
-            .unwrap_or_else(|| "--".to_owned());
-        let mut candidates = Vec::with_capacity(12);
-        candidates.push(format!("• {rate} tokens/s ({elapsed} • esc to interrupt)"));
-        candidates.push(format!("• {rate} tok/s ({elapsed} • esc)"));
-        candidates.push(format!("• {rate} t/s ({elapsed} • esc)"));
-        candidates.push(format!("• {rate} t/s • {elapsed} • esc"));
-        candidates.push(format!("• {rate} t/s • esc"));
-        candidates.push(format!("• {rate} t/s"));
-
-        candidates
-            .iter()
-            .find(|candidate| UnicodeWidthStr::width(candidate.as_str()) <= width)
-            .cloned()
-            .or_else(|| {
-                candidates
-                    .last()
-                    .map(|candidate| truncate_end(candidate, width))
-            })
+        Some(ActivitySnapshot {
+            elapsed: self.elapsed_at(now),
+            output_rate: self.output_rate(now),
+            can_interrupt: !matches!(status, TaskStatus::Aborting),
+        })
     }
 
     #[cfg(test)]
@@ -334,52 +330,6 @@ fn provider_delta_chars(event: &RuntimeEvent) -> u64 {
             .unwrap_or(0),
         _ => 0,
     }
-}
-
-fn format_elapsed(seconds: u64) -> String {
-    if seconds < 60 {
-        return format!("{seconds}s");
-    }
-    if seconds < 3_600 {
-        return format!("{}m {:02}s", seconds / 60, seconds % 60);
-    }
-    format!(
-        "{}h {:02}m {:02}s",
-        seconds / 3_600,
-        (seconds % 3_600) / 60,
-        seconds % 60
-    )
-}
-
-fn format_rate(rate: f64) -> String {
-    if rate >= 100.0 {
-        format!("{rate:.0}")
-    } else {
-        format!("{rate:.1}")
-    }
-}
-
-fn truncate_end(value: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    if UnicodeWidthStr::width(value) <= width {
-        return value.to_owned();
-    }
-    if width == 1 {
-        return "…".to_owned();
-    }
-    let mut result = String::new();
-    for character in value.chars() {
-        let mut candidate = result.clone();
-        candidate.push(character);
-        if UnicodeWidthStr::width(candidate.as_str()) + 1 > width {
-            break;
-        }
-        result.push(character);
-    }
-    result.push('…');
-    result
 }
 
 #[cfg(test)]
@@ -414,18 +364,11 @@ mod tests {
     }
 
     #[test]
-    fn elapsed_formats_like_codex() {
-        assert_eq!(format_elapsed(0), "0s");
-        assert_eq!(format_elapsed(61), "1m 01s");
-        assert_eq!(format_elapsed(3_661), "1h 01m 01s");
-    }
-
-    #[test]
     fn rate_uses_active_sampling_window_and_provider_usage_when_available() {
         let base = Utc::now();
         let task = TaskId::new();
         let turn = TurnId::new();
-        let mut status = LiveTaskStatus::default();
+        let mut status = ActivityProjection::default();
         status.apply(&event(
             1,
             task,
@@ -434,14 +377,14 @@ mod tests {
             base,
             json!({}),
         ));
-        let pre_sample_line = status
-            .display(
+        let pre_sample = status
+            .snapshot(
                 Some(TaskStatus::Running),
                 base + chrono::Duration::seconds(1),
-                80,
             )
-            .expect("pre-sample status line");
-        assert_eq!(pre_sample_line, "• -- tokens/s (1s • esc to interrupt)");
+            .expect("pre-sample status");
+        assert_eq!(pre_sample.elapsed, Duration::from_secs(1));
+        assert_eq!(pre_sample.output_rate, None);
         status.apply(&event(
             2,
             task,
@@ -469,7 +412,8 @@ mod tests {
         let live = status
             .output_rate(base + chrono::Duration::seconds(8))
             .expect("live rate");
-        assert!((live - 50.5).abs() < 0.01);
+        assert!((live.tokens_per_second - 50.5).abs() < 0.01);
+        assert!(live.estimated);
 
         status.apply(&event(
             5,
@@ -483,7 +427,8 @@ mod tests {
         let completed = status
             .output_rate(base + chrono::Duration::seconds(20))
             .expect("completed rate");
-        assert!((completed - 120.0).abs() < 0.01);
+        assert!((completed.tokens_per_second - 120.0).abs() < 0.01);
+        assert!(!completed.estimated);
     }
 
     #[test]
@@ -491,7 +436,7 @@ mod tests {
         let base = Utc::now();
         let task = TaskId::new();
         let turn = TurnId::new();
-        let mut status = LiveTaskStatus::default();
+        let mut status = ActivityProjection::default();
         status.apply(&event(
             1,
             task,
@@ -569,7 +514,7 @@ mod tests {
             .output_rate(base + chrono::Duration::seconds(20))
             .expect("multi-request rate");
         // First request: 100 / 1s = 100; second: 200 / 4s = 50.
-        assert!((rate - 75.0).abs() < 0.01);
+        assert!((rate.tokens_per_second - 75.0).abs() < 0.01);
     }
 
     #[test]
@@ -578,7 +523,7 @@ mod tests {
         let first_task = TaskId::new();
         let active_task = TaskId::new();
         let turn = TurnId::new();
-        let mut status = LiveTaskStatus::default();
+        let mut status = ActivityProjection::default();
         status.apply(&event(
             1,
             first_task,
@@ -632,7 +577,7 @@ mod tests {
         let base = Utc::now();
         let task = TaskId::new();
         let turn = TurnId::new();
-        let mut status = LiveTaskStatus::default();
+        let mut status = ActivityProjection::default();
         status.apply(&event(
             1,
             task,
@@ -680,58 +625,5 @@ mod tests {
             status.elapsed_at(base + chrono::Duration::seconds(41)),
             Duration::from_secs(1)
         );
-    }
-
-    #[test]
-    fn display_keeps_rate_and_escape_affordance_when_width_is_tight() {
-        let base = Utc::now();
-        let task = TaskId::new();
-        let turn = TurnId::new();
-        let mut status = LiveTaskStatus::default();
-        status.apply(&event(
-            1,
-            task,
-            Some(turn),
-            RuntimeEventType::TaskCreated,
-            base,
-            json!({}),
-        ));
-        status.apply(&event(
-            2,
-            task,
-            Some(turn),
-            RuntimeEventType::ProviderStarted,
-            base,
-            json!({}),
-        ));
-        status.apply(&event(
-            3,
-            task,
-            Some(turn),
-            RuntimeEventType::ProviderStreamed,
-            base + chrono::Duration::seconds(1),
-            json!({"delta": {"kind": "text_delta", "text": "x".repeat(80)}}),
-        ));
-        let line = status
-            .display(
-                Some(TaskStatus::Running),
-                base + chrono::Duration::seconds(2),
-                42,
-            )
-            .expect("status line");
-        assert!(UnicodeWidthStr::width(line.as_str()) <= 42);
-        assert_eq!(line, "• 20.0 tokens/s (2s • esc to interrupt)");
-        assert!(!line.contains("Working"));
-        assert!(!line.contains("Responding"));
-
-        let compact_line = status
-            .display(
-                Some(TaskStatus::Running),
-                base + chrono::Duration::seconds(2),
-                20,
-            )
-            .expect("compact status line");
-        assert!(UnicodeWidthStr::width(compact_line.as_str()) <= 20);
-        assert!(compact_line.contains("esc"));
     }
 }

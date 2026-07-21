@@ -9,10 +9,10 @@ use golutra_context::{
     ContextBuilder, ContextContributor, context_snapshot_from_request, provider_request_from_plan,
 };
 use golutra_core::{
-    Actor, ActorKind, ArtifactId, ArtifactRecord, CommandId, EvidenceId, PostTaskJob,
-    PostTaskJobId, PostTaskJobKind, PostTaskJobStatus, QueryId, RedactionStatus, TaskId,
-    TaskStatus, TraceView, TurnId, VerificationId, VerificationRecord, VerificationResult,
-    WorkspaceId,
+    Actor, ActorKind, ArtifactId, ArtifactRecord, CommandId, EvidenceId, FileChangeKind,
+    FileChangeSummary, PostTaskJob, PostTaskJobId, PostTaskJobKind, PostTaskJobStatus, QueryId,
+    RedactionStatus, TaskId, TaskStatus, TraceView, TurnChangeSummary, TurnId, VerificationId,
+    VerificationRecord, VerificationResult, WorkspaceId,
 };
 use golutra_llm::{ConfiguredProvider, MockProvider, ProviderError, ProviderRole};
 use golutra_protocol::{
@@ -3288,9 +3288,29 @@ async fn prompt_runs_mock_agent_loop_and_writes_file() {
         .iter()
         .position(|event| event["event_type"] == json!(RuntimeEventType::ToolCompleted))
         .expect("tool completed event");
+    let tool_payload = &events[tool_completed_index]["payload"];
+    let operation_changes: Vec<FileChangeSummary> =
+        serde_json::from_value(tool_payload["file_changes"].clone())
+            .expect("typed operation changes");
+    let turn_changes: TurnChangeSummary =
+        serde_json::from_value(tool_payload["turn_change_summary"].clone())
+            .expect("typed turn changes");
     assert!(tool_started_index < checkpoint_index);
     assert!(policy_index < checkpoint_index);
     assert!(checkpoint_index < tool_completed_index);
+    assert_eq!(
+        operation_changes,
+        vec![FileChangeSummary {
+            path: "result.txt".to_owned(),
+            kind: FileChangeKind::Modified,
+            added_lines: Some(1),
+            removed_lines: Some(1),
+        }]
+    );
+    assert_eq!(turn_changes.files, operation_changes);
+    assert_eq!(turn_changes.added_lines, Some(1));
+    assert_eq!(turn_changes.removed_lines, Some(1));
+    assert!(turn_changes.stats_complete);
     assert!(
         events[checkpoint_index]["payload"]["checkpoint"]["artifact_refs"]
             .as_array()

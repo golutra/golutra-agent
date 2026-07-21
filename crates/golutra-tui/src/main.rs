@@ -36,8 +36,8 @@ use golutra_llm::{
     provider_protocol_catalog,
 };
 use golutra_protocol::{
-    CommandAck, EventPageDirection, EventPageRequest, RuntimeEvent, RuntimeEventType, RuntimeQuery,
-    RuntimeQueryKind, SessionCommandKind, UserProjection,
+    CommandAck, EventPageDirection, EventPageRequest, RuntimeEvent, RuntimeQuery, RuntimeQueryKind,
+    SessionCommandKind, UserProjection,
 };
 use golutra_tui::{
     AuthConfigScope, AuthCredentialStore, OAuthLoginCommand, OpenAiCompatibleLogin,
@@ -46,7 +46,7 @@ use golutra_tui::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use secrecy::SecretString;
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -55,23 +55,39 @@ static TUI_ACTOR_ID: LazyLock<String> =
     LazyLock::new(|| format!("golutra-tui-{}-{}", std::process::id(), Uuid::now_v7()));
 const TUI_HISTORY_PAGE_SIZE: u32 = 256;
 
+mod activity_view;
+mod activity_widget;
 mod auth_flow;
 mod auth_state;
+mod change_projection;
 mod composer_input;
-mod developer;
+mod developer_projection;
+mod developer_query;
+mod developer_view;
+mod developer_widget;
 mod driver;
 mod live_status;
 mod render;
 mod runtime_controller;
 mod session;
+mod transcript_view;
+mod transcript_widget;
+pub(crate) use activity_view::*;
+pub(crate) use activity_widget::*;
 pub(crate) use auth_flow::*;
 pub(crate) use auth_state::*;
+pub(crate) use change_projection::*;
 pub(crate) use composer_input::*;
-pub(crate) use developer::*;
+pub(crate) use developer_projection::*;
+pub(crate) use developer_query::*;
+pub(crate) use developer_view::*;
+pub(crate) use developer_widget::*;
 pub(crate) use live_status::*;
 pub(crate) use render::*;
 pub(crate) use runtime_controller::*;
 pub(crate) use session::*;
+pub(crate) use transcript_view::*;
+pub(crate) use transcript_widget::*;
 
 #[derive(Debug, Parser)]
 #[command(name = "golutra-tui")]
@@ -155,7 +171,7 @@ struct TuiApp {
     projection: Option<UserProjection>,
     developer_projection: Option<golutra_protocol::DebugProjection>,
     developer_error: Option<String>,
-    events: Vec<Value>,
+    events: Vec<RuntimeEvent>,
     command_messages: Vec<TranscriptItem>,
     resume_picker: Option<ResumePickerState>,
     export_flow: Option<ExportFlowState>,
@@ -169,7 +185,8 @@ struct TuiApp {
     provider_model: String,
     workspace_path: PathBuf,
     debug_mode: bool,
-    live_status: LiveTaskStatus,
+    activity_projection: ActivityProjection,
+    change_projection: ChangeProjection,
     developer_facts_expanded: bool,
     transcript_scroll: PaneScrollState,
     developer_scroll: PaneScrollState,
@@ -183,21 +200,6 @@ struct TuiApp {
     should_quit: bool,
     last_prompt_ack: Option<CommandAck>,
     last_control_ack: Option<CommandAck>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum TranscriptRole {
-    User,
-    Assistant,
-    Status,
-    System,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TranscriptItem {
-    role: TranscriptRole,
-    title: String,
-    body: Vec<String>,
 }
 
 struct ProviderUiStatus {
@@ -237,7 +239,8 @@ impl TuiApp {
             provider_model,
             workspace_path,
             debug_mode,
-            live_status: LiveTaskStatus::default(),
+            activity_projection: ActivityProjection::default(),
+            change_projection: ChangeProjection::default(),
             developer_facts_expanded: false,
             transcript_scroll: PaneScrollState {
                 follow_tail: true,
@@ -339,13 +342,8 @@ impl TuiApp {
             })
             .await
             .map_err(|error| miette::miette!("{error}"))?;
-        self.events = page
-            .events
-            .into_iter()
-            .map(serde_json::to_value)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| miette::miette!("{error}"))?;
-        self.rebuild_live_status();
+        self.events = page.events;
+        self.rebuild_event_projections();
         self.history_start_cursor = page.start_cursor;
         self.cursor = page.end_cursor;
         self.history_has_more_before = page.has_more;
@@ -370,12 +368,7 @@ impl TuiApp {
             })
             .await
             .map_err(|error| miette::miette!("{error}"))?;
-        let mut older = page
-            .events
-            .into_iter()
-            .map(serde_json::to_value)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| miette::miette!("{error}"))?;
+        let mut older = page.events;
         self.history_load_requested = false;
         if older.is_empty() {
             self.history_has_more_before = false;
@@ -383,7 +376,7 @@ impl TuiApp {
         }
         older.append(&mut self.events);
         self.events = older;
-        self.rebuild_live_status();
+        self.rebuild_event_projections();
         self.history_start_cursor = page.start_cursor;
         self.history_has_more_before = page.has_more;
         let current_rows = transcript_rows(self).len();
@@ -421,19 +414,14 @@ impl TuiApp {
         }
         self.history_start_cursor = self.history_start_cursor.or(Some(event.sequence_no));
         self.cursor = Some(event.sequence_no);
-        self.live_status.apply(&event);
-        if let Ok(value) = serde_json::to_value(event) {
-            self.events.push(value);
-        }
+        self.activity_projection.apply(&event);
+        self.change_projection.apply(&event);
+        self.events.push(event);
     }
 
-    fn rebuild_live_status(&mut self) {
-        let events = self
-            .events
-            .iter()
-            .filter_map(|value| serde_json::from_value::<RuntimeEvent>(value.clone()).ok())
-            .collect::<Vec<_>>();
-        self.live_status.rebuild(&events);
+    fn rebuild_event_projections(&mut self) {
+        self.activity_projection.rebuild(&self.events);
+        self.change_projection.rebuild(&self.events);
     }
 
     async fn send_prompt(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
@@ -598,10 +586,14 @@ impl TuiApp {
             .developer_projection
             .as_ref()
             .map(|projection| {
-                developer_panel_rows(projection, usize::MAX)
-                    .into_iter()
-                    .filter(|row| matches!(row, DeveloperPanelRow::Event { .. }))
-                    .count()
+                developer_panel_rows_with_changes(
+                    projection,
+                    self.change_projection.summary(),
+                    usize::MAX,
+                )
+                .into_iter()
+                .filter(|row| matches!(row, DeveloperPanelRow::Event { .. }))
+                .count()
             })
             .unwrap_or(0);
         self.developer_scroll.set_row_count(row_count);
@@ -801,7 +793,8 @@ impl TuiApp {
                 self.developer_scroll.reset(0);
                 self.developer_load_requested = false;
                 self.events.clear();
-                self.live_status = LiveTaskStatus::default();
+                self.activity_projection = ActivityProjection::default();
+                self.change_projection = ChangeProjection::default();
                 self.command_messages.clear();
                 self.input.clear();
                 self.export_flow = None;
@@ -1091,7 +1084,8 @@ impl TuiApp {
         self.developer_scroll.reset(0);
         self.developer_load_requested = false;
         self.events.clear();
-        self.live_status = LiveTaskStatus::default();
+        self.activity_projection = ActivityProjection::default();
+        self.change_projection = ChangeProjection::default();
         self.command_messages.clear();
         self.input.clear();
         self.export_flow = None;
@@ -1120,7 +1114,8 @@ impl TuiApp {
         self.developer_scroll.reset(0);
         self.developer_load_requested = false;
         self.events.clear();
-        self.live_status = LiveTaskStatus::default();
+        self.activity_projection = ActivityProjection::default();
+        self.change_projection = ChangeProjection::default();
         self.command_messages.clear();
         self.input.clear();
         self.export_flow = None;
