@@ -40,6 +40,7 @@ pub enum RuntimeEventType {
     TokenUsageRecorded,
     AssistantMessage,
     ToolStarted,
+    ToolProgress,
     ToolCompleted,
     PolicyEvaluated,
     VerificationCompleted,

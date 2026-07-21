@@ -24,6 +24,42 @@ pub enum ToolResultStatus {
     Timeout,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolProgressPhase {
+    Started,
+    Output,
+    Completed,
+}
+
+/// Bounded, presentation-safe progress for one tool call.
+///
+/// Progress is diagnostic and may be sampled. Durable completion facts live in
+/// [`ToolExecutionMetrics`], so consumers must not infer success from the last
+/// progress event they happened to receive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ToolProgress {
+    pub tool_call_id: ToolCallId,
+    pub tool_name: String,
+    pub phase: ToolProgressPhase,
+    pub elapsed_ms: u64,
+    pub output_bytes: u64,
+    pub output_lines: u64,
+    pub detail: Option<String>,
+}
+
+/// Stable execution metrics attached to every terminal tool report.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ToolExecutionMetrics {
+    pub duration_ms: u64,
+    pub output_bytes: u64,
+    pub output_lines: u64,
+    pub output_truncated: bool,
+    pub exit_code: Option<i32>,
+    pub item_count: Option<u64>,
+    pub match_count: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolContract {
     pub tool_name: String,

@@ -2,8 +2,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub const RUNTIME_PROTOCOL_NAME: &str = "golutra-runtime";
-pub const RUNTIME_PROTOCOL_VERSION: u32 = 3;
-pub const MINIMUM_RUNTIME_PROTOCOL_VERSION: u32 = 2;
+pub const RUNTIME_PROTOCOL_VERSION: u32 = 4;
+pub const MINIMUM_RUNTIME_PROTOCOL_VERSION: u32 = 4;
 pub const RUNTIME_STATE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -51,6 +51,7 @@ mod tests {
     fn runtime_protocol_range_rejects_unknown_versions() {
         let range = ProtocolVersionRange::runtime();
         assert!(range.accepts(RUNTIME_PROTOCOL_VERSION));
+        assert!(!range.accepts(3));
         assert!(!range.accepts(0));
         assert!(!range.accepts(RUNTIME_PROTOCOL_VERSION + 1));
     }

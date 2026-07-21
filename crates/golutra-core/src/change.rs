@@ -21,6 +21,13 @@ pub struct FileChangeSummary {
     pub removed_lines: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FileDiffPreview {
+    pub path: String,
+    pub lines: Vec<String>,
+    pub truncated: bool,
+}
+
 /// The net workspace change from the beginning of a turn to its latest file
 /// side effect. This is a durable event payload, not a live filesystem query.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
