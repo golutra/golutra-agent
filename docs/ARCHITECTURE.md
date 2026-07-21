@@ -285,13 +285,13 @@ artifact、durable job、thread 五类事实访问边界。`EmbeddedTransport`�
 
 | Crate | 内部模块 | 约束 |
 | --- | --- | --- |
-| `golutra-client` | `application`、`command`、`query`、`session`、`execution`、`execution_trace`、`change_tracker`、`task_governance`、`post_task`、`governance`、`governance_commands`、`regression`、`trace`、`transport`、`transport::ipc` | `RuntimeApplication` 是前端用例 facade；`RuntimeHost` 只拥有 lane/worker/EventBus/sequence 与生命周期；文件副作用由 `change_tracker` 从工具 before-image 生成 operation 与 turn net change facts；command、查询、执行、trace、后台治理和回归共享同一事实与 owner |
+| `golutra-client` | `application`、`command`、`query`、`session`、`execution`、`execution_trace`、`change_tracker`、`task_governance`、`post_task`、`governance`、`governance_commands`、`regression`、`trace`、`transport`、`transport::ipc` | `RuntimeApplication` 是前端用例 facade；`RuntimeHost` 只拥有 lane/worker/EventBus/sequence 与生命周期；文件副作用由 `change_tracker` 从工具执行时冻结的 before/after-image 生成 operation 与 turn net change facts，不重新读取可能已变化的 live workspace；command、查询、执行、trace、后台治理和回归共享同一事实与 owner |
 | `golutra-runtime` | `lane`、`checkpoint`、`completion`、`context_guard`、`provider_retry`、`trace`、`verification` | lane 状态机、checkpoint、终态策略、context guard、retry、trace adapter 和 verification service 独立于 loop orchestration；loop 不直接实现 session controller 转换或快照 IO |
 | `golutra-tui` | `live_status`、`change_projection`、`developer_projection`、`developer_query`、`activity_view`、`transcript_view`、`developer_view`、`activity_widget`、`transcript_widget`、`developer_widget`、`auth_state`、`auth_flow`、`session`、`render`、`runtime_controller`、`driver::{frame,io,session,wait}` | Runtime facts、replayable projection、terminal-neutral view model、Ratatui widget 和 controller 五层分离；developer transport 查询与纯 projection reducer 分离；交互 TUI 与离屏 Driver 共用同一投影和 widget；渲染不查询 SQLite、不写 provider 配置，认证 flow 不编排 runtime task |
 | `golutra-config` | `provider_auth`、`provider_storage` | provider catalog 与凭据/配置事务分离；磁盘写入、锁、迁移、probe 和 rollback 统一由 storage 层负责 |
 | `golutra-llm` | `provider_config`、`openai_responses`、`genai_adapter` | 环境解析与 URL/错误处理不进入 adapter 执行循环；各协议 adapter 只处理自己的 wire contract |
 | `golutra-store` | `projection`、`repositories` | event reducer 保持纯函数；`RuntimeRepositories` 对 event/projection/artifact/job/thread 提供逻辑 seam；SQLite 只负责事实读写和持久化派生索引 |
-| `golutra-tools` | `process` | shell argv、进程组取消、timeout 和有界管道读取由单一模块维护 |
+| `golutra-tools` | `process`、`workspace_scan` | shell argv、进程组取消、timeout、有界管道读取和有界 workspace before/after scan 分层维护 |
 
 每个大型入口的单元测试位于同目录 `tests.rs`；生产模块通过 `#[cfg(test)] mod tests;` 接入。测试可以验证 crate 内实现，但生产模块不能通过 test-only 重导出形成运行时依赖。
 
@@ -443,6 +443,19 @@ golutra-tui
 `TuiApp` 内的历史窗口保持 `Vec<RuntimeEvent>`，不降级成 `serde_json::Value` 再容错反序列化。projection 必须可以只靠有序 event replay 重建；view model 不执行 transport 查询；widget 不解析 runtime payload；controller 只负责查询、订阅、分页、滚动和 modal 交互。这样普通交互 TUI 与 TestBackend/Driver 不会形成两套展示语义。
 
 文件修改采用同一事实的两种投影：每个 `ToolCompleted.payload.file_changes` 表示该次工具操作，`turn_change_summary` 表示从本轮第一份 before-image 到当前文件状态的净变化。路径相对 canonical workspace；文本文件提供 `+/-` 行数，二进制、越界或超过预算时为 `None`，前端不得伪装成零。普通 transcript 只显示 `Edited N files (+A -D)`、`Ran`、`Explored`；developer facts 展示本轮文件总数、净行数和统计完整性。输出速率同样来自 provider stream/usage event：字符估算值带 `~`，provider usage 的精确 token 数不带估算标记。
+
+工具运行观测遵循独立的生命周期合同，不把高频诊断事件当作事实终态：
+
+```text
+ToolStarted(tool_call_id, tool_name, redacted arguments)
+  -> ToolProgress(tool_call_id, sampled phase/elapsed/output metrics)
+  -> ToolCompleted(tool_call_id, ToolResultEnvelope, durable metrics)
+```
+
+- `tool_call_id` 在开始、进度和完成事件之间稳定关联；`ToolProgress` 可以丢失或采样，成功与否只能由 `ToolCompleted` 的结构化 status 判断。
+- shell 同时 drain stdout/stderr，管道消息队列、保留输出和 workspace 扫描都受固定预算约束；扫描无法覆盖完整 workspace 时必须写 `workspace_changes_known=false`，不能伪装成没有改动。工具执行异常也必须生成终态 `ToolCompleted(error)`，不能让 transcript 永远停在 Running。
+- 文件工具和可观测到的 shell 副作用写入执行时捕获的 `changed_files`、before/after-image、`FileDiffPreview`；完整 unified diff 只进入先脱敏、checksum 和 2 MiB 上限保护的 `workspace_diff` artifact，preview 还有跨文件总预算，普通模型上下文只收到摘要/excerpt。
+- 普通 transcript 将同一生命周期合并为一条可展开 operation：运行中显示 `Running/Exploring/Editing`，成功显示 `Ran/Explored/Edited`，错误、超时、取消和阻断使用独立状态/颜色；默认折叠，`Ctrl+O`、鼠标箭头或 Driver 的 `transcript_operation_toggle:<tool_call_id>` hit region 才展开细节。完整 facts、artifact ref 和治理事件仍只进入 Developer runtime。
 
 当前这些边界已经落地：TUI 默认创建新的本地 thread/session，首个 prompt 才持久化；`/resume` 按当前 canonical cwd 过滤全局历史；`/fork --from-turn`、rollout export、`/export` 和 thread rebind 通过同一 transport/API；普通 transcript 只渲染用户可见事件，也不查询开发者投影。只有显式 `--debug` 或 `/debug` 才启用 developer mode；主体区按左右 1:1 展示 transcript 与 Developer runtime，按事件分页刷新 `DebugProjection`。治理 facts 默认收起在标题的 `▸ facts` 后，可用鼠标左键展开或收回；对话和事件列表的鼠标滚轮按 pane 命中区域独立滚动，`/new`/`/resume` 保留 debug 偏好。`/export` 固定每个 session 的 event high-watermark，后台异步写 owner-only 临时目录；导出期间 session 变化会显式降级为 incomplete。
 

@@ -15,11 +15,13 @@
 - shell 使用 `shlex` 解析结构化 argv，不经过 shell 解释器；policy 会阻断敏感路径、`find -exec/-delete`、`rg --pre` 等执行型参数，把 `sed -i`、`cargo run`、未知脚本等降为 Ask；执行器支持 timeout、`CancellationToken`、每管道 2 MiB 上限，并在 Unix 上终止整个进程组后排空管道。`golutra-sandbox` 在 macOS 使用 Seatbelt、Linux 检测 bubblewrap，外部 MCP 没有 OS-enforced sandbox 时拒绝执行。
 - `RuntimeHost` 保存 task handle、pending turn queue 和 durable command ack；pause/resume/abort 影响真实执行，不是 UI 标记。终态 lane 拒绝控制转换；若 owner 已退出且新 host 成功取得 session lease，则先以 durable `TaskAborted` 回收孤儿状态，再把 `TurnQueued` 中尚未出现 `TurnStarted` 的输入转移到 recovery task。
 - `AgentLoop` 支持多轮 assistant/tool message、LoopGuard、有限 retry/fallback 和 verification-backed terminal state。初始或工具消息累积导致的 context overflow 会产生 `LoopGuardTriggered` 和 Blocked/AskUser `LoopDecision`，不会降级成笼统执行错误。
-- 文件工具在修改前捕获并持久化 before-image；checkpoint manifest 与 owner-only artifact blob 带 checksum、redaction 状态和 rollback metadata，持久化失败时不执行文件副作用。
-- Embedded、Unix IPC 与 HTTP/SSE transport 使用同一 `SessionCommand`、`RuntimeQuery`、`RuntimeEvent` 语义和 protocol version；用户级 daemon 通过 attachment 路由多个 cwd，Unix socket owner-only，HTTP 仅允许安全 endpoint 并校验 bearer/Host/Origin。SQLite 在 event append 事务内原子分配全局 sequence，host 再按提交顺序 publish；command lease 与 durable ack 负责重试去重，但 command ack 与后续业务事件仍不是一个跨运行时事务。
+- 文件工具和 shell 等可产生工作区副作用的工具在修改前捕获并持久化有界 before-image；checkpoint manifest 与 owner-only artifact blob 带 checksum、redaction 状态和 rollback metadata，持久化失败时不执行文件副作用。无法覆盖完整工作区时仍记录 checkpoint，但明确标记 `before_image_complete=false`，不得把它当作完整回滚保证。
+- Embedded、Unix IPC 与 HTTP/SSE transport 使用同一 `SessionCommand`、`RuntimeQuery`、`RuntimeEvent` 语义和 protocol version；包含 `ToolProgress` 的当前 runtime protocol 为 v4，v3 reader 不与新事件流协商。用户级 daemon 通过 attachment 路由多个 cwd，Unix socket owner-only，HTTP 仅允许安全 endpoint 并校验 bearer/Host/Origin。SQLite 在 event append 事务内原子分配全局 sequence，host 再按提交顺序 publish；command lease 与 durable ack 负责重试去重，但 command ack 与后续业务事件仍不是一个跨运行时事务。
 - 外部 MCP 工具必须来自 checksum 未变化的 reviewed/enabled plugin revision，远端 `tools/list` schema 必须与 manifest 一致；默认 Ask，批准前不启动进程，批准后继续经过 timeout/cancel/redaction/artifact/evidence，远端 annotation 不参与权限决策。
 - provider 缺失会把 lane 置为 `WaitingAuthentication` 并产生 durable `ProviderAuthRequired`；客户端只提交 verified provider config 的 request id，secret 不通过 runtime command/event 传递。取消或 probe 失败都有显式终态。
 - checkpoint 每 workspace 保留最近 20 个；artifact 维护按 retention/expiry 清理 blob，并保护仍被 lineage、verification 或 rollback 引用的记录。
+- 工具生命周期统一使用稳定 `tool_call_id`：`ToolStarted` 写入脱敏且有界的展示参数，`ToolProgress` 只写可丢失的采样诊断，`ToolCompleted` 写入终态 envelope 和执行指标；硬执行错误也必须转换为 `ToolCompleted(error)`。展示参数保留 `path`、`command`、`pattern`、`query`、`symbol`、`timeout_ms` 等定位字段，`content`、`search`、`replace` 等正文只保留长度摘要，序列化结果硬限制为 8 KiB。shell 的 stdout/stderr 会完整 drain，管道消息队列、保留输出、diff preview 和 workspace before/after scan 均有硬上限。
+- shell 扫描发现的新增、修改、删除文件进入 `changed_files`、before-image 和执行时捕获的 after-image；扫描越过文件数/内容预算、遇到排除目录或无法读取时写 `workspace_changes_known=false`。完整 unified diff 以 redacted、checksum、最多 2 MiB 的 `workspace_diff` artifact 持久化，结构化 diff preview 还有跨文件总预算，不能把未知状态解释为零变更。
 
 ## 核心原则
 
@@ -70,6 +72,32 @@ ToolContract
 - 错误不能只返回自然语言。
 - 有副作用工具必须声明幂等与重试边界。
 - raw output 默认进入 artifact，不直接进入模型。
+
+### ToolExecutionObservationContract
+
+```text
+ToolStarted
+  tool_call_id
+  tool_name
+  redacted_arguments
+
+ToolProgress (sampled, diagnostic)
+  tool_call_id
+  phase: started | output | completed
+  elapsed_ms
+  output_bytes
+  output_lines
+
+ToolCompleted (durable, terminal)
+  tool_call_id
+  ToolResultEnvelope.status
+  ToolExecutionMetrics
+  changed_files / file_changes
+  diff_previews / workspace_diff artifact ref
+  workspace_changes_known
+```
+
+`ToolProgress` 不能替代终态，也不能单独触发 verification 或 promotion。消费者应按 `tool_call_id` 合并生命周期，并对缺失 progress 保持可用；只有终态事件和 artifact/evidence 才进入可审计完成判断。
 
 ## ProviderContract
 

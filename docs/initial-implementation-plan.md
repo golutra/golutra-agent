@@ -860,6 +860,8 @@ P0 不做：
 - [x] Hardening-13 完成 Plugin/MCP 生命周期、OS sandbox、approval 和外部工具统一治理。
 - [x] Hardening-14 完成 Unix IPC、Python SDK、安装脚本、三平台 compile 与连续会话/跨进程验收。
 - [x] Hardening-15 完成 Audit/Events/OpenTelemetry 投影和普通/开发者 TUI 观测隔离。
+- [x] Hardening-16 完成 correlated tool lifecycle progress、bounded shell workspace side-effect scan、structured diff preview/artifact，以及普通 transcript/Driver 的可展开 operation projection。
+- [x] Hardening-17 收紧工具观测边界：硬执行错误写入终态、shell before-image 先持久化、stdout/stderr 使用有界队列、after-image 固定单次操作归属、diff preview 脱敏并设置跨文件总预算；runtime protocol 升级到 v4。
 - [x] P2.5-G0 固定治理可信性协议、fixture 和 capability truth matrix。
 - [x] P2.5-G1 实现完整、分页、带 integrity/disclosure 的 TaskTraceService。
 - [x] P2.5-G2 实现 durable PostTaskJob 与跨进程恢复。
