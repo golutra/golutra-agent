@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     io::{self, Stdout},
     path::{Path, PathBuf},
     sync::LazyLock,
@@ -187,6 +188,8 @@ struct TuiApp {
     debug_mode: bool,
     activity_projection: ActivityProjection,
     change_projection: ChangeProjection,
+    expanded_operations: HashSet<OperationId>,
+    transcript_details_expanded: bool,
     developer_facts_expanded: bool,
     transcript_scroll: PaneScrollState,
     developer_scroll: PaneScrollState,
@@ -241,6 +244,8 @@ impl TuiApp {
             debug_mode,
             activity_projection: ActivityProjection::default(),
             change_projection: ChangeProjection::default(),
+            expanded_operations: HashSet::new(),
+            transcript_details_expanded: false,
             developer_facts_expanded: false,
             transcript_scroll: PaneScrollState {
                 follow_tail: true,
@@ -518,7 +523,27 @@ impl TuiApp {
     }
 
     fn reset_transcript_view(&mut self) {
+        self.expanded_operations.clear();
+        self.transcript_details_expanded = false;
         self.transcript_scroll.reset(transcript_rows(self).len());
+    }
+
+    fn toggle_operation(&mut self, id: OperationId) {
+        if !self.expanded_operations.insert(id.clone()) {
+            self.expanded_operations.remove(&id);
+        }
+        self.sync_transcript_row_count(self.transcript_scroll.row_count);
+    }
+
+    fn toggle_transcript_details(&mut self) {
+        self.transcript_details_expanded = !self.transcript_details_expanded;
+        self.sync_transcript_row_count(self.transcript_scroll.row_count);
+        self.status_message = if self.transcript_details_expanded {
+            "transcript details expanded"
+        } else {
+            "transcript details collapsed"
+        }
+        .to_owned();
     }
 
     fn reset_history_window(&mut self) {
@@ -1635,6 +1660,10 @@ async fn handle_key(
     if app.auth_dialog.is_some() {
         return handle_auth_dialog_key(key, app, transport).await;
     }
+    if key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.toggle_transcript_details();
+        return Ok(());
+    }
     if app.input.is_empty()
         && app
             .projection
@@ -1875,6 +1904,14 @@ fn handle_paste(pasted: &str, app: &mut TuiApp) {
 
 fn handle_mouse(mouse: MouseEvent, app: &mut TuiApp) {
     let target = app.layout.hit_test(mouse.column, mouse.row, app);
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        && target == UiHitTarget::Transcript
+        && let Some(operation_id) =
+            transcript_toggle_at(app, app.layout.transcript, mouse.column, mouse.row)
+    {
+        app.toggle_operation(operation_id);
+        return;
+    }
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left)
             if app

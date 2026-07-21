@@ -190,6 +190,57 @@ fn cjk_lines_and_cells_skip_continuation_columns() {
 }
 
 #[test]
+fn hit_regions_expose_visible_transcript_operation_toggles() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let turn_id = TurnId::new();
+    let tool_call_id = ToolCallId::new();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.events.push(event(
+        1,
+        session_id,
+        task_id,
+        turn_id,
+        RuntimeEventType::ToolCompleted,
+        json!({
+            "envelope": {
+                "tool_call_id": tool_call_id,
+                "tool_name": "shell",
+                "status": "ok",
+                "summary": "shell command completed",
+                "structured_facts": {"command": "cargo test"},
+                "model_visible_excerpt": "test result: ok"
+            }
+        }),
+    ));
+    let layout = UiLayoutSnapshot {
+        header: Rect::new(0, 0, 80, 1),
+        transcript: Rect::new(0, 1, 80, 12),
+        developer: None,
+        bottom: Rect::new(0, 13, 80, 4),
+    };
+
+    let regions = frame_hit_regions(layout, layout.transcript, &app);
+    let toggle = regions
+        .iter()
+        .find(|region| region.id == format!("transcript_operation_toggle:{tool_call_id}"))
+        .expect("operation toggle hit region");
+
+    assert_eq!(toggle.pane, TuiHitPane::Transcript);
+    assert_eq!(
+        (toggle.x, toggle.y, toggle.width, toggle.height),
+        (0, 2, 4, 1)
+    );
+}
+
+#[test]
 fn frozen_pages_keep_the_same_digest_and_next_range() {
     let mut frame = TuiFrame {
         frame_id: String::new(),

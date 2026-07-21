@@ -11,7 +11,9 @@ use ratatui::{buffer::Buffer, layout::Rect};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::super::{TuiApp, UiLayoutSnapshot, developer_facts_toggle_rect, display_width};
+use super::super::{
+    TuiApp, UiLayoutSnapshot, developer_facts_toggle_rect, display_width, transcript_toggle_regions,
+};
 
 pub(super) fn scoped_runtime_events(
     events: &[RuntimeEvent],
@@ -242,7 +244,11 @@ pub(super) fn frame_cells(buffer: &Buffer, area: Rect, panes: SnapshotPanes) -> 
     cells
 }
 
-pub(super) fn frame_hit_regions(layout: UiLayoutSnapshot, area: Rect) -> Vec<TuiHitRegion> {
+pub(super) fn frame_hit_regions(
+    layout: UiLayoutSnapshot,
+    area: Rect,
+    app: &TuiApp,
+) -> Vec<TuiHitRegion> {
     let mut regions = Vec::new();
     push_hit_region(
         &mut regions,
@@ -251,6 +257,10 @@ pub(super) fn frame_hit_regions(layout: UiLayoutSnapshot, area: Rect) -> Vec<Tui
         layout.transcript,
         area,
     );
+    let transcript_area = layout.transcript.intersection(area);
+    for (id, region) in transcript_toggle_regions(app, transcript_area) {
+        push_hit_region(&mut regions, &id, TuiHitPane::Transcript, region, area);
+    }
     push_hit_region(
         &mut regions,
         "composer",

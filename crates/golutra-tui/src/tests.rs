@@ -1920,6 +1920,109 @@ fn transcript_event(
     }
 }
 
+#[tokio::test]
+async fn transcript_operation_details_toggle_with_ctrl_o_and_mouse() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let tool_call_id = golutra_core::ToolCallId::new();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.events = vec![transcript_event(
+        1,
+        session_id,
+        task_id,
+        RuntimeEventType::ToolCompleted,
+        json!({
+            "envelope": {
+                "tool_call_id": tool_call_id,
+                "tool_name": "edit_file",
+                "status": "ok",
+                "summary": "file edited",
+                "structured_facts": {}
+            },
+            "file_changes": [{
+                "path": "src/lib.rs",
+                "kind": "modified",
+                "added_lines": 1,
+                "removed_lines": 1
+            }],
+            "diff_previews": [{
+                "path": "src/lib.rs",
+                "lines": ["-old value", "+new value"],
+                "truncated": false
+            }]
+        }),
+    )];
+    app.projection = Some(UserProjection {
+        session_id,
+        task_id: Some(task_id),
+        status: golutra_core::TaskStatus::Completed,
+        visible_steps: Vec::new(),
+        pending_approval: None,
+        final_message: None,
+        residual_risks: Vec::new(),
+    });
+
+    assert!(
+        transcript_items(&app)[0]
+            .body
+            .iter()
+            .all(|line| line != "-old value")
+    );
+    handle_key(
+        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("expand all transcript operations");
+    assert!(
+        transcript_items(&app)[0]
+            .body
+            .iter()
+            .any(|line| line == "-old value")
+    );
+    handle_key(
+        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("collapse all transcript operations");
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 20)).expect("terminal");
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw collapsed operation");
+    let (_, toggle) = transcript_toggle_regions(&app, app.layout.transcript)
+        .into_iter()
+        .next()
+        .expect("visible operation toggle");
+    handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: toggle.x,
+            row: toggle.y,
+            modifiers: KeyModifiers::NONE,
+        },
+        &mut app,
+    );
+
+    assert!(
+        transcript_items(&app)[0]
+            .body
+            .iter()
+            .any(|line| line == "+new value")
+    );
+}
+
 #[test]
 fn resumed_completed_history_renders_user_prompt_and_terminal_steps() {
     let session_id = SessionId::new();

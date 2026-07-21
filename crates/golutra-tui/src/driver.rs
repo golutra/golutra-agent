@@ -796,7 +796,7 @@ impl TuiDriver {
             let lines = frame_lines(buffer, area, request.panes);
             let cells = matches!(request.detail, SnapshotDetail::Cells)
                 .then(|| frame_cells(buffer, area, request.panes));
-            let hit_regions = frame_hit_regions(layout, area);
+            let hit_regions = frame_hit_regions(layout, area, &self.app);
             let scope_ids = current_task_and_turn(&self.app);
             let completeness = snapshot_completeness(&self.app, request.scope, request.panes);
             Ok((lines, cells, hit_regions, scope_ids, completeness, layout))

@@ -15,7 +15,7 @@ use golutra_client::{RuntimeClient, RuntimeTransport};
 use golutra_config::{ProviderConfigPaths, ProviderProfile, ProviderSettings};
 use golutra_core::{ActorKind, QueryId, RedactionStatus, SessionId, TaskStatus};
 use golutra_llm::ProviderGenerationConfig;
-use golutra_protocol::{RuntimeQuery, RuntimeQueryKind, TuiFrame, UserProjection};
+use golutra_protocol::{EventFilter, RuntimeQuery, RuntimeQueryKind, TuiFrame, UserProjection};
 use serde_json::{Value, json};
 use tempfile::tempdir;
 use tokio::{
@@ -1379,6 +1379,37 @@ async fn daemon_driver_enforces_binding_and_survives_disconnect_and_restart() {
         }))
         .await;
     let approval = driver_a.receive("approval-before-takeover").await;
+    if approval["type"] != "wait_result" {
+        let projection = transport
+            .query(RuntimeQuery {
+                query_id: QueryId::new(),
+                session_id,
+                task_id: None,
+                kind: RuntimeQueryKind::UserProjection,
+                requester: ActorKind::Sdk,
+                cursor: None,
+                timestamp: chrono::Utc::now(),
+            })
+            .await
+            .expect("query approval projection");
+        let events = transport
+            .replay_events(EventFilter {
+                session_id,
+                task_id: None,
+                after_sequence_no: None,
+            })
+            .await
+            .expect("query approval events")
+            .into_iter()
+            .filter_map(|event| {
+                event
+                    .get("event_type")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        panic!("approval wait failed: {approval}; projection: {projection}; events: {events:?}");
+    }
     assert_eq!(approval["type"], "wait_result", "approval wait: {approval}");
 
     let waiting_inspect = inspect_command(home.path(), workspace.path(), &session_id.to_string())
