@@ -264,11 +264,7 @@ impl RuntimeLaneManager {
         {
             return Err(RuntimeLaneError::LaneNotFound);
         }
-        let event_type = if status == TaskStatus::Cancelled {
-            RuntimeEventType::TaskAborted
-        } else {
-            RuntimeEventType::TaskCompleted
-        };
+        let event_type = RuntimeEventType::for_terminal_status(status);
         self.set_status(session_id, status, sequence_no, event_type)
     }
 
@@ -338,15 +334,7 @@ impl RuntimeLaneManager {
 
 #[must_use]
 pub fn is_active_status(status: TaskStatus) -> bool {
-    matches!(
-        status,
-        TaskStatus::Running
-            | TaskStatus::WaitingApproval
-            | TaskStatus::WaitingAuthentication
-            | TaskStatus::Pausing
-            | TaskStatus::Paused
-            | TaskStatus::Aborting
-    )
+    status.is_active()
 }
 
 fn lane_event(

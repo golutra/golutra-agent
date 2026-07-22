@@ -1495,6 +1495,8 @@ fn task_trace_event_digest(
 fn event_is_failure(event: &golutra_protocol::RuntimeEvent) -> bool {
     match event.event_type {
         golutra_protocol::RuntimeEventType::TaskAborted
+        | golutra_protocol::RuntimeEventType::TaskInterrupted
+        | golutra_protocol::RuntimeEventType::TaskUncertain
         | golutra_protocol::RuntimeEventType::ProviderAuthFailed => true,
         golutra_protocol::RuntimeEventType::PolicyEvaluated => event
             .payload

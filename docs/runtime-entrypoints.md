@@ -92,7 +92,7 @@ The server publishes endpoint metadata and an owner-only transport token under
   bounded HTTP-like IPC envelope;
 - JSON-RPC over HTTP, WebSocket and newline-delimited stdio;
 - thread start/resume/fork/list;
-- turn start, steer, interrupt and approval resolution;
+- turn start, steer, interrupt, crash reconciliation and approval resolution;
 - `agent/event` notifications projected from the durable event stream;
 - attachment routing from canonical cwd to one shared runtime registry.
 
@@ -102,7 +102,7 @@ The JSON-RPC methods are intentionally small and transport-neutral:
 runtime/info       runtime/attach
 thread/start       thread/resume       thread/fork       thread/list
 turn/start         turn/steer          turn/interrupt    turn/takeover
-approval/resolve   turn/status         runtime/events/replay
+task/reconcile     approval/resolve    turn/status       runtime/events/replay
 ```
 
 HTTP and WebSocket clients must send the bearer token and the negotiated
@@ -118,6 +118,14 @@ is authoritative for steer, interrupt, approval and takeover checks.
 it cannot change control ownership. WebSocket, stdio, HTTP and Unix IPC all
 resolve commands through the attachment actor, so a second client must call
 `turn/takeover` before controlling an active lane.
+
+After a host restart, `turn/status` can report `interrupted` or `uncertain`.
+`uncertain` means an incomplete side effect or background process could not be
+proven complete. The runtime rejects new work until an attached controller
+calls `task/reconcile` with `no_side_effect_observed`,
+`side_effect_observed`, or `abandon`; the equivalent local command is
+`golutra reconcile --decision <decision>`. Reconciliation is durable and can
+never convert the old task to `completed`.
 
 JSON-RPC messages without an `id` are notifications: HTTP returns `204 No
 Content`, while WebSocket and stdio send no response. Turn streams publish

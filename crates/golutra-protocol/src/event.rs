@@ -1,4 +1,4 @@
-use golutra_core::{ArtifactId, EventId, SessionId, TaskId, Timestamp, TurnId};
+use golutra_core::{ArtifactId, EventId, SessionId, TaskId, TaskStatus, Timestamp, TurnId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -52,6 +52,9 @@ pub enum RuntimeEventType {
     TaskCompleted,
     TaskAbortRequested,
     TaskAborted,
+    TaskInterrupted,
+    TaskUncertain,
+    TaskReconciled,
     TaskPaused,
     TaskResumed,
     ApprovalRequested,
@@ -109,6 +112,26 @@ pub enum RuntimeEventType {
     MemoryCandidateQuarantined,
     MemoryActivated,
     MemoryInvalidated,
+}
+
+impl RuntimeEventType {
+    #[must_use]
+    pub const fn is_task_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::TaskCompleted | Self::TaskAborted | Self::TaskInterrupted | Self::TaskUncertain
+        )
+    }
+
+    #[must_use]
+    pub const fn for_terminal_status(status: TaskStatus) -> Self {
+        match status {
+            TaskStatus::Cancelled => Self::TaskAborted,
+            TaskStatus::Interrupted => Self::TaskInterrupted,
+            TaskStatus::Uncertain => Self::TaskUncertain,
+            _ => Self::TaskCompleted,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

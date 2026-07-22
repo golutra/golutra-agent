@@ -17,7 +17,8 @@ use golutra_core::{
     Actor, ApprovalDecision, ApprovalId, ApprovalResolution, ArtifactId, ArtifactRecord,
     BusyPolicy, CommandId, EventId, MemoryId, PolicyDecision, PolicyEvaluation, PostTaskJob,
     PostTaskJobId, PostTaskJobKind, PostTaskJobStatus, ProviderAuthRequestId, RedactionStatus,
-    SessionId, TaskId, TaskStatus, ThreadId, TokenUsageRecord, TurnId, WorkspaceId,
+    SessionId, TaskId, TaskReconciliationDecision, TaskReconciliationRecord, TaskRecoveryRecord,
+    TaskStatus, ThreadId, TokenUsageRecord, TurnId, WorkspaceId,
 };
 #[cfg(test)]
 use golutra_eval::EvaluationRunner;
@@ -114,6 +115,7 @@ mod paths;
 mod post_task;
 mod provider_runtime;
 mod query;
+mod recovery;
 mod regression;
 mod rollout;
 mod session;
@@ -689,18 +691,14 @@ impl RuntimeHost {
                 .projections
                 .state(thread.session_id, None)
                 .await?;
-            let orphan_is_active = matches!(
-                state.task_status,
-                TaskStatus::Running
-                    | TaskStatus::WaitingApproval
-                    | TaskStatus::Pausing
-                    | TaskStatus::Paused
-                    | TaskStatus::Aborting
-            );
+            let orphan_is_active = state.task_status.is_active();
             let may_have_pending_turns = state
                 .runtime_lane
                 .as_ref()
                 .is_some_and(|lane| !lane.pending_turns.is_empty());
+            if state.task_status.requires_reconciliation() {
+                continue;
+            }
             if !orphan_is_active && !may_have_pending_turns {
                 continue;
             }
@@ -712,16 +710,19 @@ impl RuntimeHost {
             let pending_turns = self
                 .recoverable_pending_turns(state.session_id, state.active_task_id)
                 .await?;
-            if orphan_is_active {
-                self.record_orphaned_task_cancelled(
-                    state.session_id,
-                    state.active_task_id,
-                    "runtime_process_restart",
-                    "orphaned task cancelled during runtime host recovery",
-                )
-                .await?;
-            }
-            if !pending_turns.is_empty() {
+            let reconciliation_required =
+                if orphan_is_active && let Some(task_id) = state.active_task_id {
+                    self.record_orphaned_task_recovery(
+                        state.session_id,
+                        task_id,
+                        "runtime_process_restart",
+                    )
+                    .await?
+                    .reconciliation_required
+                } else {
+                    false
+                };
+            if !reconciliation_required && !pending_turns.is_empty() {
                 self.clone()
                     .restart_pending_turns(state.session_id, pending_turns, lease)
                     .await?;
@@ -867,6 +868,62 @@ impl RuntimeHost {
             }),
         ))
         .await
+    }
+
+    async fn record_orphaned_task_recovery(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+        recovery: &str,
+    ) -> Result<TaskRecoveryRecord, ClientError> {
+        let events = self
+            .repositories
+            .events
+            .load(session_id, Some(task_id), None)
+            .await?;
+        if let Some(record) = events.iter().rev().find_map(|event| {
+            matches!(
+                event.event_type,
+                RuntimeEventType::TaskInterrupted | RuntimeEventType::TaskUncertain
+            )
+            .then(|| event.payload.get("record").cloned())
+            .flatten()
+        }) {
+            return serde_json::from_value(record).map_err(ClientError::Serialization);
+        }
+        let record = recovery::analyze_task(&events, task_id, &runtime_identity());
+        let (event_type, status) = match record.disposition {
+            golutra_core::TaskRecoveryDisposition::Interrupted => {
+                (RuntimeEventType::TaskInterrupted, TaskStatus::Interrupted)
+            }
+            golutra_core::TaskRecoveryDisposition::Uncertain => {
+                (RuntimeEventType::TaskUncertain, TaskStatus::Uncertain)
+            }
+        };
+        let mut event = host_event(
+            self.next_sequence_no(),
+            session_id,
+            Some(task_id),
+            event_type,
+            RuntimeEventSource::Runtime,
+            json!({
+                "summary": &record.reason,
+                "status": status,
+                "recovery": recovery,
+                "record": &record,
+                "safe_to_replay": false,
+            }),
+        );
+        event.turn_id = events.iter().rev().find_map(|event| {
+            matches!(
+                event.event_type,
+                RuntimeEventType::TurnStarted | RuntimeEventType::TaskCreated
+            )
+            .then_some(event.turn_id)
+            .flatten()
+        });
+        self.record_event(event).await?;
+        Ok(record)
     }
 
     async fn record_event(&self, event: RuntimeEvent) -> Result<(), ClientError> {
@@ -1241,12 +1298,7 @@ fn fork_sequence_for_turn(events: &[RuntimeEvent], turn_id: TurnId) -> Option<u6
     events
         .iter()
         .filter(|event| event.turn_id == Some(turn_id))
-        .filter(|event| {
-            matches!(
-                event.event_type,
-                RuntimeEventType::TaskCompleted | RuntimeEventType::TaskAborted
-            )
-        })
+        .filter(|event| event.event_type.is_task_terminal())
         .map(|event| event.sequence_no)
         .max()
         .or_else(|| {

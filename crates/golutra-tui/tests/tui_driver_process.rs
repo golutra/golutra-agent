@@ -1992,6 +1992,8 @@ async fn wait_for_terminal_projection(
                 | TaskStatus::Failed
                 | TaskStatus::Blocked
                 | TaskStatus::Cancelled
+                | TaskStatus::Interrupted
+                | TaskStatus::Uncertain
         ) {
             return projection;
         }

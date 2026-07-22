@@ -1466,6 +1466,8 @@ pub(crate) fn status_chip(app: &TuiApp) -> &'static str {
         Some(golutra_core::TaskStatus::Failed) => "failed",
         Some(golutra_core::TaskStatus::Blocked) => "blocked",
         Some(golutra_core::TaskStatus::Cancelled) => "cancelled",
+        Some(golutra_core::TaskStatus::Interrupted) => "interrupted",
+        Some(golutra_core::TaskStatus::Uncertain) => "uncertain",
         Some(golutra_core::TaskStatus::Aborting) => "aborting",
         Some(golutra_core::TaskStatus::Paused) => "paused",
         Some(golutra_core::TaskStatus::Pausing) => "pausing",
@@ -1483,7 +1485,9 @@ pub(crate) fn status_color(app: &TuiApp) -> Color {
         Some(golutra_core::TaskStatus::Completed) => Color::Green,
         Some(golutra_core::TaskStatus::Failed)
         | Some(golutra_core::TaskStatus::Blocked)
-        | Some(golutra_core::TaskStatus::Cancelled) => Color::Red,
+        | Some(golutra_core::TaskStatus::Cancelled)
+        | Some(golutra_core::TaskStatus::Interrupted)
+        | Some(golutra_core::TaskStatus::Uncertain) => Color::Red,
         Some(golutra_core::TaskStatus::WaitingApproval)
         | Some(golutra_core::TaskStatus::WaitingAuthentication)
         | Some(golutra_core::TaskStatus::Aborting)

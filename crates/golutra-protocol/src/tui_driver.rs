@@ -262,6 +262,8 @@ pub enum DriverTaskStatus {
     Failed,
     Blocked,
     Cancelled,
+    Interrupted,
+    Uncertain,
 }
 
 impl From<TaskStatus> for DriverTaskStatus {
@@ -279,6 +281,8 @@ impl From<TaskStatus> for DriverTaskStatus {
             TaskStatus::Failed => Self::Failed,
             TaskStatus::Blocked => Self::Blocked,
             TaskStatus::Cancelled => Self::Cancelled,
+            TaskStatus::Interrupted => Self::Interrupted,
+            TaskStatus::Uncertain => Self::Uncertain,
         }
     }
 }

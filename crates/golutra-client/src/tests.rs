@@ -4310,7 +4310,7 @@ async fn aborting_lane_rejects_a_new_prompt_until_cancellation_finishes() {
 }
 
 #[tokio::test]
-async fn runtime_recovery_cancels_unlocked_orphaned_active_tasks() {
+async fn runtime_recovery_interrupts_unlocked_orphaned_active_tasks() {
     let workspace = tempdir().expect("workspace");
     let _home = IsolatedGlobalMockProvider::empty().await;
     let host = RuntimeHost::for_cwd(workspace.path()).await.expect("host");
@@ -4338,8 +4338,185 @@ async fn runtime_recovery_cancels_unlocked_orphaned_active_tasks() {
         .expect("state");
 
     assert_eq!(recovered, 1);
-    assert_eq!(state.task_status, TaskStatus::Cancelled);
+    assert_eq!(state.task_status, TaskStatus::Interrupted);
+    let events = host
+        .store
+        .load_events(session_id, Some(task_id), None)
+        .await
+        .expect("recovery events");
+    let recovery = events
+        .iter()
+        .find(|event| event.event_type == RuntimeEventType::TaskInterrupted)
+        .expect("interrupted recovery event");
+    assert_eq!(recovery.payload["safe_to_replay"], false);
+    assert_eq!(recovery.payload["record"]["reconciliation_required"], false);
     assert_eq!(state.active_task_id, Some(task_id));
+}
+
+#[tokio::test]
+async fn runtime_recovery_marks_unclosed_side_effects_uncertain_without_replay() {
+    let workspace = tempdir().expect("workspace");
+    let _home = IsolatedGlobalMockProvider::empty().await;
+    let host = RuntimeHost::for_cwd(workspace.path()).await.expect("host");
+    let session_id = host.default_session_id();
+    let task_id = TaskId::new();
+    let turn_id = TurnId::new();
+    let tool_call_id = ToolCallId::new();
+    host.upsert_current_thread(session_id, &json!({"prompt": "uncertain task"}))
+        .await
+        .expect("thread");
+    let mut task_created = host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(task_id),
+        RuntimeEventType::TaskCreated,
+        RuntimeEventSource::Runtime,
+        json!({"summary": "task with an unclosed side effect", "runtime_identity": "old"}),
+    );
+    task_created.turn_id = Some(turn_id);
+    host.record_event(task_created).await.expect("task event");
+    host.record_event(host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(task_id),
+        RuntimeEventType::CheckpointCreated,
+        RuntimeEventSource::Runtime,
+        json!({"summary": "before image persisted", "before_image_complete": true}),
+    ))
+    .await
+    .expect("checkpoint event");
+    host.record_event(host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(task_id),
+        RuntimeEventType::ToolStarted,
+        RuntimeEventSource::Tool,
+        json!({
+            "summary": "tool write_file started",
+            "tool_call_id": tool_call_id,
+            "tool_name": "write_file",
+            "arguments": {"path": "out.txt"},
+        }),
+    ))
+    .await
+    .expect("tool start event");
+
+    assert_eq!(host.recover_orphaned_tasks().await.expect("recovery"), 1);
+    let state = host
+        .store
+        .query_state(session_id, None)
+        .await
+        .expect("state");
+    let events = host
+        .store
+        .load_events(session_id, Some(task_id), None)
+        .await
+        .expect("events");
+    let recovery = events
+        .iter()
+        .find(|event| event.event_type == RuntimeEventType::TaskUncertain)
+        .expect("uncertain recovery event");
+
+    assert_eq!(state.task_status, TaskStatus::Uncertain);
+    assert_eq!(recovery.payload["status"], json!(TaskStatus::Uncertain));
+    assert_eq!(recovery.payload["safe_to_replay"], false);
+    assert_eq!(recovery.payload["record"]["reconciliation_required"], true);
+    assert_eq!(
+        recovery.payload["record"]["incomplete_tool_calls"][0]["tool_name"],
+        "write_file"
+    );
+    assert_eq!(
+        recovery.payload["record"]["checkpoint_event_refs"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn uncertain_recovery_requires_explicit_reconciliation_before_new_work() {
+    let workspace = tempdir().expect("workspace");
+    let _home = IsolatedGlobalMockProvider::empty().await;
+    let host = RuntimeHost::for_cwd(workspace.path()).await.expect("host");
+    let transport = EmbeddedTransport::new(host.clone());
+    let session_id = host.default_session_id();
+    let task_id = TaskId::new();
+    let turn_id = TurnId::new();
+    let tool_call_id = ToolCallId::new();
+
+    host.upsert_current_thread(session_id, &json!({"prompt": "uncertain task"}))
+        .await
+        .expect("thread");
+    let mut task_created = host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(task_id),
+        RuntimeEventType::TaskCreated,
+        RuntimeEventSource::Runtime,
+        json!({"summary": "uncertain task"}),
+    );
+    task_created.turn_id = Some(turn_id);
+    host.record_event(task_created).await.expect("task event");
+    host.record_event(host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(task_id),
+        RuntimeEventType::ToolStarted,
+        RuntimeEventSource::Tool,
+        json!({"tool_call_id": tool_call_id, "tool_name": "write_file"}),
+    ))
+    .await
+    .expect("tool event");
+    assert_eq!(host.recover_orphaned_tasks().await.expect("recovery"), 1);
+
+    let rejected = transport
+        .send_command(command(session_id, "must wait for reconciliation"))
+        .await
+        .expect("prompt ack");
+    assert!(!rejected.accepted);
+    assert!(
+        rejected
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("reconciliation"))
+    );
+
+    let mut reconcile = command(session_id, "");
+    reconcile.kind = SessionCommandKind::ReconcileTask;
+    reconcile.payload = json!({
+        "task_id": task_id,
+        "decision": TaskReconciliationDecision::SideEffectObserved,
+        "note": "verified the file was written before the host stopped",
+    });
+    let reconciled = transport
+        .send_command(reconcile)
+        .await
+        .expect("reconciliation ack");
+    assert!(reconciled.accepted);
+
+    let state = host
+        .store
+        .query_state(session_id, None)
+        .await
+        .expect("state");
+    assert_eq!(state.task_status, TaskStatus::Interrupted);
+    let events = host
+        .store
+        .load_events(session_id, Some(task_id), None)
+        .await
+        .expect("events");
+    let reconciliation = events
+        .iter()
+        .find(|event| event.event_type == RuntimeEventType::TaskReconciled)
+        .expect("reconciliation event");
+    assert_eq!(
+        reconciliation.payload["record"]["decision"],
+        "side_effect_observed"
+    );
+    assert_eq!(
+        reconciliation.payload["status"],
+        json!(TaskStatus::Interrupted)
+    );
 }
 
 #[tokio::test]
@@ -4409,7 +4586,7 @@ async fn runtime_recovery_restarts_durable_unstarted_pending_turns() {
     let events = wait_for_task_completed_count(&transport, session_id, 1).await;
 
     assert!(events.iter().any(|event| {
-        event.event_type == RuntimeEventType::TaskAborted
+        event.event_type == RuntimeEventType::TaskInterrupted
             && event.task_id == Some(task_id)
             && event.payload["recovery"] == "runtime_process_restart"
     }));
@@ -4447,6 +4624,109 @@ async fn runtime_recovery_restarts_durable_unstarted_pending_turns() {
         ),
         Some(TaskStatus::Completed)
     );
+}
+
+#[tokio::test]
+async fn uncertain_recovery_holds_pending_turns_until_reconciled() {
+    let workspace = tempdir().expect("workspace");
+    let _provider = IsolatedGlobalMockProvider::install().await;
+    let host = RuntimeHost::for_cwd(workspace.path()).await.expect("host");
+    let session_id = host.default_session_id();
+    let task_id = TaskId::new();
+    let active_turn_id = TurnId::new();
+    let pending_turn_id = TurnId::new();
+    host.upsert_current_thread(session_id, &json!({"prompt": "orphaned task"}))
+        .await
+        .expect("thread");
+    let started = host
+        .lane_manager
+        .lock()
+        .await
+        .start_task(
+            host.workspace_id,
+            session_id,
+            task_id,
+            active_turn_id,
+            Actor {
+                kind: ActorKind::Cli,
+                id: "uncertain-queue-owner".to_owned(),
+            },
+            host.next_sequence_no(),
+        )
+        .expect("task starts");
+    host.record_event(started.event).await.expect("task event");
+    host.record_event(host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(task_id),
+        RuntimeEventType::ToolStarted,
+        RuntimeEventSource::Tool,
+        json!({
+            "tool_call_id": ToolCallId::new(),
+            "tool_name": "write_file",
+        }),
+    ))
+    .await
+    .expect("side effect start");
+    let queued = host
+        .lane_manager
+        .lock()
+        .await
+        .queue_turn(session_id, pending_turn_id, host.next_sequence_no())
+        .expect("turn queues");
+    host.record_event(with_command_payload(
+        queued.event,
+        CommandId::new(),
+        json!({"prompt": "run only after reconciliation"}),
+    ))
+    .await
+    .expect("queued event");
+    drop(host);
+
+    let reopened = RuntimeHost::for_cwd(workspace.path())
+        .await
+        .expect("reopened host");
+    let transport = EmbeddedTransport::new(reopened.clone());
+    let held_events = reopened
+        .store
+        .load_events(session_id, None, None)
+        .await
+        .expect("held events");
+    assert!(held_events.iter().any(|event| {
+        event.event_type == RuntimeEventType::TaskUncertain && event.task_id == Some(task_id)
+    }));
+    assert!(!held_events.iter().any(|event| {
+        event.event_type == RuntimeEventType::TurnStarted && event.turn_id == Some(pending_turn_id)
+    }));
+
+    let mut reconcile = command(session_id, "");
+    reconcile.kind = SessionCommandKind::ReconcileTask;
+    reconcile.payload = json!({
+        "task_id": task_id,
+        "decision": TaskReconciliationDecision::NoSideEffectObserved,
+    });
+    assert!(
+        transport
+            .send_command(reconcile)
+            .await
+            .expect("reconcile")
+            .accepted
+    );
+    let events = wait_for_task_completed_count(&transport, session_id, 1).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event.event_type == RuntimeEventType::TurnStarted
+                    && event.turn_id == Some(pending_turn_id)
+            })
+            .count(),
+        1
+    );
+    assert!(events.iter().any(|event| {
+        event.event_type == RuntimeEventType::AssistantMessage
+            && event.turn_id == Some(pending_turn_id)
+    }));
 }
 
 #[tokio::test]
@@ -4642,7 +4922,7 @@ async fn long_lived_host_recovers_an_orphan_when_the_next_prompt_reacquires_its_
 
     assert!(ack.accepted);
     assert!(events.iter().any(|event| {
-        event.event_type == RuntimeEventType::TaskAborted
+        event.event_type == RuntimeEventType::TaskInterrupted
             && event.task_id == Some(orphaned_task_id)
             && event.payload.get("recovery").and_then(Value::as_str)
                 == Some("session_lease_reacquired")

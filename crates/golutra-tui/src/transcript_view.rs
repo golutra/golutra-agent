@@ -813,6 +813,9 @@ pub(crate) fn event_status_title(event_type: RuntimeEventType) -> Option<&'stati
         RuntimeEventType::TaskResumed => Some("Resumed"),
         RuntimeEventType::TaskAbortRequested => Some("Stopping"),
         RuntimeEventType::TaskAborted => Some("Aborted"),
+        RuntimeEventType::TaskInterrupted => Some("Task Interrupted"),
+        RuntimeEventType::TaskUncertain => Some("Task Uncertain / reconciliation required"),
+        RuntimeEventType::TaskReconciled => Some("Task Recovery Reconciled"),
         RuntimeEventType::ToolProgress => None,
         _ => None,
     }
@@ -943,6 +946,14 @@ mod tests {
         assert_eq!(
             event_status_title(RuntimeEventType::ProviderTransportFallback),
             Some("Transport Fallback")
+        );
+        assert_eq!(
+            event_status_title(RuntimeEventType::TaskInterrupted),
+            Some("Task Interrupted")
+        );
+        assert_eq!(
+            event_status_title(RuntimeEventType::TaskUncertain),
+            Some("Task Uncertain / reconciliation required")
         );
     }
 

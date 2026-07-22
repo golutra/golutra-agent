@@ -30,7 +30,7 @@ pub(crate) fn conversation_history_line(event: &RuntimeEvent) -> Option<String> 
             .and_then(Value::as_str)
             .filter(|summary| !summary.trim().is_empty())
             .map(|summary| format!("Tool: {}", compact_history_text(summary, 180))),
-        RuntimeEventType::TaskCompleted => event
+        event_type if event_type.is_task_terminal() => event
             .payload
             .get("status")
             .and_then(Value::as_str)

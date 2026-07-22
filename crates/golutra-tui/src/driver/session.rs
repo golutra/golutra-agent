@@ -148,14 +148,7 @@ pub(super) fn event_type_name(event_type: golutra_protocol::RuntimeEventType) ->
 }
 
 pub(super) fn is_terminal_status(status: TaskStatus) -> bool {
-    matches!(
-        status,
-        TaskStatus::Completed
-            | TaskStatus::Partial
-            | TaskStatus::Failed
-            | TaskStatus::Blocked
-            | TaskStatus::Cancelled
-    )
+    status.is_terminal()
 }
 
 pub(super) fn capabilities() -> Vec<String> {

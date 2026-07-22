@@ -101,10 +101,7 @@ impl AgentEventProjector {
 
         let timestamp = event.timestamp;
         let task_id = event.task_id.or(self.task_id);
-        let turn_id = if matches!(
-            event.event_type,
-            RuntimeEventType::TaskCompleted | RuntimeEventType::TaskAborted
-        ) {
+        let turn_id = if event.event_type.is_task_terminal() {
             self.turn_id.or(event.turn_id)
         } else {
             event.turn_id.or(self.turn_id)
@@ -126,7 +123,10 @@ impl AgentEventProjector {
                     }
                 }
             }
-            RuntimeEventType::TaskCompleted | RuntimeEventType::TaskAborted => {
+            RuntimeEventType::TaskCompleted
+            | RuntimeEventType::TaskAborted
+            | RuntimeEventType::TaskInterrupted
+            | RuntimeEventType::TaskUncertain => {
                 let status = event
                     .payload
                     .get("status")
@@ -205,12 +205,7 @@ impl AgentEventProjector {
             if event.turn_id == Some(turn_id) {
                 return true;
             }
-            if event.task_id == self.task_id
-                && matches!(
-                    event.event_type,
-                    RuntimeEventType::TaskCompleted | RuntimeEventType::TaskAborted
-                )
-            {
+            if event.task_id == self.task_id && event.event_type.is_task_terminal() {
                 return true;
             }
             // A steer is intentionally projected as a continuation of the
@@ -494,6 +489,45 @@ mod tests {
         assert_eq!(result.status, TaskStatus::Completed);
         assert_eq!(result.final_message.as_deref(), Some("done"));
         assert_eq!(result.last_sequence_no, Some(6));
+    }
+
+    #[test]
+    fn uncertain_recovery_is_a_failed_terminal_agent_event() {
+        let thread = thread_ref();
+        let command_id = CommandId::new();
+        let task_id = TaskId::new();
+        let turn_id = TurnId::new();
+        let mut projector = AgentEventProjector::new(thread.clone(), Some(command_id));
+        projector.project(event(
+            &thread,
+            1,
+            Some(task_id),
+            Some(turn_id),
+            RuntimeEventType::TurnStarted,
+            json!({"command_id": command_id}),
+        ));
+
+        let terminal = projector.project(event(
+            &thread,
+            2,
+            Some(task_id),
+            Some(turn_id),
+            RuntimeEventType::TaskUncertain,
+            json!({
+                "status": "uncertain",
+                "summary": "side effect requires reconciliation",
+            }),
+        ));
+
+        assert!(matches!(
+            terminal,
+            Some(AgentStreamEvent::TurnFailed {
+                status: TaskStatus::Uncertain,
+                ref error,
+                ..
+            }) if error.contains("reconciliation")
+        ));
+        assert!(projector.is_finished());
     }
 
     #[test]

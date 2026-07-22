@@ -145,7 +145,7 @@ impl WaitFacts {
                 });
         }
         match event.event_type {
-            RuntimeEventType::TaskCompleted | RuntimeEventType::TaskAborted => {
+            event_type if event_type.is_task_terminal() => {
                 if let Some(task_id) = event.task_id {
                     record_max(&mut self.task_terminal, task_id, event.sequence_no);
                 }

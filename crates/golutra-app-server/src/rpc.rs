@@ -202,7 +202,8 @@ async fn dispatch(
             "protocol_versions": ProtocolVersionRange::runtime(),
             "capabilities": [
                 "thread.start", "thread.resume", "thread.fork", "turn.start",
-                "turn.steer", "turn.interrupt", "turn.takeover", "approval.resolve", "agent.event"
+                "turn.steer", "turn.interrupt", "turn.takeover", "task.reconcile",
+                "approval.resolve", "agent.event"
             ]
         })),
         "runtime/info" => Ok(json!(state.info())),
@@ -215,6 +216,7 @@ async fn dispatch(
         "turn/steer" => turn_control(state, &params, attachment_hint, actor, false).await,
         "turn/interrupt" => turn_control(state, &params, attachment_hint, actor, true).await,
         "turn/takeover" => turn_takeover(state, &params, attachment_hint, actor).await,
+        "task/reconcile" => task_reconcile(state, &params, attachment_hint, actor).await,
         "approval/resolve" => approval_resolve(state, &params, attachment_hint, actor).await,
         "turn/status" => turn_status(state, &params, attachment_hint).await,
         "runtime/events/replay" => replay_events(state, &params, attachment_hint).await,
@@ -432,6 +434,39 @@ async fn turn_takeover(
             session_id,
             SessionCommandKind::Takeover,
             json!({"_thread_id": params.get("thread_id")}),
+            &actor,
+        ))
+        .await
+        .map_err(RpcDispatchError::from_client)?;
+    Ok(json!({"attachment_id": attachment_id, "ack": ack}))
+}
+
+async fn task_reconcile(
+    state: &AppState,
+    params: &Value,
+    attachment_hint: Option<&str>,
+    _actor: &Actor,
+) -> RpcResult {
+    let (transport, attachment_id) = resolve_transport(state, params, attachment_hint).await?;
+    let actor = state
+        .attached_actor(&attachment_id)
+        .await
+        .map_err(RpcDispatchError::from_app)?;
+    let session_id = resolve_session(&transport, params).await?;
+    let decision = params
+        .get("decision")
+        .cloned()
+        .ok_or_else(|| RpcDispatchError::new(-32602, "decision is required"))?;
+    let ack = transport
+        .send_command(rpc_command(
+            session_id,
+            SessionCommandKind::ReconcileTask,
+            json!({
+                "task_id": params.get("task_id"),
+                "decision": decision,
+                "note": params.get("note"),
+                "_thread_id": params.get("thread_id"),
+            }),
             &actor,
         ))
         .await

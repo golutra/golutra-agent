@@ -173,12 +173,8 @@ impl RuntimeHost {
             .iter()
             .rev()
             .find(|event| {
-                matches!(
-                    event.event_type,
-                    RuntimeEventType::TaskCompleted
-                        | RuntimeEventType::TaskAborted
-                        | RuntimeEventType::LoopDecided
-                )
+                event.event_type.is_task_terminal()
+                    || event.event_type == RuntimeEventType::LoopDecided
             })
             .and_then(|event| event.payload.get("status"))
             .cloned()

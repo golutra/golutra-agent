@@ -13,6 +13,7 @@ pub enum SessionCommandKind {
     Pause,
     Resume,
     Abort,
+    ReconcileTask,
     Takeover,
     Compact,
     MemoryRollback,

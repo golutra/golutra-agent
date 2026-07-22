@@ -188,7 +188,7 @@ impl ActivityProjection {
             RuntimeEventType::TaskResumed => {
                 self.resume_at(event.timestamp);
             }
-            RuntimeEventType::TaskAborted | RuntimeEventType::TaskCompleted => {
+            event_type if event_type.is_task_terminal() => {
                 self.pause_at(event.timestamp);
             }
             _ => {}
@@ -570,6 +570,36 @@ mod tests {
             status.elapsed_at(base + chrono::Duration::seconds(7)),
             Duration::from_secs(5)
         );
+    }
+
+    #[test]
+    fn uncertain_recovery_stops_the_live_activity_timer() {
+        let base = Utc::now();
+        let task = TaskId::new();
+        let turn = TurnId::new();
+        let mut status = ActivityProjection::default();
+        status.apply(&event(
+            1,
+            task,
+            Some(turn),
+            RuntimeEventType::TaskCreated,
+            base,
+            json!({}),
+        ));
+        status.apply(&event(
+            2,
+            task,
+            Some(turn),
+            RuntimeEventType::TaskUncertain,
+            base + chrono::Duration::seconds(3),
+            json!({"status": "uncertain"}),
+        ));
+
+        assert_eq!(
+            status.elapsed_at(base + chrono::Duration::seconds(30)),
+            Duration::from_secs(3)
+        );
+        assert!(status.paused);
     }
 
     #[test]

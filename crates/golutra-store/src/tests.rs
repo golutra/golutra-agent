@@ -440,6 +440,31 @@ fn projection_tracks_runtime_lane_and_keeps_pause_after_approval_resolution() {
     );
 }
 
+#[test]
+fn projection_turns_reconciled_uncertain_task_into_interrupted_state() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let event = RuntimeEvent {
+        id: golutra_core::EventId::new(),
+        sequence_no: 1,
+        session_id,
+        turn_id: Some(TurnId::new()),
+        task_id: Some(task_id),
+        parent_event_id: None,
+        event_type: RuntimeEventType::TaskReconciled,
+        timestamp: Utc::now(),
+        source: RuntimeEventSource::Runtime,
+        payload: json!({"status": "interrupted"}),
+        payload_ref: None,
+        durable: true,
+    };
+
+    let projection = RuntimeStore::reduce_state(session_id, &[event]);
+
+    assert_eq!(projection.active_task_id, Some(task_id));
+    assert_eq!(projection.task_status, TaskStatus::Interrupted);
+}
+
 #[tokio::test]
 async fn stores_artifact_metadata() {
     let store = RuntimeStore::in_memory().await.expect("store opens");

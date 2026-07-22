@@ -9,7 +9,7 @@ use golutra_client::RuntimeApplication;
 use golutra_core::{Actor, ActorKind, CommandId, TraceView};
 use golutra_protocol::{
     EventFilter, RuntimeEvaluationWorkerRequest, RuntimeEvaluationWorkerResponse, RuntimeEventType,
-    SessionCommand, SessionCommandKind, TaskTraceRequest,
+    RuntimeQuery, RuntimeQueryKind, SessionCommand, SessionCommandKind, TaskTraceRequest,
 };
 
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
@@ -33,11 +33,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let application = RuntimeApplication::from_home_and_cwd(&cli.home, &cli.workspace).await?;
     let session_id = application.session_service().default_session_id();
+    let cursor = application
+        .query(RuntimeQuery {
+            query_id: golutra_core::QueryId::new(),
+            session_id,
+            task_id: None,
+            kind: RuntimeQueryKind::SessionState,
+            requester: ActorKind::Runtime,
+            cursor: None,
+            timestamp: chrono::Utc::now(),
+        })
+        .await?
+        .get("last_sequence_no")
+        .and_then(serde_json::Value::as_u64);
     let mut events = application
         .subscribe(EventFilter {
             session_id,
             task_id: None,
-            after_sequence_no: None,
+            after_sequence_no: cursor,
         })
         .await?;
     let mut payload = request.payload.clone();
@@ -72,20 +85,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
+    let command_id_text = command_id.to_string();
     let task_id = tokio::time::timeout(TASK_TIMEOUT, async {
+        let mut task_id = None;
         loop {
             let event = match events.recv().await {
                 Some(Ok(event)) => event,
                 Some(Err(error)) => return Err(error.to_string()),
                 None => return Err("runtime event stream ended".to_owned()),
             };
-            if matches!(
-                event.event_type,
-                RuntimeEventType::TaskCompleted | RuntimeEventType::TaskAborted
-            ) {
-                return event
-                    .task_id
-                    .ok_or_else(|| "terminal event has no task id".to_owned());
+            if task_id.is_none()
+                && matches!(
+                    event.event_type,
+                    RuntimeEventType::TaskCreated | RuntimeEventType::TurnStarted
+                )
+                && event
+                    .payload
+                    .get("command_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(command_id_text.as_str())
+            {
+                task_id = event.task_id;
+            }
+            if event.event_type.is_task_terminal() && event.task_id == task_id {
+                return task_id.ok_or_else(|| "terminal event has no task id".to_owned());
             }
         }
     })

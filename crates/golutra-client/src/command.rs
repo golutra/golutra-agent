@@ -141,6 +141,10 @@ impl RuntimeHost {
                     self.handle_lane_command(session_id, &command, "abort")
                         .await?
                 }
+                SessionCommandKind::ReconcileTask => {
+                    self.handle_reconcile_task_command(session_id, command)
+                        .await?
+                }
                 SessionCommandKind::Takeover => {
                     self.handle_takeover_command(session_id, &command).await?
                 }
@@ -456,14 +460,41 @@ impl RuntimeHost {
                 });
             }
         };
-        if let Some(active_task_id) = self.persisted_active_task(session_id).await? {
-            self.record_orphaned_task_cancelled(
-                session_id,
-                Some(active_task_id),
-                "session_lease_reacquired",
-                "orphaned persisted task cancelled before starting the next prompt",
-            )
+        let persisted_state = self
+            .repositories
+            .projections
+            .state(session_id, None)
             .await?;
+        if persisted_state.task_status.requires_reconciliation() {
+            drop(session_lease);
+            return Ok(CommandAck {
+                command_id: command.command_id,
+                accepted: false,
+                reason: Some(
+                    "prompt rejected because the previous task has unreconciled side effects; run task reconciliation first"
+                        .to_owned(),
+                ),
+            });
+        }
+        if let Some(active_task_id) = self.persisted_active_task(session_id).await? {
+            let recovery = self
+                .record_orphaned_task_recovery(
+                    session_id,
+                    active_task_id,
+                    "session_lease_reacquired",
+                )
+                .await?;
+            if recovery.reconciliation_required {
+                drop(session_lease);
+                return Ok(CommandAck {
+                    command_id: command.command_id,
+                    accepted: false,
+                    reason: Some(
+                        "prompt rejected because recovery found an uncertain side effect; run task reconciliation first"
+                            .to_owned(),
+                    ),
+                });
+            }
         }
 
         self.upsert_current_thread(session_id, &payload).await?;
@@ -509,6 +540,186 @@ impl RuntimeHost {
             command_id: command.command_id,
             accepted: true,
             reason: Some(format!("started task {task_id} in session {session_id}")),
+        })
+    }
+
+    async fn handle_reconcile_task_command(
+        self: &Arc<Self>,
+        session_id: SessionId,
+        command: SessionCommand,
+    ) -> Result<CommandAck, ClientError> {
+        const MAX_RECONCILIATION_NOTE_CHARS: usize = 4_096;
+
+        let command_id = command.command_id;
+        let state = self
+            .repositories
+            .projections
+            .state(session_id, None)
+            .await?;
+        if state.task_status != TaskStatus::Uncertain {
+            return Ok(CommandAck {
+                command_id,
+                accepted: false,
+                reason: Some("task reconciliation requires an uncertain session state".to_owned()),
+            });
+        }
+        let task_id = match command.payload.get("task_id").and_then(Value::as_str) {
+            Some(value) => match value.parse::<TaskId>() {
+                Ok(task_id) => task_id,
+                Err(_) => {
+                    return Ok(CommandAck {
+                        command_id,
+                        accepted: false,
+                        reason: Some("task_id is invalid".to_owned()),
+                    });
+                }
+            },
+            None => match state.active_task_id {
+                Some(task_id) => task_id,
+                None => {
+                    return Ok(CommandAck {
+                        command_id,
+                        accepted: false,
+                        reason: Some("uncertain session has no active task id".to_owned()),
+                    });
+                }
+            },
+        };
+        if state.active_task_id != Some(task_id) {
+            return Ok(CommandAck {
+                command_id,
+                accepted: false,
+                reason: Some("task_id is not the session's uncertain task".to_owned()),
+            });
+        }
+        let decision = match command.payload.get("decision").cloned() {
+            Some(value) => match serde_json::from_value::<TaskReconciliationDecision>(value) {
+                Ok(decision) => decision,
+                Err(_) => {
+                    return Ok(CommandAck {
+                        command_id,
+                        accepted: false,
+                        reason: Some(
+                            "decision must be no_side_effect_observed, side_effect_observed, or abandon"
+                                .to_owned(),
+                        ),
+                    });
+                }
+            },
+            None => {
+                return Ok(CommandAck {
+                    command_id,
+                    accepted: false,
+                    reason: Some("reconciliation decision is required".to_owned()),
+                });
+            }
+        };
+        let note = command
+            .payload
+            .get("note")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|note| !note.is_empty())
+            .map(ToOwned::to_owned);
+        if note
+            .as_ref()
+            .is_some_and(|note| note.chars().count() > MAX_RECONCILIATION_NOTE_CHARS)
+        {
+            return Ok(CommandAck {
+                command_id,
+                accepted: false,
+                reason: Some(format!(
+                    "reconciliation note exceeds {MAX_RECONCILIATION_NOTE_CHARS} characters"
+                )),
+            });
+        }
+
+        let session_lease = match self.try_acquire_session_lease(session_id)? {
+            SessionLeaseAttempt::Acquired(lease) => lease,
+            SessionLeaseAttempt::Busy => {
+                return Ok(CommandAck {
+                    command_id,
+                    accepted: false,
+                    reason: Some(
+                        "task reconciliation rejected because the session is owned by another runtime process"
+                            .to_owned(),
+                    ),
+                });
+            }
+        };
+        let events = self
+            .repositories
+            .events
+            .load(session_id, Some(task_id), None)
+            .await?;
+        let Some(recovery_event) = events
+            .iter()
+            .rev()
+            .find(|event| event.event_type == RuntimeEventType::TaskUncertain)
+        else {
+            drop(session_lease);
+            return Ok(CommandAck {
+                command_id,
+                accepted: false,
+                reason: Some("uncertain task has no durable recovery record".to_owned()),
+            });
+        };
+        if events.iter().any(|event| {
+            event.sequence_no > recovery_event.sequence_no
+                && event.event_type == RuntimeEventType::TaskReconciled
+        }) {
+            drop(session_lease);
+            return Ok(CommandAck {
+                command_id,
+                accepted: false,
+                reason: Some("task recovery was already reconciled".to_owned()),
+            });
+        }
+        let pending_turns = self
+            .recoverable_pending_turns(session_id, Some(task_id))
+            .await?;
+        let resulting_status = match decision {
+            TaskReconciliationDecision::Abandon => TaskStatus::Cancelled,
+            TaskReconciliationDecision::NoSideEffectObserved
+            | TaskReconciliationDecision::SideEffectObserved => TaskStatus::Interrupted,
+        };
+        let record = TaskReconciliationRecord {
+            task_id,
+            recovery_event_ref: recovery_event.id,
+            decision,
+            resulting_status,
+            note,
+            reconciled_by: command.actor,
+            reconciled_at: chrono::Utc::now(),
+            resumed_pending_turns: !pending_turns.is_empty(),
+        };
+        self.record_event(host_event(
+            self.next_sequence_no(),
+            session_id,
+            Some(task_id),
+            RuntimeEventType::TaskReconciled,
+            RuntimeEventSource::Runtime,
+            json!({
+                "summary": "uncertain task recovery was explicitly reconciled",
+                "status": resulting_status,
+                "record": record,
+                "command_id": command_id,
+            }),
+        ))
+        .await?;
+        if !pending_turns.is_empty() {
+            self.clone()
+                .restart_pending_turns(session_id, pending_turns, session_lease)
+                .await?;
+        } else {
+            drop(session_lease);
+        }
+        Ok(CommandAck {
+            command_id,
+            accepted: true,
+            reason: Some(format!(
+                "task {task_id} recovery reconciled as {resulting_status:?}"
+            )),
         })
     }
 

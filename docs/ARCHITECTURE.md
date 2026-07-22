@@ -142,7 +142,7 @@ Golutra 当前主场景是 coding agent，不按通用 agent 平台做第一阶�
 - `inject` 只能在安全边界处发生，不能打断正在执行的文件写入、shell、网络或外部系统副作用。
 - 所有 busy policy 决策都必须写入 `RuntimeEvent`，并进入 `StateProjection`。
 - `interrupt` 与 `abort` 都必须走 `CancellationContract`，不能只停止 UI stream。
-- 当前 task handle 使用 `CancellationToken` 驱动 provider/tool loop；shell cancel 在 Unix 上终止整个进程组并继续排空 stdout/stderr，pause/resume 和 pending turn queue 都属于 `RuntimeHost` 状态。`TurnQueued` 是 durable queue fact；owner 崩溃后，尚未产生 `TurnStarted` 的 turn 会在新 host 取得 session lease 后转移到 recovery task，已经开始的 turn 不做不安全的自动重放。
+- 当前 task handle 使用 `CancellationToken` 驱动 provider/tool loop；shell cancel 在 Unix 上终止整个进程组并继续排空 stdout/stderr，pause/resume 和 pending turn queue 都属于 `RuntimeHost` 状态。`TurnQueued` 是 durable queue fact；owner 崩溃后，已经开始的 turn 不做不安全的自动重放。恢复分析器根据未闭合 tool call、后台 process、checkpoint refs 和 runtime identity 写 `TaskInterrupted` 或 `TaskUncertain`。只有前者可以自动转移尚未开始的 pending turn；后者必须经 CLI `reconcile` 或 App Server `task/reconcile` 写入显式对账记录后才能继续。
 
 ## 四个核心系统
 

@@ -604,6 +604,8 @@ fn task_status_name(status: TaskStatus) -> &'static str {
         TaskStatus::Failed => "failed",
         TaskStatus::Blocked => "blocked",
         TaskStatus::Cancelled => "cancelled",
+        TaskStatus::Interrupted => "interrupted",
+        TaskStatus::Uncertain => "uncertain",
     }
 }
 

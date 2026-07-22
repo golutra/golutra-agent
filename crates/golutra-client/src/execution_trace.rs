@@ -313,11 +313,7 @@ impl RuntimeHost {
                 self.record_event(transition.event).await
             }
             Err(RuntimeLaneError::LaneNotFound) => {
-                let event_type = if status == TaskStatus::Cancelled {
-                    RuntimeEventType::TaskAborted
-                } else {
-                    RuntimeEventType::TaskCompleted
-                };
+                let event_type = RuntimeEventType::for_terminal_status(status);
                 self.record_event(agent_event(
                     self.next_sequence_no(),
                     task,

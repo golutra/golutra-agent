@@ -61,7 +61,29 @@ pub(crate) fn apply_event_to_projection(projection: &mut StateProjection, event:
             projection.task_status = TaskStatus::Aborting;
         }
         RuntimeEventType::TaskAborted => {
-            projection.task_status = TaskStatus::Cancelled;
+            projection.task_status = event
+                .payload
+                .get("status")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or(TaskStatus::Cancelled);
+            projection.pending_approval = None;
+        }
+        RuntimeEventType::TaskInterrupted => {
+            projection.task_status = TaskStatus::Interrupted;
+            projection.pending_approval = None;
+        }
+        RuntimeEventType::TaskUncertain => {
+            projection.task_status = TaskStatus::Uncertain;
+            projection.pending_approval = None;
+        }
+        RuntimeEventType::TaskReconciled => {
+            projection.task_status = event
+                .payload
+                .get("status")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or(TaskStatus::Interrupted);
             projection.pending_approval = None;
         }
         RuntimeEventType::TaskPaused => {

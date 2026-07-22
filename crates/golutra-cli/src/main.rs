@@ -16,7 +16,8 @@ use golutra_config::{
     update_provider_settings_verified, validate_provider_protocol_runtime_supported,
 };
 use golutra_core::{
-    Actor, ActorKind, CommandId, SessionId, TaskId, TaskStatus, ThreadId, TraceView, TurnId,
+    Actor, ActorKind, CommandId, SessionId, TaskId, TaskReconciliationDecision, TaskStatus,
+    ThreadId, TraceView, TurnId,
 };
 use golutra_llm::{
     ConfiguredProvider, ProviderGenerationConfig, ProviderHeaderConfig, ProviderHeaderValue,
@@ -79,6 +80,13 @@ enum Command {
         from_turn: Option<String>,
     },
     Abort,
+    Reconcile {
+        task_id: Option<String>,
+        #[arg(long, value_enum)]
+        decision: ReconciliationDecisionArg,
+        #[arg(long)]
+        note: Option<String>,
+    },
     Takeover,
     Pause,
     Approve {
@@ -136,6 +144,23 @@ enum Command {
         #[command(subcommand)]
         command: PluginCommand,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ReconciliationDecisionArg {
+    NoSideEffectObserved,
+    SideEffectObserved,
+    Abandon,
+}
+
+impl From<ReconciliationDecisionArg> for TaskReconciliationDecision {
+    fn from(value: ReconciliationDecisionArg) -> Self {
+        match value {
+            ReconciliationDecisionArg::NoSideEffectObserved => Self::NoSideEffectObserved,
+            ReconciliationDecisionArg::SideEffectObserved => Self::SideEffectObserved,
+            ReconciliationDecisionArg::Abandon => Self::Abandon,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -663,6 +688,25 @@ async fn main() -> miette::Result<()> {
                     session_id,
                     SessionCommandKind::Abort,
                     serde_json::json!({}),
+                ))
+                .await
+                .map_err(|error| miette::miette!("{error}"))?;
+            println!("{}", serde_json::to_string_pretty(&ack).unwrap_or_default());
+        }
+        Command::Reconcile {
+            task_id,
+            decision,
+            note,
+        } => {
+            let ack = transport
+                .send_command(command(
+                    session_id,
+                    SessionCommandKind::ReconcileTask,
+                    serde_json::json!({
+                        "task_id": task_id,
+                        "decision": TaskReconciliationDecision::from(decision),
+                        "note": note,
+                    }),
                 ))
                 .await
                 .map_err(|error| miette::miette!("{error}"))?;
@@ -2298,14 +2342,7 @@ async fn approval_detail(
 }
 
 fn is_terminal_status(status: TaskStatus) -> bool {
-    matches!(
-        status,
-        TaskStatus::Completed
-            | TaskStatus::Partial
-            | TaskStatus::Failed
-            | TaskStatus::Blocked
-            | TaskStatus::Cancelled
-    )
+    status.is_terminal()
 }
 
 fn run_plugin_command(command: &PluginCommand) -> miette::Result<()> {
