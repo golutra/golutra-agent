@@ -264,7 +264,7 @@ pub(crate) async fn run_process_with_progress(
     })
 }
 
-fn terminate_process_group(process_id: Option<u32>) {
+pub(crate) fn terminate_process_group(process_id: Option<u32>) {
     #[cfg(unix)]
     if let Some(process_id) = process_id.and_then(|id| i32::try_from(id).ok()) {
         let pid = Pid::from_raw(process_id);

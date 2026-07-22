@@ -316,6 +316,133 @@ async fn event_writer_assigns_sequence_numbers_in_record_order() {
 }
 
 #[tokio::test]
+async fn runtime_host_reuses_one_process_supervisor_across_tool_executors() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(
+        workspace.path().join("host_process.sh"),
+        "sleep 0.05\nprintf host-survived-turn\n",
+    )
+    .expect("process script");
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let session_id = host.default_session_id();
+    let root = workspace.path().to_path_buf();
+    let first = host
+        .build_tool_executor(
+            WorkspacePolicy::new(&root).expect("first policy"),
+            root.clone(),
+        )
+        .await
+        .expect("first executor");
+    let start_request = ToolRequest {
+        tool_call_id: ToolCallId::new(),
+        session_id,
+        turn_id: Some(TurnId::new()),
+        tool_name: "shell".to_owned(),
+        arguments: json!({
+            "command": "sh host_process.sh",
+            "background": true,
+            "yield_time_ms": 0,
+        }),
+    };
+    let policy = first.evaluate(&start_request).expect("shell policy");
+    let started = first
+        .execute_with_policy(start_request, policy, true, CancellationToken::new())
+        .await
+        .expect("start process");
+    let process_id = started.envelope.structured_facts["process_id"]
+        .as_str()
+        .expect("process id")
+        .to_owned();
+
+    let second = host
+        .build_tool_executor(WorkspacePolicy::new(&root).expect("second policy"), root)
+        .await
+        .expect("second executor");
+    sleep(Duration::from_millis(100)).await;
+    let reconnected = second
+        .execute(
+            ToolRequest {
+                tool_call_id: ToolCallId::new(),
+                session_id,
+                turn_id: Some(TurnId::new()),
+                tool_name: "process_reconnect".to_owned(),
+                arguments: json!({"process_id": process_id, "cursor": 0}),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("reconnect from next turn");
+
+    assert_eq!(
+        reconnected.envelope.structured_facts["process_state"],
+        "exited"
+    );
+    assert!(
+        String::from_utf8_lossy(&reconnected.artifact_contents[0].bytes)
+            .contains("host-survived-turn")
+    );
+}
+
+#[tokio::test]
+async fn dropping_runtime_host_terminates_its_background_processes() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(
+        workspace.path().join("delayed_write.sh"),
+        "sleep 1\nprintf escaped > should-not-exist.txt\n",
+    )
+    .expect("process script");
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let session_id = host.default_session_id();
+    let root = workspace.path().to_path_buf();
+    let executor = host
+        .build_tool_executor(WorkspacePolicy::new(&root).expect("policy"), root.clone())
+        .await
+        .expect("executor");
+    let start_request = ToolRequest {
+        tool_call_id: ToolCallId::new(),
+        session_id,
+        turn_id: Some(TurnId::new()),
+        tool_name: "shell".to_owned(),
+        arguments: json!({
+            "command": "sh delayed_write.sh",
+            "background": true,
+            "yield_time_ms": 0,
+        }),
+    };
+    let policy = executor.evaluate(&start_request).expect("shell policy");
+    let started = executor
+        .execute_with_policy(start_request, policy, true, CancellationToken::new())
+        .await
+        .expect("start process");
+    let process_id = started.envelope.structured_facts["process_id"]
+        .as_str()
+        .expect("process id")
+        .to_owned();
+
+    drop(host);
+    sleep(Duration::from_millis(100)).await;
+    let reconnected = executor
+        .execute(
+            ToolRequest {
+                tool_call_id: ToolCallId::new(),
+                session_id,
+                turn_id: Some(TurnId::new()),
+                tool_name: "process_reconnect".to_owned(),
+                arguments: json!({"process_id": process_id, "cursor": 0}),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("terminal process snapshot");
+
+    assert_eq!(
+        reconnected.envelope.structured_facts["process_state"],
+        "cancelled"
+    );
+    assert!(!root.join("should-not-exist.txt").exists());
+}
+
+#[tokio::test]
 async fn event_pages_move_backward_and_forward_without_overlap() {
     let host = RuntimeHost::in_memory().await.expect("host");
     let session_id = host.default_session_id();

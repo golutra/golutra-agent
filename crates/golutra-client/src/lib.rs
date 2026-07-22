@@ -44,7 +44,7 @@ use golutra_runtime::{
     WorkspaceCheckpointManager, agent_execution_channel, is_active_status,
 };
 use golutra_store::{CommandClaim, RuntimeRepositories, RuntimeStore, StoreError, ThreadRecord};
-use golutra_tools::{BasicToolExecutor, FileBeforeImage, ToolRequest};
+use golutra_tools::{BasicToolExecutor, FileBeforeImage, ProcessSupervisor, ToolRequest};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -277,10 +277,17 @@ pub struct RuntimeHost {
     command_mutex: Mutex<()>,
     task_controls: Mutex<HashMap<SessionId, HostedTaskControl>>,
     provider_auth_waiters: Mutex<HashMap<SessionId, PendingProviderAuth>>,
+    process_supervisor: ProcessSupervisor,
     workspace_change_tracker: Mutex<change_tracker::WorkspaceChangeTracker>,
     deep_evaluation_inputs: Mutex<HashMap<PostTaskJobId, TaskEvaluationInput>>,
     force_mock_provider: bool,
     _temporary_root: Option<Arc<tempfile::TempDir>>,
+}
+
+impl Drop for RuntimeHost {
+    fn drop(&mut self) {
+        self.process_supervisor.shutdown();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -523,6 +530,7 @@ impl RuntimeHost {
             command_mutex: Mutex::new(()),
             task_controls: Mutex::new(HashMap::new()),
             provider_auth_waiters: Mutex::new(HashMap::new()),
+            process_supervisor: ProcessSupervisor::new(),
             workspace_change_tracker: Mutex::new(change_tracker::WorkspaceChangeTracker::default()),
             deep_evaluation_inputs: Mutex::new(HashMap::new()),
             force_mock_provider,

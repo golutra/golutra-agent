@@ -530,7 +530,8 @@ impl RuntimeHost {
         policy: WorkspacePolicy,
         workspace_root: PathBuf,
     ) -> Result<BasicToolExecutor, ClientError> {
-        let executor = BasicToolExecutor::new(policy);
+        let executor =
+            BasicToolExecutor::new(policy).with_process_supervisor(self.process_supervisor.clone());
         let Some(paths) = self
             .runtime_paths
             .as_ref()

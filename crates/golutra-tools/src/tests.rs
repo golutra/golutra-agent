@@ -72,6 +72,10 @@ async fn registry_contains_p0_tools() {
             "edit_file",
             "find_references",
             "list_dir",
+            "process_poll",
+            "process_reconnect",
+            "process_terminate",
+            "process_write",
             "read_file",
             "rg_search",
             "shell",
@@ -753,6 +757,266 @@ async fn shell_reuses_the_persisted_preparation_as_its_diff_baseline() {
     assert_eq!(after.content.as_deref(), Some(b"after".as_slice()));
 }
 
+#[tokio::test]
+async fn background_process_supports_cursor_reconnect_stdin_and_terminal_diff() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(
+        workspace.path().join("interactive.sh"),
+        concat!(
+            "printf 'first\\n'\n",
+            "sleep 0.05\n",
+            "read value\n",
+            "printf 'second:%s\\n' \"$value\"\n",
+            "printf changed > background.txt\n",
+        ),
+    )
+    .expect("interactive script");
+    let executor = executor(workspace.path());
+    let session_id = SessionId::new();
+    let start = execute_approved(
+        &executor,
+        request_for_session(
+            session_id,
+            "shell",
+            json!({
+                "command": "sh interactive.sh",
+                "background": true,
+                "yield_time_ms": 1_000,
+            }),
+        ),
+        CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(start.envelope.structured_facts["process_state"], "running");
+    let process_id = start.envelope.structured_facts["process_id"]
+        .as_str()
+        .expect("process id")
+        .to_owned();
+    let first_cursor = start.envelope.structured_facts["output_cursor"]
+        .as_u64()
+        .expect("output cursor");
+    assert!(first_cursor > 0);
+    assert!(artifact_text(&start).contains("first"));
+
+    let reconnect = executor
+        .execute(
+            request_for_session(
+                session_id,
+                "process_reconnect",
+                json!({"process_id": process_id, "cursor": first_cursor}),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("reconnect");
+    assert!(artifact_text(&reconnect).is_empty());
+
+    let isolated = executor
+        .execute(
+            request_for_session(
+                SessionId::new(),
+                "process_poll",
+                json!({"process_id": process_id, "cursor": first_cursor, "wait_ms": 0}),
+            ),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(isolated, Err(ToolError::Execution(_))));
+
+    let write_request = request_for_session(
+        session_id,
+        "process_write",
+        json!({
+            "process_id": process_id,
+            "input": "hello-from-stdin\n",
+            "cursor": first_cursor,
+            "wait_ms": 1_000,
+        }),
+    );
+    let write_policy = executor.evaluate(&write_request).expect("write policy");
+    assert!(!write_policy.resource.contains("hello-from-stdin"));
+    let write = executor
+        .execute_with_policy(write_request, write_policy, false, CancellationToken::new())
+        .await
+        .expect("write stdin");
+    assert!(!artifact_text(&write).contains("first"));
+    assert!(artifact_text(&write).contains("second:hello-from-stdin"));
+
+    let mut cursor = write.envelope.structured_facts["output_cursor"]
+        .as_u64()
+        .expect("write cursor");
+    let terminal = loop {
+        let report = executor
+            .execute(
+                request_for_session(
+                    session_id,
+                    "process_poll",
+                    json!({"process_id": process_id, "cursor": cursor, "wait_ms": 1_000}),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("terminal poll");
+        cursor = report.envelope.structured_facts["output_cursor"]
+            .as_u64()
+            .expect("terminal cursor");
+        if report.envelope.structured_facts["process_state"] != "running" {
+            break report;
+        }
+    };
+    assert_eq!(
+        terminal.envelope.structured_facts["process_state"],
+        "exited"
+    );
+    assert_eq!(
+        terminal.envelope.structured_facts["workspace_changes_known"],
+        true
+    );
+    assert!(
+        terminal
+            .changed_files
+            .iter()
+            .any(|path| path.ends_with("background.txt"))
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn background_process_terminate_timeout_and_cancellation_are_terminal() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("descendants.sh"), "sleep 5 &\nwait\n")
+        .expect("descendant script");
+    let executor = executor(workspace.path());
+    let session_id = SessionId::new();
+    let running = execute_approved(
+        &executor,
+        request_for_session(
+            session_id,
+            "shell",
+            json!({
+                "command": "sh descendants.sh",
+                "background": true,
+                "yield_time_ms": 0,
+            }),
+        ),
+        CancellationToken::new(),
+    )
+    .await;
+    let process_id = running.envelope.structured_facts["process_id"]
+        .as_str()
+        .expect("process id");
+    let terminated = tokio::time::timeout(
+        Duration::from_secs(2),
+        executor.execute(
+            request_for_session(
+                session_id,
+                "process_terminate",
+                json!({"process_id": process_id}),
+            ),
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("process group terminates")
+    .expect("terminate report");
+    assert_eq!(
+        terminated.envelope.structured_facts["process_state"],
+        "terminated"
+    );
+    assert_eq!(terminated.envelope.status, ToolResultStatus::Cancelled);
+
+    let timed_out = execute_approved(
+        &executor,
+        request_for_session(
+            SessionId::new(),
+            "shell",
+            json!({
+                "command": "sleep 5",
+                "background": true,
+                "timeout_ms": 20,
+                "yield_time_ms": 1_000,
+            }),
+        ),
+        CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(timed_out.envelope.status, ToolResultStatus::Timeout);
+    assert_eq!(
+        timed_out.envelope.structured_facts["process_state"],
+        "timed_out"
+    );
+
+    let cancellation = CancellationToken::new();
+    let cancel_from_task = cancellation.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancel_from_task.cancel();
+    });
+    let cancelled = execute_approved(
+        &executor,
+        request_for_session(
+            SessionId::new(),
+            "shell",
+            json!({
+                "command": "sleep 5",
+                "background": true,
+                "yield_time_ms": 1_000,
+            }),
+        ),
+        cancellation,
+    )
+    .await;
+    assert_eq!(cancelled.envelope.status, ToolResultStatus::Cancelled);
+    assert_eq!(
+        cancelled.envelope.structured_facts["process_state"],
+        "cancelled"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn background_process_output_journal_is_bounded_and_reports_cursor_loss() {
+    let workspace = tempdir().expect("workspace");
+    let executor = executor(workspace.path());
+    let session_id = SessionId::new();
+    let start = execute_approved(
+        &executor,
+        request_for_session(
+            session_id,
+            "shell",
+            json!({
+                "command": "yes output",
+                "background": true,
+                "timeout_ms": 100,
+                "yield_time_ms": 0,
+            }),
+        ),
+        CancellationToken::new(),
+    )
+    .await;
+    let process_id = start.envelope.structured_facts["process_id"]
+        .as_str()
+        .expect("process id");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let report = executor
+        .execute(
+            request_for_session(
+                session_id,
+                "process_reconnect",
+                json!({"process_id": process_id, "cursor": 0}),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("reconnect after output flood");
+
+    assert_eq!(report.envelope.structured_facts["output_truncated"], true);
+    assert_eq!(report.envelope.structured_facts["output_lost"], true);
+    assert!(report.metrics.output_bytes > 2 * 1024 * 1024);
+    assert!(artifact_text(&report).starts_with("[earlier process output omitted]"));
+    assert!(artifact_text(&report).len() <= 2 * 1024 * 1024 + 64);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn process_cancellation_terminates_descendants_and_drains_pipes() {
@@ -951,11 +1215,19 @@ fn executor(path: &Path) -> BasicToolExecutor {
 }
 
 fn request(tool_name: &str, arguments: Value) -> ToolRequest {
+    request_for_session(SessionId::new(), tool_name, arguments)
+}
+
+fn request_for_session(session_id: SessionId, tool_name: &str, arguments: Value) -> ToolRequest {
     ToolRequest {
         tool_call_id: ToolCallId::new(),
-        session_id: SessionId::new(),
+        session_id,
         turn_id: Some(TurnId::new()),
         tool_name: tool_name.to_owned(),
         arguments,
     }
+}
+
+fn artifact_text(report: &ToolExecutionReport) -> String {
+    String::from_utf8_lossy(&report.artifact_contents[0].bytes).into_owned()
 }

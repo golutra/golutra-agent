@@ -28,6 +28,8 @@ const MAX_DIRECTORY_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_PATH_ARGUMENT_CHARS: usize = 4 * 1024;
 const MAX_PATTERN_ARGUMENT_CHARS: usize = 64 * 1024;
 const MAX_SHELL_COMMAND_CHARS: usize = 64 * 1024;
+const MAX_PROCESS_INPUT_CHARS: usize = 64 * 1024;
+const MAX_BACKGROUND_PROCESS_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
 const MAX_TOOL_ERROR_CHARS: usize = 4 * 1024;
 const MAX_AUDIT_RESOURCE_CHARS: usize = 64 * 1024;
 pub const MAX_TOOL_ARGUMENT_DISPLAY_BYTES: usize = 8 * 1024;
@@ -38,6 +40,7 @@ const MAX_TOOL_ARGUMENT_DISPLAY_DEPTH: usize = 4;
 const EXTERNAL_TOOL_TIMEOUT_MS: u64 = if cfg!(test) { 100 } else { 30_000 };
 
 mod process;
+mod process_supervisor;
 mod workspace_scan;
 
 pub(crate) use process::{
@@ -45,6 +48,11 @@ pub(crate) use process::{
 };
 #[cfg(test)]
 pub(crate) use process::{MAX_PIPE_OUTPUT_BYTES, join_pipe_reader, run_process, spawn_pipe_reader};
+pub use process_supervisor::ProcessSupervisor;
+pub(crate) use process_supervisor::{
+    ProcessSnapshot, ProcessStartRequest, ProcessState, default_poll_wait_ms,
+    default_start_wait_ms, max_poll_wait_ms,
+};
 
 #[derive(Debug, Error)]
 pub enum ToolError {
@@ -136,6 +144,10 @@ impl ToolRegistry {
             contract("symbol_search", SideEffectType::None),
             contract("find_references", SideEffectType::None),
             contract("shell", SideEffectType::Process),
+            contract("process_poll", SideEffectType::None),
+            contract("process_write", SideEffectType::Process),
+            contract("process_terminate", SideEffectType::Process),
+            contract("process_reconnect", SideEffectType::None),
         ]
         .into_iter()
         .map(|contract| (contract.tool_name.clone(), contract))
@@ -189,6 +201,7 @@ pub struct BasicToolExecutor {
     registry: ToolRegistry,
     sandbox: SystemSandbox,
     external_backend: Option<Arc<dyn ExternalToolBackend>>,
+    process_supervisor: ProcessSupervisor,
 }
 
 impl BasicToolExecutor {
@@ -199,6 +212,7 @@ impl BasicToolExecutor {
             registry: ToolRegistry::p0_default(),
             sandbox: SystemSandbox::detect(),
             external_backend: None,
+            process_supervisor: ProcessSupervisor::new(),
         }
     }
 
@@ -215,6 +229,12 @@ impl BasicToolExecutor {
         self.registry.register_external(backend.contracts())?;
         self.external_backend = Some(backend);
         Ok(self)
+    }
+
+    #[must_use]
+    pub fn with_process_supervisor(mut self, process_supervisor: ProcessSupervisor) -> Self {
+        self.process_supervisor = process_supervisor;
+        self
     }
 
     pub async fn execute(
@@ -266,6 +286,9 @@ impl BasicToolExecutor {
             "shell" => self
                 .policy
                 .evaluate_shell(&string_arg(&request.arguments, "command")?),
+            "process_poll" | "process_write" | "process_terminate" | "process_reconnect" => {
+                process_control_policy(request)
+            }
             _ if self.external_backend.is_some() => {
                 let mut policy = execution_policy(
                     request,
@@ -502,6 +525,10 @@ impl BasicToolExecutor {
                     )
                     .await
                 }
+                "process_poll" => self.process_poll(request, policy).await,
+                "process_write" => self.process_write(request, policy).await,
+                "process_terminate" => self.process_terminate(request, policy).await,
+                "process_reconnect" => self.process_reconnect(request, policy).await,
                 _ => self.execute_external(request, policy, cancellation).await,
             }
         }
@@ -919,16 +946,52 @@ impl BasicToolExecutor {
         progress: &mut Option<&mut (dyn FnMut(ToolProgress) + Send)>,
     ) -> Result<ToolExecutionReport, ToolError> {
         let command = string_arg(&request.arguments, "command")?;
+        let background = request
+            .arguments
+            .get("background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let timeout_ms = request
             .arguments
             .get("timeout_ms")
             .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_TIMEOUT_MS);
+            .unwrap_or(if background {
+                60 * 60 * 1_000
+            } else {
+                DEFAULT_TIMEOUT_MS
+            });
         let command_line = CommandLine::parse(&command)?;
         let workspace_before = match workspace_before {
             Some(snapshot) => snapshot,
             None => workspace_scan::capture(self.policy.workspace_root()).await,
         };
+        if background {
+            let wait_ms = request
+                .arguments
+                .get("yield_time_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or_else(default_start_wait_ms)
+                .min(max_poll_wait_ms());
+            let process_id = format!("proc-{}", request.tool_call_id);
+            let snapshot = self
+                .process_supervisor
+                .start(ProcessStartRequest {
+                    process_id,
+                    session_id: request.session_id,
+                    program: &command_line.program,
+                    args: &command_line.args,
+                    command_display: redact_sensitive_text(&command).0,
+                    cwd: self.policy.workspace_root(),
+                    timeout_ms: timeout_ms.min(MAX_BACKGROUND_PROCESS_TIMEOUT_MS),
+                    wait_ms,
+                    cancellation,
+                    sandbox: &self.sandbox,
+                    workspace_access: WorkspaceAccess::ReadWrite,
+                    workspace_before,
+                })
+                .await?;
+            return Ok(supervised_process_report(request, policy, snapshot));
+        }
         let tool_call_id = request.tool_call_id;
         let tool_name = request.tool_name.clone();
         let shell_output = {
@@ -989,6 +1052,65 @@ impl BasicToolExecutor {
         report.before_images = workspace_changes.before_images;
         report.after_images = workspace_changes.after_images;
         Ok(report)
+    }
+
+    async fn process_poll(
+        &self,
+        request: ToolRequest,
+        policy: PolicyEvaluation,
+    ) -> Result<ToolExecutionReport, ToolError> {
+        let process_id = string_arg(&request.arguments, "process_id")?;
+        let cursor = process_cursor(&request.arguments);
+        let wait_ms = process_wait_ms(&request.arguments, default_poll_wait_ms());
+        let snapshot = self
+            .process_supervisor
+            .poll(request.session_id, &process_id, cursor, wait_ms)
+            .await?;
+        Ok(supervised_process_report(request, policy, snapshot))
+    }
+
+    async fn process_reconnect(
+        &self,
+        request: ToolRequest,
+        policy: PolicyEvaluation,
+    ) -> Result<ToolExecutionReport, ToolError> {
+        let process_id = string_arg(&request.arguments, "process_id")?;
+        let cursor = process_cursor(&request.arguments);
+        let snapshot = self
+            .process_supervisor
+            .reconnect(request.session_id, &process_id, cursor)
+            .await?;
+        Ok(supervised_process_report(request, policy, snapshot))
+    }
+
+    async fn process_write(
+        &self,
+        request: ToolRequest,
+        policy: PolicyEvaluation,
+    ) -> Result<ToolExecutionReport, ToolError> {
+        let process_id = string_arg(&request.arguments, "process_id")?;
+        let input = string_arg(&request.arguments, "input")?;
+        let cursor = process_cursor(&request.arguments);
+        let wait_ms = process_wait_ms(&request.arguments, 250);
+        let snapshot = self
+            .process_supervisor
+            .write(request.session_id, &process_id, &input, cursor, wait_ms)
+            .await?;
+        Ok(supervised_process_report(request, policy, snapshot))
+    }
+
+    async fn process_terminate(
+        &self,
+        request: ToolRequest,
+        policy: PolicyEvaluation,
+    ) -> Result<ToolExecutionReport, ToolError> {
+        let process_id = string_arg(&request.arguments, "process_id")?;
+        let cursor = process_cursor(&request.arguments);
+        let snapshot = self
+            .process_supervisor
+            .terminate(request.session_id, &process_id, cursor)
+            .await?;
+        Ok(supervised_process_report(request, policy, snapshot))
     }
 
     async fn execute_external(
@@ -1151,10 +1273,24 @@ fn contract(tool_name: &str, side_effect_type: SideEffectType) -> ToolContract {
                     "minLength": 1,
                     "maxLength": MAX_SHELL_COMMAND_CHARS
                 },
-                "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 30000}
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_BACKGROUND_PROCESS_TIMEOUT_MS
+                },
+                "background": {"type": "boolean"},
+                "yield_time_ms": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": max_poll_wait_ms()
+                }
             },
             "required": ["command"]
         }),
+        "process_poll" => process_session_schema(false, true),
+        "process_write" => process_session_schema(true, true),
+        "process_terminate" => process_session_schema(false, false),
+        "process_reconnect" => process_session_schema(false, false),
         _ => json!({"type": "object", "additionalProperties": false}),
     };
     ToolContract {
@@ -1202,6 +1338,43 @@ fn query_schema(field: &str) -> Value {
             "limit": {"type": "integer", "minimum": 1, "maximum": 100}
         },
         "required": [field]
+    })
+}
+
+fn process_session_schema(include_input: bool, include_wait: bool) -> Value {
+    let mut properties = serde_json::Map::from_iter([
+        (
+            "process_id".to_owned(),
+            json!({"type": "string", "minLength": 1, "maxLength": 128}),
+        ),
+        (
+            "cursor".to_owned(),
+            json!({"type": "integer", "minimum": 0}),
+        ),
+    ]);
+    let mut required = vec!["process_id"];
+    if include_input {
+        properties.insert(
+            "input".to_owned(),
+            json!({
+                "type": "string",
+                "minLength": 1,
+                "maxLength": MAX_PROCESS_INPUT_CHARS
+            }),
+        );
+        required.push("input");
+    }
+    if include_wait {
+        properties.insert(
+            "wait_ms".to_owned(),
+            json!({"type": "integer", "minimum": 0, "maximum": max_poll_wait_ms()}),
+        );
+    }
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": properties,
+        "required": required,
     })
 }
 
@@ -1456,6 +1629,113 @@ fn process_metrics(output: &process::ShellOutput) -> ToolExecutionMetrics {
         output_truncated: output.output_truncated,
         exit_code: output.exit_code,
         ..ToolExecutionMetrics::default()
+    }
+}
+
+fn process_control_policy(request: &ToolRequest) -> PolicyEvaluation {
+    let process_id = request
+        .arguments
+        .get("process_id")
+        .and_then(Value::as_str)
+        .unwrap_or("<invalid-process-id>");
+    let mut policy = execution_policy(
+        request,
+        PolicyDecision::Allow,
+        "process session control is scoped to the current session",
+    );
+    // A write request may contain arbitrary stdin. Keep it out of durable
+    // policy/audit resources while retaining the handle needed for review.
+    policy.resource = format!("process:{process_id}");
+    policy
+}
+
+fn process_cursor(arguments: &Value) -> u64 {
+    arguments.get("cursor").and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn process_wait_ms(arguments: &Value, default: u64) -> u64 {
+    arguments
+        .get("wait_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(default)
+        .min(max_poll_wait_ms())
+}
+
+fn supervised_process_report(
+    request: ToolRequest,
+    policy: PolicyEvaluation,
+    snapshot: ProcessSnapshot,
+) -> ToolExecutionReport {
+    let state = process_state_name(snapshot.state);
+    let status = match snapshot.state {
+        ProcessState::Running | ProcessState::Exited => ToolResultStatus::Ok,
+        ProcessState::Failed => ToolResultStatus::Error,
+        ProcessState::TimedOut => ToolResultStatus::Timeout,
+        ProcessState::Cancelled | ProcessState::Terminated => ToolResultStatus::Cancelled,
+    };
+    let workspace_changes_known = snapshot.workspace_changes_known;
+    let mut result = report(
+        request,
+        status,
+        match snapshot.state {
+            ProcessState::Running => "background process is running",
+            ProcessState::Exited => "background process exited successfully",
+            ProcessState::Failed => "background process exited with an error",
+            ProcessState::TimedOut => "background process timed out",
+            ProcessState::Cancelled => "background process was cancelled",
+            ProcessState::Terminated => "background process was terminated",
+        },
+        json!({
+            "process_id": snapshot.process_id,
+            "process_state": state,
+            "exit_code": snapshot.exit_code,
+            "output_cursor": snapshot.output_cursor,
+            "output_bytes": snapshot.output_bytes,
+            "output_lines": snapshot.output_lines,
+            "output_truncated": snapshot.output_truncated,
+            "output_lost": snapshot.output_lost,
+            "workspace_changes_known": workspace_changes_known,
+            "workspace_change_count": if workspace_changes_known {
+                snapshot.changed_files.len()
+            } else {
+                0
+            },
+            "sandbox_backend": snapshot.sandbox_backend,
+            "sandbox_os_enforced": snapshot.sandbox_os_enforced,
+        }),
+        snapshot.output,
+        if workspace_changes_known {
+            snapshot.changed_files.clone()
+        } else {
+            Vec::new()
+        },
+        policy,
+    );
+    result.before_images = if workspace_changes_known {
+        snapshot.before_images
+    } else {
+        Vec::new()
+    };
+    result.after_images = if workspace_changes_known {
+        snapshot.after_images
+    } else {
+        Vec::new()
+    };
+    result.metrics.output_bytes = snapshot.output_bytes;
+    result.metrics.output_lines = snapshot.output_lines;
+    result.metrics.output_truncated = snapshot.output_truncated;
+    result.metrics.exit_code = snapshot.exit_code;
+    result
+}
+
+fn process_state_name(state: ProcessState) -> &'static str {
+    match state {
+        ProcessState::Running => "running",
+        ProcessState::Exited => "exited",
+        ProcessState::TimedOut => "timed_out",
+        ProcessState::Cancelled => "cancelled",
+        ProcessState::Terminated => "terminated",
+        ProcessState::Failed => "failed",
     }
 }
 
