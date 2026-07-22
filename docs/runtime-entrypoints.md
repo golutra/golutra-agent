@@ -153,9 +153,13 @@ result = turn.wait()
 The TypeScript API has the corresponding `startThread`, `Thread.run`,
 `TurnHandle.events()` and `TurnHandle.wait()` methods. Both SDKs also expose
 `steer`, `interrupt`, `takeover`, approval resolution, `resume`, bounded
-history/event pages, event replay, task trace and artifact range reads. They
-use the same Agent SSE projector as `exec` and MCP, so command/turn correlation
-and terminal status do not vary by language.
+history/event pages, event replay, task reconciliation, task trace and artifact
+range reads. Python exposes `Thread.reconcile_task`; TypeScript exposes
+`Thread.reconcileTask`. Terminal turn results include the correlated optional
+`VerificationRecord`, including failed verification, rather than asking SDK
+callers to infer success from the final message. They use the same Agent SSE
+projector as `exec` and MCP, so command/turn correlation and terminal status do
+not vary by language.
 
 SDK connection steps are fixed:
 
