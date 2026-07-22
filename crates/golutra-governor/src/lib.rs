@@ -55,12 +55,14 @@ pub struct GovernorLimits {
 impl Default for GovernorLimits {
     fn default() -> Self {
         Self {
-            max_iterations: 4,
-            max_tool_calls: 16,
-            max_failed_tool_calls: 2,
+            // Zero disables the legacy fixed iteration cap. Long-running work
+            // is bounded by the independent time, cost, tool, and progress limits.
+            max_iterations: 0,
+            max_tool_calls: 256,
+            max_failed_tool_calls: 8,
             max_planned_input_tokens: 96_000,
-            max_elapsed_ms: 10 * 60 * 1_000,
-            max_estimated_cost_microusd: 5_000_000,
+            max_elapsed_ms: 4 * 60 * 60 * 1_000,
+            max_estimated_cost_microusd: 25_000_000,
         }
     }
 }
@@ -149,7 +151,9 @@ impl RuntimeGovernor {
                 "runtime estimated cost exceeds the configured budget",
                 "exceeded",
             )
-        } else if observation.iteration > self.limits.max_iterations {
+        } else if self.limits.max_iterations > 0
+            && observation.iteration > self.limits.max_iterations
+        {
             (
                 GovernorAction::Block,
                 "runtime iteration budget exceeded",
@@ -206,9 +210,11 @@ impl RuntimeGovernor {
                 "low",
             )
         };
+        let iteration_risk = self.limits.max_iterations > 0
+            && observation.iteration.saturating_mul(100)
+                >= self.limits.max_iterations.saturating_mul(80);
         let budget_risk = if budget_risk == "low"
-            && (observation.iteration.saturating_mul(100)
-                >= self.limits.max_iterations.saturating_mul(80)
+            && (iteration_risk
                 || observation.tool_calls.saturating_mul(100)
                     >= self.limits.max_tool_calls.saturating_mul(80)
                 || observation.estimated_cost_microusd.is_some_and(|cost| {

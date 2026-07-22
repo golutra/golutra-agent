@@ -28,6 +28,7 @@ use golutra_tools::{
 };
 use golutra_verify::VerificationInput;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -37,12 +38,14 @@ mod completion;
 mod context_guard;
 mod lane;
 mod provider_retry;
+mod step_machine;
 mod trace;
 mod verification;
 
 pub use checkpoint::{CheckpointError, WorkspaceCheckpointManager, checkpoint_fingerprint};
 pub use golutra_protocol::UserProjection;
 pub use lane::{RuntimeLaneError, RuntimeLaneManager, RuntimeTransition, is_active_status};
+pub(crate) use step_machine::{StepCheckpoint, StepCompletion, StepMachine, StepSnapshot};
 pub use trace::{AgentLoopTraceEvent, RuntimeObservation, RuntimeObservationSink};
 pub use verification::RuntimeVerificationService;
 
@@ -256,7 +259,6 @@ pub struct AgentLoop<P> {
     verifier: RuntimeVerificationService,
     governor: RuntimeGovernor,
     before_side_effect_recorder: Option<Arc<dyn BeforeSideEffectRecorder>>,
-    max_iterations: u32,
 }
 
 impl<P> AgentLoop<P>
@@ -277,7 +279,6 @@ where
             verifier: RuntimeVerificationService::default(),
             governor: RuntimeGovernor::default(),
             before_side_effect_recorder: None,
-            max_iterations: 4,
         }
     }
 
@@ -289,7 +290,6 @@ where
 
     #[must_use]
     pub fn with_governor(mut self, governor: RuntimeGovernor) -> Self {
-        self.max_iterations = governor.limits().max_iterations;
         self.governor = governor;
         self
     }
@@ -369,7 +369,6 @@ where
         let mut repeated_failure_signature = None;
         let mut repeated_failure_count = 0_u32;
         let mut empty_response_count = 0_u32;
-        let mut terminated = false;
         let started_at = Instant::now();
         let mut tool_call_count = 0_u32;
         let mut failed_tool_call_count = 0_u32;
@@ -393,6 +392,7 @@ where
             compact_recommended: false,
             cost_risk: "low".to_owned(),
         };
+        let mut step_machine = StepMachine::default();
         let provider_tools = request
             .tools
             .iter()
@@ -429,7 +429,10 @@ where
         }
         let mut messages = base_plan.messages.clone();
 
-        'agent_loop: for iteration in 0..=self.max_iterations {
+        'agent_loop: loop {
+            let step_snapshot = step_machine.begin(current_turn_id);
+            let iteration = step_snapshot.step_no;
+            trace(AgentLoopTraceEvent::StepStarted(step_snapshot.clone()));
             control.wait_until_runnable().await?;
             let mut plan = base_plan.clone();
             plan.messages = messages.clone();
@@ -470,9 +473,15 @@ where
                     trigger: golutra_core::LoopGuardTrigger::ContextOverflow,
                     reason: reason.clone(),
                 });
+                finish_runtime_step(
+                    &mut step_machine,
+                    step_snapshot.clone(),
+                    "context-overflow",
+                    false,
+                    &mut trace,
+                );
                 guard_reason = Some(reason);
                 governor_action = Some(GovernorAction::AskUser);
-                terminated = true;
                 break;
             }
             trace(AgentLoopTraceEvent::ContextBuilt {
@@ -502,7 +511,9 @@ where
             trace(AgentLoopTraceEvent::GovernorDecided(governance));
             if !permits_execution {
                 trace(AgentLoopTraceEvent::LoopGuardTriggered {
-                    trigger: if iteration >= self.max_iterations {
+                    trigger: if self.governor.limits().max_iterations > 0
+                        && iteration >= self.governor.limits().max_iterations
+                    {
                         golutra_core::LoopGuardTrigger::MaxIteration
                     } else {
                         golutra_core::LoopGuardTrigger::ContextOverflow
@@ -511,7 +522,13 @@ where
                         .clone()
                         .unwrap_or_else(|| "runtime governor blocked execution".to_owned()),
                 });
-                terminated = true;
+                finish_runtime_step(
+                    &mut step_machine,
+                    step_snapshot.clone(),
+                    "governor-blocked",
+                    false,
+                    &mut trace,
+                );
                 break;
             }
             let provider_contract = self.provider.contract();
@@ -535,16 +552,27 @@ where
                 provider_id: provider_request.provider_id.clone(),
                 model_id: provider_request.model_id.clone(),
             });
-            let (provider_response, completed_request) = self
+            let provider_result = self
                 .complete_with_retry(provider_request.clone(), &mut control, &mut trace)
-                .await
-                .map_err(|error| {
-                    if error == ProviderError::Cancelled {
+                .await;
+            let (provider_response, completed_request) = match provider_result {
+                Ok(result) => result,
+                Err(error) => {
+                    finish_runtime_step(
+                        &mut step_machine,
+                        step_snapshot.clone(),
+                        format!("provider-error:{error}"),
+                        false,
+                        &mut trace,
+                    );
+                    return Err(if error == ProviderError::Cancelled {
                         AgentLoopError::Cancelled
                     } else {
                         AgentLoopError::Provider(error)
-                    }
-                })?;
+                    });
+                }
+            };
+            let step_fingerprint = provider_response_fingerprint(&provider_response);
             if let Some(message) = provider_response
                 .message
                 .as_ref()
@@ -617,6 +645,13 @@ where
                 } else {
                     empty_response_count = empty_response_count.saturating_add(1);
                     if empty_response_count < 2 {
+                        finish_runtime_step(
+                            &mut step_machine,
+                            step_snapshot.clone(),
+                            "empty-response",
+                            false,
+                            &mut trace,
+                        );
                         trace(AgentLoopTraceEvent::RetryScheduled {
                             attempt: empty_response_count,
                             reason: "provider returned an empty response".to_owned(),
@@ -636,8 +671,14 @@ where
                         trigger: golutra_core::LoopGuardTrigger::EmptyResponse,
                         reason: reason.clone(),
                     });
+                    finish_runtime_step(
+                        &mut step_machine,
+                        step_snapshot.clone(),
+                        "empty-response",
+                        false,
+                        &mut trace,
+                    );
                     guard_reason = Some(reason);
-                    terminated = true;
                     break;
                 }
 
@@ -666,12 +707,26 @@ where
                         tool_calls: Vec::new(),
                         metadata: Default::default(),
                     });
+                    finish_runtime_step(
+                        &mut step_machine,
+                        step_snapshot.clone(),
+                        step_fingerprint.clone(),
+                        true,
+                        &mut trace,
+                    );
                     continue;
                 }
-                terminated = true;
+                finish_runtime_step(
+                    &mut step_machine,
+                    step_snapshot.clone(),
+                    step_fingerprint,
+                    true,
+                    &mut trace,
+                );
                 break;
             }
 
+            let tool_reports_before_step = tool_reports.len();
             messages.push(ProviderMessage {
                 role: ProviderRole::Assistant,
                 content: provider_response
@@ -713,7 +768,13 @@ where
                 }
                 trace(AgentLoopTraceEvent::GovernorDecided(governance));
                 if !permits_execution {
-                    terminated = true;
+                    finish_runtime_step(
+                        &mut step_machine,
+                        step_snapshot.clone(),
+                        step_fingerprint.clone(),
+                        false,
+                        &mut trace,
+                    );
                     break 'agent_loop;
                 }
                 tool_call_count = tool_call_count.saturating_add(1);
@@ -890,9 +951,37 @@ where
                 });
                 tool_reports.push(report);
                 if !permits_continuation {
-                    terminated = true;
+                    finish_runtime_step(
+                        &mut step_machine,
+                        step_snapshot.clone(),
+                        step_fingerprint.clone(),
+                        false,
+                        &mut trace,
+                    );
                     break 'agent_loop;
                 }
+            }
+            let made_progress = tool_reports[tool_reports_before_step..]
+                .iter()
+                .any(|report| !report.changed_files.is_empty());
+            let step_completion = finish_runtime_step(
+                &mut step_machine,
+                step_snapshot.clone(),
+                step_fingerprint,
+                made_progress,
+                &mut trace,
+            );
+            if step_completion.should_stop {
+                let reason = format!(
+                    "runtime made no observable progress for {} identical steps",
+                    step_completion.repeated_no_progress
+                );
+                trace(AgentLoopTraceEvent::LoopGuardTriggered {
+                    trigger: golutra_core::LoopGuardTrigger::NoProgress,
+                    reason: reason.clone(),
+                });
+                guard_reason = Some(reason);
+                break;
             }
             if repeated_failure_count >= 2 {
                 let reason = "the same deterministic tool call failed repeatedly".to_owned();
@@ -901,16 +990,8 @@ where
                     reason: reason.clone(),
                 });
                 guard_reason = Some(reason);
-                terminated = true;
                 break;
             }
-        }
-
-        if !terminated && guard_reason.is_none() {
-            guard_reason = Some(format!(
-                "agent loop reached max iteration {}",
-                self.max_iterations
-            ));
         }
 
         let evidence_refs = tool_reports
@@ -1111,7 +1192,7 @@ where
             &goal_ledger,
             &GovernorObservation {
                 phase: GovernorPhase::Completion,
-                iteration: self.max_iterations.min(tool_call_count.saturating_add(1)),
+                iteration: step_machine.checkpoint().next_step_no,
                 tool_calls: tool_call_count,
                 failed_tool_calls: failed_tool_call_count,
                 planned_input_tokens: last_budget_state.planned_input_tokens.unwrap_or_default(),
@@ -1657,6 +1738,44 @@ fn objective_content_hint(objective: &str) -> Option<String> {
 
 fn elapsed_millis(started_at: Instant) -> u64 {
     u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn finish_runtime_step<F>(
+    machine: &mut StepMachine,
+    snapshot: StepSnapshot,
+    fingerprint: impl Into<String>,
+    made_progress: bool,
+    trace: &mut F,
+) -> StepCompletion
+where
+    F: FnMut(AgentLoopTraceEvent) + Send,
+{
+    let completion = machine.complete(snapshot, fingerprint, made_progress);
+    trace(AgentLoopTraceEvent::StepCompleted(completion.clone()));
+    trace(AgentLoopTraceEvent::StepCheckpointed(machine.checkpoint()));
+    completion
+}
+
+fn provider_response_fingerprint(response: &ProviderResponse) -> String {
+    let tool_calls = response
+        .tool_calls
+        .iter()
+        .map(|call| {
+            serde_json::json!({
+                "tool_name": &call.tool_name,
+                "arguments": &call.arguments,
+            })
+        })
+        .collect::<Vec<_>>();
+    let canonical = serde_json::json!({
+        "message": response.message.as_ref().map(|message| &message.content),
+        "tool_calls": tool_calls,
+        "finish_reason": response.finish_reason,
+    });
+    format!(
+        "sha256:{:x}",
+        Sha256::digest(canonical.to_string().as_bytes())
+    )
 }
 
 fn cost_to_microusd(cost_usd: f64) -> Option<u64> {

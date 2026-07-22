@@ -13,9 +13,13 @@ use golutra_llm::{ProviderFinishReason, ProviderRequest, ProviderStreamEvent};
 use golutra_tools::ToolExecutionReport;
 
 use super::PendingAgentTurn;
+use super::{StepCheckpoint, StepCompletion, StepSnapshot};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentLoopTraceEvent {
+    StepStarted(StepSnapshot),
+    StepCompleted(StepCompletion),
+    StepCheckpointed(StepCheckpoint),
     ContextBuilt {
         contributors: Vec<String>,
         planned_input_tokens: u64,

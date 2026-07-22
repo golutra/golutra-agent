@@ -1,6 +1,10 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use golutra_context::{ContextBudgetPolicy, ContextBuilder, ContextContributor, estimate_tokens};
@@ -8,7 +12,10 @@ use golutra_core::{
     Actor, ActorKind, BudgetOverflowAction, BusyPolicy, TaskStatus, ToolCallId, WorkspaceId,
 };
 use golutra_governor::GovernorLimits;
-use golutra_llm::{MockProvider, ProviderStreamEvent};
+use golutra_llm::{
+    LlmProvider, MockProvider, ProviderFinishReason, ProviderMessage, ProviderRequest,
+    ProviderResponse, ProviderStreamEvent, ProviderToolCall, ProviderUsage, UsageSource,
+};
 use golutra_policy::WorkspacePolicy;
 use golutra_protocol::RuntimeEventType;
 use golutra_tools::BasicToolExecutor;
@@ -41,6 +48,61 @@ fn runtime_observation_sink_accepts_a_function_adapter() {
 enum FallbackTestProvider {
     Failing(Box<golutra_core::ProviderContract>),
     Success(Box<MockProvider>),
+}
+
+#[derive(Debug, Clone)]
+struct SixRoundProvider {
+    calls: Arc<AtomicUsize>,
+    contract: golutra_core::ProviderContract,
+}
+
+#[async_trait]
+impl LlmProvider for SixRoundProvider {
+    async fn complete(&self, _request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let usage = ProviderUsage {
+            input_tokens: Some(32),
+            output_tokens: Some(8),
+            reasoning_tokens: None,
+            cached_input_tokens: None,
+            total_tokens: Some(40),
+            usage_source: UsageSource::Estimated,
+            raw: json!({"round": call}),
+        };
+        if call < 6 {
+            return Ok(ProviderResponse {
+                response_id: golutra_core::ProviderResponseId::new(),
+                message: None,
+                tool_calls: vec![ProviderToolCall {
+                    tool_call_id: format!("round-{call}"),
+                    tool_name: "read_file".to_owned(),
+                    arguments: json!({"path": format!("round-{call}.txt")}),
+                }],
+                usage,
+                finish_reason: ProviderFinishReason::ToolCalls,
+                raw_metadata: json!({"round": call}),
+            });
+        }
+        Ok(ProviderResponse {
+            response_id: golutra_core::ProviderResponseId::new(),
+            message: Some(ProviderMessage {
+                role: ProviderRole::Assistant,
+                content: "finished six rounds".to_owned(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+                metadata: Default::default(),
+            }),
+            tool_calls: Vec::new(),
+            usage,
+            finish_reason: ProviderFinishReason::Stop,
+            raw_metadata: json!({"round": call}),
+        })
+    }
+
+    fn contract(&self) -> golutra_core::ProviderContract {
+        self.contract.clone()
+    }
 }
 
 #[async_trait]
@@ -368,7 +430,7 @@ async fn fallback_completion_and_usage_are_attributed_to_the_actual_provider() {
 }
 
 #[tokio::test]
-async fn agent_loop_governor_blocks_before_iteration_budget_is_exceeded() {
+async fn zero_iteration_budget_disables_the_legacy_fixed_round_cap() {
     let workspace = tempdir().expect("workspace");
     let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
     let governor = RuntimeGovernor::new(GovernorLimits {
@@ -376,7 +438,7 @@ async fn agent_loop_governor_blocks_before_iteration_budget_is_exceeded() {
         ..GovernorLimits::default()
     });
     let agent_loop = AgentLoop::new(
-        MockProvider::text_response("should not run"),
+        MockProvider::text_response("completed without fixed cap"),
         ContextBuilder::default(),
         executor,
     )
@@ -401,12 +463,73 @@ async fn agent_loop_governor_blocks_before_iteration_budget_is_exceeded() {
         .await
         .expect("governed outcome");
 
-    assert_eq!(outcome.loop_decision.action, LoopAction::Blocked);
+    assert!(outcome.final_message.is_some());
     assert!(trace.iter().any(|event| matches!(
+        event,
+        AgentLoopTraceEvent::AssistantMessage { content, .. }
+            if content == "completed without fixed cap"
+    )));
+    assert!(!trace.iter().any(|event| matches!(
         event,
         AgentLoopTraceEvent::GovernorDecided(decision)
             if decision.action == GovernorAction::Block
     )));
+}
+
+#[tokio::test]
+async fn agent_loop_can_complete_more_than_four_provider_tool_rounds() {
+    let workspace = tempdir().expect("workspace");
+    for round in 0..6 {
+        fs::write(workspace.path().join(format!("round-{round}.txt")), "ok").expect("fixture");
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = SixRoundProvider {
+        calls: Arc::clone(&calls),
+        contract: MockProvider::text_response("contract").contract(),
+    };
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor);
+    let mut trace = Vec::new();
+
+    let outcome = agent_loop
+        .run_with_trace(
+            AgentTaskRequest {
+                session_id: SessionId::new(),
+                task_id: TaskId::new(),
+                turn_id: TurnId::new(),
+                objective: "read six files and report completion".to_owned(),
+                completion_criteria: vec!["all files read".to_owned()],
+                output_schema: None,
+                touched_code: false,
+                contributors: Vec::new(),
+                tools: vec!["read_file".to_owned()],
+            },
+            |event| trace.push(event),
+        )
+        .await
+        .expect("long loop");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 7);
+    assert!(outcome.final_message.is_some());
+    assert!(trace.iter().any(|event| matches!(
+        event,
+        AgentLoopTraceEvent::AssistantMessage { content, .. }
+            if content == "finished six rounds"
+    )));
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|event| matches!(event, AgentLoopTraceEvent::StepStarted(_)))
+            .count(),
+        7
+    );
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|event| matches!(event, AgentLoopTraceEvent::StepCheckpointed(_)))
+            .count(),
+        7
+    );
 }
 
 #[tokio::test]

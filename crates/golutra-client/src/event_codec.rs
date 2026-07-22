@@ -255,6 +255,21 @@ pub(crate) struct ObservationDescriptor {
 /// variant requires an explicit disclosure and integrity decision here.
 pub(crate) fn observation_descriptor(observation: &RuntimeObservation) -> ObservationDescriptor {
     let (event_type, source, integrity) = match observation {
+        RuntimeObservation::StepStarted(_) => (
+            RuntimeEventType::StepStarted,
+            RuntimeEventSource::Runtime,
+            ObservationIntegrityClass::Required,
+        ),
+        RuntimeObservation::StepCompleted(_) => (
+            RuntimeEventType::StepCompleted,
+            RuntimeEventSource::Runtime,
+            ObservationIntegrityClass::Required,
+        ),
+        RuntimeObservation::StepCheckpointed(_) => (
+            RuntimeEventType::StepCheckpointed,
+            RuntimeEventSource::Runtime,
+            ObservationIntegrityClass::Required,
+        ),
         RuntimeObservation::ContextBuilt { .. } => (
             RuntimeEventType::ContextBuilt,
             RuntimeEventSource::Runtime,
@@ -374,6 +389,34 @@ pub(crate) fn trace_event_payload(
 ) -> Option<(RuntimeEventType, RuntimeEventSource, Value)> {
     let descriptor = observation_descriptor(&trace_event);
     let mapped = match trace_event {
+        AgentLoopTraceEvent::StepStarted(step) => Some((
+            RuntimeEventType::StepStarted,
+            RuntimeEventSource::Runtime,
+            json!({
+                "summary": format!("runtime step {} started", step.step_no),
+                "step": step,
+            }),
+        )),
+        AgentLoopTraceEvent::StepCompleted(completion) => Some((
+            RuntimeEventType::StepCompleted,
+            RuntimeEventSource::Runtime,
+            json!({
+                "summary": format!("runtime step {} completed", completion.snapshot.step_no),
+                "step": completion.snapshot,
+                "fingerprint": completion.fingerprint,
+                "made_progress": completion.made_progress,
+                "repeated_no_progress": completion.repeated_no_progress,
+                "should_stop": completion.should_stop,
+            }),
+        )),
+        AgentLoopTraceEvent::StepCheckpointed(checkpoint) => Some((
+            RuntimeEventType::StepCheckpointed,
+            RuntimeEventSource::Runtime,
+            json!({
+                "summary": "runtime step checkpoint persisted",
+                "checkpoint": checkpoint,
+            }),
+        )),
         AgentLoopTraceEvent::ContextBuilt {
             contributors,
             planned_input_tokens,

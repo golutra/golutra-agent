@@ -25,6 +25,7 @@ pub enum LoopGuardTrigger {
     EmptyResponse,
     ContextOverflow,
     MaxIteration,
+    NoProgress,
     RetryCostExceeded,
     OversizedToolOutput,
 }
