@@ -18,6 +18,7 @@ import type {
   EvaluationCase,
   EvaluationResult,
   EvaluationRun,
+  ExternalVerificationSpec,
   EvaluationProjection,
   EvolutionState,
   EventFilter,
@@ -156,6 +157,7 @@ export interface AgentSubscriptionRequest {
 export interface ThreadRunOptions {
   outputSchema?: Record<string, unknown>;
   completionCriteria?: readonly string[];
+  externalVerifiers?: readonly ExternalVerificationSpec[];
 }
 
 export interface ReconcileTaskOptions {
@@ -198,6 +200,7 @@ export class Thread {
       thread_id: this.threadId,
       prompt,
       completion_criteria: [...(options.completionCriteria ?? [])].filter((value) => value.trim()),
+      external_verifiers: [...(options.externalVerifiers ?? [])],
     };
     if (options.outputSchema !== undefined) {
       params.output_schema = options.outputSchema;

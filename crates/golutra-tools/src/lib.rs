@@ -38,6 +38,8 @@ const MAX_TOOL_ARGUMENT_COMPACT_STRING_BYTES: usize = 96;
 const MAX_TOOL_ARGUMENT_DISPLAY_ITEMS: usize = 24;
 const MAX_TOOL_ARGUMENT_DISPLAY_DEPTH: usize = 4;
 const EXTERNAL_TOOL_TIMEOUT_MS: u64 = if cfg!(test) { 100 } else { 30_000 };
+const MAX_VERIFIER_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
+const MAX_VERIFIER_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 
 mod process;
 mod process_supervisor;
@@ -245,6 +247,115 @@ impl BasicToolExecutor {
         let policy = self.evaluate(&request)?;
         self.execute_with_policy(request, policy, false, cancellation)
             .await
+    }
+
+    /// Execute a caller-declared verification command without shell parsing.
+    /// The command remains sandboxed, cancellable and scoped to this executor's
+    /// workspace, but it does not require model-tool approval.
+    pub async fn execute_verifier(
+        &self,
+        request: VerifierExecutionRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ToolExecutionReport, ToolError> {
+        if request.program.trim().is_empty() {
+            return Err(ToolError::InvalidArguments(
+                "verifier program cannot be empty".to_owned(),
+            ));
+        }
+        let cwd = self
+            .policy
+            .resolve_path(&request.cwd, true)
+            .map_err(|error| {
+                ToolError::InvalidArguments(format!("invalid verifier cwd: {error}"))
+            })?;
+        if !cwd.starts_with(self.policy.workspace_root()) || !cwd.is_dir() {
+            return Err(ToolError::InvalidArguments(
+                "verifier cwd must be a directory inside the workspace".to_owned(),
+            ));
+        }
+        let timeout_ms = request.timeout_ms.clamp(1, MAX_VERIFIER_TIMEOUT_MS);
+        let output = run_process_with_progress(
+            ProcessExecutionRequest {
+                program: &request.program,
+                args: &request.args,
+                cwd: &cwd,
+                workspace_root: self.policy.workspace_root(),
+                timeout_ms,
+                cancellation,
+                sandbox: &self.sandbox,
+                workspace_access: WorkspaceAccess::ReadWrite,
+            },
+            None,
+        )
+        .await?;
+        let retained_limit = request.max_output_bytes.clamp(1, MAX_VERIFIER_OUTPUT_BYTES);
+        let raw_output = bounded_text(&output.raw_output, retained_limit);
+        let passed = !output.cancelled
+            && !output.timed_out
+            && output.exit_code == Some(request.expected_exit_code);
+        let status = if output.cancelled {
+            ToolResultStatus::Cancelled
+        } else if output.timed_out {
+            ToolResultStatus::Timeout
+        } else if passed {
+            ToolResultStatus::Ok
+        } else {
+            ToolResultStatus::Error
+        };
+        let tool_request = ToolRequest {
+            tool_call_id: ToolCallId::new(),
+            session_id: request.session_id,
+            turn_id: request.turn_id,
+            tool_name: "external_verifier".to_owned(),
+            arguments: json!({
+                "program": request.program,
+                "args": request.args,
+                "cwd": request.cwd,
+                "timeout_ms": timeout_ms,
+                "expected_exit_code": request.expected_exit_code,
+            }),
+        };
+        let command = command_display(
+            tool_request.arguments["program"]
+                .as_str()
+                .unwrap_or_default(),
+            tool_request.arguments["args"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str),
+        );
+        let policy = execution_policy(
+            &tool_request,
+            PolicyDecision::Allow,
+            "caller-declared verifier runs in the workspace sandbox",
+        );
+        let mut report = report(
+            tool_request,
+            status,
+            if passed {
+                "external verification passed"
+            } else {
+                "external verification failed"
+            },
+            json!({
+                "command": command,
+                "cwd": cwd,
+                "exit_code": output.exit_code,
+                "expected_exit_code": request.expected_exit_code,
+                "timed_out": output.timed_out,
+                "cancelled": output.cancelled,
+                "output_truncated": output.output_truncated || output.raw_output.len() > retained_limit,
+            }),
+            raw_output,
+            Vec::new(),
+            policy,
+        );
+        report.metrics = process_metrics(&output);
+        report.envelope.risk = "caller_declared_workspace_verifier".to_owned();
+        report.envelope.verification_hint =
+            Some("objective test result from a caller-declared command".to_owned());
+        Ok(report)
     }
 
     pub fn evaluate(&self, request: &ToolRequest) -> Result<PolicyEvaluation, ToolError> {
@@ -809,6 +920,7 @@ impl BasicToolExecutor {
                     resolved_path.display().to_string(),
                 ],
                 cwd: self.policy.workspace_root(),
+                workspace_root: self.policy.workspace_root(),
                 timeout_ms: DEFAULT_TIMEOUT_MS,
                 cancellation,
                 sandbox: &self.sandbox,
@@ -1003,6 +1115,7 @@ impl BasicToolExecutor {
                     program: &command_line.program,
                     args: &command_line.args,
                     cwd: self.policy.workspace_root(),
+                    workspace_root: self.policy.workspace_root(),
                     timeout_ms: timeout_ms.min(30_000),
                     cancellation,
                     sandbox: &self.sandbox,
@@ -1197,6 +1310,26 @@ impl BasicToolExecutor {
         }
         Ok(PathBuf::from(evaluation.resource))
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifierExecutionRequest {
+    pub session_id: SessionId,
+    pub turn_id: Option<TurnId>,
+    pub program: String,
+    pub args: Vec<String>,
+    pub cwd: PathBuf,
+    pub timeout_ms: u64,
+    pub expected_exit_code: i32,
+    pub max_output_bytes: usize,
+}
+
+fn command_display<'a>(program: &'a str, args: impl Iterator<Item = &'a str>) -> String {
+    std::iter::once(program)
+        .chain(args)
+        .map(|part| shlex::try_quote(part).map_or_else(|_| part.to_owned(), Into::into))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 async fn directory_entries(path: &Path) -> Result<Vec<String>, ToolError> {

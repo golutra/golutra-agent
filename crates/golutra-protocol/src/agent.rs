@@ -159,4 +159,36 @@ pub struct AgentTurnOptions {
     pub output_schema: Option<Value>,
     #[serde(default)]
     pub completion_criteria: Vec<String>,
+    /// Caller-owned commands that objectively verify the candidate workspace
+    /// after the model stops. These commands are argv-based and are never
+    /// interpreted by a shell.
+    #[serde(default)]
+    pub external_verifiers: Vec<ExternalVerificationSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ExternalVerificationSpec {
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default = "default_verifier_cwd")]
+    pub cwd: String,
+    #[serde(default = "default_verifier_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default)]
+    pub expected_exit_code: i32,
+    #[serde(default = "default_verifier_output_bytes")]
+    pub max_output_bytes: usize,
+}
+
+fn default_verifier_cwd() -> String {
+    ".".to_owned()
+}
+
+const fn default_verifier_timeout_ms() -> u64 {
+    120_000
+}
+
+const fn default_verifier_output_bytes() -> usize {
+    256 * 1024
 }

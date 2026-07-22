@@ -43,6 +43,13 @@ fn hosted_tasks_use_only_explicit_completion_criteria() {
 }
 
 #[test]
+fn system_prompt_explains_the_argv_only_shell_recovery_path() {
+    let prompt = system_prompt();
+    assert!(prompt.contains("parsed as inert argv"));
+    assert!(prompt.contains("create a workspace file with write_file"));
+}
+
+#[test]
 fn memory_support_requires_a_claim_related_objective() {
     let memory = "Objective: list workspace files\nVerified outcome: files listed";
     assert!(memory_support_matches("list workspace files again", memory));

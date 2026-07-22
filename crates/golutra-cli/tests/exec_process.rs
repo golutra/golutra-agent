@@ -139,6 +139,71 @@ async fn exec_reads_a_piped_prompt_without_mixing_progress_into_stdout() {
     app_server.kill().await.expect("stop app server");
 }
 
+#[tokio::test]
+async fn exec_runs_caller_declared_verifier_across_the_app_server_boundary() {
+    let home = tempdir().expect("home");
+    let workspace = tempdir().expect("workspace");
+    install_mock_provider(home.path());
+    let address = reserve_address();
+    let mut app_server = Command::new(env!("CARGO_BIN_EXE_golutra-cli"))
+        .arg("app-server")
+        .arg("--addr")
+        .arg(address.to_string())
+        .env("GOLUTRA_HOME", home.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("app server process");
+    let (info, token, _transport) = wait_for_runtime(home.path(), workspace.path()).await;
+
+    let passed = run_cli(
+        home.path(),
+        workspace.path(),
+        &info,
+        &token,
+        &[
+            "exec",
+            "--completion-criterion",
+            "tests pass",
+            "--verify-program",
+            "true",
+            "reply after verification",
+        ],
+    )
+    .await;
+    assert!(
+        passed.status.success(),
+        "passing verifier failed: {passed:?}"
+    );
+
+    let failed = run_cli(
+        home.path(),
+        workspace.path(),
+        &info,
+        &token,
+        &[
+            "exec",
+            "--completion-criterion",
+            "tests pass",
+            "--verify-program",
+            "false",
+            "reply after verification",
+        ],
+    )
+    .await;
+    assert!(
+        !failed.status.success(),
+        "failing verifier unexpectedly completed: {failed:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&failed.stderr).contains("agent turn ended with status Failed")
+    );
+
+    app_server.kill().await.expect("stop app server");
+}
+
 async fn run_cli(
     home: &Path,
     workspace: &Path,

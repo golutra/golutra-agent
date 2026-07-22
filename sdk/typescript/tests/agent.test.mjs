@@ -64,6 +64,7 @@ test("Thread and TurnHandle preserve the shared agent lifecycle", async () => {
   const handle = await thread.run("inspect the workspace", {
     outputSchema: { type: "object" },
     completionCriteria: [" verified ", ""],
+    externalVerifiers: [{ program: "pytest", args: ["-q"] }],
   });
   const events = [];
   for await (const event of handle.events()) {
@@ -84,6 +85,7 @@ test("Thread and TurnHandle preserve the shared agent lifecycle", async () => {
       thread_id: "thread-1",
       prompt: "inspect the workspace",
       completion_criteria: [" verified "],
+      external_verifiers: [{ program: "pytest", args: ["-q"] }],
       output_schema: { type: "object" },
     },
   ]);

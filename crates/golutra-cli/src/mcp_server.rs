@@ -192,6 +192,7 @@ impl GolutraMcpServer {
             AgentTurnOptions {
                 output_schema: parameters.output_schema,
                 completion_criteria: parameters.completion_criteria,
+                external_verifiers: Vec::new(),
             },
             parameters.include_events,
         )

@@ -285,6 +285,16 @@ impl RuntimeHost {
         let started_at = Instant::now();
         let objective = prompt_from_payload(&task.payload);
         let completion_criteria = completion_criteria_from_payload(&task.payload);
+        let external_verifiers = task
+            .payload
+            .get("external_verifiers")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| {
+                ClientError::TaskExecution(format!("invalid external verifier contract: {error}"))
+            })?
+            .unwrap_or_default();
         let workspace_root = self.execution_workspace_root()?;
         let policy = WorkspacePolicy::new(workspace_root.clone())
             .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
@@ -309,7 +319,8 @@ impl RuntimeHost {
             provider_session_policy,
         } = provider_plan;
         let agent_loop = AgentLoop::new(provider, context_builder, tool_executor)
-            .with_provider_session_policy(provider_session_policy);
+            .with_provider_session_policy(provider_session_policy)
+            .with_external_verifiers(external_verifiers);
         let agent_loop = match fallback_provider {
             Some(fallback) => agent_loop.with_fallback(fallback),
             None => agent_loop,

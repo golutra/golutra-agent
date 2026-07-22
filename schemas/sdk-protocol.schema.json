@@ -682,6 +682,14 @@
             "type": "string"
           }
         },
+        "external_verifiers": {
+          "description": "Caller-owned commands that objectively verify the candidate workspace\nafter the model stops. These commands are argv-based and are never\ninterpreted by a shell.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ExternalVerificationSpec"
+          }
+        },
         "output_schema": {
           "default": null
         }
@@ -3823,6 +3831,45 @@
         "recipes",
         "executions",
         "skills"
+      ]
+    },
+    "ExternalVerificationSpec": {
+      "type": "object",
+      "properties": {
+        "args": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "cwd": {
+          "type": "string",
+          "default": "."
+        },
+        "expected_exit_code": {
+          "type": "integer",
+          "format": "int32",
+          "default": 0
+        },
+        "max_output_bytes": {
+          "type": "integer",
+          "format": "uint",
+          "default": 262144,
+          "minimum": 0
+        },
+        "program": {
+          "type": "string"
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 120000,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "program"
       ]
     },
     "GeneratedTask": {

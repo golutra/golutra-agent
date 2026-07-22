@@ -22,9 +22,10 @@ use golutra_governor::{
 use golutra_llm::{
     LlmProvider, ProviderError, ProviderMessage, ProviderRequest, ProviderResponse, ProviderRole,
 };
+use golutra_protocol::ExternalVerificationSpec;
 use golutra_tools::{
     BasicToolExecutor, FileBeforeImage, ToolError, ToolExecutionReport, ToolRequest,
-    redact_tool_arguments,
+    VerifierExecutionRequest, redact_tool_arguments,
 };
 use golutra_verify::VerificationInput;
 use serde_json::Value;
@@ -262,6 +263,7 @@ pub struct AgentLoop<P> {
     governor: RuntimeGovernor,
     provider_session_policy: ProviderSessionPolicy,
     before_side_effect_recorder: Option<Arc<dyn BeforeSideEffectRecorder>>,
+    external_verifiers: Vec<ExternalVerificationSpec>,
 }
 
 impl<P> AgentLoop<P>
@@ -283,6 +285,7 @@ where
             governor: RuntimeGovernor::default(),
             provider_session_policy: ProviderSessionPolicy::default(),
             before_side_effect_recorder: None,
+            external_verifiers: Vec::new(),
         }
     }
 
@@ -310,6 +313,15 @@ where
         recorder: Arc<dyn BeforeSideEffectRecorder>,
     ) -> Self {
         self.before_side_effect_recorder = Some(recorder);
+        self
+    }
+
+    #[must_use]
+    pub fn with_external_verifiers(
+        mut self,
+        external_verifiers: Vec<ExternalVerificationSpec>,
+    ) -> Self {
+        self.external_verifiers = external_verifiers;
         self
     }
 
@@ -1023,6 +1035,45 @@ where
             }
         }
 
+        for verifier in &self.external_verifiers {
+            control.wait_until_runnable().await?;
+            let display_arguments = serde_json::json!({
+                "program": verifier.program,
+                "args": verifier.args,
+                "cwd": verifier.cwd,
+                "timeout_ms": verifier.timeout_ms,
+                "expected_exit_code": verifier.expected_exit_code,
+            });
+            let tool_call_id = golutra_core::ToolCallId::new();
+            trace(AgentLoopTraceEvent::ToolStarted {
+                tool_call_id,
+                tool_name: "external_verifier".to_owned(),
+                display_arguments: redact_tool_arguments(&display_arguments),
+            });
+            let mut report = self
+                .tool_executor
+                .execute_verifier(
+                    VerifierExecutionRequest {
+                        session_id: request.session_id,
+                        turn_id: Some(current_turn_id),
+                        program: verifier.program.clone(),
+                        args: verifier.args.clone(),
+                        cwd: verifier.cwd.clone().into(),
+                        timeout_ms: verifier.timeout_ms,
+                        expected_exit_code: verifier.expected_exit_code,
+                        max_output_bytes: verifier.max_output_bytes,
+                    },
+                    control.cancellation.clone(),
+                )
+                .await?;
+            report.envelope.tool_call_id = tool_call_id;
+            for artifact in &mut report.artifacts {
+                artifact.tool_call_id = Some(tool_call_id);
+            }
+            trace(AgentLoopTraceEvent::ToolCompleted(report.clone()));
+            tool_reports.push(report);
+        }
+
         let evidence_refs = tool_reports
             .iter()
             .flat_map(|report| report.evidence.iter().map(|evidence| evidence.evidence_id))
@@ -1042,28 +1093,65 @@ where
             .iter()
             .flat_map(|report| report.changed_files.iter())
             .collect::<Vec<_>>();
+        let expected_delivery_path = request
+            .completion_criteria
+            .iter()
+            .find_map(|criterion| objective_path_hint(criterion))
+            .or_else(|| objective_path_hint(&current_objective));
         if !changed_files.is_empty() {
-            let path_matches = changed_files
-                .iter()
-                .any(|path| objective_path_matches(&current_objective, path));
             command_checks.push(VerificationCheck {
                 kind: VerificationCheckKind::WorkspaceChange,
                 name: "workspace_diff".to_owned(),
                 command: None,
-                passed: path_matches || objective_path_hint(&current_objective).is_none(),
+                passed: true,
                 evidence_refs: tool_reports
                     .iter()
                     .flat_map(|report| report.envelope.evidence_refs.iter().copied())
                     .collect(),
-                message: if path_matches || objective_path_hint(&current_objective).is_none() {
-                    format!("{} workspace file(s) changed", changed_files.len())
+                message: format!("{} workspace file(s) changed", changed_files.len()),
+            });
+        }
+        if !changed_files.is_empty()
+            && let Some(expected_path) = expected_delivery_path.as_deref()
+        {
+            let path_matches = changed_files
+                .iter()
+                .any(|path| path_matches_expected(path, expected_path));
+            command_checks.push(VerificationCheck {
+                kind: VerificationCheckKind::ObjectiveValidation,
+                name: "objective:path:delivery".to_owned(),
+                command: None,
+                passed: path_matches,
+                evidence_refs: tool_reports
+                    .iter()
+                    .filter(|report| !report.changed_files.is_empty())
+                    .flat_map(|report| report.envelope.evidence_refs.iter().copied())
+                    .collect(),
+                message: if path_matches {
+                    format!("a changed file matches requested `{expected_path}`")
                 } else {
-                    "workspace changed files do not match the requested path".to_owned()
+                    format!("no changed file matches requested `{expected_path}`")
                 },
             });
         }
         let code_files_changed = changed_files.iter().any(|path| is_code_file(path));
         for report in &tool_reports {
+            if report.envelope.tool_name == "external_verifier" {
+                command_checks.push(VerificationCheck {
+                    kind: VerificationCheckKind::ObjectiveValidation,
+                    name: "objective:test:external_verifier".to_owned(),
+                    command: report
+                        .envelope
+                        .structured_facts
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    passed: report.envelope.status == ToolResultStatus::Ok,
+                    evidence_refs: report.envelope.evidence_refs.clone(),
+                    message: report.envelope.summary.clone(),
+                });
+                continue;
+            }
             if let Some(validation) = objective_validation_report(report, code_files_changed) {
                 command_checks.push(VerificationCheck {
                     kind: VerificationCheckKind::ObjectiveValidation,
@@ -1081,30 +1169,6 @@ where
                     passed: validation.passed,
                     evidence_refs: report.envelope.evidence_refs.clone(),
                     message: validation.message,
-                });
-            }
-            if let Some(observed_path) = report
-                .envelope
-                .structured_facts
-                .get("path")
-                .and_then(Value::as_str)
-                && let Some(expected_path) = objective_path_hint(&current_objective)
-            {
-                let matches = observed_path.ends_with(&expected_path)
-                    || expected_path.ends_with(observed_path);
-                command_checks.push(VerificationCheck {
-                    kind: VerificationCheckKind::ObjectiveValidation,
-                    name: format!("objective:path:{}", report.envelope.tool_name),
-                    command: None,
-                    passed: matches,
-                    evidence_refs: report.envelope.evidence_refs.clone(),
-                    message: if matches {
-                        "tool path matches the requested path".to_owned()
-                    } else {
-                        format!(
-                            "tool path `{observed_path}` does not match requested `{expected_path}`"
-                        )
-                    },
                 });
             }
             if report.envelope.tool_name == "write_file"
@@ -1711,12 +1775,9 @@ fn objective_path_hint(objective: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn objective_path_matches(objective: &str, path: &Path) -> bool {
-    let Some(expected) = objective_path_hint(objective) else {
-        return false;
-    };
+fn path_matches_expected(path: &Path, expected: &str) -> bool {
     let observed = path.to_string_lossy();
-    observed.ends_with(&expected) || expected.ends_with(observed.as_ref())
+    observed.ends_with(expected) || expected.ends_with(observed.as_ref())
 }
 
 fn objective_content_hint(objective: &str) -> Option<String> {

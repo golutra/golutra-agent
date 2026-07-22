@@ -1231,3 +1231,58 @@ fn request_for_session(session_id: SessionId, tool_name: &str, arguments: Value)
 fn artifact_text(report: &ToolExecutionReport) -> String {
     String::from_utf8_lossy(&report.artifact_contents[0].bytes).into_owned()
 }
+
+#[tokio::test]
+async fn caller_declared_verifier_records_pass_and_failure_as_evidence() {
+    let workspace = tempdir().expect("workspace");
+    let executor = executor(workspace.path());
+    let request = |expected_exit_code| VerifierExecutionRequest {
+        session_id: SessionId::new(),
+        turn_id: Some(TurnId::new()),
+        program: "sh".to_owned(),
+        args: vec!["-c".to_owned(), "printf verifier-output; exit 3".to_owned()],
+        cwd: PathBuf::from("."),
+        timeout_ms: 5_000,
+        expected_exit_code,
+        max_output_bytes: 1024,
+    };
+
+    let passed = executor
+        .execute_verifier(request(3), CancellationToken::new())
+        .await
+        .expect("verifier runs");
+    let failed = executor
+        .execute_verifier(request(0), CancellationToken::new())
+        .await
+        .expect("verifier runs");
+
+    assert_eq!(passed.envelope.status, ToolResultStatus::Ok);
+    assert_eq!(failed.envelope.status, ToolResultStatus::Error);
+    assert_eq!(passed.metrics.exit_code, Some(3));
+    assert_eq!(artifact_text(&passed), "verifier-output");
+    assert!(!passed.envelope.evidence_refs.is_empty());
+}
+
+#[tokio::test]
+async fn caller_declared_verifier_rejects_cwd_outside_workspace() {
+    let workspace = tempdir().expect("workspace");
+    let outside = tempdir().expect("outside");
+    let error = executor(workspace.path())
+        .execute_verifier(
+            VerifierExecutionRequest {
+                session_id: SessionId::new(),
+                turn_id: Some(TurnId::new()),
+                program: "true".to_owned(),
+                args: Vec::new(),
+                cwd: outside.path().to_path_buf(),
+                timeout_ms: 1_000,
+                expected_exit_code: 0,
+                max_output_bytes: 1024,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("outside cwd rejected");
+
+    assert!(error.to_string().contains("inside the workspace"));
+}

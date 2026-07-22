@@ -25,8 +25,9 @@ use golutra_llm::{
 };
 use golutra_plugin::PluginStore;
 use golutra_protocol::{
-    AgentStreamEvent, AgentTurnOptions, EventFilter, RuntimeEvent, RuntimeEventType, RuntimeQuery,
-    RuntimeQueryKind, SessionCommand, SessionCommandKind, TaskTraceRequest,
+    AgentStreamEvent, AgentTurnOptions, EventFilter, ExternalVerificationSpec, RuntimeEvent,
+    RuntimeEventType, RuntimeQuery, RuntimeQueryKind, SessionCommand, SessionCommandKind,
+    TaskTraceRequest,
 };
 use secrecy::SecretString;
 use std::io::{IsTerminal, Write};
@@ -183,6 +184,57 @@ struct ExecArgs {
     /// Write the final assistant message to a file.
     #[arg(short = 'o', long, value_name = "FILE")]
     output_last_message: Option<std::path::PathBuf>,
+    /// Add an objective completion criterion. May be repeated.
+    #[arg(long = "completion-criterion", value_name = "TEXT")]
+    completion_criteria: Vec<String>,
+    /// Run this caller-trusted program after the agent stops. No shell is used.
+    #[arg(long, value_name = "PROGRAM")]
+    verify_program: Option<String>,
+    /// Append one argv element to the verifier command. May be repeated.
+    #[arg(
+        long,
+        value_name = "ARG",
+        requires = "verify_program",
+        allow_hyphen_values = true
+    )]
+    verify_arg: Vec<String>,
+    /// Workspace-relative verifier working directory.
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = ".",
+        requires = "verify_program"
+    )]
+    verify_cwd: std::path::PathBuf,
+    #[arg(long, default_value_t = 120_000, requires = "verify_program")]
+    verify_timeout_ms: u64,
+    #[arg(long, default_value_t = 0, requires = "verify_program")]
+    verify_expected_exit_code: i32,
+    #[arg(long, default_value_t = 256 * 1024, requires = "verify_program")]
+    verify_max_output_bytes: usize,
+    /// How exec resolves runtime requests already classified as requiring approval.
+    #[arg(long, value_enum, default_value_t = ExecApprovalModeArg::Prompt)]
+    approval_mode: ExecApprovalModeArg,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ExecApprovalModeArg {
+    /// Ask on a terminal; deny when stdin is not interactive.
+    Prompt,
+    /// Deny every approval request.
+    Deny,
+    /// Approve `Ask` decisions. Policy-blocked actions remain blocked.
+    Auto,
+}
+
+impl std::fmt::Display for ExecApprovalModeArg {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Prompt => "prompt",
+            Self::Deny => "deny",
+            Self::Auto => "auto",
+        })
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1985,6 +2037,19 @@ fn approval_payload(approval_id: Option<String>) -> serde_json::Value {
 }
 
 async fn run_exec(transport: &RuntimeTransport, args: ExecArgs) -> miette::Result<()> {
+    let external_verifiers = args
+        .verify_program
+        .clone()
+        .map_or_else(Vec::new, |program| {
+            vec![ExternalVerificationSpec {
+                program,
+                args: args.verify_arg.clone(),
+                cwd: args.verify_cwd.display().to_string(),
+                timeout_ms: args.verify_timeout_ms,
+                expected_exit_code: args.verify_expected_exit_code,
+                max_output_bytes: args.verify_max_output_bytes,
+            }]
+        });
     let prompt = match &args.command {
         Some(ExecCommand::Resume { prompt, .. }) => prompt.clone().or(args.prompt.clone()),
         None => args.prompt.clone(),
@@ -2008,6 +2073,7 @@ async fn run_exec(transport: &RuntimeTransport, args: ExecArgs) -> miette::Resul
     };
     let json_output = args.json;
     let output_last_message = args.output_last_message;
+    let approval_mode = args.approval_mode;
     let client = AgentClient::new(transport.clone());
     let (thread, prompt) = match args.command {
         Some(ExecCommand::Resume { thread_id, .. }) => {
@@ -2035,7 +2101,8 @@ async fn run_exec(transport: &RuntimeTransport, args: ExecArgs) -> miette::Resul
             prompt,
             AgentTurnOptions {
                 output_schema,
-                completion_criteria: Vec::new(),
+                completion_criteria: args.completion_criteria,
+                external_verifiers,
             },
         )
         .await
@@ -2055,7 +2122,7 @@ async fn run_exec(transport: &RuntimeTransport, args: ExecArgs) -> miette::Resul
             report_exec_progress(&event);
         }
         if let Some(approval_id) = approval_id_from_exec_event(&event) {
-            let approve = prompt_for_exec_approval(&approval_id).await?;
+            let approve = resolve_exec_approval(&approval_id, approval_mode).await?;
             let ack = handle
                 .resolve_approval(approval_id, approve)
                 .await
@@ -2171,6 +2238,23 @@ async fn prompt_for_exec_approval(approval_id: &str) -> miette::Result<bool> {
     })
     .await
     .map_err(|error| miette::miette!("approval prompt task failed: {error}"))?
+}
+
+async fn resolve_exec_approval(
+    approval_id: &str,
+    mode: ExecApprovalModeArg,
+) -> miette::Result<bool> {
+    match mode {
+        ExecApprovalModeArg::Auto => {
+            eprintln!("approval {approval_id} accepted by explicit exec auto mode");
+            Ok(true)
+        }
+        ExecApprovalModeArg::Deny => {
+            eprintln!("approval {approval_id} denied by exec policy");
+            Ok(false)
+        }
+        ExecApprovalModeArg::Prompt => prompt_for_exec_approval(approval_id).await,
+    }
 }
 
 async fn wait_for_terminal_state(

@@ -709,9 +709,24 @@ export interface AgentThreadRef {
 }
 export interface AgentTurnOptions {
   completion_criteria?: string[];
+  /**
+   * Caller-owned commands that objectively verify the candidate workspace
+   * after the model stops. These commands are argv-based and are never
+   * interpreted by a shell.
+   */
+  external_verifiers?: ExternalVerificationSpec[];
   output_schema?: {
     [k: string]: unknown;
   };
+  [k: string]: unknown;
+}
+export interface ExternalVerificationSpec {
+  args?: string[];
+  cwd?: string;
+  expected_exit_code?: number;
+  max_output_bytes?: number;
+  program: string;
+  timeout_ms?: number;
   [k: string]: unknown;
 }
 export interface AgentTurnResult {

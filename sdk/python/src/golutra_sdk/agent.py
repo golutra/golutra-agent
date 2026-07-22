@@ -26,6 +26,7 @@ class Thread:
         *,
         output_schema: dict[str, Any] | None = None,
         completion_criteria: Iterable[str] = (),
+        external_verifiers: Iterable[dict[str, Any]] = (),
     ) -> TurnHandle:
         if not prompt.strip():
             raise ValueError("turn prompt cannot be empty")
@@ -33,6 +34,7 @@ class Thread:
             "thread_id": self.thread_id,
             "prompt": prompt,
             "completion_criteria": [item for item in completion_criteria if item.strip()],
+            "external_verifiers": [dict(item) for item in external_verifiers],
         }
         if output_schema is not None:
             params["output_schema"] = output_schema
@@ -47,11 +49,13 @@ class Thread:
         *,
         output_schema: dict[str, Any] | None = None,
         completion_criteria: Iterable[str] = (),
+        external_verifiers: Iterable[dict[str, Any]] = (),
     ) -> TurnHandle:
         return self.run(
             prompt,
             output_schema=output_schema,
             completion_criteria=completion_criteria,
+            external_verifiers=external_verifiers,
         )
 
     def steer(self, prompt: str) -> dict[str, Any]:

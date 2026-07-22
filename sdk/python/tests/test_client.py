@@ -533,6 +533,7 @@ class ClientTest(unittest.TestCase):
             "inspect the workspace",
             output_schema={"type": "object"},
             completion_criteria=[" verified ", ""],
+            external_verifiers=[{"program": "pytest", "args": ["-q"]}],
         )
         events = []
         stream = handle.events()
@@ -549,6 +550,10 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(calls[0][0], "turn/start")
         self.assertEqual(calls[0][1]["completion_criteria"], [" verified "])
         self.assertEqual(calls[0][1]["output_schema"], {"type": "object"})
+        self.assertEqual(
+            calls[0][1]["external_verifiers"],
+            [{"program": "pytest", "args": ["-q"]}],
+        )
         self.assertEqual(calls[1][0], "subscribe_agent")
         self.assertEqual(calls[1][1]["request"][2], "command-1")
         self.assertEqual(calls[1][1]["request"][4], 10)

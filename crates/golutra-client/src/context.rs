@@ -100,6 +100,7 @@ pub(crate) fn system_prompt() -> String {
         "Use the provided tools whenever the task requires reading files, listing directories, searching, writing files, or running validation commands.",
         "Use workspace-relative paths. Do not invent file contents when a read or search tool can inspect them.",
         "For write tasks, call write_file or edit_file with complete arguments instead of only explaining the change.",
+        "Shell commands are parsed as inert argv, not by a shell: do not use pipes, redirection, command substitution, chained commands, or inline code. For nontrivial scripts, create a workspace file with write_file, then run that file with a simple command.",
     ]
     .join(" ")
 }

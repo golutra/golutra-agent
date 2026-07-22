@@ -365,6 +365,7 @@ async fn turn_start(
         "_thread_id": thread.thread_id,
         "output_schema": params.get("output_schema").cloned(),
         "completion_criteria": params.get("completion_criteria").cloned().unwrap_or_else(|| json!([])),
+        "external_verifiers": params.get("external_verifiers").cloned().unwrap_or_else(|| json!([])),
     });
     let ack = transport
         .send_command(rpc_command(

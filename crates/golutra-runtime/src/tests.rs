@@ -18,7 +18,7 @@ use golutra_llm::{
     ProviderResponse, ProviderStreamEvent, ProviderToolCall, ProviderUsage, UsageSource,
 };
 use golutra_policy::WorkspacePolicy;
-use golutra_protocol::RuntimeEventType;
+use golutra_protocol::{ExternalVerificationSpec, RuntimeEventType};
 use golutra_tools::BasicToolExecutor;
 use serde_json::json;
 use tempfile::tempdir;
@@ -55,6 +55,81 @@ enum FallbackTestProvider {
 struct SixRoundProvider {
     calls: Arc<AtomicUsize>,
     contract: golutra_core::ProviderContract,
+}
+
+#[derive(Debug, Clone)]
+struct SupportThenDeliveryProvider {
+    calls: Arc<AtomicUsize>,
+    contract: golutra_core::ProviderContract,
+}
+
+#[async_trait]
+impl LlmProvider for SupportThenDeliveryProvider {
+    async fn complete(&self, _request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let usage = ProviderUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            reasoning_tokens: None,
+            cached_input_tokens: None,
+            total_tokens: Some(15),
+            usage_source: UsageSource::Estimated,
+            raw: json!({"round": call}),
+        };
+        let (message, tool_calls, finish_reason) = match call {
+            0 => (
+                None,
+                vec![ProviderToolCall {
+                    tool_call_id: "read-support".to_owned(),
+                    tool_name: "read_file".to_owned(),
+                    arguments: json!({"path": "input.txt"}),
+                }],
+                ProviderFinishReason::ToolCalls,
+            ),
+            1 => (
+                None,
+                vec![ProviderToolCall {
+                    tool_call_id: "write-support".to_owned(),
+                    tool_name: "write_file".to_owned(),
+                    arguments: json!({"path": "helper.py", "content": "print('support')"}),
+                }],
+                ProviderFinishReason::ToolCalls,
+            ),
+            2 => (
+                None,
+                vec![ProviderToolCall {
+                    tool_call_id: "write-result".to_owned(),
+                    tool_name: "write_file".to_owned(),
+                    arguments: json!({"path": "results.txt", "content": "done"}),
+                }],
+                ProviderFinishReason::ToolCalls,
+            ),
+            _ => (
+                Some(ProviderMessage {
+                    role: ProviderRole::Assistant,
+                    content: "done".to_owned(),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: Vec::new(),
+                    metadata: Default::default(),
+                }),
+                Vec::new(),
+                ProviderFinishReason::Stop,
+            ),
+        };
+        Ok(ProviderResponse {
+            response_id: golutra_core::ProviderResponseId::new(),
+            message,
+            tool_calls,
+            usage,
+            finish_reason,
+            raw_metadata: json!({"round": call}),
+        })
+    }
+
+    fn contract(&self) -> golutra_core::ProviderContract {
+        self.contract.clone()
+    }
 }
 
 #[async_trait]
@@ -739,6 +814,106 @@ async fn code_change_without_an_objective_validation_is_partial() {
     }));
 }
 
+#[tokio::test]
+async fn caller_declared_verifier_controls_code_change_completion() {
+    for (path, expected_result, expected_action) in [
+        (
+            "src/lib.rs",
+            VerificationResult::Pass,
+            LoopAction::StopSuccess,
+        ),
+        (
+            "src/missing.rs",
+            VerificationResult::Fail,
+            LoopAction::StopFailed,
+        ),
+    ] {
+        let workspace = tempdir().expect("workspace");
+        fs::create_dir_all(workspace.path().join("src")).expect("source directory");
+        let provider = MockProvider::tool_call(
+            "write_file",
+            json!({"path": "src/lib.rs", "content": "pub fn answer() -> u8 { 42 }"}),
+        );
+        let executor =
+            BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+        let agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor)
+            .with_external_verifiers(vec![ExternalVerificationSpec {
+                program: "test".to_owned(),
+                args: vec!["-f".to_owned(), path.to_owned()],
+                cwd: ".".to_owned(),
+                timeout_ms: 5_000,
+                expected_exit_code: 0,
+                max_output_bytes: 1024,
+            }]);
+
+        let outcome = agent_loop
+            .run(AgentTaskRequest {
+                session_id: SessionId::new(),
+                task_id: TaskId::new(),
+                turn_id: TurnId::new(),
+                objective: "write Rust code".to_owned(),
+                completion_criteria: vec!["tests pass".to_owned()],
+                output_schema: None,
+                touched_code: true,
+                contributors: Vec::new(),
+                tools: vec!["write_file".to_owned()],
+            })
+            .await
+            .expect("loop runs");
+
+        assert_eq!(outcome.verification.result, expected_result);
+        assert_eq!(outcome.loop_decision.action, expected_action);
+        assert!(outcome.verification.checks.iter().any(|check| {
+            check.name == "objective:test:external_verifier"
+                && check.passed == (expected_result == VerificationResult::Pass)
+                && !check.evidence_refs.is_empty()
+        }));
+        assert!(outcome.tool_reports.iter().any(|report| {
+            report.envelope.tool_name == "external_verifier" && !report.artifact_contents.is_empty()
+        }));
+    }
+}
+
+#[tokio::test]
+async fn caller_declared_verifier_can_validate_an_unchanged_existing_delivery() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("results.txt"), "done\n").expect("existing result");
+    let provider = MockProvider::text_response("The existing result is valid.");
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let outcome = AgentLoop::new(provider, ContextBuilder::default(), executor)
+        .with_external_verifiers(vec![ExternalVerificationSpec {
+            program: "test".to_owned(),
+            args: vec!["-f".to_owned(), "results.txt".to_owned()],
+            cwd: ".".to_owned(),
+            timeout_ms: 5_000,
+            expected_exit_code: 0,
+            max_output_bytes: 1024,
+        }])
+        .run(AgentTaskRequest {
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            turn_id: TurnId::new(),
+            objective: "verify the existing results.txt without changing it".to_owned(),
+            completion_criteria: vec!["results.txt contains the expected result".to_owned()],
+            output_schema: None,
+            touched_code: false,
+            contributors: Vec::new(),
+            tools: Vec::new(),
+        })
+        .await
+        .expect("loop runs");
+
+    assert_eq!(outcome.verification.result, VerificationResult::Pass);
+    assert_eq!(outcome.loop_decision.action, LoopAction::StopSuccess);
+    assert!(
+        !outcome
+            .verification
+            .checks
+            .iter()
+            .any(|check| check.name == "objective:path:delivery")
+    );
+}
+
 #[test]
 fn verification_command_classifier_rejects_arbitrary_shell_success() {
     assert!(is_objective_validation_command(
@@ -789,9 +964,49 @@ async fn agent_loop_does_not_accept_a_write_to_the_wrong_requested_path() {
         .expect("loop runs");
 
     assert_ne!(outcome.loop_decision.action, LoopAction::StopSuccess);
-    assert!(outcome.verification.checks.iter().any(|check| {
-        check.kind == golutra_core::VerificationCheckKind::WorkspaceChange && !check.passed
-    }));
+    assert!(
+        outcome
+            .verification
+            .checks
+            .iter()
+            .any(|check| { check.name == "objective:path:delivery" && !check.passed })
+    );
+}
+
+#[tokio::test]
+async fn supporting_read_paths_do_not_fail_a_correct_delivery_path() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("input.txt"), "source").expect("input");
+    let provider = SupportThenDeliveryProvider {
+        calls: Arc::new(AtomicUsize::new(0)),
+        contract: MockProvider::text_response("unused").contract(),
+    };
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let outcome = AgentLoop::new(provider, ContextBuilder::default(), executor)
+        .run(AgentTaskRequest {
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            turn_id: TurnId::new(),
+            objective: "read input.txt and write results.txt; diagnostic: /tmp/very/long/verify.py"
+                .to_owned(),
+            completion_criteria: vec!["results.txt is delivered".to_owned()],
+            output_schema: None,
+            touched_code: true,
+            contributors: Vec::new(),
+            tools: vec!["read_file".to_owned(), "write_file".to_owned()],
+        })
+        .await
+        .expect("loop runs");
+
+    assert!(
+        outcome
+            .verification
+            .checks
+            .iter()
+            .any(|check| { check.name == "objective:path:delivery" && check.passed })
+    );
+    assert!(workspace.path().join("helper.py").is_file());
+    assert!(workspace.path().join("results.txt").is_file());
 }
 
 #[tokio::test]

@@ -89,6 +89,7 @@ class AgentThreadRef(TypedDict, total=False):
 
 class AgentTurnOptions(TypedDict, total=False):
     completion_criteria: NotRequired[list[str]]
+    external_verifiers: NotRequired[list[ExternalVerificationSpec]]
     output_schema: NotRequired[Any]
 
 class AgentTurnResult(TypedDict, total=False):
@@ -730,6 +731,14 @@ class EvolutionState(TypedDict, total=False):
     recipes: Required[list[EnvironmentRecipe]]
     runs: Required[list[OpenEndedRun]]
     skills: Required[list[SkillLifecycleRecord]]
+
+class ExternalVerificationSpec(TypedDict, total=False):
+    args: NotRequired[list[str]]
+    cwd: NotRequired[str]
+    expected_exit_code: NotRequired[int]
+    max_output_bytes: NotRequired[int]
+    program: Required[str]
+    timeout_ms: NotRequired[int]
 
 class GeneratedTask(TypedDict, total=False):
     difficulty_score: NotRequired[float | None]
@@ -1574,6 +1583,7 @@ __all__ = [
     "EvidenceRecord",
     "EvidenceStrength",
     "EvolutionState",
+    "ExternalVerificationSpec",
     "GeneratedTask",
     "GeneratedTaskExecution",
     "GoalAlignmentCheck",

@@ -468,6 +468,8 @@ PolicyStatus
 
 当前 hosted task 只采用 payload 中显式 `completion_criteria`，不再注入“有任意 evidence 即完成”的固定条件。Delivery assertion 要求关联到通过的 matching check；Test criterion 只接受 `objective:test:*`，shell test 还必须同时满足 exit code、timeout/cancel 和“至少执行了一个测试”的输出解析。普通对话仍可只凭非空 assistant response 完成。
 
+调用方现在可以通过 `ExternalVerificationSpec` 声明独立于模型的客观检查。Runtime 在候选回复产生后、终态判定前，以结构化 argv 执行检查，并把 exit code、timeout/cancel、有界输出 artifact 和 evidence 写回同一事实链。该检查不经过模型工具审批，因为命令来自受信任调用方；但 cwd 必须位于 workspace 内，仍使用无网络 sandbox，且不能绕过模型工具的 Block/Deny 策略。外部检查名称固定为 `objective:test:external_verifier`，因此可满足 code task 的 `tests_or_diagnostics`，失败则形成 blocking assertion。
+
 ## 真实 Regression Execution
 
 ### Replay 模式分级

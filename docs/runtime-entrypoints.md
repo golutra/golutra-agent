@@ -55,6 +55,10 @@ golutra --cwd "$PWD" exec - < prompt.txt
 golutra --cwd "$PWD" exec --json "run the checks"
 golutra --cwd "$PWD" exec --output-last-message /tmp/answer.txt "summarize the change"
 golutra --cwd "$PWD" exec resume <thread-id> "continue the same task"
+golutra --cwd "$PWD" exec \
+  --completion-criterion "tests pass" \
+  --verify-program cargo --verify-arg test --verify-arg --workspace \
+  "implement the requested change"
 ```
 
 Output rules:
@@ -68,6 +72,24 @@ Output rules:
   same runtime lane;
 - `--ephemeral` uses an isolated embedded runtime and cannot be combined with
   `--daemon` or `--connect`.
+
+`--completion-criterion` may be repeated. `--verify-program` and repeated
+`--verify-arg` values declare an argv-based external verifier that runs after
+the model stops and before the terminal decision. No shell parses this command.
+Its cwd must remain inside the attached workspace; network remains disabled by
+the runtime sandbox; timeout and retained output are bounded. The verifier
+produces the same artifact, evidence, tool event and `VerificationRecord` facts
+as built-in checks. A failed verifier prevents `completed`, even when the model
+claims success.
+
+External verifiers are trusted caller configuration, not model output. They may
+execute workspace code and must therefore only come from the user, CI harness or
+authenticated SDK caller. Model-generated tool calls keep the ordinary policy
+path. `--approval-mode prompt` is the default and denies requests when stdin is
+not interactive; `deny` always denies. Explicit `--approval-mode auto` approves
+only requests the runtime already classified as `Ask`. It cannot override
+`Block` or `Deny`, shell metacharacter guards, sensitive paths, workspace
+boundaries or the no-network sandbox.
 
 The final exit status is non-zero unless the runtime returns a verified
 `completed` turn. A model saying it is finished is not sufficient.
@@ -160,6 +182,10 @@ range reads. Python exposes `Thread.reconcile_task`; TypeScript exposes
 callers to infer success from the final message. They use the same Agent SSE
 projector as `exec` and MCP, so command/turn correlation and terminal status do
 not vary by language.
+`Thread.run` also accepts `external_verifiers` in Python and
+`externalVerifiers` in TypeScript. These fields use the generated
+`ExternalVerificationSpec` contract and reach the same Runtime verifier path as
+headless exec and App Server JSON-RPC.
 
 SDK connection steps are fixed:
 
