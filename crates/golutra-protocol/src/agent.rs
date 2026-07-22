@@ -4,7 +4,9 @@
 //! deliberately small presentation contract for `exec`, SDKs, MCP and rich
 //! clients; adapters must never create a second task state machine.
 
-use golutra_core::{CommandId, SessionId, TaskId, TaskStatus, ThreadId, Timestamp, TurnId};
+use golutra_core::{
+    CommandId, SessionId, TaskId, TaskStatus, ThreadId, Timestamp, TurnId, VerificationRecord,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -104,6 +106,7 @@ pub enum AgentStreamEvent {
         turn_id: Option<TurnId>,
         status: TaskStatus,
         final_message: Option<String>,
+        verification: Option<VerificationRecord>,
         last_sequence_no: Option<u64>,
         timestamp: Timestamp,
     },
@@ -116,6 +119,7 @@ pub enum AgentStreamEvent {
         status: TaskStatus,
         error: String,
         final_message: Option<String>,
+        verification: Option<VerificationRecord>,
         last_sequence_no: Option<u64>,
         timestamp: Timestamp,
     },
@@ -145,6 +149,7 @@ pub struct AgentTurnResult {
     pub turn_id: Option<TurnId>,
     pub status: TaskStatus,
     pub final_message: Option<String>,
+    pub verification: Option<VerificationRecord>,
     pub last_sequence_no: Option<u64>,
 }
 

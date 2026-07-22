@@ -180,6 +180,15 @@
     "storage_stats": {
       "$ref": "#/$defs/StorageStats"
     },
+    "task_reconciliation_decision": {
+      "$ref": "#/$defs/TaskReconciliationDecision"
+    },
+    "task_reconciliation_record": {
+      "$ref": "#/$defs/TaskReconciliationRecord"
+    },
+    "task_recovery_record": {
+      "$ref": "#/$defs/TaskRecoveryRecord"
+    },
     "task_trace_page": {
       "$ref": "#/$defs/TaskTracePage"
     },
@@ -206,6 +215,9 @@
     "json_rpc_notification",
     "command",
     "command_ack",
+    "task_recovery_record",
+    "task_reconciliation_decision",
+    "task_reconciliation_record",
     "query",
     "event_filter",
     "event_page_request",
@@ -542,6 +554,16 @@
             "type": {
               "type": "string",
               "const": "turn.completed"
+            },
+            "verification": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/VerificationRecord"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -604,6 +626,16 @@
             "type": {
               "type": "string",
               "const": "turn.failed"
+            },
+            "verification": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/VerificationRecord"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -696,6 +728,16 @@
             "null"
           ],
           "format": "uuid"
+        },
+        "verification": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VerificationRecord"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -3152,7 +3194,9 @@
         "partial",
         "failed",
         "blocked",
-        "cancelled"
+        "cancelled",
+        "interrupted",
+        "uncertain"
       ]
     },
     "EnvironmentRecipe": {
@@ -4027,6 +4071,31 @@
         "benchmark_refs",
         "rollback_plan",
         "status"
+      ]
+    },
+    "IncompleteToolCall": {
+      "type": "object",
+      "properties": {
+        "side_effect_possible": {
+          "type": "boolean"
+        },
+        "started_event_ref": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "tool_call_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "tool_name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool_call_id",
+        "tool_name",
+        "side_effect_possible",
+        "started_event_ref"
       ]
     },
     "JsonRpcErrorObject": {
@@ -5321,6 +5390,9 @@
         "thread_rebound",
         "task_created",
         "turn_started",
+        "step_started",
+        "step_completed",
+        "step_checkpointed",
         "turn_queued",
         "busy_policy_decided",
         "controller_changed",
@@ -5340,12 +5412,16 @@
         "task_completed",
         "task_abort_requested",
         "task_aborted",
+        "task_interrupted",
+        "task_uncertain",
+        "task_reconciled",
         "task_paused",
         "task_resumed",
         "approval_requested",
         "approval_resolved",
         "retry_scheduled",
         "provider_fallback",
+        "provider_transport_fallback",
         "provider_auth_required",
         "provider_auth_submitted",
         "provider_auth_cancelled",
@@ -5356,7 +5432,9 @@
         "provider_rate_limited",
         "provider_credential_refreshed",
         "loop_guard_triggered",
+        "compaction_started",
         "compaction_completed",
+        "compaction_failed",
         "memory_retrieved",
         "memory_promoted",
         "memory_promotion_rejected",
@@ -5666,6 +5744,7 @@
         "pause",
         "resume",
         "abort",
+        "reconcile_task",
         "takeover",
         "compact",
         "memory_rollback",
@@ -6287,6 +6366,145 @@
         "code_change"
       ]
     },
+    "TaskReconciliationDecision": {
+      "type": "string",
+      "enum": [
+        "no_side_effect_observed",
+        "side_effect_observed",
+        "abandon"
+      ]
+    },
+    "TaskReconciliationRecord": {
+      "type": "object",
+      "properties": {
+        "decision": {
+          "$ref": "#/$defs/TaskReconciliationDecision"
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reconciled_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "reconciled_by": {
+          "$ref": "#/$defs/Actor"
+        },
+        "recovery_event_ref": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "resulting_status": {
+          "$ref": "#/$defs/TaskStatus"
+        },
+        "resumed_pending_turns": {
+          "type": "boolean"
+        },
+        "task_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "task_id",
+        "recovery_event_ref",
+        "decision",
+        "resulting_status",
+        "reconciled_by",
+        "reconciled_at",
+        "resumed_pending_turns"
+      ]
+    },
+    "TaskRecoveryDisposition": {
+      "type": "string",
+      "enum": [
+        "interrupted",
+        "uncertain"
+      ]
+    },
+    "TaskRecoveryRecord": {
+      "type": "object",
+      "properties": {
+        "checkpoint_event_refs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "detected_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "disposition": {
+          "$ref": "#/$defs/TaskRecoveryDisposition"
+        },
+        "incomplete_tool_calls": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/IncompleteToolCall"
+          }
+        },
+        "interrupted_turn_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "last_event_ref": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "previous_runtime_identity": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "type": "string"
+        },
+        "reconciliation_required": {
+          "type": "boolean"
+        },
+        "recovering_runtime_identity": {
+          "type": "string"
+        },
+        "running_process_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "safe_to_replay": {
+          "type": "boolean"
+        },
+        "task_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "task_id",
+        "disposition",
+        "interrupted_turn_ids",
+        "incomplete_tool_calls",
+        "running_process_ids",
+        "checkpoint_event_refs",
+        "recovering_runtime_identity",
+        "safe_to_replay",
+        "reconciliation_required",
+        "reason",
+        "detected_at"
+      ]
+    },
     "TaskStatus": {
       "type": "string",
       "enum": [
@@ -6301,7 +6519,9 @@
         "partial",
         "failed",
         "blocked",
-        "cancelled"
+        "cancelled",
+        "interrupted",
+        "uncertain"
       ]
     },
     "TaskTracePage": {

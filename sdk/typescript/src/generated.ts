@@ -51,6 +51,7 @@ export type AgentStreamEvent =
       timestamp: string;
       turn_id?: string | null;
       type: "turn.completed";
+      verification?: VerificationRecord | null;
       [k: string]: unknown;
     }
   | {
@@ -64,6 +65,7 @@ export type AgentStreamEvent =
       timestamp: string;
       turn_id?: string | null;
       type: "turn.failed";
+      verification?: VerificationRecord | null;
       [k: string]: unknown;
     };
 export type RuntimeEventType =
@@ -76,6 +78,9 @@ export type RuntimeEventType =
   | "thread_rebound"
   | "task_created"
   | "turn_started"
+  | "step_started"
+  | "step_completed"
+  | "step_checkpointed"
   | "turn_queued"
   | "busy_policy_decided"
   | "controller_changed"
@@ -95,12 +100,16 @@ export type RuntimeEventType =
   | "task_completed"
   | "task_abort_requested"
   | "task_aborted"
+  | "task_interrupted"
+  | "task_uncertain"
+  | "task_reconciled"
   | "task_paused"
   | "task_resumed"
   | "approval_requested"
   | "approval_resolved"
   | "retry_scheduled"
   | "provider_fallback"
+  | "provider_transport_fallback"
   | "provider_auth_required"
   | "provider_auth_submitted"
   | "provider_auth_cancelled"
@@ -111,7 +120,9 @@ export type RuntimeEventType =
   | "provider_rate_limited"
   | "provider_credential_refreshed"
   | "loop_guard_triggered"
+  | "compaction_started"
   | "compaction_completed"
+  | "compaction_failed"
   | "memory_retrieved"
   | "memory_promoted"
   | "memory_promotion_rejected"
@@ -172,7 +183,12 @@ export type TaskStatus =
   | "partial"
   | "failed"
   | "blocked"
-  | "cancelled";
+  | "cancelled"
+  | "interrupted"
+  | "uncertain";
+export type VerificationCheckKind =
+  "tool_execution" | "workspace_change" | "objective_validation" | "assistant_response" | "schema";
+export type VerificationResult = "pass" | "fail" | "partial" | "unknown";
 export type AutomationCandidateKind = "benchmark" | "generated_task" | "skill" | "runtime_change";
 export type CandidateRisk = "low" | "medium" | "high" | "critical";
 export type CandidateStatus =
@@ -193,6 +209,7 @@ export type SessionCommandKind =
   | "pause"
   | "resume"
   | "abort"
+  | "reconcile_task"
   | "takeover"
   | "compact"
   | "memory_rollback"
@@ -240,9 +257,6 @@ export type PostTaskJobKind = "deep_evaluation" | "candidate_generation" | "regr
 export type PostTaskJobStatus =
   "queued" | "leased" | "running" | "succeeded" | "failed" | "cancelled";
 export type ToolResultStatus = "ok" | "error" | "blocked" | "cancelled" | "timeout";
-export type VerificationCheckKind =
-  "tool_execution" | "workspace_change" | "objective_validation" | "assistant_response" | "schema";
-export type VerificationResult = "pass" | "fail" | "partial" | "unknown";
 export type PromotionDecisionKind = "approve" | "reject" | "needs_human_review";
 export type PromotionReviewer = "system" | "human" | "agent";
 export type EvaluationVerdict = "pass" | "fail" | "partial" | "unknown";
@@ -279,6 +293,9 @@ export type RegressionExecutionRole = "baseline" | "candidate";
 export type RegressionExecutionStatus =
   "queued" | "running" | "succeeded" | "failed" | "inconclusive";
 export type SessionRangeDirection = "single" | "newer" | "older";
+export type TaskReconciliationDecision =
+  "no_side_effect_observed" | "side_effect_observed" | "abandon";
+export type TaskRecoveryDisposition = "interrupted" | "uncertain";
 export type VerificationAssertionKind =
   | "file_state"
   | "diff"
@@ -558,7 +575,9 @@ export type DriverTaskStatus =
   | "partial"
   | "failed"
   | "blocked"
-  | "cancelled";
+  | "cancelled"
+  | "interrupted"
+  | "uncertain";
 export type TuiFramePane = "transcript" | "developer" | "response_and_developer" | "screen";
 export type TuiHitPane = "transcript" | "bottom" | "developer";
 export type SnapshotPanes = "transcript" | "developer" | "response_and_developer" | "full_screen";
@@ -626,6 +645,9 @@ export interface SdkProtocolBundle {
   state_projection: StateProjection;
   storage_maintenance_report: StorageMaintenanceReport;
   storage_stats: StorageStats;
+  task_reconciliation_decision: TaskReconciliationDecision;
+  task_reconciliation_record: TaskReconciliationRecord;
+  task_recovery_record: TaskRecoveryRecord;
   task_trace_page: TaskTracePage;
   task_trace_request: TaskTraceRequest;
   tui_driver: TuiDriverProtocolBundle;
@@ -658,6 +680,27 @@ export interface RuntimeEvent {
   turn_id?: string | null;
   [k: string]: unknown;
 }
+export interface VerificationRecord {
+  checks: VerificationCheck[];
+  completion_criteria: string[];
+  evidence_refs: string[];
+  objective: string;
+  policy_status: string;
+  residual_risks: string[];
+  result: VerificationResult;
+  task_id: string;
+  verification_id: string;
+  [k: string]: unknown;
+}
+export interface VerificationCheck {
+  command?: string | null;
+  evidence_refs: string[];
+  kind: VerificationCheckKind;
+  message: string;
+  name: string;
+  passed: boolean;
+  [k: string]: unknown;
+}
 export interface AgentThreadRef {
   session_id: string;
   thread_id: string;
@@ -679,6 +722,7 @@ export interface AgentTurnResult {
   task_id?: string | null;
   thread_id: string;
   turn_id?: string | null;
+  verification?: VerificationRecord | null;
   [k: string]: unknown;
 }
 export interface AgentTurnStart {
@@ -1033,27 +1077,6 @@ export interface ToolResultEnvelope {
   tool_call_id: string;
   tool_name: string;
   verification_hint?: string | null;
-  [k: string]: unknown;
-}
-export interface VerificationRecord {
-  checks: VerificationCheck[];
-  completion_criteria: string[];
-  evidence_refs: string[];
-  objective: string;
-  policy_status: string;
-  residual_risks: string[];
-  result: VerificationResult;
-  task_id: string;
-  verification_id: string;
-  [k: string]: unknown;
-}
-export interface VerificationCheck {
-  command?: string | null;
-  evidence_refs: string[];
-  kind: VerificationCheckKind;
-  message: string;
-  name: string;
-  passed: boolean;
   [k: string]: unknown;
 }
 export interface EnvironmentRecipe {
@@ -1599,6 +1622,40 @@ export interface StorageStats {
   live_artifact_blobs: number;
   live_artifact_bytes: number;
   rollout_files: number;
+  [k: string]: unknown;
+}
+export interface TaskReconciliationRecord {
+  decision: TaskReconciliationDecision;
+  note?: string | null;
+  reconciled_at: string;
+  reconciled_by: Actor;
+  recovery_event_ref: string;
+  resulting_status: TaskStatus;
+  resumed_pending_turns: boolean;
+  task_id: string;
+  [k: string]: unknown;
+}
+export interface TaskRecoveryRecord {
+  checkpoint_event_refs: string[];
+  detected_at: string;
+  disposition: TaskRecoveryDisposition;
+  incomplete_tool_calls: IncompleteToolCall[];
+  interrupted_turn_ids: string[];
+  last_event_ref?: string | null;
+  previous_runtime_identity?: string | null;
+  reason: string;
+  reconciliation_required: boolean;
+  recovering_runtime_identity: string;
+  running_process_ids: string[];
+  safe_to_replay: boolean;
+  task_id: string;
+  [k: string]: unknown;
+}
+export interface IncompleteToolCall {
+  side_effect_possible: boolean;
+  started_event_ref: string;
+  tool_call_id: string;
+  tool_name: string;
   [k: string]: unknown;
 }
 export interface TaskTracePage {

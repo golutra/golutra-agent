@@ -9,7 +9,15 @@ from typing import get_args
 SDK_SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SDK_SRC))
 
-from golutra_sdk.generated import DriverEnvelope, DriverKey, DriverResponseEnvelope, WaitCondition
+from golutra_sdk.generated import (
+    DriverEnvelope,
+    DriverKey,
+    DriverResponseEnvelope,
+    TaskReconciliationDecision,
+    TaskRecoveryRecord,
+    TaskStatus,
+    WaitCondition,
+)
 
 
 class GeneratedContractTest(unittest.TestCase):
@@ -35,6 +43,15 @@ class GeneratedContractTest(unittest.TestCase):
 
         key_variants = get_args(DriverKey)
         self.assertTrue(any(getattr(variant, "__name__", "") == "DriverKeyChar" for variant in key_variants))
+
+    def test_recovery_contract_is_exported_to_generated_clients(self) -> None:
+        self.assertIn("interrupted", get_args(TaskStatus))
+        self.assertIn("uncertain", get_args(TaskStatus))
+        self.assertEqual(
+            set(get_args(TaskReconciliationDecision)),
+            {"no_side_effect_observed", "side_effect_observed", "abandon"},
+        )
+        self.assertIn("reconciliation_required", TaskRecoveryRecord.__annotations__)
 
 
 if __name__ == "__main__":

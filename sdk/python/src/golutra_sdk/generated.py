@@ -65,6 +65,7 @@ class AgentStreamEventTurnCompleted(TypedDict, total=False):
     timestamp: Required[str]
     turn_id: NotRequired[str | None]
     type: Required[Literal['turn.completed']]
+    verification: NotRequired[VerificationRecord | None]
 
 class AgentStreamEventTurnFailed(TypedDict, total=False):
     error: Required[str]
@@ -77,6 +78,7 @@ class AgentStreamEventTurnFailed(TypedDict, total=False):
     timestamp: Required[str]
     turn_id: NotRequired[str | None]
     type: Required[Literal['turn.failed']]
+    verification: NotRequired[VerificationRecord | None]
 
 AgentStreamEvent: TypeAlias = AgentStreamEventThreadStarted | AgentStreamEventTurnStarted | AgentStreamEventItemStarted | AgentStreamEventItemUpdated | AgentStreamEventItemCompleted | AgentStreamEventRuntimeEvent | AgentStreamEventTurnCompleted | AgentStreamEventTurnFailed
 
@@ -97,6 +99,7 @@ class AgentTurnResult(TypedDict, total=False):
     task_id: NotRequired[str | None]
     thread_id: Required[str]
     turn_id: NotRequired[str | None]
+    verification: NotRequired[VerificationRecord | None]
 
 class AgentTurnStart(TypedDict, total=False):
     accepted: Required[bool]
@@ -612,7 +615,7 @@ class DriverState(TypedDict, total=False):
     turn_id: NotRequired[str | None]
     width: Required[int]
 
-DriverTaskStatus: TypeAlias = Literal['connecting', 'idle', 'running', 'waiting_approval', 'waiting_authentication', 'pausing', 'paused', 'aborting', 'completed', 'partial', 'failed', 'blocked', 'cancelled']
+DriverTaskStatus: TypeAlias = Literal['connecting', 'idle', 'running', 'waiting_approval', 'waiting_authentication', 'pausing', 'paused', 'aborting', 'completed', 'partial', 'failed', 'blocked', 'cancelled', 'interrupted', 'uncertain']
 
 class EnvironmentRecipe(TypedDict, total=False):
     dependency_snapshot: Required[str]
@@ -778,6 +781,12 @@ class ImprovementCandidate(TypedDict, total=False):
     status: Required[CandidateStatus]
     target_id: NotRequired[str | None]
     target_type: Required[str]
+
+class IncompleteToolCall(TypedDict, total=False):
+    side_effect_possible: Required[bool]
+    started_event_ref: Required[str]
+    tool_call_id: Required[str]
+    tool_name: Required[str]
 
 class JsonRpcErrorObject(TypedDict, total=False):
     code: Required[int]
@@ -1033,7 +1042,7 @@ class RuntimeEvent(TypedDict, total=False):
 
 RuntimeEventSource: TypeAlias = Literal['runtime', 'provider', 'tool', 'policy', 'verifier', 'memory', 'evaluator', 'governor', 'evolution', 'user']
 
-RuntimeEventType: TypeAlias = Literal['command_received', 'command_completed', 'command_accepted', 'command_rejected', 'session_created', 'thread_forked', 'thread_rebound', 'task_created', 'turn_started', 'turn_queued', 'busy_policy_decided', 'controller_changed', 'context_built', 'provider_started', 'provider_streamed', 'provider_completed', 'token_usage_recorded', 'assistant_message', 'tool_started', 'tool_progress', 'tool_completed', 'policy_evaluated', 'verification_completed', 'loop_decided', 'checkpoint_created', 'task_completed', 'task_abort_requested', 'task_aborted', 'task_paused', 'task_resumed', 'approval_requested', 'approval_resolved', 'retry_scheduled', 'provider_fallback', 'provider_auth_required', 'provider_auth_submitted', 'provider_auth_cancelled', 'provider_configured', 'provider_probe_started', 'provider_probe_completed', 'provider_auth_failed', 'provider_rate_limited', 'provider_credential_refreshed', 'loop_guard_triggered', 'compaction_completed', 'memory_retrieved', 'memory_promoted', 'memory_promotion_rejected', 'memory_rolled_back', 'memory_feedback_recorded', 'post_task_reviewed', 'evaluation_completed', 'improvement_candidate_created', 'automation_candidate_created', 'regression_completed', 'promotion_decided', 'candidate_applied', 'candidate_rolled_back', 'benchmark_recorded', 'counterfactual_compared', 'evolution_planned', 'evolution_task_started', 'evolution_task_completed', 'evolution_completed', 'skill_staged', 'skill_reviewed', 'skill_installed', 'skill_rolled_back', 'governor_decided', 'storage_maintenance_completed', 'context_snapshot_created', 'post_task_job_queued', 'post_task_job_started', 'post_task_job_completed', 'post_task_job_failed', 'verification_planned', 'verification_assertion_completed', 'regression_campaign_started', 'regression_execution_completed', 'memory_candidate_quarantined', 'memory_activated', 'memory_invalidated']
+RuntimeEventType: TypeAlias = Literal['command_received', 'command_completed', 'command_accepted', 'command_rejected', 'session_created', 'thread_forked', 'thread_rebound', 'task_created', 'turn_started', 'step_started', 'step_completed', 'step_checkpointed', 'turn_queued', 'busy_policy_decided', 'controller_changed', 'context_built', 'provider_started', 'provider_streamed', 'provider_completed', 'token_usage_recorded', 'assistant_message', 'tool_started', 'tool_progress', 'tool_completed', 'policy_evaluated', 'verification_completed', 'loop_decided', 'checkpoint_created', 'task_completed', 'task_abort_requested', 'task_aborted', 'task_interrupted', 'task_uncertain', 'task_reconciled', 'task_paused', 'task_resumed', 'approval_requested', 'approval_resolved', 'retry_scheduled', 'provider_fallback', 'provider_transport_fallback', 'provider_auth_required', 'provider_auth_submitted', 'provider_auth_cancelled', 'provider_configured', 'provider_probe_started', 'provider_probe_completed', 'provider_auth_failed', 'provider_rate_limited', 'provider_credential_refreshed', 'loop_guard_triggered', 'compaction_started', 'compaction_completed', 'compaction_failed', 'memory_retrieved', 'memory_promoted', 'memory_promotion_rejected', 'memory_rolled_back', 'memory_feedback_recorded', 'post_task_reviewed', 'evaluation_completed', 'improvement_candidate_created', 'automation_candidate_created', 'regression_completed', 'promotion_decided', 'candidate_applied', 'candidate_rolled_back', 'benchmark_recorded', 'counterfactual_compared', 'evolution_planned', 'evolution_task_started', 'evolution_task_completed', 'evolution_completed', 'skill_staged', 'skill_reviewed', 'skill_installed', 'skill_rolled_back', 'governor_decided', 'storage_maintenance_completed', 'context_snapshot_created', 'post_task_job_queued', 'post_task_job_started', 'post_task_job_completed', 'post_task_job_failed', 'verification_planned', 'verification_assertion_completed', 'regression_campaign_started', 'regression_execution_completed', 'memory_candidate_quarantined', 'memory_activated', 'memory_invalidated']
 
 class RuntimeGovernorDecision(TypedDict, total=False):
     action: Required[GovernorAction]
@@ -1086,7 +1095,7 @@ class SessionCommand(TypedDict, total=False):
     session_id: NotRequired[str | None]
     timestamp: Required[str]
 
-SessionCommandKind: TypeAlias = Literal['create', 'prompt', 'approve', 'deny', 'pause', 'resume', 'abort', 'takeover', 'compact', 'memory_rollback', 'memory_feedback', 'run_regression', 'review_candidate', 'apply_candidate', 'rollback_candidate', 'record_benchmark', 'compare_counterfactual', 'plan_evolution', 'run_evolution', 'stage_skill', 'review_skill', 'install_skill', 'rollback_skill', 'provider_configured', 'provider_auth_submitted', 'provider_auth_cancelled', 'run_storage_maintenance', 'wait_post_task_job', 'retry_post_task_job', 'run_regression_campaign', 'review_memory_candidate', 'expire_memory', 'verify', 'replay', 'export']
+SessionCommandKind: TypeAlias = Literal['create', 'prompt', 'approve', 'deny', 'pause', 'resume', 'abort', 'reconcile_task', 'takeover', 'compact', 'memory_rollback', 'memory_feedback', 'run_regression', 'review_candidate', 'apply_candidate', 'rollback_candidate', 'record_benchmark', 'compare_counterfactual', 'plan_evolution', 'run_evolution', 'stage_skill', 'review_skill', 'install_skill', 'rollback_skill', 'provider_configured', 'provider_auth_submitted', 'provider_auth_cancelled', 'run_storage_maintenance', 'wait_post_task_job', 'retry_post_task_job', 'run_regression_campaign', 'review_memory_candidate', 'expire_memory', 'verify', 'replay', 'export']
 
 class SessionCursor(TypedDict, total=False):
     recency_at: Required[str]
@@ -1205,7 +1214,36 @@ class StorageStats(TypedDict, total=False):
 
 TaskClass: TypeAlias = Literal['plain_conversation', 'read_only_analysis', 'workspace_change', 'code_change']
 
-TaskStatus: TypeAlias = Literal['idle', 'running', 'waiting_approval', 'waiting_authentication', 'pausing', 'paused', 'aborting', 'completed', 'partial', 'failed', 'blocked', 'cancelled']
+TaskReconciliationDecision: TypeAlias = Literal['no_side_effect_observed', 'side_effect_observed', 'abandon']
+
+class TaskReconciliationRecord(TypedDict, total=False):
+    decision: Required[TaskReconciliationDecision]
+    note: NotRequired[str | None]
+    reconciled_at: Required[str]
+    reconciled_by: Required[Actor]
+    recovery_event_ref: Required[str]
+    resulting_status: Required[TaskStatus]
+    resumed_pending_turns: Required[bool]
+    task_id: Required[str]
+
+TaskRecoveryDisposition: TypeAlias = Literal['interrupted', 'uncertain']
+
+class TaskRecoveryRecord(TypedDict, total=False):
+    checkpoint_event_refs: Required[list[str]]
+    detected_at: Required[str]
+    disposition: Required[TaskRecoveryDisposition]
+    incomplete_tool_calls: Required[list[IncompleteToolCall]]
+    interrupted_turn_ids: Required[list[str]]
+    last_event_ref: NotRequired[str | None]
+    previous_runtime_identity: NotRequired[str | None]
+    reason: Required[str]
+    reconciliation_required: Required[bool]
+    recovering_runtime_identity: Required[str]
+    running_process_ids: Required[list[str]]
+    safe_to_replay: Required[bool]
+    task_id: Required[str]
+
+TaskStatus: TypeAlias = Literal['idle', 'running', 'waiting_approval', 'waiting_authentication', 'pausing', 'paused', 'aborting', 'completed', 'partial', 'failed', 'blocked', 'cancelled', 'interrupted', 'uncertain']
 
 class TaskTracePage(TypedDict, total=False):
     artifacts: Required[list[ArtifactRecord]]
@@ -1542,6 +1580,7 @@ __all__ = [
     "GovernorAction",
     "GovernorPhase",
     "ImprovementCandidate",
+    "IncompleteToolCall",
     "JsonRpcErrorObject",
     "JsonRpcNotification",
     "JsonRpcRequest",
@@ -1604,6 +1643,10 @@ __all__ = [
     "StorageMaintenanceReport",
     "StorageStats",
     "TaskClass",
+    "TaskReconciliationDecision",
+    "TaskReconciliationRecord",
+    "TaskRecoveryDisposition",
+    "TaskRecoveryRecord",
     "TaskStatus",
     "TaskTracePage",
     "TaskTraceRequest",

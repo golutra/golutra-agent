@@ -7,6 +7,7 @@ from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .client import GolutraClient
+    from .generated import TaskReconciliationDecision
 
 
 class Thread:
@@ -75,6 +76,27 @@ class Thread:
         return _command_ack(
             self._client.rpc("turn/takeover", {"thread_id": self.thread_id}),
             "turn/takeover",
+        )
+
+    def reconcile_task(
+        self,
+        decision: TaskReconciliationDecision,
+        *,
+        task_id: str | None = None,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """Resolve an uncertain task before pending turns may continue."""
+        params: dict[str, Any] = {
+            "thread_id": self.thread_id,
+            "decision": decision,
+        }
+        if task_id is not None:
+            params["task_id"] = task_id
+        if note is not None:
+            params["note"] = note
+        return _command_ack(
+            self._client.rpc("task/reconcile", params),
+            "task/reconcile",
         )
 
     def event_page(
@@ -168,6 +190,7 @@ class TurnHandle:
             "turn_id": self._terminal.get("turn_id"),
             "status": self._terminal.get("status", "failed"),
             "final_message": self._terminal.get("final_message"),
+            "verification": self._terminal.get("verification"),
             "last_sequence_no": self._terminal.get("last_sequence_no"),
         }
 

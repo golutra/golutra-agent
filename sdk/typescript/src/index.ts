@@ -44,6 +44,7 @@ import type {
   StorageStats,
   TaskTracePage,
   TaskTraceRequest,
+  TaskReconciliationDecision,
 } from "./generated.js";
 
 const JSON_REQUEST_TIMEOUT_MS = 30_000;
@@ -157,6 +158,11 @@ export interface ThreadRunOptions {
   completionCriteria?: readonly string[];
 }
 
+export interface ReconcileTaskOptions {
+  taskId?: string;
+  note?: string;
+}
+
 /** Optional bounds for one durable runtime event history page. */
 export interface EventPageOptions {
   cursor?: number | null;
@@ -223,6 +229,18 @@ export class Thread {
 
   async takeover(): Promise<CommandAck> {
     return this.client.rpcCommand("turn/takeover", { thread_id: this.threadId });
+  }
+
+  async reconcileTask(
+    decision: TaskReconciliationDecision,
+    options: ReconcileTaskOptions = {},
+  ): Promise<CommandAck> {
+    return this.client.rpcCommand("task/reconcile", {
+      thread_id: this.threadId,
+      decision,
+      ...(options.taskId !== undefined ? { task_id: options.taskId } : {}),
+      ...(options.note !== undefined ? { note: options.note } : {}),
+    });
   }
 
   async eventPage(

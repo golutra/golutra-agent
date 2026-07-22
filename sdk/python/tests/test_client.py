@@ -510,6 +510,7 @@ class ClientTest(unittest.TestCase):
                             "task_id": TASK_ID,
                             "turn_id": "turn-1",
                             "final_message": "done",
+                            "verification": {"result": "pass"},
                             "last_sequence_no": 12,
                         },
                     ]
@@ -544,6 +545,7 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(events[-1]["type"], "turn.completed")
         self.assertEqual(handle.wait()["status"], "completed")
         self.assertEqual(handle.wait()["final_message"], "done")
+        self.assertEqual(handle.wait()["verification"]["result"], "pass")
         self.assertEqual(calls[0][0], "turn/start")
         self.assertEqual(calls[0][1]["completion_criteria"], [" verified "])
         self.assertEqual(calls[0][1]["output_schema"], {"type": "object"})
@@ -558,12 +560,32 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(thread.steer("continue")["accepted"], True)
         self.assertEqual(thread.interrupt()["accepted"], True)
         self.assertEqual(thread.takeover()["accepted"], True)
+        self.assertEqual(
+            thread.reconcile_task(
+                "side_effect_observed",
+                task_id=TASK_ID,
+                note="external change confirmed",
+            )["accepted"],
+            True,
+        )
         self.assertEqual(handle.resolve_approval("approval-1", False)["accepted"], True)
         self.assertEqual(
             thread.history(cursor=9, direction="forward", limit=25)["direction"],
             "forward",
         )
         self.assertEqual(thread.replay_events(cursor=9), [])
+        self.assertIn(
+            (
+                "task/reconcile",
+                {
+                    "thread_id": THREAD_ID,
+                    "decision": "side_effect_observed",
+                    "task_id": TASK_ID,
+                    "note": "external change confirmed",
+                },
+            ),
+            calls,
+        )
         event_page_call = next(params for name, params in calls if name == "event_page")
         self.assertEqual(
             event_page_call,

@@ -1,7 +1,8 @@
 use chrono::Utc;
 use golutra_core::{
     Actor, ActorKind, BudgetState, EvidenceId, LoopAction, LoopDecision, LoopDecisionId,
-    RegressionCampaign, RegressionExecution, SessionId, TaskId, TaskStatus, TurnId, VerificationId,
+    RegressionCampaign, RegressionExecution, SessionId, TaskId, TaskReconciliationDecision,
+    TaskReconciliationRecord, TaskRecoveryRecord, TaskStatus, TurnId, VerificationId,
 };
 use golutra_eval::{
     AppliedCandidate, AutomationCandidate, BenchmarkPromotion, BenchmarkRun, CausalComparison,
@@ -52,6 +53,9 @@ pub struct SdkProtocolBundle {
     pub json_rpc_notification: JsonRpcNotification,
     pub command: SessionCommand,
     pub command_ack: CommandAck,
+    pub task_recovery_record: TaskRecoveryRecord,
+    pub task_reconciliation_decision: TaskReconciliationDecision,
+    pub task_reconciliation_record: TaskReconciliationRecord,
     pub query: RuntimeQuery,
     pub event_filter: EventFilter,
     pub event_page_request: EventPageRequest,
@@ -281,6 +285,9 @@ pub fn protocol_schema_names() -> Vec<&'static str> {
         "JsonRpcResponse",
         "JsonRpcNotification",
         "SessionCommand",
+        "TaskRecoveryRecord",
+        "TaskReconciliationDecision",
+        "TaskReconciliationRecord",
         "RuntimeEvent",
         "StateProjection",
         "UserProjection",
@@ -323,10 +330,23 @@ mod tests {
         let scenario_json = serde_json::to_value(&scenario_schema).expect("schema serializes");
         let command_json = serde_json::to_value(&command_schema).expect("schema serializes");
         let event_json = serde_json::to_value(&event_schema).expect("schema serializes");
+        let sdk_json =
+            serde_json::to_value(schema_for!(SdkProtocolBundle)).expect("SDK schema serializes");
 
         assert!(scenario_json.is_object());
         assert!(command_json.is_object());
         assert!(event_json.is_object());
-        assert_eq!(protocol_schema_names().len(), 17);
+        assert!(sdk_json.pointer("/$defs/TaskRecoveryRecord").is_some());
+        assert!(
+            sdk_json
+                .pointer("/$defs/TaskReconciliationDecision")
+                .is_some()
+        );
+        assert!(
+            sdk_json
+                .pointer("/$defs/TaskReconciliationRecord")
+                .is_some()
+        );
+        assert_eq!(protocol_schema_names().len(), 20);
     }
 }

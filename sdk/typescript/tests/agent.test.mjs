@@ -49,6 +49,7 @@ test("Thread and TurnHandle preserve the shared agent lifecycle", async () => {
           task_id: "task-1",
           turn_id: "turn-1",
           final_message: "done",
+          verification: { result: "pass" },
           last_sequence_no: 12,
         },
       ]) {
@@ -75,6 +76,7 @@ test("Thread and TurnHandle preserve the shared agent lifecycle", async () => {
   const result = await handle.wait();
   assert.equal(result.status, "completed");
   assert.equal(result.final_message, "done");
+  assert.equal(result.verification.result, "pass");
   assert.equal((await handle.wait()).final_message, "done");
   assert.deepEqual(calls[0], [
     "turn/start",
@@ -94,6 +96,13 @@ test("Thread and TurnHandle preserve the shared agent lifecycle", async () => {
   await assert.rejects(thread.steer("   "), /steering prompt cannot be empty/);
   assert.equal((await thread.interrupt()).accepted, true);
   assert.equal((await thread.takeover()).accepted, true);
+  assert.equal(
+    (await thread.reconcileTask("side_effect_observed", {
+      taskId: "task-1",
+      note: "external change confirmed",
+    })).accepted,
+    true,
+  );
   assert.equal((await handle.resolveApproval("approval-1", false)).accepted, true);
   const history = await thread.history({ cursor: 9, direction: "forward", limit: 25 });
   assert.equal(history.direction, "forward");
@@ -105,6 +114,15 @@ test("Thread and TurnHandle preserve the shared agent lifecycle", async () => {
       cursor: 9,
       direction: "forward",
       limit: 25,
+    },
+  ]);
+  assert.deepEqual(calls.find(([name]) => name === "task/reconcile"), [
+    "task/reconcile",
+    {
+      thread_id: "thread-1",
+      decision: "side_effect_observed",
+      task_id: "task-1",
+      note: "external change confirmed",
     },
   ]);
   await assert.rejects(thread.eventPage({ limit: 0 }), /between 1 and 512/);

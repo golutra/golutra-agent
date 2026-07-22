@@ -5,7 +5,7 @@
 //! a queued turn must not finish when the task that was active before it is
 //! completed.
 
-use golutra_core::{CommandId, TaskId, TaskStatus, ToolResultStatus, TurnId};
+use golutra_core::{CommandId, TaskId, TaskStatus, ToolResultStatus, TurnId, VerificationRecord};
 use golutra_protocol::{
     AgentItem, AgentItemKind, AgentItemStatus, AgentStreamEvent, AgentThreadRef, AgentTurnResult,
     RuntimeEvent, RuntimeEventType,
@@ -19,6 +19,7 @@ pub struct AgentEventProjector {
     task_id: Option<TaskId>,
     turn_id: Option<TurnId>,
     final_message: Option<String>,
+    verification: Option<VerificationRecord>,
     last_sequence_no: Option<u64>,
     terminal_status: Option<TaskStatus>,
     turn_started: bool,
@@ -34,6 +35,7 @@ impl AgentEventProjector {
             task_id: None,
             turn_id: None,
             final_message: None,
+            verification: None,
             last_sequence_no: None,
             terminal_status: None,
             turn_started: false,
@@ -67,6 +69,11 @@ impl AgentEventProjector {
     }
 
     #[must_use]
+    pub fn verification(&self) -> Option<&VerificationRecord> {
+        self.verification.as_ref()
+    }
+
+    #[must_use]
     pub fn last_sequence_no(&self) -> Option<u64> {
         self.last_sequence_no
     }
@@ -97,6 +104,14 @@ impl AgentEventProjector {
             && let Some(content) = event.payload.get("content").and_then(Value::as_str)
         {
             self.final_message = Some(content.to_owned());
+        }
+        if event.event_type == RuntimeEventType::VerificationCompleted {
+            self.verification = event
+                .payload
+                .get("record")
+                .cloned()
+                .or_else(|| Some(event.payload.clone()))
+                .and_then(|value| serde_json::from_value(value).ok());
         }
 
         let timestamp = event.timestamp;
@@ -143,6 +158,7 @@ impl AgentEventProjector {
                         turn_id,
                         status,
                         final_message: self.final_message.clone(),
+                        verification: self.verification.clone(),
                         last_sequence_no: Some(event.sequence_no),
                         timestamp,
                     }
@@ -160,6 +176,7 @@ impl AgentEventProjector {
                             .unwrap_or("runtime task did not complete successfully")
                             .to_owned(),
                         final_message: self.final_message.clone(),
+                        verification: self.verification.clone(),
                         last_sequence_no: Some(event.sequence_no),
                         timestamp,
                     }
@@ -196,6 +213,7 @@ impl AgentEventProjector {
             turn_id: self.turn_id,
             status,
             final_message: self.final_message.clone(),
+            verification: self.verification.clone(),
             last_sequence_no: self.last_sequence_no,
         })
     }
@@ -206,6 +224,11 @@ impl AgentEventProjector {
                 return true;
             }
             if event.task_id == self.task_id && event.event_type.is_task_terminal() {
+                return true;
+            }
+            if event.task_id == self.task_id
+                && event.event_type == RuntimeEventType::VerificationCompleted
+            {
                 return true;
             }
             // A steer is intentionally projected as a continuation of the
@@ -371,7 +394,10 @@ fn completed_tool_status(event: &RuntimeEvent) -> AgentItemStatus {
 
 #[cfg(test)]
 mod tests {
-    use golutra_core::{CommandId, EventId, SessionId, TaskId, TaskStatus, ThreadId, TurnId};
+    use golutra_core::{
+        CommandId, EventId, SessionId, TaskId, TaskStatus, ThreadId, TurnId, VerificationId,
+        VerificationRecord, VerificationResult,
+    };
     use golutra_protocol::{
         AgentItemStatus, AgentStreamEvent, AgentThreadRef, RuntimeEvent, RuntimeEventSource,
         RuntimeEventType,
@@ -462,9 +488,28 @@ mod tests {
             RuntimeEventType::AssistantMessage,
             json!({"content": "done"}),
         ));
-        let terminal = projector.project(event(
+        let verification = VerificationRecord {
+            verification_id: VerificationId::new(),
+            task_id,
+            objective: "inspect the workspace".to_owned(),
+            completion_criteria: vec!["assistant response produced".to_owned()],
+            checks: Vec::new(),
+            evidence_refs: Vec::new(),
+            result: VerificationResult::Pass,
+            policy_status: "pass".to_owned(),
+            residual_risks: Vec::new(),
+        };
+        projector.project(event(
             &thread,
             6,
+            Some(task_id),
+            Some(turn_id),
+            RuntimeEventType::VerificationCompleted,
+            json!({"record": &verification}),
+        ));
+        let terminal = projector.project(event(
+            &thread,
+            7,
             Some(task_id),
             None,
             RuntimeEventType::TaskCompleted,
@@ -478,17 +523,20 @@ mod tests {
                 turn_id: Some(completed_turn),
                 status: TaskStatus::Completed,
                 ref final_message,
+                verification: Some(ref completed_verification),
                 ..
             }) if completed_task == task_id
                 && completed_turn == turn_id
                 && final_message.as_deref() == Some("done")
+                && completed_verification == &verification
         ));
         let result = projector.result().expect("terminal result");
         assert_eq!(result.task_id, Some(task_id));
         assert_eq!(result.turn_id, Some(turn_id));
         assert_eq!(result.status, TaskStatus::Completed);
         assert_eq!(result.final_message.as_deref(), Some("done"));
-        assert_eq!(result.last_sequence_no, Some(6));
+        assert_eq!(result.verification.as_ref(), Some(&verification));
+        assert_eq!(result.last_sequence_no, Some(7));
     }
 
     #[test]
@@ -528,6 +576,65 @@ mod tests {
             }) if error.contains("reconciliation")
         ));
         assert!(projector.is_finished());
+    }
+
+    #[test]
+    fn task_verification_is_retained_when_the_final_turn_differs() {
+        let thread = thread_ref();
+        let command_id = CommandId::new();
+        let task_id = TaskId::new();
+        let initial_turn_id = TurnId::new();
+        let final_turn_id = TurnId::new();
+        let verification = VerificationRecord {
+            verification_id: VerificationId::new(),
+            task_id,
+            objective: "final pending turn".to_owned(),
+            completion_criteria: Vec::new(),
+            checks: Vec::new(),
+            evidence_refs: Vec::new(),
+            result: VerificationResult::Pass,
+            policy_status: "pass".to_owned(),
+            residual_risks: Vec::new(),
+        };
+        let mut projector = AgentEventProjector::new(thread.clone(), Some(command_id));
+        projector.project(event(
+            &thread,
+            1,
+            Some(task_id),
+            Some(initial_turn_id),
+            RuntimeEventType::TaskCreated,
+            json!({"command_id": command_id}),
+        ));
+
+        assert!(matches!(
+            projector.project(event(
+                &thread,
+                2,
+                Some(task_id),
+                Some(final_turn_id),
+                RuntimeEventType::VerificationCompleted,
+                json!({"record": &verification}),
+            )),
+            Some(AgentStreamEvent::ItemCompleted { .. })
+        ));
+        assert!(matches!(
+            projector.project(event(
+                &thread,
+                3,
+                Some(task_id),
+                Some(final_turn_id),
+                RuntimeEventType::TaskCompleted,
+                json!({"status": "completed"}),
+            )),
+            Some(AgentStreamEvent::TurnCompleted {
+                verification: Some(ref actual),
+                ..
+            }) if actual == &verification
+        ));
+        assert_eq!(
+            projector.result().and_then(|result| result.verification),
+            Some(verification)
+        );
     }
 
     #[test]

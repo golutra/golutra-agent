@@ -9,7 +9,9 @@ use std::collections::VecDeque;
 use crate::{
     AgentEventProjector, ClientError, RuntimeClient, RuntimeEventStream, RuntimeTransport,
 };
-use golutra_core::{Actor, ActorKind, CommandId, SessionId, ThreadId};
+use golutra_core::{
+    Actor, ActorKind, CommandId, SessionId, TaskId, TaskReconciliationDecision, ThreadId,
+};
 use golutra_protocol::{
     AgentStreamEvent, AgentThreadRef, AgentTurnOptions, AgentTurnResult, AgentTurnStart,
     EventFilter, RuntimeQuery, RuntimeQueryKind, SessionCommand, SessionCommandKind,
@@ -253,6 +255,28 @@ impl AgentThread {
                 self.thread.session_id,
                 SessionCommandKind::Abort,
                 json!({"_thread_id": self.thread.thread_id}),
+                &self.client.actor,
+            ))
+            .await
+    }
+
+    pub async fn reconcile_task(
+        &self,
+        decision: TaskReconciliationDecision,
+        task_id: Option<TaskId>,
+        note: Option<String>,
+    ) -> Result<golutra_protocol::CommandAck, ClientError> {
+        self.client
+            .transport
+            .send_command(command(
+                self.thread.session_id,
+                SessionCommandKind::ReconcileTask,
+                json!({
+                    "task_id": task_id,
+                    "decision": decision,
+                    "note": note,
+                    "_thread_id": self.thread.thread_id,
+                }),
                 &self.client.actor,
             ))
             .await
