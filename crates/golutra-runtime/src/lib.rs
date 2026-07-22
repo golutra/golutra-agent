@@ -8,7 +8,7 @@ use std::{
 use async_trait::async_trait;
 use golutra_context::{
     ContextBuilder, ContextContributor, ContextError, context_snapshot_from_request,
-    estimate_tokens, provider_request_from_plan, token_usage_record,
+    estimate_message_tokens, estimate_tokens, provider_request_from_plan, token_usage_record,
 };
 use golutra_core::{
     ApprovalDecision, ApprovalId, ApprovalRequest, ApprovalResolution, BudgetState, CommandId,
@@ -428,6 +428,8 @@ where
             });
         }
         let mut messages = base_plan.messages.clone();
+        let protected_prefix_len = base_plan.messages.len();
+        let context_window_manager = self.context_builder.window_manager();
 
         'agent_loop: loop {
             let step_snapshot = step_machine.begin(current_turn_id);
@@ -438,21 +440,38 @@ where
             plan.messages = messages.clone();
             plan.budget_snapshot.turn_id = current_turn_id;
             plan.budget_snapshot.planned_tool_tokens = planned_tool_tokens;
-            plan.budget_snapshot.planned_input_tokens = messages
-                .iter()
-                .map(|message| {
-                    estimate_tokens(&message.content)
-                        + message
-                            .tool_calls
-                            .iter()
-                            .map(|call| estimate_tokens(&call.arguments.to_string()))
-                            .sum::<u64>()
-                        + serde_json::to_string(&message.metadata)
-                            .map(|metadata| estimate_tokens(&metadata))
-                            .unwrap_or_default()
-                })
-                .sum::<u64>()
-                .saturating_add(planned_tool_tokens);
+            plan.budget_snapshot.planned_input_tokens =
+                estimate_message_tokens(&messages).saturating_add(planned_tool_tokens);
+            if plan.budget_snapshot.planned_input_tokens > plan.budget_snapshot.budget_limit {
+                trace(AgentLoopTraceEvent::ContextCompactionStarted {
+                    original_input_tokens: plan.budget_snapshot.planned_input_tokens,
+                    budget_limit: plan.budget_snapshot.budget_limit,
+                });
+                match context_window_manager.compact_if_needed(
+                    current_turn_id,
+                    protected_prefix_len,
+                    &messages,
+                    planned_tool_tokens,
+                ) {
+                    Ok(Some(record)) => {
+                        messages = record.replacement_messages.clone();
+                        plan.messages = messages.clone();
+                        plan.budget_snapshot.planned_input_tokens =
+                            record.replacement_estimated_tokens;
+                        plan.budget_snapshot.planned_summary_tokens =
+                            estimate_tokens(&record.summary);
+                        trace(AgentLoopTraceEvent::ContextAutoCompacted(record));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        trace(AgentLoopTraceEvent::ContextCompactionFailed {
+                            planned_input_tokens: plan.budget_snapshot.planned_input_tokens,
+                            budget_limit: plan.budget_snapshot.budget_limit,
+                            reason: error.to_string(),
+                        });
+                    }
+                }
+            }
             if plan.budget_snapshot.planned_input_tokens > plan.budget_snapshot.budget_limit {
                 let reason = ContextError::BudgetExceeded {
                     planned: plan.budget_snapshot.planned_input_tokens,

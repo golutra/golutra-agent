@@ -129,9 +129,9 @@ pub use application::{
 };
 pub(crate) use context::{
     compact_event_summary, compact_history_text, compact_history_with_summary,
-    completion_criteria_from_payload, conversation_history_line, environment_context_prompt,
-    explicit_compaction_from_event, load_project_instructions, memory_context,
-    preview_from_payload, prompt_from_payload, system_prompt, title_from_payload,
+    completion_criteria_from_payload, context_compaction_from_event, conversation_history_line,
+    environment_context_prompt, load_project_instructions, memory_context, preview_from_payload,
+    prompt_from_payload, system_prompt, title_from_payload,
 };
 pub use debug_export::{
     DebugExportCoordinator, DebugExportManifest, DebugExportReceipt, DebugExportRequest,
@@ -140,10 +140,10 @@ pub use debug_export::{
 };
 pub(crate) use event_codec::redact_provider_json;
 pub(crate) use event_codec::{
-    agent_event, agent_event_for_turn, candidate_id_from_payload, context_request_artifact,
-    event_matches_filter, host_event, provider_raw_artifact, recovered_pending_turn_from_event,
-    task_status_from_loop_action, thread_id_from_payload, thread_title_for_prompt,
-    trace_event_payload, with_command_payload,
+    agent_event, agent_event_for_turn, candidate_id_from_payload, context_compaction_artifact,
+    context_request_artifact, event_matches_filter, host_event, provider_raw_artifact,
+    recovered_pending_turn_from_event, task_status_from_loop_action, thread_id_from_payload,
+    thread_title_for_prompt, trace_event_payload, with_command_payload,
 };
 pub use event_codec::{event_sequence_no, projection_status};
 pub(crate) use execution_trace::CanonicalFactRecorder;

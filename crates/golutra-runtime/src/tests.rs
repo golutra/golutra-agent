@@ -591,7 +591,7 @@ async fn initial_context_overflow_returns_a_structured_blocked_outcome() {
 }
 
 #[tokio::test]
-async fn accumulated_tool_messages_return_an_ask_user_context_outcome() {
+async fn accumulated_tool_messages_are_compacted_and_the_turn_continues() {
     let workspace = tempdir().expect("workspace");
     fs::write(workspace.path().join("large.txt"), "x".repeat(4_096)).expect("fixture");
     let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
@@ -612,7 +612,7 @@ async fn accumulated_tool_messages_return_an_ask_user_context_outcome() {
     let context_builder = ContextBuilder::new(ContextBudgetPolicy {
         context_window: initial_tokens.saturating_add(1_024),
         max_output: 64,
-        budget_limit: initial_tokens.saturating_add(8),
+        budget_limit: initial_tokens.saturating_add(256),
         action_if_exceeded: BudgetOverflowAction::Trim,
     });
     let agent_loop = AgentLoop::new(
@@ -629,7 +629,7 @@ async fn accumulated_tool_messages_return_an_ask_user_context_outcome() {
                 task_id: TaskId::new(),
                 turn_id: TurnId::new(),
                 objective: "read large.txt".to_owned(),
-                completion_criteria: vec!["file read".to_owned()],
+                completion_criteria: Vec::new(),
                 output_schema: None,
                 touched_code: false,
                 contributors: vec![contributor],
@@ -638,19 +638,23 @@ async fn accumulated_tool_messages_return_an_ask_user_context_outcome() {
             |event| trace.push(event),
         )
         .await
-        .expect("context guard outcome");
+        .expect("compacted outcome");
 
     assert_eq!(outcome.tool_reports.len(), 1);
-    assert_eq!(outcome.loop_decision.action, LoopAction::AskUser);
-    assert!(outcome.loop_decision.budget_state.compact_recommended);
+    assert_eq!(outcome.loop_decision.action, LoopAction::StopSuccess);
     assert_eq!(
         trace
             .iter()
             .filter(|event| matches!(event, AgentLoopTraceEvent::ProviderStarted { .. }))
             .count(),
-        1
+        2
     );
-    assert!(trace.iter().any(|event| matches!(
+    assert!(
+        trace
+            .iter()
+            .any(|event| matches!(event, AgentLoopTraceEvent::ContextAutoCompacted(_)))
+    );
+    assert!(!trace.iter().any(|event| matches!(
         event,
         AgentLoopTraceEvent::LoopGuardTriggered {
             trigger: golutra_core::LoopGuardTrigger::ContextOverflow,

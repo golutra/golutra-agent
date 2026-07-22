@@ -6,7 +6,8 @@ use golutra_config::{
     ProviderSettings, runtime_env_from_settings,
 };
 use golutra_context::{
-    ContextBuilder, ContextContributor, context_snapshot_from_request, provider_request_from_plan,
+    ContextBuilder, ContextCompactionRecord, ContextContributor, context_snapshot_from_request,
+    provider_request_from_plan,
 };
 use golutra_core::{
     Actor, ActorKind, ArtifactId, ArtifactRecord, CommandId, EvidenceId, FileChangeKind,
@@ -14,7 +15,7 @@ use golutra_core::{
     RedactionStatus, TaskId, TaskStatus, ToolCallId, TraceView, TurnChangeSummary, TurnId,
     VerificationId, VerificationRecord, VerificationResult, WorkspaceId,
 };
-use golutra_llm::{ConfiguredProvider, MockProvider, ProviderError, ProviderRole};
+use golutra_llm::{ConfiguredProvider, MockProvider, ProviderError, ProviderMessage, ProviderRole};
 use golutra_protocol::{
     ArtifactReadRequest, EventFilter, RuntimeEventType, RuntimeQueryKind, TaskTraceRequest,
 };
@@ -3938,6 +3939,55 @@ fn context_request_artifact_redacts_secrets_inside_model_visible_messages() {
     assert_eq!(artifact.redaction_status, RedactionStatus::Redacted);
     assert!(!encoded.contains("plain-secret-value"));
     assert!(encoded.contains("<redacted-secret>"));
+}
+
+#[test]
+fn context_compaction_persists_a_redacted_baseline_outside_the_event_payload() {
+    let task = HostedAgentTask {
+        session_id: SessionId::new(),
+        task_id: TaskId::new(),
+        turn_id: TurnId::new(),
+        payload: json!({}),
+    };
+    let record = ContextCompactionRecord {
+        turn_id: task.turn_id,
+        mode: "automatic".to_owned(),
+        strategy: "protected_prefix_summary_tail".to_owned(),
+        original_message_count: 3,
+        replacement_message_count: 2,
+        dropped_message_count: 1,
+        protected_prefix_len: 1,
+        original_estimated_tokens: 120,
+        replacement_estimated_tokens: 64,
+        planned_tool_tokens: 8,
+        budget_limit: 80,
+        summary: "provider call completed".to_owned(),
+        checksum: "sha256:source".to_owned(),
+        replacement_messages: vec![ProviderMessage {
+            role: ProviderRole::User,
+            content: "API_KEY=plain-secret-value".to_owned(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        }],
+    };
+
+    let (artifact, bytes) =
+        context_compaction_artifact(&task, &record).expect("compaction artifact");
+    let encoded = String::from_utf8(bytes).expect("artifact UTF-8");
+    let artifact_payload: Value = serde_json::from_str(&encoded).expect("artifact JSON");
+    let (_, _, payload) = trace_event_payload(AgentLoopTraceEvent::ContextAutoCompacted(record))
+        .expect("compaction event");
+
+    assert_eq!(artifact.artifact_type, "context_compaction_baseline");
+    assert_eq!(artifact.redaction_status, RedactionStatus::Redacted);
+    assert!(!encoded.contains("plain-secret-value"));
+    assert!(encoded.contains("<redacted-secret>"));
+    assert_eq!(artifact_payload["source_checksum"], "sha256:source");
+    assert_ne!(artifact_payload["checksum"], "sha256:source");
+    assert_eq!(payload["content"], "provider call completed");
+    assert!(payload.get("replacement_messages").is_none());
 }
 
 #[tokio::test]

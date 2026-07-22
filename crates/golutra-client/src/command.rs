@@ -973,7 +973,7 @@ impl RuntimeHost {
             .latest_explicit_compaction(session_id)
             .await?
             .as_ref()
-            .and_then(explicit_compaction_from_event);
+            .and_then(context_compaction_from_event);
         let compacted_after = explicit_compaction
             .as_ref()
             .map(|(sequence_no, _)| *sequence_no)

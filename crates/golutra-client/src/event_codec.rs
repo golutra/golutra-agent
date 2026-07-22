@@ -1,5 +1,6 @@
 //! Runtime 领域记录与持久化协议事件之间的转换。
 
+use golutra_context::ContextCompactionRecord;
 use golutra_core::{
     Actor, ActorKind, ArtifactId, ArtifactRecord, CommandId, ContextSnapshot, EventId, LoopAction,
     RedactionStatus, SessionId, TaskId, TaskStatus, ThreadId, TurnId,
@@ -176,6 +177,56 @@ pub(crate) fn context_request_artifact(
     ))
 }
 
+pub(crate) fn context_compaction_artifact(
+    task: &HostedAgentTask,
+    record: &ContextCompactionRecord,
+) -> Result<(ArtifactRecord, Vec<u8>), ClientError> {
+    let raw = serde_json::to_value(record)?;
+    let mut redacted = raw.clone();
+    redact_provider_json(&mut redacted);
+    let redaction_status = if redacted == raw {
+        RedactionStatus::NotRequired
+    } else {
+        RedactionStatus::Redacted
+    };
+    if let Some(object) = redacted.as_object_mut() {
+        object.insert(
+            "source_checksum".to_owned(),
+            Value::String(record.checksum.clone()),
+        );
+        let replacement = object
+            .get("replacement_messages")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let replacement_bytes = serde_json::to_vec(&replacement)?;
+        object.insert(
+            "checksum".to_owned(),
+            Value::String(format!("sha256:{:x}", Sha256::digest(&replacement_bytes))),
+        );
+    }
+    let bytes = serde_json::to_vec(&redacted)?;
+    let checksum = Sha256::digest(&bytes);
+    let artifact_id = ArtifactId::new();
+    Ok((
+        ArtifactRecord {
+            artifact_id,
+            session_id: task.session_id,
+            turn_id: Some(record.turn_id),
+            tool_call_id: None,
+            artifact_type: "context_compaction_baseline".to_owned(),
+            uri: format!("artifact://context/compaction/{artifact_id}"),
+            checksum: format!("sha256:{checksum:x}"),
+            size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            created_at: chrono::Utc::now(),
+            producer: "context-window-manager".to_owned(),
+            redaction_status,
+            retention_policy: "debug_default".to_owned(),
+            provenance_refs: Vec::new(),
+        },
+        bytes,
+    ))
+}
+
 pub(crate) fn redact_provider_json(value: &mut Value) {
     match value {
         Value::Object(object) => {
@@ -279,6 +330,21 @@ pub(crate) fn observation_descriptor(observation: &RuntimeObservation) -> Observ
             RuntimeEventType::CompactionCompleted,
             RuntimeEventSource::Runtime,
             ObservationIntegrityClass::Supporting,
+        ),
+        RuntimeObservation::ContextCompactionStarted { .. } => (
+            RuntimeEventType::CompactionStarted,
+            RuntimeEventSource::Runtime,
+            ObservationIntegrityClass::Supporting,
+        ),
+        RuntimeObservation::ContextAutoCompacted(_) => (
+            RuntimeEventType::CompactionCompleted,
+            RuntimeEventSource::Runtime,
+            ObservationIntegrityClass::Required,
+        ),
+        RuntimeObservation::ContextCompactionFailed { .. } => (
+            RuntimeEventType::CompactionFailed,
+            RuntimeEventSource::Runtime,
+            ObservationIntegrityClass::Required,
         ),
         RuntimeObservation::ContextSnapshot(_)
         | RuntimeObservation::ContextSnapshotCaptured { .. } => (
@@ -441,6 +507,53 @@ pub(crate) fn trace_event_payload(
                 "original_input_tokens": original_input_tokens,
                 "planned_input_tokens": planned_input_tokens,
                 "trimmed_contributors": trimmed_contributors,
+            }),
+        )),
+        AgentLoopTraceEvent::ContextCompactionStarted {
+            original_input_tokens,
+            budget_limit,
+        } => Some((
+            RuntimeEventType::CompactionStarted,
+            RuntimeEventSource::Runtime,
+            json!({
+                "summary": "automatic context compaction started",
+                "mode": "automatic",
+                "original_input_tokens": original_input_tokens,
+                "budget_limit": budget_limit,
+            }),
+        )),
+        AgentLoopTraceEvent::ContextAutoCompacted(record) => Some((
+            RuntimeEventType::CompactionCompleted,
+            RuntimeEventSource::Runtime,
+            json!({
+                "summary": "automatic context compaction completed",
+                "mode": record.mode,
+                "strategy": record.strategy,
+                "content": record.summary,
+                "original_message_count": record.original_message_count,
+                "replacement_message_count": record.replacement_message_count,
+                "dropped_message_count": record.dropped_message_count,
+                "protected_prefix_len": record.protected_prefix_len,
+                "original_estimated_tokens": record.original_estimated_tokens,
+                "replacement_estimated_tokens": record.replacement_estimated_tokens,
+                "planned_tool_tokens": record.planned_tool_tokens,
+                "budget_limit": record.budget_limit,
+                "checksum": record.checksum,
+            }),
+        )),
+        AgentLoopTraceEvent::ContextCompactionFailed {
+            planned_input_tokens,
+            budget_limit,
+            reason,
+        } => Some((
+            RuntimeEventType::CompactionFailed,
+            RuntimeEventSource::Runtime,
+            json!({
+                "summary": "automatic context compaction failed",
+                "mode": "automatic",
+                "planned_input_tokens": planned_input_tokens,
+                "budget_limit": budget_limit,
+                "reason": reason,
             }),
         )),
         AgentLoopTraceEvent::ContextSnapshot(snapshot) => Some((

@@ -683,6 +683,31 @@ impl RuntimeStore {
         .transpose()
     }
 
+    pub async fn load_latest_context_compaction(
+        &self,
+        session_id: SessionId,
+    ) -> StoreResult<Option<RuntimeEvent>> {
+        let row = sqlx::query(
+            r#"
+            SELECT event_json
+            FROM runtime_events
+            WHERE session_id = ?
+              AND event_type = 'CompactionCompleted'
+              AND json_extract(payload_json, '$.content') IS NOT NULL
+            ORDER BY sequence_no DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(session_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            let event_json: String = row.try_get("event_json")?;
+            Ok(serde_json::from_str(&event_json)?)
+        })
+        .transpose()
+    }
+
     pub fn reduce_state(session_id: SessionId, events: &[RuntimeEvent]) -> StateProjection {
         let mut projection = initial_projection(session_id);
 

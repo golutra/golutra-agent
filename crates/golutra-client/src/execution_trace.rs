@@ -40,7 +40,14 @@ impl RuntimeHost {
                 }
                 (
                     AgentLoopTraceEvent::ContextSnapshot(snapshot),
-                    Some((artifact, bytes)),
+                    Some((artifact, bytes, "redacted_request_artifact_ref")),
+                )
+            }
+            AgentLoopTraceEvent::ContextAutoCompacted(record) => {
+                let (artifact, bytes) = context_compaction_artifact(task, &record)?;
+                (
+                    AgentLoopTraceEvent::ContextAutoCompacted(record),
+                    Some((artifact, bytes, "replacement_context_artifact_ref")),
                 )
             }
             trace_event => (trace_event, None),
@@ -85,12 +92,11 @@ impl RuntimeHost {
             if let Some(turn_id) = event_turn_id {
                 event.turn_id = Some(turn_id);
             }
-            if let Some((mut artifact, bytes)) = context_artifact {
+            if let Some((mut artifact, bytes, payload_key)) = context_artifact {
                 artifact.provenance_refs.push(event.id);
                 self.repositories.artifacts.store(&artifact, &bytes).await?;
                 event.payload_ref = Some(artifact.artifact_id);
-                event.payload["redacted_request_artifact_ref"] =
-                    Value::String(artifact.artifact_id.to_string());
+                event.payload[payload_key] = Value::String(artifact.artifact_id.to_string());
             }
             if let Some((mut artifact, bytes)) = provider_artifact {
                 artifact.provenance_refs.push(event.id);

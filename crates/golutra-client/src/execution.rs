@@ -138,21 +138,21 @@ impl RuntimeHost {
             .events
             .load_recent(session_id, None, None, MAX_HISTORY_SOURCE_EVENTS)
             .await?;
-        let explicit_compaction = self
+        let context_compaction = self
             .repositories
             .events
-            .latest_explicit_compaction(session_id)
+            .latest_context_compaction(session_id)
             .await?
             .as_ref()
-            .and_then(explicit_compaction_from_event);
-        let compacted_after = explicit_compaction
+            .and_then(context_compaction_from_event);
+        let compacted_after = context_compaction
             .as_ref()
             .map(|(sequence_no, _)| *sequence_no)
             .unwrap_or_default();
-        let summary_source_ref = explicit_compaction
+        let summary_source_ref = context_compaction
             .as_ref()
             .map(|(sequence_no, _)| format!("event-sequence:{sequence_no}"));
-        let summary_line = explicit_compaction.map(|(_, content)| format!("Summary: {content}"));
+        let summary_line = context_compaction.map(|(_, content)| format!("Summary: {content}"));
         let history_events = events
             .iter()
             .filter(|event| event.sequence_no > compacted_after)

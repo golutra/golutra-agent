@@ -220,6 +220,38 @@ async fn loads_the_latest_explicit_compaction_without_materializing_history() {
         .expect("explicit compaction");
 
     assert_eq!(event.payload["content"], "latest summary");
+
+    store
+        .append_event_assigning_sequence(RuntimeEvent {
+            id: golutra_core::EventId::new(),
+            sequence_no: 0,
+            session_id,
+            turn_id: None,
+            task_id: None,
+            parent_event_id: None,
+            event_type: RuntimeEventType::CompactionCompleted,
+            timestamp: Utc::now(),
+            source: RuntimeEventSource::Runtime,
+            payload: json!({"mode": "automatic", "content": "latest automatic summary"}),
+            payload_ref: Some(ArtifactId::new()),
+            durable: true,
+        })
+        .await
+        .expect("automatic compaction");
+
+    let latest = store
+        .load_latest_context_compaction(session_id)
+        .await
+        .expect("query")
+        .expect("context compaction");
+    let explicit = store
+        .load_latest_explicit_compaction(session_id)
+        .await
+        .expect("query")
+        .expect("explicit compaction");
+
+    assert_eq!(latest.payload["content"], "latest automatic summary");
+    assert_eq!(explicit.payload["content"], "latest summary");
 }
 
 #[tokio::test]

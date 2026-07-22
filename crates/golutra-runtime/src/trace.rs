@@ -4,6 +4,7 @@
 //! they are persisted or projected.  RuntimeHost is the adapter that turns
 //! these facts into canonical `RuntimeEvent` and artifact records.
 
+use golutra_context::ContextCompactionRecord;
 use golutra_core::{
     ApprovalRequest, ApprovalResolution, ContextSnapshot, ToolCallId, ToolProgress, TurnId,
     VerificationAssertion, VerificationPlan,
@@ -28,6 +29,16 @@ pub enum AgentLoopTraceEvent {
         original_input_tokens: u64,
         planned_input_tokens: u64,
         trimmed_contributors: Vec<String>,
+    },
+    ContextCompactionStarted {
+        original_input_tokens: u64,
+        budget_limit: u64,
+    },
+    ContextAutoCompacted(ContextCompactionRecord),
+    ContextCompactionFailed {
+        planned_input_tokens: u64,
+        budget_limit: u64,
+        reason: String,
     },
     ContextSnapshot(ContextSnapshot),
     ContextSnapshotCaptured {

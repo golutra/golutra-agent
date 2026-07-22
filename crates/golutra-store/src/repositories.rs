@@ -146,6 +146,13 @@ impl EventRepository {
         self.store.load_latest_explicit_compaction(session_id).await
     }
 
+    pub async fn latest_context_compaction(
+        &self,
+        session_id: SessionId,
+    ) -> StoreResult<Option<RuntimeEvent>> {
+        self.store.load_latest_context_compaction(session_id).await
+    }
+
     pub async fn claim_command(
         &self,
         idempotency_key: &str,

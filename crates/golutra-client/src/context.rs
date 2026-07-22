@@ -39,7 +39,7 @@ pub(crate) fn conversation_history_line(event: &RuntimeEvent) -> Option<String> 
     }
 }
 
-pub(crate) fn explicit_compaction_from_event(event: &RuntimeEvent) -> Option<(u64, String)> {
+pub(crate) fn context_compaction_from_event(event: &RuntimeEvent) -> Option<(u64, String)> {
     event
         .payload
         .get("content")

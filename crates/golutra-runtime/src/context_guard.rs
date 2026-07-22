@@ -22,6 +22,9 @@ where
         ContextError::UserActionRequired { planned, limit } => {
             (planned, limit, LoopAction::AskUser)
         }
+        ContextError::CompactionImpossible { planned, limit } => {
+            (planned, limit, LoopAction::Blocked)
+        }
     };
     let reason = format!("context budget exceeded: planned {planned} > limit {limit}");
     trace(AgentLoopTraceEvent::LoopGuardTriggered {
