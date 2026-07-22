@@ -1,5 +1,7 @@
 //! Provider 解析与 runtime 执行计划构造。
 
+use std::time::Duration;
+
 use golutra_config::{
     ProviderConfigPaths, ProviderRuntimeEnv, load_provider_runtime_env_from_paths,
 };
@@ -7,6 +9,7 @@ use golutra_context::{ContextBudgetPolicy, ContextBuilder};
 use golutra_llm::{
     ConfiguredProvider, MockProvider, ProviderError, ProviderProtocol, protocol_capabilities,
 };
+use golutra_runtime::ProviderSessionPolicy;
 use serde_json::{Value, json};
 
 #[derive(Debug, Clone)]
@@ -16,6 +19,7 @@ pub(crate) struct MockProviderPlan {
     pub(crate) touched_code: bool,
     pub(crate) workspace_tools_enabled: bool,
     pub(crate) context_builder: ContextBuilder,
+    pub(crate) provider_session_policy: ProviderSessionPolicy,
 }
 
 pub(crate) fn mock_provider_plan(
@@ -149,6 +153,7 @@ pub(crate) fn isolated_mock_provider_plan(
         touched_code,
         workspace_tools_enabled,
         context_builder: ContextBuilder::default(),
+        provider_session_policy: ProviderSessionPolicy::default(),
     })
 }
 
@@ -173,7 +178,78 @@ pub(crate) fn configured_provider_plan(
         touched_code,
         workspace_tools_enabled,
         context_builder: context_builder_from_provider_env(provider_env)?,
+        provider_session_policy: provider_session_policy_from_env(provider_env)?,
     })
+}
+
+fn provider_session_policy_from_env(
+    provider_env: Option<&ProviderRuntimeEnv>,
+) -> Result<ProviderSessionPolicy, ProviderError> {
+    let mut policy = ProviderSessionPolicy::default();
+    if let Some(value) = provider_runtime_value(provider_env, "GOLUTRA_PROVIDER_STREAM_MAX_RETRIES")
+    {
+        policy.max_stream_retries = parse_provider_u32("stream max retries", &value)?;
+    }
+    if let Some(value) =
+        provider_runtime_value(provider_env, "GOLUTRA_PROVIDER_REQUEST_MAX_RETRIES")
+    {
+        policy.max_request_retries = parse_provider_u32("request max retries", &value)?;
+    }
+    if let Some(value) =
+        provider_runtime_value(provider_env, "GOLUTRA_PROVIDER_STREAM_IDLE_TIMEOUT_MS")
+    {
+        policy.stream_idle_timeout =
+            Duration::from_millis(parse_provider_u64("stream idle timeout", &value)?);
+    }
+    if let Some(value) = provider_runtime_value(provider_env, "GOLUTRA_PROVIDER_REQUEST_TIMEOUT_MS")
+    {
+        policy.request_timeout =
+            Duration::from_millis(parse_provider_u64("request timeout", &value)?);
+    }
+    if let Some(value) = provider_runtime_value(provider_env, "GOLUTRA_PROVIDER_TRANSPORT_FALLBACK")
+    {
+        policy.enable_transport_fallback = match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => {
+                return Err(ProviderError::NotConfigured {
+                    message: "provider transport fallback must be a boolean".to_owned(),
+                });
+            }
+        };
+    }
+    Ok(policy.bounded())
+}
+
+fn provider_runtime_value(provider_env: Option<&ProviderRuntimeEnv>, key: &str) -> Option<String> {
+    provider_env
+        .and_then(|environment| environment.get(key))
+        .or_else(|| std::env::var(key).ok())
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn parse_provider_u32(label: &str, value: &str) -> Result<u32, ProviderError> {
+    value
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| ProviderError::NotConfigured {
+            message: format!("provider {label} must be a non-negative integer"),
+        })
+}
+
+fn parse_provider_u64(label: &str, value: &str) -> Result<u64, ProviderError> {
+    let value = value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| ProviderError::NotConfigured {
+            message: format!("provider {label} must be a positive integer"),
+        })?;
+    if value == 0 {
+        return Err(ProviderError::NotConfigured {
+            message: format!("provider {label} must be greater than zero"),
+        });
+    }
+    Ok(value)
 }
 
 fn context_builder_from_provider_env(

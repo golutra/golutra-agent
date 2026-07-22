@@ -72,6 +72,38 @@ fn observation_catalog_classifies_loop_facts_before_persistence() {
     });
     assert_eq!(diagnostic.event_type, RuntimeEventType::ProviderStreamed);
     assert_eq!(diagnostic.integrity, ObservationIntegrityClass::Diagnostic);
+
+    let fallback = observation_descriptor(&RuntimeObservation::ProviderTransportFallback {
+        provider_id: "provider".to_owned(),
+        from_transport: "streaming".to_owned(),
+        to_transport: "buffered".to_owned(),
+        reason: "stream disconnected".to_owned(),
+    });
+    assert_eq!(
+        fallback.event_type,
+        RuntimeEventType::ProviderTransportFallback
+    );
+    assert_eq!(fallback.source, RuntimeEventSource::Runtime);
+    assert_eq!(fallback.integrity, ObservationIntegrityClass::Supporting);
+}
+
+#[test]
+fn provider_transport_fallback_event_preserves_recovery_facts() {
+    let (event_type, source, payload) =
+        trace_event_payload(AgentLoopTraceEvent::ProviderTransportFallback {
+            provider_id: "openai".to_owned(),
+            from_transport: "streaming".to_owned(),
+            to_transport: "buffered".to_owned(),
+            reason: "stream idle for 300000 ms".to_owned(),
+        })
+        .expect("transport fallback event");
+
+    assert_eq!(event_type, RuntimeEventType::ProviderTransportFallback);
+    assert_eq!(source, RuntimeEventSource::Runtime);
+    assert_eq!(payload["provider_id"], "openai");
+    assert_eq!(payload["from_transport"], "streaming");
+    assert_eq!(payload["to_transport"], "buffered");
+    assert_eq!(payload["reason"], "stream idle for 300000 ms");
 }
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());

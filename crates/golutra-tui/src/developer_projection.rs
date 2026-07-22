@@ -26,6 +26,7 @@ pub(crate) struct DeveloperFactsProjection {
     pub(crate) token_count: usize,
     pub(crate) retry_count: usize,
     pub(crate) fallback_count: usize,
+    pub(crate) transport_fallback_count: usize,
     pub(crate) verification: Option<VerificationRecord>,
     pub(crate) loop_decision: Option<LoopDecision>,
     pub(crate) evaluation: EvaluationFactCounts,
@@ -65,6 +66,10 @@ pub(crate) fn developer_facts_projection(
         token_count: count_events(&projection.events, RuntimeEventType::TokenUsageRecorded),
         retry_count: count_events(&projection.events, RuntimeEventType::RetryScheduled),
         fallback_count: count_events(&projection.events, RuntimeEventType::ProviderFallback),
+        transport_fallback_count: count_events(
+            &projection.events,
+            RuntimeEventType::ProviderTransportFallback,
+        ),
         verification: projection.verification.clone(),
         loop_decision: projection.loop_decisions.last().cloned(),
         evaluation: EvaluationFactCounts {

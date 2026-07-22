@@ -5,6 +5,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use golutra_context::{ContextBudgetPolicy, ContextBuilder, ContextContributor, estimate_tokens};

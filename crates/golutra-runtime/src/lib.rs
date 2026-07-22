@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     path::Path,
     sync::{Arc, Mutex as StdMutex},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use async_trait::async_trait;
@@ -38,6 +38,7 @@ mod completion;
 mod context_guard;
 mod lane;
 mod provider_retry;
+mod provider_session;
 mod step_machine;
 mod trace;
 mod verification;
@@ -45,6 +46,7 @@ mod verification;
 pub use checkpoint::{CheckpointError, WorkspaceCheckpointManager, checkpoint_fingerprint};
 pub use golutra_protocol::UserProjection;
 pub use lane::{RuntimeLaneError, RuntimeLaneManager, RuntimeTransition, is_active_status};
+pub use provider_session::{ProviderSessionPolicy, ProviderTransport};
 pub(crate) use step_machine::{StepCheckpoint, StepCompletion, StepMachine, StepSnapshot};
 pub use trace::{AgentLoopTraceEvent, RuntimeObservation, RuntimeObservationSink};
 pub use verification::RuntimeVerificationService;
@@ -258,6 +260,7 @@ pub struct AgentLoop<P> {
     tool_executor: BasicToolExecutor,
     verifier: RuntimeVerificationService,
     governor: RuntimeGovernor,
+    provider_session_policy: ProviderSessionPolicy,
     before_side_effect_recorder: Option<Arc<dyn BeforeSideEffectRecorder>>,
 }
 
@@ -278,6 +281,7 @@ where
             tool_executor,
             verifier: RuntimeVerificationService::default(),
             governor: RuntimeGovernor::default(),
+            provider_session_policy: ProviderSessionPolicy::default(),
             before_side_effect_recorder: None,
         }
     }
@@ -291,6 +295,12 @@ where
     #[must_use]
     pub fn with_governor(mut self, governor: RuntimeGovernor) -> Self {
         self.governor = governor;
+        self
+    }
+
+    #[must_use]
+    pub fn with_provider_session_policy(mut self, policy: ProviderSessionPolicy) -> Self {
+        self.provider_session_policy = policy;
         self
     }
 
@@ -1284,87 +1294,71 @@ where
     where
         F: FnMut(AgentLoopTraceEvent) + Send,
     {
-        match self
-            .complete_provider(&self.provider, request.clone(), control, trace)
+        control
+            .wait_until_runnable()
             .await
-        {
-            Ok(response) => Ok((response, request)),
-            Err(primary_error) => {
-                let Some(fallback) = &self.fallback_provider else {
-                    return Err(primary_error);
-                };
-                let from_provider = self.provider.contract().provider_id;
-                let to_provider = fallback.contract().provider_id;
+            .map_err(|_| ProviderError::Cancelled)?;
+        let fallback_model_id = self
+            .fallback_provider
+            .as_ref()
+            .map(|provider| provider.contract().model_id);
+        let mut on_event = |event| match event {
+            provider_session::ProviderSessionEvent::Streamed {
+                provider_id,
+                model_id,
+                event,
+            } => trace(AgentLoopTraceEvent::ProviderStreamed {
+                provider_id,
+                model_id,
+                event,
+            }),
+            provider_session::ProviderSessionEvent::RetryScheduled {
+                attempt,
+                max_retries,
+                transport,
+                reason,
+            } => trace(AgentLoopTraceEvent::RetryScheduled {
+                attempt,
+                reason: format!(
+                    "{} transport retry {attempt}/{max_retries}: {reason}",
+                    transport.label()
+                ),
+            }),
+            provider_session::ProviderSessionEvent::TransportFallback {
+                provider_id,
+                from,
+                to,
+                reason,
+            } => trace(AgentLoopTraceEvent::ProviderTransportFallback {
+                provider_id,
+                from_transport: from.label().to_owned(),
+                to_transport: to.label().to_owned(),
+                reason,
+            }),
+            provider_session::ProviderSessionEvent::ProviderFallback {
+                from_provider,
+                to_provider,
+                reason,
+            } => {
                 trace(AgentLoopTraceEvent::ProviderFallback {
                     from_provider,
                     to_provider: to_provider.clone(),
-                    reason: primary_error.to_string(),
+                    reason,
                 });
-                let mut fallback_request = request;
-                fallback_request.provider_id = to_provider;
-                fallback_request.model_id = fallback.contract().model_id;
                 trace(AgentLoopTraceEvent::ProviderStarted {
-                    provider_id: fallback_request.provider_id.clone(),
-                    model_id: fallback_request.model_id.clone(),
+                    provider_id: to_provider,
+                    model_id: fallback_model_id.clone().unwrap_or_default(),
                 });
-                self.complete_provider(fallback, fallback_request.clone(), control, trace)
-                    .await
-                    .map(|response| (response, fallback_request))
             }
-        }
-    }
-
-    async fn complete_provider<F>(
-        &self,
-        provider: &P,
-        request: ProviderRequest,
-        control: &mut AgentExecutionControl,
-        trace: &mut F,
-    ) -> Result<ProviderResponse, ProviderError>
-    where
-        F: FnMut(AgentLoopTraceEvent) + Send,
-    {
-        const MAX_ATTEMPTS: u32 = 3;
-        for attempt in 1..=MAX_ATTEMPTS {
-            control
-                .wait_until_runnable()
-                .await
-                .map_err(|_| ProviderError::Cancelled)?;
-            let contract = provider.contract();
-            let result = {
-                let provider_id = contract.provider_id;
-                let model_id = contract.model_id;
-                let mut on_event = |event| {
-                    trace(AgentLoopTraceEvent::ProviderStreamed {
-                        provider_id: provider_id.clone(),
-                        model_id: model_id.clone(),
-                        event,
-                    });
-                };
-                tokio::select! {
-                    biased;
-                    _ = control.cancellation.cancelled() => Err(ProviderError::Cancelled),
-                    result = provider.complete_stream(request.clone(), &mut on_event) => result,
-                }
-            };
-            match result {
-                Ok(response) => return Ok(response),
-                Err(error) if provider_retry::is_retryable(&error) && attempt < MAX_ATTEMPTS => {
-                    trace(AgentLoopTraceEvent::RetryScheduled {
-                        attempt,
-                        reason: error.to_string(),
-                    });
-                    let delay = tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt)));
-                    tokio::pin!(delay);
-                    tokio::select! {
-                        _ = control.cancellation.cancelled() => return Err(ProviderError::Cancelled),
-                        _ = &mut delay => {}
-                    }
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        unreachable!("provider retry loop always returns")
+        };
+        let session = provider_session::ProviderSession::new(
+            &self.provider,
+            self.fallback_provider.as_ref(),
+            self.provider_session_policy,
+        );
+        session
+            .complete(request, &control.cancellation, &mut on_event)
+            .await
     }
 }
 

@@ -807,6 +807,7 @@ pub(crate) fn event_status_title(event_type: RuntimeEventType) -> Option<&'stati
         RuntimeEventType::LoopDecided => Some("Loop Decided"),
         RuntimeEventType::RetryScheduled => Some("Retrying"),
         RuntimeEventType::ProviderFallback => Some("Fallback"),
+        RuntimeEventType::ProviderTransportFallback => Some("Transport Fallback"),
         RuntimeEventType::LoopGuardTriggered => Some("Stopped"),
         RuntimeEventType::TaskPaused => Some("Paused"),
         RuntimeEventType::TaskResumed => Some("Resumed"),
@@ -932,6 +933,18 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn provider_recovery_events_have_distinct_user_facing_labels() {
+        assert_eq!(
+            event_status_title(RuntimeEventType::ProviderFallback),
+            Some("Fallback")
+        );
+        assert_eq!(
+            event_status_title(RuntimeEventType::ProviderTransportFallback),
+            Some("Transport Fallback")
+        );
+    }
 
     fn tool_event(sequence_no: u64, event_type: RuntimeEventType, payload: Value) -> RuntimeEvent {
         RuntimeEvent {

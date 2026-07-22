@@ -422,6 +422,11 @@ pub(crate) fn observation_descriptor(observation: &RuntimeObservation) -> Observ
             RuntimeEventSource::Runtime,
             ObservationIntegrityClass::Supporting,
         ),
+        RuntimeObservation::ProviderTransportFallback { .. } => (
+            RuntimeEventType::ProviderTransportFallback,
+            RuntimeEventSource::Runtime,
+            ObservationIntegrityClass::Supporting,
+        ),
         RuntimeObservation::LoopGuardTriggered { .. } => (
             RuntimeEventType::LoopGuardTriggered,
             RuntimeEventSource::Runtime,
@@ -726,6 +731,24 @@ pub(crate) fn trace_event_payload(
                 "summary": format!("provider fallback from {from_provider} to {to_provider}"),
                 "from_provider": from_provider,
                 "to_provider": to_provider,
+                "reason": reason,
+            }),
+        )),
+        AgentLoopTraceEvent::ProviderTransportFallback {
+            provider_id,
+            from_transport,
+            to_transport,
+            reason,
+        } => Some((
+            RuntimeEventType::ProviderTransportFallback,
+            RuntimeEventSource::Runtime,
+            json!({
+                "summary": format!(
+                    "provider transport fallback for {provider_id}: {from_transport} -> {to_transport}"
+                ),
+                "provider_id": provider_id,
+                "from_transport": from_transport,
+                "to_transport": to_transport,
                 "reason": reason,
             }),
         )),

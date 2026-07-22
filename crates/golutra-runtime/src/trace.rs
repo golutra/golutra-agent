@@ -84,6 +84,12 @@ pub enum AgentLoopTraceEvent {
         to_provider: String,
         reason: String,
     },
+    ProviderTransportFallback {
+        provider_id: String,
+        from_transport: String,
+        to_transport: String,
+        reason: String,
+    },
     LoopGuardTriggered {
         trigger: golutra_core::LoopGuardTrigger,
         reason: String,

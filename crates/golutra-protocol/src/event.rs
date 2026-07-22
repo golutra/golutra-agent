@@ -58,6 +58,7 @@ pub enum RuntimeEventType {
     ApprovalResolved,
     RetryScheduled,
     ProviderFallback,
+    ProviderTransportFallback,
     ProviderAuthRequired,
     ProviderAuthSubmitted,
     ProviderAuthCancelled,

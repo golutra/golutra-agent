@@ -67,12 +67,13 @@ fn summary_rows(facts: &DeveloperFactsProjection) -> Vec<DeveloperPanelRow> {
             facts.policy_count
         )),
         DeveloperPanelRow::Summary(format!(
-            "model context={} provider_calls={} token_records={} retries={} fallbacks={}",
+            "model context={} provider_calls={} token_records={} retries={} fallbacks={} transport_fallbacks={}",
             facts.context_count,
             facts.provider_count,
             facts.token_count,
             facts.retry_count,
-            facts.fallback_count
+            facts.fallback_count,
+            facts.transport_fallback_count
         )),
     ];
     if let Some(changes) = &facts.changes {

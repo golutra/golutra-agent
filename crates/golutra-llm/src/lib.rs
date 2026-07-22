@@ -401,6 +401,13 @@ struct ProviderEnvMapping {
 pub trait LlmProvider: Send + Sync {
     async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError>;
 
+    /// Whether `complete` uses a transport distinct from `complete_stream`.
+    /// ProviderSession uses this to avoid claiming a fallback when both paths
+    /// are backed by the same streaming protocol.
+    fn supports_buffered_transport(&self) -> bool {
+        true
+    }
+
     async fn complete_stream(
         &self,
         request: ProviderRequest,
@@ -1157,6 +1164,18 @@ impl LlmProvider for ConfiguredProvider {
         }
     }
 
+    fn supports_buffered_transport(&self) -> bool {
+        match self {
+            Self::Mock(provider) => provider.supports_buffered_transport(),
+            Self::OpenAiCompatible(provider) => provider.supports_buffered_transport(),
+            Self::OpenAiResponses(provider) => provider.supports_buffered_transport(),
+            Self::Anthropic(provider)
+            | Self::Gemini(provider)
+            | Self::VertexAi(provider)
+            | Self::Genai(provider) => provider.supports_buffered_transport(),
+        }
+    }
+
     fn contract(&self) -> ProviderContract {
         match self {
             Self::Mock(provider) => provider.contract(),
@@ -1606,7 +1625,7 @@ async fn provider_response_from_openai_stream(
     let mut stream_terminated = false;
 
     while let Some(event) = stream.next().await {
-        let event = event.map_err(|error| ProviderError::Failed {
+        let event = event.map_err(|error| ProviderError::Unavailable {
             message: sanitize_provider_error(&error.to_string()),
         })?;
         parsed_bytes = parsed_bytes.saturating_add(event.data.len());
@@ -1730,7 +1749,7 @@ async fn provider_response_from_openai_stream(
         }
     }
     if !stream_terminated {
-        return Err(ProviderError::Malformed {
+        return Err(ProviderError::Unavailable {
             message: "chat completion SSE stream ended before a terminal event".to_owned(),
         });
     }
@@ -1994,7 +2013,9 @@ fn provider_transport_error(error: reqwest::Error) -> ProviderError {
 fn provider_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(120))
+        // Streaming requests are bounded by ProviderSession's idle deadline;
+        // a total HTTP deadline would incorrectly kill active long turns.
+        .read_timeout(std::time::Duration::from_secs(300))
         .build()
         .expect("static reqwest client configuration is valid")
 }

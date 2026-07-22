@@ -306,8 +306,10 @@ impl RuntimeHost {
             touched_code,
             workspace_tools_enabled,
             context_builder,
+            provider_session_policy,
         } = provider_plan;
-        let agent_loop = AgentLoop::new(provider, context_builder, tool_executor);
+        let agent_loop = AgentLoop::new(provider, context_builder, tool_executor)
+            .with_provider_session_policy(provider_session_policy);
         let agent_loop = match fallback_provider {
             Some(fallback) => agent_loop.with_fallback(fallback),
             None => agent_loop,

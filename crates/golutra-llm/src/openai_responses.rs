@@ -282,6 +282,10 @@ impl super::LlmProvider for OpenAiResponsesProvider {
         responses_provider_response(response, on_event).await
     }
 
+    fn supports_buffered_transport(&self) -> bool {
+        false
+    }
+
     fn contract(&self) -> ProviderContract {
         ProviderContract {
             provider_id: self.config.provider_id.clone(),
@@ -491,7 +495,7 @@ async fn responses_provider_response(
     let mut completed = false;
 
     while let Some(event) = stream.next().await {
-        let event = event.map_err(|error| ProviderError::Failed {
+        let event = event.map_err(|error| ProviderError::Unavailable {
             message: super::sanitize_provider_error(&error.to_string()),
         })?;
         parsed_bytes = parsed_bytes.saturating_add(event.data.len());
@@ -579,7 +583,7 @@ async fn responses_provider_response(
         }
     }
     if !completed {
-        return Err(ProviderError::Malformed {
+        return Err(ProviderError::Unavailable {
             message: "responses SSE stream ended before response.completed".to_owned(),
         });
     }

@@ -88,7 +88,10 @@ impl GenaiProviderAdapter {
     ) -> Self {
         let web_config = WebConfig::default()
             .with_connect_timeout(std::time::Duration::from_secs(10))
-            .with_timeout(std::time::Duration::from_secs(120))
+            // ProviderSession enforces per-event idle and buffered request
+            // deadlines; keep the adapter's coarse total timeout out of the
+            // way of an active long-running stream.
+            .with_timeout(std::time::Duration::from_secs(3_600))
             .with_default_headers(config.custom_headers.to_header_map());
         Self {
             config,
@@ -320,7 +323,7 @@ impl GenaiProviderAdapter {
                 }
             }
         }
-        let end = stream_end.ok_or_else(|| ProviderError::Malformed {
+        let end = stream_end.ok_or_else(|| ProviderError::Unavailable {
             message: "native provider stream ended before a terminal event".to_owned(),
         })?;
         provider_response_from_genai_stream(end, &model_id)
@@ -687,6 +690,20 @@ fn map_genai_error(error: genai::Error) -> ProviderError {
         | genai::Error::SerdeJson(_) => ProviderError::Malformed { message },
         _ if message.to_ascii_lowercase().contains("timed out") => {
             ProviderError::Timeout { message }
+        }
+        _ if [
+            "stream",
+            "connection",
+            "connect",
+            "disconnect",
+            "reset",
+            "transport",
+            "broken pipe",
+        ]
+        .iter()
+        .any(|marker| message.to_ascii_lowercase().contains(marker)) =>
+        {
+            ProviderError::Unavailable { message }
         }
         _ => ProviderError::Failed { message },
     }
