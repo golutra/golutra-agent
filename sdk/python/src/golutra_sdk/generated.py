@@ -10,6 +10,111 @@ class Actor(TypedDict, total=False):
 
 ActorKind: TypeAlias = Literal['user', 'api', 'tui', 'cli', 'sdk', 'web', 'ide', 'runtime']
 
+class AgentItem(TypedDict, total=False):
+    content: NotRequired[str | None]
+    data: Required[Any]
+    id: Required[str]
+    kind: Required[AgentItemKind]
+    runtime_event_id: NotRequired[str | None]
+    sequence_no: NotRequired[int | None]
+    status: Required[AgentItemStatus]
+    title: Required[str]
+
+AgentItemKind: TypeAlias = Literal['user_message', 'assistant_message', 'model', 'tool', 'approval', 'verification', 'runtime']
+
+AgentItemStatus: TypeAlias = Literal['in_progress', 'completed', 'failed', 'cancelled']
+
+class AgentStreamEventThreadStarted(TypedDict, total=False):
+    session_id: Required[str]
+    thread_id: Required[str]
+    timestamp: Required[str]
+    type: Required[Literal['thread.started']]
+    workspace_root: NotRequired[str | None]
+
+class AgentStreamEventTurnStarted(TypedDict, total=False):
+    session_id: Required[str]
+    task_id: NotRequired[str | None]
+    thread_id: Required[str]
+    timestamp: Required[str]
+    turn_id: NotRequired[str | None]
+    type: Required[Literal['turn.started']]
+
+class AgentStreamEventItemStarted(TypedDict, total=False):
+    item: Required[AgentItem]
+    type: Required[Literal['item.started']]
+
+class AgentStreamEventItemUpdated(TypedDict, total=False):
+    item: Required[AgentItem]
+    type: Required[Literal['item.updated']]
+
+class AgentStreamEventItemCompleted(TypedDict, total=False):
+    item: Required[AgentItem]
+    type: Required[Literal['item.completed']]
+
+class AgentStreamEventRuntimeEvent(TypedDict, total=False):
+    event: Required[RuntimeEvent]
+    type: Required[Literal['runtime.event']]
+
+class AgentStreamEventTurnCompleted(TypedDict, total=False):
+    final_message: NotRequired[str | None]
+    last_sequence_no: NotRequired[int | None]
+    session_id: Required[str]
+    status: Required[TaskStatus]
+    task_id: NotRequired[str | None]
+    thread_id: Required[str]
+    timestamp: Required[str]
+    turn_id: NotRequired[str | None]
+    type: Required[Literal['turn.completed']]
+
+class AgentStreamEventTurnFailed(TypedDict, total=False):
+    error: Required[str]
+    final_message: NotRequired[str | None]
+    last_sequence_no: NotRequired[int | None]
+    session_id: Required[str]
+    status: Required[TaskStatus]
+    task_id: NotRequired[str | None]
+    thread_id: Required[str]
+    timestamp: Required[str]
+    turn_id: NotRequired[str | None]
+    type: Required[Literal['turn.failed']]
+
+AgentStreamEvent: TypeAlias = AgentStreamEventThreadStarted | AgentStreamEventTurnStarted | AgentStreamEventItemStarted | AgentStreamEventItemUpdated | AgentStreamEventItemCompleted | AgentStreamEventRuntimeEvent | AgentStreamEventTurnCompleted | AgentStreamEventTurnFailed
+
+class AgentThreadRef(TypedDict, total=False):
+    session_id: Required[str]
+    thread_id: Required[str]
+    workspace_root: NotRequired[str | None]
+
+class AgentTurnOptions(TypedDict, total=False):
+    completion_criteria: NotRequired[list[str]]
+    output_schema: NotRequired[Any]
+
+class AgentTurnResult(TypedDict, total=False):
+    final_message: NotRequired[str | None]
+    last_sequence_no: NotRequired[int | None]
+    session_id: Required[str]
+    status: Required[TaskStatus]
+    task_id: NotRequired[str | None]
+    thread_id: Required[str]
+    turn_id: NotRequired[str | None]
+
+class AgentTurnStart(TypedDict, total=False):
+    accepted: Required[bool]
+    command_id: Required[str]
+    reason: NotRequired[str | None]
+    session_id: Required[str]
+    task_id: NotRequired[str | None]
+    thread_id: Required[str]
+    turn_id: NotRequired[str | None]
+
+class AgentTurnStartResponse(TypedDict, total=False):
+    accepted: Required[bool]
+    attachment_id: Required[str]
+    command_id: Required[str]
+    cursor: NotRequired[int | None]
+    reason: NotRequired[str | None]
+    thread: Required[AgentThreadRef]
+
 class AppliedCandidate(TypedDict, total=False):
     applied_at: Required[str]
     applied_version: Required[str]
@@ -674,6 +779,28 @@ class ImprovementCandidate(TypedDict, total=False):
     target_id: NotRequired[str | None]
     target_type: Required[str]
 
+class JsonRpcErrorObject(TypedDict, total=False):
+    code: Required[int]
+    data: NotRequired[Any]
+    message: Required[str]
+
+class JsonRpcNotification(TypedDict, total=False):
+    jsonrpc: Required[str]
+    method: Required[str]
+    params: Required[Any]
+
+class JsonRpcRequest(TypedDict, total=False):
+    id: NotRequired[Any]
+    jsonrpc: Required[str]
+    method: Required[str]
+    params: NotRequired[Any]
+
+class JsonRpcResponse(TypedDict, total=False):
+    error: NotRequired[JsonRpcErrorObject | None]
+    id: NotRequired[Any]
+    jsonrpc: Required[str]
+    result: NotRequired[Any]
+
 LoopAction: TypeAlias = Literal['continue', 'compact', 'retry', 'fallback', 'ask_user', 'verify', 'stop_success', 'stop_partial', 'stop_failed', 'blocked']
 
 class LoopDecision(TypedDict, total=False):
@@ -906,7 +1033,7 @@ class RuntimeEvent(TypedDict, total=False):
 
 RuntimeEventSource: TypeAlias = Literal['runtime', 'provider', 'tool', 'policy', 'verifier', 'memory', 'evaluator', 'governor', 'evolution', 'user']
 
-RuntimeEventType: TypeAlias = Literal['command_received', 'command_completed', 'command_accepted', 'command_rejected', 'session_created', 'thread_forked', 'thread_rebound', 'task_created', 'turn_started', 'turn_queued', 'busy_policy_decided', 'controller_changed', 'context_built', 'provider_started', 'provider_streamed', 'provider_completed', 'token_usage_recorded', 'assistant_message', 'tool_started', 'tool_completed', 'policy_evaluated', 'verification_completed', 'loop_decided', 'checkpoint_created', 'task_completed', 'task_abort_requested', 'task_aborted', 'task_paused', 'task_resumed', 'approval_requested', 'approval_resolved', 'retry_scheduled', 'provider_fallback', 'provider_auth_required', 'provider_auth_submitted', 'provider_auth_cancelled', 'provider_configured', 'provider_probe_started', 'provider_probe_completed', 'provider_auth_failed', 'provider_rate_limited', 'provider_credential_refreshed', 'loop_guard_triggered', 'compaction_completed', 'memory_retrieved', 'memory_promoted', 'memory_promotion_rejected', 'memory_rolled_back', 'memory_feedback_recorded', 'post_task_reviewed', 'evaluation_completed', 'improvement_candidate_created', 'automation_candidate_created', 'regression_completed', 'promotion_decided', 'candidate_applied', 'candidate_rolled_back', 'benchmark_recorded', 'counterfactual_compared', 'evolution_planned', 'evolution_task_started', 'evolution_task_completed', 'evolution_completed', 'skill_staged', 'skill_reviewed', 'skill_installed', 'skill_rolled_back', 'governor_decided', 'storage_maintenance_completed', 'context_snapshot_created', 'post_task_job_queued', 'post_task_job_started', 'post_task_job_completed', 'post_task_job_failed', 'verification_planned', 'verification_assertion_completed', 'regression_campaign_started', 'regression_execution_completed', 'memory_candidate_quarantined', 'memory_activated', 'memory_invalidated']
+RuntimeEventType: TypeAlias = Literal['command_received', 'command_completed', 'command_accepted', 'command_rejected', 'session_created', 'thread_forked', 'thread_rebound', 'task_created', 'turn_started', 'turn_queued', 'busy_policy_decided', 'controller_changed', 'context_built', 'provider_started', 'provider_streamed', 'provider_completed', 'token_usage_recorded', 'assistant_message', 'tool_started', 'tool_progress', 'tool_completed', 'policy_evaluated', 'verification_completed', 'loop_decided', 'checkpoint_created', 'task_completed', 'task_abort_requested', 'task_aborted', 'task_paused', 'task_resumed', 'approval_requested', 'approval_resolved', 'retry_scheduled', 'provider_fallback', 'provider_auth_required', 'provider_auth_submitted', 'provider_auth_cancelled', 'provider_configured', 'provider_probe_started', 'provider_probe_completed', 'provider_auth_failed', 'provider_rate_limited', 'provider_credential_refreshed', 'loop_guard_triggered', 'compaction_completed', 'memory_retrieved', 'memory_promoted', 'memory_promotion_rejected', 'memory_rolled_back', 'memory_feedback_recorded', 'post_task_reviewed', 'evaluation_completed', 'improvement_candidate_created', 'automation_candidate_created', 'regression_completed', 'promotion_decided', 'candidate_applied', 'candidate_rolled_back', 'benchmark_recorded', 'counterfactual_compared', 'evolution_planned', 'evolution_task_started', 'evolution_task_completed', 'evolution_completed', 'skill_staged', 'skill_reviewed', 'skill_installed', 'skill_rolled_back', 'governor_decided', 'storage_maintenance_completed', 'context_snapshot_created', 'post_task_job_queued', 'post_task_job_started', 'post_task_job_completed', 'post_task_job_failed', 'verification_planned', 'verification_assertion_completed', 'regression_campaign_started', 'regression_execution_completed', 'memory_candidate_quarantined', 'memory_activated', 'memory_invalidated']
 
 class RuntimeGovernorDecision(TypedDict, total=False):
     action: Required[GovernorAction]
@@ -1234,7 +1361,7 @@ class VerificationCheck(TypedDict, total=False):
     name: Required[str]
     passed: Required[bool]
 
-VerificationCheckKind: TypeAlias = Literal['tool_execution', 'workspace_change', 'objective_validation', 'assistant_response']
+VerificationCheckKind: TypeAlias = Literal['tool_execution', 'workspace_change', 'objective_validation', 'assistant_response', 'schema']
 
 VerificationDimensionStatus: TypeAlias = Literal['pass', 'fail', 'partial', 'unknown']
 
@@ -1309,6 +1436,23 @@ WaitCondition: TypeAlias = WaitConditionReady | WaitConditionIdle | WaitConditio
 __all__ = [
     "Actor",
     "ActorKind",
+    "AgentItem",
+    "AgentItemKind",
+    "AgentItemStatus",
+    "AgentStreamEvent",
+    "AgentStreamEventItemCompleted",
+    "AgentStreamEventItemStarted",
+    "AgentStreamEventItemUpdated",
+    "AgentStreamEventRuntimeEvent",
+    "AgentStreamEventThreadStarted",
+    "AgentStreamEventTurnCompleted",
+    "AgentStreamEventTurnFailed",
+    "AgentStreamEventTurnStarted",
+    "AgentThreadRef",
+    "AgentTurnOptions",
+    "AgentTurnResult",
+    "AgentTurnStart",
+    "AgentTurnStartResponse",
     "AppliedCandidate",
     "ArtifactChunk",
     "ArtifactReadRequest",
@@ -1398,6 +1542,10 @@ __all__ = [
     "GovernorAction",
     "GovernorPhase",
     "ImprovementCandidate",
+    "JsonRpcErrorObject",
+    "JsonRpcNotification",
+    "JsonRpcRequest",
+    "JsonRpcResponse",
     "LoopAction",
     "LoopDecision",
     "MemoryClaim",

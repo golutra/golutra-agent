@@ -1,10 +1,10 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use golutra_auth::{
     CredentialRef, CredentialSource, OAuthFlow, OAuthProviderDescriptor, SecretKind,
 };
 use golutra_client::{
-    DebugExportCoordinator, DebugExportRequest, RuntimeClient, RuntimeTransport, TaskTraceClient,
-    parse_session_range,
+    AgentClient, DebugExportCoordinator, DebugExportRequest, RuntimeClient, RuntimeTransport,
+    TaskTraceClient, parse_session_range,
 };
 use golutra_config::{
     BuiltinOAuthMethod, ProviderConfigPaths, ProviderConfigScope, ProviderInstallPlan,
@@ -24,15 +24,18 @@ use golutra_llm::{
 };
 use golutra_plugin::PluginStore;
 use golutra_protocol::{
-    EventFilter, RuntimeEvent, RuntimeEventType, RuntimeQuery, RuntimeQueryKind, SessionCommand,
-    SessionCommandKind, TaskTraceRequest,
+    AgentStreamEvent, AgentTurnOptions, EventFilter, RuntimeEvent, RuntimeEventType, RuntimeQuery,
+    RuntimeQueryKind, SessionCommand, SessionCommandKind, TaskTraceRequest,
 };
 use secrecy::SecretString;
 use std::io::{IsTerminal, Write};
+use tokio::io::AsyncReadExt;
 use tokio::time::{Duration, sleep};
 use uuid::Uuid;
 
 const CLI_ACTOR_ID: &str = "golutra-cli";
+
+mod mcp_server;
 
 #[derive(Debug, Parser)]
 #[command(name = "golutra")]
@@ -55,11 +58,17 @@ enum Command {
     AppServer {
         #[arg(long, env = "GOLUTRA_APP_ADDR", default_value = "127.0.0.1:47831")]
         addr: std::net::SocketAddr,
+        #[arg(long, conflicts_with = "addr")]
+        stdio: bool,
     },
     Chat {
         #[arg(default_value = "")]
         prompt: String,
     },
+    /// Run one agent turn without opening the interactive TUI.
+    Exec(ExecArgs),
+    /// Expose the shared Agent Runtime as an MCP stdio server.
+    McpServer(McpServerArgs),
     Status,
     Resume {
         thread_id: Option<String>,
@@ -126,6 +135,45 @@ enum Command {
     Plugin {
         #[command(subcommand)]
         command: PluginCommand,
+    },
+}
+
+#[derive(Debug, Clone, Args)]
+struct ExecArgs {
+    /// Resume an existing thread instead of creating a new one.
+    #[command(subcommand)]
+    command: Option<ExecCommand>,
+    /// Initial instructions. Use `-` or omit it when stdin is piped.
+    #[arg(value_name = "PROMPT")]
+    prompt: Option<String>,
+    /// Emit lifecycle and item events as compact JSONL on stdout.
+    #[arg(long, alias = "experimental-json")]
+    json: bool,
+    /// Do not persist runtime state after this process exits.
+    #[arg(long)]
+    ephemeral: bool,
+    /// JSON Schema file for the final response.
+    #[arg(long, value_name = "FILE")]
+    output_schema: Option<std::path::PathBuf>,
+    /// Write the final assistant message to a file.
+    #[arg(short = 'o', long, value_name = "FILE")]
+    output_last_message: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct McpServerArgs {
+    /// Use an in-process runtime instead of the user-level app server.
+    #[arg(long)]
+    embedded: bool,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum ExecCommand {
+    /// Resume a thread and optionally send a new prompt.
+    Resume {
+        thread_id: String,
+        #[arg(value_name = "PROMPT")]
+        prompt: Option<String>,
     },
 }
 
@@ -473,18 +521,45 @@ impl ReviewDecisionArg {
 #[tokio::main]
 async fn main() -> miette::Result<()> {
     let cli = Cli::parse();
-    if let Command::AppServer { addr } = &cli.command {
-        return golutra_app_server::run(*addr).await;
+    if let Command::AppServer { addr, stdio } = &cli.command {
+        return if *stdio {
+            golutra_app_server::run_stdio().await
+        } else {
+            golutra_app_server::run(*addr).await
+        };
     }
     if let Command::Plugin { command } = &cli.command {
         return run_plugin_command(command);
+    }
+    if let Command::McpServer(args) = &cli.command {
+        let cwd = cli
+            .cwd
+            .clone()
+            .map_or_else(std::env::current_dir, Ok)
+            .map_err(|error| miette::miette!("{error}"))?;
+        return mcp_server::run(mcp_server::Config {
+            cwd,
+            connect: cli.connect.clone(),
+            daemon: cli.daemon,
+            embedded: args.embedded,
+        })
+        .await
+        .map_err(|error| miette::miette!("{error}"));
     }
     let cwd = cli
         .cwd
         .clone()
         .map_or_else(std::env::current_dir, Ok)
         .map_err(|error| miette::miette!("{error}"))?;
-    let transport = if let Some(base_url) = cli.connect.clone() {
+    let ephemeral_exec = matches!(&cli.command, Command::Exec(args) if args.ephemeral);
+    if ephemeral_exec && (cli.daemon || cli.connect.is_some()) {
+        return Err(miette::miette!(
+            "exec --ephemeral cannot be combined with --daemon or --connect"
+        ));
+    }
+    let transport = if ephemeral_exec {
+        RuntimeTransport::ephemeral_for_cwd(&cwd).await
+    } else if let Some(base_url) = cli.connect.clone() {
         RuntimeTransport::connect(base_url, &cwd).await
     } else if cli.daemon {
         RuntimeTransport::local_daemon(&cwd).await
@@ -515,6 +590,8 @@ async fn main() -> miette::Result<()> {
                 );
             }
         }
+        Command::Exec(args) => run_exec(&transport, args).await?,
+        Command::McpServer(_) => unreachable!("mcp-server exits before runtime setup"),
         Command::Status => {
             let state = transport
                 .query(RuntimeQuery {
@@ -1861,6 +1938,195 @@ fn approval_payload(approval_id: Option<String>) -> serde_json::Value {
         || serde_json::json!({}),
         |approval_id| serde_json::json!({"approval_id": approval_id}),
     )
+}
+
+async fn run_exec(transport: &RuntimeTransport, args: ExecArgs) -> miette::Result<()> {
+    let prompt = match &args.command {
+        Some(ExecCommand::Resume { prompt, .. }) => prompt.clone().or(args.prompt.clone()),
+        None => args.prompt.clone(),
+    };
+    let prompt = read_exec_prompt(prompt).await?;
+    if prompt.trim().is_empty() {
+        return Err(miette::miette!(
+            "exec requires PROMPT or piped stdin (use `-` to read stdin)"
+        ));
+    }
+    let output_schema = match args.output_schema {
+        Some(path) => {
+            let bytes = tokio::fs::read(&path)
+                .await
+                .map_err(|error| miette::miette!("{}: {error}", path.display()))?;
+            Some(serde_json::from_slice(&bytes).map_err(|error| {
+                miette::miette!("{} is not valid JSON: {error}", path.display())
+            })?)
+        }
+        None => None,
+    };
+    let json_output = args.json;
+    let output_last_message = args.output_last_message;
+    let client = AgentClient::new(transport.clone());
+    let (thread, prompt) = match args.command {
+        Some(ExecCommand::Resume { thread_id, .. }) => {
+            let thread_id = thread_id
+                .parse()
+                .map_err(|error| miette::miette!("invalid thread id `{thread_id}`: {error}"))?;
+            (
+                client
+                    .resume_thread(thread_id)
+                    .await
+                    .map_err(|error| miette::miette!("{error}"))?,
+                prompt,
+            )
+        }
+        None => (
+            client
+                .start_thread()
+                .await
+                .map_err(|error| miette::miette!("{error}"))?,
+            prompt,
+        ),
+    };
+    let mut handle = thread
+        .start_turn(
+            prompt,
+            AgentTurnOptions {
+                output_schema,
+                completion_criteria: Vec::new(),
+            },
+        )
+        .await
+        .map_err(|error| miette::miette!("{error}"))?;
+
+    while let Some(event) = handle
+        .next_event()
+        .await
+        .map_err(|error| miette::miette!("{error}"))?
+    {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string(&event).map_err(|error| miette::miette!("{error}"))?
+            );
+        } else {
+            report_exec_progress(&event);
+        }
+        if let Some(approval_id) = approval_id_from_exec_event(&event) {
+            let approve = prompt_for_exec_approval(&approval_id).await?;
+            let ack = handle
+                .resolve_approval(approval_id, approve)
+                .await
+                .map_err(|error| miette::miette!("{error}"))?;
+            if !ack.accepted {
+                return Err(miette::miette!(
+                    "runtime rejected approval resolution: {}",
+                    ack.reason.unwrap_or_else(|| "unknown reason".to_owned())
+                ));
+            }
+        }
+    }
+    let result = handle
+        .wait()
+        .await
+        .map_err(|error| miette::miette!("{error}"))?;
+    if let Some(path) = output_last_message {
+        tokio::fs::write(&path, result.final_message.as_deref().unwrap_or_default())
+            .await
+            .map_err(|error| miette::miette!("{}: {error}", path.display()))?;
+    }
+    if !json_output && let Some(message) = &result.final_message {
+        println!("{message}");
+    }
+    if result.status != TaskStatus::Completed {
+        return Err(miette::miette!(
+            "agent turn ended with status {:?}",
+            result.status
+        ));
+    }
+    Ok(())
+}
+
+async fn read_exec_prompt(prompt: Option<String>) -> miette::Result<String> {
+    let read_stdin = prompt.as_deref() == Some("-") || !std::io::stdin().is_terminal();
+    if !read_stdin {
+        return Ok(prompt.unwrap_or_default());
+    }
+    let mut stdin_prompt = String::new();
+    tokio::io::stdin()
+        .read_to_string(&mut stdin_prompt)
+        .await
+        .map_err(|error| miette::miette!("failed to read stdin: {error}"))?;
+    if prompt.as_deref() == Some("-") {
+        return Ok(stdin_prompt);
+    }
+    match prompt {
+        Some(prompt) if !prompt.trim().is_empty() => Ok(format!("{prompt}\n\n{stdin_prompt}")),
+        _ => Ok(stdin_prompt),
+    }
+}
+
+fn report_exec_progress(event: &AgentStreamEvent) {
+    match event {
+        AgentStreamEvent::ItemStarted { item } => {
+            eprintln!("• {}", item.title);
+        }
+        AgentStreamEvent::ItemUpdated { item } => {
+            if let Some(content) = &item.content {
+                eprintln!("  {}", content);
+            }
+        }
+        AgentStreamEvent::RuntimeEvent { event } => {
+            if let Some(summary) = event
+                .payload
+                .get("summary")
+                .and_then(serde_json::Value::as_str)
+            {
+                eprintln!("  {summary}");
+            }
+        }
+        AgentStreamEvent::TurnFailed { error, .. } => eprintln!("• failed: {error}"),
+        AgentStreamEvent::TurnCompleted { .. }
+        | AgentStreamEvent::ThreadStarted { .. }
+        | AgentStreamEvent::TurnStarted { .. }
+        | AgentStreamEvent::ItemCompleted { .. } => {}
+    }
+}
+
+fn approval_id_from_exec_event(event: &AgentStreamEvent) -> Option<String> {
+    let AgentStreamEvent::ItemStarted { item } = event else {
+        return None;
+    };
+    (item.kind == golutra_protocol::AgentItemKind::Approval)
+        .then(|| {
+            item.data
+                .pointer("/payload/approval_id")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .flatten()
+}
+
+async fn prompt_for_exec_approval(approval_id: &str) -> miette::Result<bool> {
+    if !std::io::stdin().is_terminal() {
+        eprintln!("approval {approval_id} denied because stdin is not interactive");
+        return Ok(false);
+    }
+    let approval_id = approval_id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        eprint!("Approval required ({approval_id}). Approve? [y/N] ");
+        std::io::stderr()
+            .flush()
+            .map_err(|error| miette::miette!("failed to flush approval prompt: {error}"))?;
+        let mut response = String::new();
+        std::io::stdin()
+            .read_line(&mut response)
+            .map_err(|error| miette::miette!("failed to read approval response: {error}"))?;
+        Ok(matches!(
+            response.trim().to_ascii_lowercase().as_str(),
+            "y" | "yes"
+        ))
+    })
+    .await
+    .map_err(|error| miette::miette!("approval prompt task failed: {error}"))?
 }
 
 async fn wait_for_terminal_state(

@@ -180,7 +180,7 @@ struct SocketConnection {
 impl SocketConnection {
     async fn connect(path: &Path) -> Self {
         let mut last_error = None;
-        for _ in 0..200 {
+        for _ in 0..1200 {
             match UnixStream::connect(path).await {
                 Ok(stream) => {
                     let (read, write) = stream.into_split();

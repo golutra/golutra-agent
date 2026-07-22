@@ -1,6 +1,10 @@
 import { createParser } from "eventsource-parser";
 
 import type {
+  AgentStreamEvent,
+  AgentThreadRef,
+  AgentTurnResult,
+  AgentTurnStartResponse,
   AppliedCandidate,
   ArtifactChunk,
   ArtifactReadRequest,
@@ -18,6 +22,7 @@ import type {
   EvolutionState,
   EventFilter,
   EventPage,
+  EventPageDirection,
   EventPageRequest,
   GeneratedTask,
   ImprovementCandidate,
@@ -44,7 +49,22 @@ import type {
 const JSON_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024;
 const MAX_COMPLETE_TRACE_PAGES = 4096;
-export const RUNTIME_PROTOCOL_VERSION = 3;
+export const RUNTIME_PROTOCOL_VERSION = 4;
+
+class HttpStatusError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(`HTTP ${status}: ${message}`);
+    this.name = "HttpStatusError";
+  }
+
+  get retryable(): boolean {
+    return this.status === 408 || this.status === 409 || this.status === 410 ||
+      this.status === 425 || this.status === 429 || this.status >= 500;
+  }
+}
 
 export * from "./generated.js";
 
@@ -124,6 +144,264 @@ export interface RuntimeSubscription {
   close(): void;
 }
 
+export interface AgentSubscriptionRequest {
+  session_id: string;
+  thread_id: string;
+  command_id: string;
+  start_cursor?: number | null;
+  cursor?: number | null;
+}
+
+export interface ThreadRunOptions {
+  outputSchema?: Record<string, unknown>;
+  completionCriteria?: readonly string[];
+}
+
+/** Optional bounds for one durable runtime event history page. */
+export interface EventPageOptions {
+  cursor?: number | null;
+  direction?: EventPageDirection;
+  limit?: number;
+  task_id?: string | null;
+}
+
+/** A durable thread controlled by the shared app-server runtime. */
+export class Thread {
+  readonly thread: AgentThreadRef;
+
+  constructor(
+    readonly client: GolutraClient,
+    reference: AgentThreadRef,
+  ) {
+    this.thread = { ...reference };
+  }
+
+  get threadId(): string {
+    return this.thread.thread_id;
+  }
+
+  get sessionId(): string {
+    return this.thread.session_id;
+  }
+
+  async run(prompt: string, options: ThreadRunOptions = {}): Promise<TurnHandle> {
+    if (!prompt.trim()) {
+      throw new Error("turn prompt cannot be empty");
+    }
+    const params: Record<string, unknown> = {
+      thread_id: this.threadId,
+      prompt,
+      completion_criteria: [...(options.completionCriteria ?? [])].filter((value) => value.trim()),
+    };
+    if (options.outputSchema !== undefined) {
+      params.output_schema = options.outputSchema;
+    }
+    const start = await this.client.rpc<AgentTurnStartResponse>("turn/start", params);
+    if (start.accepted !== true) {
+      throw new Error(start.reason ?? "turn was rejected");
+    }
+    return new TurnHandle(this, start);
+  }
+
+  runStreamed(prompt: string, options: ThreadRunOptions = {}): Promise<TurnHandle> {
+    return this.run(prompt, options);
+  }
+
+  async steer(prompt: string): Promise<CommandAck> {
+    if (!prompt.trim()) {
+      throw new Error("steering prompt cannot be empty");
+    }
+    return this.client.rpcCommand("turn/steer", {
+      thread_id: this.threadId,
+      prompt,
+    });
+  }
+
+  async interrupt(): Promise<CommandAck> {
+    return this.client.rpcCommand("turn/interrupt", { thread_id: this.threadId });
+  }
+
+  async takeover(): Promise<CommandAck> {
+    return this.client.rpcCommand("turn/takeover", { thread_id: this.threadId });
+  }
+
+  async eventPage(
+    request: EventPageOptions = {},
+  ): Promise<EventPage> {
+    const limit = request.limit ?? 128;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 512) {
+      throw new Error("event page limit must be between 1 and 512");
+    }
+    const direction: EventPageDirection = request.direction ?? "backward";
+    return this.client.eventPage({
+      session_id: this.sessionId,
+      task_id: request.task_id ?? null,
+      cursor: request.cursor ?? null,
+      direction,
+      limit,
+    });
+  }
+
+  async history(
+    request: EventPageOptions = {},
+  ): Promise<EventPage> {
+    return this.eventPage(request);
+  }
+}
+
+/** A single accepted turn and its normalized streaming lifecycle. */
+export class TurnHandle {
+  readonly commandId: string;
+  private readonly startCursor: number;
+  private cursor: number | null | undefined;
+  private terminal: AgentTurnResult | undefined;
+
+  constructor(
+    private readonly thread: Thread,
+    private readonly start: AgentTurnStartResponse,
+  ) {
+    this.commandId = start.command_id;
+    this.cursor = start.cursor;
+    this.startCursor = start.cursor ?? 0;
+  }
+
+  get acceptedStart(): AgentTurnStartResponse {
+    return this.start;
+  }
+
+  async *events(signal?: AbortSignal): AsyncGenerator<AgentStreamEvent> {
+    // The terminal event is already cached; the live SSE endpoint is not a
+    // history query and must not be reopened after the turn was consumed.
+    if (this.terminal) {
+      return;
+    }
+    const queue = new AsyncEventQueue<AgentStreamEvent>();
+    const subscriptionOptions: SubscriptionOptions = {};
+    if (signal) {
+      subscriptionOptions.signal = signal;
+    }
+    const subscription = this.thread.client.subscribeAgent(
+      {
+        session_id: this.thread.sessionId,
+        thread_id: this.thread.threadId,
+        command_id: this.commandId,
+        start_cursor: this.startCursor,
+        ...(this.cursor !== undefined ? { cursor: this.cursor } : {}),
+      },
+      (event) => {
+        const sequence = agentEventSequence(event);
+        if (sequence !== undefined && this.cursor !== null && this.cursor !== undefined) {
+          if (sequence <= this.cursor) {
+            return;
+          }
+        }
+        if (sequence !== undefined) {
+          this.cursor = sequence;
+        }
+        queue.push(event);
+      },
+      subscriptionOptions,
+    );
+    void subscription.done.then(
+      () => queue.close(),
+      (error: unknown) =>
+        queue.fail(error instanceof Error ? error : new Error(String(error))),
+    );
+    try {
+      while (true) {
+        const next = await queue.next();
+        if (next.done) {
+          return;
+        }
+        if (next.value.type === "turn.completed" || next.value.type === "turn.failed") {
+          this.terminal = next.value;
+          yield next.value;
+          return;
+        }
+        yield next.value;
+      }
+    } finally {
+      subscription.close();
+    }
+  }
+
+  async wait(): Promise<AgentTurnResult> {
+    if (this.terminal) {
+      return this.terminal;
+    }
+    for await (const _event of this.events()) {
+      // Drain the shared stream until the projector emits a terminal event.
+    }
+    if (!this.terminal) {
+      throw new Error("agent event stream ended before turn completion");
+    }
+    return this.terminal;
+  }
+
+  steer(prompt: string): Promise<CommandAck> {
+    return this.thread.steer(prompt);
+  }
+
+  interrupt(): Promise<CommandAck> {
+    return this.thread.interrupt();
+  }
+
+  resolveApproval(approvalId: string, approve: boolean): Promise<CommandAck> {
+    return this.thread.client.rpcCommand("approval/resolve", {
+      thread_id: this.thread.threadId,
+      approval_id: approvalId,
+      approve,
+    });
+  }
+}
+
+class AsyncEventQueue<T> {
+  private readonly values: T[] = [];
+  private readonly waiters: Array<{
+    resolve: (result: IteratorResult<T>) => void;
+    reject: (error: Error) => void;
+  }> = [];
+  private failure: Error | undefined;
+  private closed = false;
+
+  push(value: T): void {
+    const waiter = this.waiters.shift();
+    if (waiter) {
+      waiter.resolve({ done: false, value });
+    } else {
+      this.values.push(value);
+    }
+  }
+
+  fail(error: Error): void {
+    this.failure = error;
+    while (this.waiters.length > 0) {
+      this.waiters.shift()?.reject(error);
+    }
+  }
+
+  close(): void {
+    this.closed = true;
+    while (this.waiters.length > 0) {
+      this.waiters.shift()?.resolve({ done: true, value: undefined as never });
+    }
+  }
+
+  next(): Promise<IteratorResult<T>> {
+    if (this.failure) {
+      return Promise.reject(this.failure);
+    }
+    const value = this.values.shift();
+    if (value !== undefined) {
+      return Promise.resolve({ done: false, value });
+    }
+    if (this.closed) {
+      return Promise.resolve({ done: true, value: undefined as never });
+    }
+    return new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
+  }
+}
+
 export interface GolutraClientOptions {
   transportToken: string;
 }
@@ -179,6 +457,42 @@ export class GolutraClient {
 
   async runtimeInfo(): Promise<RuntimeHostInfo> {
     return (await this.runtimeAttachment()).runtime;
+  }
+
+  async rpc<T = unknown>(method: string, params: Record<string, unknown> = {}): Promise<T> {
+    const response = await this.postJson<{
+      error?: { code: number; message: string } | null;
+      result?: unknown;
+    }>("/rpc", {
+      jsonrpc: "2.0",
+      id: globalThis.crypto.randomUUID(),
+      method,
+      params,
+    });
+    if (response.error) {
+      throw new Error(`JSON-RPC ${response.error.code}: ${response.error.message}`);
+    }
+    return response.result as T;
+  }
+
+  async rpcCommand(method: string, params: Record<string, unknown> = {}): Promise<CommandAck> {
+    const result = await this.rpc<{ ack?: CommandAck }>(method, params);
+    if (!result.ack) {
+      throw new Error(`JSON-RPC ${method} did not return a command acknowledgement`);
+    }
+    return result.ack;
+  }
+
+  async startThread(): Promise<Thread> {
+    const result = await this.rpc<{ thread: AgentThreadRef }>("thread/start");
+    return new Thread(this, result.thread);
+  }
+
+  async resume(threadId: string): Promise<Thread> {
+    const result = await this.rpc<{ thread: AgentThreadRef }>("thread/resume", {
+      thread_id: threadId,
+    });
+    return new Thread(this, result.thread);
   }
 
   async serverInfo(): Promise<AppServerInfo> {
@@ -579,6 +893,107 @@ export class GolutraClient {
     };
   }
 
+  subscribeAgent(
+    request: AgentSubscriptionRequest,
+    onEvent: (event: AgentStreamEvent) => void,
+    options: SubscriptionOptions = {},
+  ): RuntimeSubscription {
+    const controller = new AbortController();
+    const abortFromCaller = () => controller.abort(options.signal?.reason);
+    options.signal?.addEventListener("abort", abortFromCaller, { once: true });
+    if (options.signal?.aborted) {
+      abortFromCaller();
+    }
+    const done = this.runAgentSubscription(request, onEvent, options, controller.signal).finally(
+      () => options.signal?.removeEventListener("abort", abortFromCaller),
+    );
+    return {
+      done,
+      close: () => controller.abort(),
+    };
+  }
+
+  private async runAgentSubscription(
+    request: AgentSubscriptionRequest,
+    onEvent: (event: AgentStreamEvent) => void,
+    options: SubscriptionOptions,
+    signal: AbortSignal,
+  ): Promise<void> {
+    let cursor = request.cursor ?? undefined;
+    let retryMs = options.initialRetryMs ?? 100;
+    const maxRetryMs = options.maxRetryMs ?? 2_000;
+    while (!signal.aborted) {
+      try {
+        const url = new URL("/agent/events", this.baseUrl);
+        url.searchParams.set("session_id", request.session_id);
+        url.searchParams.set("thread_id", request.thread_id);
+        url.searchParams.set("command_id", request.command_id);
+        if (request.start_cursor !== undefined && request.start_cursor !== null) {
+          url.searchParams.set("start_cursor", String(request.start_cursor));
+        }
+        if (cursor !== undefined) {
+          url.searchParams.set("cursor", String(cursor));
+        }
+        const headers = new Headers({ accept: "text/event-stream" });
+        if (cursor !== undefined) {
+          headers.set("last-event-id", String(cursor));
+        }
+        const response = await this.fetchWithAttachment(url, { headers, signal });
+        if (!response.ok) {
+          throw new HttpStatusError(
+            response.status,
+            await readBoundedResponseText(response),
+          );
+        }
+        if (!response.body) {
+          throw new Error("Golutra Agent SSE response has no body");
+        }
+        const decoder = new TextDecoder();
+        let terminalSeen = false;
+        const parser = createParser({
+          maxBufferSize: 1_048_576,
+          onEvent: (message) => {
+            if (message.event === "error") {
+              throw new Error(message.data);
+            }
+            const event = JSON.parse(message.data) as AgentStreamEvent;
+            const sequence = agentEventSequence(event);
+            if (cursor !== undefined && sequence !== undefined && sequence <= cursor) {
+              return;
+            }
+            onEvent(event);
+            terminalSeen = event.type === "turn.completed" || event.type === "turn.failed";
+            if (sequence !== undefined) {
+              cursor = sequence;
+            }
+            retryMs = options.initialRetryMs ?? 100;
+          },
+        });
+        for await (const chunk of response.body) {
+          parser.feed(decoder.decode(chunk, { stream: true }));
+        }
+        parser.feed(decoder.decode());
+        if (terminalSeen) {
+          return;
+        }
+        if (!signal.aborted) {
+          throw new Error("Golutra Agent SSE connection closed");
+        }
+      } catch (cause) {
+        if (signal.aborted) {
+          return;
+        }
+        const error = cause instanceof Error ? cause : new Error(String(cause));
+        if (error instanceof HttpStatusError && !error.retryable) {
+          throw error;
+        }
+        options.onError?.(error);
+        await abortableDelay(retryMs, signal);
+        retryMs = Math.min(retryMs * 2, maxRetryMs);
+      }
+    }
+  }
+
   private async runSubscription(
     filter: EventFilter,
     onEvent: (event: RuntimeEvent) => void,
@@ -601,8 +1016,9 @@ export class GolutraClient {
           signal,
         });
         if (!response.ok) {
-          throw new Error(
-            `Golutra SSE failed: ${response.status} ${await readBoundedResponseText(response)}`,
+          throw new HttpStatusError(
+            response.status,
+            await readBoundedResponseText(response),
           );
         }
         if (!response.body) {
@@ -639,6 +1055,9 @@ export class GolutraClient {
           return;
         }
         const error = cause instanceof Error ? cause : new Error(String(cause));
+        if (error instanceof HttpStatusError && !error.retryable) {
+          throw error;
+        }
         options.onError?.(error);
         await abortableDelay(retryMs, signal);
         retryMs = Math.min(retryMs * 2, maxRetryMs);
@@ -758,7 +1177,7 @@ export class GolutraClient {
     };
     const attachment = await this.runtimeAttachment();
     const response = await send(attachment.attachment_id);
-    if (response.status !== 401) {
+    if (response.status !== 410) {
       return response;
     }
     const refreshed = await this.refreshRuntimeAttachment(attachment.attachment_id);
@@ -777,6 +1196,7 @@ export class GolutraClient {
   private transportHeaders(initial?: HeadersInit): Headers {
     const headers = new Headers(initial);
     headers.set("authorization", `Bearer ${this.transportToken}`);
+    headers.set("x-golutra-actor-id", this.actorId);
     headers.set("x-golutra-protocol-version", String(RUNTIME_PROTOCOL_VERSION));
     return headers;
   }
@@ -888,6 +1308,23 @@ function optionalMax(
     return left;
   }
   return Math.max(left, right);
+}
+
+function agentEventSequence(event: AgentStreamEvent): number | undefined {
+  if (event.type === "runtime.event") {
+    return event.event.sequence_no;
+  }
+  if (
+    event.type === "item.started" ||
+    event.type === "item.updated" ||
+    event.type === "item.completed"
+  ) {
+    return event.item.sequence_no ?? undefined;
+  }
+  if (event.type === "turn.completed" || event.type === "turn.failed") {
+    return event.last_sequence_no ?? undefined;
+  }
+  return undefined;
 }
 
 async function decodeJson<T>(response: Response): Promise<T> {

@@ -169,6 +169,7 @@ fn axum_request(request: IpcHttpRequest) -> Result<Request<Body>, String> {
                 | "content-type"
                 | "last-event-id"
                 | "x-golutra-attachment"
+                | "x-golutra-actor-id"
                 | "x-golutra-protocol-version"
         ) {
             return Err(format!("IPC request header `{name}` is not allowed"));

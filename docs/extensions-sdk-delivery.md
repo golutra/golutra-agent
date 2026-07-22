@@ -8,6 +8,7 @@
 - `golutra-mcp` 使用官方 `rmcp 2.2.0` 适配 stdio MCP server；外部工具进入统一 `ToolRegistry`、PolicyEvaluation、approval、timeout/cancel、artifact/evidence 链路。
 - Unix 本地 daemon 默认通过 owner-only Unix socket 连接；socket 请求复用同一个 Axum Router，HTTP/SSE 继续用于 Windows 和远端。
 - TypeScript 与 Python SDK 都从 Rust 协议 schema 生成类型，并实现 cwd attachment、command/query、event replay/live stream、thread 与治理 API。
+- Agent 高层 SDK 还提供统一的 `Thread`/`TurnHandle` 生命周期；`exec`、MCP 和 Remote TUI 复用同一个 App Server/Agent event projector，不形成第二套执行状态机。SDK 可发送 actor 元数据，但控制权由 App Server 为 attachment 分配的 server-side actor 决定，不能通过伪造 header 提权。
 - 根安装脚本覆盖 Unix 和 Windows；CI 对 Linux/macOS/Windows 执行 workspace all-target compile，并在 Linux 执行完整 Rust/SDK 门禁。
 
 ## Plugin Store
@@ -94,6 +95,7 @@ provider tool call
 | Unix 本地 daemon | `UnixIpcTransport` | owner-only socket，复用 Axum command/query/SSE Router；server-side IPC marker 可访问 forensic trace |
 | Windows 本地 daemon | `HttpSseTransport` | loopback + bearer token + protocol version |
 | 远端/端口转发 | `HttpSseTransport` | HTTPS 或 loopback HTTP，cursor replay + SSE live；最多 full-redacted trace |
+| App Server JSON-RPC | HTTP、WebSocket、stdio；Unix IPC 通过共享 `/rpc` Router | thread/turn 控制和 `agent/event` 增量通知；按 server-issued attachment actor 隔离控制权；复用同一 `RuntimeApplication` |
 
 IPC 不是第二套业务协议。它把受限 HTTP-like request 交给同一个 Router，并以有界 response frame 回传 body/SSE；attachment、认证、status code、event cursor 和错误语义与 HTTP 对拍。
 
@@ -162,3 +164,4 @@ just release-package-smoke
 ```
 
 跨进程验收覆盖多 cwd、daemon 重启、HTTP/SSE、Unix IPC、command 幂等、thread fork/rebind 和 durable post-task evaluation；稳定性 smoke 连续执行多轮 turn，验证 event sequence 单调、同一 thread 不分叉并能在 RuntimeHost 重启后恢复。`PostTaskJob` 与排队事件在任务终态前写入 SQLite，worker 通过 lease、retry 和 recovery 接管，Embedded one-shot 退出后可由下一 Host/daemon 继续执行。
+入口级验收还覆盖 `exec`/`exec resume` 的独立进程、MCP stdio 子进程、WebSocket/stdio JSON-RPC、SDK 高层 handle 和 Remote TUI attach；详见 `runtime-entrypoints.md`。

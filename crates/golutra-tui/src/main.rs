@@ -68,6 +68,7 @@ mod developer_view;
 mod developer_widget;
 mod driver;
 mod live_status;
+mod provider_status;
 mod render;
 mod runtime_controller;
 mod session;
@@ -84,6 +85,7 @@ pub(crate) use developer_query::*;
 pub(crate) use developer_view::*;
 pub(crate) use developer_widget::*;
 pub(crate) use live_status::*;
+pub(crate) use provider_status::*;
 pub(crate) use render::*;
 pub(crate) use runtime_controller::*;
 pub(crate) use session::*;
@@ -112,10 +114,19 @@ struct Args {
 
 #[derive(Debug, Clone, Subcommand)]
 enum TuiCommand {
+    /// Attach the interactive TUI to a remote app server.
+    Remote(RemoteArgs),
     /// Render one deterministic offscreen frame and exit.
     Inspect(InspectArgs),
     /// Run a long-lived NDJSON TUI controller over stdin/stdout.
     Driver(DriverArgs),
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+struct RemoteArgs {
+    /// Root HTTP(S) URL of the Golutra app server.
+    #[arg(long, value_name = "URL")]
+    url: String,
 }
 
 #[derive(Debug, Clone, ClapArgs)]
@@ -205,11 +216,6 @@ struct TuiApp {
     last_control_ack: Option<CommandAck>,
 }
 
-struct ProviderUiStatus {
-    message: String,
-    model: String,
-}
-
 impl TuiApp {
     fn new(
         thread_id: ThreadId,
@@ -279,9 +285,22 @@ impl TuiApp {
     }
 
     fn refresh_provider_status(&mut self) {
-        let status = current_provider_ui_status();
-        self.provider_message = status.message;
-        self.provider_model = status.model;
+        if let Ok(status) = current_provider_ui_status() {
+            self.provider_message = status.message;
+            self.provider_model = status.model;
+        }
+    }
+
+    async fn refresh_provider_status_from_runtime(&mut self, transport: &RuntimeTransport) {
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            provider_ui_status_from_runtime(transport, self.session_id),
+        )
+        .await;
+        if let Ok(Ok(status)) = result {
+            self.provider_message = status.message;
+            self.provider_model = status.model;
+        }
     }
 
     async fn refresh(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
@@ -301,9 +320,11 @@ impl TuiApp {
         self.projection = serde_json::from_value(projection)
             .map(Some)
             .map_err(|error| miette::miette!("{error}"))?;
+        self.refresh_provider_status_from_runtime(transport).await;
         if self.projection.as_ref().is_some_and(|projection| {
             projection.status == golutra_core::TaskStatus::WaitingAuthentication
-        }) && self.auth_dialog.is_none()
+        }) && !transport.is_remote()
+            && self.auth_dialog.is_none()
             && self.auth_operation.is_none()
             && self.resume_picker.is_none()
             && self.export_flow.is_none()
@@ -755,7 +776,17 @@ impl TuiApp {
         }
         match command {
             SlashCommand::Auth(SlashAuthCommand::Setup) => {
-                self.open_auth_dialog();
+                if transport.is_remote() {
+                    self.push_system_message(
+                        "Auth",
+                        vec![
+                            "remote TUI cannot write provider credentials".to_owned(),
+                            "configure the app-server host, then use /auth status".to_owned(),
+                        ],
+                    );
+                } else {
+                    self.open_auth_dialog();
+                }
             }
             SlashCommand::Help => {
                 self.push_system_message("Slash commands", slash_help_lines());
@@ -1186,12 +1217,27 @@ impl TuiApp {
         transport: &RuntimeTransport,
         command: SlashAuthCommand,
     ) -> miette::Result<()> {
+        if transport.is_remote()
+            && !matches!(
+                &command,
+                SlashAuthCommand::Status | SlashAuthCommand::Protocols
+            )
+        {
+            self.push_system_message(
+                "Auth",
+                vec![
+                    "remote TUI cannot write provider credentials".to_owned(),
+                    "configure the app-server host, then use /auth status".to_owned(),
+                ],
+            );
+            return Ok(());
+        }
         match command {
             SlashAuthCommand::Setup => {
                 self.open_auth_dialog();
             }
             SlashAuthCommand::Status => {
-                self.refresh_provider_status();
+                self.refresh_provider_status_from_runtime(transport).await;
                 self.push_system_message("Auth status", vec![self.provider_message.clone()]);
             }
             SlashAuthCommand::Protocols => {
@@ -1560,6 +1606,18 @@ fn main() -> miette::Result<()> {
 async fn async_main() -> miette::Result<()> {
     let args = Args::parse();
     match args.command.clone() {
+        Some(TuiCommand::Remote(command)) => {
+            if args.connect.is_some() || args.daemon {
+                return Err(miette::miette!(
+                    "remote cannot be combined with --connect or --daemon"
+                ));
+            }
+            let cwd = resolve_tui_cwd(&args)?;
+            let transport = RuntimeTransport::connect(command.url, &cwd)
+                .await
+                .map_err(|error| miette::miette!("{error}"))?;
+            return run_interactive(&args, cwd, transport).await;
+        }
         Some(TuiCommand::Inspect(command)) => {
             return driver::run_inspect_command(&args, command).await;
         }
@@ -1568,12 +1626,7 @@ async fn async_main() -> miette::Result<()> {
         }
         None => {}
     }
-    let task_id = parse_task_id(args.task_id.as_deref())?;
-    let cwd = args
-        .cwd
-        .clone()
-        .map_or_else(std::env::current_dir, Ok)
-        .map_err(|error| miette::miette!("{error}"))?;
+    let cwd = resolve_tui_cwd(&args)?;
     let transport = if let Some(base_url) = args.connect.clone() {
         RuntimeTransport::connect(base_url, &cwd).await
     } else if args.daemon {
@@ -1582,10 +1635,26 @@ async fn async_main() -> miette::Result<()> {
         RuntimeTransport::for_cwd(&cwd).await
     }
     .map_err(|error| miette::miette!("{error}"))?;
+    run_interactive(&args, cwd, transport).await
+}
+
+fn resolve_tui_cwd(args: &Args) -> miette::Result<PathBuf> {
+    args.cwd
+        .clone()
+        .map_or_else(std::env::current_dir, Ok)
+        .map_err(|error| miette::miette!("{error}"))
+}
+
+async fn run_interactive(
+    args: &Args,
+    cwd: PathBuf,
+    transport: RuntimeTransport,
+) -> miette::Result<()> {
+    let task_id = parse_task_id(args.task_id.as_deref())?;
     let (thread_id, session_id) = initial_session(args.session_id.as_deref(), &transport).await?;
-    let provider_status = current_provider_ui_status();
+    let provider_status = initial_provider_ui_status(&transport, session_id).await;
     let runtime_cwd = transport.cwd().unwrap_or(&cwd).to_path_buf();
-    let auth_dialog = initial_auth_dialog();
+    let auth_dialog = (!transport.is_remote()).then(initial_auth_dialog).flatten();
     let app = TuiApp::new(
         thread_id,
         session_id,

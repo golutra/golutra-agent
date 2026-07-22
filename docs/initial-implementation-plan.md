@@ -38,6 +38,7 @@
 - `golutra-vis` 已提供 Audit、Events 与 OpenTelemetry JSON 投影；普通 TUI 仍只展示 UserProjection，显式 developer/debug mode 才消费治理事实。
 - `golutra-supervisor` 与 `golutra-release` 已建立本地 P3 受治理执行面：有限 epoch、OS-enforced internal/external command producer、从 stable release 创建的候选 worktree、parent/candidate 真实文件 diff 与 digest freeze、sealed/fresh disclosure budget、只读 source + 独立 artifact staging 的 OS-enforced TrustedBuilder、内容寻址 source/bin、preview/canary/stable pointer、rollback 和 `golutra-launcher`。候选不能通过伪造 `target_paths` 修改 Supervisor、evaluator、policy、sandbox、CI、signer 或 release pointer，也不能在构建阶段改写 frozen source。producer 在启动前验证 epoch/opportunity/worktree，关闭网络并清空敏感环境，timeout/输出超限会终止进程组；无 Seatbelt/bubblewrap 时拒绝运行。
 - 当前应用层重构已落地：`golutra-client::RuntimeApplication`（`GovernedRuntime`）统一 command/query/session/trace/governance facade，`EmbeddedTransport` 主路径通过该 facade；`golutra-store::RuntimeRepositories` 固定 event/projection/artifact/job/thread 五类事实 seam；post-task worker 和 runtime loop 的 completion/context guard/retry/trace/verification 已拆为独立模块。`RuntimeHost` 继续是唯一 execution owner，不再向前端暴露 SQL 或私有状态机。
+- Codex 风格的运行入口已完成当前范围：`golutra exec`（stdin/JSONL/ephemeral/resume）、长期 App Server（HTTP/SSE、Unix IPC、WebSocket、stdio JSON-RPC）、Python/TypeScript `Thread`/`TurnHandle` SDK、daemon-backed `golutra mcp-server` 和 `golutra-tui remote` 均复用 `AgentClient`/`AgentEventProjector`；一个 App Server 可按 canonical cwd attach 多个 workspace，workspace 不创建第二个 daemon。跨进程入口验收见 `runtime-entrypoints.md`。
 - 第一阶段范围已在 `implementation-blueprint.md` 中明确，不能继续扩张到复杂 multi-agent 或不可审计的自动自我改进。
 
 ## 已知实现边界

@@ -71,6 +71,9 @@ pub struct AgentTaskRequest {
     pub turn_id: TurnId,
     pub objective: String,
     pub completion_criteria: Vec<String>,
+    /// Optional machine-checkable response contract. It is verified by the
+    /// runtime before the terminal task event is emitted.
+    pub output_schema: Option<Value>,
     pub touched_code: bool,
     pub contributors: Vec<ContextContributor>,
     pub tools: Vec<String>,
@@ -91,6 +94,9 @@ pub struct PendingAgentTurn {
     pub command_id: CommandId,
     pub turn_id: TurnId,
     pub content: String,
+    /// A steer is a continuation of the active turn for stream projection;
+    /// an ordinary queued prompt remains an independent turn.
+    pub steer: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1039,12 +1045,26 @@ where
             || tool_reports
                 .iter()
                 .any(|report| !report.changed_files.is_empty());
+        if let Some(schema) = request
+            .output_schema
+            .as_ref()
+            .filter(|value| !value.is_null())
+        {
+            command_checks.push(output_schema_check(
+                schema,
+                last_assistant_message.as_deref(),
+            ));
+        }
         let verification_input = if completion::accepts_text_response_without_evidence(
             &current_objective,
             requires_workspace_evidence,
             last_assistant_message.as_deref(),
             &tool_reports,
-        ) {
+        ) && request
+            .output_schema
+            .as_ref()
+            .is_none_or(serde_json::Value::is_null)
+        {
             VerificationInput {
                 task_id: request.task_id,
                 objective: current_objective.clone(),
@@ -1482,6 +1502,39 @@ fn line_reports_executed_tests(line: &str) -> bool {
                 .and_then(|value| value.parse::<u64>().ok())
                 .is_some_and(|count| count > 0)
         })
+}
+
+fn output_schema_check(schema: &Value, message: Option<&str>) -> VerificationCheck {
+    let (passed, detail) = match message {
+        None => (false, "assistant response is empty".to_owned()),
+        Some(message) => match serde_json::from_str::<Value>(message) {
+            Err(error) => (
+                false,
+                format!("assistant response is not valid JSON: {error}"),
+            ),
+            Ok(value) => match jsonschema::validator_for(schema) {
+                Err(error) => (false, format!("output schema is invalid: {error}")),
+                Ok(validator) => match validator.validate(&value) {
+                    Ok(()) => (
+                        true,
+                        "assistant response validates against output schema".to_owned(),
+                    ),
+                    Err(error) => (
+                        false,
+                        format!("assistant response failed output schema: {error}"),
+                    ),
+                },
+            },
+        },
+    };
+    VerificationCheck {
+        kind: VerificationCheckKind::Schema,
+        name: "output_schema".to_owned(),
+        command: None,
+        passed,
+        evidence_refs: Vec::new(),
+        message: detail.chars().take(512).collect(),
+    }
 }
 
 fn objective_requires_workspace_evidence(objective: &str) -> bool {

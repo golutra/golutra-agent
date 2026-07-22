@@ -1,0 +1,267 @@
+# Runtime Entry Points
+
+## Purpose
+
+Golutra exposes several execution surfaces, but there is only one agent
+runtime. Every surface eventually uses the same `SessionCommand`,
+`RuntimeEvent`, `RuntimeApplication`, `RuntimeHost`, and
+`AgentEventProjector` contracts. An entry point may translate framing or
+render a projection; it must not create a second task state machine.
+
+The current implementation deliberately supports both a simple local mode and
+a long-lived shared mode:
+
+```text
+CLI / TUI / SDK / MCP adapter
+        |
+        v
+  RuntimeTransport
+        |
+  RuntimeApplication
+        |
+  RuntimeHost (one execution owner)
+        |
+  RuntimeEvent -> state/context/user/debug/evaluation projections
+```
+
+## Process Model
+
+| Surface | Default process | Workspace behavior | Primary use |
+| --- | --- | --- | --- |
+| `golutra exec` | One short-lived client process; embedded host by default | `--cwd` is the host cwd and permission boundary | scripts, CI, other agents |
+| App Server | One explicit long-lived user-level process | one server attaches many canonical cwd values; each attachment has its own session/workspace routing | IDEs, multiple clients, durable service |
+| Python/TypeScript SDK | Library process; connects to an App Server | each client creates an authenticated cwd attachment | application integration |
+| `golutra mcp-server` | MCP stdio process; connects to the local daemon by default | tool calls may select a workspace; clients are cached per cwd | expose Golutra to another agent |
+| Remote TUI | TUI process separate from the App Server | TUI attaches to the selected remote cwd | interactive UI over a remote/shared runtime |
+
+Therefore, a workspace does not require its own daemon. In shared mode one
+App Server owns multiple workspace attachments. The workspace still controls
+cwd, file policy, state partition, default session resolution and history
+visibility. It is not a process boundary.
+
+The ordinary no-daemon path remains intentionally simple: `golutra-tui` and
+`golutra` construct an `EmbeddedTransport`, so a single invocation owns its
+local `RuntimeHost`. Use the daemon or App Server surfaces when another
+process must observe or control the same running task.
+
+## 1. Headless Exec
+
+`exec` is the non-interactive equivalent of one agent turn. It does not open a
+TUI and can be used from a shell or an automation runner:
+
+```bash
+golutra --cwd "$PWD" exec "inspect the workspace"
+golutra --cwd "$PWD" exec - < prompt.txt
+golutra --cwd "$PWD" exec --json "run the checks"
+golutra --cwd "$PWD" exec --output-last-message /tmp/answer.txt "summarize the change"
+golutra --cwd "$PWD" exec resume <thread-id> "continue the same task"
+```
+
+Output rules:
+
+- normal progress and bounded runtime/tool observations go to `stderr`;
+- the final assistant message goes to `stdout`;
+- `--json` emits normalized lifecycle/item/runtime events as JSONL on
+  `stdout`, with no human progress stream;
+- `-` or a non-terminal stdin supplies the prompt;
+- `exec resume` resolves a durable thread and sends a new turn through the
+  same runtime lane;
+- `--ephemeral` uses an isolated embedded runtime and cannot be combined with
+  `--daemon` or `--connect`.
+
+The final exit status is non-zero unless the runtime returns a verified
+`completed` turn. A model saying it is finished is not sufficient.
+
+## 2. App Server
+
+Start the long-lived server explicitly:
+
+```bash
+golutra app-server --addr 127.0.0.1:47831
+# or
+cargo run -p golutra-app-server -- --addr 127.0.0.1:47831
+# stdio JSON-RPC supervisor mode
+golutra app-server --stdio
+```
+
+The server publishes endpoint metadata and an owner-only transport token under
+`$GOLUTRA_HOME/app-server/`. It provides:
+
+- authenticated HTTP command/query and cursor-based SSE;
+- owner-only Unix IPC for local clients, including `/rpc` through the shared
+  bounded HTTP-like IPC envelope;
+- JSON-RPC over HTTP, WebSocket and newline-delimited stdio;
+- thread start/resume/fork/list;
+- turn start, steer, interrupt and approval resolution;
+- `agent/event` notifications projected from the durable event stream;
+- attachment routing from canonical cwd to one shared runtime registry.
+
+The JSON-RPC methods are intentionally small and transport-neutral:
+
+```text
+runtime/info       runtime/attach
+thread/start       thread/resume       thread/fork       thread/list
+turn/start         turn/steer          turn/interrupt    turn/takeover
+approval/resolve   turn/status         runtime/events/replay
+```
+
+HTTP and WebSocket clients must send the bearer token and the negotiated
+`x-golutra-protocol-version`. Remote HTTP connections use
+`GOLUTRA_TRANSPORT_TOKEN`; local daemon discovery reads the owner-only token
+file. The server binds loopback by default and validates local Host/Origin
+headers.
+
+`runtime/attach` creates a server-issued attachment capability and binds one
+runtime actor to it. That binding, rather than a caller-provided HTTP header,
+is authoritative for steer, interrupt, approval and takeover checks.
+`x-golutra-actor-id` may be sent as client metadata, but changing or spoofing
+it cannot change control ownership. WebSocket, stdio, HTTP and Unix IPC all
+resolve commands through the attachment actor, so a second client must call
+`turn/takeover` before controlling an active lane.
+
+JSON-RPC messages without an `id` are notifications: HTTP returns `204 No
+Content`, while WebSocket and stdio send no response. Turn streams publish
+`agent/event`; if their projector or transport terminates before a runtime
+terminal fact, WebSocket and stdio publish an `agent/error` notification
+instead of silently dropping the stream. Unix IPC does not add a second
+raw-line JSON-RPC protocol; clients post the same JSON-RPC body to `/rpc`
+inside `IpcHttpRequest`, and the shared Axum router applies the same
+authentication, attachment and notification rules.
+
+## 3. Python and TypeScript SDK
+
+Both SDKs are generated from the Rust protocol schema for data types and share
+the same high-level lifecycle:
+
+```python
+client = GolutraClient(base_url, cwd, transport_token)
+thread = client.start_thread()
+turn = thread.run("inspect the workspace")
+for event in turn.events():
+    ...
+result = turn.wait()
+```
+
+The TypeScript API has the corresponding `startThread`, `Thread.run`,
+`TurnHandle.events()` and `TurnHandle.wait()` methods. Both SDKs also expose
+`steer`, `interrupt`, `takeover`, approval resolution, `resume`, bounded
+history/event pages, event replay, task trace and artifact range reads. They
+use the same Agent SSE projector as `exec` and MCP, so command/turn correlation
+and terminal status do not vary by language.
+
+SDK connection steps are fixed:
+
+```text
+validate absolute cwd and token
+-> GET /runtime/info and negotiate protocol range
+-> POST /runtime/attach
+-> use command/query/thread/agent-event APIs
+-> reattach only after an explicit 410 Gone
+```
+
+SDKs do not own the runtime loop or persist a competing conversation history.
+Each SDK client may send an actor identity as diagnostic metadata, but control
+ownership is always the server-issued attachment actor. This keeps turn
+control isolated even when several SDKs share the same workspace attachment;
+spoofing the client actor header cannot grant control. Agent SSE subscriptions
+retain both the immutable
+`start_cursor` returned by `turn/start` and the latest consumed `cursor`.
+After a disconnect, the server replays from `start_cursor` to rebuild the
+command-to-turn projector state, suppresses facts through the consumed cursor,
+and then resumes delivery. This avoids losing turn correlation when the
+binding event predates the reconnect cursor. Transient transport errors and
+retryable HTTP statuses reconnect with bounded backoff; permanent 4xx statuses
+end the subscription and surface an SDK error. A `TurnHandle` also observes
+the subscription completion promise, so a clean stream close without a
+terminal event fails promptly instead of waiting forever.
+
+## 4. MCP Server
+
+`golutra mcp-server` is a stdio MCP adapter. It translates MCP framing into
+the shared `AgentClient` API and exposes two tools:
+
+- `golutra`: create or resume a durable thread and execute one turn;
+- `golutra-reply`: continue a supplied `thread_id`.
+
+Examples:
+
+```bash
+# default: connect to the user-level daemon
+golutra --cwd "$PWD" mcp-server
+
+# connect to an explicit App Server
+golutra --cwd "$PWD" --connect http://127.0.0.1:47831 mcp-server
+
+# deliberately isolate the adapter in its own embedded runtime
+golutra --cwd "$PWD" mcp-server --embedded
+```
+
+The default is daemon-backed so an MCP caller can share state with TUI, CLI
+and SDK clients. `--embedded` is an explicit isolation choice. Workspace
+clients are cached by canonical cwd, non-interactive approvals are denied by
+default, and the adapter returns the verified turn result plus an optional
+bounded event sample.
+
+## 5. Remote TUI
+
+Remote TUI separates rendering from execution:
+
+```bash
+export GOLUTRA_TRANSPORT_TOKEN="$(<\"$GOLUTRA_HOME/app-server/transport.token\")"
+golutra-tui --cwd "$PWD" remote --url http://127.0.0.1:47831
+```
+
+The TUI process owns terminal input, scrolling and rendering only. The remote
+App Server owns sessions, tools, cancellation, approvals and durable events.
+The existing compatibility form remains available:
+
+```bash
+golutra-tui --cwd "$PWD" --connect http://127.0.0.1:47831
+```
+
+`remote` cannot be combined with `--daemon` or `--connect`; this keeps the
+transport choice explicit. A remote TUI sees the same user projection and
+event cursor as any other attached client, while developer/debug views remain
+an opt-in projection. Its provider footer/status is read from the Runtime's
+redacted `ProviderState` query. Remote mode never reads or writes the TUI
+machine's provider files and does not open a local OAuth/setup dialog; provider
+credentials must be configured on the App Server host.
+
+## Shared Event and Projection Rules
+
+All five surfaces follow the same lifecycle:
+
+```text
+start/queue command
+-> durable TaskCreated/TurnStarted facts
+-> provider/tool/approval/progress facts
+-> AssistantMessage and VerificationCompleted
+-> TaskCompleted or TaskAborted
+-> AgentEventProjector emits terminal turn result
+```
+
+`AgentEventProjector` filters by session, task, turn and command correlation.
+An old task's terminal event cannot complete a newly queued turn. The durable
+`RuntimeEvent` stream remains the source of truth; Agent stream events are a
+bounded adapter contract for clients.
+
+## Verification Matrix
+
+The implementation is exercised at each boundary:
+
+```bash
+cargo test -p golutra-client agent_projection::tests
+cargo test -p golutra-app-server --test rpc_process
+cargo test -p golutra-cli --test mcp_server_process
+cargo test -p golutra-cli --test exec_process
+cargo test -p golutra-tui remote_transport_attaches_to_the_real_app_server
+python3 -m unittest discover -s sdk/python/tests -v
+cd sdk/typescript && npm test
+```
+
+These tests cover lifecycle correlation, stable tool item IDs, HTTP/SSE,
+WebSocket and stdio JSON-RPC notification semantics, multi-client actor
+isolation, MCP process execution, independent `exec`/`exec resume` processes,
+SDK high-level handles and a real remote TUI attachment. They do not claim that a
+remote deployment fleet or browser-based Web onboarding is part of this
+runtime entry-point layer.

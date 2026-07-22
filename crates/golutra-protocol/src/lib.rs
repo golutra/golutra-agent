@@ -1,19 +1,23 @@
+pub mod agent;
 pub mod command;
 pub mod event;
 pub mod ipc;
 pub mod projection;
 pub mod query;
+pub mod rpc;
 pub mod session;
 pub mod storage;
 pub mod trace;
 pub mod tui_driver;
 pub mod version;
 
+pub use agent::*;
 pub use command::*;
 pub use event::*;
 pub use ipc::*;
 pub use projection::*;
 pub use query::*;
+pub use rpc::*;
 pub use session::*;
 pub use storage::*;
 pub use trace::*;

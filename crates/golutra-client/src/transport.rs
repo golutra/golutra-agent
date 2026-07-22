@@ -86,6 +86,10 @@ impl EmbeddedTransport {
         Ok(Self::new(RuntimeHost::in_memory().await?))
     }
 
+    pub async fn ephemeral_for_cwd(cwd: impl AsRef<Path>) -> Result<Self, ClientError> {
+        Ok(Self::new(RuntimeHost::ephemeral_for_cwd(cwd).await?))
+    }
+
     pub async fn for_current_cwd() -> Result<Self, ClientError> {
         let cwd = std::env::current_dir().map_err(|error| ClientError::Io(error.to_string()))?;
         Self::for_cwd(cwd).await
@@ -558,6 +562,11 @@ impl HttpSseTransport {
             .map_err(|_| ClientError::Http("runtime attachment lock is poisoned".to_owned()))
     }
 
+    pub(crate) fn current_attachment_actor_id(&self) -> Result<String, ClientError> {
+        self.current_attachment_id()
+            .map(|id| app_server_attachment_actor_id(&id))
+    }
+
     async fn refresh_attachment(&self, stale_attachment_id: &str) -> Result<String, ClientError> {
         let current = self.current_attachment_id()?;
         if current != stale_attachment_id {
@@ -824,10 +833,16 @@ impl HttpSseTransport {
             if sender.is_closed() {
                 return;
             }
-            if let Err(error) = result
-                && sender.send(Err(error)).await.is_err()
-            {
-                return;
+            if let Err(error) = result {
+                // A dropped SSE connection is a normal reconnect boundary.
+                // Do not surface it through RuntimeEventStream: doing so
+                // makes AgentClient fail before the background subscription
+                // can replay the missing facts. Permanent HTTP/protocol
+                // failures are still delivered to the consumer.
+                if is_permanent_subscription_error(&error) {
+                    let _ = sender.send(Err(error)).await;
+                    return;
+                }
             }
             if made_progress {
                 retry_delay = Duration::from_millis(100);
@@ -911,6 +926,23 @@ impl HttpSseTransport {
     }
 }
 
+fn is_permanent_subscription_error(error: &ClientError) -> bool {
+    match error {
+        ClientError::Serialization(_) | ClientError::InvalidSession(_) => true,
+        ClientError::Http(message) => {
+            let Some(status) = message
+                .strip_prefix("HTTP ")
+                .and_then(|value| value.split_whitespace().next())
+                .and_then(|value| value.parse::<u16>().ok())
+            else {
+                return false;
+            };
+            (400..500).contains(&status) && status != 410
+        }
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ParsedSseEvent {
     pub(crate) event: String,
@@ -964,6 +996,12 @@ impl RuntimeTransport {
         EmbeddedTransport::in_memory().await.map(Self::Embedded)
     }
 
+    pub async fn ephemeral_for_cwd(cwd: impl AsRef<Path>) -> Result<Self, ClientError> {
+        EmbeddedTransport::ephemeral_for_cwd(cwd)
+            .await
+            .map(Self::Embedded)
+    }
+
     pub async fn for_current_cwd() -> Result<Self, ClientError> {
         let cwd = std::env::current_dir().map_err(|error| ClientError::Io(error.to_string()))?;
         Self::for_cwd(cwd).await
@@ -1005,6 +1043,33 @@ impl RuntimeTransport {
         HttpSseTransport::connect_with_token(base_url, cwd, transport_token)
             .await
             .map(Self::Remote)
+    }
+
+    /// Whether this client renders a runtime owned by another process.
+    ///
+    /// Remote clients may query and control the runtime, but provider files,
+    /// OAuth callbacks and other host-local side effects belong to the app
+    /// server process rather than the client process.
+    #[must_use]
+    pub fn is_remote(&self) -> bool {
+        matches!(self, Self::Remote(_))
+    }
+
+    /// Return the actor identity that the runtime uses for control commands.
+    /// Embedded runtimes preserve the frontend actor; app-server attachments
+    /// use a server-owned actor so callers cannot spoof control ownership.
+    #[must_use]
+    pub fn control_actor_id(&self, embedded_actor_id: &str) -> String {
+        match self {
+            Self::Embedded(_) => embedded_actor_id.to_owned(),
+            #[cfg(unix)]
+            Self::LocalIpc(transport) => transport
+                .current_attachment_actor_id()
+                .unwrap_or_else(|_| embedded_actor_id.to_owned()),
+            Self::LocalDaemon(transport) | Self::Remote(transport) => transport
+                .current_attachment_actor_id()
+                .unwrap_or_else(|_| embedded_actor_id.to_owned()),
+        }
     }
 
     #[must_use]

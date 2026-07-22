@@ -761,14 +761,10 @@ async fn run_socket_driver(
     socket_path: &Path,
     command: &DriverArgs,
 ) -> miette::Result<()> {
-    use tokio::net::UnixListener;
-
     prepare_socket_parent(socket_path).await?;
     let _lease = SocketLease::acquire(socket_path)?;
     prepare_socket_path(socket_path).await?;
-    let listener = UnixListener::bind(socket_path).map_err(|error| {
-        miette::miette!("bind driver socket {}: {error}", socket_path.display())
-    })?;
+    let listener = bind_secure_socket(socket_path)?;
     set_socket_permissions(socket_path)?;
     let _guard = SocketGuard(socket_path.to_path_buf());
     eprintln!("golutra-tui driver ready: {}", socket_path.display());
@@ -842,6 +838,46 @@ fn validate_peer_uid(peer_uid: u32, expected_uid: u32) -> miette::Result<()> {
         Err(miette::miette!(
             "peer_uid_mismatch: peer UID {peer_uid} does not match Driver UID {expected_uid}"
         ))
+    }
+}
+
+#[cfg(unix)]
+fn bind_secure_socket(path: &Path) -> miette::Result<tokio::net::UnixListener> {
+    use std::os::unix::net::UnixListener as StdUnixListener;
+
+    // The socket path becomes visible as soon as bind returns. Restrict the
+    // creation umask so clients can never observe the platform default mode
+    // during the short interval before the explicit permission check below.
+    let listener = {
+        let _umask = RestrictiveUmask::new();
+        StdUnixListener::bind(path)
+            .map_err(|error| miette::miette!("bind driver socket {}: {error}", path.display()))?
+    };
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| miette::miette!("configure driver socket: {error}"))?;
+    tokio::net::UnixListener::from_std(listener)
+        .map_err(|error| miette::miette!("register driver socket: {error}"))
+}
+
+#[cfg(unix)]
+struct RestrictiveUmask(nix::libc::mode_t);
+
+#[cfg(unix)]
+impl RestrictiveUmask {
+    fn new() -> Self {
+        // Unix domain sockets are created with a platform-dependent default
+        // mode. 0177 reduces that mode to owner read/write (0600).
+        Self(unsafe { nix::libc::umask(0o177) })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RestrictiveUmask {
+    fn drop(&mut self) {
+        unsafe {
+            nix::libc::umask(self.0);
+        }
     }
 }
 

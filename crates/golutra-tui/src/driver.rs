@@ -99,12 +99,12 @@ impl TuiDriver {
         let (thread_id, session_id) = resolve_driver_session(session, &transport).await?;
         let task_id = parse_task_id(task_id)?;
         validate_task_id(task_id, session_id, &transport).await?;
-        let provider_status = current_provider_ui_status();
+        let provider_status = initial_provider_ui_status(&transport, session_id).await;
         let runtime_cwd = transport
             .cwd()
             .map(Path::to_path_buf)
             .ok_or_else(|| miette::miette!("TUI driver transport has no workspace"))?;
-        let auth_dialog = if task_id.is_some() {
+        let auth_dialog = if task_id.is_some() || transport.is_remote() {
             None
         } else {
             initial_auth_dialog()
@@ -204,10 +204,14 @@ impl TuiDriver {
             .map_err(|error| miette::miette!("{error}"))?;
         let projection: StateProjection =
             serde_json::from_value(value).map_err(|error| miette::miette!("{error}"))?;
+        let control_actor_id = self
+            .controller
+            .transport()
+            .control_actor_id(TUI_ACTOR_ID.as_str());
         Ok(projection
             .runtime_lane
             .map_or(DriverControllerMode::Controller, |lane| {
-                if lane.active_controller.id == TUI_ACTOR_ID.as_str() {
+                if lane.active_controller.id == control_actor_id {
                     DriverControllerMode::Controller
                 } else {
                     DriverControllerMode::Observer

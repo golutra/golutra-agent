@@ -3,6 +3,27 @@
   "title": "SdkProtocolBundle",
   "type": "object",
   "properties": {
+    "agent_item": {
+      "$ref": "#/$defs/AgentItem"
+    },
+    "agent_stream_event": {
+      "$ref": "#/$defs/AgentStreamEvent"
+    },
+    "agent_thread_ref": {
+      "$ref": "#/$defs/AgentThreadRef"
+    },
+    "agent_turn_options": {
+      "$ref": "#/$defs/AgentTurnOptions"
+    },
+    "agent_turn_result": {
+      "$ref": "#/$defs/AgentTurnResult"
+    },
+    "agent_turn_start": {
+      "$ref": "#/$defs/AgentTurnStart"
+    },
+    "agent_turn_start_response": {
+      "$ref": "#/$defs/AgentTurnStartResponse"
+    },
     "applied_candidate": {
       "$ref": "#/$defs/AppliedCandidate"
     },
@@ -84,6 +105,15 @@
     "improvement_candidate": {
       "$ref": "#/$defs/ImprovementCandidate"
     },
+    "json_rpc_notification": {
+      "$ref": "#/$defs/JsonRpcNotification"
+    },
+    "json_rpc_request": {
+      "$ref": "#/$defs/JsonRpcRequest"
+    },
+    "json_rpc_response": {
+      "$ref": "#/$defs/JsonRpcResponse"
+    },
     "memory_record": {
       "$ref": "#/$defs/MemoryRecord"
     },
@@ -164,6 +194,16 @@
     }
   },
   "required": [
+    "agent_thread_ref",
+    "agent_turn_start",
+    "agent_turn_start_response",
+    "agent_turn_options",
+    "agent_turn_result",
+    "agent_item",
+    "agent_stream_event",
+    "json_rpc_request",
+    "json_rpc_response",
+    "json_rpc_notification",
     "command",
     "command_ack",
     "query",
@@ -245,6 +285,507 @@
         "web",
         "ide",
         "runtime"
+      ]
+    },
+    "AgentItem": {
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "data": true,
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/AgentItemKind"
+        },
+        "runtime_event_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sequence_no": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/AgentItemStatus"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "status",
+        "title",
+        "data"
+      ]
+    },
+    "AgentItemKind": {
+      "type": "string",
+      "enum": [
+        "user_message",
+        "assistant_message",
+        "model",
+        "tool",
+        "approval",
+        "verification",
+        "runtime"
+      ]
+    },
+    "AgentItemStatus": {
+      "type": "string",
+      "enum": [
+        "in_progress",
+        "completed",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "AgentStreamEvent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "session_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "thread_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "timestamp": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "type": {
+              "type": "string",
+              "const": "thread.started"
+            },
+            "workspace_root": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "thread_id",
+            "session_id",
+            "timestamp"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "session_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "task_id": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "uuid"
+            },
+            "thread_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "timestamp": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "turn_id": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "uuid"
+            },
+            "type": {
+              "type": "string",
+              "const": "turn.started"
+            }
+          },
+          "required": [
+            "type",
+            "thread_id",
+            "session_id",
+            "timestamp"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "item": {
+              "$ref": "#/$defs/AgentItem"
+            },
+            "type": {
+              "type": "string",
+              "const": "item.started"
+            }
+          },
+          "required": [
+            "type",
+            "item"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "item": {
+              "$ref": "#/$defs/AgentItem"
+            },
+            "type": {
+              "type": "string",
+              "const": "item.updated"
+            }
+          },
+          "required": [
+            "type",
+            "item"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "item": {
+              "$ref": "#/$defs/AgentItem"
+            },
+            "type": {
+              "type": "string",
+              "const": "item.completed"
+            }
+          },
+          "required": [
+            "type",
+            "item"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "$ref": "#/$defs/RuntimeEvent"
+            },
+            "type": {
+              "type": "string",
+              "const": "runtime.event"
+            }
+          },
+          "required": [
+            "type",
+            "event"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "final_message": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "last_sequence_no": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
+            "session_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "status": {
+              "$ref": "#/$defs/TaskStatus"
+            },
+            "task_id": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "uuid"
+            },
+            "thread_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "timestamp": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "turn_id": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "uuid"
+            },
+            "type": {
+              "type": "string",
+              "const": "turn.completed"
+            }
+          },
+          "required": [
+            "type",
+            "thread_id",
+            "session_id",
+            "status",
+            "timestamp"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "error": {
+              "type": "string"
+            },
+            "final_message": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "last_sequence_no": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
+            "session_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "status": {
+              "$ref": "#/$defs/TaskStatus"
+            },
+            "task_id": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "uuid"
+            },
+            "thread_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "timestamp": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "turn_id": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "uuid"
+            },
+            "type": {
+              "type": "string",
+              "const": "turn.failed"
+            }
+          },
+          "required": [
+            "type",
+            "thread_id",
+            "session_id",
+            "status",
+            "error",
+            "timestamp"
+          ]
+        }
+      ]
+    },
+    "AgentThreadRef": {
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "thread_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "workspace_root": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "thread_id",
+        "session_id"
+      ]
+    },
+    "AgentTurnOptions": {
+      "type": "object",
+      "properties": {
+        "completion_criteria": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "output_schema": {
+          "default": null
+        }
+      }
+    },
+    "AgentTurnResult": {
+      "type": "object",
+      "properties": {
+        "final_message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_sequence_no": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "status": {
+          "$ref": "#/$defs/TaskStatus"
+        },
+        "task_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "thread_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "turn_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "thread_id",
+        "session_id",
+        "status"
+      ]
+    },
+    "AgentTurnStart": {
+      "type": "object",
+      "properties": {
+        "accepted": {
+          "type": "boolean"
+        },
+        "command_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "task_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "thread_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "turn_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "thread_id",
+        "session_id",
+        "command_id",
+        "accepted"
+      ]
+    },
+    "AgentTurnStartResponse": {
+      "type": "object",
+      "properties": {
+        "accepted": {
+          "type": "boolean"
+        },
+        "attachment_id": {
+          "type": "string"
+        },
+        "command_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "cursor": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "thread": {
+          "$ref": "#/$defs/AgentThreadRef"
+        }
+      },
+      "required": [
+        "attachment_id",
+        "thread",
+        "command_id",
+        "accepted"
       ]
     },
     "AppliedCandidate": {
@@ -3488,6 +4029,84 @@
         "status"
       ]
     },
+    "JsonRpcErrorObject": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "data": true,
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ]
+    },
+    "JsonRpcNotification": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "type": "string"
+        },
+        "method": {
+          "type": "string"
+        },
+        "params": true
+      },
+      "required": [
+        "jsonrpc",
+        "method",
+        "params"
+      ]
+    },
+    "JsonRpcRequest": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "default": null
+        },
+        "jsonrpc": {
+          "type": "string"
+        },
+        "method": {
+          "type": "string"
+        },
+        "params": {
+          "default": null
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "method"
+      ]
+    },
+    "JsonRpcResponse": {
+      "type": "object",
+      "properties": {
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JsonRpcErrorObject"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": true,
+        "jsonrpc": {
+          "type": "string"
+        },
+        "result": true
+      },
+      "required": [
+        "jsonrpc"
+      ]
+    },
     "LoopAction": {
       "type": "string",
       "enum": [
@@ -4712,6 +5331,7 @@
         "token_usage_recorded",
         "assistant_message",
         "tool_started",
+        "tool_progress",
         "tool_completed",
         "policy_evaluated",
         "verification_completed",
@@ -6480,7 +7100,8 @@
         "tool_execution",
         "workspace_change",
         "objective_validation",
-        "assistant_response"
+        "assistant_response",
+        "schema"
       ]
     },
     "VerificationDimensionStatus": {

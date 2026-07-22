@@ -16,11 +16,13 @@ use golutra_evolution::{
 use golutra_governor::RuntimeGovernorDecision;
 use golutra_memory::MemoryRecord;
 use golutra_protocol::{
-    ArtifactChunk, ArtifactReadRequest, CommandAck, ContextProjection, DebugProjection,
-    EvaluationProjection, EventFilter, EventPage, EventPageRequest, ProtocolHandshake,
-    RuntimeEvent, RuntimeEventSource, RuntimeEventType, RuntimeQuery, SessionCommand,
-    SessionCommandKind, SessionPage, SessionPageRequest, SessionWindow, SessionWindowRequest,
-    StateProjection, StorageMaintenanceReport, StorageStats, TaskTracePage, TaskTraceRequest,
+    AgentItem, AgentStreamEvent, AgentThreadRef, AgentTurnOptions, AgentTurnResult, AgentTurnStart,
+    AgentTurnStartResponse, ArtifactChunk, ArtifactReadRequest, CommandAck, ContextProjection,
+    DebugProjection, EvaluationProjection, EventFilter, EventPage, EventPageRequest,
+    JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, ProtocolHandshake, RuntimeEvent,
+    RuntimeEventSource, RuntimeEventType, RuntimeQuery, SessionCommand, SessionCommandKind,
+    SessionPage, SessionPageRequest, SessionWindow, SessionWindowRequest, StateProjection,
+    StorageMaintenanceReport, StorageStats, TaskTracePage, TaskTraceRequest,
     TuiDriverProtocolBundle, UserProjection, VisibleStep,
 };
 use schemars::JsonSchema;
@@ -38,6 +40,16 @@ pub struct ScenarioFixture {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SdkProtocolBundle {
+    pub agent_thread_ref: AgentThreadRef,
+    pub agent_turn_start: AgentTurnStart,
+    pub agent_turn_start_response: AgentTurnStartResponse,
+    pub agent_turn_options: AgentTurnOptions,
+    pub agent_turn_result: AgentTurnResult,
+    pub agent_item: AgentItem,
+    pub agent_stream_event: AgentStreamEvent,
+    pub json_rpc_request: JsonRpcRequest,
+    pub json_rpc_response: JsonRpcResponse,
+    pub json_rpc_notification: JsonRpcNotification,
     pub command: SessionCommand,
     pub command_ack: CommandAck,
     pub query: RuntimeQuery,
@@ -258,6 +270,16 @@ fn residual_risks(status: TaskStatus) -> Vec<String> {
 pub fn protocol_schema_names() -> Vec<&'static str> {
     vec![
         "ScenarioFixture",
+        "AgentThreadRef",
+        "AgentTurnStart",
+        "AgentTurnStartResponse",
+        "AgentTurnOptions",
+        "AgentTurnResult",
+        "AgentItem",
+        "AgentStreamEvent",
+        "JsonRpcRequest",
+        "JsonRpcResponse",
+        "JsonRpcNotification",
         "SessionCommand",
         "RuntimeEvent",
         "StateProjection",
@@ -305,6 +327,6 @@ mod tests {
         assert!(scenario_json.is_object());
         assert!(command_json.is_object());
         assert!(event_json.is_object());
-        assert_eq!(protocol_schema_names().len(), 7);
+        assert_eq!(protocol_schema_names().len(), 17);
     }
 }

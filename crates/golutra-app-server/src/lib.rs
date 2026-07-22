@@ -22,14 +22,15 @@ use axum::{
 };
 use fs2::FileExt;
 use golutra_client::{
-    APP_SERVER_ATTACHMENT_HEADER, APP_SERVER_PROTOCOL_HEADER, AppServerInfo, AppServerPaths,
-    ClientError, EmbeddedTransport, RuntimeAttachment, RuntimeClient, TaskTraceClient,
+    APP_SERVER_ATTACHMENT_HEADER, APP_SERVER_PROTOCOL_HEADER, AgentEventProjector, AppServerInfo,
+    AppServerPaths, ClientError, EmbeddedTransport, RuntimeAttachment, RuntimeClient,
+    TaskTraceClient, app_server_attachment_actor_id,
 };
-use golutra_core::{SessionId, TaskId, ThreadId, TraceView};
+use golutra_core::{Actor, ActorKind, CommandId, SessionId, TaskId, ThreadId, TraceView};
 use golutra_protocol::{
-    ArtifactChunk, ArtifactReadRequest, CommandAck, EventFilter, EventPage, EventPageRequest,
-    ProtocolVersionRange, RuntimeQuery, SessionCommand, SessionPage, SessionPageRequest,
-    SessionWindow, SessionWindowRequest, TaskTracePage, TaskTraceRequest,
+    AgentThreadRef, ArtifactChunk, ArtifactReadRequest, CommandAck, EventFilter, EventPage,
+    EventPageRequest, ProtocolVersionRange, RuntimeQuery, SessionCommand, SessionPage,
+    SessionPageRequest, SessionWindow, SessionWindowRequest, TaskTracePage, TaskTraceRequest,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -39,6 +40,7 @@ use uuid::Uuid;
 const MAX_ATTACHED_RUNTIMES: usize = 128;
 
 mod ipc;
+mod rpc;
 mod transport_security;
 
 use transport_security::TransportAuth;
@@ -52,15 +54,21 @@ pub struct AppState {
 struct AppStateInner {
     info: AppServerInfo,
     max_runtimes: usize,
+    runtime_home: Option<PathBuf>,
     transport_auth: TransportAuth,
     runtimes: Mutex<HashMap<PathBuf, Arc<OnceCell<AttachedRuntime>>>>,
-    attachments: Mutex<HashMap<String, EmbeddedTransport>>,
+    attachments: Mutex<HashMap<String, AttachedAttachment>>,
 }
 
 #[derive(Debug, Clone)]
 struct AttachedRuntime {
-    attachment_id: String,
     transport: EmbeddedTransport,
+}
+
+#[derive(Debug, Clone)]
+struct AttachedAttachment {
+    transport: EmbeddedTransport,
+    actor: Actor,
 }
 
 impl AppState {
@@ -77,19 +85,30 @@ impl AppState {
             info,
             TransportAuth::from_token(transport_token)?,
             max_runtimes,
+            None,
         ))
     }
 
-    fn from_auth(info: AppServerInfo, transport_auth: TransportAuth, max_runtimes: usize) -> Self {
+    fn from_auth(
+        info: AppServerInfo,
+        transport_auth: TransportAuth,
+        max_runtimes: usize,
+        runtime_home: Option<PathBuf>,
+    ) -> Self {
         Self {
             inner: Arc::new(AppStateInner {
                 info,
                 max_runtimes: max_runtimes.max(1),
+                runtime_home,
                 transport_auth,
                 runtimes: Mutex::new(HashMap::new()),
                 attachments: Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    pub(crate) fn info(&self) -> &AppServerInfo {
+        &self.inner.info
     }
 
     async fn attach_cwd(&self, cwd: impl AsRef<Path>) -> Result<RuntimeAttachment, ClientError> {
@@ -119,13 +138,14 @@ impl AppState {
                 runtime
             }
         };
+        let runtime_home = self.inner.runtime_home.clone();
         let attached = match runtime
             .get_or_try_init(|| async {
-                let transport = EmbeddedTransport::for_cwd(&cwd).await?;
-                Ok::<_, ClientError>(AttachedRuntime {
-                    attachment_id: Uuid::now_v7().to_string(),
-                    transport,
-                })
+                let transport = match runtime_home.as_ref() {
+                    Some(home) => EmbeddedTransport::from_home_and_cwd(home, &cwd).await?,
+                    None => EmbeddedTransport::for_cwd(&cwd).await?,
+                };
+                Ok::<_, ClientError>(AttachedRuntime { transport })
             })
             .await
         {
@@ -146,13 +166,23 @@ impl AppState {
             .transport
             .runtime_info(self.inner.info.base_url.clone())
             .await?;
-        self.inner
-            .attachments
-            .lock()
-            .await
-            .insert(attached.attachment_id.clone(), attached.transport);
+        // Every attach is a distinct controller capability. The durable
+        // runtime is shared by cwd, but the attachment id is the server-bound
+        // actor identity used for control commands.
+        let attachment_id = Uuid::now_v7().to_string();
+        let actor = Actor {
+            kind: ActorKind::Api,
+            id: app_server_attachment_actor_id(&attachment_id),
+        };
+        self.inner.attachments.lock().await.insert(
+            attachment_id.clone(),
+            AttachedAttachment {
+                transport: attached.transport,
+                actor,
+            },
+        );
         Ok(RuntimeAttachment {
-            attachment_id: attached.attachment_id,
+            attachment_id,
             runtime,
         })
     }
@@ -170,8 +200,42 @@ impl AppState {
             .lock()
             .await
             .get(attachment_id)
-            .cloned()
+            .map(|attachment| attachment.transport.clone())
             .ok_or_else(|| AppError::Attachment("runtime attachment was not found".to_owned()))
+    }
+
+    async fn attached_transport_id(
+        &self,
+        attachment_id: &str,
+    ) -> Result<EmbeddedTransport, AppError> {
+        self.inner
+            .attachments
+            .lock()
+            .await
+            .get(attachment_id)
+            .map(|attachment| attachment.transport.clone())
+            .ok_or_else(|| AppError::Attachment("runtime attachment was not found".to_owned()))
+    }
+
+    async fn attached_actor(&self, attachment_id: &str) -> Result<Actor, AppError> {
+        self.inner
+            .attachments
+            .lock()
+            .await
+            .get(attachment_id)
+            .map(|attachment| attachment.actor.clone())
+            .ok_or_else(|| AppError::Attachment("runtime attachment was not found".to_owned()))
+    }
+
+    async fn actor_from_headers(&self, headers: &HeaderMap) -> Result<Actor, AppError> {
+        let attachment_id = headers
+            .get(APP_SERVER_ATTACHMENT_HEADER)
+            .ok_or_else(|| {
+                AppError::Attachment("runtime attachment header is required".to_owned())
+            })?
+            .to_str()
+            .map_err(|_| AppError::Attachment("runtime attachment header is invalid".to_owned()))?;
+        self.attached_actor(attachment_id).await
     }
 }
 
@@ -180,12 +244,15 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/runtime/info", get(runtime_info))
         .route("/runtime/attach", post(attach_runtime))
+        .route("/rpc", post(rpc::http_rpc))
+        .route("/rpc/ws", get(rpc::websocket_rpc))
         .route("/attach", get(attach_page))
         .route("/commands", post(send_command))
         .route("/queries", post(query_runtime))
         .route("/traces", post(task_trace))
         .route("/artifacts/chunk", post(read_artifact_chunk))
         .route("/events", get(events))
+        .route("/agent/events", get(agent_events))
         .route("/events/page", get(event_page))
         .route("/events/replay", get(replay_events))
         .route("/threads", get(list_threads))
@@ -206,6 +273,7 @@ pub fn router(state: AppState) -> Router {
 pub async fn run(addr: SocketAddr) -> miette::Result<()> {
     validate_runtime_bind_addr(addr)?;
     let paths = AppServerPaths::global().map_err(|error| miette::miette!("{error}"))?;
+    let runtime_home = paths.home.clone();
     let lease = AppServerLease::acquire(&paths)?;
     let transport_auth = TransportAuth::load_or_create(&paths)?;
     let listener = tokio::net::TcpListener::bind(addr)
@@ -229,6 +297,7 @@ pub async fn run(addr: SocketAddr) -> miette::Result<()> {
         info,
         transport_auth,
         MAX_ATTACHED_RUNTIMES,
+        Some(runtime_home),
     ));
     #[cfg(unix)]
     {
@@ -247,6 +316,33 @@ pub async fn run(addr: SocketAddr) -> miette::Result<()> {
             .await
             .map_err(|error| miette::miette!("{error}"))
     }
+}
+
+/// Run the same app-server JSON-RPC dispatcher over newline-delimited stdio.
+/// This is intended for IDE bridges and local process supervisors. It does
+/// not publish a TCP endpoint, but attached workspaces still use the normal
+/// durable runtime storage under the Golutra home directory.
+pub async fn run_stdio() -> miette::Result<()> {
+    let paths = AppServerPaths::global().map_err(|error| miette::miette!("{error}"))?;
+    let runtime_home = paths.home.clone();
+    let transport_auth = TransportAuth::load_or_create(&paths)?;
+    let info = AppServerInfo {
+        instance_id: Uuid::now_v7().to_string(),
+        pid: std::process::id(),
+        base_url: "stdio://golutra-app-server".to_owned(),
+        ipc_path: app_server_ipc_path(&paths),
+        protocol_versions: ProtocolVersionRange::runtime(),
+        started_at: chrono::Utc::now(),
+    };
+    let state = AppState::from_auth(
+        info,
+        transport_auth,
+        MAX_ATTACHED_RUNTIMES,
+        Some(runtime_home),
+    );
+    rpc::serve_stdio(state)
+        .await
+        .map_err(|error| miette::miette!("{error}"))
 }
 
 #[cfg(unix)]
@@ -422,6 +518,8 @@ async fn send_command(
     Json(command): Json<SessionCommand>,
 ) -> Result<Json<CommandAck>, AppError> {
     let transport = state.attached_transport(&headers).await?;
+    let mut command = command;
+    command.actor = state.actor_from_headers(&headers).await?;
     Ok(Json(transport.send_command(command).await?))
 }
 
@@ -523,6 +621,115 @@ async fn events(
     Ok(Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default()))
 }
 
+/// Stream the normalized Agent contract over SSE.  The raw `/events` route is
+/// still available for audit consumers; this route is for SDKs and clients
+/// that should not reimplement RuntimeEvent projection in another language.
+async fn agent_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AgentEventQuery>,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, AppError> {
+    let transport = state.attached_transport(&headers).await?;
+    let session_id = parse_session_id(&query.session_id)?;
+    let thread = if let Some(thread_id) = query.thread_id.as_deref() {
+        let record = transport.resume_thread(parse_thread_id(thread_id)?).await?;
+        AgentThreadRef {
+            thread_id: record.thread_id,
+            session_id: record.session_id,
+            workspace_root: record.workspace_root,
+        }
+    } else {
+        let record = transport.thread_for_session(session_id).await?;
+        let record = record
+            .ok_or_else(|| AppError::InvalidId(format!("session `{session_id}` has no thread")))?;
+        AgentThreadRef {
+            thread_id: record.thread_id,
+            session_id: record.session_id,
+            workspace_root: record.workspace_root,
+        }
+    };
+    if thread.session_id != session_id {
+        return Err(AppError::InvalidId(
+            "thread and session do not belong together".to_owned(),
+        ));
+    }
+    let command_id = query
+        .command_id
+        .as_deref()
+        .map(parse_command_id)
+        .transpose()?;
+    let header_cursor = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let cursor = query.cursor.or(header_cursor);
+    let projection_cursor = query.start_cursor.or(cursor);
+    if let (Some(projection_cursor), Some(cursor)) = (projection_cursor, cursor)
+        && projection_cursor > cursor
+    {
+        return Err(AppError::InvalidId(
+            "start_cursor cannot be newer than cursor".to_owned(),
+        ));
+    }
+    let mut events = transport
+        .subscribe(EventFilter {
+            session_id,
+            task_id: None,
+            after_sequence_no: projection_cursor,
+        })
+        .await?;
+    let mut projector = AgentEventProjector::new(thread, command_id);
+    let stream = async_stream::stream! {
+        // This transport lifecycle marker is emitted once per SSE connection,
+        // including reconnects that carry a runtime cursor. Consumers must
+        // therefore treat thread.started as idempotent.
+        let initial = projector.thread_started();
+        if let Ok(value) = serde_json::to_value(initial) {
+            yield Ok::<Event, Infallible>(agent_sse_event(value));
+        }
+        while let Some(event) = events.recv().await {
+            match event {
+                Ok(event) => {
+                    let sequence_no = event.sequence_no;
+                    let Some(projected) = projector.project(event) else {
+                        continue;
+                    };
+                    let terminal = projector.is_finished();
+                    if cursor.is_some_and(|cursor| sequence_no <= cursor) {
+                        if terminal {
+                            break;
+                        }
+                        continue;
+                    }
+                    match serde_json::to_value(projected) {
+                        Ok(value) => {
+                            yield Ok::<Event, Infallible>(agent_sse_event(value));
+                        }
+                        Err(error) => {
+                            yield Ok::<Event, Infallible>(sse_named_event(
+                                "error",
+                                json!({"error": error.to_string()}),
+                            ));
+                            break;
+                        }
+                    }
+                    if terminal {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    yield Ok::<Event, Infallible>(sse_named_event(
+                        "error",
+                        json!({"error": error.to_string()}),
+                    ));
+                    break;
+                }
+            }
+        }
+    };
+    Ok(Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default()))
+}
+
 fn sse_event(value: Value) -> Event {
     let sequence_no = value.get("sequence_no").and_then(Value::as_u64);
     let builder = sequence_no.map_or_else(Event::default, |sequence_no| {
@@ -541,6 +748,23 @@ fn sse_named_event(name: &'static str, value: Value) -> Event {
             Event::default()
                 .event("error")
                 .data("event serialization failed")
+        })
+}
+
+fn agent_sse_event(value: Value) -> Event {
+    let sequence_no = value
+        .pointer("/event/sequence_no")
+        .or_else(|| value.pointer("/item/sequence_no"))
+        .or_else(|| value.get("last_sequence_no"))
+        .and_then(Value::as_u64);
+    let builder = sequence_no.map_or_else(Event::default, |sequence_no| {
+        Event::default().id(sequence_no.to_string())
+    });
+    builder
+        .event("agent_event")
+        .json_data(value)
+        .unwrap_or_else(|_| {
+            Event::default().data(json!({"error": "event serialization failed"}).to_string())
         })
 }
 
@@ -680,6 +904,15 @@ struct EventQuery {
     cursor: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct AgentEventQuery {
+    session_id: String,
+    thread_id: Option<String>,
+    command_id: Option<String>,
+    start_cursor: Option<u64>,
+    cursor: Option<u64>,
+}
+
 fn event_filter(query: EventQuery) -> Result<EventFilter, AppError> {
     Ok(EventFilter {
         session_id: parse_session_id(&query.session_id)?,
@@ -733,6 +966,12 @@ fn parse_thread_id(value: &str) -> Result<ThreadId, AppError> {
     value
         .parse()
         .map_err(|_| AppError::InvalidId(format!("invalid thread_id: {value}")))
+}
+
+fn parse_command_id(value: &str) -> Result<CommandId, AppError> {
+    value
+        .parse()
+        .map_err(|_| AppError::InvalidId(format!("invalid command_id: {value}")))
 }
 
 struct AppServerLease {
@@ -978,12 +1217,16 @@ mod tests {
         let transport = EmbeddedTransport::in_memory().await.expect("transport");
         let attachment_id = Uuid::now_v7().to_string();
         let session_id = transport.default_session_id();
-        state
-            .inner
-            .attachments
-            .lock()
-            .await
-            .insert(attachment_id.clone(), transport);
+        state.inner.attachments.lock().await.insert(
+            attachment_id.clone(),
+            AttachedAttachment {
+                transport,
+                actor: Actor {
+                    kind: ActorKind::Api,
+                    id: format!("test-attachment-{attachment_id}"),
+                },
+            },
+        );
         (state, attachment_id, session_id)
     }
 
@@ -1000,16 +1243,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_attachment_uses_the_home_captured_by_the_server() {
+        let home = tempfile::tempdir().expect("runtime home");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let state = AppState::from_auth(
+            server_info(),
+            TransportAuth::from_token(TEST_TRANSPORT_TOKEN).expect("transport auth"),
+            MAX_ATTACHED_RUNTIMES,
+            Some(home.path().to_path_buf()),
+        );
+
+        state
+            .attach_cwd(workspace.path())
+            .await
+            .expect("attach runtime");
+
+        assert!(home.path().join("state/runtime.sqlite").is_file());
+    }
+
+    #[tokio::test]
     async fn runtime_attachment_registry_is_bounded_and_failed_slots_are_released() {
         let state = AppState::with_runtime_limit(server_info(), TEST_TRANSPORT_TOKEN, 1)
             .expect("app state");
         let transport = EmbeddedTransport::in_memory().await.expect("transport");
         let occupied = Arc::new(OnceCell::new());
         occupied
-            .set(AttachedRuntime {
-                attachment_id: "existing".to_owned(),
-                transport,
-            })
+            .set(AttachedRuntime { transport })
             .expect("runtime cell");
         state
             .inner

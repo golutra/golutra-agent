@@ -12,6 +12,120 @@ use tokio::{
 
 use super::*;
 
+#[test]
+fn remote_subcommand_is_an_explicit_app_server_transport() {
+    let args = Args::try_parse_from([
+        "golutra-tui",
+        "--cwd",
+        "/tmp",
+        "remote",
+        "--url",
+        "https://runtime.example",
+    ])
+    .expect("remote arguments");
+    let Some(TuiCommand::Remote(remote)) = args.command else {
+        panic!("remote command");
+    };
+    assert_eq!(remote.url, "https://runtime.example");
+    assert_eq!(args.cwd, Some(PathBuf::from("/tmp")));
+}
+
+#[tokio::test]
+async fn remote_transport_attaches_to_the_real_app_server_and_resolves_a_session() {
+    let _guard = env_lock_guard().await;
+    let home = tempfile::tempdir().expect("home");
+    let cwd = tempfile::tempdir().expect("cwd");
+    let token = "remote-tui-test-token-000000000000000000000000000000000000";
+    let address = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("reserve app-server port")
+        .local_addr()
+        .expect("app-server address");
+    let previous_home = std::env::var("GOLUTRA_HOME").ok();
+    let previous_token = std::env::var("GOLUTRA_TRANSPORT_TOKEN").ok();
+    unsafe {
+        std::env::set_var("GOLUTRA_HOME", home.path());
+        std::env::set_var("GOLUTRA_TRANSPORT_TOKEN", token);
+    }
+    apply_auth_mock().expect("install app-server provider");
+    let server = tokio::spawn(golutra_app_server::run(address));
+    let mut last_error = None;
+    let mut transport = None;
+    for _ in 0..200 {
+        match RuntimeTransport::connect_with_token(
+            format!("http://{address}"),
+            cwd.path(),
+            SecretString::from(token.to_owned()),
+        )
+        .await
+        {
+            Ok(connected) => {
+                transport = Some(connected);
+                break;
+            }
+            Err(error) => {
+                last_error = Some(error.to_string());
+                assert!(
+                    !server.is_finished(),
+                    "remote app server exited: {}",
+                    last_error.as_deref().unwrap_or_default()
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }
+    }
+    let transport = transport.unwrap_or_else(|| {
+        panic!(
+            "remote app server did not accept a TUI attachment: {}",
+            last_error.unwrap_or_else(|| "unknown error".to_owned())
+        )
+    });
+    let (thread_id, session_id) = initial_session(None, &transport)
+        .await
+        .expect("initial remote session");
+    let canonical_cwd = cwd.path().canonicalize().expect("canonical cwd");
+    assert_eq!(transport.cwd(), Some(canonical_cwd.as_path()));
+    let RuntimeTransport::Remote(remote) = &transport else {
+        panic!("remote subcommand must use the remote transport variant");
+    };
+    assert_eq!(remote.server_info().base_url, format!("http://{address}"));
+    assert_ne!(thread_id, transport.default_thread_id());
+    assert_ne!(session_id, transport.default_session_id());
+    let provider_status = initial_provider_ui_status(&transport, session_id).await;
+    assert_eq!(provider_status.message, "ready (mock)");
+    assert_eq!(provider_status.model, "mock-model");
+
+    let mut app = TuiApp::new(
+        thread_id,
+        session_id,
+        None,
+        false,
+        provider_status.message,
+        None,
+    );
+    app.execute_slash_command(&transport, SlashCommand::Auth(SlashAuthCommand::Setup))
+        .await
+        .expect("remote auth setup guard");
+    assert!(app.auth_dialog.is_none());
+    assert!(app.command_messages.iter().any(|item| {
+        item.title == "Auth"
+            && item
+                .body
+                .iter()
+                .any(|line| line.contains("remote TUI cannot write provider credentials"))
+    }));
+
+    server.abort();
+    let _ = server.await;
+    match previous_home {
+        Some(value) => unsafe { std::env::set_var("GOLUTRA_HOME", value) },
+        None => unsafe { std::env::remove_var("GOLUTRA_HOME") },
+    }
+    match previous_token {
+        Some(value) => unsafe { std::env::set_var("GOLUTRA_TRANSPORT_TOKEN", value) },
+        None => unsafe { std::env::remove_var("GOLUTRA_TRANSPORT_TOKEN") },
+    }
+}
+
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
 async fn env_lock_guard() -> MutexGuard<'static, ()> {

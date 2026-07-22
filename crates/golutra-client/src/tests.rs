@@ -2625,7 +2625,12 @@ async fn fork_from_turn_copies_complete_history_with_fresh_runtime_ids() {
 
     let contributors = transport
         .host
-        .context_contributors_for_task(child.session_id, TaskId::new(), "continue child".to_owned())
+        .context_contributors_for_task(
+            child.session_id,
+            TaskId::new(),
+            "continue child".to_owned(),
+            None,
+        )
         .await
         .expect("child context");
     let history = contributors
@@ -3020,6 +3025,7 @@ async fn resumed_session_context_includes_previous_conversation_summary() {
             transport.default_session_id(),
             TaskId::new(),
             "continue from previous task".to_owned(),
+            None,
         )
         .await
         .expect("contributors");
@@ -3087,7 +3093,7 @@ async fn explicit_compaction_is_reused_by_follow_up_context() {
         .expect("compact");
     let contributors = transport
         .host
-        .context_contributors_for_task(session_id, TaskId::new(), "continue".to_owned())
+        .context_contributors_for_task(session_id, TaskId::new(), "continue".to_owned(), None)
         .await
         .expect("context");
     let history = contributors
@@ -3532,12 +3538,10 @@ async fn observer_must_take_over_before_controlling_or_approving_a_task() {
 
 #[test]
 fn plain_conversation_plan_does_not_send_workspace_tools() {
-    let workspace = tempdir().expect("workspace");
-    let provider = IsolatedGlobalMockProvider::install_blocking();
-    let runtime_paths = RuntimePaths::from_home_and_cwd(provider._home.path(), workspace.path())
-        .expect("runtime paths");
+    let _provider = IsolatedGlobalMockProvider::install_blocking();
+    let provider_paths = ProviderConfigPaths::global().expect("provider paths");
 
-    let plan = mock_provider_plan(Some(&runtime_paths), &json!({"prompt": "你好"}), "你好")
+    let plan = mock_provider_plan(Some(&provider_paths), &json!({"prompt": "你好"}), "你好")
         .expect("provider plan");
 
     assert!(!plan.touched_code);
@@ -3580,13 +3584,11 @@ fn live_provider_keeps_workspace_tools_available_for_queued_turns() {
 
 #[test]
 fn workspace_objective_plan_still_sends_workspace_tools() {
-    let workspace = tempdir().expect("workspace");
-    let provider = IsolatedGlobalMockProvider::install_blocking();
-    let runtime_paths = RuntimePaths::from_home_and_cwd(provider._home.path(), workspace.path())
-        .expect("runtime paths");
+    let _provider = IsolatedGlobalMockProvider::install_blocking();
+    let provider_paths = ProviderConfigPaths::global().expect("provider paths");
 
     let plan = mock_provider_plan(
-        Some(&runtime_paths),
+        Some(&provider_paths),
         &json!({"prompt": "读取 README.md"}),
         "读取 README.md",
     )
@@ -3598,18 +3600,70 @@ fn workspace_objective_plan_still_sends_workspace_tools() {
 
 #[tokio::test]
 async fn malformed_provider_config_does_not_silently_fallback_to_mock() {
-    let workspace = tempdir().expect("workspace");
-    let home = IsolatedGlobalMockProvider::empty().await;
+    let _home = IsolatedGlobalMockProvider::empty().await;
     let paths = ProviderConfigPaths::global().expect("provider paths");
     fs::write(&paths.user_config, "{invalid-json").expect("malformed provider config");
-    let runtime_paths = RuntimePaths::from_home_and_cwd(home._home.path(), workspace.path())
-        .expect("runtime paths");
 
-    let error = mock_provider_plan(Some(&runtime_paths), &json!({}), "hello")
+    let error = mock_provider_plan(Some(&paths), &json!({}), "hello")
         .expect_err("malformed config must fail");
 
     assert!(matches!(error, ProviderError::NotConfigured { .. }));
     assert!(error.to_string().contains("could not be loaded"));
+}
+
+#[tokio::test]
+async fn ephemeral_runtime_separates_global_provider_config_from_temporary_state() {
+    let workspace = tempdir().expect("workspace");
+    let provider = IsolatedGlobalMockProvider::install().await;
+    let global_provider_paths = ProviderConfigPaths::global().expect("provider paths");
+    let transport = EmbeddedTransport::ephemeral_for_cwd(workspace.path())
+        .await
+        .expect("ephemeral transport");
+    let host = transport.host.clone();
+    let runtime_paths = host
+        .runtime_paths
+        .as_ref()
+        .expect("temporary runtime paths");
+
+    assert_ne!(runtime_paths.home, global_provider_paths.home);
+    assert_eq!(
+        host.provider_config_paths
+            .as_ref()
+            .expect("global provider paths"),
+        &global_provider_paths
+    );
+
+    let ack = transport
+        .send_command(command_with_payload(
+            transport.default_session_id(),
+            json!({
+                "prompt": "write a file",
+                "path": "ephemeral.txt",
+                "content": "temporary state",
+            }),
+        ))
+        .await
+        .expect("write command");
+    assert!(ack.accepted);
+    wait_for_status(
+        &transport,
+        transport.default_session_id(),
+        TaskStatus::Completed,
+    )
+    .await;
+
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("ephemeral.txt")).expect("written file"),
+        "temporary state"
+    );
+    assert!(
+        fs::read_dir(&runtime_paths.checkpoints_dir)
+            .expect("checkpoint directory")
+            .next()
+            .is_some(),
+        "ephemeral writes must still produce checkpoints"
+    );
+    drop(provider);
 }
 
 #[tokio::test]
@@ -3905,6 +3959,7 @@ async fn context_loads_bounded_root_agents_instructions_as_system_context() {
             transport.default_session_id(),
             TaskId::new(),
             "inspect project".to_owned(),
+            None,
         )
         .await
         .expect("contributors");

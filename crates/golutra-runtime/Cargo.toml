@@ -17,6 +17,7 @@ golutra-protocol.workspace = true
 golutra-tools = { path = "../golutra-tools" }
 golutra-verify = { path = "../golutra-verify" }
 ignore.workspace = true
+jsonschema.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 shlex.workspace = true

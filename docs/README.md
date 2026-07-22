@@ -23,6 +23,7 @@
 19. `extensions-sdk-delivery.md`：Plugin/MCP、IPC、TypeScript/Python SDK 和安装交付。
 20. `tui-driver.md`：agent 可控的原生离屏 TUI、NDJSON/Unix socket 协议、快照和安全边界。
 21. `framework-comparison.md`：六个外部 agent 项目对 Golutra 的影响。
+22. `runtime-entrypoints.md`：exec、App Server、Python/TypeScript SDK、MCP 和 Remote TUI 的进程模型、协议边界和验收方式。
 
 ## 文档分工
 
@@ -49,3 +50,4 @@
 | `extensions-sdk-delivery.md` | Plugin/MCP、transport、SDK 和交付 |
 | `tui-driver.md` | 原生 TUI Driver、离屏快照、NDJSON/Unix socket 和进程级验收 |
 | `framework-comparison.md` | 外部项目调研结论 |
+| `runtime-entrypoints.md` | 五类运行入口、共享 Runtime 分层、进程模型和跨进程验收 |

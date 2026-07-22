@@ -45,7 +45,7 @@ rust-version = "1.93"
 anyhow = "1.0"
 async-stream = "0.3"
 async-trait = "0.1"
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
@@ -62,7 +62,7 @@ oauth2 = { version = "5.0", default-features = false, features = ["reqwest", "ru
 ratatui = "0.28"
 regex = "1.11"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-rmcp = { version = "2.2.0", default-features = false, features = ["client", "transport-child-process"] }
+rmcp = { version = "2.2.0", default-features = false, features = ["client", "macros", "server", "transport-child-process", "transport-io"] }
 schemars = { version = "1.0", features = ["chrono04", "uuid1"] }
 secrecy = "0.10"
 serde = { version = "1.0", features = ["derive"] }
@@ -79,6 +79,7 @@ tree-sitter-rust = "0.24"
 tree-sitter-typescript = "0.23"
 tokio = { version = "1.47", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1"
+tokio-tungstenite = "0.29"
 tokio-util = { version = "0.7", features = ["rt"] }
 tower = { version = "0.5", features = ["util"] }
 uuid = { version = "1.17", features = ["serde", "v4", "v7"] }

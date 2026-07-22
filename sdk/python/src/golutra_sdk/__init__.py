@@ -1,5 +1,6 @@
 from . import generated as _generated
-from .client import GolutraClient, GolutraError
+from .client import GolutraClient, GolutraError, GolutraHttpError
+from .agent import Thread, TurnHandle
 from .generated import *
 from .tui_driver import (
     TUI_DRIVER_PROTOCOL_VERSION,
@@ -11,6 +12,9 @@ from .tui_driver import (
 __all__ = [
     "GolutraClient",
     "GolutraError",
+    "GolutraHttpError",
+    "Thread",
+    "TurnHandle",
     "TUI_DRIVER_PROTOCOL_VERSION",
     "TuiDriverClient",
     "TuiDriverDisconnectedError",

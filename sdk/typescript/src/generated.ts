@@ -1,56 +1,71 @@
 // Generated from Golutra Rust protocol schemas. Do not edit manually.
 
-export type AutomationCandidateKind = "benchmark" | "generated_task" | "skill" | "runtime_change";
-export type CandidateRisk = "low" | "medium" | "high" | "critical";
-export type CandidateStatus =
-  | "proposed"
-  | "regression_passed"
-  | "needs_human_review"
-  | "approved"
-  | "applied"
-  | "rejected"
-  | "rolled_back";
-export type BenchmarkCheckStatus = "pass" | "fail" | "unknown" | "not_applicable";
-export type ActorKind = "user" | "api" | "tui" | "cli" | "sdk" | "web" | "ide" | "runtime";
-export type SessionCommandKind =
-  | "create"
-  | "prompt"
-  | "approve"
-  | "deny"
-  | "pause"
-  | "resume"
-  | "abort"
-  | "takeover"
-  | "compact"
-  | "memory_rollback"
-  | "memory_feedback"
-  | "run_regression"
-  | "review_candidate"
-  | "apply_candidate"
-  | "rollback_candidate"
-  | "record_benchmark"
-  | "compare_counterfactual"
-  | "plan_evolution"
-  | "run_evolution"
-  | "stage_skill"
-  | "review_skill"
-  | "install_skill"
-  | "rollback_skill"
-  | "provider_configured"
-  | "provider_auth_submitted"
-  | "provider_auth_cancelled"
-  | "run_storage_maintenance"
-  | "wait_post_task_job"
-  | "retry_post_task_job"
-  | "run_regression_campaign"
-  | "review_memory_candidate"
-  | "expire_memory"
-  | "verify"
-  | "replay"
-  | "export";
-export type BudgetOverflowAction = "trim" | "compact" | "ask_user" | "block";
-export type RedactionStatus = "raw" | "redacted" | "not_required";
-export type BusyPolicy = "append" | "inject" | "interrupt" | "reject";
+export type AgentItemKind =
+  "user_message" | "assistant_message" | "model" | "tool" | "approval" | "verification" | "runtime";
+export type AgentItemStatus = "in_progress" | "completed" | "failed" | "cancelled";
+export type AgentStreamEvent =
+  | {
+      session_id: string;
+      thread_id: string;
+      timestamp: string;
+      type: "thread.started";
+      workspace_root?: string | null;
+      [k: string]: unknown;
+    }
+  | {
+      session_id: string;
+      task_id?: string | null;
+      thread_id: string;
+      timestamp: string;
+      turn_id?: string | null;
+      type: "turn.started";
+      [k: string]: unknown;
+    }
+  | {
+      item: AgentItem;
+      type: "item.started";
+      [k: string]: unknown;
+    }
+  | {
+      item: AgentItem;
+      type: "item.updated";
+      [k: string]: unknown;
+    }
+  | {
+      item: AgentItem;
+      type: "item.completed";
+      [k: string]: unknown;
+    }
+  | {
+      event: RuntimeEvent;
+      type: "runtime.event";
+      [k: string]: unknown;
+    }
+  | {
+      final_message?: string | null;
+      last_sequence_no?: number | null;
+      session_id: string;
+      status: TaskStatus;
+      task_id?: string | null;
+      thread_id: string;
+      timestamp: string;
+      turn_id?: string | null;
+      type: "turn.completed";
+      [k: string]: unknown;
+    }
+  | {
+      error: string;
+      final_message?: string | null;
+      last_sequence_no?: number | null;
+      session_id: string;
+      status: TaskStatus;
+      task_id?: string | null;
+      thread_id: string;
+      timestamp: string;
+      turn_id?: string | null;
+      type: "turn.failed";
+      [k: string]: unknown;
+    };
 export type RuntimeEventType =
   | "command_received"
   | "command_completed"
@@ -71,6 +86,7 @@ export type RuntimeEventType =
   | "token_usage_recorded"
   | "assistant_message"
   | "tool_started"
+  | "tool_progress"
   | "tool_completed"
   | "policy_evaluated"
   | "verification_completed"
@@ -144,6 +160,70 @@ export type RuntimeEventSource =
   | "governor"
   | "evolution"
   | "user";
+export type TaskStatus =
+  | "idle"
+  | "running"
+  | "waiting_approval"
+  | "waiting_authentication"
+  | "pausing"
+  | "paused"
+  | "aborting"
+  | "completed"
+  | "partial"
+  | "failed"
+  | "blocked"
+  | "cancelled";
+export type AutomationCandidateKind = "benchmark" | "generated_task" | "skill" | "runtime_change";
+export type CandidateRisk = "low" | "medium" | "high" | "critical";
+export type CandidateStatus =
+  | "proposed"
+  | "regression_passed"
+  | "needs_human_review"
+  | "approved"
+  | "applied"
+  | "rejected"
+  | "rolled_back";
+export type BenchmarkCheckStatus = "pass" | "fail" | "unknown" | "not_applicable";
+export type ActorKind = "user" | "api" | "tui" | "cli" | "sdk" | "web" | "ide" | "runtime";
+export type SessionCommandKind =
+  | "create"
+  | "prompt"
+  | "approve"
+  | "deny"
+  | "pause"
+  | "resume"
+  | "abort"
+  | "takeover"
+  | "compact"
+  | "memory_rollback"
+  | "memory_feedback"
+  | "run_regression"
+  | "review_candidate"
+  | "apply_candidate"
+  | "rollback_candidate"
+  | "record_benchmark"
+  | "compare_counterfactual"
+  | "plan_evolution"
+  | "run_evolution"
+  | "stage_skill"
+  | "review_skill"
+  | "install_skill"
+  | "rollback_skill"
+  | "provider_configured"
+  | "provider_auth_submitted"
+  | "provider_auth_cancelled"
+  | "run_storage_maintenance"
+  | "wait_post_task_job"
+  | "retry_post_task_job"
+  | "run_regression_campaign"
+  | "review_memory_candidate"
+  | "expire_memory"
+  | "verify"
+  | "replay"
+  | "export";
+export type BudgetOverflowAction = "trim" | "compact" | "ask_user" | "block";
+export type RedactionStatus = "raw" | "redacted" | "not_required";
+export type BusyPolicy = "append" | "inject" | "interrupt" | "reject";
 export type EvidenceStrength = "weak" | "medium" | "strong";
 export type LoopAction =
   | "continue"
@@ -161,7 +241,7 @@ export type PostTaskJobStatus =
   "queued" | "leased" | "running" | "succeeded" | "failed" | "cancelled";
 export type ToolResultStatus = "ok" | "error" | "blocked" | "cancelled" | "timeout";
 export type VerificationCheckKind =
-  "tool_execution" | "workspace_change" | "objective_validation" | "assistant_response";
+  "tool_execution" | "workspace_change" | "objective_validation" | "assistant_response" | "schema";
 export type VerificationResult = "pass" | "fail" | "partial" | "unknown";
 export type PromotionDecisionKind = "approve" | "reject" | "needs_human_review";
 export type PromotionReviewer = "system" | "human" | "agent";
@@ -199,19 +279,6 @@ export type RegressionExecutionRole = "baseline" | "candidate";
 export type RegressionExecutionStatus =
   "queued" | "running" | "succeeded" | "failed" | "inconclusive";
 export type SessionRangeDirection = "single" | "newer" | "older";
-export type TaskStatus =
-  | "idle"
-  | "running"
-  | "waiting_approval"
-  | "waiting_authentication"
-  | "pausing"
-  | "paused"
-  | "aborting"
-  | "completed"
-  | "partial"
-  | "failed"
-  | "blocked"
-  | "cancelled";
 export type VerificationAssertionKind =
   | "file_state"
   | "diff"
@@ -500,6 +567,13 @@ export type DriverNotificationKind =
   "heartbeat" | "runtime_event_available" | "state_changed" | "task_terminal";
 
 export interface SdkProtocolBundle {
+  agent_item: AgentItem;
+  agent_stream_event: AgentStreamEvent;
+  agent_thread_ref: AgentThreadRef;
+  agent_turn_options: AgentTurnOptions;
+  agent_turn_result: AgentTurnResult;
+  agent_turn_start: AgentTurnStart;
+  agent_turn_start_response: AgentTurnStartResponse;
   applied_candidate: AppliedCandidate;
   artifact_chunk: ArtifactChunk;
   artifact_read_request: ArtifactReadRequest;
@@ -527,6 +601,9 @@ export interface SdkProtocolBundle {
   generated_task_execution: GeneratedTaskExecution;
   governor_decision: RuntimeGovernorDecision;
   improvement_candidate: ImprovementCandidate;
+  json_rpc_notification: JsonRpcNotification;
+  json_rpc_request: JsonRpcRequest;
+  json_rpc_response: JsonRpcResponse;
   memory_record: MemoryRecord;
   novelty_record: NoveltyRecord;
   open_ended_budget: OpenEndedBudget;
@@ -553,6 +630,74 @@ export interface SdkProtocolBundle {
   task_trace_request: TaskTraceRequest;
   tui_driver: TuiDriverProtocolBundle;
   user_projection: UserProjection;
+  [k: string]: unknown;
+}
+export interface AgentItem {
+  content?: string | null;
+  data: unknown;
+  id: string;
+  kind: AgentItemKind;
+  runtime_event_id?: string | null;
+  sequence_no?: number | null;
+  status: AgentItemStatus;
+  title: string;
+  [k: string]: unknown;
+}
+export interface RuntimeEvent {
+  durable: boolean;
+  event_type: RuntimeEventType;
+  id: string;
+  parent_event_id?: string | null;
+  payload: unknown;
+  payload_ref?: string | null;
+  sequence_no: number;
+  session_id: string;
+  source: RuntimeEventSource;
+  task_id?: string | null;
+  timestamp: string;
+  turn_id?: string | null;
+  [k: string]: unknown;
+}
+export interface AgentThreadRef {
+  session_id: string;
+  thread_id: string;
+  workspace_root?: string | null;
+  [k: string]: unknown;
+}
+export interface AgentTurnOptions {
+  completion_criteria?: string[];
+  output_schema?: {
+    [k: string]: unknown;
+  };
+  [k: string]: unknown;
+}
+export interface AgentTurnResult {
+  final_message?: string | null;
+  last_sequence_no?: number | null;
+  session_id: string;
+  status: TaskStatus;
+  task_id?: string | null;
+  thread_id: string;
+  turn_id?: string | null;
+  [k: string]: unknown;
+}
+export interface AgentTurnStart {
+  accepted: boolean;
+  command_id: string;
+  reason?: string | null;
+  session_id: string;
+  task_id?: string | null;
+  thread_id: string;
+  turn_id?: string | null;
+  [k: string]: unknown;
+}
+export interface AgentTurnStartResponse {
+  accepted: boolean;
+  attachment_id: string;
+  command_id: string;
+  cursor?: number | null;
+  reason?: string | null;
+  thread: AgentThreadRef;
   [k: string]: unknown;
 }
 export interface AppliedCandidate {
@@ -819,21 +964,6 @@ export interface DebugEventWindow {
   has_more_before: boolean;
   limit: number;
   start_cursor?: number | null;
-  [k: string]: unknown;
-}
-export interface RuntimeEvent {
-  durable: boolean;
-  event_type: RuntimeEventType;
-  id: string;
-  parent_event_id?: string | null;
-  payload: unknown;
-  payload_ref?: string | null;
-  sequence_no: number;
-  session_id: string;
-  source: RuntimeEventSource;
-  task_id?: string | null;
-  timestamp: string;
-  turn_id?: string | null;
   [k: string]: unknown;
 }
 export interface EvidenceRecord {
@@ -1244,6 +1374,36 @@ export interface GoalAlignmentCheck {
   evidence_refs: string[];
   reason: string;
   task_id: string;
+  [k: string]: unknown;
+}
+export interface JsonRpcNotification {
+  jsonrpc: string;
+  method: string;
+  params: unknown;
+  [k: string]: unknown;
+}
+export interface JsonRpcRequest {
+  id?: {
+    [k: string]: unknown;
+  };
+  jsonrpc: string;
+  method: string;
+  params?: {
+    [k: string]: unknown;
+  };
+  [k: string]: unknown;
+}
+export interface JsonRpcResponse {
+  error?: JsonRpcErrorObject | null;
+  id?: unknown;
+  jsonrpc: string;
+  result?: unknown;
+  [k: string]: unknown;
+}
+export interface JsonRpcErrorObject {
+  code: number;
+  data?: unknown;
+  message: string;
   [k: string]: unknown;
 }
 export interface MemoryRecord {

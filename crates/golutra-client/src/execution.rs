@@ -20,6 +20,7 @@ impl RuntimeHost {
         session_id: SessionId,
         current_task_id: TaskId,
         objective: String,
+        output_schema: Option<&Value>,
     ) -> Result<Vec<ContextContributor>, ClientError> {
         let workspace_root = self.execution_workspace_root()?;
         let mut contributors = vec![ContextContributor {
@@ -100,6 +101,19 @@ impl RuntimeHost {
                 content: history,
                 token_budget_hint: 1024,
                 source_refs,
+            });
+        }
+
+        if let Some(output_schema) = output_schema.filter(|value| !value.is_null()) {
+            let schema = serde_json::to_string(output_schema)?;
+            contributors.push(ContextContributor {
+                name: "output_schema".to_owned(),
+                role: ProviderRole::System,
+                content: format!(
+                    "The final assistant response must contain only JSON that validates against this JSON Schema. Do not wrap it in Markdown:\n{schema}"
+                ),
+                token_budget_hint: 1_024,
+                source_refs: vec![format!("task:{current_task_id}:output_schema")],
             });
         }
 
@@ -299,7 +313,12 @@ impl RuntimeHost {
             None => agent_loop,
         };
         let contributors = self
-            .context_contributors_for_task(task.session_id, task.task_id, objective.clone())
+            .context_contributors_for_task(
+                task.session_id,
+                task.task_id,
+                objective.clone(),
+                task.payload.get("output_schema"),
+            )
             .await?;
         let (trace_tx, mut trace_rx) = mpsc::unbounded_channel::<HostedTraceCommand>();
         let fact_recorder = CanonicalFactRecorder::new(self.clone(), task.clone());
@@ -333,6 +352,7 @@ impl RuntimeHost {
                     turn_id: task.turn_id,
                     objective: objective.clone(),
                     completion_criteria,
+                    output_schema: task.payload.get("output_schema").cloned(),
                     touched_code,
                     contributors,
                     tools: if workspace_tools_enabled {
@@ -428,7 +448,11 @@ impl RuntimeHost {
             let plan = if self.force_mock_provider {
                 isolated_mock_provider_plan(&task.payload, objective)
             } else {
-                mock_provider_plan(self.runtime_paths.as_ref(), &task.payload, objective)
+                mock_provider_plan(
+                    self.provider_config_paths.as_ref(),
+                    &task.payload,
+                    objective,
+                )
             };
             match plan {
                 Ok(plan) => {

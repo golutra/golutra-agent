@@ -14,7 +14,7 @@ from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 
-RUNTIME_PROTOCOL_VERSION = 3
+RUNTIME_PROTOCOL_VERSION = 4
 JSON_REQUEST_TIMEOUT_SECONDS = 30
 MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_SSE_EVENT_BYTES = 1024 * 1024
@@ -24,6 +24,18 @@ T = TypeVar("T")
 
 class GolutraError(RuntimeError):
     pass
+
+
+class GolutraHttpError(GolutraError):
+    """An HTTP response that can be classified by SDK reconnect logic."""
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(f"HTTP {status}: {message}")
+        self.status = status
+
+    @property
+    def retryable(self) -> bool:
+        return self.status in {408, 409, 425, 429, 410} or self.status >= 500
 
 
 class GolutraClient:
@@ -59,6 +71,46 @@ class GolutraClient:
 
     def runtime_info(self) -> dict[str, Any]:
         return dict(self._runtime_attachment()["runtime"])
+
+    def rpc(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Call an app-server JSON-RPC method through the authenticated attachment."""
+        response = self._request_json(
+            "POST",
+            "/rpc",
+            body={
+                "jsonrpc": "2.0",
+                "id": str(uuid.uuid4()),
+                "method": method,
+                "params": params or {},
+            },
+        )
+        error = response.get("error")
+        if isinstance(error, dict):
+            raise GolutraError(
+                f"JSON-RPC {error.get('code', -32000)}: {error.get('message', 'request failed')}"
+            )
+        result = response.get("result")
+        if not isinstance(result, dict):
+            raise GolutraError("JSON-RPC response result must be an object")
+        return result
+
+    def start_thread(self):
+        from .agent import Thread
+
+        result = self.rpc("thread/start")
+        thread = result.get("thread")
+        if not isinstance(thread, dict):
+            raise GolutraError("thread/start response did not include a thread")
+        return Thread(self, thread)
+
+    def resume(self, thread_id: str):
+        from .agent import Thread
+
+        result = self.rpc("thread/resume", {"thread_id": thread_id})
+        thread = result.get("thread")
+        if not isinstance(thread, dict):
+            raise GolutraError("thread/resume response did not include a thread")
+        return Thread(self, thread)
 
     def send_command(self, command: dict[str, Any]) -> dict[str, Any]:
         return self._request_json("POST", "/commands", body=command)
@@ -171,7 +223,99 @@ class GolutraClient:
                         yield event
                         if isinstance(sequence, int):
                             cursor = sequence
-            except (GolutraError, URLError, OSError):
+            except GolutraHttpError as error:
+                if not error.retryable:
+                    raise
+                if stop_event is not None and stop_event.is_set():
+                    return
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 2.0)
+            except (URLError, OSError):
+                if stop_event is not None and stop_event.is_set():
+                    return
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 2.0)
+
+    def subscribe_agent(
+        self,
+        session_id: str,
+        thread_id: str,
+        command_id: str,
+        cursor: int | None = None,
+        *,
+        start_cursor: int | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> Generator[dict[str, Any], None, None]:
+        """Yield normalized AgentStreamEvent JSON from the shared projector."""
+        retry_delay = 0.1
+        while stop_event is None or not stop_event.is_set():
+            parameters: dict[str, Any] = {
+                "session_id": session_id,
+                "thread_id": thread_id,
+                "command_id": command_id,
+            }
+            if start_cursor is not None:
+                parameters["start_cursor"] = start_cursor
+            if cursor is not None:
+                parameters["cursor"] = cursor
+            request = self._request(
+                "GET",
+                f"/agent/events?{urlencode(parameters)}",
+                attached=True,
+                last_event_id=cursor,
+            )
+            try:
+                with self._open(request) as response:
+                    if response.status == 410:
+                        self._clear_attachment()
+                        continue
+                    if not 200 <= response.status < 300:
+                        raise self._http_error(response.status, self._read_bounded(response))
+                    retry_delay = 0.1
+                    event_name = ""
+                    data: list[str] = []
+                    frame_size = 0
+                    for raw_line in response:
+                        frame_size += len(raw_line)
+                        if frame_size > MAX_SSE_EVENT_BYTES:
+                            raise GolutraError(
+                                f"SSE event exceeds {MAX_SSE_EVENT_BYTES} byte limit"
+                            )
+                        line = raw_line.decode("utf-8").rstrip("\r\n")
+                        if line:
+                            if line.startswith("event:"):
+                                event_name = line[6:].strip()
+                            elif line.startswith("data:"):
+                                data.append(line[5:].lstrip())
+                            continue
+                        frame_size = 0
+                        if not data:
+                            event_name = ""
+                            continue
+                        payload = "\n".join(data)
+                        data = []
+                        if event_name == "error":
+                            raise GolutraError(payload)
+                        event_name = ""
+                        event = json.loads(payload)
+                        if not isinstance(event, dict):
+                            raise GolutraError("agent SSE payload must be an object")
+                        sequence = _agent_event_sequence(event)
+                        if isinstance(sequence, int) and isinstance(cursor, int) and sequence <= cursor:
+                            continue
+                        yield event
+                        if isinstance(sequence, int):
+                            cursor = sequence
+                        if event.get("type") in {"turn.completed", "turn.failed"}:
+                            return
+            except GolutraHttpError as error:
+                if not error.retryable:
+                    raise
+                if stop_event is not None and stop_event.is_set():
+                    return
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 2.0)
+            except (URLError, OSError):
                 if stop_event is not None and stop_event.is_set():
                     return
                 time.sleep(retry_delay)
@@ -485,14 +629,18 @@ class GolutraClient:
         body: dict[str, Any] | None = None,
         attached: bool = True,
     ) -> Any:
-        request = self._request(method, path, body, attached)
-        with self._open(request) as response:
-            payload = self._read_bounded(response)
-            if response.status == 410 and attached:
-                self._clear_attachment()
-                return self._request_json(method, path, body, attached)
-            if not 200 <= response.status < 300:
-                raise self._http_error(response.status, payload)
+        reattached = False
+        while True:
+            request = self._request(method, path, body, attached)
+            with self._open(request) as response:
+                payload = self._read_bounded(response)
+                if response.status == 410 and attached and not reattached:
+                    self._clear_attachment()
+                    reattached = True
+                    continue
+                if not 200 <= response.status < 300:
+                    raise self._http_error(response.status, payload)
+                break
         try:
             return json.loads(payload)
         except json.JSONDecodeError as error:
@@ -510,6 +658,7 @@ class GolutraClient:
             raise ValueError(f"runtime path must be absolute: {path}")
         headers = {
             "authorization": f"Bearer {self._transport_token}",
+            "x-golutra-actor-id": self._actor_id,
             "x-golutra-protocol-version": str(RUNTIME_PROTOCOL_VERSION),
         }
         if attached:
@@ -545,13 +694,13 @@ class GolutraClient:
             body.extend(chunk)
 
     @staticmethod
-    def _http_error(status: int, body: bytes) -> GolutraError:
+    def _http_error(status: int, body: bytes) -> GolutraHttpError:
         try:
             value = json.loads(body)
             message = value.get("error", body.decode("utf-8", errors="replace"))
         except json.JSONDecodeError:
             message = body.decode("utf-8", errors="replace")
-        return GolutraError(f"HTTP {status}: {message}")
+        return GolutraHttpError(status, str(message))
 
 
 def _merge_task_trace_page(target: dict[str, Any], page: dict[str, Any]) -> None:
@@ -644,6 +793,17 @@ def _event_parameters(event_filter: dict[str, Any], cursor: int | None = None) -
     if selected_cursor is not None:
         parameters["cursor"] = selected_cursor
     return parameters
+
+
+def _agent_event_sequence(event: dict[str, Any]) -> int | None:
+    runtime_event = event.get("event")
+    if isinstance(runtime_event, dict) and isinstance(runtime_event.get("sequence_no"), int):
+        return runtime_event["sequence_no"]
+    item = event.get("item")
+    if isinstance(item, dict) and isinstance(item.get("sequence_no"), int):
+        return item["sequence_no"]
+    sequence = event.get("last_sequence_no")
+    return sequence if isinstance(sequence, int) else None
 
 
 def _validate_base_url(base_url: str) -> str:

@@ -376,6 +376,10 @@ impl RuntimeHost {
                                 command_id: command.command_id,
                                 turn_id,
                                 content: prompt.clone(),
+                                steer: payload
+                                    .get("steer")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false),
                             })
                             .await
                         {
@@ -629,11 +633,9 @@ impl RuntimeHost {
         command: SessionCommand,
     ) -> Result<CommandAck, ClientError> {
         let paths = self
-            .runtime_paths
-            .as_ref()
-            .map_or_else(ProviderConfigPaths::global, |runtime_paths| {
-                ProviderConfigPaths::from_home(&runtime_paths.home)
-            })
+            .provider_config_paths
+            .clone()
+            .map_or_else(ProviderConfigPaths::global, Ok)
             .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
         let environment = load_provider_runtime_env_from_paths(&paths)
             .map_err(|error| ClientError::TaskExecution(error.to_string()))?;

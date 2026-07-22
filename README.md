@@ -10,6 +10,10 @@ Golutra 是 Rust-first 的本地 Coding Agent Runtime。CLI、TUI、SDK 和 app-
 cargo run -p golutra-tui
 cargo run -p golutra-cli -- chat "inspect this workspace"
 cargo run -p golutra-app-server -- --addr 127.0.0.1:47831
+cargo run -p golutra-cli -- --cwd "$PWD" exec "inspect this workspace"
+cargo run -p golutra-cli -- --cwd "$PWD" exec --json "run the checks"
+cargo run -p golutra-cli -- --cwd "$PWD" mcp-server
+cargo run -p golutra-tui -- --cwd "$PWD" remote --url http://127.0.0.1:47831
 ```
 
 Agent 或自动化测试可以直接驱动真实离屏 TUI：
@@ -88,3 +92,5 @@ just release-package-smoke
 ```
 
 架构入口见 [docs/README.md](docs/README.md)，当前实施状态见 [docs/initial-implementation-plan.md](docs/initial-implementation-plan.md)。
+各运行入口的进程模型、SDK 示例和 JSON-RPC/SSE 边界见
+[docs/runtime-entrypoints.md](docs/runtime-entrypoints.md)。

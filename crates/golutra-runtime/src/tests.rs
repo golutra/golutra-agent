@@ -100,6 +100,7 @@ async fn pending_turn_queue_closes_atomically_when_the_loop_becomes_idle() {
         command_id: CommandId::new(),
         turn_id: TurnId::new(),
         content: "first queued turn".to_owned(),
+        steer: false,
     };
 
     handle
@@ -114,6 +115,7 @@ async fn pending_turn_queue_closes_atomically_when_the_loop_becomes_idle() {
                 command_id: CommandId::new(),
                 turn_id: TurnId::new(),
                 content: "late turn".to_owned(),
+                steer: false,
             })
             .await,
         Err(AgentLoopError::PendingTurnQueueClosed)
@@ -296,6 +298,7 @@ async fn agent_loop_provider_error_includes_detail() {
             turn_id: TurnId::new(),
             objective: "你好".to_owned(),
             completion_criteria: vec!["assistant response".to_owned()],
+            output_schema: None,
             touched_code: false,
             contributors: Vec::new(),
             tools: Vec::new(),
@@ -328,6 +331,7 @@ async fn fallback_completion_and_usage_are_attributed_to_the_actual_provider() {
                 turn_id: TurnId::new(),
                 objective: "hello".to_owned(),
                 completion_criteria: vec!["assistant response".to_owned()],
+                output_schema: None,
                 touched_code: false,
                 contributors: Vec::new(),
                 tools: Vec::new(),
@@ -387,6 +391,7 @@ async fn agent_loop_governor_blocks_before_iteration_budget_is_exceeded() {
                 turn_id: TurnId::new(),
                 objective: "inspect runtime".to_owned(),
                 completion_criteria: vec!["runtime inspected".to_owned()],
+                output_schema: None,
                 touched_code: false,
                 contributors: Vec::new(),
                 tools: Vec::new(),
@@ -429,6 +434,7 @@ async fn initial_context_overflow_returns_a_structured_blocked_outcome() {
                 turn_id: TurnId::new(),
                 objective: "inspect runtime".to_owned(),
                 completion_criteria: vec!["runtime inspected".to_owned()],
+                output_schema: None,
                 touched_code: false,
                 contributors: vec![ContextContributor {
                     name: "objective".to_owned(),
@@ -501,6 +507,7 @@ async fn accumulated_tool_messages_return_an_ask_user_context_outcome() {
                 turn_id: TurnId::new(),
                 objective: "read large.txt".to_owned(),
                 completion_criteria: vec!["file read".to_owned()],
+                output_schema: None,
                 touched_code: false,
                 contributors: vec![contributor],
                 tools: vec!["read_file".to_owned()],
@@ -549,6 +556,7 @@ async fn agent_loop_stops_success_when_tool_evidence_exists() {
             turn_id,
             objective: "write result".to_owned(),
             completion_criteria: vec!["file written".to_owned()],
+            output_schema: None,
             touched_code: true,
             contributors: Vec::new(),
             tools: vec!["write_file".to_owned()],
@@ -585,6 +593,7 @@ async fn code_change_without_an_objective_validation_is_partial() {
             turn_id: TurnId::new(),
             objective: "write Rust code".to_owned(),
             completion_criteria: vec!["tests pass".to_owned()],
+            output_schema: None,
             touched_code: true,
             contributors: Vec::new(),
             tools: vec!["write_file".to_owned()],
@@ -643,6 +652,7 @@ async fn agent_loop_does_not_accept_a_write_to_the_wrong_requested_path() {
             turn_id: TurnId::new(),
             objective: "write expected.txt with content expected".to_owned(),
             completion_criteria: vec!["expected.txt contains expected".to_owned()],
+            output_schema: None,
             touched_code: false,
             contributors: Vec::new(),
             tools: vec!["write_file".to_owned()],
@@ -673,6 +683,7 @@ async fn agent_loop_does_not_accept_wrong_written_content() {
             turn_id: TurnId::new(),
             objective: "write expected.txt with content expected".to_owned(),
             completion_criteria: vec!["expected.txt contains expected".to_owned()],
+            output_schema: None,
             touched_code: false,
             contributors: Vec::new(),
             tools: vec!["write_file".to_owned()],
@@ -704,6 +715,7 @@ async fn agent_loop_returns_invalid_tool_calls_to_the_provider_as_tool_results()
             turn_id: TurnId::new(),
             objective: "try a tool".to_owned(),
             completion_criteria: vec!["tool result returned".to_owned()],
+            output_schema: None,
             touched_code: false,
             contributors: Vec::new(),
             tools: Vec::new(),
@@ -736,6 +748,7 @@ async fn agent_loop_blocks_without_evidence() {
             turn_id: TurnId::new(),
             objective: "claim done".to_owned(),
             completion_criteria: vec!["objective evidence".to_owned()],
+            output_schema: None,
             touched_code: true,
             contributors: Vec::new(),
             tools: Vec::new(),
@@ -764,6 +777,7 @@ async fn agent_loop_accepts_plain_conversation_response_without_tool_evidence() 
             turn_id: TurnId::new(),
             objective: "你好".to_owned(),
             completion_criteria: vec!["assistant response".to_owned()],
+            output_schema: None,
             touched_code: false,
             contributors: Vec::new(),
             tools: Vec::new(),
@@ -774,6 +788,86 @@ async fn agent_loop_accepts_plain_conversation_response_without_tool_evidence() 
     assert_eq!(outcome.loop_decision.action, LoopAction::StopSuccess);
     assert_eq!(outcome.verification.result, VerificationResult::Pass);
     assert_eq!(outcome.final_message, Some("你好，我在。".to_owned()));
+}
+
+#[tokio::test]
+async fn output_schema_is_verified_by_the_runtime_before_success() {
+    let workspace = tempdir().expect("workspace");
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let agent_loop = AgentLoop::new(
+        MockProvider::text_response(r#"{"answer":"ok"}"#),
+        ContextBuilder::default(),
+        executor,
+    );
+
+    let outcome = agent_loop
+        .run(AgentTaskRequest {
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            turn_id: TurnId::new(),
+            objective: "return a structured answer".to_owned(),
+            completion_criteria: vec!["assistant response".to_owned()],
+            output_schema: Some(json!({
+                "type": "object",
+                "required": ["answer"],
+                "properties": {"answer": {"type": "string"}},
+                "additionalProperties": false
+            })),
+            touched_code: false,
+            contributors: Vec::new(),
+            tools: Vec::new(),
+        })
+        .await
+        .expect("schema-valid response");
+
+    assert_eq!(outcome.verification.result, VerificationResult::Pass);
+    assert!(
+        outcome
+            .verification
+            .checks
+            .iter()
+            .any(|check| { check.kind == VerificationCheckKind::Schema && check.passed })
+    );
+}
+
+#[tokio::test]
+async fn output_schema_failure_is_a_runtime_turn_failure() {
+    let workspace = tempdir().expect("workspace");
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let agent_loop = AgentLoop::new(
+        MockProvider::text_response(r#"{"answer":42}"#),
+        ContextBuilder::default(),
+        executor,
+    );
+
+    let outcome = agent_loop
+        .run(AgentTaskRequest {
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            turn_id: TurnId::new(),
+            objective: "return a structured answer".to_owned(),
+            completion_criteria: vec!["assistant response".to_owned()],
+            output_schema: Some(json!({
+                "type": "object",
+                "required": ["answer"],
+                "properties": {"answer": {"type": "string"}},
+                "additionalProperties": false
+            })),
+            touched_code: false,
+            contributors: Vec::new(),
+            tools: Vec::new(),
+        })
+        .await
+        .expect("schema failure is represented in the outcome");
+
+    assert_ne!(outcome.verification.result, VerificationResult::Pass);
+    assert!(
+        outcome
+            .verification
+            .checks
+            .iter()
+            .any(|check| { check.kind == VerificationCheckKind::Schema && !check.passed })
+    );
 }
 
 #[tokio::test]
@@ -792,6 +886,7 @@ async fn queued_plain_turn_does_not_inherit_the_previous_turn_workspace_requirem
             command_id: CommandId::new(),
             turn_id: queued_turn_id,
             content: "hello".to_owned(),
+            steer: false,
         })
         .await
         .expect("queued turn");
@@ -804,6 +899,7 @@ async fn queued_plain_turn_does_not_inherit_the_previous_turn_workspace_requirem
                 turn_id: TurnId::new(),
                 objective: "write a file".to_owned(),
                 completion_criteria: vec!["assistant response".to_owned()],
+                output_schema: None,
                 touched_code: true,
                 contributors: Vec::new(),
                 tools: Vec::new(),
@@ -834,6 +930,7 @@ async fn agent_loop_still_requires_evidence_for_workspace_objectives() {
             turn_id: TurnId::new(),
             objective: "read README.md".to_owned(),
             completion_criteria: vec!["file read evidence".to_owned()],
+            output_schema: None,
             touched_code: false,
             contributors: Vec::new(),
             tools: vec!["read_file".to_owned()],
@@ -859,6 +956,7 @@ async fn agent_loop_does_not_stop_success_when_tool_fails() {
             turn_id: TurnId::new(),
             objective: "read missing file".to_owned(),
             completion_criteria: vec!["file read evidence".to_owned()],
+            output_schema: None,
             touched_code: false,
             contributors: Vec::new(),
             tools: vec!["read_file".to_owned()],
@@ -895,6 +993,7 @@ async fn hard_tool_execution_errors_still_emit_a_terminal_report() {
                 turn_id: TurnId::new(),
                 objective: "read binary.txt".to_owned(),
                 completion_criteria: vec!["file read evidence".to_owned()],
+                output_schema: None,
                 touched_code: false,
                 contributors: Vec::new(),
                 tools: vec!["read_file".to_owned()],
@@ -937,6 +1036,7 @@ async fn agent_loop_waits_for_approval_before_process_execution() {
                     turn_id: TurnId::new(),
                     objective: "run approved command".to_owned(),
                     completion_criteria: vec!["command evidence".to_owned()],
+                    output_schema: None,
                     touched_code: false,
                     contributors: Vec::new(),
                     tools: vec!["shell".to_owned()],
@@ -994,6 +1094,7 @@ async fn paused_approval_does_not_execute_tool_until_resume() {
                     turn_id: TurnId::new(),
                     objective: "run command after resume".to_owned(),
                     completion_criteria: vec!["command evidence".to_owned()],
+                    output_schema: None,
                     touched_code: false,
                     contributors: Vec::new(),
                     tools: vec!["shell".to_owned()],

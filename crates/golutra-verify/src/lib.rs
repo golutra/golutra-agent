@@ -120,6 +120,19 @@ impl VerificationRunner {
                 true,
             ));
         }
+        if input
+            .command_checks
+            .iter()
+            .any(|check| check.kind == VerificationCheckKind::Schema)
+        {
+            assertions.push(assertion(
+                "output_schema",
+                VerificationAssertionKind::Schema,
+                "assistant output",
+                "the final assistant response validates against the requested JSON Schema",
+                true,
+            ));
+        }
         let policy_assertion = assertion(
             "policy",
             VerificationAssertionKind::Policy,
@@ -221,13 +234,24 @@ impl VerificationRunner {
             &input.command_checks,
             VerificationCheckKind::AssistantResponse,
         );
+        let schema_passed = input
+            .command_checks
+            .iter()
+            .filter(|check| check.kind == VerificationCheckKind::Schema)
+            .all(|check| check.passed);
         let result = if !input.code_files_changed
             && !input.requires_workspace_evidence
             && assistant_response
+            && schema_passed
             && input
                 .command_checks
                 .iter()
-                .filter(|check| check.kind != VerificationCheckKind::AssistantResponse)
+                .filter(|check| {
+                    !matches!(
+                        check.kind,
+                        VerificationCheckKind::AssistantResponse | VerificationCheckKind::Schema
+                    )
+                })
                 .all(|check| check.passed)
         {
             VerificationResult::Pass
@@ -326,10 +350,12 @@ fn classify_task(input: &VerificationInput) -> TaskClass {
     } else if input.requires_workspace_evidence {
         TaskClass::ReadOnlyAnalysis
     } else if input.evidence_refs.is_empty()
-        && input
-            .command_checks
-            .iter()
-            .all(|check| check.kind == VerificationCheckKind::AssistantResponse)
+        && input.command_checks.iter().all(|check| {
+            matches!(
+                check.kind,
+                VerificationCheckKind::AssistantResponse | VerificationCheckKind::Schema
+            )
+        })
     {
         TaskClass::PlainConversation
     } else {
@@ -441,6 +467,28 @@ fn assertion_status(
                 (
                     VerificationAssertionStatus::Unknown,
                     "assistant response fact is missing".to_owned(),
+                    refs,
+                )
+            }
+        }
+        VerificationAssertionKind::Schema => {
+            let checks = matching_checks(&[VerificationCheckKind::Schema]);
+            if checks.iter().any(|check| !check.passed) {
+                (
+                    VerificationAssertionStatus::Fail,
+                    "assistant response does not satisfy the requested JSON Schema".to_owned(),
+                    refs,
+                )
+            } else if checks.iter().any(|check| check.passed) {
+                (
+                    VerificationAssertionStatus::Pass,
+                    "assistant response satisfies the requested JSON Schema".to_owned(),
+                    refs,
+                )
+            } else {
+                (
+                    VerificationAssertionStatus::Unknown,
+                    "no output schema validation fact was recorded".to_owned(),
                     refs,
                 )
             }
@@ -558,7 +606,7 @@ fn assertion_status(
                 )
             }
         }
-        VerificationAssertionKind::CommandExit | VerificationAssertionKind::Schema => (
+        VerificationAssertionKind::CommandExit => (
             VerificationAssertionStatus::NotApplicable,
             "assertion kind is not emitted by the current tool adapter".to_owned(),
             refs,

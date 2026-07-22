@@ -72,6 +72,10 @@ pub(crate) fn recovered_pending_turn_from_event(
     if content.trim().is_empty() {
         return None;
     }
+    let steer = payload
+        .get("steer")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let command_id = event
         .payload
         .get("command_id")
@@ -96,6 +100,7 @@ pub(crate) fn recovered_pending_turn_from_event(
             command_id,
             turn_id,
             content,
+            steer,
         },
     })
 }
@@ -592,6 +597,7 @@ pub(crate) fn trace_event_payload(
                 "command_id": turn.command_id,
                 "turn_id": turn.turn_id,
                 "prompt": turn.content,
+                "steer": turn.steer,
             }),
         )),
         AgentLoopTraceEvent::AssistantMessage { content, .. } => Some((

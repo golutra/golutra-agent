@@ -19,6 +19,7 @@ pub enum VerificationCheckKind {
     WorkspaceChange,
     ObjectiveValidation,
     AssistantResponse,
+    Schema,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
@@ -66,6 +67,8 @@ impl<'de> Deserialize<'de> for VerificationCheck {
 fn infer_legacy_verification_check_kind(name: &str) -> VerificationCheckKind {
     if name == "assistant_response" {
         VerificationCheckKind::AssistantResponse
+    } else if name.starts_with("output_schema") {
+        VerificationCheckKind::Schema
     } else if name == "workspace_diff" {
         VerificationCheckKind::WorkspaceChange
     } else if name.starts_with("objective:") {

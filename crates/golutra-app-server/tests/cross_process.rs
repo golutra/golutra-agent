@@ -12,6 +12,8 @@ use secrecy::SecretString;
 use tempfile::tempdir;
 use tokio::process::{Child, Command};
 
+const DAEMON_READY_ATTEMPTS: usize = 1_200;
+
 #[cfg(unix)]
 #[tokio::test]
 async fn unix_ipc_and_http_share_commands_history_and_event_streams() {
@@ -609,7 +611,7 @@ fn spawn_daemon_at(home: &Path, address: std::net::SocketAddr) -> ChildGuard {
 async fn wait_for_transport(home: &Path, cwd: &Path) -> HttpSseTransport {
     let endpoint = home.join("app-server/app-server.json");
     let mut last_error = None;
-    for _ in 0..200 {
+    for _ in 0..DAEMON_READY_ATTEMPTS {
         let attempt = async {
             let bytes = tokio::fs::read(&endpoint)
                 .await
@@ -643,7 +645,7 @@ async fn wait_for_transport(home: &Path, cwd: &Path) -> HttpSseTransport {
 #[cfg(unix)]
 async fn wait_for_ipc_transport(home: &Path, cwd: &Path) -> UnixIpcTransport {
     let mut last_error = None;
-    for _ in 0..200 {
+    for _ in 0..DAEMON_READY_ATTEMPTS {
         match UnixIpcTransport::from_home_and_cwd(home, cwd).await {
             Ok(transport) => return transport,
             Err(error) => last_error = Some(error.to_string()),

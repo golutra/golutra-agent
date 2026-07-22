@@ -56,6 +56,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub const APP_SERVER_ATTACHMENT_HEADER: &str = "x-golutra-attachment";
+pub const APP_SERVER_ACTOR_HEADER: &str = "x-golutra-actor-id";
+pub const APP_SERVER_ATTACHMENT_ACTOR_PREFIX: &str = "app-attachment-";
 pub const APP_SERVER_PROTOCOL_HEADER: &str = "x-golutra-protocol-version";
 pub const APP_SERVER_TRANSPORT_TOKEN_ENV: &str = "GOLUTRA_TRANSPORT_TOKEN";
 pub const RUNTIME_RELEASE_ID_ENV: &str = "GOLUTRA_RELEASE_ID";
@@ -76,6 +78,11 @@ const POST_TASK_JOB_LEASE_MINUTES: i64 = 5;
 const POST_TASK_JOB_POLL_MILLIS: u64 = 250;
 const POST_TASK_JOB_IDLE_POLL_MILLIS: u64 = 1_000;
 
+#[must_use]
+pub fn app_server_attachment_actor_id(attachment_id: &str) -> String {
+    format!("{APP_SERVER_ATTACHMENT_ACTOR_PREFIX}{attachment_id}")
+}
+
 pub(crate) fn runtime_identity() -> String {
     std::env::var(RUNTIME_RELEASE_ID_ENV)
         .ok()
@@ -90,6 +97,8 @@ pub(crate) fn runtime_identity() -> String {
         .unwrap_or_else(|| format!("build:{}", env!("CARGO_PKG_VERSION")))
 }
 
+mod agent;
+mod agent_projection;
 mod application;
 mod change_tracker;
 mod command;
@@ -112,6 +121,8 @@ mod task_governance;
 mod trace;
 mod transport;
 
+pub use agent::{AgentClient, AgentThread, TurnHandle};
+pub use agent_projection::AgentEventProjector;
 pub use application::{
     GovernedRuntime, RuntimeApplication, RuntimeCommandService, RuntimeGovernanceService,
     RuntimeQueryService, RuntimeSessionService, TaskTraceService,
@@ -200,6 +211,50 @@ pub enum ClientError {
 }
 
 #[derive(Debug)]
+struct RuntimeHostStorage {
+    runtime_paths: Option<RuntimePaths>,
+    provider_config_paths: Option<ProviderConfigPaths>,
+    temporary_root: Option<Arc<tempfile::TempDir>>,
+}
+
+impl RuntimeHostStorage {
+    fn in_memory() -> Result<Self, ClientError> {
+        let temporary_root = tempfile::tempdir()
+            .map(Arc::new)
+            .map_err(|error| ClientError::Io(error.to_string()))?;
+        Ok(Self {
+            runtime_paths: None,
+            provider_config_paths: None,
+            temporary_root: Some(temporary_root),
+        })
+    }
+
+    fn durable(runtime_paths: RuntimePaths) -> Result<Self, ClientError> {
+        let provider_config_paths = ProviderConfigPaths::from_home(&runtime_paths.home)
+            .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
+        Ok(Self {
+            runtime_paths: Some(runtime_paths),
+            provider_config_paths: Some(provider_config_paths),
+            temporary_root: None,
+        })
+    }
+
+    fn ephemeral(cwd: impl AsRef<Path>) -> Result<Self, ClientError> {
+        let provider_config_paths = ProviderConfigPaths::global()
+            .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
+        let temporary_root = tempfile::tempdir()
+            .map(Arc::new)
+            .map_err(|error| ClientError::Io(error.to_string()))?;
+        let runtime_paths = RuntimePaths::from_home_and_cwd(temporary_root.path(), cwd)?;
+        Ok(Self {
+            runtime_paths: Some(runtime_paths),
+            provider_config_paths: Some(provider_config_paths),
+            temporary_root: Some(temporary_root),
+        })
+    }
+}
+
+#[derive(Debug)]
 pub struct RuntimeHost {
     store: RuntimeStore,
     repositories: RuntimeRepositories,
@@ -214,6 +269,7 @@ pub struct RuntimeHost {
     workspace_id: WorkspaceId,
     workspace_root: Option<PathBuf>,
     runtime_paths: Option<RuntimePaths>,
+    provider_config_paths: Option<ProviderConfigPaths>,
     default_session_id: SessionId,
     default_thread_id: ThreadId,
     instance_id: String,
@@ -224,7 +280,7 @@ pub struct RuntimeHost {
     workspace_change_tracker: Mutex<change_tracker::WorkspaceChangeTracker>,
     deep_evaluation_inputs: Mutex<HashMap<PostTaskJobId, TaskEvaluationInput>>,
     force_mock_provider: bool,
-    _evolution_temp_root: Option<Arc<tempfile::TempDir>>,
+    _temporary_root: Option<Arc<tempfile::TempDir>>,
 }
 
 #[derive(Debug, Clone)]
@@ -321,10 +377,34 @@ impl RuntimeHost {
         Self::from_store(
             store,
             None,
-            None,
+            RuntimeHostStorage::in_memory()?,
             WorkspaceId::new(),
             default_session_id,
             default_thread_id,
+            false,
+        )
+        .await
+    }
+
+    /// Build an in-memory runtime with a real workspace boundary. Runtime
+    /// state is kept below a process-owned temporary root, while provider
+    /// credentials still come from the user's global configuration.
+    pub async fn ephemeral_for_cwd(cwd: impl AsRef<Path>) -> Result<Arc<Self>, ClientError> {
+        let storage = RuntimeHostStorage::ephemeral(cwd)?;
+        let cwd = storage
+            .runtime_paths
+            .as_ref()
+            .expect("ephemeral runtime paths are initialized")
+            .cwd
+            .clone();
+        let store = RuntimeStore::in_memory().await?;
+        Self::from_store(
+            store,
+            Some(cwd),
+            storage,
+            WorkspaceId::new(),
+            SessionId::new(),
+            ThreadId::new(),
             false,
         )
         .await
@@ -356,10 +436,11 @@ impl RuntimeHost {
             || (SessionId::new(), ThreadId::new()),
             |thread| (thread.session_id, thread.thread_id),
         );
+        let storage = RuntimeHostStorage::durable(paths.clone())?;
         let host = Self::from_store(
             store,
             Some(paths.cwd.clone()),
-            Some(paths.clone()),
+            storage,
             paths.workspace_id(),
             default_session_id,
             default_thread_id,
@@ -375,12 +456,17 @@ impl RuntimeHost {
     async fn from_store(
         store: RuntimeStore,
         workspace_root: Option<PathBuf>,
-        runtime_paths: Option<RuntimePaths>,
+        storage: RuntimeHostStorage,
         workspace_id: WorkspaceId,
         default_session_id: SessionId,
         default_thread_id: ThreadId,
         force_mock_provider: bool,
     ) -> Result<Arc<Self>, ClientError> {
+        let RuntimeHostStorage {
+            runtime_paths,
+            provider_config_paths,
+            temporary_root,
+        } = storage;
         let (event_bus, _) = broadcast::channel(512);
         let max_sequence_no = store.max_sequence_no().await?;
         let next_sequence_no = max_sequence_no.saturating_add(1);
@@ -394,16 +480,11 @@ impl RuntimeHost {
             .map_or_else(EvaluationStore::in_memory, |paths| {
                 EvaluationStore::new(paths.evaluation_file.clone())
             });
-        let evolution_temp_root = runtime_paths
-            .is_none()
-            .then(|| tempfile::tempdir().map(Arc::new))
-            .transpose()
-            .map_err(|error| ClientError::Io(error.to_string()))?;
         let evolution_store = runtime_paths.as_ref().map_or_else(
             || {
-                let root = evolution_temp_root
+                let root = temporary_root
                     .as_ref()
-                    .expect("temporary evolution root is initialized")
+                    .expect("in-memory runtime temporary root is initialized")
                     .path();
                 EvolutionStore::new(root.join("evolution.json"), root.join("skills"))
             },
@@ -434,6 +515,7 @@ impl RuntimeHost {
             workspace_id,
             workspace_root,
             runtime_paths,
+            provider_config_paths,
             default_session_id,
             default_thread_id,
             instance_id: Uuid::now_v7().to_string(),
@@ -444,7 +526,7 @@ impl RuntimeHost {
             workspace_change_tracker: Mutex::new(change_tracker::WorkspaceChangeTracker::default()),
             deep_evaluation_inputs: Mutex::new(HashMap::new()),
             force_mock_provider,
-            _evolution_temp_root: evolution_temp_root,
+            _temporary_root: temporary_root,
         });
         host.repositories
             .jobs

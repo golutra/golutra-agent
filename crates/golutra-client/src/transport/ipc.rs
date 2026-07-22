@@ -270,6 +270,11 @@ impl UnixIpcTransport {
             .map_err(|_| ClientError::Daemon("runtime attachment lock is poisoned".to_owned()))
     }
 
+    pub(crate) fn current_attachment_actor_id(&self) -> Result<String, ClientError> {
+        self.current_attachment_id()
+            .map(|id| app_server_attachment_actor_id(&id))
+    }
+
     async fn refresh_attachment(&self, stale_attachment_id: &str) -> Result<String, ClientError> {
         let current = self.current_attachment_id()?;
         if current != stale_attachment_id {

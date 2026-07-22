@@ -12,6 +12,7 @@
 ```
 
 P0-P2 骨架到 P3 自进化之间的治理可信性补全不在本文重复展开，统一见 `runtime-governance-completion-design.md`。
+五类运行入口的进程模型和跨进程协议不在本文重复展开，统一见 `runtime-entrypoints.md`。
 
 ## 第一阶段目标
 
@@ -72,6 +73,18 @@ Plugin/MCP：已完成本地 reviewed package 与 sandboxed stdio 主链
 P2 当前状态包含类型、持久状态和受控本地流程；P2.5 已在此基础上完成可信治理闭环：统一 `TaskTraceService`、实际 provider request 的 `ContextSnapshot`、SQLite durable post-task job、客观 assertion、真实 baseline/candidate execution 和 memory quarantine 均已接入。P3 本地 Supervisor 也已接入完整 trace、候选隔离、密封/新鲜门禁、可信构建、内容寻址 release、canary、launcher 和 rollback；远端 fleet 与 E5 meta-evolution 后置。
 
 `ImprovementCandidate`、Evaluation、counterfactual comparison、regression/promotion 和 Evolution 都在后台或显式命令中运行，不污染普通用户同步链路。普通 Runtime 的自动 apply 只允许 clean regression 后的低风险 benchmark state；Skill 必须人工 review，runtime code/policy 放宽不会自动应用。runtime code 候选和连续发布只由独立 Supervisor 承担密封评测、不可变构建、canary 和 rollback，不改变普通任务同步边界。
+
+### 运行入口完成状态
+
+当前五类入口已共享同一 `RuntimeHost`/`RuntimeApplication` 边界：
+
+- `golutra exec` 提供 stdin、JSONL、durable thread resume、output file 和 ephemeral 模式；
+- App Server 提供 HTTP/SSE、Unix IPC、WebSocket 和 stdio JSON-RPC；
+- Python/TypeScript SDK 提供 thread/turn handle、流式事件、steer、interrupt 和 approval；
+- `golutra mcp-server` 默认连接用户级 daemon，并支持显式 remote/embedded；
+- `golutra-tui remote` 将终端渲染与远程 Runtime 分离。
+
+这些入口只负责传输、参数和 projection，不复制 RuntimeLane、AgentLoop 或终态验证逻辑。跨进程验收命令和输出语义见 `runtime-entrypoints.md`。
 
 ## 第一阶段吸收的架构启示
 

@@ -443,7 +443,7 @@ impl RuntimeHost {
         RuntimeHost::from_store(
             store,
             Some(paths.cwd.clone()),
-            Some(paths.clone()),
+            RuntimeHostStorage::durable(paths.clone())?,
             paths.workspace_id(),
             session_id,
             ThreadId::new(),

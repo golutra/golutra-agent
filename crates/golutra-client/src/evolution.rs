@@ -14,8 +14,8 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::{
-    ClientError, RuntimeHost, RuntimePaths, RuntimeStore, ensure_private_dir, host_event,
-    run_blocking, set_owner_only_file,
+    ClientError, RuntimeHost, RuntimeHostStorage, RuntimePaths, RuntimeStore, ensure_private_dir,
+    host_event, run_blocking, set_owner_only_file,
 };
 
 const MAX_GENERATED_TASKS: u32 = 100;
@@ -514,7 +514,7 @@ impl RuntimeHost {
         RuntimeHost::from_store(
             store,
             Some(paths.cwd.clone()),
-            Some(paths.clone()),
+            RuntimeHostStorage::durable(paths.clone())?,
             paths.workspace_id(),
             session_id,
             golutra_core::ThreadId::new(),

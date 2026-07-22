@@ -9,8 +9,6 @@ use golutra_llm::{
 };
 use serde_json::{Value, json};
 
-use super::RuntimePaths;
-
 #[derive(Debug, Clone)]
 pub(crate) struct MockProviderPlan {
     pub(crate) provider: ConfiguredProvider,
@@ -21,15 +19,12 @@ pub(crate) struct MockProviderPlan {
 }
 
 pub(crate) fn mock_provider_plan(
-    runtime_paths: Option<&RuntimePaths>,
+    provider_config_paths: Option<&ProviderConfigPaths>,
     payload: &Value,
     objective: &str,
 ) -> Result<MockProviderPlan, ProviderError> {
-    let provider_env = runtime_paths
-        .map(|paths| {
-            let config_paths = ProviderConfigPaths::from_home(&paths.home)?;
-            load_provider_runtime_env_from_paths(&config_paths)
-        })
+    let provider_env = provider_config_paths
+        .map(load_provider_runtime_env_from_paths)
         .transpose()
         .map_err(|error| ProviderError::NotConfigured {
             message: format!("provider configuration could not be loaded: {error}"),

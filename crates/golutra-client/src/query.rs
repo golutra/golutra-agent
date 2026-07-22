@@ -116,23 +116,18 @@ impl RuntimeHost {
                 serde_json::to_value(run_blocking(move || evolution_store.snapshot()).await??)?
             }
             RuntimeQueryKind::ProviderState => {
-                let provider =
-                    self.runtime_paths.as_ref().map_or_else(
-                        ConfiguredProvider::redacted_from_env,
-                        |paths| {
-                            let paths =
-                                ProviderConfigPaths::from_home(&paths.home).map_err(|error| {
-                                    ProviderError::NotConfigured {
-                                        message: error.to_string(),
-                                    }
-                                })?;
-                            let environment = load_provider_runtime_env_from_paths(&paths)
-                                .map_err(|error| ProviderError::NotConfigured {
+                let provider = self.provider_config_paths.as_ref().map_or_else(
+                    ConfiguredProvider::redacted_from_env,
+                    |paths| {
+                        let environment =
+                            load_provider_runtime_env_from_paths(paths).map_err(|error| {
+                                ProviderError::NotConfigured {
                                     message: error.to_string(),
-                                })?;
-                            ConfiguredProvider::redacted_from_reader(|key| environment.get(key))
-                        },
-                    );
+                                }
+                            })?;
+                        ConfiguredProvider::redacted_from_reader(|key| environment.get(key))
+                    },
+                );
                 let latest_runtime_fact = self
                     .repositories
                     .events

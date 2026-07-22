@@ -8,12 +8,13 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
+from unittest.mock import patch
 
 
 SDK_SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SDK_SRC))
 
-from golutra_sdk import GolutraClient
+from golutra_sdk import GolutraClient, GolutraError, GolutraHttpError, Thread
 
 
 TOKEN = "python-sdk-test-token-000000000000000000000000000000000000000000"
@@ -38,7 +39,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     "instance_id": "server-1",
                     "pid": 1,
                     "base_url": self.server.base_url,
-                    "protocol_versions": {"minimum": 2, "current": 3},
+                    "protocol_versions": {"minimum": 4, "current": 4},
                     "started_at": "2026-01-01T00:00:00Z",
                 }
             )
@@ -135,7 +136,8 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         )
         valid = (
             self.headers.get("authorization") == f"Bearer {TOKEN}"
-            and self.headers.get("x-golutra-protocol-version") == "3"
+            and self.headers.get("x-golutra-actor-id", "").startswith("python-sdk-")
+            and self.headers.get("x-golutra-protocol-version") == "4"
         )
         if not valid:
             self._json({"error": "unauthorized"}, 401)
@@ -312,10 +314,290 @@ class ClientTest(unittest.TestCase):
                 for headers in RuntimeHandler.observed_headers
             )
         )
+        self.assertEqual(
+            len(
+                {
+                    headers.get("x-golutra-actor-id")
+                    for headers in RuntimeHandler.observed_headers
+                }
+            ),
+            1,
+        )
 
     def test_rejects_insecure_remote_http(self) -> None:
         with self.assertRaises(ValueError):
             GolutraClient("http://example.com", self.workspace.name, TOKEN)
+
+    def test_persistent_gone_response_retries_once_then_fails(self) -> None:
+        class GoneResponse:
+            status = 410
+
+            def __init__(self) -> None:
+                self._read = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _type, _value, _traceback) -> None:
+                return None
+
+            def read(self, _size: int) -> bytes:
+                if self._read:
+                    return b""
+                self._read = True
+                return b'{"error":"stale attachment"}'
+
+        self.client._attachment = {"attachment_id": "stale"}
+        with patch.object(self.client, "_request", side_effect=["first", "second"]) as request:
+            with patch.object(
+                self.client,
+                "_open",
+                side_effect=[GoneResponse(), GoneResponse()],
+            ):
+                with patch.object(self.client, "_clear_attachment") as clear:
+                    with self.assertRaisesRegex(GolutraError, "HTTP 410"):
+                        self.client._request_json("GET", "/events")
+        self.assertEqual(request.call_count, 2)
+        clear.assert_called_once_with()
+
+    def test_agent_subscription_does_not_retry_permanent_http_errors(self) -> None:
+        class UnauthorizedResponse:
+            status = 401
+
+            def __init__(self) -> None:
+                self._read = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _type, _value, _traceback) -> None:
+                return None
+
+            def read(self, _size: int) -> bytes:
+                if self._read:
+                    return b""
+                self._read = True
+                return b'{"error":"unauthorized"}'
+
+        self.client._attachment = {"attachment_id": "attachment-1"}
+        with patch.object(self.client, "_request", return_value="request") as request:
+            with patch.object(self.client, "_open", return_value=UnauthorizedResponse()) as opened:
+                stream = self.client.subscribe_agent(
+                    SESSION_ID,
+                    THREAD_ID,
+                    "command-1",
+                    10,
+                    start_cursor=10,
+                )
+                with self.assertRaises(GolutraHttpError) as raised:
+                    next(stream)
+        self.assertEqual(raised.exception.status, 401)
+        self.assertFalse(raised.exception.retryable)
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(opened.call_count, 1)
+
+    def test_agent_subscription_reconnects_from_the_last_consumed_cursor(self) -> None:
+        class SseResponse:
+            status = 200
+
+            def __init__(self, event: dict) -> None:
+                payload = json.dumps(event, separators=(",", ":"))
+                self.lines = iter(
+                    [
+                        b"event: agent_event\n",
+                        f"data: {payload}\n".encode(),
+                        b"\n",
+                    ]
+                )
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _type, _value, _traceback) -> None:
+                return None
+
+            def __iter__(self):
+                return self.lines
+
+        first = SseResponse({"type": "runtime.event", "event": {"sequence_no": 11}})
+        second = SseResponse(
+            {
+                "type": "turn.completed",
+                "status": "completed",
+                "task_id": TASK_ID,
+                "turn_id": "turn-1",
+                "final_message": "done",
+                "last_sequence_no": 12,
+            }
+        )
+        self.client._attachment = {"attachment_id": "attachment-1"}
+        with patch.object(self.client, "_request", side_effect=["first", "second"]) as request:
+            with patch.object(self.client, "_open", side_effect=[first, second]):
+                stream = self.client.subscribe_agent(
+                    SESSION_ID,
+                    THREAD_ID,
+                    "command-1",
+                    10,
+                    start_cursor=10,
+                )
+                self.assertEqual(next(stream)["type"], "runtime.event")
+                self.assertEqual(next(stream)["type"], "turn.completed")
+                with self.assertRaises(StopIteration):
+                    next(stream)
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(request.call_args_list[0].kwargs["last_event_id"], 10)
+        self.assertEqual(request.call_args_list[1].kwargs["last_event_id"], 11)
+        self.assertIn("start_cursor=10", request.call_args_list[1].args[1])
+        self.assertIn("cursor=11", request.call_args_list[1].args[1])
+
+    def test_high_level_thread_and_turn_handle_preserve_lifecycle_contract(self) -> None:
+        calls: list[tuple[str, dict]] = []
+
+        class FakeAgentClient:
+            def rpc(self, method: str, params: dict) -> dict:
+                calls.append((method, params))
+                if method == "turn/start":
+                    return {
+                        "accepted": True,
+                        "command_id": "command-1",
+                        "cursor": 10,
+                        "thread": {
+                            "thread_id": THREAD_ID,
+                            "session_id": SESSION_ID,
+                            "workspace_root": self_workspace,
+                        },
+                    }
+                return {"ack": {"accepted": True}}
+
+            def event_page(self, request: dict) -> dict:
+                calls.append(("event_page", request))
+                return {
+                    "direction": request["direction"],
+                    "events": [],
+                    "has_more": False,
+                }
+
+            def replay_events(self, request: dict) -> list[dict]:
+                calls.append(("replay_events", request))
+                return []
+
+            def subscribe_agent(
+                self,
+                session_id: str,
+                thread_id: str,
+                command_id: str,
+                cursor: int | None = None,
+                *,
+                start_cursor: int | None = None,
+                stop_event=None,
+            ):
+                self_subscription = (
+                    session_id,
+                    thread_id,
+                    command_id,
+                    cursor,
+                    start_cursor,
+                    stop_event,
+                )
+                calls.append(("subscribe_agent", {"request": self_subscription}))
+                return iter(
+                    [
+                        {"type": "thread.started"},
+                        {"type": "turn.started", "turn_id": "turn-1"},
+                        {
+                            "type": "turn.completed",
+                            "status": "completed",
+                            "task_id": TASK_ID,
+                            "turn_id": "turn-1",
+                            "final_message": "done",
+                            "last_sequence_no": 12,
+                        },
+                    ]
+                )
+
+        self_workspace = self.workspace.name
+        fake = FakeAgentClient()
+        thread = Thread(
+            fake,
+            {
+                "thread_id": THREAD_ID,
+                "session_id": SESSION_ID,
+                "workspace_root": self_workspace,
+            },
+        )
+        with self.assertRaises(ValueError):
+            thread.run("   ")
+
+        handle = thread.run(
+            "inspect the workspace",
+            output_schema={"type": "object"},
+            completion_criteria=[" verified ", ""],
+        )
+        events = []
+        stream = handle.events()
+        while True:
+            event = next(stream)
+            events.append(event)
+            if event["type"] == "turn.completed":
+                break
+        stream.close()
+        self.assertEqual(events[-1]["type"], "turn.completed")
+        self.assertEqual(handle.wait()["status"], "completed")
+        self.assertEqual(handle.wait()["final_message"], "done")
+        self.assertEqual(calls[0][0], "turn/start")
+        self.assertEqual(calls[0][1]["completion_criteria"], [" verified "])
+        self.assertEqual(calls[0][1]["output_schema"], {"type": "object"})
+        self.assertEqual(calls[1][0], "subscribe_agent")
+        self.assertEqual(calls[1][1]["request"][2], "command-1")
+        self.assertEqual(calls[1][1]["request"][4], 10)
+        self.assertEqual(
+            sum(1 for name, _params in calls if name == "subscribe_agent"),
+            1,
+        )
+
+        self.assertEqual(thread.steer("continue")["accepted"], True)
+        self.assertEqual(thread.interrupt()["accepted"], True)
+        self.assertEqual(thread.takeover()["accepted"], True)
+        self.assertEqual(handle.resolve_approval("approval-1", False)["accepted"], True)
+        self.assertEqual(
+            thread.history(cursor=9, direction="forward", limit=25)["direction"],
+            "forward",
+        )
+        self.assertEqual(thread.replay_events(cursor=9), [])
+        event_page_call = next(params for name, params in calls if name == "event_page")
+        self.assertEqual(
+            event_page_call,
+            {
+                "session_id": SESSION_ID,
+                "cursor": 9,
+                "direction": "forward",
+                "limit": 25,
+            },
+        )
+        with self.assertRaises(ValueError):
+            thread.event_page(limit=0)
+        with self.assertRaises(ValueError):
+            thread.event_page(direction="sideways")
+        with self.assertRaises(ValueError):
+            thread.steer("   ")
+
+    def test_client_start_and_resume_wrap_rpc_thread_references(self) -> None:
+        reference = {
+            "thread_id": THREAD_ID,
+            "session_id": SESSION_ID,
+            "workspace_root": self.workspace.name,
+        }
+        with patch.object(
+            self.client,
+            "rpc",
+            side_effect=[{"thread": reference}, {"thread": reference}],
+        ) as rpc:
+            started = self.client.start_thread()
+            resumed = self.client.resume(THREAD_ID)
+        self.assertIsInstance(started, Thread)
+        self.assertEqual(started.thread_id, THREAD_ID)
+        self.assertEqual(resumed.session_id, SESSION_ID)
+        self.assertEqual([call.args[0] for call in rpc.call_args_list], ["thread/start", "thread/resume"])
 
 
 if __name__ == "__main__":
