@@ -1,12 +1,15 @@
-use std::{fs, path::Path, process::Stdio, time::Duration};
+use std::{collections::BTreeSet, env, fs, path::Path, process::Stdio, time::Duration};
 
 #[cfg(unix)]
 use golutra_client::UnixIpcTransport;
 use golutra_client::{AppServerInfo, HttpSseTransport, RuntimeClient, TaskTraceClient};
-use golutra_core::{Actor, ActorKind, CommandId, SessionId, TaskId, ThreadId, TraceView};
+use golutra_core::{
+    Actor, ActorKind, CommandId, SessionId, TaskId, TaskReconciliationDecision, ThreadId, TraceView,
+};
 use golutra_protocol::{
-    EventFilter, RuntimeEventType, SessionCommand, SessionCommandKind, SessionPageRequest,
-    SessionRangeDirection, SessionRangeSpec, SessionWindowRequest, TaskTraceRequest,
+    EventFilter, EventPageDirection, EventPageRequest, RuntimeEvent, RuntimeEventType,
+    SessionCommand, SessionCommandKind, SessionPageRequest, SessionRangeDirection,
+    SessionRangeSpec, SessionWindowRequest, TaskTraceRequest,
 };
 use secrecy::SecretString;
 use tempfile::tempdir;
@@ -328,6 +331,305 @@ async fn existing_http_transport_reattaches_after_daemon_restart_on_the_same_end
             .is_empty()
     );
     second_daemon.0.kill().await.expect("stop second daemon");
+}
+
+#[tokio::test]
+async fn daemon_crash_holds_pending_turn_until_uncertain_task_is_reconciled() {
+    let cwd = tempdir().expect("cwd");
+    let home = tempdir().expect("home");
+    install_mock_provider(home.path());
+    let mut daemon = spawn_daemon(home.path());
+    let transport = wait_for_transport(home.path(), cwd.path()).await;
+    let session_id = transport.info().default_session_id;
+    let mut stream = transport
+        .subscribe(EventFilter {
+            session_id,
+            task_id: None,
+            after_sequence_no: None,
+        })
+        .await
+        .expect("runtime event stream");
+
+    assert!(
+        transport
+            .send_command(prompt_command(session_id, "sleep before replying"))
+            .await
+            .expect("long-running prompt")
+            .accepted
+    );
+    let (active_task_id, tool_call_id) = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = stream
+                .recv()
+                .await
+                .expect("stream remains open")
+                .expect("runtime event");
+            if event.event_type == RuntimeEventType::ApprovalRequested {
+                let approval_id = event
+                    .payload
+                    .get("approval_id")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("approval id");
+                assert!(
+                    transport
+                        .send_command(runtime_command(
+                            session_id,
+                            SessionCommandKind::Approve,
+                            serde_json::json!({"approval_id": approval_id}),
+                        ))
+                        .await
+                        .expect("approve shell tool")
+                        .accepted
+                );
+            }
+            if event.event_type == RuntimeEventType::ToolStarted {
+                return (
+                    event.task_id.expect("active task id"),
+                    event
+                        .payload
+                        .get("tool_call_id")
+                        .and_then(serde_json::Value::as_str)
+                        .expect("tool call id")
+                        .to_owned(),
+                );
+            }
+        }
+    })
+    .await
+    .expect("shell tool start");
+
+    let pending = prompt_command(session_id, "pending turn after restart");
+    let pending_command_id = pending.command_id;
+    assert!(
+        transport
+            .send_command(pending)
+            .await
+            .expect("pending prompt")
+            .accepted
+    );
+    let pending_turn_id = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = stream
+                .recv()
+                .await
+                .expect("stream remains open")
+                .expect("runtime event");
+            if event.event_type == RuntimeEventType::TurnQueued
+                && event.payload.get("command_id") == Some(&serde_json::json!(pending_command_id))
+            {
+                return event.turn_id.expect("pending turn id");
+            }
+        }
+    })
+    .await
+    .expect("durable pending turn");
+
+    daemon.0.kill().await.expect("crash daemon");
+    drop(stream);
+    let mut restarted = spawn_daemon(home.path());
+    let restarted_transport = wait_for_transport(home.path(), cwd.path()).await;
+    let recovered = wait_for_event_type(
+        &restarted_transport,
+        session_id,
+        RuntimeEventType::TaskUncertain,
+        None,
+    )
+    .await;
+    let uncertain_sequence = recovered
+        .iter()
+        .find(|event| {
+            event.event_type == RuntimeEventType::TaskUncertain
+                && event.task_id == Some(active_task_id)
+        })
+        .expect("uncertain recovery event")
+        .sequence_no;
+    assert!(!recovered.iter().any(|event| {
+        event.event_type == RuntimeEventType::TurnStarted && event.turn_id == Some(pending_turn_id)
+    }));
+
+    assert!(
+        restarted_transport
+            .send_command(runtime_command(
+                session_id,
+                SessionCommandKind::ReconcileTask,
+                serde_json::json!({
+                    "task_id": active_task_id,
+                    "decision": TaskReconciliationDecision::NoSideEffectObserved,
+                    "note": "cross-process test confirmed no external side effect",
+                }),
+            ))
+            .await
+            .expect("reconcile uncertain task")
+            .accepted
+    );
+    let completed = wait_for_event_type(
+        &restarted_transport,
+        session_id,
+        RuntimeEventType::TaskCompleted,
+        Some(uncertain_sequence),
+    )
+    .await;
+
+    assert_eq!(
+        completed
+            .iter()
+            .filter(|event| {
+                event.event_type == RuntimeEventType::ToolStarted
+                    && event.task_id == Some(active_task_id)
+                    && event.payload.get("tool_call_id") == Some(&serde_json::json!(tool_call_id))
+            })
+            .count(),
+        1,
+        "an uncertain side-effecting tool must never be replayed",
+    );
+    assert!(!completed.iter().any(|event| {
+        event.event_type == RuntimeEventType::ToolCompleted
+            && event.task_id == Some(active_task_id)
+            && (event.payload.get("tool_call_id") == Some(&serde_json::json!(tool_call_id))
+                || event.payload.pointer("/envelope/tool_call_id")
+                    == Some(&serde_json::json!(tool_call_id)))
+    }));
+    assert_eq!(
+        completed
+            .iter()
+            .filter(|event| {
+                event.event_type == RuntimeEventType::TurnStarted
+                    && event.turn_id == Some(pending_turn_id)
+            })
+            .count(),
+        1,
+        "the durable pending turn must resume exactly once",
+    );
+    assert_eq!(
+        completed
+            .iter()
+            .filter(|event| {
+                event.event_type == RuntimeEventType::AssistantMessage
+                    && event.turn_id == Some(pending_turn_id)
+            })
+            .count(),
+        1,
+    );
+    restarted.0.kill().await.expect("stop restarted daemon");
+}
+
+#[tokio::test]
+#[ignore = "set GOLUTRA_SOAK_ROUNDS to run the configurable restart soak"]
+async fn daemon_restart_soak_preserves_event_invariants() {
+    let rounds = env::var("GOLUTRA_SOAK_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|rounds| (1..=10_000).contains(rounds))
+        .unwrap_or(0);
+    if rounds == 0 {
+        eprintln!("set GOLUTRA_SOAK_ROUNDS=... to run the restart soak");
+        return;
+    }
+    let restart_every = env::var("GOLUTRA_SOAK_RESTART_EVERY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|every| *every > 0)
+        .unwrap_or(5);
+
+    let cwd = tempdir().expect("cwd");
+    let home = tempdir().expect("home");
+    install_mock_provider(home.path());
+    let mut daemon = spawn_daemon(home.path());
+    let mut transport = wait_for_transport(home.path(), cwd.path()).await;
+    let session_id = transport.info().default_session_id;
+    let mut last_sequence_no = 0;
+
+    for round in 0..rounds {
+        assert!(
+            transport
+                .send_command(prompt_command(
+                    session_id,
+                    &format!("soak round {round}: reply with an acknowledgement"),
+                ))
+                .await
+                .expect("soak prompt")
+                .accepted
+        );
+        let events = wait_for_new_event_type(
+            &transport,
+            session_id,
+            RuntimeEventType::TaskCompleted,
+            Some(last_sequence_no),
+        )
+        .await;
+        last_sequence_no = events
+            .iter()
+            .map(|event| event.sequence_no)
+            .max()
+            .expect("soak events");
+
+        if (round + 1) % restart_every == 0 && round + 1 < rounds {
+            daemon.0.kill().await.expect("periodic daemon restart");
+            daemon = spawn_daemon(home.path());
+            let restarted = wait_for_transport(home.path(), cwd.path()).await;
+            assert_eq!(restarted.info().default_session_id, session_id);
+            transport = restarted;
+        }
+    }
+
+    let events = load_all_typed_events(&transport, session_id).await;
+    assert!(
+        events
+            .windows(2)
+            .all(|pair| { pair[0].sequence_no < pair[1].sequence_no })
+    );
+    let task_ids = events
+        .iter()
+        .filter(|event| event.event_type == RuntimeEventType::TaskCreated)
+        .filter_map(|event| event.task_id)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(task_ids.len(), rounds);
+    for task_id in task_ids {
+        let terminal_count = events
+            .iter()
+            .filter(|event| {
+                event.task_id == Some(task_id)
+                    && matches!(
+                        event.event_type,
+                        RuntimeEventType::TaskCompleted
+                            | RuntimeEventType::TaskAborted
+                            | RuntimeEventType::TaskInterrupted
+                            | RuntimeEventType::TaskUncertain
+                    )
+            })
+            .count();
+        assert_eq!(
+            terminal_count, 1,
+            "task {task_id} has duplicate terminal facts"
+        );
+    }
+    let turn_ids = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.event_type,
+                RuntimeEventType::TaskCreated | RuntimeEventType::TurnStarted
+            )
+        })
+        .filter_map(|event| event.turn_id)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(turn_ids.len(), rounds);
+    for turn_id in turn_ids {
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event.event_type,
+                        RuntimeEventType::TaskCreated | RuntimeEventType::TurnStarted
+                    ) && event.turn_id == Some(turn_id)
+                })
+                .count(),
+            1,
+            "turn {turn_id} started more than once",
+        );
+    }
+    daemon.0.kill().await.expect("stop soak daemon");
 }
 
 #[tokio::test]
@@ -685,4 +987,77 @@ async fn wait_for_terminal(transport: &HttpSseTransport, session_id: golutra_cor
         .await
         .expect("subscription");
     wait_for_completion(&mut events).await;
+}
+
+async fn wait_for_event_type(
+    transport: &HttpSseTransport,
+    session_id: SessionId,
+    event_type: RuntimeEventType,
+    after_sequence_no: Option<u64>,
+) -> Vec<RuntimeEvent> {
+    wait_for_new_event_type(transport, session_id, event_type, after_sequence_no).await;
+    load_all_typed_events(transport, session_id).await
+}
+
+async fn wait_for_new_event_type(
+    transport: &HttpSseTransport,
+    session_id: SessionId,
+    event_type: RuntimeEventType,
+    after_sequence_no: Option<u64>,
+) -> Vec<RuntimeEvent> {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let events = transport
+                .replay_events(EventFilter {
+                    session_id,
+                    task_id: None,
+                    after_sequence_no,
+                })
+                .await
+                .expect("runtime event replay")
+                .into_iter()
+                .map(|event| serde_json::from_value(event).expect("typed runtime event"))
+                .collect::<Vec<RuntimeEvent>>();
+            if events.iter().any(|event| {
+                event.event_type == event_type
+                    && after_sequence_no.is_none_or(|sequence| event.sequence_no > sequence)
+            }) {
+                return events;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("expected durable runtime event")
+}
+
+async fn load_all_typed_events(
+    transport: &HttpSseTransport,
+    session_id: SessionId,
+) -> Vec<RuntimeEvent> {
+    let mut events = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = transport
+            .event_page(EventPageRequest {
+                session_id,
+                task_id: None,
+                cursor,
+                direction: EventPageDirection::Forward,
+                limit: 512,
+            })
+            .await
+            .expect("runtime event page");
+        if page.events.is_empty() {
+            break;
+        }
+        let next_cursor = page.end_cursor.expect("non-empty event page cursor");
+        assert!(cursor.is_none_or(|previous| next_cursor > previous));
+        events.extend(page.events);
+        if !page.has_more {
+            break;
+        }
+        cursor = Some(next_cursor);
+    }
+    events
 }
