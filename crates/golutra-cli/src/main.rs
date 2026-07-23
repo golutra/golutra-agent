@@ -3,8 +3,9 @@ use golutra_auth::{
     CredentialRef, CredentialSource, OAuthFlow, OAuthProviderDescriptor, SecretKind,
 };
 use golutra_client::{
-    AgentClient, DebugExportCoordinator, DebugExportRequest, RuntimeClient, RuntimeTransport,
-    TaskTraceClient, parse_session_range,
+    AgentClient, DebugExportCoordinator, DebugExportRequest, RunBundleExportRequest,
+    RunBundleExporter, RunBundleTerminalOutcome, RuntimeClient, RuntimeTransport, TaskTraceClient,
+    parse_session_range,
 };
 use golutra_config::{
     BuiltinOAuthMethod, ProviderConfigPaths, ProviderConfigScope, ProviderInstallPlan,
@@ -178,6 +179,14 @@ struct ExecArgs {
     /// Do not persist runtime state after this process exits.
     #[arg(long)]
     ephemeral: bool,
+    /// Write isolated runtime state and full owner-only observations to this new directory.
+    /// Implies --ephemeral. The legacy --ephemeral-state-dir spelling remains accepted.
+    #[arg(
+        long = "run-dir",
+        visible_alias = "ephemeral-state-dir",
+        value_name = "DIR"
+    )]
+    run_dir: Option<std::path::PathBuf>,
     /// JSON Schema file for the final response.
     #[arg(long, value_name = "FILE")]
     output_schema: Option<std::path::PathBuf>,
@@ -628,13 +637,20 @@ async fn main() -> miette::Result<()> {
         .clone()
         .map_or_else(std::env::current_dir, Ok)
         .map_err(|error| miette::miette!("{error}"))?;
-    let ephemeral_exec = matches!(&cli.command, Command::Exec(args) if args.ephemeral);
+    let ephemeral_exec =
+        matches!(&cli.command, Command::Exec(args) if args.ephemeral || args.run_dir.is_some());
+    let run_dir = match &cli.command {
+        Command::Exec(args) => args.run_dir.clone(),
+        _ => None,
+    };
     if ephemeral_exec && (cli.daemon || cli.connect.is_some()) {
         return Err(miette::miette!(
-            "exec --ephemeral cannot be combined with --daemon or --connect"
+            "exec --ephemeral or --run-dir cannot be combined with --daemon or --connect"
         ));
     }
-    let transport = if ephemeral_exec {
+    let transport = if let Some(state_dir) = run_dir.as_ref() {
+        RuntimeTransport::ephemeral_persistent_for_cwd(&cwd, state_dir).await
+    } else if ephemeral_exec {
         RuntimeTransport::ephemeral_for_cwd(&cwd).await
     } else if let Some(base_url) = cli.connect.clone() {
         RuntimeTransport::connect(base_url, &cwd).await
@@ -2073,6 +2089,7 @@ async fn run_exec(transport: &RuntimeTransport, args: ExecArgs) -> miette::Resul
     };
     let json_output = args.json;
     let output_last_message = args.output_last_message;
+    let run_dir = args.run_dir;
     let approval_mode = args.approval_mode;
     let client = AgentClient::new(transport.clone());
     let (thread, prompt) = match args.command {
@@ -2108,37 +2125,56 @@ async fn run_exec(transport: &RuntimeTransport, args: ExecArgs) -> miette::Resul
         .await
         .map_err(|error| miette::miette!("{error}"))?;
 
-    while let Some(event) = handle
-        .next_event()
-        .await
-        .map_err(|error| miette::miette!("{error}"))?
-    {
-        if json_output {
-            println!(
-                "{}",
-                serde_json::to_string(&event).map_err(|error| miette::miette!("{error}"))?
-            );
-        } else {
-            report_exec_progress(&event);
-        }
-        if let Some(approval_id) = approval_id_from_exec_event(&event) {
-            let approve = resolve_exec_approval(&approval_id, approval_mode).await?;
-            let ack = handle
-                .resolve_approval(approval_id, approve)
-                .await
-                .map_err(|error| miette::miette!("{error}"))?;
-            if !ack.accepted {
-                return Err(miette::miette!(
-                    "runtime rejected approval resolution: {}",
-                    ack.reason.unwrap_or_else(|| "unknown reason".to_owned())
-                ));
+    let turn_result = async {
+        while let Some(event) = handle.next_event().await? {
+            if json_output {
+                println!("{}", serde_json::to_string(&event)?);
+            } else {
+                report_exec_progress(&event);
+            }
+            if let Some(approval_id) = approval_id_from_exec_event(&event) {
+                let approve = resolve_exec_approval(&approval_id, approval_mode)
+                    .await
+                    .map_err(|error| {
+                        golutra_client::ClientError::TaskExecution(error.to_string())
+                    })?;
+                let ack = handle.resolve_approval(approval_id, approve).await?;
+                if !ack.accepted {
+                    return Err(golutra_client::ClientError::TaskExecution(format!(
+                        "runtime rejected approval resolution: {}",
+                        ack.reason.unwrap_or_else(|| "unknown reason".to_owned())
+                    )));
+                }
             }
         }
+        handle.wait().await
     }
-    let result = handle
-        .wait()
-        .await
-        .map_err(|error| miette::miette!("{error}"))?;
+    .await;
+
+    let export_result = if let Some(destination) = run_dir {
+        let terminal_outcome = match &turn_result {
+            Ok(result) => RunBundleTerminalOutcome::Result {
+                result: result.clone(),
+            },
+            Err(error) => RunBundleTerminalOutcome::Error {
+                error: error.to_string(),
+            },
+        };
+        export_exec_run_bundle(transport, thread.thread_id(), destination, terminal_outcome).await
+    } else {
+        Ok(())
+    };
+
+    let result = match (turn_result, export_result) {
+        (Err(turn_error), Err(export_error)) => {
+            return Err(miette::miette!(
+                "agent turn failed: {turn_error}; runtime data export failed: {export_error}"
+            ));
+        }
+        (Err(error), Ok(())) => return Err(miette::miette!("{error}")),
+        (Ok(_), Err(error)) => return Err(miette::miette!("runtime data export failed: {error}")),
+        (Ok(result), Ok(())) => result,
+    };
     if let Some(path) = output_last_message {
         tokio::fs::write(&path, result.final_message.as_deref().unwrap_or_default())
             .await
@@ -2152,6 +2188,43 @@ async fn run_exec(transport: &RuntimeTransport, args: ExecArgs) -> miette::Resul
             "agent turn ended with status {:?}",
             result.status
         ));
+    }
+    Ok(())
+}
+
+async fn export_exec_run_bundle(
+    transport: &RuntimeTransport,
+    thread_id: ThreadId,
+    destination: std::path::PathBuf,
+    terminal_outcome: RunBundleTerminalOutcome,
+) -> Result<(), golutra_client::ClientError> {
+    let receipt = RunBundleExporter::new(transport)
+        .export(RunBundleExportRequest {
+            destination: destination.clone(),
+            selection: golutra_client::SessionWindowRequest {
+                anchor_thread_id: thread_id,
+                range: golutra_client::SessionRangeSpec {
+                    direction: golutra_client::SessionRangeDirection::Single,
+                    count: 1,
+                },
+            },
+            terminal_outcome,
+        })
+        .await?;
+    let debug_export = receipt
+        .debug_export_path
+        .as_deref()
+        .map(|path| destination.join(path).display().to_string())
+        .unwrap_or_else(|| "unavailable".to_owned());
+    eprintln!(
+        "golutra run bundle retained at {}; observations: {}; redacted debug export: {}; complete: {}",
+        destination.display(),
+        destination.join(&receipt.observations_path).display(),
+        debug_export,
+        receipt.complete,
+    );
+    if let Some(error) = receipt.debug_export_error {
+        eprintln!("redacted debug export failed without losing raw observations: {error}");
     }
     Ok(())
 }

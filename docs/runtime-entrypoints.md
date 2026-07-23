@@ -56,6 +56,9 @@ golutra --cwd "$PWD" exec --json "run the checks"
 golutra --cwd "$PWD" exec --output-last-message /tmp/answer.txt "summarize the change"
 golutra --cwd "$PWD" exec resume <thread-id> "continue the same task"
 golutra --cwd "$PWD" exec \
+  --run-dir /absolute/path/to/golutra-run \
+  --approval-mode auto "run the benchmark task"
+golutra --cwd "$PWD" exec \
   --completion-criterion "tests pass" \
   --verify-program cargo --verify-arg test --verify-arg --workspace \
   "implement the requested change"
@@ -72,6 +75,56 @@ Output rules:
   same runtime lane;
 - `--ephemeral` uses an isolated embedded runtime and cannot be combined with
   `--daemon` or `--connect`.
+
+Ordinary `--ephemeral` discards its state when the process exits. `--run-dir`
+creates one new absolute, owner-only run directory for an isolated invocation;
+it therefore implies `--ephemeral`. The legacy spelling
+`--ephemeral-state-dir` remains accepted. `--run-dir` cannot be combined with
+`--daemon` or `--connect`, because a benchmark run must not join a shared
+runtime store.
+
+After a turn reaches a terminal result, including a failed verifier result,
+Golutra writes this layout:
+
+```text
+<run-dir>/
+  manifest.json
+  state/
+    runtime.sqlite
+    artifacts/
+    workspaces/<workspace-hash>/{checkpoints,rollouts,memory,evaluation,...}
+  observations/
+    manifest.json
+    sessions/<session-id>/
+      thread.json
+      events.jsonl
+      conversation.jsonl
+      tasks/<task-id>/trace.json
+  debug-export/
+    manifest.json
+    ... redacted handoff files
+```
+
+`state/` is the canonical raw runtime state. `observations/` is a stable,
+full-owner-only projection built from the same `RuntimeEvent` and
+`TaskTraceService` facts: `events.jsonl` contains the full event stream,
+`conversation.jsonl` contains the user/assistant history, and `trace.json`
+contains context snapshots, artifact/evidence metadata, verification plan and
+record, post-task jobs, evaluation and integrity facts. Its manifest lists
+file checksums and explains incomplete or retained-away data. This lets a test
+harness consume structured observations without querying SQLite.
+
+`debug-export/` is separately redacted and suitable for handoff. Failure to
+build that optional portable export is recorded in the top-level manifest but
+does not discard the raw state or structured observations. Any durable
+post-task evaluation that remains queued is represented as pending in the
+trace rather than delaying a benchmark task.
+
+Golutra continues to read the active provider profile and credentials from
+the configured global `GOLUTRA_HOME`, and never copies them into the run
+directory. Raw state and `observations/` may contain workspace content,
+prompts and tool output, so keep the whole run directory owner-only and treat
+it as sensitive.
 
 `--completion-criterion` may be repeated. `--verify-program` and repeated
 `--verify-arg` values declare an argv-based external verifier that runs after

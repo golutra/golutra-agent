@@ -15,6 +15,42 @@ fn separate_cli_commands_use_the_same_controller_identity() {
 }
 
 #[test]
+fn run_directory_implies_ephemeral_exec_and_keeps_legacy_alias() {
+    let cli = Cli::try_parse_from([
+        "golutra",
+        "exec",
+        "--run-dir",
+        "/tmp/golutra-run",
+        "inspect the workspace",
+    ])
+    .expect("persisted run exec");
+    assert!(matches!(
+        cli.command,
+        Command::Exec(ExecArgs {
+            ephemeral: false,
+            run_dir: Some(path),
+            ..
+        }) if path == std::path::Path::new("/tmp/golutra-run")
+    ));
+
+    let legacy = Cli::try_parse_from([
+        "golutra",
+        "exec",
+        "--ephemeral-state-dir",
+        "/tmp/golutra-run",
+        "inspect the workspace",
+    ])
+    .expect("legacy run-dir alias");
+    assert!(matches!(
+        legacy.command,
+        Command::Exec(ExecArgs {
+            run_dir: Some(path),
+            ..
+        }) if path == std::path::Path::new("/tmp/golutra-run")
+    ));
+}
+
+#[test]
 fn evolution_commands_parse_governed_budget_and_skill_review() {
     let plan = Cli::try_parse_from([
         "golutra",

@@ -90,6 +90,15 @@ impl EmbeddedTransport {
         Ok(Self::new(RuntimeHost::ephemeral_for_cwd(cwd).await?))
     }
 
+    pub async fn ephemeral_persistent_for_cwd(
+        cwd: impl AsRef<Path>,
+        state_home: impl AsRef<Path>,
+    ) -> Result<Self, ClientError> {
+        Ok(Self::new(
+            RuntimeHost::ephemeral_persistent_for_cwd(cwd, state_home).await?,
+        ))
+    }
+
     pub async fn for_current_cwd() -> Result<Self, ClientError> {
         let cwd = std::env::current_dir().map_err(|error| ClientError::Io(error.to_string()))?;
         Self::for_cwd(cwd).await
@@ -998,6 +1007,15 @@ impl RuntimeTransport {
 
     pub async fn ephemeral_for_cwd(cwd: impl AsRef<Path>) -> Result<Self, ClientError> {
         EmbeddedTransport::ephemeral_for_cwd(cwd)
+            .await
+            .map(Self::Embedded)
+    }
+
+    pub async fn ephemeral_persistent_for_cwd(
+        cwd: impl AsRef<Path>,
+        state_home: impl AsRef<Path>,
+    ) -> Result<Self, ClientError> {
+        EmbeddedTransport::ephemeral_persistent_for_cwd(cwd, state_home)
             .await
             .map(Self::Embedded)
     }

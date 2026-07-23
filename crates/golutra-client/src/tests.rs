@@ -224,6 +224,27 @@ fn runtime_paths_reject_a_file_as_cwd() {
 }
 
 #[test]
+fn ephemeral_state_directory_requires_a_new_absolute_directory() {
+    let workspace = tempdir().expect("workspace");
+    let parent = tempdir().expect("state parent");
+    let state_dir = parent.path().join("run");
+
+    let paths = RuntimePaths::for_ephemeral_state_dir(&state_dir, workspace.path())
+        .expect("new state directory");
+    let canonical_state_dir = state_dir.canonicalize().expect("state home");
+    assert_eq!(paths.home, canonical_state_dir);
+    assert!(paths.runtime_db.starts_with(&paths.home));
+
+    let existing = RuntimePaths::for_ephemeral_state_dir(&state_dir, workspace.path())
+        .expect_err("state directory cannot be reused");
+    assert!(existing.to_string().contains("already exists"));
+
+    let relative = RuntimePaths::for_ephemeral_state_dir("relative-run", workspace.path())
+        .expect_err("state directory must be absolute");
+    assert!(relative.to_string().contains("must be absolute"));
+}
+
+#[test]
 fn session_and_command_leases_are_global_across_cwds() {
     let home = tempdir().expect("home");
     let cwd_a = tempdir().expect("cwd a");
@@ -3830,6 +3851,193 @@ async fn ephemeral_runtime_separates_global_provider_config_from_temporary_state
             .is_some(),
         "ephemeral writes must still produce checkpoints"
     );
+    drop(provider);
+}
+
+#[tokio::test]
+async fn persisted_ephemeral_runtime_retains_isolated_state_and_full_run_bundle() {
+    let workspace = tempdir().expect("workspace");
+    let state_parent = tempdir().expect("state parent");
+    let state_dir = state_parent.path().join("benchmark-run");
+    let provider = IsolatedGlobalMockProvider::install().await;
+    let global_provider_paths = ProviderConfigPaths::global().expect("provider paths");
+    let global_runtime_db = global_provider_paths.home.join("state/runtime.sqlite");
+
+    let transport = EmbeddedTransport::ephemeral_persistent_for_cwd(workspace.path(), &state_dir)
+        .await
+        .expect("persisted ephemeral transport");
+    let host = transport.host.clone();
+    let runtime_paths = host
+        .runtime_paths
+        .as_ref()
+        .expect("persisted runtime paths")
+        .clone();
+
+    assert_eq!(
+        runtime_paths.home,
+        state_dir.canonicalize().expect("state home")
+    );
+    assert_ne!(runtime_paths.home, global_provider_paths.home);
+    assert_eq!(
+        host.provider_config_paths
+            .as_ref()
+            .expect("global provider paths"),
+        &global_provider_paths
+    );
+    assert!(!global_runtime_db.exists());
+    assert!(!state_dir.join("provider.json").exists());
+    assert!(!state_dir.join("credentials.json").exists());
+
+    let runtime_transport = RuntimeTransport::Embedded(transport.clone());
+    let client = AgentClient::new(runtime_transport.clone());
+    let thread = client.start_thread().await.expect("thread");
+    let mut handle = thread
+        .start_turn(
+            "write file persisted.txt with content retained state",
+            golutra_protocol::AgentTurnOptions::default(),
+        )
+        .await
+        .expect("turn");
+    while handle.next_event().await.expect("turn event").is_some() {}
+    let result = handle.wait().await.expect("turn result");
+    let task_id = result.task_id.expect("task id");
+
+    assert_eq!(result.status, TaskStatus::Completed);
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("persisted.txt")).expect("written file"),
+        "retained state"
+    );
+    host.wait_for_deep_task_evaluation(task_id).await;
+    assert!(runtime_paths.runtime_db.is_file());
+    assert!(runtime_paths.artifacts_dir.is_dir());
+    assert!(
+        fs::read_dir(&runtime_paths.checkpoints_dir)
+            .expect("checkpoint directory")
+            .next()
+            .is_some(),
+        "persisted ephemeral writes must keep checkpoints"
+    );
+    assert!(
+        !host
+            .store
+            .load_events(result.session_id, Some(task_id), None)
+            .await
+            .expect("runtime events")
+            .is_empty(),
+        "runtime events must remain queryable before shutdown"
+    );
+
+    let receipt = RunBundleExporter::new(&runtime_transport)
+        .export(RunBundleExportRequest {
+            destination: state_dir.clone(),
+            selection: SessionWindowRequest {
+                anchor_thread_id: thread.thread_id(),
+                range: SessionRangeSpec {
+                    direction: SessionRangeDirection::Single,
+                    count: 1,
+                },
+            },
+            terminal_outcome: RunBundleTerminalOutcome::Result {
+                result: result.clone(),
+            },
+        })
+        .await
+        .expect("full run bundle");
+    assert_eq!(receipt.session_count, 1);
+    assert!(receipt.complete);
+    assert!(receipt.debug_export_error.is_none());
+    assert_eq!(receipt.debug_export_path.as_deref(), Some("debug-export"));
+    let run_manifest: RunBundleManifest = serde_json::from_slice(
+        &fs::read(state_dir.join("manifest.json")).expect("run bundle manifest"),
+    )
+    .expect("parse run bundle manifest");
+    assert_eq!(run_manifest.format, "golutra-run-bundle");
+    assert_eq!(run_manifest.mode, "full-owner-only");
+    assert!(matches!(
+        &run_manifest.terminal_outcome,
+        RunBundleTerminalOutcome::Result { result: exported } if exported.task_id == result.task_id
+    ));
+    assert!(run_manifest.raw_state.runtime_database.present);
+    assert!(run_manifest.raw_state.runtime_database.checksum.is_some());
+    let observations = &run_manifest.observations;
+    assert!(observations.complete);
+    assert_eq!(observations.sessions.len(), 1);
+    assert!(observations.files.iter().any(|file| {
+        file.path.ends_with("/events.jsonl") && file.checksum.starts_with("sha256:")
+    }));
+    let observation_root = state_dir.join("observations");
+    assert!(observation_root.join("manifest.json").is_file());
+    assert!(
+        observation_root
+            .join(format!("sessions/{}/events.jsonl", result.session_id))
+            .is_file()
+    );
+    assert!(
+        observation_root
+            .join(format!(
+                "sessions/{}/tasks/{task_id}/trace.json",
+                result.session_id
+            ))
+            .is_file()
+    );
+    let conversation = fs::read_to_string(
+        observation_root.join(format!("sessions/{}/conversation.jsonl", result.session_id)),
+    )
+    .expect("full conversation history");
+    assert!(conversation.contains("write file persisted.txt"));
+    let trace: golutra_protocol::TaskTracePage = serde_json::from_slice(
+        &fs::read(observation_root.join(format!(
+            "sessions/{}/tasks/{task_id}/trace.json",
+            result.session_id
+        )))
+        .expect("task trace"),
+    )
+    .expect("parse task trace");
+    assert_eq!(
+        trace
+            .verification
+            .as_ref()
+            .map(|verification| verification.result),
+        Some(VerificationResult::Pass)
+    );
+    assert!(state_dir.join("debug-export/manifest.json").is_file());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = |path: &std::path::Path| {
+            fs::metadata(path)
+                .expect("run bundle metadata")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode(&state_dir), 0o700);
+        assert_eq!(mode(&observation_root), 0o700);
+        assert_eq!(mode(&observation_root.join("manifest.json")), 0o600);
+    }
+
+    drop(client);
+    drop(runtime_transport);
+    drop(transport);
+    drop(thread);
+    drop(host);
+
+    let reopened = RuntimeStore::connect_with_artifact_root(
+        &runtime_paths.sqlite_url(),
+        runtime_paths.artifacts_dir.clone(),
+    )
+    .await
+    .expect("reopen persisted runtime store");
+    assert!(
+        !reopened
+            .load_events(result.session_id, Some(task_id), None)
+            .await
+            .expect("persisted runtime events")
+            .is_empty(),
+        "events must survive transport shutdown"
+    );
+    assert!(!global_runtime_db.exists());
     drop(provider);
 }
 

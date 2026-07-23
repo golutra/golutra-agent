@@ -138,6 +138,87 @@ impl RuntimePaths {
         })
     }
 
+    /// Create a new isolated runtime home for one persisted ephemeral run.
+    ///
+    /// The caller supplies the run root rather than a shared Golutra home, so
+    /// the resulting state can be retained or moved without joining the
+    /// user's normal runtime history. Provider configuration is selected by
+    /// the host separately.
+    pub fn for_ephemeral_state_dir(
+        state_home: impl AsRef<Path>,
+        cwd: impl AsRef<Path>,
+    ) -> Result<Self, ClientError> {
+        let state_home = state_home.as_ref();
+        if !state_home.is_absolute() {
+            return Err(ClientError::Io(format!(
+                "ephemeral state directory must be absolute: {}",
+                state_home.display()
+            )));
+        }
+        if state_home.file_name().is_none() {
+            return Err(ClientError::Io(
+                "ephemeral state directory must name a new directory".to_owned(),
+            ));
+        }
+
+        let parent = state_home.parent().ok_or_else(|| {
+            ClientError::Io(format!(
+                "ephemeral state directory has no parent: {}",
+                state_home.display()
+            ))
+        })?;
+        match fs::symlink_metadata(parent) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(ClientError::Io(format!(
+                    "ephemeral state directory parent cannot be a symbolic link: {}",
+                    parent.display()
+                )));
+            }
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(ClientError::Io(format!(
+                    "ephemeral state directory parent is not a directory: {}",
+                    parent.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ClientError::Io(format!(
+                    "ephemeral state directory parent does not exist: {}",
+                    parent.display()
+                )));
+            }
+            Err(error) => return Err(ClientError::Io(error.to_string())),
+        }
+        match fs::symlink_metadata(state_home) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(ClientError::Io(format!(
+                    "ephemeral state directory cannot be a symbolic link: {}",
+                    state_home.display()
+                )));
+            }
+            Ok(_) => {
+                return Err(ClientError::Io(format!(
+                    "ephemeral state directory already exists: {}",
+                    state_home.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ClientError::Io(error.to_string())),
+        }
+
+        fs::create_dir(state_home).map_err(|error| {
+            ClientError::Io(format!(
+                "failed to create ephemeral state directory {}: {error}",
+                state_home.display()
+            ))
+        })?;
+        set_owner_only_dir(state_home)?;
+        let state_home = state_home
+            .canonicalize()
+            .map_err(|error| ClientError::Io(error.to_string()))?;
+        Self::from_home_and_cwd(state_home, cwd)
+    }
+
     #[must_use]
     pub fn sqlite_url(&self) -> String {
         format!("sqlite://{}", self.runtime_db.display())

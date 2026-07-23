@@ -1,7 +1,7 @@
 //! Local, redacted export of session history and governed runtime facts.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
@@ -9,25 +9,23 @@ use std::{
 
 use base64::Engine;
 use chrono::{DateTime, Utc};
-use golutra_core::{ArtifactId, ArtifactRecord, RedactionStatus, SessionId, TaskId, TraceView};
+use golutra_core::{ArtifactId, ArtifactRecord, RedactionStatus, SessionId, TaskId};
 use golutra_protocol::{
-    ArtifactReadRequest, EventPageDirection, EventPageRequest, RuntimeEvent, RuntimeEventType,
-    SessionRangeDirection, SessionRangeSpec, SessionSummary, SessionWindowRequest,
-    TaskTraceRequest,
+    ArtifactReadRequest, SessionRangeDirection, SessionRangeSpec, SessionSummary,
+    SessionWindowRequest,
 };
 use golutra_store::MAX_ARTIFACT_READ_BYTES;
 use golutra_tools::redact_sensitive_text;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::{
-    ClientError, RuntimeClient, RuntimeTransport, TaskTraceClient, redact_provider_json,
+    ClientError, ConversationEntry, ConversationRole, ObservedSession, RuntimeObservationCollector,
+    RuntimeObservationSnapshot, RuntimeTransport, TaskTraceClient, redact_provider_json,
     set_owner_only_file,
 };
 
 const EXPORT_FORMAT_VERSION: u32 = 1;
-const MAX_EVENT_EXPORT_PAGES: usize = 65_536;
 const MAX_ARTIFACT_EXPORT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,16 +105,6 @@ pub struct ExportedArtifactManifest {
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct ConversationEntry {
-    sequence_no: u64,
-    timestamp: DateTime<Utc>,
-    turn_id: Option<String>,
-    task_id: Option<TaskId>,
-    role: &'static str,
-    content: String,
-}
-
 #[derive(Debug, Clone)]
 pub struct DebugExportCoordinator<'a> {
     transport: &'a RuntimeTransport,
@@ -132,16 +120,18 @@ impl<'a> DebugExportCoordinator<'a> {
         &self,
         request: DebugExportRequest,
     ) -> Result<DebugExportReceipt, ClientError> {
-        let parent = validate_export_destination(&request.destination)?;
-        let window = self
-            .transport
-            .session_window(request.selection.clone())
+        let snapshot = RuntimeObservationCollector::new(self.transport)
+            .collect(request.selection)
             .await?;
-        if window.sessions.is_empty() {
-            return Err(ClientError::InvalidSession(
-                "debug export selection contains no sessions".to_owned(),
-            ));
-        }
+        self.export_snapshot(snapshot, request.destination).await
+    }
+
+    pub(crate) async fn export_snapshot(
+        &self,
+        snapshot: RuntimeObservationSnapshot,
+        destination: PathBuf,
+    ) -> Result<DebugExportReceipt, ClientError> {
+        let parent = validate_export_destination(&destination)?;
 
         let temporary = tempfile::Builder::new()
             .prefix(".golutra-export-")
@@ -154,17 +144,17 @@ impl<'a> DebugExportCoordinator<'a> {
         create_private_dir(&partial_root)?;
 
         let mut combined_markdown = String::from("# Golutra conversation export\n\n");
-        let mut session_manifests = Vec::with_capacity(window.sessions.len());
+        let mut session_manifests = Vec::with_capacity(snapshot.sessions.len());
         let mut artifact_records = BTreeMap::<ArtifactId, ArtifactRecord>::new();
-        let mut missing_data = Vec::new();
-        let mut retention_losses = Vec::new();
+        let mut missing_data = snapshot.missing_data.clone();
+        let mut retention_losses = snapshot.retention_losses.clone();
         let mut redacted_fields = BTreeSet::from([
             "provider_credentials".to_owned(),
             "restricted_context_request".to_owned(),
             "raw_artifact_blobs".to_owned(),
         ]);
 
-        for session in &window.sessions {
+        for session in &snapshot.sessions {
             let exported = self
                 .export_session(
                     staging,
@@ -225,7 +215,8 @@ impl<'a> DebugExportCoordinator<'a> {
         missing_data.dedup();
         retention_losses.sort();
         retention_losses.dedup();
-        let complete = missing_data.is_empty()
+        let complete = snapshot.complete
+            && missing_data.is_empty()
             && retention_losses.is_empty()
             && session_manifests.iter().all(|session| {
                 session.events_complete && session.tasks.iter().all(|task| task.complete)
@@ -240,7 +231,7 @@ impl<'a> DebugExportCoordinator<'a> {
                 .cwd()
                 .map(|path| path.display().to_string())
                 .unwrap_or_default(),
-            selection: request.selection,
+            selection: snapshot.selection,
             mode: "full-redacted".to_owned(),
             complete,
             redacted: true,
@@ -254,21 +245,21 @@ impl<'a> DebugExportCoordinator<'a> {
         write_bytes(&staging.join("manifest.json"), &manifest_bytes)?;
         sync_export_tree(staging)?;
 
-        if fs::symlink_metadata(&request.destination).is_ok() {
+        if fs::symlink_metadata(&destination).is_ok() {
             return Err(ClientError::Io(format!(
                 "debug export destination already exists: {}",
-                request.destination.display()
+                destination.display()
             )));
         }
         let staging_path = temporary.keep();
-        if let Err(error) = fs::rename(&staging_path, &request.destination) {
+        if let Err(error) = fs::rename(&staging_path, &destination) {
             let _ = fs::remove_dir_all(&staging_path);
-            return Err(export_io(&request.destination, error));
+            return Err(export_io(&destination, error));
         }
         sync_directory(&parent)?;
 
         Ok(DebugExportReceipt {
-            destination: request.destination,
+            destination,
             session_count: manifest.sessions.len(),
             task_count: manifest
                 .sessions
@@ -285,56 +276,29 @@ impl<'a> DebugExportCoordinator<'a> {
     async fn export_session(
         &self,
         staging: &Path,
-        summary: &SessionSummary,
+        observed: &ObservedSession,
         combined_markdown: &mut String,
         artifact_records: &mut BTreeMap<ArtifactId, ArtifactRecord>,
         missing_data: &mut Vec<String>,
         retention_losses: &mut Vec<String>,
         redacted_fields: &mut BTreeSet<String>,
     ) -> Result<ExportedSessionManifest, ClientError> {
+        let summary = &observed.summary;
         let relative_root = format!("sessions/{}", summary.session_id);
         let session_root = staging.join(&relative_root);
         create_private_dir(&session_root)?;
         create_private_dir(&session_root.join("tasks"))?;
 
-        let thread = self
-            .transport
-            .thread_for_session(summary.session_id)
-            .await?
-            .ok_or_else(|| {
-                ClientError::InvalidSession(format!(
-                    "thread for session `{}` disappeared during export",
-                    summary.session_id
-                ))
-            })?;
-        write_json(&session_root.join("thread.json"), &thread, true)?;
-
-        let snapshot_end_sequence = self.latest_event_sequence(summary.session_id).await?;
-        let events = self
-            .load_all_events(summary.session_id, snapshot_end_sequence)
-            .await?;
-        write_json_lines(&session_root.join("events.jsonl"), &events)?;
-        let conversation = conversation_entries(&events);
+        write_json(&session_root.join("thread.json"), &observed.thread, true)?;
+        write_json_lines(&session_root.join("events.jsonl"), &observed.events)?;
+        let conversation = redact_conversation_entries(&observed.conversation);
         write_json_lines(&session_root.join("conversation.jsonl"), &conversation)?;
         append_markdown_session(combined_markdown, summary, &conversation);
 
-        let task_ids = events
-            .iter()
-            .filter_map(|event| event.task_id)
-            .collect::<BTreeSet<_>>();
-        let mut tasks = Vec::with_capacity(task_ids.len());
-        for task_id in task_ids {
-            let trace = self
-                .transport
-                .complete_task_trace(TaskTraceRequest {
-                    session_id: summary.session_id,
-                    task_id,
-                    view: TraceView::Full,
-                    cursor: None,
-                    limit: 512,
-                    wait_for_evaluation: false,
-                })
-                .await?;
+        let mut tasks = Vec::with_capacity(observed.tasks.len());
+        for task in &observed.tasks {
+            let task_id = task.task_id;
+            let trace = &task.trace;
             let task_root = session_root.join("tasks").join(task_id.to_string());
             create_private_dir(&task_root)?;
             write_json(&task_root.join("trace.json"), &trace, true)?;
@@ -375,104 +339,21 @@ impl<'a> DebugExportCoordinator<'a> {
                 task_id,
                 trace_path: format!("{relative_root}/tasks/{task_id}/trace.json"),
                 complete: trace.integrity.complete,
-                unresolved_refs: trace.integrity.unresolved_refs,
-                missing_sections: trace.integrity.missing_sections,
-                retention_losses: trace.integrity.retention_losses,
-                redacted_fields: trace.integrity.redacted_fields,
+                unresolved_refs: trace.integrity.unresolved_refs.clone(),
+                missing_sections: trace.integrity.missing_sections.clone(),
+                retention_losses: trace.integrity.retention_losses.clone(),
+                redacted_fields: trace.integrity.redacted_fields.clone(),
             });
-        }
-
-        let events_complete = event_snapshot_is_stable(
-            snapshot_end_sequence,
-            self.latest_event_sequence(summary.session_id).await?,
-        );
-        if !events_complete {
-            missing_data.push(format!(
-                "session:{}:events changed during export",
-                summary.session_id
-            ));
         }
 
         Ok(ExportedSessionManifest {
             thread_id: summary.thread_id.to_string(),
             session_id: summary.session_id,
             path: relative_root,
-            event_count: events.len(),
-            events_complete,
+            event_count: observed.events.len(),
+            events_complete: observed.events_complete,
             tasks,
         })
-    }
-
-    async fn latest_event_sequence(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Option<u64>, ClientError> {
-        let page = self
-            .transport
-            .event_page(EventPageRequest {
-                session_id,
-                task_id: None,
-                cursor: None,
-                direction: EventPageDirection::Backward,
-                limit: 1,
-            })
-            .await?;
-        Ok(page.events.last().map(|event| event.sequence_no))
-    }
-
-    async fn load_all_events(
-        &self,
-        session_id: SessionId,
-        upper_bound: Option<u64>,
-    ) -> Result<Vec<RuntimeEvent>, ClientError> {
-        let mut cursor = None;
-        let mut events = Vec::new();
-        for _ in 0..MAX_EVENT_EXPORT_PAGES {
-            let page = self
-                .transport
-                .event_page(EventPageRequest {
-                    session_id,
-                    task_id: None,
-                    cursor,
-                    direction: EventPageDirection::Forward,
-                    limit: 512,
-                })
-                .await?;
-            if page.events.is_empty() {
-                if page.has_more {
-                    return Err(ClientError::TaskExecution(
-                        "event export page has_more without events".to_owned(),
-                    ));
-                }
-                return Ok(events);
-            }
-            let next = page.end_cursor.ok_or_else(|| {
-                ClientError::TaskExecution("event export page has no end cursor".to_owned())
-            })?;
-            if cursor == Some(next) {
-                return Err(ClientError::TaskExecution(
-                    "event export cursor did not advance".to_owned(),
-                ));
-            }
-            cursor = Some(next);
-            let reached_upper_bound = upper_bound.is_some_and(|upper_bound| {
-                page.events
-                    .iter()
-                    .any(|event| event.sequence_no >= upper_bound)
-            });
-            events.extend(page.events.into_iter().filter(|event| {
-                upper_bound.is_none_or(|upper_bound| event.sequence_no <= upper_bound)
-            }));
-            if reached_upper_bound {
-                return Ok(events);
-            }
-            if !page.has_more {
-                return Ok(events);
-            }
-        }
-        Err(ClientError::TaskExecution(format!(
-            "session event export exceeds {MAX_EVENT_EXPORT_PAGES} pages"
-        )))
     }
 
     async fn export_artifact(
@@ -764,47 +645,15 @@ fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), ClientError> {
         .map_err(|error| export_io(path, error))
 }
 
-fn conversation_entries(events: &[RuntimeEvent]) -> Vec<ConversationEntry> {
-    let mut entries = Vec::new();
-    let mut user_turns = HashSet::new();
-    for event in events {
-        let (role, content) = match event.event_type {
-            RuntimeEventType::TaskCreated | RuntimeEventType::TurnQueued => (
-                "user",
-                event
-                    .payload
-                    .pointer("/payload/prompt")
-                    .and_then(Value::as_str),
-            ),
-            RuntimeEventType::TurnStarted => {
-                ("user", event.payload.get("prompt").and_then(Value::as_str))
-            }
-            RuntimeEventType::AssistantMessage => (
-                "assistant",
-                event.payload.get("content").and_then(Value::as_str),
-            ),
-            _ => continue,
-        };
-        let Some(content) = content.filter(|content| !content.trim().is_empty()) else {
-            continue;
-        };
-        if role == "user"
-            && let Some(turn_id) = event.turn_id
-            && !user_turns.insert(turn_id)
-        {
-            continue;
-        }
-        let content = redact_sensitive_text(content).0;
-        entries.push(ConversationEntry {
-            sequence_no: event.sequence_no,
-            timestamp: event.timestamp,
-            turn_id: event.turn_id.map(|turn_id| turn_id.to_string()),
-            task_id: event.task_id,
-            role,
-            content,
-        });
-    }
+fn redact_conversation_entries(entries: &[ConversationEntry]) -> Vec<ConversationEntry> {
     entries
+        .iter()
+        .cloned()
+        .map(|mut entry| {
+            entry.content = redact_sensitive_text(&entry.content).0;
+            entry
+        })
+        .collect()
 }
 
 fn append_markdown_session(
@@ -817,7 +666,7 @@ fn append_markdown_session(
         session.title, session.session_id, session.thread_id
     ));
     for entry in entries {
-        output.push_str(if entry.role == "user" {
+        output.push_str(if entry.role == ConversationRole::User {
             "### You\n\n"
         } else {
             "### Golutra\n\n"
@@ -830,10 +679,6 @@ fn append_markdown_session(
 fn sha256_checksum_hex(checksum: &str) -> Option<String> {
     let value = checksum.strip_prefix("sha256:")?.to_ascii_lowercase();
     (value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(value)
-}
-
-fn event_snapshot_is_stable(before: Option<u64>, after: Option<u64>) -> bool {
-    before == after
 }
 
 #[cfg(unix)]
@@ -905,13 +750,5 @@ mod tests {
         for invalid in ["0", "50", "+0", "-501", "+nope"] {
             assert!(parse_session_range(invalid).is_err(), "{invalid}");
         }
-    }
-
-    #[test]
-    fn event_snapshot_detects_concurrent_session_growth() {
-        assert!(event_snapshot_is_stable(Some(10), Some(10)));
-        assert!(event_snapshot_is_stable(None, None));
-        assert!(!event_snapshot_is_stable(Some(10), Some(11)));
-        assert!(!event_snapshot_is_stable(None, Some(1)));
     }
 }

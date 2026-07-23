@@ -60,6 +60,15 @@ impl RuntimeApplication {
         Ok(Self::from_host(RuntimeHost::for_cwd(cwd).await?))
     }
 
+    pub async fn ephemeral_persistent_for_cwd(
+        cwd: impl AsRef<Path>,
+        state_home: impl AsRef<Path>,
+    ) -> Result<Self, ClientError> {
+        Ok(Self::from_host(
+            RuntimeHost::ephemeral_persistent_for_cwd(cwd, state_home).await?,
+        ))
+    }
+
     pub async fn from_home_and_cwd(
         home: impl AsRef<Path>,
         cwd: impl AsRef<Path>,

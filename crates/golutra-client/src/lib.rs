@@ -111,6 +111,7 @@ mod execution;
 mod execution_trace;
 mod governance;
 mod governance_commands;
+mod observation;
 mod paths;
 mod post_task;
 mod provider_runtime;
@@ -118,6 +119,7 @@ mod query;
 mod recovery;
 mod regression;
 mod rollout;
+mod run_bundle;
 mod session;
 mod task_governance;
 mod trace;
@@ -153,6 +155,10 @@ pub use golutra_protocol::{
     SessionCursor, SessionPage, SessionPageRequest, SessionRangeDirection, SessionRangeSpec,
     SessionSummary, SessionWindow, SessionWindowRequest,
 };
+pub use observation::{
+    ConversationEntry, ConversationRole, ObservedSession, ObservedTask,
+    RuntimeObservationCollector, RuntimeObservationSnapshot,
+};
 pub use paths::{AppServerPaths, RuntimePaths};
 pub(crate) use paths::{ensure_private_dir, set_owner_only_file, workspace_hash};
 pub use post_task::PostTaskCoordinator;
@@ -170,6 +176,12 @@ pub(crate) use rollout::{
 };
 #[cfg(test)]
 pub(crate) use rollout::{redact_rollout_value, rollout_lock_path};
+pub use run_bundle::{
+    DebugExportManifestReceipt, DebugExportOutcome, ObservationBundleManifest,
+    ObservationSessionManifest, ObservationTaskManifest, RawStateManifest, RunBundleExportRequest,
+    RunBundleExporter, RunBundleFile, RunBundleManifest, RunBundlePath, RunBundleReceipt,
+    RunBundleTerminalOutcome,
+};
 pub use trace::merge_task_trace_page;
 #[cfg(unix)]
 pub use transport::UnixIpcTransport;
@@ -252,6 +264,16 @@ impl RuntimeHostStorage {
             runtime_paths: Some(runtime_paths),
             provider_config_paths: Some(provider_config_paths),
             temporary_root: Some(temporary_root),
+        })
+    }
+
+    fn ephemeral_persistent(runtime_paths: RuntimePaths) -> Result<Self, ClientError> {
+        let provider_config_paths = ProviderConfigPaths::global()
+            .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
+        Ok(Self {
+            runtime_paths: Some(runtime_paths),
+            provider_config_paths: Some(provider_config_paths),
+            temporary_root: None,
         })
     }
 }
@@ -410,6 +432,34 @@ impl RuntimeHost {
         Self::from_store(
             store,
             Some(cwd),
+            storage,
+            WorkspaceId::new(),
+            SessionId::new(),
+            ThreadId::new(),
+            false,
+        )
+        .await
+    }
+
+    /// Build an isolated runtime whose state remains below `state_home` after
+    /// this process exits. Provider configuration continues to come from the
+    /// global Golutra home, so the persisted run directory contains no
+    /// provider configuration or credentials.
+    pub async fn ephemeral_persistent_for_cwd(
+        cwd: impl AsRef<Path>,
+        state_home: impl AsRef<Path>,
+    ) -> Result<Arc<Self>, ClientError> {
+        let paths = RuntimePaths::for_ephemeral_state_dir(state_home, cwd)?;
+        let store = RuntimeStore::connect_with_artifact_root(
+            &paths.sqlite_url(),
+            paths.artifacts_dir.clone(),
+        )
+        .await?;
+        set_owner_only_file(&paths.runtime_db)?;
+        let storage = RuntimeHostStorage::ephemeral_persistent(paths.clone())?;
+        Self::from_store(
+            store,
+            Some(paths.cwd.clone()),
             storage,
             WorkspaceId::new(),
             SessionId::new(),

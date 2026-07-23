@@ -140,6 +140,185 @@ async fn exec_reads_a_piped_prompt_without_mixing_progress_into_stdout() {
 }
 
 #[tokio::test]
+async fn exec_run_dir_retains_an_isolated_structured_runtime_bundle() {
+    let home = tempdir().expect("home");
+    let workspace = tempdir().expect("workspace");
+    let export_parent = tempdir().expect("export parent");
+    let state_dir = export_parent.path().join("runtime");
+    install_mock_provider(home.path());
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(20),
+        Command::new(env!("CARGO_BIN_EXE_golutra-cli"))
+            .arg("--cwd")
+            .arg(workspace.path())
+            .arg("exec")
+            .arg("--run-dir")
+            .arg(&state_dir)
+            .arg("--approval-mode")
+            .arg("auto")
+            .arg("write file retained.txt with content retained")
+            .env("GOLUTRA_HOME", home.path())
+            .output(),
+    )
+    .await
+    .expect("run-dir exec timeout")
+    .expect("run-dir exec output");
+
+    assert!(
+        output.status.success(),
+        "persisted run-dir exec failed: {output:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("retained.txt")).expect("workspace file"),
+        "retained"
+    );
+    assert!(state_dir.join("state/runtime.sqlite").is_file());
+    assert!(state_dir.join("state/artifacts").is_dir());
+    assert!(state_dir.join("manifest.json").is_file());
+    assert!(state_dir.join("observations/manifest.json").is_file());
+    assert!(state_dir.join("debug-export/manifest.json").is_file());
+    assert!(
+        fs::read_dir(state_dir.join("debug-export/sessions"))
+            .expect("exported sessions")
+            .next()
+            .is_some(),
+        "the debug export must contain the ephemeral session"
+    );
+    assert!(!state_dir.join("provider.json").exists());
+    assert!(!state_dir.join("credentials.json").exists());
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(state_dir.join("manifest.json")).expect("run bundle manifest"),
+    )
+    .expect("valid run bundle manifest");
+    assert_eq!(manifest["format"], "golutra-run-bundle");
+    assert_eq!(manifest["mode"], "full-owner-only");
+    assert_eq!(manifest["terminal_outcome"]["kind"], "result");
+    assert_eq!(manifest["raw_state"]["runtime_database"]["present"], true);
+    let observations: Value = serde_json::from_slice(
+        &fs::read(state_dir.join("observations/manifest.json")).expect("observation manifest"),
+    )
+    .expect("valid observation manifest");
+    assert_eq!(observations["format"], "golutra-runtime-observation");
+    assert_eq!(observations["disclosure"], "full-owner-only");
+    assert!(
+        observations["files"]
+            .as_array()
+            .is_some_and(|files| !files.is_empty())
+    );
+    let session = observations["sessions"]
+        .as_array()
+        .and_then(|sessions| sessions.first())
+        .expect("one observed session");
+    let session_id = session["session_id"].as_str().expect("session id");
+    let task_id = session["tasks"]
+        .as_array()
+        .and_then(|tasks| tasks.first())
+        .and_then(|task| task["task_id"].as_str())
+        .expect("observed task id");
+    let observation_session = state_dir.join("observations/sessions").join(session_id);
+    assert!(observation_session.join("events.jsonl").is_file());
+    let conversation = fs::read_to_string(observation_session.join("conversation.jsonl"))
+        .expect("full conversation history");
+    assert!(conversation.contains("write file retained.txt"));
+    let trace: Value = serde_json::from_slice(
+        &fs::read(
+            observation_session
+                .join("tasks")
+                .join(task_id)
+                .join("trace.json"),
+        )
+        .expect("task trace"),
+    )
+    .expect("valid task trace");
+    assert!(
+        trace["events"]
+            .as_array()
+            .is_some_and(|events| !events.is_empty())
+    );
+    assert!(!trace["verification"].is_null());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("golutra run bundle retained"),
+        "retention receipt belongs on stderr"
+    );
+}
+
+#[tokio::test]
+async fn failed_exec_run_dir_still_retains_verification_observations() {
+    let home = tempdir().expect("home");
+    let workspace = tempdir().expect("workspace");
+    let export_parent = tempdir().expect("export parent");
+    let state_dir = export_parent.path().join("failed-runtime");
+    install_mock_provider(home.path());
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(20),
+        Command::new(env!("CARGO_BIN_EXE_golutra-cli"))
+            .arg("--cwd")
+            .arg(workspace.path())
+            .arg("exec")
+            .arg("--run-dir")
+            .arg(&state_dir)
+            .arg("--verify-program")
+            .arg("false")
+            .arg("reply after a failing verifier")
+            .env("GOLUTRA_HOME", home.path())
+            .output(),
+    )
+    .await
+    .expect("failed run-dir exec timeout")
+    .expect("failed run-dir exec output");
+
+    assert!(
+        !output.status.success(),
+        "failing verifier unexpectedly passed"
+    );
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(state_dir.join("manifest.json")).expect("failed run bundle manifest"),
+    )
+    .expect("valid failed run bundle manifest");
+    assert_eq!(manifest["terminal_outcome"]["kind"], "result");
+    assert_eq!(manifest["terminal_outcome"]["result"]["status"], "failed");
+    let observations: Value = serde_json::from_slice(
+        &fs::read(state_dir.join("observations/manifest.json"))
+            .expect("failed observation manifest"),
+    )
+    .expect("valid failed observation manifest");
+    let session = observations["sessions"]
+        .as_array()
+        .and_then(|sessions| sessions.first())
+        .expect("observed failed session");
+    let session_id = session["session_id"].as_str().expect("session id");
+    let task_id = session["tasks"]
+        .as_array()
+        .and_then(|tasks| tasks.first())
+        .and_then(|task| task["task_id"].as_str())
+        .expect("failed task id");
+    let trace: Value = serde_json::from_slice(
+        &fs::read(
+            state_dir
+                .join("observations/sessions")
+                .join(session_id)
+                .join("tasks")
+                .join(task_id)
+                .join("trace.json"),
+        )
+        .expect("failed task trace"),
+    )
+    .expect("valid failed task trace");
+    assert_eq!(trace["verification"]["result"], "fail");
+    assert!(
+        trace["verification"]["checks"]
+            .as_array()
+            .is_some_and(|checks| checks
+                .iter()
+                .any(|check| { check["name"] == "objective:test:external_verifier" }))
+    );
+    assert!(state_dir.join("state/runtime.sqlite").is_file());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("golutra run bundle retained"));
+}
+
+#[tokio::test]
 async fn exec_runs_caller_declared_verifier_across_the_app_server_boundary() {
     let home = tempdir().expect("home");
     let workspace = tempdir().expect("workspace");
@@ -231,7 +410,9 @@ async fn wait_for_runtime(
     let endpoint = home.join("app-server/app-server.json");
     let token_path = home.join("app-server/transport.token");
     let mut last_error = None;
-    for _ in 0..200 {
+    // App-server startup has to initialize an isolated runtime home. Under a
+    // parallel process-test load that can exceed the old five-second window.
+    for _ in 0..800 {
         let attempt = async {
             let info: AppServerInfo = serde_json::from_slice(
                 &tokio::fs::read(&endpoint)
