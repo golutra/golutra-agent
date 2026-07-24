@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shlex
+import shutil
+import subprocess
 import tempfile
+import threading
+import time
+from datetime import datetime, timezone
+from importlib import metadata
 from pathlib import Path
 
 from terminal_bench.agents.base_agent import AgentResult, BaseAgent
@@ -17,6 +24,15 @@ from terminal_bench.terminal.tmux_session import TmuxSession
 class GolutraAgent(BaseAgent):
     """Run a locally built Golutra CLI and retain governed runtime data."""
 
+    _PROXY_ENV_NAMES = (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    )
+
     def __init__(
         self,
         model_name: str = "openai-compatible/gpt-5.5",
@@ -24,6 +40,13 @@ class GolutraAgent(BaseAgent):
         amd64_binary: str = "/tmp/golutra-linux-bin-amd64/golutra-cli",
         provider_path: str | None = None,
         credentials_path: str | None = None,
+        proxy_url: str | None = None,
+        no_proxy: str = "localhost,127.0.0.1,::1",
+        workspace_path: str | None = None,
+        collector_binary: str | None = None,
+        dataset_id: str = "terminal-bench",
+        dataset_version: str = "unknown",
+        result_collection_timeout_sec: float = 300.0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -41,6 +64,13 @@ class GolutraAgent(BaseAgent):
             if credentials_path
             else golutra_home / "credentials.json"
         )
+        self._proxy_url = proxy_url or os.environ.get("GOLUTRA_TBENCH_PROXY")
+        self._no_proxy = no_proxy
+        self._workspace_path_override = workspace_path
+        self._collector_binary = self._resolve_collector_binary(collector_binary)
+        self._dataset_id = dataset_id
+        self._dataset_version = dataset_version
+        self._result_collection_timeout_sec = result_collection_timeout_sec
 
     @staticmethod
     def name() -> str:
@@ -92,6 +122,227 @@ class GolutraAgent(BaseAgent):
         credentials_file.chmod(0o600)
         return provider_file, credentials_file
 
+    def _runtime_environment(self) -> dict[str, str]:
+        environment = {"HOME": "/root", "GOLUTRA_HOME": "/root/.golutra"}
+        if self._proxy_url:
+            environment.update(
+                {name: self._proxy_url for name in self._PROXY_ENV_NAMES}
+            )
+            environment.update({"NO_PROXY": self._no_proxy, "no_proxy": self._no_proxy})
+        return environment
+
+    def _configure_tmux_proxy(self, session: TmuxSession) -> bool:
+        if not self._proxy_url:
+            return True
+        proxy_environment = {
+            name: self._proxy_url for name in self._PROXY_ENV_NAMES
+        }
+        proxy_environment.update({"NO_PROXY": self._no_proxy, "no_proxy": self._no_proxy})
+        for name, value in proxy_environment.items():
+            result = session.container.exec_run(
+                ["tmux", "set-environment", "-g", name, value]
+            )
+            if result.exit_code != 0:
+                return False
+        return True
+
+    def _workspace_path(self, session: TmuxSession) -> str | None:
+        if self._workspace_path_override:
+            candidate = self._workspace_path_override.strip()
+        else:
+            result = session.container.exec_run(["pwd"])
+            if result.exit_code != 0:
+                return None
+            candidate = result.output.decode(errors="replace").strip()
+        if not candidate.startswith("/") or "\x00" in candidate or "\n" in candidate:
+            return None
+        return candidate
+
+    @staticmethod
+    def _resolve_collector_binary(configured: str | None) -> Path | None:
+        candidates = [
+            configured,
+            os.environ.get("GOLUTRA_TBENCH_COLLECTOR"),
+            shutil.which("golutra"),
+        ]
+        repository_root = Path(__file__).resolve().parents[2]
+        candidates.extend(
+            [
+                str(repository_root / "target" / "release" / "golutra"),
+                str(repository_root / "target" / "debug" / "golutra"),
+            ]
+        )
+        for candidate in candidates:
+            if not candidate:
+                continue
+            path = Path(candidate).expanduser()
+            if path.is_file() and os.access(path, os.X_OK):
+                return path.resolve()
+        return None
+
+    def _start_result_collector(self, logging_dir: Path | None) -> None:
+        if logging_dir is None:
+            return
+        thread = threading.Thread(
+            target=self._collect_result,
+            args=(logging_dir.parent,),
+            name=f"golutra-evaluation-{logging_dir.parent.name}",
+            daemon=False,
+        )
+        thread.start()
+
+    def _collect_result(self, trial_root: Path) -> None:
+        deadline = time.monotonic() + self._result_collection_timeout_sec
+        results_path: Path | None = None
+        run_dir: Path | None = None
+        while time.monotonic() < deadline:
+            results_path = _find_trial_results(trial_root)
+            run_dir = _find_run_bundle(trial_root)
+            if results_path is not None and run_dir is not None:
+                break
+            time.sleep(0.25)
+        else:
+            _write_json_atomic(
+                trial_root / "golutra-evaluation.pending.json",
+                {
+                    "status": "pending_inputs",
+                    "reason": "Terminal-Bench results.json or Golutra manifest did not appear before the collection deadline",
+                    "trial_root": str(trial_root),
+                    "results_path": str(results_path) if results_path else None,
+                    "run_bundle": str(run_dir) if run_dir else None,
+                },
+            )
+            return
+
+        try:
+            assert results_path is not None
+            assert run_dir is not None
+            results = json.loads(results_path.read_text())
+            manifest = json.loads((run_dir / "manifest.json").read_text())
+            terminal_result = manifest.get("terminal_outcome", {}).get("result", {})
+            task_id = terminal_result.get("task_id")
+            session_id = terminal_result.get("session_id")
+            if not task_id or not session_id:
+                _write_json_atomic(
+                    run_dir / "terminal-bench-evaluation.pending.json",
+                    {
+                        "status": "pending_runtime_identity",
+                        "reason": "run manifest has no terminal task/session identity",
+                        "results_path": str(results_path),
+                    },
+                )
+                return
+            parser_results, resolved = _extract_trial_result(results, task_id)
+            evidence_refs = _existing_evidence_refs(trial_root)
+            assertions = [
+                {
+                    "assertion_id": f"terminal-bench:{name}",
+                    "name": name,
+                    "passed": str(status).lower() in {"pass", "passed"},
+                    "message": str(status),
+                    "evidence_refs": evidence_refs,
+                }
+                for name, status in sorted(parser_results.items())
+            ]
+            if not assertions:
+                assertions = [
+                    {
+                        "assertion_id": "terminal-bench:resolved",
+                        "name": "resolved",
+                        "passed": resolved,
+                        "message": str(resolved),
+                        "evidence_refs": evidence_refs,
+                    }
+                ]
+            passed = sum(assertion["passed"] for assertion in assertions)
+            total = len(assertions)
+            harness_version = _terminal_bench_version()
+            trace_digest, runtime_identity = _trace_identity(run_dir, task_id, session_id)
+            record = {
+                "evaluation_id": f"terminal-bench:{results.get('id', trial_root.name)}:{task_id}",
+                "source_task_id": task_id,
+                "evaluator_id": "terminal-bench",
+                "evaluator_version": harness_version,
+                "harness_id": "terminal-bench",
+                "harness_version": harness_version,
+                "dataset_id": self._dataset_id,
+                "dataset_version": self._dataset_version,
+                "case_id": str(results.get("task_id", task_id)),
+                "verdict": "pass" if resolved else "fail",
+                "score": float(passed),
+                "score_max": float(total) if total else 1.0,
+                "assertions": assertions,
+                "artifact_refs": evidence_refs,
+                "partition": "source",
+                "seed": None,
+                "provider_variant": self._model_name,
+                "holdout_protected": False,
+                "base_trace_digest": trace_digest or "auto",
+                "runtime_identity": runtime_identity or "auto",
+                "result_digest": "auto",
+                "trust": "owner_local",
+                "attestation": None,
+                "ingested_at": _now_rfc3339(),
+            }
+            if record["base_trace_digest"] != "auto" and record["runtime_identity"] != "auto":
+                record["result_digest"] = _external_result_digest(record)
+            record_path = run_dir / "terminal-bench-evaluation.json"
+            _write_json_atomic(record_path, record)
+            if self._collector_binary is None:
+                _write_json_atomic(
+                    run_dir / "terminal-bench-evaluation.pending.json",
+                    {
+                        "status": "pending_collector",
+                        "reason": "Golutra collector binary was not found; evaluation JSON is retained for later ingestion",
+                        "record_path": str(record_path),
+                        "record": record,
+                    },
+                )
+                return
+            completed = subprocess.run(
+                [
+                    str(self._collector_binary),
+                    "--run-bundle",
+                    str(run_dir),
+                    "--session-id",
+                    session_id,
+                    "eval",
+                    "ingest",
+                    str(record_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+            _write_json_atomic(
+                run_dir / "terminal-bench-evaluation.log",
+                {
+                    "exit_code": completed.returncode,
+                    "stdout": completed.stdout,
+                    "stderr": completed.stderr,
+                    "record_path": str(record_path),
+                },
+            )
+            if completed.returncode == 0:
+                _remove_if_exists(run_dir / "terminal-bench-evaluation.pending.json")
+            else:
+                _write_json_atomic(
+                    run_dir / "terminal-bench-evaluation.pending.json",
+                    {
+                        "status": "ingest_failed",
+                        "reason": "Golutra collector rejected the external evaluation",
+                        "record_path": str(record_path),
+                        "exit_code": completed.returncode,
+                    },
+                )
+        except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as error:
+            target = run_dir or trial_root
+            _write_json_atomic(
+                target / "terminal-bench-evaluation.pending.json",
+                {"status": "collector_error", "reason": str(error)},
+            )
+
     def perform_task(
         self,
         instruction: str,
@@ -125,11 +376,20 @@ class GolutraAgent(BaseAgent):
         )
         if setup_result.exit_code != 0:
             return AgentResult(failure_mode=FailureMode.AGENT_INSTALLATION_FAILED)
+        if not self._configure_tmux_proxy(session):
+            return AgentResult(failure_mode=FailureMode.AGENT_INSTALLATION_FAILED)
+        workspace_path = self._workspace_path(session)
+        if workspace_path is None:
+            return AgentResult(failure_mode=FailureMode.AGENT_INSTALLATION_FAILED)
 
         rendered_instruction = self._render_instruction(instruction)
+        environment = " ".join(
+            f"{name}={shlex.quote(value)}"
+            for name, value in self._runtime_environment().items()
+        )
         command = (
-            "HOME=/root GOLUTRA_HOME=/root/.golutra "
-            "/installed-agent/golutra --cwd /app exec "
+            f"{environment} "
+            f"/installed-agent/golutra --cwd {shlex.quote(workspace_path)} exec "
             "--run-dir /logs/golutra-runtime "
             "--approval-mode auto -- "
             f"{shlex.quote(rendered_instruction)}"
@@ -143,4 +403,180 @@ class GolutraAgent(BaseAgent):
                 append_enter=True,
             )
         )
+        self._start_result_collector(logging_dir)
         return AgentResult()
+
+
+def _find_trial_results(trial_root: Path) -> Path | None:
+    candidates = [trial_root / "results.json", trial_root.parent / "results.json"]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    # Some Terminal-Bench versions place the result one level below the task
+    # root. Keep the search bounded so an aggregate results file is not picked
+    # up from an unrelated sibling trial.
+    try:
+        matches = sorted(trial_root.glob("*/results.json"))
+    except OSError:
+        return None
+    return matches[0] if len(matches) == 1 else None
+
+
+def _find_run_bundle(trial_root: Path) -> Path | None:
+    candidates = [trial_root / "golutra-runtime", trial_root / "sessions" / "golutra-runtime"]
+    for candidate in candidates:
+        if (candidate / "manifest.json").is_file():
+            return candidate
+    try:
+        matches = sorted(
+            path.parent
+            for path in trial_root.glob("**/golutra-runtime/manifest.json")
+            if path.is_file()
+        )
+    except OSError:
+        return None
+    return matches[0] if len(matches) == 1 else None
+
+
+def _extract_trial_result(results: dict, task_id: str) -> tuple[dict, bool]:
+    if isinstance(results.get("parser_results"), dict):
+        return results["parser_results"], bool(results.get("is_resolved", False))
+    aggregate = results.get("results")
+    if isinstance(aggregate, list):
+        candidates = [
+            item
+            for item in aggregate
+            if isinstance(item, dict)
+            and str(item.get("task_id", item.get("id", ""))) == str(task_id)
+        ]
+        if len(candidates) == 1:
+            return _extract_trial_result(candidates[0], task_id)
+    if isinstance(aggregate, dict):
+        candidate = aggregate.get(task_id)
+        if isinstance(candidate, dict):
+            return _extract_trial_result(candidate, task_id)
+    return {}, bool(results.get("is_resolved", results.get("resolved", False)))
+
+
+def _existing_evidence_refs(trial_root: Path) -> list[str]:
+    candidates = [
+        "results.json",
+        "panes/post-agent.txt",
+        "panes/post-test.txt",
+        "commands.txt",
+    ]
+    return [path for path in candidates if (trial_root / path).is_file()]
+
+
+def _trace_identity(run_dir: Path, task_id: str, session_id: str) -> tuple[str | None, str | None]:
+    manifest_path = run_dir / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None, None
+    trace_paths: list[Path] = []
+    for session in manifest.get("observations", {}).get("sessions", []):
+        if str(session.get("session_id")) != str(session_id):
+            continue
+        for task in session.get("tasks", []):
+            if str(task.get("task_id")) == str(task_id) and task.get("trace_path"):
+                trace_paths.append(run_dir / str(task["trace_path"]))
+    if not trace_paths:
+        try:
+            trace_paths = list(run_dir.glob("observations/**/trace.json"))
+        except OSError:
+            return None, None
+    for path in trace_paths:
+        try:
+            trace = json.loads(path.read_text())
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        integrity = trace.get("integrity") or {}
+        digest = integrity.get("event_chain_digest")
+        identity = trace.get("runtime_identity")
+        if isinstance(digest, str) and digest.startswith("sha256:") and isinstance(identity, str):
+            return digest, identity
+    return None, None
+
+
+def _external_result_digest(record: dict) -> str:
+    facts = {
+        key: record.get(key)
+        for key in (
+            "evaluation_id",
+            "source_task_id",
+            "evaluator_id",
+            "evaluator_version",
+            "harness_id",
+            "harness_version",
+            "dataset_id",
+            "dataset_version",
+            "case_id",
+            "verdict",
+            "score",
+            "score_max",
+            "assertions",
+            "artifact_refs",
+            "partition",
+            "seed",
+            "provider_variant",
+            "holdout_protected",
+            "comparison_group_id",
+            "candidate_id",
+            "campaign_id",
+            "role",
+            "base_trace_digest",
+            "runtime_identity",
+            "trust",
+        )
+    }
+    encoded = json.dumps(
+        _canonical_json(facts),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _canonical_json(value):
+    if isinstance(value, dict):
+        return {key: _canonical_json(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        return [_canonical_json(item) for item in value]
+    return value
+
+
+def _now_rfc3339() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _write_json_atomic(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}-", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+    finally:
+        _remove_if_exists(temporary)
+
+
+def _remove_if_exists(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except IsADirectoryError:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def _terminal_bench_version() -> str:
+    try:
+        return metadata.version("terminal-bench")
+    except metadata.PackageNotFoundError:
+        return "unknown"
