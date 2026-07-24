@@ -1028,6 +1028,37 @@ impl RuntimeStore {
         .transpose()
     }
 
+    pub async fn find_artifact_by_content(
+        &self,
+        session_id: SessionId,
+        artifact_type: &str,
+        checksum: &str,
+        size_bytes: u64,
+    ) -> StoreResult<Option<ArtifactRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT artifact_json
+            FROM artifact_records
+            WHERE session_id = ? AND checksum = ? AND size_bytes = ?
+              AND blob_deleted_at IS NULL
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(session_id.to_string())
+        .bind(checksum)
+        .bind(i64::try_from(size_bytes).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+        for row in rows {
+            let artifact_json: String = row.try_get("artifact_json")?;
+            let artifact: ArtifactRecord = serde_json::from_str(&artifact_json)?;
+            if artifact.artifact_type == artifact_type {
+                return Ok(Some(artifact));
+            }
+        }
+        Ok(None)
+    }
+
     pub async fn load_artifact_bytes(
         &self,
         artifact_id: ArtifactId,

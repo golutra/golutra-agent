@@ -1,11 +1,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use golutra_core::{ArtifactId, EventId, EvidenceId, ProviderRequestId, TaskId};
+use golutra_core::{ArtifactId, CausalRelation, EventId, EvidenceId, ProviderRequestId, TaskId};
 use golutra_eval::{
-    CandidateRisk, CandidateStatus, CodeTargetRef, DiagnosticSlice, FailureDiagnosis,
-    FailureDomain, FailureEpisode, FailureEpisodeStatus, FailureRecovery, FailureSignalKind,
-    FailureSignalRef, FailureTaxonomy, ImprovementCandidate, ReplayCapsule, ReplayMode,
-    ReplayProviderExchange, ReplayToolResult,
+    CandidateRisk, CandidateStatus, CodeTargetRef, DiagnosticSlice, DiagnosticSliceContinuation,
+    FailureDiagnosis, FailureDomain, FailureEpisode, FailureEpisodeStatus, FailureRecovery,
+    FailureSignalKind, FailureSignalRef, FailureTaxonomy, ImprovementCandidate, ReplayCapsule,
+    ReplayMode, ReplayProviderExchange, ReplayToolResult,
 };
 use golutra_protocol::{RuntimeEvent, RuntimeEventType};
 use serde_json::Value;
@@ -35,17 +35,18 @@ pub(crate) fn diagnose_task(
     let trigger_index = events.iter().position(|event| event.id == trigger.id)?;
     let (taxonomy, summary, expected, actual, counterfactual, targets, commands, confidence) =
         classify_failure(events, trigger_index, trigger, source_digest);
-    let causal_events = diagnostic_slice_events(events, trigger.id, &episodes, 512);
+    let selected = diagnostic_slice_events(events, trigger.id, &episodes, 512);
     let mut artifact_refs = HashSet::new();
     let mut evidence_refs = HashSet::new();
-    for event in &causal_events {
+    for event in &selected.events {
         if let Some(artifact_id) = event.payload_ref {
             artifact_refs.insert(artifact_id);
         }
         collect_artifact_ids(&event.payload, None, &mut artifact_refs);
         collect_evidence_ids(&event.payload, &mut evidence_refs);
     }
-    let event_refs = causal_events
+    let event_refs = selected
+        .events
         .iter()
         .map(|event| event.id)
         .collect::<Vec<_>>();
@@ -56,14 +57,14 @@ pub(crate) fn diagnose_task(
         taxonomy,
         summary,
         trigger_event_refs: vec![trigger.id],
-        causal_event_refs: event_refs.clone(),
+        causal_event_refs: selected.causal_event_refs.clone(),
         expected_behavior: expected,
         actual_behavior: actual,
         counterfactual,
         confidence,
         code_targets: targets,
         regression_commands: commands,
-        analyzer_version: "golutra-failure-diagnosis-v2".to_owned(),
+        analyzer_version: "golutra-failure-diagnosis-v4".to_owned(),
         failure_episode_id: Some(primary_episode_id.clone()),
         revision: u32::try_from(
             events
@@ -82,26 +83,24 @@ pub(crate) fn diagnose_task(
             .map(ToOwned::to_owned),
         created_at: chrono::Utc::now(),
     };
-    let complete = event_refs.iter().all(|event_id| {
-        events
-            .iter()
-            .find(|event| event.id == *event_id)
-            .is_some_and(|event| {
-                event.parent_event_id.is_none()
-                    || event_refs.contains(&event.parent_event_id.expect("checked"))
-                    || events.first().is_some_and(|first| first.id == event.id)
-            })
-    });
+    let (continuation_pages, continuation_pages_truncated) =
+        diagnostic_continuation_pages(events, &event_refs, 64);
     let slice = DiagnosticSlice {
         slice_id: format!("diagnostic-slice-{task_id}-{}", trigger.id),
         source_task_id: task_id,
         diagnosis: diagnosis.clone(),
         event_refs,
+        causal_event_refs: selected.causal_event_refs,
+        supporting_event_refs: selected.supporting_event_refs,
         artifact_refs: sorted(artifact_refs),
         evidence_refs: sorted(evidence_refs),
-        omitted_event_count: u64::try_from(events.len().saturating_sub(causal_events.len()))
+        omitted_event_count: u64::try_from(events.len().saturating_sub(selected.events.len()))
             .unwrap_or(u64::MAX),
-        complete,
+        continuation_pages,
+        continuation_pages_truncated,
+        selection_strategy: "semantic_causal_frontier_then_lifecycle_and_temporal_context_v2"
+            .to_owned(),
+        complete: selected.causal_complete,
         generated_at: chrono::Utc::now(),
     };
     let mut episodes = episodes;
@@ -301,6 +300,26 @@ fn failure_episodes(task_id: TaskId, events: &[RuntimeEvent]) -> Vec<FailureEpis
                 episode.updated_at = event.timestamp;
             }
         }
+        if let Some(summary) = authoritative_success_summary(event) {
+            let recovered_keys = active_by_key
+                .iter()
+                .filter(|(_, index)| episodes[**index].external_assertion_failures.is_empty())
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            for key in recovered_keys {
+                let Some(index) = active_by_key.remove(&key) else {
+                    continue;
+                };
+                let episode = &mut episodes[index];
+                episode.status = FailureEpisodeStatus::Recovered;
+                episode.recovered_by = Some(FailureRecovery {
+                    event_ref: event.id,
+                    signal_key: key,
+                    summary: summary.clone(),
+                });
+                episode.updated_at = event.timestamp;
+            }
+        }
         if event.event_type.is_task_terminal()
             && event
                 .payload
@@ -341,6 +360,30 @@ fn failure_episodes(task_id: TaskId, events: &[RuntimeEvent]) -> Vec<FailureEpis
         }
     }
     episodes
+}
+
+fn authoritative_success_summary(event: &RuntimeEvent) -> Option<String> {
+    match event.event_type {
+        RuntimeEventType::VerificationCompleted
+            if event
+                .payload
+                .pointer("/record/result")
+                .and_then(Value::as_str)
+                == Some("pass") =>
+        {
+            Some("terminal verification passed after earlier exploratory failures".to_owned())
+        }
+        RuntimeEventType::ExternalEvaluationIngested
+            if event
+                .payload
+                .pointer("/record/verdict")
+                .and_then(Value::as_str)
+                == Some("pass") =>
+        {
+            Some("external evaluator passed the final task output".to_owned())
+        }
+        _ => None,
+    }
 }
 
 fn failure_signals(event: &RuntimeEvent) -> Option<(String, Vec<FailureSignalRef>)> {
@@ -658,6 +701,82 @@ fn classify_failure(
         } else {
             failed_assertions.join("; ")
         };
+        let terminal_cause = record
+            .get("terminal_cause")
+            .filter(|value| !value.is_null());
+        let terminal_code = terminal_cause
+            .and_then(|cause| cause.get("code"))
+            .and_then(Value::as_str);
+        let terminal_message = terminal_cause
+            .and_then(|cause| cause.get("message"))
+            .and_then(Value::as_str);
+        let failed_phase = record
+            .get("phases")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|phase| {
+                phase
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .is_some_and(|status| matches!(status, "failed" | "timed_out" | "error"))
+            });
+        let pipeline_failure = terminal_code.is_some_and(|code| code != "assertion_failed")
+            || (terminal_code.is_none() && failed_assertions.is_empty() && failed_phase.is_some());
+        if pipeline_failure {
+            let phase_id = failed_phase
+                .and_then(|phase| phase.get("phase_id"))
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    terminal_cause
+                        .and_then(|cause| cause.get("phase_id"))
+                        .and_then(Value::as_str)
+                })
+                .unwrap_or("unknown phase");
+            let phase_status = failed_phase
+                .and_then(|phase| phase.get("status"))
+                .and_then(Value::as_str)
+                .unwrap_or("failed");
+            let cause_code = terminal_code.unwrap_or(phase_status);
+            let mut actual_parts = vec![format!(
+                "{evaluator} pipeline phase {phase_id} ended as {phase_status}"
+            )];
+            if let Some(message) = terminal_message {
+                actual_parts.push(message.to_owned());
+            }
+            if !failed_assertions.is_empty() {
+                actual_parts.push(actual);
+            }
+            return (
+                FailureTaxonomy {
+                    domain: FailureDomain::ExternalEvaluation,
+                    code: format!(
+                        "{}_{}",
+                        normalized_code(evaluator),
+                        normalized_code(cause_code)
+                    ),
+                },
+                format!(
+                    "{evaluator} could not produce trustworthy assertions for case {case_id}: {}",
+                    actual_parts.join("; ")
+                ),
+                "the external evaluator completes its pipeline and returns trustworthy assertions"
+                    .to_owned(),
+                actual_parts.join("; "),
+                "inspect the imported evaluator artifacts, repair or reprovision the evaluator pipeline, and rerun the same case; do not change task output until an assertion identifies an output defect"
+                    .to_owned(),
+                vec![CodeTargetRef {
+                    crate_name: "evaluation-harness".to_owned(),
+                    module_path: evaluator.to_owned(),
+                    symbol: None,
+                    source_path: None,
+                    source_digest,
+                    owner: "external-evaluator".to_owned(),
+                }],
+                vec![format!("rerun external evaluator {evaluator} case {case_id}")],
+                96,
+            );
+        }
         return (
             FailureTaxonomy {
                 domain: FailureDomain::ExternalEvaluation,
@@ -901,31 +1020,49 @@ fn runtime_target(symbol: &str, source_digest: Option<String>) -> CodeTargetRef 
     }
 }
 
-fn causal_slice(events: &[RuntimeEvent], trigger_id: EventId, limit: usize) -> Vec<&RuntimeEvent> {
+struct DiagnosticEventSelection<'a> {
+    events: Vec<&'a RuntimeEvent>,
+    causal_event_refs: Vec<EventId>,
+    supporting_event_refs: Vec<EventId>,
+    causal_complete: bool,
+}
+
+fn causal_distances(
+    events: &[RuntimeEvent],
+    roots: &HashSet<EventId>,
+) -> (HashMap<EventId, usize>, bool) {
     let by_id = events
         .iter()
         .map(|event| (event.id, event))
         .collect::<HashMap<_, _>>();
-    let mut pending = VecDeque::from([trigger_id]);
-    let mut selected = HashSet::new();
-    while let Some(event_id) = pending.pop_front() {
-        if selected.len() >= limit || !selected.insert(event_id) {
+    let mut pending = roots
+        .iter()
+        .copied()
+        .map(|event_id| (event_id, 0_usize))
+        .collect::<VecDeque<_>>();
+    let mut distances = HashMap::new();
+    let mut missing_link = false;
+    while let Some((event_id, distance)) = pending.pop_front() {
+        if distances
+            .get(&event_id)
+            .is_some_and(|known| *known <= distance)
+        {
             continue;
         }
         let Some(event) = by_id.get(&event_id) else {
+            missing_link = true;
             continue;
         };
-        if let Some(parent) = event.parent_event_id {
-            pending.push_back(parent);
-        }
-        pending.extend(event.causal_links.iter().map(|link| link.event_id));
+        distances.insert(event_id, distance);
+        pending.extend(
+            event
+                .causal_links
+                .iter()
+                .filter(|link| link.relation != CausalRelation::Parent)
+                .map(|link| (link.event_id, distance.saturating_add(1))),
+        );
     }
-    let mut selected = events
-        .iter()
-        .filter(|event| selected.contains(&event.id))
-        .collect::<Vec<_>>();
-    selected.sort_by_key(|event| event.sequence_no);
-    selected
+    (distances, missing_link)
 }
 
 fn diagnostic_slice_events<'a>(
@@ -933,42 +1070,46 @@ fn diagnostic_slice_events<'a>(
     trigger_id: EventId,
     episodes: &[FailureEpisode],
     limit: usize,
-) -> Vec<&'a RuntimeEvent> {
-    let mut selected_ids = causal_slice(events, trigger_id, limit)
-        .into_iter()
-        .map(|event| event.id)
-        .collect::<HashSet<_>>();
-    selected_ids.extend(episodes.iter().flat_map(|episode| {
-        std::iter::once(episode.primary_signal.event_ref)
-            .chain(
-                episode
-                    .producer_failures
-                    .iter()
-                    .map(|signal| signal.event_ref),
-            )
-            .chain(
-                episode
-                    .self_check_failures
-                    .iter()
-                    .map(|signal| signal.event_ref),
-            )
-            .chain(
-                episode
-                    .external_assertion_failures
-                    .iter()
-                    .map(|signal| signal.event_ref),
-            )
-            .chain(
-                episode
-                    .recovered_by
-                    .iter()
-                    .map(|recovery| recovery.event_ref),
-            )
-    }));
+) -> DiagnosticEventSelection<'a> {
+    let mut root_ids = HashSet::from([trigger_id]);
+    root_ids.extend(
+        episodes
+            .iter()
+            .filter(|episode| episode.status == FailureEpisodeStatus::Active)
+            .flat_map(|episode| {
+                std::iter::once(episode.primary_signal.event_ref)
+                    .chain(
+                        episode
+                            .producer_failures
+                            .iter()
+                            .map(|signal| signal.event_ref),
+                    )
+                    .chain(
+                        episode
+                            .self_check_failures
+                            .iter()
+                            .map(|signal| signal.event_ref),
+                    )
+                    .chain(
+                        episode
+                            .external_assertion_failures
+                            .iter()
+                            .map(|signal| signal.event_ref),
+                    )
+                    .chain(
+                        episode
+                            .recovered_by
+                            .iter()
+                            .map(|recovery| recovery.event_ref),
+                    )
+            }),
+    );
+    let (causal_distances, missing_causal_link) = causal_distances(events, &root_ids);
+    let mut supporting_ids = HashSet::new();
     if let Some(trigger_index) = events.iter().position(|event| event.id == trigger_id) {
         let start = trigger_index.saturating_sub(64);
         let end = trigger_index.saturating_add(33).min(events.len());
-        selected_ids.extend(events[start..end].iter().map(|event| event.id));
+        supporting_ids.extend(events[start..end].iter().map(|event| event.id));
     }
     for event_type in [
         RuntimeEventType::ContextSnapshotCreated,
@@ -984,23 +1125,133 @@ fn diagnostic_slice_events<'a>(
             .rev()
             .find(|event| event.event_type == event_type)
         {
-            selected_ids.insert(event.id);
+            supporting_ids.insert(event.id);
         }
     }
-    let mut selected = events
+    let trigger_sequence = events
         .iter()
-        .filter(|event| selected_ids.contains(&event.id))
+        .find(|event| event.id == trigger_id)
+        .map_or(u64::MAX, |event| event.sequence_no);
+    let mut candidates = events
+        .iter()
+        .filter(|event| {
+            causal_distances.contains_key(&event.id) || supporting_ids.contains(&event.id)
+        })
         .collect::<Vec<_>>();
-    if selected.len() > limit {
-        let trigger_sequence = events
-            .iter()
-            .find(|event| event.id == trigger_id)
-            .map_or(u64::MAX, |event| event.sequence_no);
-        selected.sort_by_key(|event| event.sequence_no.abs_diff(trigger_sequence));
-        selected.truncate(limit);
+    candidates.sort_by_key(|event| {
+        let priority = if event.id == trigger_id {
+            0
+        } else if root_ids.contains(&event.id) {
+            1
+        } else if causal_distances.contains_key(&event.id) {
+            2
+        } else if matches!(
+            event.event_type,
+            RuntimeEventType::ContextSnapshotCreated
+                | RuntimeEventType::VerificationCompleted
+                | RuntimeEventType::LoopDecided
+                | RuntimeEventType::TaskCompleted
+                | RuntimeEventType::TaskAborted
+                | RuntimeEventType::TaskInterrupted
+                | RuntimeEventType::TaskUncertain
+        ) {
+            3
+        } else {
+            4
+        };
+        (
+            priority,
+            causal_distances
+                .get(&event.id)
+                .copied()
+                .unwrap_or(usize::MAX),
+            event.sequence_no.abs_diff(trigger_sequence),
+            event.sequence_no,
+        )
+    });
+    candidates.truncate(limit);
+    let selected_ids = candidates
+        .iter()
+        .map(|event| event.id)
+        .collect::<HashSet<_>>();
+    let causal_complete = !missing_causal_link
+        && causal_distances
+            .keys()
+            .all(|event_id| selected_ids.contains(event_id));
+    let mut causal_event_refs = candidates
+        .iter()
+        .filter(|event| causal_distances.contains_key(&event.id))
+        .map(|event| event.id)
+        .collect::<Vec<_>>();
+    let mut supporting_event_refs = candidates
+        .iter()
+        .filter(|event| !causal_distances.contains_key(&event.id))
+        .map(|event| event.id)
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|event| event.sequence_no);
+    let sequence_by_id = events
+        .iter()
+        .map(|event| (event.id, event.sequence_no))
+        .collect::<HashMap<_, _>>();
+    causal_event_refs.sort_by_key(|event_id| sequence_by_id.get(event_id).copied());
+    supporting_event_refs.sort_by_key(|event_id| sequence_by_id.get(event_id).copied());
+    DiagnosticEventSelection {
+        events: candidates,
+        causal_event_refs,
+        supporting_event_refs,
+        causal_complete,
     }
-    selected.sort_by_key(|event| event.sequence_no);
-    selected
+}
+
+fn diagnostic_continuation_pages(
+    events: &[RuntimeEvent],
+    selected_event_refs: &[EventId],
+    max_pages: usize,
+) -> (Vec<DiagnosticSliceContinuation>, bool) {
+    let selected = selected_event_refs.iter().copied().collect::<HashSet<_>>();
+    let mut pages = Vec::new();
+    let mut active: Option<(Option<u64>, u64, u64)> = None;
+    let mut previous_sequence = None;
+    for event in events {
+        if selected.contains(&event.id) {
+            if let Some((after_sequence_no, through_sequence_no, omitted_event_count)) =
+                active.take()
+            {
+                pages.push(DiagnosticSliceContinuation {
+                    after_sequence_no,
+                    through_sequence_no,
+                    omitted_event_count,
+                });
+            }
+        } else if let Some((_, through_sequence_no, omitted_event_count)) = active.as_mut() {
+            *through_sequence_no = event.sequence_no;
+            *omitted_event_count = omitted_event_count.saturating_add(1);
+        } else {
+            active = Some((previous_sequence, event.sequence_no, 1));
+        }
+        previous_sequence = Some(event.sequence_no);
+    }
+    if let Some((after_sequence_no, through_sequence_no, omitted_event_count)) = active {
+        pages.push(DiagnosticSliceContinuation {
+            after_sequence_no,
+            through_sequence_no,
+            omitted_event_count,
+        });
+    }
+    let truncated = pages.len() > max_pages;
+    if truncated {
+        let overflow = pages.split_off(max_pages.saturating_sub(1));
+        if let (Some(first), Some(last)) = (overflow.first(), overflow.last()) {
+            pages.push(DiagnosticSliceContinuation {
+                after_sequence_no: first.after_sequence_no,
+                through_sequence_no: last.through_sequence_no,
+                omitted_event_count: overflow.iter().fold(0_u64, |total, page| {
+                    total.saturating_add(page.omitted_event_count)
+                }),
+            });
+        }
+    }
+    (pages, truncated)
 }
 
 fn improvement_candidate(
@@ -1055,12 +1306,10 @@ fn improvement_candidate(
             .collect(),
         target_type: target.map_or_else(
             || "runtime_or_workspace".to_owned(),
-            |target| {
-                if target.crate_name == "workspace" {
-                    "workspace_code".to_owned()
-                } else {
-                    "runtime_code".to_owned()
-                }
+            |target| match target.owner.as_str() {
+                "task-workspace" => "workspace_code".to_owned(),
+                "external-evaluator" => "evaluation_harness".to_owned(),
+                _ => "runtime_code".to_owned(),
             },
         ),
         target_id,
@@ -1077,8 +1326,11 @@ fn improvement_candidate(
         evidence_refs,
         causal_evidence_refs,
         benchmark_refs,
-        rollback_plan: "revert the candidate patch and restore the pre-change checkpoint"
-            .to_owned(),
+        rollback_plan: if target.is_some_and(|target| target.owner == "external-evaluator") {
+            "revert evaluator integration changes and preserve the task workspace".to_owned()
+        } else {
+            "revert the candidate patch and restore the pre-change checkpoint".to_owned()
+        },
         diagnosis_ref: Some(diagnosis.diagnosis_id.clone()),
         proposed_commands: diagnosis.regression_commands.clone(),
         validation_plan: vec![
@@ -1228,6 +1480,73 @@ mod tests {
     }
 
     #[test]
+    fn passing_verification_recovers_non_equivalent_exploratory_failures() {
+        let task_id = TaskId::new();
+        let failed = event(
+            1,
+            task_id,
+            RuntimeEventType::ToolCompleted,
+            json!({
+                "envelope": {
+                    "tool_name": "shell",
+                    "status": "error",
+                    "summary": "optional dependency was unavailable",
+                    "structured_facts": {"command": ["which", "duckdb"]}
+                }
+            }),
+        );
+        let verified = event(
+            2,
+            task_id,
+            RuntimeEventType::VerificationCompleted,
+            json!({"summary": "verification passed", "record": {"result": "pass"}}),
+        );
+
+        let events = vec![failed, verified.clone()];
+        let episodes = task_failure_episodes(task_id, &events);
+
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0].status, FailureEpisodeStatus::Recovered);
+        assert_eq!(
+            episodes[0]
+                .recovered_by
+                .as_ref()
+                .map(|recovery| recovery.event_ref),
+            Some(verified.id)
+        );
+        assert!(diagnose_task(task_id, &events, None).is_none());
+    }
+
+    #[test]
+    fn internal_verification_does_not_recover_external_assertion_failure() {
+        let task_id = TaskId::new();
+        let external = event(
+            1,
+            task_id,
+            RuntimeEventType::ExternalEvaluationIngested,
+            json!({
+                "record": {
+                    "evaluator_id": "terminal-bench",
+                    "case_id": "case-a",
+                    "verdict": "fail",
+                    "assertions": [{"name": "output", "passed": false, "message": "wrong"}]
+                }
+            }),
+        );
+        let verified = event(
+            2,
+            task_id,
+            RuntimeEventType::VerificationCompleted,
+            json!({"summary": "runtime verification passed", "record": {"result": "pass"}}),
+        );
+
+        let episodes = task_failure_episodes(task_id, &[external, verified]);
+
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0].status, FailureEpisodeStatus::Active);
+    }
+
+    #[test]
     fn external_failure_revises_and_supersedes_the_self_check_diagnosis() {
         let task_id = TaskId::new();
         let verification = event(
@@ -1303,5 +1622,127 @@ mod tests {
         }));
         assert!(revised.candidate.evidence_refs.contains(&evidence_id));
         assert!(revised.slice.artifact_refs.contains(&artifact_id));
+    }
+
+    #[test]
+    fn external_pipeline_failure_does_not_blame_task_workspace_output() {
+        let task_id = TaskId::new();
+        let external = event(
+            1,
+            task_id,
+            RuntimeEventType::ExternalEvaluationIngested,
+            json!({
+                "record": {
+                    "evaluator_id": "terminal-bench",
+                    "case_id": "csv-to-parquet",
+                    "verdict": "fail",
+                    "assertions": [{
+                        "name": "harness_failure_mode",
+                        "passed": false,
+                        "message": "test_timeout"
+                    }],
+                    "phases": [{
+                        "phase_id": "terminal-bench:test",
+                        "kind": "test",
+                        "status": "timed_out"
+                    }],
+                    "terminal_cause": {
+                        "code": "test_timeout",
+                        "phase_id": "terminal-bench:test",
+                        "message": "Terminal-Bench test phase timed out",
+                        "retryable": true
+                    }
+                }
+            }),
+        );
+
+        let analysis = diagnose_task(task_id, &[external], None).expect("diagnosis");
+
+        assert_eq!(
+            analysis.diagnosis.taxonomy.code,
+            "terminal_bench_test_timeout"
+        );
+        assert_eq!(
+            analysis.diagnosis.code_targets[0].owner,
+            "external-evaluator"
+        );
+        assert!(
+            analysis
+                .diagnosis
+                .counterfactual
+                .contains("do not change task output")
+        );
+        assert_eq!(analysis.candidate.target_type, "evaluation_harness");
+    }
+
+    #[test]
+    fn diagnostic_slice_prioritizes_causal_history_and_publishes_trace_pages() {
+        let task_id = TaskId::new();
+        let causal_root = event(
+            1,
+            task_id,
+            RuntimeEventType::ProviderFailed,
+            json!({"summary": "root provider failure"}),
+        );
+        let causal_root_id = causal_root.id;
+        let mut events = vec![causal_root];
+        let mut previous_id = causal_root_id;
+        for sequence_no in 2..700 {
+            let mut unrelated = event(
+                sequence_no,
+                task_id,
+                RuntimeEventType::StepCompleted,
+                json!({"summary": "unrelated history"}),
+            );
+            unrelated.parent_event_id = Some(previous_id);
+            unrelated.causal_links.push(golutra_core::CausalLink {
+                event_id: previous_id,
+                relation: CausalRelation::Parent,
+            });
+            previous_id = unrelated.id;
+            events.push(unrelated);
+        }
+        let mut trigger = event(
+            700,
+            task_id,
+            RuntimeEventType::VerificationCompleted,
+            json!({"summary": "verification failed", "record": {"result": "fail"}}),
+        );
+        trigger.parent_event_id = Some(previous_id);
+        trigger.causal_links.push(golutra_core::CausalLink {
+            event_id: previous_id,
+            relation: CausalRelation::Parent,
+        });
+        trigger.causal_links.push(golutra_core::CausalLink {
+            event_id: causal_root_id,
+            relation: CausalRelation::TriggeredBy,
+        });
+        let trigger_id = trigger.id;
+        events.push(trigger);
+
+        let analysis = diagnose_task(task_id, &events, None).expect("diagnosis");
+
+        assert!(analysis.slice.event_refs.contains(&trigger_id));
+        assert!(analysis.slice.causal_event_refs.contains(&causal_root_id));
+        assert!(analysis.slice.causal_event_refs.contains(&trigger_id));
+        assert_eq!(analysis.slice.causal_event_refs.len(), 2);
+        assert_eq!(analysis.slice.supporting_event_refs.len(), 64);
+        assert_eq!(analysis.slice.event_refs.len(), 66);
+        assert_eq!(analysis.slice.omitted_event_count, 634);
+        assert!(analysis.slice.complete);
+        assert!(!analysis.slice.continuation_pages.is_empty());
+        assert_eq!(
+            analysis
+                .slice
+                .continuation_pages
+                .iter()
+                .map(|page| page.omitted_event_count)
+                .sum::<u64>(),
+            analysis.slice.omitted_event_count
+        );
+        assert_eq!(
+            analysis.slice.selection_strategy,
+            "semantic_causal_frontier_then_lifecycle_and_temporal_context_v2"
+        );
     }
 }

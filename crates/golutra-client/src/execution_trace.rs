@@ -1,5 +1,7 @@
 //! AgentLoop trace、artifact/checkpoint 持久化与失败终态适配。
 
+use std::collections::HashSet;
+
 use super::*;
 
 const MAX_INLINE_CHANGE_FILES: usize = 32;
@@ -180,55 +182,26 @@ impl RuntimeHost {
             ))
         })
         .await?;
-        let (mut checkpoint, checkpoint_before_images, excluded_count) =
+        let (checkpoint, checkpoint_before_images, excluded_count) =
             checkpoint_result.map_err(|error| ClientError::TaskExecution(error.to_string()))?;
         let before_image_complete = complete && excluded_count == 0;
 
         let checkpoint_event_id = EventId::new();
-        for before_image in &checkpoint_before_images {
-            let Some(bytes) = &before_image.content else {
-                continue;
-            };
-            let artifact_id = ArtifactId::new();
-            let checksum = Sha256::digest(bytes);
-            let artifact = ArtifactRecord {
-                artifact_id,
-                session_id: task.session_id,
-                turn_id: request.turn_id,
-                tool_call_id: Some(tool_call_id),
-                artifact_type: "checkpoint_before_image".to_owned(),
-                uri: format!(
-                    "artifact://checkpoint/{}/{artifact_id}",
-                    checkpoint.checkpoint_id
-                ),
-                checksum: format!("sha256:{checksum:x}"),
-                size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-                created_at: chrono::Utc::now(),
-                producer: "runtime-checkpoint".to_owned(),
-                redaction_status: RedactionStatus::Raw,
-                retention_policy: "restore_only_owner_access".to_owned(),
-                provenance_refs: vec![checkpoint_event_id],
-            };
-            self.repositories.artifacts.store(&artifact, bytes).await?;
-            checkpoint.artifact_refs.push(artifact_id);
-        }
-
-        let payload_ref = checkpoint.artifact_refs.first().copied();
         let mut event = agent_event(
             self.next_sequence_no(),
             task,
             RuntimeEventType::CheckpointCreated,
             RuntimeEventSource::Runtime,
             json!({
-                "summary": "workspace before-image persisted before tool side effect",
+                "summary": "workspace restore checkpoint persisted before tool side effect",
                 "before_image_complete": before_image_complete,
                 "omitted_before_image_count": excluded_count,
+                "candidate_before_image_count": checkpoint_before_images.len(),
                 "checkpoint": checkpoint,
             }),
         );
         event.id = checkpoint_event_id;
         event.turn_id = request.turn_id;
-        event.payload_ref = payload_ref;
         self.record_event(event).await
     }
 
@@ -249,14 +222,55 @@ impl RuntimeHost {
             event_turn_id,
             change_samples,
         );
-        let change_manifest_artifact = if change_facts.operation_changes.is_empty()
-            && change_facts.turn_summary.files.is_empty()
-        {
+        let actual_changed_files = change_facts
+            .operation_changes
+            .iter()
+            .map(|change| change.path.clone())
+            .collect::<Vec<_>>();
+        let actual_changed_paths = actual_changed_files.iter().cloned().collect::<HashSet<_>>();
+        let mut seen_before_images = HashSet::new();
+        let checkpoint_before_image_artifacts = report
+            .before_images
+            .iter()
+            .filter_map(|before_image| {
+                let path = change_tracker::display_path(
+                    self.workspace_root.as_deref(),
+                    &before_image.path,
+                );
+                if !actual_changed_paths.contains(&path) || !seen_before_images.insert(path.clone())
+                {
+                    return None;
+                }
+                let bytes = before_image.content.clone()?;
+                let artifact_id = ArtifactId::new();
+                let checksum = format!("sha256:{:x}", Sha256::digest(&bytes));
+                Some((
+                    path,
+                    ArtifactRecord {
+                        artifact_id,
+                        session_id: task.session_id,
+                        turn_id: Some(event_turn_id),
+                        tool_call_id: Some(report.envelope.tool_call_id),
+                        artifact_type: "checkpoint_before_image".to_owned(),
+                        uri: format!("artifact://checkpoint-content/{artifact_id}"),
+                        checksum,
+                        size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                        created_at: chrono::Utc::now(),
+                        producer: "runtime-checkpoint".to_owned(),
+                        redaction_status: RedactionStatus::Raw,
+                        retention_policy: "restore_only_owner_access".to_owned(),
+                        provenance_refs: Vec::new(),
+                    },
+                    bytes,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let change_manifest_artifact = if change_facts.operation_changes.is_empty() {
             None
         } else {
             let bytes = serde_json::to_vec(&json!({
                 "schema_version": 1,
-                "changed_files": report.changed_files,
+                "changed_files": actual_changed_files,
                 "operation_changes": change_facts.operation_changes,
                 "diff_previews": change_facts.diff_previews,
                 "turn_change_summary": change_facts.turn_summary,
@@ -334,8 +348,7 @@ impl RuntimeHost {
             };
             (artifact, bytes)
         };
-        let inline_changed_files = report
-            .changed_files
+        let inline_changed_files = actual_changed_files
             .iter()
             .take(MAX_INLINE_CHANGE_FILES)
             .collect::<Vec<_>>();
@@ -362,9 +375,9 @@ impl RuntimeHost {
                 "summary": report.envelope.summary,
                 "envelope": report.envelope,
                 "metrics": report.metrics,
-                "changed_file_count": report.changed_files.len(),
+                "changed_file_count": actual_changed_files.len(),
                 "changed_files": inline_changed_files,
-                "changed_files_truncated": report.changed_files.len() > MAX_INLINE_CHANGE_FILES,
+                "changed_files_truncated": actual_changed_files.len() > MAX_INLINE_CHANGE_FILES,
                 "file_changes": inline_operation_changes,
                 "file_changes_truncated": change_facts.operation_changes.len() > MAX_INLINE_CHANGE_FILES,
                 "diff_previews": inline_diff_previews,
@@ -387,11 +400,24 @@ impl RuntimeHost {
             .artifacts
             .store(&replay_artifact, &replay_bytes)
             .await?;
+        let mut before_image_refs = Vec::new();
+        for (path, mut artifact, bytes) in checkpoint_before_image_artifacts {
+            artifact.provenance_refs.push(tool_event_id);
+            let checksum = artifact.checksum.clone();
+            let artifact_ref = self.store_or_reuse_artifact(artifact, &bytes).await?;
+            before_image_refs.push(json!({
+                "path": path,
+                "artifact_ref": artifact_ref,
+                "checksum": checksum,
+            }));
+        }
+        if !before_image_refs.is_empty() {
+            event.payload["checkpoint_before_images"] = Value::Array(before_image_refs);
+        }
         if let Some((mut artifact, bytes)) = change_manifest_artifact {
             artifact.provenance_refs.push(tool_event_id);
-            event.payload["change_manifest_artifact_ref"] =
-                Value::String(artifact.artifact_id.to_string());
-            self.repositories.artifacts.store(&artifact, &bytes).await?;
+            let artifact_ref = self.store_or_reuse_artifact(artifact, &bytes).await?;
+            event.payload["change_manifest_artifact_ref"] = Value::String(artifact_ref.to_string());
         }
         if let Some((mut artifact, bytes)) = diff_artifact {
             artifact.provenance_refs.push(tool_event_id);
@@ -429,6 +455,29 @@ impl RuntimeHost {
                 .await?;
         }
         self.record_event(event).await
+    }
+
+    async fn store_or_reuse_artifact(
+        &self,
+        artifact: ArtifactRecord,
+        bytes: &[u8],
+    ) -> Result<ArtifactId, ClientError> {
+        if let Some(existing) = self
+            .repositories
+            .artifacts
+            .find_by_content(
+                artifact.session_id,
+                &artifact.artifact_type,
+                &artifact.checksum,
+                artifact.size_bytes,
+            )
+            .await?
+        {
+            return Ok(existing.artifact_id);
+        }
+        let artifact_id = artifact.artifact_id;
+        self.repositories.artifacts.store(&artifact, bytes).await?;
+        Ok(artifact_id)
     }
 
     pub(super) async fn finish_lane(

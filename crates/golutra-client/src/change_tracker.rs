@@ -35,7 +35,7 @@ impl FileContent {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ChangeSample {
     path: String,
     before: FileContent,
@@ -84,15 +84,17 @@ impl WorkspaceChangeTracker {
         turn_id: TurnId,
         samples: Vec<ChangeSample>,
     ) -> ToolChangeFacts {
-        let operation_changes = samples
-            .iter()
-            .filter_map(sample_summary)
-            .collect::<Vec<_>>();
-        let diff_previews = bounded_diff_previews(&samples);
-        let diff_artifact = build_diff_artifact(&samples);
         let turn = self.turns.entry((task_id, turn_id)).or_default();
+        let mut delta_samples = Vec::with_capacity(samples.len());
         for sample in samples {
             if let Some(tracked) = turn.files.get_mut(&sample.path) {
+                delta_samples.push(ChangeSample {
+                    path: sample.path.clone(),
+                    before: tracked.latest.clone(),
+                    after: sample.after.clone(),
+                    before_metadata: tracked.latest_metadata.clone(),
+                    after_metadata: sample.after_metadata.clone(),
+                });
                 turn.retained_content_bytes = turn
                     .retained_content_bytes
                     .saturating_sub(tracked.latest.byte_len());
@@ -104,6 +106,7 @@ impl WorkspaceChangeTracker {
                 tracked.latest_metadata = sample.after_metadata;
                 continue;
             }
+            delta_samples.push(sample.clone());
             let baseline = retain_bounded_content(
                 sample.before,
                 &mut turn.retained_content_bytes,
@@ -124,6 +127,12 @@ impl WorkspaceChangeTracker {
                 },
             );
         }
+        let operation_changes = delta_samples
+            .iter()
+            .filter_map(sample_summary)
+            .collect::<Vec<_>>();
+        let diff_previews = bounded_diff_previews(&delta_samples);
+        let diff_artifact = build_diff_artifact(&delta_samples);
 
         ToolChangeFacts {
             operation_changes,
@@ -247,7 +256,7 @@ async fn read_after_content(
     (FileContent::Unavailable, None)
 }
 
-fn display_path(workspace_root: Option<&Path>, path: &Path) -> String {
+pub(crate) fn display_path(workspace_root: Option<&Path>, path: &Path) -> String {
     workspace_root
         .and_then(|root| path.strip_prefix(root).ok())
         .unwrap_or(path)
@@ -256,12 +265,12 @@ fn display_path(workspace_root: Option<&Path>, path: &Path) -> String {
 }
 
 fn sample_summary(sample: &ChangeSample) -> Option<FileChangeSummary> {
-    (!known_unchanged(
+    proven_change(
         &sample.before,
         &sample.after,
         sample.before_metadata.as_ref(),
         sample.after_metadata.as_ref(),
-    ))
+    )
     .then(|| {
         change_summary(
             &sample.path,
@@ -278,7 +287,7 @@ fn turn_summary(turn: &TurnChangeState) -> TurnChangeSummary {
         .files
         .iter()
         .filter(|(_, tracked)| {
-            !known_unchanged(
+            proven_change(
                 &tracked.baseline,
                 &tracked.latest,
                 tracked.baseline_metadata.as_ref(),
@@ -321,22 +330,29 @@ fn turn_summary(turn: &TurnChangeState) -> TurnChangeSummary {
     }
 }
 
-fn known_unchanged(
+fn proven_change(
     before: &FileContent,
     after: &FileContent,
     before_metadata: Option<&FileStateMetadata>,
     after_metadata: Option<&FileStateMetadata>,
 ) -> bool {
     match (before, after) {
-        (FileContent::Missing, FileContent::Missing) => true,
-        (FileContent::Text(before), FileContent::Text(after)) => before == after,
+        (FileContent::Missing, FileContent::Missing) => false,
+        (FileContent::Missing, FileContent::Text(_))
+        | (FileContent::Text(_), FileContent::Missing) => true,
+        (FileContent::Missing, FileContent::Unavailable) => after_metadata.is_some(),
+        (FileContent::Unavailable, FileContent::Missing) => before_metadata.is_some(),
+        (FileContent::Text(before), FileContent::Text(after)) => before != after,
         _ => before_metadata
             .zip(after_metadata)
             .is_some_and(|(before, after)| {
-                before.size_bytes == after.size_bytes
-                    && before.unix_mode == after.unix_mode
-                    && before.checksum.is_some()
-                    && before.checksum == after.checksum
+                before.size_bytes != after.size_bytes
+                    || before.unix_mode != after.unix_mode
+                    || before
+                        .checksum
+                        .as_ref()
+                        .zip(after.checksum.as_ref())
+                        .is_some_and(|(before, after)| before != after)
             }),
     }
 }
@@ -383,7 +399,7 @@ fn line_changes(before: &FileContent, after: &FileContent) -> Option<(u64, u64)>
 }
 
 fn diff_preview(sample: &ChangeSample) -> Option<FileDiffPreview> {
-    if known_unchanged(
+    if !proven_change(
         &sample.before,
         &sample.after,
         sample.before_metadata.as_ref(),
@@ -469,7 +485,7 @@ fn build_diff_artifact(samples: &[ChangeSample]) -> Option<DiffArtifact> {
     let mut content = String::new();
     let mut truncated = false;
     for sample in samples {
-        if known_unchanged(
+        if !proven_change(
             &sample.before,
             &sample.after,
             sample.before_metadata.as_ref(),
@@ -612,6 +628,29 @@ mod tests {
     }
 
     #[test]
+    fn repeated_process_snapshot_does_not_emit_duplicate_operation_changes() {
+        let task = TaskId::new();
+        let turn = TurnId::new();
+        let mut tracker = WorkspaceChangeTracker::default();
+        let sample = ChangeSample {
+            path: "src/lib.rs".to_owned(),
+            before: FileContent::Text(b"before\n".to_vec()),
+            after: FileContent::Text(b"after\n".to_vec()),
+            before_metadata: None,
+            after_metadata: None,
+        };
+
+        let first = tracker.record(task, turn, vec![sample.clone()]);
+        let repeated = tracker.record(task, turn, vec![sample]);
+
+        assert_eq!(first.operation_changes.len(), 1);
+        assert!(repeated.operation_changes.is_empty());
+        assert!(repeated.diff_previews.is_empty());
+        assert!(repeated.diff_artifact.is_none());
+        assert_eq!(repeated.turn_summary.file_count, 1);
+    }
+
+    #[test]
     fn binary_metadata_changes_remain_visible_without_text_line_counts() {
         let task = TaskId::new();
         let turn = TurnId::new();
@@ -674,6 +713,28 @@ mod tests {
                 path: "src/lib.rs".to_owned(),
                 before: FileContent::Text(b"same\n".to_vec()),
                 after: FileContent::Text(b"same\n".to_vec()),
+                before_metadata: None,
+                after_metadata: None,
+            }],
+        );
+
+        assert!(facts.operation_changes.is_empty());
+        assert!(facts.turn_summary.files.is_empty());
+    }
+
+    #[test]
+    fn unavailable_content_without_comparable_metadata_is_not_claimed_as_a_change() {
+        let task = TaskId::new();
+        let turn = TurnId::new();
+        let mut tracker = WorkspaceChangeTracker::default();
+
+        let facts = tracker.record(
+            task,
+            turn,
+            vec![ChangeSample {
+                path: "opaque.bin".to_owned(),
+                before: FileContent::Unavailable,
+                after: FileContent::Unavailable,
                 before_metadata: None,
                 after_metadata: None,
             }],

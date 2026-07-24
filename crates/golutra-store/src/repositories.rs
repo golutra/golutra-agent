@@ -238,6 +238,18 @@ impl ArtifactRepository {
         self.store.load_artifact(artifact_id).await
     }
 
+    pub async fn find_by_content(
+        &self,
+        session_id: SessionId,
+        artifact_type: &str,
+        checksum: &str,
+        size_bytes: u64,
+    ) -> StoreResult<Option<ArtifactRecord>> {
+        self.store
+            .find_artifact_by_content(session_id, artifact_type, checksum, size_bytes)
+            .await
+    }
+
     pub async fn bytes(&self, artifact_id: ArtifactId) -> StoreResult<Option<Vec<u8>>> {
         self.store.load_artifact_bytes(artifact_id).await
     }

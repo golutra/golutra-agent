@@ -586,6 +586,16 @@ async fn identical_artifact_blobs_share_content_storage() {
         .store_artifact(&second, bytes)
         .await
         .expect("second artifact");
+    let canonical = store
+        .find_artifact_by_content(
+            first.session_id,
+            &first.artifact_type,
+            &first.checksum,
+            first.size_bytes,
+        )
+        .await
+        .expect("content lookup")
+        .expect("canonical artifact");
 
     let first_metadata = std::fs::metadata(store.artifact_blob_path(first.artifact_id))
         .expect("first blob metadata");
@@ -593,6 +603,7 @@ async fn identical_artifact_blobs_share_content_storage() {
         .expect("second blob metadata");
     assert_eq!(first_metadata.ino(), second_metadata.ino());
     assert!(first_metadata.nlink() >= 2);
+    assert_eq!(canonical.artifact_id, first.artifact_id);
     assert_eq!(
         store
             .load_artifact_bytes(second.artifact_id)
