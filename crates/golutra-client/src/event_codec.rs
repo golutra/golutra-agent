@@ -5,7 +5,7 @@ use golutra_core::{
     Actor, ActorKind, ArtifactId, ArtifactRecord, CommandId, ContextSnapshot, EventId, LoopAction,
     RedactionStatus, SessionId, TaskId, TaskStatus, ThreadId, TurnId,
 };
-use golutra_llm::{ProviderRequest, ProviderStreamEvent};
+use golutra_llm::{ProviderRequest, ProviderResponse, ProviderStreamEvent};
 use golutra_protocol::{EventFilter, RuntimeEvent, RuntimeEventSource, RuntimeEventType};
 use golutra_runtime::{AgentLoopTraceEvent, PendingAgentTurn, RuntimeObservation};
 use golutra_store::ThreadRecord;
@@ -171,6 +171,62 @@ pub(crate) fn context_request_artifact(
             producer: "context-builder".to_owned(),
             redaction_status,
             retention_policy: "debug_default".to_owned(),
+            provenance_refs: Vec::new(),
+        },
+        bytes,
+    ))
+}
+
+pub(crate) fn context_replay_request_artifact(
+    task: &HostedAgentTask,
+    snapshot: &ContextSnapshot,
+    request: &ProviderRequest,
+) -> Result<(ArtifactRecord, Vec<u8>), ClientError> {
+    let bytes = serde_json::to_vec(request)?;
+    let checksum = Sha256::digest(&bytes);
+    let artifact_id = ArtifactId::new();
+    Ok((
+        ArtifactRecord {
+            artifact_id,
+            session_id: task.session_id,
+            turn_id: Some(snapshot.turn_id),
+            tool_call_id: None,
+            artifact_type: "provider_request_replay".to_owned(),
+            uri: format!("artifact://replay/provider-request/{artifact_id}"),
+            checksum: format!("sha256:{checksum:x}"),
+            size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            created_at: chrono::Utc::now(),
+            producer: "context-builder".to_owned(),
+            redaction_status: RedactionStatus::Raw,
+            retention_policy: "replay_owner_access".to_owned(),
+            provenance_refs: Vec::new(),
+        },
+        bytes,
+    ))
+}
+
+pub(crate) fn provider_response_replay_artifact(
+    task: &HostedAgentTask,
+    turn_id: TurnId,
+    response: &ProviderResponse,
+) -> Result<(ArtifactRecord, Vec<u8>), ClientError> {
+    let bytes = serde_json::to_vec(response)?;
+    let checksum = Sha256::digest(&bytes);
+    let artifact_id = ArtifactId::new();
+    Ok((
+        ArtifactRecord {
+            artifact_id,
+            session_id: task.session_id,
+            turn_id: Some(turn_id),
+            tool_call_id: None,
+            artifact_type: "provider_response_replay".to_owned(),
+            uri: format!("artifact://replay/provider-response/{artifact_id}"),
+            checksum: format!("sha256:{checksum:x}"),
+            size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            created_at: chrono::Utc::now(),
+            producer: "provider".to_owned(),
+            redaction_status: RedactionStatus::Raw,
+            retention_policy: "replay_owner_access".to_owned(),
             provenance_refs: Vec::new(),
         },
         bytes,
@@ -376,6 +432,11 @@ pub(crate) fn observation_descriptor(observation: &RuntimeObservation) -> Observ
             RuntimeEventType::ProviderCompleted,
             RuntimeEventSource::Provider,
             ObservationIntegrityClass::Supporting,
+        ),
+        RuntimeObservation::ProviderFailed { .. } => (
+            RuntimeEventType::ProviderFailed,
+            RuntimeEventSource::Provider,
+            ObservationIntegrityClass::Required,
         ),
         RuntimeObservation::TokenUsageRecorded(_) => (
             RuntimeEventType::TokenUsageRecorded,
@@ -598,6 +659,7 @@ pub(crate) fn trace_event_payload(
             }),
         )),
         AgentLoopTraceEvent::ProviderStarted {
+            request_id,
             provider_id,
             model_id,
         } => Some((
@@ -605,11 +667,13 @@ pub(crate) fn trace_event_payload(
             RuntimeEventSource::Provider,
             json!({
                 "summary": "provider request started",
+                "provider_request_id": request_id,
                 "provider_id": provider_id,
                 "model_id": model_id,
             }),
         )),
         AgentLoopTraceEvent::ProviderStreamed {
+            request_id,
             provider_id,
             model_id,
             event,
@@ -627,6 +691,7 @@ pub(crate) fn trace_event_payload(
                 RuntimeEventSource::Provider,
                 json!({
                     "summary": "provider response delta received",
+                    "provider_request_id": request_id,
                     "provider_id": provider_id,
                     "model_id": model_id,
                     "delta": delta,
@@ -634,22 +699,51 @@ pub(crate) fn trace_event_payload(
             ))
         }
         AgentLoopTraceEvent::ProviderCompleted {
+            request_id,
             provider_id,
             model_id,
-            finish_reason,
-            tool_call_count,
-            usage,
-            raw_metadata: _,
+            response,
+        } => {
+            let provider_tool_calls = response
+                .tool_calls
+                .into_iter()
+                .map(|tool_call| {
+                    json!({
+                        "provider_tool_call_id": tool_call.tool_call_id,
+                        "tool_name": tool_call.tool_name,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Some((
+                RuntimeEventType::ProviderCompleted,
+                RuntimeEventSource::Provider,
+                json!({
+                    "summary": "provider request completed",
+                    "provider_request_id": request_id,
+                    "provider_response_id": response.response_id,
+                    "provider_id": provider_id,
+                    "model_id": model_id,
+                    "finish_reason": response.finish_reason,
+                    "tool_call_count": provider_tool_calls.len(),
+                    "provider_tool_calls": provider_tool_calls,
+                    "usage": response.usage,
+                }),
+            ))
+        }
+        AgentLoopTraceEvent::ProviderFailed {
+            request_id,
+            provider_id,
+            model_id,
+            error,
         } => Some((
-            RuntimeEventType::ProviderCompleted,
+            RuntimeEventType::ProviderFailed,
             RuntimeEventSource::Provider,
             json!({
-                "summary": "provider request completed",
+                "summary": "provider request failed",
+                "provider_request_id": request_id,
                 "provider_id": provider_id,
                 "model_id": model_id,
-                "finish_reason": finish_reason,
-                "tool_call_count": tool_call_count,
-                "usage": usage,
+                "error": error,
             }),
         )),
         AgentLoopTraceEvent::TokenUsageRecorded(record) => Some((
@@ -662,6 +756,7 @@ pub(crate) fn trace_event_payload(
         )),
         AgentLoopTraceEvent::ToolStarted {
             tool_call_id,
+            provider_tool_call_id,
             tool_name,
             display_arguments,
         } => Some((
@@ -670,6 +765,7 @@ pub(crate) fn trace_event_payload(
             json!({
                 "summary": format!("tool {tool_name} started"),
                 "tool_call_id": tool_call_id,
+                "provider_tool_call_id": provider_tool_call_id,
                 "tool_name": tool_name,
                 "arguments": display_arguments,
             }),
@@ -804,6 +900,9 @@ pub(crate) fn host_event(
     payload: Value,
 ) -> RuntimeEvent {
     RuntimeEvent {
+        schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+        causal_context: Default::default(),
+        causal_links: Vec::new(),
         id: EventId::new(),
         sequence_no,
         session_id,
@@ -827,6 +926,9 @@ pub(crate) fn agent_event(
     payload: Value,
 ) -> RuntimeEvent {
     RuntimeEvent {
+        schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+        causal_context: Default::default(),
+        causal_links: Vec::new(),
         id: EventId::new(),
         sequence_no,
         session_id: task.session_id,

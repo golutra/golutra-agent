@@ -23,6 +23,7 @@ pub enum SessionCommandKind {
     ApplyCandidate,
     RollbackCandidate,
     RecordBenchmark,
+    IngestExternalEvaluation,
     CompareCounterfactual,
     PlanEvolution,
     RunEvolution,

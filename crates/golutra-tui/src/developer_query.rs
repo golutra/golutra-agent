@@ -100,6 +100,17 @@ pub(crate) fn merge_debug_projection(
     previous.post_task_jobs.extend(latest.post_task_jobs);
     previous.post_task_jobs.sort_by_key(|job| job.created_at);
     previous.post_task_jobs.dedup_by_key(|job| job.job_id);
+    if latest.failure_diagnosis.is_some() {
+        previous.failure_diagnosis = latest.failure_diagnosis;
+    }
+    if latest.diagnostic_slice.is_some() {
+        previous.diagnostic_slice = latest.diagnostic_slice;
+    }
+    if latest.replay_execution.is_some() {
+        previous.replay_execution = latest.replay_execution;
+    }
+    previous.external_evaluations = latest.external_evaluations;
+    previous.causal_comparisons = latest.causal_comparisons;
     previous.trace_complete = latest.trace_complete;
     previous.missing_sections = latest.missing_sections;
     previous.retention_losses = latest.retention_losses;

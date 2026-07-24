@@ -18,6 +18,9 @@ fn test_app(task_id: Option<TaskId>, auth_dialog: Option<AuthDialogState>) -> Tu
 
 fn terminal_event(sequence_no: u64, task_id: TaskId, turn_id: TurnId) -> RuntimeEvent {
     RuntimeEvent {
+        schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+        causal_context: Default::default(),
+        causal_links: Vec::new(),
         id: EventId::new(),
         sequence_no,
         session_id: SessionId::new(),

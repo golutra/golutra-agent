@@ -113,6 +113,32 @@ impl WorkspaceCheckpointManager {
         })
     }
 
+    /// Select the before-images that may be persisted in a partial checkpoint.
+    ///
+    /// Opaque process tools take a bounded workspace snapshot before execution.
+    /// That snapshot can contain gitignored files while already being marked
+    /// incomplete because internal or generated subtrees were omitted. Callers
+    /// may use this selection for that partial-checkpoint path. Direct file
+    /// tools must continue to call `create_checkpoint` with their original
+    /// before-images so excluded targets fail closed.
+    pub fn filter_checkpointable_before_images(
+        &self,
+        before_images: &[FileBeforeImage],
+    ) -> Result<(Vec<FileBeforeImage>, usize), CheckpointError> {
+        let mut retained = Vec::with_capacity(before_images.len());
+        let mut excluded_count = 0_usize;
+        for before_image in before_images {
+            match self.relative_checkpoint_path(&before_image.path) {
+                Ok(_) => retained.push(before_image.clone()),
+                Err(CheckpointError::Excluded(_)) => {
+                    excluded_count = excluded_count.saturating_add(1);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok((retained, excluded_count))
+    }
+
     pub fn restore_checkpoint(&self, checkpoint_id: CheckpointId) -> Result<(), CheckpointError> {
         let checkpoint_dir = self.checkpoint_root.join(checkpoint_id.to_string());
         let manifest_bytes = fs::read(checkpoint_dir.join("manifest.json"))

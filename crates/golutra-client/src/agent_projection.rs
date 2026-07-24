@@ -193,6 +193,7 @@ impl AgentEventProjector {
                 }
             }
             RuntimeEventType::ProviderCompleted
+            | RuntimeEventType::ProviderFailed
             | RuntimeEventType::AssistantMessage
             | RuntimeEventType::ToolCompleted
             | RuntimeEventType::ApprovalResolved
@@ -284,6 +285,16 @@ fn item_from_event(event: &RuntimeEvent) -> AgentItem {
             AgentItemStatus::Completed,
             "model request".to_owned(),
             None,
+        ),
+        RuntimeEventType::ProviderFailed => (
+            AgentItemKind::Model,
+            AgentItemStatus::Failed,
+            "model request".to_owned(),
+            event
+                .payload
+                .get("error")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
         ),
         RuntimeEventType::AssistantMessage => (
             AgentItemKind::AssistantMessage,
@@ -864,6 +875,9 @@ mod tests {
         payload: Value,
     ) -> RuntimeEvent {
         RuntimeEvent {
+            schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+            causal_context: Default::default(),
+            causal_links: Vec::new(),
             id: EventId::new(),
             sequence_no,
             session_id: thread.session_id,

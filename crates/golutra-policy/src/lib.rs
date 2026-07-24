@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use golutra_core::{EvidenceId, PolicyDecision, PolicyEvaluation, PolicyId};
+use golutra_core::{
+    EvidenceId, PolicyBlockDisposition, PolicyDecision, PolicyEvaluation, PolicyId,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -64,6 +66,7 @@ impl WorkspacePolicy {
                 action,
                 &resolved_path,
                 PolicyDecision::Block,
+                Some(PolicyBlockDisposition::Terminal),
                 "sensitive path",
             ),
             Ok(resolved_path) if resolved_path.starts_with(&self.workspace_root) => self
@@ -71,18 +74,21 @@ impl WorkspacePolicy {
                     action,
                     &resolved_path,
                     PolicyDecision::Allow,
+                    None,
                     "path is inside workspace",
                 ),
             Ok(resolved_path) => self.evaluation(
                 action,
                 &resolved_path,
                 PolicyDecision::Block,
+                Some(PolicyBlockDisposition::Terminal),
                 "path is outside workspace",
             ),
             Err(error) => self.evaluation(
                 action,
                 path,
                 PolicyDecision::Block,
+                Some(PolicyBlockDisposition::Recoverable),
                 &format!("path resolution failed: {error}"),
             ),
         }
@@ -90,15 +96,15 @@ impl WorkspacePolicy {
 
     pub fn evaluate_shell(&self, command: &str) -> PolicyEvaluation {
         let parsed = shlex::split(command);
-        let blocked = contains_shell_metacharacter(command)
-            || self
-                .denied_shell_fragments
-                .iter()
-                .any(|fragment| command.contains(fragment))
-            || parsed.is_none()
+        let terminal_violation = self
+            .denied_shell_fragments
+            .iter()
+            .any(|fragment| command.contains(fragment))
             || parsed
                 .as_deref()
                 .is_some_and(|parts| self.shell_command_is_blocked(parts));
+        let recoverable_violation = contains_shell_metacharacter(command) || parsed.is_none();
+        let blocked = terminal_violation || recoverable_violation;
         let decision = if blocked {
             PolicyDecision::Block
         } else if parsed
@@ -112,8 +118,18 @@ impl WorkspacePolicy {
         let reason = match decision {
             PolicyDecision::Allow => "inert workspace command is pre-approved",
             PolicyDecision::Ask => "process command requires explicit user approval",
-            PolicyDecision::Block => "shell command matched P0 deny-list or metacharacter guard",
+            PolicyDecision::Block if terminal_violation => {
+                "shell command matched P0 deny-list or sensitive-path guard"
+            }
+            PolicyDecision::Block => {
+                "shell command syntax is not permitted; submit one command and quote operators that belong inside an argument"
+            }
             PolicyDecision::Deny => "shell command denied by policy",
+        };
+        let block_disposition = match decision {
+            PolicyDecision::Block if terminal_violation => Some(PolicyBlockDisposition::Terminal),
+            PolicyDecision::Block => Some(PolicyBlockDisposition::Recoverable),
+            PolicyDecision::Allow | PolicyDecision::Ask | PolicyDecision::Deny => None,
         };
 
         PolicyEvaluation {
@@ -122,6 +138,7 @@ impl WorkspacePolicy {
             action: "shell".to_owned(),
             resource: command.to_owned(),
             decision,
+            block_disposition,
             reason: reason.to_owned(),
             evidence_refs: Vec::<EvidenceId>::new(),
         }
@@ -208,6 +225,7 @@ impl WorkspacePolicy {
         action: &str,
         resource: &Path,
         decision: PolicyDecision,
+        block_disposition: Option<PolicyBlockDisposition>,
         reason: &str,
     ) -> PolicyEvaluation {
         PolicyEvaluation {
@@ -216,6 +234,7 @@ impl WorkspacePolicy {
             action: action.to_owned(),
             resource: resource.display().to_string(),
             decision,
+            block_disposition,
             reason: reason.to_owned(),
             evidence_refs: Vec::new(),
         }
@@ -229,12 +248,40 @@ pub fn default_workspace_policy_name() -> &'static str {
 
 #[must_use]
 pub fn contains_shell_metacharacter(command: &str) -> bool {
-    command.chars().any(|character| {
-        matches!(
-            character,
-            ';' | '|' | '&' | '>' | '<' | '$' | '`' | '\\' | '\n'
-        )
-    })
+    let mut quote = None;
+    let mut escaped = false;
+
+    for character in command.chars() {
+        if character == '\n' {
+            return true;
+        }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        match quote {
+            Some('\'') => {
+                if character == '\'' {
+                    quote = None;
+                }
+            }
+            Some('"') => match character {
+                '"' => quote = None,
+                '\\' => escaped = true,
+                _ => {}
+            },
+            Some(_) => unreachable!("quote state only stores shell quote characters"),
+            None => match character {
+                '\'' | '"' => quote = Some(character),
+                '\\' => escaped = true,
+                ';' | '|' | '&' | '>' | '<' | '$' | '`' => return true,
+                _ => {}
+            },
+        }
+    }
+
+    false
 }
 
 fn canonicalize_existing(path: &Path) -> Result<PathBuf, PolicyError> {
@@ -325,6 +372,45 @@ mod tests {
         let evaluation = policy.evaluate_shell("cargo test; cat .env");
 
         assert_eq!(evaluation.decision, PolicyDecision::Block);
+        assert_eq!(
+            evaluation.block_disposition,
+            Some(PolicyBlockDisposition::Terminal)
+        );
+    }
+
+    #[test]
+    fn quoted_metacharacters_are_inert_but_unquoted_operators_remain_blocked() {
+        let workspace = tempdir().expect("workspace");
+        let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
+
+        for command in [
+            r#"python -c "import pandas as pd; import pyarrow; print('ok')""#,
+            r#"printf '%s' 'a | b & c > d < e $HOME `pwd`'"#,
+        ] {
+            assert_eq!(
+                policy.evaluate_shell(command).decision,
+                PolicyDecision::Ask,
+                "{command}"
+            );
+        }
+
+        for command in [
+            r#"python -c "print('ok')"; echo second"#,
+            r#"python -c "print('ok')" && echo second"#,
+            r#"python -c "print('ok')" | cat"#,
+            r#"python -c "print('ok')" > output.txt"#,
+        ] {
+            assert_eq!(
+                policy.evaluate_shell(command).decision,
+                PolicyDecision::Block,
+                "{command}"
+            );
+            assert_eq!(
+                policy.evaluate_shell(command).block_disposition,
+                Some(PolicyBlockDisposition::Recoverable),
+                "{command}"
+            );
+        }
     }
 
     #[test]
@@ -374,6 +460,24 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[test]
+    fn marks_workspace_escape_and_sensitive_path_blocks_as_terminal() {
+        let workspace = tempdir().expect("workspace");
+        let outside = tempdir().expect("outside");
+        let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
+
+        assert_eq!(
+            policy
+                .evaluate_path("read_file", outside.path(), true)
+                .block_disposition,
+            Some(PolicyBlockDisposition::Terminal)
+        );
+        assert_eq!(
+            policy.evaluate_shell("rg token .env").block_disposition,
+            Some(PolicyBlockDisposition::Terminal)
+        );
     }
 
     #[test]

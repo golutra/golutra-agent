@@ -87,6 +87,25 @@ impl<'a> RuntimeObservationCollector<'a> {
         &self,
         selection: SessionWindowRequest,
     ) -> Result<RuntimeObservationSnapshot, ClientError> {
+        self.collect_with_evaluation_policy(selection, false).await
+    }
+
+    /// Collect after giving each discovered task's durable post-task job a
+    /// bounded opportunity to reach a terminal state. This is intended for
+    /// retained run bundles, where fidelity is more important than returning
+    /// immediately after the agent turn ends.
+    pub async fn collect_settled(
+        &self,
+        selection: SessionWindowRequest,
+    ) -> Result<RuntimeObservationSnapshot, ClientError> {
+        self.collect_with_evaluation_policy(selection, true).await
+    }
+
+    async fn collect_with_evaluation_policy(
+        &self,
+        selection: SessionWindowRequest,
+        wait_for_evaluation: bool,
+    ) -> Result<RuntimeObservationSnapshot, ClientError> {
         let window = self.transport.session_window(selection.clone()).await?;
         if window.sessions.is_empty() {
             return Err(ClientError::InvalidSession(
@@ -98,7 +117,7 @@ impl<'a> RuntimeObservationCollector<'a> {
         let mut missing_data = Vec::new();
         let mut retention_losses = Vec::new();
         for summary in window.sessions {
-            let observed = self.collect_session(summary).await?;
+            let observed = self.collect_session(summary, wait_for_evaluation).await?;
             for task in &observed.tasks {
                 missing_data.extend(
                     task.trace
@@ -156,6 +175,7 @@ impl<'a> RuntimeObservationCollector<'a> {
     async fn collect_session(
         &self,
         summary: SessionSummary,
+        wait_for_evaluation: bool,
     ) -> Result<ObservedSession, ClientError> {
         let thread = self
             .transport
@@ -167,6 +187,32 @@ impl<'a> RuntimeObservationCollector<'a> {
                     summary.session_id
                 ))
             })?;
+
+        if wait_for_evaluation {
+            let initial_end_sequence =
+                latest_event_sequence(self.transport, summary.session_id).await?;
+            let initial_events =
+                load_all_events(self.transport, summary.session_id, initial_end_sequence).await?;
+            let task_ids = initial_events
+                .iter()
+                .filter_map(|event| event.task_id)
+                .collect::<BTreeSet<_>>();
+            for task_id in task_ids {
+                self.transport
+                    .task_trace(TaskTraceRequest {
+                        session_id: summary.session_id,
+                        task_id,
+                        view: TraceView::Full,
+                        cursor: None,
+                        limit: 1,
+                        wait_for_evaluation: true,
+                    })
+                    .await?;
+            }
+        }
+
+        // Freeze the event boundary only after optional post-task waiting so
+        // terminal evaluation events are included in the retained snapshot.
         let snapshot_end_sequence =
             latest_event_sequence(self.transport, summary.session_id).await?;
         let events =

@@ -62,6 +62,7 @@ oauth2 = { version = "5.0", default-features = false, features = ["reqwest", "ru
 ratatui = "0.28"
 regex = "1.11"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+ring = "0.17"
 rmcp = { version = "2.2.0", default-features = false, features = ["client", "macros", "server", "transport-child-process", "transport-io"] }
 schemars = { version = "1.0", features = ["chrono04", "uuid1"] }
 secrecy = "0.10"

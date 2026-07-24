@@ -18,6 +18,9 @@ fn event(
     payload: Value,
 ) -> RuntimeEvent {
     RuntimeEvent {
+        schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+        causal_context: Default::default(),
+        causal_links: Vec::new(),
         id: EventId::new(),
         sequence_no,
         session_id,
@@ -151,6 +154,11 @@ fn current_turn_drops_old_tool_facts_and_redacts_loop_reason() {
             next_step: None,
         }],
         post_task_jobs: Vec::new(),
+        failure_diagnosis: None,
+        diagnostic_slice: None,
+        replay_execution: None,
+        external_evaluations: Vec::new(),
+        causal_comparisons: Vec::new(),
         trace_complete: true,
         missing_sections: Vec::new(),
         retention_losses: Vec::new(),

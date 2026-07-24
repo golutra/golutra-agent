@@ -117,6 +117,17 @@ impl EventRepository {
         self.store.event_integrity(session_id, task_id).await
     }
 
+    pub async fn integrity_before(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+        before_sequence_no: u64,
+    ) -> StoreResult<EventIntegrity> {
+        self.store
+            .event_integrity_before(session_id, task_id, Some(before_sequence_no))
+            .await
+    }
+
     pub async fn load_by_sequence(
         &self,
         session_id: SessionId,

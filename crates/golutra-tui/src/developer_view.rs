@@ -87,6 +87,25 @@ fn summary_rows(facts: &DeveloperFactsProjection) -> Vec<DeveloperPanelRow> {
             changes.stats_complete
         )));
     }
+    if let Some(diagnosis) = &facts.diagnosis {
+        rows.push(DeveloperPanelRow::Summary(format!(
+            "diagnosis {diagnosis} slice_events={} omitted={} complete={}",
+            facts.diagnostic_event_count,
+            facts.diagnostic_omitted_event_count,
+            facts.diagnostic_complete
+        )));
+    }
+    if facts.replay_status.is_some()
+        || facts.external_evaluation_count > 0
+        || facts.causal_comparison_count > 0
+    {
+        rows.push(DeveloperPanelRow::Summary(format!(
+            "replay={} external_evaluations={} causal_comparisons={}",
+            facts.replay_status.as_deref().unwrap_or("not_run"),
+            facts.external_evaluation_count,
+            facts.causal_comparison_count
+        )));
+    }
     rows.extend([
         DeveloperPanelRow::Summary(format!("verify {verification}")),
         DeveloperPanelRow::Summary(format!("loop {loop_decision}")),

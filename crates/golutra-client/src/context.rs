@@ -100,7 +100,10 @@ pub(crate) fn system_prompt() -> String {
         "Use the provided tools whenever the task requires reading files, listing directories, searching, writing files, or running validation commands.",
         "Use workspace-relative paths. Do not invent file contents when a read or search tool can inspect them.",
         "For write tasks, call write_file or edit_file with complete arguments instead of only explaining the change.",
-        "Shell commands are parsed as inert argv, not by a shell: do not use pipes, redirection, command substitution, chained commands, or inline code. For nontrivial scripts, create a workspace file with write_file, then run that file with a simple command.",
+        "The shell tool has one command field: include the program and every argument in that string, for example `git status --short`. Commands are parsed as inert argv, not by a shell: do not use pipes, redirection, command substitution, chained commands, or inline code. For nontrivial scripts, create a workspace file with write_file, then run that file with a simple command.",
+        "When a required local dependency is missing, inspect the available package manager and call the needed install command with the shell tool instead of asking in prose or abandoning the task. The runtime will request any required approval before execution; validate the delivered artifact afterward.",
+        "Before claiming completion after changing the workspace, run an objective validation that exits non-zero when the delivered result is wrong; status, log, or listing commands alone are not validation.",
+        "When recovering or merging version-control history, preserve the source blobs during conflict resolution and compare the recovered result with the source commit instead of retyping exact content.",
     ]
     .join(" ")
 }

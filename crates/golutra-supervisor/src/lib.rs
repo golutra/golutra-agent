@@ -1979,6 +1979,9 @@ mod tests {
         let task_id = TaskId::new();
         let turn_id = TurnId::new();
         let event = RuntimeEvent {
+            schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+            causal_context: Default::default(),
+            causal_links: Vec::new(),
             id: golutra_core::EventId::new(),
             sequence_no: 1,
             session_id,
@@ -2001,6 +2004,7 @@ mod tests {
             session_id,
             task_id,
             runtime_identity: "release-test".to_owned(),
+            run_provenance: None,
             view: TraceView::Full,
             events: events.clone(),
             context_snapshots: vec![ContextSnapshot {
@@ -2089,6 +2093,12 @@ mod tests {
                 automation_candidates: Vec::new(),
                 regressions: Vec::new(),
                 promotion_decisions: Vec::new(),
+                failure_diagnoses: Vec::new(),
+                diagnostic_slices: Vec::new(),
+                replay_capsules: Vec::new(),
+                replay_executions: Vec::new(),
+                external_evaluations: Vec::new(),
+                causal_comparisons: Vec::new(),
                 post_task_jobs: Vec::new(),
                 terminal: true,
                 integrity_warnings: Vec::new(),
@@ -2102,6 +2112,12 @@ mod tests {
                 missing_sections: Vec::new(),
                 retention_losses: Vec::new(),
                 redacted_fields: vec!["provider_credentials".to_owned()],
+                missing_causal_links: Vec::new(),
+                orphan_events: Vec::new(),
+                broken_lifecycle_pairs: Vec::new(),
+                provenance_mismatches: Vec::new(),
+                artifact_checksum_failures: Vec::new(),
+                external_overlay_failures: Vec::new(),
                 complete: true,
             },
             next_cursor: None,

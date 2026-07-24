@@ -2,6 +2,7 @@ mod model;
 mod runner;
 mod store;
 
+pub use golutra_core::EvaluationPartitionKind;
 pub use model::*;
 pub use runner::{
     EvaluationRunner, benchmark_run_has_required_metadata, candidate_mutates_control_plane,

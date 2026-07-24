@@ -10,10 +10,10 @@ use golutra_context::{
     provider_request_from_plan,
 };
 use golutra_core::{
-    Actor, ActorKind, ArtifactId, ArtifactRecord, CommandId, EvidenceId, FileChangeKind,
-    FileChangeSummary, PostTaskJob, PostTaskJobId, PostTaskJobKind, PostTaskJobStatus, QueryId,
-    RedactionStatus, TaskId, TaskStatus, ToolCallId, TraceView, TurnChangeSummary, TurnId,
-    VerificationId, VerificationRecord, VerificationResult, WorkspaceId,
+    Actor, ActorKind, ArtifactId, ArtifactRecord, CausalRelation, CommandId, EvidenceId,
+    FileChangeKind, FileChangeSummary, PostTaskJob, PostTaskJobId, PostTaskJobKind,
+    PostTaskJobStatus, QueryId, RedactionStatus, TaskId, TaskStatus, ToolCallId, TraceView,
+    TurnChangeSummary, TurnId, VerificationId, VerificationRecord, VerificationResult, WorkspaceId,
 };
 use golutra_llm::{ConfiguredProvider, MockProvider, ProviderError, ProviderMessage, ProviderRole};
 use golutra_protocol::{
@@ -46,7 +46,16 @@ fn hosted_tasks_use_only_explicit_completion_criteria() {
 fn system_prompt_explains_the_argv_only_shell_recovery_path() {
     let prompt = system_prompt();
     assert!(prompt.contains("parsed as inert argv"));
+    assert!(prompt.contains("include the program and every argument"));
+    assert!(prompt.contains("git status --short"));
     assert!(prompt.contains("create a workspace file with write_file"));
+    assert!(prompt.contains("required local dependency"));
+    assert!(prompt.contains("instead of asking in prose"));
+    assert!(prompt.contains("runtime will request any required approval"));
+    assert!(prompt.contains("exits non-zero"));
+    assert!(prompt.contains("status, log, or listing commands alone are not validation"));
+    assert!(prompt.contains("preserve the source blobs"));
+    assert!(prompt.contains("compare the recovered result with the source commit"));
 }
 
 #[test]
@@ -63,6 +72,7 @@ fn memory_support_requires_a_claim_related_objective() {
 fn observation_catalog_classifies_loop_facts_before_persistence() {
     let required = observation_descriptor(&RuntimeObservation::ToolStarted {
         tool_call_id: ToolCallId::new(),
+        provider_tool_call_id: None,
         tool_name: "read_file".to_owned(),
         display_arguments: json!({"path": "README.md"}),
     });
@@ -71,6 +81,7 @@ fn observation_catalog_classifies_loop_facts_before_persistence() {
     assert_eq!(required.integrity, ObservationIntegrityClass::Supporting);
 
     let diagnostic = observation_descriptor(&RuntimeObservation::ProviderStreamed {
+        request_id: golutra_core::ProviderRequestId::new(),
         provider_id: "provider".to_owned(),
         model_id: "model".to_owned(),
         event: golutra_llm::ProviderStreamEvent::TextDelta {
@@ -344,6 +355,63 @@ async fn event_writer_assigns_sequence_numbers_in_record_order() {
 }
 
 #[tokio::test]
+async fn failed_event_append_does_not_pollute_causal_lifecycle_indexes() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let session_id = host.default_session_id();
+    let task_id = TaskId::new();
+    let request_id = golutra_core::ProviderRequestId::new();
+    let task = host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(task_id),
+        RuntimeEventType::TaskCreated,
+        RuntimeEventSource::Runtime,
+        json!({"summary": "causal rollback"}),
+    );
+    let task_event_id = task.id;
+    host.record_event(task).await.expect("task event");
+
+    let mut failed_provider_start = host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(task_id),
+        RuntimeEventType::ProviderStarted,
+        RuntimeEventSource::Provider,
+        json!({"provider_request_id": request_id}),
+    );
+    // Force the SQL append to fail after the in-memory ledger has been enriched.
+    failed_provider_start.id = task_event_id;
+    assert!(host.record_event(failed_provider_start).await.is_err());
+
+    let provider_completed = host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(task_id),
+        RuntimeEventType::ProviderCompleted,
+        RuntimeEventSource::Provider,
+        json!({"provider_request_id": request_id}),
+    );
+    host.record_event(provider_completed)
+        .await
+        .expect("provider event");
+    let events = host
+        .store
+        .load_events(session_id, Some(task_id), None)
+        .await
+        .expect("events");
+    let completed = events
+        .iter()
+        .find(|event| event.event_type == RuntimeEventType::ProviderCompleted)
+        .expect("completed provider event");
+    assert!(
+        !completed
+            .causal_links
+            .iter()
+            .any(|link| link.relation == CausalRelation::RespondsTo)
+    );
+}
+
+#[tokio::test]
 async fn runtime_host_reuses_one_process_supervisor_across_tool_executors() {
     let workspace = tempdir().expect("workspace");
     fs::write(
@@ -363,6 +431,7 @@ async fn runtime_host_reuses_one_process_supervisor_across_tool_executors() {
         .expect("first executor");
     let start_request = ToolRequest {
         tool_call_id: ToolCallId::new(),
+        provider_tool_call_id: None,
         session_id,
         turn_id: Some(TurnId::new()),
         tool_name: "shell".to_owned(),
@@ -391,6 +460,7 @@ async fn runtime_host_reuses_one_process_supervisor_across_tool_executors() {
         .execute(
             ToolRequest {
                 tool_call_id: ToolCallId::new(),
+                provider_tool_call_id: None,
                 session_id,
                 turn_id: Some(TurnId::new()),
                 tool_name: "process_reconnect".to_owned(),
@@ -428,6 +498,7 @@ async fn dropping_runtime_host_terminates_its_background_processes() {
         .expect("executor");
     let start_request = ToolRequest {
         tool_call_id: ToolCallId::new(),
+        provider_tool_call_id: None,
         session_id,
         turn_id: Some(TurnId::new()),
         tool_name: "shell".to_owned(),
@@ -453,6 +524,7 @@ async fn dropping_runtime_host_terminates_its_background_processes() {
         .execute(
             ToolRequest {
                 tool_call_id: ToolCallId::new(),
+                provider_tool_call_id: None,
                 session_id,
                 turn_id: Some(TurnId::new()),
                 tool_name: "process_reconnect".to_owned(),
@@ -1011,13 +1083,16 @@ async fn governed_runtime_facade_routes_the_canonical_task_and_trace_chain() {
             })
         }) && event.payload_ref.is_none()
     }));
-    assert!(!forensic_trace.integrity.complete);
     assert!(
-        forensic_trace
-            .integrity
-            .retention_losses
-            .contains(&"restricted_context_capture_disabled".to_owned())
+        forensic_trace.integrity.complete,
+        "{:?}",
+        forensic_trace.integrity
     );
+    assert!(forensic_trace.integrity.retention_losses.is_empty());
+    assert!(forensic_trace.artifacts.iter().any(|artifact| {
+        artifact.artifact_type == "provider_request_replay"
+            && artifact.redaction_status == RedactionStatus::Raw
+    }));
 }
 
 #[tokio::test]
@@ -2623,6 +2698,7 @@ async fn cwd_attachment_rejects_foreign_session_access() {
 #[tokio::test]
 async fn prompt_updates_resumed_thread_metadata_by_session() {
     let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("expected-child.txt"), "child").expect("expected child");
     let _provider = IsolatedGlobalMockProvider::install().await;
     let transport = EmbeddedTransport::for_cwd(workspace.path())
         .await
@@ -2646,6 +2722,7 @@ async fn prompt_updates_resumed_thread_metadata_by_session() {
                 "prompt": "write child output",
                 "path": "child.txt",
                 "content": "child",
+                "external_verifiers": [exact_file_verifier("expected-child.txt", "child.txt")],
             }),
         ))
         .await
@@ -2733,6 +2810,11 @@ async fn rollout_jsonl_is_complete_checksummed_redacted_and_owner_only() {
 #[tokio::test]
 async fn fork_from_turn_copies_complete_history_with_fresh_runtime_ids() {
     let workspace = tempdir().expect("workspace");
+    fs::write(
+        workspace.path().join("expected-fork-parent.txt"),
+        "parent artifact",
+    )
+    .expect("expected fork artifact");
     let _provider = IsolatedGlobalMockProvider::install().await;
     let transport = EmbeddedTransport::for_cwd(workspace.path())
         .await
@@ -2745,6 +2827,10 @@ async fn fork_from_turn_copies_complete_history_with_fresh_runtime_ids() {
                 "prompt": "first fork turn writes an artifact",
                 "path": "fork-parent.txt",
                 "content": "parent artifact",
+                "external_verifiers": [exact_file_verifier(
+                    "expected-fork-parent.txt",
+                    "fork-parent.txt",
+                )],
             }),
         ))
         .await
@@ -3371,6 +3457,7 @@ async fn prompt_with_explicit_thread_id_does_not_persist_bootstrap_default() {
 async fn prompt_runs_mock_agent_loop_and_writes_file() {
     let workspace = tempdir().expect("workspace");
     fs::write(workspace.path().join("result.txt"), "before").expect("before image");
+    fs::write(workspace.path().join("expected-result.txt"), "done").expect("expected result");
     let _provider = IsolatedGlobalMockProvider::install().await;
     let transport = EmbeddedTransport::for_cwd(workspace.path())
         .await
@@ -3384,6 +3471,7 @@ async fn prompt_runs_mock_agent_loop_and_writes_file() {
                 "prompt": "write file",
                 "path": "result.txt",
                 "content": "done",
+                "external_verifiers": [exact_file_verifier("expected-result.txt", "result.txt")],
             }),
         ))
         .await
@@ -3555,6 +3643,85 @@ async fn prompt_runs_mock_agent_loop_and_writes_file() {
                 })
         );
     }
+}
+
+#[tokio::test]
+async fn shell_checkpoint_records_partial_coverage_without_persisting_ignored_images() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(
+        workspace.path().join(".gitignore"),
+        ".gitignore\n*.secret\n",
+    )
+    .expect("gitignore");
+    fs::write(workspace.path().join("safe.txt"), "safe").expect("safe file");
+    fs::write(workspace.path().join("token.secret"), "secret").expect("ignored file");
+    let _home = IsolatedGlobalMockProvider::empty().await;
+    let transport = EmbeddedTransport::for_cwd(workspace.path())
+        .await
+        .expect("transport");
+    let session_id = transport.default_session_id();
+    let task = HostedAgentTask {
+        session_id,
+        task_id: TaskId::new(),
+        turn_id: TurnId::new(),
+        payload: json!({"prompt": "inspect workspace"}),
+    };
+    let request = ToolRequest {
+        tool_call_id: ToolCallId::new(),
+        provider_tool_call_id: None,
+        session_id,
+        turn_id: Some(task.turn_id),
+        tool_name: "shell".to_owned(),
+        arguments: json!({"command": "git status --short"}),
+    };
+    let before_images = vec![
+        FileBeforeImage {
+            path: workspace.path().join(".gitignore"),
+            content: Some(b".gitignore\n*.secret\n".to_vec()),
+            unix_mode: None,
+        },
+        FileBeforeImage {
+            path: workspace.path().join("safe.txt"),
+            content: Some(b"safe".to_vec()),
+            unix_mode: None,
+        },
+        FileBeforeImage {
+            path: workspace.path().join("token.secret"),
+            content: Some(b"secret".to_vec()),
+            unix_mode: None,
+        },
+    ];
+
+    transport
+        .host
+        .persist_checkpoint_before_side_effect(&task, &request, &before_images, false)
+        .await
+        .expect("partial checkpoint");
+    let events = transport
+        .replay_events(EventFilter {
+            session_id,
+            task_id: Some(task.task_id),
+            after_sequence_no: None,
+        })
+        .await
+        .expect("checkpoint events");
+    let checkpoint = events
+        .iter()
+        .find(|event| event["event_type"] == json!(RuntimeEventType::CheckpointCreated))
+        .expect("checkpoint event");
+
+    assert_eq!(checkpoint["payload"]["before_image_complete"], false);
+    assert_eq!(checkpoint["payload"]["omitted_before_image_count"], 2);
+    assert_eq!(
+        checkpoint["payload"]["checkpoint"]["changed_files"],
+        json!(["safe.txt"])
+    );
+    assert_eq!(
+        checkpoint["payload"]["checkpoint"]["artifact_refs"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
 }
 
 #[tokio::test]
@@ -3802,6 +3969,11 @@ async fn malformed_provider_config_does_not_silently_fallback_to_mock() {
 #[tokio::test]
 async fn ephemeral_runtime_separates_global_provider_config_from_temporary_state() {
     let workspace = tempdir().expect("workspace");
+    fs::write(
+        workspace.path().join("expected-ephemeral.txt"),
+        "temporary state",
+    )
+    .expect("expected ephemeral state");
     let provider = IsolatedGlobalMockProvider::install().await;
     let global_provider_paths = ProviderConfigPaths::global().expect("provider paths");
     let transport = EmbeddedTransport::ephemeral_for_cwd(workspace.path())
@@ -3828,6 +4000,10 @@ async fn ephemeral_runtime_separates_global_provider_config_from_temporary_state
                 "prompt": "write a file",
                 "path": "ephemeral.txt",
                 "content": "temporary state",
+                "external_verifiers": [exact_file_verifier(
+                    "expected-ephemeral.txt",
+                    "ephemeral.txt",
+                )],
             }),
         ))
         .await
@@ -3907,7 +4083,6 @@ async fn persisted_ephemeral_runtime_retains_isolated_state_and_full_run_bundle(
         fs::read_to_string(workspace.path().join("persisted.txt")).expect("written file"),
         "retained state"
     );
-    host.wait_for_deep_task_evaluation(task_id).await;
     assert!(runtime_paths.runtime_db.is_file());
     assert!(runtime_paths.artifacts_dir.is_dir());
     assert!(
@@ -4022,6 +4197,7 @@ async fn persisted_ephemeral_runtime_retains_isolated_state_and_full_run_bundle(
     drop(transport);
     drop(thread);
     drop(host);
+    workspace.close().expect("remove original workspace");
 
     let reopened = RuntimeStore::connect_with_artifact_root(
         &runtime_paths.sqlite_url(),
@@ -4037,8 +4213,244 @@ async fn persisted_ephemeral_runtime_retains_isolated_state_and_full_run_bundle(
             .is_empty(),
         "events must survive transport shutdown"
     );
+    let reopened_transport = RuntimeTransport::open_persisted_run(&state_dir)
+        .await
+        .expect("reopen persisted run transport");
+    assert_eq!(reopened_transport.default_session_id(), result.session_id);
+    let trace = reopened_transport
+        .complete_task_trace(TaskTraceRequest {
+            session_id: result.session_id,
+            task_id,
+            view: TraceView::Full,
+            cursor: None,
+            limit: 512,
+            wait_for_evaluation: true,
+        })
+        .await
+        .expect("reopened trace");
+    let mut external = golutra_eval::ExternalEvaluationRecord {
+        evaluation_id: "terminal-bench:test".to_owned(),
+        source_task_id: task_id,
+        evaluator_id: "terminal-bench".to_owned(),
+        evaluator_version: "test".to_owned(),
+        harness_id: "terminal-bench".to_owned(),
+        harness_version: "test".to_owned(),
+        dataset_id: "terminal-bench-core".to_owned(),
+        dataset_version: "test".to_owned(),
+        case_id: "persisted-run".to_owned(),
+        verdict: golutra_eval::EvaluationVerdict::Pass,
+        score: Some(1.0),
+        score_max: Some(1.0),
+        assertions: Vec::new(),
+        artifact_refs: vec!["results.json".to_owned()],
+        partition: golutra_eval::EvaluationPartitionKind::Source,
+        seed: None,
+        provider_variant: None,
+        holdout_protected: false,
+        comparison_group_id: None,
+        candidate_id: None,
+        campaign_id: None,
+        role: None,
+        base_trace_digest: trace.integrity.event_chain_digest,
+        runtime_identity: trace.runtime_identity,
+        result_digest: String::new(),
+        trust: golutra_eval::ExternalEvaluationTrust::OwnerLocal,
+        attestation: None,
+        ingested_at: chrono::Utc::now(),
+    };
+    external.result_digest = golutra_eval::external_evaluation_result_digest(&external);
+    let ack = reopened_transport
+        .send_command(runtime_command(
+            result.session_id,
+            SessionCommandKind::IngestExternalEvaluation,
+            json!({"record": external}),
+        ))
+        .await
+        .expect("ingest external result into reopened run");
+    assert!(ack.accepted);
+    let refreshed = RunBundleExporter::new(&reopened_transport)
+        .refresh(&state_dir)
+        .await
+        .expect("refresh observations");
+    assert!(refreshed.complete);
+    let refreshed_trace: golutra_protocol::TaskTracePage = serde_json::from_slice(
+        &fs::read(observation_root.join(format!(
+            "sessions/{}/tasks/{task_id}/trace.json",
+            result.session_id
+        )))
+        .expect("refreshed trace"),
+    )
+    .expect("parse refreshed trace");
+    assert_eq!(refreshed_trace.evaluation.external_evaluations.len(), 1);
+    assert!(
+        refreshed_trace
+            .events
+            .iter()
+            .any(|event| { event.event_type == RuntimeEventType::ExternalEvaluationIngested })
+    );
     assert!(!global_runtime_db.exists());
+    drop(reopened_transport);
+
+    let refreshed_manifest_path = state_dir.join("manifest.json");
+    let original_manifest_bytes = fs::read(&refreshed_manifest_path).expect("refreshed manifest");
+    let trace_path = observation_root.join(format!(
+        "sessions/{}/tasks/{task_id}/trace.json",
+        result.session_id
+    ));
+    let original_trace_bytes = fs::read(&trace_path).expect("refreshed trace bytes");
+    let artifact_id = refreshed_trace
+        .artifacts
+        .first()
+        .expect("persisted trace artifact")
+        .artifact_id;
+    let artifact_path = state_dir.join(format!("state/artifacts/{artifact_id}.blob"));
+    let original_artifact_bytes = fs::read(&artifact_path).expect("persisted artifact blob");
+
+    fs::write(&artifact_path, b"tampered artifact blob").expect("tamper artifact");
+    let artifact_error = match RuntimeTransport::open_persisted_run(&state_dir).await {
+        Ok(_) => panic!("tampered artifact must not open"),
+        Err(error) => error,
+    };
+    assert!(artifact_error.to_string().contains("artifact"));
+    assert!(artifact_error.to_string().contains("integrity"));
+    fs::write(&artifact_path, &original_artifact_bytes).expect("restore artifact");
+
+    let mut checksum_tampered_trace = original_trace_bytes.clone();
+    checksum_tampered_trace.push(b'\n');
+    fs::write(&trace_path, checksum_tampered_trace).expect("tamper trace checksum");
+    let trace_error = match RuntimeTransport::open_persisted_run(&state_dir).await {
+        Ok(_) => panic!("trace with a mismatched manifest checksum must not open"),
+        Err(error) => error,
+    };
+    assert!(
+        trace_error
+            .to_string()
+            .contains("observation manifest integrity")
+    );
+    fs::write(&trace_path, &original_trace_bytes).expect("restore trace");
+
+    let mut tampered_trace = refreshed_trace;
+    tampered_trace.events[0].payload["tampered"] = json!(true);
+    let mut digest = Sha256::new();
+    for event in &tampered_trace.events {
+        digest.update(event.sequence_no.to_be_bytes());
+        digest.update(serde_json::to_vec(event).expect("event json"));
+    }
+    tampered_trace.integrity.event_chain_digest = format!("sha256:{:x}", digest.finalize());
+    let tampered_trace_bytes = serde_json::to_vec_pretty(&tampered_trace).expect("tampered trace");
+    fs::write(&trace_path, &tampered_trace_bytes).expect("write self-consistent trace tamper");
+    let mut tampered_manifest: RunBundleManifest =
+        serde_json::from_slice(&original_manifest_bytes).expect("refreshed manifest json");
+    let trace_relative = format!(
+        "observations/sessions/{}/tasks/{task_id}/trace.json",
+        result.session_id
+    );
+    let trace_entry = tampered_manifest
+        .observations
+        .files
+        .iter_mut()
+        .find(|file| file.path == trace_relative)
+        .expect("trace manifest entry");
+    trace_entry.bytes = tampered_trace_bytes.len() as u64;
+    trace_entry.checksum = format!("sha256:{:x}", Sha256::digest(&tampered_trace_bytes));
+    fs::write(
+        &refreshed_manifest_path,
+        serde_json::to_vec_pretty(&tampered_manifest).expect("tampered manifest"),
+    )
+    .expect("write tampered manifest");
+    let prefix_error = match RuntimeTransport::open_persisted_run(&state_dir).await {
+        Ok(_) => panic!("trace that diverges from SQLite source events must not open"),
+        Err(error) => error,
+    };
+    assert!(prefix_error.to_string().contains("source event prefix"));
     drop(provider);
+}
+
+#[tokio::test]
+async fn external_evaluation_ingestion_rejects_trace_and_runtime_identity_mismatches() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let transport = EmbeddedTransport::new(host.clone());
+    let session_id = host.default_session_id();
+    let accepted = transport
+        .send_command(command(session_id, "produce a verifiable result"))
+        .await
+        .expect("prompt");
+    assert!(accepted.accepted);
+    let events = wait_for_task_completed_count(&transport, session_id, 1).await;
+    let task_id = events
+        .iter()
+        .find(|event| event.event_type == RuntimeEventType::TaskCompleted)
+        .and_then(|event| event.task_id)
+        .expect("completed task");
+    let trace = transport
+        .complete_task_trace(TaskTraceRequest {
+            session_id,
+            task_id,
+            view: TraceView::Full,
+            cursor: None,
+            limit: 512,
+            wait_for_evaluation: true,
+        })
+        .await
+        .expect("trace");
+
+    let mut record = golutra_eval::ExternalEvaluationRecord {
+        evaluation_id: "mismatch-test".to_owned(),
+        source_task_id: task_id,
+        evaluator_id: "test-evaluator".to_owned(),
+        evaluator_version: "1".to_owned(),
+        harness_id: "test-harness".to_owned(),
+        harness_version: "1".to_owned(),
+        dataset_id: "test-dataset".to_owned(),
+        dataset_version: "1".to_owned(),
+        case_id: "test-case".to_owned(),
+        verdict: golutra_eval::EvaluationVerdict::Pass,
+        score: Some(1.0),
+        score_max: Some(1.0),
+        assertions: Vec::new(),
+        artifact_refs: Vec::new(),
+        partition: golutra_eval::EvaluationPartitionKind::Source,
+        seed: Some(1),
+        provider_variant: Some("mock".to_owned()),
+        holdout_protected: false,
+        comparison_group_id: None,
+        candidate_id: None,
+        campaign_id: None,
+        role: None,
+        base_trace_digest: trace.integrity.event_chain_digest.clone(),
+        runtime_identity: trace.runtime_identity.clone(),
+        result_digest: String::new(),
+        trust: golutra_eval::ExternalEvaluationTrust::OwnerLocal,
+        attestation: None,
+        ingested_at: chrono::Utc::now(),
+    };
+
+    record.base_trace_digest = "sha256:wrong-trace".to_owned();
+    record.result_digest = golutra_eval::external_evaluation_result_digest(&record);
+    assert!(
+        transport
+            .send_command(runtime_command(
+                session_id,
+                SessionCommandKind::IngestExternalEvaluation,
+                json!({"record": record}),
+            ))
+            .await
+            .is_err()
+    );
+
+    record.base_trace_digest = trace.integrity.event_chain_digest;
+    record.runtime_identity = "runtime:wrong".to_owned();
+    record.result_digest = golutra_eval::external_evaluation_result_digest(&record);
+    assert!(
+        transport
+            .send_command(runtime_command(
+                session_id,
+                SessionCommandKind::IngestExternalEvaluation,
+                json!({"record": record}),
+            ))
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -5212,6 +5624,17 @@ fn command_with_payload(session_id: SessionId, payload: Value) -> SessionCommand
         payload,
         timestamp: chrono::Utc::now(),
     }
+}
+
+fn exact_file_verifier(expected_path: &str, actual_path: &str) -> Value {
+    json!({
+        "program": "cmp",
+        "args": [expected_path, actual_path],
+        "cwd": ".",
+        "timeout_ms": 5_000,
+        "expected_exit_code": 0,
+        "max_output_bytes": 1_024,
+    })
 }
 
 fn runtime_command(

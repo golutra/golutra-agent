@@ -186,6 +186,9 @@ impl RuntimeHost {
                 SessionCommandKind::RunRegression | SessionCommandKind::RunRegressionCampaign => {
                     self.handle_regression_command(session_id, command).await?
                 }
+                SessionCommandKind::Replay => {
+                    self.handle_replay_command(session_id, command).await?
+                }
                 SessionCommandKind::ReviewCandidate => {
                     self.handle_review_candidate_command(session_id, command)
                         .await?
@@ -200,6 +203,10 @@ impl RuntimeHost {
                 }
                 SessionCommandKind::RecordBenchmark => {
                     self.handle_record_benchmark_command(session_id, command)
+                        .await?
+                }
+                SessionCommandKind::IngestExternalEvaluation => {
+                    self.handle_external_evaluation_command(session_id, command)
                         .await?
                 }
                 SessionCommandKind::CompareCounterfactual => {
@@ -508,14 +515,11 @@ impl RuntimeHost {
             self.next_sequence_no(),
         )?;
         drop(lane_manager);
-        if let Err(error) = self
-            .record_event(with_command_payload(
-                transition.event,
-                command.command_id,
-                payload.clone(),
-            ))
-            .await
-        {
+        let mut task_created =
+            with_command_payload(transition.event, command.command_id, payload.clone());
+        task_created.payload["run_provenance"] =
+            serde_json::to_value(self.capture_run_provenance(task_id))?;
+        if let Err(error) = self.record_event(task_created).await {
             let _ = self.lane_manager.lock().await.finish_task(
                 session_id,
                 TaskStatus::Failed,

@@ -14,7 +14,7 @@ from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 
-RUNTIME_PROTOCOL_VERSION = 4
+RUNTIME_PROTOCOL_VERSION = 5
 JSON_REQUEST_TIMEOUT_SECONDS = 30
 MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_SSE_EVENT_BYTES = 1024 * 1024
@@ -139,6 +139,10 @@ class GolutraClient:
 
     def evaluation_projection(self, session_id: str, task_id: str) -> dict[str, Any]:
         return self.query(self.runtime_query(session_id, "evaluation_projection", task_id))
+
+    def debug_projection(self, session_id: str, task_id: str) -> dict[str, Any]:
+        """Read the developer/debug projection for one task."""
+        return self.query(self.runtime_query(session_id, "debug_projection", task_id))
 
     def task_trace(self, request: dict[str, Any]) -> dict[str, Any]:
         return self._request_json("POST", "/traces", body=request)
@@ -505,6 +509,86 @@ class GolutraClient:
             self.session_command(
                 session_id, "run_regression", {"candidate_id": candidate_id}, actor_id
             )
+        )
+
+    def run_regression_campaign(
+        self,
+        session_id: str,
+        candidate_id: str,
+        *,
+        candidate_files: Iterable[dict[str, Any]],
+        case_refs: Iterable[str] = (),
+        provider_matrix: Iterable[str] = (),
+        seeds: Iterable[int] = (),
+        minimum_trusted_external_pairs: int | None = None,
+        minimum_trusted_external_evaluations: int | None = None,
+        actor_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Start the isolated baseline/candidate campaign with explicit matrix inputs."""
+        payload: dict[str, Any] = {
+            "candidate_id": candidate_id,
+            "candidate_files": [dict(item) for item in candidate_files],
+        }
+        normalized_case_refs = [item for item in case_refs if item.strip()]
+        normalized_providers = [item for item in provider_matrix if item.strip()]
+        normalized_seeds = list(seeds)
+        if normalized_case_refs:
+            payload["case_refs"] = normalized_case_refs
+        if normalized_providers:
+            payload["provider_matrix"] = normalized_providers
+        if normalized_seeds:
+            payload["seeds"] = normalized_seeds
+        if (
+            minimum_trusted_external_pairs is not None
+            and minimum_trusted_external_evaluations is not None
+        ):
+            raise ValueError(
+                "use minimum_trusted_external_pairs or its legacy evaluations alias, not both"
+            )
+        minimum_pairs = (
+            minimum_trusted_external_pairs
+            if minimum_trusted_external_pairs is not None
+            else minimum_trusted_external_evaluations
+        )
+        if minimum_pairs is not None:
+            if minimum_pairs < 0:
+                raise ValueError("minimum_trusted_external_pairs cannot be negative")
+            payload["minimum_trusted_external_pairs"] = minimum_pairs
+        return self.send_command(
+            self.session_command(session_id, "run_regression_campaign", payload, actor_id)
+        )
+
+    def ingest_external_evaluation(
+        self,
+        session_id: str,
+        record: dict[str, Any],
+        actor_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Attach an evaluator-owned result to the source trace after host validation."""
+        if not record.get("evaluation_id"):
+            raise ValueError("external evaluation record requires evaluation_id")
+        return self.send_command(
+            self.session_command(
+                session_id,
+                "ingest_external_evaluation",
+                {"record": dict(record)},
+                actor_id,
+            )
+        )
+
+    def replay(
+        self,
+        session_id: str,
+        task_id: str,
+        capsule_id: str | None = None,
+        actor_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Run the artifact-backed deterministic replay for a task."""
+        payload: dict[str, Any] = {"task_id": task_id}
+        if capsule_id:
+            payload["capsule_id"] = capsule_id
+        return self.send_command(
+            self.session_command(session_id, "replay", payload, actor_id)
         )
 
     def review_candidate(

@@ -201,6 +201,7 @@ async fn exec_run_dir_retains_an_isolated_structured_runtime_bundle() {
     .expect("valid observation manifest");
     assert_eq!(observations["format"], "golutra-runtime-observation");
     assert_eq!(observations["disclosure"], "full-owner-only");
+    assert_eq!(observations["complete"], true);
     assert!(
         observations["files"]
             .as_array()
@@ -237,6 +238,8 @@ async fn exec_run_dir_retains_an_isolated_structured_runtime_bundle() {
             .is_some_and(|events| !events.is_empty())
     );
     assert!(!trace["verification"].is_null());
+    assert_eq!(trace["integrity"]["complete"], true);
+    assert_eq!(trace["evaluation"]["terminal"], true);
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("golutra run bundle retained"),
         "retention receipt belongs on stderr"

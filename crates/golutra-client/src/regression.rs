@@ -1,15 +1,16 @@
 //! Baseline/candidate 隔离执行编排；`golutra-eval` 只保存事实和执行纯比较。
 
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
 
 use base64::Engine;
 use golutra_core::{
-    ActorKind, RegressionCampaign, RegressionCampaignId, RegressionExecution,
-    RegressionExecutionId, RegressionExecutionRole, RegressionExecutionStatus, TaskStatus,
-    TraceView, VerificationResult,
+    ActorKind, EvaluationPartitionKind, RegressionCampaign, RegressionCampaignId,
+    RegressionExecution, RegressionExecutionId, RegressionExecutionRole, RegressionExecutionStatus,
+    TaskStatus, TraceView, VerificationResult,
 };
 use golutra_eval::RegressionResult;
 use golutra_protocol::{SessionCommand, SessionCommandKind, TaskTraceRequest};
@@ -27,6 +28,7 @@ const MAX_CANDIDATE_FILE_BYTES: usize = 1024 * 1024;
 struct RegressionCaseInput {
     case_ref: String,
     objective: String,
+    partition: EvaluationPartitionKind,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +44,9 @@ struct RegressionRoleInput<'a> {
     home: &'a Path,
     workspace: &'a Path,
     objective: &'a str,
+    partition: EvaluationPartitionKind,
+    provider_variant: &'a str,
+    seed: u64,
 }
 
 impl RuntimeHost {
@@ -136,9 +141,30 @@ impl RuntimeHost {
                 Ok(RegressionCaseInput {
                     case_ref: case_ref.clone(),
                     objective,
+                    partition: evaluation_case_partition(case),
                 })
             })
             .collect::<Result<Vec<_>, ClientError>>()?;
+        let provider_matrix = string_array_payload(&command.payload, "provider_matrix")
+            .unwrap_or_else(|| vec!["isolated-mock".to_owned()]);
+        if !provider_matrix
+            .iter()
+            .any(|provider| provider == "isolated-mock")
+        {
+            return Err(ClientError::TaskExecution(
+                "regression campaign must include isolated-mock for the executable local baseline/candidate pair"
+                    .to_owned(),
+            ));
+        }
+        let seeds = u64_array_payload(&command.payload, "seeds").unwrap_or_else(|| vec![0]);
+        let mut required_partitions = partition_array_payload(&command.payload)?
+            .unwrap_or_else(|| regression_cases.iter().map(|case| case.partition).collect());
+        required_partitions.sort();
+        required_partitions.dedup();
+        let case_partitions = regression_cases
+            .iter()
+            .map(|case| (case.case_ref.clone(), case.partition))
+            .collect::<BTreeMap<_, _>>();
         let mut campaign = RegressionCampaign {
             campaign_id: RegressionCampaignId::new(),
             candidate_id: candidate_id.to_owned(),
@@ -149,9 +175,17 @@ impl RuntimeHost {
                 .iter()
                 .map(|case| case.case_ref.clone())
                 .collect(),
+            case_partitions,
+            required_partitions,
             replay_modes: vec!["live_execution".to_owned()],
-            provider_matrix: vec!["isolated-mock".to_owned()],
-            seeds: vec![0],
+            provider_matrix,
+            seeds: seeds.clone(),
+            minimum_trusted_external_pairs: command
+                .payload
+                .get("minimum_trusted_external_pairs")
+                .or_else(|| command.payload.get("minimum_trusted_external_evaluations"))
+                .and_then(Value::as_u64)
+                .map_or(0, |value| u32::try_from(value).unwrap_or(u32::MAX)),
             resource_budget: format!("timeout={}s", REGRESSION_EXECUTION_TIMEOUT_SECS),
             hard_gates: vec![
                 "paired_task_trace".to_owned(),
@@ -203,53 +237,61 @@ impl RuntimeHost {
 
             let baseline_home = case_root.join("baseline-home");
             let candidate_home = case_root.join("candidate-home");
-            let baseline = self
-                .execute_regression_role(
-                    &campaign,
-                    RegressionRoleInput {
+            for seed in &seeds {
+                let baseline = self
+                    .execute_regression_role(
+                        &campaign,
+                        RegressionRoleInput {
+                            parent_session_id,
+                            case_ref: &case.case_ref,
+                            role: RegressionExecutionRole::Baseline,
+                            home: &baseline_home,
+                            workspace: &baseline_workspace,
+                            objective: &case.objective,
+                            partition: case.partition,
+                            provider_variant: "isolated-mock",
+                            seed: *seed,
+                        },
+                    )
+                    .await?;
+                let candidate_execution = self
+                    .execute_regression_role(
+                        &campaign,
+                        RegressionRoleInput {
+                            parent_session_id,
+                            case_ref: &case.case_ref,
+                            role: RegressionExecutionRole::Candidate,
+                            home: &candidate_home,
+                            workspace: &candidate_workspace,
+                            objective: &case.objective,
+                            partition: case.partition,
+                            provider_variant: "isolated-mock",
+                            seed: *seed,
+                        },
+                    )
+                    .await?;
+                for execution in [baseline, candidate_execution] {
+                    let evaluation_store = self.evaluation_store.clone();
+                    let stored = execution.clone();
+                    run_blocking(move || evaluation_store.record_regression_execution(stored))
+                        .await??;
+                    self.record_event(host_event(
+                        self.next_sequence_no(),
                         parent_session_id,
-                        case_ref: &case.case_ref,
-                        role: RegressionExecutionRole::Baseline,
-                        home: &baseline_home,
-                        workspace: &baseline_workspace,
-                        objective: &case.objective,
-                    },
-                )
-                .await?;
-            let candidate_execution = self
-                .execute_regression_role(
-                    &campaign,
-                    RegressionRoleInput {
-                        parent_session_id,
-                        case_ref: &case.case_ref,
-                        role: RegressionExecutionRole::Candidate,
-                        home: &candidate_home,
-                        workspace: &candidate_workspace,
-                        objective: &case.objective,
-                    },
-                )
-                .await?;
-            for execution in [baseline, candidate_execution] {
-                let evaluation_store = self.evaluation_store.clone();
-                let stored = execution.clone();
-                run_blocking(move || evaluation_store.record_regression_execution(stored))
-                    .await??;
-                self.record_event(host_event(
-                    self.next_sequence_no(),
-                    parent_session_id,
-                    Some(candidate.source_task_id),
-                    RuntimeEventType::RegressionExecutionCompleted,
-                    RuntimeEventSource::Evaluator,
-                    json!({
-                        "summary": format!(
-                            "{} {:?} regression execution finished as {:?}",
-                            execution.case_ref, execution.role, execution.status
-                        ),
-                        "execution": execution,
-                        "campaign_id": campaign.campaign_id,
-                    }),
-                ))
-                .await?;
+                        Some(candidate.source_task_id),
+                        RuntimeEventType::RegressionExecutionCompleted,
+                        RuntimeEventSource::Evaluator,
+                        json!({
+                            "summary": format!(
+                                "{} {:?} regression execution finished as {:?}",
+                                execution.case_ref, execution.role, execution.status
+                            ),
+                            "execution": execution,
+                            "campaign_id": campaign.campaign_id,
+                        }),
+                    ))
+                    .await?;
+                }
             }
         }
         campaign.completed_at = Some(chrono::Utc::now());
@@ -276,8 +318,10 @@ impl RuntimeHost {
             session_id: Some(session_id),
             kind: SessionCommandKind::Prompt,
             idempotency_key: format!(
-                "regression:{}:{role:?}:{:x}",
+                "regression:{}:{role:?}:{}:{}:{:x}",
                 campaign.campaign_id,
+                input.provider_variant,
+                input.seed,
                 Sha256::digest(input.case_ref.as_bytes()),
                 role = input.role,
             ),
@@ -289,6 +333,9 @@ impl RuntimeHost {
                 "prompt": input.objective,
                 "regression_role": input.role,
                 "regression_case_ref": input.case_ref,
+                "regression_partition": input.partition,
+                "regression_provider_variant": input.provider_variant,
+                "regression_seed": input.seed,
             }),
             timestamp: chrono::Utc::now(),
         };
@@ -349,6 +396,9 @@ impl RuntimeHost {
             execution_id: RegressionExecutionId::new(),
             campaign_id: campaign.campaign_id,
             case_ref: input.case_ref.to_owned(),
+            partition: input.partition,
+            provider_variant: input.provider_variant.to_owned(),
+            seed: input.seed,
             role: input.role,
             runtime_version: env!("CARGO_PKG_VERSION").to_owned(),
             workspace_snapshot_digest,
@@ -490,6 +540,80 @@ fn included_snapshot_entry(entry: &DirEntry) -> bool {
         entry.file_name().to_str(),
         Some(".git" | ".golutra" | "target" | "node_modules")
     )
+}
+
+fn evaluation_case_partition(case: &golutra_eval::EvaluationCase) -> EvaluationPartitionKind {
+    if let Some(partition) = case
+        .tags
+        .iter()
+        .find_map(|tag| tag.strip_prefix("partition:"))
+        .and_then(parse_partition)
+    {
+        return partition;
+    }
+    parse_partition(&case.source).unwrap_or_default()
+}
+
+fn parse_partition(value: &str) -> Option<EvaluationPartitionKind> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "source" => Some(EvaluationPartitionKind::Source),
+        "historical" => Some(EvaluationPartitionKind::Historical),
+        "generated" => Some(EvaluationPartitionKind::Generated),
+        "holdout" => Some(EvaluationPartitionKind::Holdout),
+        "adversarial" => Some(EvaluationPartitionKind::Adversarial),
+        _ => None,
+    }
+}
+
+fn partition_array_payload(
+    payload: &Value,
+) -> Result<Option<Vec<EvaluationPartitionKind>>, ClientError> {
+    let Some(values) = payload.get("required_partitions") else {
+        return Ok(None);
+    };
+    let values = values.as_array().ok_or_else(|| {
+        ClientError::TaskExecution("required_partitions must be a JSON array".to_owned())
+    })?;
+    let mut partitions = values
+        .iter()
+        .map(|value| {
+            value.as_str().and_then(parse_partition).ok_or_else(|| {
+                ClientError::TaskExecution(
+                    "required_partitions contains an unknown partition".to_owned(),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    partitions.sort();
+    partitions.dedup();
+    Ok((!partitions.is_empty()).then_some(partitions))
+}
+
+fn string_array_payload(payload: &Value, key: &str) -> Option<Vec<String>> {
+    let mut values = payload
+        .get(key)?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    (!values.is_empty()).then_some(values)
+}
+
+fn u64_array_payload(payload: &Value, key: &str) -> Option<Vec<u64>> {
+    let mut values = payload
+        .get(key)?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_u64)
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    values.dedup();
+    (!values.is_empty()).then_some(values)
 }
 
 fn candidate_files_from_payload(payload: &Value) -> Result<Vec<CandidateFile>, ClientError> {

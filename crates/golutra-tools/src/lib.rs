@@ -7,9 +7,10 @@ use std::{
 
 use async_trait::async_trait;
 use golutra_core::{
-    ArtifactId, ArtifactRecord, EvidenceRecord, EvidenceStrength, PolicyDecision, PolicyEvaluation,
-    RedactionStatus, SessionId, SideEffectType, ToolCallId, ToolContract, ToolExecutionMetrics,
-    ToolProgress, ToolProgressPhase, ToolResultEnvelope, ToolResultStatus, TurnId,
+    ArtifactId, ArtifactRecord, EvidenceRecord, EvidenceStrength, PolicyBlockDisposition,
+    PolicyDecision, PolicyEvaluation, RedactionStatus, SessionId, SideEffectType, ToolCallId,
+    ToolContract, ToolExecutionMetrics, ToolProgress, ToolProgressPhase, ToolResultEnvelope,
+    ToolResultStatus, TurnId,
 };
 use golutra_policy::WorkspacePolicy;
 use golutra_sandbox::{SystemSandbox, WorkspaceAccess};
@@ -71,6 +72,7 @@ pub enum ToolError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolRequest {
     pub tool_call_id: ToolCallId,
+    pub provider_tool_call_id: Option<String>,
     pub session_id: SessionId,
     pub turn_id: Option<TurnId>,
     pub tool_name: String,
@@ -127,6 +129,16 @@ pub trait ExternalToolBackend: std::fmt::Debug + Send + Sync {
         request: &ToolRequest,
         cancellation: CancellationToken,
     ) -> Result<ExternalToolOutput, ToolError>;
+}
+
+/// Owner-provided source for deterministic tool replay.
+///
+/// A replay backend returns the recorded model-visible result and never
+/// performs the original side effect. `BasicToolExecutor` still emits the
+/// ordinary policy/progress/report contract around the injected result.
+#[async_trait]
+pub trait ToolReplayBackend: std::fmt::Debug + Send + Sync {
+    async fn replay(&self, request: &ToolRequest) -> Result<ToolResultEnvelope, ToolError>;
 }
 
 #[derive(Debug, Clone)]
@@ -203,6 +215,7 @@ pub struct BasicToolExecutor {
     registry: ToolRegistry,
     sandbox: SystemSandbox,
     external_backend: Option<Arc<dyn ExternalToolBackend>>,
+    replay_backend: Option<Arc<dyn ToolReplayBackend>>,
     process_supervisor: ProcessSupervisor,
 }
 
@@ -214,6 +227,7 @@ impl BasicToolExecutor {
             registry: ToolRegistry::p0_default(),
             sandbox: SystemSandbox::detect(),
             external_backend: None,
+            replay_backend: None,
             process_supervisor: ProcessSupervisor::new(),
         }
     }
@@ -231,6 +245,14 @@ impl BasicToolExecutor {
         self.registry.register_external(backend.contracts())?;
         self.external_backend = Some(backend);
         Ok(self)
+    }
+
+    /// Replace real tool execution with deterministic, artifact-backed
+    /// results. This is only intended for explicit replay entrypoints.
+    #[must_use]
+    pub fn with_replay_backend(mut self, backend: Arc<dyn ToolReplayBackend>) -> Self {
+        self.replay_backend = Some(backend);
+        self
     }
 
     #[must_use]
@@ -261,6 +283,30 @@ impl BasicToolExecutor {
             return Err(ToolError::InvalidArguments(
                 "verifier program cannot be empty".to_owned(),
             ));
+        }
+        if self.replay_backend.is_some() {
+            let tool_request = ToolRequest {
+                tool_call_id: ToolCallId::new(),
+                provider_tool_call_id: None,
+                session_id: request.session_id,
+                turn_id: request.turn_id,
+                tool_name: "external_verifier".to_owned(),
+                arguments: json!({
+                    "program": request.program,
+                    "args": request.args,
+                    "cwd": request.cwd,
+                    "timeout_ms": request.timeout_ms,
+                    "expected_exit_code": request.expected_exit_code,
+                }),
+            };
+            let policy = execution_policy(
+                &tool_request,
+                PolicyDecision::Allow,
+                "deterministic replay injects a recorded verifier result",
+            );
+            return self
+                .execute_with_policy(tool_request, policy, false, cancellation)
+                .await;
         }
         let cwd = self
             .policy
@@ -304,6 +350,7 @@ impl BasicToolExecutor {
         };
         let tool_request = ToolRequest {
             tool_call_id: ToolCallId::new(),
+            provider_tool_call_id: None,
             session_id: request.session_id,
             turn_id: request.turn_id,
             tool_name: "external_verifier".to_owned(),
@@ -359,6 +406,13 @@ impl BasicToolExecutor {
     }
 
     pub fn evaluate(&self, request: &ToolRequest) -> Result<PolicyEvaluation, ToolError> {
+        if self.replay_backend.is_some() {
+            return Ok(execution_policy(
+                request,
+                PolicyDecision::Allow,
+                "deterministic replay injects a recorded tool result",
+            ));
+        }
         let contract = self
             .registry
             .contract(&request.tool_name)
@@ -432,6 +486,9 @@ impl BasicToolExecutor {
         &self,
         request: &ToolRequest,
     ) -> Result<SideEffectPreparation, ToolError> {
+        if self.replay_backend.is_some() {
+            return Ok(SideEffectPreparation::default());
+        }
         let contract = self
             .registry
             .contract(&request.tool_name)
@@ -588,6 +645,40 @@ impl BasicToolExecutor {
             },
         );
         let result = async {
+            if let Some(replay_backend) = &self.replay_backend {
+                if cancellation.is_cancelled() {
+                    return Ok(cancelled_report(
+                        request,
+                        "tool replay cancelled before result injection",
+                    ));
+                }
+                let mut envelope = replay_backend.replay(&request).await?;
+                envelope.tool_call_id = request.tool_call_id;
+                envelope.tool_name = request.tool_name.clone();
+                let output_bytes = envelope
+                    .model_visible_excerpt
+                    .as_deref()
+                    .map_or(0, str::len);
+                let output_lines = envelope
+                    .model_visible_excerpt
+                    .as_deref()
+                    .map_or(0, |output| output.lines().count());
+                return Ok(ToolExecutionReport {
+                    envelope,
+                    artifacts: Vec::new(),
+                    evidence: Vec::new(),
+                    changed_files: Vec::new(),
+                    policy_evaluation: policy,
+                    artifact_contents: Vec::new(),
+                    before_images: Vec::new(),
+                    after_images: Vec::new(),
+                    metrics: ToolExecutionMetrics {
+                        output_bytes: u64::try_from(output_bytes).unwrap_or(u64::MAX),
+                        output_lines: u64::try_from(output_lines).unwrap_or(u64::MAX),
+                        ..ToolExecutionMetrics::default()
+                    },
+                });
+            }
             let contract = self
                 .registry
                 .contract(&request.tool_name)
@@ -686,7 +777,8 @@ impl BasicToolExecutor {
         reason: impl Into<String>,
     ) -> ToolExecutionReport {
         let reason = bounded_text(&reason.into(), MAX_TOOL_ERROR_CHARS);
-        let policy = execution_policy(&request, PolicyDecision::Block, &reason);
+        let mut policy = execution_policy(&request, PolicyDecision::Block, &reason);
+        policy.block_disposition = Some(PolicyBlockDisposition::Recoverable);
         error_report(
             request,
             "tool request is invalid",
@@ -2261,6 +2353,7 @@ fn execution_policy(
             MAX_AUDIT_RESOURCE_CHARS,
         ),
         decision,
+        block_disposition: None,
         reason: reason.to_owned(),
         evidence_refs: Vec::new(),
     }

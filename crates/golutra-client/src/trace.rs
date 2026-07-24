@@ -10,12 +10,15 @@ use std::future::Future;
 use std::sync::Arc;
 
 use base64::Engine;
-use golutra_core::{ArtifactId, EvidenceId, PostTaskJobStatus, TraceIntegrity, TraceView};
+use golutra_core::{
+    ArtifactId, EvidenceId, PostTaskJobStatus, RunProvenance, TraceIntegrity, TraceView,
+};
+use golutra_eval::{ExternalEvaluationRecord, external_evaluation_result_digest};
 use golutra_protocol::{ArtifactChunk, ArtifactReadRequest, TaskTracePage, TaskTraceRequest};
-use golutra_store::MAX_ARTIFACT_READ_BYTES;
+use golutra_store::{MAX_ARTIFACT_READ_BYTES, StoreError};
 use serde_json::{Map, Value};
 
-use super::{ClientError, RuntimeEvent, RuntimeEventType, RuntimeHost};
+use super::{ClientError, RuntimeEvent, RuntimeEventType, RuntimeHost, trace_integrity};
 
 const MAX_TRACE_PAGE_SIZE: u32 = 512;
 const MAX_SUMMARY_PAGE_SIZE: u32 = 64;
@@ -97,6 +100,7 @@ pub fn merge_task_trace_page(
     if target.session_id != page.session_id
         || target.task_id != page.task_id
         || target.runtime_identity != page.runtime_identity
+        || target.run_provenance != page.run_provenance
         || target.view != page.view
     {
         return Err(ClientError::TaskExecution(
@@ -132,6 +136,30 @@ pub fn merge_task_trace_page(
         .integrity
         .redacted_fields
         .extend(page.integrity.redacted_fields);
+    target
+        .integrity
+        .missing_causal_links
+        .extend(page.integrity.missing_causal_links);
+    target
+        .integrity
+        .orphan_events
+        .extend(page.integrity.orphan_events);
+    target
+        .integrity
+        .broken_lifecycle_pairs
+        .extend(page.integrity.broken_lifecycle_pairs);
+    target
+        .integrity
+        .provenance_mismatches
+        .extend(page.integrity.provenance_mismatches);
+    target
+        .integrity
+        .artifact_checksum_failures
+        .extend(page.integrity.artifact_checksum_failures);
+    target
+        .integrity
+        .external_overlay_failures
+        .extend(page.integrity.external_overlay_failures);
     target.events.extend(page.events);
     target
         .events
@@ -173,6 +201,12 @@ pub fn merge_task_trace_page(
         &mut target.integrity.missing_sections,
         &mut target.integrity.retention_losses,
         &mut target.integrity.redacted_fields,
+        &mut target.integrity.missing_causal_links,
+        &mut target.integrity.orphan_events,
+        &mut target.integrity.broken_lifecycle_pairs,
+        &mut target.integrity.provenance_mismatches,
+        &mut target.integrity.artifact_checksum_failures,
+        &mut target.integrity.external_overlay_failures,
     ] {
         values.sort();
         values.dedup();
@@ -180,7 +214,13 @@ pub fn merge_task_trace_page(
     target.integrity.complete = !target.has_more
         && target.integrity.unresolved_refs.is_empty()
         && target.integrity.missing_sections.is_empty()
-        && target.integrity.retention_losses.is_empty();
+        && target.integrity.retention_losses.is_empty()
+        && target.integrity.missing_causal_links.is_empty()
+        && target.integrity.orphan_events.is_empty()
+        && target.integrity.broken_lifecycle_pairs.is_empty()
+        && target.integrity.provenance_mismatches.is_empty()
+        && target.integrity.artifact_checksum_failures.is_empty()
+        && target.integrity.external_overlay_failures.is_empty();
     Ok(())
 }
 
@@ -208,6 +248,24 @@ pub(crate) async fn read_task_trace(
         host.wait_for_deep_task_evaluation(request.task_id).await;
     }
     let repositories = &host.repositories;
+    let all_task_events = repositories
+        .events
+        .load(request.session_id, Some(request.task_id), None)
+        .await?;
+    let run_provenance = all_task_events
+        .first()
+        .and_then(|event| event.payload.get("run_provenance"))
+        .cloned()
+        .and_then(|value| serde_json::from_value::<RunProvenance>(value).ok());
+    let runtime_identity = run_provenance
+        .as_ref()
+        .map(|provenance| provenance.runtime_identity.clone())
+        .unwrap_or_else(super::runtime_identity);
+    let causal_integrity = trace_integrity::validate_causal_trace(
+        request.task_id,
+        &all_task_events,
+        run_provenance.as_ref(),
+    );
     let limit = request.limit.clamp(
         1,
         if request.view == TraceView::Summary {
@@ -270,11 +328,23 @@ pub(crate) async fn read_task_trace(
     let mut artifacts = Vec::new();
     let mut unresolved_refs = Vec::new();
     let mut artifact_retention_losses = Vec::new();
+    let mut artifact_checksum_failures = Vec::new();
     for artifact_id in &artifact_ids {
         match repositories.artifacts.get(*artifact_id).await? {
             Some(artifact) if artifact.session_id == request.session_id => {
-                if repositories.artifacts.bytes(*artifact_id).await?.is_none() {
-                    artifact_retention_losses.push(format!("artifact_blob:{artifact_id}"));
+                match repositories.artifacts.bytes(*artifact_id).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        artifact_retention_losses.push(format!("artifact_blob:{artifact_id}"));
+                    }
+                    Err(StoreError::ArtifactChecksum(_)) => {
+                        artifact_checksum_failures.push(artifact_id.to_string());
+                    }
+                    Err(StoreError::ArtifactIo(error)) => {
+                        artifact_checksum_failures
+                            .push(format!("{artifact_id}:artifact_io:{error}"));
+                    }
+                    Err(error) => return Err(error.into()),
                 }
                 artifacts.push(artifact);
             }
@@ -345,6 +415,42 @@ pub(crate) async fn read_task_trace(
         .events
         .integrity(request.session_id, request.task_id)
         .await?;
+    let mut external_overlay_failures = Vec::new();
+    for event in all_task_events
+        .iter()
+        .filter(|event| event.event_type == RuntimeEventType::ExternalEvaluationIngested)
+    {
+        let Some(value) = event.payload.get("record").cloned() else {
+            external_overlay_failures.push(format!("event:{}:missing_record", event.id));
+            continue;
+        };
+        let record = match serde_json::from_value::<ExternalEvaluationRecord>(value) {
+            Ok(record) => record,
+            Err(error) => {
+                external_overlay_failures
+                    .push(format!("event:{}:invalid_record:{error}", event.id));
+                continue;
+            }
+        };
+        let prefix = repositories
+            .events
+            .integrity_before(request.session_id, request.task_id, event.sequence_no)
+            .await?;
+        if prefix.event_chain_digest != record.base_trace_digest {
+            external_overlay_failures
+                .push(format!("event:{}:base_trace_digest_mismatch", event.id));
+        }
+        if record.runtime_identity != runtime_identity {
+            external_overlay_failures.push(format!("event:{}:runtime_identity_mismatch", event.id));
+        }
+        if external_evaluation_result_digest(&record) != record.result_digest {
+            external_overlay_failures.push(format!("event:{}:result_digest_mismatch", event.id));
+        }
+    }
+    artifact_checksum_failures.sort();
+    artifact_checksum_failures.dedup();
+    external_overlay_failures.sort();
+    external_overlay_failures.dedup();
     let mut missing_sections = Vec::new();
     if context_snapshots.is_empty() {
         missing_sections.push("context_snapshot".to_owned());
@@ -406,11 +512,18 @@ pub(crate) async fn read_task_trace(
     let complete = missing_sections.is_empty()
         && unresolved_refs.is_empty()
         && retention_losses.is_empty()
+        && causal_integrity.missing_causal_links.is_empty()
+        && causal_integrity.orphan_events.is_empty()
+        && causal_integrity.broken_lifecycle_pairs.is_empty()
+        && causal_integrity.provenance_mismatches.is_empty()
+        && artifact_checksum_failures.is_empty()
+        && external_overlay_failures.is_empty()
         && !has_more;
     Ok(TaskTracePage {
         session_id: request.session_id,
         task_id: request.task_id,
-        runtime_identity: super::runtime_identity(),
+        runtime_identity,
+        run_provenance,
         view: request.view,
         events,
         context_snapshots,
@@ -429,6 +542,12 @@ pub(crate) async fn read_task_trace(
             missing_sections,
             retention_losses,
             redacted_fields,
+            missing_causal_links: causal_integrity.missing_causal_links,
+            orphan_events: causal_integrity.orphan_events,
+            broken_lifecycle_pairs: causal_integrity.broken_lifecycle_pairs,
+            provenance_mismatches: causal_integrity.provenance_mismatches,
+            artifact_checksum_failures,
+            external_overlay_failures,
             complete,
         },
         next_cursor,
@@ -510,7 +629,9 @@ fn collect_artifact_refs(value: &Value, key: Option<&str>, artifact_ids: &mut Ha
                 key == "artifact" || key == "uri" || key.ends_with("_ref") || key.ends_with("_refs")
             }) =>
         {
-            if let Some(artifact_id) = parse_artifact_uri(value) {
+            if let Some(artifact_id) =
+                parse_artifact_ref(value, key.is_some_and(|key| key.contains("artifact")))
+            {
                 artifact_ids.insert(artifact_id);
             }
         }
@@ -518,13 +639,13 @@ fn collect_artifact_refs(value: &Value, key: Option<&str>, artifact_ids: &mut Ha
     }
 }
 
-fn parse_artifact_uri(value: &str) -> Option<ArtifactId> {
-    let path = value.strip_prefix("artifact://")?.split('?').next()?;
-    path.rsplit('/')
-        .next()?
-        .parse::<uuid::Uuid>()
-        .ok()
-        .map(ArtifactId)
+fn parse_artifact_ref(value: &str, allow_plain_id: bool) -> Option<ArtifactId> {
+    let candidate = match value.strip_prefix("artifact://") {
+        Some(path) => path.split('?').next()?.rsplit('/').next()?,
+        None if allow_plain_id => value,
+        None => return None,
+    };
+    candidate.parse::<uuid::Uuid>().ok().map(ArtifactId)
 }
 
 #[cfg(test)]

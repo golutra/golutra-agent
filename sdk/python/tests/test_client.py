@@ -39,7 +39,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     "instance_id": "server-1",
                     "pid": 1,
                     "base_url": self.server.base_url,
-                    "protocol_versions": {"minimum": 4, "current": 4},
+                    "protocol_versions": {"minimum": 5, "current": 5},
                     "started_at": "2026-01-01T00:00:00Z",
                 }
             )
@@ -137,7 +137,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         valid = (
             self.headers.get("authorization") == f"Bearer {TOKEN}"
             and self.headers.get("x-golutra-actor-id", "").startswith("python-sdk-")
-            and self.headers.get("x-golutra-protocol-version") == "4"
+            and self.headers.get("x-golutra-protocol-version") == "5"
         )
         if not valid:
             self._json({"error": "unauthorized"}, 401)
@@ -327,6 +327,50 @@ class ClientTest(unittest.TestCase):
     def test_rejects_insecure_remote_http(self) -> None:
         with self.assertRaises(ValueError):
             GolutraClient("http://example.com", self.workspace.name, TOKEN)
+
+    def test_governance_helpers_build_observation_commands(self) -> None:
+        with patch.object(
+            self.client,
+            "query",
+            return_value={"kind": "debug_projection"},
+        ) as query:
+            self.assertEqual(
+                self.client.debug_projection(SESSION_ID, TASK_ID)["kind"],
+                "debug_projection",
+            )
+            self.assertEqual(query.call_args.args[0]["kind"], "debug_projection")
+
+        with patch.object(self.client, "send_command", return_value={"accepted": True}) as send:
+            self.client.replay(SESSION_ID, TASK_ID, "capsule-1")
+            replay_command = send.call_args.args[0]
+            self.assertEqual(replay_command["kind"], "replay")
+            self.assertEqual(replay_command["payload"]["capsule_id"], "capsule-1")
+
+            self.client.ingest_external_evaluation(
+                SESSION_ID,
+                {"evaluation_id": "evaluation-1", "result_digest": "sha256:test"},
+            )
+            evaluation_command = send.call_args.args[0]
+            self.assertEqual(evaluation_command["kind"], "ingest_external_evaluation")
+            self.assertEqual(
+                evaluation_command["payload"]["record"]["evaluation_id"],
+                "evaluation-1",
+            )
+
+            self.client.run_regression_campaign(
+                SESSION_ID,
+                "candidate-1",
+                candidate_files=[{"path": "src/lib.rs", "content": "change"}],
+                provider_matrix=["mock"],
+                seeds=[7],
+                minimum_trusted_external_pairs=2,
+            )
+            campaign_command = send.call_args.args[0]
+            self.assertEqual(campaign_command["kind"], "run_regression_campaign")
+            self.assertEqual(campaign_command["payload"]["seeds"], [7])
+            self.assertEqual(
+                campaign_command["payload"]["minimum_trusted_external_pairs"], 2
+            )
 
     def test_persistent_gone_response_retries_once_then_fails(self) -> None:
         class GoneResponse:

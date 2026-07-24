@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use golutra_core::{EvidenceId, PolicyDecision, TaskId};
+use golutra_core::{EvidenceId, PolicyBlockDisposition, PolicyDecision, TaskId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +46,8 @@ pub enum GovernorPhase {
 pub struct GovernorLimits {
     pub max_iterations: u32,
     pub max_tool_calls: u32,
+    /// Maximum consecutive failed tool calls before the runtime stops. Total
+    /// failures remain observable but do not accumulate forever on long tasks.
     pub max_failed_tool_calls: u32,
     pub max_planned_input_tokens: u64,
     pub max_elapsed_ms: u64,
@@ -73,11 +75,13 @@ pub struct GovernorObservation {
     pub iteration: u32,
     pub tool_calls: u32,
     pub failed_tool_calls: u32,
+    pub consecutive_failed_tool_calls: u32,
     pub planned_input_tokens: u64,
     pub elapsed_ms: u64,
     pub latest_action: String,
     pub estimated_cost_microusd: Option<u64>,
     pub policy_decision: Option<PolicyDecision>,
+    pub policy_block_disposition: Option<PolicyBlockDisposition>,
     pub security_risk: String,
 }
 
@@ -92,6 +96,7 @@ pub struct RuntimeGovernorDecision {
     pub iteration: u32,
     pub tool_calls: u32,
     pub failed_tool_calls: u32,
+    pub consecutive_failed_tool_calls: u32,
     pub alignment: GoalAlignmentCheck,
 }
 
@@ -128,8 +133,10 @@ impl RuntimeGovernor {
         let normalized_security_risk = observation.security_risk.trim().to_ascii_lowercase();
         let (action, reason, budget_risk) = if ledger.original_objective.trim().is_empty() {
             (GovernorAction::Block, "runtime objective is empty", "low")
-        } else if observation.policy_decision == Some(PolicyDecision::Block)
-            || normalized_security_risk == "critical"
+        } else if normalized_security_risk == "critical"
+            || (observation.policy_decision == Some(PolicyDecision::Block)
+                && observation.policy_block_disposition
+                    != Some(PolicyBlockDisposition::Recoverable))
         {
             (
                 GovernorAction::Block,
@@ -165,13 +172,13 @@ impl RuntimeGovernor {
                 "runtime tool-call budget exceeded",
                 "exceeded",
             )
-        } else if observation.failed_tool_calls > 0
-            && observation.failed_tool_calls >= self.limits.max_failed_tool_calls
+        } else if observation.consecutive_failed_tool_calls > 0
+            && observation.consecutive_failed_tool_calls >= self.limits.max_failed_tool_calls
             && observation.phase == GovernorPhase::ToolResult
         {
             (
                 GovernorAction::Block,
-                "runtime failed-tool budget reached",
+                "runtime consecutive failed-tool budget reached",
                 "exceeded",
             )
         } else if observation.planned_input_tokens > self.limits.max_planned_input_tokens {
@@ -186,10 +193,13 @@ impl RuntimeGovernor {
                 "runtime wall-clock budget exceeded",
                 "exceeded",
             )
-        } else if observation.policy_decision == Some(PolicyDecision::Deny) {
+        } else if matches!(
+            observation.policy_decision,
+            Some(PolicyDecision::Deny | PolicyDecision::Block)
+        ) {
             (
                 GovernorAction::Warn,
-                "policy denied the requested action; the loop may recover with a safer action",
+                "policy rejected the current tool call; the loop may recover with a safer action",
                 "low",
             )
         } else if !alignment.aligned
@@ -239,6 +249,7 @@ impl RuntimeGovernor {
             iteration: observation.iteration,
             tool_calls: observation.tool_calls,
             failed_tool_calls: observation.failed_tool_calls,
+            consecutive_failed_tool_calls: observation.consecutive_failed_tool_calls,
             alignment,
         }
     }
@@ -345,11 +356,13 @@ mod tests {
                 iteration: 2,
                 tool_calls: 1,
                 failed_tool_calls: 0,
+                consecutive_failed_tool_calls: 0,
                 planned_input_tokens: 10,
                 elapsed_ms: 1,
                 latest_action: "implement runtime cancellation".to_owned(),
                 estimated_cost_microusd: None,
                 policy_decision: None,
+                policy_block_disposition: None,
                 security_risk: "low".to_owned(),
             },
         );
@@ -371,11 +384,13 @@ mod tests {
                 iteration: 1,
                 tool_calls: 0,
                 failed_tool_calls: 0,
+                consecutive_failed_tool_calls: 0,
                 planned_input_tokens: 11,
                 elapsed_ms: 1,
                 latest_action: "implement runtime cancellation".to_owned(),
                 estimated_cost_microusd: None,
                 policy_decision: None,
+                policy_block_disposition: None,
                 security_risk: "low".to_owned(),
             },
         );
@@ -392,11 +407,13 @@ mod tests {
                 iteration: 1,
                 tool_calls: 1,
                 failed_tool_calls: 0,
+                consecutive_failed_tool_calls: 0,
                 planned_input_tokens: 10,
                 elapsed_ms: 1,
                 latest_action: "inspect unrelated marketing assets".to_owned(),
                 estimated_cost_microusd: None,
                 policy_decision: None,
+                policy_block_disposition: None,
                 security_risk: "low".to_owned(),
             },
         );
@@ -406,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_policy_rejection_and_asks_for_high_cost_review() {
+    fn separates_terminal_and_recoverable_policy_blocks() {
         let governor = RuntimeGovernor::new(GovernorLimits {
             max_estimated_cost_microusd: 100,
             ..GovernorLimits::default()
@@ -418,12 +435,31 @@ mod tests {
                 iteration: 1,
                 tool_calls: 1,
                 failed_tool_calls: 0,
+                consecutive_failed_tool_calls: 0,
                 planned_input_tokens: 10,
                 elapsed_ms: 1,
                 latest_action: "write runtime file".to_owned(),
                 estimated_cost_microusd: Some(10),
                 policy_decision: Some(PolicyDecision::Block),
+                policy_block_disposition: Some(PolicyBlockDisposition::Terminal),
                 security_risk: "high".to_owned(),
+            },
+        );
+        let recoverable = governor.evaluate(
+            &ledger(),
+            &GovernorObservation {
+                phase: GovernorPhase::ToolResult,
+                iteration: 1,
+                tool_calls: 1,
+                failed_tool_calls: 1,
+                consecutive_failed_tool_calls: 1,
+                planned_input_tokens: 10,
+                elapsed_ms: 1,
+                latest_action: "shell command syntax is not permitted".to_owned(),
+                estimated_cost_microusd: Some(10),
+                policy_decision: Some(PolicyDecision::Block),
+                policy_block_disposition: Some(PolicyBlockDisposition::Recoverable),
+                security_risk: "low".to_owned(),
             },
         );
         let costly = governor.evaluate(
@@ -433,18 +469,69 @@ mod tests {
                 iteration: 1,
                 tool_calls: 0,
                 failed_tool_calls: 0,
+                consecutive_failed_tool_calls: 0,
                 planned_input_tokens: 10,
                 elapsed_ms: 1,
                 latest_action: "implement runtime cancellation".to_owned(),
                 estimated_cost_microusd: Some(101),
                 policy_decision: None,
+                policy_block_disposition: None,
                 security_risk: "low".to_owned(),
             },
         );
 
         assert_eq!(blocked.action, GovernorAction::Block);
         assert_eq!(blocked.security_risk, "high");
+        assert_eq!(recoverable.action, GovernorAction::Warn);
+        assert!(recoverable.permits_execution());
         assert_eq!(costly.action, GovernorAction::AskUser);
         assert_eq!(costly.budget_risk, "exceeded");
+    }
+
+    #[test]
+    fn only_consecutive_failures_exhaust_the_failed_tool_budget() {
+        let recovered = RuntimeGovernor::default().evaluate(
+            &ledger(),
+            &GovernorObservation {
+                phase: GovernorPhase::ToolResult,
+                iteration: 10,
+                tool_calls: 16,
+                failed_tool_calls: 8,
+                consecutive_failed_tool_calls: 2,
+                planned_input_tokens: 10,
+                elapsed_ms: 1,
+                latest_action: "tool execution failed".to_owned(),
+                estimated_cost_microusd: None,
+                policy_decision: None,
+                policy_block_disposition: None,
+                security_risk: "low".to_owned(),
+            },
+        );
+        let exhausted = RuntimeGovernor::default().evaluate(
+            &ledger(),
+            &GovernorObservation {
+                phase: GovernorPhase::ToolResult,
+                iteration: 10,
+                tool_calls: 16,
+                failed_tool_calls: 8,
+                consecutive_failed_tool_calls: 8,
+                planned_input_tokens: 10,
+                elapsed_ms: 1,
+                latest_action: "tool execution failed".to_owned(),
+                estimated_cost_microusd: None,
+                policy_decision: None,
+                policy_block_disposition: None,
+                security_risk: "low".to_owned(),
+            },
+        );
+
+        assert!(recovered.permits_execution());
+        assert_eq!(recovered.failed_tool_calls, 8);
+        assert_eq!(recovered.consecutive_failed_tool_calls, 2);
+        assert_eq!(exhausted.action, GovernorAction::Block);
+        assert_eq!(
+            exhausted.reason,
+            "runtime consecutive failed-tool budget reached"
+        );
     }
 }

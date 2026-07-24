@@ -570,7 +570,7 @@ async fn shell_parser_preserves_quoted_arguments() {
 
     let report = execute_approved(
         &executor,
-        request("shell", json!({"command": "printf '%s' 'hello world'"})),
+        request("shell", json!({"command": "printf '%s' 'hello; world'"})),
         CancellationToken::new(),
     )
     .await;
@@ -578,7 +578,7 @@ async fn shell_parser_preserves_quoted_arguments() {
     assert_eq!(report.envelope.status, ToolResultStatus::Ok);
     assert_eq!(
         report.envelope.model_visible_excerpt.as_deref(),
-        Some("hello world")
+        Some("hello; world")
     );
 }
 
@@ -1221,6 +1221,7 @@ fn request(tool_name: &str, arguments: Value) -> ToolRequest {
 fn request_for_session(session_id: SessionId, tool_name: &str, arguments: Value) -> ToolRequest {
     ToolRequest {
         tool_call_id: ToolCallId::new(),
+        provider_tool_call_id: None,
         session_id,
         turn_id: Some(TurnId::new()),
         tool_name: tool_name.to_owned(),

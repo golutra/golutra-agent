@@ -17,14 +17,14 @@ use golutra_core::{
     Actor, ApprovalDecision, ApprovalId, ApprovalResolution, ArtifactId, ArtifactRecord,
     BusyPolicy, CommandId, EventId, MemoryId, PolicyDecision, PolicyEvaluation, PostTaskJob,
     PostTaskJobId, PostTaskJobKind, PostTaskJobStatus, ProviderAuthRequestId, RedactionStatus,
-    SessionId, TaskId, TaskReconciliationDecision, TaskReconciliationRecord, TaskRecoveryRecord,
-    TaskStatus, ThreadId, TokenUsageRecord, TurnId, WorkspaceId,
+    RunProvenance, SessionId, TaskId, TaskReconciliationDecision, TaskReconciliationRecord,
+    TaskRecoveryRecord, TaskStatus, ThreadId, TokenUsageRecord, TurnId, WorkspaceId,
 };
 #[cfg(test)]
 use golutra_eval::EvaluationRunner;
 use golutra_eval::{
     BenchmarkRun, CandidateStatus, EvaluationError, EvaluationStore, PromotionDecisionKind,
-    TaskEvaluationBundle, TaskEvaluationInput,
+    ReviewMode, TaskEvaluationBundle, TaskEvaluationInput,
 };
 use golutra_evolution::{EvolutionError, EvolutionStore};
 use golutra_llm::{ConfiguredProvider, ProviderError, ProviderRole, protocol_capabilities};
@@ -68,6 +68,7 @@ const MAX_EVENT_PAGE_SIZE: u32 = 512;
 const CHECKPOINTS_TO_RETAIN_PER_WORKSPACE: usize = 20;
 const MAX_HISTORY_SOURCE_EVENTS: u32 = 512;
 const MAX_HTTP_JSON_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_RUN_BUNDLE_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_COMMAND_PAYLOAD_JSON_BYTES: usize = 256 * 1024;
 const MAX_IDEMPOTENCY_KEY_CHARS: usize = 512;
@@ -101,28 +102,34 @@ pub(crate) fn runtime_identity() -> String {
 mod agent;
 mod agent_projection;
 mod application;
+mod causal_recorder;
 mod change_tracker;
 mod command;
 mod context;
 mod debug_export;
+mod diagnosis;
 mod event_codec;
 mod evolution;
 mod execution;
 mod execution_trace;
+mod external_evaluation;
 mod governance;
 mod governance_commands;
 mod observation;
 mod paths;
 mod post_task;
+mod provenance;
 mod provider_runtime;
 mod query;
 mod recovery;
 mod regression;
+mod replay;
 mod rollout;
 mod run_bundle;
 mod session;
 mod task_governance;
 mod trace;
+mod trace_integrity;
 mod transport;
 
 pub use agent::{AgentClient, AgentThread, TurnHandle};
@@ -145,9 +152,10 @@ pub use debug_export::{
 pub(crate) use event_codec::redact_provider_json;
 pub(crate) use event_codec::{
     agent_event, agent_event_for_turn, candidate_id_from_payload, context_compaction_artifact,
-    context_request_artifact, event_matches_filter, host_event, provider_raw_artifact,
-    recovered_pending_turn_from_event, task_status_from_loop_action, thread_id_from_payload,
-    thread_title_for_prompt, trace_event_payload, with_command_payload,
+    context_replay_request_artifact, context_request_artifact, event_matches_filter, host_event,
+    provider_raw_artifact, provider_response_replay_artifact, recovered_pending_turn_from_event,
+    task_status_from_loop_action, thread_id_from_payload, thread_title_for_prompt,
+    trace_event_payload, with_command_payload,
 };
 pub use event_codec::{event_sequence_no, projection_status};
 pub(crate) use execution_trace::CanonicalFactRecorder;
@@ -290,6 +298,7 @@ pub struct RuntimeHost {
     event_bus: broadcast::Sender<RuntimeEvent>,
     next_sequence_no: AtomicU64,
     event_writer: Mutex<()>,
+    causal_ledger: Mutex<causal_recorder::CausalLedger>,
     workspace_id: WorkspaceId,
     workspace_root: Option<PathBuf>,
     runtime_paths: Option<RuntimePaths>,
@@ -469,6 +478,65 @@ impl RuntimeHost {
         .await
     }
 
+    /// Reopen a completed owner-only run bundle for appending evaluator
+    /// overlays. The recorded cwd may belong to a deleted container and is
+    /// therefore used as an identity boundary without filesystem access.
+    pub async fn open_persisted_run(run_root: impl AsRef<Path>) -> Result<Arc<Self>, ClientError> {
+        let run_root = run_root.as_ref();
+        let manifest_path = run_root.join("manifest.json");
+        let metadata = fs::symlink_metadata(&manifest_path)
+            .map_err(|error| ClientError::Io(format!("{}: {error}", manifest_path.display())))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() > MAX_RUN_BUNDLE_MANIFEST_BYTES
+        {
+            return Err(ClientError::Io(
+                "persisted run manifest must be a bounded regular file".to_owned(),
+            ));
+        }
+        let manifest_bytes = fs::read(&manifest_path)
+            .map_err(|error| ClientError::Io(format!("{}: {error}", manifest_path.display())))?;
+        let manifest: RunBundleManifest = serde_json::from_slice(&manifest_bytes)?;
+        if manifest.format != "golutra-run-bundle" || manifest.format_version != 1 {
+            return Err(ClientError::TaskExecution(
+                "persisted run manifest format is unsupported".to_owned(),
+            ));
+        }
+        let workspace_id = manifest
+            .workspace_id
+            .parse::<WorkspaceId>()
+            .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
+        let paths = RuntimePaths::open_ephemeral_state_dir(run_root, &manifest.workspace_root)?;
+        let store = RuntimeStore::connect_with_artifact_root(
+            &paths.sqlite_url(),
+            paths.artifacts_dir.clone(),
+        )
+        .await?;
+        set_owner_only_file(&paths.runtime_db)?;
+        run_bundle::validate_persisted_run_store(run_root, &manifest, &store).await?;
+        let latest_thread = store
+            .list_threads(Some(&manifest.workspace_root), 1)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                ClientError::TaskExecution(
+                    "persisted run has no thread for its recorded workspace".to_owned(),
+                )
+            })?;
+        let storage = RuntimeHostStorage::ephemeral_persistent(paths.clone())?;
+        Self::from_store(
+            store,
+            Some(paths.cwd.clone()),
+            storage,
+            workspace_id,
+            latest_thread.session_id,
+            latest_thread.thread_id,
+            false,
+        )
+        .await
+    }
+
     pub async fn for_cwd(cwd: impl AsRef<Path>) -> Result<Arc<Self>, ClientError> {
         let paths = RuntimePaths::for_cwd(cwd)?;
         Self::from_runtime_paths(paths).await
@@ -571,6 +639,7 @@ impl RuntimeHost {
             event_bus,
             next_sequence_no: AtomicU64::new(next_sequence_no),
             event_writer: Mutex::new(()),
+            causal_ledger: Mutex::new(causal_recorder::CausalLedger::default()),
             workspace_id,
             workspace_root,
             runtime_paths,
@@ -614,6 +683,17 @@ impl RuntimeHost {
     #[must_use]
     pub fn workspace_id(&self) -> WorkspaceId {
         self.workspace_id
+    }
+
+    fn capture_run_provenance(&self, task_id: TaskId) -> RunProvenance {
+        provenance::run_provenance(
+            task_id,
+            self.workspace_id,
+            self.workspace_root.as_deref(),
+            self.provider_config_paths
+                .as_ref()
+                .map(|paths| paths.user_config.as_path()),
+        )
     }
 
     pub async fn runtime_info(
@@ -978,11 +1058,26 @@ impl RuntimeHost {
 
     async fn record_event(&self, event: RuntimeEvent) -> Result<(), ClientError> {
         let _writer = self.event_writer.lock().await;
-        let event = self
+        let causal_before = self.causal_ledger.lock().await.clone();
+        let event = match self.prepare_canonical_event(event).await {
+            Ok(event) => event,
+            Err(error) => {
+                *self.causal_ledger.lock().await = causal_before;
+                return Err(error);
+            }
+        };
+        let event = match self
             .repositories
             .events
             .append_assigning_sequence(event)
-            .await?;
+            .await
+        {
+            Ok(event) => event,
+            Err(error) => {
+                *self.causal_ledger.lock().await = causal_before;
+                return Err(error.into());
+            }
+        };
         self.publish_committed_event(event).await
     }
 
@@ -994,16 +1089,33 @@ impl RuntimeHost {
         receipt_event: RuntimeEvent,
     ) -> Result<CommandClaim, ClientError> {
         let _writer = self.event_writer.lock().await;
-        let claim = self
+        let causal_before = self.causal_ledger.lock().await.clone();
+        let receipt_event = match self.prepare_canonical_event(receipt_event).await {
+            Ok(event) => event,
+            Err(error) => {
+                *self.causal_ledger.lock().await = causal_before;
+                return Err(error);
+            }
+        };
+        let claim = match self
             .repositories
             .events
             .claim_command(idempotency_key, command_id, provisional_ack, receipt_event)
-            .await?;
+            .await
+        {
+            Ok(claim) => claim,
+            Err(error) => {
+                *self.causal_ledger.lock().await = causal_before;
+                return Err(error.into());
+            }
+        };
         if let CommandClaim::Claimed {
             receipt_event: Some(event),
         } = &claim
         {
             self.publish_committed_event(event.clone()).await?;
+        } else {
+            *self.causal_ledger.lock().await = causal_before;
         }
         Ok(claim)
     }
@@ -1016,11 +1128,26 @@ impl RuntimeHost {
         completion_event: RuntimeEvent,
     ) -> Result<(), ClientError> {
         let _writer = self.event_writer.lock().await;
-        let event = self
+        let causal_before = self.causal_ledger.lock().await.clone();
+        let completion_event = match self.prepare_canonical_event(completion_event).await {
+            Ok(event) => event,
+            Err(error) => {
+                *self.causal_ledger.lock().await = causal_before;
+                return Err(error);
+            }
+        };
+        let event = match self
             .repositories
             .events
             .complete_command(idempotency_key, command_id, ack, completion_event)
-            .await?;
+            .await
+        {
+            Ok(event) => event,
+            Err(error) => {
+                *self.causal_ledger.lock().await = causal_before;
+                return Err(error.into());
+            }
+        };
         self.publish_committed_event(event).await
     }
 

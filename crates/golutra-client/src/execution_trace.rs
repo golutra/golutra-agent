@@ -26,31 +26,46 @@ impl RuntimeHost {
         task: &HostedAgentTask,
         trace_event: RuntimeObservation,
     ) -> Result<(), ClientError> {
-        let (trace_event, context_artifact) = match trace_event {
+        let (trace_event, context_artifacts) = match trace_event {
             AgentLoopTraceEvent::ContextSnapshotCaptured {
                 mut snapshot,
                 request,
             } => {
-                let (artifact, bytes) = context_request_artifact(task, &snapshot, &request)?;
-                snapshot.redacted_request_artifact_ref = Some(artifact.artifact_id);
+                let (redacted_artifact, redacted_bytes) =
+                    context_request_artifact(task, &snapshot, &request)?;
+                let (restricted_artifact, restricted_bytes) =
+                    context_replay_request_artifact(task, &snapshot, &request)?;
+                snapshot.redacted_request_artifact_ref = Some(redacted_artifact.artifact_id);
+                snapshot.restricted_request_artifact_ref = Some(restricted_artifact.artifact_id);
                 for contributor in &mut snapshot.contributor_manifest {
                     if contributor.included {
-                        contributor.redacted_content_ref = Some(artifact.artifact_id);
+                        contributor.redacted_content_ref = Some(redacted_artifact.artifact_id);
                     }
                 }
                 (
                     AgentLoopTraceEvent::ContextSnapshot(snapshot),
-                    Some((artifact, bytes, "redacted_request_artifact_ref")),
+                    vec![
+                        (
+                            redacted_artifact,
+                            redacted_bytes,
+                            "redacted_request_artifact_ref",
+                        ),
+                        (
+                            restricted_artifact,
+                            restricted_bytes,
+                            "restricted_request_artifact_ref",
+                        ),
+                    ],
                 )
             }
             AgentLoopTraceEvent::ContextAutoCompacted(record) => {
                 let (artifact, bytes) = context_compaction_artifact(task, &record)?;
                 (
                     AgentLoopTraceEvent::ContextAutoCompacted(record),
-                    Some((artifact, bytes, "replacement_context_artifact_ref")),
+                    vec![(artifact, bytes, "replacement_context_artifact_ref")],
                 )
             }
-            trace_event => (trace_event, None),
+            trace_event => (trace_event, Vec::new()),
         };
         if let AgentLoopTraceEvent::ContextSnapshot(snapshot) = &trace_event {
             self.repositories.artifacts.store_context(snapshot).await?;
@@ -81,28 +96,37 @@ impl RuntimeHost {
             AgentLoopTraceEvent::TokenUsageRecorded(record) => Some(record.turn_id),
             _ => Some(active_turn_id),
         };
-        let provider_artifact = match &trace_event {
-            AgentLoopTraceEvent::ProviderCompleted { raw_metadata, .. } => {
-                Some(provider_raw_artifact(task, active_turn_id, raw_metadata)?)
+        let provider_artifacts = match &trace_event {
+            AgentLoopTraceEvent::ProviderCompleted { response, .. } => {
+                vec![
+                    (
+                        provider_raw_artifact(task, active_turn_id, &response.raw_metadata)?,
+                        "raw_metadata_ref",
+                    ),
+                    (
+                        provider_response_replay_artifact(task, active_turn_id, response)?,
+                        "response_artifact_ref",
+                    ),
+                ]
             }
-            _ => None,
+            _ => Vec::new(),
         };
         if let Some((event_type, source, payload)) = trace_event_payload(trace_event) {
             let mut event = agent_event(self.next_sequence_no(), task, event_type, source, payload);
             if let Some(turn_id) = event_turn_id {
                 event.turn_id = Some(turn_id);
             }
-            if let Some((mut artifact, bytes, payload_key)) = context_artifact {
+            for (mut artifact, bytes, payload_key) in context_artifacts {
                 artifact.provenance_refs.push(event.id);
                 self.repositories.artifacts.store(&artifact, &bytes).await?;
-                event.payload_ref = Some(artifact.artifact_id);
+                event.payload_ref.get_or_insert(artifact.artifact_id);
                 event.payload[payload_key] = Value::String(artifact.artifact_id.to_string());
             }
-            if let Some((mut artifact, bytes)) = provider_artifact {
+            for ((mut artifact, bytes), payload_key) in provider_artifacts {
                 artifact.provenance_refs.push(event.id);
                 self.repositories.artifacts.store(&artifact, &bytes).await?;
-                event.payload_ref = Some(artifact.artifact_id);
-                event.payload["raw_metadata_ref"] = Value::String(artifact.artifact_id.to_string());
+                event.payload_ref.get_or_insert(artifact.artifact_id);
+                event.payload[payload_key] = Value::String(artifact.artifact_id.to_string());
             }
             self.record_event(event).await?;
         }
@@ -131,21 +155,34 @@ impl RuntimeHost {
         let task_id = task.task_id;
         let turn_id = request.turn_id.unwrap_or(task.turn_id);
         let tool_call_id = request.tool_call_id;
+        let partial_checkpoint = request.tool_name == "shell";
         let owned_before_images = before_images.to_vec();
-        let mut checkpoint = run_blocking(move || {
-            manager.create_checkpoint(
+        let checkpoint_result = run_blocking(move || {
+            let (checkpoint_before_images, excluded_count) = if partial_checkpoint {
+                manager.filter_checkpointable_before_images(&owned_before_images)?
+            } else {
+                (owned_before_images, 0)
+            };
+            let checkpoint = manager.create_checkpoint(
                 workspace_id,
                 task_id,
                 turn_id,
-                &owned_before_images,
+                &checkpoint_before_images,
                 tool_call_id,
-            )
+            )?;
+            Ok::<_, golutra_runtime::CheckpointError>((
+                checkpoint,
+                checkpoint_before_images,
+                excluded_count,
+            ))
         })
-        .await?
-        .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
+        .await?;
+        let (mut checkpoint, checkpoint_before_images, excluded_count) =
+            checkpoint_result.map_err(|error| ClientError::TaskExecution(error.to_string()))?;
+        let before_image_complete = complete && excluded_count == 0;
 
         let checkpoint_event_id = EventId::new();
-        for before_image in before_images {
+        for before_image in &checkpoint_before_images {
             let Some(bytes) = &before_image.content else {
                 continue;
             };
@@ -181,7 +218,8 @@ impl RuntimeHost {
             RuntimeEventSource::Runtime,
             json!({
                 "summary": "workspace before-image persisted before tool side effect",
-                "before_image_complete": complete,
+                "before_image_complete": before_image_complete,
+                "omitted_before_image_count": excluded_count,
                 "checkpoint": checkpoint,
             }),
         );
@@ -233,6 +271,30 @@ impl RuntimeHost {
             };
             (artifact, bytes)
         });
+        let replay_result_artifact = {
+            let bytes = serde_json::to_vec(&report.envelope)?;
+            let artifact_id = ArtifactId::new();
+            let checksum = Sha256::digest(&bytes);
+            let artifact = ArtifactRecord {
+                artifact_id,
+                session_id: task.session_id,
+                turn_id: Some(event_turn_id),
+                tool_call_id: Some(report.envelope.tool_call_id),
+                artifact_type: "tool_result_replay".to_owned(),
+                uri: format!(
+                    "artifact://replay/tool-result/{}/{artifact_id}",
+                    report.envelope.tool_call_id
+                ),
+                checksum: format!("sha256:{checksum:x}"),
+                size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                created_at: chrono::Utc::now(),
+                producer: "tool-executor".to_owned(),
+                redaction_status: RedactionStatus::Raw,
+                retention_policy: "replay_owner_access".to_owned(),
+                provenance_refs: Vec::new(),
+            };
+            (artifact, bytes)
+        };
         let mut event = agent_event(
             self.next_sequence_no(),
             task,
@@ -254,9 +316,17 @@ impl RuntimeHost {
         );
         event.turn_id = Some(event_turn_id);
         let tool_event_id = event.id;
+        let (mut replay_artifact, replay_bytes) = replay_result_artifact;
+        replay_artifact.provenance_refs.push(tool_event_id);
+        event.payload["replay_result_artifact_ref"] =
+            Value::String(replay_artifact.artifact_id.to_string());
+        event.payload_ref = Some(replay_artifact.artifact_id);
+        self.repositories
+            .artifacts
+            .store(&replay_artifact, &replay_bytes)
+            .await?;
         if let Some((mut artifact, bytes)) = diff_artifact {
             artifact.provenance_refs.push(tool_event_id);
-            event.payload_ref = Some(artifact.artifact_id);
             event.payload["diff_artifact_ref"] = Value::String(artifact.artifact_id.to_string());
             self.repositories.artifacts.store(&artifact, &bytes).await?;
         }

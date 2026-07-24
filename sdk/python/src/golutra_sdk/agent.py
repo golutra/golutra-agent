@@ -140,6 +140,13 @@ class Thread:
             {"session_id": self.session_id, "after_sequence_no": cursor}
         )
 
+    def debug_projection(self, task_id: str) -> dict[str, Any]:
+        """Read the developer projection without exposing it in ordinary user views."""
+        return self._client.debug_projection(self.session_id, task_id)
+
+    def replay(self, task_id: str, capsule_id: str | None = None) -> dict[str, Any]:
+        return self._client.replay(self.session_id, task_id, capsule_id)
+
 
 class TurnHandle:
     """A single accepted turn and its normalized event stream."""

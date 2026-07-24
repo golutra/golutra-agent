@@ -1,6 +1,7 @@
 use golutra_core::{
     ArtifactId, ArtifactRecord, ContextSnapshot, EvidenceRecord, PostTaskJob, RedactionStatus,
-    SessionId, TaskId, TraceIntegrity, TraceView, VerificationPlan, VerificationRecord,
+    RunProvenance, SessionId, TaskId, TraceIntegrity, TraceView, VerificationPlan,
+    VerificationRecord,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,8 @@ pub struct TaskTracePage {
     pub session_id: SessionId,
     pub task_id: TaskId,
     pub runtime_identity: String,
+    #[serde(default)]
+    pub run_provenance: Option<RunProvenance>,
     pub view: TraceView,
     pub events: Vec<RuntimeEvent>,
     pub context_snapshots: Vec<ContextSnapshot>,

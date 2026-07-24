@@ -66,6 +66,9 @@ fn event(
     payload: Value,
 ) -> RuntimeEvent {
     RuntimeEvent {
+        schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+        causal_context: Default::default(),
+        causal_links: Vec::new(),
         id: EventId::new(),
         sequence_no,
         session_id,

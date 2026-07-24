@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     path::Path,
     sync::{Arc, Mutex as StdMutex},
     time::Instant,
@@ -12,9 +12,9 @@ use golutra_context::{
 };
 use golutra_core::{
     ApprovalDecision, ApprovalId, ApprovalRequest, ApprovalResolution, BudgetState, CommandId,
-    LoopAction, LoopDecision, PolicyDecision, SessionId, TaskId, ToolProgress, ToolProgressPhase,
-    ToolResultStatus, TurnId, VerificationCheck, VerificationCheckKind, VerificationPlan,
-    VerificationRecord, VerificationResult,
+    LoopAction, LoopDecision, PolicyDecision, SessionId, TaskId, ToolContract, ToolProgress,
+    ToolProgressPhase, ToolResultStatus, TurnId, VerificationCheck, VerificationCheckKind,
+    VerificationPlan, VerificationRecord, VerificationResult,
 };
 use golutra_governor::{
     GoalLedger, GovernorAction, GovernorObservation, GovernorPhase, RuntimeGovernor,
@@ -93,6 +93,14 @@ pub struct AgentLoopOutcome {
     pub tool_reports: Vec<ToolExecutionReport>,
     pub final_message: Option<String>,
     pub final_turn_id: TurnId,
+}
+
+/// Captured provider inputs used to re-enter the ordinary AgentLoop without
+/// rebuilding historical assistant/tool messages from a lossy projection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentReplayContext {
+    pub initial_messages: Vec<ProviderMessage>,
+    pub tools: Vec<ToolContract>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -375,8 +383,41 @@ where
     pub async fn run_with_control_and_trace<F>(
         &self,
         request: AgentTaskRequest,
+        control: AgentExecutionControl,
+        trace: F,
+    ) -> Result<AgentLoopOutcome, AgentLoopError>
+    where
+        F: FnMut(AgentLoopTraceEvent) + Send,
+    {
+        self.run_with_control_trace_and_replay_context(request, control, trace, None)
+            .await
+    }
+
+    pub async fn replay_with_trace<F>(
+        &self,
+        request: AgentTaskRequest,
+        replay_context: AgentReplayContext,
+        trace: F,
+    ) -> Result<AgentLoopOutcome, AgentLoopError>
+    where
+        F: FnMut(AgentLoopTraceEvent) + Send,
+    {
+        let (_handle, control) = agent_execution_channel(1);
+        self.run_with_control_trace_and_replay_context(
+            request,
+            control,
+            trace,
+            Some(replay_context),
+        )
+        .await
+    }
+
+    async fn run_with_control_trace_and_replay_context<F>(
+        &self,
+        request: AgentTaskRequest,
         mut control: AgentExecutionControl,
         mut trace: F,
+        replay_context: Option<AgentReplayContext>,
     ) -> Result<AgentLoopOutcome, AgentLoopError>
     where
         F: FnMut(AgentLoopTraceEvent) + Send,
@@ -391,9 +432,11 @@ where
         let mut repeated_failure_signature = None;
         let mut repeated_failure_count = 0_u32;
         let mut empty_response_count = 0_u32;
+        let mut verification_nudge_count = 0_u32;
         let started_at = Instant::now();
         let mut tool_call_count = 0_u32;
         let mut failed_tool_call_count = 0_u32;
+        let mut consecutive_failed_tool_call_count = 0_u32;
         let mut estimated_cost_microusd: Option<u64> = None;
         let mut governor_action = None;
         let mut goal_ledger = GoalLedger {
@@ -415,17 +458,20 @@ where
             cost_risk: "low".to_owned(),
         };
         let mut step_machine = StepMachine::default();
-        let provider_tools = request
-            .tools
-            .iter()
-            .map(|tool_name| {
-                self.tool_executor
-                    .registry()
-                    .contract(tool_name)
-                    .cloned()
-                    .ok_or_else(|| ToolError::UnknownTool(tool_name.clone()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let provider_tools = match replay_context.as_ref() {
+            Some(replay_context) => replay_context.tools.clone(),
+            None => request
+                .tools
+                .iter()
+                .map(|tool_name| {
+                    self.tool_executor
+                        .registry()
+                        .contract(tool_name)
+                        .cloned()
+                        .ok_or_else(|| ToolError::UnknownTool(tool_name.clone()))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        };
         let planned_tool_tokens = provider_tools
             .iter()
             .map(|contract| {
@@ -434,11 +480,19 @@ where
                     .unwrap_or_default()
             })
             .sum::<u64>();
-        let base_plan = match self.context_builder.build(
-            request.task_id,
-            current_turn_id,
-            request.contributors.clone(),
-        ) {
+        let base_plan_result = match replay_context.as_ref() {
+            Some(replay_context) => self.context_builder.build_from_messages(
+                request.task_id,
+                current_turn_id,
+                replay_context.initial_messages.clone(),
+            ),
+            None => self.context_builder.build(
+                request.task_id,
+                current_turn_id,
+                request.contributors.clone(),
+            ),
+        };
+        let base_plan = match base_plan_result {
             Ok(plan) => plan,
             Err(error) => return Ok(context_guard::outcome(&request, error, &mut trace)),
         };
@@ -536,11 +590,13 @@ where
                     iteration: iteration.saturating_add(1),
                     tool_calls: tool_call_count,
                     failed_tool_calls: failed_tool_call_count,
+                    consecutive_failed_tool_calls: consecutive_failed_tool_call_count,
                     planned_input_tokens: plan.budget_snapshot.planned_input_tokens,
                     elapsed_ms: elapsed_millis(started_at),
                     latest_action: current_objective.clone(),
                     estimated_cost_microusd,
                     policy_decision: None,
+                    policy_block_disposition: None,
                     security_risk: "low".to_owned(),
                 },
             );
@@ -590,6 +646,7 @@ where
                 request: provider_request.clone(),
             });
             trace(AgentLoopTraceEvent::ProviderStarted {
+                request_id: provider_request.request_id,
                 provider_id: provider_request.provider_id.clone(),
                 model_id: provider_request.model_id.clone(),
             });
@@ -599,6 +656,12 @@ where
             let (provider_response, completed_request) = match provider_result {
                 Ok(result) => result,
                 Err(error) => {
+                    trace(AgentLoopTraceEvent::ProviderFailed {
+                        request_id: provider_request.request_id,
+                        provider_id: provider_request.provider_id.clone(),
+                        model_id: provider_request.model_id.clone(),
+                        error: error.to_string(),
+                    });
                     finish_runtime_step(
                         &mut step_machine,
                         step_snapshot.clone(),
@@ -622,12 +685,10 @@ where
                 last_assistant_message = Some(message.content.trim().to_owned());
             }
             trace(AgentLoopTraceEvent::ProviderCompleted {
+                request_id: completed_request.request_id,
                 provider_id: completed_request.provider_id.clone(),
                 model_id: completed_request.model_id.clone(),
-                finish_reason: provider_response.finish_reason,
-                tool_call_count: provider_response.tool_calls.len(),
-                usage: provider_response.usage.clone(),
-                raw_metadata: provider_response.raw_metadata.clone(),
+                response: provider_response.clone(),
             });
             let usage_record = token_usage_record(
                 &completed_request,
@@ -733,6 +794,7 @@ where
                     tool_reports.clear();
                     repeated_failure_signature = None;
                     repeated_failure_count = 0;
+                    verification_nudge_count = 0;
                     goal_ledger.original_objective = current_objective.clone();
                     goal_ledger.current_plan = request.completion_criteria.clone();
                     goal_ledger.completed_steps.clear();
@@ -757,6 +819,34 @@ where
                     );
                     continue;
                 }
+                if self.external_verifiers.is_empty()
+                    && request.tools.iter().any(|tool| tool == "shell")
+                    && verification_nudge_count < MAX_VERIFICATION_NUDGES
+                    && workspace_changes_need_validation(&tool_reports)
+                {
+                    verification_nudge_count = verification_nudge_count.saturating_add(1);
+                    let reason = "workspace changed without fresh objective validation evidence";
+                    trace(AgentLoopTraceEvent::RetryScheduled {
+                        attempt: verification_nudge_count,
+                        reason: reason.to_owned(),
+                    });
+                    messages.push(ProviderMessage {
+                        role: ProviderRole::User,
+                        content: VERIFICATION_NUDGE.to_owned(),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls: Vec::new(),
+                        metadata: Default::default(),
+                    });
+                    finish_runtime_step(
+                        &mut step_machine,
+                        step_snapshot.clone(),
+                        "verification-required",
+                        true,
+                        &mut trace,
+                    );
+                    continue;
+                }
                 finish_runtime_step(
                     &mut step_machine,
                     step_snapshot.clone(),
@@ -768,6 +858,8 @@ where
             }
 
             let tool_reports_before_step = tool_reports.len();
+            let mut failed_signatures_this_step = HashSet::new();
+            let mut successful_signatures_this_step = HashSet::new();
             messages.push(ProviderMessage {
                 role: ProviderRole::Assistant,
                 content: provider_response
@@ -794,11 +886,13 @@ where
                         iteration: iteration.saturating_add(1),
                         tool_calls: tool_call_count.saturating_add(1),
                         failed_tool_calls: failed_tool_call_count,
+                        consecutive_failed_tool_calls: consecutive_failed_tool_call_count,
                         planned_input_tokens: plan.budget_snapshot.planned_input_tokens,
                         elapsed_ms: elapsed_millis(started_at),
                         latest_action: tool_action,
                         estimated_cost_microusd,
                         policy_decision: None,
+                        policy_block_disposition: None,
                         security_risk: "medium".to_owned(),
                     },
                 );
@@ -823,6 +917,7 @@ where
                 let failure_signature = format!("{}:{}", tool_call.tool_name, tool_call.arguments);
                 let tool_request = ToolRequest {
                     tool_call_id: golutra_core::ToolCallId::new(),
+                    provider_tool_call_id: Some(provider_tool_call_id.clone()),
                     session_id: request.session_id,
                     turn_id: Some(current_turn_id),
                     tool_name: tool_call.tool_name,
@@ -830,6 +925,7 @@ where
                 };
                 trace(AgentLoopTraceEvent::ToolStarted {
                     tool_call_id: tool_request.tool_call_id,
+                    provider_tool_call_id: Some(provider_tool_call_id.clone()),
                     tool_name: tool_request.tool_name.clone(),
                     display_arguments: redact_tool_arguments(&tool_request.arguments),
                 });
@@ -948,17 +1044,15 @@ where
                     }
                 };
                 trace(AgentLoopTraceEvent::ToolCompleted(report.clone()));
+                update_tool_failure_counts(
+                    report.envelope.status,
+                    &mut failed_tool_call_count,
+                    &mut consecutive_failed_tool_call_count,
+                );
                 if report.envelope.status == ToolResultStatus::Ok {
-                    repeated_failure_signature = None;
-                    repeated_failure_count = 0;
-                } else if repeated_failure_signature.as_deref() == Some(failure_signature.as_str())
-                {
-                    failed_tool_call_count = failed_tool_call_count.saturating_add(1);
-                    repeated_failure_count = repeated_failure_count.saturating_add(1);
+                    successful_signatures_this_step.insert(failure_signature);
                 } else {
-                    failed_tool_call_count = failed_tool_call_count.saturating_add(1);
-                    repeated_failure_signature = Some(failure_signature);
-                    repeated_failure_count = 1;
+                    failed_signatures_this_step.insert(failure_signature);
                 }
                 let result_governance = self.governor.evaluate(
                     &goal_ledger,
@@ -967,11 +1061,15 @@ where
                         iteration: iteration.saturating_add(1),
                         tool_calls: tool_call_count,
                         failed_tool_calls: failed_tool_call_count,
+                        consecutive_failed_tool_calls: consecutive_failed_tool_call_count,
                         planned_input_tokens: plan.budget_snapshot.planned_input_tokens,
                         elapsed_ms: elapsed_millis(started_at),
                         latest_action: report.envelope.summary.clone(),
                         estimated_cost_microusd,
                         policy_decision: Some(report.policy_evaluation.decision),
+                        policy_block_disposition: report
+                            .policy_evaluation
+                            .effective_block_disposition(),
                         security_risk: report.envelope.risk.clone(),
                     },
                 );
@@ -1002,6 +1100,13 @@ where
                     break 'agent_loop;
                 }
             }
+            failed_signatures_this_step
+                .retain(|signature| !successful_signatures_this_step.contains(signature));
+            update_repeated_failure_streak(
+                &failed_signatures_this_step,
+                &mut repeated_failure_signature,
+                &mut repeated_failure_count,
+            );
             let made_progress = tool_reports[tool_reports_before_step..]
                 .iter()
                 .any(|report| !report.changed_files.is_empty());
@@ -1047,6 +1152,7 @@ where
             let tool_call_id = golutra_core::ToolCallId::new();
             trace(AgentLoopTraceEvent::ToolStarted {
                 tool_call_id,
+                provider_tool_call_id: None,
                 tool_name: "external_verifier".to_owned(),
                 display_arguments: redact_tool_arguments(&display_arguments),
             });
@@ -1152,7 +1258,7 @@ where
                 });
                 continue;
             }
-            if let Some(validation) = objective_validation_report(report, code_files_changed) {
+            if let Some(validation) = objective_validation_report(report) {
                 command_checks.push(VerificationCheck {
                     kind: VerificationCheckKind::ObjectiveValidation,
                     name: format!(
@@ -1288,6 +1394,7 @@ where
                 iteration: step_machine.checkpoint().next_step_no,
                 tool_calls: tool_call_count,
                 failed_tool_calls: failed_tool_call_count,
+                consecutive_failed_tool_calls: consecutive_failed_tool_call_count,
                 planned_input_tokens: last_budget_state.planned_input_tokens.unwrap_or_default(),
                 elapsed_ms: elapsed_millis(started_at),
                 latest_action: last_assistant_message
@@ -1295,6 +1402,7 @@ where
                     .unwrap_or_else(|| current_objective.clone()),
                 estimated_cost_microusd,
                 policy_decision: None,
+                policy_block_disposition: None,
                 security_risk: "low".to_owned(),
             },
         );
@@ -1366,12 +1474,14 @@ where
             .fallback_provider
             .as_ref()
             .map(|provider| provider.contract().model_id);
+        let request_id = request.request_id;
         let mut on_event = |event| match event {
             provider_session::ProviderSessionEvent::Streamed {
                 provider_id,
                 model_id,
                 event,
             } => trace(AgentLoopTraceEvent::ProviderStreamed {
+                request_id,
                 provider_id,
                 model_id,
                 event,
@@ -1410,6 +1520,7 @@ where
                     reason,
                 });
                 trace(AgentLoopTraceEvent::ProviderStarted {
+                    request_id,
                     provider_id: to_provider,
                     model_id: fallback_model_id.clone().unwrap_or_default(),
                 });
@@ -1423,6 +1534,37 @@ where
         session
             .complete(request, &control.cancellation, &mut on_event)
             .await
+    }
+}
+
+fn update_tool_failure_counts(status: ToolResultStatus, total: &mut u32, consecutive: &mut u32) {
+    if status == ToolResultStatus::Ok {
+        *consecutive = 0;
+    } else {
+        *total = total.saturating_add(1);
+        *consecutive = consecutive.saturating_add(1);
+    }
+}
+
+fn update_repeated_failure_streak(
+    failed_signatures_this_step: &HashSet<String>,
+    repeated_signature: &mut Option<String>,
+    repeated_count: &mut u32,
+) {
+    if failed_signatures_this_step.len() != 1 {
+        *repeated_signature = None;
+        *repeated_count = 0;
+        return;
+    }
+    let signature = failed_signatures_this_step
+        .iter()
+        .next()
+        .expect("one failed signature");
+    if repeated_signature.as_deref() == Some(signature.as_str()) {
+        *repeated_count = repeated_count.saturating_add(1);
+    } else {
+        *repeated_signature = Some(signature.clone());
+        *repeated_count = 1;
     }
 }
 
@@ -1504,7 +1646,6 @@ fn is_code_file(path: &Path) -> bool {
 enum ObjectiveValidationKind {
     Test,
     Diagnostic,
-    Delivery,
 }
 
 impl ObjectiveValidationKind {
@@ -1512,7 +1653,6 @@ impl ObjectiveValidationKind {
         match self {
             Self::Test => "test",
             Self::Diagnostic => "diagnostic",
-            Self::Delivery => "delivery",
         }
     }
 }
@@ -1524,10 +1664,14 @@ struct ObjectiveValidationOutcome {
     message: String,
 }
 
-fn objective_validation_report(
-    report: &ToolExecutionReport,
-    code_files_changed: bool,
-) -> Option<ObjectiveValidationOutcome> {
+fn objective_validation_report(report: &ToolExecutionReport) -> Option<ObjectiveValidationOutcome> {
+    if report.envelope.tool_name == "external_verifier" {
+        return Some(ObjectiveValidationOutcome {
+            kind: ObjectiveValidationKind::Test,
+            passed: report.envelope.status == ToolResultStatus::Ok,
+            message: report.envelope.summary.clone(),
+        });
+    }
     if report.envelope.tool_name == "shell" {
         let command = report
             .envelope
@@ -1573,17 +1717,7 @@ fn objective_validation_report(
             message,
         });
     }
-    let is_delivery = !code_files_changed
-        && report.changed_files.iter().any(|path| !is_code_file(path))
-        && matches!(
-            report.envelope.tool_name.as_str(),
-            "write_file" | "edit_file"
-        );
-    is_delivery.then(|| ObjectiveValidationOutcome {
-        kind: ObjectiveValidationKind::Delivery,
-        passed: report.envelope.status == ToolResultStatus::Ok,
-        message: report.envelope.summary.clone(),
-    })
+    None
 }
 
 #[cfg(test)]
@@ -1614,6 +1748,11 @@ fn objective_validation_command_kind(command: &str) -> Option<ObjectiveValidatio
             Some(ObjectiveValidationKind::Diagnostic)
         }
         "pytest" => Some(ObjectiveValidationKind::Test),
+        "cmp" | "diff" if comparison_has_two_operands(&parts) => {
+            Some(ObjectiveValidationKind::Diagnostic)
+        }
+        "test" if parts.len() >= 3 => Some(ObjectiveValidationKind::Diagnostic),
+        "git" if git_command_validates_result(&parts) => Some(ObjectiveValidationKind::Diagnostic),
         "go" if parts.get(1).is_some_and(|part| part == "test") => {
             Some(ObjectiveValidationKind::Test)
         }
@@ -1636,6 +1775,59 @@ fn objective_validation_command_kind(command: &str) -> Option<ObjectiveValidatio
         }
         _ => None,
     }
+}
+
+fn comparison_has_two_operands(parts: &[String]) -> bool {
+    parts
+        .iter()
+        .skip(1)
+        .filter(|part| !part.starts_with('-'))
+        .take(2)
+        .count()
+        == 2
+}
+
+fn git_command_validates_result(parts: &[String]) -> bool {
+    if parts.get(1).is_some_and(|part| part == "merge-base")
+        && parts.get(2).is_some_and(|part| part == "--is-ancestor")
+    {
+        return parts.len() >= 5;
+    }
+    if parts.get(1).is_none_or(|part| part != "diff")
+        || !parts
+            .iter()
+            .any(|part| matches!(part.as_str(), "--exit-code" | "--quiet"))
+    {
+        return false;
+    }
+    let revisions = parts
+        .iter()
+        .skip(2)
+        .take_while(|part| part.as_str() != "--")
+        .filter(|part| !part.starts_with('-'))
+        .collect::<Vec<_>>();
+    revisions.len() >= 2 || revisions.iter().any(|revision| revision.contains(".."))
+}
+
+const MAX_VERIFICATION_NUDGES: u32 = 2;
+const VERIFICATION_NUDGE: &str = "Runtime verification is still missing after workspace changes. Before finalizing, use the shell tool to run a relevant check that exits non-zero when the delivered result is wrong, such as tests, cmp/diff, or a source-versus-result git diff. A clean status, log, or listing alone is insufficient. For version-control recovery or merges, preserve source blobs and compare the recovered result with the source commit.";
+
+fn workspace_changes_need_validation(tool_reports: &[ToolExecutionReport]) -> bool {
+    let last_unvalidated_change = tool_reports
+        .iter()
+        .enumerate()
+        .rfind(|(_, report)| {
+            !report.changed_files.is_empty() && objective_validation_report(report).is_none()
+        })
+        .map(|(index, _)| index);
+    let Some(last_unvalidated_change) = last_unvalidated_change else {
+        return false;
+    };
+    !tool_reports
+        .iter()
+        .skip(last_unvalidated_change.saturating_add(1))
+        .filter_map(objective_validation_report)
+        .any(|validation| validation.passed)
 }
 
 fn test_report_executed_tests(report: &ToolExecutionReport) -> bool {

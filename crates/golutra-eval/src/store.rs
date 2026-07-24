@@ -8,8 +8,10 @@ use std::{
 use chrono::Utc;
 use fs2::FileExt;
 use golutra_core::{
-    RegressionCampaign, RegressionExecution, RegressionExecutionRole, RegressionExecutionStatus,
+    EvaluationPartitionKind, RegressionCampaign, RegressionExecution, RegressionExecutionRole,
+    RegressionExecutionStatus,
 };
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -20,9 +22,11 @@ use crate::runner::{
 use crate::{
     AppliedCandidate, AutomationCandidate, AutomationCandidateKind, BenchmarkCheckStatus,
     BenchmarkRun, BenchmarkSuiteKind, CandidateStatus, CausalComparison, CounterfactualReplay,
-    EvaluationState, EvaluationVerdict, PromotionDecision, PromotionDecisionKind,
-    PromotionReviewer, RegressionCaseResult, RegressionResult, RegressionVerdict,
-    TaskEvaluationBundle,
+    DiagnosticSlice, EvaluationState, EvaluationVerdict, ExternalEvaluationRecord,
+    ExternalEvaluationTrust, FailureDiagnosis, PromotionDecision, PromotionDecisionKind,
+    PromotionReviewer, RegressionCaseResult, RegressionCoverage, RegressionResult,
+    RegressionVerdict, ReplayCapsule, ReplayExecution, TaskEvaluationBundle,
+    external_evaluation_result_digest,
 };
 
 pub(crate) const MAX_EVALUATION_STATE_BYTES: u64 = 64 * 1024 * 1024;
@@ -148,6 +152,189 @@ impl EvaluationStore {
         })
     }
 
+    pub fn record_diagnostic(
+        &self,
+        diagnosis: FailureDiagnosis,
+        slice: DiagnosticSlice,
+    ) -> Result<bool, EvaluationError> {
+        if diagnosis.source_task_id != slice.source_task_id
+            || diagnosis.diagnosis_id != slice.diagnosis.diagnosis_id
+            || slice.event_refs.is_empty()
+            || diagnosis.trigger_event_refs.is_empty()
+        {
+            return Err(EvaluationError::Invariant(
+                "diagnostic slice must reference one matching diagnosis and trigger".to_owned(),
+            ));
+        }
+        self.update(|state| {
+            let inserted = !state
+                .failure_diagnoses
+                .iter()
+                .any(|value| value.diagnosis_id == diagnosis.diagnosis_id);
+            replace_by(&mut state.failure_diagnoses, diagnosis, |value| {
+                value.diagnosis_id.clone()
+            });
+            replace_by(&mut state.diagnostic_slices, slice, |value| {
+                value.slice_id.clone()
+            });
+            Ok(inserted)
+        })
+    }
+
+    pub fn record_replay_capsule(&self, capsule: ReplayCapsule) -> Result<bool, EvaluationError> {
+        let complete_inputs_valid = !capsule.provider_exchanges.is_empty()
+            && capsule.runtime_config_digest.starts_with("sha256:")
+            && capsule.source_last_sequence_no.is_some()
+            && capsule.missing_inputs.is_empty();
+        if !capsule.event_chain_digest.starts_with("sha256:")
+            || capsule.runtime_config_digest.trim().is_empty()
+            || (capsule.complete && !complete_inputs_valid)
+            || (!capsule.complete && capsule.missing_inputs.is_empty())
+        {
+            return Err(EvaluationError::Invariant(
+                "replay capsule completeness or digest is invalid".to_owned(),
+            ));
+        }
+        self.update(|state| {
+            let inserted = !state
+                .replay_capsules
+                .iter()
+                .any(|value| value.capsule_id == capsule.capsule_id);
+            replace_by(&mut state.replay_capsules, capsule, |value| {
+                value.capsule_id.clone()
+            });
+            Ok(inserted)
+        })
+    }
+
+    pub fn record_replay_execution(
+        &self,
+        execution: ReplayExecution,
+    ) -> Result<bool, EvaluationError> {
+        self.update(|state| {
+            let capsule = state
+                .replay_capsules
+                .iter()
+                .find(|capsule| capsule.capsule_id == execution.capsule_id)
+                .ok_or_else(|| {
+                    EvaluationError::Invariant(format!(
+                        "replay capsule {} is not recorded",
+                        execution.capsule_id
+                    ))
+                })?;
+            if capsule.source_task_id != execution.source_task_id
+                || capsule.mode != execution.mode
+                || execution.provider_exchanges_total
+                    != u32::try_from(capsule.provider_exchanges.len()).unwrap_or(u32::MAX)
+                || execution.tool_results_total
+                    != u32::try_from(capsule.tool_results.len()).unwrap_or(u32::MAX)
+                || execution.provider_exchanges_consumed > execution.provider_exchanges_total
+                || execution.tool_results_consumed > execution.tool_results_total
+                || execution.completed_at < execution.started_at
+            {
+                return Err(EvaluationError::Invariant(
+                    "replay execution source or consumption counts are invalid".to_owned(),
+                ));
+            }
+            let status_valid = match execution.status {
+                crate::ReplayExecutionStatus::Matched => {
+                    capsule.complete
+                        && execution.provider_exchanges_consumed
+                            == execution.provider_exchanges_total
+                        && execution.tool_results_consumed == execution.tool_results_total
+                        && execution.expected_loop_action.is_some()
+                        && execution.expected_loop_action == execution.observed_loop_action
+                        && execution.expected_verification.is_some()
+                        && execution.expected_verification == execution.observed_verification
+                        && execution.mismatches.is_empty()
+                }
+                crate::ReplayExecutionStatus::Diverged => !execution.mismatches.is_empty(),
+                crate::ReplayExecutionStatus::Incomplete => {
+                    !capsule.complete || !execution.mismatches.is_empty()
+                }
+                crate::ReplayExecutionStatus::Failed => !execution.mismatches.is_empty(),
+            };
+            if !status_valid {
+                return Err(EvaluationError::Invariant(
+                    "replay execution status is inconsistent with its evidence".to_owned(),
+                ));
+            }
+            let inserted = !state
+                .replay_executions
+                .iter()
+                .any(|value| value.execution_id == execution.execution_id);
+            replace_by(&mut state.replay_executions, execution, |value| {
+                value.execution_id.clone()
+            });
+            Ok(inserted)
+        })
+    }
+
+    pub fn record_external_evaluation(
+        &self,
+        record: ExternalEvaluationRecord,
+    ) -> Result<bool, EvaluationError> {
+        let association_fields = [
+            record.comparison_group_id.is_some(),
+            record.candidate_id.is_some(),
+            record.campaign_id.is_some(),
+            record.role.is_some(),
+        ];
+        let association_valid = association_fields.iter().all(|value| *value)
+            || association_fields.iter().all(|value| !*value);
+        let score_valid = record.score.is_none_or(f64::is_finite)
+            && record
+                .score_max
+                .is_none_or(|value| value.is_finite() && value > 0.0)
+            && record
+                .score
+                .zip(record.score_max)
+                .is_none_or(|(score, maximum)| score >= 0.0 && score <= maximum);
+        let signed_attestation_valid = record.trust != ExternalEvaluationTrust::Signed
+            || record.attestation.as_ref().is_some_and(|attestation| {
+                attestation.algorithm == "ed25519"
+                    && !attestation.key_id.trim().is_empty()
+                    && !attestation.signature.trim().is_empty()
+                    && attestation.signed_digest == record.result_digest
+            });
+        if record.evaluator_id.trim().is_empty()
+            || record.case_id.trim().is_empty()
+            || !record.base_trace_digest.starts_with("sha256:")
+            || !record.result_digest.starts_with("sha256:")
+            || record.result_digest != external_evaluation_result_digest(&record)
+            || !score_valid
+            || !association_valid
+            || !signed_attestation_valid
+            || holdout_disclosure_violation(&record).is_some()
+        {
+            return Err(EvaluationError::Invariant(
+                "external evaluation identity, digest, or attestation is invalid".to_owned(),
+            ));
+        }
+        self.update(|state| {
+            let existing = state
+                .external_evaluations
+                .iter()
+                .find(|value| value.evaluation_id == record.evaluation_id);
+            if existing.is_some_and(|existing| existing != &record) {
+                return Err(EvaluationError::Invariant(format!(
+                    "external evaluation {} already exists with different facts",
+                    record.evaluation_id
+                )));
+            }
+            let inserted = existing.is_none();
+            replace_by(&mut state.external_evaluations, record.clone(), |value| {
+                value.evaluation_id.clone()
+            });
+            if let Some(comparison) = external_causal_comparison(state, &record) {
+                replace_by(&mut state.causal_comparisons, comparison, |value| {
+                    value.comparison_id.clone()
+                });
+            }
+            Ok(inserted)
+        })
+    }
+
     pub fn record_benchmark_run(&self, run: BenchmarkRun) -> Result<(), EvaluationError> {
         if !benchmark_run_has_required_metadata(&run) {
             return Err(EvaluationError::InvalidBenchmark(
@@ -164,14 +351,37 @@ impl EvaluationStore {
 
     pub fn record_regression_campaign(
         &self,
-        campaign: RegressionCampaign,
+        mut campaign: RegressionCampaign,
     ) -> Result<(), EvaluationError> {
+        if campaign.required_partitions.is_empty() {
+            campaign.required_partitions = campaign
+                .case_refs
+                .iter()
+                .map(|case_ref| {
+                    campaign
+                        .case_partitions
+                        .get(case_ref)
+                        .copied()
+                        .unwrap_or_default()
+                })
+                .collect();
+            campaign.required_partitions.sort();
+            campaign.required_partitions.dedup();
+        }
         if campaign.candidate_id.trim().is_empty()
             || campaign.candidate_digest.trim().is_empty()
             || campaign.case_refs.is_empty()
+            || campaign.provider_matrix.is_empty()
+            || campaign.seeds.is_empty()
+            || campaign.required_partitions.is_empty()
+            || campaign
+                .case_partitions
+                .keys()
+                .any(|case_ref| !campaign.case_refs.contains(case_ref))
         {
             return Err(EvaluationError::InvalidBenchmark(
-                "regression campaign requires candidate digest and executable cases".to_owned(),
+                "regression campaign requires candidate digest, executable cases, partitions, providers, and seeds"
+                    .to_owned(),
             ));
         }
         self.update(|state| {
@@ -200,10 +410,31 @@ impl EvaluationStore {
             if execution.case_ref.trim().is_empty() && campaign.case_refs.len() == 1 {
                 execution.case_ref.clone_from(&campaign.case_refs[0]);
             }
+            if execution.provider_variant.trim().is_empty() && campaign.provider_matrix.len() == 1 {
+                execution
+                    .provider_variant
+                    .clone_from(&campaign.provider_matrix[0]);
+            }
             if !campaign.case_refs.contains(&execution.case_ref) {
                 return Err(EvaluationError::RegressionExecutionRequired(format!(
                     "execution case `{}` is not part of campaign {}",
                     execution.case_ref, execution.campaign_id
+                )));
+            }
+            let expected_partition = campaign
+                .case_partitions
+                .get(&execution.case_ref)
+                .copied()
+                .unwrap_or_default();
+            if execution.partition != expected_partition
+                || !campaign
+                    .provider_matrix
+                    .contains(&execution.provider_variant)
+                || !campaign.seeds.contains(&execution.seed)
+            {
+                return Err(EvaluationError::RegressionExecutionRequired(format!(
+                    "execution metadata is outside campaign {} partition/provider/seed matrix",
+                    execution.campaign_id
                 )));
             }
             if execution.status == RegressionExecutionStatus::Succeeded
@@ -316,45 +547,76 @@ impl EvaluationStore {
             let mut execution_regressions = Vec::new();
             let mut needs_review = false;
             for case_ref in &campaign.case_refs {
-                let baseline_execution = executions.iter().rev().find(|execution| {
-                    execution.role == RegressionExecutionRole::Baseline
-                        && execution_matches_case(execution, case_ref, campaign.case_refs.len())
-                });
-                let candidate_execution = executions.iter().rev().find(|execution| {
-                    execution.role == RegressionExecutionRole::Candidate
-                        && execution_matches_case(execution, case_ref, campaign.case_refs.len())
-                });
-                let Some((baseline_trace_ref, candidate_trace_ref)) = baseline_execution
-                    .zip(candidate_execution)
-                    .filter(|(baseline, candidate)| {
-                        baseline.status == RegressionExecutionStatus::Succeeded
-                            && candidate.status == RegressionExecutionStatus::Succeeded
-                    })
-                    .and_then(|(baseline, candidate)| {
-                        baseline
-                            .task_trace_ref
-                            .as_ref()
-                            .zip(candidate.task_trace_ref.as_ref())
-                    })
-                else {
+                let pairs =
+                    completed_execution_pairs(&executions, case_ref, campaign.case_refs.len());
+                if pairs.is_empty() {
                     needs_review = true;
                     execution_regressions.push(format!(
                         "regression case {case_ref} has no completed baseline/candidate pair"
                     ));
                     continue;
-                };
-                if baseline_trace_ref == candidate_trace_ref
-                    || !valid_execution_trace_ref(baseline_trace_ref)
-                    || !valid_execution_trace_ref(candidate_trace_ref)
-                {
+                }
+                let valid_refs = pairs
+                    .into_iter()
+                    .filter_map(|(baseline, candidate)| {
+                        baseline
+                            .task_trace_ref
+                            .as_ref()
+                            .zip(candidate.task_trace_ref.as_ref())
+                    })
+                    .filter(|(baseline, candidate)| {
+                        baseline != candidate
+                            && valid_execution_trace_ref(baseline)
+                            && valid_execution_trace_ref(candidate)
+                    })
+                    .flat_map(|(baseline, candidate)| [baseline.clone(), candidate.clone()])
+                    .collect::<Vec<_>>();
+                if valid_refs.is_empty() {
                     needs_review = true;
                     execution_regressions.push(format!(
                         "regression case {case_ref} has invalid paired execution trace references"
                     ));
                     continue;
                 }
-                paired_execution_refs
-                    .extend([baseline_trace_ref.clone(), candidate_trace_ref.clone()]);
+                paired_execution_refs.extend(valid_refs);
+            }
+            paired_execution_refs.sort();
+            paired_execution_refs.dedup();
+            let coverage_evidence = regression_coverage(state, campaign, &executions);
+            if !coverage_evidence.coverage.complete() {
+                needs_review = true;
+                execution_regressions.extend(
+                    coverage_evidence
+                        .coverage
+                        .missing_cells
+                        .iter()
+                        .map(|cell| format!("missing regression coverage: {cell}")),
+                );
+                if !coverage_evidence.coverage.missing_partitions.is_empty() {
+                    execution_regressions.push(format!(
+                        "missing evaluation partitions: {:?}",
+                        coverage_evidence.coverage.missing_partitions
+                    ));
+                }
+                if !coverage_evidence.coverage.missing_providers.is_empty() {
+                    execution_regressions.push(format!(
+                        "missing provider variants: {}",
+                        coverage_evidence.coverage.missing_providers.join(", ")
+                    ));
+                }
+                if !coverage_evidence.coverage.missing_seeds.is_empty() {
+                    execution_regressions.push(format!(
+                        "missing evaluation seeds: {:?}",
+                        coverage_evidence.coverage.missing_seeds
+                    ));
+                }
+                execution_regressions.extend(
+                    coverage_evidence
+                        .coverage
+                        .holdout_disclosure_violations
+                        .iter()
+                        .map(|violation| format!("holdout disclosure violation: {violation}")),
+                );
             }
             let (case_results, mut regressions) =
                 execute_durable_regression_suite(state, &candidate, campaign, &executions);
@@ -410,7 +672,10 @@ impl EvaluationStore {
                 latency_delta: comparison.as_ref().and_then(|value| value.latency_delta_ms),
                 quality_delta: comparison.as_ref().and_then(|value| value.quality_delta),
                 security_delta: comparison.as_ref().and_then(|value| value.security_delta),
-                causal_comparison_refs: paired_execution_refs,
+                causal_comparison_refs: coverage_evidence.causal_comparison_refs,
+                paired_execution_refs,
+                external_evaluation_refs: coverage_evidence.external_evaluation_refs,
+                coverage: coverage_evidence.coverage,
                 suite_kind: BenchmarkSuiteKind::Regression,
                 case_results,
                 baseline_benchmark_refs: baseline
@@ -478,10 +743,20 @@ impl EvaluationStore {
                 &candidate,
                 regression,
                 &crate::PromotionGateFacts {
-                    trace_complete: regression.causal_comparison_refs.len() >= 2,
+                    trace_complete: regression.paired_execution_refs.len() >= 2,
                     unresolved_refs: Vec::new(),
                     verification: EvaluationVerdict::Pass,
-                    paired_execution_refs: regression.causal_comparison_refs.clone(),
+                    paired_execution_refs: regression.paired_execution_refs.clone(),
+                    trusted_external_evaluation_refs: regression
+                        .coverage
+                        .trusted_external_evaluation_refs
+                        .clone(),
+                    coverage_complete: regression.coverage.complete(),
+                    missing_coverage: regression.coverage.missing_cells.clone(),
+                    holdout_disclosure_violations: regression
+                        .coverage
+                        .holdout_disclosure_violations
+                        .clone(),
                     candidate_mutates_control_plane: candidate_mutates_control_plane(&candidate),
                     mutation_reasons: Vec::new(),
                 },
@@ -613,11 +888,12 @@ impl EvaluationStore {
                     && regression.verdict == RegressionVerdict::Pass
                     && regression.failed_cases == 0
                     && regression.regressions.is_empty()
-                    && regression.causal_comparison_refs.len() >= 2
+                    && regression.paired_execution_refs.len() >= 2
                     && regression
-                        .causal_comparison_refs
+                        .paired_execution_refs
                         .iter()
                         .all(|reference| !reference.trim().is_empty())
+                    && regression.coverage.complete()
             });
             if decision == PromotionDecisionKind::Approve && !clean_regression {
                 return Err(EvaluationError::RegressionRequired(candidate_id.to_owned()));
@@ -1060,6 +1336,428 @@ fn execute_durable_regression_suite(
     (case_results, suite_failures)
 }
 
+#[derive(Debug)]
+struct RegressionCoverageEvidence {
+    coverage: RegressionCoverage,
+    causal_comparison_refs: Vec<String>,
+    external_evaluation_refs: Vec<String>,
+}
+
+fn regression_coverage(
+    state: &EvaluationState,
+    campaign: &RegressionCampaign,
+    executions: &[&RegressionExecution],
+) -> RegressionCoverageEvidence {
+    let mut required_partitions = campaign.required_partitions.clone();
+    required_partitions.extend(campaign.case_refs.iter().map(|case_ref| {
+        campaign
+            .case_partitions
+            .get(case_ref)
+            .copied()
+            .unwrap_or_default()
+    }));
+    required_partitions.sort();
+    required_partitions.dedup();
+
+    let associated = state
+        .external_evaluations
+        .iter()
+        .filter(|record| {
+            record.campaign_id == Some(campaign.campaign_id)
+                && record.candidate_id.as_deref() == Some(campaign.candidate_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    let external_pairs = trusted_external_pairs(&associated);
+    let mut observed_partitions = Vec::new();
+    let mut observed_providers = Vec::new();
+    let mut observed_seeds = Vec::new();
+    let mut missing_cells = Vec::new();
+    let mut completed_cells = 0_u32;
+    let mut trusted_external_pairs = 0_u32;
+    let mut trusted_external_evaluation_refs = Vec::new();
+    let mut used_external_evaluation_refs = Vec::new();
+
+    let mut required_providers = campaign.provider_matrix.clone();
+    required_providers.sort();
+    required_providers.dedup();
+    let mut required_seeds = campaign.seeds.clone();
+    required_seeds.sort_unstable();
+    required_seeds.dedup();
+    for case_ref in &campaign.case_refs {
+        let partition = campaign
+            .case_partitions
+            .get(case_ref)
+            .copied()
+            .unwrap_or_default();
+        for provider in &required_providers {
+            for seed in &required_seeds {
+                let local_pair = completed_execution_pair_for_cell(
+                    executions, case_ref, partition, provider, *seed,
+                );
+                let external_pair = external_pairs.iter().find(|(baseline, candidate)| {
+                    external_pair_matches_cell(
+                        baseline, candidate, case_ref, partition, provider, *seed,
+                    )
+                });
+                if local_pair.is_none() && external_pair.is_none() {
+                    missing_cells.push(format!(
+                        "case:{case_ref}|partition:{partition:?}|provider:{provider}|seed:{seed}"
+                    ));
+                    continue;
+                }
+                completed_cells = completed_cells.saturating_add(1);
+                observed_partitions.push(partition);
+                observed_providers.push(provider.clone());
+                observed_seeds.push(*seed);
+                if let Some((baseline, candidate)) = external_pair {
+                    trusted_external_pairs = trusted_external_pairs.saturating_add(1);
+                    trusted_external_evaluation_refs.extend([
+                        baseline.evaluation_id.clone(),
+                        candidate.evaluation_id.clone(),
+                    ]);
+                    used_external_evaluation_refs.extend([
+                        baseline.evaluation_id.clone(),
+                        candidate.evaluation_id.clone(),
+                    ]);
+                }
+            }
+        }
+    }
+
+    let mut untrusted_external_evaluation_refs = Vec::new();
+    let mut external_evaluation_refs = associated
+        .iter()
+        .map(|record| record.evaluation_id.clone())
+        .collect::<Vec<_>>();
+    let mut holdout_disclosure_violations = associated
+        .iter()
+        .filter_map(|record| holdout_disclosure_violation(record))
+        .collect::<Vec<_>>();
+    for record in &associated {
+        if !used_external_evaluation_refs.contains(&record.evaluation_id) {
+            untrusted_external_evaluation_refs.push(record.evaluation_id.clone());
+        }
+    }
+
+    observed_partitions.sort();
+    observed_partitions.dedup();
+    observed_providers.retain(|provider| !provider.trim().is_empty());
+    observed_providers.sort();
+    observed_providers.dedup();
+    observed_seeds.sort_unstable();
+    observed_seeds.dedup();
+    trusted_external_evaluation_refs.sort();
+    trusted_external_evaluation_refs.dedup();
+    untrusted_external_evaluation_refs.sort();
+    untrusted_external_evaluation_refs.dedup();
+    external_evaluation_refs.sort();
+    external_evaluation_refs.dedup();
+    holdout_disclosure_violations.sort();
+    holdout_disclosure_violations.dedup();
+
+    let missing_partitions = required_partitions
+        .iter()
+        .copied()
+        .filter(|partition| !observed_partitions.contains(partition))
+        .collect::<Vec<_>>();
+    let missing_providers = required_providers
+        .iter()
+        .filter(|provider| !observed_providers.contains(provider))
+        .cloned()
+        .collect::<Vec<_>>();
+    let missing_seeds = required_seeds
+        .iter()
+        .copied()
+        .filter(|seed| !observed_seeds.contains(seed))
+        .collect::<Vec<_>>();
+    let minimum_external =
+        usize::try_from(campaign.minimum_trusted_external_pairs).unwrap_or(usize::MAX);
+    if usize::try_from(trusted_external_pairs).unwrap_or(usize::MAX) < minimum_external {
+        missing_cells.push(format!(
+            "trusted_external_pairs:{}/{}",
+            trusted_external_pairs, minimum_external
+        ));
+    }
+
+    let mut causal_comparison_refs = state
+        .causal_comparisons
+        .iter()
+        .filter(|comparison| {
+            comparison
+                .baseline_evaluation_ref
+                .as_ref()
+                .is_some_and(|reference| trusted_external_evaluation_refs.contains(reference))
+                && comparison
+                    .candidate_evaluation_ref
+                    .as_ref()
+                    .is_some_and(|reference| trusted_external_evaluation_refs.contains(reference))
+        })
+        .map(|comparison| comparison.comparison_id.clone())
+        .collect::<Vec<_>>();
+    causal_comparison_refs.sort();
+    causal_comparison_refs.dedup();
+    let expected_cells = u32::try_from(
+        campaign
+            .case_refs
+            .len()
+            .saturating_mul(required_providers.len())
+            .saturating_mul(required_seeds.len()),
+    )
+    .unwrap_or(u32::MAX);
+
+    RegressionCoverageEvidence {
+        coverage: RegressionCoverage {
+            required_partitions,
+            observed_partitions,
+            missing_partitions,
+            required_providers,
+            observed_providers,
+            missing_providers,
+            required_seeds,
+            observed_seeds,
+            missing_seeds,
+            expected_cells,
+            completed_cells,
+            missing_cells,
+            trusted_external_pairs,
+            trusted_external_evaluation_refs,
+            untrusted_external_evaluation_refs,
+            holdout_disclosure_violations,
+        },
+        causal_comparison_refs,
+        external_evaluation_refs,
+    }
+}
+
+fn completed_execution_pair_for_cell<'a>(
+    executions: &'a [&'a RegressionExecution],
+    case_ref: &str,
+    partition: EvaluationPartitionKind,
+    provider: &str,
+    seed: u64,
+) -> Option<(&'a RegressionExecution, &'a RegressionExecution)> {
+    let candidate = executions.iter().rev().copied().find(|execution| {
+        execution.role == RegressionExecutionRole::Candidate
+            && execution.status == RegressionExecutionStatus::Succeeded
+            && execution.case_ref == case_ref
+            && execution.partition == partition
+            && execution.provider_variant == provider
+            && execution.seed == seed
+    })?;
+    executions
+        .iter()
+        .rev()
+        .copied()
+        .find(|execution| {
+            execution.role == RegressionExecutionRole::Baseline
+                && execution.status == RegressionExecutionStatus::Succeeded
+                && execution.case_ref == case_ref
+                && execution.partition == partition
+                && execution.provider_variant == provider
+                && execution.seed == seed
+        })
+        .map(|baseline| (baseline, candidate))
+}
+
+fn external_pair_matches_cell(
+    baseline: &ExternalEvaluationRecord,
+    candidate: &ExternalEvaluationRecord,
+    case_ref: &str,
+    partition: EvaluationPartitionKind,
+    provider: &str,
+    seed: u64,
+) -> bool {
+    baseline.case_id == case_ref
+        && candidate.case_id == case_ref
+        && baseline.partition == partition
+        && candidate.partition == partition
+        && baseline.provider_variant.as_deref() == Some(provider)
+        && candidate.provider_variant.as_deref() == Some(provider)
+        && baseline.seed == Some(seed)
+        && candidate.seed == Some(seed)
+}
+
+fn completed_execution_pairs<'a>(
+    executions: &'a [&'a RegressionExecution],
+    case_ref: &str,
+    campaign_case_count: usize,
+) -> Vec<(&'a RegressionExecution, &'a RegressionExecution)> {
+    executions
+        .iter()
+        .rev()
+        .copied()
+        .filter(|execution| {
+            execution.role == RegressionExecutionRole::Candidate
+                && execution.status == RegressionExecutionStatus::Succeeded
+                && execution_matches_case(execution, case_ref, campaign_case_count)
+        })
+        .filter_map(|candidate| {
+            executions
+                .iter()
+                .rev()
+                .copied()
+                .find(|baseline| {
+                    baseline.role == RegressionExecutionRole::Baseline
+                        && baseline.status == RegressionExecutionStatus::Succeeded
+                        && execution_matches_case(baseline, case_ref, campaign_case_count)
+                        && baseline.partition == candidate.partition
+                        && baseline.provider_variant == candidate.provider_variant
+                        && baseline.seed == candidate.seed
+                })
+                .map(|baseline| (baseline, candidate))
+        })
+        .collect()
+}
+
+fn trusted_external_pairs<'a>(
+    records: &[&'a ExternalEvaluationRecord],
+) -> Vec<(&'a ExternalEvaluationRecord, &'a ExternalEvaluationRecord)> {
+    records
+        .iter()
+        .copied()
+        .filter(|record| {
+            record.role == Some(RegressionExecutionRole::Candidate)
+                && external_evaluation_is_trusted(record)
+        })
+        .filter_map(|candidate| {
+            records
+                .iter()
+                .copied()
+                .find(|baseline| {
+                    baseline.role == Some(RegressionExecutionRole::Baseline)
+                        && external_evaluation_is_trusted(baseline)
+                        && external_evaluation_pair_matches(baseline, candidate)
+                })
+                .map(|baseline| (baseline, candidate))
+        })
+        .collect()
+}
+
+fn external_evaluation_is_trusted(record: &ExternalEvaluationRecord) -> bool {
+    record.trust != ExternalEvaluationTrust::UntrustedLocal
+        && (record.partition != EvaluationPartitionKind::Holdout
+            || (record.trust == ExternalEvaluationTrust::Signed && record.holdout_protected))
+}
+
+fn external_evaluation_pair_matches(
+    baseline: &ExternalEvaluationRecord,
+    candidate: &ExternalEvaluationRecord,
+) -> bool {
+    baseline.comparison_group_id == candidate.comparison_group_id
+        && baseline.candidate_id == candidate.candidate_id
+        && baseline.campaign_id == candidate.campaign_id
+        && baseline.dataset_id == candidate.dataset_id
+        && baseline.dataset_version == candidate.dataset_version
+        && baseline.harness_id == candidate.harness_id
+        && baseline.harness_version == candidate.harness_version
+        && baseline.case_id == candidate.case_id
+        && baseline.partition == candidate.partition
+        && baseline.seed == candidate.seed
+        && baseline.provider_variant == candidate.provider_variant
+}
+
+fn holdout_disclosure_violation(record: &ExternalEvaluationRecord) -> Option<String> {
+    if record.partition != EvaluationPartitionKind::Holdout {
+        return None;
+    }
+    if !record.holdout_protected {
+        return Some(format!(
+            "evaluation {} is not marked holdout_protected",
+            record.evaluation_id
+        ));
+    }
+    if record.trust != ExternalEvaluationTrust::Signed {
+        return Some(format!(
+            "evaluation {} is not signed by a trusted evaluator",
+            record.evaluation_id
+        ));
+    }
+    if record.score.is_some()
+        || record.score_max.is_some()
+        || !record.artifact_refs.is_empty()
+        || record
+            .assertions
+            .iter()
+            .any(|assertion| !assertion.message.is_empty() || !assertion.evidence_refs.is_empty())
+    {
+        return Some(format!(
+            "evaluation {} discloses holdout score, artifacts, or assertion details",
+            record.evaluation_id
+        ));
+    }
+    None
+}
+
+fn external_causal_comparison(
+    state: &EvaluationState,
+    record: &ExternalEvaluationRecord,
+) -> Option<CausalComparison> {
+    if record.comparison_group_id.is_none() || !external_evaluation_is_trusted(record) {
+        return None;
+    }
+    let counterpart = state.external_evaluations.iter().find(|candidate| {
+        candidate.evaluation_id != record.evaluation_id
+            && candidate.role != record.role
+            && external_evaluation_is_trusted(candidate)
+            && external_evaluation_pair_matches(candidate, record)
+    })?;
+    let (baseline, candidate) = if record.role == Some(RegressionExecutionRole::Baseline) {
+        (record, counterpart)
+    } else {
+        (counterpart, record)
+    };
+    if candidate.role != Some(RegressionExecutionRole::Candidate) {
+        return None;
+    }
+    let quality_delta = normalized_external_score(candidate)
+        .zip(normalized_external_score(baseline))
+        .map(|(candidate, baseline)| candidate - baseline);
+    let mut ids = [
+        baseline.evaluation_id.as_str(),
+        candidate.evaluation_id.as_str(),
+    ];
+    ids.sort_unstable();
+    let digest = Sha256::digest(format!("{}\0{}", ids[0], ids[1]).as_bytes());
+    let conclusion = match (baseline.verdict, candidate.verdict, quality_delta) {
+        (EvaluationVerdict::Pass, EvaluationVerdict::Pass, Some(delta)) if delta > 0.0 => {
+            "candidate retained a passing verdict and improved normalized external score"
+        }
+        (EvaluationVerdict::Pass, EvaluationVerdict::Pass, _) => {
+            "candidate retained the baseline passing external verdict"
+        }
+        (EvaluationVerdict::Pass, _, _) => {
+            "candidate regressed from a passing baseline external verdict"
+        }
+        (_, EvaluationVerdict::Pass, _) => "candidate improved to a passing external verdict",
+        _ => "external evaluator did not establish a passing candidate result",
+    };
+    Some(CausalComparison {
+        comparison_id: format!("external-comparison-{digest:x}"),
+        replay_id: record.comparison_group_id.clone().unwrap_or_default(),
+        quality_delta,
+        utility_delta: None,
+        security_delta: None,
+        token_delta: None,
+        cost_delta_usd: None,
+        latency_delta_ms: None,
+        scaffold_inflation: false,
+        conclusion: conclusion.to_owned(),
+        baseline_evaluation_ref: Some(baseline.evaluation_id.clone()),
+        candidate_evaluation_ref: Some(candidate.evaluation_id.clone()),
+        partition: Some(record.partition),
+        provider_variant: record.provider_variant.clone(),
+        seed: record.seed,
+    })
+}
+
+fn normalized_external_score(record: &ExternalEvaluationRecord) -> Option<f32> {
+    record
+        .score
+        .zip(record.score_max)
+        .map(|(score, maximum)| (score / maximum) as f32)
+        .filter(|score| score.is_finite())
+}
+
 fn execution_matches_case(
     execution: &RegressionExecution,
     case_ref: &str,
@@ -1121,6 +1819,11 @@ fn benchmark_delta(baseline: &BenchmarkRun, variant: &BenchmarkRun) -> CausalCom
         } else {
             "the controlled variant did not demonstrate a quality improvement".to_owned()
         },
+        baseline_evaluation_ref: None,
+        candidate_evaluation_ref: None,
+        partition: None,
+        provider_variant: None,
+        seed: None,
     }
 }
 

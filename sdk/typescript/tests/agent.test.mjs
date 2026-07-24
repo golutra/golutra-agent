@@ -158,6 +158,50 @@ test("TurnHandle ends or fails when the backing subscription settles", async () 
   await assert.rejects(failedHandle.wait(), /HTTP 401/);
 });
 
+test("governance helpers use the shared query and command contracts", async () => {
+  const client = new GolutraClient(
+    "http://127.0.0.1:47831",
+    "/tmp/golutra-sdk-test",
+    { transportToken: "t".repeat(32) },
+  );
+  const queries = [];
+  const commands = [];
+  client.query = async (query) => {
+    queries.push(query);
+    return { kind: "debug_projection" };
+  };
+  client.sendCommand = async (command) => {
+    commands.push(command);
+    return { accepted: true };
+  };
+
+  assert.equal(
+    (await client.debugProjection("session-1", "task-1")).kind,
+    "debug_projection",
+  );
+  assert.equal(queries[0].kind, "debug_projection");
+
+  await client.replay("session-1", "task-1", "capsule-1");
+  assert.equal(commands.at(-1).kind, "replay");
+  assert.equal(commands.at(-1).payload.capsule_id, "capsule-1");
+
+  await client.ingestExternalEvaluation("session-1", {
+    evaluation_id: "evaluation-1",
+  });
+  assert.equal(commands.at(-1).kind, "ingest_external_evaluation");
+  assert.equal(commands.at(-1).payload.record.evaluation_id, "evaluation-1");
+
+  await client.runRegressionCampaign("session-1", "candidate-1", {
+    candidateFiles: [{ path: "src/lib.rs", content: "change" }],
+    providerMatrix: ["mock"],
+    seeds: [7],
+    minimumTrustedExternalPairs: 2,
+  });
+  assert.equal(commands.at(-1).kind, "run_regression_campaign");
+  assert.deepEqual(commands.at(-1).payload.seeds, [7]);
+  assert.equal(commands.at(-1).payload.minimum_trusted_external_pairs, 2);
+});
+
 test("Agent SSE reconnect keeps the consumed cursor and reaches the terminal event", async () => {
   const originalFetch = globalThis.fetch;
   const agentRequests = [];

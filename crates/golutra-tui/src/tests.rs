@@ -1632,10 +1632,46 @@ fn developer_panel_exposes_governance_without_leaking_into_normal_view() {
         verification: Some(verification),
         loop_decisions: Vec::new(),
         post_task_jobs: Vec::new(),
+        failure_diagnosis: None,
+        diagnostic_slice: None,
+        replay_execution: None,
+        external_evaluations: Vec::new(),
+        causal_comparisons: Vec::new(),
         trace_complete: true,
         missing_sections: Vec::new(),
         retention_losses: Vec::new(),
     };
+    let diagnosis = json!({
+        "diagnosis_id": "diagnosis-test",
+        "source_task_id": task_id,
+        "taxonomy": {"domain": "tool", "code": "tool_failed"},
+        "summary": "tool failed during verification",
+        "trigger_event_refs": [events[0].id],
+        "causal_event_refs": [events[0].id],
+        "expected_behavior": "tool succeeds",
+        "actual_behavior": "tool failed",
+        "counterfactual": "use a corrected invocation",
+        "confidence": 90,
+        "code_targets": [],
+        "regression_commands": ["cargo test"],
+        "analyzer_version": "test",
+        "created_at": chrono::Utc::now(),
+    });
+    let mut debug_value = serde_json::to_value(debug_projection).expect("debug projection");
+    debug_value["failure_diagnosis"] = diagnosis.clone();
+    debug_value["diagnostic_slice"] = json!({
+        "slice_id": "slice-test",
+        "source_task_id": task_id,
+        "diagnosis": diagnosis,
+        "event_refs": [events[0].id],
+        "artifact_refs": [],
+        "evidence_refs": [],
+        "omitted_event_count": 7,
+        "complete": true,
+        "generated_at": chrono::Utc::now(),
+    });
+    let debug_projection: golutra_protocol::DebugProjection =
+        serde_json::from_value(debug_value).expect("diagnostic debug projection");
 
     let rows = developer_panel_rows(&debug_projection, 2);
     let row_text = rows
@@ -1653,6 +1689,8 @@ fn developer_panel_exposes_governance_without_leaking_into_normal_view() {
     assert!(row_text.contains("RegressionCompleted/Runtime"));
     assert!(row_text.contains("sequence_no: 8"));
     assert!(row_text.contains("PromotionDecided/Runtime"));
+    assert!(row_text.contains("diagnosis Tool/tool_failed confidence=90"));
+    assert!(row_text.contains("slice_events=1 omitted=7 complete=true"));
 
     let mut app = TuiApp::new(
         ThreadId::new(),
@@ -1733,6 +1771,7 @@ fn developer_panel_exposes_governance_without_leaking_into_normal_view() {
         .collect::<String>();
     assert!(expanded_text.contains("▾ facts"));
     assert!(expanded_text.contains("verify Pass"));
+    assert!(expanded_text.contains("diagnosis Tool/tool_failed"));
     assert_eq!(
         developer_terminal
             .backend()
@@ -1993,6 +2032,11 @@ fn file_changes_are_compact_in_normal_mode_and_detailed_in_developer_mode() {
         verification: None,
         loop_decisions: Vec::new(),
         post_task_jobs: Vec::new(),
+        failure_diagnosis: None,
+        diagnostic_slice: None,
+        replay_execution: None,
+        external_evaluations: Vec::new(),
+        causal_comparisons: Vec::new(),
         trace_complete: true,
         missing_sections: Vec::new(),
         retention_losses: Vec::new(),
@@ -2019,6 +2063,9 @@ fn transcript_event(
     payload: serde_json::Value,
 ) -> RuntimeEvent {
     RuntimeEvent {
+        schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+        causal_context: Default::default(),
+        causal_links: Vec::new(),
         id: golutra_core::EventId::new(),
         sequence_no,
         session_id,
@@ -2428,6 +2475,9 @@ fn mouse_wheel_routes_to_the_pane_under_the_pointer() {
         task_id: None,
         events: (0..40)
             .map(|sequence_no| RuntimeEvent {
+                schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+                causal_context: Default::default(),
+                causal_links: Vec::new(),
                 id: golutra_core::EventId::new(),
                 sequence_no,
                 session_id,
@@ -2455,6 +2505,11 @@ fn mouse_wheel_routes_to_the_pane_under_the_pointer() {
         verification: None,
         loop_decisions: Vec::new(),
         post_task_jobs: Vec::new(),
+        failure_diagnosis: None,
+        diagnostic_slice: None,
+        replay_execution: None,
+        external_evaluations: Vec::new(),
+        causal_comparisons: Vec::new(),
         trace_complete: true,
         missing_sections: Vec::new(),
         retention_losses: Vec::new(),

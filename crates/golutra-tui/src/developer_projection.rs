@@ -35,6 +35,13 @@ pub(crate) struct DeveloperFactsProjection {
     pub(crate) trace_complete: bool,
     pub(crate) missing_sections: usize,
     pub(crate) retention_losses: usize,
+    pub(crate) diagnosis: Option<String>,
+    pub(crate) diagnostic_event_count: usize,
+    pub(crate) diagnostic_omitted_event_count: u64,
+    pub(crate) diagnostic_complete: bool,
+    pub(crate) replay_status: Option<String>,
+    pub(crate) external_evaluation_count: usize,
+    pub(crate) causal_comparison_count: usize,
     pub(crate) changes: Option<TurnChangeSummary>,
 }
 
@@ -88,6 +95,30 @@ pub(crate) fn developer_facts_projection(
         trace_complete: projection.trace_complete,
         missing_sections: projection.missing_sections.len(),
         retention_losses: projection.retention_losses.len(),
+        diagnosis: projection.failure_diagnosis.as_ref().map(|diagnosis| {
+            format!(
+                "{:?}/{} confidence={}",
+                diagnosis.taxonomy.domain, diagnosis.taxonomy.code, diagnosis.confidence
+            )
+        }),
+        diagnostic_event_count: projection
+            .diagnostic_slice
+            .as_ref()
+            .map_or(0, |slice| slice.event_refs.len()),
+        diagnostic_omitted_event_count: projection
+            .diagnostic_slice
+            .as_ref()
+            .map_or(0, |slice| slice.omitted_event_count),
+        diagnostic_complete: projection
+            .diagnostic_slice
+            .as_ref()
+            .is_some_and(|slice| slice.complete),
+        replay_status: projection
+            .replay_execution
+            .as_ref()
+            .map(|execution| format!("{:?}", execution.status)),
+        external_evaluation_count: projection.external_evaluations.len(),
+        causal_comparison_count: projection.causal_comparisons.len(),
         changes: changes.cloned(),
     }
 }

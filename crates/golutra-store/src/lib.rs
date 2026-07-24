@@ -81,6 +81,7 @@ pub struct ThreadRecord {
     pub archived: bool,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum CommandClaim {
     Claimed { receipt_event: Option<RuntimeEvent> },
@@ -484,12 +485,25 @@ impl RuntimeStore {
         session_id: SessionId,
         task_id: TaskId,
     ) -> StoreResult<EventIntegrity> {
+        self.event_integrity_before(session_id, task_id, None).await
+    }
+
+    pub async fn event_integrity_before(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+        before_sequence_no: Option<u64>,
+    ) -> StoreResult<EventIntegrity> {
         let rows = sqlx::query(
             "SELECT sequence_no, event_json FROM runtime_events
-             WHERE session_id = ? AND task_id = ? ORDER BY sequence_no ASC",
+             WHERE session_id = ? AND task_id = ?
+               AND (? IS NULL OR sequence_no < ?)
+             ORDER BY sequence_no ASC",
         )
         .bind(session_id.to_string())
         .bind(task_id.to_string())
+        .bind(before_sequence_no.and_then(|value| i64::try_from(value).ok()))
+        .bind(before_sequence_no.and_then(|value| i64::try_from(value).ok()))
         .fetch_all(&self.pool)
         .await?;
         let mut digest = Sha256::new();
@@ -785,11 +799,14 @@ impl RuntimeStore {
                     .and_then(|value| serde_json::from_value::<ToolResultEnvelope>(value).ok())
             })
             .collect::<Vec<_>>();
-        let referenced_artifacts = tool_results
+        let mut referenced_artifacts = tool_results
             .iter()
             .filter_map(|result| result.raw_artifact_ref)
             .chain(events.iter().filter_map(|event| event.payload_ref))
             .collect::<HashSet<_>>();
+        for event in &events {
+            collect_structured_artifact_refs(&event.payload, None, &mut referenced_artifacts);
+        }
         let mut artifacts = Vec::with_capacity(referenced_artifacts.len());
         for artifact_id in &referenced_artifacts {
             if let Some(artifact) = self.load_artifact(*artifact_id).await? {
@@ -864,6 +881,11 @@ impl RuntimeStore {
             verification,
             loop_decisions,
             post_task_jobs,
+            failure_diagnosis: None,
+            diagnostic_slice: None,
+            replay_execution: None,
+            external_evaluations: Vec::new(),
+            causal_comparisons: Vec::new(),
             trace_complete,
             missing_sections,
             retention_losses: Vec::new(),
@@ -2420,6 +2442,47 @@ fn parse_timestamp(value: Option<String>) -> StoreResult<Option<chrono::DateTime
                 .map_err(|error| StoreError::InvalidId(error.to_string()))
         })
         .transpose()
+}
+
+fn collect_structured_artifact_refs(
+    value: &serde_json::Value,
+    key: Option<&str>,
+    artifact_ids: &mut HashSet<ArtifactId>,
+) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, value) in object {
+                collect_structured_artifact_refs(value, Some(key), artifact_ids);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_structured_artifact_refs(value, key, artifact_ids);
+            }
+        }
+        serde_json::Value::String(value)
+            if key.is_some_and(|key| {
+                key == "artifact" || key == "uri" || key.ends_with("_ref") || key.ends_with("_refs")
+            }) =>
+        {
+            if let Some(artifact_id) = parse_structured_artifact_ref(
+                value,
+                key.is_some_and(|key| key.contains("artifact")),
+            ) {
+                artifact_ids.insert(artifact_id);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_structured_artifact_ref(value: &str, allow_plain_id: bool) -> Option<ArtifactId> {
+    let candidate = match value.strip_prefix("artifact://") {
+        Some(path) => path.split('?').next()?.rsplit('/').next()?,
+        None if allow_plain_id => value,
+        None => return None,
+    };
+    candidate.parse::<ArtifactId>().ok()
 }
 
 fn parse_required_timestamp(value: String) -> StoreResult<chrono::DateTime<chrono::Utc>> {

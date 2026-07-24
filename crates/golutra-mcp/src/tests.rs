@@ -207,6 +207,7 @@ for line in sys.stdin:
 fn request(tool_name: &str, arguments: Value) -> ToolRequest {
     ToolRequest {
         tool_call_id: ToolCallId::new(),
+        provider_tool_call_id: None,
         session_id: SessionId::new(),
         turn_id: Some(TurnId::new()),
         tool_name: tool_name.to_owned(),

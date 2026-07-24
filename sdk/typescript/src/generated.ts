@@ -68,6 +68,14 @@ export type AgentStreamEvent =
       verification?: VerificationRecord | null;
       [k: string]: unknown;
     };
+export type CausalRelation =
+  | "parent"
+  | "triggered_by"
+  | "responds_to"
+  | "derived_from"
+  | "verifies"
+  | "compares"
+  | "supersedes";
 export type RuntimeEventType =
   | "command_received"
   | "command_completed"
@@ -88,6 +96,7 @@ export type RuntimeEventType =
   | "provider_started"
   | "provider_streamed"
   | "provider_completed"
+  | "provider_failed"
   | "token_usage_recorded"
   | "assistant_message"
   | "tool_started"
@@ -159,7 +168,13 @@ export type RuntimeEventType =
   | "regression_execution_completed"
   | "memory_candidate_quarantined"
   | "memory_activated"
-  | "memory_invalidated";
+  | "memory_invalidated"
+  | "failure_diagnosed"
+  | "diagnostic_slice_created"
+  | "replay_capsule_created"
+  | "replay_executed"
+  | "external_evaluation_ingested"
+  | "external_evaluation_compared";
 export type RuntimeEventSource =
   | "runtime"
   | "provider"
@@ -200,6 +215,8 @@ export type CandidateStatus =
   | "rejected"
   | "rolled_back";
 export type BenchmarkCheckStatus = "pass" | "fail" | "unknown" | "not_applicable";
+export type EvaluationPartitionKind =
+  "source" | "historical" | "generated" | "holdout" | "adversarial";
 export type ActorKind = "user" | "api" | "tui" | "cli" | "sdk" | "web" | "ide" | "runtime";
 export type SessionCommandKind =
   | "create"
@@ -219,6 +236,7 @@ export type SessionCommandKind =
   | "apply_candidate"
   | "rollback_candidate"
   | "record_benchmark"
+  | "ingest_external_evaluation"
   | "compare_counterfactual"
   | "plan_evolution"
   | "run_evolution"
@@ -241,7 +259,20 @@ export type SessionCommandKind =
 export type BudgetOverflowAction = "trim" | "compact" | "ask_user" | "block";
 export type RedactionStatus = "raw" | "redacted" | "not_required";
 export type BusyPolicy = "append" | "inject" | "interrupt" | "reject";
+export type FailureDomain =
+  | "runtime_control_flow"
+  | "context"
+  | "provider"
+  | "tool"
+  | "policy"
+  | "verification"
+  | "memory"
+  | "external_evaluation"
+  | "unknown";
 export type EvidenceStrength = "weak" | "medium" | "strong";
+export type RegressionExecutionRole = "baseline" | "candidate";
+export type ExternalEvaluationTrust = "untrusted_local" | "owner_local" | "signed";
+export type EvaluationVerdict = "pass" | "fail" | "partial" | "unknown";
 export type LoopAction =
   | "continue"
   | "compact"
@@ -256,10 +287,11 @@ export type LoopAction =
 export type PostTaskJobKind = "deep_evaluation" | "candidate_generation" | "regression_execution";
 export type PostTaskJobStatus =
   "queued" | "leased" | "running" | "succeeded" | "failed" | "cancelled";
+export type ReplayMode = "projection" | "deterministic_control_flow" | "live_regression";
+export type ReplayExecutionStatus = "matched" | "diverged" | "incomplete" | "failed";
 export type ToolResultStatus = "ok" | "error" | "blocked" | "cancelled" | "timeout";
 export type PromotionDecisionKind = "approve" | "reject" | "needs_human_review";
 export type PromotionReviewer = "system" | "human" | "agent";
-export type EvaluationVerdict = "pass" | "fail" | "partial" | "unknown";
 export type RegressionVerdict = "pass" | "fail" | "needs_review";
 export type ReviewMode = "minimal" | "deep";
 export type EventPageDirection = "forward" | "backward";
@@ -289,7 +321,6 @@ export type RuntimeQueryKind =
   | "task_trace"
   | "post_task_jobs"
   | "artifact_chunk";
-export type RegressionExecutionRole = "baseline" | "candidate";
 export type RegressionExecutionStatus =
   "queued" | "running" | "succeeded" | "failed" | "inconclusive";
 export type SessionRangeDirection = "single" | "newer" | "older";
@@ -634,6 +665,8 @@ export interface SdkProtocolBundle {
   regression_campaign: RegressionCampaign;
   regression_execution: RegressionExecution;
   regression_result: RegressionResult;
+  replay_capsule: ReplayCapsule;
+  replay_execution: ReplayExecution;
   security_utility_result: SecurityUtilityResult;
   session_page: SessionPage;
   session_page_request: SessionPageRequest;
@@ -666,18 +699,51 @@ export interface AgentItem {
   [k: string]: unknown;
 }
 export interface RuntimeEvent {
+  causal_context?: CausalContext;
+  causal_links?: CausalLink[];
   durable: boolean;
   event_type: RuntimeEventType;
   id: string;
   parent_event_id?: string | null;
   payload: unknown;
   payload_ref?: string | null;
+  schema_version?: number;
   sequence_no: number;
   session_id: string;
   source: RuntimeEventSource;
   task_id?: string | null;
   timestamp: string;
   turn_id?: string | null;
+  [k: string]: unknown;
+}
+/**
+ * Correlation identifiers propagated through one governed runtime execution.
+ *
+ * The event envelope remains authoritative for session/task/turn ownership.
+ * Repeating those identifiers here makes detached facts self-describing and
+ * lets integrity validation reject mismatched context rather than guessing.
+ */
+export interface CausalContext {
+  candidate_id?: string | null;
+  provider_request_id?: string | null;
+  provider_response_id?: string | null;
+  provider_round_id?: string | null;
+  provider_tool_call_id?: string | null;
+  regression_campaign_id?: string | null;
+  run_id?: string | null;
+  session_id?: string | null;
+  step_id?: string | null;
+  step_no?: number | null;
+  task_id?: string | null;
+  tool_call_id?: string | null;
+  turn_id?: string | null;
+  verification_id?: string | null;
+  workspace_id?: string | null;
+  [k: string]: unknown;
+}
+export interface CausalLink {
+  event_id: string;
+  relation: CausalRelation;
   [k: string]: unknown;
 }
 export interface VerificationRecord {
@@ -847,14 +913,19 @@ export interface BenchmarkCheck {
   [k: string]: unknown;
 }
 export interface CausalComparison {
+  baseline_evaluation_ref?: string | null;
+  candidate_evaluation_ref?: string | null;
   comparison_id: string;
   conclusion: string;
   cost_delta_usd?: number | null;
   latency_delta_ms?: number | null;
+  partition?: EvaluationPartitionKind | null;
+  provider_variant?: string | null;
   quality_delta?: number | null;
   replay_id: string;
   scaffold_inflation: boolean;
   security_delta?: number | null;
+  seed?: number | null;
   token_delta?: number | null;
   utility_delta?: number | null;
   [k: string]: unknown;
@@ -977,12 +1048,17 @@ export interface CounterfactualReplay {
 export interface DebugProjection {
   artifacts: ArtifactRecord[];
   busy_policy_decisions: BusyPolicyDecision[];
+  causal_comparisons?: CausalComparison[];
+  diagnostic_slice?: DiagnosticSlice | null;
   event_window: DebugEventWindow;
   events: RuntimeEvent[];
   evidence: EvidenceRecord[];
+  external_evaluations?: ExternalEvaluationRecord[];
+  failure_diagnosis?: FailureDiagnosis | null;
   loop_decisions: LoopDecision[];
   missing_sections?: string[];
   post_task_jobs?: PostTaskJob[];
+  replay_execution?: ReplayExecution | null;
   retention_losses?: string[];
   session_id: string;
   task_id?: string | null;
@@ -1018,6 +1094,49 @@ export interface BusyPolicyDecision {
   safe_to_inject: boolean;
   [k: string]: unknown;
 }
+export interface DiagnosticSlice {
+  artifact_refs: string[];
+  complete: boolean;
+  diagnosis: FailureDiagnosis;
+  event_refs: string[];
+  evidence_refs: string[];
+  generated_at: string;
+  omitted_event_count: number;
+  slice_id: string;
+  source_task_id: string;
+  [k: string]: unknown;
+}
+export interface FailureDiagnosis {
+  actual_behavior: string;
+  analyzer_version: string;
+  causal_event_refs: string[];
+  code_targets: CodeTargetRef[];
+  confidence: number;
+  counterfactual: string;
+  created_at: string;
+  diagnosis_id: string;
+  expected_behavior: string;
+  regression_commands: string[];
+  source_task_id: string;
+  summary: string;
+  taxonomy: FailureTaxonomy;
+  trigger_event_refs: string[];
+  [k: string]: unknown;
+}
+export interface CodeTargetRef {
+  crate_name: string;
+  module_path: string;
+  owner: string;
+  source_digest?: string | null;
+  source_path?: string | null;
+  symbol?: string | null;
+  [k: string]: unknown;
+}
+export interface FailureTaxonomy {
+  code: string;
+  domain: FailureDomain;
+  [k: string]: unknown;
+}
 export interface DebugEventWindow {
   end_cursor?: number | null;
   has_more_before: boolean;
@@ -1034,6 +1153,52 @@ export interface EvidenceRecord {
   limitations: string;
   source_event_refs: string[];
   verifier: string;
+  [k: string]: unknown;
+}
+export interface ExternalEvaluationRecord {
+  artifact_refs: string[];
+  assertions: ExternalEvaluationAssertion[];
+  attestation?: EvaluationAttestation | null;
+  base_trace_digest: string;
+  campaign_id?: string | null;
+  candidate_id?: string | null;
+  case_id: string;
+  comparison_group_id?: string | null;
+  dataset_id: string;
+  dataset_version: string;
+  evaluation_id: string;
+  evaluator_id: string;
+  evaluator_version: string;
+  harness_id: string;
+  harness_version: string;
+  holdout_protected?: boolean;
+  ingested_at: string;
+  partition?: "source" | "historical" | "generated" | "holdout" | "adversarial";
+  provider_variant?: string | null;
+  result_digest: string;
+  role?: RegressionExecutionRole | null;
+  runtime_identity: string;
+  score?: number | null;
+  score_max?: number | null;
+  seed?: number | null;
+  source_task_id: string;
+  trust: ExternalEvaluationTrust;
+  verdict: EvaluationVerdict;
+  [k: string]: unknown;
+}
+export interface ExternalEvaluationAssertion {
+  assertion_id: string;
+  evidence_refs: string[];
+  message: string;
+  name: string;
+  passed: boolean;
+  [k: string]: unknown;
+}
+export interface EvaluationAttestation {
+  algorithm: string;
+  key_id: string;
+  signature: string;
+  signed_digest: string;
   [k: string]: unknown;
 }
 export interface LoopDecision {
@@ -1081,6 +1246,30 @@ export interface PostTaskJob {
   workspace_id: string;
   [k: string]: unknown;
 }
+/**
+ * Result of re-entering the ordinary AgentLoop with recorded provider and
+ * tool artifacts. This is an executable replay result, not a projection-only
+ * reconstruction.
+ */
+export interface ReplayExecution {
+  capsule_id: string;
+  completed_at: string;
+  execution_id: string;
+  expected_loop_action?: LoopAction | null;
+  expected_verification?: VerificationResult | null;
+  mismatches: string[];
+  mode: ReplayMode;
+  observed_loop_action?: LoopAction | null;
+  observed_verification?: VerificationResult | null;
+  provider_exchanges_consumed: number;
+  provider_exchanges_total: number;
+  source_task_id: string;
+  started_at: string;
+  status: ReplayExecutionStatus;
+  tool_results_consumed: number;
+  tool_results_total: number;
+  [k: string]: unknown;
+}
 export interface ToolResultEnvelope {
   evidence_refs: string[];
   model_visible_excerpt?: string | null;
@@ -1126,11 +1315,17 @@ export interface EvaluationCase {
  */
 export interface EvaluationProjection {
   automation_candidates: AutomationCandidate[];
+  causal_comparisons?: CausalComparison[];
+  diagnostic_slices?: DiagnosticSlice[];
+  external_evaluations?: ExternalEvaluationRecord[];
+  failure_diagnoses?: FailureDiagnosis[];
   improvement_candidates: ImprovementCandidate[];
   integrity_warnings: string[];
   post_task_jobs: PostTaskJob[];
   promotion_decisions: PromotionDecision[];
   regressions: RegressionResult[];
+  replay_capsules?: ReplayCapsule[];
+  replay_executions?: ReplayExecution[];
   results: EvaluationResult[];
   reviews: PostTaskReview[];
   session_id: string;
@@ -1176,9 +1371,12 @@ export interface RegressionResult {
   cases_run: number;
   causal_comparison_refs: string[];
   cost_delta?: number | null;
+  coverage?: RegressionCoverage;
   created_at: string;
+  external_evaluation_refs?: string[];
   failed_cases: number;
   latency_delta?: number | null;
+  paired_execution_refs?: string[];
   passed_cases: number;
   quality_delta?: number | null;
   regression_id: string;
@@ -1196,6 +1394,57 @@ export interface RegressionCaseResult {
   observed_verdict: EvaluationVerdict;
   passed: boolean;
   replay_id: string;
+  [k: string]: unknown;
+}
+export interface RegressionCoverage {
+  completed_cells: number;
+  expected_cells: number;
+  holdout_disclosure_violations: string[];
+  missing_cells: string[];
+  missing_partitions: EvaluationPartitionKind[];
+  missing_providers: string[];
+  missing_seeds: number[];
+  observed_partitions: EvaluationPartitionKind[];
+  observed_providers: string[];
+  observed_seeds: number[];
+  required_partitions: EvaluationPartitionKind[];
+  required_providers: string[];
+  required_seeds: number[];
+  trusted_external_evaluation_refs: string[];
+  trusted_external_pairs?: number;
+  untrusted_external_evaluation_refs: string[];
+  [k: string]: unknown;
+}
+export interface ReplayCapsule {
+  capsule_id: string;
+  clock_seed: string;
+  complete: boolean;
+  created_at: string;
+  event_chain_digest: string;
+  fixture_ref?: string | null;
+  limitations: string[];
+  missing_inputs: string[];
+  mode: ReplayMode;
+  provider_exchanges: ReplayProviderExchange[];
+  random_seed: number;
+  runtime_config_digest: string;
+  source_last_sequence_no?: number | null;
+  source_run_id: string;
+  source_task_id: string;
+  tool_results: ReplayToolResult[];
+  [k: string]: unknown;
+}
+export interface ReplayProviderExchange {
+  request_artifact_ref: string;
+  request_id: string;
+  response_artifact_ref: string;
+  response_id: string;
+  [k: string]: unknown;
+}
+export interface ReplayToolResult {
+  provider_tool_call_id?: string | null;
+  result_artifact_ref: string;
+  tool_call_id: string;
   [k: string]: unknown;
 }
 export interface EvaluationResult {
@@ -1396,6 +1645,7 @@ export interface RuntimeGovernorDecision {
   action: GovernorAction;
   alignment: GoalAlignmentCheck;
   budget_risk: string;
+  consecutive_failed_tool_calls: number;
   failed_tool_calls: number;
   iteration: number;
   phase: GovernorPhase;
@@ -1507,13 +1757,18 @@ export interface RegressionCampaign {
   campaign_id: string;
   candidate_digest: string;
   candidate_id: string;
+  case_partitions?: {
+    [k: string]: EvaluationPartitionKind;
+  };
   case_refs: string[];
   completed_at?: string | null;
   created_at: string;
   environment_recipe: string;
   hard_gates: string[];
+  minimum_trusted_external_pairs?: number;
   provider_matrix: string[];
   replay_modes: string[];
+  required_partitions?: EvaluationPartitionKind[];
   resource_budget: string;
   seeds: number[];
   started_at?: string | null;
@@ -1524,8 +1779,11 @@ export interface RegressionExecution {
   case_ref?: string;
   cost_latency_ref?: string | null;
   execution_id: string;
+  partition?: "source" | "historical" | "generated" | "holdout" | "adversarial";
+  provider_variant?: string;
   role: RegressionExecutionRole;
   runtime_version: string;
+  seed?: number;
   status: RegressionExecutionStatus;
   task_trace_ref?: string | null;
   verification_ref?: string | null;
@@ -1683,6 +1941,7 @@ export interface TaskTracePage {
   integrity: TraceIntegrity;
   next_cursor?: number | null;
   post_task_jobs: PostTaskJob[];
+  run_provenance?: RunProvenance | null;
   runtime_identity: string;
   session_id: string;
   task_id: string;
@@ -1692,15 +1951,49 @@ export interface TaskTracePage {
   [k: string]: unknown;
 }
 export interface TraceIntegrity {
+  artifact_checksum_failures?: string[];
+  broken_lifecycle_pairs?: string[];
   complete: boolean;
   event_chain_digest: string;
   event_count: number;
+  external_overlay_failures?: string[];
   first_sequence?: number | null;
   last_sequence?: number | null;
+  missing_causal_links?: string[];
   missing_sections: string[];
+  orphan_events?: string[];
+  provenance_mismatches?: string[];
   redacted_fields: string[];
   retention_losses: string[];
   unresolved_refs: string[];
+  [k: string]: unknown;
+}
+export interface RunProvenance {
+  build: BuildProvenance;
+  captured_at: string;
+  policy_digest?: string | null;
+  provider_config_digest?: string | null;
+  run_id: string;
+  runtime_config_digest?: string | null;
+  runtime_identity: string;
+  schema_version: number;
+  tool_manifest_digest?: string | null;
+  verifier_digest?: string | null;
+  workspace_initial_digest?: string | null;
+  [k: string]: unknown;
+}
+export interface BuildProvenance {
+  binary_checksum?: string | null;
+  cargo_lock_digest?: string | null;
+  dirty: boolean;
+  features: string[];
+  git_commit?: string | null;
+  package_version: string;
+  profile: string;
+  rustc_version: string;
+  schema_version: number;
+  source_digest?: string | null;
+  target: string;
   [k: string]: unknown;
 }
 export interface VerificationPlan {

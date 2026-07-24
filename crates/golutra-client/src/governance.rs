@@ -183,6 +183,54 @@ impl GovernanceService {
             .into_iter()
             .filter(|decision| candidate_ids.contains(decision.candidate_id.as_str()))
             .collect::<Vec<_>>();
+        let failure_diagnoses = state
+            .failure_diagnoses
+            .into_iter()
+            .filter(|diagnosis| diagnosis.source_task_id == task_id)
+            .collect::<Vec<_>>();
+        let diagnostic_slices = state
+            .diagnostic_slices
+            .into_iter()
+            .filter(|slice| slice.source_task_id == task_id)
+            .collect::<Vec<_>>();
+        let replay_capsules = state
+            .replay_capsules
+            .into_iter()
+            .filter(|capsule| capsule.source_task_id == task_id)
+            .collect::<Vec<_>>();
+        let replay_executions = state
+            .replay_executions
+            .into_iter()
+            .filter(|execution| execution.source_task_id == task_id)
+            .collect::<Vec<_>>();
+        let external_evaluations = state
+            .external_evaluations
+            .into_iter()
+            .filter(|evaluation| evaluation.source_task_id == task_id)
+            .collect::<Vec<_>>();
+        let external_evaluation_ids = external_evaluations
+            .iter()
+            .map(|evaluation| evaluation.evaluation_id.as_str())
+            .collect::<HashSet<_>>();
+        let causal_comparison_ids = regressions
+            .iter()
+            .flat_map(|regression| regression.causal_comparison_refs.iter().map(String::as_str))
+            .collect::<HashSet<_>>();
+        let causal_comparisons = state
+            .causal_comparisons
+            .into_iter()
+            .filter(|comparison| {
+                causal_comparison_ids.contains(comparison.comparison_id.as_str())
+                    || comparison
+                        .baseline_evaluation_ref
+                        .as_deref()
+                        .is_some_and(|reference| external_evaluation_ids.contains(reference))
+                    || comparison
+                        .candidate_evaluation_ref
+                        .as_deref()
+                        .is_some_and(|reference| external_evaluation_ids.contains(reference))
+            })
+            .collect::<Vec<_>>();
         let events = self
             .repositories
             .events
@@ -288,6 +336,79 @@ impl GovernanceService {
                 ));
             }
         }
+        for diagnosis in &failure_diagnoses {
+            if !event_contains_id(
+                RuntimeEventType::FailureDiagnosed,
+                "diagnosis_id",
+                &diagnosis.diagnosis_id,
+            ) {
+                integrity_warnings.push(format!(
+                    "FailureDiagnosis {} has no canonical event",
+                    diagnosis.diagnosis_id
+                ));
+            }
+        }
+        for slice in &diagnostic_slices {
+            if !event_contains_id(
+                RuntimeEventType::DiagnosticSliceCreated,
+                "slice_id",
+                &slice.slice_id,
+            ) {
+                integrity_warnings.push(format!(
+                    "DiagnosticSlice {} has no canonical event",
+                    slice.slice_id
+                ));
+            }
+        }
+        for capsule in &replay_capsules {
+            if !event_contains_id(
+                RuntimeEventType::ReplayCapsuleCreated,
+                "capsule_id",
+                &capsule.capsule_id,
+            ) {
+                integrity_warnings.push(format!(
+                    "ReplayCapsule {} has no canonical event",
+                    capsule.capsule_id
+                ));
+            }
+        }
+        for execution in &replay_executions {
+            if !event_contains_id(
+                RuntimeEventType::ReplayExecuted,
+                "execution_id",
+                &execution.execution_id,
+            ) {
+                integrity_warnings.push(format!(
+                    "ReplayExecution {} has no canonical event",
+                    execution.execution_id
+                ));
+            }
+        }
+        for evaluation in &external_evaluations {
+            if !event_contains_id(
+                RuntimeEventType::ExternalEvaluationIngested,
+                "evaluation_id",
+                &evaluation.evaluation_id,
+            ) {
+                integrity_warnings.push(format!(
+                    "ExternalEvaluationRecord {} has no canonical event",
+                    evaluation.evaluation_id
+                ));
+            }
+        }
+        for comparison in &causal_comparisons {
+            if !event_contains_id(
+                RuntimeEventType::ExternalEvaluationCompared,
+                "comparison_id",
+                &comparison.comparison_id,
+            ) && comparison.baseline_evaluation_ref.is_some()
+            {
+                integrity_warnings.push(format!(
+                    "CausalComparison {} has no canonical event",
+                    comparison.comparison_id
+                ));
+            }
+        }
         let post_task_jobs = self.repositories.jobs.list_for_task(task_id).await?;
         let terminal = !post_task_jobs.is_empty()
             && post_task_jobs.iter().all(|job| {
@@ -326,6 +447,12 @@ impl GovernanceService {
             automation_candidates,
             regressions,
             promotion_decisions,
+            failure_diagnoses,
+            diagnostic_slices,
+            replay_capsules,
+            replay_executions,
+            external_evaluations,
+            causal_comparisons,
             post_task_jobs,
             terminal,
             integrity_warnings,

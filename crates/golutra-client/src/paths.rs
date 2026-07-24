@@ -82,6 +82,63 @@ impl RuntimePaths {
     ) -> Result<Self, ClientError> {
         let cwd = canonical_cwd(cwd.as_ref())?;
         let home = prepare_private_home(home.as_ref())?;
+        Self::from_prepared_home_and_cwd(home, cwd)
+    }
+
+    /// Reopen a completed `exec --run-dir` bundle without requiring its
+    /// original container workspace path to exist on this machine.
+    pub fn open_ephemeral_state_dir(
+        state_home: impl AsRef<Path>,
+        recorded_cwd: impl AsRef<Path>,
+    ) -> Result<Self, ClientError> {
+        let state_home = state_home.as_ref();
+        let metadata = fs::symlink_metadata(state_home)
+            .map_err(|error| ClientError::Io(format!("{}: {error}", state_home.display())))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(ClientError::Io(format!(
+                "persisted run root must be a real directory: {}",
+                state_home.display()
+            )));
+        }
+        let home = state_home
+            .canonicalize()
+            .map_err(|error| ClientError::Io(error.to_string()))?;
+        let state_dir = home.join("state");
+        let state_metadata = fs::symlink_metadata(&state_dir)
+            .map_err(|error| ClientError::Io(format!("{}: {error}", state_dir.display())))?;
+        if state_metadata.file_type().is_symlink() || !state_metadata.is_dir() {
+            return Err(ClientError::Io(format!(
+                "persisted run state must be a real directory: {}",
+                state_dir.display()
+            )));
+        }
+        let runtime_db = state_dir.join("runtime.sqlite");
+        let database_metadata = fs::symlink_metadata(&runtime_db)
+            .map_err(|error| ClientError::Io(format!("{}: {error}", runtime_db.display())))?;
+        if database_metadata.file_type().is_symlink() || !database_metadata.is_file() {
+            return Err(ClientError::Io(format!(
+                "persisted run database must be a real file: {}",
+                runtime_db.display()
+            )));
+        }
+        let cwd = recorded_cwd.as_ref();
+        if !cwd.is_absolute()
+            || cwd.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(ClientError::Io(format!(
+                "persisted run workspace must be an absolute normalized path: {}",
+                cwd.display()
+            )));
+        }
+        Self::from_prepared_home_and_cwd(home, cwd.to_path_buf())
+    }
+
+    fn from_prepared_home_and_cwd(home: PathBuf, cwd: PathBuf) -> Result<Self, ClientError> {
         let app_server_paths = AppServerPaths::from_canonical_home(home.clone())?;
         let state_dir = home.join("state");
         let artifacts_dir = state_dir.join("artifacts");

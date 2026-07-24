@@ -4,6 +4,7 @@ use golutra_core::{
     VerificationDimensionStatus, VerificationDimensions, VerificationId, VerificationPlan,
     VerificationRecord, VerificationResult,
 };
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerificationInput {
@@ -221,23 +222,26 @@ impl VerificationRunner {
 
     fn verify_legacy(&self, input: VerificationInput) -> VerificationRecord {
         let has_evidence = !input.evidence_refs.is_empty();
-        let external_verifier_passed = input.command_checks.iter().any(|check| {
-            check.kind == VerificationCheckKind::ObjectiveValidation
-                && check.name == "objective:test:external_verifier"
-                && check.passed
-        });
-        let commands_passed = input.command_checks.iter().all(|check| {
-            check.passed
-                || (external_verifier_passed && check.kind == VerificationCheckKind::ToolExecution)
-        });
+        let latest_objective_checks = latest_distinct_checks(
+            input
+                .command_checks
+                .iter()
+                .filter(|check| check.kind == VerificationCheckKind::ObjectiveValidation)
+                .collect(),
+        );
+        let objective_checks_passed = !latest_objective_checks.is_empty()
+            && latest_objective_checks.iter().all(|check| check.passed);
+        let commands_passed = objective_checks_passed
+            || input
+                .command_checks
+                .iter()
+                .filter(|check| check.kind == VerificationCheckKind::ToolExecution)
+                .all(|check| check.passed);
         let change_recorded = passed_check(
             &input.command_checks,
             VerificationCheckKind::WorkspaceChange,
         );
-        let objective_validated = passed_check(
-            &input.command_checks,
-            VerificationCheckKind::ObjectiveValidation,
-        );
+        let objective_validated = objective_checks_passed;
         let assistant_response = passed_check(
             &input.command_checks,
             VerificationCheckKind::AssistantResponse,
@@ -530,23 +534,25 @@ fn assertion_status(
             }
         }
         VerificationAssertionKind::Test | VerificationAssertionKind::Diagnostic => {
-            let checks = matching_checks(&[VerificationCheckKind::ObjectiveValidation])
-                .into_iter()
-                .filter(|check| {
-                    check.name == "objective:test:external_verifier"
-                        || assertion.criterion_id == "tests_or_diagnostics"
-                        || assertion.criterion_id == "analysis_objective"
-                        || match assertion.kind {
-                            VerificationAssertionKind::Test => {
-                                check.name.starts_with("objective:test:")
+            let checks = latest_distinct_checks(
+                matching_checks(&[VerificationCheckKind::ObjectiveValidation])
+                    .into_iter()
+                    .filter(|check| {
+                        check.name == "objective:test:external_verifier"
+                            || assertion.criterion_id == "tests_or_diagnostics"
+                            || assertion.criterion_id == "analysis_objective"
+                            || match assertion.kind {
+                                VerificationAssertionKind::Test => {
+                                    check.name.starts_with("objective:test:")
+                                }
+                                VerificationAssertionKind::Diagnostic => {
+                                    !check.name.starts_with("objective:test:")
+                                }
+                                _ => false,
                             }
-                            VerificationAssertionKind::Diagnostic => {
-                                !check.name.starts_with("objective:test:")
-                            }
-                            _ => false,
-                        }
-                })
-                .collect::<Vec<_>>();
+                    })
+                    .collect::<Vec<_>>(),
+            );
             if checks.iter().any(|check| !check.passed) {
                 (
                     VerificationAssertionStatus::Fail,
@@ -622,6 +628,23 @@ fn assertion_status(
             refs,
         ),
     }
+}
+
+fn latest_distinct_checks(checks: Vec<&VerificationCheck>) -> Vec<&VerificationCheck> {
+    let mut seen = HashSet::new();
+    let mut latest = Vec::new();
+    for check in checks.into_iter().rev() {
+        let identity = format!(
+            "{}\0{}",
+            check.name,
+            check.command.as_deref().unwrap_or_default()
+        );
+        if seen.insert(identity) {
+            latest.push(check);
+        }
+    }
+    latest.reverse();
+    latest
 }
 
 fn delivery_check_matches(assertion: &VerificationAssertion, check: &VerificationCheck) -> bool {
@@ -784,6 +807,60 @@ mod tests {
                 check.kind == VerificationCheckKind::ToolExecution && !check.passed
             })
         );
+    }
+
+    #[test]
+    fn successful_validation_rerun_supersedes_its_failed_attempt_and_tool_failure() {
+        let evidence = EvidenceId::new();
+        let validation = |passed, message: &str| VerificationCheck {
+            kind: VerificationCheckKind::ObjectiveValidation,
+            name: "objective:test:shell".to_owned(),
+            command: Some("cargo test".to_owned()),
+            passed,
+            evidence_refs: vec![evidence],
+            message: message.to_owned(),
+        };
+        let input = VerificationInput {
+            task_id: TaskId::new(),
+            objective: "change code and run tests".to_owned(),
+            completion_criteria: vec!["tests pass".to_owned()],
+            evidence_refs: vec![evidence],
+            command_checks: vec![
+                VerificationCheck {
+                    kind: VerificationCheckKind::ToolExecution,
+                    name: "tool:shell".to_owned(),
+                    command: None,
+                    passed: false,
+                    evidence_refs: vec![evidence],
+                    message: "first test run failed".to_owned(),
+                },
+                VerificationCheck {
+                    kind: VerificationCheckKind::WorkspaceChange,
+                    name: "workspace_diff".to_owned(),
+                    command: None,
+                    passed: true,
+                    evidence_refs: vec![evidence],
+                    message: "code changed".to_owned(),
+                },
+                validation(false, "tests failed"),
+                validation(true, "tests passed after the fix"),
+            ],
+            requires_workspace_evidence: true,
+            code_files_changed: true,
+        };
+
+        let (record, plan) =
+            VerificationRunner.verify_with_plan(input.clone(), VerificationRunner.plan(&input));
+
+        assert_eq!(record.result, VerificationResult::Pass);
+        assert!(plan.assertions.iter().any(|assertion| {
+            assertion.criterion_id == "tests_or_diagnostics"
+                && assertion.status == VerificationAssertionStatus::Pass
+        }));
+        assert!(plan.assertions.iter().any(|assertion| {
+            assertion.criterion_id == "criterion-1"
+                && assertion.status == VerificationAssertionStatus::Pass
+        }));
     }
 
     #[test]

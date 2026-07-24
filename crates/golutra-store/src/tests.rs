@@ -26,6 +26,9 @@ async fn command_journal_atomically_records_receipt_and_completion() {
         reason: Some("accepted".to_owned()),
     };
     let event = |event_type| RuntimeEvent {
+        schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+        causal_context: Default::default(),
+        causal_links: Vec::new(),
         id: EventId::new(),
         sequence_no: 0,
         session_id,
@@ -99,6 +102,9 @@ async fn event_sequence_is_atomic_across_store_connections() {
         .expect("second store");
     let session_id = SessionId::new();
     let event = |summary: &str| RuntimeEvent {
+        schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+        causal_context: Default::default(),
+        causal_links: Vec::new(),
         id: golutra_core::EventId::new(),
         sequence_no: 0,
         session_id,
@@ -141,6 +147,9 @@ async fn event_pages_advance_from_the_last_sequence_cursor() {
     for index in 0..5 {
         store
             .append_event_assigning_sequence(RuntimeEvent {
+                schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+                causal_context: Default::default(),
+                causal_links: Vec::new(),
                 id: golutra_core::EventId::new(),
                 sequence_no: 0,
                 session_id,
@@ -196,6 +205,9 @@ async fn loads_the_latest_explicit_compaction_without_materializing_history() {
     ] {
         store
             .append_event_assigning_sequence(RuntimeEvent {
+                schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+                causal_context: Default::default(),
+                causal_links: Vec::new(),
                 id: golutra_core::EventId::new(),
                 sequence_no: 0,
                 session_id,
@@ -223,6 +235,9 @@ async fn loads_the_latest_explicit_compaction_without_materializing_history() {
 
     store
         .append_event_assigning_sequence(RuntimeEvent {
+            schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+            causal_context: Default::default(),
+            causal_links: Vec::new(),
             id: golutra_core::EventId::new(),
             sequence_no: 0,
             session_id,
@@ -260,6 +275,9 @@ async fn appends_events_and_reduces_state() {
     let session_id = SessionId::new();
     let task_id = TaskId::new();
     let event = RuntimeEvent {
+        schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+        causal_context: Default::default(),
+        causal_links: Vec::new(),
         id: golutra_core::EventId::new(),
         sequence_no: 1,
         session_id,
@@ -293,6 +311,9 @@ async fn assistant_message_becomes_user_projection_final_message() {
     let session_id = SessionId::new();
     let task_id = TaskId::new();
     let event = RuntimeEvent {
+        schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+        causal_context: Default::default(),
+        causal_links: Vec::new(),
         id: golutra_core::EventId::new(),
         sequence_no: 1,
         session_id,
@@ -329,6 +350,9 @@ async fn a_new_task_clears_terminal_fields_from_the_previous_task() {
     let session_id = SessionId::new();
     let previous_task = TaskId::new();
     let mut event = RuntimeEvent {
+        schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+        causal_context: Default::default(),
+        causal_links: Vec::new(),
         id: golutra_core::EventId::new(),
         sequence_no: 0,
         session_id,
@@ -387,6 +411,9 @@ fn projection_tracks_runtime_lane_and_keeps_pause_after_approval_resolution() {
         busy_policy_default: BusyPolicy::Append,
     };
     let event = |sequence_no, event_type, payload| RuntimeEvent {
+        schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+        causal_context: Default::default(),
+        causal_links: Vec::new(),
         id: golutra_core::EventId::new(),
         sequence_no,
         session_id,
@@ -445,6 +472,9 @@ fn projection_turns_reconciled_uncertain_task_into_interrupted_state() {
     let session_id = SessionId::new();
     let task_id = TaskId::new();
     let event = RuntimeEvent {
+        schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+        causal_context: Default::default(),
+        causal_links: Vec::new(),
         id: golutra_core::EventId::new(),
         sequence_no: 1,
         session_id,
@@ -673,6 +703,9 @@ async fn debug_projection_includes_events_and_artifacts() {
     let store = RuntimeStore::in_memory().await.expect("store opens");
     let session_id = SessionId::new();
     let mut event = RuntimeEvent {
+        schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+        causal_context: Default::default(),
+        causal_links: Vec::new(),
         id: golutra_core::EventId::new(),
         sequence_no: 1,
         session_id,
@@ -763,6 +796,9 @@ async fn fork_transaction_copies_boundary_history_and_remaps_runtime_ids() {
     let parent_turn_id = TurnId::new();
     let first = store
         .append_event_assigning_sequence(RuntimeEvent {
+            schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+            causal_context: Default::default(),
+            causal_links: Vec::new(),
             id: EventId::new(),
             sequence_no: 0,
             session_id: parent_session_id,
@@ -785,6 +821,9 @@ async fn fork_transaction_copies_boundary_history_and_remaps_runtime_ids() {
         .expect("first parent event");
     let second = store
         .append_event_assigning_sequence(RuntimeEvent {
+            schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+            causal_context: Default::default(),
+            causal_links: Vec::new(),
             id: EventId::new(),
             sequence_no: 0,
             session_id: parent_session_id,
@@ -802,6 +841,9 @@ async fn fork_transaction_copies_boundary_history_and_remaps_runtime_ids() {
         .expect("second parent event");
     store
         .append_event_assigning_sequence(RuntimeEvent {
+            schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+            causal_context: Default::default(),
+            causal_links: Vec::new(),
             id: EventId::new(),
             sequence_no: 0,
             session_id: parent_session_id,
@@ -1016,6 +1058,9 @@ async fn durable_projection_and_runtime_indexes_survive_reopen() {
     let session_id = SessionId::new();
     let task_id = TaskId::new();
     let event = RuntimeEvent {
+        schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+        causal_context: Default::default(),
+        causal_links: Vec::new(),
         id: golutra_core::EventId::new(),
         sequence_no: 1,
         session_id,
@@ -1127,6 +1172,9 @@ async fn post_task_job_queue_event_and_job_commit_atomically() {
         completed_at: None,
     };
     let event = RuntimeEvent {
+        schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+        causal_context: Default::default(),
+        causal_links: Vec::new(),
         id: EventId::new(),
         sequence_no: 0,
         session_id,

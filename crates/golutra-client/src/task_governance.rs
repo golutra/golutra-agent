@@ -118,11 +118,21 @@ impl RuntimeHost {
             }),
         );
         let _writer = self.event_writer.lock().await;
-        let event = self
-            .repositories
-            .jobs
-            .enqueue_with_event(&job, event)
-            .await?;
+        let causal_before = self.causal_ledger.lock().await.clone();
+        let event = match self.prepare_canonical_event(event).await {
+            Ok(event) => event,
+            Err(error) => {
+                *self.causal_ledger.lock().await = causal_before;
+                return Err(error);
+            }
+        };
+        let event = match self.repositories.jobs.enqueue_with_event(&job, event).await {
+            Ok(event) => event,
+            Err(error) => {
+                *self.causal_ledger.lock().await = causal_before;
+                return Err(error.into());
+            }
+        };
         self.next_sequence_no
             .fetch_max(event.sequence_no.saturating_add(1), Ordering::SeqCst);
         self.deep_evaluation_inputs
@@ -308,6 +318,7 @@ impl RuntimeHost {
         };
         let result = recorded.result;
         let review = recorded.review;
+        let deep_review = review.mode == ReviewMode::Deep;
         let improvement_candidate = recorded.improvement_candidate;
         let automation_candidates = recorded.automation_candidates;
         self.record_event(agent_event(
@@ -358,7 +369,93 @@ impl RuntimeHost {
             ))
             .await?;
         }
+        if deep_review {
+            self.record_observation_products(task).await?;
+        }
         Ok(true)
+    }
+
+    async fn record_observation_products(&self, task: &HostedAgentTask) -> Result<(), ClientError> {
+        let events = self
+            .repositories
+            .events
+            .load(task.session_id, Some(task.task_id), None)
+            .await?;
+        let integrity = self
+            .repositories
+            .events
+            .integrity(task.session_id, task.task_id)
+            .await?;
+        let run_provenance = events
+            .first()
+            .and_then(|event| event.payload.get("run_provenance"))
+            .cloned()
+            .and_then(|value| serde_json::from_value::<RunProvenance>(value).ok());
+        let capsule = diagnosis::replay_capsule(
+            task.task_id,
+            &events,
+            integrity.event_chain_digest,
+            run_provenance
+                .as_ref()
+                .and_then(|provenance| provenance.runtime_config_digest.clone()),
+        );
+        let evaluation_store = self.evaluation_store.clone();
+        let capsule_for_store = capsule.clone();
+        let replay_inserted =
+            run_blocking(move || evaluation_store.record_replay_capsule(capsule_for_store))
+                .await??;
+        if replay_inserted {
+            self.record_event(agent_event(
+                self.next_sequence_no(),
+                task,
+                RuntimeEventType::ReplayCapsuleCreated,
+                RuntimeEventSource::Evaluator,
+                json!({
+                    "summary": format!("deterministic replay capsule {} created", capsule.capsule_id),
+                    "record": capsule,
+                }),
+            ))
+            .await?;
+        }
+
+        let source_digest = run_provenance.and_then(|provenance| provenance.build.source_digest);
+        let Some((diagnosis, slice)) =
+            diagnosis::diagnose_task(task.task_id, &events, source_digest)
+        else {
+            return Ok(());
+        };
+        let evaluation_store = self.evaluation_store.clone();
+        let diagnosis_for_store = diagnosis.clone();
+        let slice_for_store = slice.clone();
+        let diagnosis_inserted = run_blocking(move || {
+            evaluation_store.record_diagnostic(diagnosis_for_store, slice_for_store)
+        })
+        .await??;
+        if diagnosis_inserted {
+            self.record_event(agent_event(
+                self.next_sequence_no(),
+                task,
+                RuntimeEventType::FailureDiagnosed,
+                RuntimeEventSource::Evaluator,
+                json!({
+                    "summary": &diagnosis.summary,
+                    "record": diagnosis,
+                }),
+            ))
+            .await?;
+            self.record_event(agent_event(
+                self.next_sequence_no(),
+                task,
+                RuntimeEventType::DiagnosticSliceCreated,
+                RuntimeEventSource::Evaluator,
+                json!({
+                    "summary": format!("bounded diagnostic slice {} created", slice.slice_id),
+                    "record": slice,
+                }),
+            ))
+            .await?;
+        }
+        Ok(())
     }
 
     pub(super) async fn promote_successful_task_memory(

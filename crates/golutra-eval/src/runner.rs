@@ -591,9 +591,9 @@ pub fn decide_low_risk_promotion(
     let clean_regression = regression.verdict == RegressionVerdict::Pass
         && regression.failed_cases == 0
         && regression.regressions.is_empty();
-    let has_paired_execution_refs = regression.causal_comparison_refs.len() >= 2
+    let has_paired_execution_refs = regression.paired_execution_refs.len() >= 2
         && regression
-            .causal_comparison_refs
+            .paired_execution_refs
             .iter()
             .all(|reference| !reference.trim().is_empty());
     let (decision, reason) = if candidate.status != CandidateStatus::RegressionPassed {
@@ -610,6 +610,11 @@ pub fn decide_low_risk_promotion(
         (
             PromotionDecisionKind::NeedsHumanReview,
             "regression has no paired baseline/candidate execution traces",
+        )
+    } else if !regression.coverage.complete() {
+        (
+            PromotionDecisionKind::NeedsHumanReview,
+            "regression does not satisfy partition, provider, seed, or holdout coverage",
         )
     } else if candidate_mutates_control_plane(candidate) {
         (
@@ -678,6 +683,20 @@ pub fn decide_governed_promotion(
             candidate,
             PromotionDecisionKind::NeedsHumanReview,
             "paired baseline/candidate execution references are missing",
+        );
+    }
+    if !facts.coverage_complete || !facts.missing_coverage.is_empty() {
+        return gated_decision(
+            candidate,
+            PromotionDecisionKind::NeedsHumanReview,
+            "regression coverage is incomplete",
+        );
+    }
+    if !facts.holdout_disclosure_violations.is_empty() {
+        return gated_decision(
+            candidate,
+            PromotionDecisionKind::Reject,
+            "holdout evaluation disclosed protected score, artifact, or assertion details",
         );
     }
     if facts.candidate_mutates_control_plane || !facts.mutation_reasons.is_empty() {

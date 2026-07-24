@@ -99,6 +99,10 @@ impl EmbeddedTransport {
         ))
     }
 
+    pub async fn open_persisted_run(run_root: impl AsRef<Path>) -> Result<Self, ClientError> {
+        Ok(Self::new(RuntimeHost::open_persisted_run(run_root).await?))
+    }
+
     pub async fn for_current_cwd() -> Result<Self, ClientError> {
         let cwd = std::env::current_dir().map_err(|error| ClientError::Io(error.to_string()))?;
         Self::for_cwd(cwd).await
@@ -1016,6 +1020,12 @@ impl RuntimeTransport {
         state_home: impl AsRef<Path>,
     ) -> Result<Self, ClientError> {
         EmbeddedTransport::ephemeral_persistent_for_cwd(cwd, state_home)
+            .await
+            .map(Self::Embedded)
+    }
+
+    pub async fn open_persisted_run(run_root: impl AsRef<Path>) -> Result<Self, ClientError> {
+        EmbeddedTransport::open_persisted_run(run_root)
             .await
             .map(Self::Embedded)
     }

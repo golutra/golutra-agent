@@ -14,11 +14,13 @@ import type {
   CausalComparison,
   CommandAck,
   ContextProjection,
+  DebugProjection,
   CounterfactualReplay,
   EvaluationCase,
   EvaluationResult,
   EvaluationRun,
   ExternalVerificationSpec,
+  ExternalEvaluationRecord,
   EvaluationProjection,
   EvolutionState,
   EventFilter,
@@ -51,7 +53,7 @@ import type {
 const JSON_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024;
 const MAX_COMPLETE_TRACE_PAGES = 4096;
-export const RUNTIME_PROTOCOL_VERSION = 4;
+export const RUNTIME_PROTOCOL_VERSION = 5;
 
 class HttpStatusError extends Error {
   constructor(
@@ -558,6 +560,10 @@ export class GolutraClient {
     );
   }
 
+  async debugProjection(sessionId: string, taskId: string): Promise<DebugProjection> {
+    return this.query<DebugProjection>(this.runtimeQuery(sessionId, "debug_projection", taskId));
+  }
+
   async taskTrace(request: TaskTraceRequest): Promise<TaskTracePage> {
     return this.postJson<TaskTracePage>("/traces", request);
   }
@@ -775,6 +781,84 @@ export class GolutraClient {
     return this.sendCommand(
       this.sessionCommand(sessionId, "run_regression", actorId ?? this.actorId, {
         candidate_id: candidateId,
+      }),
+    );
+  }
+
+  async runRegressionCampaign(
+    sessionId: string,
+    candidateId: string,
+    options: {
+      candidateFiles: readonly Record<string, unknown>[];
+      caseRefs?: readonly string[];
+      providerMatrix?: readonly string[];
+      seeds?: readonly number[];
+      minimumTrustedExternalPairs?: number;
+      /** @deprecated Use minimumTrustedExternalPairs. */
+      minimumTrustedExternalEvaluations?: number;
+    },
+    actorId?: string,
+  ): Promise<CommandAck> {
+    if (options.candidateFiles.length === 0) {
+      throw new Error("regression campaign requires candidateFiles");
+    }
+    if (
+      options.minimumTrustedExternalPairs !== undefined &&
+      options.minimumTrustedExternalEvaluations !== undefined
+    ) {
+      throw new Error(
+        "use minimumTrustedExternalPairs or its legacy evaluations alias, not both",
+      );
+    }
+    const minimumTrustedExternalPairs =
+      options.minimumTrustedExternalPairs ?? options.minimumTrustedExternalEvaluations;
+    if (
+      minimumTrustedExternalPairs !== undefined &&
+      (!Number.isInteger(minimumTrustedExternalPairs) || minimumTrustedExternalPairs < 0)
+    ) {
+      throw new Error("minimumTrustedExternalPairs must be a non-negative integer");
+    }
+    return this.sendCommand(
+      this.sessionCommand(sessionId, "run_regression_campaign", actorId ?? this.actorId, {
+        candidate_id: candidateId,
+        candidate_files: options.candidateFiles.map((file) => ({ ...file })),
+        ...(options.caseRefs?.length ? { case_refs: [...options.caseRefs] } : {}),
+        ...(options.providerMatrix?.length
+          ? { provider_matrix: [...options.providerMatrix] }
+          : {}),
+        ...(options.seeds?.length ? { seeds: [...options.seeds] } : {}),
+        ...(minimumTrustedExternalPairs !== undefined
+          ? { minimum_trusted_external_pairs: minimumTrustedExternalPairs }
+          : {}),
+      }),
+    );
+  }
+
+  async ingestExternalEvaluation(
+    sessionId: string,
+    record: ExternalEvaluationRecord,
+    actorId?: string,
+  ): Promise<CommandAck> {
+    if (!record.evaluation_id) {
+      throw new Error("external evaluation requires evaluation_id");
+    }
+    return this.sendCommand(
+      this.sessionCommand(sessionId, "ingest_external_evaluation", actorId ?? this.actorId, {
+        record: { ...record },
+      }),
+    );
+  }
+
+  async replay(
+    sessionId: string,
+    taskId: string,
+    capsuleId?: string,
+    actorId?: string,
+  ): Promise<CommandAck> {
+    return this.sendCommand(
+      this.sessionCommand(sessionId, "replay", actorId ?? this.actorId, {
+        task_id: taskId,
+        ...(capsuleId ? { capsule_id: capsuleId } : {}),
       }),
     );
   }

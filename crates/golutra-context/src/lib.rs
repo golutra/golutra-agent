@@ -346,6 +346,70 @@ impl ContextBuilder {
             },
         })
     }
+
+    /// Rebuild a context plan from an already captured provider message list.
+    ///
+    /// Deterministic replay uses this path so assistant/tool metadata is not
+    /// flattened into ordinary contributors before the AgentLoop runs again.
+    pub fn build_from_messages(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+        messages: Vec<ProviderMessage>,
+    ) -> Result<ContextBuildPlan, ContextError> {
+        let planned_input_tokens = estimate_message_tokens(&messages);
+        if planned_input_tokens > self.policy.budget_limit {
+            return Err(ContextError::BudgetExceeded {
+                planned: planned_input_tokens,
+                limit: self.policy.budget_limit,
+            });
+        }
+        let contributor_manifest = messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                let encoded = serde_json::to_vec(message).unwrap_or_default();
+                let estimated_tokens = estimate_message_tokens(std::slice::from_ref(message));
+                ContextContributorSnapshot {
+                    name: format!("replay_message_{index}"),
+                    role: format!("{:?}", message.role).to_lowercase(),
+                    source_refs: vec![format!("replay:provider-message:{index}")],
+                    included: true,
+                    trimmed: false,
+                    original_estimated_tokens: estimated_tokens,
+                    retained_estimated_tokens: estimated_tokens,
+                    strategy: "replay_exact".to_owned(),
+                    estimated_tokens,
+                    content_digest: digest_bytes(&encoded),
+                    redacted_content_ref: None,
+                    invalidation_refs: Vec::new(),
+                }
+            })
+            .collect::<Vec<_>>();
+        Ok(ContextBuildPlan {
+            contributors: (0..messages.len())
+                .map(|index| format!("replay_message_{index}"))
+                .collect(),
+            contributor_manifest,
+            messages,
+            original_planned_input_tokens: planned_input_tokens,
+            trimmed_contributors: Vec::new(),
+            budget_snapshot: TokenBudgetSnapshot {
+                snapshot_id: TokenBudgetSnapshotId::new(),
+                task_id,
+                turn_id,
+                context_window: self.policy.context_window,
+                max_output: self.policy.max_output,
+                reserved_output_tokens: self.policy.max_output,
+                planned_input_tokens,
+                planned_tool_tokens: 0,
+                planned_summary_tokens: 0,
+                budget_limit: self.policy.budget_limit,
+                budget_policy: "deterministic_replay".to_owned(),
+                action_if_exceeded: self.policy.action_if_exceeded,
+            },
+        })
+    }
 }
 
 fn trim_contributors(contributors: &mut [ContextContributor], budget_limit: u64) -> Vec<String> {

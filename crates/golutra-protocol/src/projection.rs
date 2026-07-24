@@ -3,8 +3,9 @@ use golutra_core::{
     RuntimeLane, SessionId, TaskId, TaskStatus, ToolResultEnvelope, VerificationRecord,
 };
 use golutra_eval::{
-    AutomationCandidate, EvaluationResult, ImprovementCandidate, PostTaskReview, PromotionDecision,
-    RegressionResult,
+    AutomationCandidate, CausalComparison, DiagnosticSlice, EvaluationResult,
+    ExternalEvaluationRecord, FailureDiagnosis, ImprovementCandidate, PostTaskReview,
+    PromotionDecision, RegressionResult, ReplayCapsule, ReplayExecution,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -58,6 +59,16 @@ pub struct DebugProjection {
     #[serde(default)]
     pub post_task_jobs: Vec<PostTaskJob>,
     #[serde(default)]
+    pub failure_diagnosis: Option<FailureDiagnosis>,
+    #[serde(default)]
+    pub diagnostic_slice: Option<DiagnosticSlice>,
+    #[serde(default)]
+    pub replay_execution: Option<ReplayExecution>,
+    #[serde(default)]
+    pub external_evaluations: Vec<ExternalEvaluationRecord>,
+    #[serde(default)]
+    pub causal_comparisons: Vec<CausalComparison>,
+    #[serde(default)]
     pub trace_complete: bool,
     #[serde(default)]
     pub missing_sections: Vec<String>,
@@ -99,6 +110,18 @@ pub struct EvaluationProjection {
     pub automation_candidates: Vec<AutomationCandidate>,
     pub regressions: Vec<RegressionResult>,
     pub promotion_decisions: Vec<PromotionDecision>,
+    #[serde(default)]
+    pub failure_diagnoses: Vec<FailureDiagnosis>,
+    #[serde(default)]
+    pub diagnostic_slices: Vec<DiagnosticSlice>,
+    #[serde(default)]
+    pub replay_capsules: Vec<ReplayCapsule>,
+    #[serde(default)]
+    pub replay_executions: Vec<ReplayExecution>,
+    #[serde(default)]
+    pub external_evaluations: Vec<ExternalEvaluationRecord>,
+    #[serde(default)]
+    pub causal_comparisons: Vec<CausalComparison>,
     pub post_task_jobs: Vec<PostTaskJob>,
     pub terminal: bool,
     pub integrity_warnings: Vec<String>,

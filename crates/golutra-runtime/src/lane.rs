@@ -345,6 +345,9 @@ fn lane_event(
     summary: &str,
 ) -> RuntimeEvent {
     RuntimeEvent {
+        schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+        causal_context: Default::default(),
+        causal_links: Vec::new(),
         id: golutra_core::EventId::new(),
         sequence_no,
         session_id: lane.session_id,

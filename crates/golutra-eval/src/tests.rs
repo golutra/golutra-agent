@@ -1,4 +1,4 @@
-use std::fs;
+use std::{collections::BTreeMap, fs};
 
 use chrono::Utc;
 use golutra_core::{
@@ -69,9 +69,12 @@ fn seed_paired_execution(store: &EvaluationStore, candidate_id: &str) {
             baseline_version: "baseline-test".to_owned(),
             environment_recipe: "isolated-test".to_owned(),
             case_refs: vec![case_ref.clone()],
+            case_partitions: BTreeMap::from([(case_ref.clone(), EvaluationPartitionKind::Source)]),
+            required_partitions: vec![EvaluationPartitionKind::Source],
             replay_modes: vec!["live_execution".to_owned()],
             provider_matrix: vec!["mock".to_owned()],
             seeds: vec![1],
+            minimum_trusted_external_pairs: 0,
             resource_budget: "test".to_owned(),
             hard_gates: vec!["paired_trace".to_owned()],
             created_at: Utc::now(),
@@ -88,6 +91,9 @@ fn seed_paired_execution(store: &EvaluationStore, candidate_id: &str) {
                 execution_id: RegressionExecutionId::new(),
                 campaign_id,
                 case_ref: case_ref.clone(),
+                partition: EvaluationPartitionKind::Source,
+                provider_variant: "mock".to_owned(),
+                seed: 1,
                 role,
                 runtime_version: "test".to_owned(),
                 workspace_snapshot_digest: format!("sha256:{role:?}"),
@@ -98,6 +104,71 @@ fn seed_paired_execution(store: &EvaluationStore, candidate_id: &str) {
             })
             .expect("execution");
     }
+}
+
+fn complete_coverage() -> RegressionCoverage {
+    RegressionCoverage {
+        required_partitions: vec![EvaluationPartitionKind::Source],
+        observed_partitions: vec![EvaluationPartitionKind::Source],
+        required_providers: vec!["mock".to_owned()],
+        observed_providers: vec!["mock".to_owned()],
+        required_seeds: vec![1],
+        observed_seeds: vec![1],
+        expected_cells: 1,
+        completed_cells: 1,
+        ..RegressionCoverage::default()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn external_evaluation(
+    task_id: TaskId,
+    evaluation_id: &str,
+    case_id: &str,
+    campaign_id: RegressionCampaignId,
+    candidate_id: &str,
+    role: RegressionExecutionRole,
+    partition: EvaluationPartitionKind,
+    provider_variant: &str,
+    seed: u64,
+    trust: ExternalEvaluationTrust,
+) -> ExternalEvaluationRecord {
+    let mut record = ExternalEvaluationRecord {
+        evaluation_id: evaluation_id.to_owned(),
+        source_task_id: task_id,
+        evaluator_id: "test-evaluator".to_owned(),
+        evaluator_version: "1".to_owned(),
+        harness_id: "test-harness".to_owned(),
+        harness_version: "1".to_owned(),
+        dataset_id: "test-dataset".to_owned(),
+        dataset_version: "1".to_owned(),
+        case_id: case_id.to_owned(),
+        verdict: EvaluationVerdict::Pass,
+        score: Some(if role == RegressionExecutionRole::Candidate {
+            0.9
+        } else {
+            0.8
+        }),
+        score_max: Some(1.0),
+        assertions: Vec::new(),
+        artifact_refs: Vec::new(),
+        partition,
+        seed: Some(seed),
+        provider_variant: Some(provider_variant.to_owned()),
+        holdout_protected: false,
+        comparison_group_id: Some("external-pair".to_owned()),
+        candidate_id: Some(candidate_id.to_owned()),
+        campaign_id: Some(campaign_id),
+        role: Some(role),
+        base_trace_digest: "sha256:base-trace".to_owned(),
+        runtime_identity: "runtime:test".to_owned(),
+        result_digest: String::new(),
+        trust,
+        attestation: None,
+        ingested_at: Utc::now(),
+    };
+    record.result_digest = external_evaluation_result_digest(&record);
+    record
 }
 
 #[test]
@@ -323,9 +394,15 @@ fn regression_requires_a_completed_execution_pair_for_every_campaign_case() {
             baseline_version: "baseline-test".to_owned(),
             environment_recipe: "isolated-test".to_owned(),
             case_refs: case_refs.clone(),
+            case_partitions: case_refs
+                .iter()
+                .map(|case_ref| (case_ref.clone(), EvaluationPartitionKind::Source))
+                .collect(),
+            required_partitions: vec![EvaluationPartitionKind::Source],
             replay_modes: vec!["live_execution".to_owned()],
             provider_matrix: vec!["mock".to_owned()],
             seeds: vec![1],
+            minimum_trusted_external_pairs: 0,
             resource_budget: "test".to_owned(),
             hard_gates: vec!["paired_trace".to_owned()],
             created_at: Utc::now(),
@@ -342,6 +419,9 @@ fn regression_requires_a_completed_execution_pair_for_every_campaign_case() {
                 execution_id: RegressionExecutionId::new(),
                 campaign_id,
                 case_ref: case_refs[0].clone(),
+                partition: EvaluationPartitionKind::Source,
+                provider_variant: "mock".to_owned(),
+                seed: 1,
                 role,
                 runtime_version: "test".to_owned(),
                 workspace_snapshot_digest: format!("sha256:{role:?}"),
@@ -365,7 +445,7 @@ fn regression_requires_a_completed_execution_pair_for_every_campaign_case() {
             .iter()
             .any(|reason| reason.contains(&case_refs[1]))
     );
-    assert_eq!(regression.causal_comparison_refs.len(), 2);
+    assert_eq!(regression.paired_execution_refs.len(), 2);
     assert_eq!(decision.decision, PromotionDecisionKind::NeedsHumanReview);
 }
 
@@ -395,7 +475,13 @@ fn medium_risk_skill_requires_human_review() {
         latency_delta: Some(0),
         quality_delta: Some(0.0),
         security_delta: Some(0.0),
-        causal_comparison_refs: vec!["replay".to_owned()],
+        causal_comparison_refs: Vec::new(),
+        paired_execution_refs: vec![
+            "baseline-execution".to_owned(),
+            "candidate-execution".to_owned(),
+        ],
+        external_evaluation_refs: Vec::new(),
+        coverage: complete_coverage(),
         suite_kind: BenchmarkSuiteKind::Regression,
         case_results: Vec::new(),
         baseline_benchmark_refs: Vec::new(),
@@ -467,10 +553,13 @@ fn governed_promotion_rejects_incomplete_trace_and_control_plane_mutation() {
         latency_delta: Some(0),
         quality_delta: Some(0.0),
         security_delta: Some(0.0),
-        causal_comparison_refs: vec![
+        causal_comparison_refs: vec!["comparison".to_owned()],
+        paired_execution_refs: vec![
             "baseline-execution".to_owned(),
             "candidate-execution".to_owned(),
         ],
+        external_evaluation_refs: Vec::new(),
+        coverage: complete_coverage(),
         suite_kind: BenchmarkSuiteKind::Regression,
         case_results: Vec::new(),
         baseline_benchmark_refs: Vec::new(),
@@ -489,6 +578,10 @@ fn governed_promotion_rejects_incomplete_trace_and_control_plane_mutation() {
                 "baseline-execution".to_owned(),
                 "candidate-execution".to_owned(),
             ],
+            trusted_external_evaluation_refs: Vec::new(),
+            coverage_complete: true,
+            missing_coverage: Vec::new(),
+            holdout_disclosure_violations: Vec::new(),
             candidate_mutates_control_plane: false,
             mutation_reasons: Vec::new(),
         },
@@ -506,6 +599,10 @@ fn governed_promotion_rejects_incomplete_trace_and_control_plane_mutation() {
                 "baseline-execution".to_owned(),
                 "candidate-execution".to_owned(),
             ],
+            trusted_external_evaluation_refs: Vec::new(),
+            coverage_complete: true,
+            missing_coverage: Vec::new(),
+            holdout_disclosure_violations: Vec::new(),
             candidate_mutates_control_plane: true,
             mutation_reasons: vec!["evaluator".to_owned()],
         },
@@ -541,6 +638,247 @@ fn counterfactual_comparison_detects_scaffold_inflation() {
 
     assert!(comparison.scaffold_inflation);
     assert!(comparison.quality_delta.is_some_and(|delta| delta > 0.0));
+}
+
+#[test]
+fn trusted_external_pair_is_compared_and_contributes_campaign_coverage() {
+    let task_id = TaskId::new();
+    let store = EvaluationStore::in_memory();
+    store
+        .record_task_evaluation(
+            EvaluationRunner.evaluate_task(failed_input(task_id, EvidenceId::new())),
+        )
+        .expect("evaluation");
+    let candidate_id = format!("automation-benchmark-{task_id}");
+    let case_ref = store
+        .snapshot()
+        .expect("state")
+        .cases
+        .into_iter()
+        .find(|case| case.source_task_id == Some(task_id))
+        .map(|case| case.case_id)
+        .expect("case");
+    let campaign_id = RegressionCampaignId::new();
+    store
+        .record_regression_campaign(RegressionCampaign {
+            campaign_id,
+            candidate_id: candidate_id.clone(),
+            candidate_digest: "sha256:external-coverage".to_owned(),
+            baseline_version: "baseline-test".to_owned(),
+            environment_recipe: "isolated-test".to_owned(),
+            case_refs: vec![case_ref.clone()],
+            case_partitions: BTreeMap::from([(case_ref.clone(), EvaluationPartitionKind::Source)]),
+            required_partitions: vec![EvaluationPartitionKind::Source],
+            replay_modes: vec!["live_execution".to_owned()],
+            provider_matrix: vec!["external-provider".to_owned(), "mock".to_owned()],
+            seeds: vec![1, 7],
+            minimum_trusted_external_pairs: 2,
+            resource_budget: "test".to_owned(),
+            hard_gates: vec!["paired_trace".to_owned()],
+            created_at: Utc::now(),
+            started_at: Some(Utc::now()),
+            completed_at: Some(Utc::now()),
+        })
+        .expect("campaign");
+    for seed in [1, 7] {
+        for role in [
+            RegressionExecutionRole::Baseline,
+            RegressionExecutionRole::Candidate,
+        ] {
+            store
+                .record_regression_execution(RegressionExecution {
+                    execution_id: RegressionExecutionId::new(),
+                    campaign_id,
+                    case_ref: case_ref.clone(),
+                    partition: EvaluationPartitionKind::Source,
+                    provider_variant: "mock".to_owned(),
+                    seed,
+                    role,
+                    runtime_version: "test".to_owned(),
+                    workspace_snapshot_digest: format!("sha256:{role:?}:{seed}"),
+                    task_trace_ref: Some(format!("runtime://test/{role:?}/{seed}")),
+                    verification_ref: Some(VerificationId::new()),
+                    cost_latency_ref: Some("test".to_owned()),
+                    status: RegressionExecutionStatus::Succeeded,
+                })
+                .expect("execution");
+        }
+    }
+    for seed in [1] {
+        for (evaluation_id, role) in [
+            (
+                format!("external-baseline-{seed}"),
+                RegressionExecutionRole::Baseline,
+            ),
+            (
+                format!("external-candidate-{seed}"),
+                RegressionExecutionRole::Candidate,
+            ),
+        ] {
+            store
+                .record_external_evaluation(external_evaluation(
+                    task_id,
+                    &evaluation_id,
+                    &case_ref,
+                    campaign_id,
+                    &candidate_id,
+                    role,
+                    EvaluationPartitionKind::Source,
+                    "external-provider",
+                    seed,
+                    ExternalEvaluationTrust::OwnerLocal,
+                ))
+                .expect("external evaluation");
+        }
+    }
+
+    let incomplete = store
+        .run_regression(&candidate_id)
+        .expect("partial regression");
+    assert_eq!(incomplete.verdict, RegressionVerdict::NeedsReview);
+    assert_eq!(incomplete.coverage.expected_cells, 4);
+    assert_eq!(incomplete.coverage.completed_cells, 3);
+    assert!(
+        incomplete
+            .coverage
+            .missing_cells
+            .iter()
+            .any(|cell| cell.contains("provider:external-provider|seed:7"))
+    );
+
+    for seed in [7] {
+        for (evaluation_id, role) in [
+            (
+                format!("external-baseline-{seed}"),
+                RegressionExecutionRole::Baseline,
+            ),
+            (
+                format!("external-candidate-{seed}"),
+                RegressionExecutionRole::Candidate,
+            ),
+        ] {
+            store
+                .record_external_evaluation(external_evaluation(
+                    task_id,
+                    &evaluation_id,
+                    &case_ref,
+                    campaign_id,
+                    &candidate_id,
+                    role,
+                    EvaluationPartitionKind::Source,
+                    "external-provider",
+                    seed,
+                    ExternalEvaluationTrust::OwnerLocal,
+                ))
+                .expect("external evaluation");
+        }
+    }
+
+    let regression = store.run_regression(&candidate_id).expect("regression");
+    assert_eq!(regression.verdict, RegressionVerdict::Pass);
+    assert!(regression.coverage.complete());
+    assert_eq!(regression.coverage.expected_cells, 4);
+    assert_eq!(regression.coverage.trusted_external_pairs, 2);
+    assert_eq!(regression.external_evaluation_refs.len(), 4);
+    assert_eq!(regression.causal_comparison_refs.len(), 2);
+    assert_eq!(store.snapshot().expect("state").causal_comparisons.len(), 2);
+}
+
+#[test]
+fn holdout_result_rejects_unsigned_or_detailed_disclosure() {
+    let task_id = TaskId::new();
+    let campaign_id = RegressionCampaignId::new();
+    let store = EvaluationStore::in_memory();
+    let mut record = external_evaluation(
+        task_id,
+        "holdout",
+        "holdout-case",
+        campaign_id,
+        "candidate",
+        RegressionExecutionRole::Candidate,
+        EvaluationPartitionKind::Holdout,
+        "sealed-evaluator",
+        9,
+        ExternalEvaluationTrust::OwnerLocal,
+    );
+    record.holdout_protected = true;
+    record.result_digest = external_evaluation_result_digest(&record);
+
+    assert!(matches!(
+        store.record_external_evaluation(record),
+        Err(EvaluationError::Invariant(_))
+    ));
+}
+
+#[test]
+fn external_evaluation_rejects_partial_association_and_conflicting_identity() {
+    let task_id = TaskId::new();
+    let campaign_id = RegressionCampaignId::new();
+    let store = EvaluationStore::in_memory();
+    let record = external_evaluation(
+        task_id,
+        "external-id",
+        "case-id",
+        campaign_id,
+        "candidate",
+        RegressionExecutionRole::Baseline,
+        EvaluationPartitionKind::Source,
+        "mock",
+        1,
+        ExternalEvaluationTrust::OwnerLocal,
+    );
+
+    let mut partial = record.clone();
+    partial.role = None;
+    partial.result_digest = external_evaluation_result_digest(&partial);
+    assert!(matches!(
+        store.record_external_evaluation(partial),
+        Err(EvaluationError::Invariant(_))
+    ));
+
+    assert!(
+        store
+            .record_external_evaluation(record.clone())
+            .expect("first record")
+    );
+    let mut conflicting = record;
+    conflicting.verdict = EvaluationVerdict::Fail;
+    conflicting.result_digest = external_evaluation_result_digest(&conflicting);
+    assert!(matches!(
+        store.record_external_evaluation(conflicting),
+        Err(EvaluationError::Invariant(_))
+    ));
+}
+
+#[test]
+fn signed_external_evaluation_rejects_obviously_invalid_attestation_metadata() {
+    let task_id = TaskId::new();
+    let campaign_id = RegressionCampaignId::new();
+    let store = EvaluationStore::in_memory();
+    let mut record = external_evaluation(
+        task_id,
+        "signed-invalid",
+        "case-id",
+        campaign_id,
+        "candidate",
+        RegressionExecutionRole::Candidate,
+        EvaluationPartitionKind::Source,
+        "mock",
+        1,
+        ExternalEvaluationTrust::Signed,
+    );
+    record.result_digest = external_evaluation_result_digest(&record);
+    record.attestation = Some(EvaluationAttestation {
+        algorithm: "rsa".to_owned(),
+        key_id: String::new(),
+        signature: String::new(),
+        signed_digest: "sha256:wrong".to_owned(),
+    });
+
+    assert!(matches!(
+        store.record_external_evaluation(record),
+        Err(EvaluationError::Invariant(_))
+    ));
 }
 
 #[test]

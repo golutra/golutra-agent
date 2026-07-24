@@ -20,6 +20,7 @@ use golutra_core::{
     Actor, ActorKind, CommandId, SessionId, TaskId, TaskReconciliationDecision, TaskStatus,
     ThreadId, TraceView, TurnId,
 };
+use golutra_eval::{ExternalEvaluationRecord, external_evaluation_result_digest};
 use golutra_llm::{
     ConfiguredProvider, ProviderGenerationConfig, ProviderHeaderConfig, ProviderHeaderValue,
     ProviderProtocol, ProviderReasoningEffort, provider_protocol_catalog,
@@ -52,6 +53,14 @@ struct Cli {
     connect: Option<String>,
     #[arg(long, global = true, value_name = "UUID")]
     session_id: Option<String>,
+    /// Reopen a completed owner-only `exec --run-dir` bundle for evaluator ingestion.
+    #[arg(
+        long,
+        global = true,
+        value_name = "DIR",
+        conflicts_with_all = ["daemon", "connect"]
+    )]
+    run_bundle: Option<std::path::PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -106,6 +115,25 @@ enum Command {
         #[arg(long)]
         wait_evaluation: bool,
     },
+    /// Show the bounded diagnosis and replay inputs for a completed task.
+    Diagnose {
+        #[arg(long)]
+        task_id: Option<String>,
+    },
+    /// Re-enter AgentLoop with the task's recorded provider/tool artifacts.
+    Replay {
+        #[arg(long)]
+        task_id: Option<String>,
+        #[arg(long)]
+        capsule_id: Option<String>,
+    },
+    /// Compare a deterministic replay with the source task outcome.
+    Compare {
+        #[arg(long)]
+        task_id: Option<String>,
+        #[arg(long)]
+        execution_id: Option<String>,
+    },
     Export {
         #[arg(value_name = "DESTINATION")]
         destination: std::path::PathBuf,
@@ -126,9 +154,15 @@ enum Command {
         #[command(subcommand)]
         command: MemoryCommand,
     },
+    #[command(alias = "evaluation")]
     Eval {
         #[command(subcommand)]
         command: EvalCommand,
+    },
+    /// Run an execution-backed, coverage-gated regression campaign.
+    Campaign {
+        #[command(subcommand)]
+        command: CampaignCommand,
     },
     Evolution {
         #[command(subcommand)]
@@ -536,9 +570,60 @@ enum EvalCommand {
         #[arg(value_name = "JSON_FILE")]
         file: std::path::PathBuf,
     },
+    /// Ingest a grader/evaluator result and bind it to a canonical task trace.
+    Ingest {
+        #[arg(value_name = "JSON_FILE")]
+        file: std::path::PathBuf,
+    },
     CompareCounterfactual {
         group_id: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum CampaignCommand {
+    Run {
+        candidate_id: String,
+        #[arg(long, value_name = "JSON_FILE")]
+        candidate_files: std::path::PathBuf,
+        #[arg(long)]
+        candidate_digest: Option<String>,
+        #[arg(long, value_delimiter = ',')]
+        case_refs: Vec<String>,
+        #[arg(long, value_delimiter = ',', value_enum)]
+        required_partitions: Vec<EvaluationPartitionArg>,
+        #[arg(long, value_delimiter = ',', default_value = "isolated-mock")]
+        provider_matrix: Vec<String>,
+        #[arg(long, value_delimiter = ',', default_value = "0")]
+        seeds: Vec<u64>,
+        #[arg(
+            long,
+            visible_alias = "minimum-trusted-external-evaluations",
+            default_value_t = 0
+        )]
+        minimum_trusted_external_pairs: u32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum EvaluationPartitionArg {
+    Source,
+    Historical,
+    Generated,
+    Holdout,
+    Adversarial,
+}
+
+impl EvaluationPartitionArg {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Historical => "historical",
+            Self::Generated => "generated",
+            Self::Holdout => "holdout",
+            Self::Adversarial => "adversarial",
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -637,18 +722,26 @@ async fn main() -> miette::Result<()> {
         .clone()
         .map_or_else(std::env::current_dir, Ok)
         .map_err(|error| miette::miette!("{error}"))?;
+    let opened_run_bundle = cli.run_bundle.clone();
     let ephemeral_exec =
         matches!(&cli.command, Command::Exec(args) if args.ephemeral || args.run_dir.is_some());
     let run_dir = match &cli.command {
         Command::Exec(args) => args.run_dir.clone(),
         _ => None,
     };
+    if cli.run_bundle.is_some() && !command_allows_persisted_run(&cli.command) {
+        return Err(miette::miette!(
+            "--run-bundle only supports status, trace, diagnose, compare, and eval ingest/results commands"
+        ));
+    }
     if ephemeral_exec && (cli.daemon || cli.connect.is_some()) {
         return Err(miette::miette!(
             "exec --ephemeral or --run-dir cannot be combined with --daemon or --connect"
         ));
     }
-    let transport = if let Some(state_dir) = run_dir.as_ref() {
+    let transport = if let Some(run_bundle) = cli.run_bundle.as_ref() {
+        RuntimeTransport::open_persisted_run(run_bundle).await
+    } else if let Some(state_dir) = run_dir.as_ref() {
         RuntimeTransport::ephemeral_persistent_for_cwd(&cwd, state_dir).await
     } else if ephemeral_exec {
         RuntimeTransport::ephemeral_for_cwd(&cwd).await
@@ -888,6 +981,108 @@ async fn main() -> miette::Result<()> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&trace).unwrap_or_default()
+            );
+        }
+        Command::Diagnose { task_id } => {
+            let task_id = resolve_cli_task_id(&transport, session_id, task_id.as_deref()).await?;
+            let projection = query_task_evaluation(&transport, session_id, task_id).await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "task_id": task_id,
+                    "failure_diagnoses": projection
+                        .get("failure_diagnoses")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!([])),
+                    "diagnostic_slices": projection
+                        .get("diagnostic_slices")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!([])),
+                    "replay_capsules": projection
+                        .get("replay_capsules")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!([])),
+                    "external_evaluations": projection
+                        .get("external_evaluations")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!([])),
+                    "integrity_warnings": projection
+                        .get("integrity_warnings")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!([])),
+                }))
+                .unwrap_or_default()
+            );
+        }
+        Command::Replay {
+            task_id,
+            capsule_id,
+        } => {
+            let task_id = resolve_cli_task_id(&transport, session_id, task_id.as_deref()).await?;
+            let ack = transport
+                .send_command(command(
+                    session_id,
+                    SessionCommandKind::Replay,
+                    serde_json::json!({
+                        "task_id": task_id,
+                        "capsule_id": capsule_id,
+                    }),
+                ))
+                .await
+                .map_err(|error| miette::miette!("{error}"))?;
+            if !ack.accepted {
+                return Err(miette::miette!(
+                    "replay was rejected: {}",
+                    ack.reason.unwrap_or_else(|| "unknown reason".to_owned())
+                ));
+            }
+            let projection = query_task_evaluation(&transport, session_id, task_id).await?;
+            let execution = projection
+                .get("replay_executions")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|executions| executions.last())
+                .cloned()
+                .ok_or_else(|| miette::miette!("replay completed without a durable result"))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&execution).unwrap_or_default()
+            );
+        }
+        Command::Compare {
+            task_id,
+            execution_id,
+        } => {
+            let task_id = resolve_cli_task_id(&transport, session_id, task_id.as_deref()).await?;
+            let projection = query_task_evaluation(&transport, session_id, task_id).await?;
+            let executions = projection
+                .get("replay_executions")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let execution = executions
+                .iter()
+                .rev()
+                .find(|execution| {
+                    execution_id.as_deref().is_none_or(|execution_id| {
+                        execution
+                            .get("execution_id")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(execution_id)
+                    })
+                })
+                .cloned()
+                .ok_or_else(|| miette::miette!("no matching replay execution was found"))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "task_id": task_id,
+                    "replay": execution,
+                    "external_evaluations": projection
+                        .get("external_evaluations")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!([])),
+                }))
+                .unwrap_or_default()
             );
         }
         Command::Export {
@@ -1502,6 +1697,86 @@ async fn main() -> miette::Result<()> {
                 )
                 .await?;
             }
+            EvalCommand::Ingest { file } => {
+                let content = std::fs::read_to_string(&file).map_err(|error| {
+                    miette::miette!(
+                        "failed to read external evaluation {}: {error}",
+                        file.display()
+                    )
+                })?;
+                let mut value: serde_json::Value = serde_json::from_str(&content)
+                    .map_err(|error| miette::miette!("evaluation JSON is invalid: {error}"))?;
+                let task_id = value
+                    .get("source_task_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(parse_task_id)
+                    .transpose()?
+                    .ok_or_else(|| {
+                        miette::miette!("external evaluation source_task_id is required")
+                    })?;
+                let trace = transport
+                    .complete_task_trace(TaskTraceRequest {
+                        session_id,
+                        task_id,
+                        view: TraceView::Full,
+                        cursor: None,
+                        limit: 512,
+                        wait_for_evaluation: true,
+                    })
+                    .await
+                    .map_err(|error| miette::miette!("{error}"))?;
+                if value
+                    .get("base_trace_digest")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|value| value.is_empty() || value == "auto")
+                {
+                    value["base_trace_digest"] =
+                        serde_json::Value::String(trace.integrity.event_chain_digest);
+                }
+                if value
+                    .get("runtime_identity")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|value| value.is_empty() || value == "auto")
+                {
+                    value["runtime_identity"] = serde_json::Value::String(trace.runtime_identity);
+                }
+                if value.get("trust").is_none() {
+                    value["trust"] = serde_json::Value::String("owner_local".to_owned());
+                }
+                value["ingested_at"] = serde_json::Value::String(chrono::Utc::now().to_rfc3339());
+                if value.get("result_digest").is_none() {
+                    value["result_digest"] = serde_json::Value::String(String::new());
+                }
+                let mut record: ExternalEvaluationRecord = serde_json::from_value(value)
+                    .map_err(|error| miette::miette!("evaluation record is invalid: {error}"))?;
+                if record.result_digest.is_empty() || record.result_digest == "auto" {
+                    record.result_digest = external_evaluation_result_digest(&record);
+                }
+                print_command_ack(
+                    &transport,
+                    command(
+                        session_id,
+                        SessionCommandKind::IngestExternalEvaluation,
+                        serde_json::json!({"record": record}),
+                    ),
+                )
+                .await?;
+                if let Some(destination) = opened_run_bundle.as_ref() {
+                    let receipt = RunBundleExporter::new(&transport)
+                        .refresh(destination)
+                        .await
+                        .map_err(|error| {
+                            miette::miette!(
+                                "external evaluation was ingested but run bundle refresh failed: {error}"
+                            )
+                        })?;
+                    eprintln!(
+                        "golutra run bundle observations refreshed at {}; complete: {}",
+                        destination.display(),
+                        receipt.complete
+                    );
+                }
+            }
             EvalCommand::CompareCounterfactual { group_id } => {
                 print_command_ack(
                     &transport,
@@ -1509,6 +1784,41 @@ async fn main() -> miette::Result<()> {
                         session_id,
                         SessionCommandKind::CompareCounterfactual,
                         serde_json::json!({"group_id": group_id}),
+                    ),
+                )
+                .await?;
+            }
+        },
+        Command::Campaign { command: campaign } => match campaign {
+            CampaignCommand::Run {
+                candidate_id,
+                candidate_files,
+                candidate_digest,
+                case_refs,
+                required_partitions,
+                provider_matrix,
+                seeds,
+                minimum_trusted_external_pairs,
+            } => {
+                let files = read_candidate_files(&candidate_files)?;
+                print_command_ack(
+                    &transport,
+                    command(
+                        session_id,
+                        SessionCommandKind::RunRegressionCampaign,
+                        serde_json::json!({
+                            "candidate_id": candidate_id,
+                            "candidate_files": files,
+                            "candidate_digest": candidate_digest,
+                            "case_refs": case_refs,
+                            "required_partitions": required_partitions
+                                .into_iter()
+                                .map(EvaluationPartitionArg::as_str)
+                                .collect::<Vec<_>>(),
+                            "provider_matrix": provider_matrix,
+                            "seeds": seeds,
+                            "minimum_trusted_external_pairs": minimum_trusted_external_pairs,
+                        }),
                     ),
                 )
                 .await?;
@@ -1688,6 +1998,23 @@ async fn main() -> miette::Result<()> {
     Ok(())
 }
 
+fn command_allows_persisted_run(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Status
+            | Command::Trace { .. }
+            | Command::Diagnose { .. }
+            | Command::Compare { .. }
+            | Command::Eval {
+                command: EvalCommand::Results
+                    | EvalCommand::Improvements
+                    | EvalCommand::Candidates
+                    | EvalCommand::Ingest { .. }
+                    | EvalCommand::CompareCounterfactual { .. },
+            }
+    )
+}
+
 async fn print_runtime_query(
     transport: &RuntimeTransport,
     session_id: SessionId,
@@ -1710,6 +2037,53 @@ async fn print_runtime_query(
         serde_json::to_string_pretty(&value).unwrap_or_default()
     );
     Ok(())
+}
+
+async fn resolve_cli_task_id(
+    transport: &RuntimeTransport,
+    session_id: SessionId,
+    value: Option<&str>,
+) -> miette::Result<TaskId> {
+    if let Some(value) = value {
+        return parse_task_id(value);
+    }
+    let state = transport
+        .query(RuntimeQuery {
+            query_id: golutra_core::QueryId::new(),
+            session_id,
+            task_id: None,
+            kind: RuntimeQueryKind::SessionState,
+            requester: ActorKind::Cli,
+            cursor: None,
+            timestamp: chrono::Utc::now(),
+        })
+        .await
+        .map_err(|error| miette::miette!("{error}"))?;
+    state
+        .get("active_task_id")
+        .and_then(serde_json::Value::as_str)
+        .map(parse_task_id)
+        .transpose()?
+        .ok_or_else(|| miette::miette!("an explicit task_id is required"))
+}
+
+async fn query_task_evaluation(
+    transport: &RuntimeTransport,
+    session_id: SessionId,
+    task_id: TaskId,
+) -> miette::Result<serde_json::Value> {
+    transport
+        .query(RuntimeQuery {
+            query_id: golutra_core::QueryId::new(),
+            session_id,
+            task_id: Some(task_id),
+            kind: RuntimeQueryKind::EvaluationProjection,
+            requester: ActorKind::Cli,
+            cursor: None,
+            timestamp: chrono::Utc::now(),
+        })
+        .await
+        .map_err(|error| miette::miette!("{error}"))
 }
 
 async fn print_command_ack(
@@ -2004,6 +2378,16 @@ fn parse_turn_id(value: &str) -> miette::Result<TurnId> {
     value
         .parse()
         .map_err(|error: uuid::Error| miette::miette!("invalid turn id: {error}"))
+}
+
+fn read_candidate_files(
+    path: &std::path::Path,
+) -> miette::Result<serde_json::Map<String, serde_json::Value>> {
+    let content = std::fs::read_to_string(path).map_err(|error| {
+        miette::miette!("failed to read candidate files {}: {error}", path.display())
+    })?;
+    serde_json::from_str(&content)
+        .map_err(|error| miette::miette!("candidate files JSON is invalid: {error}"))
 }
 
 fn parse_task_id(value: &str) -> miette::Result<TaskId> {

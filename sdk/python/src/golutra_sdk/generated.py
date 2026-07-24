@@ -232,6 +232,19 @@ class BudgetState(TypedDict, total=False):
     planned_input_tokens: NotRequired[int | None]
     total_tokens: NotRequired[int | None]
 
+class BuildProvenance(TypedDict, total=False):
+    binary_checksum: NotRequired[str | None]
+    cargo_lock_digest: NotRequired[str | None]
+    dirty: Required[bool]
+    features: Required[list[str]]
+    git_commit: NotRequired[str | None]
+    package_version: Required[str]
+    profile: Required[str]
+    rustc_version: Required[str]
+    schema_version: Required[int]
+    source_digest: NotRequired[str | None]
+    target: Required[str]
+
 BusyPolicy: TypeAlias = Literal['append', 'inject', 'interrupt', 'reject']
 
 class BusyPolicyDecision(TypedDict, total=False):
@@ -257,16 +270,52 @@ class CapabilityFrontier(TypedDict, total=False):
     unstable_skills: Required[list[str]]
 
 class CausalComparison(TypedDict, total=False):
+    baseline_evaluation_ref: NotRequired[str | None]
+    candidate_evaluation_ref: NotRequired[str | None]
     comparison_id: Required[str]
     conclusion: Required[str]
     cost_delta_usd: NotRequired[float | None]
     latency_delta_ms: NotRequired[int | None]
+    partition: NotRequired[EvaluationPartitionKind | None]
+    provider_variant: NotRequired[str | None]
     quality_delta: NotRequired[float | None]
     replay_id: Required[str]
     scaffold_inflation: Required[bool]
     security_delta: NotRequired[float | None]
+    seed: NotRequired[int | None]
     token_delta: NotRequired[int | None]
     utility_delta: NotRequired[float | None]
+
+class CausalContext(TypedDict, total=False):
+    candidate_id: NotRequired[str | None]
+    provider_request_id: NotRequired[str | None]
+    provider_response_id: NotRequired[str | None]
+    provider_round_id: NotRequired[str | None]
+    provider_tool_call_id: NotRequired[str | None]
+    regression_campaign_id: NotRequired[str | None]
+    run_id: NotRequired[str | None]
+    session_id: NotRequired[str | None]
+    step_id: NotRequired[str | None]
+    step_no: NotRequired[int | None]
+    task_id: NotRequired[str | None]
+    tool_call_id: NotRequired[str | None]
+    turn_id: NotRequired[str | None]
+    verification_id: NotRequired[str | None]
+    workspace_id: NotRequired[str | None]
+
+class CausalLink(TypedDict, total=False):
+    event_id: Required[str]
+    relation: Required[CausalRelation]
+
+CausalRelation: TypeAlias = Literal['parent', 'triggered_by', 'responds_to', 'derived_from', 'verifies', 'compares', 'supersedes']
+
+class CodeTargetRef(TypedDict, total=False):
+    crate_name: Required[str]
+    module_path: Required[str]
+    owner: Required[str]
+    source_digest: NotRequired[str | None]
+    source_path: NotRequired[str | None]
+    symbol: NotRequired[str | None]
 
 class CommandAck(TypedDict, total=False):
     accepted: Required[bool]
@@ -357,18 +406,34 @@ class DebugEventWindow(TypedDict, total=False):
 class DebugProjection(TypedDict, total=False):
     artifacts: Required[list[ArtifactRecord]]
     busy_policy_decisions: Required[list[BusyPolicyDecision]]
+    causal_comparisons: NotRequired[list[CausalComparison]]
+    diagnostic_slice: NotRequired[DiagnosticSlice | None]
     event_window: Required[DebugEventWindow]
     events: Required[list[RuntimeEvent]]
     evidence: Required[list[EvidenceRecord]]
+    external_evaluations: NotRequired[list[ExternalEvaluationRecord]]
+    failure_diagnosis: NotRequired[FailureDiagnosis | None]
     loop_decisions: Required[list[LoopDecision]]
     missing_sections: NotRequired[list[str]]
     post_task_jobs: NotRequired[list[PostTaskJob]]
+    replay_execution: NotRequired[ReplayExecution | None]
     retention_losses: NotRequired[list[str]]
     session_id: Required[str]
     task_id: NotRequired[str | None]
     tool_results: Required[list[ToolResultEnvelope]]
     trace_complete: NotRequired[bool]
     verification: NotRequired[VerificationRecord | None]
+
+class DiagnosticSlice(TypedDict, total=False):
+    artifact_refs: Required[list[str]]
+    complete: Required[bool]
+    diagnosis: Required[FailureDiagnosis]
+    event_refs: Required[list[str]]
+    evidence_refs: Required[list[str]]
+    generated_at: Required[str]
+    omitted_event_count: Required[int]
+    slice_id: Required[str]
+    source_task_id: Required[str]
 
 DriverControllerMode: TypeAlias = Literal['controller', 'observer']
 
@@ -628,6 +693,12 @@ class EnvironmentRecipe(TypedDict, total=False):
     replay_seed: Required[str]
     repo_ref: Required[str]
 
+class EvaluationAttestation(TypedDict, total=False):
+    algorithm: Required[str]
+    key_id: Required[str]
+    signature: Required[str]
+    signed_digest: Required[str]
+
 class EvaluationCase(TypedDict, total=False):
     case_id: Required[str]
     expected_outcome: Required[str]
@@ -641,13 +712,21 @@ class EvaluationCase(TypedDict, total=False):
     tags: Required[list[str]]
     task_type: Required[str]
 
+EvaluationPartitionKind: TypeAlias = Literal['source', 'historical', 'generated', 'holdout', 'adversarial']
+
 class EvaluationProjection(TypedDict, total=False):
     automation_candidates: Required[list[AutomationCandidate]]
+    causal_comparisons: NotRequired[list[CausalComparison]]
+    diagnostic_slices: NotRequired[list[DiagnosticSlice]]
+    external_evaluations: NotRequired[list[ExternalEvaluationRecord]]
+    failure_diagnoses: NotRequired[list[FailureDiagnosis]]
     improvement_candidates: Required[list[ImprovementCandidate]]
     integrity_warnings: Required[list[str]]
     post_task_jobs: Required[list[PostTaskJob]]
     promotion_decisions: Required[list[PromotionDecision]]
     regressions: Required[list[RegressionResult]]
+    replay_capsules: NotRequired[list[ReplayCapsule]]
+    replay_executions: NotRequired[list[ReplayExecution]]
     results: Required[list[EvaluationResult]]
     reviews: Required[list[PostTaskReview]]
     session_id: Required[str]
@@ -732,6 +811,45 @@ class EvolutionState(TypedDict, total=False):
     runs: Required[list[OpenEndedRun]]
     skills: Required[list[SkillLifecycleRecord]]
 
+class ExternalEvaluationAssertion(TypedDict, total=False):
+    assertion_id: Required[str]
+    evidence_refs: Required[list[str]]
+    message: Required[str]
+    name: Required[str]
+    passed: Required[bool]
+
+class ExternalEvaluationRecord(TypedDict, total=False):
+    artifact_refs: Required[list[str]]
+    assertions: Required[list[ExternalEvaluationAssertion]]
+    attestation: NotRequired[EvaluationAttestation | None]
+    base_trace_digest: Required[str]
+    campaign_id: NotRequired[str | None]
+    candidate_id: NotRequired[str | None]
+    case_id: Required[str]
+    comparison_group_id: NotRequired[str | None]
+    dataset_id: Required[str]
+    dataset_version: Required[str]
+    evaluation_id: Required[str]
+    evaluator_id: Required[str]
+    evaluator_version: Required[str]
+    harness_id: Required[str]
+    harness_version: Required[str]
+    holdout_protected: NotRequired[bool]
+    ingested_at: Required[str]
+    partition: NotRequired[EvaluationPartitionKind]
+    provider_variant: NotRequired[str | None]
+    result_digest: Required[str]
+    role: NotRequired[RegressionExecutionRole | None]
+    runtime_identity: Required[str]
+    score: NotRequired[float | None]
+    score_max: NotRequired[float | None]
+    seed: NotRequired[int | None]
+    source_task_id: Required[str]
+    trust: Required[ExternalEvaluationTrust]
+    verdict: Required[EvaluationVerdict]
+
+ExternalEvaluationTrust: TypeAlias = Literal['untrusted_local', 'owner_local', 'signed']
+
 class ExternalVerificationSpec(TypedDict, total=False):
     args: NotRequired[list[str]]
     cwd: NotRequired[str]
@@ -739,6 +857,28 @@ class ExternalVerificationSpec(TypedDict, total=False):
     max_output_bytes: NotRequired[int]
     program: Required[str]
     timeout_ms: NotRequired[int]
+
+class FailureDiagnosis(TypedDict, total=False):
+    actual_behavior: Required[str]
+    analyzer_version: Required[str]
+    causal_event_refs: Required[list[str]]
+    code_targets: Required[list[CodeTargetRef]]
+    confidence: Required[int]
+    counterfactual: Required[str]
+    created_at: Required[str]
+    diagnosis_id: Required[str]
+    expected_behavior: Required[str]
+    regression_commands: Required[list[str]]
+    source_task_id: Required[str]
+    summary: Required[str]
+    taxonomy: Required[FailureTaxonomy]
+    trigger_event_refs: Required[list[str]]
+
+FailureDomain: TypeAlias = Literal['runtime_control_flow', 'context', 'provider', 'tool', 'policy', 'verification', 'memory', 'external_evaluation', 'unknown']
+
+class FailureTaxonomy(TypedDict, total=False):
+    code: Required[str]
+    domain: Required[FailureDomain]
 
 class GeneratedTask(TypedDict, total=False):
     difficulty_score: NotRequired[float | None]
@@ -970,13 +1110,16 @@ class RegressionCampaign(TypedDict, total=False):
     campaign_id: Required[str]
     candidate_digest: Required[str]
     candidate_id: Required[str]
+    case_partitions: NotRequired[dict[str, EvaluationPartitionKind]]
     case_refs: Required[list[str]]
     completed_at: NotRequired[str | None]
     created_at: Required[str]
     environment_recipe: Required[str]
     hard_gates: Required[list[str]]
+    minimum_trusted_external_pairs: NotRequired[int]
     provider_matrix: Required[list[str]]
     replay_modes: Required[list[str]]
+    required_partitions: NotRequired[list[EvaluationPartitionKind]]
     resource_budget: Required[str]
     seeds: Required[list[int]]
     started_at: NotRequired[str | None]
@@ -990,13 +1133,34 @@ class RegressionCaseResult(TypedDict, total=False):
     passed: Required[bool]
     replay_id: Required[str]
 
+class RegressionCoverage(TypedDict, total=False):
+    completed_cells: Required[int]
+    expected_cells: Required[int]
+    holdout_disclosure_violations: Required[list[str]]
+    missing_cells: Required[list[str]]
+    missing_partitions: Required[list[EvaluationPartitionKind]]
+    missing_providers: Required[list[str]]
+    missing_seeds: Required[list[int]]
+    observed_partitions: Required[list[EvaluationPartitionKind]]
+    observed_providers: Required[list[str]]
+    observed_seeds: Required[list[int]]
+    required_partitions: Required[list[EvaluationPartitionKind]]
+    required_providers: Required[list[str]]
+    required_seeds: Required[list[int]]
+    trusted_external_evaluation_refs: Required[list[str]]
+    trusted_external_pairs: NotRequired[int]
+    untrusted_external_evaluation_refs: Required[list[str]]
+
 class RegressionExecution(TypedDict, total=False):
     campaign_id: Required[str]
     case_ref: NotRequired[str]
     cost_latency_ref: NotRequired[str | None]
     execution_id: Required[str]
+    partition: NotRequired[EvaluationPartitionKind]
+    provider_variant: NotRequired[str]
     role: Required[RegressionExecutionRole]
     runtime_version: Required[str]
+    seed: NotRequired[int]
     status: Required[RegressionExecutionStatus]
     task_trace_ref: NotRequired[str | None]
     verification_ref: NotRequired[str | None]
@@ -1016,9 +1180,12 @@ class RegressionResult(TypedDict, total=False):
     cases_run: Required[int]
     causal_comparison_refs: Required[list[str]]
     cost_delta: NotRequired[float | None]
+    coverage: NotRequired[RegressionCoverage]
     created_at: Required[str]
+    external_evaluation_refs: NotRequired[list[str]]
     failed_cases: Required[int]
     latency_delta: NotRequired[int | None]
+    paired_execution_refs: NotRequired[list[str]]
     passed_cases: Required[int]
     quality_delta: NotRequired[float | None]
     regression_id: Required[str]
@@ -1029,19 +1196,86 @@ class RegressionResult(TypedDict, total=False):
 
 RegressionVerdict: TypeAlias = Literal['pass', 'fail', 'needs_review']
 
+class ReplayCapsule(TypedDict, total=False):
+    capsule_id: Required[str]
+    clock_seed: Required[str]
+    complete: Required[bool]
+    created_at: Required[str]
+    event_chain_digest: Required[str]
+    fixture_ref: NotRequired[str | None]
+    limitations: Required[list[str]]
+    missing_inputs: Required[list[str]]
+    mode: Required[ReplayMode]
+    provider_exchanges: Required[list[ReplayProviderExchange]]
+    random_seed: Required[int]
+    runtime_config_digest: Required[str]
+    source_last_sequence_no: NotRequired[int | None]
+    source_run_id: Required[str]
+    source_task_id: Required[str]
+    tool_results: Required[list[ReplayToolResult]]
+
+class ReplayExecution(TypedDict, total=False):
+    capsule_id: Required[str]
+    completed_at: Required[str]
+    execution_id: Required[str]
+    expected_loop_action: NotRequired[LoopAction | None]
+    expected_verification: NotRequired[VerificationResult | None]
+    mismatches: Required[list[str]]
+    mode: Required[ReplayMode]
+    observed_loop_action: NotRequired[LoopAction | None]
+    observed_verification: NotRequired[VerificationResult | None]
+    provider_exchanges_consumed: Required[int]
+    provider_exchanges_total: Required[int]
+    source_task_id: Required[str]
+    started_at: Required[str]
+    status: Required[ReplayExecutionStatus]
+    tool_results_consumed: Required[int]
+    tool_results_total: Required[int]
+
+ReplayExecutionStatus: TypeAlias = Literal['matched', 'diverged', 'incomplete', 'failed']
+
+ReplayMode: TypeAlias = Literal['projection', 'deterministic_control_flow', 'live_regression']
+
+class ReplayProviderExchange(TypedDict, total=False):
+    request_artifact_ref: Required[str]
+    request_id: Required[str]
+    response_artifact_ref: Required[str]
+    response_id: Required[str]
+
+class ReplayToolResult(TypedDict, total=False):
+    provider_tool_call_id: NotRequired[str | None]
+    result_artifact_ref: Required[str]
+    tool_call_id: Required[str]
+
 ReviewMode: TypeAlias = Literal['minimal', 'deep']
 
 class RowRange(TypedDict, total=False):
     end: Required[int]
     start: Required[int]
 
+class RunProvenance(TypedDict, total=False):
+    build: Required[BuildProvenance]
+    captured_at: Required[str]
+    policy_digest: NotRequired[str | None]
+    provider_config_digest: NotRequired[str | None]
+    run_id: Required[str]
+    runtime_config_digest: NotRequired[str | None]
+    runtime_identity: Required[str]
+    schema_version: Required[int]
+    tool_manifest_digest: NotRequired[str | None]
+    verifier_digest: NotRequired[str | None]
+    workspace_initial_digest: NotRequired[str | None]
+
 class RuntimeEvent(TypedDict, total=False):
+    causal_context: NotRequired[CausalContext]
+    causal_links: NotRequired[list[CausalLink]]
     durable: Required[bool]
     event_type: Required[RuntimeEventType]
     id: Required[str]
     parent_event_id: NotRequired[str | None]
     payload: Required[Any]
     payload_ref: NotRequired[str | None]
+    schema_version: NotRequired[int]
     sequence_no: Required[int]
     session_id: Required[str]
     source: Required[RuntimeEventSource]
@@ -1051,12 +1285,13 @@ class RuntimeEvent(TypedDict, total=False):
 
 RuntimeEventSource: TypeAlias = Literal['runtime', 'provider', 'tool', 'policy', 'verifier', 'memory', 'evaluator', 'governor', 'evolution', 'user']
 
-RuntimeEventType: TypeAlias = Literal['command_received', 'command_completed', 'command_accepted', 'command_rejected', 'session_created', 'thread_forked', 'thread_rebound', 'task_created', 'turn_started', 'step_started', 'step_completed', 'step_checkpointed', 'turn_queued', 'busy_policy_decided', 'controller_changed', 'context_built', 'provider_started', 'provider_streamed', 'provider_completed', 'token_usage_recorded', 'assistant_message', 'tool_started', 'tool_progress', 'tool_completed', 'policy_evaluated', 'verification_completed', 'loop_decided', 'checkpoint_created', 'task_completed', 'task_abort_requested', 'task_aborted', 'task_interrupted', 'task_uncertain', 'task_reconciled', 'task_paused', 'task_resumed', 'approval_requested', 'approval_resolved', 'retry_scheduled', 'provider_fallback', 'provider_transport_fallback', 'provider_auth_required', 'provider_auth_submitted', 'provider_auth_cancelled', 'provider_configured', 'provider_probe_started', 'provider_probe_completed', 'provider_auth_failed', 'provider_rate_limited', 'provider_credential_refreshed', 'loop_guard_triggered', 'compaction_started', 'compaction_completed', 'compaction_failed', 'memory_retrieved', 'memory_promoted', 'memory_promotion_rejected', 'memory_rolled_back', 'memory_feedback_recorded', 'post_task_reviewed', 'evaluation_completed', 'improvement_candidate_created', 'automation_candidate_created', 'regression_completed', 'promotion_decided', 'candidate_applied', 'candidate_rolled_back', 'benchmark_recorded', 'counterfactual_compared', 'evolution_planned', 'evolution_task_started', 'evolution_task_completed', 'evolution_completed', 'skill_staged', 'skill_reviewed', 'skill_installed', 'skill_rolled_back', 'governor_decided', 'storage_maintenance_completed', 'context_snapshot_created', 'post_task_job_queued', 'post_task_job_started', 'post_task_job_completed', 'post_task_job_failed', 'verification_planned', 'verification_assertion_completed', 'regression_campaign_started', 'regression_execution_completed', 'memory_candidate_quarantined', 'memory_activated', 'memory_invalidated']
+RuntimeEventType: TypeAlias = Literal['command_received', 'command_completed', 'command_accepted', 'command_rejected', 'session_created', 'thread_forked', 'thread_rebound', 'task_created', 'turn_started', 'step_started', 'step_completed', 'step_checkpointed', 'turn_queued', 'busy_policy_decided', 'controller_changed', 'context_built', 'provider_started', 'provider_streamed', 'provider_completed', 'provider_failed', 'token_usage_recorded', 'assistant_message', 'tool_started', 'tool_progress', 'tool_completed', 'policy_evaluated', 'verification_completed', 'loop_decided', 'checkpoint_created', 'task_completed', 'task_abort_requested', 'task_aborted', 'task_interrupted', 'task_uncertain', 'task_reconciled', 'task_paused', 'task_resumed', 'approval_requested', 'approval_resolved', 'retry_scheduled', 'provider_fallback', 'provider_transport_fallback', 'provider_auth_required', 'provider_auth_submitted', 'provider_auth_cancelled', 'provider_configured', 'provider_probe_started', 'provider_probe_completed', 'provider_auth_failed', 'provider_rate_limited', 'provider_credential_refreshed', 'loop_guard_triggered', 'compaction_started', 'compaction_completed', 'compaction_failed', 'memory_retrieved', 'memory_promoted', 'memory_promotion_rejected', 'memory_rolled_back', 'memory_feedback_recorded', 'post_task_reviewed', 'evaluation_completed', 'improvement_candidate_created', 'automation_candidate_created', 'regression_completed', 'promotion_decided', 'candidate_applied', 'candidate_rolled_back', 'benchmark_recorded', 'counterfactual_compared', 'evolution_planned', 'evolution_task_started', 'evolution_task_completed', 'evolution_completed', 'skill_staged', 'skill_reviewed', 'skill_installed', 'skill_rolled_back', 'governor_decided', 'storage_maintenance_completed', 'context_snapshot_created', 'post_task_job_queued', 'post_task_job_started', 'post_task_job_completed', 'post_task_job_failed', 'verification_planned', 'verification_assertion_completed', 'regression_campaign_started', 'regression_execution_completed', 'memory_candidate_quarantined', 'memory_activated', 'memory_invalidated', 'failure_diagnosed', 'diagnostic_slice_created', 'replay_capsule_created', 'replay_executed', 'external_evaluation_ingested', 'external_evaluation_compared']
 
 class RuntimeGovernorDecision(TypedDict, total=False):
     action: Required[GovernorAction]
     alignment: Required[GoalAlignmentCheck]
     budget_risk: Required[str]
+    consecutive_failed_tool_calls: Required[int]
     failed_tool_calls: Required[int]
     iteration: Required[int]
     phase: Required[GovernorPhase]
@@ -1104,7 +1339,7 @@ class SessionCommand(TypedDict, total=False):
     session_id: NotRequired[str | None]
     timestamp: Required[str]
 
-SessionCommandKind: TypeAlias = Literal['create', 'prompt', 'approve', 'deny', 'pause', 'resume', 'abort', 'reconcile_task', 'takeover', 'compact', 'memory_rollback', 'memory_feedback', 'run_regression', 'review_candidate', 'apply_candidate', 'rollback_candidate', 'record_benchmark', 'compare_counterfactual', 'plan_evolution', 'run_evolution', 'stage_skill', 'review_skill', 'install_skill', 'rollback_skill', 'provider_configured', 'provider_auth_submitted', 'provider_auth_cancelled', 'run_storage_maintenance', 'wait_post_task_job', 'retry_post_task_job', 'run_regression_campaign', 'review_memory_candidate', 'expire_memory', 'verify', 'replay', 'export']
+SessionCommandKind: TypeAlias = Literal['create', 'prompt', 'approve', 'deny', 'pause', 'resume', 'abort', 'reconcile_task', 'takeover', 'compact', 'memory_rollback', 'memory_feedback', 'run_regression', 'review_candidate', 'apply_candidate', 'rollback_candidate', 'record_benchmark', 'ingest_external_evaluation', 'compare_counterfactual', 'plan_evolution', 'run_evolution', 'stage_skill', 'review_skill', 'install_skill', 'rollback_skill', 'provider_configured', 'provider_auth_submitted', 'provider_auth_cancelled', 'run_storage_maintenance', 'wait_post_task_job', 'retry_post_task_job', 'run_regression_campaign', 'review_memory_candidate', 'expire_memory', 'verify', 'replay', 'export']
 
 class SessionCursor(TypedDict, total=False):
     recency_at: Required[str]
@@ -1264,6 +1499,7 @@ class TaskTracePage(TypedDict, total=False):
     integrity: Required[TraceIntegrity]
     next_cursor: NotRequired[int | None]
     post_task_jobs: Required[list[PostTaskJob]]
+    run_provenance: NotRequired[RunProvenance | None]
     runtime_identity: Required[str]
     session_id: Required[str]
     task_id: Required[str]
@@ -1308,12 +1544,18 @@ class ToolResultEnvelope(TypedDict, total=False):
 ToolResultStatus: TypeAlias = Literal['ok', 'error', 'blocked', 'cancelled', 'timeout']
 
 class TraceIntegrity(TypedDict, total=False):
+    artifact_checksum_failures: NotRequired[list[str]]
+    broken_lifecycle_pairs: NotRequired[list[str]]
     complete: Required[bool]
     event_chain_digest: Required[str]
     event_count: Required[int]
+    external_overlay_failures: NotRequired[list[str]]
     first_sequence: NotRequired[int | None]
     last_sequence: NotRequired[int | None]
+    missing_causal_links: NotRequired[list[str]]
     missing_sections: Required[list[str]]
+    orphan_events: NotRequired[list[str]]
+    provenance_mismatches: NotRequired[list[str]]
     redacted_fields: Required[list[str]]
     retention_losses: Required[list[str]]
     unresolved_refs: Required[list[str]]
@@ -1513,12 +1755,17 @@ __all__ = [
     "BenchmarkSuiteKind",
     "BudgetOverflowAction",
     "BudgetState",
+    "BuildProvenance",
     "BusyPolicy",
     "BusyPolicyDecision",
     "CandidateRisk",
     "CandidateStatus",
     "CapabilityFrontier",
     "CausalComparison",
+    "CausalContext",
+    "CausalLink",
+    "CausalRelation",
+    "CodeTargetRef",
     "CommandAck",
     "ContextContributorSnapshot",
     "ContextMessageSnapshot",
@@ -1529,6 +1776,7 @@ __all__ = [
     "CurriculumItem",
     "DebugEventWindow",
     "DebugProjection",
+    "DiagnosticSlice",
     "DriverControllerMode",
     "DriverEnvelope",
     "DriverEnvelopeAbort",
@@ -1571,7 +1819,9 @@ __all__ = [
     "DriverState",
     "DriverTaskStatus",
     "EnvironmentRecipe",
+    "EvaluationAttestation",
     "EvaluationCase",
+    "EvaluationPartitionKind",
     "EvaluationProjection",
     "EvaluationResult",
     "EvaluationRun",
@@ -1583,7 +1833,13 @@ __all__ = [
     "EvidenceRecord",
     "EvidenceStrength",
     "EvolutionState",
+    "ExternalEvaluationAssertion",
+    "ExternalEvaluationRecord",
+    "ExternalEvaluationTrust",
     "ExternalVerificationSpec",
+    "FailureDiagnosis",
+    "FailureDomain",
+    "FailureTaxonomy",
     "GeneratedTask",
     "GeneratedTaskExecution",
     "GoalAlignmentCheck",
@@ -1617,13 +1873,21 @@ __all__ = [
     "RedactionStatus",
     "RegressionCampaign",
     "RegressionCaseResult",
+    "RegressionCoverage",
     "RegressionExecution",
     "RegressionExecutionRole",
     "RegressionExecutionStatus",
     "RegressionResult",
     "RegressionVerdict",
+    "ReplayCapsule",
+    "ReplayExecution",
+    "ReplayExecutionStatus",
+    "ReplayMode",
+    "ReplayProviderExchange",
+    "ReplayToolResult",
     "ReviewMode",
     "RowRange",
+    "RunProvenance",
     "RuntimeEvent",
     "RuntimeEventSource",
     "RuntimeEventType",

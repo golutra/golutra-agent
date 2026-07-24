@@ -3,14 +3,15 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 use golutra_context::{ContextBudgetPolicy, ContextBuilder, ContextContributor, estimate_tokens};
 use golutra_core::{
-    Actor, ActorKind, BudgetOverflowAction, BusyPolicy, TaskStatus, ToolCallId, WorkspaceId,
+    Actor, ActorKind, BudgetOverflowAction, BusyPolicy, PolicyBlockDisposition, TaskStatus,
+    ToolCallId, WorkspaceId,
 };
 use golutra_governor::GovernorLimits;
 use golutra_llm::{
@@ -34,6 +35,7 @@ fn runtime_observation_sink_accepts_a_function_adapter() {
         &mut sink,
         RuntimeObservation::ToolStarted {
             tool_call_id: ToolCallId::new(),
+            provider_tool_call_id: None,
             tool_name: "read_file".to_owned(),
             display_arguments: json!({"path": "README.md"}),
         },
@@ -43,6 +45,36 @@ fn runtime_observation_sink_accepts_a_function_adapter() {
         observed.as_slice(),
         [RuntimeObservation::ToolStarted { tool_name, .. }] if tool_name == "read_file"
     ));
+}
+
+#[test]
+fn successful_tool_result_resets_only_the_consecutive_failure_count() {
+    let mut total = 7;
+    let mut consecutive = 3;
+
+    update_tool_failure_counts(ToolResultStatus::Ok, &mut total, &mut consecutive);
+    assert_eq!(total, 7);
+    assert_eq!(consecutive, 0);
+
+    update_tool_failure_counts(ToolResultStatus::Error, &mut total, &mut consecutive);
+    assert_eq!(total, 8);
+    assert_eq!(consecutive, 1);
+}
+
+#[test]
+fn duplicate_failures_in_one_provider_round_count_as_one_retry() {
+    let failed = HashSet::from(["shell:{\"command\":\"git\"}".to_owned()]);
+    let mut signature = None;
+    let mut count = 0;
+
+    update_repeated_failure_streak(&failed, &mut signature, &mut count);
+    assert_eq!(count, 1);
+    update_repeated_failure_streak(&failed, &mut signature, &mut count);
+    assert_eq!(count, 2);
+
+    update_repeated_failure_streak(&HashSet::new(), &mut signature, &mut count);
+    assert_eq!(signature, None);
+    assert_eq!(count, 0);
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +93,182 @@ struct SixRoundProvider {
 struct SupportThenDeliveryProvider {
     calls: Arc<AtomicUsize>,
     contract: golutra_core::ProviderContract,
+}
+
+#[derive(Debug, Clone)]
+struct ValidationGateProvider {
+    calls: Arc<AtomicUsize>,
+    saw_nudge: Arc<AtomicBool>,
+    contract: golutra_core::ProviderContract,
+}
+
+#[derive(Debug, Clone)]
+struct DuplicateFailureRecoveryProvider {
+    calls: Arc<AtomicUsize>,
+    saw_duplicate_results: Arc<AtomicBool>,
+    contract: golutra_core::ProviderContract,
+}
+
+#[async_trait]
+impl LlmProvider for ValidationGateProvider {
+    async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let usage = ProviderUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            reasoning_tokens: None,
+            cached_input_tokens: None,
+            total_tokens: Some(15),
+            usage_source: UsageSource::Estimated,
+            raw: json!({"round": call}),
+        };
+        let (message, tool_calls, finish_reason) = match call {
+            0 => (
+                None,
+                vec![ProviderToolCall {
+                    tool_call_id: "write-result".to_owned(),
+                    tool_name: "write_file".to_owned(),
+                    arguments: json!({"path": "recovered.txt", "content": "source bytes"}),
+                }],
+                ProviderFinishReason::ToolCalls,
+            ),
+            1 => (
+                Some(ProviderMessage {
+                    role: ProviderRole::Assistant,
+                    content: "recovery complete".to_owned(),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: Vec::new(),
+                    metadata: Default::default(),
+                }),
+                Vec::new(),
+                ProviderFinishReason::Stop,
+            ),
+            2 => {
+                self.saw_nudge.store(
+                    request.messages.iter().any(|message| {
+                        message.role == ProviderRole::User
+                            && message
+                                .content
+                                .contains("Runtime verification is still missing")
+                    }),
+                    Ordering::SeqCst,
+                );
+                (
+                    None,
+                    vec![ProviderToolCall {
+                        tool_call_id: "compare-result".to_owned(),
+                        tool_name: "shell".to_owned(),
+                        arguments: json!({"command": "cmp source.txt recovered.txt"}),
+                    }],
+                    ProviderFinishReason::ToolCalls,
+                )
+            }
+            _ => (
+                Some(ProviderMessage {
+                    role: ProviderRole::Assistant,
+                    content: "recovery verified".to_owned(),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: Vec::new(),
+                    metadata: Default::default(),
+                }),
+                Vec::new(),
+                ProviderFinishReason::Stop,
+            ),
+        };
+        Ok(ProviderResponse {
+            response_id: golutra_core::ProviderResponseId::new(),
+            message,
+            tool_calls,
+            usage,
+            finish_reason,
+            raw_metadata: json!({"round": call}),
+        })
+    }
+
+    fn contract(&self) -> golutra_core::ProviderContract {
+        self.contract.clone()
+    }
+}
+
+#[async_trait]
+impl LlmProvider for DuplicateFailureRecoveryProvider {
+    async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let usage = ProviderUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            reasoning_tokens: None,
+            cached_input_tokens: None,
+            total_tokens: Some(15),
+            usage_source: UsageSource::Estimated,
+            raw: json!({"round": call}),
+        };
+        let (message, tool_calls, finish_reason) = match call {
+            0 => (
+                None,
+                vec![
+                    ProviderToolCall {
+                        tool_call_id: "duplicate-shell-a".to_owned(),
+                        tool_name: "shell".to_owned(),
+                        arguments: json!({"command": "pwd && pwd"}),
+                    },
+                    ProviderToolCall {
+                        tool_call_id: "duplicate-shell-b".to_owned(),
+                        tool_name: "shell".to_owned(),
+                        arguments: json!({"command": "pwd && pwd"}),
+                    },
+                ],
+                ProviderFinishReason::ToolCalls,
+            ),
+            1 => {
+                let tool_result_ids = request
+                    .messages
+                    .iter()
+                    .filter(|message| message.role == ProviderRole::Tool)
+                    .filter_map(|message| message.tool_call_id.as_deref())
+                    .collect::<HashSet<_>>();
+                self.saw_duplicate_results.store(
+                    tool_result_ids == HashSet::from(["duplicate-shell-a", "duplicate-shell-b"]),
+                    Ordering::SeqCst,
+                );
+                (
+                    None,
+                    vec![ProviderToolCall {
+                        tool_call_id: "recovered-write".to_owned(),
+                        tool_name: "write_file".to_owned(),
+                        arguments: json!({"path": "result.txt", "content": "recovered\n"}),
+                    }],
+                    ProviderFinishReason::ToolCalls,
+                )
+            }
+            _ => (
+                Some(ProviderMessage {
+                    role: ProviderRole::Assistant,
+                    content: "recovered after duplicate failures".to_owned(),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: Vec::new(),
+                    metadata: Default::default(),
+                }),
+                Vec::new(),
+                ProviderFinishReason::Stop,
+            ),
+        };
+        Ok(ProviderResponse {
+            response_id: golutra_core::ProviderResponseId::new(),
+            message,
+            tool_calls,
+            usage,
+            finish_reason,
+            raw_metadata: json!({"round": call}),
+        })
+    }
+
+    fn contract(&self) -> golutra_core::ProviderContract {
+        self.contract.clone()
+    }
 }
 
 #[async_trait]
@@ -482,7 +690,7 @@ async fn fallback_completion_and_usage_are_attributed_to_the_actual_provider() {
     assert_eq!(outcome.final_message.as_deref(), Some("fallback"));
     assert!(trace.iter().any(|event| matches!(
         event,
-        AgentLoopTraceEvent::ProviderStarted { provider_id, model_id }
+        AgentLoopTraceEvent::ProviderStarted { provider_id, model_id, .. }
             if provider_id == "mock" && model_id == "mock-model"
     )));
     assert!(trace.iter().any(|event| matches!(
@@ -496,6 +704,7 @@ async fn fallback_completion_and_usage_are_attributed_to_the_actual_provider() {
             provider_id,
             model_id,
             event: ProviderStreamEvent::TextDelta { text },
+            ..
         } if provider_id == "mock" && model_id == "mock-model" && text == "fallback"
     )));
     assert!(trace.iter().any(|event| matches!(
@@ -740,7 +949,7 @@ async fn accumulated_tool_messages_are_compacted_and_the_turn_continues() {
 }
 
 #[tokio::test]
-async fn agent_loop_stops_success_when_tool_evidence_exists() {
+async fn agent_loop_does_not_treat_a_write_as_objective_validation() {
     let workspace = tempdir().expect("workspace");
     let provider = MockProvider::tool_call(
         "write_file",
@@ -767,15 +976,90 @@ async fn agent_loop_stops_success_when_tool_evidence_exists() {
         .await
         .expect("loop runs");
 
-    assert_eq!(outcome.loop_decision.action, LoopAction::StopSuccess);
-    assert_eq!(
-        outcome.final_message,
-        Some("Completed: file written".to_owned())
+    assert_eq!(outcome.loop_decision.action, LoopAction::StopPartial);
+    assert!(
+        !outcome.verification.checks.iter().any(|check| {
+            check.kind == golutra_core::VerificationCheckKind::ObjectiveValidation
+        })
     );
     assert_eq!(
         fs::read_to_string(workspace.path().join("result.txt")).unwrap(),
         "done"
     );
+}
+
+#[tokio::test]
+async fn workspace_change_is_returned_to_the_model_until_fresh_validation_passes() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("source.txt"), "source bytes").expect("source");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let saw_nudge = Arc::new(AtomicBool::new(false));
+    let provider = ValidationGateProvider {
+        calls: calls.clone(),
+        saw_nudge: saw_nudge.clone(),
+        contract: MockProvider::text_response("unused").contract(),
+    };
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor);
+    let (handle, control) = agent_execution_channel(4);
+    let (trace_tx, mut trace_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        agent_loop
+            .run_with_control_and_trace(
+                AgentTaskRequest {
+                    session_id: SessionId::new(),
+                    task_id: TaskId::new(),
+                    turn_id: TurnId::new(),
+                    objective: "recover source.txt into recovered.txt exactly".to_owned(),
+                    completion_criteria: Vec::new(),
+                    output_schema: None,
+                    touched_code: true,
+                    contributors: Vec::new(),
+                    tools: vec!["write_file".to_owned(), "shell".to_owned()],
+                },
+                control,
+                move |event| {
+                    let _ = trace_tx.send(event);
+                },
+            )
+            .await
+    });
+    let mut trace = Vec::new();
+    let approval = loop {
+        let event = trace_rx.recv().await.expect("approval trace");
+        if let AgentLoopTraceEvent::ApprovalRequested(approval) = &event {
+            trace.push(event.clone());
+            break approval.clone();
+        }
+        trace.push(event);
+    };
+    handle
+        .resolve_approval(ApprovalResolution {
+            approval_id: approval.approval_id,
+            decision: ApprovalDecision::Approved,
+            reason: "approved by test".to_owned(),
+        })
+        .await
+        .expect("approval resolves");
+    let outcome = task.await.expect("task joins").expect("loop runs");
+    while let Ok(event) = trace_rx.try_recv() {
+        trace.push(event);
+    }
+
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    assert!(saw_nudge.load(Ordering::SeqCst));
+    assert_eq!(outcome.verification.result, VerificationResult::Pass);
+    assert_eq!(outcome.loop_decision.action, LoopAction::StopSuccess);
+    assert!(outcome.verification.checks.iter().any(|check| {
+        check.kind == golutra_core::VerificationCheckKind::ObjectiveValidation
+            && check.command.as_deref() == Some("cmp source.txt recovered.txt")
+            && check.passed
+    }));
+    assert!(trace.iter().any(|event| matches!(
+        event,
+        AgentLoopTraceEvent::RetryScheduled { reason, .. }
+            if reason.contains("without fresh objective validation")
+    )));
 }
 
 #[tokio::test]
@@ -845,19 +1129,23 @@ async fn caller_declared_verifier_controls_code_change_completion() {
                 expected_exit_code: 0,
                 max_output_bytes: 1024,
             }]);
+        let mut trace = Vec::new();
 
         let outcome = agent_loop
-            .run(AgentTaskRequest {
-                session_id: SessionId::new(),
-                task_id: TaskId::new(),
-                turn_id: TurnId::new(),
-                objective: "write Rust code".to_owned(),
-                completion_criteria: vec!["tests pass".to_owned()],
-                output_schema: None,
-                touched_code: true,
-                contributors: Vec::new(),
-                tools: vec!["write_file".to_owned()],
-            })
+            .run_with_trace(
+                AgentTaskRequest {
+                    session_id: SessionId::new(),
+                    task_id: TaskId::new(),
+                    turn_id: TurnId::new(),
+                    objective: "write Rust code".to_owned(),
+                    completion_criteria: vec!["tests pass".to_owned()],
+                    output_schema: None,
+                    touched_code: true,
+                    contributors: Vec::new(),
+                    tools: vec!["write_file".to_owned(), "shell".to_owned()],
+                },
+                |event| trace.push(event),
+            )
             .await
             .expect("loop runs");
 
@@ -871,6 +1159,11 @@ async fn caller_declared_verifier_controls_code_change_completion() {
         assert!(outcome.tool_reports.iter().any(|report| {
             report.envelope.tool_name == "external_verifier" && !report.artifact_contents.is_empty()
         }));
+        assert!(!trace.iter().any(|event| matches!(
+            event,
+            AgentLoopTraceEvent::RetryScheduled { reason, .. }
+                if reason.contains("without fresh objective validation")
+        )));
     }
 }
 
@@ -923,6 +1216,20 @@ fn verification_command_classifier_rejects_arbitrary_shell_success() {
     assert!(!is_objective_validation_command("echo done"));
     assert!(!is_objective_validation_command("echo tests passed"));
     assert!(!is_objective_validation_command("git status --short"));
+    assert!(!is_objective_validation_command("git log --oneline -2"));
+    assert!(!is_objective_validation_command("git diff --exit-code"));
+    assert!(is_objective_validation_command(
+        "git diff --exit-code source HEAD -- src/lib.rs"
+    ));
+    assert!(is_objective_validation_command(
+        "git merge-base --is-ancestor source HEAD"
+    ));
+    assert!(is_objective_validation_command(
+        "cmp expected.txt actual.txt"
+    ));
+    assert!(is_objective_validation_command(
+        "diff -q expected.txt actual.txt"
+    ));
     assert!(!is_objective_validation_command("go version"));
 }
 
@@ -1286,24 +1593,148 @@ async fn agent_loop_still_requires_evidence_for_workspace_objectives() {
 }
 
 #[tokio::test]
-async fn agent_loop_does_not_stop_success_when_tool_fails() {
+async fn agent_loop_returns_recoverable_tool_failure_to_the_provider() {
     let workspace = tempdir().expect("workspace");
     let provider = MockProvider::tool_call("read_file", json!({"path": "missing.md"}));
     let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
     let agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor);
+    let mut trace = Vec::new();
 
     let outcome = agent_loop
-        .run(AgentTaskRequest {
-            session_id: SessionId::new(),
-            task_id: TaskId::new(),
-            turn_id: TurnId::new(),
-            objective: "read missing file".to_owned(),
-            completion_criteria: vec!["file read evidence".to_owned()],
-            output_schema: None,
-            touched_code: false,
-            contributors: Vec::new(),
-            tools: vec!["read_file".to_owned()],
-        })
+        .run_with_trace(
+            AgentTaskRequest {
+                session_id: SessionId::new(),
+                task_id: TaskId::new(),
+                turn_id: TurnId::new(),
+                objective: "read missing file".to_owned(),
+                completion_criteria: vec!["file read evidence".to_owned()],
+                output_schema: None,
+                touched_code: false,
+                contributors: Vec::new(),
+                tools: vec!["read_file".to_owned()],
+            },
+            |event| trace.push(event),
+        )
+        .await
+        .expect("loop runs");
+
+    assert_eq!(outcome.loop_decision.action, LoopAction::StopFailed);
+    assert!(
+        !outcome
+            .loop_decision
+            .reason
+            .contains("security or policy boundary rejected"),
+        "{:?}",
+        outcome.loop_decision
+    );
+    assert_eq!(
+        outcome.tool_reports[0].policy_evaluation.block_disposition,
+        Some(PolicyBlockDisposition::Recoverable)
+    );
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|event| matches!(event, AgentLoopTraceEvent::ProviderCompleted { .. }))
+            .count(),
+        2,
+        "the blocked tool result must reach a follow-up provider turn"
+    );
+    assert_eq!(outcome.verification.result, VerificationResult::Fail);
+}
+
+#[tokio::test]
+async fn duplicate_failures_in_one_provider_round_can_recover_on_the_next_round() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("expected.txt"), "recovered\n").expect("expected result");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let saw_duplicate_results = Arc::new(AtomicBool::new(false));
+    let provider = DuplicateFailureRecoveryProvider {
+        calls: calls.clone(),
+        saw_duplicate_results: saw_duplicate_results.clone(),
+        contract: MockProvider::text_response("unused").contract(),
+    };
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let mut trace = Vec::new();
+
+    let outcome = AgentLoop::new(provider, ContextBuilder::default(), executor)
+        .with_external_verifiers(vec![ExternalVerificationSpec {
+            program: "cmp".to_owned(),
+            args: vec!["expected.txt".to_owned(), "result.txt".to_owned()],
+            cwd: ".".to_owned(),
+            timeout_ms: 5_000,
+            expected_exit_code: 0,
+            max_output_bytes: 1024,
+        }])
+        .run_with_trace(
+            AgentTaskRequest {
+                session_id: SessionId::new(),
+                task_id: TaskId::new(),
+                turn_id: TurnId::new(),
+                objective: "write the recovered delivery to result.txt".to_owned(),
+                completion_criteria: vec!["result.txt is delivered".to_owned()],
+                output_schema: None,
+                touched_code: false,
+                contributors: Vec::new(),
+                tools: vec!["shell".to_owned(), "write_file".to_owned()],
+            },
+            |event| trace.push(event),
+        )
+        .await
+        .expect("loop recovers");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert!(saw_duplicate_results.load(Ordering::SeqCst));
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("result.txt")).expect("result"),
+        "recovered\n"
+    );
+    assert_eq!(
+        outcome.verification.result,
+        VerificationResult::Pass,
+        "verification={:#?}\nplan={:#?}\nreports={:#?}",
+        outcome.verification,
+        outcome.verification_plan,
+        outcome.tool_reports
+    );
+    assert_eq!(outcome.loop_decision.action, LoopAction::StopSuccess);
+    assert_eq!(
+        outcome.final_message.as_deref(),
+        Some("recovered after duplicate failures")
+    );
+    assert!(!trace.iter().any(|event| matches!(
+        event,
+        AgentLoopTraceEvent::LoopGuardTriggered {
+            trigger: golutra_core::LoopGuardTrigger::RepeatedToolFailure,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn agent_loop_stops_after_a_terminal_sensitive_path_block() {
+    let workspace = tempdir().expect("workspace");
+    fs::create_dir(workspace.path().join(".git")).expect("git directory");
+    fs::write(workspace.path().join(".git/config"), "secret").expect("git config");
+    let provider = MockProvider::tool_call("read_file", json!({"path": ".git/config"}));
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor);
+    let mut trace = Vec::new();
+
+    let outcome = agent_loop
+        .run_with_trace(
+            AgentTaskRequest {
+                session_id: SessionId::new(),
+                task_id: TaskId::new(),
+                turn_id: TurnId::new(),
+                objective: "read internal git configuration".to_owned(),
+                completion_criteria: vec!["git configuration returned".to_owned()],
+                output_schema: None,
+                touched_code: false,
+                contributors: Vec::new(),
+                tools: vec!["read_file".to_owned()],
+            },
+            |event| trace.push(event),
+        )
         .await
         .expect("loop runs");
 
@@ -1312,11 +1743,20 @@ async fn agent_loop_does_not_stop_success_when_tool_fails() {
         outcome
             .loop_decision
             .reason
-            .contains("security or policy boundary rejected"),
-        "{:?}",
-        outcome.loop_decision
+            .contains("security or policy boundary rejected")
     );
-    assert_eq!(outcome.verification.result, VerificationResult::Fail);
+    assert_eq!(
+        outcome.tool_reports[0].policy_evaluation.block_disposition,
+        Some(PolicyBlockDisposition::Terminal)
+    );
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|event| matches!(event, AgentLoopTraceEvent::ProviderCompleted { .. }))
+            .count(),
+        1,
+        "terminal policy blocks must not start another provider turn"
+    );
 }
 
 #[tokio::test]
@@ -1737,4 +2177,52 @@ fn checkpoint_rejects_gitignored_before_images() {
             "{path}"
         );
     }
+}
+
+#[test]
+fn partial_checkpoint_filter_omits_ignored_images_but_keeps_safe_files() {
+    let workspace = tempdir().expect("workspace");
+    let checkpoint_root = tempdir().expect("checkpoint");
+    fs::write(
+        workspace.path().join(".gitignore"),
+        ".gitignore\n*.secret\n",
+    )
+    .expect("gitignore");
+    fs::write(workspace.path().join("safe.txt"), "safe").expect("safe file");
+    fs::write(workspace.path().join("token.secret"), "secret").expect("ignored file");
+    let manager = WorkspaceCheckpointManager::new(workspace.path(), checkpoint_root.path());
+    let before_images = [
+        FileBeforeImage {
+            path: workspace.path().join(".gitignore"),
+            content: Some(b".gitignore\n*.secret\n".to_vec()),
+            unix_mode: None,
+        },
+        FileBeforeImage {
+            path: workspace.path().join("safe.txt"),
+            content: Some(b"safe".to_vec()),
+            unix_mode: None,
+        },
+        FileBeforeImage {
+            path: workspace.path().join("token.secret"),
+            content: Some(b"secret".to_vec()),
+            unix_mode: None,
+        },
+    ];
+
+    let (retained, excluded_count) = manager
+        .filter_checkpointable_before_images(&before_images)
+        .expect("partial selection");
+    let checkpoint = manager
+        .create_checkpoint(
+            WorkspaceId::new(),
+            TaskId::new(),
+            TurnId::new(),
+            &retained,
+            ToolCallId::new(),
+        )
+        .expect("partial checkpoint");
+
+    assert_eq!(excluded_count, 2);
+    assert_eq!(retained.len(), 1);
+    assert_eq!(checkpoint.changed_files, vec!["safe.txt"]);
 }

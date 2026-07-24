@@ -52,6 +52,7 @@ macro_rules! define_id {
 }
 
 define_id!(WorkspaceId);
+define_id!(RunId);
 define_id!(ThreadId);
 define_id!(SessionId);
 define_id!(TaskId);
@@ -82,3 +83,9 @@ define_id!(VerificationAssertionId);
 define_id!(RegressionCampaignId);
 define_id!(RegressionExecutionId);
 define_id!(MemoryCandidateId);
+
+impl From<TaskId> for RunId {
+    fn from(value: TaskId) -> Self {
+        Self(value.0)
+    }
+}

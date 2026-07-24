@@ -986,6 +986,9 @@ mod tests {
     fn event_lines_ignore_invalid_json_values() {
         let session_id = SessionId::new();
         let event = RuntimeEvent {
+            schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+            causal_context: Default::default(),
+            causal_links: Vec::new(),
             id: EventId::new(),
             sequence_no: 7,
             session_id,

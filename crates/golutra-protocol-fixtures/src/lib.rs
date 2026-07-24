@@ -8,7 +8,7 @@ use golutra_eval::{
     AppliedCandidate, AutomationCandidate, BenchmarkPromotion, BenchmarkRun, CausalComparison,
     CostRecord, CounterfactualReplay, EvaluationCase, EvaluationResult, EvaluationRun,
     GeneratedTask, ImprovementCandidate, PostTaskReview, PromotionDecision, RegressionResult,
-    SecurityUtilityResult, SkillCandidate,
+    ReplayCapsule, ReplayExecution, SecurityUtilityResult, SkillCandidate,
 };
 use golutra_evolution::{
     EnvironmentRecipe, EvolutionState, GeneratedTaskExecution, NoveltyRecord, OpenEndedBudget,
@@ -90,6 +90,8 @@ pub struct SdkProtocolBundle {
     pub cost_record: CostRecord,
     pub security_utility_result: SecurityUtilityResult,
     pub regression_result: RegressionResult,
+    pub replay_capsule: ReplayCapsule,
+    pub replay_execution: ReplayExecution,
     pub regression_campaign: RegressionCampaign,
     pub regression_execution: RegressionExecution,
     pub promotion_decision: PromotionDecision,
@@ -181,6 +183,9 @@ fn fixture_with_status(name: &str, status: TaskStatus, action: LoopAction) -> Sc
         timestamp: Utc::now(),
     };
     let event = RuntimeEvent {
+        schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+        causal_context: Default::default(),
+        causal_links: Vec::new(),
         id: golutra_core::EventId::new(),
         sequence_no: 1,
         session_id,

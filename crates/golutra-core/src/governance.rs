@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -212,6 +214,19 @@ pub enum MemoryLifecycle {
     Expired,
 }
 
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationPartitionKind {
+    #[default]
+    Source,
+    Historical,
+    Generated,
+    Holdout,
+    Adversarial,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RegressionExecutionRole {
@@ -237,9 +252,15 @@ pub struct RegressionCampaign {
     pub baseline_version: String,
     pub environment_recipe: String,
     pub case_refs: Vec<String>,
+    #[serde(default)]
+    pub case_partitions: BTreeMap<String, EvaluationPartitionKind>,
+    #[serde(default)]
+    pub required_partitions: Vec<EvaluationPartitionKind>,
     pub replay_modes: Vec<String>,
     pub provider_matrix: Vec<String>,
     pub seeds: Vec<u64>,
+    #[serde(default, alias = "minimum_trusted_external_evaluations")]
+    pub minimum_trusted_external_pairs: u32,
     pub resource_budget: String,
     pub hard_gates: Vec<String>,
     pub created_at: DateTime<Utc>,
@@ -253,6 +274,12 @@ pub struct RegressionExecution {
     pub campaign_id: RegressionCampaignId,
     #[serde(default)]
     pub case_ref: String,
+    #[serde(default)]
+    pub partition: EvaluationPartitionKind,
+    #[serde(default)]
+    pub provider_variant: String,
+    #[serde(default)]
+    pub seed: u64,
     pub role: RegressionExecutionRole,
     pub runtime_version: String,
     pub workspace_snapshot_digest: String,
@@ -280,5 +307,17 @@ pub struct TraceIntegrity {
     pub missing_sections: Vec<String>,
     pub retention_losses: Vec<String>,
     pub redacted_fields: Vec<String>,
+    #[serde(default)]
+    pub missing_causal_links: Vec<String>,
+    #[serde(default)]
+    pub orphan_events: Vec<String>,
+    #[serde(default)]
+    pub broken_lifecycle_pairs: Vec<String>,
+    #[serde(default)]
+    pub provenance_mismatches: Vec<String>,
+    #[serde(default)]
+    pub artifact_checksum_failures: Vec<String>,
+    #[serde(default)]
+    pub external_overlay_failures: Vec<String>,
     pub complete: bool,
 }

@@ -959,6 +959,9 @@ mod tests {
 
     fn tool_event(sequence_no: u64, event_type: RuntimeEventType, payload: Value) -> RuntimeEvent {
         RuntimeEvent {
+            schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+            causal_context: Default::default(),
+            causal_links: Vec::new(),
             id: EventId::new(),
             sequence_no,
             session_id: SessionId::new(),
@@ -977,6 +980,9 @@ mod tests {
     #[test]
     fn file_tool_events_have_a_compact_codex_style_change_summary() {
         let event = RuntimeEvent {
+            schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+            causal_context: Default::default(),
+            causal_links: Vec::new(),
             id: EventId::new(),
             sequence_no: 1,
             session_id: SessionId::new(),
@@ -1008,6 +1014,9 @@ mod tests {
     #[test]
     fn legacy_changed_files_remain_visible_without_fake_line_counts() {
         let event = RuntimeEvent {
+            schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+            causal_context: Default::default(),
+            causal_links: Vec::new(),
             id: EventId::new(),
             sequence_no: 1,
             session_id: SessionId::new(),

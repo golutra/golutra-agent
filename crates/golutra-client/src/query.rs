@@ -32,12 +32,61 @@ impl RuntimeHost {
                     .user(query.session_id, query.task_id)
                     .await?,
             )?,
-            RuntimeQueryKind::DebugProjection => serde_json::to_value(
-                self.repositories
+            RuntimeQueryKind::DebugProjection => {
+                let mut projection = self
+                    .repositories
                     .projections
                     .debug(query.session_id, query.task_id)
-                    .await?,
-            )?,
+                    .await?;
+                if let Some(task_id) = query.task_id {
+                    let evaluation_store = self.evaluation_store.clone();
+                    let state = run_blocking(move || evaluation_store.snapshot()).await??;
+                    projection.failure_diagnosis = state
+                        .failure_diagnoses
+                        .into_iter()
+                        .rev()
+                        .find(|diagnosis| diagnosis.source_task_id == task_id);
+                    projection.diagnostic_slice = state
+                        .diagnostic_slices
+                        .into_iter()
+                        .rev()
+                        .find(|slice| slice.source_task_id == task_id);
+                    projection.replay_execution = state
+                        .replay_executions
+                        .into_iter()
+                        .rev()
+                        .find(|execution| execution.source_task_id == task_id);
+                    projection.external_evaluations = state
+                        .external_evaluations
+                        .into_iter()
+                        .rev()
+                        .filter(|evaluation| evaluation.source_task_id == task_id)
+                        .take(16)
+                        .collect();
+                    let external_ids = projection
+                        .external_evaluations
+                        .iter()
+                        .map(|evaluation| evaluation.evaluation_id.as_str())
+                        .collect::<std::collections::HashSet<_>>();
+                    projection.causal_comparisons = state
+                        .causal_comparisons
+                        .into_iter()
+                        .rev()
+                        .filter(|comparison| {
+                            comparison
+                                .baseline_evaluation_ref
+                                .as_deref()
+                                .is_some_and(|reference| external_ids.contains(reference))
+                                || comparison
+                                    .candidate_evaluation_ref
+                                    .as_deref()
+                                    .is_some_and(|reference| external_ids.contains(reference))
+                        })
+                        .take(16)
+                        .collect();
+                }
+                serde_json::to_value(projection)?
+            }
             RuntimeQueryKind::ContextProjection => {
                 let task_id = query.task_id.ok_or_else(|| {
                     ClientError::InvalidSession(

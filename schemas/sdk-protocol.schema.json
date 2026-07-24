@@ -147,6 +147,12 @@
     "regression_result": {
       "$ref": "#/$defs/RegressionResult"
     },
+    "replay_capsule": {
+      "$ref": "#/$defs/ReplayCapsule"
+    },
+    "replay_execution": {
+      "$ref": "#/$defs/ReplayExecution"
+    },
     "security_utility_result": {
       "$ref": "#/$defs/SecurityUtilityResult"
     },
@@ -252,6 +258,8 @@
     "cost_record",
     "security_utility_result",
     "regression_result",
+    "replay_capsule",
+    "replay_execution",
     "regression_campaign",
     "regression_execution",
     "promotion_decision",
@@ -1411,6 +1419,70 @@
         "cost_risk"
       ]
     },
+    "BuildProvenance": {
+      "type": "object",
+      "properties": {
+        "binary_checksum": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cargo_lock_digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dirty": {
+          "type": "boolean"
+        },
+        "features": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "git_commit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "package_version": {
+          "type": "string"
+        },
+        "profile": {
+          "type": "string"
+        },
+        "rustc_version": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "source_digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "package_version",
+        "dirty",
+        "target",
+        "profile",
+        "features",
+        "rustc_version"
+      ]
+    },
     "BusyPolicy": {
       "type": "string",
       "enum": [
@@ -1538,6 +1610,20 @@
     "CausalComparison": {
       "type": "object",
       "properties": {
+        "baseline_evaluation_ref": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "candidate_evaluation_ref": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "comparison_id": {
           "type": "string"
         },
@@ -1557,6 +1643,24 @@
             "null"
           ],
           "format": "int64"
+        },
+        "partition": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EvaluationPartitionKind"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "provider_variant": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         },
         "quality_delta": {
           "type": [
@@ -1578,6 +1682,15 @@
           ],
           "format": "float"
         },
+        "seed": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
         "token_delta": {
           "type": [
             "integer",
@@ -1598,6 +1711,179 @@
         "replay_id",
         "scaffold_inflation",
         "conclusion"
+      ]
+    },
+    "CausalContext": {
+      "description": "Correlation identifiers propagated through one governed runtime execution.\n\nThe event envelope remains authoritative for session/task/turn ownership.\nRepeating those identifiers here makes detached facts self-describing and\nlets integrity validation reject mismatched context rather than guessing.",
+      "type": "object",
+      "properties": {
+        "candidate_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider_request_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "provider_response_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "provider_round_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider_tool_call_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "regression_campaign_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "step_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "step_no": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "task_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "tool_call_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "turn_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "verification_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "workspace_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        }
+      }
+    },
+    "CausalLink": {
+      "type": "object",
+      "properties": {
+        "event_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "relation": {
+          "$ref": "#/$defs/CausalRelation"
+        }
+      },
+      "required": [
+        "event_id",
+        "relation"
+      ]
+    },
+    "CausalRelation": {
+      "type": "string",
+      "enum": [
+        "parent",
+        "triggered_by",
+        "responds_to",
+        "derived_from",
+        "verifies",
+        "compares",
+        "supersedes"
+      ]
+    },
+    "CodeTargetRef": {
+      "type": "object",
+      "properties": {
+        "crate_name": {
+          "type": "string"
+        },
+        "module_path": {
+          "type": "string"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "source_digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "symbol": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "crate_name",
+        "module_path",
+        "owner"
       ]
     },
     "CommandAck": {
@@ -2054,6 +2340,24 @@
             "$ref": "#/$defs/BusyPolicyDecision"
           }
         },
+        "causal_comparisons": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/CausalComparison"
+          }
+        },
+        "diagnostic_slice": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DiagnosticSlice"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "event_window": {
           "$ref": "#/$defs/DebugEventWindow"
         },
@@ -2068,6 +2372,24 @@
           "items": {
             "$ref": "#/$defs/EvidenceRecord"
           }
+        },
+        "external_evaluations": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ExternalEvaluationRecord"
+          }
+        },
+        "failure_diagnosis": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FailureDiagnosis"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "loop_decisions": {
           "type": "array",
@@ -2088,6 +2410,17 @@
           "items": {
             "$ref": "#/$defs/PostTaskJob"
           }
+        },
+        "replay_execution": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReplayExecution"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "retention_losses": {
           "type": "array",
@@ -2137,6 +2470,65 @@
         "artifacts",
         "evidence",
         "loop_decisions"
+      ]
+    },
+    "DiagnosticSlice": {
+      "type": "object",
+      "properties": {
+        "artifact_refs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "complete": {
+          "type": "boolean"
+        },
+        "diagnosis": {
+          "$ref": "#/$defs/FailureDiagnosis"
+        },
+        "event_refs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "generated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "omitted_event_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "slice_id": {
+          "type": "string"
+        },
+        "source_task_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "slice_id",
+        "source_task_id",
+        "diagnosis",
+        "event_refs",
+        "artifact_refs",
+        "evidence_refs",
+        "omitted_event_count",
+        "complete",
+        "generated_at"
       ]
     },
     "DriverControllerMode": {
@@ -3249,6 +3641,29 @@
         "replay_seed"
       ]
     },
+    "EvaluationAttestation": {
+      "type": "object",
+      "properties": {
+        "algorithm": {
+          "type": "string"
+        },
+        "key_id": {
+          "type": "string"
+        },
+        "signature": {
+          "type": "string"
+        },
+        "signed_digest": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "algorithm",
+        "key_id",
+        "signature",
+        "signed_digest"
+      ]
+    },
     "EvaluationCase": {
       "type": "object",
       "properties": {
@@ -3318,6 +3733,16 @@
         "tags"
       ]
     },
+    "EvaluationPartitionKind": {
+      "type": "string",
+      "enum": [
+        "source",
+        "historical",
+        "generated",
+        "holdout",
+        "adversarial"
+      ]
+    },
     "EvaluationProjection": {
       "description": "一个任务完成后治理生命周期的类型化读模型。\n\n开发工具无需解析事件文案即可区分 review、candidate、regression 和 promotion。",
       "type": "object",
@@ -3326,6 +3751,34 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/AutomationCandidate"
+          }
+        },
+        "causal_comparisons": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/CausalComparison"
+          }
+        },
+        "diagnostic_slices": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/DiagnosticSlice"
+          }
+        },
+        "external_evaluations": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ExternalEvaluationRecord"
+          }
+        },
+        "failure_diagnoses": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/FailureDiagnosis"
           }
         },
         "improvement_candidates": {
@@ -3356,6 +3809,20 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/RegressionResult"
+          }
+        },
+        "replay_capsules": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ReplayCapsule"
+          }
+        },
+        "replay_executions": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ReplayExecution"
           }
         },
         "results": {
@@ -3833,6 +4300,208 @@
         "skills"
       ]
     },
+    "ExternalEvaluationAssertion": {
+      "type": "object",
+      "properties": {
+        "assertion_id": {
+          "type": "string"
+        },
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "message": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "passed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "assertion_id",
+        "name",
+        "passed",
+        "message",
+        "evidence_refs"
+      ]
+    },
+    "ExternalEvaluationRecord": {
+      "type": "object",
+      "properties": {
+        "artifact_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "assertions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ExternalEvaluationAssertion"
+          }
+        },
+        "attestation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EvaluationAttestation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "base_trace_digest": {
+          "type": "string"
+        },
+        "campaign_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid",
+          "default": null
+        },
+        "candidate_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "case_id": {
+          "type": "string"
+        },
+        "comparison_group_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "dataset_id": {
+          "type": "string"
+        },
+        "dataset_version": {
+          "type": "string"
+        },
+        "evaluation_id": {
+          "type": "string"
+        },
+        "evaluator_id": {
+          "type": "string"
+        },
+        "evaluator_version": {
+          "type": "string"
+        },
+        "harness_id": {
+          "type": "string"
+        },
+        "harness_version": {
+          "type": "string"
+        },
+        "holdout_protected": {
+          "type": "boolean",
+          "default": false
+        },
+        "ingested_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "partition": {
+          "$ref": "#/$defs/EvaluationPartitionKind",
+          "default": "source"
+        },
+        "provider_variant": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "result_digest": {
+          "type": "string"
+        },
+        "role": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RegressionExecutionRole"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "runtime_identity": {
+          "type": "string"
+        },
+        "score": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "score_max": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "seed": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "source_task_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "trust": {
+          "$ref": "#/$defs/ExternalEvaluationTrust"
+        },
+        "verdict": {
+          "$ref": "#/$defs/EvaluationVerdict"
+        }
+      },
+      "required": [
+        "evaluation_id",
+        "source_task_id",
+        "evaluator_id",
+        "evaluator_version",
+        "harness_id",
+        "harness_version",
+        "dataset_id",
+        "dataset_version",
+        "case_id",
+        "verdict",
+        "assertions",
+        "artifact_refs",
+        "base_trace_digest",
+        "runtime_identity",
+        "result_digest",
+        "trust",
+        "ingested_at"
+      ]
+    },
+    "ExternalEvaluationTrust": {
+      "type": "string",
+      "enum": [
+        "untrusted_local",
+        "owner_local",
+        "signed"
+      ]
+    },
     "ExternalVerificationSpec": {
       "type": "object",
       "properties": {
@@ -3870,6 +4539,117 @@
       },
       "required": [
         "program"
+      ]
+    },
+    "FailureDiagnosis": {
+      "type": "object",
+      "properties": {
+        "actual_behavior": {
+          "type": "string"
+        },
+        "analyzer_version": {
+          "type": "string"
+        },
+        "causal_event_refs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "code_targets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CodeTargetRef"
+          }
+        },
+        "confidence": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "counterfactual": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "diagnosis_id": {
+          "type": "string"
+        },
+        "expected_behavior": {
+          "type": "string"
+        },
+        "regression_commands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "source_task_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "taxonomy": {
+          "$ref": "#/$defs/FailureTaxonomy"
+        },
+        "trigger_event_refs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "required": [
+        "diagnosis_id",
+        "source_task_id",
+        "taxonomy",
+        "summary",
+        "trigger_event_refs",
+        "causal_event_refs",
+        "expected_behavior",
+        "actual_behavior",
+        "counterfactual",
+        "confidence",
+        "code_targets",
+        "regression_commands",
+        "analyzer_version",
+        "created_at"
+      ]
+    },
+    "FailureDomain": {
+      "type": "string",
+      "enum": [
+        "runtime_control_flow",
+        "context",
+        "provider",
+        "tool",
+        "policy",
+        "verification",
+        "memory",
+        "external_evaluation",
+        "unknown"
+      ]
+    },
+    "FailureTaxonomy": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "domain": {
+          "$ref": "#/$defs/FailureDomain"
+        }
+      },
+      "required": [
+        "domain",
+        "code"
       ]
     },
     "GeneratedTask": {
@@ -5003,6 +5783,13 @@
         "candidate_id": {
           "type": "string"
         },
+        "case_partitions": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/EvaluationPartitionKind"
+          },
+          "default": {}
+        },
         "case_refs": {
           "type": "array",
           "items": {
@@ -5029,6 +5816,12 @@
             "type": "string"
           }
         },
+        "minimum_trusted_external_pairs": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
         "provider_matrix": {
           "type": "array",
           "items": {
@@ -5039,6 +5832,13 @@
           "type": "array",
           "items": {
             "type": "string"
+          }
+        },
+        "required_partitions": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/EvaluationPartitionKind"
           }
         },
         "resource_budget": {
@@ -5116,6 +5916,128 @@
         "failure_taxonomy"
       ]
     },
+    "RegressionCoverage": {
+      "type": "object",
+      "properties": {
+        "completed_cells": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "expected_cells": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "holdout_disclosure_violations": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "missing_cells": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "missing_partitions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EvaluationPartitionKind"
+          }
+        },
+        "missing_providers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "missing_seeds": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        },
+        "observed_partitions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EvaluationPartitionKind"
+          }
+        },
+        "observed_providers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "observed_seeds": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        },
+        "required_partitions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EvaluationPartitionKind"
+          }
+        },
+        "required_providers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "required_seeds": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        },
+        "trusted_external_evaluation_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "trusted_external_pairs": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "untrusted_external_evaluation_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "required_partitions",
+        "observed_partitions",
+        "missing_partitions",
+        "required_providers",
+        "observed_providers",
+        "missing_providers",
+        "required_seeds",
+        "observed_seeds",
+        "missing_seeds",
+        "expected_cells",
+        "completed_cells",
+        "missing_cells",
+        "trusted_external_evaluation_refs",
+        "untrusted_external_evaluation_refs",
+        "holdout_disclosure_violations"
+      ]
+    },
     "RegressionExecution": {
       "type": "object",
       "properties": {
@@ -5137,11 +6059,25 @@
           "type": "string",
           "format": "uuid"
         },
+        "partition": {
+          "$ref": "#/$defs/EvaluationPartitionKind",
+          "default": "source"
+        },
+        "provider_variant": {
+          "type": "string",
+          "default": ""
+        },
         "role": {
           "$ref": "#/$defs/RegressionExecutionRole"
         },
         "runtime_version": {
           "type": "string"
+        },
+        "seed": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
         },
         "status": {
           "$ref": "#/$defs/RegressionExecutionStatus"
@@ -5240,9 +6176,37 @@
           ],
           "format": "double"
         },
+        "coverage": {
+          "$ref": "#/$defs/RegressionCoverage",
+          "default": {
+            "completed_cells": 0,
+            "expected_cells": 0,
+            "holdout_disclosure_violations": [],
+            "missing_cells": [],
+            "missing_partitions": [],
+            "missing_providers": [],
+            "missing_seeds": [],
+            "observed_partitions": [],
+            "observed_providers": [],
+            "observed_seeds": [],
+            "required_partitions": [],
+            "required_providers": [],
+            "required_seeds": [],
+            "trusted_external_evaluation_refs": [],
+            "trusted_external_pairs": 0,
+            "untrusted_external_evaluation_refs": []
+          }
+        },
         "created_at": {
           "type": "string",
           "format": "date-time"
+        },
+        "external_evaluation_refs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
         },
         "failed_cases": {
           "type": "integer",
@@ -5255,6 +6219,13 @@
             "null"
           ],
           "format": "int64"
+        },
+        "paired_execution_refs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
         },
         "passed_cases": {
           "type": "integer",
@@ -5314,6 +6285,278 @@
         "needs_review"
       ]
     },
+    "ReplayCapsule": {
+      "type": "object",
+      "properties": {
+        "capsule_id": {
+          "type": "string"
+        },
+        "clock_seed": {
+          "type": "string"
+        },
+        "complete": {
+          "type": "boolean"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "event_chain_digest": {
+          "type": "string"
+        },
+        "fixture_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limitations": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "missing_inputs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "mode": {
+          "$ref": "#/$defs/ReplayMode"
+        },
+        "provider_exchanges": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ReplayProviderExchange"
+          }
+        },
+        "random_seed": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "runtime_config_digest": {
+          "type": "string"
+        },
+        "source_last_sequence_no": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "source_run_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "source_task_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "tool_results": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ReplayToolResult"
+          }
+        }
+      },
+      "required": [
+        "capsule_id",
+        "source_task_id",
+        "source_run_id",
+        "mode",
+        "provider_exchanges",
+        "tool_results",
+        "clock_seed",
+        "random_seed",
+        "runtime_config_digest",
+        "event_chain_digest",
+        "complete",
+        "missing_inputs",
+        "limitations",
+        "created_at"
+      ]
+    },
+    "ReplayExecution": {
+      "description": "Result of re-entering the ordinary AgentLoop with recorded provider and\ntool artifacts. This is an executable replay result, not a projection-only\nreconstruction.",
+      "type": "object",
+      "properties": {
+        "capsule_id": {
+          "type": "string"
+        },
+        "completed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "execution_id": {
+          "type": "string"
+        },
+        "expected_loop_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LoopAction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "expected_verification": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VerificationResult"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mismatches": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "mode": {
+          "$ref": "#/$defs/ReplayMode"
+        },
+        "observed_loop_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LoopAction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "observed_verification": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VerificationResult"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "provider_exchanges_consumed": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "provider_exchanges_total": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "source_task_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "status": {
+          "$ref": "#/$defs/ReplayExecutionStatus"
+        },
+        "tool_results_consumed": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "tool_results_total": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "execution_id",
+        "capsule_id",
+        "source_task_id",
+        "mode",
+        "status",
+        "provider_exchanges_total",
+        "provider_exchanges_consumed",
+        "tool_results_total",
+        "tool_results_consumed",
+        "mismatches",
+        "started_at",
+        "completed_at"
+      ]
+    },
+    "ReplayExecutionStatus": {
+      "type": "string",
+      "enum": [
+        "matched",
+        "diverged",
+        "incomplete",
+        "failed"
+      ]
+    },
+    "ReplayMode": {
+      "type": "string",
+      "enum": [
+        "projection",
+        "deterministic_control_flow",
+        "live_regression"
+      ]
+    },
+    "ReplayProviderExchange": {
+      "type": "object",
+      "properties": {
+        "request_artifact_ref": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "response_artifact_ref": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "response_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "request_id",
+        "response_id",
+        "request_artifact_ref",
+        "response_artifact_ref"
+      ]
+    },
+    "ReplayToolResult": {
+      "type": "object",
+      "properties": {
+        "provider_tool_call_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "result_artifact_ref": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "tool_call_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "tool_call_id",
+        "result_artifact_ref"
+      ]
+    },
     "ReviewMode": {
       "type": "string",
       "enum": [
@@ -5340,9 +6583,103 @@
         "end"
       ]
     },
+    "RunProvenance": {
+      "type": "object",
+      "properties": {
+        "build": {
+          "$ref": "#/$defs/BuildProvenance"
+        },
+        "captured_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "policy_digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider_config_digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "runtime_config_digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runtime_identity": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "tool_manifest_digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "verifier_digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_initial_digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "schema_version",
+        "run_id",
+        "runtime_identity",
+        "build",
+        "captured_at"
+      ]
+    },
     "RuntimeEvent": {
       "type": "object",
       "properties": {
+        "causal_context": {
+          "$ref": "#/$defs/CausalContext",
+          "default": {
+            "candidate_id": null,
+            "provider_request_id": null,
+            "provider_response_id": null,
+            "provider_round_id": null,
+            "provider_tool_call_id": null,
+            "regression_campaign_id": null,
+            "run_id": null,
+            "session_id": null,
+            "step_id": null,
+            "step_no": null,
+            "task_id": null,
+            "tool_call_id": null,
+            "turn_id": null,
+            "verification_id": null,
+            "workspace_id": null
+          }
+        },
+        "causal_links": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/CausalLink"
+          }
+        },
         "durable": {
           "type": "boolean"
         },
@@ -5367,6 +6704,12 @@
             "null"
           ],
           "format": "uuid"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 1,
+          "minimum": 0
         },
         "sequence_no": {
           "type": "integer",
@@ -5447,6 +6790,7 @@
         "provider_started",
         "provider_streamed",
         "provider_completed",
+        "provider_failed",
         "token_usage_recorded",
         "assistant_message",
         "tool_started",
@@ -5518,7 +6862,13 @@
         "regression_execution_completed",
         "memory_candidate_quarantined",
         "memory_activated",
-        "memory_invalidated"
+        "memory_invalidated",
+        "failure_diagnosed",
+        "diagnostic_slice_created",
+        "replay_capsule_created",
+        "replay_executed",
+        "external_evaluation_ingested",
+        "external_evaluation_compared"
       ]
     },
     "RuntimeGovernorDecision": {
@@ -5532,6 +6882,11 @@
         },
         "budget_risk": {
           "type": "string"
+        },
+        "consecutive_failed_tool_calls": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
         },
         "failed_tool_calls": {
           "type": "integer",
@@ -5572,6 +6927,7 @@
         "iteration",
         "tool_calls",
         "failed_tool_calls",
+        "consecutive_failed_tool_calls",
         "alignment"
       ]
     },
@@ -5801,6 +7157,7 @@
         "apply_candidate",
         "rollback_candidate",
         "record_benchmark",
+        "ingest_external_evaluation",
         "compare_counterfactual",
         "plan_evolution",
         "run_evolution",
@@ -6621,6 +7978,17 @@
             "$ref": "#/$defs/PostTaskJob"
           }
         },
+        "run_provenance": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunProvenance"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "runtime_identity": {
           "type": "string"
         },
@@ -6852,6 +8220,20 @@
     "TraceIntegrity": {
       "type": "object",
       "properties": {
+        "artifact_checksum_failures": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "broken_lifecycle_pairs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
         "complete": {
           "type": "boolean"
         },
@@ -6862,6 +8244,13 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0
+        },
+        "external_overlay_failures": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
         },
         "first_sequence": {
           "type": [
@@ -6879,8 +8268,29 @@
           "format": "uint64",
           "minimum": 0
         },
+        "missing_causal_links": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
         "missing_sections": {
           "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "orphan_events": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "provenance_mismatches": {
+          "type": "array",
+          "default": [],
           "items": {
             "type": "string"
           }

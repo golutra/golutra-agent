@@ -6,11 +6,11 @@
 
 use golutra_context::ContextCompactionRecord;
 use golutra_core::{
-    ApprovalRequest, ApprovalResolution, ContextSnapshot, ToolCallId, ToolProgress, TurnId,
-    VerificationAssertion, VerificationPlan,
+    ApprovalRequest, ApprovalResolution, ContextSnapshot, ProviderRequestId, ToolCallId,
+    ToolProgress, TurnId, VerificationAssertion, VerificationPlan,
 };
 use golutra_governor::RuntimeGovernorDecision;
-use golutra_llm::{ProviderFinishReason, ProviderRequest, ProviderStreamEvent};
+use golutra_llm::{ProviderRequest, ProviderResponse, ProviderStreamEvent};
 use golutra_tools::ToolExecutionReport;
 
 use super::PendingAgentTurn;
@@ -48,25 +48,32 @@ pub enum AgentLoopTraceEvent {
     VerificationPlanned(VerificationPlan),
     VerificationAssertionCompleted(VerificationAssertion),
     ProviderStarted {
+        request_id: ProviderRequestId,
         provider_id: String,
         model_id: String,
     },
     ProviderStreamed {
+        request_id: ProviderRequestId,
         provider_id: String,
         model_id: String,
         event: ProviderStreamEvent,
     },
     ProviderCompleted {
+        request_id: ProviderRequestId,
         provider_id: String,
         model_id: String,
-        finish_reason: ProviderFinishReason,
-        tool_call_count: usize,
-        usage: golutra_core::ProviderUsage,
-        raw_metadata: serde_json::Value,
+        response: ProviderResponse,
+    },
+    ProviderFailed {
+        request_id: ProviderRequestId,
+        provider_id: String,
+        model_id: String,
+        error: String,
     },
     TokenUsageRecorded(golutra_core::TokenUsageRecord),
     ToolStarted {
         tool_call_id: ToolCallId,
+        provider_tool_call_id: Option<String>,
         tool_name: String,
         display_arguments: serde_json::Value,
     },

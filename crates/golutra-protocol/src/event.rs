@@ -1,4 +1,7 @@
-use golutra_core::{ArtifactId, EventId, SessionId, TaskId, TaskStatus, Timestamp, TurnId};
+use golutra_core::{
+    ArtifactId, CausalContext, CausalLink, EventId, RUNTIME_EVENT_SCHEMA_VERSION, SessionId,
+    TaskId, TaskStatus, Timestamp, TurnId,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -40,6 +43,7 @@ pub enum RuntimeEventType {
     ProviderStarted,
     ProviderStreamed,
     ProviderCompleted,
+    ProviderFailed,
     TokenUsageRecorded,
     AssistantMessage,
     ToolStarted,
@@ -112,6 +116,12 @@ pub enum RuntimeEventType {
     MemoryCandidateQuarantined,
     MemoryActivated,
     MemoryInvalidated,
+    FailureDiagnosed,
+    DiagnosticSliceCreated,
+    ReplayCapsuleCreated,
+    ReplayExecuted,
+    ExternalEvaluationIngested,
+    ExternalEvaluationCompared,
 }
 
 impl RuntimeEventType {
@@ -136,18 +146,33 @@ impl RuntimeEventType {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RuntimeEvent {
+    #[serde(default = "legacy_runtime_event_schema_version")]
+    pub schema_version: u32,
     pub id: EventId,
     pub sequence_no: u64,
     pub session_id: SessionId,
     pub turn_id: Option<TurnId>,
     pub task_id: Option<TaskId>,
     pub parent_event_id: Option<EventId>,
+    #[serde(default)]
+    pub causal_context: CausalContext,
+    #[serde(default)]
+    pub causal_links: Vec<CausalLink>,
     pub event_type: RuntimeEventType,
     pub timestamp: Timestamp,
     pub source: RuntimeEventSource,
     pub payload: Value,
     pub payload_ref: Option<ArtifactId>,
     pub durable: bool,
+}
+
+#[must_use]
+pub const fn new_runtime_event_schema_version() -> u32 {
+    RUNTIME_EVENT_SCHEMA_VERSION
+}
+
+const fn legacy_runtime_event_schema_version() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
