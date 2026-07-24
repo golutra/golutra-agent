@@ -343,10 +343,14 @@ credentials must be configured on the App Server host.
 
 ```bash
 golutra --run-bundle /absolute/run-dir eval ingest /absolute/evaluation.json
+# When evidence lives outside the evaluation JSON directory:
+golutra --run-bundle /absolute/run-dir eval ingest \
+  --artifact-base /absolute/evaluator-output /absolute/evaluation.json
 ```
 
 命令会验证 source trace digest、runtime identity 和 canonical result digest，
-并以 evaluation JSON 所在目录作为相对 evidence ref 的根目录。普通文件会在
+默认以 evaluation JSON 所在目录作为相对 evidence ref 的根目录；外部 harness
+也可以通过 `--artifact-base` 显式声明独立的 evaluator 输出根目录。普通文件会在
 固定大小预算内复制为 owner-only `external_evaluator_evidence` artifact，记录
 SHA-256/size，并为 assertion 生成 `EvidenceRecord`；原路径后续被修改不会改变
 已导入事实。外部失败会在追加事件后重新计算 failure episode、诊断切片和改进
@@ -364,7 +368,8 @@ Terminal-Bench 只通过 `tools/terminal_bench/golutra_tbench_adapter.py`
 适配，不修改上游 harness。每个 trial 的 Golutra invocation 都使用独立
 `--run-dir /logs/golutra-runtime`；适配器优先读取 `<trial>/golutra-runtime`，
 兼容旧的 `sessions/golutra-runtime`，并把
-`terminal-bench-evaluation.json` 交给 `eval ingest`。找不到结果、manifest、
+`terminal-bench-evaluation.json` 交给 `eval ingest`，并以 trial 根目录作为
+`--artifact-base`，使结果、pane 和命令记录可以被导入为不可变 evidence。找不到结果、manifest、
 collector 或 trace 时，保留 `golutra-evaluation.pending.json`，而不是丢掉
 原始 observation。
 

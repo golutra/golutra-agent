@@ -335,7 +335,7 @@ fn builtin_openai_oauth_resolves_registered_responses_adapter() {
 
 #[test]
 fn evaluation_artifact_base_accepts_a_bare_relative_filename() {
-    let base = evaluation_artifact_base_path(std::path::Path::new("evaluation.json"))
+    let base = evaluation_artifact_base_path(std::path::Path::new("evaluation.json"), None)
         .expect("relative evaluation base");
 
     assert_eq!(
@@ -344,5 +344,47 @@ fn evaluation_artifact_base_accepts_a_bare_relative_filename() {
             .expect("current directory")
             .canonicalize()
             .expect("canonical current directory")
+    );
+}
+
+#[test]
+fn evaluation_ingest_accepts_an_explicit_artifact_base() {
+    let cli = Cli::try_parse_from([
+        "golutra",
+        "eval",
+        "ingest",
+        "--artifact-base",
+        "/tmp/terminal-bench-trial",
+        "/tmp/golutra-run/terminal-bench-evaluation.json",
+    ])
+    .expect("evaluation ingest args");
+
+    assert!(matches!(
+        cli.command,
+        Command::Eval {
+            command: EvalCommand::Ingest {
+                file,
+                artifact_base: Some(artifact_base),
+            }
+        } if file == std::path::Path::new("/tmp/golutra-run/terminal-bench-evaluation.json")
+            && artifact_base == std::path::Path::new("/tmp/terminal-bench-trial")
+    ));
+}
+
+#[test]
+fn evaluation_artifact_base_prefers_the_explicit_directory() {
+    let directory = tempfile::tempdir().expect("artifact base");
+    let base = evaluation_artifact_base_path(
+        std::path::Path::new("/unrelated/evaluation.json"),
+        Some(directory.path()),
+    )
+    .expect("explicit artifact base");
+
+    assert_eq!(
+        base,
+        directory
+            .path()
+            .canonicalize()
+            .expect("canonical artifact base")
     );
 }

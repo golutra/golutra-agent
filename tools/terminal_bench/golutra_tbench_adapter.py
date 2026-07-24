@@ -231,7 +231,7 @@ class GolutraAgent(BaseAgent):
                     },
                 )
                 return
-            parser_results, resolved = _extract_trial_result(results, task_id)
+            parser_results, resolved, failure_mode = _extract_trial_result(results, task_id)
             evidence_refs = _existing_evidence_refs(trial_root)
             assertions = [
                 {
@@ -243,8 +243,19 @@ class GolutraAgent(BaseAgent):
                 }
                 for name, status in sorted(parser_results.items())
             ]
-            if not assertions:
+            if failure_mode not in {None, "none", "unset"}:
+                assertions.append(
+                    {
+                        "assertion_id": "terminal-bench:harness_failure_mode",
+                        "name": "harness_failure_mode",
+                        "passed": False,
+                        "message": failure_mode,
+                        "evidence_refs": evidence_refs,
+                    }
+                )
+            if not assertions or (not resolved and all(item["passed"] for item in assertions)):
                 assertions = [
+                    *assertions,
                     {
                         "assertion_id": "terminal-bench:resolved",
                         "name": "resolved",
@@ -299,16 +310,13 @@ class GolutraAgent(BaseAgent):
                 )
                 return
             completed = subprocess.run(
-                [
-                    str(self._collector_binary),
-                    "--run-bundle",
-                    str(run_dir),
-                    "--session-id",
+                _collector_command(
+                    self._collector_binary,
+                    run_dir,
                     session_id,
-                    "eval",
-                    "ingest",
-                    str(record_path),
-                ],
+                    record_path,
+                    trial_root,
+                ),
                 capture_output=True,
                 text=True,
                 timeout=120,
@@ -402,8 +410,14 @@ class GolutraAgent(BaseAgent):
                 append_enter=True,
             )
         )
+        input_tokens, output_tokens = (
+            _trace_token_usage(logging_dir.parent) if logging_dir is not None else (0, 0)
+        )
         self._start_result_collector(logging_dir)
-        return AgentResult()
+        return AgentResult(
+            total_input_tokens=input_tokens,
+            total_output_tokens=output_tokens,
+        )
 
 
 def _find_trial_results(trial_root: Path) -> Path | None:
@@ -437,9 +451,14 @@ def _find_run_bundle(trial_root: Path) -> Path | None:
     return matches[0] if len(matches) == 1 else None
 
 
-def _extract_trial_result(results: dict, task_id: str) -> tuple[dict, bool]:
+def _extract_trial_result(results: dict, task_id: str) -> tuple[dict, bool, str | None]:
     if isinstance(results.get("parser_results"), dict):
-        return results["parser_results"], bool(results.get("is_resolved", False))
+        failure_mode = results.get("failure_mode")
+        return (
+            results["parser_results"],
+            bool(results.get("is_resolved", False)),
+            str(failure_mode).lower() if failure_mode is not None else None,
+        )
     aggregate = results.get("results")
     if isinstance(aggregate, list):
         candidates = [
@@ -454,7 +473,12 @@ def _extract_trial_result(results: dict, task_id: str) -> tuple[dict, bool]:
         candidate = aggregate.get(task_id)
         if isinstance(candidate, dict):
             return _extract_trial_result(candidate, task_id)
-    return {}, bool(results.get("is_resolved", results.get("resolved", False)))
+    failure_mode = results.get("failure_mode")
+    return (
+        {},
+        bool(results.get("is_resolved", results.get("resolved", False))),
+        str(failure_mode).lower() if failure_mode is not None else None,
+    )
 
 
 def _existing_evidence_refs(trial_root: Path) -> list[str]:
@@ -465,6 +489,62 @@ def _existing_evidence_refs(trial_root: Path) -> list[str]:
         "commands.txt",
     ]
     return [path for path in candidates if (trial_root / path).is_file()]
+
+
+def _collector_command(
+    collector_binary: Path,
+    run_dir: Path,
+    session_id: str,
+    record_path: Path,
+    artifact_base: Path,
+) -> list[str]:
+    return [
+        str(collector_binary),
+        "--run-bundle",
+        str(run_dir),
+        "--session-id",
+        session_id,
+        "eval",
+        "ingest",
+        "--artifact-base",
+        str(artifact_base),
+        str(record_path),
+    ]
+
+
+def _trace_token_usage(trial_root: Path) -> tuple[int, int]:
+    run_dir = _find_run_bundle(trial_root)
+    if run_dir is None:
+        return 0, 0
+    try:
+        manifest = json.loads((run_dir / "manifest.json").read_text())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return 0, 0
+    trace_paths = [
+        run_dir / str(task["trace_path"])
+        for session in manifest.get("observations", {}).get("sessions", [])
+        for task in session.get("tasks", [])
+        if task.get("trace_path")
+    ]
+    if len(trace_paths) != 1:
+        return 0, 0
+    try:
+        trace = json.loads(trace_paths[0].read_text())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return 0, 0
+    input_tokens = 0
+    output_tokens = 0
+    for event in trace.get("events", []):
+        if event.get("event_type") != "token_usage_recorded":
+            continue
+        record = event.get("payload", {}).get("record", {})
+        recorded_input = record.get("input_tokens")
+        recorded_output = record.get("output_tokens")
+        if isinstance(recorded_input, int) and recorded_input >= 0:
+            input_tokens += recorded_input
+        if isinstance(recorded_output, int) and recorded_output >= 0:
+            output_tokens += recorded_output
+    return input_tokens, output_tokens
 
 
 def _trace_identity(run_dir: Path, task_id: str, session_id: str) -> tuple[str | None, str | None]:

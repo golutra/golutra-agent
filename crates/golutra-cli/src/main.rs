@@ -574,6 +574,9 @@ enum EvalCommand {
     Ingest {
         #[arg(value_name = "JSON_FILE")]
         file: std::path::PathBuf,
+        /// Resolve relative evaluator evidence references from this directory.
+        #[arg(long, value_name = "DIR")]
+        artifact_base: Option<std::path::PathBuf>,
     },
     CompareCounterfactual {
         group_id: String,
@@ -1697,13 +1700,19 @@ async fn main() -> miette::Result<()> {
                 )
                 .await?;
             }
-            EvalCommand::Ingest { file } => {
-                let artifact_base_path = evaluation_artifact_base_path(&file).map_err(|error| {
-                    miette::miette!(
-                        "failed to resolve evaluation directory {}: {error}",
-                        file.display()
-                    )
-                })?;
+            EvalCommand::Ingest {
+                file,
+                artifact_base,
+            } => {
+                let artifact_base_path =
+                    evaluation_artifact_base_path(&file, artifact_base.as_deref()).map_err(
+                        |error| {
+                            miette::miette!(
+                                "failed to resolve evaluation artifact base for {}: {error}",
+                                file.display()
+                            )
+                        },
+                    )?;
                 let content = std::fs::read_to_string(&file).map_err(|error| {
                     miette::miette!(
                         "failed to read external evaluation {}: {error}",
@@ -2895,11 +2904,23 @@ fn is_terminal_status(status: TaskStatus) -> bool {
     status.is_terminal()
 }
 
-fn evaluation_artifact_base_path(file: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
-    file.parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .canonicalize()
+fn evaluation_artifact_base_path(
+    file: &std::path::Path,
+    explicit_base: Option<&std::path::Path>,
+) -> std::io::Result<std::path::PathBuf> {
+    let base = explicit_base.unwrap_or_else(|| {
+        file.parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."))
+    });
+    let canonical = base.canonicalize()?;
+    if !canonical.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "evaluation artifact base must be a directory",
+        ));
+    }
+    Ok(canonical)
 }
 
 fn run_plugin_command(command: &PluginCommand) -> miette::Result<()> {

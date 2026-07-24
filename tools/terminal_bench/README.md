@@ -36,6 +36,12 @@ the same proxy. For a proxy listening on the host loopback interface, use
 `host.docker.internal` rather than `127.0.0.1`. The
 `GOLUTRA_TBENCH_PROXY` host environment variable provides the same setting.
 
+After the agent command exits, the adapter reads the retained trace's
+`token_usage_recorded` events and returns the provider input/output totals to
+Terminal-Bench. Harness failures such as `test_timeout` are also retained as a
+failed external-evaluation assertion instead of being collapsed into a generic
+unresolved result.
+
 The provider config and credentials copied into the container are not included
 in the retained runtime directory. Raw runtime data can still contain prompts,
 tool output and workspace-derived content, so store benchmark logs accordingly.
@@ -55,7 +61,10 @@ only adapts the trial lifecycle and consumes the retained Golutra bundle:
 The preferred bundle directory is `<trial>/golutra-runtime`; older harness
 layouts under `<trial>/sessions/golutra-runtime` remain readable. The collector
 waits for both `results.json` and the runtime manifest, derives only evidence
-files that actually exist, and invokes `<collector> --run-bundle ... eval ingest`.
+files that actually exist, and invokes `<collector> --run-bundle ... eval ingest`
+with the trial directory as the explicit `--artifact-base`. The evaluation JSON
+therefore stays in the run bundle while its relative evidence references remain
+portable and resolve against the harness-owned trial output.
 It resolves that host collector from the explicit `collector_binary` agent
 argument, `GOLUTRA_TBENCH_COLLECTOR`, then this repository's release or debug
 `golutra-cli` binary. It does not select an unrelated `golutra` command from
