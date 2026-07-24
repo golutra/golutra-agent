@@ -59,14 +59,16 @@ impl GovernanceService {
         &self,
         bundle: TaskEvaluationBundle,
     ) -> Result<RecordedTaskEvaluation, ClientError> {
-        let recorded = RecordedTaskEvaluation {
+        let mut recorded = RecordedTaskEvaluation {
             result: bundle.result.clone(),
             review: bundle.review.clone(),
             improvement_candidate: bundle.improvement_candidate.clone(),
             automation_candidates: bundle.automation_candidates.clone(),
         };
         let store = self.evaluation_store.clone();
-        run_blocking(move || store.record_task_evaluation(bundle)).await??;
+        let update = run_blocking(move || store.record_task_evaluation(bundle)).await??;
+        recorded.improvement_candidate = update.improvement_candidate;
+        recorded.automation_candidates = update.automation_candidates;
         Ok(recorded)
     }
 
@@ -173,6 +175,11 @@ impl GovernanceService {
                     .map(|candidate| candidate.id.as_str()),
             )
             .collect::<HashSet<_>>();
+        let frozen_candidate_patches = state
+            .frozen_candidate_patches
+            .into_iter()
+            .filter(|patch| candidate_ids.contains(patch.candidate_id.as_str()))
+            .collect::<Vec<_>>();
         let regressions = state
             .regressions
             .into_iter()
@@ -314,6 +321,32 @@ impl GovernanceService {
                 integrity_warnings.push(format!(
                     "AutomationCandidate {} has no canonical event",
                     candidate.id
+                ));
+            }
+        }
+        for patch in &frozen_candidate_patches {
+            let artifact_ref = patch.artifact_ref.to_string();
+            let has_matching_event = events.iter().any(|event| {
+                let record = event.payload.get("record");
+                event.event_type == RuntimeEventType::CandidatePatchFrozen
+                    && event.payload_ref == Some(patch.artifact_ref)
+                    && record
+                        .and_then(|record| record.get("candidate_id"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(patch.candidate_id.as_str())
+                    && record
+                        .and_then(|record| record.get("artifact_ref"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(artifact_ref.as_str())
+                    && record
+                        .and_then(|record| record.get("digest"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(patch.digest.as_str())
+            });
+            if !has_matching_event {
+                integrity_warnings.push(format!(
+                    "FrozenCandidatePatch for {} has no matching canonical event and artifact",
+                    patch.candidate_id
                 ));
             }
         }
@@ -461,6 +494,7 @@ impl GovernanceService {
             reviews,
             results,
             improvement_candidates,
+            frozen_candidate_patches,
             automation_candidates,
             regressions,
             promotion_decisions,

@@ -7,13 +7,15 @@ use std::{
 };
 
 use base64::Engine;
+use futures_util::{FutureExt, future::BoxFuture};
 use golutra_core::{
     ActorKind, EvaluationPartitionKind, RegressionCampaign, RegressionCampaignId,
     RegressionExecution, RegressionExecutionId, RegressionExecutionRole, RegressionExecutionStatus,
     TaskStatus, TraceView, VerificationResult,
 };
-use golutra_eval::RegressionResult;
+use golutra_eval::{FrozenCandidatePatch, RegressionResult};
 use golutra_protocol::{SessionCommand, SessionCommandKind, TaskTraceRequest};
+use serde::{Deserialize, Serialize};
 use walkdir::{DirEntry, WalkDir};
 
 use super::*;
@@ -35,6 +37,12 @@ struct RegressionCaseInput {
 struct CandidateFile {
     relative_path: PathBuf,
     content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CandidatePatchBundle {
+    format: String,
+    files: BTreeMap<String, String>,
 }
 
 struct RegressionRoleInput<'a> {
@@ -74,25 +82,15 @@ impl RuntimeHost {
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
             .map(ToOwned::to_owned);
-        let candidate_files = candidate_files_from_payload(&command.payload)?;
-        if candidate_files.is_empty() {
-            return Err(ClientError::TaskExecution(
-                "regression candidate must include at least one candidate_files patch artifact"
-                    .to_owned(),
-            ));
-        }
-        let candidate_digest = candidate_files_digest(&candidate_files);
-        if let Some(declared_digest) = command
-            .payload
-            .get("candidate_digest")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            && declared_digest != candidate_digest
-        {
-            return Err(ClientError::TaskExecution(
-                "declared candidate_digest does not match candidate_files".to_owned(),
-            ));
-        }
+        let (candidate_files, frozen_patch) = self
+            .resolve_frozen_candidate_patch(
+                parent_session_id,
+                candidate.source_task_id,
+                candidate_id,
+                &command.payload,
+            )
+            .await?;
+        let candidate_digest = frozen_patch.digest.clone();
         let mut case_refs = command
             .payload
             .get("case_refs")
@@ -169,6 +167,7 @@ impl RuntimeHost {
             campaign_id: RegressionCampaignId::new(),
             candidate_id: candidate_id.to_owned(),
             candidate_digest,
+            candidate_artifact_ref: Some(frozen_patch.artifact_ref),
             baseline_version: env!("CARGO_PKG_VERSION").to_owned(),
             environment_recipe: "isolated-runtime-host/mock-provider/v1".to_owned(),
             case_refs: regression_cases
@@ -302,6 +301,377 @@ impl RuntimeHost {
         let regression =
             run_blocking(move || evaluation_store.run_regression(&candidate_id)).await??;
         Ok(regression)
+    }
+
+    pub(crate) fn automatically_process_improvement_candidate<'a>(
+        &'a self,
+        session_id: SessionId,
+        candidate_id: &'a str,
+    ) -> BoxFuture<'a, Result<(), ClientError>> {
+        async move {
+            let evaluation_store = self.evaluation_store.clone();
+            let state = run_blocking(move || evaluation_store.snapshot()).await??;
+            let Some(candidate) = state
+                .automation_candidates
+                .iter()
+                .find(|candidate| candidate.id == candidate_id)
+                .cloned()
+            else {
+                return Ok(());
+            };
+            if candidate.kind != golutra_eval::AutomationCandidateKind::RuntimeChange {
+                return Ok(());
+            }
+            let frozen_patch = state
+                .frozen_candidate_patches
+                .iter()
+                .find(|patch| patch.candidate_id == candidate_id)
+                .cloned();
+            let regression = if candidate.status == CandidateStatus::Proposed {
+                let command = SessionCommand {
+                    command_id: CommandId::new(),
+                    session_id: Some(session_id),
+                    kind: SessionCommandKind::RunRegression,
+                    idempotency_key: format!("automatic-regression:{candidate_id}"),
+                    actor: Actor {
+                        kind: ActorKind::Runtime,
+                        id: "automatic-improvement-dispatcher".to_owned(),
+                    },
+                    payload: json!({
+                        "candidate_id": candidate_id,
+                        "candidate_artifact_ref": frozen_patch.as_ref().map(|patch| patch.artifact_ref),
+                    }),
+                    timestamp: chrono::Utc::now(),
+                };
+                if frozen_patch.is_some() {
+                    match self
+                        .run_regression_campaign(session_id, &command, candidate_id)
+                        .await
+                    {
+                        Ok(regression) => regression,
+                        Err(error) => {
+                            let evaluation_store = self.evaluation_store.clone();
+                            let reason =
+                                format!("automatic isolated regression could not run: {error}");
+                            let candidate_id = candidate_id.to_owned();
+                            run_blocking(move || {
+                                evaluation_store
+                                    .record_blocked_regression(&candidate_id, &reason)
+                            })
+                            .await??
+                        }
+                    }
+                } else {
+                    let evaluation_store = self.evaluation_store.clone();
+                    let candidate_id = candidate_id.to_owned();
+                    run_blocking(move || {
+                        evaluation_store.record_blocked_regression(
+                            &candidate_id,
+                            "candidate has no immutable candidate_patch_set artifact; generate and freeze an executable patch before regression",
+                        )
+                    })
+                    .await??
+                }
+            } else {
+                let Some(regression) = state
+                    .regressions
+                    .iter()
+                    .rev()
+                    .find(|regression| regression.candidate_id == candidate_id)
+                    .cloned()
+                else {
+                    return Ok(());
+                };
+                regression
+            };
+            let evaluation_store = self.evaluation_store.clone();
+            let state = run_blocking(move || evaluation_store.snapshot()).await??;
+            let decision = if let Some(decision) = state
+                .promotion_decisions
+                .iter()
+                .rev()
+                .find(|decision| decision.candidate_id == candidate_id)
+                .cloned()
+            {
+                decision
+            } else {
+                let evaluation_store = self.evaluation_store.clone();
+                let candidate_id_owned = candidate_id.to_owned();
+                run_blocking(move || {
+                    evaluation_store.decide_after_regression(&candidate_id_owned)
+                })
+                .await??
+            };
+            self.record_automatic_improvement_events(
+                session_id,
+                candidate.source_task_id,
+                &regression,
+                &decision,
+            )
+            .await
+        }
+        .boxed()
+    }
+
+    async fn record_automatic_improvement_events(
+        &self,
+        session_id: SessionId,
+        source_task_id: TaskId,
+        regression: &RegressionResult,
+        decision: &golutra_eval::PromotionDecision,
+    ) -> Result<(), ClientError> {
+        let events = self
+            .repositories
+            .events
+            .load(session_id, Some(source_task_id), None)
+            .await?;
+        let has_regression = events.iter().any(|event| {
+            event.event_type == RuntimeEventType::RegressionCompleted
+                && event.payload["record"]["regression_id"] == regression.regression_id
+        });
+        if !has_regression {
+            self.record_event(host_event(
+                self.next_sequence_no(),
+                session_id,
+                Some(source_task_id),
+                RuntimeEventType::RegressionCompleted,
+                RuntimeEventSource::Evaluator,
+                json!({
+                    "summary": format!(
+                        "candidate {} automatic regression settled",
+                        regression.candidate_id
+                    ),
+                    "record": regression,
+                    "automatic": true,
+                }),
+            ))
+            .await?;
+        }
+        let has_decision = events.iter().any(|event| {
+            event.event_type == RuntimeEventType::PromotionDecided
+                && event.payload["record"]["decision_id"] == decision.decision_id
+        });
+        if !has_decision {
+            self.record_event(host_event(
+                self.next_sequence_no(),
+                session_id,
+                Some(source_task_id),
+                RuntimeEventType::PromotionDecided,
+                RuntimeEventSource::Evaluator,
+                json!({
+                    "summary": format!(
+                        "candidate {} automatic promotion decision: {:?}",
+                        decision.candidate_id, decision.decision
+                    ),
+                    "record": decision,
+                    "automatic": true,
+                }),
+            ))
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn resolve_frozen_candidate_patch(
+        &self,
+        session_id: SessionId,
+        source_task_id: TaskId,
+        candidate_id: &str,
+        payload: &Value,
+    ) -> Result<(Vec<CandidateFile>, FrozenCandidatePatch), ClientError> {
+        let supplied_files = candidate_files_from_payload(payload)?;
+        let evaluation_store = self.evaluation_store.clone();
+        let candidate_id_owned = candidate_id.to_owned();
+        let existing = run_blocking(move || {
+            evaluation_store.snapshot().map(|state| {
+                state
+                    .frozen_candidate_patches
+                    .into_iter()
+                    .find(|patch| patch.candidate_id == candidate_id_owned)
+            })
+        })
+        .await??;
+        if let Some(patch) = existing {
+            let files = self.load_frozen_candidate_patch(session_id, &patch).await?;
+            if !supplied_files.is_empty() && candidate_files_digest(&supplied_files) != patch.digest
+            {
+                return Err(ClientError::TaskExecution(
+                    "candidate_files do not match the immutable frozen candidate patch".to_owned(),
+                ));
+            }
+            validate_declared_candidate_digest(payload, &patch.digest)?;
+            validate_declared_candidate_artifact(payload, patch.artifact_ref)?;
+            self.record_candidate_patch_event_if_missing(session_id, &patch)
+                .await?;
+            return Ok((files, patch));
+        }
+        if supplied_files.is_empty() {
+            return Err(ClientError::TaskExecution(
+                "regression candidate has no frozen candidate_patch_set artifact or candidate_files"
+                    .to_owned(),
+            ));
+        }
+        let patch = self
+            .freeze_candidate_patch(session_id, source_task_id, candidate_id, &supplied_files)
+            .await?;
+        validate_declared_candidate_digest(payload, &patch.digest)?;
+        validate_declared_candidate_artifact(payload, patch.artifact_ref)?;
+        Ok((supplied_files, patch))
+    }
+
+    async fn freeze_candidate_patch(
+        &self,
+        session_id: SessionId,
+        source_task_id: TaskId,
+        candidate_id: &str,
+        files: &[CandidateFile],
+    ) -> Result<FrozenCandidatePatch, ClientError> {
+        let bundle = CandidatePatchBundle {
+            format: "golutra.candidate-patch.v1".to_owned(),
+            files: files
+                .iter()
+                .map(|file| {
+                    (
+                        file.relative_path.to_string_lossy().into_owned(),
+                        file.content.clone(),
+                    )
+                })
+                .collect(),
+        };
+        let bytes = serde_json::to_vec(&bundle)?;
+        let artifact_id = ArtifactId::new();
+        let event_id = EventId::new();
+        let checksum = format!("sha256:{:x}", Sha256::digest(&bytes));
+        let artifact = ArtifactRecord {
+            artifact_id,
+            session_id,
+            turn_id: None,
+            tool_call_id: None,
+            artifact_type: "candidate_patch_set".to_owned(),
+            uri: format!("artifact://candidate-patch/{candidate_id}/{artifact_id}"),
+            checksum,
+            size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            created_at: chrono::Utc::now(),
+            producer: "improvement-candidate-dispatcher".to_owned(),
+            redaction_status: RedactionStatus::Raw,
+            retention_policy: "governance_evidence".to_owned(),
+            provenance_refs: vec![event_id],
+        };
+        self.repositories.artifacts.store(&artifact, &bytes).await?;
+        let patch = FrozenCandidatePatch {
+            candidate_id: candidate_id.to_owned(),
+            source_task_id,
+            artifact_ref: artifact_id,
+            digest: candidate_files_digest(files),
+            format: bundle.format,
+            file_count: u32::try_from(files.len()).unwrap_or(u32::MAX),
+            total_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            frozen_at: chrono::Utc::now(),
+        };
+        let evaluation_store = self.evaluation_store.clone();
+        let stored_patch = patch.clone();
+        run_blocking(move || evaluation_store.record_frozen_candidate_patch(stored_patch))
+            .await??;
+        self.record_candidate_patch_event_if_missing(session_id, &patch)
+            .await?;
+        Ok(patch)
+    }
+
+    async fn record_candidate_patch_event_if_missing(
+        &self,
+        session_id: SessionId,
+        patch: &FrozenCandidatePatch,
+    ) -> Result<(), ClientError> {
+        let events = self
+            .repositories
+            .events
+            .load(session_id, Some(patch.source_task_id), None)
+            .await?;
+        if events.iter().any(|event| {
+            event.event_type == RuntimeEventType::CandidatePatchFrozen
+                && event.payload_ref == Some(patch.artifact_ref)
+                && event.payload["record"]["candidate_id"] == patch.candidate_id
+                && event.payload["record"]["artifact_ref"] == patch.artifact_ref.to_string()
+                && event.payload["record"]["digest"] == patch.digest
+        }) {
+            return Ok(());
+        }
+        let artifact = self
+            .repositories
+            .artifacts
+            .get(patch.artifact_ref)
+            .await?
+            .ok_or_else(|| {
+                ClientError::TaskExecution("frozen candidate patch artifact is missing".to_owned())
+            })?;
+        let event_id = artifact.provenance_refs.first().copied().ok_or_else(|| {
+            ClientError::TaskExecution(
+                "frozen candidate patch artifact has no canonical event provenance".to_owned(),
+            )
+        })?;
+        let mut event = host_event(
+            self.next_sequence_no(),
+            session_id,
+            Some(patch.source_task_id),
+            RuntimeEventType::CandidatePatchFrozen,
+            RuntimeEventSource::Evaluator,
+            json!({
+                "summary": format!(
+                    "candidate {} executable patch frozen",
+                    patch.candidate_id
+                ),
+                "record": patch,
+            }),
+        );
+        event.id = event_id;
+        event.payload_ref = Some(patch.artifact_ref);
+        self.record_event(event).await
+    }
+
+    async fn load_frozen_candidate_patch(
+        &self,
+        session_id: SessionId,
+        patch: &FrozenCandidatePatch,
+    ) -> Result<Vec<CandidateFile>, ClientError> {
+        let artifact = self
+            .repositories
+            .artifacts
+            .get(patch.artifact_ref)
+            .await?
+            .ok_or_else(|| {
+                ClientError::TaskExecution("frozen candidate patch artifact is missing".to_owned())
+            })?;
+        if artifact.session_id != session_id || artifact.artifact_type != "candidate_patch_set" {
+            return Err(ClientError::TaskExecution(
+                "frozen candidate patch artifact belongs to another session or type".to_owned(),
+            ));
+        }
+        let bytes = self
+            .repositories
+            .artifacts
+            .bytes(patch.artifact_ref)
+            .await?
+            .ok_or_else(|| {
+                ClientError::TaskExecution(
+                    "frozen candidate patch artifact content is unavailable".to_owned(),
+                )
+            })?;
+        let bundle: CandidatePatchBundle = serde_json::from_slice(&bytes)?;
+        if bundle.format != patch.format || bundle.format != "golutra.candidate-patch.v1" {
+            return Err(ClientError::TaskExecution(
+                "frozen candidate patch format is unsupported".to_owned(),
+            ));
+        }
+        let files = candidate_files_from_map(&bundle.files)?;
+        if candidate_files_digest(&files) != patch.digest
+            || u32::try_from(files.len()).unwrap_or(u32::MAX) != patch.file_count
+            || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != patch.total_bytes
+        {
+            return Err(ClientError::TaskExecution(
+                "frozen candidate patch digest or file count does not match its record".to_owned(),
+            ));
+        }
+        Ok(files)
     }
 
     async fn execute_regression_role(
@@ -627,37 +997,91 @@ fn candidate_files_from_payload(payload: &Value) -> Result<Vec<CandidateFile>, C
     }
     let mut candidate_files = Vec::with_capacity(files.len());
     for (relative, content) in files {
-        let relative = PathBuf::from(relative);
-        if relative.is_absolute()
-            || relative
-                .components()
-                .any(|component| matches!(component, std::path::Component::ParentDir))
-        {
-            return Err(ClientError::TaskExecution(
-                "candidate_files paths must stay inside the isolated workspace".to_owned(),
-            ));
-        }
-        if let Some(reason) = sealed_candidate_path_reason(&relative) {
-            return Err(ClientError::TaskExecution(format!(
-                "candidate file `{}` modifies sealed control-plane state: {reason}",
-                relative.display()
-            )));
-        }
         let content = content.as_str().ok_or_else(|| {
             ClientError::TaskExecution("candidate_files values must be strings".to_owned())
         })?;
-        if content.len() > MAX_CANDIDATE_FILE_BYTES {
-            return Err(ClientError::TaskExecution(format!(
-                "candidate file exceeds {MAX_CANDIDATE_FILE_BYTES} bytes"
-            )));
-        }
-        candidate_files.push(CandidateFile {
-            relative_path: relative,
-            content: content.to_owned(),
-        });
+        candidate_files.push(candidate_file(relative, content)?);
     }
     candidate_files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     Ok(candidate_files)
+}
+
+fn candidate_files_from_map(
+    files: &BTreeMap<String, String>,
+) -> Result<Vec<CandidateFile>, ClientError> {
+    if files.len() > MAX_CANDIDATE_FILES {
+        return Err(ClientError::TaskExecution(format!(
+            "candidate patch exceeds {MAX_CANDIDATE_FILES} entries"
+        )));
+    }
+    files
+        .iter()
+        .map(|(relative, content)| candidate_file(relative, content))
+        .collect()
+}
+
+fn candidate_file(relative: &str, content: &str) -> Result<CandidateFile, ClientError> {
+    let relative = PathBuf::from(relative);
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(ClientError::TaskExecution(
+            "candidate file paths must stay inside the isolated workspace".to_owned(),
+        ));
+    }
+    if let Some(reason) = sealed_candidate_path_reason(&relative) {
+        return Err(ClientError::TaskExecution(format!(
+            "candidate file `{}` modifies sealed control-plane state: {reason}",
+            relative.display()
+        )));
+    }
+    if content.len() > MAX_CANDIDATE_FILE_BYTES {
+        return Err(ClientError::TaskExecution(format!(
+            "candidate file exceeds {MAX_CANDIDATE_FILE_BYTES} bytes"
+        )));
+    }
+    Ok(CandidateFile {
+        relative_path: relative,
+        content: content.to_owned(),
+    })
+}
+
+fn validate_declared_candidate_digest(
+    payload: &Value,
+    candidate_digest: &str,
+) -> Result<(), ClientError> {
+    if let Some(declared_digest) = payload
+        .get("candidate_digest")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        && declared_digest != candidate_digest
+    {
+        return Err(ClientError::TaskExecution(
+            "declared candidate_digest does not match the immutable candidate patch".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_declared_candidate_artifact(
+    payload: &Value,
+    artifact_ref: ArtifactId,
+) -> Result<(), ClientError> {
+    let Some(declared) = payload.get("candidate_artifact_ref") else {
+        return Ok(());
+    };
+    let declared = declared.as_str().ok_or_else(|| {
+        ClientError::TaskExecution("candidate_artifact_ref must be an artifact id".to_owned())
+    })?;
+    if declared != artifact_ref.to_string() {
+        return Err(ClientError::TaskExecution(
+            "candidate_artifact_ref does not match the immutable candidate patch".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn candidate_files_digest(files: &[CandidateFile]) -> String {
@@ -832,6 +1256,90 @@ mod tests {
         assert_ne!(
             candidate_files_digest(&first),
             candidate_files_digest(&changed)
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_candidate_patch_event_is_recovered_idempotently() {
+        let application = RuntimeApplication::in_memory().await.expect("application");
+        let host = application.host();
+        let session_id = application.session_service().default_session_id();
+        let source_task_id = TaskId::new();
+        let artifact_id = ArtifactId::new();
+        let event_id = EventId::new();
+        let bytes = br#"{"format":"golutra.candidate-patch.v1","files":{"src/lib.rs":""}}"#;
+        let artifact = ArtifactRecord {
+            artifact_id,
+            session_id,
+            turn_id: None,
+            tool_call_id: None,
+            artifact_type: "candidate_patch_set".to_owned(),
+            uri: format!("artifact://candidate-patch/test/{artifact_id}"),
+            checksum: format!("sha256:{:x}", Sha256::digest(bytes)),
+            size_bytes: u64::try_from(bytes.len()).expect("artifact size"),
+            created_at: chrono::Utc::now(),
+            producer: "test".to_owned(),
+            redaction_status: RedactionStatus::Raw,
+            retention_policy: "governance_evidence".to_owned(),
+            provenance_refs: vec![event_id],
+        };
+        host.repositories
+            .artifacts
+            .store(&artifact, bytes)
+            .await
+            .expect("candidate artifact");
+        let patch = FrozenCandidatePatch {
+            candidate_id: "candidate-crash-recovery".to_owned(),
+            source_task_id,
+            artifact_ref: artifact_id,
+            digest: "sha256:test".to_owned(),
+            format: "golutra.candidate-patch.v1".to_owned(),
+            file_count: 1,
+            total_bytes: u64::try_from(bytes.len()).expect("patch size"),
+            frozen_at: chrono::Utc::now(),
+        };
+        host.record_event(host_event(
+            host.next_sequence_no(),
+            session_id,
+            Some(source_task_id),
+            RuntimeEventType::CandidatePatchFrozen,
+            RuntimeEventSource::Evaluator,
+            json!({
+                "record": {
+                    "candidate_id": patch.candidate_id,
+                    "artifact_ref": ArtifactId::new(),
+                    "digest": "sha256:stale",
+                }
+            }),
+        ))
+        .await
+        .expect("stale candidate event");
+
+        host.record_candidate_patch_event_if_missing(session_id, &patch)
+            .await
+            .expect("recover event");
+        host.record_candidate_patch_event_if_missing(session_id, &patch)
+            .await
+            .expect("idempotent recovery");
+
+        let matching = host
+            .repositories
+            .events
+            .load(session_id, Some(source_task_id), None)
+            .await
+            .expect("candidate events")
+            .into_iter()
+            .filter(|event| {
+                event.event_type == RuntimeEventType::CandidatePatchFrozen
+                    && event.payload_ref == Some(artifact_id)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].id, event_id);
+        assert_eq!(matching[0].payload_ref, Some(artifact_id));
+        assert_eq!(
+            matching[0].payload["record"]["candidate_id"],
+            patch.candidate_id
         );
     }
 }

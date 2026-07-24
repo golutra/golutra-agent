@@ -88,6 +88,7 @@ pub enum RuntimeEventType {
     EvaluationCompleted,
     ImprovementCandidateCreated,
     AutomationCandidateCreated,
+    CandidatePatchFrozen,
     RegressionCompleted,
     PromotionDecided,
     CandidateApplied,

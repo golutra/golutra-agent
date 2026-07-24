@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, fs};
 
 use chrono::Utc;
 use golutra_core::{
-    EvidenceId, RegressionCampaign, RegressionCampaignId, RegressionExecution,
+    ArtifactId, EvidenceId, RegressionCampaign, RegressionCampaignId, RegressionExecution,
     RegressionExecutionId, RegressionExecutionRole, RegressionExecutionStatus, TaskId, TaskStatus,
     VerificationCheck, VerificationCheckKind, VerificationId, VerificationRecord,
     VerificationResult,
@@ -66,6 +66,7 @@ fn seed_paired_execution(store: &EvaluationStore, candidate_id: &str) {
             campaign_id,
             candidate_id: candidate_id.to_owned(),
             candidate_digest: "sha256:test-candidate".to_owned(),
+            candidate_artifact_ref: None,
             baseline_version: "baseline-test".to_owned(),
             environment_recipe: "isolated-test".to_owned(),
             case_refs: vec![case_ref.clone()],
@@ -151,6 +152,8 @@ fn external_evaluation(
         }),
         score_max: Some(1.0),
         assertions: Vec::new(),
+        phases: Vec::new(),
+        terminal_cause: None,
         artifact_refs: Vec::new(),
         imported_artifacts: Vec::new(),
         imported_evidence_refs: Vec::new(),
@@ -171,6 +174,40 @@ fn external_evaluation(
     };
     record.result_digest = external_evaluation_result_digest(&record);
     record
+}
+
+#[test]
+fn external_evaluation_rejects_inconsistent_phase_outcomes() {
+    let task_id = TaskId::new();
+    let mut record = external_evaluation(
+        task_id,
+        "phase-invalid",
+        "case",
+        RegressionCampaignId::new(),
+        "candidate",
+        RegressionExecutionRole::Candidate,
+        EvaluationPartitionKind::Source,
+        "mock",
+        1,
+        ExternalEvaluationTrust::OwnerLocal,
+    );
+    let now = Utc::now();
+    record.phases = vec![ExternalEvaluationPhase {
+        phase_id: "test".to_owned(),
+        kind: ExternalEvaluationPhaseKind::Test,
+        status: ExternalEvaluationPhaseStatus::Failed,
+        started_at: Some(now),
+        completed_at: Some(now),
+        duration_ms: Some(0),
+        assertion_refs: Vec::new(),
+        evidence_refs: Vec::new(),
+    }];
+    record.result_digest = external_evaluation_result_digest(&record);
+
+    assert!(matches!(
+        EvaluationStore::in_memory().record_external_evaluation(record),
+        Err(EvaluationError::Invariant(_))
+    ));
 }
 
 #[test]
@@ -306,33 +343,134 @@ fn repeated_task_evaluation_is_idempotent_for_candidates() {
     assert_eq!(state.cases.len(), 1);
     assert_eq!(state.results.len(), 1);
     assert_eq!(state.improvement_candidates.len(), 1);
-    assert_eq!(state.automation_candidates.len(), 2);
+    assert_eq!(state.automation_candidates.len(), 3);
+}
+
+#[test]
+fn failed_improvement_candidate_settles_as_review_without_an_executable_patch() {
+    let task_id = TaskId::new();
+    let candidate_id = format!("candidate-{task_id}");
+    let store = EvaluationStore::in_memory();
+    let bundle = EvaluationRunner.evaluate_task(failed_input(task_id, EvidenceId::new()));
+    assert!(
+        bundle
+            .improvement_candidate
+            .as_ref()
+            .is_some_and(|candidate| {
+                candidate.id == candidate_id && candidate.status == CandidateStatus::Proposed
+            })
+    );
+    assert!(bundle.automation_candidates.iter().any(|candidate| {
+        candidate.id == candidate_id
+            && candidate.kind == AutomationCandidateKind::RuntimeChange
+            && candidate.status == CandidateStatus::Proposed
+    }));
+    store.record_task_evaluation(bundle).expect("evaluation");
+
+    let regression = store
+        .record_blocked_regression(&candidate_id, "no frozen candidate patch")
+        .expect("blocked regression");
+    let decision = store
+        .decide_after_regression(&candidate_id)
+        .expect("promotion decision");
+    let state = store.snapshot().expect("state");
+
+    assert_eq!(regression.verdict, RegressionVerdict::NeedsReview);
+    assert_eq!(decision.decision, PromotionDecisionKind::NeedsHumanReview);
+    assert!(state.improvement_candidates.iter().any(|candidate| {
+        candidate.id == candidate_id && candidate.status == CandidateStatus::NeedsHumanReview
+    }));
+    assert!(state.automation_candidates.iter().any(|candidate| {
+        candidate.id == candidate_id && candidate.status == CandidateStatus::NeedsHumanReview
+    }));
+    assert!(state.applied_candidates.is_empty());
+}
+
+#[test]
+fn frozen_candidate_patch_is_idempotent_but_immutable() {
+    let task_id = TaskId::new();
+    let candidate_id = format!("candidate-{task_id}");
+    let store = EvaluationStore::in_memory();
+    store
+        .record_task_evaluation(
+            EvaluationRunner.evaluate_task(failed_input(task_id, EvidenceId::new())),
+        )
+        .expect("evaluation");
+    let patch = FrozenCandidatePatch {
+        candidate_id: candidate_id.clone(),
+        source_task_id: task_id,
+        artifact_ref: ArtifactId::new(),
+        digest: "sha256:frozen-patch".to_owned(),
+        format: "golutra.candidate-patch.v1".to_owned(),
+        file_count: 1,
+        total_bytes: 128,
+        frozen_at: Utc::now(),
+    };
+
+    assert!(
+        store
+            .record_frozen_candidate_patch(patch.clone())
+            .expect("first freeze")
+    );
+    assert!(
+        !store
+            .record_frozen_candidate_patch(FrozenCandidatePatch {
+                frozen_at: Utc::now(),
+                ..patch.clone()
+            })
+            .expect("idempotent freeze")
+    );
+    let replacement = FrozenCandidatePatch {
+        artifact_ref: ArtifactId::new(),
+        digest: "sha256:different-patch".to_owned(),
+        ..patch
+    };
+    assert!(matches!(
+        store.record_frozen_candidate_patch(replacement),
+        Err(EvaluationError::InvalidCandidateState { .. })
+    ));
 }
 
 #[test]
 fn applied_benchmark_can_be_rolled_back() {
     let task_id = TaskId::new();
     let store = EvaluationStore::in_memory();
+    let bundle = EvaluationRunner.evaluate_task(failed_input(task_id, EvidenceId::new()));
     store
-        .record_task_evaluation(
-            EvaluationRunner.evaluate_task(failed_input(task_id, EvidenceId::new())),
-        )
+        .record_task_evaluation(bundle.clone())
         .expect("record");
     let candidate_id = format!("automation-benchmark-{task_id}");
     seed_paired_execution(&store, &candidate_id);
     store.run_regression(&candidate_id).expect("regression");
     store.decide_promotion(&candidate_id).expect("decision");
     store.apply_candidate(&candidate_id).expect("apply");
+    store
+        .record_task_evaluation(bundle.clone())
+        .expect("repeat applied source evaluation");
+    let applied_state = store.snapshot().expect("applied snapshot");
+    assert!(applied_state.benchmark_promotions.iter().any(|candidate| {
+        candidate.source_task_id == task_id
+            && candidate.promotion_status == CandidateStatus::Applied
+            && candidate.accepted_by.as_deref() == Some("system")
+    }));
 
     let rolled_back = store
         .rollback_candidate(&candidate_id, "superseded")
         .expect("rollback");
+    store
+        .record_task_evaluation(bundle)
+        .expect("repeat source evaluation");
 
     assert!(rolled_back.rolled_back_at.is_some());
-    assert_eq!(
-        store.snapshot().expect("snapshot").automation_candidates[0].status,
-        CandidateStatus::RolledBack
-    );
+    let state = store.snapshot().expect("snapshot");
+    assert!(state.automation_candidates.iter().any(|candidate| {
+        candidate.id == candidate_id && candidate.status == CandidateStatus::RolledBack
+    }));
+    assert!(state.benchmark_promotions.iter().any(|candidate| {
+        candidate.source_task_id == task_id
+            && candidate.promotion_status == CandidateStatus::RolledBack
+            && candidate.accepted_by.is_none()
+    }));
 }
 
 #[test]
@@ -393,6 +531,7 @@ fn regression_requires_a_completed_execution_pair_for_every_campaign_case() {
             campaign_id,
             candidate_id: candidate_id.clone(),
             candidate_digest: "sha256:multi-case".to_owned(),
+            candidate_artifact_ref: None,
             baseline_version: "baseline-test".to_owned(),
             environment_recipe: "isolated-test".to_owned(),
             case_refs: case_refs.clone(),
@@ -666,6 +805,7 @@ fn trusted_external_pair_is_compared_and_contributes_campaign_coverage() {
             campaign_id,
             candidate_id: candidate_id.clone(),
             candidate_digest: "sha256:external-coverage".to_owned(),
+            candidate_artifact_ref: None,
             baseline_version: "baseline-test".to_owned(),
             environment_recipe: "isolated-test".to_owned(),
             case_refs: vec![case_ref.clone()],

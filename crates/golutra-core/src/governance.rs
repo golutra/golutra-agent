@@ -257,6 +257,8 @@ pub struct RegressionCampaign {
     pub campaign_id: RegressionCampaignId,
     pub candidate_id: String,
     pub candidate_digest: String,
+    #[serde(default)]
+    pub candidate_artifact_ref: Option<ArtifactId>,
     pub baseline_version: String,
     pub environment_recipe: String,
     pub case_refs: Vec<String>,

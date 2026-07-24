@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -17,16 +18,17 @@ use uuid::Uuid;
 
 use crate::runner::{
     benchmark_check, benchmark_run_has_required_metadata, candidate_mutates_control_plane,
-    decide_governed_promotion, sanitize_text,
+    decide_governed_promotion, runtime_candidate_from_improvement, sanitize_text,
 };
 use crate::{
     AppliedCandidate, AutomationCandidate, AutomationCandidateKind, BenchmarkCheckStatus,
     BenchmarkRun, BenchmarkSuiteKind, CandidateStatus, CausalComparison, CounterfactualReplay,
-    DiagnosticSlice, EvaluationState, EvaluationVerdict, ExternalEvaluationRecord,
-    ExternalEvaluationTrust, FailureDiagnosis, FailureEpisode, FailureEpisodeStatus,
-    ImprovementCandidate, PromotionDecision, PromotionDecisionKind, PromotionReviewer,
-    RegressionCaseResult, RegressionCoverage, RegressionResult, RegressionVerdict, ReplayCapsule,
-    ReplayExecution, TaskEvaluationBundle, external_evaluation_result_digest,
+    DiagnosticSlice, EvaluationState, EvaluationVerdict, ExternalEvaluationPhaseStatus,
+    ExternalEvaluationRecord, ExternalEvaluationTrust, FailureDiagnosis, FailureEpisode,
+    FailureEpisodeStatus, FrozenCandidatePatch, ImprovementCandidate, PromotionDecision,
+    PromotionDecisionKind, PromotionReviewer, RegressionCaseResult, RegressionCoverage,
+    RegressionResult, RegressionVerdict, ReplayCapsule, ReplayExecution, TaskEvaluationBundle,
+    external_evaluation_result_digest,
 };
 
 pub(crate) const MAX_EVALUATION_STATE_BYTES: u64 = 64 * 1024 * 1024;
@@ -47,7 +49,14 @@ pub struct EvaluationStore {
 pub struct FailureProductUpdate {
     pub diagnosis_inserted: bool,
     pub changed_episodes: Vec<FailureEpisode>,
-    pub candidate_changed: bool,
+    pub improvement_candidate: Option<ImprovementCandidate>,
+    pub automation_candidate: Option<AutomationCandidate>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskEvaluationUpdate {
+    pub improvement_candidate: Option<ImprovementCandidate>,
+    pub automation_candidates: Vec<AutomationCandidate>,
 }
 
 #[derive(Debug, Error)]
@@ -118,44 +127,65 @@ impl EvaluationStore {
     pub fn record_task_evaluation(
         &self,
         bundle: TaskEvaluationBundle,
-    ) -> Result<(), EvaluationError> {
+    ) -> Result<TaskEvaluationUpdate, EvaluationError> {
+        let TaskEvaluationBundle {
+            case,
+            run,
+            result,
+            replay,
+            review,
+            mut improvement_candidate,
+            generated_task,
+            skill_candidate,
+            mut benchmark_promotion,
+            mut automation_candidates,
+            benchmark_run,
+        } = bundle;
         self.update(|state| {
-            replace_by(&mut state.cases, bundle.case, |value| value.case_id.clone());
-            replace_by(&mut state.runs, bundle.run, |value| value.run_id.clone());
-            replace_by(&mut state.results, bundle.result, |value| {
-                value.result_id.clone()
-            });
-            replace_by(&mut state.replays, bundle.replay, |value| {
-                value.replay_id.clone()
-            });
-            replace_by(&mut state.reviews, bundle.review, |value| {
+            replace_by(&mut state.cases, case, |value| value.case_id.clone());
+            replace_by(&mut state.runs, run, |value| value.run_id.clone());
+            replace_by(&mut state.results, result, |value| value.result_id.clone());
+            replace_by(&mut state.replays, replay, |value| value.replay_id.clone());
+            replace_by(&mut state.reviews, review, |value| {
                 format!("{}:{:?}", value.task_id, value.mode)
             });
-            replace_by(&mut state.benchmark_runs, bundle.benchmark_run, |value| {
+            replace_by(&mut state.benchmark_runs, benchmark_run, |value| {
                 value.benchmark_id.clone()
             });
-            if let Some(candidate) = bundle.improvement_candidate {
-                replace_by(&mut state.improvement_candidates, candidate, |value| {
-                    value.id.clone()
-                });
+            if let Some(candidate) = improvement_candidate.as_mut() {
+                preserve_improvement_candidate_status(state, candidate);
+                replace_by(
+                    &mut state.improvement_candidates,
+                    candidate.clone(),
+                    |value| value.id.clone(),
+                );
             }
-            if let Some(task) = bundle.generated_task {
+            if let Some(task) = generated_task {
                 replace_by(&mut state.generated_tasks, task, |value| value.id.clone());
             }
-            if let Some(skill) = bundle.skill_candidate {
+            if let Some(skill) = skill_candidate {
                 replace_by(&mut state.skill_candidates, skill, |value| value.id.clone());
             }
-            if let Some(benchmark) = bundle.benchmark_promotion {
-                replace_by(&mut state.benchmark_promotions, benchmark, |value| {
-                    value.id.clone()
-                });
+            if let Some(benchmark) = benchmark_promotion.as_mut() {
+                preserve_benchmark_promotion_status(state, benchmark);
+                replace_by(
+                    &mut state.benchmark_promotions,
+                    benchmark.clone(),
+                    |value| value.id.clone(),
+                );
             }
-            for candidate in bundle.automation_candidates {
-                replace_by(&mut state.automation_candidates, candidate, |value| {
-                    value.id.clone()
-                });
+            for candidate in &mut automation_candidates {
+                preserve_automation_candidate_status(state, candidate);
+                replace_by(
+                    &mut state.automation_candidates,
+                    candidate.clone(),
+                    |value| value.id.clone(),
+                );
             }
-            Ok(())
+            Ok(TaskEvaluationUpdate {
+                improvement_candidate,
+                automation_candidates,
+            })
         })
     }
 
@@ -164,11 +194,7 @@ impl EvaluationStore {
         diagnosis: FailureDiagnosis,
         slice: DiagnosticSlice,
     ) -> Result<bool, EvaluationError> {
-        if diagnosis.source_task_id != slice.source_task_id
-            || diagnosis.diagnosis_id != slice.diagnosis.diagnosis_id
-            || slice.event_refs.is_empty()
-            || diagnosis.trigger_event_refs.is_empty()
-        {
+        if !diagnostic_slice_valid(&diagnosis, &slice) {
             return Err(EvaluationError::Invariant(
                 "diagnostic slice must reference one matching diagnosis and trigger".to_owned(),
             ));
@@ -195,10 +221,7 @@ impl EvaluationStore {
         episodes: Vec<FailureEpisode>,
         candidate: Option<ImprovementCandidate>,
     ) -> Result<FailureProductUpdate, EvaluationError> {
-        if diagnosis.source_task_id != slice.source_task_id
-            || diagnosis.diagnosis_id != slice.diagnosis.diagnosis_id
-            || slice.event_refs.is_empty()
-            || diagnosis.trigger_event_refs.is_empty()
+        if !diagnostic_slice_valid(&diagnosis, &slice)
             || episodes.is_empty()
             || !episodes
                 .iter()
@@ -250,12 +273,32 @@ impl EvaluationStore {
                     value.episode_id.clone()
                 });
             }
+            let mut candidate = candidate;
+            if let Some(candidate) = candidate.as_mut() {
+                preserve_improvement_candidate_status(state, candidate);
+            }
             let candidate_changed = candidate.as_ref().is_some_and(|candidate| {
                 state
                     .improvement_candidates
                     .iter()
                     .find(|existing| existing.id == candidate.id)
                     != Some(candidate)
+            });
+            let improvement_candidate = candidate.as_ref().filter(|_| candidate_changed).cloned();
+            let automation_candidate = candidate.as_ref().and_then(|candidate| {
+                let mut automation = runtime_candidate_from_improvement(candidate);
+                preserve_automation_candidate_status(state, &mut automation);
+                let changed = state
+                    .automation_candidates
+                    .iter()
+                    .find(|existing| existing.id == automation.id)
+                    != Some(&automation);
+                replace_by(
+                    &mut state.automation_candidates,
+                    automation.clone(),
+                    |value| value.id.clone(),
+                );
+                changed.then_some(automation)
             });
             if let Some(candidate) = candidate {
                 replace_by(&mut state.improvement_candidates, candidate, |value| {
@@ -265,7 +308,8 @@ impl EvaluationStore {
             Ok(FailureProductUpdate {
                 diagnosis_inserted,
                 changed_episodes,
-                candidate_changed,
+                improvement_candidate,
+                automation_candidate,
             })
         })
     }
@@ -302,6 +346,133 @@ impl EvaluationStore {
                 });
             }
             Ok(changed)
+        })
+    }
+
+    pub fn record_frozen_candidate_patch(
+        &self,
+        patch: FrozenCandidatePatch,
+    ) -> Result<bool, EvaluationError> {
+        if patch.candidate_id.trim().is_empty()
+            || patch.digest.trim().is_empty()
+            || patch.format.trim().is_empty()
+            || patch.file_count == 0
+            || patch.total_bytes == 0
+        {
+            return Err(EvaluationError::Invariant(
+                "frozen candidate patch requires an artifact, digest, format, and files".to_owned(),
+            ));
+        }
+        self.update(|state| {
+            let source_task_id = state
+                .improvement_candidates
+                .iter()
+                .find(|candidate| candidate.id == patch.candidate_id)
+                .map(|candidate| candidate.source_task_id)
+                .or_else(|| {
+                    state
+                        .automation_candidates
+                        .iter()
+                        .find(|candidate| candidate.id == patch.candidate_id)
+                        .map(|candidate| candidate.source_task_id)
+                })
+                .ok_or_else(|| EvaluationError::CandidateNotFound(patch.candidate_id.clone()))?;
+            if source_task_id != patch.source_task_id {
+                return Err(EvaluationError::Invariant(
+                    "frozen candidate patch source task does not match its candidate".to_owned(),
+                ));
+            }
+            if let Some(existing) = state
+                .frozen_candidate_patches
+                .iter()
+                .find(|existing| existing.candidate_id == patch.candidate_id)
+            {
+                if same_frozen_candidate_patch(existing, &patch) {
+                    return Ok(false);
+                }
+                return Err(EvaluationError::InvalidCandidateState {
+                    candidate_id: patch.candidate_id,
+                    status: state
+                        .automation_candidates
+                        .iter()
+                        .find(|candidate| candidate.id == existing.candidate_id)
+                        .map_or(CandidateStatus::NeedsHumanReview, |candidate| {
+                            candidate.status
+                        }),
+                    action: "replace an immutable frozen patch".to_owned(),
+                });
+            }
+            state.frozen_candidate_patches.push(patch);
+            Ok(true)
+        })
+    }
+
+    pub fn record_blocked_regression(
+        &self,
+        candidate_id: &str,
+        reason: &str,
+    ) -> Result<RegressionResult, EvaluationError> {
+        if reason.trim().is_empty() {
+            return Err(EvaluationError::Invariant(
+                "blocked regression requires an actionable reason".to_owned(),
+            ));
+        }
+        self.update(|state| {
+            let candidate = state
+                .automation_candidates
+                .iter()
+                .find(|candidate| candidate.id == candidate_id)
+                .cloned()
+                .ok_or_else(|| EvaluationError::CandidateNotFound(candidate_id.to_owned()))?;
+            if candidate.status == CandidateStatus::NeedsHumanReview
+                && let Some(existing) = state
+                    .regressions
+                    .iter()
+                    .rev()
+                    .find(|regression| regression.candidate_id == candidate_id)
+            {
+                return Ok(existing.clone());
+            }
+            if candidate.status != CandidateStatus::Proposed {
+                return Err(EvaluationError::InvalidCandidateState {
+                    candidate_id: candidate.id,
+                    status: candidate.status,
+                    action: "record blocked regression".to_owned(),
+                });
+            }
+            let reason = sanitize_text(reason);
+            let regression = RegressionResult {
+                regression_id: format!("regression-{}", Uuid::now_v7()),
+                candidate_id: candidate.id.clone(),
+                baseline_version: env!("CARGO_PKG_VERSION").to_owned(),
+                candidate_version: "unfrozen-candidate".to_owned(),
+                cases_run: 0,
+                passed_cases: 0,
+                failed_cases: 0,
+                regressions: vec![reason],
+                cost_delta: None,
+                latency_delta: None,
+                quality_delta: None,
+                security_delta: None,
+                causal_comparison_refs: Vec::new(),
+                paired_execution_refs: Vec::new(),
+                external_evaluation_refs: Vec::new(),
+                coverage: RegressionCoverage::default(),
+                suite_kind: BenchmarkSuiteKind::Regression,
+                case_results: Vec::new(),
+                baseline_benchmark_refs: vec![format!(
+                    "benchmark-run-{}",
+                    candidate.source_task_id
+                )],
+                candidate_benchmark_refs: Vec::new(),
+                verdict: RegressionVerdict::NeedsReview,
+                created_at: Utc::now(),
+            };
+            set_candidate_status(state, &candidate.id, CandidateStatus::NeedsHumanReview)?;
+            replace_by(&mut state.regressions, regression.clone(), |value| {
+                value.regression_id.clone()
+            });
+            Ok(regression)
         })
     }
 
@@ -427,6 +598,7 @@ impl EvaluationStore {
             || !record.result_digest.starts_with("sha256:")
             || record.result_digest != external_evaluation_result_digest(&record)
             || !score_valid
+            || !external_evaluation_phases_valid(&record)
             || !association_valid
             || !signed_attestation_valid
             || holdout_disclosure_violation(&record).is_some()
@@ -819,21 +991,12 @@ impl EvaluationStore {
                 },
                 created_at: Utc::now(),
             };
-            let stored_candidate = state
-                .automation_candidates
-                .iter_mut()
-                .find(|stored| stored.id == candidate.id)
-                .ok_or_else(|| {
-                    EvaluationError::Invariant(format!(
-                        "candidate {} disappeared during regression",
-                        candidate.id
-                    ))
-                })?;
-            stored_candidate.status = match regression.verdict {
+            let status = match regression.verdict {
                 RegressionVerdict::Pass => CandidateStatus::RegressionPassed,
                 RegressionVerdict::NeedsReview => CandidateStatus::NeedsHumanReview,
                 RegressionVerdict::Fail => CandidateStatus::Rejected,
             };
+            set_candidate_status(state, &candidate.id, status)?;
             replace_by(&mut state.regressions, regression.clone(), |value| {
                 value.regression_id.clone()
             });
@@ -887,21 +1050,12 @@ impl EvaluationStore {
                     mutation_reasons: Vec::new(),
                 },
             );
-            let stored_candidate = state
-                .automation_candidates
-                .iter_mut()
-                .find(|stored| stored.id == candidate.id)
-                .ok_or_else(|| {
-                    EvaluationError::Invariant(format!(
-                        "candidate {} disappeared during promotion",
-                        candidate.id
-                    ))
-                })?;
-            stored_candidate.status = match decision.decision {
+            let status = match decision.decision {
                 PromotionDecisionKind::Approve => CandidateStatus::Approved,
                 PromotionDecisionKind::Reject => CandidateStatus::Rejected,
                 PromotionDecisionKind::NeedsHumanReview => CandidateStatus::NeedsHumanReview,
             };
+            set_candidate_status(state, &candidate.id, status)?;
             replace_by(&mut state.promotion_decisions, decision.clone(), |value| {
                 value.decision_id.clone()
             });
@@ -957,6 +1111,13 @@ impl EvaluationStore {
                     });
                 }
             };
+            if let Some(existing) = state.promotion_decisions.iter().rev().find(|existing| {
+                existing.candidate_id == candidate_id
+                    && existing.decision == decision
+                    && existing.reviewer == PromotionReviewer::System
+            }) {
+                return Ok(existing.clone());
+            }
             let promotion = PromotionDecision {
                 decision_id: format!("promotion-{}", Uuid::now_v7()),
                 candidate_id: candidate_id.to_owned(),
@@ -1035,16 +1196,12 @@ impl EvaluationStore {
                 expires_at: None,
                 created_at: Utc::now(),
             };
-            let stored_candidate = state
-                .automation_candidates
-                .iter_mut()
-                .find(|candidate| candidate.id == candidate_id)
-                .ok_or_else(|| EvaluationError::CandidateNotFound(candidate_id.to_owned()))?;
-            stored_candidate.status = match decision {
+            let status = match decision {
                 PromotionDecisionKind::Approve => CandidateStatus::Approved,
                 PromotionDecisionKind::Reject => CandidateStatus::Rejected,
                 PromotionDecisionKind::NeedsHumanReview => unreachable!(),
             };
+            set_candidate_status(state, candidate_id, status)?;
             replace_by(&mut state.promotion_decisions, promotion.clone(), |value| {
                 value.decision_id.clone()
             });
@@ -1087,17 +1244,7 @@ impl EvaluationStore {
                 rolled_back_at: None,
                 rollback_reason: None,
             };
-            state
-                .automation_candidates
-                .iter_mut()
-                .find(|stored| stored.id == candidate.id)
-                .ok_or_else(|| {
-                    EvaluationError::Invariant(format!(
-                        "candidate {} disappeared during apply",
-                        candidate.id
-                    ))
-                })?
-                .status = CandidateStatus::Applied;
+            set_candidate_status(state, &candidate.id, CandidateStatus::Applied)?;
             replace_by(&mut state.applied_candidates, applied.clone(), |value| {
                 value.candidate_id.clone()
             });
@@ -1112,11 +1259,11 @@ impl EvaluationStore {
     ) -> Result<AppliedCandidate, EvaluationError> {
         let reason = reason.into();
         self.update(|state| {
-            let candidate_status = state
+            let (candidate_status, source_task_id) = state
                 .automation_candidates
                 .iter()
                 .find(|candidate| candidate.id == candidate_id)
-                .map(|candidate| candidate.status)
+                .map(|candidate| (candidate.status, candidate.source_task_id))
                 .ok_or_else(|| EvaluationError::CandidateNotFound(candidate_id.to_owned()))?;
             if candidate_status != CandidateStatus::Applied {
                 return Err(EvaluationError::InvalidCandidateState {
@@ -1133,20 +1280,12 @@ impl EvaluationStore {
             applied.rolled_back_at = Some(Utc::now());
             applied.rollback_reason = Some(reason.clone());
             let rolled_back = applied.clone();
-            if let Some(candidate) = state
-                .automation_candidates
+            set_candidate_status(state, candidate_id, CandidateStatus::RolledBack)?;
+            if let Some(benchmark) = state
+                .benchmark_promotions
                 .iter_mut()
-                .find(|candidate| candidate.id == candidate_id)
+                .find(|benchmark| benchmark.source_task_id == source_task_id)
             {
-                candidate.status = CandidateStatus::RolledBack;
-            }
-            if let Some(benchmark) = state.benchmark_promotions.iter_mut().find(|benchmark| {
-                state
-                    .automation_candidates
-                    .iter()
-                    .find(|candidate| candidate.id == candidate_id)
-                    .is_some_and(|candidate| candidate.source_task_id == benchmark.source_task_id)
-            }) {
                 benchmark.promotion_status = CandidateStatus::RolledBack;
                 benchmark.accepted_by = None;
             }
@@ -2087,4 +2226,173 @@ fn replace_by<T, K: PartialEq>(values: &mut Vec<T>, value: T, key: impl Fn(&T) -
     } else {
         values.push(value);
     }
+}
+
+fn preserve_improvement_candidate_status(
+    state: &EvaluationState,
+    candidate: &mut ImprovementCandidate,
+) {
+    if let Some(existing) = state
+        .improvement_candidates
+        .iter()
+        .find(|existing| existing.id == candidate.id)
+    {
+        candidate.status = existing.status;
+    }
+}
+
+fn preserve_automation_candidate_status(
+    state: &EvaluationState,
+    candidate: &mut AutomationCandidate,
+) {
+    if let Some(existing) = state
+        .automation_candidates
+        .iter()
+        .find(|existing| existing.id == candidate.id)
+    {
+        candidate.status = existing.status;
+    }
+}
+
+fn preserve_benchmark_promotion_status(
+    state: &EvaluationState,
+    candidate: &mut crate::BenchmarkPromotion,
+) {
+    if let Some(existing) = state
+        .benchmark_promotions
+        .iter()
+        .find(|existing| existing.id == candidate.id)
+    {
+        candidate.promotion_status = existing.promotion_status;
+        candidate.accepted_by.clone_from(&existing.accepted_by);
+    }
+}
+
+fn set_candidate_status(
+    state: &mut EvaluationState,
+    candidate_id: &str,
+    status: CandidateStatus,
+) -> Result<(), EvaluationError> {
+    let candidate = state
+        .automation_candidates
+        .iter_mut()
+        .find(|candidate| candidate.id == candidate_id)
+        .ok_or_else(|| EvaluationError::CandidateNotFound(candidate_id.to_owned()))?;
+    candidate.status = status;
+    if let Some(improvement) = state
+        .improvement_candidates
+        .iter_mut()
+        .find(|candidate| candidate.id == candidate_id)
+    {
+        improvement.status = status;
+    }
+    Ok(())
+}
+
+fn same_frozen_candidate_patch(left: &FrozenCandidatePatch, right: &FrozenCandidatePatch) -> bool {
+    left.candidate_id == right.candidate_id
+        && left.source_task_id == right.source_task_id
+        && left.artifact_ref == right.artifact_ref
+        && left.digest == right.digest
+        && left.format == right.format
+        && left.file_count == right.file_count
+        && left.total_bytes == right.total_bytes
+}
+
+fn external_evaluation_phases_valid(record: &ExternalEvaluationRecord) -> bool {
+    let assertion_ids = record
+        .assertions
+        .iter()
+        .map(|assertion| assertion.assertion_id.as_str())
+        .collect::<HashSet<_>>();
+    if assertion_ids.len() != record.assertions.len()
+        || record.assertions.iter().any(|assertion| {
+            assertion.assertion_id.trim().is_empty() || assertion.name.trim().is_empty()
+        })
+    {
+        return false;
+    }
+    let mut phase_ids = HashSet::new();
+    let mut has_failed_phase = false;
+    for phase in &record.phases {
+        if phase.phase_id.trim().is_empty()
+            || !phase_ids.insert(phase.phase_id.as_str())
+            || phase
+                .assertion_refs
+                .iter()
+                .any(|reference| !assertion_ids.contains(reference.as_str()))
+        {
+            return false;
+        }
+        if let (Some(started_at), Some(completed_at)) = (phase.started_at, phase.completed_at) {
+            let duration = completed_at
+                .signed_duration_since(started_at)
+                .num_milliseconds();
+            if duration < 0
+                || phase
+                    .duration_ms
+                    .is_some_and(|recorded| recorded != u64::try_from(duration).unwrap_or(u64::MAX))
+            {
+                return false;
+            }
+        }
+        has_failed_phase |= matches!(
+            phase.status,
+            ExternalEvaluationPhaseStatus::Failed
+                | ExternalEvaluationPhaseStatus::TimedOut
+                | ExternalEvaluationPhaseStatus::Error
+        );
+    }
+    if let Some(cause) = &record.terminal_cause
+        && (cause.code.trim().is_empty()
+            || cause.message.trim().is_empty()
+            || cause
+                .phase_id
+                .as_deref()
+                .is_some_and(|phase_id| !phase_ids.contains(phase_id)))
+    {
+        return false;
+    }
+    match record.verdict {
+        EvaluationVerdict::Pass => record.terminal_cause.is_none() && !has_failed_phase,
+        EvaluationVerdict::Fail if !record.phases.is_empty() => record.terminal_cause.is_some(),
+        EvaluationVerdict::Fail | EvaluationVerdict::Partial | EvaluationVerdict::Unknown => true,
+    }
+}
+
+fn diagnostic_slice_valid(diagnosis: &FailureDiagnosis, slice: &DiagnosticSlice) -> bool {
+    let event_refs = slice.event_refs.iter().copied().collect::<HashSet<_>>();
+    let causal_refs = slice
+        .causal_event_refs
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let supporting_refs = slice
+        .supporting_event_refs
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let continuation_omitted = slice.continuation_pages.iter().fold(0_u64, |total, page| {
+        total.saturating_add(page.omitted_event_count)
+    });
+    diagnosis.source_task_id == slice.source_task_id
+        && diagnosis.diagnosis_id == slice.diagnosis.diagnosis_id
+        && !event_refs.is_empty()
+        && !diagnosis.trigger_event_refs.is_empty()
+        && diagnosis
+            .trigger_event_refs
+            .iter()
+            .all(|event_id| causal_refs.contains(event_id))
+        && causal_refs.is_disjoint(&supporting_refs)
+        && causal_refs
+            .union(&supporting_refs)
+            .copied()
+            .collect::<HashSet<_>>()
+            == event_refs
+        && continuation_omitted == slice.omitted_event_count
+        && slice
+            .continuation_pages
+            .iter()
+            .all(|page| page.omitted_event_count > 0)
+        && !slice.selection_strategy.trim().is_empty()
 }

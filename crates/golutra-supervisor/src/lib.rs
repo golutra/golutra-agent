@@ -2090,6 +2090,7 @@ mod tests {
                 reviews: Vec::new(),
                 results: Vec::new(),
                 improvement_candidates: Vec::new(),
+                frozen_candidate_patches: Vec::new(),
                 automation_candidates: Vec::new(),
                 regressions: Vec::new(),
                 promotion_decisions: Vec::new(),

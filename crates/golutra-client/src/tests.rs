@@ -1601,6 +1601,7 @@ async fn failed_task_reaches_rejected_promotion_without_polluting_memory() {
         .find(|candidate| candidate.id.starts_with("automation-benchmark-"))
         .map(|candidate| candidate.id.clone())
         .expect("benchmark candidate");
+    let runtime_candidate_id = format!("candidate-{task_id}");
     let memories = application
         .query(RuntimeQuery {
             query_id: QueryId::new(),
@@ -1670,6 +1671,39 @@ async fn failed_task_reaches_rejected_promotion_without_polluting_memory() {
         .rev()
         .find(|campaign| campaign.candidate_id == candidate_id)
         .expect("campaign");
+    let candidate_artifact_ref = campaign
+        .candidate_artifact_ref
+        .expect("campaign frozen candidate patch");
+    let frozen_patch = evaluation_state
+        .frozen_candidate_patches
+        .iter()
+        .find(|patch| patch.candidate_id == candidate_id)
+        .expect("frozen patch record");
+    assert_eq!(frozen_patch.artifact_ref, candidate_artifact_ref);
+    assert_eq!(frozen_patch.file_count, 1);
+    let candidate_artifact = application
+        .host()
+        .repositories
+        .artifacts
+        .get(candidate_artifact_ref)
+        .await
+        .expect("candidate artifact metadata")
+        .expect("candidate artifact");
+    assert_eq!(candidate_artifact.artifact_type, "candidate_patch_set");
+    let candidate_bytes = application
+        .host()
+        .repositories
+        .artifacts
+        .bytes(candidate_artifact_ref)
+        .await
+        .expect("candidate artifact read")
+        .expect("candidate artifact bytes");
+    let candidate_bundle: Value =
+        serde_json::from_slice(&candidate_bytes).expect("candidate patch JSON");
+    assert_eq!(
+        candidate_bundle["files"]["regression-marker.txt"],
+        "candidate workspace"
+    );
     let executions = evaluation_state
         .regression_executions
         .iter()
@@ -1751,6 +1785,36 @@ async fn failed_task_reaches_rejected_promotion_without_polluting_memory() {
     assert!(!trace.evaluation.reviews.is_empty());
     assert!(!trace.evaluation.results.is_empty());
     assert!(!trace.evaluation.improvement_candidates.is_empty());
+    assert!(trace.evaluation.regressions.iter().any(|regression| {
+        regression.candidate_id == runtime_candidate_id
+            && regression.verdict == golutra_eval::RegressionVerdict::NeedsReview
+    }));
+    assert!(trace.evaluation.promotion_decisions.iter().any(|decision| {
+        decision.candidate_id == runtime_candidate_id
+            && decision.decision == PromotionDecisionKind::NeedsHumanReview
+    }));
+    assert!(
+        !evaluation_store
+            .snapshot()
+            .expect("automatic lifecycle state")
+            .applied_candidates
+            .iter()
+            .any(|candidate| candidate.candidate_id == runtime_candidate_id)
+    );
+    assert!(trace.events.iter().any(|event| {
+        event.event_type == RuntimeEventType::RegressionCompleted
+            && event.payload["automatic"] == true
+            && event.payload["record"]["candidate_id"] == runtime_candidate_id
+    }));
+    assert!(trace.events.iter().any(|event| {
+        event.event_type == RuntimeEventType::PromotionDecided
+            && event.payload["automatic"] == true
+            && event.payload["record"]["candidate_id"] == runtime_candidate_id
+    }));
+    assert!(!trace.events.iter().any(|event| {
+        event.event_type == RuntimeEventType::CandidateApplied
+            && event.payload["record"]["candidate_id"] == runtime_candidate_id
+    }));
     assert!(trace.integrity.complete, "{:?}", trace.integrity);
     assert!(memories.as_array().is_some_and(Vec::is_empty));
     assert!(matches!(
@@ -1767,6 +1831,12 @@ async fn failed_task_reaches_rejected_promotion_without_polluting_memory() {
         )))
     ));
     assert!(!governed.regressions.is_empty());
+    assert!(
+        governed
+            .frozen_candidate_patches
+            .iter()
+            .any(|patch| patch.candidate_id == candidate_id)
+    );
     assert!(governed.integrity_warnings.is_empty(), "{governed:?}");
     assert!(governed.promotion_decisions.iter().any(|decision| {
         decision.candidate_id == candidate_id && decision.decision == PromotionDecisionKind::Reject
@@ -1782,6 +1852,10 @@ async fn failed_task_reaches_rejected_promotion_without_polluting_memory() {
             .iter()
             .any(|event| event.event_type == RuntimeEventType::RegressionCompleted)
     );
+    assert!(governed_trace.events.iter().any(|event| {
+        event.event_type == RuntimeEventType::CandidatePatchFrozen
+            && event.payload["record"]["candidate_id"] == candidate_id
+    }));
     assert!(executions.iter().all(|execution| {
         execution
             .task_trace_ref
@@ -3666,8 +3740,22 @@ async fn prompt_runs_mock_agent_loop_and_writes_file() {
     assert!(
         events[checkpoint_index]["payload"]["checkpoint"]["artifact_refs"]
             .as_array()
-            .is_some_and(|references| !references.is_empty())
+            .is_some_and(Vec::is_empty)
     );
+    let checkpoint_before_images = tool_payload["checkpoint_before_images"]
+        .as_array()
+        .expect("changed-file checkpoint before images");
+    assert_eq!(checkpoint_before_images.len(), 1);
+    assert_eq!(checkpoint_before_images[0]["path"], "result.txt");
+    let checkpoint_artifact_ref = checkpoint_before_images[0]["artifact_ref"]
+        .as_str()
+        .expect("checkpoint artifact ref");
+    assert!(debug["artifacts"].as_array().is_some_and(|artifacts| {
+        artifacts.iter().any(|artifact| {
+            artifact["artifact_id"] == checkpoint_artifact_ref
+                && artifact["artifact_type"] == "checkpoint_before_image"
+        })
+    }));
     for artifact in debug["artifacts"].as_array().expect("debug artifacts") {
         assert!(
             artifact["provenance_refs"]
@@ -3760,8 +3848,9 @@ async fn shell_checkpoint_records_partial_coverage_without_persisting_ignored_im
         checkpoint["payload"]["checkpoint"]["artifact_refs"]
             .as_array()
             .map(Vec::len),
-        Some(1)
+        Some(0)
     );
+    assert_eq!(checkpoint["payload"]["candidate_before_image_count"], 1);
 }
 
 #[tokio::test]
@@ -4291,6 +4380,8 @@ async fn persisted_ephemeral_runtime_retains_isolated_state_and_full_run_bundle(
             message: "result manifest was accepted".to_owned(),
             evidence_refs: vec!["results.json".to_owned()],
         }],
+        phases: Vec::new(),
+        terminal_cause: None,
         artifact_refs: vec!["results.json".to_owned()],
         imported_artifacts: Vec::new(),
         imported_evidence_refs: Vec::new(),
@@ -4496,6 +4587,8 @@ async fn external_evaluation_ingestion_rejects_trace_and_runtime_identity_mismat
         score: Some(1.0),
         score_max: Some(1.0),
         assertions: Vec::new(),
+        phases: Vec::new(),
+        terminal_cause: None,
         artifact_refs: Vec::new(),
         imported_artifacts: Vec::new(),
         imported_evidence_refs: Vec::new(),

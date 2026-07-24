@@ -320,6 +320,9 @@ impl RuntimeHost {
         let review = recorded.review;
         let deep_review = review.mode == ReviewMode::Deep;
         let improvement_candidate = recorded.improvement_candidate;
+        let improvement_candidate_id = improvement_candidate
+            .as_ref()
+            .map(|candidate| candidate.id.clone());
         let automation_candidates = recorded.automation_candidates;
         self.record_event(agent_event(
             self.next_sequence_no(),
@@ -371,6 +374,15 @@ impl RuntimeHost {
         }
         if deep_review {
             self.record_observation_products(task).await?;
+            if let Some(candidate_id) = improvement_candidate_id {
+                Box::pin(
+                    self.automatically_process_improvement_candidate(
+                        task.session_id,
+                        &candidate_id,
+                    ),
+                )
+                .await?;
+            }
         }
         Ok(true)
     }
@@ -497,7 +509,7 @@ impl RuntimeHost {
             ))
             .await?;
         }
-        if update.candidate_changed {
+        if let Some(candidate) = update.improvement_candidate {
             self.record_event(agent_event(
                 self.next_sequence_no(),
                 task,
@@ -506,9 +518,25 @@ impl RuntimeHost {
                 json!({
                     "summary": format!(
                         "actionable improvement candidate {} projected from failure diagnosis",
-                        analysis.candidate.id
+                        candidate.id
                     ),
-                    "record": analysis.candidate,
+                    "record": candidate,
+                }),
+            ))
+            .await?;
+        }
+        if let Some(candidate) = update.automation_candidate {
+            self.record_event(agent_event(
+                self.next_sequence_no(),
+                task,
+                RuntimeEventType::AutomationCandidateCreated,
+                RuntimeEventSource::Evaluator,
+                json!({
+                    "summary": format!(
+                        "runtime automation candidate {} synchronized from failure diagnosis",
+                        candidate.id
+                    ),
+                    "record": candidate,
                 }),
             ))
             .await?;

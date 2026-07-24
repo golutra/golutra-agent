@@ -223,14 +223,33 @@ pub struct FailureEpisode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DiagnosticSliceContinuation {
+    /// Cursor for `TaskTraceRequest.cursor`; `None` starts at the first event.
+    #[serde(default)]
+    pub after_sequence_no: Option<u64>,
+    pub through_sequence_no: u64,
+    pub omitted_event_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct DiagnosticSlice {
     pub slice_id: String,
     pub source_task_id: TaskId,
     pub diagnosis: FailureDiagnosis,
     pub event_refs: Vec<EventId>,
+    #[serde(default)]
+    pub causal_event_refs: Vec<EventId>,
+    #[serde(default)]
+    pub supporting_event_refs: Vec<EventId>,
     pub artifact_refs: Vec<ArtifactId>,
     pub evidence_refs: Vec<EvidenceId>,
     pub omitted_event_count: u64,
+    #[serde(default)]
+    pub continuation_pages: Vec<DiagnosticSliceContinuation>,
+    #[serde(default)]
+    pub continuation_pages_truncated: bool,
+    #[serde(default)]
+    pub selection_strategy: String,
     pub complete: bool,
     pub generated_at: DateTime<Utc>,
 }
@@ -328,6 +347,57 @@ pub struct ExternalEvaluationAssertion {
     pub evidence_refs: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalEvaluationPhaseKind {
+    Setup,
+    Agent,
+    Test,
+    Assertion,
+    Teardown,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalEvaluationPhaseStatus {
+    Passed,
+    Failed,
+    TimedOut,
+    Error,
+    Skipped,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ExternalEvaluationPhase {
+    pub phase_id: String,
+    pub kind: ExternalEvaluationPhaseKind,
+    pub status: ExternalEvaluationPhaseStatus,
+    #[serde(default)]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub completed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    #[serde(default)]
+    pub assertion_refs: Vec<String>,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ExternalEvaluationTerminalCause {
+    pub code: String,
+    #[serde(default)]
+    pub phase_id: Option<String>,
+    pub message: String,
+    #[serde(default)]
+    pub retryable: bool,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct EvaluationAttestation {
     pub algorithm: String,
@@ -351,6 +421,10 @@ pub struct ExternalEvaluationRecord {
     pub score: Option<f64>,
     pub score_max: Option<f64>,
     pub assertions: Vec<ExternalEvaluationAssertion>,
+    #[serde(default)]
+    pub phases: Vec<ExternalEvaluationPhase>,
+    #[serde(default)]
+    pub terminal_cause: Option<ExternalEvaluationTerminalCause>,
     pub artifact_refs: Vec<String>,
     #[serde(default)]
     pub imported_artifacts: Vec<ImportedEvaluationArtifact>,
@@ -409,6 +483,8 @@ pub fn external_evaluation_result_digest(record: &ExternalEvaluationRecord) -> S
         "score": record.score,
         "score_max": record.score_max,
         "assertions": record.assertions,
+        "phases": record.phases,
+        "terminal_cause": record.terminal_cause,
         "artifact_refs": record.artifact_refs,
         "partition": record.partition,
         "seed": record.seed,
@@ -583,6 +659,18 @@ pub struct ImprovementCandidate {
     #[serde(default)]
     pub validation_plan: Vec<String>,
     pub status: CandidateStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FrozenCandidatePatch {
+    pub candidate_id: String,
+    pub source_task_id: TaskId,
+    pub artifact_ref: ArtifactId,
+    pub digest: String,
+    pub format: String,
+    pub file_count: u32,
+    pub total_bytes: u64,
+    pub frozen_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -911,6 +999,8 @@ pub struct EvaluationState {
     #[serde(default)]
     pub causal_comparisons: Vec<CausalComparison>,
     pub improvement_candidates: Vec<ImprovementCandidate>,
+    #[serde(default)]
+    pub frozen_candidate_patches: Vec<FrozenCandidatePatch>,
     pub generated_tasks: Vec<GeneratedTask>,
     pub skill_candidates: Vec<SkillCandidate>,
     pub benchmark_promotions: Vec<BenchmarkPromotion>,

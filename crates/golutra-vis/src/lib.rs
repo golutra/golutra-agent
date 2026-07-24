@@ -295,6 +295,7 @@ fn event_span_name(event_type: RuntimeEventType) -> &'static str {
         RuntimeEventType::PostTaskReviewed
         | RuntimeEventType::EvaluationCompleted
         | RuntimeEventType::ImprovementCandidateCreated
+        | RuntimeEventType::CandidatePatchFrozen
         | RuntimeEventType::RegressionCompleted
         | RuntimeEventType::PromotionDecided => "golutra.post_task_review",
         RuntimeEventType::EvolutionPlanned

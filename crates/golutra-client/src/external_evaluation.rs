@@ -410,7 +410,17 @@ impl RuntimeHost {
             ))
             .await?;
         }
-        if update.candidate_changed {
+        let candidate_id_to_process = update
+            .improvement_candidate
+            .as_ref()
+            .map(|candidate| candidate.id.clone())
+            .or_else(|| {
+                update
+                    .automation_candidate
+                    .as_ref()
+                    .map(|candidate| candidate.id.clone())
+            });
+        if let Some(candidate) = update.improvement_candidate {
             self.record_event(host_event(
                 self.next_sequence_no(),
                 session_id,
@@ -420,12 +430,33 @@ impl RuntimeHost {
                 json!({
                     "summary": format!(
                         "candidate {} reprojected from external evaluator evidence",
-                        analysis.candidate.id
+                        candidate.id
                     ),
-                    "record": analysis.candidate,
+                    "record": candidate,
                 }),
             ))
             .await?;
+        }
+        if let Some(candidate) = update.automation_candidate {
+            self.record_event(host_event(
+                self.next_sequence_no(),
+                session_id,
+                Some(task_id),
+                RuntimeEventType::AutomationCandidateCreated,
+                RuntimeEventSource::Evaluator,
+                json!({
+                    "summary": format!(
+                        "runtime automation candidate {} synchronized from external evaluator evidence",
+                        candidate.id
+                    ),
+                    "record": candidate,
+                }),
+            ))
+            .await?;
+        }
+        if let Some(candidate_id) = candidate_id_to_process {
+            Box::pin(self.automatically_process_improvement_candidate(session_id, &candidate_id))
+                .await?;
         }
         Ok(())
     }

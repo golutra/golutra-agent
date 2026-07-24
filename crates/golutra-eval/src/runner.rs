@@ -204,6 +204,9 @@ impl EvaluationRunner {
                 promotion_status: CandidateStatus::Proposed,
             });
         let mut automation_candidates = Vec::new();
+        if let Some(candidate) = &improvement_candidate {
+            automation_candidates.push(runtime_candidate_from_improvement(candidate));
+        }
         if benchmark_promotion.is_some() {
             automation_candidates.push(AutomationCandidate {
                 id: format!("automation-benchmark-{}", input.task_id),
@@ -293,6 +296,22 @@ impl EvaluationRunner {
             automation_candidates,
             benchmark_run,
         }
+    }
+}
+
+pub(crate) fn runtime_candidate_from_improvement(
+    candidate: &ImprovementCandidate,
+) -> AutomationCandidate {
+    AutomationCandidate {
+        id: candidate.id.clone(),
+        source_task_id: candidate.source_task_id,
+        kind: AutomationCandidateKind::RuntimeChange,
+        summary: candidate.proposed_change.clone(),
+        risk_level: candidate.risk_level,
+        evidence_refs: candidate.evidence_refs.clone(),
+        regression_plan: candidate.validation_plan.join("; "),
+        rollback_ref: candidate.rollback_plan.clone(),
+        status: candidate.status,
     }
 }
 

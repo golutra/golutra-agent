@@ -4,8 +4,9 @@ use golutra_core::{
 };
 use golutra_eval::{
     AutomationCandidate, CausalComparison, DiagnosticSlice, EvaluationResult,
-    ExternalEvaluationRecord, FailureDiagnosis, FailureEpisode, ImprovementCandidate,
-    PostTaskReview, PromotionDecision, RegressionResult, ReplayCapsule, ReplayExecution,
+    ExternalEvaluationRecord, FailureDiagnosis, FailureEpisode, FrozenCandidatePatch,
+    ImprovementCandidate, PostTaskReview, PromotionDecision, RegressionResult, ReplayCapsule,
+    ReplayExecution,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -109,6 +110,8 @@ pub struct EvaluationProjection {
     pub reviews: Vec<PostTaskReview>,
     pub results: Vec<EvaluationResult>,
     pub improvement_candidates: Vec<ImprovementCandidate>,
+    #[serde(default)]
+    pub frozen_candidate_patches: Vec<FrozenCandidatePatch>,
     pub automation_candidates: Vec<AutomationCandidate>,
     pub regressions: Vec<RegressionResult>,
     pub promotion_decisions: Vec<PromotionDecision>,
