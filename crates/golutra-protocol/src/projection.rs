@@ -4,8 +4,8 @@ use golutra_core::{
 };
 use golutra_eval::{
     AutomationCandidate, CausalComparison, DiagnosticSlice, EvaluationResult,
-    ExternalEvaluationRecord, FailureDiagnosis, ImprovementCandidate, PostTaskReview,
-    PromotionDecision, RegressionResult, ReplayCapsule, ReplayExecution,
+    ExternalEvaluationRecord, FailureDiagnosis, FailureEpisode, ImprovementCandidate,
+    PostTaskReview, PromotionDecision, RegressionResult, ReplayCapsule, ReplayExecution,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -61,6 +61,8 @@ pub struct DebugProjection {
     #[serde(default)]
     pub failure_diagnosis: Option<FailureDiagnosis>,
     #[serde(default)]
+    pub failure_episodes: Vec<FailureEpisode>,
+    #[serde(default)]
     pub diagnostic_slice: Option<DiagnosticSlice>,
     #[serde(default)]
     pub replay_execution: Option<ReplayExecution>,
@@ -112,6 +114,8 @@ pub struct EvaluationProjection {
     pub promotion_decisions: Vec<PromotionDecision>,
     #[serde(default)]
     pub failure_diagnoses: Vec<FailureDiagnosis>,
+    #[serde(default)]
+    pub failure_episodes: Vec<FailureEpisode>,
     #[serde(default)]
     pub diagnostic_slices: Vec<DiagnosticSlice>,
     #[serde(default)]

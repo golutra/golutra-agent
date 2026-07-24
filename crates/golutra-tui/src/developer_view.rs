@@ -95,6 +95,17 @@ fn summary_rows(facts: &DeveloperFactsProjection) -> Vec<DeveloperPanelRow> {
             facts.diagnostic_complete
         )));
     }
+    if facts.active_failure_episodes > 0
+        || facts.recovered_failure_episodes > 0
+        || facts.superseded_failure_episodes > 0
+    {
+        rows.push(DeveloperPanelRow::Summary(format!(
+            "failure_episodes active={} recovered={} superseded={}",
+            facts.active_failure_episodes,
+            facts.recovered_failure_episodes,
+            facts.superseded_failure_episodes
+        )));
+    }
     if facts.replay_status.is_some()
         || facts.external_evaluation_count > 0
         || facts.causal_comparison_count > 0

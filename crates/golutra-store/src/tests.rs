@@ -552,6 +552,56 @@ async fn stores_artifact_metadata() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn identical_artifact_blobs_share_content_storage() {
+    use std::os::unix::fs::MetadataExt;
+
+    let store = RuntimeStore::in_memory().await.expect("store opens");
+    let bytes = b"same immutable artifact payload";
+    let first = ArtifactRecord {
+        artifact_id: ArtifactId::new(),
+        session_id: SessionId::new(),
+        turn_id: Some(TurnId::new()),
+        tool_call_id: None,
+        artifact_type: "workspace_change_manifest".to_owned(),
+        uri: "artifact://fixture/first".to_owned(),
+        checksum: artifact_checksum(bytes),
+        size_bytes: bytes.len() as u64,
+        created_at: Utc::now(),
+        producer: "test".to_owned(),
+        redaction_status: RedactionStatus::Redacted,
+        retention_policy: "test".to_owned(),
+        provenance_refs: Vec::new(),
+    };
+    let mut second = first.clone();
+    second.artifact_id = ArtifactId::new();
+    second.uri = "artifact://fixture/second".to_owned();
+
+    store
+        .store_artifact(&first, bytes)
+        .await
+        .expect("first artifact");
+    store
+        .store_artifact(&second, bytes)
+        .await
+        .expect("second artifact");
+
+    let first_metadata = std::fs::metadata(store.artifact_blob_path(first.artifact_id))
+        .expect("first blob metadata");
+    let second_metadata = std::fs::metadata(store.artifact_blob_path(second.artifact_id))
+        .expect("second blob metadata");
+    assert_eq!(first_metadata.ino(), second_metadata.ino());
+    assert!(first_metadata.nlink() >= 2);
+    assert_eq!(
+        store
+            .load_artifact_bytes(second.artifact_id)
+            .await
+            .expect("second blob"),
+        Some(bytes.to_vec())
+    );
+}
+
 #[tokio::test]
 async fn duplicate_artifact_id_cannot_overwrite_the_existing_blob() {
     let store = RuntimeStore::in_memory().await.expect("store opens");

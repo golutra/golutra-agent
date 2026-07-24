@@ -64,5 +64,19 @@ pub struct TokenAttribution {
     pub output_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub contributors: Vec<TokenContributorAttribution>,
+    #[serde(default)]
+    pub unattributed_input_tokens: Option<u64>,
     pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TokenContributorAttribution {
+    pub contributor: String,
+    pub source_refs: Vec<String>,
+    pub message_indexes: Vec<u32>,
+    pub estimated_input_tokens: u64,
+    pub attributed_input_tokens: Option<u64>,
+    pub attribution_method: String,
 }

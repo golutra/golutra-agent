@@ -46,6 +46,11 @@ impl RuntimeHost {
                         .into_iter()
                         .rev()
                         .find(|diagnosis| diagnosis.source_task_id == task_id);
+                    projection.failure_episodes = state
+                        .failure_episodes
+                        .into_iter()
+                        .filter(|episode| episode.source_task_id == task_id)
+                        .collect();
                     projection.diagnostic_slice = state
                         .diagnostic_slices
                         .into_iter()

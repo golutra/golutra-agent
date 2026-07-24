@@ -419,27 +419,53 @@ impl RuntimeHost {
         }
 
         let source_digest = run_provenance.and_then(|provenance| provenance.build.source_digest);
-        let Some((diagnosis, slice)) =
-            diagnosis::diagnose_task(task.task_id, &events, source_digest)
-        else {
+        let projected_episodes = diagnosis::task_failure_episodes(task.task_id, &events);
+        let Some(analysis) = diagnosis::diagnose_task(task.task_id, &events, source_digest) else {
+            if !projected_episodes.is_empty() {
+                let evaluation_store = self.evaluation_store.clone();
+                let changed = run_blocking(move || {
+                    evaluation_store.record_failure_episodes(projected_episodes)
+                })
+                .await??;
+                for episode in changed {
+                    self.record_event(agent_event(
+                        self.next_sequence_no(),
+                        task,
+                        RuntimeEventType::FailureEpisodeRecorded,
+                        RuntimeEventSource::Evaluator,
+                        json!({
+                            "summary": format!(
+                                "failure episode {} is {:?}",
+                                episode.episode_id, episode.status
+                            ),
+                            "record": episode,
+                        }),
+                    ))
+                    .await?;
+                }
+            }
             return Ok(());
         };
         let evaluation_store = self.evaluation_store.clone();
-        let diagnosis_for_store = diagnosis.clone();
-        let slice_for_store = slice.clone();
-        let diagnosis_inserted = run_blocking(move || {
-            evaluation_store.record_diagnostic(diagnosis_for_store, slice_for_store)
+        let analysis_for_store = analysis.clone();
+        let update = run_blocking(move || {
+            evaluation_store.record_failure_products(
+                analysis_for_store.diagnosis,
+                analysis_for_store.slice,
+                analysis_for_store.episodes,
+                Some(analysis_for_store.candidate),
+            )
         })
         .await??;
-        if diagnosis_inserted {
+        if update.diagnosis_inserted {
             self.record_event(agent_event(
                 self.next_sequence_no(),
                 task,
                 RuntimeEventType::FailureDiagnosed,
                 RuntimeEventSource::Evaluator,
                 json!({
-                    "summary": &diagnosis.summary,
-                    "record": diagnosis,
+                    "summary": &analysis.diagnosis.summary,
+                    "record": analysis.diagnosis,
                 }),
             ))
             .await?;
@@ -449,8 +475,40 @@ impl RuntimeHost {
                 RuntimeEventType::DiagnosticSliceCreated,
                 RuntimeEventSource::Evaluator,
                 json!({
-                    "summary": format!("bounded diagnostic slice {} created", slice.slice_id),
-                    "record": slice,
+                    "summary": format!("bounded diagnostic slice {} created", analysis.slice.slice_id),
+                    "record": analysis.slice,
+                }),
+            ))
+            .await?;
+        }
+        for episode in update.changed_episodes {
+            self.record_event(agent_event(
+                self.next_sequence_no(),
+                task,
+                RuntimeEventType::FailureEpisodeRecorded,
+                RuntimeEventSource::Evaluator,
+                json!({
+                    "summary": format!(
+                        "failure episode {} is {:?}",
+                        episode.episode_id, episode.status
+                    ),
+                    "record": episode,
+                }),
+            ))
+            .await?;
+        }
+        if update.candidate_changed {
+            self.record_event(agent_event(
+                self.next_sequence_no(),
+                task,
+                RuntimeEventType::ImprovementCandidateCreated,
+                RuntimeEventSource::Evaluator,
+                json!({
+                    "summary": format!(
+                        "actionable improvement candidate {} projected from failure diagnosis",
+                        analysis.candidate.id
+                    ),
+                    "record": analysis.candidate,
                 }),
             ))
             .await?;

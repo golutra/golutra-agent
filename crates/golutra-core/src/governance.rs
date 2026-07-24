@@ -44,6 +44,8 @@ pub struct ContextContributorSnapshot {
     pub content_digest: String,
     pub redacted_content_ref: Option<ArtifactId>,
     pub invalidation_refs: Vec<String>,
+    #[serde(default)]
+    pub message_indexes: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -53,6 +55,12 @@ pub struct ContextMessageSnapshot {
     pub content_digest: String,
     pub estimated_tokens: u64,
     pub tool_call_ids: Vec<String>,
+    #[serde(default)]
+    pub contributor: String,
+    #[serde(default)]
+    pub source_refs: Vec<String>,
+    #[serde(default)]
+    pub origin: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

@@ -6,7 +6,10 @@ use golutra_core::{
 use golutra_llm::{ProviderMessage, ProviderRequest, ProviderRole, ProviderUsage};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::ops::Range;
+use std::{
+    collections::{BTreeMap, HashSet},
+    ops::Range,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -30,11 +33,19 @@ pub struct ContextContributor {
     pub source_refs: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextMessageSource {
+    pub contributor: String,
+    pub source_refs: Vec<String>,
+    pub origin: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextBuildPlan {
     pub contributors: Vec<String>,
     pub contributor_manifest: Vec<ContextContributorSnapshot>,
     pub messages: Vec<ProviderMessage>,
+    pub message_sources: Vec<ContextMessageSource>,
     pub budget_snapshot: TokenBudgetSnapshot,
     pub original_planned_input_tokens: u64,
     pub trimmed_contributors: Vec<String>,
@@ -56,6 +67,19 @@ pub struct ContextCompactionRecord {
     pub summary: String,
     pub checksum: String,
     pub replacement_messages: Vec<ProviderMessage>,
+    #[serde(default)]
+    pub replacement_sources: Vec<ContextMessageSource>,
+    #[serde(default)]
+    pub message_decisions: Vec<ContextCompactionDecision>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCompactionDecision {
+    pub original_index: u32,
+    pub contributor: String,
+    pub action: String,
+    pub original_estimated_tokens: u64,
+    pub retained_estimated_tokens: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +108,7 @@ impl ContextWindowManager {
         turn_id: TurnId,
         protected_prefix_len: usize,
         messages: &[ProviderMessage],
+        message_sources: &[ContextMessageSource],
         planned_tool_tokens: u64,
     ) -> Result<Option<ContextCompactionRecord>, ContextError> {
         let original_estimated_tokens =
@@ -142,7 +167,9 @@ impl ContextWindowManager {
         let dropped = &tail[..dropped_end];
         let dropped_message_count = dropped.len();
         let summary = summarize_messages(dropped, summary_reserve);
+        let normalized_sources = normalized_message_sources(messages, message_sources);
         let mut replacement_messages = protected;
+        let mut replacement_sources = normalized_sources[..protected_prefix_len].to_vec();
         if !summary.is_empty() {
             replacement_messages.push(ProviderMessage {
                 role: ProviderRole::User,
@@ -154,8 +181,53 @@ impl ContextWindowManager {
                 tool_calls: Vec::new(),
                 metadata: Default::default(),
             });
+            let mut source_refs = normalized_sources
+                [protected_prefix_len..protected_prefix_len + dropped_end]
+                .iter()
+                .flat_map(|source| source.source_refs.iter().cloned())
+                .collect::<Vec<_>>();
+            source_refs.sort();
+            source_refs.dedup();
+            replacement_sources.push(ContextMessageSource {
+                contributor: "working_summary".to_owned(),
+                source_refs,
+                origin: "compaction_summary".to_owned(),
+            });
         }
+        let retained_count = retained.len();
         replacement_messages.extend(retained);
+        let retained_source_start = messages.len().saturating_sub(retained_count);
+        replacement_sources.extend_from_slice(&normalized_sources[retained_source_start..]);
+
+        let replacement_source_by_original = (0..protected_prefix_len)
+            .chain(retained_source_start..messages.len())
+            .collect::<HashSet<_>>();
+        let message_decisions = messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                let retained = replacement_source_by_original.contains(&index);
+                ContextCompactionDecision {
+                    original_index: u32::try_from(index).unwrap_or(u32::MAX),
+                    contributor: normalized_sources[index].contributor.clone(),
+                    action: if index < protected_prefix_len {
+                        "protected".to_owned()
+                    } else if retained {
+                        "retained".to_owned()
+                    } else {
+                        "summarized".to_owned()
+                    },
+                    original_estimated_tokens: estimate_message_tokens(std::slice::from_ref(
+                        message,
+                    )),
+                    retained_estimated_tokens: if retained {
+                        estimate_message_tokens(std::slice::from_ref(message))
+                    } else {
+                        0
+                    },
+                }
+            })
+            .collect();
 
         let replacement_estimated_tokens =
             estimate_message_tokens(&replacement_messages).saturating_add(planned_tool_tokens);
@@ -182,6 +254,8 @@ impl ContextWindowManager {
             summary,
             checksum,
             replacement_messages,
+            replacement_sources,
+            message_decisions,
         }))
     }
 }
@@ -305,7 +379,20 @@ impl ContextBuilder {
                     content_digest: digest_bytes(contributor.content.as_bytes()),
                     redacted_content_ref: None,
                     invalidation_refs: Vec::new(),
+                    message_indexes: vec![u32::try_from(index).unwrap_or(u32::MAX)],
                 }
+            })
+            .collect::<Vec<_>>();
+        let message_sources = contributors
+            .iter()
+            .map(|contributor| ContextMessageSource {
+                contributor: contributor.name.clone(),
+                source_refs: if contributor.source_refs.is_empty() {
+                    vec![format!("contributor:{}", contributor.name)]
+                } else {
+                    contributor.source_refs.clone()
+                },
+                origin: "initial_contributor".to_owned(),
             })
             .collect::<Vec<_>>();
         let messages = contributors
@@ -328,6 +415,7 @@ impl ContextBuilder {
             contributors: contributor_names,
             contributor_manifest,
             messages,
+            message_sources,
             original_planned_input_tokens,
             trimmed_contributors,
             budget_snapshot: TokenBudgetSnapshot {
@@ -383,15 +471,26 @@ impl ContextBuilder {
                     content_digest: digest_bytes(&encoded),
                     redacted_content_ref: None,
                     invalidation_refs: Vec::new(),
+                    message_indexes: vec![u32::try_from(index).unwrap_or(u32::MAX)],
                 }
             })
             .collect::<Vec<_>>();
+        let message_sources = messages
+            .iter()
+            .enumerate()
+            .map(|(index, _)| ContextMessageSource {
+                contributor: format!("replay_message_{index}"),
+                source_refs: vec![format!("replay:provider-message:{index}")],
+                origin: "deterministic_replay".to_owned(),
+            })
+            .collect();
         Ok(ContextBuildPlan {
             contributors: (0..messages.len())
                 .map(|index| format!("replay_message_{index}"))
                 .collect(),
             contributor_manifest,
             messages,
+            message_sources,
             original_planned_input_tokens: planned_input_tokens,
             trimmed_contributors: Vec::new(),
             budget_snapshot: TokenBudgetSnapshot {
@@ -504,11 +603,13 @@ pub fn context_snapshot_from_request(
     plan: &ContextBuildPlan,
     request: &ProviderRequest,
 ) -> ContextSnapshot {
+    let message_sources = normalized_message_sources(&request.messages, &plan.message_sources);
     let message_manifest = request
         .messages
         .iter()
+        .zip(&message_sources)
         .enumerate()
-        .map(|(index, message)| ContextMessageSnapshot {
+        .map(|(index, (message, source))| ContextMessageSnapshot {
             index: u32::try_from(index).unwrap_or(u32::MAX),
             role: format!("{:?}", message.role).to_lowercase(),
             content_digest: digest_bytes(message.content.as_bytes()),
@@ -518,14 +619,17 @@ pub fn context_snapshot_from_request(
                 .iter()
                 .map(|call| call.tool_call_id.clone())
                 .collect(),
+            contributor: source.contributor.clone(),
+            source_refs: source.source_refs.clone(),
+            origin: source.origin.clone(),
         })
-        .collect();
+        .collect::<Vec<_>>();
     let tool_schema_digests = request
         .tools
         .iter()
         .filter_map(|tool| serde_json::to_vec(tool).ok())
         .map(|bytes| digest_bytes(&bytes))
-        .collect();
+        .collect::<Vec<_>>();
     let canonical_request_digest = serde_json::to_vec(request)
         .map(|bytes| digest_bytes(&bytes))
         .unwrap_or_else(|_| digest_bytes(request.provider_id.as_bytes()));
@@ -537,7 +641,12 @@ pub fn context_snapshot_from_request(
         provider_request_id: request.request_id,
         provider_id: request.provider_id.clone(),
         model_id: request.model_id.clone(),
-        contributor_manifest: plan.contributor_manifest.clone(),
+        contributor_manifest: attributed_contributor_manifest(
+            plan,
+            request,
+            &message_sources,
+            &tool_schema_digests,
+        ),
         message_manifest,
         tool_schema_digests,
         generation_config_digest: None,
@@ -550,6 +659,122 @@ pub fn context_snapshot_from_request(
     }
 }
 
+fn normalized_message_sources(
+    messages: &[ProviderMessage],
+    message_sources: &[ContextMessageSource],
+) -> Vec<ContextMessageSource> {
+    messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            message_sources.get(index).cloned().unwrap_or_else(|| {
+                let contributor = match message.role {
+                    ProviderRole::System => "system_prompt",
+                    ProviderRole::User => "runtime_context",
+                    ProviderRole::Assistant => "assistant_recent",
+                    ProviderRole::Tool => "tool_result_excerpt",
+                };
+                ContextMessageSource {
+                    contributor: contributor.to_owned(),
+                    source_refs: vec![format!("request:message:{index}")],
+                    origin: "inferred_legacy".to_owned(),
+                }
+            })
+        })
+        .collect()
+}
+
+fn attributed_contributor_manifest(
+    plan: &ContextBuildPlan,
+    request: &ProviderRequest,
+    sources: &[ContextMessageSource],
+    tool_schema_digests: &[String],
+) -> Vec<ContextContributorSnapshot> {
+    let base = plan
+        .contributor_manifest
+        .iter()
+        .map(|contributor| (contributor.name.as_str(), contributor))
+        .collect::<BTreeMap<_, _>>();
+    let mut grouped = BTreeMap::<String, ContextContributorSnapshot>::new();
+    for (index, (message, source)) in request.messages.iter().zip(sources).enumerate() {
+        let estimated_tokens = estimate_message_tokens(std::slice::from_ref(message));
+        let entry = grouped
+            .entry(source.contributor.clone())
+            .or_insert_with(|| {
+                base.get(source.contributor.as_str()).map_or_else(
+                    || ContextContributorSnapshot {
+                        name: source.contributor.clone(),
+                        role: format!("{:?}", message.role).to_lowercase(),
+                        source_refs: Vec::new(),
+                        included: true,
+                        trimmed: source.origin.contains("compaction"),
+                        original_estimated_tokens: 0,
+                        retained_estimated_tokens: 0,
+                        strategy: source.origin.clone(),
+                        estimated_tokens: 0,
+                        content_digest: String::new(),
+                        redacted_content_ref: None,
+                        invalidation_refs: Vec::new(),
+                        message_indexes: Vec::new(),
+                    },
+                    |base| {
+                        let mut base = (*base).clone();
+                        base.source_refs.clear();
+                        base.retained_estimated_tokens = 0;
+                        base.estimated_tokens = 0;
+                        base.content_digest.clear();
+                        base.message_indexes.clear();
+                        base
+                    },
+                )
+            });
+        entry.retained_estimated_tokens = entry
+            .retained_estimated_tokens
+            .saturating_add(estimated_tokens);
+        entry.estimated_tokens = entry.retained_estimated_tokens;
+        if entry.original_estimated_tokens == 0 {
+            entry.original_estimated_tokens = entry.retained_estimated_tokens;
+        }
+        entry
+            .message_indexes
+            .push(u32::try_from(index).unwrap_or(u32::MAX));
+        entry.source_refs.extend(source.source_refs.iter().cloned());
+        entry.source_refs.sort();
+        entry.source_refs.dedup();
+        entry.content_digest.push_str(&digest_bytes(
+            &serde_json::to_vec(message).unwrap_or_default(),
+        ));
+    }
+    for contributor in grouped.values_mut() {
+        contributor.content_digest = digest_bytes(contributor.content_digest.as_bytes());
+    }
+    if plan.budget_snapshot.planned_tool_tokens > 0 {
+        grouped.insert(
+            "tool_instructions".to_owned(),
+            ContextContributorSnapshot {
+                name: "tool_instructions".to_owned(),
+                role: "tool_schema".to_owned(),
+                source_refs: request
+                    .tools
+                    .iter()
+                    .map(|tool| format!("tool-contract:{}", tool.tool_name))
+                    .collect(),
+                included: true,
+                trimmed: false,
+                original_estimated_tokens: plan.budget_snapshot.planned_tool_tokens,
+                retained_estimated_tokens: plan.budget_snapshot.planned_tool_tokens,
+                strategy: "include_schema".to_owned(),
+                estimated_tokens: plan.budget_snapshot.planned_tool_tokens,
+                content_digest: digest_bytes(tool_schema_digests.join("").as_bytes()),
+                redacted_content_ref: None,
+                invalidation_refs: Vec::new(),
+                message_indexes: Vec::new(),
+            },
+        );
+    }
+    grouped.into_values().collect()
+}
+
 fn digest_bytes(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("sha256:{:x}", digest)
@@ -557,6 +782,7 @@ fn digest_bytes(bytes: &[u8]) -> String {
 
 #[must_use]
 pub fn token_usage_record(
+    plan: &ContextBuildPlan,
     request: &ProviderRequest,
     response_event_id: golutra_core::ProviderResponseId,
     budget_snapshot: &TokenBudgetSnapshot,
@@ -573,6 +799,56 @@ pub fn token_usage_record(
             .zip(usage.output_tokens)
             .map(|(input, output)| input.saturating_add(output))
     });
+    let message_sources = normalized_message_sources(&request.messages, &plan.message_sources);
+    let tool_schema_digests = request
+        .tools
+        .iter()
+        .filter_map(|tool| serde_json::to_vec(tool).ok())
+        .map(|bytes| digest_bytes(&bytes))
+        .collect::<Vec<_>>();
+    let contributor_manifest =
+        attributed_contributor_manifest(plan, request, &message_sources, &tool_schema_digests);
+    let attributed_input_tokens = usage.input_tokens.map(|actual| {
+        proportional_token_attribution(
+            actual,
+            &contributor_manifest
+                .iter()
+                .map(|contributor| contributor.retained_estimated_tokens)
+                .collect::<Vec<_>>(),
+        )
+    });
+    let contributors = contributor_manifest
+        .iter()
+        .enumerate()
+        .map(|(index, contributor)| {
+            let attributed_input_tokens = attributed_input_tokens
+                .as_ref()
+                .and_then(|tokens| tokens.get(index).copied());
+            golutra_core::TokenContributorAttribution {
+                contributor: contributor.name.clone(),
+                source_refs: contributor.source_refs.clone(),
+                message_indexes: contributor.message_indexes.clone(),
+                estimated_input_tokens: contributor.retained_estimated_tokens,
+                attributed_input_tokens,
+                attribution_method: if usage.input_tokens.is_some() {
+                    "proportional_provider_total".to_owned()
+                } else {
+                    "estimated_request_tokens".to_owned()
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    let attributed_total = contributors
+        .iter()
+        .filter_map(|contributor| contributor.attributed_input_tokens)
+        .fold(0_u64, u64::saturating_add);
+    let contributor_tokens = |name: &str| {
+        contributor_manifest
+            .iter()
+            .filter(|contributor| contributor.name == name)
+            .map(|contributor| contributor.retained_estimated_tokens)
+            .sum::<u64>()
+    };
     TokenUsageRecord {
         task_id: request.task_id,
         turn_id: request.turn_id,
@@ -590,19 +866,23 @@ pub fn token_usage_record(
         budget_snapshot_ref: budget_snapshot.snapshot_id,
         attribution_ref: Some(golutra_core::TokenAttribution {
             system_prompt_tokens: Some(system_prompt_tokens),
-            developer_instruction_tokens: None,
-            runtime_context_tokens: None,
-            policy_tokens: None,
+            developer_instruction_tokens: Some(contributor_tokens("developer_instructions")),
+            runtime_context_tokens: Some(contributor_tokens("runtime_context")),
+            policy_tokens: Some(contributor_tokens("policy")),
             user_message_tokens: Some(user_message_tokens),
             assistant_recent_tokens: Some(assistant_recent_tokens),
-            working_summary_tokens: None,
-            memory_tokens: None,
-            evidence_tokens: None,
-            tool_instruction_tokens: None,
+            working_summary_tokens: Some(contributor_tokens("working_summary")),
+            memory_tokens: Some(contributor_tokens("memory")),
+            evidence_tokens: Some(contributor_tokens("evidence")),
+            tool_instruction_tokens: Some(contributor_tokens("tool_instructions")),
             tool_result_excerpt_tokens: Some(tool_result_tokens),
             output_tokens: usage.output_tokens,
             reasoning_tokens: usage.reasoning_tokens,
             cached_input_tokens: usage.cached_input_tokens,
+            contributors,
+            unattributed_input_tokens: usage
+                .input_tokens
+                .map(|actual| actual.saturating_sub(attributed_total)),
             source: match usage.usage_source {
                 golutra_core::UsageSource::Provider => "mixed",
                 golutra_core::UsageSource::Estimated => "tokenizer",
@@ -617,6 +897,38 @@ pub fn token_usage_record(
         }
         .to_owned(),
     }
+}
+
+fn proportional_token_attribution(actual: u64, weights: &[u64]) -> Vec<u64> {
+    let total_weight = weights
+        .iter()
+        .map(|weight| u128::from(*weight))
+        .sum::<u128>();
+    if total_weight == 0 {
+        return vec![0; weights.len()];
+    }
+    let actual = u128::from(actual);
+    let mut shares = Vec::with_capacity(weights.len());
+    let mut remainders = Vec::with_capacity(weights.len());
+    let mut assigned = 0_u64;
+    for (index, weight) in weights.iter().copied().enumerate() {
+        let numerator = actual.saturating_mul(u128::from(weight));
+        let share = u64::try_from(numerator / total_weight).unwrap_or(u64::MAX);
+        shares.push(share);
+        assigned = assigned.saturating_add(share);
+        remainders.push((index, numerator % total_weight));
+    }
+    remainders.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    let remainder = u64::try_from(actual)
+        .unwrap_or(u64::MAX)
+        .saturating_sub(assigned);
+    for (index, _) in remainders
+        .into_iter()
+        .take(usize::try_from(remainder).unwrap_or(usize::MAX))
+    {
+        shares[index] = shares[index].saturating_add(1);
+    }
+    shares
 }
 
 pub fn estimate_message_tokens(messages: &[ProviderMessage]) -> u64 {
@@ -787,9 +1099,24 @@ mod tests {
                 metadata: Default::default(),
             });
         }
+        let sources = messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| ContextMessageSource {
+                contributor: if index == 0 {
+                    "system_prompt".to_owned()
+                } else if message.role == ProviderRole::Tool {
+                    "tool_result_excerpt".to_owned()
+                } else {
+                    "assistant_recent".to_owned()
+                },
+                source_refs: vec![format!("event:source-{index}")],
+                origin: "runtime_history".to_owned(),
+            })
+            .collect::<Vec<_>>();
 
         let record = ContextWindowManager::new(180)
-            .compact_if_needed(turn_id, 1, &messages, 10)
+            .compact_if_needed(turn_id, 1, &messages, &sources, 10)
             .expect("compaction")
             .expect("needed");
 
@@ -806,6 +1133,50 @@ mod tests {
         let latest_tool = record.replacement_messages.last().expect("tool retained");
         assert_eq!(latest_tool.tool_call_id.as_deref(), Some("call-7"));
         assert!(!record.summary.is_empty());
+        assert_eq!(
+            record.replacement_sources.len(),
+            record.replacement_messages.len()
+        );
+        assert_eq!(record.message_decisions.len(), messages.len());
+        assert_eq!(record.message_decisions[0].action, "protected");
+        assert!(
+            record
+                .message_decisions
+                .iter()
+                .any(|decision| decision.action == "summarized")
+        );
+        let summary_source = record
+            .replacement_sources
+            .iter()
+            .find(|source| source.origin == "compaction_summary")
+            .expect("summary source");
+        assert_eq!(summary_source.contributor, "working_summary");
+        assert!(!summary_source.source_refs.is_empty());
+        assert_eq!(
+            record.replacement_sources.last(),
+            sources.last(),
+            "the retained tail keeps its original contributor and source"
+        );
+
+        let task_id = TaskId::new();
+        let mut plan = ContextBuilder::default()
+            .build_from_messages(task_id, turn_id, record.replacement_messages.clone())
+            .expect("compacted plan");
+        plan.message_sources = record.replacement_sources.clone();
+        let request =
+            provider_request_from_plan(&plan, task_id, turn_id, "mock", "mock-model", Vec::new());
+        let snapshot = context_snapshot_from_request(SessionId::new(), &plan, &request);
+        assert!(
+            snapshot
+                .message_manifest
+                .iter()
+                .zip(&record.replacement_sources)
+                .all(|(message, source)| {
+                    message.contributor == source.contributor
+                        && message.source_refs == source.source_refs
+                        && message.origin == source.origin
+                })
+        );
     }
 
     #[test]
@@ -820,7 +1191,7 @@ mod tests {
         }];
 
         let record = ContextWindowManager::new(100)
-            .compact_if_needed(TurnId::new(), 1, &messages, 0)
+            .compact_if_needed(TurnId::new(), 1, &messages, &[], 0)
             .expect("manager");
 
         assert!(record.is_none());
@@ -869,6 +1240,7 @@ mod tests {
         };
 
         let record = token_usage_record(
+            &plan,
             &request,
             golutra_core::ProviderResponseId::new(),
             &plan.budget_snapshot,
@@ -888,6 +1260,92 @@ mod tests {
             Some("mixed")
         );
         assert_eq!(record.budget_snapshot_ref, plan.budget_snapshot.snapshot_id);
+    }
+
+    #[test]
+    fn contributor_attribution_preserves_provider_input_token_total() {
+        let task_id = TaskId::new();
+        let turn_id = TurnId::new();
+        let mut plan = ContextBuilder::default()
+            .build(
+                task_id,
+                turn_id,
+                vec![
+                    ContextContributor {
+                        name: "objective".to_owned(),
+                        role: ProviderRole::User,
+                        content: "implement the requested behavior".repeat(3),
+                        token_budget_hint: 128,
+                        source_refs: vec!["task:objective".to_owned()],
+                    },
+                    ContextContributor {
+                        name: "memory".to_owned(),
+                        role: ProviderRole::System,
+                        content: "relevant retained fact".repeat(2),
+                        token_budget_hint: 128,
+                        source_refs: vec!["memory:fact-1".to_owned()],
+                    },
+                ],
+            )
+            .expect("context builds");
+        plan.budget_snapshot.planned_tool_tokens = 13;
+        let request = provider_request_from_plan(
+            &plan,
+            task_id,
+            turn_id,
+            "mock",
+            "mock-model",
+            vec![ToolContract {
+                tool_name: "read_file".to_owned(),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: serde_json::json!({"type": "object"}),
+                error_schema: serde_json::json!({"type": "object"}),
+                side_effect_type: golutra_core::SideEffectType::None,
+                idempotency_key_policy: "tool_call_id".to_owned(),
+                timeout_policy: "bounded".to_owned(),
+                cancellation_policy: "cooperative".to_owned(),
+                retry_policy: "none".to_owned(),
+                artifact_policy: "bounded".to_owned(),
+                permission_policy_ref: None,
+            }],
+        );
+        let usage = ProviderUsage {
+            input_tokens: Some(101),
+            output_tokens: Some(7),
+            reasoning_tokens: Some(2),
+            cached_input_tokens: Some(3),
+            total_tokens: Some(108),
+            usage_source: UsageSource::Provider,
+            raw: serde_json::json!({}),
+        };
+
+        let record = token_usage_record(
+            &plan,
+            &request,
+            golutra_core::ProviderResponseId::new(),
+            &plan.budget_snapshot,
+            &usage,
+            "zero",
+        );
+        let attribution = record.attribution_ref.expect("token attribution");
+        let attributed_total = attribution
+            .contributors
+            .iter()
+            .filter_map(|contributor| contributor.attributed_input_tokens)
+            .sum::<u64>();
+
+        assert_eq!(attributed_total, 101);
+        assert_eq!(attribution.unattributed_input_tokens, Some(0));
+        assert!(attribution.contributors.iter().any(|contributor| {
+            contributor.contributor == "objective" && contributor.source_refs == ["task:objective"]
+        }));
+        assert!(attribution.contributors.iter().any(|contributor| {
+            contributor.contributor == "memory" && contributor.source_refs == ["memory:fact-1"]
+        }));
+        assert!(attribution.contributors.iter().any(|contributor| {
+            contributor.contributor == "tool_instructions"
+                && contributor.source_refs == ["tool-contract:read_file"]
+        }));
     }
 
     #[test]

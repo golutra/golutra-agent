@@ -4,9 +4,11 @@ use std::{
 };
 
 use golutra_core::{
-    FileChangeKind, FileChangeSummary, FileDiffPreview, TaskId, TurnChangeSummary, TurnId,
+    FileChangeKind, FileChangeSummary, FileContentKind, FileDiffPreview, FileStateMetadata, TaskId,
+    TurnChangeSummary, TurnId,
 };
 use golutra_tools::{FileBeforeImage, ToolExecutionReport, redact_sensitive_text};
+use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
 
 const MAX_DIFF_FILE_BYTES: usize = 16 * 1024 * 1024;
@@ -38,12 +40,16 @@ pub(crate) struct ChangeSample {
     path: String,
     before: FileContent,
     after: FileContent,
+    before_metadata: Option<FileStateMetadata>,
+    after_metadata: Option<FileStateMetadata>,
 }
 
 #[derive(Debug)]
 struct TrackedFile {
     baseline: FileContent,
     latest: FileContent,
+    baseline_metadata: Option<FileStateMetadata>,
+    latest_metadata: Option<FileStateMetadata>,
 }
 
 #[derive(Debug, Default)]
@@ -95,6 +101,7 @@ impl WorkspaceChangeTracker {
                     &mut turn.retained_content_bytes,
                     MAX_TURN_CONTENT_BYTES,
                 );
+                tracked.latest_metadata = sample.after_metadata;
                 continue;
             }
             let baseline = retain_bounded_content(
@@ -107,8 +114,15 @@ impl WorkspaceChangeTracker {
                 &mut turn.retained_content_bytes,
                 MAX_TURN_CONTENT_BYTES,
             );
-            turn.files
-                .insert(sample.path, TrackedFile { baseline, latest });
+            turn.files.insert(
+                sample.path,
+                TrackedFile {
+                    baseline,
+                    latest,
+                    baseline_metadata: sample.before_metadata,
+                    latest_metadata: sample.after_metadata,
+                },
+            );
         }
 
         ToolChangeFacts {
@@ -150,9 +164,17 @@ pub(crate) async fn capture_change_samples(
             .find(|image| image.path == *path)
             .map(file_content_from_before_image)
             .unwrap_or(FileContent::Unavailable);
-        let after =
+        let before_metadata = report
+            .before_images
+            .iter()
+            .find(|image| image.path == *path)
+            .and_then(|image| image.metadata.clone());
+        let (after, after_metadata) =
             if let Some(image) = report.after_images.iter().find(|image| image.path == *path) {
-                file_content_from_before_image(image)
+                (
+                    file_content_from_before_image(image),
+                    image.metadata.clone(),
+                )
             } else {
                 read_after_content(workspace_root, report, path).await
             };
@@ -160,6 +182,8 @@ pub(crate) async fn capture_change_samples(
             path: display_path(workspace_root, path),
             before,
             after,
+            before_metadata,
+            after_metadata,
         });
     }
     samples.sort_by(|left, right| left.path.cmp(&right.path));
@@ -171,6 +195,7 @@ fn file_content_from_before_image(image: &FileBeforeImage) -> FileContent {
     match image.content.as_ref() {
         Some(bytes) if bytes.len() <= MAX_DIFF_FILE_BYTES => FileContent::Text(bytes.clone()),
         Some(_) => FileContent::Unavailable,
+        None if image.metadata.is_some() => FileContent::Unavailable,
         None => FileContent::Missing,
     }
 }
@@ -179,20 +204,34 @@ async fn read_after_content(
     workspace_root: Option<&Path>,
     report: &ToolExecutionReport,
     path: &Path,
-) -> FileContent {
+) -> (FileContent, Option<FileStateMetadata>) {
     if let Some(root) = workspace_root
         && path.strip_prefix(root).is_ok()
     {
         return match tokio::fs::metadata(path).await {
             Ok(metadata) if metadata.len() <= MAX_DIFF_FILE_BYTES as u64 => {
                 match tokio::fs::read(path).await {
-                    Ok(bytes) if bytes.len() <= MAX_DIFF_FILE_BYTES => FileContent::Text(bytes),
-                    Ok(_) | Err(_) => FileContent::Unavailable,
+                    Ok(bytes) if bytes.len() <= MAX_DIFF_FILE_BYTES => {
+                        let state = state_metadata(&bytes, unix_mode(&metadata), true);
+                        (FileContent::Text(bytes), Some(state))
+                    }
+                    Ok(_) | Err(_) => (FileContent::Unavailable, None),
                 }
             }
-            Ok(_) => FileContent::Unavailable,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => FileContent::Missing,
-            Err(_) => FileContent::Unavailable,
+            Ok(metadata) => (
+                FileContent::Unavailable,
+                Some(FileStateMetadata {
+                    size_bytes: metadata.len(),
+                    checksum: None,
+                    unix_mode: unix_mode(&metadata),
+                    content_kind: FileContentKind::Unknown,
+                    content_available: false,
+                }),
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (FileContent::Missing, None)
+            }
+            Err(_) => (FileContent::Unavailable, None),
         };
     }
 
@@ -200,9 +239,12 @@ async fn read_after_content(
         && let Some(content) = report.artifact_contents.first()
         && content.bytes.len() <= MAX_DIFF_FILE_BYTES
     {
-        return FileContent::Text(content.bytes.clone());
+        return (
+            FileContent::Text(content.bytes.clone()),
+            Some(state_metadata(&content.bytes, None, true)),
+        );
     }
-    FileContent::Unavailable
+    (FileContent::Unavailable, None)
 }
 
 fn display_path(workspace_root: Option<&Path>, path: &Path) -> String {
@@ -214,16 +256,44 @@ fn display_path(workspace_root: Option<&Path>, path: &Path) -> String {
 }
 
 fn sample_summary(sample: &ChangeSample) -> Option<FileChangeSummary> {
-    (!known_unchanged(&sample.before, &sample.after))
-        .then(|| change_summary(&sample.path, &sample.before, &sample.after))
+    (!known_unchanged(
+        &sample.before,
+        &sample.after,
+        sample.before_metadata.as_ref(),
+        sample.after_metadata.as_ref(),
+    ))
+    .then(|| {
+        change_summary(
+            &sample.path,
+            &sample.before,
+            &sample.after,
+            sample.before_metadata.clone(),
+            sample.after_metadata.clone(),
+        )
+    })
 }
 
 fn turn_summary(turn: &TurnChangeState) -> TurnChangeSummary {
     let files = turn
         .files
         .iter()
-        .filter(|(_, tracked)| !known_unchanged(&tracked.baseline, &tracked.latest))
-        .map(|(path, tracked)| change_summary(path, &tracked.baseline, &tracked.latest))
+        .filter(|(_, tracked)| {
+            !known_unchanged(
+                &tracked.baseline,
+                &tracked.latest,
+                tracked.baseline_metadata.as_ref(),
+                tracked.latest_metadata.as_ref(),
+            )
+        })
+        .map(|(path, tracked)| {
+            change_summary(
+                path,
+                &tracked.baseline,
+                &tracked.latest,
+                tracked.baseline_metadata.clone(),
+                tracked.latest_metadata.clone(),
+            )
+        })
         .collect::<Vec<_>>();
     let stats_complete = files
         .iter()
@@ -240,26 +310,47 @@ fn turn_summary(turn: &TurnChangeState) -> TurnChangeSummary {
             .filter_map(|change| change.removed_lines)
             .fold(0_u64, u64::saturating_add)
     });
+    let file_count = u64::try_from(files.len()).unwrap_or(u64::MAX);
     TurnChangeSummary {
         files,
         added_lines,
         removed_lines,
         stats_complete,
+        file_count,
+        files_truncated: false,
     }
 }
 
-fn known_unchanged(before: &FileContent, after: &FileContent) -> bool {
+fn known_unchanged(
+    before: &FileContent,
+    after: &FileContent,
+    before_metadata: Option<&FileStateMetadata>,
+    after_metadata: Option<&FileStateMetadata>,
+) -> bool {
     match (before, after) {
         (FileContent::Missing, FileContent::Missing) => true,
         (FileContent::Text(before), FileContent::Text(after)) => before == after,
-        _ => false,
+        _ => before_metadata
+            .zip(after_metadata)
+            .is_some_and(|(before, after)| {
+                before.size_bytes == after.size_bytes
+                    && before.unix_mode == after.unix_mode
+                    && before.checksum.is_some()
+                    && before.checksum == after.checksum
+            }),
     }
 }
 
-fn change_summary(path: &str, before: &FileContent, after: &FileContent) -> FileChangeSummary {
-    let kind = match (before, after) {
-        (FileContent::Missing, FileContent::Text(_)) => FileChangeKind::Added,
-        (FileContent::Text(_), FileContent::Missing) => FileChangeKind::Deleted,
+fn change_summary(
+    path: &str,
+    before: &FileContent,
+    after: &FileContent,
+    before_metadata: Option<FileStateMetadata>,
+    after_metadata: Option<FileStateMetadata>,
+) -> FileChangeSummary {
+    let kind = match (before_metadata.as_ref(), after_metadata.as_ref()) {
+        (None, Some(_)) => FileChangeKind::Added,
+        (Some(_), None) => FileChangeKind::Deleted,
         _ => FileChangeKind::Modified,
     };
     let (added_lines, removed_lines) = line_changes(before, after)
@@ -271,6 +362,8 @@ fn change_summary(path: &str, before: &FileContent, after: &FileContent) -> File
         kind,
         added_lines,
         removed_lines,
+        before: before_metadata,
+        after: after_metadata,
     }
 }
 
@@ -290,7 +383,12 @@ fn line_changes(before: &FileContent, after: &FileContent) -> Option<(u64, u64)>
 }
 
 fn diff_preview(sample: &ChangeSample) -> Option<FileDiffPreview> {
-    if known_unchanged(&sample.before, &sample.after) {
+    if known_unchanged(
+        &sample.before,
+        &sample.after,
+        sample.before_metadata.as_ref(),
+        sample.after_metadata.as_ref(),
+    ) {
         return None;
     }
     let before = text_content(&sample.before)?;
@@ -371,7 +469,12 @@ fn build_diff_artifact(samples: &[ChangeSample]) -> Option<DiffArtifact> {
     let mut content = String::new();
     let mut truncated = false;
     for sample in samples {
-        if known_unchanged(&sample.before, &sample.after) {
+        if known_unchanged(
+            &sample.before,
+            &sample.after,
+            sample.before_metadata.as_ref(),
+            sample.after_metadata.as_ref(),
+        ) {
             continue;
         }
         let Some(before) = text_content(&sample.before) else {
@@ -408,6 +511,36 @@ fn build_diff_artifact(samples: &[ChangeSample]) -> Option<DiffArtifact> {
         return None;
     }
     Some(DiffArtifact { content, truncated })
+}
+
+fn state_metadata(
+    bytes: &[u8],
+    unix_mode: Option<u32>,
+    content_available: bool,
+) -> FileStateMetadata {
+    FileStateMetadata {
+        size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        checksum: Some(format!("sha256:{:x}", Sha256::digest(bytes))),
+        unix_mode,
+        content_kind: if std::str::from_utf8(bytes).is_ok() && !bytes.contains(&0) {
+            FileContentKind::Text
+        } else {
+            FileContentKind::Binary
+        },
+        content_available,
+    }
+}
+
+#[cfg(unix)]
+fn unix_mode(metadata: &std::fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+
+    Some(metadata.permissions().mode() & 0o7777)
+}
+
+#[cfg(not(unix))]
+fn unix_mode(_metadata: &std::fs::Metadata) -> Option<u32> {
+    None
 }
 
 fn utf8_prefix(value: &str, max_bytes: usize) -> &str {
@@ -451,6 +584,8 @@ mod tests {
             TrackedFile {
                 baseline: FileContent::Text(b"one\ntwo\n".to_vec()),
                 latest: FileContent::Text(b"one\nthree\nfour\n".to_vec()),
+                baseline_metadata: None,
+                latest_metadata: None,
             },
         );
 
@@ -468,10 +603,62 @@ mod tests {
             "binary.dat",
             &FileContent::Unavailable,
             &FileContent::Unavailable,
+            None,
+            None,
         );
 
         assert_eq!(summary.added_lines, None);
         assert_eq!(summary.removed_lines, None);
+    }
+
+    #[test]
+    fn binary_metadata_changes_remain_visible_without_text_line_counts() {
+        let task = TaskId::new();
+        let turn = TurnId::new();
+        let mut tracker = WorkspaceChangeTracker::default();
+        let metadata = |checksum: &str| FileStateMetadata {
+            size_bytes: 3 * 1024 * 1024,
+            checksum: Some(checksum.to_owned()),
+            unix_mode: Some(0o644),
+            content_kind: FileContentKind::Binary,
+            content_available: false,
+        };
+
+        let facts = tracker.record(
+            task,
+            turn,
+            vec![ChangeSample {
+                path: "assets/model.bin".to_owned(),
+                before: FileContent::Unavailable,
+                after: FileContent::Unavailable,
+                before_metadata: Some(metadata("sha256:before")),
+                after_metadata: Some(metadata("sha256:after")),
+            }],
+        );
+
+        assert_eq!(facts.operation_changes.len(), 1);
+        let change = &facts.operation_changes[0];
+        assert_eq!(change.kind, FileChangeKind::Modified);
+        assert_eq!(change.added_lines, None);
+        assert_eq!(change.removed_lines, None);
+        assert_eq!(
+            change
+                .before
+                .as_ref()
+                .and_then(|state| state.checksum.as_deref()),
+            Some("sha256:before")
+        );
+        assert_eq!(
+            change
+                .after
+                .as_ref()
+                .and_then(|state| state.checksum.as_deref()),
+            Some("sha256:after")
+        );
+        assert!(!facts.turn_summary.stats_complete);
+        assert_eq!(facts.turn_summary.added_lines, None);
+        assert_eq!(facts.turn_summary.removed_lines, None);
+        assert!(facts.diff_previews.is_empty());
     }
 
     #[test]
@@ -487,6 +674,8 @@ mod tests {
                 path: "src/lib.rs".to_owned(),
                 before: FileContent::Text(b"same\n".to_vec()),
                 after: FileContent::Text(b"same\n".to_vec()),
+                before_metadata: None,
+                after_metadata: None,
             }],
         );
 
@@ -507,6 +696,8 @@ mod tests {
                 path: "src/lib.rs".to_owned(),
                 before: FileContent::Text(b"one\ntwo\n".to_vec()),
                 after: FileContent::Text(b"one\nthree\nfour\n".to_vec()),
+                before_metadata: None,
+                after_metadata: None,
             }],
         );
 
@@ -532,6 +723,8 @@ mod tests {
                 path: "config.txt".to_owned(),
                 before: FileContent::Text(b"old\n".to_vec()),
                 after: FileContent::Text(b"api_key=super-secret-value\n".to_vec()),
+                before_metadata: None,
+                after_metadata: None,
             }],
         );
 
@@ -555,6 +748,8 @@ mod tests {
                         .collect::<String>()
                         .into_bytes(),
                 ),
+                before_metadata: None,
+                after_metadata: None,
             })
             .collect::<Vec<_>>();
 
@@ -588,6 +783,8 @@ mod tests {
             path: "large.txt".to_owned(),
             before: FileContent::Text(Vec::new()),
             after: FileContent::Text(vec![b'x'; MAX_DIFF_ARTIFACT_BYTES + 1024]),
+            before_metadata: None,
+            after_metadata: None,
         };
 
         let artifact = build_diff_artifact(&[sample]).expect("diff artifact");
@@ -649,6 +846,8 @@ mod tests {
                 path: "src/lib.rs".to_owned(),
                 before: FileContent::Text(b"one\ntwo\n".to_vec()),
                 after: FileContent::Text(b"one\nthree\n".to_vec()),
+                before_metadata: None,
+                after_metadata: None,
             }],
         );
         let facts = tracker.record(
@@ -658,6 +857,8 @@ mod tests {
                 path: "src/lib.rs".to_owned(),
                 before: FileContent::Text(b"one\nthree\n".to_vec()),
                 after: FileContent::Text(b"one\nthree\nfour\n".to_vec()),
+                before_metadata: None,
+                after_metadata: None,
             }],
         );
 
@@ -680,6 +881,8 @@ mod tests {
                 path: "src/lib.rs".to_owned(),
                 before: FileContent::Text(b"one\ntwo\n".to_vec()),
                 after: FileContent::Text(b"one\nthree\n".to_vec()),
+                before_metadata: None,
+                after_metadata: None,
             }],
         );
         let facts = tracker.record(
@@ -689,6 +892,8 @@ mod tests {
                 path: "src/lib.rs".to_owned(),
                 before: FileContent::Text(b"one\nthree\n".to_vec()),
                 after: FileContent::Text(b"one\ntwo\n".to_vec()),
+                before_metadata: None,
+                after_metadata: None,
             }],
         );
 

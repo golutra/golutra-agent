@@ -882,6 +882,7 @@ impl RuntimeStore {
             loop_decisions,
             post_task_jobs,
             failure_diagnosis: None,
+            failure_episodes: Vec::new(),
             diagnostic_slice: None,
             replay_execution: None,
             external_evaluations: Vec::new(),
@@ -899,31 +900,62 @@ impl RuntimeStore {
             .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
         set_owner_only_dir(&self.artifact_root).await?;
         let final_path = self.artifact_blob_path(artifact.artifact_id);
-        let temporary_path = final_path.with_extension(format!("tmp-{}", uuid::Uuid::now_v7()));
-        let mut temporary = tokio::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary_path)
-            .await
-            .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
-        temporary
-            .write_all(bytes)
-            .await
-            .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
-        set_owner_only_file(&temporary_path).await?;
-        temporary
-            .sync_all()
-            .await
-            .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
-        drop(temporary);
-        let linked = match tokio::fs::hard_link(&temporary_path, &final_path).await {
-            Ok(()) => true,
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => false,
-            Err(error) => return Err(StoreError::ArtifactIo(error.to_string())),
+        let duplicate_artifact_id: Option<String> = sqlx::query_scalar(
+            "SELECT artifact_id FROM artifact_records
+             WHERE checksum = ? AND size_bytes = ? AND blob_deleted_at IS NULL
+             ORDER BY created_at ASC LIMIT 1",
+        )
+        .bind(&artifact.checksum)
+        .bind(i64::try_from(artifact.size_bytes).unwrap_or(i64::MAX))
+        .fetch_optional(&self.pool)
+        .await?;
+        let linked = if let Some(existing_id) = duplicate_artifact_id {
+            let existing_id = existing_id.parse::<ArtifactId>().map_err(|error| {
+                StoreError::ArtifactIo(format!("stored artifact id is invalid: {error}"))
+            })?;
+            let existing_path = self.artifact_blob_path(existing_id);
+            let existing_bytes = tokio::fs::read(&existing_path)
+                .await
+                .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
+            if existing_bytes != bytes {
+                return Err(StoreError::ArtifactIo(format!(
+                    "artifact checksum collision for {}",
+                    artifact.checksum
+                )));
+            }
+            match tokio::fs::hard_link(&existing_path, &final_path).await {
+                Ok(()) => true,
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => false,
+                Err(error) => return Err(StoreError::ArtifactIo(error.to_string())),
+            }
+        } else {
+            let temporary_path = final_path.with_extension(format!("tmp-{}", uuid::Uuid::now_v7()));
+            let mut temporary = tokio::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary_path)
+                .await
+                .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
+            temporary
+                .write_all(bytes)
+                .await
+                .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
+            set_owner_only_file(&temporary_path).await?;
+            temporary
+                .sync_all()
+                .await
+                .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
+            drop(temporary);
+            let linked = match tokio::fs::hard_link(&temporary_path, &final_path).await {
+                Ok(()) => true,
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => false,
+                Err(error) => return Err(StoreError::ArtifactIo(error.to_string())),
+            };
+            tokio::fs::remove_file(&temporary_path)
+                .await
+                .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
+            linked
         };
-        tokio::fs::remove_file(&temporary_path)
-            .await
-            .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
         sync_artifact_directory(&self.artifact_root).await?;
         if !linked {
             let existing_bytes = tokio::fs::read(&final_path)
@@ -2268,6 +2300,10 @@ const MIGRATIONS: &[&str] = &[
         expires_at TEXT,
         blob_deleted_at TEXT
     )
+    "#,
+    r#"
+    CREATE INDEX IF NOT EXISTS idx_artifact_records_content
+    ON artifact_records (checksum, size_bytes, blob_deleted_at)
     "#,
     r#"
     CREATE TABLE IF NOT EXISTS evidence_records (

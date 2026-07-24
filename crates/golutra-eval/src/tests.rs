@@ -152,6 +152,8 @@ fn external_evaluation(
         score_max: Some(1.0),
         assertions: Vec::new(),
         artifact_refs: Vec::new(),
+        imported_artifacts: Vec::new(),
+        imported_evidence_refs: Vec::new(),
         partition,
         seed: Some(seed),
         provider_variant: Some(provider_variant.to_owned()),
@@ -841,6 +843,20 @@ fn external_evaluation_rejects_partial_association_and_conflicting_identity() {
             .record_external_evaluation(record.clone())
             .expect("first record")
     );
+    let original_ingested_at = record.ingested_at;
+    let mut retry = record.clone();
+    retry.ingested_at += chrono::Duration::seconds(1);
+    assert!(
+        !store
+            .record_external_evaluation(retry)
+            .expect("idempotent retry")
+    );
+    assert_eq!(
+        store.snapshot().expect("state").external_evaluations[0].ingested_at,
+        original_ingested_at,
+        "the first imported record remains immutable"
+    );
+
     let mut conflicting = record;
     conflicting.verdict = EvaluationVerdict::Fail;
     conflicting.result_digest = external_evaluation_result_digest(&conflicting);

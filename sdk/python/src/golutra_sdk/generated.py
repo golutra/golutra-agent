@@ -327,6 +327,7 @@ class ContextContributorSnapshot(TypedDict, total=False):
     estimated_tokens: Required[int]
     included: Required[bool]
     invalidation_refs: Required[list[str]]
+    message_indexes: NotRequired[list[int]]
     name: Required[str]
     original_estimated_tokens: NotRequired[int]
     redacted_content_ref: NotRequired[str | None]
@@ -338,9 +339,12 @@ class ContextContributorSnapshot(TypedDict, total=False):
 
 class ContextMessageSnapshot(TypedDict, total=False):
     content_digest: Required[str]
+    contributor: NotRequired[str]
     estimated_tokens: Required[int]
     index: Required[int]
+    origin: NotRequired[str]
     role: Required[str]
+    source_refs: NotRequired[list[str]]
     tool_call_ids: Required[list[str]]
 
 class ContextProjection(TypedDict, total=False):
@@ -413,6 +417,7 @@ class DebugProjection(TypedDict, total=False):
     evidence: Required[list[EvidenceRecord]]
     external_evaluations: NotRequired[list[ExternalEvaluationRecord]]
     failure_diagnosis: NotRequired[FailureDiagnosis | None]
+    failure_episodes: NotRequired[list[FailureEpisode]]
     loop_decisions: Required[list[LoopDecision]]
     missing_sections: NotRequired[list[str]]
     post_task_jobs: NotRequired[list[PostTaskJob]]
@@ -720,6 +725,7 @@ class EvaluationProjection(TypedDict, total=False):
     diagnostic_slices: NotRequired[list[DiagnosticSlice]]
     external_evaluations: NotRequired[list[ExternalEvaluationRecord]]
     failure_diagnoses: NotRequired[list[FailureDiagnosis]]
+    failure_episodes: NotRequired[list[FailureEpisode]]
     improvement_candidates: Required[list[ImprovementCandidate]]
     integrity_warnings: Required[list[str]]
     post_task_jobs: Required[list[PostTaskJob]]
@@ -835,6 +841,8 @@ class ExternalEvaluationRecord(TypedDict, total=False):
     harness_id: Required[str]
     harness_version: Required[str]
     holdout_protected: NotRequired[bool]
+    imported_artifacts: NotRequired[list[ImportedEvaluationArtifact]]
+    imported_evidence_refs: NotRequired[list[str]]
     ingested_at: Required[str]
     partition: NotRequired[EvaluationPartitionKind]
     provider_variant: NotRequired[str | None]
@@ -868,13 +876,47 @@ class FailureDiagnosis(TypedDict, total=False):
     created_at: Required[str]
     diagnosis_id: Required[str]
     expected_behavior: Required[str]
+    failure_episode_id: NotRequired[str | None]
     regression_commands: Required[list[str]]
+    revision: NotRequired[int]
     source_task_id: Required[str]
     summary: Required[str]
+    supersedes_diagnosis_id: NotRequired[str | None]
     taxonomy: Required[FailureTaxonomy]
     trigger_event_refs: Required[list[str]]
 
 FailureDomain: TypeAlias = Literal['runtime_control_flow', 'context', 'provider', 'tool', 'policy', 'verification', 'memory', 'external_evaluation', 'unknown']
+
+class FailureEpisode(TypedDict, total=False):
+    diagnosis_refs: NotRequired[list[str]]
+    episode_id: Required[str]
+    external_assertion_failures: NotRequired[list[FailureSignalRef]]
+    opened_at: Required[str]
+    primary_signal: Required[FailureSignalRef]
+    producer_failures: NotRequired[list[FailureSignalRef]]
+    recovered_by: NotRequired[FailureRecovery | None]
+    self_check_failures: NotRequired[list[FailureSignalRef]]
+    source_task_id: Required[str]
+    status: Required[FailureEpisodeStatus]
+    superseded_by: NotRequired[str | None]
+    updated_at: Required[str]
+
+FailureEpisodeStatus: TypeAlias = Literal['active', 'recovered', 'superseded']
+
+class FailureRecovery(TypedDict, total=False):
+    event_ref: Required[str]
+    signal_key: Required[str]
+    summary: Required[str]
+
+FailureSignalKind: TypeAlias = Literal['producer', 'self_check', 'external_assertion']
+
+class FailureSignalRef(TypedDict, total=False):
+    artifact_refs: NotRequired[list[str]]
+    event_ref: Required[str]
+    evidence_refs: NotRequired[list[str]]
+    kind: Required[FailureSignalKind]
+    signal_key: Required[str]
+    summary: Required[str]
 
 class FailureTaxonomy(TypedDict, total=False):
     code: Required[str]
@@ -916,13 +958,21 @@ GovernorAction: TypeAlias = Literal['allow', 'warn', 'ask_user', 'block']
 
 GovernorPhase: TypeAlias = Literal['provider', 'tool', 'tool_result', 'completion']
 
+class ImportedEvaluationArtifact(TypedDict, total=False):
+    artifact_ref: Required[str]
+    checksum: Required[str]
+    size_bytes: Required[int]
+    source_ref: Required[str]
+
 class ImprovementCandidate(TypedDict, total=False):
     benchmark_refs: Required[list[str]]
     causal_evidence_refs: Required[list[str]]
+    diagnosis_ref: NotRequired[str | None]
     evidence_refs: Required[list[str]]
     expected_effect: Required[str]
     id: Required[str]
     proposed_change: Required[str]
+    proposed_commands: NotRequired[list[str]]
     risk_level: Required[CandidateRisk]
     rollback_plan: Required[str]
     source_failure_ids: Required[list[str]]
@@ -930,6 +980,7 @@ class ImprovementCandidate(TypedDict, total=False):
     status: Required[CandidateStatus]
     target_id: NotRequired[str | None]
     target_type: Required[str]
+    validation_plan: NotRequired[list[str]]
 
 class IncompleteToolCall(TypedDict, total=False):
     side_effect_possible: Required[bool]
@@ -1285,7 +1336,7 @@ class RuntimeEvent(TypedDict, total=False):
 
 RuntimeEventSource: TypeAlias = Literal['runtime', 'provider', 'tool', 'policy', 'verifier', 'memory', 'evaluator', 'governor', 'evolution', 'user']
 
-RuntimeEventType: TypeAlias = Literal['command_received', 'command_completed', 'command_accepted', 'command_rejected', 'session_created', 'thread_forked', 'thread_rebound', 'task_created', 'turn_started', 'step_started', 'step_completed', 'step_checkpointed', 'turn_queued', 'busy_policy_decided', 'controller_changed', 'context_built', 'provider_started', 'provider_streamed', 'provider_completed', 'provider_failed', 'token_usage_recorded', 'assistant_message', 'tool_started', 'tool_progress', 'tool_completed', 'policy_evaluated', 'verification_completed', 'loop_decided', 'checkpoint_created', 'task_completed', 'task_abort_requested', 'task_aborted', 'task_interrupted', 'task_uncertain', 'task_reconciled', 'task_paused', 'task_resumed', 'approval_requested', 'approval_resolved', 'retry_scheduled', 'provider_fallback', 'provider_transport_fallback', 'provider_auth_required', 'provider_auth_submitted', 'provider_auth_cancelled', 'provider_configured', 'provider_probe_started', 'provider_probe_completed', 'provider_auth_failed', 'provider_rate_limited', 'provider_credential_refreshed', 'loop_guard_triggered', 'compaction_started', 'compaction_completed', 'compaction_failed', 'memory_retrieved', 'memory_promoted', 'memory_promotion_rejected', 'memory_rolled_back', 'memory_feedback_recorded', 'post_task_reviewed', 'evaluation_completed', 'improvement_candidate_created', 'automation_candidate_created', 'regression_completed', 'promotion_decided', 'candidate_applied', 'candidate_rolled_back', 'benchmark_recorded', 'counterfactual_compared', 'evolution_planned', 'evolution_task_started', 'evolution_task_completed', 'evolution_completed', 'skill_staged', 'skill_reviewed', 'skill_installed', 'skill_rolled_back', 'governor_decided', 'storage_maintenance_completed', 'context_snapshot_created', 'post_task_job_queued', 'post_task_job_started', 'post_task_job_completed', 'post_task_job_failed', 'verification_planned', 'verification_assertion_completed', 'regression_campaign_started', 'regression_execution_completed', 'memory_candidate_quarantined', 'memory_activated', 'memory_invalidated', 'failure_diagnosed', 'diagnostic_slice_created', 'replay_capsule_created', 'replay_executed', 'external_evaluation_ingested', 'external_evaluation_compared']
+RuntimeEventType: TypeAlias = Literal['command_received', 'command_completed', 'command_accepted', 'command_rejected', 'session_created', 'thread_forked', 'thread_rebound', 'task_created', 'turn_started', 'step_started', 'step_completed', 'step_checkpointed', 'turn_queued', 'busy_policy_decided', 'controller_changed', 'context_built', 'provider_started', 'provider_streamed', 'provider_completed', 'provider_failed', 'token_usage_recorded', 'assistant_message', 'tool_started', 'tool_progress', 'tool_completed', 'policy_evaluated', 'verification_completed', 'loop_decided', 'checkpoint_created', 'task_completed', 'task_abort_requested', 'task_aborted', 'task_interrupted', 'task_uncertain', 'task_reconciled', 'task_paused', 'task_resumed', 'approval_requested', 'approval_resolved', 'retry_scheduled', 'provider_fallback', 'provider_transport_fallback', 'provider_auth_required', 'provider_auth_submitted', 'provider_auth_cancelled', 'provider_configured', 'provider_probe_started', 'provider_probe_completed', 'provider_auth_failed', 'provider_rate_limited', 'provider_credential_refreshed', 'loop_guard_triggered', 'compaction_started', 'compaction_completed', 'compaction_failed', 'memory_retrieved', 'memory_promoted', 'memory_promotion_rejected', 'memory_rolled_back', 'memory_feedback_recorded', 'post_task_reviewed', 'evaluation_completed', 'improvement_candidate_created', 'automation_candidate_created', 'regression_completed', 'promotion_decided', 'candidate_applied', 'candidate_rolled_back', 'benchmark_recorded', 'counterfactual_compared', 'evolution_planned', 'evolution_task_started', 'evolution_task_completed', 'evolution_completed', 'skill_staged', 'skill_reviewed', 'skill_installed', 'skill_rolled_back', 'governor_decided', 'storage_maintenance_completed', 'context_snapshot_created', 'post_task_job_queued', 'post_task_job_started', 'post_task_job_completed', 'post_task_job_failed', 'verification_planned', 'verification_assertion_completed', 'regression_campaign_started', 'regression_execution_completed', 'memory_candidate_quarantined', 'memory_activated', 'memory_invalidated', 'failure_diagnosed', 'failure_episode_recorded', 'diagnostic_slice_created', 'replay_capsule_created', 'replay_executed', 'external_evaluation_ingested', 'external_evaluation_compared']
 
 class RuntimeGovernorDecision(TypedDict, total=False):
     action: Required[GovernorAction]
@@ -1839,12 +1890,18 @@ __all__ = [
     "ExternalVerificationSpec",
     "FailureDiagnosis",
     "FailureDomain",
+    "FailureEpisode",
+    "FailureEpisodeStatus",
+    "FailureRecovery",
+    "FailureSignalKind",
+    "FailureSignalRef",
     "FailureTaxonomy",
     "GeneratedTask",
     "GeneratedTaskExecution",
     "GoalAlignmentCheck",
     "GovernorAction",
     "GovernorPhase",
+    "ImportedEvaluationArtifact",
     "ImprovementCandidate",
     "IncompleteToolCall",
     "JsonRpcErrorObject",

@@ -42,6 +42,7 @@ ToolResultEnvelope
 ArtifactRecord / EvidenceRecord
 PolicyEvaluation
 VerificationRecord
+FailureEpisode
 LoopDecision
 LoopGuardRule
 WorkspaceCheckpoint

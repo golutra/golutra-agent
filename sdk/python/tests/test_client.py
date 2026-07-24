@@ -39,7 +39,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     "instance_id": "server-1",
                     "pid": 1,
                     "base_url": self.server.base_url,
-                    "protocol_versions": {"minimum": 5, "current": 5},
+                    "protocol_versions": {"minimum": 6, "current": 6},
                     "started_at": "2026-01-01T00:00:00Z",
                 }
             )
@@ -137,7 +137,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         valid = (
             self.headers.get("authorization") == f"Bearer {TOKEN}"
             and self.headers.get("x-golutra-actor-id", "").startswith("python-sdk-")
-            and self.headers.get("x-golutra-protocol-version") == "5"
+            and self.headers.get("x-golutra-protocol-version") == "6"
         )
         if not valid:
             self._json({"error": "unauthorized"}, 401)

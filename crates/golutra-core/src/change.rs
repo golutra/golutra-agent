@@ -9,6 +9,28 @@ pub enum FileChangeKind {
     Deleted,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FileContentKind {
+    Text,
+    Binary,
+    #[default]
+    Unknown,
+}
+
+/// Immutable metadata captured for one side of a workspace file change.
+///
+/// `content_available=false` means the scanner retained metadata and a
+/// checksum without copying the file body into the bounded before-image.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FileStateMetadata {
+    pub size_bytes: u64,
+    pub checksum: Option<String>,
+    pub unix_mode: Option<u32>,
+    pub content_kind: FileContentKind,
+    pub content_available: bool,
+}
+
 /// A content change for one workspace-relative file.
 ///
 /// Line counts are absent when either side is binary, unavailable, or outside
@@ -19,6 +41,10 @@ pub struct FileChangeSummary {
     pub kind: FileChangeKind,
     pub added_lines: Option<u64>,
     pub removed_lines: Option<u64>,
+    #[serde(default)]
+    pub before: Option<FileStateMetadata>,
+    #[serde(default)]
+    pub after: Option<FileStateMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -36,4 +62,8 @@ pub struct TurnChangeSummary {
     pub added_lines: Option<u64>,
     pub removed_lines: Option<u64>,
     pub stats_complete: bool,
+    #[serde(default)]
+    pub file_count: u64,
+    #[serde(default)]
+    pub files_truncated: bool,
 }

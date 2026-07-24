@@ -13,11 +13,11 @@
 
 ## 当前实现状态
 
-截至 2026-07-16，已落地以下受控骨架：
+截至 2026-07-24，已落地以下受控骨架：
 
 - `ContextBuilder` 按 contributor 构建 stable system prompt、canonical workspace environment context、会话摘要、project memory、evidence 和工具说明；当前使用字符数近似 token、静态预算和按 contributor 截断，`TokenBudgetSnapshot` 的 policy 仍是 `p0_static_budget`。
-- provider response 后会记录 `TokenUsageRecord`；provider request 前会保存稳定 digest、redacted request artifact、message/tool schema manifest 和逐 contributor 内容引用，因此 developer trace 可以证明模型可见输入。没有 model-aware tokenizer 时，token 数仍标记为估算值。
-- compact 是 durable command/event；后续 turn 会复用 compact summary，同一 session 的历史不会作为完整 transcript 无界回灌。
+- provider response 后会记录 `TokenUsageRecord`；provider request 前会保存稳定 digest、redacted request artifact、逐 message 的 contributor/source/origin、tool schema manifest 和逐 contributor 内容引用，因此 developer trace 可以证明每条模型可见输入来自哪里。provider 给出的 input token 总数按 contributor 的保守估算做 largest-remainder 分配，分配和必须严格等于 provider 总数，同时明确标记 `proportional_provider_total`，不把比例估算伪装成 provider 原生逐消息计数。没有 model-aware tokenizer 时，估算字段继续标记为字符近似。
+- compact 是 durable command/event；每条原消息记录 `protected/retained/summarized` 决策，合成 summary 聚合被替换消息的 source refs，保留尾部消息继续沿用原 contributor。后续 turn 会复用 compact summary，同一 session 的历史不会作为完整 transcript 无界回灌。
 - `MemoryStore` 按 canonical cwd hash 持久化到 `$GOLUTRA_HOME/state/workspaces/<cwd-hash>/memory.json`，写入通过跨进程文件锁和临时文件原子替换；文件 I/O 使用 `spawn_blocking`，不会阻塞 async runtime worker。Unix runtime 目录为 `0700`、memory/lock 文件为 `0600`。
 - 成功任务可从 durable evidence 生成 project-scoped `MemoryCandidate`；RuntimeHost 只调用 quarantine，候选带 structured claim、默认 30 天 expiry 和 invalidation refs。单次成功不会进入 active memory。
 - 每轮 task 会记录 `MemoryRetrieved`，只有 active、未过期且与 query 相关的 project memory 才进入 context；完整 memory 记录不直接当作 prompt 历史。

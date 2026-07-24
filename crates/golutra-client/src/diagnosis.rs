@@ -2,21 +2,40 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use golutra_core::{ArtifactId, EventId, EvidenceId, ProviderRequestId, TaskId};
 use golutra_eval::{
-    CodeTargetRef, DiagnosticSlice, FailureDiagnosis, FailureDomain, FailureTaxonomy,
-    ReplayCapsule, ReplayMode, ReplayProviderExchange, ReplayToolResult,
+    CandidateRisk, CandidateStatus, CodeTargetRef, DiagnosticSlice, FailureDiagnosis,
+    FailureDomain, FailureEpisode, FailureEpisodeStatus, FailureRecovery, FailureSignalKind,
+    FailureSignalRef, FailureTaxonomy, ImprovementCandidate, ReplayCapsule, ReplayMode,
+    ReplayProviderExchange, ReplayToolResult,
 };
 use golutra_protocol::{RuntimeEvent, RuntimeEventType};
 use serde_json::Value;
+
+#[derive(Debug, Clone)]
+pub(crate) struct FailureAnalysis {
+    pub(crate) diagnosis: FailureDiagnosis,
+    pub(crate) slice: DiagnosticSlice,
+    pub(crate) episodes: Vec<FailureEpisode>,
+    pub(crate) candidate: ImprovementCandidate,
+}
 
 pub(crate) fn diagnose_task(
     task_id: TaskId,
     events: &[RuntimeEvent],
     source_digest: Option<String>,
-) -> Option<(FailureDiagnosis, DiagnosticSlice)> {
-    let (trigger_index, trigger) = select_failure_trigger(events)?;
+) -> Option<FailureAnalysis> {
+    let episodes = failure_episodes(task_id, events);
+    let primary_episode = episodes
+        .iter()
+        .filter(|episode| episode.status == FailureEpisodeStatus::Active)
+        .max_by_key(|episode| episode_priority(episode))?;
+    let primary_episode_id = primary_episode.episode_id.clone();
+    let trigger = events
+        .iter()
+        .find(|event| event.id == primary_episode.primary_signal.event_ref)?;
+    let trigger_index = events.iter().position(|event| event.id == trigger.id)?;
     let (taxonomy, summary, expected, actual, counterfactual, targets, commands, confidence) =
         classify_failure(events, trigger_index, trigger, source_digest);
-    let causal_events = causal_slice(events, trigger.id, 100);
+    let causal_events = diagnostic_slice_events(events, trigger.id, &episodes, 512);
     let mut artifact_refs = HashSet::new();
     let mut evidence_refs = HashSet::new();
     for event in &causal_events {
@@ -30,8 +49,9 @@ pub(crate) fn diagnose_task(
         .iter()
         .map(|event| event.id)
         .collect::<Vec<_>>();
+    let diagnosis_id = format!("diagnosis-{task_id}-{}", trigger.id);
     let diagnosis = FailureDiagnosis {
-        diagnosis_id: format!("diagnosis-{task_id}"),
+        diagnosis_id: diagnosis_id.clone(),
         source_task_id: task_id,
         taxonomy,
         summary,
@@ -43,7 +63,23 @@ pub(crate) fn diagnose_task(
         confidence,
         code_targets: targets,
         regression_commands: commands,
-        analyzer_version: "golutra-failure-diagnosis-v1".to_owned(),
+        analyzer_version: "golutra-failure-diagnosis-v2".to_owned(),
+        failure_episode_id: Some(primary_episode_id.clone()),
+        revision: u32::try_from(
+            events
+                .iter()
+                .filter(|event| event.event_type == RuntimeEventType::FailureDiagnosed)
+                .count()
+                .saturating_add(1),
+        )
+        .unwrap_or(u32::MAX),
+        supersedes_diagnosis_id: events
+            .iter()
+            .rev()
+            .find(|event| event.event_type == RuntimeEventType::FailureDiagnosed)
+            .and_then(|event| event.payload.pointer("/record/diagnosis_id"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
         created_at: chrono::Utc::now(),
     };
     let complete = event_refs.iter().all(|event_id| {
@@ -57,7 +93,7 @@ pub(crate) fn diagnose_task(
             })
     });
     let slice = DiagnosticSlice {
-        slice_id: format!("diagnostic-slice-{task_id}"),
+        slice_id: format!("diagnostic-slice-{task_id}-{}", trigger.id),
         source_task_id: task_id,
         diagnosis: diagnosis.clone(),
         event_refs,
@@ -68,7 +104,32 @@ pub(crate) fn diagnose_task(
         complete,
         generated_at: chrono::Utc::now(),
     };
-    Some((diagnosis, slice))
+    let mut episodes = episodes;
+    for episode in &mut episodes {
+        if episode.episode_id == primary_episode_id {
+            episode.diagnosis_refs.push(diagnosis_id.clone());
+            episode.diagnosis_refs.sort();
+            episode.diagnosis_refs.dedup();
+        } else if episode.status == FailureEpisodeStatus::Active {
+            episode.status = FailureEpisodeStatus::Superseded;
+            episode.superseded_by = Some(primary_episode_id.clone());
+            episode.updated_at = diagnosis.created_at;
+        }
+    }
+    let candidate = improvement_candidate(&diagnosis, &slice, &episodes);
+    Some(FailureAnalysis {
+        diagnosis,
+        slice,
+        episodes,
+        candidate,
+    })
+}
+
+pub(crate) fn task_failure_episodes(
+    task_id: TaskId,
+    events: &[RuntimeEvent],
+) -> Vec<FailureEpisode> {
+    failure_episodes(task_id, events)
 }
 
 pub(crate) fn replay_capsule(
@@ -195,42 +256,350 @@ pub(crate) fn replay_capsule(
     }
 }
 
-fn select_failure_trigger(events: &[RuntimeEvent]) -> Option<(usize, &RuntimeEvent)> {
-    events
+fn failure_episodes(task_id: TaskId, events: &[RuntimeEvent]) -> Vec<FailureEpisode> {
+    let mut episodes = Vec::<FailureEpisode>::new();
+    let mut active_by_key = HashMap::<String, usize>::new();
+    for event in events {
+        if let Some((key, signals)) = failure_signals(event) {
+            if let Some(index) = active_by_key.get(&key).copied() {
+                for signal in signals {
+                    push_episode_signal(&mut episodes[index], signal);
+                }
+                episodes[index].updated_at = event.timestamp;
+            } else if let Some(primary_signal) = signals.first().cloned() {
+                let mut episode = FailureEpisode {
+                    episode_id: format!("failure-episode-{task_id}-{}", event.id),
+                    source_task_id: task_id,
+                    status: FailureEpisodeStatus::Active,
+                    primary_signal,
+                    producer_failures: Vec::new(),
+                    self_check_failures: Vec::new(),
+                    external_assertion_failures: Vec::new(),
+                    diagnosis_refs: Vec::new(),
+                    recovered_by: None,
+                    superseded_by: None,
+                    opened_at: event.timestamp,
+                    updated_at: event.timestamp,
+                };
+                for signal in signals {
+                    push_episode_signal(&mut episode, signal);
+                }
+                let index = episodes.len();
+                episodes.push(episode);
+                active_by_key.insert(key, index);
+            }
+        }
+        for (key, summary) in recovery_signals(event) {
+            if let Some(index) = active_by_key.remove(&key) {
+                let episode = &mut episodes[index];
+                episode.status = FailureEpisodeStatus::Recovered;
+                episode.recovered_by = Some(FailureRecovery {
+                    event_ref: event.id,
+                    signal_key: key,
+                    summary,
+                });
+                episode.updated_at = event.timestamp;
+            }
+        }
+        if event.event_type.is_task_terminal()
+            && event
+                .payload
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| status != "completed")
+            && active_by_key.is_empty()
+        {
+            let signal = failure_signal_ref(
+                event,
+                FailureSignalKind::Producer,
+                "task:terminal".to_owned(),
+                event
+                    .payload
+                    .get("summary")
+                    .or_else(|| event.payload.get("error"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("task reached a non-success terminal state")
+                    .to_owned(),
+            );
+            let mut episode = FailureEpisode {
+                episode_id: format!("failure-episode-{task_id}-{}", event.id),
+                source_task_id: task_id,
+                status: FailureEpisodeStatus::Active,
+                primary_signal: signal.clone(),
+                producer_failures: Vec::new(),
+                self_check_failures: Vec::new(),
+                external_assertion_failures: Vec::new(),
+                diagnosis_refs: Vec::new(),
+                recovered_by: None,
+                superseded_by: None,
+                opened_at: event.timestamp,
+                updated_at: event.timestamp,
+            };
+            push_episode_signal(&mut episode, signal);
+            episodes.push(episode);
+            active_by_key.insert("task:terminal".to_owned(), episodes.len() - 1);
+        }
+    }
+    episodes
+}
+
+fn failure_signals(event: &RuntimeEvent) -> Option<(String, Vec<FailureSignalRef>)> {
+    match event.event_type {
+        RuntimeEventType::ExternalEvaluationIngested => {
+            let record = event.payload.get("record")?;
+            if record.get("verdict").and_then(Value::as_str) == Some("pass") {
+                return None;
+            }
+            let case_id = record
+                .get("case_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let key = format!("external:{case_id}");
+            let mut signals = record
+                .get("assertions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|assertion| {
+                    !assertion
+                        .get("passed")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                })
+                .map(|assertion| {
+                    let name = assertion
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("external assertion");
+                    let message = assertion
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("failed");
+                    failure_signal_ref(
+                        event,
+                        FailureSignalKind::ExternalAssertion,
+                        key.clone(),
+                        format!("{name}: {message}"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if signals.is_empty() {
+                signals.push(failure_signal_ref(
+                    event,
+                    FailureSignalKind::ExternalAssertion,
+                    key.clone(),
+                    format!("external evaluator failed case {case_id}"),
+                ));
+            }
+            Some((key, signals))
+        }
+        RuntimeEventType::VerificationCompleted => {
+            let result = event
+                .payload
+                .pointer("/record/result")
+                .and_then(Value::as_str)?;
+            (result != "pass").then(|| {
+                let key = "self_check:verification".to_owned();
+                (
+                    key.clone(),
+                    vec![failure_signal_ref(
+                        event,
+                        FailureSignalKind::SelfCheck,
+                        key,
+                        event
+                            .payload
+                            .get("summary")
+                            .and_then(Value::as_str)
+                            .unwrap_or("runtime verification did not pass")
+                            .to_owned(),
+                    )],
+                )
+            })
+        }
+        RuntimeEventType::ToolCompleted => {
+            let status = event
+                .payload
+                .pointer("/envelope/status")
+                .and_then(Value::as_str)?;
+            (status != "ok").then(|| {
+                let key = format!("tool:{}", tool_failure_signature(event));
+                (
+                    key.clone(),
+                    vec![failure_signal_ref(
+                        event,
+                        FailureSignalKind::Producer,
+                        key,
+                        event
+                            .payload
+                            .pointer("/envelope/summary")
+                            .and_then(Value::as_str)
+                            .unwrap_or("tool execution failed")
+                            .to_owned(),
+                    )],
+                )
+            })
+        }
+        RuntimeEventType::ProviderFailed => {
+            let provider = event
+                .payload
+                .get("provider_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let key = format!("provider:{provider}");
+            Some((
+                key.clone(),
+                vec![failure_signal_ref(
+                    event,
+                    FailureSignalKind::Producer,
+                    key,
+                    event
+                        .payload
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("provider request failed")
+                        .to_owned(),
+                )],
+            ))
+        }
+        RuntimeEventType::LoopGuardTriggered => {
+            let trigger = event
+                .payload
+                .get("trigger")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let key = format!("control:{trigger}");
+            Some((
+                key.clone(),
+                vec![failure_signal_ref(
+                    event,
+                    FailureSignalKind::Producer,
+                    key,
+                    event
+                        .payload
+                        .get("summary")
+                        .or_else(|| event.payload.get("reason"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("runtime loop guard stopped execution")
+                        .to_owned(),
+                )],
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn recovery_signals(event: &RuntimeEvent) -> Vec<(String, String)> {
+    match event.event_type {
+        RuntimeEventType::ExternalEvaluationIngested
+            if event
+                .payload
+                .pointer("/record/verdict")
+                .and_then(Value::as_str)
+                == Some("pass") =>
+        {
+            let case_id = event
+                .payload
+                .pointer("/record/case_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            vec![
+                (
+                    format!("external:{case_id}"),
+                    format!("external evaluator passed case {case_id}"),
+                ),
+                (
+                    "self_check:verification".to_owned(),
+                    format!("external evaluator passed case {case_id}"),
+                ),
+            ]
+        }
+        RuntimeEventType::VerificationCompleted
+            if event
+                .payload
+                .pointer("/record/result")
+                .and_then(Value::as_str)
+                == Some("pass") =>
+        {
+            vec![(
+                "self_check:verification".to_owned(),
+                "runtime verification passed".to_owned(),
+            )]
+        }
+        RuntimeEventType::ToolCompleted
+            if event
+                .payload
+                .pointer("/envelope/status")
+                .and_then(Value::as_str)
+                == Some("ok") =>
+        {
+            vec![(
+                format!("tool:{}", tool_failure_signature(event)),
+                "a later equivalent tool operation succeeded".to_owned(),
+            )]
+        }
+        RuntimeEventType::ProviderCompleted => {
+            let provider = event
+                .payload
+                .get("provider_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            vec![(
+                format!("provider:{provider}"),
+                "a later provider request completed".to_owned(),
+            )]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn failure_signal_ref(
+    event: &RuntimeEvent,
+    kind: FailureSignalKind,
+    signal_key: String,
+    summary: String,
+) -> FailureSignalRef {
+    let mut artifacts = HashSet::new();
+    let mut evidence = HashSet::new();
+    if let Some(artifact_id) = event.payload_ref {
+        artifacts.insert(artifact_id);
+    }
+    collect_artifact_ids(&event.payload, None, &mut artifacts);
+    collect_evidence_ids(&event.payload, &mut evidence);
+    FailureSignalRef {
+        event_ref: event.id,
+        kind,
+        signal_key,
+        summary,
+        evidence_refs: sorted(evidence),
+        artifact_refs: sorted(artifacts),
+    }
+}
+
+fn push_episode_signal(episode: &mut FailureEpisode, signal: FailureSignalRef) {
+    let target = match signal.kind {
+        FailureSignalKind::Producer => &mut episode.producer_failures,
+        FailureSignalKind::SelfCheck => &mut episode.self_check_failures,
+        FailureSignalKind::ExternalAssertion => &mut episode.external_assertion_failures,
+    };
+    if !target.contains(&signal) {
+        target.push(signal);
+    }
+}
+
+fn episode_priority(episode: &FailureEpisode) -> u8 {
+    if !episode.external_assertion_failures.is_empty() {
+        4
+    } else if !episode.self_check_failures.is_empty() {
+        3
+    } else if episode
+        .producer_failures
         .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, event)| event.event_type == RuntimeEventType::LoopGuardTriggered)
-        .or_else(|| {
-            events.iter().enumerate().rev().find(|(_, event)| {
-                event.event_type == RuntimeEventType::ToolCompleted
-                    && event
-                        .payload
-                        .pointer("/envelope/status")
-                        .and_then(Value::as_str)
-                        .is_some_and(|status| status != "ok")
-            })
-        })
-        .or_else(|| {
-            events.iter().enumerate().rev().find(|(_, event)| {
-                event.event_type == RuntimeEventType::VerificationCompleted
-                    && event
-                        .payload
-                        .pointer("/record/result")
-                        .and_then(Value::as_str)
-                        .is_some_and(|result| result != "pass")
-            })
-        })
-        .or_else(|| {
-            events.iter().enumerate().rev().find(|(_, event)| {
-                event.event_type.is_task_terminal()
-                    && event
-                        .payload
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .is_some_and(|status| status != "completed")
-            })
-        })
+        .any(|signal| signal.signal_key.starts_with("control:"))
+    {
+        2
+    } else {
+        1
+    }
 }
 
 #[allow(clippy::type_complexity)]
@@ -249,6 +618,69 @@ fn classify_failure(
     Vec<String>,
     u8,
 ) {
+    if trigger.event_type == RuntimeEventType::ExternalEvaluationIngested {
+        let record = trigger.payload.get("record").unwrap_or(&Value::Null);
+        let evaluator = record
+            .get("evaluator_id")
+            .and_then(Value::as_str)
+            .unwrap_or("external evaluator");
+        let case_id = record
+            .get("case_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let failed_assertions = record
+            .get("assertions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|assertion| {
+                !assertion
+                    .get("passed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .map(|assertion| {
+                format!(
+                    "{}: {}",
+                    assertion
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("assertion"),
+                    assertion
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("failed")
+                )
+            })
+            .collect::<Vec<_>>();
+        let actual = if failed_assertions.is_empty() {
+            format!("{evaluator} returned a failing verdict for {case_id}")
+        } else {
+            failed_assertions.join("; ")
+        };
+        return (
+            FailureTaxonomy {
+                domain: FailureDomain::ExternalEvaluation,
+                code: format!("{}_assertion_failed", normalized_code(evaluator)),
+            },
+            format!("{evaluator} rejected case {case_id}: {actual}"),
+            "all external evaluator assertions pass against the produced workspace result"
+                .to_owned(),
+            actual,
+            "inspect the imported evaluator artifacts, correct the produced workspace output, and rerun the same evaluator case"
+                .to_owned(),
+            vec![CodeTargetRef {
+                crate_name: "workspace".to_owned(),
+                module_path: case_id.to_owned(),
+                symbol: None,
+                source_path: None,
+                source_digest,
+                owner: "task-workspace".to_owned(),
+            }],
+            vec![format!("rerun external evaluator {evaluator} case {case_id}")],
+            98,
+        );
+    }
     let trigger_kind = trigger.payload.get("trigger").and_then(Value::as_str);
     if trigger_kind == Some("repeated_tool_failure")
         && repeated_failure_is_single_round(events, trigger_index, trigger)
@@ -328,6 +760,39 @@ fn classify_failure(
             82,
         );
     }
+    if trigger.event_type == RuntimeEventType::ProviderFailed {
+        let provider = trigger
+            .payload
+            .get("provider_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        return (
+            FailureTaxonomy {
+                domain: FailureDomain::Provider,
+                code: format!("{}_request_failed", normalized_code(provider)),
+            },
+            format!("provider {provider} failed without recovery"),
+            "the provider request completes or a configured fallback succeeds".to_owned(),
+            trigger
+                .payload
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("provider request failed")
+                .to_owned(),
+            "replay the request with the same provider contract and verify retry/fallback handling"
+                .to_owned(),
+            vec![CodeTargetRef {
+                crate_name: "golutra-llm".to_owned(),
+                module_path: provider.to_owned(),
+                symbol: None,
+                source_path: Some("crates/golutra-llm/src".to_owned()),
+                source_digest,
+                owner: "provider".to_owned(),
+            }],
+            vec!["cargo test -p golutra-llm".to_owned()],
+            85,
+        );
+    }
     (
         FailureTaxonomy {
             domain: FailureDomain::Verification,
@@ -353,6 +818,23 @@ fn classify_failure(
         vec!["cargo test -p golutra-verify".to_owned()],
         75,
     )
+}
+
+fn normalized_code(value: &str) -> String {
+    let mut output = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    while output.contains("__") {
+        output = output.replace("__", "_");
+    }
+    output.trim_matches('_').to_owned()
 }
 
 fn repeated_failure_is_single_round(
@@ -446,6 +928,167 @@ fn causal_slice(events: &[RuntimeEvent], trigger_id: EventId, limit: usize) -> V
     selected
 }
 
+fn diagnostic_slice_events<'a>(
+    events: &'a [RuntimeEvent],
+    trigger_id: EventId,
+    episodes: &[FailureEpisode],
+    limit: usize,
+) -> Vec<&'a RuntimeEvent> {
+    let mut selected_ids = causal_slice(events, trigger_id, limit)
+        .into_iter()
+        .map(|event| event.id)
+        .collect::<HashSet<_>>();
+    selected_ids.extend(episodes.iter().flat_map(|episode| {
+        std::iter::once(episode.primary_signal.event_ref)
+            .chain(
+                episode
+                    .producer_failures
+                    .iter()
+                    .map(|signal| signal.event_ref),
+            )
+            .chain(
+                episode
+                    .self_check_failures
+                    .iter()
+                    .map(|signal| signal.event_ref),
+            )
+            .chain(
+                episode
+                    .external_assertion_failures
+                    .iter()
+                    .map(|signal| signal.event_ref),
+            )
+            .chain(
+                episode
+                    .recovered_by
+                    .iter()
+                    .map(|recovery| recovery.event_ref),
+            )
+    }));
+    if let Some(trigger_index) = events.iter().position(|event| event.id == trigger_id) {
+        let start = trigger_index.saturating_sub(64);
+        let end = trigger_index.saturating_add(33).min(events.len());
+        selected_ids.extend(events[start..end].iter().map(|event| event.id));
+    }
+    for event_type in [
+        RuntimeEventType::ContextSnapshotCreated,
+        RuntimeEventType::VerificationCompleted,
+        RuntimeEventType::LoopDecided,
+        RuntimeEventType::TaskCompleted,
+        RuntimeEventType::TaskAborted,
+        RuntimeEventType::TaskInterrupted,
+        RuntimeEventType::TaskUncertain,
+    ] {
+        if let Some(event) = events
+            .iter()
+            .rev()
+            .find(|event| event.event_type == event_type)
+        {
+            selected_ids.insert(event.id);
+        }
+    }
+    let mut selected = events
+        .iter()
+        .filter(|event| selected_ids.contains(&event.id))
+        .collect::<Vec<_>>();
+    if selected.len() > limit {
+        let trigger_sequence = events
+            .iter()
+            .find(|event| event.id == trigger_id)
+            .map_or(u64::MAX, |event| event.sequence_no);
+        selected.sort_by_key(|event| event.sequence_no.abs_diff(trigger_sequence));
+        selected.truncate(limit);
+    }
+    selected.sort_by_key(|event| event.sequence_no);
+    selected
+}
+
+fn improvement_candidate(
+    diagnosis: &FailureDiagnosis,
+    slice: &DiagnosticSlice,
+    episodes: &[FailureEpisode],
+) -> ImprovementCandidate {
+    let target = diagnosis.code_targets.first();
+    let target_id = target.map(|target| {
+        target.source_path.clone().unwrap_or_else(|| {
+            target.symbol.as_ref().map_or_else(
+                || target.module_path.clone(),
+                |symbol| format!("{}::{symbol}", target.module_path),
+            )
+        })
+    });
+    let mut evidence_refs = slice.evidence_refs.clone();
+    evidence_refs.extend(episodes.iter().flat_map(|episode| {
+        episode
+            .external_assertion_failures
+            .iter()
+            .flat_map(|signal| signal.evidence_refs.iter().copied())
+    }));
+    evidence_refs.sort();
+    evidence_refs.dedup();
+    let mut causal_evidence_refs = vec![
+        diagnosis.diagnosis_id.clone(),
+        slice.slice_id.clone(),
+        format!("replay-{}", diagnosis.source_task_id),
+    ];
+    causal_evidence_refs.extend(episodes.iter().map(|episode| episode.episode_id.clone()));
+    causal_evidence_refs.sort();
+    causal_evidence_refs.dedup();
+    let mut benchmark_refs = episodes
+        .iter()
+        .flat_map(|episode| episode.external_assertion_failures.iter())
+        .map(|signal| signal.signal_key.clone())
+        .collect::<Vec<_>>();
+    if benchmark_refs.is_empty() {
+        benchmark_refs.push(format!("benchmark-{}", diagnosis.source_task_id));
+    }
+    benchmark_refs.sort();
+    benchmark_refs.dedup();
+    ImprovementCandidate {
+        id: format!("candidate-{}", diagnosis.source_task_id),
+        source_task_id: diagnosis.source_task_id,
+        source_failure_ids: diagnosis
+            .failure_episode_id
+            .iter()
+            .cloned()
+            .chain(std::iter::once(diagnosis.diagnosis_id.clone()))
+            .collect(),
+        target_type: target.map_or_else(
+            || "runtime_or_workspace".to_owned(),
+            |target| {
+                if target.crate_name == "workspace" {
+                    "workspace_code".to_owned()
+                } else {
+                    "runtime_code".to_owned()
+                }
+            },
+        ),
+        target_id,
+        proposed_change: format!(
+            "{}. Observed failure: {}",
+            diagnosis.counterfactual, diagnosis.actual_behavior
+        ),
+        expected_effect: diagnosis.expected_behavior.clone(),
+        risk_level: if diagnosis.taxonomy.domain == FailureDomain::ExternalEvaluation {
+            CandidateRisk::Medium
+        } else {
+            CandidateRisk::Low
+        },
+        evidence_refs,
+        causal_evidence_refs,
+        benchmark_refs,
+        rollback_plan: "revert the candidate patch and restore the pre-change checkpoint"
+            .to_owned(),
+        diagnosis_ref: Some(diagnosis.diagnosis_id.clone()),
+        proposed_commands: diagnosis.regression_commands.clone(),
+        validation_plan: vec![
+            diagnosis.expected_behavior.clone(),
+            "rerun the originating case and compare verification/evaluator evidence".to_owned(),
+        ],
+        status: CandidateStatus::Proposed,
+    }
+}
+
 fn collect_artifact_ids(value: &Value, key: Option<&str>, output: &mut HashSet<ArtifactId>) {
     match value {
         Value::Object(object) => {
@@ -472,7 +1115,7 @@ fn collect_artifact_ids(value: &Value, key: Option<&str>, output: &mut HashSet<A
 fn collect_evidence_ids(value: &Value, output: &mut HashSet<EvidenceId>) {
     if let Value::Object(object) = value {
         for (key, value) in object {
-            if key == "evidence_refs" {
+            if key == "evidence_refs" || key.ends_with("_evidence_refs") {
                 if let Value::Array(values) = value {
                     output.extend(
                         values
@@ -504,4 +1147,161 @@ fn sorted<T: Ord>(values: HashSet<T>) -> Vec<T> {
     let mut values = values.into_iter().collect::<Vec<_>>();
     values.sort();
     values
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use golutra_core::{CausalContext, EvidenceId};
+    use golutra_protocol::RuntimeEventSource;
+    use serde_json::json;
+
+    use super::*;
+
+    fn event(
+        sequence_no: u64,
+        task_id: TaskId,
+        event_type: RuntimeEventType,
+        payload: Value,
+    ) -> RuntimeEvent {
+        RuntimeEvent {
+            schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+            causal_context: CausalContext::default(),
+            causal_links: Vec::new(),
+            id: EventId::new(),
+            sequence_no,
+            session_id: golutra_core::SessionId::new(),
+            turn_id: None,
+            task_id: Some(task_id),
+            parent_event_id: None,
+            event_type,
+            timestamp: Utc::now(),
+            source: RuntimeEventSource::Runtime,
+            payload,
+            payload_ref: None,
+            durable: true,
+        }
+    }
+
+    #[test]
+    fn later_equivalent_tool_success_recovers_the_failure_episode() {
+        let task_id = TaskId::new();
+        let failed = event(
+            1,
+            task_id,
+            RuntimeEventType::ToolCompleted,
+            json!({
+                "envelope": {
+                    "tool_name": "shell",
+                    "status": "error",
+                    "summary": "command failed",
+                    "structured_facts": {"command": ["cargo", "test"]}
+                }
+            }),
+        );
+        let recovered = event(
+            2,
+            task_id,
+            RuntimeEventType::ToolCompleted,
+            json!({
+                "envelope": {
+                    "tool_name": "shell",
+                    "status": "ok",
+                    "summary": "command passed",
+                    "structured_facts": {"command": ["cargo", "test"]}
+                }
+            }),
+        );
+
+        let episodes = task_failure_episodes(task_id, &[failed, recovered.clone()]);
+
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0].status, FailureEpisodeStatus::Recovered);
+        assert_eq!(
+            episodes[0]
+                .recovered_by
+                .as_ref()
+                .map(|recovery| recovery.event_ref),
+            Some(recovered.id)
+        );
+        assert!(diagnose_task(task_id, &[recovered], None).is_none());
+    }
+
+    #[test]
+    fn external_failure_revises_and_supersedes_the_self_check_diagnosis() {
+        let task_id = TaskId::new();
+        let verification = event(
+            1,
+            task_id,
+            RuntimeEventType::VerificationCompleted,
+            json!({
+                "summary": "runtime verification failed",
+                "record": {"result": "fail"}
+            }),
+        );
+        let first = diagnose_task(task_id, std::slice::from_ref(&verification), None)
+            .expect("initial diagnosis");
+        let diagnosed = event(
+            2,
+            task_id,
+            RuntimeEventType::FailureDiagnosed,
+            json!({"record": first.diagnosis}),
+        );
+        let evidence_id = EvidenceId::new();
+        let artifact_id = ArtifactId::new();
+        let external = event(
+            3,
+            task_id,
+            RuntimeEventType::ExternalEvaluationIngested,
+            json!({
+                "record": {
+                    "evaluator_id": "terminal-bench",
+                    "case_id": "csv-to-parquet",
+                    "verdict": "fail",
+                    "assertions": [{
+                        "name": "parquet_dtype",
+                        "passed": false,
+                        "message": "column dtype does not match",
+                        "evidence_refs": ["results.json"]
+                    }],
+                    "imported_artifacts": [{
+                        "source_ref": "results.json",
+                        "artifact_ref": artifact_id,
+                        "checksum": "sha256:evidence",
+                        "size_bytes": 10
+                    }],
+                    "imported_evidence_refs": [evidence_id]
+                }
+            }),
+        );
+        let events = vec![verification, diagnosed, external];
+
+        let revised = diagnose_task(task_id, &events, None).expect("revised diagnosis");
+
+        assert_eq!(
+            revised.diagnosis.taxonomy.domain,
+            FailureDomain::ExternalEvaluation
+        );
+        assert_eq!(revised.diagnosis.revision, 2);
+        assert_eq!(
+            revised.diagnosis.supersedes_diagnosis_id.as_deref(),
+            Some(first.diagnosis.diagnosis_id.as_str())
+        );
+        let active = revised
+            .episodes
+            .iter()
+            .find(|episode| episode.status == FailureEpisodeStatus::Active)
+            .expect("active external episode");
+        assert!(!active.external_assertion_failures.is_empty());
+        assert_eq!(
+            active.external_assertion_failures[0].evidence_refs,
+            vec![evidence_id]
+        );
+        assert!(revised.episodes.iter().any(|episode| {
+            episode.status == FailureEpisodeStatus::Superseded
+                && episode.superseded_by.as_deref() == Some(active.episode_id.as_str())
+        }));
+        assert!(revised.candidate.evidence_refs.contains(&evidence_id));
+        assert!(revised.slice.artifact_refs.contains(&artifact_id));
+    }
 }

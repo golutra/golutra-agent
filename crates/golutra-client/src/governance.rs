@@ -188,6 +188,11 @@ impl GovernanceService {
             .into_iter()
             .filter(|diagnosis| diagnosis.source_task_id == task_id)
             .collect::<Vec<_>>();
+        let failure_episodes = state
+            .failure_episodes
+            .into_iter()
+            .filter(|episode| episode.source_task_id == task_id)
+            .collect::<Vec<_>>();
         let diagnostic_slices = state
             .diagnostic_slices
             .into_iter()
@@ -348,6 +353,18 @@ impl GovernanceService {
                 ));
             }
         }
+        for episode in &failure_episodes {
+            if !event_contains_id(
+                RuntimeEventType::FailureEpisodeRecorded,
+                "episode_id",
+                &episode.episode_id,
+            ) {
+                integrity_warnings.push(format!(
+                    "FailureEpisode {} has no canonical event",
+                    episode.episode_id
+                ));
+            }
+        }
         for slice in &diagnostic_slices {
             if !event_contains_id(
                 RuntimeEventType::DiagnosticSliceCreated,
@@ -448,6 +465,7 @@ impl GovernanceService {
             regressions,
             promotion_decisions,
             failure_diagnoses,
+            failure_episodes,
             diagnostic_slices,
             replay_capsules,
             replay_executions,

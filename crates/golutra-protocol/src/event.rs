@@ -117,6 +117,7 @@ pub enum RuntimeEventType {
     MemoryActivated,
     MemoryInvalidated,
     FailureDiagnosed,
+    FailureEpisodeRecorded,
     DiagnosticSliceCreated,
     ReplayCapsuleCreated,
     ReplayExecuted,

@@ -554,6 +554,11 @@ pub fn improvement_candidate_from_failure(
         causal_evidence_refs: vec![format!("replay-{source_task_id}")],
         benchmark_refs: vec![format!("benchmark-{source_task_id}")],
         rollback_plan: format!("remove-benchmark-{source_task_id}"),
+        diagnosis_ref: None,
+        proposed_commands: Vec::new(),
+        validation_plan: vec![
+            "rerun the originating benchmark and require objective verification".to_owned(),
+        ],
         status: CandidateStatus::Proposed,
     }
 }

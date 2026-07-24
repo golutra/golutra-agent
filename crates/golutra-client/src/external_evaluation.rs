@@ -1,12 +1,14 @@
 //! Validation and canonical ingestion for out-of-process evaluator results.
 
-use std::{collections::HashMap, fs, path::Path};
+use std::{collections::HashMap, fs, io::Read, path::Path};
 
 use base64::Engine;
-use golutra_core::{ActorKind, TraceView};
+use golutra_core::{
+    ActorKind, EvidenceId, EvidenceRecord, EvidenceStrength, RedactionStatus, TraceView,
+};
 use golutra_eval::{
     EvaluationAttestation, EvaluationPartitionKind, ExternalEvaluationRecord,
-    ExternalEvaluationTrust, external_evaluation_result_digest,
+    ExternalEvaluationTrust, ImportedEvaluationArtifact, external_evaluation_result_digest,
 };
 use golutra_protocol::{RuntimeEventSource, RuntimeEventType};
 use ring::signature::{ED25519, UnparsedPublicKey};
@@ -15,6 +17,14 @@ use serde::Deserialize;
 use super::*;
 
 const MAX_TRUST_STORE_BYTES: u64 = 1024 * 1024;
+const MAX_EVALUATOR_ARTIFACT_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_EVALUATOR_ARTIFACT_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+
+struct ImportedEvidenceBatch {
+    artifacts: Vec<(ArtifactRecord, Vec<u8>)>,
+    evidence: Vec<EvidenceRecord>,
+    imported: Vec<ImportedEvaluationArtifact>,
+}
 
 #[derive(Debug, Deserialize)]
 struct EvaluationTrustStore {
@@ -43,9 +53,64 @@ impl RuntimeHost {
             .ok_or_else(|| {
                 ClientError::InvalidSession("external evaluation record is required".to_owned())
             })?;
+        let existing = {
+            let evaluation_store = self.evaluation_store.clone();
+            let evaluation_id = record.evaluation_id.clone();
+            run_blocking(move || {
+                evaluation_store.snapshot().map(|state| {
+                    state
+                        .external_evaluations
+                        .into_iter()
+                        .find(|existing| existing.evaluation_id == evaluation_id)
+                })
+            })
+            .await??
+        };
+        if let Some(existing) = existing {
+            if existing.result_digest != record.result_digest {
+                return Err(ClientError::TaskExecution(format!(
+                    "external evaluation {} already exists with different facts",
+                    record.evaluation_id
+                )));
+            }
+            return Ok(CommandAck {
+                command_id: command.command_id,
+                accepted: true,
+                reason: Some(format!(
+                    "external evaluation {} was already present",
+                    record.evaluation_id
+                )),
+            });
+        }
         self.validate_external_evaluation(session_id, &command.actor, &record)
             .await?;
+        let ingestion_event_id = EventId::new();
+        let artifact_base_path = command
+            .payload
+            .get("artifact_base_path")
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from);
+        let imported = self
+            .import_external_evidence(
+                session_id,
+                &record,
+                artifact_base_path.as_deref(),
+                ingestion_event_id,
+            )
+            .await?;
+        record.imported_artifacts = imported.imported.clone();
+        record.imported_evidence_refs = imported
+            .evidence
+            .iter()
+            .map(|evidence| evidence.evidence_id)
+            .collect();
         record.ingested_at = chrono::Utc::now();
+        for (artifact, bytes) in &imported.artifacts {
+            self.repositories.artifacts.store(artifact, bytes).await?;
+        }
+        for evidence in &imported.evidence {
+            self.repositories.artifacts.store_evidence(evidence).await?;
+        }
         let evaluation_store = self.evaluation_store.clone();
         let stored = record.clone();
         let inserted =
@@ -68,7 +133,7 @@ impl RuntimeHost {
             None
         };
         if inserted {
-            self.record_event(host_event(
+            let mut ingestion_event = host_event(
                 self.next_sequence_no(),
                 session_id,
                 Some(record.source_task_id),
@@ -79,11 +144,16 @@ impl RuntimeHost {
                         "external evaluation {} ingested as {:?}",
                         record.evaluation_id, record.verdict
                     ),
-                    "record": record,
+                    "record": &record,
                     "command_id": command.command_id,
                 }),
-            ))
-            .await?;
+            );
+            ingestion_event.id = ingestion_event_id;
+            ingestion_event.payload_ref = record
+                .imported_artifacts
+                .first()
+                .map(|artifact| artifact.artifact_ref);
+            self.record_event(ingestion_event).await?;
             if let Some(comparison) = comparison {
                 self.record_event(host_event(
                     self.next_sequence_no(),
@@ -102,6 +172,11 @@ impl RuntimeHost {
                 ))
                 .await?;
             }
+            self.recompute_failure_products_after_external_evaluation(
+                session_id,
+                record.source_task_id,
+            )
+            .await?;
         }
         Ok(CommandAck {
             command_id: command.command_id,
@@ -115,6 +190,244 @@ impl RuntimeHost {
                 )
             }),
         })
+    }
+
+    async fn import_external_evidence(
+        &self,
+        session_id: SessionId,
+        record: &ExternalEvaluationRecord,
+        artifact_base_path: Option<&Path>,
+        event_id: EventId,
+    ) -> Result<ImportedEvidenceBatch, ClientError> {
+        let mut source_refs = record.artifact_refs.clone();
+        source_refs.extend(
+            record
+                .assertions
+                .iter()
+                .flat_map(|assertion| assertion.evidence_refs.iter().cloned()),
+        );
+        source_refs.sort();
+        source_refs.dedup();
+        let canonical_base = artifact_base_path
+            .map(fs::canonicalize)
+            .transpose()
+            .map_err(|error| {
+                ClientError::TaskExecution(format!(
+                    "external evaluation artifact base is invalid: {error}"
+                ))
+            })?;
+        let mut total_bytes = 0_u64;
+        let mut artifacts = Vec::new();
+        let mut imported = Vec::new();
+        let mut by_source = HashMap::<String, ArtifactId>::new();
+        for source_ref in source_refs {
+            let Some(path) = external_evidence_path(&source_ref, canonical_base.as_deref())? else {
+                continue;
+            };
+            let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                ClientError::TaskExecution(format!(
+                    "external evaluator evidence {} cannot be read: {error}",
+                    path.display()
+                ))
+            })?;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.len() > MAX_EVALUATOR_ARTIFACT_BYTES
+                || total_bytes.saturating_add(metadata.len()) > MAX_EVALUATOR_ARTIFACT_TOTAL_BYTES
+            {
+                return Err(ClientError::TaskExecution(format!(
+                    "external evaluator evidence must be a bounded regular file: {}",
+                    path.display()
+                )));
+            }
+            let remaining_total = MAX_EVALUATOR_ARTIFACT_TOTAL_BYTES.saturating_sub(total_bytes);
+            let read_limit = MAX_EVALUATOR_ARTIFACT_BYTES.min(remaining_total);
+            let read_path = path.clone();
+            let bytes =
+                run_blocking(move || read_bounded_evaluator_file(&read_path, read_limit)).await??;
+            total_bytes =
+                total_bytes.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+            let artifact_id = ArtifactId::new();
+            let checksum = format!("sha256:{:x}", Sha256::digest(&bytes));
+            let artifact = ArtifactRecord {
+                artifact_id,
+                session_id,
+                turn_id: None,
+                tool_call_id: None,
+                artifact_type: "external_evaluator_evidence".to_owned(),
+                uri: format!(
+                    "artifact://external-evaluation/{}/{artifact_id}",
+                    record.evaluation_id
+                ),
+                checksum: checksum.clone(),
+                size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                created_at: chrono::Utc::now(),
+                producer: record.evaluator_id.clone(),
+                redaction_status: RedactionStatus::Raw,
+                retention_policy: "external_evaluation_owner_access".to_owned(),
+                provenance_refs: vec![event_id],
+            };
+            by_source.insert(source_ref.clone(), artifact_id);
+            imported.push(ImportedEvaluationArtifact {
+                source_ref,
+                artifact_ref: artifact_id,
+                checksum,
+                size_bytes: artifact.size_bytes,
+            });
+            artifacts.push((artifact, bytes));
+        }
+        let evidence = record
+            .assertions
+            .iter()
+            .filter_map(|assertion| {
+                let artifact_refs = assertion
+                    .evidence_refs
+                    .iter()
+                    .filter_map(|source_ref| by_source.get(source_ref).copied())
+                    .collect::<Vec<_>>();
+                (!artifact_refs.is_empty()).then(|| EvidenceRecord {
+                    evidence_id: EvidenceId::new(),
+                    claim: format!(
+                        "external assertion {}: {}",
+                        assertion.name, assertion.message
+                    ),
+                    artifact_refs,
+                    source_event_refs: vec![event_id],
+                    evidence_strength: if record.trust == ExternalEvaluationTrust::Signed {
+                        EvidenceStrength::Strong
+                    } else {
+                        EvidenceStrength::Medium
+                    },
+                    verifier: format!("{}:{}", record.evaluator_id, record.evaluator_version),
+                    confidence: 1.0,
+                    limitations: "evaluator-owned assertion imported without reinterpretation"
+                        .to_owned(),
+                })
+            })
+            .collect();
+        Ok(ImportedEvidenceBatch {
+            artifacts,
+            evidence,
+            imported,
+        })
+    }
+
+    async fn recompute_failure_products_after_external_evaluation(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+    ) -> Result<(), ClientError> {
+        let events = self
+            .repositories
+            .events
+            .load(session_id, Some(task_id), None)
+            .await?;
+        let source_digest = events
+            .first()
+            .and_then(|event| event.payload.get("run_provenance"))
+            .cloned()
+            .and_then(|value| serde_json::from_value::<RunProvenance>(value).ok())
+            .and_then(|provenance| provenance.build.source_digest);
+        let projected_episodes = diagnosis::task_failure_episodes(task_id, &events);
+        let Some(analysis) = diagnosis::diagnose_task(task_id, &events, source_digest) else {
+            let evaluation_store = self.evaluation_store.clone();
+            let changed =
+                run_blocking(move || evaluation_store.record_failure_episodes(projected_episodes))
+                    .await??;
+            for episode in changed {
+                self.record_event(host_event(
+                    self.next_sequence_no(),
+                    session_id,
+                    Some(task_id),
+                    RuntimeEventType::FailureEpisodeRecorded,
+                    RuntimeEventSource::Evaluator,
+                    json!({
+                        "summary": format!(
+                            "failure episode {} is {:?}",
+                            episode.episode_id, episode.status
+                        ),
+                        "record": episode,
+                    }),
+                ))
+                .await?;
+            }
+            return Ok(());
+        };
+        let evaluation_store = self.evaluation_store.clone();
+        let analysis_for_store = analysis.clone();
+        let update = run_blocking(move || {
+            evaluation_store.record_failure_products(
+                analysis_for_store.diagnosis,
+                analysis_for_store.slice,
+                analysis_for_store.episodes,
+                Some(analysis_for_store.candidate),
+            )
+        })
+        .await??;
+        if update.diagnosis_inserted {
+            self.record_event(host_event(
+                self.next_sequence_no(),
+                session_id,
+                Some(task_id),
+                RuntimeEventType::FailureDiagnosed,
+                RuntimeEventSource::Evaluator,
+                json!({
+                    "summary": analysis.diagnosis.summary,
+                    "record": analysis.diagnosis,
+                }),
+            ))
+            .await?;
+            self.record_event(host_event(
+                self.next_sequence_no(),
+                session_id,
+                Some(task_id),
+                RuntimeEventType::DiagnosticSliceCreated,
+                RuntimeEventSource::Evaluator,
+                json!({
+                    "summary": format!(
+                        "diagnostic slice {} recomputed after external evaluation",
+                        analysis.slice.slice_id
+                    ),
+                    "record": analysis.slice,
+                }),
+            ))
+            .await?;
+        }
+        for episode in update.changed_episodes {
+            self.record_event(host_event(
+                self.next_sequence_no(),
+                session_id,
+                Some(task_id),
+                RuntimeEventType::FailureEpisodeRecorded,
+                RuntimeEventSource::Evaluator,
+                json!({
+                    "summary": format!(
+                        "failure episode {} is {:?}",
+                        episode.episode_id, episode.status
+                    ),
+                    "record": episode,
+                }),
+            ))
+            .await?;
+        }
+        if update.candidate_changed {
+            self.record_event(host_event(
+                self.next_sequence_no(),
+                session_id,
+                Some(task_id),
+                RuntimeEventType::ImprovementCandidateCreated,
+                RuntimeEventSource::Evaluator,
+                json!({
+                    "summary": format!(
+                        "candidate {} reprojected from external evaluator evidence",
+                        analysis.candidate.id
+                    ),
+                    "record": analysis.candidate,
+                }),
+            ))
+            .await?;
+        }
+        Ok(())
     }
 
     async fn validate_external_evaluation(
@@ -212,6 +525,62 @@ impl RuntimeHost {
                 )
             })
     }
+}
+
+fn external_evidence_path(
+    source_ref: &str,
+    canonical_base: Option<&Path>,
+) -> Result<Option<PathBuf>, ClientError> {
+    if source_ref.contains("://") {
+        return Ok(None);
+    }
+    let declared = Path::new(source_ref);
+    if !declared.is_absolute() && canonical_base.is_none() {
+        return Ok(None);
+    }
+    let candidate = if declared.is_absolute() {
+        declared.to_path_buf()
+    } else {
+        canonical_base.expect("checked").join(declared)
+    };
+    let canonical = fs::canonicalize(&candidate).map_err(|error| {
+        ClientError::TaskExecution(format!(
+            "external evaluator evidence {} cannot be resolved: {error}",
+            candidate.display()
+        ))
+    })?;
+    if !declared.is_absolute() && canonical_base.is_some_and(|base| !canonical.starts_with(base)) {
+        return Err(ClientError::TaskExecution(format!(
+            "external evaluator evidence escapes its base directory: {}",
+            candidate.display()
+        )));
+    }
+    Ok(Some(canonical))
+}
+
+fn read_bounded_evaluator_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, ClientError> {
+    let file = fs::File::open(path).map_err(|error| ClientError::Io(error.to_string()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| ClientError::Io(error.to_string()))?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return Err(ClientError::TaskExecution(format!(
+            "external evaluator evidence exceeds its read budget: {}",
+            path.display()
+        )));
+    }
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(metadata.len().min(max_bytes)).unwrap_or(usize::MAX));
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| ClientError::Io(error.to_string()))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(ClientError::TaskExecution(format!(
+            "external evaluator evidence exceeds its read budget: {}",
+            path.display()
+        )));
+    }
+    Ok(bytes)
 }
 
 fn verify_evaluation_attestation_at(
@@ -365,5 +734,18 @@ mod tests {
                 .expect("unsafe permissions");
             assert!(load_evaluation_trust_store(&path).is_err());
         }
+    }
+
+    #[test]
+    fn evaluator_evidence_read_enforces_the_actual_byte_limit() {
+        let directory = tempdir().expect("evidence directory");
+        let path = directory.path().join("result.json");
+        fs::write(&path, b"1234").expect("evidence file");
+
+        assert!(read_bounded_evaluator_file(&path, 3).is_err());
+        assert_eq!(
+            read_bounded_evaluator_file(&path, 4).expect("bounded evidence"),
+            b"1234"
+        );
     }
 }

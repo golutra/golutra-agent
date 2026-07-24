@@ -23,10 +23,10 @@ use crate::{
     AppliedCandidate, AutomationCandidate, AutomationCandidateKind, BenchmarkCheckStatus,
     BenchmarkRun, BenchmarkSuiteKind, CandidateStatus, CausalComparison, CounterfactualReplay,
     DiagnosticSlice, EvaluationState, EvaluationVerdict, ExternalEvaluationRecord,
-    ExternalEvaluationTrust, FailureDiagnosis, PromotionDecision, PromotionDecisionKind,
-    PromotionReviewer, RegressionCaseResult, RegressionCoverage, RegressionResult,
-    RegressionVerdict, ReplayCapsule, ReplayExecution, TaskEvaluationBundle,
-    external_evaluation_result_digest,
+    ExternalEvaluationTrust, FailureDiagnosis, FailureEpisode, FailureEpisodeStatus,
+    ImprovementCandidate, PromotionDecision, PromotionDecisionKind, PromotionReviewer,
+    RegressionCaseResult, RegressionCoverage, RegressionResult, RegressionVerdict, ReplayCapsule,
+    ReplayExecution, TaskEvaluationBundle, external_evaluation_result_digest,
 };
 
 pub(crate) const MAX_EVALUATION_STATE_BYTES: u64 = 64 * 1024 * 1024;
@@ -41,6 +41,13 @@ struct EvaluationStoreState {
 pub struct EvaluationStore {
     path: Option<PathBuf>,
     state: Arc<Mutex<EvaluationStoreState>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FailureProductUpdate {
+    pub diagnosis_inserted: bool,
+    pub changed_episodes: Vec<FailureEpisode>,
+    pub candidate_changed: bool,
 }
 
 #[derive(Debug, Error)]
@@ -181,6 +188,123 @@ impl EvaluationStore {
         })
     }
 
+    pub fn record_failure_products(
+        &self,
+        diagnosis: FailureDiagnosis,
+        slice: DiagnosticSlice,
+        episodes: Vec<FailureEpisode>,
+        candidate: Option<ImprovementCandidate>,
+    ) -> Result<FailureProductUpdate, EvaluationError> {
+        if diagnosis.source_task_id != slice.source_task_id
+            || diagnosis.diagnosis_id != slice.diagnosis.diagnosis_id
+            || slice.event_refs.is_empty()
+            || diagnosis.trigger_event_refs.is_empty()
+            || episodes.is_empty()
+            || !episodes
+                .iter()
+                .any(|episode| episode.source_task_id == diagnosis.source_task_id)
+        {
+            return Err(EvaluationError::Invariant(
+                "failure products must share a task, diagnosis, slice, and episode".to_owned(),
+            ));
+        }
+        self.update(|state| {
+            let diagnosis_inserted = !state
+                .failure_diagnoses
+                .iter()
+                .any(|value| value.diagnosis_id == diagnosis.diagnosis_id);
+            replace_by(&mut state.failure_diagnoses, diagnosis, |value| {
+                value.diagnosis_id.clone()
+            });
+            replace_by(&mut state.diagnostic_slices, slice, |value| {
+                value.slice_id.clone()
+            });
+
+            let incoming_active = episodes
+                .iter()
+                .find(|episode| episode.status == FailureEpisodeStatus::Active)
+                .map(|episode| episode.episode_id.clone());
+            let mut changed_episodes = Vec::new();
+            if let Some(active_id) = incoming_active.as_deref() {
+                for existing in state.failure_episodes.iter_mut().filter(|episode| {
+                    episode.source_task_id == episodes[0].source_task_id
+                        && episode.status == FailureEpisodeStatus::Active
+                        && episode.episode_id != active_id
+                }) {
+                    existing.status = FailureEpisodeStatus::Superseded;
+                    existing.superseded_by = Some(active_id.to_owned());
+                    existing.updated_at = Utc::now();
+                    changed_episodes.push(existing.clone());
+                }
+            }
+            for episode in episodes {
+                let changed = state
+                    .failure_episodes
+                    .iter()
+                    .find(|existing| existing.episode_id == episode.episode_id)
+                    != Some(&episode);
+                if changed {
+                    changed_episodes.push(episode.clone());
+                }
+                replace_by(&mut state.failure_episodes, episode, |value| {
+                    value.episode_id.clone()
+                });
+            }
+            let candidate_changed = candidate.as_ref().is_some_and(|candidate| {
+                state
+                    .improvement_candidates
+                    .iter()
+                    .find(|existing| existing.id == candidate.id)
+                    != Some(candidate)
+            });
+            if let Some(candidate) = candidate {
+                replace_by(&mut state.improvement_candidates, candidate, |value| {
+                    value.id.clone()
+                });
+            }
+            Ok(FailureProductUpdate {
+                diagnosis_inserted,
+                changed_episodes,
+                candidate_changed,
+            })
+        })
+    }
+
+    pub fn record_failure_episodes(
+        &self,
+        episodes: Vec<FailureEpisode>,
+    ) -> Result<Vec<FailureEpisode>, EvaluationError> {
+        if episodes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let task_id = episodes[0].source_task_id;
+        if episodes
+            .iter()
+            .any(|episode| episode.source_task_id != task_id)
+        {
+            return Err(EvaluationError::Invariant(
+                "failure episode batch must belong to one task".to_owned(),
+            ));
+        }
+        self.update(|state| {
+            let mut changed = Vec::new();
+            for episode in episodes {
+                if state
+                    .failure_episodes
+                    .iter()
+                    .find(|existing| existing.episode_id == episode.episode_id)
+                    != Some(&episode)
+                {
+                    changed.push(episode.clone());
+                }
+                replace_by(&mut state.failure_episodes, episode, |value| {
+                    value.episode_id.clone()
+                });
+            }
+            Ok(changed)
+        })
+    }
+
     pub fn record_replay_capsule(&self, capsule: ReplayCapsule) -> Result<bool, EvaluationError> {
         let complete_inputs_valid = !capsule.provider_exchanges.is_empty()
             && capsule.runtime_config_digest.starts_with("sha256:")
@@ -316,20 +440,22 @@ impl EvaluationStore {
                 .external_evaluations
                 .iter()
                 .find(|value| value.evaluation_id == record.evaluation_id);
-            if existing.is_some_and(|existing| existing != &record) {
+            if existing.is_some_and(|existing| existing.result_digest != record.result_digest) {
                 return Err(EvaluationError::Invariant(format!(
                     "external evaluation {} already exists with different facts",
                     record.evaluation_id
                 )));
             }
             let inserted = existing.is_none();
-            replace_by(&mut state.external_evaluations, record.clone(), |value| {
-                value.evaluation_id.clone()
-            });
-            if let Some(comparison) = external_causal_comparison(state, &record) {
-                replace_by(&mut state.causal_comparisons, comparison, |value| {
-                    value.comparison_id.clone()
+            if inserted {
+                replace_by(&mut state.external_evaluations, record.clone(), |value| {
+                    value.evaluation_id.clone()
                 });
+                if let Some(comparison) = external_causal_comparison(state, &record) {
+                    replace_by(&mut state.causal_comparisons, comparison, |value| {
+                        value.comparison_id.clone()
+                    });
+                }
             }
             Ok(inserted)
         })

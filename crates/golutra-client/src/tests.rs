@@ -3596,14 +3596,24 @@ async fn prompt_runs_mock_agent_loop_and_writes_file() {
     }));
     assert_eq!(tool_payload["metrics"]["item_count"], 1);
     assert!(tool_payload["metrics"]["duration_ms"].is_u64());
-    assert_eq!(
-        operation_changes,
-        vec![FileChangeSummary {
-            path: "result.txt".to_owned(),
-            kind: FileChangeKind::Modified,
-            added_lines: Some(1),
-            removed_lines: Some(1),
-        }]
+    assert_eq!(operation_changes.len(), 1);
+    assert_eq!(operation_changes[0].path, "result.txt");
+    assert_eq!(operation_changes[0].kind, FileChangeKind::Modified);
+    assert_eq!(operation_changes[0].added_lines, Some(1));
+    assert_eq!(operation_changes[0].removed_lines, Some(1));
+    assert!(
+        operation_changes[0]
+            .before
+            .as_ref()
+            .and_then(|state| state.checksum.as_deref())
+            .is_some_and(|checksum| checksum.starts_with("sha256:"))
+    );
+    assert!(
+        operation_changes[0]
+            .after
+            .as_ref()
+            .and_then(|state| state.checksum.as_deref())
+            .is_some_and(|checksum| checksum.starts_with("sha256:"))
     );
     assert_eq!(turn_changes.files, operation_changes);
     assert_eq!(turn_changes.added_lines, Some(1));
@@ -3617,6 +3627,9 @@ async fn prompt_runs_mock_agent_loop_and_writes_file() {
     let diff_artifact_ref = tool_payload["diff_artifact_ref"]
         .as_str()
         .expect("workspace diff artifact ref");
+    let change_manifest_ref = tool_payload["change_manifest_artifact_ref"]
+        .as_str()
+        .expect("workspace change manifest artifact ref");
     assert!(debug["artifacts"].as_array().is_some_and(|artifacts| {
         artifacts.iter().any(|artifact| {
             artifact["artifact_id"] == diff_artifact_ref
@@ -3624,8 +3637,32 @@ async fn prompt_runs_mock_agent_loop_and_writes_file() {
                 && artifact["checksum"]
                     .as_str()
                     .is_some_and(|checksum| checksum.starts_with("sha256:"))
+        }) && artifacts.iter().any(|artifact| {
+            artifact["artifact_id"] == change_manifest_ref
+                && artifact["artifact_type"] == "workspace_change_manifest"
+                && artifact["checksum"]
+                    .as_str()
+                    .is_some_and(|checksum| checksum.starts_with("sha256:"))
         })
     }));
+    let change_manifest_bytes = transport
+        .host
+        .store
+        .load_artifact_bytes(
+            change_manifest_ref
+                .parse::<ArtifactId>()
+                .expect("change manifest artifact id"),
+        )
+        .await
+        .expect("change manifest artifact")
+        .expect("change manifest bytes");
+    let change_manifest: Value =
+        serde_json::from_slice(&change_manifest_bytes).expect("change manifest JSON");
+    assert_eq!(
+        change_manifest["operation_changes"][0]["path"],
+        "result.txt"
+    );
+    assert_eq!(change_manifest["turn_change_summary"]["file_count"], 1);
     assert!(
         events[checkpoint_index]["payload"]["checkpoint"]["artifact_refs"]
             .as_array()
@@ -3679,16 +3716,19 @@ async fn shell_checkpoint_records_partial_coverage_without_persisting_ignored_im
             path: workspace.path().join(".gitignore"),
             content: Some(b".gitignore\n*.secret\n".to_vec()),
             unix_mode: None,
+            metadata: None,
         },
         FileBeforeImage {
             path: workspace.path().join("safe.txt"),
             content: Some(b"safe".to_vec()),
             unix_mode: None,
+            metadata: None,
         },
         FileBeforeImage {
             path: workspace.path().join("token.secret"),
             content: Some(b"secret".to_vec()),
             unix_mode: None,
+            metadata: None,
         },
     ];
 
@@ -4228,6 +4268,9 @@ async fn persisted_ephemeral_runtime_retains_isolated_state_and_full_run_bundle(
         })
         .await
         .expect("reopened trace");
+    let evaluator_evidence = br#"{"case":"persisted-run","passed":true}"#;
+    fs::write(state_dir.join("results.json"), evaluator_evidence)
+        .expect("external evaluator evidence");
     let mut external = golutra_eval::ExternalEvaluationRecord {
         evaluation_id: "terminal-bench:test".to_owned(),
         source_task_id: task_id,
@@ -4241,8 +4284,16 @@ async fn persisted_ephemeral_runtime_retains_isolated_state_and_full_run_bundle(
         verdict: golutra_eval::EvaluationVerdict::Pass,
         score: Some(1.0),
         score_max: Some(1.0),
-        assertions: Vec::new(),
+        assertions: vec![golutra_eval::ExternalEvaluationAssertion {
+            assertion_id: "persisted-result".to_owned(),
+            name: "result_manifest".to_owned(),
+            passed: true,
+            message: "result manifest was accepted".to_owned(),
+            evidence_refs: vec!["results.json".to_owned()],
+        }],
         artifact_refs: vec!["results.json".to_owned()],
+        imported_artifacts: Vec::new(),
+        imported_evidence_refs: Vec::new(),
         partition: golutra_eval::EvaluationPartitionKind::Source,
         seed: None,
         provider_variant: None,
@@ -4263,11 +4314,19 @@ async fn persisted_ephemeral_runtime_retains_isolated_state_and_full_run_bundle(
         .send_command(runtime_command(
             result.session_id,
             SessionCommandKind::IngestExternalEvaluation,
-            json!({"record": external}),
+            json!({
+                "record": external,
+                "artifact_base_path": state_dir.to_string_lossy(),
+            }),
         ))
         .await
         .expect("ingest external result into reopened run");
     assert!(ack.accepted);
+    fs::write(
+        state_dir.join("results.json"),
+        b"source changed after ingestion",
+    )
+    .expect("mutate evaluator source after ingestion");
     let refreshed = RunBundleExporter::new(&reopened_transport)
         .refresh(&state_dir)
         .await
@@ -4282,6 +4341,35 @@ async fn persisted_ephemeral_runtime_retains_isolated_state_and_full_run_bundle(
     )
     .expect("parse refreshed trace");
     assert_eq!(refreshed_trace.evaluation.external_evaluations.len(), 1);
+    let imported_evaluation = &refreshed_trace.evaluation.external_evaluations[0];
+    assert_eq!(imported_evaluation.imported_artifacts.len(), 1);
+    assert_eq!(imported_evaluation.imported_evidence_refs.len(), 1);
+    let imported_artifact = &imported_evaluation.imported_artifacts[0];
+    assert_eq!(imported_artifact.source_ref, "results.json");
+    assert_eq!(
+        imported_artifact.checksum,
+        format!("sha256:{:x}", sha2::Sha256::digest(evaluator_evidence))
+    );
+    assert_eq!(
+        reopened
+            .load_artifact_bytes(imported_artifact.artifact_ref)
+            .await
+            .expect("imported evidence artifact")
+            .expect("imported evaluator evidence bytes"),
+        evaluator_evidence
+    );
+    assert!(refreshed_trace.artifacts.iter().any(|artifact| {
+        artifact.artifact_id == imported_artifact.artifact_ref
+            && artifact.artifact_type == "external_evaluator_evidence"
+    }));
+    assert!(refreshed_trace.evidence.iter().any(|evidence| {
+        imported_evaluation
+            .imported_evidence_refs
+            .contains(&evidence.evidence_id)
+            && evidence
+                .artifact_refs
+                .contains(&imported_artifact.artifact_ref)
+    }));
     assert!(
         refreshed_trace
             .events
@@ -4409,6 +4497,8 @@ async fn external_evaluation_ingestion_rejects_trace_and_runtime_identity_mismat
         score_max: Some(1.0),
         assertions: Vec::new(),
         artifact_refs: Vec::new(),
+        imported_artifacts: Vec::new(),
+        imported_evidence_refs: Vec::new(),
         partition: golutra_eval::EvaluationPartitionKind::Source,
         seed: Some(1),
         provider_variant: Some("mock".to_owned()),
@@ -4757,6 +4847,8 @@ fn context_compaction_persists_a_redacted_baseline_outside_the_event_payload() {
             tool_calls: Vec::new(),
             metadata: Default::default(),
         }],
+        replacement_sources: Vec::new(),
+        message_decisions: Vec::new(),
     };
 
     let (artifact, bytes) =

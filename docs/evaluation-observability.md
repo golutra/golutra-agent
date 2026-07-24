@@ -10,7 +10,7 @@
 
 ## 当前实现状态
 
-截至 2026-07-23，runtime 已具备持久化 evaluation、完整 trace 和多投影观测；P2.5 当前范围已经形成可信闭环，并把完整事实交给独立 P3 本地 Supervisor：
+截至 2026-07-24，runtime 已具备持久化 evaluation、完整 trace 和多投影观测；P2.5 当前范围已经形成可信闭环，并把完整事实交给独立 P3 本地 Supervisor：
 
 - terminal task 可生成 `PostTaskReview`、`EvaluationCase`、`TrajectoryReplay`、`EvaluationRun` 和 `EvaluationResult`，并按 canonical cwd hash 持久化到 `$GOLUTRA_HOME/state/workspaces/<cwd-hash>/evaluation.json`；状态更新有文件锁、大小边界和 owner-only 权限。
 - pass/partial/fail、latency、evidence refs、residual risks 和 failure taxonomy 来自 runtime facts 与 verification plan/assertions，不从聊天文本反推；当前支持的路径、内容、命令和 policy assertion 会进入三维 hard gate，无法客观证明的标准保持 Unknown/Partial。
@@ -84,6 +84,22 @@ case_ref × partition × provider_variant × seed
 单条 evaluation 数。任意缺 cell、holdout 泄漏、untrusted external result、
 不完整 trace 或 unknown verification 都只能生成 `NeedsReview`，并且三种
 回归结论都必须写出显式 `PromotionDecision`。
+
+## 可操作的失败观测闭包
+
+单个 error event 不再直接等同于最终根因。runtime protocol v6 把失败投影成
+一等 `FailureEpisode`：producer failure、runtime self-check 和 external
+assertion 可以归并为同一 episode，并显式记录 `active/recovered/superseded`、
+`recovered_by` 与 `superseded_by`。后续等价工具成功或 verification/evaluator
+通过会关闭可恢复 episode；更高可信度的外部失败会生成新 diagnosis revision，
+引用被取代 diagnosis，而不是让早期 `tool_failed` 永久成为结论。
+
+每次 diagnosis 同时生成可移交的 `DiagnosticSlice` 与 actionable
+`ImprovementCandidate`。候选包含 diagnosis ref、代码目标、建议命令、验证计划、
+benchmark/evidence refs 和 rollback plan；外部 evaluator 的本地文件先复制为
+不可变 checksummed artifact 和 `EvidenceRecord`，之后才参与重新诊断。Developer
+projection 显示 active/recovered/superseded episode 数量，普通 UserProjection
+不增加这类治理噪声。
 
 ## 核心原则
 

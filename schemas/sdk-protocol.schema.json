@@ -1928,6 +1928,15 @@
             "type": "string"
           }
         },
+        "message_indexes": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          }
+        },
         "name": {
           "type": "string"
         },
@@ -1984,6 +1993,10 @@
         "content_digest": {
           "type": "string"
         },
+        "contributor": {
+          "type": "string",
+          "default": ""
+        },
         "estimated_tokens": {
           "type": "integer",
           "format": "uint64",
@@ -1994,8 +2007,19 @@
           "format": "uint32",
           "minimum": 0
         },
+        "origin": {
+          "type": "string",
+          "default": ""
+        },
         "role": {
           "type": "string"
+        },
+        "source_refs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
         },
         "tool_call_ids": {
           "type": "array",
@@ -2390,6 +2414,13 @@
             }
           ],
           "default": null
+        },
+        "failure_episodes": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/FailureEpisode"
+          }
         },
         "loop_decisions": {
           "type": "array",
@@ -3781,6 +3812,13 @@
             "$ref": "#/$defs/FailureDiagnosis"
           }
         },
+        "failure_episodes": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/FailureEpisode"
+          }
+        },
         "improvement_candidates": {
           "type": "array",
           "items": {
@@ -4408,6 +4446,21 @@
           "type": "boolean",
           "default": false
         },
+        "imported_artifacts": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ImportedEvaluationArtifact"
+          }
+        },
+        "imported_evidence_refs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
         "ingested_at": {
           "type": "string",
           "format": "date-time"
@@ -4582,11 +4635,24 @@
         "expected_behavior": {
           "type": "string"
         },
+        "failure_episode_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "regression_commands": {
           "type": "array",
           "items": {
             "type": "string"
           }
+        },
+        "revision": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
         },
         "source_task_id": {
           "type": "string",
@@ -4594,6 +4660,13 @@
         },
         "summary": {
           "type": "string"
+        },
+        "supersedes_diagnosis_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         },
         "taxonomy": {
           "$ref": "#/$defs/FailureTaxonomy"
@@ -4635,6 +4708,162 @@
         "memory",
         "external_evaluation",
         "unknown"
+      ]
+    },
+    "FailureEpisode": {
+      "type": "object",
+      "properties": {
+        "diagnosis_refs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "episode_id": {
+          "type": "string"
+        },
+        "external_assertion_failures": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/FailureSignalRef"
+          }
+        },
+        "opened_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "primary_signal": {
+          "$ref": "#/$defs/FailureSignalRef"
+        },
+        "producer_failures": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/FailureSignalRef"
+          }
+        },
+        "recovered_by": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FailureRecovery"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "self_check_failures": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/FailureSignalRef"
+          }
+        },
+        "source_task_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "status": {
+          "$ref": "#/$defs/FailureEpisodeStatus"
+        },
+        "superseded_by": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "episode_id",
+        "source_task_id",
+        "status",
+        "primary_signal",
+        "opened_at",
+        "updated_at"
+      ]
+    },
+    "FailureEpisodeStatus": {
+      "type": "string",
+      "enum": [
+        "active",
+        "recovered",
+        "superseded"
+      ]
+    },
+    "FailureRecovery": {
+      "type": "object",
+      "properties": {
+        "event_ref": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "signal_key": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "event_ref",
+        "signal_key",
+        "summary"
+      ]
+    },
+    "FailureSignalKind": {
+      "type": "string",
+      "enum": [
+        "producer",
+        "self_check",
+        "external_assertion"
+      ]
+    },
+    "FailureSignalRef": {
+      "type": "object",
+      "properties": {
+        "artifact_refs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "event_ref": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "evidence_refs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "kind": {
+          "$ref": "#/$defs/FailureSignalKind"
+        },
+        "signal_key": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "event_ref",
+        "kind",
+        "signal_key",
+        "summary"
       ]
     },
     "FailureTaxonomy": {
@@ -4825,6 +5054,33 @@
         "completion"
       ]
     },
+    "ImportedEvaluationArtifact": {
+      "description": "Host-derived immutable copy of evaluator evidence. These fields are not\npart of `result_digest`; the digest authenticates evaluator-controlled\nfacts while the imported artifact checksum authenticates local retention.",
+      "type": "object",
+      "properties": {
+        "artifact_ref": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "checksum": {
+          "type": "string"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "source_ref": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_ref",
+        "artifact_ref",
+        "checksum",
+        "size_bytes"
+      ]
+    },
     "ImprovementCandidate": {
       "type": "object",
       "properties": {
@@ -4839,6 +5095,13 @@
           "items": {
             "type": "string"
           }
+        },
+        "diagnosis_ref": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         },
         "evidence_refs": {
           "type": "array",
@@ -4855,6 +5118,13 @@
         },
         "proposed_change": {
           "type": "string"
+        },
+        "proposed_commands": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
         },
         "risk_level": {
           "$ref": "#/$defs/CandidateRisk"
@@ -4883,6 +5153,13 @@
         },
         "target_type": {
           "type": "string"
+        },
+        "validation_plan": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
         }
       },
       "required": [
@@ -6864,6 +7141,7 @@
         "memory_activated",
         "memory_invalidated",
         "failure_diagnosed",
+        "failure_episode_recorded",
         "diagnostic_slice_created",
         "replay_capsule_created",
         "replay_executed",

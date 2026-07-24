@@ -103,6 +103,7 @@ pub(crate) fn merge_debug_projection(
     if latest.failure_diagnosis.is_some() {
         previous.failure_diagnosis = latest.failure_diagnosis;
     }
+    previous.failure_episodes = latest.failure_episodes;
     if latest.diagnostic_slice.is_some() {
         previous.diagnostic_slice = latest.diagnostic_slice;
     }

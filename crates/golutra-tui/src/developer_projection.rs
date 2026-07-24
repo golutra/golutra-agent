@@ -36,6 +36,9 @@ pub(crate) struct DeveloperFactsProjection {
     pub(crate) missing_sections: usize,
     pub(crate) retention_losses: usize,
     pub(crate) diagnosis: Option<String>,
+    pub(crate) active_failure_episodes: usize,
+    pub(crate) recovered_failure_episodes: usize,
+    pub(crate) superseded_failure_episodes: usize,
     pub(crate) diagnostic_event_count: usize,
     pub(crate) diagnostic_omitted_event_count: u64,
     pub(crate) diagnostic_complete: bool,
@@ -101,6 +104,21 @@ pub(crate) fn developer_facts_projection(
                 diagnosis.taxonomy.domain, diagnosis.taxonomy.code, diagnosis.confidence
             )
         }),
+        active_failure_episodes: projection
+            .failure_episodes
+            .iter()
+            .filter(|episode| episode.status.is_active())
+            .count(),
+        recovered_failure_episodes: projection
+            .failure_episodes
+            .iter()
+            .filter(|episode| episode.status.is_recovered())
+            .count(),
+        superseded_failure_episodes: projection
+            .failure_episodes
+            .iter()
+            .filter(|episode| episode.status.is_superseded())
+            .count(),
         diagnostic_event_count: projection
             .diagnostic_slice
             .as_ref()

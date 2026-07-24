@@ -68,7 +68,15 @@ impl WorkspaceCheckpointManager {
                     fs::create_dir_all(parent)
                         .map_err(|error| CheckpointError::Io(error.to_string()))?;
                 }
-                write_checkpoint_file(&target_path, content)?;
+                let object_path = self.store_checkpoint_object(content)?;
+                fs::hard_link(&object_path, &target_path).map_err(|error| {
+                    CheckpointError::Io(format!(
+                        "failed to link checkpoint object {} to {}: {error}",
+                        object_path.display(),
+                        target_path.display()
+                    ))
+                })?;
+                set_owner_only_checkpoint_file(&target_path)?;
                 sync_checkpoint_ancestors(
                     target_path.parent().unwrap_or(&checkpoint_dir),
                     &checkpoint_dir,
@@ -128,6 +136,10 @@ impl WorkspaceCheckpointManager {
         let mut retained = Vec::with_capacity(before_images.len());
         let mut excluded_count = 0_usize;
         for before_image in before_images {
+            if before_image.content.is_none() && before_image.metadata.is_some() {
+                excluded_count = excluded_count.saturating_add(1);
+                continue;
+            }
             match self.relative_checkpoint_path(&before_image.path) {
                 Ok(_) => retained.push(before_image.clone()),
                 Err(CheckpointError::Excluded(_)) => {
@@ -215,6 +227,7 @@ impl WorkspaceCheckpointManager {
             removed = removed.saturating_add(1);
         }
         if removed > 0 {
+            self.prune_unreferenced_objects()?;
             sync_checkpoint_directory(&self.checkpoint_root)?;
         }
         Ok(removed)
@@ -254,6 +267,47 @@ impl WorkspaceCheckpointManager {
             checkpoints.push((entry.path(), modified));
         }
         Ok(checkpoints)
+    }
+
+    fn store_checkpoint_object(&self, content: &[u8]) -> Result<PathBuf, CheckpointError> {
+        let object_root = self.checkpoint_root.join(".objects");
+        fs::create_dir_all(&object_root).map_err(|error| CheckpointError::Io(error.to_string()))?;
+        set_owner_only_checkpoint_dir(&object_root)?;
+        let checksum = checksum_bytes(content);
+        let object_path = object_root.join(checksum.trim_start_matches("sha256:"));
+        match fs::read(&object_path) {
+            Ok(existing) if existing == content => return Ok(object_path),
+            Ok(_) => {
+                return Err(CheckpointError::InvalidManifest(format!(
+                    "checkpoint object checksum collision: {checksum}"
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(CheckpointError::Io(error.to_string())),
+        }
+        write_checkpoint_file(&object_path, content)?;
+        sync_checkpoint_directory(&object_root)?;
+        Ok(object_path)
+    }
+
+    fn prune_unreferenced_objects(&self) -> Result<(), CheckpointError> {
+        let object_root = self.checkpoint_root.join(".objects");
+        let entries = match fs::read_dir(&object_root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(CheckpointError::Io(error.to_string())),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| CheckpointError::Io(error.to_string()))?;
+            let metadata = entry
+                .metadata()
+                .map_err(|error| CheckpointError::Io(error.to_string()))?;
+            if metadata.is_file() && checkpoint_object_is_unreferenced(&metadata) {
+                fs::remove_file(entry.path())
+                    .map_err(|error| CheckpointError::Io(error.to_string()))?;
+            }
+        }
+        sync_checkpoint_directory(&object_root)
     }
 
     fn relative_checkpoint_path(&self, changed_file: &Path) -> Result<PathBuf, CheckpointError> {
@@ -353,6 +407,18 @@ pub fn checkpoint_fingerprint(checkpoint: &WorkspaceCheckpoint) -> String {
 fn checksum_bytes(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("sha256:{digest:x}")
+}
+
+#[cfg(unix)]
+fn checkpoint_object_is_unreferenced(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    metadata.nlink() <= 1
+}
+
+#[cfg(not(unix))]
+fn checkpoint_object_is_unreferenced(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 fn is_checkpoint_excluded(relative_path: &Path) -> bool {

@@ -2094,6 +2094,7 @@ mod tests {
                 regressions: Vec::new(),
                 promotion_decisions: Vec::new(),
                 failure_diagnoses: Vec::new(),
+                failure_episodes: Vec::new(),
                 diagnostic_slices: Vec::new(),
                 replay_capsules: Vec::new(),
                 replay_executions: Vec::new(),

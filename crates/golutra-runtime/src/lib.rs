@@ -7,8 +7,9 @@ use std::{
 
 use async_trait::async_trait;
 use golutra_context::{
-    ContextBuilder, ContextContributor, ContextError, context_snapshot_from_request,
-    estimate_message_tokens, estimate_tokens, provider_request_from_plan, token_usage_record,
+    ContextBuilder, ContextContributor, ContextError, ContextMessageSource,
+    context_snapshot_from_request, estimate_message_tokens, estimate_tokens,
+    provider_request_from_plan, token_usage_record,
 };
 use golutra_core::{
     ApprovalDecision, ApprovalId, ApprovalRequest, ApprovalResolution, BudgetState, CommandId,
@@ -504,6 +505,7 @@ where
             });
         }
         let mut messages = base_plan.messages.clone();
+        let mut message_sources = base_plan.message_sources.clone();
         let protected_prefix_len = base_plan.messages.len();
         let context_window_manager = self.context_builder.window_manager();
 
@@ -514,6 +516,7 @@ where
             control.wait_until_runnable().await?;
             let mut plan = base_plan.clone();
             plan.messages = messages.clone();
+            plan.message_sources = message_sources.clone();
             plan.budget_snapshot.turn_id = current_turn_id;
             plan.budget_snapshot.planned_tool_tokens = planned_tool_tokens;
             plan.budget_snapshot.planned_input_tokens =
@@ -527,11 +530,14 @@ where
                     current_turn_id,
                     protected_prefix_len,
                     &messages,
+                    &message_sources,
                     planned_tool_tokens,
                 ) {
                     Ok(Some(record)) => {
                         messages = record.replacement_messages.clone();
+                        message_sources = record.replacement_sources.clone();
                         plan.messages = messages.clone();
+                        plan.message_sources = message_sources.clone();
                         plan.budget_snapshot.planned_input_tokens =
                             record.replacement_estimated_tokens;
                         plan.budget_snapshot.planned_summary_tokens =
@@ -691,6 +697,7 @@ where
                 response: provider_response.clone(),
             });
             let usage_record = token_usage_record(
+                &plan,
                 &completed_request,
                 provider_response.response_id,
                 &plan.budget_snapshot,
@@ -742,6 +749,14 @@ where
 
             if provider_response.tool_calls.is_empty() {
                 if let Some(message) = provider_response.message {
+                    message_sources.push(ContextMessageSource {
+                        contributor: "assistant_recent".to_owned(),
+                        source_refs: vec![format!(
+                            "provider-response:{}",
+                            provider_response.response_id
+                        )],
+                        origin: "provider_response".to_owned(),
+                    });
                     messages.push(message);
                     empty_response_count = 0;
                 } else {
@@ -765,6 +780,11 @@ where
                             tool_name: None,
                             tool_calls: Vec::new(),
                             metadata: Default::default(),
+                        });
+                        message_sources.push(ContextMessageSource {
+                            contributor: "runtime_context".to_owned(),
+                            source_refs: vec!["runtime:empty-response-recovery".to_owned()],
+                            origin: "runtime_recovery".to_owned(),
                         });
                         continue;
                     }
@@ -810,6 +830,11 @@ where
                         tool_calls: Vec::new(),
                         metadata: Default::default(),
                     });
+                    message_sources.push(ContextMessageSource {
+                        contributor: "user_message".to_owned(),
+                        source_refs: vec![format!("turn:{}", current_turn_id)],
+                        origin: "pending_turn".to_owned(),
+                    });
                     finish_runtime_step(
                         &mut step_machine,
                         step_snapshot.clone(),
@@ -837,6 +862,11 @@ where
                         tool_name: None,
                         tool_calls: Vec::new(),
                         metadata: Default::default(),
+                    });
+                    message_sources.push(ContextMessageSource {
+                        contributor: "runtime_context".to_owned(),
+                        source_refs: vec!["runtime:verification-nudge".to_owned()],
+                        origin: "runtime_verification_nudge".to_owned(),
                     });
                     finish_runtime_step(
                         &mut step_machine,
@@ -875,6 +905,14 @@ where
                     .as_ref()
                     .map(|message| message.metadata.clone())
                     .unwrap_or_default(),
+            });
+            message_sources.push(ContextMessageSource {
+                contributor: "assistant_recent".to_owned(),
+                source_refs: vec![format!(
+                    "provider-response:{}",
+                    provider_response.response_id
+                )],
+                origin: "provider_tool_request".to_owned(),
             });
             for tool_call in provider_response.tool_calls {
                 control.wait_until_runnable().await?;
@@ -1087,6 +1125,11 @@ where
                     tool_name: Some(report.envelope.tool_name.clone()),
                     tool_calls: Vec::new(),
                     metadata: Default::default(),
+                });
+                message_sources.push(ContextMessageSource {
+                    contributor: "tool_result_excerpt".to_owned(),
+                    source_refs: vec![format!("tool-call:{}", report.envelope.tool_call_id)],
+                    origin: "tool_result".to_owned(),
                 });
                 tool_reports.push(report);
                 if !permits_continuation {

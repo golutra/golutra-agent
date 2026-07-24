@@ -155,6 +155,7 @@ fn current_turn_drops_old_tool_facts_and_redacts_loop_reason() {
         }],
         post_task_jobs: Vec::new(),
         failure_diagnosis: None,
+        failure_episodes: Vec::new(),
         diagnostic_slice: None,
         replay_execution: None,
         external_evaluations: Vec::new(),

@@ -1936,6 +1936,7 @@ fn checkpoint_restores_file_before_image_without_touching_git() {
                 path: PathBuf::from("src/lib.rs"),
                 content: Some(b"pub fn value() -> u8 { 1 }".to_vec()),
                 unix_mode: Some(0o755),
+                metadata: None,
             }],
             ToolCallId::new(),
         )
@@ -1973,6 +1974,55 @@ fn checkpoint_restores_file_before_image_without_touching_git() {
         assert_eq!(mode(&checkpoint_dir.join("files/src/lib.rs")), 0o600);
         assert_eq!(mode(&source), 0o755);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoints_hard_link_identical_before_images() {
+    use std::os::unix::fs::MetadataExt;
+
+    let workspace = tempdir().expect("workspace");
+    let checkpoint_root = tempdir().expect("checkpoint");
+    fs::write(workspace.path().join("shared.txt"), "same baseline").expect("baseline");
+    let manager = WorkspaceCheckpointManager::new(workspace.path(), checkpoint_root.path());
+    let before_image = FileBeforeImage {
+        path: PathBuf::from("shared.txt"),
+        content: Some(b"same baseline".to_vec()),
+        unix_mode: Some(0o644),
+        metadata: None,
+    };
+    let first = manager
+        .create_checkpoint(
+            WorkspaceId::new(),
+            TaskId::new(),
+            TurnId::new(),
+            std::slice::from_ref(&before_image),
+            ToolCallId::new(),
+        )
+        .expect("first checkpoint");
+    let second = manager
+        .create_checkpoint(
+            WorkspaceId::new(),
+            TaskId::new(),
+            TurnId::new(),
+            std::slice::from_ref(&before_image),
+            ToolCallId::new(),
+        )
+        .expect("second checkpoint");
+
+    let first_path = checkpoint_root
+        .path()
+        .join(first.checkpoint_id.to_string())
+        .join("files/shared.txt");
+    let second_path = checkpoint_root
+        .path()
+        .join(second.checkpoint_id.to_string())
+        .join("files/shared.txt");
+    let first_metadata = fs::metadata(first_path).expect("first checkpoint file");
+    let second_metadata = fs::metadata(second_path).expect("second checkpoint file");
+
+    assert_eq!(first_metadata.ino(), second_metadata.ino());
+    assert!(first_metadata.nlink() >= 3);
 }
 
 #[test]
@@ -2013,6 +2063,7 @@ fn checkpoint_restore_removes_file_created_by_task() {
                 path: PathBuf::from("created.txt"),
                 content: None,
                 unix_mode: None,
+                metadata: None,
             }],
             ToolCallId::new(),
         )
@@ -2043,6 +2094,7 @@ fn checkpoint_rejects_parent_directory_escape() {
             path: outside_file,
             content: Some(b"secret".to_vec()),
             unix_mode: None,
+            metadata: None,
         }],
         ToolCallId::new(),
     );
@@ -2068,6 +2120,7 @@ fn checkpoint_restore_rejects_traversal_in_a_tampered_manifest() {
                 path: PathBuf::from("created.txt"),
                 content: None,
                 unix_mode: None,
+                metadata: None,
             }],
             ToolCallId::new(),
         )
@@ -2118,11 +2171,13 @@ fn checkpoint_validates_every_entry_before_restoring_any_file() {
                     path: PathBuf::from("first.txt"),
                     content: Some(b"first before".to_vec()),
                     unix_mode: None,
+                    metadata: None,
                 },
                 FileBeforeImage {
                     path: PathBuf::from("second.txt"),
                     content: Some(b"second before".to_vec()),
                     unix_mode: None,
+                    metadata: None,
                 },
             ],
             ToolCallId::new(),
@@ -2168,6 +2223,7 @@ fn checkpoint_rejects_gitignored_before_images() {
                 path: workspace.path().join(path),
                 content: None,
                 unix_mode: None,
+                metadata: None,
             }],
             ToolCallId::new(),
         );
@@ -2196,16 +2252,19 @@ fn partial_checkpoint_filter_omits_ignored_images_but_keeps_safe_files() {
             path: workspace.path().join(".gitignore"),
             content: Some(b".gitignore\n*.secret\n".to_vec()),
             unix_mode: None,
+            metadata: None,
         },
         FileBeforeImage {
             path: workspace.path().join("safe.txt"),
             content: Some(b"safe".to_vec()),
             unix_mode: None,
+            metadata: None,
         },
         FileBeforeImage {
             path: workspace.path().join("token.secret"),
             content: Some(b"secret".to_vec()),
             unix_mode: None,
+            metadata: None,
         },
     ];
 

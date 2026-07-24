@@ -1698,6 +1698,12 @@ async fn main() -> miette::Result<()> {
                 .await?;
             }
             EvalCommand::Ingest { file } => {
+                let artifact_base_path = evaluation_artifact_base_path(&file).map_err(|error| {
+                    miette::miette!(
+                        "failed to resolve evaluation directory {}: {error}",
+                        file.display()
+                    )
+                })?;
                 let content = std::fs::read_to_string(&file).map_err(|error| {
                     miette::miette!(
                         "failed to read external evaluation {}: {error}",
@@ -1757,7 +1763,10 @@ async fn main() -> miette::Result<()> {
                     command(
                         session_id,
                         SessionCommandKind::IngestExternalEvaluation,
-                        serde_json::json!({"record": record}),
+                        serde_json::json!({
+                            "record": record,
+                            "artifact_base_path": artifact_base_path,
+                        }),
                     ),
                 )
                 .await?;
@@ -2884,6 +2893,13 @@ async fn approval_detail(
 
 fn is_terminal_status(status: TaskStatus) -> bool {
     status.is_terminal()
+}
+
+fn evaluation_artifact_base_path(file: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    file.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .canonicalize()
 }
 
 fn run_plugin_command(command: &PluginCommand) -> miette::Result<()> {

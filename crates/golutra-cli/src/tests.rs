@@ -332,3 +332,17 @@ fn builtin_openai_oauth_resolves_registered_responses_adapter() {
         .is_err()
     );
 }
+
+#[test]
+fn evaluation_artifact_base_accepts_a_bare_relative_filename() {
+    let base = evaluation_artifact_base_path(std::path::Path::new("evaluation.json"))
+        .expect("relative evaluation base");
+
+    assert_eq!(
+        base,
+        std::env::current_dir()
+            .expect("current directory")
+            .canonicalize()
+            .expect("canonical current directory")
+    );
+}

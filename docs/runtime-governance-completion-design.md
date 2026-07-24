@@ -23,12 +23,13 @@ P3 不能绕过本文。没有完整事实、可靠验证和真实 regression，
 
 ## 当前事实与缺口
 
-截至 2026-07-23，真实隔离任务已经证明以下主链存在：
+截至 2026-07-24，真实隔离任务已经证明以下主链存在：
 
 - 成功 coding task 会持久化 context、provider、tool、policy、checkpoint、verification、LoopDecision、memory 和 minimal evaluation 事件。
 - failed/partial task 会生成 deep PostTaskReview、ImprovementCandidate 和 AutomationCandidate。
 - artifact blob、evidence、rollout 和 evaluation state 都会落盘。
 - 普通 TUI 与 developer/debug 投影已经分离。
+- 大 workspace change payload 已转为 artifact 引用；binary/超预算文件仍保留 before/after checksum。失败复盘使用带恢复/取代状态的 `FailureEpisode`，外部 evaluator evidence 导入后会重新投影 diagnosis/candidate；context snapshot 和 token record 可逐 contributor 对账。
 
 P2.5 验收后，以下 capability truth matrix 记录真实边界：
 
@@ -693,7 +694,7 @@ MemoryInvalidated
 | Crate | P2.5 已实施内容 |
 | --- | --- |
 | `golutra-core` | VerificationPlan/Assertion、ContextSnapshot、PostTaskJob、MemoryClaim 基础类型 |
-| `golutra-protocol` | typed Context/Evaluation projection、TaskTrace、artifact chunk、job、regression、memory query/command/event schema（runtime protocol v2） |
+| `golutra-protocol` | typed Context/Evaluation projection、TaskTrace、artifact chunk、job、regression、memory query/command/event schema（runtime protocol v6） |
 | `golutra-store` | context snapshot、job lease、trace ref closure、artifact range read、migration；`RuntimeRepositories` 五类事实访问 seam |
 | `golutra-context` | canonical request snapshot、contributor manifest、tool output budget |
 | `golutra-runtime` | task 前 verification plan、criterion/assertion 终态判定；completion/context guard/retry/trace/verification 模块边界 |

@@ -1633,6 +1633,7 @@ fn developer_panel_exposes_governance_without_leaking_into_normal_view() {
         loop_decisions: Vec::new(),
         post_task_jobs: Vec::new(),
         failure_diagnosis: None,
+        failure_episodes: Vec::new(),
         diagnostic_slice: None,
         replay_execution: None,
         external_evaluations: Vec::new(),
@@ -1659,6 +1660,53 @@ fn developer_panel_exposes_governance_without_leaking_into_normal_view() {
     });
     let mut debug_value = serde_json::to_value(debug_projection).expect("debug projection");
     debug_value["failure_diagnosis"] = diagnosis.clone();
+    debug_value["failure_episodes"] = json!([
+        {
+            "episode_id": "episode-active",
+            "source_task_id": task_id,
+            "status": "active",
+            "primary_signal": {
+                "event_ref": events[0].id,
+                "kind": "self_check",
+                "signal_key": "self_check:verification",
+                "summary": "verification failed"
+            },
+            "opened_at": chrono::Utc::now(),
+            "updated_at": chrono::Utc::now()
+        },
+        {
+            "episode_id": "episode-recovered",
+            "source_task_id": task_id,
+            "status": "recovered",
+            "primary_signal": {
+                "event_ref": events[0].id,
+                "kind": "producer",
+                "signal_key": "tool:shell",
+                "summary": "shell failed"
+            },
+            "recovered_by": {
+                "event_ref": events[1].id,
+                "signal_key": "tool:shell",
+                "summary": "shell recovered"
+            },
+            "opened_at": chrono::Utc::now(),
+            "updated_at": chrono::Utc::now()
+        },
+        {
+            "episode_id": "episode-superseded",
+            "source_task_id": task_id,
+            "status": "superseded",
+            "primary_signal": {
+                "event_ref": events[0].id,
+                "kind": "producer",
+                "signal_key": "provider:mock",
+                "summary": "provider failed"
+            },
+            "superseded_by": "episode-active",
+            "opened_at": chrono::Utc::now(),
+            "updated_at": chrono::Utc::now()
+        }
+    ]);
     debug_value["diagnostic_slice"] = json!({
         "slice_id": "slice-test",
         "source_task_id": task_id,
@@ -1690,6 +1738,7 @@ fn developer_panel_exposes_governance_without_leaking_into_normal_view() {
     assert!(row_text.contains("sequence_no: 8"));
     assert!(row_text.contains("PromotionDecided/Runtime"));
     assert!(row_text.contains("diagnosis Tool/tool_failed confidence=90"));
+    assert!(row_text.contains("failure_episodes active=1 recovered=1 superseded=1"));
     assert!(row_text.contains("slice_events=1 omitted=7 complete=true"));
 
     let mut app = TuiApp::new(
@@ -2033,6 +2082,7 @@ fn file_changes_are_compact_in_normal_mode_and_detailed_in_developer_mode() {
         loop_decisions: Vec::new(),
         post_task_jobs: Vec::new(),
         failure_diagnosis: None,
+        failure_episodes: Vec::new(),
         diagnostic_slice: None,
         replay_execution: None,
         external_evaluations: Vec::new(),
@@ -2506,6 +2556,7 @@ fn mouse_wheel_routes_to_the_pane_under_the_pointer() {
         loop_decisions: Vec::new(),
         post_task_jobs: Vec::new(),
         failure_diagnosis: None,
+        failure_episodes: Vec::new(),
         diagnostic_slice: None,
         replay_execution: None,
         external_evaluations: Vec::new(),

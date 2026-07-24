@@ -6,7 +6,7 @@ use crate::{
     Timestamp, ToolCallId, TurnId, VerificationId, WorkspaceId,
 };
 
-pub const RUNTIME_EVENT_SCHEMA_VERSION: u32 = 2;
+pub const RUNTIME_EVENT_SCHEMA_VERSION: u32 = 3;
 pub const BUILD_PROVENANCE_SCHEMA_VERSION: u32 = 1;
 pub const RUN_PROVENANCE_SCHEMA_VERSION: u32 = 1;
 

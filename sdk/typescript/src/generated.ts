@@ -170,6 +170,7 @@ export type RuntimeEventType =
   | "memory_activated"
   | "memory_invalidated"
   | "failure_diagnosed"
+  | "failure_episode_recorded"
   | "diagnostic_slice_created"
   | "replay_capsule_created"
   | "replay_executed"
@@ -273,6 +274,8 @@ export type EvidenceStrength = "weak" | "medium" | "strong";
 export type RegressionExecutionRole = "baseline" | "candidate";
 export type ExternalEvaluationTrust = "untrusted_local" | "owner_local" | "signed";
 export type EvaluationVerdict = "pass" | "fail" | "partial" | "unknown";
+export type FailureSignalKind = "producer" | "self_check" | "external_assertion";
+export type FailureEpisodeStatus = "active" | "recovered" | "superseded";
 export type LoopAction =
   | "continue"
   | "compact"
@@ -1005,6 +1008,7 @@ export interface ContextContributorSnapshot {
   estimated_tokens: number;
   included: boolean;
   invalidation_refs: string[];
+  message_indexes?: number[];
   name: string;
   original_estimated_tokens?: number;
   redacted_content_ref?: string | null;
@@ -1017,9 +1021,12 @@ export interface ContextContributorSnapshot {
 }
 export interface ContextMessageSnapshot {
   content_digest: string;
+  contributor?: string;
   estimated_tokens: number;
   index: number;
+  origin?: string;
   role: string;
+  source_refs?: string[];
   tool_call_ids: string[];
   [k: string]: unknown;
 }
@@ -1055,6 +1062,7 @@ export interface DebugProjection {
   evidence: EvidenceRecord[];
   external_evaluations?: ExternalEvaluationRecord[];
   failure_diagnosis?: FailureDiagnosis | null;
+  failure_episodes?: FailureEpisode[];
   loop_decisions: LoopDecision[];
   missing_sections?: string[];
   post_task_jobs?: PostTaskJob[];
@@ -1116,9 +1124,12 @@ export interface FailureDiagnosis {
   created_at: string;
   diagnosis_id: string;
   expected_behavior: string;
+  failure_episode_id?: string | null;
   regression_commands: string[];
+  revision?: number;
   source_task_id: string;
   summary: string;
+  supersedes_diagnosis_id?: string | null;
   taxonomy: FailureTaxonomy;
   trigger_event_refs: string[];
   [k: string]: unknown;
@@ -1172,6 +1183,8 @@ export interface ExternalEvaluationRecord {
   harness_id: string;
   harness_version: string;
   holdout_protected?: boolean;
+  imported_artifacts?: ImportedEvaluationArtifact[];
+  imported_evidence_refs?: string[];
   ingested_at: string;
   partition?: "source" | "historical" | "generated" | "holdout" | "adversarial";
   provider_variant?: string | null;
@@ -1199,6 +1212,48 @@ export interface EvaluationAttestation {
   key_id: string;
   signature: string;
   signed_digest: string;
+  [k: string]: unknown;
+}
+/**
+ * Host-derived immutable copy of evaluator evidence. These fields are not
+ * part of `result_digest`; the digest authenticates evaluator-controlled
+ * facts while the imported artifact checksum authenticates local retention.
+ */
+export interface ImportedEvaluationArtifact {
+  artifact_ref: string;
+  checksum: string;
+  size_bytes: number;
+  source_ref: string;
+  [k: string]: unknown;
+}
+export interface FailureEpisode {
+  diagnosis_refs?: string[];
+  episode_id: string;
+  external_assertion_failures?: FailureSignalRef[];
+  opened_at: string;
+  primary_signal: FailureSignalRef;
+  producer_failures?: FailureSignalRef[];
+  recovered_by?: FailureRecovery | null;
+  self_check_failures?: FailureSignalRef[];
+  source_task_id: string;
+  status: FailureEpisodeStatus;
+  superseded_by?: string | null;
+  updated_at: string;
+  [k: string]: unknown;
+}
+export interface FailureSignalRef {
+  artifact_refs?: string[];
+  event_ref: string;
+  evidence_refs?: string[];
+  kind: FailureSignalKind;
+  signal_key: string;
+  summary: string;
+  [k: string]: unknown;
+}
+export interface FailureRecovery {
+  event_ref: string;
+  signal_key: string;
+  summary: string;
   [k: string]: unknown;
 }
 export interface LoopDecision {
@@ -1319,6 +1374,7 @@ export interface EvaluationProjection {
   diagnostic_slices?: DiagnosticSlice[];
   external_evaluations?: ExternalEvaluationRecord[];
   failure_diagnoses?: FailureDiagnosis[];
+  failure_episodes?: FailureEpisode[];
   improvement_candidates: ImprovementCandidate[];
   integrity_warnings: string[];
   post_task_jobs: PostTaskJob[];
@@ -1336,10 +1392,12 @@ export interface EvaluationProjection {
 export interface ImprovementCandidate {
   benchmark_refs: string[];
   causal_evidence_refs: string[];
+  diagnosis_ref?: string | null;
   evidence_refs: string[];
   expected_effect: string;
   id: string;
   proposed_change: string;
+  proposed_commands?: string[];
   risk_level: CandidateRisk;
   rollback_plan: string;
   source_failure_ids: string[];
@@ -1347,6 +1405,7 @@ export interface ImprovementCandidate {
   status: CandidateStatus;
   target_id?: string | null;
   target_type: string;
+  validation_plan?: string[];
   [k: string]: unknown;
 }
 export interface PromotionDecision {

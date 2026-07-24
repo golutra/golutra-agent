@@ -346,7 +346,11 @@ golutra --run-bundle /absolute/run-dir eval ingest /absolute/evaluation.json
 ```
 
 命令会验证 source trace digest、runtime identity 和 canonical result digest，
-成功后原子刷新 `observations/` 与 `debug-export/`。刷新允许合法的 evaluator
+并以 evaluation JSON 所在目录作为相对 evidence ref 的根目录。普通文件会在
+固定大小预算内复制为 owner-only `external_evaluator_evidence` artifact，记录
+SHA-256/size，并为 assertion 生成 `EvidenceRecord`；原路径后续被修改不会改变
+已导入事实。外部失败会在追加事件后重新计算 failure episode、诊断切片和改进
+候选。成功后原子刷新 `observations/` 与 `debug-export/`。刷新允许合法的 evaluator
 事件追加，但会验证旧 task event prefix 与 prior trace boundary 没有被修改；
 每次打开 bundle 还会先验证 trace 文件的 manifest checksum、SQLite 中的
 source event prefix，以及 prior trace 引用的 artifact metadata/blob checksum。

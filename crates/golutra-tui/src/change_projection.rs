@@ -81,11 +81,14 @@ fn event_turn_change_summary(event: &RuntimeEvent) -> Option<TurnChangeSummary> 
         .and_then(|value| serde_json::from_value(value).ok())
         .or_else(|| {
             let files = legacy_file_changes(event);
+            let file_count = u64::try_from(files.len()).unwrap_or(u64::MAX);
             (!files.is_empty()).then_some(TurnChangeSummary {
                 files,
                 added_lines: None,
                 removed_lines: None,
                 stats_complete: false,
+                file_count,
+                files_truncated: false,
             })
         })
 }
@@ -103,6 +106,8 @@ fn legacy_file_changes(event: &RuntimeEvent) -> Vec<FileChangeSummary> {
             kind: FileChangeKind::Modified,
             added_lines: None,
             removed_lines: None,
+            before: None,
+            after: None,
         })
         .collect()
 }

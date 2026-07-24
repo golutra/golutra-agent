@@ -138,7 +138,88 @@ pub struct FailureDiagnosis {
     pub code_targets: Vec<CodeTargetRef>,
     pub regression_commands: Vec<String>,
     pub analyzer_version: String,
+    #[serde(default)]
+    pub failure_episode_id: Option<String>,
+    #[serde(default)]
+    pub revision: u32,
+    #[serde(default)]
+    pub supersedes_diagnosis_id: Option<String>,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureSignalKind {
+    Producer,
+    SelfCheck,
+    ExternalAssertion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FailureSignalRef {
+    pub event_ref: EventId,
+    pub kind: FailureSignalKind,
+    pub signal_key: String,
+    pub summary: String,
+    #[serde(default)]
+    pub evidence_refs: Vec<EvidenceId>,
+    #[serde(default)]
+    pub artifact_refs: Vec<ArtifactId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FailureRecovery {
+    pub event_ref: EventId,
+    pub signal_key: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureEpisodeStatus {
+    #[default]
+    Active,
+    Recovered,
+    Superseded,
+}
+
+impl FailureEpisodeStatus {
+    #[must_use]
+    pub const fn is_active(self) -> bool {
+        matches!(self, Self::Active)
+    }
+
+    #[must_use]
+    pub const fn is_recovered(self) -> bool {
+        matches!(self, Self::Recovered)
+    }
+
+    #[must_use]
+    pub const fn is_superseded(self) -> bool {
+        matches!(self, Self::Superseded)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FailureEpisode {
+    pub episode_id: String,
+    pub source_task_id: TaskId,
+    pub status: FailureEpisodeStatus,
+    pub primary_signal: FailureSignalRef,
+    #[serde(default)]
+    pub producer_failures: Vec<FailureSignalRef>,
+    #[serde(default)]
+    pub self_check_failures: Vec<FailureSignalRef>,
+    #[serde(default)]
+    pub external_assertion_failures: Vec<FailureSignalRef>,
+    #[serde(default)]
+    pub diagnosis_refs: Vec<String>,
+    #[serde(default)]
+    pub recovered_by: Option<FailureRecovery>,
+    #[serde(default)]
+    pub superseded_by: Option<String>,
+    pub opened_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -272,6 +353,10 @@ pub struct ExternalEvaluationRecord {
     pub assertions: Vec<ExternalEvaluationAssertion>,
     pub artifact_refs: Vec<String>,
     #[serde(default)]
+    pub imported_artifacts: Vec<ImportedEvaluationArtifact>,
+    #[serde(default)]
+    pub imported_evidence_refs: Vec<EvidenceId>,
+    #[serde(default)]
     pub partition: EvaluationPartitionKind,
     #[serde(default)]
     pub seed: Option<u64>,
@@ -293,6 +378,17 @@ pub struct ExternalEvaluationRecord {
     pub trust: ExternalEvaluationTrust,
     pub attestation: Option<EvaluationAttestation>,
     pub ingested_at: DateTime<Utc>,
+}
+
+/// Host-derived immutable copy of evaluator evidence. These fields are not
+/// part of `result_digest`; the digest authenticates evaluator-controlled
+/// facts while the imported artifact checksum authenticates local retention.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ImportedEvaluationArtifact {
+    pub source_ref: String,
+    pub artifact_ref: ArtifactId,
+    pub checksum: String,
+    pub size_bytes: u64,
 }
 
 /// Digest over evaluator-controlled result facts. Local ingestion time and
@@ -480,6 +576,12 @@ pub struct ImprovementCandidate {
     pub causal_evidence_refs: Vec<String>,
     pub benchmark_refs: Vec<String>,
     pub rollback_plan: String,
+    #[serde(default)]
+    pub diagnosis_ref: Option<String>,
+    #[serde(default)]
+    pub proposed_commands: Vec<String>,
+    #[serde(default)]
+    pub validation_plan: Vec<String>,
     pub status: CandidateStatus,
 }
 
@@ -795,6 +897,8 @@ pub struct EvaluationState {
     pub replay_executions: Vec<ReplayExecution>,
     #[serde(default)]
     pub failure_diagnoses: Vec<FailureDiagnosis>,
+    #[serde(default)]
+    pub failure_episodes: Vec<FailureEpisode>,
     #[serde(default)]
     pub diagnostic_slices: Vec<DiagnosticSlice>,
     #[serde(default)]

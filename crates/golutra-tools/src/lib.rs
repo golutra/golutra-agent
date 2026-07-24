@@ -7,10 +7,10 @@ use std::{
 
 use async_trait::async_trait;
 use golutra_core::{
-    ArtifactId, ArtifactRecord, EvidenceRecord, EvidenceStrength, PolicyBlockDisposition,
-    PolicyDecision, PolicyEvaluation, RedactionStatus, SessionId, SideEffectType, ToolCallId,
-    ToolContract, ToolExecutionMetrics, ToolProgress, ToolProgressPhase, ToolResultEnvelope,
-    ToolResultStatus, TurnId,
+    ArtifactId, ArtifactRecord, EvidenceRecord, EvidenceStrength, FileContentKind,
+    FileStateMetadata, PolicyBlockDisposition, PolicyDecision, PolicyEvaluation, RedactionStatus,
+    SessionId, SideEffectType, ToolCallId, ToolContract, ToolExecutionMetrics, ToolProgress,
+    ToolProgressPhase, ToolResultEnvelope, ToolResultStatus, TurnId,
 };
 use golutra_policy::WorkspacePolicy;
 use golutra_sandbox::{SystemSandbox, WorkspaceAccess};
@@ -103,6 +103,7 @@ pub struct FileBeforeImage {
     pub path: PathBuf,
     pub content: Option<Vec<u8>>,
     pub unix_mode: Option<u32>,
+    pub metadata: Option<FileStateMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -879,6 +880,14 @@ impl BasicToolExecutor {
                 .before_images
                 .first()
                 .and_then(|image| image.unix_mode),
+            metadata: Some(file_state_metadata(
+                content.as_bytes(),
+                report
+                    .before_images
+                    .first()
+                    .and_then(|image| image.unix_mode),
+                true,
+            )),
         }];
         report.metrics.item_count = Some(1);
         Ok(report)
@@ -956,6 +965,14 @@ impl BasicToolExecutor {
                 .before_images
                 .first()
                 .and_then(|image| image.unix_mode),
+            metadata: Some(file_state_metadata(
+                edited.as_bytes(),
+                report
+                    .before_images
+                    .first()
+                    .and_then(|image| image.unix_mode),
+                true,
+            )),
         }];
         report.metrics.item_count = Some(1);
         Ok(report)
@@ -2247,6 +2264,7 @@ async fn read_optional_file(path: &Path) -> Result<FileBeforeImage, ToolError> {
                 path: path.to_path_buf(),
                 content: None,
                 unix_mode: None,
+                metadata: None,
             });
         }
         Err(error) => return Err(ToolError::Execution(error.to_string())),
@@ -2271,11 +2289,32 @@ async fn read_optional_file(path: &Path) -> Result<FileBeforeImage, ToolError> {
             path.display()
         )));
     }
+    let unix_mode = unix_mode(&metadata);
+    let file_metadata = file_state_metadata(&content, unix_mode, true);
     Ok(FileBeforeImage {
         path: path.to_path_buf(),
         content: Some(content),
-        unix_mode: unix_mode(&metadata),
+        unix_mode,
+        metadata: Some(file_metadata),
     })
+}
+
+fn file_state_metadata(
+    bytes: &[u8],
+    unix_mode: Option<u32>,
+    content_available: bool,
+) -> FileStateMetadata {
+    FileStateMetadata {
+        size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        checksum: Some(format!("sha256:{:x}", Sha256::digest(bytes))),
+        unix_mode,
+        content_kind: if std::str::from_utf8(bytes).is_ok() && !bytes.contains(&0) {
+            FileContentKind::Text
+        } else {
+            FileContentKind::Binary
+        },
+        content_available,
+    }
 }
 
 async fn before_image_still_current(

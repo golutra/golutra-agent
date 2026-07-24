@@ -2,6 +2,9 @@
 
 use super::*;
 
+const MAX_INLINE_CHANGE_FILES: usize = 32;
+const MAX_INLINE_DIFF_PREVIEWS: usize = 8;
+
 #[derive(Clone)]
 pub(crate) struct CanonicalFactRecorder {
     host: Arc<RuntimeHost>,
@@ -246,6 +249,42 @@ impl RuntimeHost {
             event_turn_id,
             change_samples,
         );
+        let change_manifest_artifact = if change_facts.operation_changes.is_empty()
+            && change_facts.turn_summary.files.is_empty()
+        {
+            None
+        } else {
+            let bytes = serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "changed_files": report.changed_files,
+                "operation_changes": change_facts.operation_changes,
+                "diff_previews": change_facts.diff_previews,
+                "turn_change_summary": change_facts.turn_summary,
+            }))?;
+            let artifact_id = ArtifactId::new();
+            let checksum = Sha256::digest(&bytes);
+            Some((
+                ArtifactRecord {
+                    artifact_id,
+                    session_id: task.session_id,
+                    turn_id: Some(event_turn_id),
+                    tool_call_id: Some(report.envelope.tool_call_id),
+                    artifact_type: "workspace_change_manifest".to_owned(),
+                    uri: format!(
+                        "artifact://tool/{}/changes/{artifact_id}",
+                        report.envelope.tool_call_id
+                    ),
+                    checksum: format!("sha256:{checksum:x}"),
+                    size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                    created_at: chrono::Utc::now(),
+                    producer: "workspace-change-tracker".to_owned(),
+                    redaction_status: RedactionStatus::Redacted,
+                    retention_policy: "debug_default".to_owned(),
+                    provenance_refs: Vec::new(),
+                },
+                bytes,
+            ))
+        };
         let diff_artifact = change_facts.diff_artifact.as_ref().map(|diff| {
             let (content, redaction_status) = golutra_tools::redact_sensitive_text(&diff.content);
             let bytes = content.into_bytes();
@@ -295,6 +334,25 @@ impl RuntimeHost {
             };
             (artifact, bytes)
         };
+        let inline_changed_files = report
+            .changed_files
+            .iter()
+            .take(MAX_INLINE_CHANGE_FILES)
+            .collect::<Vec<_>>();
+        let inline_operation_changes = change_facts
+            .operation_changes
+            .iter()
+            .take(MAX_INLINE_CHANGE_FILES)
+            .collect::<Vec<_>>();
+        let inline_diff_previews = change_facts
+            .diff_previews
+            .iter()
+            .take(MAX_INLINE_DIFF_PREVIEWS)
+            .collect::<Vec<_>>();
+        let mut inline_turn_summary = change_facts.turn_summary.clone();
+        inline_turn_summary.files.truncate(MAX_INLINE_CHANGE_FILES);
+        inline_turn_summary.files_truncated = inline_turn_summary.file_count
+            > u64::try_from(inline_turn_summary.files.len()).unwrap_or(u64::MAX);
         let mut event = agent_event(
             self.next_sequence_no(),
             task,
@@ -304,14 +362,18 @@ impl RuntimeHost {
                 "summary": report.envelope.summary,
                 "envelope": report.envelope,
                 "metrics": report.metrics,
-                "changed_files": report.changed_files,
-                "file_changes": change_facts.operation_changes,
-                "diff_previews": change_facts.diff_previews,
+                "changed_file_count": report.changed_files.len(),
+                "changed_files": inline_changed_files,
+                "changed_files_truncated": report.changed_files.len() > MAX_INLINE_CHANGE_FILES,
+                "file_changes": inline_operation_changes,
+                "file_changes_truncated": change_facts.operation_changes.len() > MAX_INLINE_CHANGE_FILES,
+                "diff_previews": inline_diff_previews,
+                "diff_previews_truncated": change_facts.diff_previews.len() > MAX_INLINE_DIFF_PREVIEWS,
                 "diff_artifact_truncated": change_facts
                     .diff_artifact
                     .as_ref()
                     .is_some_and(|diff| diff.truncated),
-                "turn_change_summary": change_facts.turn_summary,
+                "turn_change_summary": inline_turn_summary,
             }),
         );
         event.turn_id = Some(event_turn_id);
@@ -325,6 +387,12 @@ impl RuntimeHost {
             .artifacts
             .store(&replay_artifact, &replay_bytes)
             .await?;
+        if let Some((mut artifact, bytes)) = change_manifest_artifact {
+            artifact.provenance_refs.push(tool_event_id);
+            event.payload["change_manifest_artifact_ref"] =
+                Value::String(artifact.artifact_id.to_string());
+            self.repositories.artifacts.store(&artifact, &bytes).await?;
+        }
         if let Some((mut artifact, bytes)) = diff_artifact {
             artifact.provenance_refs.push(tool_event_id);
             event.payload["diff_artifact_ref"] = Value::String(artifact.artifact_id.to_string());
