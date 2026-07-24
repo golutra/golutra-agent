@@ -694,7 +694,7 @@ MemoryInvalidated
 | Crate | P2.5 已实施内容 |
 | --- | --- |
 | `golutra-core` | VerificationPlan/Assertion、ContextSnapshot、PostTaskJob、MemoryClaim 基础类型 |
-| `golutra-protocol` | typed Context/Evaluation projection、TaskTrace、artifact chunk、job、regression、memory query/command/event schema（runtime protocol v6） |
+| `golutra-protocol` | typed Context/Evaluation projection、TaskTrace、artifact chunk、job、regression、memory query/command/event schema（runtime protocol v7） |
 | `golutra-store` | context snapshot、job lease、trace ref closure、artifact range read、migration；`RuntimeRepositories` 五类事实访问 seam |
 | `golutra-context` | canonical request snapshot、contributor manifest、tool output budget |
 | `golutra-runtime` | task 前 verification plan、criterion/assertion 终态判定；completion/context guard/retry/trace/verification 模块边界 |
@@ -768,6 +768,8 @@ P2.5 已迁移已有事实，并且不保留两套运行语义：
 ### G4：真实 Regression（已完成当前范围）
 
 - task-level candidate artifact/digest、逐 `case_ref` baseline/candidate 隔离执行、durable regression trace bundle、paired result、资源预算和 hard gate 已实现；任一 case 缺 pair 时持久化 NeedsHumanReview，而不是中断在无 PromotionDecision 状态。
+- candidate file set 首次执行时冻结为不可变 `candidate_patch_set` artifact，并通过独立 `CandidatePatchFrozen` 事件进入完整性对账；campaign 和每次 candidate execution 都读取同一 artifact bytes。
+- deep failure 的 runtime-change candidate 自动进入 regression/promotion dispatcher；缺冻结补丁或隔离执行失败时形成 blocked `RegressionResult(NeedsReview)` 与 `PromotionDecision(NeedsHumanReview)`，不自动 apply runtime code。
 - runtime 源码版本候选走独立 P3 路径：stable release 与 candidate evaluation build 中的 `golutra-eval-worker` 是两个实际不同的 binary；它们在独立 home/workspace 和外层断网 OS sandbox 中运行。Supervisor 不向 worker 发送 assertion、partition、真实 case id 或 holdout 答案，并在进程外验证 workspace outcome、完整 trace、VerificationRecord 和引用 artifact blob。
 - candidate worktree 由 Supervisor 从 epoch 的 immutable parent release source 创建；冻结时按完整文件摘要集合计算 canonical changed paths。proposal 的 `target_paths` 只是待核对声明，不能掩盖 evaluator、sandbox、release、policy 或其他 sealed 路径的新增、修改和删除。
 - secondary evaluation/memory store 负责 durable lifecycle，但不能伪装成事件源；EvaluationProjection 必须把 review/result/candidate/regression/decision 与 source-task RuntimeEvent 对账。缺事件、未终态 job/evaluation 或 unresolved regression artifact 都让 TaskTrace integrity 失败。

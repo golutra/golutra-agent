@@ -15,6 +15,7 @@
 - terminal task 可生成 `PostTaskReview`、`EvaluationCase`、`TrajectoryReplay`、`EvaluationRun` 和 `EvaluationResult`，并按 canonical cwd hash 持久化到 `$GOLUTRA_HOME/state/workspaces/<cwd-hash>/evaluation.json`；状态更新有文件锁、大小边界和 owner-only 权限。
 - pass/partial/fail、latency、evidence refs、residual risks 和 failure taxonomy 来自 runtime facts 与 verification plan/assertions，不从聊天文本反推；当前支持的路径、内容、命令和 policy assertion 会进入三维 hard gate，无法客观证明的标准保持 Unknown/Partial。
 - 失败或 partial trajectory 可生成 benchmark、generated-task 和 improvement 候选；CLI、transport 与双 SDK 可以查询候选、regression、apply 和 rollback 状态。
+- deep failure 会为 `ImprovementCandidate` 建立同 ID 的 `RuntimeChange` 候选，并自动推进到 `RegressionResult -> PromotionDecision`。没有不可变 `candidate_patch_set` 时必须落 `NeedsReview -> NeedsHumanReview`，不能伪造执行结果，也不会自动应用代码。
 - `TrajectoryReplay` 仍是 event/artifact 的 projection replay；候选 regression 由 `RuntimeHost::run_regression_campaign` 启动配对 baseline/candidate RuntimeHost，`run_regression` 对已记录 execution facts 做纯比较。
 - `EvaluationStore::compare_counterfactual` 能比较调用方提供的 baseline/variant durable run facts，但不会自行生成受控 paired execution；没有 execution refs 的结果不能作为未来代码晋升证据。
 - deep evaluation 在 TaskCompleted 前写入 SQLite `PostTaskJob`，worker 提供 lease/retry/recovery；Embedded one-shot 退出后新 Host/daemon 可继续完成 job。
@@ -71,6 +72,12 @@ summary/full 投影不把 secret 或 raw request 复制进用户视图。
    attestation 才能进入 holdout gate。
 5. `owner_local` 只接受 owner/CLI/TUI actor；`untrusted_local` 永远不能
    满足 promotion gate。
+6. phase id、阶段时间、assertion refs 与 terminal cause 必须内部一致；通过结果不能同时声明 failed/timed-out/error phase，失败结果在提供 phase 数据时必须给出结构化终止原因。
+
+`ExternalEvaluationRecord.phases` 把 setup、agent、test、assertion 和 teardown
+分开记录，`terminal_cause` 指向实际终止阶段。Terminal-Bench adapter 会保留这些
+阶段的起止时间、耗时、状态和 evidence refs，因此 harness timeout 不再与 agent
+失败或 assertion 失败混成一个字符串。
 
 campaign 的覆盖不是“有若干结果”就算完成，而是精确覆盖：
 
@@ -87,11 +94,13 @@ case_ref × partition × provider_variant × seed
 
 ## 可操作的失败观测闭包
 
-单个 error event 不再直接等同于最终根因。runtime protocol v6 把失败投影成
+单个 error event 不再直接等同于最终根因。runtime protocol v7 把失败投影成
 一等 `FailureEpisode`：producer failure、runtime self-check 和 external
 assertion 可以归并为同一 episode，并显式记录 `active/recovered/superseded`、
 `recovered_by` 与 `superseded_by`。后续等价工具成功或 verification/evaluator
-通过会关闭可恢复 episode；更高可信度的外部失败会生成新 diagnosis revision，
+通过会关闭可恢复 episode；终态 verification pass 会把仍未匹配到等价重试的
+探索性 producer failure 标记为 recovered，但不会覆盖 external assertion failure。
+更高可信度的外部失败会生成新 diagnosis revision，
 引用被取代 diagnosis，而不是让早期 `tool_failed` 永久成为结论。
 
 每次 diagnosis 同时生成可移交的 `DiagnosticSlice` 与 actionable
@@ -100,6 +109,25 @@ benchmark/evidence refs 和 rollback plan；外部 evaluator 的本地文件先�
 不可变 checksummed artifact 和 `EvidenceRecord`，之后才参与重新诊断。Developer
 projection 显示 active/recovered/superseded episode 数量，普通 UserProjection
 不增加这类治理噪声。
+
+`DiagnosticSlice` 以当前 active failure episode 为根，只沿 `TriggeredBy`、
+`RespondsTo`、`DerivedFrom`、`Verifies` 等语义 causal links 选择因果前沿，再补
+生命周期锚点和有界时间邻域；`parent_event_id`/`Parent` 是防篡改顺序链，不递归
+解释为根因，否则长任务的整个历史都会被错误标成 causal。`causal_event_refs` 与
+`supporting_event_refs` 明确区分根因证据和辅助上下文，未纳入切片的区间通过
+`continuation_pages` 发布可直接用于 `TaskTraceRequest.cursor` 的范围，调用方无需
+猜测被省略历史的位置。
+
+外部 evaluator 的 assertion failure 可以指向任务输出；setup/test timeout、
+parse error 等 pipeline failure 必须指向 evaluator integration，并明确要求先修复或
+重新配置 evaluator 后重跑。没有具体失败 assertion 时，不得自动建议修改任务
+workspace 或把基础设施故障当作 Agent 代码缺陷。
+
+工具变更观测只为经过 before/after 内容或 metadata 证明的实际变化生成 manifest、
+diff 和 before-image artifact。进程轮询重复返回同一累计快照时不再重复生成变化事实；
+同一 session 内相同类型、checksum 和大小的证据复用一个逻辑 artifact，并由每个
+`ToolCompleted` 事件保留引用关系。副作用前的物理 restore checkpoint 仍独立创建，
+不会因为观测去重而降低恢复能力。
 
 ## 核心原则
 

@@ -141,6 +141,7 @@ export type RuntimeEventType =
   | "evaluation_completed"
   | "improvement_candidate_created"
   | "automation_candidate_created"
+  | "candidate_patch_frozen"
   | "regression_completed"
   | "promotion_decided"
   | "candidate_applied"
@@ -271,6 +272,10 @@ export type FailureDomain =
   | "external_evaluation"
   | "unknown";
 export type EvidenceStrength = "weak" | "medium" | "strong";
+export type ExternalEvaluationPhaseKind =
+  "setup" | "agent" | "test" | "assertion" | "teardown" | "other";
+export type ExternalEvaluationPhaseStatus =
+  "passed" | "failed" | "timed_out" | "error" | "skipped" | "unknown";
 export type RegressionExecutionRole = "baseline" | "candidate";
 export type ExternalEvaluationTrust = "untrusted_local" | "owner_local" | "signed";
 export type EvaluationVerdict = "pass" | "fail" | "partial" | "unknown";
@@ -1104,14 +1109,28 @@ export interface BusyPolicyDecision {
 }
 export interface DiagnosticSlice {
   artifact_refs: string[];
+  causal_event_refs?: string[];
   complete: boolean;
+  continuation_pages?: DiagnosticSliceContinuation[];
+  continuation_pages_truncated?: boolean;
   diagnosis: FailureDiagnosis;
   event_refs: string[];
   evidence_refs: string[];
   generated_at: string;
   omitted_event_count: number;
+  selection_strategy?: string;
   slice_id: string;
   source_task_id: string;
+  supporting_event_refs?: string[];
+  [k: string]: unknown;
+}
+export interface DiagnosticSliceContinuation {
+  /**
+   * Cursor for `TaskTraceRequest.cursor`; `None` starts at the first event.
+   */
+  after_sequence_no?: number | null;
+  omitted_event_count: number;
+  through_sequence_no: number;
   [k: string]: unknown;
 }
 export interface FailureDiagnosis {
@@ -1187,6 +1206,7 @@ export interface ExternalEvaluationRecord {
   imported_evidence_refs?: string[];
   ingested_at: string;
   partition?: "source" | "historical" | "generated" | "holdout" | "adversarial";
+  phases?: ExternalEvaluationPhase[];
   provider_variant?: string | null;
   result_digest: string;
   role?: RegressionExecutionRole | null;
@@ -1195,6 +1215,7 @@ export interface ExternalEvaluationRecord {
   score_max?: number | null;
   seed?: number | null;
   source_task_id: string;
+  terminal_cause?: ExternalEvaluationTerminalCause | null;
   trust: ExternalEvaluationTrust;
   verdict: EvaluationVerdict;
   [k: string]: unknown;
@@ -1224,6 +1245,25 @@ export interface ImportedEvaluationArtifact {
   checksum: string;
   size_bytes: number;
   source_ref: string;
+  [k: string]: unknown;
+}
+export interface ExternalEvaluationPhase {
+  assertion_refs?: string[];
+  completed_at?: string | null;
+  duration_ms?: number | null;
+  evidence_refs?: string[];
+  kind: ExternalEvaluationPhaseKind;
+  phase_id: string;
+  started_at?: string | null;
+  status: ExternalEvaluationPhaseStatus;
+  [k: string]: unknown;
+}
+export interface ExternalEvaluationTerminalCause {
+  code: string;
+  evidence_refs?: string[];
+  message: string;
+  phase_id?: string | null;
+  retryable?: boolean;
   [k: string]: unknown;
 }
 export interface FailureEpisode {
@@ -1375,6 +1415,7 @@ export interface EvaluationProjection {
   external_evaluations?: ExternalEvaluationRecord[];
   failure_diagnoses?: FailureDiagnosis[];
   failure_episodes?: FailureEpisode[];
+  frozen_candidate_patches?: FrozenCandidatePatch[];
   improvement_candidates: ImprovementCandidate[];
   integrity_warnings: string[];
   post_task_jobs: PostTaskJob[];
@@ -1387,6 +1428,17 @@ export interface EvaluationProjection {
   session_id: string;
   task_id: string;
   terminal: boolean;
+  [k: string]: unknown;
+}
+export interface FrozenCandidatePatch {
+  artifact_ref: string;
+  candidate_id: string;
+  digest: string;
+  file_count: number;
+  format: string;
+  frozen_at: string;
+  source_task_id: string;
+  total_bytes: number;
   [k: string]: unknown;
 }
 export interface ImprovementCandidate {
@@ -1814,6 +1866,7 @@ export interface RuntimeQuery {
 export interface RegressionCampaign {
   baseline_version: string;
   campaign_id: string;
+  candidate_artifact_ref?: string | null;
   candidate_digest: string;
   candidate_id: string;
   case_partitions?: {

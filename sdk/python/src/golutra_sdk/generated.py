@@ -431,14 +431,24 @@ class DebugProjection(TypedDict, total=False):
 
 class DiagnosticSlice(TypedDict, total=False):
     artifact_refs: Required[list[str]]
+    causal_event_refs: NotRequired[list[str]]
     complete: Required[bool]
+    continuation_pages: NotRequired[list[DiagnosticSliceContinuation]]
+    continuation_pages_truncated: NotRequired[bool]
     diagnosis: Required[FailureDiagnosis]
     event_refs: Required[list[str]]
     evidence_refs: Required[list[str]]
     generated_at: Required[str]
     omitted_event_count: Required[int]
+    selection_strategy: NotRequired[str]
     slice_id: Required[str]
     source_task_id: Required[str]
+    supporting_event_refs: NotRequired[list[str]]
+
+class DiagnosticSliceContinuation(TypedDict, total=False):
+    after_sequence_no: NotRequired[int | None]
+    omitted_event_count: Required[int]
+    through_sequence_no: Required[int]
 
 DriverControllerMode: TypeAlias = Literal['controller', 'observer']
 
@@ -726,6 +736,7 @@ class EvaluationProjection(TypedDict, total=False):
     external_evaluations: NotRequired[list[ExternalEvaluationRecord]]
     failure_diagnoses: NotRequired[list[FailureDiagnosis]]
     failure_episodes: NotRequired[list[FailureEpisode]]
+    frozen_candidate_patches: NotRequired[list[FrozenCandidatePatch]]
     improvement_candidates: Required[list[ImprovementCandidate]]
     integrity_warnings: Required[list[str]]
     post_task_jobs: Required[list[PostTaskJob]]
@@ -824,6 +835,20 @@ class ExternalEvaluationAssertion(TypedDict, total=False):
     name: Required[str]
     passed: Required[bool]
 
+class ExternalEvaluationPhase(TypedDict, total=False):
+    assertion_refs: NotRequired[list[str]]
+    completed_at: NotRequired[str | None]
+    duration_ms: NotRequired[int | None]
+    evidence_refs: NotRequired[list[str]]
+    kind: Required[ExternalEvaluationPhaseKind]
+    phase_id: Required[str]
+    started_at: NotRequired[str | None]
+    status: Required[ExternalEvaluationPhaseStatus]
+
+ExternalEvaluationPhaseKind: TypeAlias = Literal['setup', 'agent', 'test', 'assertion', 'teardown', 'other']
+
+ExternalEvaluationPhaseStatus: TypeAlias = Literal['passed', 'failed', 'timed_out', 'error', 'skipped', 'unknown']
+
 class ExternalEvaluationRecord(TypedDict, total=False):
     artifact_refs: Required[list[str]]
     assertions: Required[list[ExternalEvaluationAssertion]]
@@ -845,6 +870,7 @@ class ExternalEvaluationRecord(TypedDict, total=False):
     imported_evidence_refs: NotRequired[list[str]]
     ingested_at: Required[str]
     partition: NotRequired[EvaluationPartitionKind]
+    phases: NotRequired[list[ExternalEvaluationPhase]]
     provider_variant: NotRequired[str | None]
     result_digest: Required[str]
     role: NotRequired[RegressionExecutionRole | None]
@@ -853,8 +879,16 @@ class ExternalEvaluationRecord(TypedDict, total=False):
     score_max: NotRequired[float | None]
     seed: NotRequired[int | None]
     source_task_id: Required[str]
+    terminal_cause: NotRequired[ExternalEvaluationTerminalCause | None]
     trust: Required[ExternalEvaluationTrust]
     verdict: Required[EvaluationVerdict]
+
+class ExternalEvaluationTerminalCause(TypedDict, total=False):
+    code: Required[str]
+    evidence_refs: NotRequired[list[str]]
+    message: Required[str]
+    phase_id: NotRequired[str | None]
+    retryable: NotRequired[bool]
 
 ExternalEvaluationTrust: TypeAlias = Literal['untrusted_local', 'owner_local', 'signed']
 
@@ -921,6 +955,16 @@ class FailureSignalRef(TypedDict, total=False):
 class FailureTaxonomy(TypedDict, total=False):
     code: Required[str]
     domain: Required[FailureDomain]
+
+class FrozenCandidatePatch(TypedDict, total=False):
+    artifact_ref: Required[str]
+    candidate_id: Required[str]
+    digest: Required[str]
+    file_count: Required[int]
+    format: Required[str]
+    frozen_at: Required[str]
+    source_task_id: Required[str]
+    total_bytes: Required[int]
 
 class GeneratedTask(TypedDict, total=False):
     difficulty_score: NotRequired[float | None]
@@ -1159,6 +1203,7 @@ RedactionStatus: TypeAlias = Literal['raw', 'redacted', 'not_required']
 class RegressionCampaign(TypedDict, total=False):
     baseline_version: Required[str]
     campaign_id: Required[str]
+    candidate_artifact_ref: NotRequired[str | None]
     candidate_digest: Required[str]
     candidate_id: Required[str]
     case_partitions: NotRequired[dict[str, EvaluationPartitionKind]]
@@ -1336,7 +1381,7 @@ class RuntimeEvent(TypedDict, total=False):
 
 RuntimeEventSource: TypeAlias = Literal['runtime', 'provider', 'tool', 'policy', 'verifier', 'memory', 'evaluator', 'governor', 'evolution', 'user']
 
-RuntimeEventType: TypeAlias = Literal['command_received', 'command_completed', 'command_accepted', 'command_rejected', 'session_created', 'thread_forked', 'thread_rebound', 'task_created', 'turn_started', 'step_started', 'step_completed', 'step_checkpointed', 'turn_queued', 'busy_policy_decided', 'controller_changed', 'context_built', 'provider_started', 'provider_streamed', 'provider_completed', 'provider_failed', 'token_usage_recorded', 'assistant_message', 'tool_started', 'tool_progress', 'tool_completed', 'policy_evaluated', 'verification_completed', 'loop_decided', 'checkpoint_created', 'task_completed', 'task_abort_requested', 'task_aborted', 'task_interrupted', 'task_uncertain', 'task_reconciled', 'task_paused', 'task_resumed', 'approval_requested', 'approval_resolved', 'retry_scheduled', 'provider_fallback', 'provider_transport_fallback', 'provider_auth_required', 'provider_auth_submitted', 'provider_auth_cancelled', 'provider_configured', 'provider_probe_started', 'provider_probe_completed', 'provider_auth_failed', 'provider_rate_limited', 'provider_credential_refreshed', 'loop_guard_triggered', 'compaction_started', 'compaction_completed', 'compaction_failed', 'memory_retrieved', 'memory_promoted', 'memory_promotion_rejected', 'memory_rolled_back', 'memory_feedback_recorded', 'post_task_reviewed', 'evaluation_completed', 'improvement_candidate_created', 'automation_candidate_created', 'regression_completed', 'promotion_decided', 'candidate_applied', 'candidate_rolled_back', 'benchmark_recorded', 'counterfactual_compared', 'evolution_planned', 'evolution_task_started', 'evolution_task_completed', 'evolution_completed', 'skill_staged', 'skill_reviewed', 'skill_installed', 'skill_rolled_back', 'governor_decided', 'storage_maintenance_completed', 'context_snapshot_created', 'post_task_job_queued', 'post_task_job_started', 'post_task_job_completed', 'post_task_job_failed', 'verification_planned', 'verification_assertion_completed', 'regression_campaign_started', 'regression_execution_completed', 'memory_candidate_quarantined', 'memory_activated', 'memory_invalidated', 'failure_diagnosed', 'failure_episode_recorded', 'diagnostic_slice_created', 'replay_capsule_created', 'replay_executed', 'external_evaluation_ingested', 'external_evaluation_compared']
+RuntimeEventType: TypeAlias = Literal['command_received', 'command_completed', 'command_accepted', 'command_rejected', 'session_created', 'thread_forked', 'thread_rebound', 'task_created', 'turn_started', 'step_started', 'step_completed', 'step_checkpointed', 'turn_queued', 'busy_policy_decided', 'controller_changed', 'context_built', 'provider_started', 'provider_streamed', 'provider_completed', 'provider_failed', 'token_usage_recorded', 'assistant_message', 'tool_started', 'tool_progress', 'tool_completed', 'policy_evaluated', 'verification_completed', 'loop_decided', 'checkpoint_created', 'task_completed', 'task_abort_requested', 'task_aborted', 'task_interrupted', 'task_uncertain', 'task_reconciled', 'task_paused', 'task_resumed', 'approval_requested', 'approval_resolved', 'retry_scheduled', 'provider_fallback', 'provider_transport_fallback', 'provider_auth_required', 'provider_auth_submitted', 'provider_auth_cancelled', 'provider_configured', 'provider_probe_started', 'provider_probe_completed', 'provider_auth_failed', 'provider_rate_limited', 'provider_credential_refreshed', 'loop_guard_triggered', 'compaction_started', 'compaction_completed', 'compaction_failed', 'memory_retrieved', 'memory_promoted', 'memory_promotion_rejected', 'memory_rolled_back', 'memory_feedback_recorded', 'post_task_reviewed', 'evaluation_completed', 'improvement_candidate_created', 'automation_candidate_created', 'candidate_patch_frozen', 'regression_completed', 'promotion_decided', 'candidate_applied', 'candidate_rolled_back', 'benchmark_recorded', 'counterfactual_compared', 'evolution_planned', 'evolution_task_started', 'evolution_task_completed', 'evolution_completed', 'skill_staged', 'skill_reviewed', 'skill_installed', 'skill_rolled_back', 'governor_decided', 'storage_maintenance_completed', 'context_snapshot_created', 'post_task_job_queued', 'post_task_job_started', 'post_task_job_completed', 'post_task_job_failed', 'verification_planned', 'verification_assertion_completed', 'regression_campaign_started', 'regression_execution_completed', 'memory_candidate_quarantined', 'memory_activated', 'memory_invalidated', 'failure_diagnosed', 'failure_episode_recorded', 'diagnostic_slice_created', 'replay_capsule_created', 'replay_executed', 'external_evaluation_ingested', 'external_evaluation_compared']
 
 class RuntimeGovernorDecision(TypedDict, total=False):
     action: Required[GovernorAction]
@@ -1828,6 +1873,7 @@ __all__ = [
     "DebugEventWindow",
     "DebugProjection",
     "DiagnosticSlice",
+    "DiagnosticSliceContinuation",
     "DriverControllerMode",
     "DriverEnvelope",
     "DriverEnvelopeAbort",
@@ -1885,7 +1931,11 @@ __all__ = [
     "EvidenceStrength",
     "EvolutionState",
     "ExternalEvaluationAssertion",
+    "ExternalEvaluationPhase",
+    "ExternalEvaluationPhaseKind",
+    "ExternalEvaluationPhaseStatus",
     "ExternalEvaluationRecord",
+    "ExternalEvaluationTerminalCause",
     "ExternalEvaluationTrust",
     "ExternalVerificationSpec",
     "FailureDiagnosis",
@@ -1896,6 +1946,7 @@ __all__ = [
     "FailureSignalKind",
     "FailureSignalRef",
     "FailureTaxonomy",
+    "FrozenCandidatePatch",
     "GeneratedTask",
     "GeneratedTaskExecution",
     "GoalAlignmentCheck",

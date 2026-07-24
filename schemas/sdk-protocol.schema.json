@@ -2513,8 +2513,27 @@
             "format": "uuid"
           }
         },
+        "causal_event_refs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
         "complete": {
           "type": "boolean"
+        },
+        "continuation_pages": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/DiagnosticSliceContinuation"
+          }
+        },
+        "continuation_pages_truncated": {
+          "type": "boolean",
+          "default": false
         },
         "diagnosis": {
           "$ref": "#/$defs/FailureDiagnosis"
@@ -2542,12 +2561,24 @@
           "format": "uint64",
           "minimum": 0
         },
+        "selection_strategy": {
+          "type": "string",
+          "default": ""
+        },
         "slice_id": {
           "type": "string"
         },
         "source_task_id": {
           "type": "string",
           "format": "uuid"
+        },
+        "supporting_event_refs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
         }
       },
       "required": [
@@ -2560,6 +2591,35 @@
         "omitted_event_count",
         "complete",
         "generated_at"
+      ]
+    },
+    "DiagnosticSliceContinuation": {
+      "type": "object",
+      "properties": {
+        "after_sequence_no": {
+          "description": "Cursor for `TaskTraceRequest.cursor`; `None` starts at the first event.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "omitted_event_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "through_sequence_no": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "through_sequence_no",
+        "omitted_event_count"
       ]
     },
     "DriverControllerMode": {
@@ -3819,6 +3879,13 @@
             "$ref": "#/$defs/FailureEpisode"
           }
         },
+        "frozen_candidate_patches": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/FrozenCandidatePatch"
+          }
+        },
         "improvement_candidates": {
           "type": "array",
           "items": {
@@ -4368,6 +4435,86 @@
         "evidence_refs"
       ]
     },
+    "ExternalEvaluationPhase": {
+      "type": "object",
+      "properties": {
+        "assertion_refs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "completed_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time",
+          "default": null
+        },
+        "duration_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "evidence_refs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "kind": {
+          "$ref": "#/$defs/ExternalEvaluationPhaseKind"
+        },
+        "phase_id": {
+          "type": "string"
+        },
+        "started_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time",
+          "default": null
+        },
+        "status": {
+          "$ref": "#/$defs/ExternalEvaluationPhaseStatus"
+        }
+      },
+      "required": [
+        "phase_id",
+        "kind",
+        "status"
+      ]
+    },
+    "ExternalEvaluationPhaseKind": {
+      "type": "string",
+      "enum": [
+        "setup",
+        "agent",
+        "test",
+        "assertion",
+        "teardown",
+        "other"
+      ]
+    },
+    "ExternalEvaluationPhaseStatus": {
+      "type": "string",
+      "enum": [
+        "passed",
+        "failed",
+        "timed_out",
+        "error",
+        "skipped",
+        "unknown"
+      ]
+    },
     "ExternalEvaluationRecord": {
       "type": "object",
       "properties": {
@@ -4469,6 +4616,13 @@
           "$ref": "#/$defs/EvaluationPartitionKind",
           "default": "source"
         },
+        "phases": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ExternalEvaluationPhase"
+          }
+        },
         "provider_variant": {
           "type": [
             "string",
@@ -4520,6 +4674,17 @@
           "type": "string",
           "format": "uuid"
         },
+        "terminal_cause": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExternalEvaluationTerminalCause"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "trust": {
           "$ref": "#/$defs/ExternalEvaluationTrust"
         },
@@ -4545,6 +4710,39 @@
         "result_digest",
         "trust",
         "ingested_at"
+      ]
+    },
+    "ExternalEvaluationTerminalCause": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "evidence_refs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "message": {
+          "type": "string"
+        },
+        "phase_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "retryable": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "code",
+        "message"
       ]
     },
     "ExternalEvaluationTrust": {
@@ -4879,6 +5077,52 @@
       "required": [
         "domain",
         "code"
+      ]
+    },
+    "FrozenCandidatePatch": {
+      "type": "object",
+      "properties": {
+        "artifact_ref": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "candidate_id": {
+          "type": "string"
+        },
+        "digest": {
+          "type": "string"
+        },
+        "file_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "format": {
+          "type": "string"
+        },
+        "frozen_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "source_task_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "total_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "candidate_id",
+        "source_task_id",
+        "artifact_ref",
+        "digest",
+        "format",
+        "file_count",
+        "total_bytes",
+        "frozen_at"
       ]
     },
     "GeneratedTask": {
@@ -6054,6 +6298,14 @@
           "type": "string",
           "format": "uuid"
         },
+        "candidate_artifact_ref": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid",
+          "default": null
+        },
         "candidate_digest": {
           "type": "string"
         },
@@ -7112,6 +7364,7 @@
         "evaluation_completed",
         "improvement_candidate_created",
         "automation_candidate_created",
+        "candidate_patch_frozen",
         "regression_completed",
         "promotion_decided",
         "candidate_applied",

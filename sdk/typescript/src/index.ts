@@ -53,7 +53,7 @@ import type {
 const JSON_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024;
 const MAX_COMPLETE_TRACE_PAGES = 4096;
-export const RUNTIME_PROTOCOL_VERSION = 6;
+export const RUNTIME_PROTOCOL_VERSION = 7;
 
 class HttpStatusError extends Error {
   constructor(

@@ -16,7 +16,7 @@ execution-backed regression 和可信晋升输入的 P2.5 实施记录见 `runti
 
 ## 当前实现边界
 
-截至 2026-07-15：
+截至 2026-07-24：
 
 - failed/partial trajectory 可生成 `ImprovementCandidate`、`BenchmarkPromotion`、`GeneratedTask` 和对应 `AutomationCandidate`；成功且有 evidence 的 trajectory 可生成 `SkillCandidate`。
 - GeneratedTask 只有通过 budget、novelty、difficulty、fixture-only 和 no-external-side-effects gate 才会在隔离目录、deterministic mock provider、同一 RuntimeHost/Verification 主链中执行；结果和 verification ref 持久化到 evolution state。
@@ -26,6 +26,8 @@ execution-backed regression 和可信晋升输入的 P2.5 实施记录见 `runti
 - candidate 状态转换受约束，不能跳过 regression/promotion gate；apply 后可 rollback，原因和 applied version 会持久化。
 - `RuntimeGovernor` 在 provider/tool/result/completion 阶段执行确定性 token/cost/tool/time budget、policy/security risk 和目标对齐检查，但不自动生成或部署改动。
 - deep review 通过 TaskCompleted 前写入的 durable PostTaskJob 执行；worker 使用 lease/retry/recovery，Embedded one-shot 退出后由下一 Host/daemon 接管。
+- deep failure 的 `ImprovementCandidate` 与 `RuntimeChange AutomationCandidate` 使用同一 candidate id 和同步状态；diagnosis 或 external evaluation 更新后，摘要、证据、回归计划与 rollback ref 同步刷新。
+- runtime change 候选由 dispatcher 自动推进。存在 `candidate_patch_set` 时使用冻结 bytes 启动隔离回归；不存在可执行补丁时写入真实的 blocked `RegressionResult(NeedsReview)` 和 `PromotionDecision(NeedsHumanReview)`。该路径不调用 `CandidateApplied`。
 
 核心原则：
 
@@ -133,7 +135,7 @@ RegressionResult
 - 涉及 context、memory、tool policy、provider route、prompt 或 security policy 的候选，优先使用 CounterfactualReplay 做对照。
 - 不能用同一个模型 judge 的一句话作为唯一判断。
 
-`run_regression` 只负责对已记录 execution facts 做纯比较；冻结候选的“跑”语义由 `RuntimeHost::run_regression_campaign` 提供。campaign 的每个 durable `case_ref` 都使用同 fixture、同预算、同 verifier version 建立独立 baseline/candidate workspace 与 RuntimeHost；complete trace 和引用 blob 在临时 home 删除前打包进父 workspace governance artifact，再把带 `case_ref` 的 paired refs 写入 evaluation store。任一 case 缺完整、可持久读取的 pair 时 verdict 为 `NeedsReview`，并继续产生显式 `PromotionDecision`。
+`run_regression` 只负责对已记录 execution facts 做纯比较；冻结候选的“跑”语义由 `RuntimeHost::run_regression_campaign` 提供。首次接收 `candidate_files` 时先生成不可变、checksummed `candidate_patch_set` artifact 与 `CandidatePatchFrozen` 事件，campaign 只引用该 artifact 和 canonical digest，后续请求不能替换 bytes。campaign 的每个 durable `case_ref` 都使用同 fixture、同预算、同 verifier version 建立独立 baseline/candidate workspace 与 RuntimeHost；complete trace 和引用 blob 在临时 home 删除前打包进父 workspace governance artifact，再把带 `case_ref` 的 paired refs 写入 evaluation store。任一 case 缺完整、可持久读取的 pair 时 verdict 为 `NeedsReview`，并继续产生显式 `PromotionDecision`。
 
 ## PromotionDecision
 
@@ -202,6 +204,16 @@ ImprovementCandidate + candidate digest
 -> paired trace / verification refs
 -> execution-backed RegressionResult
 -> PromotionDecision
+```
+
+自动 dispatcher 的保守分支同样是完整闭环：
+
+```text
+ImprovementCandidate
+-> RuntimeChange candidate
+-> candidate_patch_set present ? isolated regression : blocked regression
+-> PromotionDecision
+-> never auto-apply runtime code
 ```
 
 已完成的受治理 Evolution/Skill 阶段：

@@ -14,7 +14,7 @@ from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 
-RUNTIME_PROTOCOL_VERSION = 6
+RUNTIME_PROTOCOL_VERSION = 7
 JSON_REQUEST_TIMEOUT_SECONDS = 30
 MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_SSE_EVENT_BYTES = 1024 * 1024
