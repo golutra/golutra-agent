@@ -5,6 +5,7 @@ import types
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 
 def _load_adapter():
@@ -67,6 +68,59 @@ ADAPTER = _load_adapter()
 
 
 class AdapterHelpersTest(unittest.TestCase):
+    def test_collector_resolution_is_explicit_and_repository_local(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            explicit = root / "explicit"
+            environment = root / "environment"
+            release = root / "target/release/golutra-cli"
+            debug = root / "target/debug/golutra-cli"
+            for candidate in (explicit, environment, release, debug):
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                candidate.write_text("#!/bin/sh\n", encoding="utf-8")
+                candidate.chmod(0o755)
+
+            with patch.dict(
+                ADAPTER.os.environ,
+                {"GOLUTRA_TBENCH_COLLECTOR": str(environment)},
+            ):
+                self.assertEqual(
+                    ADAPTER.GolutraAgent._resolve_collector_binary(
+                        str(explicit), repository_root=root
+                    ),
+                    explicit.resolve(),
+                )
+                self.assertEqual(
+                    ADAPTER.GolutraAgent._resolve_collector_binary(
+                        None, repository_root=root
+                    ),
+                    environment.resolve(),
+                )
+
+            with patch.dict(
+                ADAPTER.os.environ,
+                {"GOLUTRA_TBENCH_COLLECTOR": ""},
+            ):
+                self.assertEqual(
+                    ADAPTER.GolutraAgent._resolve_collector_binary(
+                        None, repository_root=root
+                    ),
+                    release.resolve(),
+                )
+                release.unlink()
+                self.assertEqual(
+                    ADAPTER.GolutraAgent._resolve_collector_binary(
+                        None, repository_root=root
+                    ),
+                    debug.resolve(),
+                )
+                debug.unlink()
+                self.assertIsNone(
+                    ADAPTER.GolutraAgent._resolve_collector_binary(
+                        None, repository_root=root
+                    )
+                )
+
     def test_trace_identity_uses_manifest_path_relative_to_run_root(self):
         with TemporaryDirectory() as temporary:
             run_dir = Path(temporary)

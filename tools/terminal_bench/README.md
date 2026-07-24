@@ -55,7 +55,11 @@ only adapts the trial lifecycle and consumes the retained Golutra bundle:
 The preferred bundle directory is `<trial>/golutra-runtime`; older harness
 layouts under `<trial>/sessions/golutra-runtime` remain readable. The collector
 waits for both `results.json` and the runtime manifest, derives only evidence
-files that actually exist, and invokes `golutra --run-bundle ... eval ingest`.
+files that actually exist, and invokes `<collector> --run-bundle ... eval ingest`.
+It resolves that host collector from the explicit `collector_binary` agent
+argument, `GOLUTRA_TBENCH_COLLECTOR`, then this repository's release or debug
+`golutra-cli` binary. It does not select an unrelated `golutra` command from
+the host `PATH`.
 If the result file, runtime identity, trace, or collector is unavailable, it
 keeps a `golutra-evaluation.pending.json` file with the reason and the original
 record instead of dropping the structured observation. This makes a later

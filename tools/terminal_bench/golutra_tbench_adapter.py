@@ -159,19 +159,18 @@ class GolutraAgent(BaseAgent):
         return candidate
 
     @staticmethod
-    def _resolve_collector_binary(configured: str | None) -> Path | None:
+    def _resolve_collector_binary(
+        configured: str | None,
+        *,
+        repository_root: Path | None = None,
+    ) -> Path | None:
+        repository_root = repository_root or Path(__file__).resolve().parents[2]
         candidates = [
             configured,
             os.environ.get("GOLUTRA_TBENCH_COLLECTOR"),
-            shutil.which("golutra"),
+            repository_root / "target" / "release" / "golutra-cli",
+            repository_root / "target" / "debug" / "golutra-cli",
         ]
-        repository_root = Path(__file__).resolve().parents[2]
-        candidates.extend(
-            [
-                str(repository_root / "target" / "release" / "golutra"),
-                str(repository_root / "target" / "debug" / "golutra"),
-            ]
-        )
         for candidate in candidates:
             if not candidate:
                 continue
