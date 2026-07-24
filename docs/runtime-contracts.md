@@ -13,15 +13,22 @@
 
 - `ToolContract` 使用唯一的 JSON Schema 校验输入；必填 path/pattern/edit search 拒绝空串，校验错误隐藏实例值，summary、structured facts 和 raw output 在持久化前统一脱敏；policy、workspace guard、approval、execution、artifact/evidence 顺序固定。
 - shell 使用 `shlex` 解析结构化 argv，不经过 shell 解释器；policy 会阻断敏感路径、`find -exec/-delete`、`rg --pre` 等执行型参数，把 `sed -i`、`cargo run`、未知脚本等降为 Ask；执行器支持 timeout、`CancellationToken`、每管道 2 MiB 上限，并在 Unix 上终止整个进程组后排空管道。`golutra-sandbox` 在 macOS 使用 Seatbelt、Linux 检测 bubblewrap，外部 MCP 没有 OS-enforced sandbox 时拒绝执行。
+- `PolicyEvaluation.block_disposition` 把当前调用阻断区分为 `recoverable` 和 `terminal`：参数/schema 错误、缺失路径和可纠正的 shell 语法只生成 durable blocked/error tool result，回送模型后受连续失败预算约束；敏感路径、workspace escape、破坏性命令及旧事件中未分类的 Block 仍立即终止任务。Runtime 不通过 reason 文本猜测处置级别。
 - `RuntimeHost` 保存 task handle、pending turn queue 和 durable command ack；pause/resume/abort 影响真实执行，不是 UI 标记。终态 lane 拒绝控制转换。owner 退出后，新 host 取得 session lease 才能分析 durable event chain：只有未闭合读操作时写 `TaskInterrupted`，存在未闭合副作用工具或后台进程时写 `TaskUncertain`；两者都明确 `safe_to_replay=false`，已经 `TurnStarted` 的输入永不自动重放。`TaskUncertain` 会冻结新 prompt 和未开始的 pending turn，直到 `ReconcileTask` 写入结构化 `TaskReconciliationRecord`；对账不能把任务伪造成 `Completed`。
 - `AgentLoop` 支持多轮 assistant/tool message、LoopGuard、有限 retry/fallback 和 verification-backed terminal state。初始或工具消息累积导致的 context overflow 会产生 `LoopGuardTriggered` 和 Blocked/AskUser `LoopDecision`，不会降级成笼统执行错误。
-- 文件工具和 shell 等可产生工作区副作用的工具在修改前捕获并持久化有界 before-image；checkpoint manifest 与 owner-only artifact blob 带 checksum、redaction 状态和 rollback metadata，持久化失败时不执行文件副作用。无法覆盖完整工作区时仍记录 checkpoint，但明确标记 `before_image_complete=false`，不得把它当作完整回滚保证。
-- Embedded、Unix IPC 与 HTTP/SSE transport 使用同一 `SessionCommand`、`RuntimeQuery`、`RuntimeEvent` 语义和 protocol version；包含 `ToolProgress` 的当前 runtime protocol 为 v4，v3 reader 不与新事件流协商。用户级 daemon 通过 attachment 路由多个 cwd，Unix socket owner-only，HTTP 仅允许安全 endpoint 并校验 bearer/Host/Origin。SQLite 在 event append 事务内原子分配全局 sequence，host 再按提交顺序 publish；command lease 与 durable ack 负责重试去重，但 command ack 与后续业务事件仍不是一个跨运行时事务。
+- 工作区写入、编辑或一次成功工具调用只证明发生了动作，不构成 objective validation。最后一次未验证修改之后必须出现新的测试、诊断、`cmp`/`diff` 或严格 Git 比较；模型在缺少该证据时提前结束，Runtime 最多两次写入 durable `RetryScheduled` 并把验证要求回送模型。clean status、log 和目录列表不能满足该门禁。
+- caller-owned external verifier 在模型停止后通过受限 argv runner 执行，因此已声明 verifier 的任务不再要求模型重复运行 shell。相同 `(check name, command)` 的失败后重跑只保留最新结果：成功重跑可以覆盖同一检查及其已恢复的探索性工具失败，其他不同检查的未解决失败仍保留。
+- 文件工具和 shell 等可产生工作区副作用的工具在修改前捕获并持久化有界 before-image；checkpoint manifest 与 owner-only artifact blob 带 checksum、redaction 状态和 rollback metadata，持久化失败时不执行文件副作用。无法覆盖完整工作区时仍记录 checkpoint，但明确标记 `before_image_complete=false` 和 `omitted_before_image_count`，不得把它当作完整回滚保证；shell 的部分快照可以省略 gitignored/sensitive image，直接文件工具仍严格拒绝无法 checkpoint 的目标。
+- Embedded、Unix IPC 与 HTTP/SSE transport 使用同一 `SessionCommand`、`RuntimeQuery`、`RuntimeEvent` 语义和 protocol version；加入 causal envelope、诊断/replay/external-evaluation 事件和 `ProviderFailed` 生命周期终态后的当前 runtime protocol 为 v5，旧 reader 不与新事件流协商。用户级 daemon 通过 attachment 路由多个 cwd，Unix socket owner-only，HTTP 仅允许安全 endpoint 并校验 bearer/Host/Origin。SQLite 在 event append 事务内原子分配全局 sequence，host 再按提交顺序 publish；command lease 与 durable ack 负责重试去重，但 command ack 与后续业务事件仍不是一个跨运行时事务。
 - 外部 MCP 工具必须来自 checksum 未变化的 reviewed/enabled plugin revision，远端 `tools/list` schema 必须与 manifest 一致；默认 Ask，批准前不启动进程，批准后继续经过 timeout/cancel/redaction/artifact/evidence，远端 annotation 不参与权限决策。
 - provider 缺失会把 lane 置为 `WaitingAuthentication` 并产生 durable `ProviderAuthRequired`；客户端只提交 verified provider config 的 request id，secret 不通过 runtime command/event 传递。取消或 probe 失败都有显式终态。
 - checkpoint 每 workspace 保留最近 20 个；artifact 维护按 retention/expiry 清理 blob，并保护仍被 lineage、verification 或 rollback 引用的记录。
 - 工具生命周期统一使用稳定 `tool_call_id`：`ToolStarted` 写入脱敏且有界的展示参数，`ToolProgress` 只写可丢失的采样诊断，`ToolCompleted` 写入终态 envelope 和执行指标；硬执行错误也必须转换为 `ToolCompleted(error)`。展示参数保留 `path`、`command`、`pattern`、`query`、`symbol`、`timeout_ms` 等定位字段，`content`、`search`、`replace` 等正文只保留长度摘要，序列化结果硬限制为 8 KiB。shell 的 stdout/stderr 会完整 drain，管道消息队列、保留输出、diff preview 和 workspace before/after scan 均有硬上限。
 - shell 扫描发现的新增、修改、删除文件进入 `changed_files`、before-image 和执行时捕获的 after-image；扫描越过文件数/内容预算、遇到排除目录或无法读取时写 `workspace_changes_known=false`。完整 unified diff 以 redacted、checksum、最多 2 MiB 的 `workspace_diff` artifact 持久化，结构化 diff preview 还有跨文件总预算，不能把未知状态解释为零变更。
+- canonical event append 前必须由 `CausalLedger` 补齐 envelope/parent/lifecycle link；append 失败回滚 ledger。`ProviderStarted` 必须由 `ProviderCompleted` 或 `ProviderFailed` 闭合，tool/verification 也必须有对应终态；缺口直接使 `TraceIntegrity.complete=false`。
+- executable replay 必须绑定 source task 的最后 event sequence 与 prefix digest，且 provider request、tool call、artifact owner/type/redaction/checksum/size 全部匹配；projection replay、缺 fixture 或 divergence 不得成为 promotion evidence。
+- persisted run 不能依赖会随合法 evaluator append 改变的 SQLite 文件 checksum 判断篡改；每次打开都必须以 checksummed prior trace 为边界，重算 SQLite source event prefix，并验证其引用 artifact 的 metadata 与 blob checksum。trace 文件、路径组件或 source prefix 任一不一致时，在执行 status/diagnose/eval 命令前拒绝 bundle。
+- external evaluation 必须验证 source digest、runtime identity、canonical result digest 和 trust。holdout 只接受 owner trust store 中 Ed25519 key 的有效签名；regression 逐 `case × partition × provider × seed` 要求 baseline/candidate pair，缺 cell 时只能 `NeedsReview`。
 
 ## 核心原则
 
@@ -237,7 +244,7 @@ LoopGuardContract
 
 要求：
 
-- 同一工具连续确定性失败达到阈值后，必须改变策略、询问用户或 blocked。
+- 同一工具连续确定性失败达到阈值后，必须改变策略、询问用户或 blocked；同一个 provider response 中重复的等价调用只计一个失败轮次，模型至少先看到一次失败结果再判断为跨轮重复。
 - provider 空回复只能有限恢复，恢复用的 synthetic message 不能进入长期历史。
 - context overflow 优先裁剪旧工具输出和低价值上下文；裁剪失败必须产生 `LoopGuardTriggered`，并进入 Blocked/AskUser `LoopDecision`。
 - max iteration 后必须产生 `stop_partial`、`stop_failed` 或 `blocked`，不能无声结束。
@@ -316,6 +323,7 @@ RolloutEnvelope
 - retry 不会重复制造副作用。
 - fallback 不会绕过 `LoopDecision`。
 - stop_success 不会绕过 `VerificationRecord`。
+- 工作区 mutation 后没有 fresh objective validation 时不能 stop_success；同一检查成功重跑后不再被它已取代的失败尝试永久降级。
 - running task 中的新输入不会绕过 `RuntimeLaneContract`。
 - crash recovery 不会重放已经开始的 turn；不确定副作用未显式 reconciliation 前不能继续 session。
 - loop guard 不允许重复工具失败、空回复、context overflow 或 max iteration 形成无界循环。

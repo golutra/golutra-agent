@@ -10,7 +10,7 @@
 
 ## 当前实现状态
 
-截至 2026-07-16，runtime 已具备持久化 evaluation、完整 trace 和多投影观测；P2.5 当前范围已经形成可信闭环，并把完整事实交给独立 P3 本地 Supervisor：
+截至 2026-07-23，runtime 已具备持久化 evaluation、完整 trace 和多投影观测；P2.5 当前范围已经形成可信闭环，并把完整事实交给独立 P3 本地 Supervisor：
 
 - terminal task 可生成 `PostTaskReview`、`EvaluationCase`、`TrajectoryReplay`、`EvaluationRun` 和 `EvaluationResult`，并按 canonical cwd hash 持久化到 `$GOLUTRA_HOME/state/workspaces/<cwd-hash>/evaluation.json`；状态更新有文件锁、大小边界和 owner-only 权限。
 - pass/partial/fail、latency、evidence refs、residual risks 和 failure taxonomy 来自 runtime facts 与 verification plan/assertions，不从聊天文本反推；当前支持的路径、内容、命令和 policy assertion 会进入三维 hard gate，无法客观证明的标准保持 Unknown/Partial。
@@ -23,6 +23,67 @@
 - `golutra-supervisor` 只接收 complete TaskTrace，使用 paired execution、sealed/fresh/security/migration、holdout disclosure budget 和 OS-enforced TrustedBuilder 决定 runtime code release；普通 Runtime 无 stable pointer 写权限。
 
 隔离 GeneratedTask 已能由 `golutra-evolution` 通过独立 fixture RuntimeHost 执行；任意冻结候选的 baseline/candidate regression 也已由 `golutra-client` 接入。完整 `TaskTrace`、SQLite durable job、语义 verification 和 execution-backed regression 属于已完成的 P2.5 当前范围。
+
+## 事实完整性与因果账本
+
+`RuntimeEvent` 不是只按时间排序的日志。RuntimeHost 在落库前由
+`CausalLedger` 补齐 `schema_version`、`CausalContext`、`parent_event_id`
+和生命周期链接；事件 append 失败时 ledger 索引回滚，失败的 provider/tool
+尝试不会污染下一次 `RespondsTo` 关联。provider 生命周期必须闭合为：
+
+```text
+ProviderStarted
+  -> ProviderStreamed*
+  -> ProviderCompleted | ProviderFailed
+```
+
+`TaskTraceService` 会同时检查 event-chain digest、父链接、provider/tool
+生命周期、verification 计划/结果、runtime identity 和引用 artifact 的
+checksum。任何缺口都进入 `TraceIntegrity` 的具体字段，而不是把 trace
+标成看似完整的 JSON。`DebugProjection` 仍是有界窗口；完整事实必须通过
+分页 `TaskTracePage` 或 run bundle 读取。
+
+## 可执行回放边界
+
+历史事件重放和再次执行不是同一能力：
+
+| 模式 | 内容 | promotion 资格 |
+| --- | --- | --- |
+| projection | 重新投影事件、状态和视图 | 否 |
+| deterministic control flow | 从 owner-only artifact 读取 provider/tool fixture，再进入同一 `AgentLoop` | 仅作为诊断/回归辅助 |
+| live regression | 在隔离 workspace/RuntimeHost 中重新执行 baseline 与 candidate | 可作为 paired evidence |
+
+`ReplayCapsule` 必须包含 provider exchange、tool result、runtime config
+digest、source event 最后序号和 source prefix digest。执行前只允许读取该
+source prefix；边界缺失、digest 改变、请求/工具参数不匹配或 fixture 队列
+耗尽都会产生终态 `ReplayExecution`，并写入 `ReplayExecuted`，不能静默退化
+成一次普通成功任务。raw replay artifact 只允许 owner-local 读取，普通
+summary/full 投影不把 secret 或 raw request 复制进用户视图。
+
+## 外部评估与回归矩阵
+
+外部 evaluator 不是可信的“直接写分数”接口。`eval ingest` 先验证：
+
+1. `base_trace_digest` 与 source task 的完整 event prefix 一致。
+2. `runtime_identity` 与 source trace 一致。
+3. `result_digest` 等于 evaluator 事实的 canonical digest。
+4. `holdout` 必须 `holdout_protected=true`，且只有 `signed` + 有效 Ed25519
+   attestation 才能进入 holdout gate。
+5. `owner_local` 只接受 owner/CLI/TUI actor；`untrusted_local` 永远不能
+   满足 promotion gate。
+
+campaign 的覆盖不是“有若干结果”就算完成，而是精确覆盖：
+
+```text
+case_ref × partition × provider_variant × seed
+```
+
+每个 cell 必须有完整 baseline/candidate pair，可以来自隔离 execution，也
+可以来自通过信任校验的外部 pair。`RegressionCoverage.missing_cells` 会
+列出具体缺失 cell；`minimum_trusted_external_pairs` 统计的是 pair 数，不是
+单条 evaluation 数。任意缺 cell、holdout 泄漏、untrusted external result、
+不完整 trace 或 unknown verification 都只能生成 `NeedsReview`，并且三种
+回归结论都必须写出显式 `PromotionDecision`。
 
 ## 核心原则
 

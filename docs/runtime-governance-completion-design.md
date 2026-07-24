@@ -23,7 +23,7 @@ P3 不能绕过本文。没有完整事实、可靠验证和真实 regression，
 
 ## 当前事实与缺口
 
-截至 2026-07-16，真实隔离任务已经证明以下主链存在：
+截至 2026-07-23，真实隔离任务已经证明以下主链存在：
 
 - 成功 coding task 会持久化 context、provider、tool、policy、checkpoint、verification、LoopDecision、memory 和 minimal evaluation 事件。
 - failed/partial task 会生成 deep PostTaskReview、ImprovementCandidate 和 AutomationCandidate。
@@ -51,6 +51,37 @@ artifact metadata available != artifact content inspectable
 candidate proposed != improvement verified
 memory gated != memory pollution eliminated
 ```
+
+### 因果完整性与失败闭合
+
+RuntimeHost 在 append 前维护 per-session/per-task `CausalLedger`，统一补齐
+`CausalContext`、父事件和 provider/tool/verification 生命周期链接。ledger
+只在 event transaction 成功后推进；重复键、校验失败或存储错误不会把失败
+尝试留在后续事件的因果头上。provider 失败也有独立的
+`ProviderFailed` 终态，不能只留下一个未闭合的 `ProviderStarted`。
+
+`TraceIntegrity` 的 `missing_causal_links`、`broken_lifecycle_pairs`、
+`provenance_mismatches`、`artifact_checksum_failures` 和
+`external_overlay_failures` 都是 promotion/complete 的硬输入。debug 窗口
+只是一种投影，不代表完整性；完整 trace 必须按 cursor 聚合并校验 event
+chain digest。
+
+### Replay 与外部 evaluator 的边界
+
+`ReplayCapsule` 保存 source event prefix 的最后序号和 digest。deterministic
+replay 只向 `AgentLoop` 注入 owner-only provider/tool artifact fixture，并
+验证请求、工具调用、artifact 所属 session、类型、redaction、大小和
+checksum。缺 source boundary 或发生 divergence 时，结果是显式
+`Incomplete`/`Diverged` replay record，不得被当成 execution-backed
+regression。
+
+外部 evaluator 通过 `ExternalEvaluationRecord` 进入 canonical overlay：host
+验证 base trace digest、runtime identity、canonical result digest、trust
+level 和 holdout disclosure，再写 `ExternalEvaluationIngested`。回归覆盖按
+`case_ref × partition × provider_variant × seed` 展开，每个 cell 必须有
+baseline/candidate pair；`minimum_trusted_external_pairs` 的单位是 pair。
+不完整矩阵、未签名 holdout、untrusted local result 或缺 paired trace 都只
+能得到 `NeedsHumanReview`。
 
 ## 成功定义
 

@@ -124,10 +124,14 @@ ContextProjectionCache
 当前状态：
 
 1. `GoalLedger + GoalAlignmentCheck + RuntimeGovernor` 已在 provider/tool/result/completion 边界执行，不调用额外 judge。
-2. 验证已按 plain conversation、workspace objective、workspace change 和 code change 分级，并用 `VerificationCheckKind` 记录客观来源。
+2. 验证已按 plain conversation、workspace objective、workspace change 和 code change 分级，并用 `VerificationCheckKind` 记录客观来源。mutation 不等于 validation；最后一次工作区修改后若缺少新的客观检查，AgentLoop 会以 `RetryScheduled` 最多回送两次验证要求。caller-owned external verifier 直接承担后置检查，不重复要求模型执行 shell；同一检查重跑以最新结果为准。
 3. deep PostTaskReview/evaluation 在终态前先持久 enqueue，之后由带 lease/retry/recovery 的 worker 执行；普通 TUI 不查询 debug/evaluation projection。
 4. `EventSamplingPolicy` 只保留配置模型；canonical RuntimeEvent 不能采样丢失，当前也没有独立高成本派生索引需要抽样。
 5. `ContextProjectionCache` 只保留带 invalidation refs 的模型；当前 ContextBuilder 成本未形成瓶颈，启用 cache 反而会引入 stale context 风险。
+6. `CausalLedger` 在 canonical append 前补齐事件 provenance，并把 provider failure、tool completion、verification 和 external evaluation 连接到可审计的因果链；event append 失败会回滚 ledger 索引。
+7. deterministic replay 只消费带 source sequence boundary 的 owner-only artifact capsule；`ReplayExecution` 的 divergence/incomplete 不能伪装成 execution-backed regression。
+8. 外部评估按精确 `case × partition × provider × seed` 矩阵配对，`minimum_trusted_external_pairs` 的单位是 baseline/candidate pair；digest、runtime identity、trust 和 holdout gate 在 host 侧验证。
+9. `exec --run-dir` 的 raw state、full observations、debug export 和 evaluator overlay 可在进程退出后重开；刷新验证旧 event prefix 不变，并以 pending 文件表达未完成收集。
 
 稳定扩展位：
 
@@ -340,7 +344,7 @@ LoopGuardRule
 
 第一阶段内置规则：
 
-- 同一工具连续确定性失败时，不能无限重复同一调用；应要求换方法、询问用户或 blocked。
+- 同一工具连续确定性失败时，不能无限重复同一调用；应要求换方法、询问用户或 blocked。同一个 provider response 内的重复调用按一个失败轮次计算，不能在模型收到工具结果前提前触发跨轮重复 guard。
 - provider 空回复时最多做有限恢复，恢复失败后不能写入污染历史。
 - context overflow 优先裁剪旧工具输出和低价值上下文，裁剪失败进入 `LoopDecision`。
 - max iteration 不应静默失败，必须生成可解释的 partial / failed / blocked 结果。
@@ -450,9 +454,12 @@ PolicyEvaluation
   action
   resource
   decision: allow | ask | deny | block
+  block_disposition: recoverable | terminal | null
   reason
   evidence_refs
 ```
+
+`block_disposition` 只对 `block` 有意义。`recoverable` 仅拒绝当前工具调用并允许模型改正；`terminal` 停止整个任务。为保持安全兼容，反序列化旧 Block 记录时若字段缺失，effective disposition 必须是 `terminal`。
 
 ### PostTaskReview
 
@@ -864,7 +871,9 @@ Debug Projection 只在 debug/audit/replay 模式启用，并且只承担治理�
 | loop guard | 重复工具失败、空回复、context overflow、max iteration 都有明确 `LoopDecision`，不能无界循环 |
 | artifact | raw output 可通过 checksum 校验，模型只读取摘要或受控 excerpt |
 | workspace checkpoint | 文件副作用前已持久化 before-image、artifact 和可恢复引用，且不修改用户 `.git` |
-| verification | 没有足够 evidence 时不能 `stop_success`，只能 `stop_partial`、`stop_failed` 或 `blocked` |
+| verification | 没有足够 evidence 时不能 `stop_success`；工作区最后一次 mutation 后必须有 fresh objective validation，或有 caller-owned external verifier；同一检查只采信最新重跑结果 |
+| provenance / replay | 每个 provider lifecycle 必须以 completed/failed 闭合；replay 必须校验 source prefix、artifact checksum 和 request/tool fixture 消费量 |
+| external evaluation | evaluator 结果必须绑定 trace digest/runtime identity；回归矩阵缺 cell、untrusted pair 或 holdout 泄漏时只能 `NeedsReview` |
 | memory | 只有 evidence-backed project candidate 可按 gate 晋升；user/global 或冲突候选必须 human review，并保留 scope/expiry/rollback |
 
 ## 第一阶段落地顺序

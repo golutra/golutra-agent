@@ -116,9 +116,11 @@ harness consume structured observations without querying SQLite.
 
 `debug-export/` is separately redacted and suitable for handoff. Failure to
 build that optional portable export is recorded in the top-level manifest but
-does not discard the raw state or structured observations. Any durable
-post-task evaluation that remains queued is represented as pending in the
-trace rather than delaying a benchmark task.
+does not discard the raw state or structured observations. Before freezing a
+run bundle, Golutra gives each discovered durable post-task evaluation a
+bounded opportunity to reach a terminal state, then reloads the event boundary
+and task trace. A job that exceeds that bound remains explicitly pending and
+marks the observation manifest incomplete.
 
 Golutra continues to read the active provider profile and credentials from
 the configured global `GOLUTRA_HOME`, and never copies them into the run
@@ -143,6 +145,12 @@ not interactive; `deny` always denies. Explicit `--approval-mode auto` approves
 only requests the runtime already classified as `Ask`. It cannot override
 `Block` or `Deny`, shell metacharacter guards, sensitive paths, workspace
 boundaries or the no-network sandbox.
+
+When an external verifier is declared, the runtime runs it after the model
+stops and does not ask the model to duplicate the same check through `shell`.
+Without one, a workspace mutation must be followed by a fresh objective check;
+if the model tries to finish first, the runtime returns a bounded verification
+request to the model and records that retry in the canonical event stream.
 
 The final exit status is non-zero unless the runtime returns a verified
 `completed` turn. A model saying it is finished is not sufficient.
@@ -317,6 +325,44 @@ an opt-in projection. Its provider footer/status is read from the Runtime's
 redacted `ProviderState` query. Remote mode never reads or writes the TUI
 machine's provider files and does not open a local OAuth/setup dialog; provider
 credentials must be configured on the App Server host.
+
+## 6. Run Bundle 与外部评估
+
+`--run-dir` 生成的是可延续的 owner-only observation bundle，而不是一次性
+日志目录。任务结束后，外部 harness 可以读取：
+
+```text
+<run-dir>/manifest.json
+<run-dir>/observations/manifest.json
+<run-dir>/observations/sessions/.../events.jsonl
+<run-dir>/observations/sessions/.../tasks/.../trace.json
+<run-dir>/state/runtime.sqlite
+```
+
+评估器把结果写成 `ExternalEvaluationRecord`，然后在同一个 bundle 上执行：
+
+```bash
+golutra --run-bundle /absolute/run-dir eval ingest /absolute/evaluation.json
+```
+
+命令会验证 source trace digest、runtime identity 和 canonical result digest，
+成功后原子刷新 `observations/` 与 `debug-export/`。刷新允许合法的 evaluator
+事件追加，但会验证旧 task event prefix 与 prior trace boundary 没有被修改；
+每次打开 bundle 还会先验证 trace 文件的 manifest checksum、SQLite 中的
+source event prefix，以及 prior trace 引用的 artifact metadata/blob checksum。
+物理 SQLite/WAL checksum 的变化本身不等于篡改。输入、collector、trace 或
+evaluator 只完成一部分时，bundle 会保留 `*.pending.json` 和具体缺失原因，
+不会生成假 complete。
+
+## 7. Terminal-Bench 适配边界
+
+Terminal-Bench 只通过 `tools/terminal_bench/golutra_tbench_adapter.py`
+适配，不修改上游 harness。每个 trial 的 Golutra invocation 都使用独立
+`--run-dir /logs/golutra-runtime`；适配器优先读取 `<trial>/golutra-runtime`，
+兼容旧的 `sessions/golutra-runtime`，并把
+`terminal-bench-evaluation.json` 交给 `eval ingest`。找不到结果、manifest、
+collector 或 trace 时，保留 `golutra-evaluation.pending.json`，而不是丢掉
+原始 observation。
 
 ## Shared Event and Projection Rules
 

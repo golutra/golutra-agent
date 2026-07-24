@@ -2,7 +2,7 @@
 
 ## 当前状态
 
-截至 2026-07-17，Golutra 的扩展和交付层已经进入可运行主链：
+截至 2026-07-23，Golutra 的扩展和交付层已经进入可运行主链：
 
 - `golutra-plugin` 管理 owner-only 本地插件包，生命周期为 `stage -> review -> enable -> disable/rollback`。
 - `golutra-mcp` 使用官方 `rmcp 2.2.0` 适配 stdio MCP server；外部工具进入统一 `ToolRegistry`、PolicyEvaluation、approval、timeout/cancel、artifact/evidence 链路。
@@ -10,6 +10,12 @@
 - TypeScript 与 Python SDK 都从 Rust 协议 schema 生成类型，并实现 cwd attachment、command/query、event replay/live stream、thread 与治理 API。
 - Agent 高层 SDK 还提供统一的 `Thread`/`TurnHandle` 生命周期；`exec`、MCP 和 Remote TUI 复用同一个 App Server/Agent event projector，不形成第二套执行状态机。SDK 可发送 actor 元数据，但控制权由 App Server 为 attachment 分配的 server-side actor 决定，不能通过伪造 header 提权。
 - 根安装脚本覆盖 Unix 和 Windows；CI 对 Linux/macOS/Windows 执行 workspace all-target compile，并在 Linux 执行完整 Rust/SDK 门禁。
+
+治理 SDK 读取和 evaluator 写入也共用同一条事实链：SDK 只能通过
+`taskTrace`/`completeTaskTrace` 读取分页完整 trace，通过
+`ingestExternalEvaluation` 提交带 `base_trace_digest`、`runtime_identity`、
+`result_digest` 和 trust/attestation 的结果；SDK 不得自行修改
+`VerificationRecord`、`RegressionResult` 或 `PromotionDecision`。
 
 ## Plugin Store
 
@@ -117,6 +123,20 @@ TypeScript 的 `@golutra/agent-sdk/tui-driver` 和 Python 的 `TuiDriverClient` 
 - `taskTrace(request)` / `task_trace(request)` 按 cursor 返回 `TaskTracePage` 和完整性原因。
 - `completeTaskTrace(request)` / `complete_task_trace(request)` bounded 聚合所有 page，校验 session/task/view、cursor 前进和 event-chain digest。
 - `readArtifactChunk(request)` 按范围读取带 checksum 的 artifact 内容。
+
+高层 client 还提供：
+
+```text
+debugProjection(session_id, task_id)
+replay(session_id, task_id, capsule_id?)
+ingestExternalEvaluation(session_id, record)
+runRegressionCampaign(session_id, candidate_id, candidate_files, matrix)
+```
+
+`runRegressionCampaign` 的矩阵按 `case × partition × provider × seed` 解释，
+最低可信外部覆盖使用 `minimumTrustedExternalPairs`（Python 为
+`minimum_trusted_external_pairs`）。旧的 `...Evaluations` 参数仅作为兼容
+别名解析，传输到 runtime 后统一转换为 pair 语义。
 
 `summary` trace 省略 context/artifact/evidence 明细并净化事件 payload；`full` 返回脱敏 manifest；HTTP 客户端请求 `forensic` 会得到 `403 Forbidden`。浏览器 attach 页面同样先读取 runtime info，不再复制 Rust protocol 常量。
 
