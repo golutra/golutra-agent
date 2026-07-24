@@ -266,6 +266,14 @@ class GolutraAgent(BaseAgent):
                 ]
             passed = sum(assertion["passed"] for assertion in assertions)
             total = len(assertions)
+            phases, terminal_cause = _evaluation_phases(
+                results,
+                task_id,
+                assertions,
+                resolved,
+                failure_mode,
+                evidence_refs,
+            )
             harness_version = _terminal_bench_version()
             trace_digest, runtime_identity = _trace_identity(run_dir, task_id, session_id)
             record = {
@@ -282,6 +290,8 @@ class GolutraAgent(BaseAgent):
                 "score": float(passed),
                 "score_max": float(total) if total else 1.0,
                 "assertions": assertions,
+                "phases": phases,
+                "terminal_cause": terminal_cause,
                 "artifact_refs": evidence_refs,
                 "partition": "source",
                 "seed": None,
@@ -451,14 +461,12 @@ def _find_run_bundle(trial_root: Path) -> Path | None:
     return matches[0] if len(matches) == 1 else None
 
 
-def _extract_trial_result(results: dict, task_id: str) -> tuple[dict, bool, str | None]:
-    if isinstance(results.get("parser_results"), dict):
-        failure_mode = results.get("failure_mode")
-        return (
-            results["parser_results"],
-            bool(results.get("is_resolved", False)),
-            str(failure_mode).lower() if failure_mode is not None else None,
-        )
+def _select_trial_result(results: dict, task_id: str) -> dict:
+    if isinstance(results.get("parser_results"), dict) or any(
+        key in results
+        for key in ("is_resolved", "failure_mode", "trial_started_at", "test_started_at")
+    ):
+        return results
     aggregate = results.get("results")
     if isinstance(aggregate, list):
         candidates = [
@@ -468,17 +476,180 @@ def _extract_trial_result(results: dict, task_id: str) -> tuple[dict, bool, str 
             and str(item.get("task_id", item.get("id", ""))) == str(task_id)
         ]
         if len(candidates) == 1:
-            return _extract_trial_result(candidates[0], task_id)
+            return candidates[0]
     if isinstance(aggregate, dict):
         candidate = aggregate.get(task_id)
         if isinstance(candidate, dict):
-            return _extract_trial_result(candidate, task_id)
-    failure_mode = results.get("failure_mode")
+            return candidate
+    return results
+
+
+def _extract_trial_result(results: dict, task_id: str) -> tuple[dict, bool, str | None]:
+    selected = _select_trial_result(results, task_id)
+    if isinstance(selected.get("parser_results"), dict):
+        failure_mode = selected.get("failure_mode")
+        return (
+            selected["parser_results"],
+            bool(selected.get("is_resolved", False)),
+            str(failure_mode).lower() if failure_mode is not None else None,
+        )
+    failure_mode = selected.get("failure_mode")
     return (
         {},
-        bool(results.get("is_resolved", results.get("resolved", False))),
+        bool(selected.get("is_resolved", selected.get("resolved", False))),
         str(failure_mode).lower() if failure_mode is not None else None,
     )
+
+
+def _parse_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _normalized_timestamp(value: object) -> str | None:
+    parsed = _parse_timestamp(value)
+    if parsed is None:
+        return None
+    return parsed.isoformat().replace("+00:00", "Z")
+
+
+def _phase_duration_ms(started_at: object, completed_at: object) -> int | None:
+    started = _parse_timestamp(started_at)
+    completed = _parse_timestamp(completed_at)
+    if started is None or completed is None or completed < started:
+        return None
+    elapsed = completed - started
+    return (
+        elapsed.days * 86_400_000
+        + elapsed.seconds * 1_000
+        + elapsed.microseconds // 1_000
+    )
+
+
+def _phase_record(
+    phase_id: str,
+    kind: str,
+    status: str,
+    started_at: object,
+    completed_at: object,
+    evidence_refs: list[str],
+    assertion_refs: list[str] | None = None,
+) -> dict:
+    return {
+        "phase_id": phase_id,
+        "kind": kind,
+        "status": status,
+        "started_at": _normalized_timestamp(started_at),
+        "completed_at": _normalized_timestamp(completed_at),
+        "duration_ms": _phase_duration_ms(started_at, completed_at),
+        "assertion_refs": assertion_refs or [],
+        "evidence_refs": evidence_refs,
+    }
+
+
+def _evaluation_phases(
+    results: dict,
+    task_id: str,
+    assertions: list[dict],
+    resolved: bool,
+    failure_mode: str | None,
+    evidence_refs: list[str],
+) -> tuple[list[dict], dict | None]:
+    selected = _select_trial_result(results, task_id)
+    normalized_failure = (
+        failure_mode if failure_mode not in {None, "none", "unset"} else None
+    )
+    failed_assertions = [item for item in assertions if not item["passed"]]
+    failure_phase = None
+    if normalized_failure:
+        if "install" in normalized_failure or "setup" in normalized_failure:
+            failure_phase = "terminal-bench:setup"
+        elif "agent" in normalized_failure:
+            failure_phase = "terminal-bench:agent"
+        elif "test" in normalized_failure or "timeout" in normalized_failure:
+            failure_phase = "terminal-bench:test"
+        else:
+            failure_phase = "terminal-bench:assertions"
+    elif failed_assertions or not resolved:
+        failure_phase = "terminal-bench:assertions"
+
+    def status_for(phase_id: str, completed_key: str) -> str:
+        if failure_phase == phase_id:
+            if normalized_failure and "timeout" in normalized_failure:
+                return "timed_out"
+            return "error" if normalized_failure else "failed"
+        if phase_id == "terminal-bench:test":
+            if failed_assertions or not resolved:
+                return "failed"
+            return "passed" if selected.get(completed_key) else "unknown"
+        if phase_id == "terminal-bench:assertions":
+            if failed_assertions or not resolved:
+                return "failed"
+            return "passed" if assertions else "unknown"
+        return "passed" if selected.get(completed_key) else "unknown"
+
+    phases = [
+        _phase_record(
+            "terminal-bench:setup",
+            "setup",
+            status_for("terminal-bench:setup", "agent_started_at"),
+            selected.get("trial_started_at"),
+            selected.get("agent_started_at"),
+            evidence_refs,
+        ),
+        _phase_record(
+            "terminal-bench:agent",
+            "agent",
+            status_for("terminal-bench:agent", "agent_ended_at"),
+            selected.get("agent_started_at"),
+            selected.get("agent_ended_at"),
+            evidence_refs,
+        ),
+        _phase_record(
+            "terminal-bench:test",
+            "test",
+            status_for("terminal-bench:test", "test_ended_at"),
+            selected.get("test_started_at"),
+            selected.get("test_ended_at"),
+            evidence_refs,
+        ),
+        _phase_record(
+            "terminal-bench:assertions",
+            "assertion",
+            status_for("terminal-bench:assertions", "trial_ended_at"),
+            selected.get("test_ended_at"),
+            selected.get("trial_ended_at"),
+            evidence_refs,
+            [item["assertion_id"] for item in assertions],
+        ),
+    ]
+    if normalized_failure:
+        terminal_cause = {
+            "code": normalized_failure,
+            "phase_id": failure_phase,
+            "message": f"Terminal-Bench stopped with {normalized_failure}",
+            "retryable": "timeout" in normalized_failure,
+            "evidence_refs": evidence_refs,
+        }
+    elif failed_assertions or not resolved:
+        names = ", ".join(item["name"] for item in failed_assertions) or "resolved"
+        terminal_cause = {
+            "code": "assertion_failed",
+            "phase_id": failure_phase,
+            "message": f"failed evaluator assertions: {names}",
+            "retryable": False,
+            "evidence_refs": evidence_refs,
+        }
+    else:
+        terminal_cause = None
+    return phases, terminal_cause
 
 
 def _existing_evidence_refs(trial_root: Path) -> list[str]:
@@ -595,6 +766,8 @@ def _external_result_digest(record: dict) -> str:
             "score",
             "score_max",
             "assertions",
+            "phases",
+            "terminal_cause",
             "artifact_refs",
             "partition",
             "seed",

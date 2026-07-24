@@ -198,6 +198,68 @@ class AdapterHelpersTest(unittest.TestCase):
         self.assertFalse(resolved)
         self.assertEqual(failure_mode, "test_timeout")
 
+    def test_evaluation_phases_preserve_timing_and_terminal_cause(self):
+        assertions = [
+            {
+                "assertion_id": "terminal-bench:resolved",
+                "name": "resolved",
+                "passed": False,
+                "message": "False",
+                "evidence_refs": ["results.json"],
+            }
+        ]
+        phases, terminal_cause = ADAPTER._evaluation_phases(
+            {
+                "task_id": "target",
+                "trial_started_at": "2026-07-24T06:21:58+00:00",
+                "agent_started_at": "2026-07-24T06:22:04+00:00",
+                "agent_ended_at": "2026-07-24T06:25:57+00:00",
+                "test_started_at": "2026-07-24T06:26:00+00:00",
+                "test_ended_at": "2026-07-24T06:27:00+00:00",
+                "trial_ended_at": "2026-07-24T06:27:01+00:00",
+            },
+            "target",
+            assertions,
+            False,
+            "test_timeout",
+            ["results.json"],
+        )
+
+        self.assertEqual([phase["kind"] for phase in phases], ["setup", "agent", "test", "assertion"])
+        self.assertEqual(phases[0]["duration_ms"], 6_000)
+        self.assertEqual(phases[1]["duration_ms"], 233_000)
+        self.assertEqual(phases[2]["duration_ms"], 60_000)
+        self.assertEqual(phases[2]["status"], "timed_out")
+        self.assertEqual(
+            phases[3]["assertion_refs"], ["terminal-bench:resolved"]
+        )
+        self.assertEqual(terminal_cause["code"], "test_timeout")
+        self.assertEqual(terminal_cause["phase_id"], "terminal-bench:test")
+        self.assertTrue(terminal_cause["retryable"])
+
+    def test_phase_timestamps_are_normalized_to_rfc3339_utc(self):
+        phase = ADAPTER._phase_record(
+            "setup",
+            "setup",
+            "passed",
+            "2026-07-24T06:21:58",
+            "2026-07-24T06:22:04+00:00",
+            [],
+        )
+
+        self.assertEqual(phase["started_at"], "2026-07-24T06:21:58Z")
+        self.assertEqual(phase["completed_at"], "2026-07-24T06:22:04Z")
+        self.assertEqual(phase["duration_ms"], 6_000)
+
+    def test_phase_duration_uses_exact_millisecond_flooring(self):
+        self.assertEqual(
+            ADAPTER._phase_duration_ms(
+                "2026-07-24T06:21:58.999999Z",
+                "2026-07-25T06:21:59.001998Z",
+            ),
+            86_400_001,
+        )
+
     def test_collector_uses_trial_root_as_the_evidence_base(self):
         command = ADAPTER._collector_command(
             Path("/bin/golutra"),
@@ -343,6 +405,13 @@ class AdapterHelpersTest(unittest.TestCase):
                 ["harness_failure_mode"],
             )
             self.assertEqual(record["assertions"][0]["message"], "test_timeout")
+            self.assertEqual(record["terminal_cause"]["code"], "test_timeout")
+            self.assertEqual(
+                next(phase for phase in record["phases"] if phase["kind"] == "test")[
+                    "status"
+                ],
+                "timed_out",
+            )
             self.assertFalse(
                 (run_dir / "terminal-bench-evaluation.pending.json").exists()
             )
