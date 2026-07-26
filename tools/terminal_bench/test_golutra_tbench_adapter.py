@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import sys
 import types
 import unittest
@@ -68,6 +69,11 @@ ADAPTER = _load_adapter()
 
 
 class AdapterHelpersTest(unittest.TestCase):
+    def test_default_collector_horizon_covers_long_agent_and_test_timeouts(self):
+        agent = ADAPTER.GolutraAgent()
+
+        self.assertEqual(agent._result_collection_timeout_sec, 3600.0)
+
     def test_collector_resolution_is_explicit_and_repository_local(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -79,6 +85,8 @@ class AdapterHelpersTest(unittest.TestCase):
                 candidate.parent.mkdir(parents=True, exist_ok=True)
                 candidate.write_text("#!/bin/sh\n", encoding="utf-8")
                 candidate.chmod(0o755)
+            os.utime(release, (300, 300))
+            os.utime(debug, (200, 200))
 
             with patch.dict(
                 ADAPTER.os.environ,
@@ -119,6 +127,52 @@ class AdapterHelpersTest(unittest.TestCase):
                     ADAPTER.GolutraAgent._resolve_collector_binary(
                         None, repository_root=root
                     )
+                )
+
+                self.assertIsNone(
+                    ADAPTER.GolutraAgent._resolve_collector_binary(
+                        str(root / "missing"), repository_root=root
+                    )
+                )
+
+    def test_collector_prefers_freshest_binary_and_rejects_stale_builds(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release = root / "target/release/golutra-cli"
+            debug = root / "target/debug/golutra-cli"
+            source = root / "crates/golutra-cli/src/main.rs"
+            for candidate in (release, debug):
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                candidate.write_text("#!/bin/sh\n", encoding="utf-8")
+                candidate.chmod(0o755)
+            source.parent.mkdir(parents=True)
+            source.write_text("fn main() {}\n", encoding="utf-8")
+            os.utime(release, (100, 100))
+            os.utime(source, (200, 200))
+            os.utime(debug, (300, 300))
+
+            with patch.dict(
+                ADAPTER.os.environ,
+                {"GOLUTRA_TBENCH_COLLECTOR": ""},
+            ):
+                self.assertEqual(
+                    ADAPTER.GolutraAgent._resolve_collector_binary(
+                        None, repository_root=root
+                    ),
+                    debug.resolve(),
+                )
+                os.utime(debug, (150, 150))
+                self.assertIsNone(
+                    ADAPTER.GolutraAgent._resolve_collector_binary(
+                        None, repository_root=root
+                    )
+                )
+                os.utime(release, (400, 400))
+                self.assertEqual(
+                    ADAPTER.GolutraAgent._resolve_collector_binary(
+                        None, repository_root=root
+                    ),
+                    release.resolve(),
                 )
 
     def test_trace_identity_uses_manifest_path_relative_to_run_root(self):
@@ -353,7 +407,8 @@ class AdapterHelpersTest(unittest.TestCase):
                 json.dumps(
                     {
                         "terminal_outcome": {
-                            "result": {"task_id": "task", "session_id": "session"}
+                            "kind": "in_progress",
+                            "reason": "agent still running",
                         },
                         "observations": {
                             "sessions": [
@@ -385,6 +440,10 @@ class AdapterHelpersTest(unittest.TestCase):
                 encoding="utf-8",
             )
             (trial_root / "commands.txt").write_text("command", encoding="utf-8")
+            stale_pending = trial_root / "golutra-evaluation.pending.json"
+            stale_pending.write_text(
+                json.dumps({"status": "pending_inputs"}), encoding="utf-8"
+            )
             agent = ADAPTER.GolutraAgent.__new__(ADAPTER.GolutraAgent)
             agent._result_collection_timeout_sec = 0.1
             agent._dataset_id = "terminal-bench"
@@ -399,6 +458,8 @@ class AdapterHelpersTest(unittest.TestCase):
             record = json.loads(
                 (run_dir / "terminal-bench-evaluation.json").read_text()
             )
+            self.assertEqual(record["base_trace_digest"], "auto")
+            self.assertEqual(record["runtime_identity"], "auto")
             self.assertEqual(record["verdict"], "fail")
             self.assertEqual(
                 [assertion["name"] for assertion in record["assertions"]],
@@ -415,6 +476,7 @@ class AdapterHelpersTest(unittest.TestCase):
             self.assertFalse(
                 (run_dir / "terminal-bench-evaluation.pending.json").exists()
             )
+            self.assertFalse(stale_pending.exists())
 
 
 if __name__ == "__main__":

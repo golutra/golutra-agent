@@ -5,6 +5,7 @@
 ```bash
 golutra --cwd <container-workdir> exec \
   --run-dir /logs/golutra-runtime \
+  [--allow-network when proxy_url is configured] \
   --approval-mode auto -- "<task prompt>"
 ```
 
@@ -18,8 +19,18 @@ trial exits, its `golutra-runtime/` directory contains isolated raw runtime
 state (`state/runtime.sqlite`, artifacts, checkpoints, memory, evaluation and
 evolution records), `observations/` with full owner-only event/conversation/
 trace JSON, and `debug-export/`, the redacted portable analysis bundle.
+Immediately after the turn starts, Golutra also writes an atomic in-progress
+checkpoint. It is a recoverable identity and event boundary, not a successful
+terminal result; a normal completion replaces it with the final result/error
+manifest. This preserves a usable bundle when the harness kills the agent
+before the final export.
 
-Build or copy the architecture-specific Golutra binaries before running:
+The result collector remains alive for one hour by default so agent and test
+timeouts from long Terminal-Bench cases can still be attached to that bundle.
+Override `result_collection_timeout_sec` only when the dataset has a longer
+combined agent/test horizon or a deliberately shorter local feedback loop.
+
+Build or copy the architecture-specific Golutra agent binaries before running:
 
 ```bash
 tb run \
@@ -29,8 +40,17 @@ tb run \
   --output-path /tmp/terminal-bench/runs
 ```
 
+The `arm64_binary` and `amd64_binary` arguments are copied into the Linux
+trial container and must be Linux ELF binaries for the matching architecture.
+`collector_binary` is different: it is executed by the host after the trial
+finishes, so it must be a host-native Golutra CLI (for example,
+`target/release/golutra-cli` on macOS), not one of the Linux container
+binaries. If no usable host collector is available, the adapter keeps the
+evaluation in a pending file for later ingestion.
+
 `proxy_url` is optional. When set, the adapter passes HTTP, HTTPS and ALL proxy
-variables to Golutra and updates
+variables to Golutra, adds `--allow-network` to the embedded `exec` invocation,
+and updates
 the tmux server environment so the separate Terminal-Bench test session uses
 the same proxy. For a proxy listening on the host loopback interface, use
 `host.docker.internal` rather than `127.0.0.1`. The
@@ -60,15 +80,18 @@ only adapts the trial lifecycle and consumes the retained Golutra bundle:
 
 The preferred bundle directory is `<trial>/golutra-runtime`; older harness
 layouts under `<trial>/sessions/golutra-runtime` remain readable. The collector
-waits for both `results.json` and the runtime manifest, derives only evidence
-files that actually exist, and invokes `<collector> --run-bundle ... eval ingest`
+starts before the blocking agent command, then waits for both `results.json` and
+the runtime manifest, derives only evidence files that actually exist, and
+invokes `<collector> --run-bundle ... eval ingest`
 with the trial directory as the explicit `--artifact-base`. The evaluation JSON
 therefore stays in the run bundle while its relative evidence references remain
 portable and resolve against the harness-owned trial output.
 It resolves that host collector from the explicit `collector_binary` agent
-argument, `GOLUTRA_TBENCH_COLLECTOR`, then this repository's release or debug
-`golutra-cli` binary. It does not select an unrelated `golutra` command from
-the host `PATH`.
+argument or `GOLUTRA_TBENCH_COLLECTOR` first. Those settings are authoritative.
+Without either override it considers only this repository's release/debug
+`golutra-cli` binaries, selects the newest executable, and rejects candidates
+older than the current Rust sources. It does not select an unrelated `golutra`
+command from the host `PATH`.
 If the result file, runtime identity, trace, or collector is unavailable, it
 keeps a `golutra-evaluation.pending.json` file with the reason and the original
 record instead of dropping the structured observation. This makes a later

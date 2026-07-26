@@ -20,6 +20,8 @@ from terminal_bench.agents.failure_mode import FailureMode
 from terminal_bench.terminal.models import TerminalCommand
 from terminal_bench.terminal.tmux_session import TmuxSession
 
+_DEFAULT_RESULT_COLLECTION_TIMEOUT_SEC = 3600.0
+
 
 class GolutraAgent(BaseAgent):
     """Run a locally built Golutra CLI and retain governed runtime data."""
@@ -46,7 +48,7 @@ class GolutraAgent(BaseAgent):
         collector_binary: str | None = None,
         dataset_id: str = "terminal-bench",
         dataset_version: str = "unknown",
-        result_collection_timeout_sec: float = 300.0,
+        result_collection_timeout_sec: float = _DEFAULT_RESULT_COLLECTION_TIMEOUT_SEC,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -165,19 +167,53 @@ class GolutraAgent(BaseAgent):
         repository_root: Path | None = None,
     ) -> Path | None:
         repository_root = repository_root or Path(__file__).resolve().parents[2]
-        candidates = [
-            configured,
-            os.environ.get("GOLUTRA_TBENCH_COLLECTOR"),
-            repository_root / "target" / "release" / "golutra-cli",
-            repository_root / "target" / "debug" / "golutra-cli",
+
+        def executable(value: str | Path) -> Path | None:
+            path = Path(value).expanduser()
+            return path.resolve() if path.is_file() and os.access(path, os.X_OK) else None
+
+        if configured and str(configured).strip():
+            return executable(configured)
+        environment = os.environ.get("GOLUTRA_TBENCH_COLLECTOR")
+        if environment and environment.strip():
+            return executable(environment)
+
+        local_candidates = [
+            executable(repository_root / "target" / "release" / "golutra-cli"),
+            executable(repository_root / "target" / "debug" / "golutra-cli"),
         ]
-        for candidate in candidates:
-            if not candidate:
+        local_candidates = [candidate for candidate in local_candidates if candidate]
+        if not local_candidates:
+            return None
+
+        source_candidates = [repository_root / "Cargo.toml", repository_root / "Cargo.lock"]
+        crates_root = repository_root / "crates"
+        if crates_root.is_dir():
+            source_candidates.extend(crates_root.rglob("Cargo.toml"))
+            source_candidates.extend(crates_root.rglob("*.rs"))
+        source_mtimes = []
+        for source in source_candidates:
+            try:
+                source_mtimes.append(source.stat().st_mtime_ns)
+            except OSError:
                 continue
-            path = Path(candidate).expanduser()
-            if path.is_file() and os.access(path, os.X_OK):
-                return path.resolve()
-        return None
+        if source_mtimes:
+            newest_source = max(source_mtimes)
+            local_candidates = [
+                candidate
+                for candidate in local_candidates
+                if candidate.stat().st_mtime_ns >= newest_source
+            ]
+        if not local_candidates:
+            return None
+
+        return max(
+            local_candidates,
+            key=lambda candidate: (
+                candidate.stat().st_mtime_ns,
+                candidate.parent.name == "release",
+            ),
+        )
 
     def _start_result_collector(self, logging_dir: Path | None) -> None:
         if logging_dir is None:
@@ -216,11 +252,23 @@ class GolutraAgent(BaseAgent):
         try:
             assert results_path is not None
             assert run_dir is not None
+            _remove_if_exists(trial_root / "golutra-evaluation.pending.json")
             results = json.loads(results_path.read_text())
             manifest = json.loads((run_dir / "manifest.json").read_text())
+            checkpoint_only = manifest.get("terminal_outcome", {}).get("kind") == "in_progress"
             terminal_result = manifest.get("terminal_outcome", {}).get("result", {})
             task_id = terminal_result.get("task_id")
             session_id = terminal_result.get("session_id")
+            if not task_id or not session_id:
+                # A harness timeout can leave the in-progress checkpoint as
+                # the last manifest. Its observation index still contains the
+                # canonical identity needed to attach the evaluator result.
+                sessions = manifest.get("observations", {}).get("sessions", [])
+                if len(sessions) == 1 and isinstance(sessions[0], dict):
+                    session_id = sessions[0].get("session_id")
+                    tasks = sessions[0].get("tasks", [])
+                    if len(tasks) == 1 and isinstance(tasks[0], dict):
+                        task_id = tasks[0].get("task_id")
             if not task_id or not session_id:
                 _write_json_atomic(
                     run_dir / "terminal-bench-evaluation.pending.json",
@@ -275,7 +323,14 @@ class GolutraAgent(BaseAgent):
                 evidence_refs,
             )
             harness_version = _terminal_bench_version()
-            trace_digest, runtime_identity = _trace_identity(run_dir, task_id, session_id)
+            # Recovery may append lifecycle events after an external timeout,
+            # so the checkpoint's prefix digest is no longer the final trace
+            # digest. Let `eval ingest` bind the record to the reopened trace.
+            trace_digest, runtime_identity = (
+                (None, None)
+                if checkpoint_only
+                else _trace_identity(run_dir, task_id, session_id)
+            )
             record = {
                 "evaluation_id": f"terminal-bench:{results.get('id', trial_root.name)}:{task_id}",
                 "source_task_id": task_id,
@@ -404,13 +459,18 @@ class GolutraAgent(BaseAgent):
             f"{name}={shlex.quote(value)}"
             for name, value in self._runtime_environment().items()
         )
+        network_flag = "--allow-network " if self._proxy_url else ""
         command = (
             f"{environment} "
             f"/installed-agent/golutra --cwd {shlex.quote(workspace_path)} exec "
             "--run-dir /logs/golutra-runtime "
-            "--approval-mode auto -- "
+            f"{network_flag}--approval-mode auto -- "
             f"{shlex.quote(rendered_instruction)}"
         )
+        # Start collection before waiting on the agent command.  If
+        # Terminal-Bench's outer timeout abandons this call, the collector can
+        # still ingest the checkpoint once the harness writes results.json.
+        self._start_result_collector(logging_dir)
         session.send_command(
             TerminalCommand(
                 command=command,
@@ -423,7 +483,6 @@ class GolutraAgent(BaseAgent):
         input_tokens, output_tokens = (
             _trace_token_usage(logging_dir.parent) if logging_dir is not None else (0, 0)
         )
-        self._start_result_collector(logging_dir)
         return AgentResult(
             total_input_tokens=input_tokens,
             total_output_tokens=output_tokens,
