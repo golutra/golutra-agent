@@ -576,6 +576,7 @@ class ClientTest(unittest.TestCase):
         handle = thread.run(
             "inspect the workspace",
             output_schema={"type": "object"},
+            allow_network=True,
             completion_criteria=[" verified ", ""],
             external_verifiers=[{"program": "pytest", "args": ["-q"]}],
         )
@@ -593,6 +594,7 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(handle.wait()["verification"]["result"], "pass")
         self.assertEqual(calls[0][0], "turn/start")
         self.assertEqual(calls[0][1]["completion_criteria"], [" verified "])
+        self.assertEqual(calls[0][1]["allow_network"], True)
         self.assertEqual(calls[0][1]["output_schema"], {"type": "object"})
         self.assertEqual(
             calls[0][1]["external_verifiers"],

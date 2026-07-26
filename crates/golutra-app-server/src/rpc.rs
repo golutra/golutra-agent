@@ -364,6 +364,7 @@ async fn turn_start(
         "prompt": prompt,
         "_thread_id": thread.thread_id,
         "output_schema": params.get("output_schema").cloned(),
+        "allow_network": params.get("allow_network").cloned().unwrap_or_else(|| json!(false)),
         "completion_criteria": params.get("completion_criteria").cloned().unwrap_or_else(|| json!([])),
         "external_verifiers": params.get("external_verifiers").cloned().unwrap_or_else(|| json!([])),
     });

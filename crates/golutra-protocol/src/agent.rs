@@ -159,6 +159,10 @@ pub struct AgentTurnOptions {
     pub output_schema: Option<Value>,
     #[serde(default)]
     pub completion_criteria: Vec<String>,
+    /// Request network access for child tools. The runtime host may still
+    /// reject this request when its capability is disabled.
+    #[serde(default)]
+    pub allow_network: bool,
     /// Caller-owned commands that objectively verify the candidate workspace
     /// after the model stops. These commands are argv-based and are never
     /// interpreted by a shell.

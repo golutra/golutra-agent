@@ -54,7 +54,8 @@ async fn http_json_rpc_streams_the_same_turn_over_agent_sse() {
             "method": "turn/start",
             "params": {
                 "cwd": workspace.path(),
-                "prompt": "reply with a short acknowledgement"
+                "prompt": "reply with a short acknowledgement",
+                "allow_network": true
             }
         }),
     )
@@ -114,6 +115,36 @@ async fn http_json_rpc_streams_the_same_turn_over_agent_sse() {
     );
     assert!(events.iter().any(|event| event["type"] == "turn.started"));
     assert!(events.iter().any(|event| event["type"] == "item.completed"));
+    let replay = post_rpc(
+        &client,
+        &info.base_url,
+        rpc_headers(&token, Some(attachment_id)),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "runtime/events/replay",
+            "params": {"session_id": session_id, "limit": 512}
+        }),
+    )
+    .await;
+    let task_created = replay
+        .pointer("/result/events")
+        .and_then(Value::as_array)
+        .and_then(|events| {
+            events
+                .iter()
+                .find(|event| event["event_type"] == "task_created")
+        })
+        .expect("task-created runtime event");
+    assert_eq!(
+        task_created.pointer("/payload/execution_capabilities/network/requested"),
+        Some(&Value::Bool(true)),
+        "task-created event: {task_created:#}"
+    );
+    assert_eq!(
+        task_created.pointer("/payload/execution_capabilities/network/enabled"),
+        Some(&Value::Bool(false))
+    );
     assert!(
         events
             .iter()

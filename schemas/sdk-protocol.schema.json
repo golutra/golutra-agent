@@ -683,6 +683,11 @@
     "AgentTurnOptions": {
       "type": "object",
       "properties": {
+        "allow_network": {
+          "description": "Request network access for child tools. The runtime host may still reject this request when its capability is disabled.",
+          "type": "boolean",
+          "default": false
+        },
         "completion_criteria": {
           "type": "array",
           "default": [],

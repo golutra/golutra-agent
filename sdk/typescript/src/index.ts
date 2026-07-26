@@ -159,6 +159,7 @@ export interface AgentSubscriptionRequest {
 export interface ThreadRunOptions {
   outputSchema?: Record<string, unknown>;
   completionCriteria?: readonly string[];
+  allowNetwork?: boolean;
   externalVerifiers?: readonly ExternalVerificationSpec[];
 }
 
@@ -201,6 +202,7 @@ export class Thread {
     const params: Record<string, unknown> = {
       thread_id: this.threadId,
       prompt,
+      allow_network: options.allowNetwork ?? false,
       completion_criteria: [...(options.completionCriteria ?? [])].filter((value) => value.trim()),
       external_verifiers: [...(options.externalVerifiers ?? [])],
     };

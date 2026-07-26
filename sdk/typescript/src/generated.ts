@@ -782,6 +782,10 @@ export interface AgentThreadRef {
   [k: string]: unknown;
 }
 export interface AgentTurnOptions {
+  /**
+   * Request network access for child tools. The runtime host may still reject this request when its capability is disabled.
+   */
+  allow_network?: boolean;
   completion_criteria?: string[];
   /**
    * Caller-owned commands that objectively verify the candidate workspace

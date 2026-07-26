@@ -25,6 +25,7 @@ class Thread:
         prompt: str,
         *,
         output_schema: dict[str, Any] | None = None,
+        allow_network: bool = False,
         completion_criteria: Iterable[str] = (),
         external_verifiers: Iterable[dict[str, Any]] = (),
     ) -> TurnHandle:
@@ -33,6 +34,7 @@ class Thread:
         params: dict[str, Any] = {
             "thread_id": self.thread_id,
             "prompt": prompt,
+            "allow_network": allow_network,
             "completion_criteria": [item for item in completion_criteria if item.strip()],
             "external_verifiers": [dict(item) for item in external_verifiers],
         }
@@ -48,12 +50,14 @@ class Thread:
         prompt: str,
         *,
         output_schema: dict[str, Any] | None = None,
+        allow_network: bool = False,
         completion_criteria: Iterable[str] = (),
         external_verifiers: Iterable[dict[str, Any]] = (),
     ) -> TurnHandle:
         return self.run(
             prompt,
             output_schema=output_schema,
+            allow_network=allow_network,
             completion_criteria=completion_criteria,
             external_verifiers=external_verifiers,
         )

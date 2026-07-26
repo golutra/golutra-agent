@@ -88,6 +88,7 @@ class AgentThreadRef(TypedDict, total=False):
     workspace_root: NotRequired[str | None]
 
 class AgentTurnOptions(TypedDict, total=False):
+    allow_network: NotRequired[bool]
     completion_criteria: NotRequired[list[str]]
     external_verifiers: NotRequired[list[ExternalVerificationSpec]]
     output_schema: NotRequired[Any]
