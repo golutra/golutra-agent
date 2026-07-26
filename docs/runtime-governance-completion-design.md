@@ -678,6 +678,7 @@ PostTaskJobQueued
 PostTaskJobStarted
 PostTaskJobCompleted
 PostTaskJobFailed
+PostTaskStageFailed
 VerificationPlanned
 VerificationAssertionCompleted
 RegressionCampaignStarted
@@ -751,7 +752,7 @@ P2.5 已迁移已有事实，并且不保留两套运行语义：
 ### G2：Durable Post-Task Job（已完成）
 
 - SQLite job table、lease、retry、recovery 已实现；claim 在事务查询中按 workspace_id 过滤，worker 执行前再次复核 partition。
-- deep evaluation 已先 enqueue，再写 TaskCompleted。
+- runtime terminal fact 先写入，随后 active worker 以 settlement barrier 完成 best-effort enqueue；deep evaluation 仍由 durable job 执行，治理失败只产生诊断/integrity fact，不改写 TaskCompleted。
 - Embedded/daemon/remote 查询和等待语义一致。
 
 验收结果：Host restart 恢复 queued job、lease exhausted terminal、幂等 candidate 和跨进程查询测试通过。

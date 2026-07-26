@@ -65,6 +65,9 @@ golutra --cwd "$PWD" exec \
   --completion-criterion "tests pass" \
   --verify-program cargo --verify-arg test --verify-arg --workspace \
   "implement the requested change"
+golutra --cwd "$PWD" exec \
+  --task-contract /absolute/path/to/task-contract.json \
+  "implement the requested change"
 ```
 
 Output rules:
@@ -159,6 +162,28 @@ the runtime sandbox; timeout and retained output are bounded. The verifier
 produces the same artifact, evidence, tool event and `VerificationRecord` facts
 as built-in checks. A failed verifier prevents `completed`, even when the model
 claims success.
+
+`--task-contract` accepts a JSON object that makes the completion boundary
+explicit for CI, SDK and other-agent callers:
+
+```json
+{
+  "schema_version": 1,
+  "workspace_change": "required",
+  "required_paths": ["crates/example/src/lib.rs"],
+  "completion_criteria": ["the workspace tests pass"],
+  "require_objective_validation": true,
+  "verification": "independent",
+  "max_correction_rounds": 1
+}
+```
+
+Required paths must be portable workspace-relative paths; absolute paths,
+drive-prefixed paths and parent traversal are rejected before execution. The
+same `task_contract` field is available through App Server, MCP, Rust,
+TypeScript and Python turn options. Older callers remain supported by an
+application-boundary compatibility adapter, while the runtime terminal gate
+always evaluates a validated `TaskContract`.
 
 External verifiers are trusted caller configuration, not model output. They may
 execute workspace code and must therefore only come from the user, CI harness or

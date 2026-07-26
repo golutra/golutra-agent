@@ -25,7 +25,8 @@ User Input
 -> Session Command Protocol
 -> Runtime Event
 -> State Projection
--> Context Projection
+-> Runtime OS control loop
+-> ModelInputEnvelope (approved provider boundary)
 -> Provider / Tool Loop
 -> Verification
 -> LoopDecision
@@ -39,7 +40,9 @@ User Input
 架构收敛原则是：
 
 ```text
-所有能力都必须围绕 Runtime Event、State Projection、Context Projection、LoopDecision 和多投影观测展开。
+所有能力都必须围绕 Runtime Event、Runtime OS control loop、ModelInputEnvelope、Verification、
+LoopDecision 和多投影观测展开。`ContextProjection` 是模型输入的审计读模型，不是模型可见
+的控制对象；`DebugProjection`/`EvaluationProjection` 也不能自动回灌 provider request。
 ```
 
 如果一个能力无法说明它产生什么 runtime fact、改变什么 state projection、是否影响 context projection、是否参与 Verification / LoopDecision / PromotionGate，它就不进入核心，只作为插件或实验能力。
@@ -57,7 +60,7 @@ GoalLedger
 -> LoopDecision
 ```
 
-这些能力不属于第一阶段的最低门槛，但当前实现已经完成 P2.5 治理闭环：`TaskTraceService`、ContextSnapshot、durable post-task job、客观 verification、baseline/candidate execution-backed regression 和 memory quarantine 均已接入。普通运行仍只消费 UserProjection；P3 的 `golutra-supervisor`/`golutra-release` 是独立本地控制面，不进入普通 TUI 同步路径。
+这些能力不属于第一阶段的最低门槛，但当前实现已经完成 P2.5 治理闭环：`TaskTraceService`、ContextSnapshot、durable post-task job、客观 verification、baseline/candidate execution-backed regression 和 memory quarantine 均已接入。普通运行仍只消费 UserProjection；P3 的 `golutra-supervisor`/`golutra-release` 是独立本地控制面，不进入普通 TUI 同步路径。Runtime OS 在 provider 边界只发送经过 `compile_model_input` 检查的 `ModelInputEnvelope`，模型不能查询 RuntimeEvent 或离线治理状态。
 
 ## 阶段分层
 
@@ -82,6 +85,7 @@ GoalLedger
 主架构只保留最稳定的骨架与边界，支持层和未来治理细节分别下沉到专题文档：
 
 - Agent 核心是 runtime，不是 prompt 包装器。CLI、TUI、API、SDK 都要进入同一套 runtime loop。
+- Runtime OS control plane、model boundary 和 observation/governance plane 必须解耦：运行事实可完整保存，但只有显式允许的消息才进入 `ModelInputEnvelope`。
 - 任务完成必须由 `VerificationRecord` 判定，不能只看模型自然语言。
 - `ProviderContract`、`ToolContract`、`PolicyEvaluation`、`ArtifactRecord`、`EvidenceRecord` 属于支持层，细节见 `implementation-blueprint.md` 和观测/记忆专题文档。
 - `GoalLedger`、`RuntimeGovernor`、`VerificationTier`、`EventSamplingPolicy`、`ContextProjectionCache` 属于治理增强；当前轻量确定性 governor 进入 runtime loop，重型评估通过 durable post-task job 运行，ContextProjectionCache 仍因 stale-context 风险保持禁用。
@@ -477,16 +481,20 @@ Golutra 的观测不是一条全部展示给用户的链路，而是同一批 ru
 
 ```text
 Runtime Control Projection
-  给 runtime 自己使用，用于 LoopDecision、context、verification、retry、fallback、compact。
+  给 Runtime OS 自己使用，用于 LoopDecision、context 编译、verification、retry、fallback、compact；不等于模型输入。
+
+Model Input Boundary
+  RuntimeHost 只把通过 visibility、allowlist 和 budget 检查的 `ModelInputEnvelope` 发送给 provider。
+  模型看不到完整 RuntimeEvent、Debug/Evaluation projection 或 PromotionDecision。
 
 User Projection
   给普通 CLI / TUI / API 用户使用，只展示进度、权限请求、最终结果和必要风险。
 
 Debug / Audit Projection
-  给开发者、人类审计者或其他 agent 使用，展开 event、policy、evidence、token、provider raw event、context projection。
+  给开发者、人类审计者或其他 agent 使用，展开 event、policy、evidence、token、provider raw event、context projection；它在模型边界之外。
 
 Evaluation / Improvement Projection
-  给离线 replay、benchmark、regression 和 agent 改进使用，用于分析失败并生成 memory / policy / skill / benchmark 候选。
+  给离线 replay、benchmark、regression 和 agent 改进使用，用于分析失败并生成 memory / policy / skill / benchmark 候选；不阻塞或改写已经落定的 runtime task。
 ```
 
 普通用户模式只使用 `User Projection`：

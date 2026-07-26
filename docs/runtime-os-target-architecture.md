@@ -12,6 +12,36 @@
 6. workspace 是 cwd、权限和历史过滤边界，不是 runtime 进程边界。默认 embedded host 与显式用户级 daemon 共享同一 durable store 语义。
 7. candidate 生成与 candidate 晋升必须分权。命令 producer 只能获得 Supervisor 管理的 worktree、脱敏 `CandidateRequest` 和独立 scratch；没有 OS-enforced sandbox 时拒绝启动，且永远不能直接访问网络、provider/release 凭据、evaluator 或 stable pointer。
 
+### 1.1 三个平面不是同一个投影
+
+Runtime OS 的“运行事实”“模型输入”和“开发者观测”必须明确分开。`RuntimeEvent` 是
+canonical fact，不是 prompt；`ContextProjection` 是对实际模型输入的审计读模型，也不是
+模型收到的 JSON；`DebugProjection`、`EvaluationProjection` 和导出 bundle 都在模型边界之外。
+
+```text
+Runtime OS control plane
+  owns session/lane/turn/tool/verification/recovery and terminal state
+  decides which bounded facts may become model input
+
+Model boundary
+  RuntimeHost -> compile_model_input -> ModelInputEnvelope -> Provider
+  provider receives only the approved ProviderRequest and tool contracts
+  it cannot query RuntimeEvent, DebugProjection, EvaluationProjection or promotion state
+
+Observation / governance plane
+  RuntimeEvent + artifacts -> State/User/Debug/Context/Evaluation/Trace projections
+  post-task review -> candidate -> regression -> promotion runs out of band
+  its failures are diagnostic facts and never rewrite the active task result
+```
+
+`ModelInputVisibility` 是消息级的硬门禁：只有 `ModelVisible` 能进入
+`ModelInputEnvelope`；`ObservationOnly` 与 `GovernanceOnly` 即使 payload 中有可读文本也会被
+拒绝。验证反馈进入模型时只能通过当前 turn 的有界 correction envelope，不能把整个治理投影
+回灌为上下文。事件的 `RuntimeEventClass` 是由 `event_type` 派生的路由/统计分类，不能替代
+实际 projection 的 allowlist，也不等于披露权限；最终权限由显式 projection allowlist 和消息
+visibility 决定。`compile_model_input` 还要求 message 与 source 一一对应；缺失 source 时直接
+阻断 provider 调用，不能为未知消息推断一个 model-visible 来源。
+
 ## 2. 分层架构
 
 ```text
@@ -82,6 +112,7 @@ Projection Plane                 Improvement Plane
 `RuntimeHost` 是执行 owner：
 
 - 持有 `RuntimeLaneManager`、任务 handle、`CancellationToken`、pending turn queue、approval waiter 和 EventBus。
+- 在执行前校验显式 `TaskContract`，包括 workspace change、delivery path、verification independence 和 correction 上限；兼容旧客户端的 prompt 推断只存在于 application adapter，不能进入核心终态判断。
 - 将每个 provider/tool/context/verification 阶段转成 `AgentLoopTraceEvent`，由 host adapter 写入 `RuntimeEvent` 和 artifact。
 - `RuntimeVerificationService` 只接受结构化 `VerificationInput`，由 `golutra-verify` 产生 assertion status；模型不能直接写 Pass。
 - context guard、completion policy、provider retry/fallback 和 trace adapter 在 `golutra-runtime` 的独立模块中，loop orchestration 只负责顺序和控制流。
@@ -106,7 +137,8 @@ Projection Plane                 Improvement Plane
 | --- | --- | --- |
 | `StateProjection` | Runtime control、CLI status | 当前 lane、task status、controller、verification；可从 event 重建 |
 | `UserProjection` | 普通 TUI/Web 对话 | 只含用户可理解的步骤、终态、回复和 residual risk |
-| `ContextProjection` | 模型输入审计 | 类型化 `ContextSnapshot`、实际 request digest、贡献者/消息/tool schema manifest；默认只引用脱敏 artifact |
+| `ModelInputEnvelope` | provider 边界 | 唯一实际发送给模型的 `ProviderRequest`；只含通过 visibility 和 context budget 的消息与 tool contract |
+| `ContextProjection` | 模型输入审计 | 对实际 request 的类型化 `ContextSnapshot`、digest、贡献者/消息/tool schema manifest；它不自动进入模型 |
 | `DebugProjection` | 交互式开发调试 | 最近有界事件窗口，不承诺完整历史 |
 | `EvaluationProjection` | post-task 与 promotion 治理 | review/result/candidate/regression/decision/job 的类型化生命周期，不解析事件文案 |
 | `TaskTracePage` | CLI/SDK/Audit/Supervisor | 按 cursor 关联完整事实并返回 `TraceIntegrity`；summary/full/forensic 是披露级别，不是三套事实 |
@@ -125,15 +157,24 @@ command
   -> before-image checkpoint
   -> Tool artifact + structured evidence + model excerpt
   -> VerificationPlan + VerificationRecord
-  -> LoopDecision + UserProjection
-  -> durable PostTaskJob (before task process can exit)
+  -> bounded correction envelope or terminal LoopDecision
+  -> TaskCompleted / TaskAborted (Runtime OS terminal result)
+  -> post-terminal memory quarantine + minimal evaluation
+  -> durable PostTaskJob scheduling barrier, then deep evaluation
+  -> UserProjection (ordinary UI) / Debug-Trace-Evaluation projections (out of band)
   -> PostTaskReview / ImprovementCandidate
   -> task-level per-case isolated baseline/candidate RegressionResult
   -> version-level stable/candidate eval-worker paired execution
   -> PromotionDecision (human/control-plane gate)
 ```
 
-provider/runtime 失败也必须在终态前生成固定失败 `VerificationPlan` 和 `VerificationRecord(Fail)`，再进入 durable post-task 链；不能因为 loop 提前返回错误而跳过验证。每个已完成 regression 都必须形成显式 `PromotionDecision`，包括 `Reject` 和 `NeedsHumanReview`，不能只靠 candidate status 暗示治理结论。
+provider/runtime 失败也必须在运行时终态决策前生成固定失败 `VerificationPlan` 和
+`VerificationRecord(Fail)`，再落下 `TaskAborted`/`TaskCompleted` 等 runtime terminal fact；
+不能因为 loop 提前返回错误而跳过验证。Task terminal fact 一旦持久化，后置 memory/evaluation
+失败只能记录 `PostTaskStageFailed`、`PostTaskJobFailed` 或 integrity warning，不能改写用户任务状态。settled trace
+会等待本地 supervisor 完成“治理已调度或调度失败”的屏障，再判断 job/evaluation 是否完整。
+每个已完成 regression 都必须形成显式 `PromotionDecision`，包括 `Reject` 和
+`NeedsHumanReview`，不能只靠 candidate status 暗示治理结论。
 
 任何箭头缺失都必须在 `TaskTracePage.integrity` 中表现为 `missing_sections`、`unresolved_refs` 或 `retention_losses`，不能返回看起来完整的成功 JSON。post-task job 尚未进入 `Succeeded/Failed/Cancelled` 或 evaluation projection 尚未 terminal 时，最后一页必须保持 `complete=false`。每个引用 artifact 不只检查 manifest：trace 读取还会验证实际 blob 的 size/checksum；retention 已删除的 blob 进入 `retention_losses`，磁盘篡改直接报 integrity failure。
 
@@ -162,6 +203,18 @@ TaskTraceBundle
 - 每个候选保留 candidate digest、campaign、逐 case baseline/candidate trace ref、verification ref 和 decision ref；子 runtime 的完整 trace 与引用 blob 在 TempDir 回收前打包成父 workspace 的 content-addressed `regression_trace_bundle`，任一 case 缺 durable pair 只能 `NeedsReview`。
 - RuntimeHost 内的 `regression_trace_bundle` 用于 prompt/config/tool 等任务级候选；涉及 runtime 源码的版本候选不能复用同一个已编译 Host。Supervisor 必须从 stable release 和 candidate evaluation build 分别启动 sealed `golutra-eval-worker`，在独立 home/workspace 中执行相同 case，并把完整 trace、artifact blob、binary checksum、workspace digest 和外部 assertion 结果持久化为 `artifact://supervisor-evaluation/...`。
 - memory 只从独立 evidence 进入 quarantine，不能把候选修改或单次成功直接写成 active memory。
+
+### 4.1 观测不能反向污染模型
+
+观测链路可以完整，但完整不代表全部回到 prompt。每次 provider 调用至少有两条结果：
+
+1. `ModelInputEnvelope.provider_request`：实际发送的、经过 allowlist/visibility/budget 检查的输入。
+2. `ContextProjection` / `TaskTracePage`：供开发者、审计和评估读取的脱敏事实及完整性信息。
+
+后者可以包含 event、artifact ref、verification、token、job 和治理状态，但这些字段不会因为
+被持久化或被 TUI 展开而自动成为下一轮的历史。下一轮 context 只从明确允许的 user/assistant/
+tool facts、项目指令、受治理 memory 和当前 turn correction 重新编译；hidden visibility 在
+compaction summary 中也必须保持 hidden。
 
 ## 5. crate 映射
 
@@ -201,6 +254,8 @@ TaskTraceBundle
 - `golutra-runtime` 的 context guard、completion policy、provider retry、trace adapter、verification service 文件拆分。
 - `golutra-client` 已按 application、command、query、session、execution、execution trace、post-task、governance、regression 和 task trace 拆分；`RuntimeHost` 根模块只保留 owner 状态和共同基础设施。
 - `ContextProjection`、`EvaluationProjection` 和 `TaskTracePage` 已进入 Rust protocol、schema、TypeScript/Python SDK。
+- `ModelInputEnvelope` 已成为 Runtime OS 到 provider 的唯一边界；`compile_model_input` 对 typed visibility 和 legacy hidden labels 双重拒绝，`ContextProjection` 只作为实际请求的审计投影，不是模型上下文。
+- `RuntimeEventClass` 由 `event_type` 派生并作为 control/execution/memory/evaluation/governance 的统计/路由分类；模型历史和普通用户投影仍使用更窄的显式 allowlist，不能用 event class 代替披露权限。
 - `EvaluationProjection` 会逐条核对 review/result/candidate/regression/decision 是否存在对应 canonical event；secondary governance store 已落盘但事件提交中断时会产生 integrity warning，`TaskTrace.complete` 不会静默成功。regression/decision 事件绑定 source task，trace 会解析其受控 artifact refs，将完整 child trace bundle manifest 纳入同一审计页。
 - CLI、Rust client、TypeScript SDK 和 Python SDK 都提供 bounded all-pages trace 聚合；cursor 不前进、页身份不一致或超过页数上限会显式失败，regression 也不再把第一页冒充完整 trace。
 - success/failure facade 端到端测试覆盖 command -> task -> verification -> durable post-task -> candidate -> regression -> explicit promotion decision；失败任务同时断言不会污染 memory。
@@ -241,3 +296,5 @@ just py-check
 7. Supervisor 重新验证 trace 完整性；candidate producer 无网络、无控制面文件访问、无 process-only fallback，并且 timeout/output overflow 后不存在遗留进程。
 8. runtime 源码 candidate 的 paired refs 来自两个不同 checksum 的 stable/candidate eval-worker 执行证据；伪造 evaluation/build report 没有公开提交入口。
 9. Supervisor 中断事务可由 pending journal 恢复，release source/manifest/binary 任一磁盘篡改都会阻止 launcher、preview、promotion 或 rollback。
+10. 模型 boundary 测试证明 Evaluation/Governance facts、DebugProjection 和 hidden context 不会进入 provider request；compaction 不会把 hidden fact 升格为 model-visible。
+11. `TaskCompleted` 先于 post-task governance 持久化；治理调度/worker 失败不会改写已验证的 runtime terminal status，settled export 不会因竞态丢失后置 job。

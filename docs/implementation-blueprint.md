@@ -126,7 +126,7 @@ ContextProjectionCache
 
 1. `GoalLedger + GoalAlignmentCheck + RuntimeGovernor` 已在 provider/tool/result/completion 边界执行，不调用额外 judge。
 2. 验证已按 plain conversation、workspace objective、workspace change 和 code change 分级，并用 `VerificationCheckKind` 记录客观来源。mutation 不等于 validation；最后一次工作区修改后若缺少新的客观检查，AgentLoop 会以 `RetryScheduled` 最多回送两次验证要求。caller-owned external verifier 直接承担后置检查，不重复要求模型执行 shell；同一检查重跑以最新结果为准。
-3. deep PostTaskReview/evaluation 在终态前先持久 enqueue，之后由带 lease/retry/recovery 的 worker 执行；普通 TUI 不查询 debug/evaluation projection。
+3. runtime terminal fact 先持久化；随后以 best-effort 方式完成 memory quarantine 和 minimal evaluation，并在 active worker 内建立 settlement barrier。`PostTaskJob` 再由带 lease/retry/recovery 的 worker 执行；治理失败记录诊断事实但不改写任务终态，普通 TUI 不查询 debug/evaluation projection。
 4. `EventSamplingPolicy` 只保留配置模型；canonical RuntimeEvent 不能采样丢失，当前也没有独立高成本派生索引需要抽样。
 5. `ContextProjectionCache` 只保留带 invalidation refs 的模型；当前 ContextBuilder 成本未形成瓶颈，启用 cache 反而会引入 stale context 风险。
 6. `CausalLedger` 在 canonical append 前补齐事件 provenance，并把 provider failure、tool completion、verification 和 external evaluation 连接到可审计的因果链；event append 失败会回滚 ledger 索引。
@@ -292,7 +292,7 @@ TokenUsageRecord
   usage_source: provider | estimated | unknown
 ```
 
-`input_tokens` 包含 system prompt、developer/runtime instructions、policy constraints、user / assistant recent messages、context projection、working summary、memory、evidence summary、tool instructions 和 tool result excerpts 等所有进入 provider request 的模型可见内容。
+`input_tokens` 包含 system prompt、developer/runtime instructions、policy constraints、user / assistant recent messages、working summary、memory、evidence summary、tool instructions 和 tool result excerpts 等所有进入 `ModelInputEnvelope.provider_request` 的模型可见内容。`ContextProjection` 只记录这些输入的脱敏 snapshot/digest，不能被当作额外 prompt 内容。
 
 ### TokenAttribution
 
@@ -850,7 +850,7 @@ DebugProjection
   tool_result_envelopes
 ```
 
-Debug Projection 只在 debug/audit/replay 模式启用，并且只承担治理摘要与当前事件窗口；typed projection 同时携带 post-task jobs、trace completeness、missing sections 和 retention losses，TUI developer mode 通过 `EventPage` cursor 按需加载更早事件。完整、分页且带缺失原因的事实包由 P2.5 `TaskTraceService` 返回，调用方本地 `DebugExportCoordinator` 再将选定 SessionWindow 按 high-watermark 物化为 `full-redacted` bundle；期间发生新事件时必须标记 incomplete。
+Debug Projection 只在 debug/audit/replay 模式启用，并且只承担治理摘要与当前事件窗口；typed projection 同时携带 post-task jobs、trace completeness、missing sections 和 retention losses，但不进入 model input。TUI developer mode 通过 `EventPage` cursor 按需加载更早事件。完整、分页且带缺失原因的事实包由 P2.5 `TaskTraceService` 返回，调用方本地 `DebugExportCoordinator` 再将选定 SessionWindow 按 high-watermark 物化为 `full-redacted` bundle；期间发生新事件时必须标记 incomplete。
 
 ## P0 验收矩阵
 

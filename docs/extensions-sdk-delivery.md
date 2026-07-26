@@ -183,5 +183,5 @@ just py-check
 just release-package-smoke
 ```
 
-跨进程验收覆盖多 cwd、daemon 重启、HTTP/SSE、Unix IPC、command 幂等、thread fork/rebind 和 durable post-task evaluation；稳定性 smoke 连续执行多轮 turn，验证 event sequence 单调、同一 thread 不分叉并能在 RuntimeHost 重启后恢复。`PostTaskJob` 与排队事件在任务终态前写入 SQLite，worker 通过 lease、retry 和 recovery 接管，Embedded one-shot 退出后可由下一 Host/daemon 继续执行。
+跨进程验收覆盖多 cwd、daemon 重启、HTTP/SSE、Unix IPC、command 幂等、thread fork/rebind 和 durable post-task evaluation；稳定性 smoke 连续执行多轮 turn，验证 event sequence 单调、同一 thread 不分叉并能在 RuntimeHost 重启后恢复。runtime terminal fact 先写入 SQLite，active worker 随后建立治理调度屏障并创建 `PostTaskJob`；worker 通过 lease、retry 和 recovery 接管，Embedded one-shot 退出后可由下一 Host/daemon 继续执行。
 入口级验收还覆盖 `exec`/`exec resume` 的独立进程、MCP stdio 子进程、WebSocket/stdio JSON-RPC、SDK 高层 handle 和 Remote TUI attach；详见 `runtime-entrypoints.md`。

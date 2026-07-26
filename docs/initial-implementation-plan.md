@@ -48,7 +48,7 @@
 - 已产生 `TurnStarted` 的中断 turn 不会自动重放。原 active task 会根据未闭合 tool/process facts 标为 `Interrupted` 或 `Uncertain`；后者阻断新 prompt 与 pending turn，必须通过 `TaskReconciliationRecord` 明确记录 `no_side_effect_observed`、`side_effect_observed` 或 `abandon`。对账结果只能进入 `Interrupted/Cancelled`，不能伪造成功。
 - checkpoint 对单文件使用临时文件 + fsync + 原子替换；多文件 rollback 会先完整校验 manifest，但不是跨文件系统事务。
 - `/events/replay` 与 SSE 主链支持 cursor 历史分页和 live stream；`DebugProjection` 最多保留 512 条最近事件，显式 TUI developer mode 只展示有界摘要，普通 TUI 不查询该投影。统一 `TaskTraceService` 已提供分页、integrity/disclosure、artifact range read 和 CLI/SDK full trace；HTTP 拒绝 forensic，owner-only Unix IPC/embedded 可请求，restricted capture 未启用时不会伪装为 complete。
-- Embedded one-shot 会在 `TaskCompleted` 前 durable enqueue deep evaluation；worker 使用带 workspace 原子过滤的 SQLite lease、retry 和 recovery，进程退出后只能由同 cwd 的下一 Host/daemon 接管，其他 cwd worker 不会修改其 event/rollout 分区。
+- Embedded one-shot 先持久化 `TaskCompleted`，再由 active worker 完成 best-effort governance scheduling barrier；`PostTaskJob` 使用带 workspace 原子过滤的 SQLite lease、retry 和 recovery，进程退出后只能由同 cwd 的下一 Host/daemon 接管，其他 cwd worker 不会修改其 event/rollout 分区。治理失败不改写已落定的 runtime status。
 - ContextBuilder 在实际 provider request 前保存 redacted `ContextSnapshot`、digest、contributor/message/tool manifest；verification 使用 plan/assertion 和 Evidence/Object/Policy hard gate。无法客观证明的标准保持 Unknown/Partial。
 - `TrajectoryReplay` 仍明确是 event/artifact projection；RegressionCampaign 已为冻结候选的每个 durable case 启动配对 baseline/candidate RuntimeHost，并在临时 home 回收前保存 content-addressed trace bundle；只有所有 case 都有可持久读取的 execution-backed pair 时才能成为 P3 晋升证据。
 - project memory 只进入 quarantine，带 structured claim、默认 expiry 和 invalidation refs；独立任务 evidence 或 human review 后才 active，legacy active 记录读取时降级。
@@ -412,7 +412,7 @@ schema validation
 
 ## P0.5 ProviderContract 与 ContextBuilder
 
-目标：接入模型但不让 runtime 依赖 provider 原生类型，模型输入必须来自 projection。
+目标：接入模型但不让 runtime 依赖 provider 原生类型；模型输入必须由 ContextBuilder 编译成经过 visibility/预算门禁的 `ModelInputEnvelope`，任意 Debug/Evaluation projection 都不能直接进入 provider request。
 
 Provider 内部模型：
 

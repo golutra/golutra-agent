@@ -958,7 +958,7 @@ cost
 - 能持续检查计划和动作是否偏离原始目标。
 - 能按风险分级验证，避免每个动作都付出完整审计成本。
 - 能区分 raw event、indexed event 和 evaluation event，避免观测成本失控。
-- 能证明模型当时看到的 context projection 是什么。
+- 能通过 `ContextSnapshot` 和 `ModelInputEnvelope` 审计摘要证明模型当时看到的实际输入；不能把 `ContextProjection` 本身误当成模型可见上下文。
 - 能区分失败归因。
 - 能 replay 任意关键 turn。
 - 能把失败转成 benchmark。
