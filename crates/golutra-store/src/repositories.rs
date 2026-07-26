@@ -319,9 +319,18 @@ impl DurableJobRepository {
         &self,
         job: &PostTaskJob,
         event: RuntimeEvent,
-    ) -> StoreResult<RuntimeEvent> {
+    ) -> StoreResult<Option<RuntimeEvent>> {
         self.store
             .enqueue_post_task_job_with_event(job, event)
+            .await
+    }
+
+    pub async fn unscheduled_terminal_events(
+        &self,
+        workspace_root: Option<&str>,
+    ) -> StoreResult<Vec<RuntimeEvent>> {
+        self.store
+            .unscheduled_post_task_terminal_events(workspace_root)
             .await
     }
 

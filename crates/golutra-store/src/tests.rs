@@ -1252,7 +1252,8 @@ async fn post_task_job_queue_event_and_job_commit_atomically() {
     let committed = store
         .enqueue_post_task_job_with_event(&job, event)
         .await
-        .expect("atomic queue");
+        .expect("atomic queue")
+        .expect("new job");
 
     assert_eq!(committed.sequence_no, 1);
     assert_eq!(
@@ -1271,6 +1272,130 @@ async fn post_task_job_queue_event_and_job_commit_atomically() {
             .expect("events")
             .len(),
         1
+    );
+
+    let mut duplicate = job.clone();
+    duplicate.job_id = PostTaskJobId::new();
+    let duplicate_event = RuntimeEvent {
+        id: EventId::new(),
+        sequence_no: 0,
+        payload: json!({"job_id": duplicate.job_id}),
+        ..committed
+    };
+    assert!(
+        store
+            .enqueue_post_task_job_with_event(&duplicate, duplicate_event)
+            .await
+            .expect("duplicate queue is idempotent")
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .list_post_task_jobs(task_id)
+            .await
+            .expect("jobs")
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .load_events(session_id, None, None)
+            .await
+            .expect("events")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn unscheduled_post_task_scan_requires_pending_governance_without_terminal_failure() {
+    let store = RuntimeStore::in_memory().await.expect("store");
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let workspace_root = "/workspace/recovery";
+    let now = Utc::now();
+    store
+        .upsert_thread(&ThreadRecord {
+            thread_id: ThreadId::new(),
+            session_id,
+            parent_thread_id: None,
+            forked_from_turn_id: None,
+            forked_from_sequence_no: None,
+            workspace_root: Some(workspace_root.to_owned()),
+            rebound_from_workspace_root: None,
+            rollout_path: None,
+            title: "recovery".to_owned(),
+            preview: "recovery".to_owned(),
+            created_at: now,
+            updated_at: now,
+            recency_at: now,
+            archived: false,
+        })
+        .await
+        .expect("thread");
+    let terminal = RuntimeEvent {
+        schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+        causal_context: Default::default(),
+        causal_links: Vec::new(),
+        id: EventId::new(),
+        sequence_no: 0,
+        session_id,
+        turn_id: Some(TurnId::new()),
+        task_id: Some(task_id),
+        parent_event_id: None,
+        event_type: RuntimeEventType::TaskCompleted,
+        timestamp: now,
+        source: RuntimeEventSource::Runtime,
+        payload: json!({
+            "status": "failed",
+            "post_task_governance": {"status": "pending"}
+        }),
+        payload_ref: None,
+        durable: true,
+    };
+    store
+        .append_event_assigning_sequence(terminal)
+        .await
+        .expect("terminal");
+
+    assert_eq!(
+        store
+            .unscheduled_post_task_terminal_events(Some(workspace_root))
+            .await
+            .expect("pending terminals")
+            .len(),
+        1
+    );
+    assert!(
+        store
+            .unscheduled_post_task_terminal_events(Some("/other/workspace"))
+            .await
+            .expect("foreign terminals")
+            .is_empty()
+    );
+
+    store
+        .append_event_assigning_sequence(RuntimeEvent {
+            id: EventId::new(),
+            sequence_no: 0,
+            event_type: RuntimeEventType::PostTaskStageFailed,
+            payload: json!({"phase": "evaluation_scheduling", "terminal": true}),
+            ..store
+                .load_events(session_id, Some(task_id), None)
+                .await
+                .expect("events")
+                .into_iter()
+                .next()
+                .expect("terminal event")
+        })
+        .await
+        .expect("stage failure");
+    assert!(
+        store
+            .unscheduled_post_task_terminal_events(Some(workspace_root))
+            .await
+            .expect("terminal failure suppresses recovery")
+            .is_empty()
     );
 }
 

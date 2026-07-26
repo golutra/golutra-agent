@@ -959,6 +959,103 @@ async fn durable_post_task_worker_recovers_a_queued_job_after_host_restart() {
 }
 
 #[tokio::test]
+async fn startup_recreates_a_post_task_job_missing_after_terminal_commit() {
+    let home = tempdir().expect("home");
+    let workspace = tempdir().expect("workspace");
+    let paths = RuntimePaths::from_home_and_cwd(home.path(), workspace.path()).expect("paths");
+    let store =
+        RuntimeStore::connect_with_artifact_root(&paths.sqlite_url(), paths.artifacts_dir.clone())
+            .await
+            .expect("store");
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let turn_id = TurnId::new();
+    let now = chrono::Utc::now();
+    store
+        .upsert_thread(&ThreadRecord {
+            thread_id: ThreadId::new(),
+            session_id,
+            parent_thread_id: None,
+            forked_from_turn_id: None,
+            forked_from_sequence_no: None,
+            workspace_root: Some(paths.cwd.display().to_string()),
+            rebound_from_workspace_root: None,
+            rollout_path: None,
+            title: "terminal recovery".to_owned(),
+            preview: "terminal recovery".to_owned(),
+            created_at: now,
+            updated_at: now,
+            recency_at: now,
+            archived: false,
+        })
+        .await
+        .expect("thread");
+    let mut created = host_event(
+        0,
+        session_id,
+        Some(task_id),
+        RuntimeEventType::TaskCreated,
+        RuntimeEventSource::Runtime,
+        json!({"prompt": "recover missing governance job"}),
+    );
+    created.turn_id = Some(turn_id);
+    store
+        .append_event_assigning_sequence(created)
+        .await
+        .expect("task event");
+    let mut terminal = host_event(
+        0,
+        session_id,
+        Some(task_id),
+        RuntimeEventType::TaskCompleted,
+        RuntimeEventSource::Runtime,
+        json!({
+            "status": "failed",
+            "post_task_governance": {"status": "pending"}
+        }),
+    );
+    terminal.turn_id = Some(turn_id);
+    store
+        .append_event_assigning_sequence(terminal)
+        .await
+        .expect("terminal event");
+    assert!(
+        store
+            .post_task_job(task_id)
+            .await
+            .expect("job query")
+            .is_none()
+    );
+    drop(store);
+
+    let host = RuntimeHost::from_home_and_cwd(home.path(), workspace.path())
+        .await
+        .expect("restarted host");
+    host.wait_for_deep_task_evaluation(task_id).await;
+    let jobs = host
+        .repositories
+        .jobs
+        .list_for_task(task_id)
+        .await
+        .expect("jobs");
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].status, PostTaskJobStatus::Succeeded);
+    let events = host
+        .repositories
+        .events
+        .load(session_id, Some(task_id), None)
+        .await
+        .expect("events");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == RuntimeEventType::PostTaskJobQueued)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn cross_process_settlement_waits_for_durable_scheduling_outcome() {
     let host = RuntimeHost::in_memory().await.expect("host");
     let session_id = host.default_session_id();

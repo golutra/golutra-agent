@@ -107,7 +107,7 @@ impl RuntimeHost {
         &self,
         task: &HostedAgentTask,
         input: TaskEvaluationInput,
-    ) -> Result<(), ClientError> {
+    ) -> Result<bool, ClientError> {
         if let Some(existing) = self.repositories.jobs.get_for_task(task.task_id).await? {
             match existing.status {
                 PostTaskJobStatus::Queued
@@ -117,10 +117,19 @@ impl RuntimeHost {
                         .lock()
                         .await
                         .insert(existing.job_id, input);
-                    return Ok(());
+                    return Ok(false);
                 }
-                PostTaskJobStatus::Succeeded => return Ok(()),
-                PostTaskJobStatus::Failed | PostTaskJobStatus::Cancelled => {}
+                PostTaskJobStatus::Succeeded => return Ok(false),
+                PostTaskJobStatus::Failed | PostTaskJobStatus::Cancelled => {
+                    let retried = self.repositories.jobs.retry(existing.job_id).await?;
+                    if retried {
+                        self.deep_evaluation_inputs
+                            .lock()
+                            .await
+                            .insert(existing.job_id, input);
+                    }
+                    return Ok(retried);
+                }
             }
         }
 
@@ -168,7 +177,11 @@ impl RuntimeHost {
             }
         };
         let event = match self.repositories.jobs.enqueue_with_event(&job, event).await {
-            Ok(event) => event,
+            Ok(Some(event)) => event,
+            Ok(None) => {
+                *self.causal_ledger.lock().await = causal_before;
+                return Ok(false);
+            }
             Err(error) => {
                 *self.causal_ledger.lock().await = causal_before;
                 return Err(error.into());
@@ -180,7 +193,49 @@ impl RuntimeHost {
             .lock()
             .await
             .insert(job.job_id, input);
-        self.publish_committed_event(event).await
+        self.publish_committed_event(event).await?;
+        Ok(true)
+    }
+
+    /// Recreate a missing durable post-task job after a process exits between
+    /// terminal event commit and job enqueue. The store query is workspace
+    /// scoped and the enqueue transaction is idempotent across processes.
+    pub(super) async fn recover_unscheduled_post_task_jobs(&self) -> Result<usize, ClientError> {
+        let workspace_root = self.workspace_root_string();
+        let terminal_events = self
+            .repositories
+            .jobs
+            .unscheduled_terminal_events(workspace_root.as_deref())
+            .await?;
+        let mut recovered = 0usize;
+        for terminal_event in terminal_events {
+            let Some(task_id) = terminal_event.task_id else {
+                continue;
+            };
+            let synthetic_job = PostTaskJob {
+                job_id: PostTaskJobId::new(),
+                kind: PostTaskJobKind::DeepEvaluation,
+                workspace_id: self.workspace_id.to_string(),
+                session_id: terminal_event.session_id.to_string(),
+                task_id,
+                input_refs: Vec::new(),
+                status: PostTaskJobStatus::Queued,
+                attempt: 0,
+                max_attempts: POST_TASK_JOB_MAX_ATTEMPTS,
+                lease_owner: None,
+                lease_expires_at: None,
+                result_refs: Vec::new(),
+                last_error: None,
+                created_at: terminal_event.timestamp,
+                started_at: None,
+                completed_at: None,
+            };
+            let (task, input) = self.reconstruct_post_task_context(&synthetic_job).await?;
+            if self.enqueue_deep_task_evaluation(&task, input).await? {
+                recovered = recovered.saturating_add(1);
+            }
+        }
+        Ok(recovered)
     }
 
     pub(super) async fn reconstruct_post_task_context(

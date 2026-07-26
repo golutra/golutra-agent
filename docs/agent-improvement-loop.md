@@ -25,7 +25,7 @@ execution-backed regression 和可信晋升输入的 P2.5 实施记录见 `runti
 - 只有低风险 benchmark candidate 在 clean regression 后可由 system reviewer approve；apply 只更新 workspace evaluation dataset 状态，不执行任意代码。
 - candidate 状态转换受约束，不能跳过 regression/promotion gate；apply 后可 rollback，原因和 applied version 会持久化。
 - `RuntimeGovernor` 在 provider/tool/result/completion 阶段执行确定性 token/cost/tool/time budget、policy/security risk 和目标对齐检查，但不自动生成或部署改动。
-- deep review 通过 TaskCompleted 前写入的 durable PostTaskJob 执行；worker 使用 lease/retry/recovery，Embedded one-shot 退出后由下一 Host/daemon 接管。
+- deep review 在 TaskCompleted 落盘后通过 durable PostTaskJob 执行；worker 使用 lease/retry/recovery。若进程在终态提交与 job 入队之间退出，下一 Host/daemon 会按 workspace 扫描 pending terminal fact 并幂等补建 job。
 - deep failure 的 `ImprovementCandidate` 与 `RuntimeChange AutomationCandidate` 使用同一 candidate id 和同步状态；diagnosis 或 external evaluation 更新后，摘要、证据、回归计划与 rollback ref 同步刷新。
 - runtime change 候选由 dispatcher 自动推进。存在 `candidate_patch_set` 时使用冻结 bytes 启动隔离回归；不存在可执行补丁时写入真实的 blocked `RegressionResult(NeedsReview)` 和 `PromotionDecision(NeedsHumanReview)`。该路径不调用 `CandidateApplied`。
 

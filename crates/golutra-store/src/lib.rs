@@ -1264,17 +1264,36 @@ impl RuntimeStore {
         &self,
         job: &PostTaskJob,
         mut event: RuntimeEvent,
-    ) -> StoreResult<RuntimeEvent> {
+    ) -> StoreResult<Option<RuntimeEvent>> {
         let mut transaction = self.pool.begin().await?;
+        // Acquire the SQLite writer lock before checking for an existing job.
+        // This keeps independent RuntimeHost processes from scheduling the
+        // same task concurrently in the terminal-event/enqueue recovery window.
         sqlx::query(
-            "INSERT OR IGNORE INTO post_task_jobs
+            "UPDATE runtime_sequence SET last_sequence_no = last_sequence_no WHERE singleton = 1",
+        )
+        .execute(&mut *transaction)
+        .await?;
+        let kind = enum_json(job.kind)?;
+        let existing =
+            sqlx::query("SELECT job_id FROM post_task_jobs WHERE task_id = ? AND kind = ? LIMIT 1")
+                .bind(job.task_id.to_string())
+                .bind(&kind)
+                .fetch_optional(&mut *transaction)
+                .await?;
+        if existing.is_some() {
+            transaction.commit().await?;
+            return Ok(None);
+        }
+        sqlx::query(
+            "INSERT INTO post_task_jobs
              (job_id, kind, workspace_id, session_id, task_id, input_refs_json, status,
               attempt, max_attempts, lease_owner, lease_expires_at, result_refs_json,
               last_error, created_at, started_at, completed_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(job.job_id.to_string())
-        .bind(enum_json(job.kind)?)
+        .bind(kind)
         .bind(&job.workspace_id)
         .bind(&job.session_id)
         .bind(job.task_id.to_string())
@@ -1294,7 +1313,7 @@ impl RuntimeStore {
         event.sequence_no = next_sequence_in_transaction(&mut transaction).await?;
         append_event_in_transaction(&mut transaction, &event).await?;
         transaction.commit().await?;
-        Ok(event)
+        Ok(Some(event))
     }
 
     pub async fn post_task_job(&self, task_id: TaskId) -> StoreResult<Option<PostTaskJob>> {
@@ -1337,6 +1356,85 @@ impl RuntimeStore {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(post_task_job_from_row).collect()
+    }
+
+    /// Return terminal tasks whose durable event declares pending governance,
+    /// but which have neither a deep-evaluation job nor a terminal scheduling
+    /// failure. This closes the crash window between terminal event commit and
+    /// atomic job enqueue.
+    pub async fn unscheduled_post_task_terminal_events(
+        &self,
+        workspace_root: Option<&str>,
+    ) -> StoreResult<Vec<RuntimeEvent>> {
+        let rows = sqlx::query(
+            r#"
+            WITH scoped_events AS (
+                SELECT event.*
+                FROM runtime_events AS event
+                JOIN threads AS thread ON thread.session_id = event.session_id
+                WHERE (? IS NULL OR thread.workspace_root = ?)
+            ),
+            latest_terminal AS (
+                SELECT task_id, MAX(sequence_no) AS sequence_no
+                FROM scoped_events
+                WHERE task_id IS NOT NULL
+                  AND event_type IN ('TaskCompleted', 'TaskAborted', 'TaskInterrupted', 'TaskUncertain')
+                GROUP BY task_id
+            )
+            SELECT terminal.event_json,
+                   (
+                       SELECT failure.event_json
+                       FROM scoped_events AS failure
+                       WHERE failure.task_id = terminal.task_id
+                         AND failure.event_type = 'PostTaskStageFailed'
+                       ORDER BY failure.sequence_no DESC
+                       LIMIT 1
+                   ) AS stage_failure_json
+            FROM latest_terminal
+            JOIN scoped_events AS terminal
+              ON terminal.task_id = latest_terminal.task_id
+             AND terminal.sequence_no = latest_terminal.sequence_no
+            LEFT JOIN post_task_jobs AS job
+              ON job.task_id = terminal.task_id
+             AND job.kind = 'deep_evaluation'
+            WHERE job.job_id IS NULL
+            ORDER BY terminal.sequence_no ASC
+            "#,
+        )
+        .bind(workspace_root)
+        .bind(workspace_root)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            let event_json: String = row.try_get("event_json")?;
+            let event = serde_json::from_str::<RuntimeEvent>(&event_json)?;
+            if event
+                .payload
+                .pointer("/post_task_governance/status")
+                .and_then(serde_json::Value::as_str)
+                != Some("pending")
+            {
+                continue;
+            }
+            let stage_failure_json: Option<String> = row.try_get("stage_failure_json")?;
+            let scheduling_terminal = stage_failure_json
+                .as_deref()
+                .map(serde_json::from_str::<RuntimeEvent>)
+                .transpose()?
+                .is_some_and(|failure| {
+                    failure
+                        .payload
+                        .get("terminal")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                });
+            if !scheduling_terminal {
+                events.push(event);
+            }
+        }
+        Ok(events)
     }
 
     pub async fn recover_expired_post_task_jobs(

@@ -161,6 +161,7 @@ command
   -> TaskCompleted / TaskAborted (Runtime OS terminal result)
   -> post-terminal memory quarantine + minimal evaluation
   -> durable PostTaskJob scheduling barrier, then deep evaluation
+     (startup reconstructs a missing job from a pending terminal fact)
   -> UserProjection (ordinary UI) / Debug-Trace-Evaluation projections (out of band)
   -> PostTaskReview / ImprovementCandidate
   -> task-level per-case isolated baseline/candidate RegressionResult
@@ -173,6 +174,8 @@ provider/runtime 失败也必须在运行时终态决策前生成固定失败 `V
 不能因为 loop 提前返回错误而跳过验证。Task terminal fact 一旦持久化，后置 memory/evaluation
 失败只能记录 `PostTaskStageFailed`、`PostTaskJobFailed` 或 integrity warning，不能改写用户任务状态。settled trace
 会等待本地 supervisor 完成“治理已调度或调度失败”的屏障，再判断 job/evaluation 是否完整。
+若进程在 terminal fact 与 job enqueue 之间退出，Host 启动扫描必须按 workspace 找出 pending
+terminal fact，并通过原子幂等 enqueue 补建 job；不能把这个崩溃窗口误判成治理已完成。
 每个已完成 regression 都必须形成显式 `PromotionDecision`，包括 `Reject` 和
 `NeedsHumanReview`，不能只靠 candidate status 暗示治理结论。
 

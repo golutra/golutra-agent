@@ -235,7 +235,7 @@ pub enum ClientError {
     Store(#[from] StoreError),
     #[error("runtime lane failed")]
     RuntimeLane(#[from] RuntimeLaneError),
-    #[error("query result serialization failed")]
+    #[error("query result serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error("runtime workspace io failed: {0}")]
     Io(String),
@@ -532,7 +532,7 @@ impl RuntimeHost {
         .await?;
         set_owner_only_file(&paths.runtime_db)?;
         let storage = RuntimeHostStorage::ephemeral_persistent(paths.clone())?;
-        Self::from_store(RuntimeHostBootstrap {
+        let host = Self::from_store(RuntimeHostBootstrap {
             store,
             workspace_root: Some(paths.cwd.clone()),
             storage,
@@ -542,7 +542,9 @@ impl RuntimeHost {
             force_mock_provider: false,
             execution_options,
         })
-        .await
+        .await?;
+        host.recover_unscheduled_post_task_jobs().await?;
+        Ok(host)
     }
 
     /// Reopen a completed or checkpointed owner-only run bundle for appending
@@ -592,7 +594,7 @@ impl RuntimeHost {
                 )
             })?;
         let storage = RuntimeHostStorage::ephemeral_persistent(paths.clone())?;
-        Self::from_store(RuntimeHostBootstrap {
+        let host = Self::from_store(RuntimeHostBootstrap {
             store,
             workspace_root: Some(paths.cwd.clone()),
             storage,
@@ -602,7 +604,9 @@ impl RuntimeHost {
             force_mock_provider: false,
             execution_options: RuntimeExecutionOptions::isolated(),
         })
-        .await
+        .await?;
+        host.recover_unscheduled_post_task_jobs().await?;
+        Ok(host)
     }
 
     pub async fn for_cwd(cwd: impl AsRef<Path>) -> Result<Arc<Self>, ClientError> {
@@ -975,6 +979,7 @@ impl RuntimeHost {
             }
             recovered += 1;
         }
+        self.recover_unscheduled_post_task_jobs().await?;
         Ok(recovered)
     }
 
@@ -1111,6 +1116,7 @@ impl RuntimeHost {
                 "summary": summary,
                 "status": TaskStatus::Cancelled,
                 "recovery": recovery,
+                "post_task_governance": {"status": "pending"},
             }),
         ))
         .await
@@ -1158,6 +1164,7 @@ impl RuntimeHost {
                 "recovery": recovery,
                 "record": &record,
                 "safe_to_replay": false,
+                "post_task_governance": {"status": "pending"},
             }),
         );
         event.turn_id = events.iter().rev().find_map(|event| {
