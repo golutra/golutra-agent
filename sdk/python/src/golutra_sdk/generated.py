@@ -92,6 +92,7 @@ class AgentTurnOptions(TypedDict, total=False):
     completion_criteria: NotRequired[list[str]]
     external_verifiers: NotRequired[list[ExternalVerificationSpec]]
     output_schema: NotRequired[Any]
+    task_contract: NotRequired[TaskContract | None]
 
 class AgentTurnResult(TypedDict, total=False):
     final_message: NotRequired[str | None]
@@ -1382,7 +1383,7 @@ class RuntimeEvent(TypedDict, total=False):
 
 RuntimeEventSource: TypeAlias = Literal['runtime', 'provider', 'tool', 'policy', 'verifier', 'memory', 'evaluator', 'governor', 'evolution', 'user']
 
-RuntimeEventType: TypeAlias = Literal['command_received', 'command_completed', 'command_accepted', 'command_rejected', 'session_created', 'thread_forked', 'thread_rebound', 'task_created', 'turn_started', 'step_started', 'step_completed', 'step_checkpointed', 'turn_queued', 'busy_policy_decided', 'controller_changed', 'context_built', 'provider_started', 'provider_streamed', 'provider_completed', 'provider_failed', 'token_usage_recorded', 'assistant_message', 'tool_started', 'tool_progress', 'tool_completed', 'policy_evaluated', 'verification_completed', 'loop_decided', 'checkpoint_created', 'task_completed', 'task_abort_requested', 'task_aborted', 'task_interrupted', 'task_uncertain', 'task_reconciled', 'task_paused', 'task_resumed', 'approval_requested', 'approval_resolved', 'retry_scheduled', 'provider_fallback', 'provider_transport_fallback', 'provider_auth_required', 'provider_auth_submitted', 'provider_auth_cancelled', 'provider_configured', 'provider_probe_started', 'provider_probe_completed', 'provider_auth_failed', 'provider_rate_limited', 'provider_credential_refreshed', 'loop_guard_triggered', 'compaction_started', 'compaction_completed', 'compaction_failed', 'memory_retrieved', 'memory_promoted', 'memory_promotion_rejected', 'memory_rolled_back', 'memory_feedback_recorded', 'post_task_reviewed', 'evaluation_completed', 'improvement_candidate_created', 'automation_candidate_created', 'candidate_patch_frozen', 'regression_completed', 'promotion_decided', 'candidate_applied', 'candidate_rolled_back', 'benchmark_recorded', 'counterfactual_compared', 'evolution_planned', 'evolution_task_started', 'evolution_task_completed', 'evolution_completed', 'skill_staged', 'skill_reviewed', 'skill_installed', 'skill_rolled_back', 'governor_decided', 'storage_maintenance_completed', 'context_snapshot_created', 'post_task_job_queued', 'post_task_job_started', 'post_task_job_completed', 'post_task_job_failed', 'verification_planned', 'verification_assertion_completed', 'regression_campaign_started', 'regression_execution_completed', 'memory_candidate_quarantined', 'memory_activated', 'memory_invalidated', 'failure_diagnosed', 'failure_episode_recorded', 'diagnostic_slice_created', 'replay_capsule_created', 'replay_executed', 'external_evaluation_ingested', 'external_evaluation_compared']
+RuntimeEventType: TypeAlias = Literal['command_received', 'command_completed', 'command_accepted', 'command_rejected', 'session_created', 'thread_forked', 'thread_rebound', 'task_created', 'turn_started', 'step_started', 'step_completed', 'step_checkpointed', 'turn_queued', 'busy_policy_decided', 'controller_changed', 'context_built', 'provider_started', 'provider_streamed', 'provider_completed', 'provider_failed', 'token_usage_recorded', 'assistant_message', 'tool_started', 'tool_progress', 'tool_completed', 'policy_evaluated', 'verification_completed', 'loop_decided', 'checkpoint_created', 'task_completed', 'task_abort_requested', 'task_aborted', 'task_interrupted', 'task_uncertain', 'task_reconciled', 'task_paused', 'task_resumed', 'approval_requested', 'approval_resolved', 'retry_scheduled', 'provider_fallback', 'provider_transport_fallback', 'provider_auth_required', 'provider_auth_submitted', 'provider_auth_cancelled', 'provider_configured', 'provider_probe_started', 'provider_probe_completed', 'provider_auth_failed', 'provider_rate_limited', 'provider_credential_refreshed', 'loop_guard_triggered', 'compaction_started', 'compaction_completed', 'compaction_failed', 'memory_retrieved', 'memory_promoted', 'memory_promotion_rejected', 'memory_rolled_back', 'memory_feedback_recorded', 'post_task_reviewed', 'evaluation_completed', 'improvement_candidate_created', 'automation_candidate_created', 'candidate_patch_frozen', 'regression_completed', 'promotion_decided', 'candidate_applied', 'candidate_rolled_back', 'benchmark_recorded', 'counterfactual_compared', 'evolution_planned', 'evolution_task_started', 'evolution_task_completed', 'evolution_completed', 'skill_staged', 'skill_reviewed', 'skill_installed', 'skill_rolled_back', 'governor_decided', 'storage_maintenance_completed', 'context_snapshot_created', 'post_task_job_queued', 'post_task_job_started', 'post_task_job_completed', 'post_task_job_failed', 'post_task_stage_failed', 'verification_planned', 'verification_assertion_completed', 'continuation_decided', 'regression_campaign_started', 'regression_execution_completed', 'memory_candidate_quarantined', 'memory_activated', 'memory_invalidated', 'failure_diagnosed', 'failure_episode_recorded', 'diagnostic_slice_created', 'replay_capsule_created', 'replay_executed', 'external_evaluation_ingested', 'external_evaluation_compared']
 
 class RuntimeGovernorDecision(TypedDict, total=False):
     action: Required[GovernorAction]
@@ -1554,6 +1555,15 @@ class StorageStats(TypedDict, total=False):
     rollout_files: Required[int]
 
 TaskClass: TypeAlias = Literal['plain_conversation', 'read_only_analysis', 'workspace_change', 'code_change']
+
+class TaskContract(TypedDict, total=False):
+    completion_criteria: NotRequired[list[str]]
+    max_correction_rounds: NotRequired[int]
+    require_objective_validation: NotRequired[bool]
+    required_paths: NotRequired[list[str]]
+    schema_version: NotRequired[int]
+    verification: NotRequired[VerificationRequirement]
+    workspace_change: NotRequired[WorkspaceChangeRequirement]
 
 TaskReconciliationDecision: TypeAlias = Literal['no_side_effect_observed', 'side_effect_observed', 'abandon']
 
@@ -1756,6 +1766,8 @@ class VerificationDimensions(TypedDict, total=False):
     objective_status: Required[VerificationDimensionStatus]
     policy_status: Required[VerificationDimensionStatus]
 
+VerificationIndependence: TypeAlias = Literal['unspecified', 'runtime_evidence', 'independent']
+
 class VerificationPlan(TypedDict, total=False):
     assertions: Required[list[VerificationAssertion]]
     created_at: Required[str]
@@ -1771,17 +1783,26 @@ class VerificationPlan(TypedDict, total=False):
     verifier_versions: Required[list[str]]
 
 class VerificationRecord(TypedDict, total=False):
+    assertions: NotRequired[list[VerificationAssertion]]
     checks: Required[list[VerificationCheck]]
     completion_criteria: Required[list[str]]
+    environment_digest: NotRequired[str | None]
     evidence_refs: Required[list[str]]
+    independence: NotRequired[VerificationIndependence]
     objective: Required[str]
+    plan_id: NotRequired[str | None]
     policy_status: Required[str]
     residual_risks: Required[list[str]]
     result: Required[VerificationResult]
+    source: NotRequired[VerificationSource]
     task_id: Required[str]
     verification_id: Required[str]
 
+VerificationRequirement: TypeAlias = Literal['best_effort', 'required', 'independent']
+
 VerificationResult: TypeAlias = Literal['pass', 'fail', 'partial', 'unknown']
+
+VerificationSource: TypeAlias = Literal['runtime', 'external_verifier', 'mixed']
 
 class VisibleStep(TypedDict, total=False):
     label: Required[str]
@@ -1818,6 +1839,8 @@ class WaitConditionEvent(TypedDict, total=False):
     sequence_at_least: NotRequired[int | None]
 
 WaitCondition: TypeAlias = WaitConditionReady | WaitConditionIdle | WaitConditionTaskStarted | WaitConditionTaskTerminal | WaitConditionTurnTerminal | WaitConditionApprovalRequired | WaitConditionAuthenticationRequired | WaitConditionEvaluationTerminal | WaitConditionEvent
+
+WorkspaceChangeRequirement: TypeAlias = Literal['optional', 'required', 'forbidden']
 
 __all__ = [
     "Actor",
@@ -2026,6 +2049,7 @@ __all__ = [
     "StorageMaintenanceReport",
     "StorageStats",
     "TaskClass",
+    "TaskContract",
     "TaskReconciliationDecision",
     "TaskReconciliationRecord",
     "TaskRecoveryDisposition",
@@ -2053,9 +2077,12 @@ __all__ = [
     "VerificationCheckKind",
     "VerificationDimensionStatus",
     "VerificationDimensions",
+    "VerificationIndependence",
     "VerificationPlan",
     "VerificationRecord",
+    "VerificationRequirement",
     "VerificationResult",
+    "VerificationSource",
     "VisibleStep",
     "WaitCondition",
     "WaitConditionApprovalRequired",
@@ -2067,4 +2094,5 @@ __all__ = [
     "WaitConditionTaskStarted",
     "WaitConditionTaskTerminal",
     "WaitConditionTurnTerminal",
+    "WorkspaceChangeRequirement",
 ]

@@ -7,7 +7,7 @@ from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .client import GolutraClient
-    from .generated import TaskReconciliationDecision
+    from .generated import TaskContract, TaskReconciliationDecision
 
 
 class Thread:
@@ -25,6 +25,7 @@ class Thread:
         prompt: str,
         *,
         output_schema: dict[str, Any] | None = None,
+        task_contract: TaskContract | None = None,
         allow_network: bool = False,
         completion_criteria: Iterable[str] = (),
         external_verifiers: Iterable[dict[str, Any]] = (),
@@ -38,6 +39,8 @@ class Thread:
             "completion_criteria": [item for item in completion_criteria if item.strip()],
             "external_verifiers": [dict(item) for item in external_verifiers],
         }
+        if task_contract is not None:
+            params["task_contract"] = dict(task_contract)
         if output_schema is not None:
             params["output_schema"] = output_schema
         result = self._client.rpc("turn/start", params)
@@ -50,6 +53,7 @@ class Thread:
         prompt: str,
         *,
         output_schema: dict[str, Any] | None = None,
+        task_contract: TaskContract | None = None,
         allow_network: bool = False,
         completion_criteria: Iterable[str] = (),
         external_verifiers: Iterable[dict[str, Any]] = (),
@@ -57,6 +61,7 @@ class Thread:
         return self.run(
             prompt,
             output_schema=output_schema,
+            task_contract=task_contract,
             allow_network=allow_network,
             completion_criteria=completion_criteria,
             external_verifiers=external_verifiers,

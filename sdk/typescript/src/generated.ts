@@ -163,8 +163,10 @@ export type RuntimeEventType =
   | "post_task_job_started"
   | "post_task_job_completed"
   | "post_task_job_failed"
+  | "post_task_stage_failed"
   | "verification_planned"
   | "verification_assertion_completed"
+  | "continuation_decided"
   | "regression_campaign_started"
   | "regression_execution_completed"
   | "memory_candidate_quarantined"
@@ -203,6 +205,18 @@ export type TaskStatus =
   | "cancelled"
   | "interrupted"
   | "uncertain";
+export type VerificationAssertionKind =
+  | "file_state"
+  | "diff"
+  | "command_exit"
+  | "test"
+  | "diagnostic"
+  | "schema"
+  | "policy"
+  | "delivery"
+  | "assistant_response";
+export type VerificationAssertionStatus =
+  "pending" | "pass" | "fail" | "unknown" | "not_applicable";
 export type VerificationCheckKind =
   "tool_execution" | "workspace_change" | "objective_validation" | "assistant_response" | "schema";
 export type VerificationResult = "pass" | "fail" | "partial" | "unknown";
@@ -335,18 +349,6 @@ export type SessionRangeDirection = "single" | "newer" | "older";
 export type TaskReconciliationDecision =
   "no_side_effect_observed" | "side_effect_observed" | "abandon";
 export type TaskRecoveryDisposition = "interrupted" | "uncertain";
-export type VerificationAssertionKind =
-  | "file_state"
-  | "diff"
-  | "command_exit"
-  | "test"
-  | "diagnostic"
-  | "schema"
-  | "policy"
-  | "delivery"
-  | "assistant_response";
-export type VerificationAssertionStatus =
-  "pending" | "pass" | "fail" | "unknown" | "not_applicable";
 export type VerificationDimensionStatus = "pass" | "fail" | "partial" | "unknown";
 export type TaskClass =
   "plain_conversation" | "read_only_analysis" | "workspace_change" | "code_change";
@@ -755,15 +757,39 @@ export interface CausalLink {
   [k: string]: unknown;
 }
 export interface VerificationRecord {
+  assertions?: VerificationAssertion[];
   checks: VerificationCheck[];
   completion_criteria: string[];
+  environment_digest?: string | null;
   evidence_refs: string[];
+  independence?: "unspecified" | "runtime_evidence" | "independent";
   objective: string;
+  /**
+   * The fixed plan and assertion statuses are copied into the record so a
+   * consumer can validate a terminal result without guessing from event
+   * prose or loading a second mutable object.
+   */
+  plan_id?: string | null;
   policy_status: string;
   residual_risks: string[];
   result: VerificationResult;
+  source?: "runtime" | "external_verifier" | "mixed";
   task_id: string;
   verification_id: string;
+  [k: string]: unknown;
+}
+export interface VerificationAssertion {
+  assertion_id: string;
+  blocking: boolean;
+  criterion_id: string;
+  evidence_refs: string[];
+  expected: string;
+  kind: VerificationAssertionKind;
+  message: string;
+  required_evidence_strength: string;
+  status: VerificationAssertionStatus;
+  subject: string;
+  verifier_id: string;
   [k: string]: unknown;
 }
 export interface VerificationCheck {
@@ -783,7 +809,8 @@ export interface AgentThreadRef {
 }
 export interface AgentTurnOptions {
   /**
-   * Request network access for child tools. The runtime host may still reject this request when its capability is disabled.
+   * Request network access for child tools. The runtime host may still
+   * reject this request when its capability is disabled.
    */
   allow_network?: boolean;
   completion_criteria?: string[];
@@ -796,6 +823,12 @@ export interface AgentTurnOptions {
   output_schema?: {
     [k: string]: unknown;
   };
+  /**
+   * Explicit runtime completion/verification contract.  `None` keeps wire
+   * compatibility for older clients; the application adapter supplies a
+   * normalized default before execution.
+   */
+  task_contract?: TaskContract | null;
   [k: string]: unknown;
 }
 export interface ExternalVerificationSpec {
@@ -805,6 +838,21 @@ export interface ExternalVerificationSpec {
   max_output_bytes?: number;
   program: string;
   timeout_ms?: number;
+  [k: string]: unknown;
+}
+export interface TaskContract {
+  completion_criteria?: string[];
+  max_correction_rounds?: number;
+  require_objective_validation?: boolean;
+  required_paths?: string[];
+  schema_version?: number;
+  verification?: "best_effort" | "required" | "independent";
+  /**
+   * Explicitly describes what a turn must deliver.  The runtime uses this
+   * contract for verification; it never infers the requirement from prompt
+   * wording.
+   */
+  workspace_change?: "optional" | "required" | "forbidden";
   [k: string]: unknown;
 }
 export interface AgentTurnResult {
@@ -964,9 +1012,11 @@ export interface CommandAck {
   [k: string]: unknown;
 }
 /**
- * 一个任务实际进入模型上下文的事实投影。
+ * 一个任务实际发送给 provider 的模型输入审计投影。
  *
- * 该视图只暴露脱敏 manifest 和 digest；provider 原始请求仍受 artifact 权限控制。
+ * 这是对 `ModelInputEnvelope` 的脱敏、可查询读模型，不是 provider request 本身，也不会
+ * 因为被持久化或被开发者读取而自动进入下一轮模型上下文。provider 原始请求仍受 artifact
+ * 权限控制。
  */
 export interface ContextProjection {
   complete: boolean;
@@ -2125,20 +2175,6 @@ export interface VerificationPlan {
   task_class: TaskClass;
   task_id: string;
   verifier_versions: string[];
-  [k: string]: unknown;
-}
-export interface VerificationAssertion {
-  assertion_id: string;
-  blocking: boolean;
-  criterion_id: string;
-  evidence_refs: string[];
-  expected: string;
-  kind: VerificationAssertionKind;
-  message: string;
-  required_evidence_strength: string;
-  status: VerificationAssertionStatus;
-  subject: string;
-  verifier_id: string;
   [k: string]: unknown;
 }
 export interface VerificationDimensions {

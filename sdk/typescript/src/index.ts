@@ -48,6 +48,7 @@ import type {
   TaskTracePage,
   TaskTraceRequest,
   TaskReconciliationDecision,
+  TaskContract,
 } from "./generated.js";
 
 const JSON_REQUEST_TIMEOUT_MS = 30_000;
@@ -158,6 +159,7 @@ export interface AgentSubscriptionRequest {
 
 export interface ThreadRunOptions {
   outputSchema?: Record<string, unknown>;
+  taskContract?: TaskContract;
   completionCriteria?: readonly string[];
   allowNetwork?: boolean;
   externalVerifiers?: readonly ExternalVerificationSpec[];
@@ -206,6 +208,9 @@ export class Thread {
       completion_criteria: [...(options.completionCriteria ?? [])].filter((value) => value.trim()),
       external_verifiers: [...(options.externalVerifiers ?? [])],
     };
+    if (options.taskContract !== undefined) {
+      params.task_contract = options.taskContract;
+    }
     if (options.outputSchema !== undefined) {
       params.output_schema = options.outputSchema;
     }

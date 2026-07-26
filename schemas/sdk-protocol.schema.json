@@ -684,7 +684,7 @@
       "type": "object",
       "properties": {
         "allow_network": {
-          "description": "Request network access for child tools. The runtime host may still reject this request when its capability is disabled.",
+          "description": "Request network access for child tools. The runtime host may still\nreject this request when its capability is disabled.",
           "type": "boolean",
           "default": false
         },
@@ -704,6 +704,18 @@
           }
         },
         "output_schema": {
+          "default": null
+        },
+        "task_contract": {
+          "description": "Explicit runtime completion/verification contract.  `None` keeps wire\ncompatibility for older clients; the application adapter supplies a\nnormalized default before execution.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskContract"
+            },
+            {
+              "type": "null"
+            }
+          ],
           "default": null
         }
       }
@@ -2042,7 +2054,7 @@
       ]
     },
     "ContextProjection": {
-      "description": "一个任务实际进入模型上下文的事实投影。\n\n该视图只暴露脱敏 manifest 和 digest；provider 原始请求仍受 artifact 权限控制。",
+      "description": "一个任务实际发送给 provider 的模型输入审计投影。\n\n这是对 `ModelInputEnvelope` 的脱敏、可查询读模型，不是 provider request 本身，也不会\n因为被持久化或被开发者读取而自动进入下一轮模型上下文。provider 原始请求仍受 artifact\n权限控制。",
       "type": "object",
       "properties": {
         "complete": {
@@ -7391,8 +7403,10 @@
         "post_task_job_started",
         "post_task_job_completed",
         "post_task_job_failed",
+        "post_task_stage_failed",
         "verification_planned",
         "verification_assertion_completed",
+        "continuation_decided",
         "regression_campaign_started",
         "regression_execution_completed",
         "memory_candidate_quarantined",
@@ -8305,6 +8319,49 @@
         "workspace_change",
         "code_change"
       ]
+    },
+    "TaskContract": {
+      "type": "object",
+      "properties": {
+        "completion_criteria": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "max_correction_rounds": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 1,
+          "minimum": 0
+        },
+        "require_objective_validation": {
+          "type": "boolean",
+          "default": false
+        },
+        "required_paths": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 1,
+          "minimum": 0
+        },
+        "verification": {
+          "$ref": "#/$defs/VerificationRequirement",
+          "default": "best_effort"
+        },
+        "workspace_change": {
+          "$ref": "#/$defs/WorkspaceChangeRequirement",
+          "default": "optional"
+        }
+      }
     },
     "TaskReconciliationDecision": {
       "type": "string",
@@ -9345,6 +9402,14 @@
         "policy_status"
       ]
     },
+    "VerificationIndependence": {
+      "type": "string",
+      "enum": [
+        "unspecified",
+        "runtime_evidence",
+        "independent"
+      ]
+    },
     "VerificationPlan": {
       "type": "object",
       "properties": {
@@ -9427,6 +9492,13 @@
     "VerificationRecord": {
       "type": "object",
       "properties": {
+        "assertions": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/VerificationAssertion"
+          }
+        },
         "checks": {
           "type": "array",
           "items": {
@@ -9439,6 +9511,13 @@
             "type": "string"
           }
         },
+        "environment_digest": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "evidence_refs": {
           "type": "array",
           "items": {
@@ -9446,8 +9525,21 @@
             "format": "uuid"
           }
         },
+        "independence": {
+          "$ref": "#/$defs/VerificationIndependence",
+          "default": "unspecified"
+        },
         "objective": {
           "type": "string"
+        },
+        "plan_id": {
+          "description": "The fixed plan and assertion statuses are copied into the record so a\nconsumer can validate a terminal result without guessing from event\nprose or loading a second mutable object.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid",
+          "default": null
         },
         "policy_status": {
           "type": "string"
@@ -9460,6 +9552,10 @@
         },
         "result": {
           "$ref": "#/$defs/VerificationResult"
+        },
+        "source": {
+          "$ref": "#/$defs/VerificationSource",
+          "default": "runtime"
         },
         "task_id": {
           "type": "string",
@@ -9482,6 +9578,14 @@
         "residual_risks"
       ]
     },
+    "VerificationRequirement": {
+      "type": "string",
+      "enum": [
+        "best_effort",
+        "required",
+        "independent"
+      ]
+    },
     "VerificationResult": {
       "type": "string",
       "enum": [
@@ -9489,6 +9593,14 @@
         "fail",
         "partial",
         "unknown"
+      ]
+    },
+    "VerificationSource": {
+      "type": "string",
+      "enum": [
+        "runtime",
+        "external_verifier",
+        "mixed"
       ]
     },
     "VisibleStep": {
@@ -9633,6 +9745,15 @@
             "event_type"
           ]
         }
+      ]
+    },
+    "WorkspaceChangeRequirement": {
+      "description": "Explicitly describes what a turn must deliver.  The runtime uses this\ncontract for verification; it never infers the requirement from prompt\nwording.",
+      "type": "string",
+      "enum": [
+        "optional",
+        "required",
+        "forbidden"
       ]
     }
   }

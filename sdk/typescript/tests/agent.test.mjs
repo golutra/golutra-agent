@@ -63,6 +63,12 @@ test("Thread and TurnHandle preserve the shared agent lifecycle", async () => {
   await assert.rejects(thread.run("   "), /turn prompt cannot be empty/);
   const handle = await thread.run("inspect the workspace", {
     outputSchema: { type: "object" },
+    taskContract: {
+      workspace_change: "required",
+      required_paths: ["src/main.rs"],
+      verification: "independent",
+      max_correction_rounds: 1,
+    },
     allowNetwork: true,
     completionCriteria: [" verified ", ""],
     externalVerifiers: [{ program: "pytest", args: ["-q"] }],
@@ -89,6 +95,12 @@ test("Thread and TurnHandle preserve the shared agent lifecycle", async () => {
       completion_criteria: [" verified "],
       external_verifiers: [{ program: "pytest", args: ["-q"] }],
       output_schema: { type: "object" },
+      task_contract: {
+        workspace_change: "required",
+        required_paths: ["src/main.rs"],
+        verification: "independent",
+        max_correction_rounds: 1,
+      },
     },
   ]);
   assert.equal(calls[1][0], "subscribeAgent");
