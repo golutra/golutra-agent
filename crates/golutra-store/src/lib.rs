@@ -480,6 +480,23 @@ impl RuntimeStore {
             .collect()
     }
 
+    pub async fn session_for_task(&self, task_id: TaskId) -> StoreResult<Option<SessionId>> {
+        let row = sqlx::query(
+            "SELECT session_id FROM runtime_events
+             WHERE task_id = ? ORDER BY sequence_no ASC LIMIT 1",
+        )
+        .bind(task_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            let value: String = row.try_get("session_id")?;
+            value
+                .parse()
+                .map_err(|error: uuid::Error| StoreError::InvalidId(error.to_string()))
+        })
+        .transpose()
+    }
+
     pub async fn event_integrity(
         &self,
         session_id: SessionId,

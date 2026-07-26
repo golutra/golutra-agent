@@ -77,6 +77,11 @@ pub(crate) fn recovered_pending_turn_from_event(
         .get("steer")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let task_contract = payload
+        .get("task_contract")
+        .filter(|value| !value.is_null())
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok());
     let command_id = event
         .payload
         .get("command_id")
@@ -101,6 +106,7 @@ pub(crate) fn recovered_pending_turn_from_event(
             command_id,
             turn_id,
             content,
+            task_contract,
             steer,
         },
     })
@@ -418,6 +424,16 @@ pub(crate) fn observation_descriptor(observation: &RuntimeObservation) -> Observ
             RuntimeEventSource::Verifier,
             ObservationIntegrityClass::Required,
         ),
+        RuntimeObservation::VerificationCompleted { .. } => (
+            RuntimeEventType::VerificationCompleted,
+            RuntimeEventSource::Verifier,
+            ObservationIntegrityClass::Required,
+        ),
+        RuntimeObservation::CorrectionIssued(_) => (
+            RuntimeEventType::ContinuationDecided,
+            RuntimeEventSource::Runtime,
+            ObservationIntegrityClass::Required,
+        ),
         RuntimeObservation::ProviderStarted { .. } => (
             RuntimeEventType::ProviderStarted,
             RuntimeEventSource::Provider,
@@ -656,6 +672,24 @@ pub(crate) fn trace_event_payload(
                     assertion.status
                 ),
                 "assertion": assertion,
+            }),
+        )),
+        AgentLoopTraceEvent::VerificationCompleted { record, terminal } => Some((
+            RuntimeEventType::VerificationCompleted,
+            RuntimeEventSource::Verifier,
+            json!({
+                "summary": format!("verification result: {:?}", record.result),
+                "terminal": terminal,
+                "record": record,
+            }),
+        )),
+        AgentLoopTraceEvent::CorrectionIssued(correction) => Some((
+            RuntimeEventType::ContinuationDecided,
+            RuntimeEventSource::Runtime,
+            json!({
+                "summary": "runtime requested a bounded correction after verification",
+                "reason": "verification_failed",
+                "correction": correction,
             }),
         )),
         AgentLoopTraceEvent::ProviderStarted {

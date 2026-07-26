@@ -5,7 +5,8 @@
 //! clients; adapters must never create a second task state machine.
 
 use golutra_core::{
-    CommandId, SessionId, TaskId, TaskStatus, ThreadId, Timestamp, TurnId, VerificationRecord,
+    CommandId, SessionId, TaskContract, TaskId, TaskStatus, ThreadId, Timestamp, TurnId,
+    VerificationRecord,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -155,6 +156,11 @@ pub struct AgentTurnResult {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentTurnOptions {
+    /// Explicit runtime completion/verification contract.  `None` keeps wire
+    /// compatibility for older clients; the application adapter supplies a
+    /// normalized default before execution.
+    #[serde(default)]
+    pub task_contract: Option<TaskContract>,
     #[serde(default)]
     pub output_schema: Option<Value>,
     #[serde(default)]

@@ -363,8 +363,9 @@ async fn turn_start(
     let payload = json!({
         "prompt": prompt,
         "_thread_id": thread.thread_id,
+        "task_contract": params.get("task_contract").cloned().unwrap_or(Value::Null),
         "output_schema": params.get("output_schema").cloned(),
-        "allow_network": params.get("allow_network").cloned().unwrap_or_else(|| json!(false)),
+        "allow_network": params.get("allow_network").cloned().unwrap_or(Value::Bool(false)),
         "completion_criteria": params.get("completion_criteria").cloned().unwrap_or_else(|| json!([])),
         "external_verifiers": params.get("external_verifiers").cloned().unwrap_or_else(|| json!([])),
     });

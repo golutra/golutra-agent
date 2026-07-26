@@ -157,6 +157,7 @@ impl RuntimeHost {
             .iter()
             .filter(|event| event.sequence_no > compacted_after)
             .filter(|event| event.task_id != Some(current_task_id))
+            .filter(|event| event.event_type.is_model_history_fact())
             .collect::<Vec<_>>();
         let lines = history_events
             .iter()
@@ -284,7 +285,11 @@ impl RuntimeHost {
     ) -> Result<(), ClientError> {
         let started_at = Instant::now();
         let objective = prompt_from_payload(&task.payload);
-        let completion_criteria = completion_criteria_from_payload(&task.payload);
+        let explicit_task_contract = task
+            .payload
+            .get("task_contract")
+            .is_some_and(|value| !value.is_null());
+        let mut task_contract = task_contract_from_payload(&task.payload)?;
         let requested_network = task
             .payload
             .get("allow_network")
@@ -323,6 +328,22 @@ impl RuntimeHost {
             context_builder,
             provider_session_policy,
         } = provider_plan;
+        if !explicit_task_contract
+            && (touched_code
+                || provider_runtime::legacy_task_requests_workspace_change(
+                    &task.payload,
+                    &objective,
+                ))
+        {
+            provider_runtime::apply_legacy_task_contract(
+                &task.payload,
+                &objective,
+                &mut task_contract,
+            );
+        }
+        task_contract
+            .validate()
+            .map_err(ClientError::TaskExecution)?;
         let agent_loop = AgentLoop::new(provider, context_builder, tool_executor)
             .with_provider_session_policy(provider_session_policy)
             .with_external_verifiers(external_verifiers);
@@ -363,13 +384,13 @@ impl RuntimeHost {
             agent_loop
         };
         let outcome = agent_loop
-            .run_with_control_and_observation_sink(
+            .run_with_task_contract_and_observation_sink(
                 AgentTaskRequest {
                     session_id: task.session_id,
                     task_id: task.task_id,
                     turn_id: task.turn_id,
                     objective: objective.clone(),
-                    completion_criteria,
+                    completion_criteria: task_contract.completion_criteria.clone(),
                     output_schema: task.payload.get("output_schema").cloned(),
                     touched_code,
                     contributors,
@@ -379,6 +400,7 @@ impl RuntimeHost {
                         Vec::new()
                     },
                 },
+                task_contract,
                 control,
                 ChannelObservationSink {
                     sender: trace_tx.clone(),
@@ -395,22 +417,6 @@ impl RuntimeHost {
             .await
             .map_err(|error| ClientError::TaskExecution(error.to_string()))??;
         let outcome = outcome?;
-        self.repositories
-            .artifacts
-            .store_verification(&outcome.verification_plan)
-            .await?;
-        self.record_event(agent_event_for_turn(
-            self.next_sequence_no(),
-            &task,
-            outcome.final_turn_id,
-            RuntimeEventType::VerificationCompleted,
-            RuntimeEventSource::Verifier,
-            json!({
-                "summary": format!("verification result: {:?}", outcome.verification.result),
-                "record": outcome.verification,
-            }),
-        ))
-        .await?;
         let terminal_status = task_status_from_loop_action(outcome.loop_decision.action);
         self.record_event(agent_event_for_turn(
             self.next_sequence_no(),
@@ -429,29 +435,36 @@ impl RuntimeHost {
             ..task.clone()
         };
         let final_objective = outcome.verification.objective.clone();
-        self.promote_successful_task_memory(
-            &final_task,
-            &final_objective,
-            &outcome,
-            terminal_status,
-        )
-        .await?;
-        let evaluation_input = self
-            .evaluate_completed_task(
-                &final_task,
-                HostedTaskEvaluation {
-                    objective: &final_objective,
-                    task_status: terminal_status,
-                    verification: Some(outcome.verification.clone()),
-                    tool_reports: &outcome.tool_reports,
-                    failure_summary: Some(outcome.loop_decision.reason.clone()),
-                    latency: started_at.elapsed(),
-                },
-            )
-            .await?;
-        self.enqueue_deep_task_evaluation(&final_task, evaluation_input)
-            .await?;
         self.finish_lane(&final_task, terminal_status).await?;
+        if let Err(error) = self
+            .promote_successful_task_memory(
+                &final_task,
+                &final_objective,
+                &outcome,
+                terminal_status,
+            )
+            .await
+        {
+            self.record_post_task_governance_failure(
+                &final_task,
+                "memory_quarantine",
+                false,
+                &error,
+            )
+            .await;
+        }
+        self.schedule_task_evaluation_best_effort(
+            &final_task,
+            HostedTaskEvaluation {
+                objective: &final_objective,
+                task_status: terminal_status,
+                verification: Some(outcome.verification.clone()),
+                tool_reports: &outcome.tool_reports,
+                failure_summary: Some(outcome.loop_decision.reason.clone()),
+                latency: started_at.elapsed(),
+            },
+        )
+        .await;
         Ok(())
     }
 

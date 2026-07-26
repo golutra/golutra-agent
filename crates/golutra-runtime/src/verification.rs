@@ -6,8 +6,8 @@
 //! result from assistant text.
 
 use golutra_core::{
-    TaskId, VerificationCheck, VerificationCheckKind, VerificationPlan, VerificationRecord,
-    VerificationResult,
+    TaskContract, TaskId, VerificationCheck, VerificationCheckKind, VerificationIndependence,
+    VerificationPlan, VerificationRecord, VerificationResult, WorkspaceChangeRequirement,
 };
 use golutra_verify::{VerificationInput, VerificationRunner};
 
@@ -29,6 +29,67 @@ impl RuntimeVerificationService {
         plan: VerificationPlan,
     ) -> (VerificationRecord, VerificationPlan) {
         self.runner.verify_with_plan(input, plan)
+    }
+
+    /// Apply the task contract after the assertion runner has evaluated
+    /// objective facts.  This is the terminal policy gate owned by the Runtime
+    /// OS; provider wording cannot bypass it.
+    #[must_use]
+    pub fn verify_governed(
+        &self,
+        input: VerificationInput,
+        plan: VerificationPlan,
+        contract: &TaskContract,
+        environment_digest: String,
+    ) -> (VerificationRecord, VerificationPlan) {
+        let workspace_changed = input.code_files_changed
+            || input
+                .command_checks
+                .iter()
+                .any(|check| check.kind == VerificationCheckKind::WorkspaceChange && check.passed);
+        let objective_validated = input
+            .command_checks
+            .iter()
+            .any(|check| check.kind == VerificationCheckKind::ObjectiveValidation && check.passed);
+        let external_verified = input
+            .command_checks
+            .iter()
+            .any(|check| check.name == "objective:test:external_verifier" && check.passed);
+        let (mut record, plan) = self.runner.verify_with_plan(input, plan);
+        record.environment_digest = Some(environment_digest);
+
+        let mut contract_failures = Vec::new();
+        match contract.workspace_change {
+            WorkspaceChangeRequirement::Required if !workspace_changed => {
+                contract_failures.push("task contract requires a workspace change");
+            }
+            WorkspaceChangeRequirement::Forbidden if workspace_changed => {
+                contract_failures.push("task contract forbids workspace changes");
+            }
+            WorkspaceChangeRequirement::Optional
+            | WorkspaceChangeRequirement::Required
+            | WorkspaceChangeRequirement::Forbidden => {}
+        }
+        if contract.require_objective_validation && !objective_validated {
+            contract_failures.push("task contract requires objective validation");
+        }
+        if contract.requires_independent_verification() && !external_verified {
+            contract_failures.push("task contract requires an independent verifier");
+        }
+
+        if !contract_failures.is_empty() {
+            record.result = VerificationResult::Fail;
+            record.policy_status = "task_contract_failed".to_owned();
+            record
+                .residual_risks
+                .extend(contract_failures.into_iter().map(ToOwned::to_owned));
+        } else {
+            record.policy_status = "task_contract_satisfied".to_owned();
+            if contract.requires_independent_verification() {
+                record.independence = VerificationIndependence::Independent;
+            }
+        }
+        (record, plan)
     }
 
     #[must_use]

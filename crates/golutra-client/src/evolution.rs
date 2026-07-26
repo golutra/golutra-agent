@@ -511,16 +511,16 @@ impl RuntimeHost {
         )
         .await?;
         set_owner_only_file(&paths.runtime_db)?;
-        RuntimeHost::from_store(
+        RuntimeHost::from_store(super::RuntimeHostBootstrap {
             store,
-            Some(paths.cwd.clone()),
-            RuntimeHostStorage::durable(paths.clone())?,
-            paths.workspace_id(),
-            session_id,
-            golutra_core::ThreadId::new(),
-            true,
-            RuntimeExecutionOptions::isolated(),
-        )
+            workspace_root: Some(paths.cwd.clone()),
+            storage: RuntimeHostStorage::durable(paths.clone())?,
+            workspace_id: paths.workspace_id(),
+            default_session_id: session_id,
+            default_thread_id: golutra_core::ThreadId::new(),
+            force_mock_provider: true,
+            execution_options: RuntimeExecutionOptions::isolated(),
+        })
         .await
     }
 

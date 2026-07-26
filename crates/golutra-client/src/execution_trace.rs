@@ -497,6 +497,7 @@ impl RuntimeHost {
                 transition.event.payload["summary"] =
                     json!(format!("runtime task finished with {status:?}"));
                 transition.event.payload["status"] = json!(status);
+                transition.event.payload["post_task_governance"] = json!({"status": "pending"});
                 self.record_event(transition.event).await
             }
             Err(RuntimeLaneError::LaneNotFound) => {
@@ -509,6 +510,7 @@ impl RuntimeHost {
                     json!({
                         "summary": format!("persisted runtime task finished with {status:?}"),
                         "status": status,
+                        "post_task_governance": {"status": "pending"},
                     }),
                 ))
                 .await
@@ -542,23 +544,20 @@ impl RuntimeHost {
                     "task cancelled by controller",
                 )
                 .await?;
-            let evaluation_input = self
-                .evaluate_completed_task(
-                    &failure_task,
-                    HostedTaskEvaluation {
-                        objective: &objective,
-                        task_status: TaskStatus::Cancelled,
-                        verification: Some(verification),
-                        tool_reports: &[],
-                        failure_summary: Some("task cancelled by controller".to_owned()),
-                        latency: Duration::ZERO,
-                    },
-                )
-                .await?;
-            self.enqueue_deep_task_evaluation(&failure_task, evaluation_input)
-                .await?;
             self.finish_lane(&failure_task, TaskStatus::Cancelled)
                 .await?;
+            self.schedule_task_evaluation_best_effort(
+                &failure_task,
+                HostedTaskEvaluation {
+                    objective: &objective,
+                    task_status: TaskStatus::Cancelled,
+                    verification: Some(verification),
+                    tool_reports: &[],
+                    failure_summary: Some("task cancelled by controller".to_owned()),
+                    latency: Duration::ZERO,
+                },
+            )
+            .await;
             return Ok(());
         }
         let error_summary = compact_event_summary(&error.to_string());
@@ -589,22 +588,19 @@ impl RuntimeHost {
             }),
         ))
         .await?;
-        let evaluation_input = self
-            .evaluate_completed_task(
-                &failure_task,
-                HostedTaskEvaluation {
-                    objective: &objective,
-                    task_status: TaskStatus::Failed,
-                    verification: Some(verification),
-                    tool_reports: &[],
-                    failure_summary: Some(error.to_string()),
-                    latency: Duration::ZERO,
-                },
-            )
-            .await?;
-        self.enqueue_deep_task_evaluation(&failure_task, evaluation_input)
-            .await?;
         self.finish_lane(&failure_task, TaskStatus::Failed).await?;
+        self.schedule_task_evaluation_best_effort(
+            &failure_task,
+            HostedTaskEvaluation {
+                objective: &objective,
+                task_status: TaskStatus::Failed,
+                verification: Some(verification),
+                tool_reports: &[],
+                failure_summary: Some(error.to_string()),
+                latency: Duration::ZERO,
+            },
+        )
+        .await;
         Ok(())
     }
 

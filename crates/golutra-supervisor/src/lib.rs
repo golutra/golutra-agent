@@ -2065,6 +2065,11 @@ mod tests {
                 result: VerificationResult::Fail,
                 policy_status: "allowed".to_owned(),
                 residual_risks: vec!["provider failed".to_owned()],
+                plan_id: None,
+                assertions: Vec::new(),
+                source: Default::default(),
+                independence: Default::default(),
+                environment_digest: None,
             }),
             post_task_jobs: vec![PostTaskJob {
                 job_id: PostTaskJobId::new(),

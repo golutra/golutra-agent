@@ -8,8 +8,8 @@ use std::{
 use async_trait::async_trait;
 use golutra_context::{ContextBudgetPolicy, ContextBuilder};
 use golutra_core::{
-    ArtifactId, ArtifactRecord, LoopAction, ProviderContract, RedactionStatus, SessionId, TaskId,
-    ToolResultEnvelope, VerificationResult,
+    ArtifactId, ArtifactRecord, LoopAction, ProviderContract, RedactionStatus, SessionId,
+    TaskContract, TaskId, ToolResultEnvelope, VerificationResult,
 };
 use golutra_eval::{ReplayCapsule, ReplayExecution, ReplayExecutionStatus};
 use golutra_llm::{LlmProvider, ProviderError, ProviderRequest, ProviderResponse};
@@ -396,6 +396,7 @@ impl RuntimeHost {
             .and_then(|event| event.payload.get("payload").cloned())
             .unwrap_or(Value::Null);
         let objective = prompt_from_payload(&task_payload);
+        let task_contract = replay_task_contract(&task_payload, &objective)?;
         let external_verifiers = task_payload
             .get("external_verifiers")
             .cloned()
@@ -419,7 +420,7 @@ impl RuntimeHost {
         let agent_loop = AgentLoop::new(provider.clone(), context_builder, tool_executor)
             .with_external_verifiers(external_verifiers);
         let outcome = agent_loop
-            .replay_with_trace(
+            .replay_with_trace_and_task_contract(
                 AgentTaskRequest {
                     session_id,
                     task_id: source_task_id,
@@ -439,6 +440,7 @@ impl RuntimeHost {
                     initial_messages: first_request.messages,
                     tools: first_request.tools,
                 },
+                task_contract,
                 |_| {},
             )
             .await;
@@ -558,6 +560,18 @@ impl RuntimeHost {
             })?;
         decode_replay_artifact_bytes(&artifact, &bytes)
     }
+}
+
+fn replay_task_contract(payload: &Value, objective: &str) -> Result<TaskContract, ClientError> {
+    let explicit = payload
+        .get("task_contract")
+        .is_some_and(|value| !value.is_null());
+    let mut contract = task_contract_from_payload(payload)?;
+    if !explicit {
+        provider_runtime::apply_legacy_task_contract(payload, objective, &mut contract);
+        contract.validate().map_err(ClientError::TaskExecution)?;
+    }
+    Ok(contract)
 }
 
 fn validate_replay_artifact_metadata(
@@ -840,5 +854,43 @@ mod tests {
         artifact.checksum = format!("sha256:{:x}", Sha256::digest(&bytes));
         artifact.size_bytes = artifact.size_bytes.saturating_add(1);
         assert!(decode_replay_artifact_bytes::<Value>(&artifact, &bytes).is_err());
+    }
+
+    #[test]
+    fn replay_restores_the_recorded_task_contract_instead_of_using_a_default() {
+        let payload = json!({
+            "prompt": "refactor the runtime",
+            "task_contract": {
+                "workspace_change": "forbidden",
+                "verification": "independent",
+                "require_objective_validation": true,
+                "max_correction_rounds": 0
+            }
+        });
+
+        let contract = replay_task_contract(&payload, "refactor the runtime").expect("contract");
+
+        assert_eq!(
+            contract.workspace_change,
+            golutra_core::WorkspaceChangeRequirement::Forbidden
+        );
+        assert_eq!(
+            contract.verification,
+            golutra_core::VerificationRequirement::Independent
+        );
+        assert!(contract.require_objective_validation);
+        assert_eq!(contract.max_correction_rounds, 0);
+    }
+
+    #[test]
+    fn replay_reconstructs_legacy_change_contract_without_a_fake_delivery_path() {
+        let payload = json!({"prompt": "修改 runtime 代码"});
+        let contract = replay_task_contract(&payload, "修改 runtime 代码").expect("contract");
+
+        assert_eq!(
+            contract.workspace_change,
+            golutra_core::WorkspaceChangeRequirement::Required
+        );
+        assert!(contract.required_paths.is_empty());
     }
 }

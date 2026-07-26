@@ -17,8 +17,8 @@ use golutra_config::{
     update_provider_settings_verified, validate_provider_protocol_runtime_supported,
 };
 use golutra_core::{
-    Actor, ActorKind, CommandId, SessionId, TaskId, TaskReconciliationDecision, TaskStatus,
-    ThreadId, TraceView, TurnId,
+    Actor, ActorKind, CommandId, SessionId, TaskContract, TaskId, TaskReconciliationDecision,
+    TaskStatus, ThreadId, TraceView, TurnId,
 };
 use golutra_eval::{ExternalEvaluationRecord, external_evaluation_result_digest};
 use golutra_llm::{
@@ -227,6 +227,9 @@ struct ExecArgs {
     /// JSON Schema file for the final response.
     #[arg(long, value_name = "FILE")]
     output_schema: Option<std::path::PathBuf>,
+    /// JSON file containing the explicit runtime completion and verification contract.
+    #[arg(long, value_name = "FILE")]
+    task_contract: Option<std::path::PathBuf>,
     /// Write the final assistant message to a file.
     #[arg(short = 'o', long, value_name = "FILE")]
     output_last_message: Option<std::path::PathBuf>,
@@ -2504,6 +2507,27 @@ async fn run_exec(transport: &RuntimeTransport, args: ExecArgs) -> miette::Resul
         }
         None => None,
     };
+    let task_contract = match args.task_contract {
+        Some(path) => {
+            let bytes = tokio::fs::read(&path)
+                .await
+                .map_err(|error| miette::miette!("{}: {error}", path.display()))?;
+            let contract: TaskContract = serde_json::from_slice(&bytes).map_err(|error| {
+                miette::miette!(
+                    "{} is not a valid task contract JSON file: {error}",
+                    path.display()
+                )
+            })?;
+            contract.validate().map_err(|error| {
+                miette::miette!(
+                    "{} contains an invalid task contract: {error}",
+                    path.display()
+                )
+            })?;
+            Some(contract)
+        }
+        None => None,
+    };
     let json_output = args.json;
     let output_last_message = args.output_last_message;
     let run_dir = args.run_dir;
@@ -2534,6 +2558,7 @@ async fn run_exec(transport: &RuntimeTransport, args: ExecArgs) -> miette::Resul
         .start_turn(
             prompt,
             AgentTurnOptions {
+                task_contract,
                 output_schema,
                 completion_criteria: args.completion_criteria,
                 allow_network: args.allow_network,
@@ -2546,15 +2571,14 @@ async fn run_exec(transport: &RuntimeTransport, args: ExecArgs) -> miette::Resul
     // Leave a recoverable identity/event boundary before consuming the turn.
     // An external harness can terminate the caller while the runtime is still
     // working, so a later collector must be able to reopen this run.
-    if let Some(destination) = run_dir.as_ref() {
-        if let Err(error) =
+    if let Some(destination) = run_dir.as_ref()
+        && let Err(error) =
             checkpoint_exec_run_bundle(transport, thread.thread_id(), destination.clone()).await
-        {
-            let _ = handle.interrupt().await;
-            return Err(miette::miette!(
-                "initial runtime data checkpoint failed: {error}"
-            ));
-        }
+    {
+        let _ = handle.interrupt().await;
+        return Err(miette::miette!(
+            "initial runtime data checkpoint failed: {error}"
+        ));
     }
 
     let turn_result = async {

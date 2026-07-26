@@ -226,6 +226,13 @@ fn terminal_evaluation_is_derived_from_runtime_events() {
     let facts = WaitFacts::from_app(&app);
     assert!(facts.evaluation_terminal(task_id));
     assert!(!facts.evaluation_terminal(TaskId::new()));
+
+    let stage_task_id = TaskId::new();
+    let mut stage_failure = terminal_event(5, stage_task_id, turn_id);
+    stage_failure.event_type = RuntimeEventType::PostTaskStageFailed;
+    stage_failure.payload = json!({"phase": "evaluation_scheduling", "terminal": true});
+    app.events.push(stage_failure);
+    assert!(WaitFacts::from_app(&app).evaluation_terminal(stage_task_id));
 }
 
 #[test]

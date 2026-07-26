@@ -1614,6 +1614,11 @@ fn developer_panel_exposes_governance_without_leaking_into_normal_view() {
         result: golutra_core::VerificationResult::Pass,
         policy_status: "verified".to_owned(),
         residual_risks: Vec::new(),
+        plan_id: None,
+        assertions: Vec::new(),
+        source: Default::default(),
+        independence: Default::default(),
+        environment_digest: None,
     };
     let debug_projection = golutra_protocol::DebugProjection {
         session_id,

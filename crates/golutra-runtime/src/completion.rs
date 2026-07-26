@@ -10,8 +10,6 @@ use golutra_core::{
 };
 use golutra_tools::ToolExecutionReport;
 
-use super::objective_requires_workspace_evidence;
-
 pub(crate) fn loop_decision(
     task_id: TaskId,
     turn_id: TurnId,
@@ -83,13 +81,11 @@ pub(crate) fn final_message(
 }
 
 pub(crate) fn accepts_text_response_without_evidence(
-    objective: &str,
-    touched_code: bool,
+    requires_workspace_evidence: bool,
     assistant_message: Option<&str>,
     tool_reports: &[ToolExecutionReport],
 ) -> bool {
-    !touched_code
+    !requires_workspace_evidence
         && tool_reports.is_empty()
         && assistant_message.is_some_and(|message| !message.trim().is_empty())
-        && !objective_requires_workspace_evidence(objective)
 }

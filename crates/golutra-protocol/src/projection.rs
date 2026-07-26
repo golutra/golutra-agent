@@ -87,9 +87,11 @@ pub struct DebugEventWindow {
     pub limit: u32,
 }
 
-/// 一个任务实际进入模型上下文的事实投影。
+/// 一个任务实际发送给 provider 的模型输入审计投影。
 ///
-/// 该视图只暴露脱敏 manifest 和 digest；provider 原始请求仍受 artifact 权限控制。
+/// 这是对 `ModelInputEnvelope` 的脱敏、可查询读模型，不是 provider request 本身，也不会
+/// 因为被持久化或被开发者读取而自动进入下一轮模型上下文。provider 原始请求仍受 artifact
+/// 权限控制。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ContextProjection {
     pub session_id: SessionId,

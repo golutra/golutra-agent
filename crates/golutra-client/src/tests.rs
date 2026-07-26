@@ -13,7 +13,8 @@ use golutra_core::{
     Actor, ActorKind, ArtifactId, ArtifactRecord, CausalRelation, CommandId, EvidenceId,
     FileChangeKind, FileChangeSummary, PostTaskJob, PostTaskJobId, PostTaskJobKind,
     PostTaskJobStatus, QueryId, RedactionStatus, TaskId, TaskStatus, ToolCallId, TraceView,
-    TurnChangeSummary, TurnId, VerificationId, VerificationRecord, VerificationResult, WorkspaceId,
+    TurnChangeSummary, TurnId, VerificationId, VerificationRecord, VerificationResult,
+    WorkspaceChangeRequirement, WorkspaceId,
 };
 use golutra_llm::{ConfiguredProvider, MockProvider, ProviderError, ProviderMessage, ProviderRole};
 use golutra_protocol::{
@@ -955,6 +956,50 @@ async fn durable_post_task_worker_recovers_a_queued_job_after_host_restart() {
             .iter()
             .any(|event| event.event_type == RuntimeEventType::PostTaskJobCompleted)
     );
+}
+
+#[tokio::test]
+async fn cross_process_settlement_waits_for_durable_scheduling_outcome() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let session_id = host.default_session_id();
+    let task_id = TaskId::new();
+    host.record_event(host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(task_id),
+        RuntimeEventType::TaskCompleted,
+        RuntimeEventSource::Runtime,
+        json!({
+            "status": "completed",
+            "post_task_governance": {"status": "pending"}
+        }),
+    ))
+    .await
+    .expect("terminal event");
+
+    let delayed_host = host.clone();
+    tokio::spawn(async move {
+        sleep(Duration::from_millis(350)).await;
+        delayed_host
+            .record_event(host_event(
+                delayed_host.next_sequence_no(),
+                session_id,
+                Some(task_id),
+                RuntimeEventType::PostTaskStageFailed,
+                RuntimeEventSource::Evaluator,
+                json!({
+                    "phase": "evaluation_scheduling",
+                    "terminal": true,
+                    "execution_outcome_unchanged": true
+                }),
+            ))
+            .await
+            .expect("scheduling failure event");
+    });
+
+    let started = std::time::Instant::now();
+    host.wait_for_deep_task_evaluation(task_id).await;
+    assert!(started.elapsed() >= Duration::from_millis(250));
 }
 
 #[tokio::test]
@@ -2119,6 +2164,76 @@ async fn evaluation_persistence_failure_is_reported_to_the_durable_worker() {
 }
 
 #[tokio::test]
+async fn post_task_governance_failure_does_not_rewrite_verified_terminal_status() {
+    let transport = EmbeddedTransport::in_memory().await.expect("transport");
+    let session_id = transport.default_session_id();
+    transport
+        .send_command(command(session_id, "list workspace"))
+        .await
+        .expect("task accepted");
+    let state = wait_for_status(&transport, session_id, TaskStatus::Completed).await;
+    let task_id = state
+        .get("active_task_id")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<TaskId>().ok())
+        .expect("task id");
+    let turn_id = transport
+        .host
+        .repositories
+        .events
+        .load(session_id, Some(task_id), None)
+        .await
+        .expect("events")
+        .iter()
+        .rev()
+        .find_map(|event| event.turn_id)
+        .expect("turn id");
+    let task = HostedAgentTask {
+        session_id,
+        task_id,
+        turn_id,
+        payload: json!({"prompt": "list workspace"}),
+    };
+    transport
+        .host
+        .record_post_task_governance_failure(
+            &task,
+            "projection",
+            false,
+            &ClientError::TaskExecution("forced projection failure".to_owned()),
+        )
+        .await;
+    let events = transport
+        .host
+        .repositories
+        .events
+        .load(session_id, Some(task_id), None)
+        .await
+        .expect("events");
+
+    assert!(events.iter().any(|event| {
+        event.event_type == RuntimeEventType::TaskCompleted
+            && event.payload.get("status").and_then(Value::as_str) == Some("completed")
+    }));
+    assert!(events.iter().any(|event| {
+        event.event_type == RuntimeEventType::PostTaskStageFailed
+            && event.payload.get("execution_outcome_unchanged") == Some(&json!(true))
+            && event.payload.get("terminal") == Some(&json!(false))
+    }));
+    assert_eq!(
+        transport
+            .host
+            .repositories
+            .projections
+            .state(session_id, None)
+            .await
+            .expect("projection")
+            .task_status,
+        TaskStatus::Completed
+    );
+}
+
+#[tokio::test]
 async fn reviewed_skill_is_installed_and_injected_only_for_matching_objectives() {
     let transport = EmbeddedTransport::in_memory().await.expect("transport");
     let session_id = SessionId::new();
@@ -2147,6 +2262,11 @@ async fn reviewed_skill_is_installed_and_injected_only_for_matching_objectives()
                     result: VerificationResult::Pass,
                     policy_status: "allowed".to_owned(),
                     residual_risks: Vec::new(),
+                    plan_id: None,
+                    assertions: Vec::new(),
+                    source: Default::default(),
+                    independence: Default::default(),
+                    environment_digest: None,
                 }),
                 tool_reports: &[],
                 failure_summary: None,
@@ -4916,6 +5036,126 @@ async fn prompt_write_file_natural_language_uses_requested_path_and_content() {
     assert!(!workspace.path().join("golutra-agent-output.txt").exists());
 }
 
+#[tokio::test]
+async fn task_contract_is_normalized_into_task_and_queued_turn_events() {
+    let workspace = tempdir().expect("workspace");
+    let _provider = IsolatedGlobalMockProvider::install().await;
+    let transport = EmbeddedTransport::for_cwd(workspace.path())
+        .await
+        .expect("transport");
+    let session_id = transport.default_session_id();
+
+    transport
+        .send_command(command(session_id, "sleep"))
+        .await
+        .expect("blocking task");
+    wait_for_status(&transport, session_id, TaskStatus::WaitingApproval).await;
+
+    let queued = transport
+        .send_command(command(
+            session_id,
+            "write file queued.txt with content queued",
+        ))
+        .await
+        .expect("queued task");
+    assert!(queued.accepted);
+
+    let events = transport
+        .host
+        .repositories
+        .events
+        .load(session_id, None, None)
+        .await
+        .expect("events");
+    let task_created = events
+        .iter()
+        .find(|event| event.event_type == RuntimeEventType::TaskCreated)
+        .expect("task created");
+    let queued_turn = events
+        .iter()
+        .find(|event| event.event_type == RuntimeEventType::TurnQueued)
+        .expect("queued turn");
+
+    let task_payload = task_created.payload.get("payload").expect("task payload");
+    assert_eq!(task_payload["_task_contract_origin"], "legacy_adapter");
+    assert_eq!(
+        task_payload["task_contract"]["workspace_change"],
+        "optional"
+    );
+    assert_eq!(task_payload["task_contract"]["schema_version"], 1);
+
+    let queued_payload = queued_turn.payload.get("payload").expect("turn payload");
+    assert_eq!(queued_payload["_task_contract_origin"], "legacy_adapter");
+    assert_eq!(
+        queued_payload["task_contract"]["workspace_change"],
+        serde_json::to_value(WorkspaceChangeRequirement::Required).expect("enum")
+    );
+    assert_eq!(
+        queued_payload["task_contract"]["required_paths"],
+        json!(["queued.txt"])
+    );
+
+    transport
+        .send_command(runtime_command(
+            session_id,
+            SessionCommandKind::Abort,
+            json!({}),
+        ))
+        .await
+        .expect("release blocking task");
+    if let Some(control) = transport.host.task_controls.lock().await.get(&session_id) {
+        control.abort_handle.abort();
+    }
+    sleep(Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn forbidden_workspace_contract_blocks_provider_side_effects() {
+    let workspace = tempdir().expect("workspace");
+    let _provider = IsolatedGlobalMockProvider::install().await;
+    let transport = EmbeddedTransport::for_cwd(workspace.path())
+        .await
+        .expect("transport");
+    let session_id = transport.default_session_id();
+    let ack = transport
+        .send_command(command_with_payload(
+            session_id,
+            json!({
+                "prompt": "write file blocked.txt with content must-not-write",
+                "task_contract": {
+                    "workspace_change": "forbidden",
+                    "verification": "required"
+                }
+            }),
+        ))
+        .await
+        .expect("command");
+    assert!(ack.accepted);
+    let state = wait_for_status(&transport, session_id, TaskStatus::Partial).await;
+    assert_eq!(projection_status(&state), Some(TaskStatus::Partial));
+    assert!(!workspace.path().join("blocked.txt").exists());
+
+    let task_id = state["active_task_id"]
+        .as_str()
+        .expect("task id")
+        .parse::<TaskId>()
+        .expect("task id format");
+    let events = transport
+        .host
+        .repositories
+        .events
+        .load(session_id, Some(task_id), None)
+        .await
+        .expect("events");
+    assert!(events.iter().any(|event| {
+        event.event_type == RuntimeEventType::ToolCompleted
+            && event.payload["envelope"]["status"] == "error"
+            && event.payload["envelope"]["structured_facts"]["error"]
+                .as_str()
+                .is_some_and(|summary| summary.contains("forbids side-effecting tools"))
+    }));
+}
+
 #[test]
 fn mock_write_file_args_prefers_payload_over_prompt() {
     let args = mock_write_file_args(
@@ -4933,6 +5173,40 @@ fn mock_write_file_args_prefers_payload_over_prompt() {
             content: "explicit".to_owned(),
         }
     );
+}
+
+#[test]
+fn legacy_change_intent_handles_coding_verbs_without_inventing_delivery_paths() {
+    let chinese = json!({"prompt": "修改 runtime 代码，修复验证链路"});
+    assert!(legacy_task_requests_workspace_change(
+        &chinese,
+        chinese["prompt"].as_str().expect("prompt"),
+    ));
+    assert_eq!(
+        legacy_task_required_path(&chinese, chinese["prompt"].as_str().expect("prompt"),),
+        None
+    );
+
+    let explicit = json!({
+        "prompt": "refactor the runtime",
+        "path": "src/runtime.rs",
+    });
+    assert_eq!(
+        legacy_task_required_path(&explicit, explicit["prompt"].as_str().expect("prompt"),),
+        Some("src/runtime.rs".to_owned())
+    );
+
+    let mut contract = golutra_core::TaskContract::default();
+    assert!(apply_legacy_task_contract(
+        &chinese,
+        chinese["prompt"].as_str().expect("prompt"),
+        &mut contract,
+    ));
+    assert_eq!(
+        contract.workspace_change,
+        WorkspaceChangeRequirement::Required
+    );
+    assert!(contract.required_paths.is_empty());
 }
 
 #[test]

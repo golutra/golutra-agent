@@ -1,8 +1,8 @@
 use golutra_core::{
     EvidenceId, TaskClass, TaskId, VerificationAssertion, VerificationAssertionKind,
     VerificationAssertionStatus, VerificationCheck, VerificationCheckKind,
-    VerificationDimensionStatus, VerificationDimensions, VerificationId, VerificationPlan,
-    VerificationRecord, VerificationResult,
+    VerificationDimensionStatus, VerificationDimensions, VerificationId, VerificationIndependence,
+    VerificationPlan, VerificationRecord, VerificationResult, VerificationSource,
 };
 use std::collections::HashSet;
 
@@ -212,6 +212,29 @@ impl VerificationRunner {
             assertion.evidence_refs = refs;
         }
         plan.dimensions = verification_dimensions(&plan, has_evidence);
+        record.plan_id = Some(plan.plan_id);
+        record.assertions = plan
+            .assertions
+            .iter()
+            .chain(plan.policy_assertions.iter())
+            .cloned()
+            .collect();
+        record.source = if input
+            .command_checks
+            .iter()
+            .any(|check| check.name == "objective:test:external_verifier")
+        {
+            VerificationSource::ExternalVerifier
+        } else {
+            VerificationSource::Runtime
+        };
+        record.independence = if record.source == VerificationSource::ExternalVerifier {
+            VerificationIndependence::Independent
+        } else if has_evidence {
+            VerificationIndependence::RuntimeEvidence
+        } else {
+            VerificationIndependence::Unspecified
+        };
         let blocking_failed = plan
             .assertions
             .iter()
@@ -325,6 +348,11 @@ impl VerificationRunner {
             result,
             policy_status: "p0_policy_checked".to_owned(),
             residual_risks: residual_risks(result),
+            plan_id: None,
+            assertions: Vec::new(),
+            source: VerificationSource::Runtime,
+            independence: VerificationIndependence::Unspecified,
+            environment_digest: None,
         }
     }
 }

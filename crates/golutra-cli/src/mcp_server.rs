@@ -11,7 +11,7 @@ use std::{
 };
 
 use golutra_client::{AgentClient, AgentThread, RuntimeTransport};
-use golutra_core::TaskStatus;
+use golutra_core::{TaskContract, TaskStatus};
 use golutra_protocol::{AgentItemKind, AgentStreamEvent, AgentTurnOptions};
 use rmcp::{
     ServerHandler, ServiceExt,
@@ -118,6 +118,9 @@ struct RunParameters {
     /// Optional JSON Schema applied to the final assistant response.
     #[serde(default)]
     output_schema: Option<Value>,
+    /// Explicit runtime completion and verification contract.
+    #[serde(default)]
+    task_contract: Option<TaskContract>,
     /// Additional objective checks for the runtime verification layer.
     #[serde(default)]
     completion_criteria: Vec<String>,
@@ -138,6 +141,9 @@ struct ReplyParameters {
     /// Optional JSON Schema applied to the final assistant response.
     #[serde(default)]
     output_schema: Option<Value>,
+    /// Explicit runtime completion and verification contract.
+    #[serde(default)]
+    task_contract: Option<TaskContract>,
     /// Additional objective checks for the runtime verification layer.
     #[serde(default)]
     completion_criteria: Vec<String>,
@@ -190,6 +196,7 @@ impl GolutraMcpServer {
             thread,
             parameters.prompt,
             AgentTurnOptions {
+                task_contract: parameters.task_contract,
                 output_schema: parameters.output_schema,
                 completion_criteria: parameters.completion_criteria,
                 allow_network: false,
@@ -224,6 +231,7 @@ impl GolutraMcpServer {
                 workspace: parameters.workspace,
                 thread_id: None,
                 output_schema: parameters.output_schema,
+                task_contract: parameters.task_contract,
                 completion_criteria: parameters.completion_criteria,
                 include_events: parameters.include_events,
             },

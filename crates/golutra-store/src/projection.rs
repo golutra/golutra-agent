@@ -137,16 +137,18 @@ pub(crate) fn apply_event_to_projection(projection: &mut StateProjection, event:
         }
     }
 
-    projection.visible_steps.push(VisibleStep {
-        label: format!("{:?}", event.event_type),
-        status: format!("{:?}", projection.task_status),
-        summary: event
-            .payload
-            .get("summary")
-            .and_then(|summary| summary.as_str())
-            .unwrap_or("runtime event recorded")
-            .to_owned(),
-    });
+    if event.event_type.is_user_projection_fact() {
+        projection.visible_steps.push(VisibleStep {
+            label: format!("{:?}", event.event_type),
+            status: format!("{:?}", projection.task_status),
+            summary: event
+                .payload
+                .get("summary")
+                .and_then(|summary| summary.as_str())
+                .unwrap_or("runtime event recorded")
+                .to_owned(),
+        });
+    }
     let overflow = projection
         .visible_steps
         .len()
@@ -181,4 +183,80 @@ pub(crate) fn loop_decision_from_event(event: &RuntimeEvent) -> Option<LoopDecis
         .cloned()
         .or_else(|| Some(event.payload.clone()))
         .and_then(|value| serde_json::from_value(value).ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use golutra_core::{EventId, RUNTIME_EVENT_SCHEMA_VERSION, TaskId, TurnId};
+    use golutra_protocol::RuntimeEventSource;
+    use serde_json::json;
+
+    use super::*;
+
+    fn event(
+        session_id: SessionId,
+        task_id: TaskId,
+        sequence_no: u64,
+        event_type: RuntimeEventType,
+        summary: &str,
+    ) -> RuntimeEvent {
+        RuntimeEvent {
+            schema_version: RUNTIME_EVENT_SCHEMA_VERSION,
+            causal_context: Default::default(),
+            causal_links: Vec::new(),
+            id: EventId::new(),
+            sequence_no,
+            session_id,
+            turn_id: Some(TurnId::new()),
+            task_id: Some(task_id),
+            parent_event_id: None,
+            event_type,
+            timestamp: Utc::now(),
+            source: RuntimeEventSource::Runtime,
+            payload: json!({"summary": summary}),
+            payload_ref: None,
+            durable: true,
+        }
+    }
+
+    #[test]
+    fn user_projection_excludes_evaluation_and_governance_steps() {
+        let session_id = SessionId::new();
+        let task_id = TaskId::new();
+        let mut projection = initial_projection(session_id);
+        apply_event_to_projection(
+            &mut projection,
+            &event(
+                session_id,
+                task_id,
+                1,
+                RuntimeEventType::TaskCreated,
+                "task started",
+            ),
+        );
+        apply_event_to_projection(
+            &mut projection,
+            &event(
+                session_id,
+                task_id,
+                2,
+                RuntimeEventType::EvaluationCompleted,
+                "offline evaluation details",
+            ),
+        );
+        apply_event_to_projection(
+            &mut projection,
+            &event(
+                session_id,
+                task_id,
+                3,
+                RuntimeEventType::PromotionDecided,
+                "promotion details",
+            ),
+        );
+
+        assert_eq!(projection.visible_steps.len(), 1);
+        assert_eq!(projection.visible_steps[0].summary, "task started");
+    }
 }

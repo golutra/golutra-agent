@@ -15,8 +15,9 @@ use golutra_core::{
 };
 use golutra_governor::GovernorLimits;
 use golutra_llm::{
-    LlmProvider, MockProvider, ProviderFinishReason, ProviderMessage, ProviderRequest,
-    ProviderResponse, ProviderStreamEvent, ProviderToolCall, ProviderUsage, UsageSource,
+    LlmProvider, MockProvider, ProviderError, ProviderFinishReason, ProviderMessage,
+    ProviderRequest, ProviderResponse, ProviderStreamEvent, ProviderToolCall, ProviderUsage,
+    UsageSource,
 };
 use golutra_policy::WorkspacePolicy;
 use golutra_protocol::{ExternalVerificationSpec, RuntimeEventType};
@@ -109,6 +110,87 @@ struct DuplicateFailureRecoveryProvider {
     contract: golutra_core::ProviderContract,
 }
 
+#[derive(Debug, Clone)]
+struct ToolResultProjectionProvider {
+    calls: Arc<AtomicUsize>,
+    saw_operational_facts: Arc<AtomicBool>,
+    saw_governance_metadata: Arc<AtomicBool>,
+    contract: golutra_core::ProviderContract,
+}
+
+#[async_trait]
+impl LlmProvider for ToolResultProjectionProvider {
+    async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call == 1
+            && let Some(tool_message) = request
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == ProviderRole::Tool)
+        {
+            let projection = serde_json::from_str::<serde_json::Value>(&tool_message.content)
+                .expect("model-visible tool result is JSON");
+            self.saw_operational_facts.store(
+                projection["structured_facts"]["bytes"] == 2
+                    && projection["model_visible_excerpt"] == "ok",
+                Ordering::SeqCst,
+            );
+            self.saw_governance_metadata.store(
+                projection.get("raw_artifact_ref").is_some()
+                    || projection.get("evidence_refs").is_some()
+                    || projection.get("risk").is_some()
+                    || projection.get("verification_hint").is_some(),
+                Ordering::SeqCst,
+            );
+        }
+        let (message, tool_calls, finish_reason) = if call == 0 {
+            (
+                None,
+                vec![ProviderToolCall {
+                    tool_call_id: "projection-read".to_owned(),
+                    tool_name: "read_file".to_owned(),
+                    arguments: json!({"path": "input.txt"}),
+                }],
+                ProviderFinishReason::ToolCalls,
+            )
+        } else {
+            (
+                Some(ProviderMessage {
+                    role: ProviderRole::Assistant,
+                    content: "tool result received".to_owned(),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: Vec::new(),
+                    metadata: Default::default(),
+                }),
+                Vec::new(),
+                ProviderFinishReason::Stop,
+            )
+        };
+        Ok(ProviderResponse {
+            response_id: golutra_core::ProviderResponseId::new(),
+            message,
+            tool_calls,
+            usage: ProviderUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                reasoning_tokens: None,
+                cached_input_tokens: None,
+                total_tokens: Some(15),
+                usage_source: UsageSource::Estimated,
+                raw: json!({"round": call}),
+            },
+            finish_reason,
+            raw_metadata: json!({"round": call}),
+        })
+    }
+
+    fn contract(&self) -> golutra_core::ProviderContract {
+        self.contract.clone()
+    }
+}
+
 #[async_trait]
 impl LlmProvider for ValidationGateProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
@@ -150,7 +232,7 @@ impl LlmProvider for ValidationGateProvider {
                         message.role == ProviderRole::User
                             && message
                                 .content
-                                .contains("Runtime verification is still missing")
+                                .contains("Runtime verification did not pass")
                     }),
                     Ordering::SeqCst,
                 );
@@ -446,6 +528,7 @@ async fn pending_turn_queue_closes_atomically_when_the_loop_becomes_idle() {
         command_id: CommandId::new(),
         turn_id: TurnId::new(),
         content: "first queued turn".to_owned(),
+        task_contract: None,
         steer: false,
     };
 
@@ -461,6 +544,7 @@ async fn pending_turn_queue_closes_atomically_when_the_loop_becomes_idle() {
                 command_id: CommandId::new(),
                 turn_id: TurnId::new(),
                 content: "late turn".to_owned(),
+                task_contract: None,
                 steer: false,
             })
             .await,
@@ -976,7 +1060,7 @@ async fn agent_loop_does_not_treat_a_write_as_objective_validation() {
         .await
         .expect("loop runs");
 
-    assert_eq!(outcome.loop_decision.action, LoopAction::StopPartial);
+    assert_eq!(outcome.loop_decision.action, LoopAction::StopFailed);
     assert!(
         !outcome.verification.checks.iter().any(|check| {
             check.kind == golutra_core::VerificationCheckKind::ObjectiveValidation
@@ -1057,13 +1141,20 @@ async fn workspace_change_is_returned_to_the_model_until_fresh_validation_passes
     }));
     assert!(trace.iter().any(|event| matches!(
         event,
-        AgentLoopTraceEvent::RetryScheduled { reason, .. }
-            if reason.contains("without fresh objective validation")
+        AgentLoopTraceEvent::VerificationCompleted {
+            terminal: false,
+            ..
+        }
     )));
+    assert!(
+        trace
+            .iter()
+            .any(|event| matches!(event, AgentLoopTraceEvent::CorrectionIssued(_)))
+    );
 }
 
 #[tokio::test]
-async fn code_change_without_an_objective_validation_is_partial() {
+async fn code_change_without_an_objective_validation_fails() {
     let workspace = tempdir().expect("workspace");
     let provider = MockProvider::tool_call(
         "write_file",
@@ -1088,8 +1179,8 @@ async fn code_change_without_an_objective_validation_is_partial() {
         .await
         .expect("loop runs");
 
-    assert_eq!(outcome.verification.result, VerificationResult::Partial);
-    assert_eq!(outcome.loop_decision.action, LoopAction::StopPartial);
+    assert_eq!(outcome.verification.result, VerificationResult::Fail);
+    assert_eq!(outcome.loop_decision.action, LoopAction::StopFailed);
     assert!(outcome.verification.checks.iter().any(|check| {
         check.kind == golutra_core::VerificationCheckKind::WorkspaceChange && check.passed
     }));
@@ -1410,6 +1501,41 @@ async fn agent_loop_returns_invalid_tool_calls_to_the_provider_as_tool_results()
 }
 
 #[tokio::test]
+async fn provider_receives_only_the_model_visible_tool_result_projection() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("input.txt"), "ok").expect("input");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let saw_operational_facts = Arc::new(AtomicBool::new(false));
+    let saw_governance_metadata = Arc::new(AtomicBool::new(false));
+    let provider = ToolResultProjectionProvider {
+        calls: calls.clone(),
+        saw_operational_facts: saw_operational_facts.clone(),
+        saw_governance_metadata: saw_governance_metadata.clone(),
+        contract: MockProvider::text_response("unused").contract(),
+    };
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let outcome = AgentLoop::new(provider, ContextBuilder::default(), executor)
+        .run(AgentTaskRequest {
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            turn_id: TurnId::new(),
+            objective: "read input.txt".to_owned(),
+            completion_criteria: Vec::new(),
+            output_schema: None,
+            touched_code: false,
+            contributors: Vec::new(),
+            tools: vec!["read_file".to_owned()],
+        })
+        .await
+        .expect("loop runs");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(saw_operational_facts.load(Ordering::SeqCst));
+    assert!(!saw_governance_metadata.load(Ordering::SeqCst));
+    assert_eq!(outcome.loop_decision.action, LoopAction::StopSuccess);
+}
+
+#[tokio::test]
 async fn agent_loop_blocks_without_evidence() {
     let workspace = tempdir().expect("workspace");
     let provider = MockProvider::text_response("done");
@@ -1463,6 +1589,59 @@ async fn agent_loop_accepts_plain_conversation_response_without_tool_evidence() 
     assert_eq!(outcome.loop_decision.action, LoopAction::StopSuccess);
     assert_eq!(outcome.verification.result, VerificationResult::Pass);
     assert_eq!(outcome.final_message, Some("你好，我在。".to_owned()));
+}
+
+#[tokio::test]
+async fn explicit_task_contract_blocks_model_claim_without_required_delivery() {
+    let workspace = tempdir().expect("workspace");
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let agent_loop = AgentLoop::new(
+        MockProvider::text_response("implemented everything"),
+        ContextBuilder::default(),
+        executor,
+    );
+    let (_handle, control) = agent_execution_channel(1);
+    let mut trace = Vec::new();
+
+    let outcome = agent_loop
+        .run_with_task_contract_and_observation_sink(
+            AgentTaskRequest {
+                session_id: SessionId::new(),
+                task_id: TaskId::new(),
+                turn_id: TurnId::new(),
+                objective: "do it".to_owned(),
+                completion_criteria: Vec::new(),
+                output_schema: None,
+                touched_code: false,
+                contributors: Vec::new(),
+                tools: Vec::new(),
+            },
+            TaskContract {
+                workspace_change: golutra_core::WorkspaceChangeRequirement::Required,
+                required_paths: vec!["src/result.rs".to_owned()],
+                verification: golutra_core::VerificationRequirement::Required,
+                max_correction_rounds: 0,
+                ..TaskContract::default()
+            },
+            control,
+            |event| trace.push(event),
+        )
+        .await
+        .expect("runtime returns governed outcome");
+
+    assert_eq!(outcome.verification.result, VerificationResult::Fail);
+    assert_ne!(outcome.loop_decision.action, LoopAction::StopSuccess);
+    assert!(
+        outcome
+            .verification
+            .residual_risks
+            .iter()
+            .any(|risk| risk.contains("requires a workspace change"))
+    );
+    assert!(trace.iter().any(|event| matches!(
+        event,
+        AgentLoopTraceEvent::VerificationCompleted { terminal: true, .. }
+    )));
 }
 
 #[tokio::test]
@@ -1561,6 +1740,7 @@ async fn queued_plain_turn_does_not_inherit_the_previous_turn_workspace_requirem
             command_id: CommandId::new(),
             turn_id: queued_turn_id,
             content: "hello".to_owned(),
+            task_contract: None,
             steer: false,
         })
         .await
@@ -1592,29 +1772,40 @@ async fn queued_plain_turn_does_not_inherit_the_previous_turn_workspace_requirem
 }
 
 #[tokio::test]
-async fn agent_loop_still_requires_evidence_for_workspace_objectives() {
+async fn explicit_read_contract_requires_objective_evidence() {
     let workspace = tempdir().expect("workspace");
     let provider = MockProvider::text_response("README looks fine.");
     let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
     let agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor);
 
+    let (_handle, control) = agent_execution_channel(1);
     let outcome = agent_loop
-        .run(AgentTaskRequest {
-            session_id: SessionId::new(),
-            task_id: TaskId::new(),
-            turn_id: TurnId::new(),
-            objective: "read README.md".to_owned(),
-            completion_criteria: vec!["file read evidence".to_owned()],
-            output_schema: None,
-            touched_code: false,
-            contributors: Vec::new(),
-            tools: vec!["read_file".to_owned()],
-        })
+        .run_with_task_contract_and_observation_sink(
+            AgentTaskRequest {
+                session_id: SessionId::new(),
+                task_id: TaskId::new(),
+                turn_id: TurnId::new(),
+                objective: "read README.md".to_owned(),
+                completion_criteria: vec!["file read evidence".to_owned()],
+                output_schema: None,
+                touched_code: false,
+                contributors: Vec::new(),
+                tools: vec!["read_file".to_owned()],
+            },
+            TaskContract {
+                require_objective_validation: true,
+                verification: golutra_core::VerificationRequirement::Required,
+                max_correction_rounds: 0,
+                ..TaskContract::default()
+            },
+            control,
+            |_| {},
+        )
         .await
         .expect("loop runs");
 
-    assert_eq!(outcome.loop_decision.action, LoopAction::Blocked);
-    assert_eq!(outcome.verification.result, VerificationResult::Unknown);
+    assert_eq!(outcome.loop_decision.action, LoopAction::StopFailed);
+    assert_eq!(outcome.verification.result, VerificationResult::Fail);
 }
 
 #[tokio::test]

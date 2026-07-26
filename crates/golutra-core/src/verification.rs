@@ -1,7 +1,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{EvidenceId, TaskId, VerificationId};
+use crate::{EvidenceId, TaskId, VerificationAssertion, VerificationId, VerificationPlanId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -10,6 +10,24 @@ pub enum VerificationResult {
     Fail,
     Partial,
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationSource {
+    #[default]
+    Runtime,
+    ExternalVerifier,
+    Mixed,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationIndependence {
+    #[default]
+    Unspecified,
+    RuntimeEvidence,
+    Independent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -91,6 +109,19 @@ pub struct VerificationRecord {
     pub result: VerificationResult,
     pub policy_status: String,
     pub residual_risks: Vec<String>,
+    /// The fixed plan and assertion statuses are copied into the record so a
+    /// consumer can validate a terminal result without guessing from event
+    /// prose or loading a second mutable object.
+    #[serde(default)]
+    pub plan_id: Option<VerificationPlanId>,
+    #[serde(default)]
+    pub assertions: Vec<VerificationAssertion>,
+    #[serde(default)]
+    pub source: VerificationSource,
+    #[serde(default)]
+    pub independence: VerificationIndependence,
+    #[serde(default)]
+    pub environment_digest: Option<String>,
 }
 
 #[cfg(test)]

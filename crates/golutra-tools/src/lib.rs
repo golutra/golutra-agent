@@ -38,6 +38,13 @@ const MAX_TOOL_ARGUMENT_DISPLAY_STRING_BYTES: usize = 1024;
 const MAX_TOOL_ARGUMENT_COMPACT_STRING_BYTES: usize = 96;
 const MAX_TOOL_ARGUMENT_DISPLAY_ITEMS: usize = 24;
 const MAX_TOOL_ARGUMENT_DISPLAY_DEPTH: usize = 4;
+pub const MAX_MODEL_TOOL_RESULT_BYTES: usize = 16 * 1024;
+const MAX_MODEL_TOOL_RESULT_SUMMARY_CHARS: usize = 2 * 1024;
+const MAX_MODEL_TOOL_RESULT_EXCERPT_CHARS: usize = 4 * 1024;
+const MAX_MODEL_TOOL_RESULT_COMPACT_EXCERPT_CHARS: usize = 512;
+const MAX_MODEL_TOOL_RESULT_FACT_STRING_CHARS: usize = 4 * 1024;
+const MAX_MODEL_TOOL_RESULT_ITEMS: usize = 32;
+const MAX_MODEL_TOOL_RESULT_DEPTH: usize = 5;
 const EXTERNAL_TOOL_TIMEOUT_MS: u64 = if cfg!(test) { 100 } else { 30_000 };
 const MAX_VERIFIER_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
 const MAX_VERIFIER_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
@@ -234,6 +241,11 @@ impl BasicToolExecutor {
             replay_backend: None,
             process_supervisor: ProcessSupervisor::new(),
         }
+    }
+
+    #[must_use]
+    pub fn workspace_root(&self) -> &Path {
+        self.policy.workspace_root()
     }
 
     #[must_use]
@@ -2183,6 +2195,170 @@ pub fn redact_tool_arguments(arguments: &Value) -> Value {
     } else {
         json!({"_golutra_truncated": true})
     }
+}
+
+/// Project the operational tool envelope into the only representation that
+/// may be appended to a provider request. Artifact/evidence references,
+/// security risk, and governance hints remain durable runtime facts and are
+/// intentionally excluded from model context.
+#[must_use]
+pub fn model_visible_tool_result(envelope: &ToolResultEnvelope) -> String {
+    let summary = bounded_text(
+        &redact_sensitive_text(&envelope.summary).0,
+        MAX_MODEL_TOOL_RESULT_SUMMARY_CHARS,
+    );
+    let facts = project_model_tool_value(
+        &redact_sensitive_value(envelope.structured_facts.clone()),
+        0,
+    );
+    let excerpt = envelope.model_visible_excerpt.as_deref().map(|value| {
+        bounded_text(
+            &redact_sensitive_text(value).0,
+            MAX_MODEL_TOOL_RESULT_EXCERPT_CHARS,
+        )
+    });
+    let mut projection = model_tool_result_value(
+        &envelope.tool_name,
+        envelope.status,
+        summary.clone(),
+        facts,
+        excerpt.clone(),
+    );
+    if serialized_value_len(&projection) > MAX_MODEL_TOOL_RESULT_BYTES {
+        projection["structured_facts"] = compact_model_tool_value(&projection["structured_facts"]);
+    }
+    if serialized_value_len(&projection) > MAX_MODEL_TOOL_RESULT_BYTES {
+        projection["structured_facts"] = json!({"_golutra_truncated": true});
+        if let Some(output) = projection
+            .get("model_visible_excerpt")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+        {
+            projection["model_visible_excerpt"] = Value::String(bounded_text(
+                &output,
+                MAX_MODEL_TOOL_RESULT_COMPACT_EXCERPT_CHARS,
+            ));
+        }
+    }
+    let serialized = serde_json::to_string(&projection).unwrap_or_else(|_| {
+        "{\"status\":\"error\",\"summary\":\"tool result could not be serialized\"}".to_owned()
+    });
+    if serialized.len() <= MAX_MODEL_TOOL_RESULT_BYTES {
+        return serialized;
+    }
+
+    serde_json::to_string(&json!({
+        "tool_name": bounded_text(&envelope.tool_name, 128),
+        "status": envelope.status,
+        "summary": bounded_text(&summary, 512),
+        "structured_facts": {"_golutra_truncated": true},
+        "model_visible_excerpt": excerpt.map(|value| bounded_text(&value, 128)),
+    }))
+    .unwrap_or_else(|_| "{\"status\":\"error\"}".to_owned())
+}
+
+fn model_tool_result_value(
+    tool_name: &str,
+    status: ToolResultStatus,
+    summary: String,
+    facts: Value,
+    excerpt: Option<String>,
+) -> Value {
+    let mut object = serde_json::Map::new();
+    object.insert(
+        "tool_name".to_owned(),
+        Value::String(bounded_text(tool_name, 128)),
+    );
+    object.insert(
+        "status".to_owned(),
+        serde_json::to_value(status).unwrap_or(Value::Null),
+    );
+    object.insert("summary".to_owned(), Value::String(summary));
+    object.insert("structured_facts".to_owned(), facts);
+    if let Some(excerpt) = excerpt {
+        object.insert("model_visible_excerpt".to_owned(), Value::String(excerpt));
+    }
+    Value::Object(object)
+}
+
+fn project_model_tool_value(value: &Value, depth: usize) -> Value {
+    if depth >= MAX_MODEL_TOOL_RESULT_DEPTH {
+        return omitted_model_tool_value(value);
+    }
+    match value {
+        Value::Object(object) => {
+            let mut projected = serde_json::Map::new();
+            for (key, value) in object.iter().take(MAX_MODEL_TOOL_RESULT_ITEMS) {
+                projected.insert(
+                    bounded_text(key, 128),
+                    project_model_tool_value(value, depth + 1),
+                );
+            }
+            if object.len() > MAX_MODEL_TOOL_RESULT_ITEMS {
+                projected.insert("_golutra_truncated".to_owned(), Value::Bool(true));
+            }
+            Value::Object(projected)
+        }
+        Value::Array(values) => {
+            let mut projected = values
+                .iter()
+                .take(MAX_MODEL_TOOL_RESULT_ITEMS)
+                .map(|value| project_model_tool_value(value, depth + 1))
+                .collect::<Vec<_>>();
+            if values.len() > MAX_MODEL_TOOL_RESULT_ITEMS {
+                projected.push(Value::String(format!(
+                    "<omitted {} additional items>",
+                    values.len() - MAX_MODEL_TOOL_RESULT_ITEMS
+                )));
+            }
+            Value::Array(projected)
+        }
+        Value::String(text) => {
+            Value::String(bounded_text(text, MAX_MODEL_TOOL_RESULT_FACT_STRING_CHARS))
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
+    }
+}
+
+fn compact_model_tool_value(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut projected = serde_json::Map::new();
+            for (key, value) in object.iter().take(8) {
+                projected.insert(bounded_text(key, 64), compact_model_tool_value(value));
+            }
+            if object.len() > 8 {
+                projected.insert("_golutra_truncated".to_owned(), Value::Bool(true));
+            }
+            Value::Object(projected)
+        }
+        Value::Array(values) => {
+            let mut projected = values
+                .iter()
+                .take(8)
+                .map(compact_model_tool_value)
+                .collect::<Vec<_>>();
+            if values.len() > 8 {
+                projected.push(Value::String(format!(
+                    "<omitted {} additional items>",
+                    values.len() - 8
+                )));
+            }
+            Value::Array(projected)
+        }
+        Value::String(text) => Value::String(bounded_text(text, 256)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
+    }
+}
+
+fn omitted_model_tool_value(value: &Value) -> Value {
+    let summary = match value {
+        Value::Object(object) => format!("<omitted object with {} fields>", object.len()),
+        Value::Array(values) => format!("<omitted array with {} items>", values.len()),
+        Value::String(text) => format!("<omitted {} characters>", text.chars().count()),
+        Value::Null | Value::Bool(_) | Value::Number(_) => "<omitted value>".to_owned(),
+    };
+    Value::String(summary)
 }
 
 const PREFERRED_TOOL_ARGUMENT_KEYS: &[&str] = &[

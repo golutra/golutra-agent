@@ -255,6 +255,9 @@ impl PostTaskCoordinator {
                     json!({
                         "summary": "post-task evaluation exhausted its retry budget",
                         "job_id": job.job_id,
+                        "phase": "deep_evaluation",
+                        "terminal": true,
+                        "execution_outcome_unchanged": true,
                         "error": error,
                         "attempt": job.attempt,
                     }),

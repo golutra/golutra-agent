@@ -85,6 +85,10 @@ impl EventRepository {
             .await
     }
 
+    pub async fn session_for_task(&self, task_id: TaskId) -> StoreResult<Option<SessionId>> {
+        self.store.session_for_task(task_id).await
+    }
+
     pub async fn load_page(
         &self,
         session_id: SessionId,

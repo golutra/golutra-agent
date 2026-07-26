@@ -17,16 +17,43 @@ pub(crate) fn outcome<F>(
 where
     F: FnMut(AgentLoopTraceEvent) + Send,
 {
-    let (planned, limit, action) = match error {
-        ContextError::BudgetExceeded { planned, limit } => (planned, limit, LoopAction::Blocked),
-        ContextError::UserActionRequired { planned, limit } => {
-            (planned, limit, LoopAction::AskUser)
-        }
-        ContextError::CompactionImpossible { planned, limit } => {
-            (planned, limit, LoopAction::Blocked)
-        }
+    let (planned, limit, action, reason) = match error {
+        ContextError::BudgetExceeded { planned, limit } => (
+            planned,
+            limit,
+            LoopAction::Blocked,
+            format!("context budget exceeded: planned {planned} > limit {limit}"),
+        ),
+        ContextError::UserActionRequired { planned, limit } => (
+            planned,
+            limit,
+            LoopAction::AskUser,
+            format!("context budget exceeded: planned {planned} > limit {limit}"),
+        ),
+        ContextError::CompactionImpossible { planned, limit } => (
+            planned,
+            limit,
+            LoopAction::Blocked,
+            format!("context budget exceeded: planned {planned} > limit {limit}"),
+        ),
+        ContextError::ForbiddenModelInputSource { source_name } => (
+            0,
+            0,
+            LoopAction::Blocked,
+            format!("model input disclosure policy rejected source {source_name}"),
+        ),
+        ContextError::ModelInputSourceCardinality {
+            message_count,
+            source_count,
+        } => (
+            0,
+            0,
+            LoopAction::Blocked,
+            format!(
+                "model input disclosure policy requires one source per message: {message_count} messages, {source_count} sources"
+            ),
+        ),
     };
-    let reason = format!("context budget exceeded: planned {planned} > limit {limit}");
     trace(AgentLoopTraceEvent::LoopGuardTriggered {
         trigger: golutra_core::LoopGuardTrigger::ContextOverflow,
         reason: reason.clone(),
@@ -41,6 +68,11 @@ where
         result: VerificationResult::Unknown,
         policy_status: "context_guard_blocked".to_owned(),
         residual_risks: vec![reason.clone()],
+        plan_id: None,
+        assertions: Vec::new(),
+        source: Default::default(),
+        independence: Default::default(),
+        environment_digest: None,
     };
     let verification_plan = RuntimeVerificationService::default().plan(&VerificationInput {
         task_id: request.task_id,
@@ -54,9 +86,17 @@ where
     trace(AgentLoopTraceEvent::VerificationPlanned(
         verification_plan.clone(),
     ));
-    let final_message = format!(
-        "Cannot continue because the context budget is exhausted ({planned} > {limit}). Compact the conversation or reduce the request."
-    );
+    trace(AgentLoopTraceEvent::VerificationCompleted {
+        record: verification.clone(),
+        terminal: true,
+    });
+    let final_message = if planned == 0 && limit == 0 {
+        format!("Cannot continue because runtime rejected the model input: {reason}.")
+    } else {
+        format!(
+            "Cannot continue because the context budget is exhausted ({planned} > {limit}). Compact the conversation or reduce the request."
+        )
+    };
     trace(AgentLoopTraceEvent::AssistantMessage {
         turn_id: request.turn_id,
         content: final_message.clone(),

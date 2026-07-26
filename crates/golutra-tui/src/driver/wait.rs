@@ -81,6 +81,7 @@ pub(super) struct WaitFacts {
     authentication_required: ScopedSequences,
     event_high_watermarks: HashMap<String, u64>,
     evaluation_jobs: HashMap<TaskId, EvaluationJobs>,
+    evaluation_stage_failures: HashSet<TaskId>,
 }
 
 impl WaitFacts {
@@ -115,6 +116,7 @@ impl WaitFacts {
             authentication_required: ScopedSequences::default(),
             event_high_watermarks: HashMap::new(),
             evaluation_jobs: HashMap::new(),
+            evaluation_stage_failures: HashSet::new(),
         };
         for event in events {
             facts.record(event);
@@ -183,6 +185,17 @@ impl WaitFacts {
                         .or_default()
                         .terminal
                         .insert(job_id.to_owned());
+                }
+            }
+            RuntimeEventType::PostTaskStageFailed => {
+                if event
+                    .payload
+                    .get("terminal")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                    && let Some(task_id) = event.task_id
+                {
+                    self.evaluation_stage_failures.insert(task_id);
                 }
             }
             _ => {}
@@ -268,9 +281,10 @@ impl WaitFacts {
     }
 
     pub(super) fn evaluation_terminal(&self, task_id: TaskId) -> bool {
-        self.evaluation_jobs
-            .get(&task_id)
-            .is_some_and(|jobs| !jobs.queued.is_empty() && jobs.queued.is_subset(&jobs.terminal))
+        self.evaluation_stage_failures.contains(&task_id)
+            || self.evaluation_jobs.get(&task_id).is_some_and(|jobs| {
+                !jobs.queued.is_empty() && jobs.queued.is_subset(&jobs.terminal)
+            })
     }
 }
 

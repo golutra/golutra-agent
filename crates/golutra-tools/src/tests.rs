@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use golutra_core::EvidenceId;
 use golutra_policy::WorkspacePolicy;
 use tempfile::tempdir;
 use tokio::process::Command;
@@ -263,6 +264,63 @@ fn tool_started_arguments_summarize_payloads_and_enforce_a_hard_limit() {
             .len()
             <= MAX_TOOL_ARGUMENT_DISPLAY_BYTES
     );
+}
+
+#[test]
+fn model_visible_tool_result_excludes_governance_and_artifact_metadata() {
+    let envelope = ToolResultEnvelope {
+        tool_call_id: ToolCallId::new(),
+        tool_name: "shell".to_owned(),
+        status: ToolResultStatus::Ok,
+        summary: "command completed".to_owned(),
+        structured_facts: json!({
+            "command": "cargo test",
+            "exit_code": 0,
+            "output": "ok 1 test",
+        }),
+        model_visible_excerpt: Some("ok 1 test".to_owned()),
+        raw_artifact_ref: Some(ArtifactId::new()),
+        evidence_refs: vec![EvidenceId::new()],
+        risk: "high-risk-internal-value".to_owned(),
+        verification_hint: Some("internal governance hint".to_owned()),
+    };
+
+    let serialized = model_visible_tool_result(&envelope);
+    let projection: Value = serde_json::from_str(&serialized).expect("projection JSON");
+
+    assert_eq!(projection["status"], "ok");
+    assert_eq!(projection["structured_facts"]["exit_code"], 0);
+    assert!(projection.get("raw_artifact_ref").is_none());
+    assert!(projection.get("evidence_refs").is_none());
+    assert!(projection.get("risk").is_none());
+    assert!(projection.get("verification_hint").is_none());
+    assert!(!serialized.contains("high-risk-internal-value"));
+    assert!(!serialized.contains("internal governance hint"));
+    assert!(serialized.len() <= MAX_MODEL_TOOL_RESULT_BYTES);
+}
+
+#[test]
+fn model_visible_tool_result_bounds_large_facts_and_output() {
+    let envelope = ToolResultEnvelope {
+        tool_call_id: ToolCallId::new(),
+        tool_name: "external_mcp".to_owned(),
+        status: ToolResultStatus::Ok,
+        summary: "summary".to_owned(),
+        structured_facts: json!({
+            "items": (0..256)
+                .map(|index| Value::String(format!("item-{index}-{}", "x".repeat(512))))
+                .collect::<Vec<_>>(),
+        }),
+        model_visible_excerpt: Some("output".repeat(16 * 1024)),
+        raw_artifact_ref: None,
+        evidence_refs: Vec::new(),
+        risk: "external".to_owned(),
+        verification_hint: None,
+    };
+
+    let serialized = model_visible_tool_result(&envelope);
+    assert!(serialized.len() <= MAX_MODEL_TOOL_RESULT_BYTES);
+    assert!(serialized.contains("_golutra_truncated") || serialized.contains("omitted"));
 }
 
 #[tokio::test]

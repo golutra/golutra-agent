@@ -25,6 +25,34 @@ pub enum ContextError {
         "context compaction cannot preserve the protected prefix: planned {planned} > limit {limit}"
     )]
     CompactionImpossible { planned: u64, limit: u64 },
+    #[error("model input cannot include runtime observation source: {source_name}")]
+    ForbiddenModelInputSource { source_name: String },
+    #[error(
+        "model input source cardinality mismatch: {message_count} messages but {source_count} sources"
+    )]
+    ModelInputSourceCardinality {
+        message_count: usize,
+        source_count: usize,
+    },
+}
+
+/// Disclosure classification attached to each message that is about to be
+/// sent to a provider. Observation and governance data can be durable facts
+/// without being valid model input.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelInputVisibility {
+    #[default]
+    ModelVisible,
+    ObservationOnly,
+    GovernanceOnly,
+}
+
+impl ModelInputVisibility {
+    #[must_use]
+    pub const fn is_model_visible(self) -> bool {
+        matches!(self, Self::ModelVisible)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +69,8 @@ pub struct ContextMessageSource {
     pub contributor: String,
     pub source_refs: Vec<String>,
     pub origin: String,
+    #[serde(default)]
+    pub visibility: ModelInputVisibility,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +82,35 @@ pub struct ContextBuildPlan {
     pub budget_snapshot: TokenBudgetSnapshot,
     pub original_planned_input_tokens: u64,
     pub trimmed_contributors: Vec<String>,
+}
+
+/// The only value that crosses the Runtime OS -> provider boundary.
+///
+/// The audit snapshot deliberately lives beside, rather than inside, the
+/// provider request.  RuntimeEvent, debug, evaluation and governance data
+/// can therefore be recorded after the call without becoming model input by
+/// accident.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelInputEnvelope {
+    provider_request: ProviderRequest,
+    audit_snapshot: ContextSnapshot,
+}
+
+impl ModelInputEnvelope {
+    #[must_use]
+    pub fn provider_request(&self) -> &ProviderRequest {
+        &self.provider_request
+    }
+
+    #[must_use]
+    pub fn audit_snapshot(&self) -> &ContextSnapshot {
+        &self.audit_snapshot
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (ProviderRequest, ContextSnapshot) {
+        (self.provider_request, self.audit_snapshot)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -228,6 +287,12 @@ impl ContextWindowManager {
                 contributor: "working_summary".to_owned(),
                 source_refs,
                 origin: "compaction_summary".to_owned(),
+                visibility: normalized_sources
+                    [protected_prefix_len..protected_prefix_len + dropped_end]
+                    .iter()
+                    .map(|source| source.visibility)
+                    .find(|visibility| !visibility.is_model_visible())
+                    .unwrap_or_default(),
             });
         }
         let retained_count = retained.len();
@@ -436,6 +501,7 @@ impl ContextBuilder {
                     contributor.source_refs.clone()
                 },
                 origin: "initial_contributor".to_owned(),
+                visibility: ModelInputVisibility::ModelVisible,
             })
             .collect::<Vec<_>>();
         let messages = contributors
@@ -525,6 +591,7 @@ impl ContextBuilder {
                 contributor: format!("replay_message_{index}"),
                 source_refs: vec![format!("replay:provider-message:{index}")],
                 origin: "deterministic_replay".to_owned(),
+                visibility: ModelInputVisibility::ModelVisible,
             })
             .collect();
         Ok(ContextBuildPlan {
@@ -640,6 +707,61 @@ pub fn provider_request_from_plan(
     }
 }
 
+/// Compile a provider request after applying the model-input disclosure
+/// boundary.  Observation projections are intentionally rejected here rather
+/// than relying on callers to remember which event-derived contributors are
+/// safe to expose.
+pub fn compile_model_input(
+    session_id: SessionId,
+    plan: &ContextBuildPlan,
+    task_id: TaskId,
+    turn_id: TurnId,
+    provider_id: impl Into<String>,
+    model_id: impl Into<String>,
+    tools: Vec<ToolContract>,
+) -> Result<ModelInputEnvelope, ContextError> {
+    if plan.messages.len() != plan.message_sources.len() {
+        return Err(ContextError::ModelInputSourceCardinality {
+            message_count: plan.messages.len(),
+            source_count: plan.message_sources.len(),
+        });
+    }
+    for source in &plan.message_sources {
+        if !source.visibility.is_model_visible() || is_observation_source(source) {
+            return Err(ContextError::ForbiddenModelInputSource {
+                source_name: source.origin.clone(),
+            });
+        }
+    }
+
+    let provider_request =
+        provider_request_from_plan(plan, task_id, turn_id, provider_id, model_id, tools);
+    let audit_snapshot = context_snapshot_from_request(session_id, plan, &provider_request);
+    Ok(ModelInputEnvelope {
+        provider_request,
+        audit_snapshot,
+    })
+}
+
+fn is_observation_source(source: &ContextMessageSource) -> bool {
+    const HIDDEN_ORIGINS: &[&str] = &[
+        "observation_projection",
+        "debug_projection",
+        "evaluation_projection",
+        "governance_projection",
+        "runtime_event",
+    ];
+    const HIDDEN_CONTRIBUTORS: &[&str] = &[
+        "observation",
+        "debug_projection",
+        "evaluation_projection",
+        "governance_projection",
+        "runtime_events",
+    ];
+    HIDDEN_ORIGINS.contains(&source.origin.as_str())
+        || HIDDEN_CONTRIBUTORS.contains(&source.contributor.as_str())
+}
+
 #[must_use]
 pub fn context_snapshot_from_request(
     session_id: SessionId,
@@ -721,6 +843,7 @@ fn normalized_message_sources(
                     contributor: contributor.to_owned(),
                     source_refs: vec![format!("request:message:{index}")],
                     origin: "inferred_legacy".to_owned(),
+                    visibility: ModelInputVisibility::ModelVisible,
                 }
             })
         })
@@ -1161,6 +1284,7 @@ mod tests {
                 },
                 source_refs: vec![format!("event:source-{index}")],
                 origin: "runtime_history".to_owned(),
+                visibility: ModelInputVisibility::ModelVisible,
             })
             .collect::<Vec<_>>();
 
@@ -1345,6 +1469,211 @@ mod tests {
         assert_eq!(plan.contributors, vec!["objective"]);
         assert_eq!(plan.budget_snapshot.task_id, task_id);
         assert!(plan.budget_snapshot.planned_input_tokens > 0);
+    }
+
+    #[test]
+    fn model_input_envelope_rejects_observation_projection_sources() {
+        let task_id = TaskId::new();
+        let turn_id = TurnId::new();
+        let mut plan = ContextBuilder::default()
+            .build(
+                task_id,
+                turn_id,
+                vec![ContextContributor {
+                    name: "objective".to_owned(),
+                    role: ProviderRole::User,
+                    content: "inspect the workspace".to_owned(),
+                    token_budget_hint: 32,
+                    source_refs: vec!["task:objective".to_owned()],
+                }],
+            )
+            .expect("context builds");
+        plan.message_sources[0].contributor = "debug_projection".to_owned();
+        plan.message_sources[0].origin = "observation_projection".to_owned();
+
+        let result = compile_model_input(
+            SessionId::new(),
+            &plan,
+            task_id,
+            turn_id,
+            "mock",
+            "mock-model",
+            Vec::new(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(ContextError::ForbiddenModelInputSource { source_name })
+                if source_name == "observation_projection"
+        ));
+    }
+
+    #[test]
+    fn model_input_envelope_rejects_typed_hidden_visibility_even_with_safe_labels() {
+        let task_id = TaskId::new();
+        let turn_id = TurnId::new();
+        let mut plan = ContextBuilder::default()
+            .build(
+                task_id,
+                turn_id,
+                vec![ContextContributor {
+                    name: "runtime-fact".to_owned(),
+                    role: ProviderRole::User,
+                    content: "governance candidate details".to_owned(),
+                    token_budget_hint: 32,
+                    source_refs: vec!["governance:candidate".to_owned()],
+                }],
+            )
+            .expect("context builds");
+        plan.message_sources[0].visibility = ModelInputVisibility::GovernanceOnly;
+        plan.message_sources[0].origin = "initial_contributor".to_owned();
+
+        let result = compile_model_input(
+            SessionId::new(),
+            &plan,
+            task_id,
+            turn_id,
+            "mock",
+            "mock-model",
+            Vec::new(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(ContextError::ForbiddenModelInputSource { source_name })
+                if source_name == "initial_contributor"
+        ));
+    }
+
+    #[test]
+    fn model_input_envelope_rejects_messages_without_explicit_sources() {
+        let task_id = TaskId::new();
+        let turn_id = TurnId::new();
+        let mut plan = ContextBuilder::default()
+            .build(
+                task_id,
+                turn_id,
+                vec![ContextContributor {
+                    name: "objective".to_owned(),
+                    role: ProviderRole::User,
+                    content: "inspect the workspace".to_owned(),
+                    token_budget_hint: 32,
+                    source_refs: vec!["task:objective".to_owned()],
+                }],
+            )
+            .expect("context builds");
+        plan.message_sources.clear();
+
+        let result = compile_model_input(
+            SessionId::new(),
+            &plan,
+            task_id,
+            turn_id,
+            "mock",
+            "mock-model",
+            Vec::new(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(ContextError::ModelInputSourceCardinality {
+                message_count: 1,
+                source_count: 0,
+            })
+        ));
+    }
+
+    #[test]
+    fn compaction_summary_preserves_hidden_visibility() {
+        let turn_id = TurnId::new();
+        let mut messages = vec![ProviderMessage {
+            role: ProviderRole::System,
+            content: "protected".to_owned(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        }];
+        let mut sources = vec![ContextMessageSource {
+            contributor: "system".to_owned(),
+            source_refs: vec!["system".to_owned()],
+            origin: "test".to_owned(),
+            visibility: ModelInputVisibility::ModelVisible,
+        }];
+        for index in 0..8 {
+            messages.push(ProviderMessage {
+                role: ProviderRole::User,
+                content: format!("hidden evaluation evidence {index} ").repeat(40),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+                metadata: Default::default(),
+            });
+            sources.push(ContextMessageSource {
+                contributor: "evaluation".to_owned(),
+                source_refs: vec![format!("evaluation:{index}")],
+                origin: "test".to_owned(),
+                visibility: ModelInputVisibility::GovernanceOnly,
+            });
+        }
+
+        let record = ContextWindowManager::new(96)
+            .compact_if_needed(turn_id, 1, &messages, &sources, 0)
+            .expect("compaction")
+            .expect("compaction required");
+        let summary_source = record
+            .replacement_sources
+            .iter()
+            .find(|source| source.contributor == "working_summary")
+            .expect("summary source");
+        assert_eq!(
+            summary_source.visibility,
+            ModelInputVisibility::GovernanceOnly
+        );
+    }
+
+    #[test]
+    fn model_input_envelope_separates_provider_input_from_audit_snapshot() {
+        let session_id = SessionId::new();
+        let task_id = TaskId::new();
+        let turn_id = TurnId::new();
+        let plan = ContextBuilder::default()
+            .build(
+                task_id,
+                turn_id,
+                vec![ContextContributor {
+                    name: "objective".to_owned(),
+                    role: ProviderRole::User,
+                    content: "summarize repository".to_owned(),
+                    token_budget_hint: 32,
+                    source_refs: vec!["task:objective".to_owned()],
+                }],
+            )
+            .expect("context builds");
+
+        let envelope = compile_model_input(
+            session_id,
+            &plan,
+            task_id,
+            turn_id,
+            "mock",
+            "mock-model",
+            Vec::new(),
+        )
+        .expect("model input compiles");
+
+        assert_eq!(envelope.provider_request().messages, plan.messages);
+        assert_eq!(envelope.audit_snapshot().session_id, session_id);
+        assert_eq!(
+            envelope.audit_snapshot().provider_request_id,
+            envelope.provider_request().request_id
+        );
+        assert!(
+            serde_json::to_value(envelope.provider_request())
+                .expect("provider request json")
+                .get("events")
+                .is_none()
+        );
     }
 
     #[test]

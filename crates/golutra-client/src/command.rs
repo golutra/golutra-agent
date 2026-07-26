@@ -345,7 +345,7 @@ impl RuntimeHost {
     ) -> Result<CommandAck, ClientError> {
         let task_id = TaskId::new();
         let turn_id = TurnId::new();
-        let payload = command.payload.clone();
+        let mut payload = command.payload.clone();
         let prompt = prompt_from_payload(&payload);
         if prompt.trim().is_empty() {
             return Ok(CommandAck {
@@ -354,6 +354,21 @@ impl RuntimeHost {
                 reason: Some("prompt cannot be empty".to_owned()),
             });
         }
+        let explicit_task_contract = payload
+            .get("task_contract")
+            .is_some_and(|value| !value.is_null());
+        let mut task_contract = task_contract_from_payload(&payload)?;
+        let contract_origin = if explicit_task_contract {
+            "explicit"
+        } else {
+            provider_runtime::apply_legacy_task_contract(&payload, &prompt, &mut task_contract);
+            "legacy_adapter"
+        };
+        task_contract
+            .validate()
+            .map_err(ClientError::TaskExecution)?;
+        payload["task_contract"] = serde_json::to_value(&task_contract)?;
+        payload["_task_contract_origin"] = Value::String(contract_origin.to_owned());
         let busy_decision = {
             let lane_manager = self.lane_manager.lock().await;
             lane_manager
@@ -387,6 +402,7 @@ impl RuntimeHost {
                                 command_id: command.command_id,
                                 turn_id,
                                 content: prompt.clone(),
+                                task_contract: Some(task_contract.clone()),
                                 steer: payload
                                     .get("steer")
                                     .and_then(Value::as_bool)
@@ -441,7 +457,7 @@ impl RuntimeHost {
                         "summary": reason,
                         "command_id": command.command_id.to_string(),
                         "decision": decision,
-                        "payload": command.payload,
+                        "payload": payload,
                     }),
                 ))
                 .await?;
@@ -1202,6 +1218,7 @@ impl RuntimeHost {
         let lines = events
             .iter()
             .filter(|event| event.sequence_no > compacted_after)
+            .filter(|event| event.event_type.is_model_history_fact())
             .filter_map(conversation_history_line)
             .collect::<Vec<_>>();
         if explicit_compaction.is_none() && lines.is_empty() {

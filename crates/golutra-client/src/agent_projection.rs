@@ -509,6 +509,11 @@ mod tests {
             result: VerificationResult::Pass,
             policy_status: "pass".to_owned(),
             residual_risks: Vec::new(),
+            plan_id: None,
+            assertions: Vec::new(),
+            source: Default::default(),
+            independence: Default::default(),
+            environment_digest: None,
         };
         projector.project(event(
             &thread,
@@ -606,6 +611,11 @@ mod tests {
             result: VerificationResult::Pass,
             policy_status: "pass".to_owned(),
             residual_risks: Vec::new(),
+            plan_id: None,
+            assertions: Vec::new(),
+            source: Default::default(),
+            independence: Default::default(),
+            environment_digest: None,
         };
         let mut projector = AgentEventProjector::new(thread.clone(), Some(command_id));
         projector.project(event(

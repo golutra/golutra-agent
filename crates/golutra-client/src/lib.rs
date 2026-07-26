@@ -166,7 +166,7 @@ pub(crate) use context::{
     compact_event_summary, compact_history_text, compact_history_with_summary,
     completion_criteria_from_payload, context_compaction_from_event, conversation_history_line,
     environment_context_prompt, load_project_instructions, memory_context, preview_from_payload,
-    prompt_from_payload, system_prompt, title_from_payload,
+    prompt_from_payload, system_prompt, task_contract_from_payload, title_from_payload,
 };
 pub use debug_export::{
     DebugExportCoordinator, DebugExportManifest, DebugExportReceipt, DebugExportRequest,
@@ -199,7 +199,8 @@ pub(crate) use provider_runtime::{
 };
 #[cfg(test)]
 pub(crate) use provider_runtime::{
-    MockWriteFileArgs, configured_provider_plan, mock_write_file_args,
+    MockWriteFileArgs, apply_legacy_task_contract, configured_provider_plan,
+    legacy_task_requests_workspace_change, legacy_task_required_path, mock_write_file_args,
 };
 pub use rollout::{RolloutEnvelope, RolloutExport, ThreadRebindResult, redact_runtime_value};
 pub(crate) use rollout::{
@@ -308,6 +309,18 @@ impl RuntimeHostStorage {
             temporary_root: None,
         })
     }
+}
+
+#[derive(Debug)]
+struct RuntimeHostBootstrap {
+    store: RuntimeStore,
+    workspace_root: Option<PathBuf>,
+    storage: RuntimeHostStorage,
+    workspace_id: WorkspaceId,
+    default_session_id: SessionId,
+    default_thread_id: ThreadId,
+    force_mock_provider: bool,
+    execution_options: RuntimeExecutionOptions,
 }
 
 #[derive(Debug)]
@@ -445,16 +458,16 @@ impl RuntimeHost {
         let store = RuntimeStore::in_memory().await?;
         let default_session_id = SessionId::new();
         let default_thread_id = ThreadId::new();
-        Self::from_store(
+        Self::from_store(RuntimeHostBootstrap {
             store,
-            None,
-            RuntimeHostStorage::in_memory()?,
-            WorkspaceId::new(),
+            workspace_root: None,
+            storage: RuntimeHostStorage::in_memory()?,
+            workspace_id: WorkspaceId::new(),
             default_session_id,
             default_thread_id,
-            false,
+            force_mock_provider: false,
             execution_options,
-        )
+        })
         .await
     }
 
@@ -477,16 +490,16 @@ impl RuntimeHost {
             .cwd
             .clone();
         let store = RuntimeStore::in_memory().await?;
-        Self::from_store(
+        Self::from_store(RuntimeHostBootstrap {
             store,
-            Some(cwd),
+            workspace_root: Some(cwd),
             storage,
-            WorkspaceId::new(),
-            SessionId::new(),
-            ThreadId::new(),
-            false,
+            workspace_id: WorkspaceId::new(),
+            default_session_id: SessionId::new(),
+            default_thread_id: ThreadId::new(),
+            force_mock_provider: false,
             execution_options,
-        )
+        })
         .await
     }
 
@@ -519,16 +532,16 @@ impl RuntimeHost {
         .await?;
         set_owner_only_file(&paths.runtime_db)?;
         let storage = RuntimeHostStorage::ephemeral_persistent(paths.clone())?;
-        Self::from_store(
+        Self::from_store(RuntimeHostBootstrap {
             store,
-            Some(paths.cwd.clone()),
+            workspace_root: Some(paths.cwd.clone()),
             storage,
-            WorkspaceId::new(),
-            SessionId::new(),
-            ThreadId::new(),
-            false,
+            workspace_id: WorkspaceId::new(),
+            default_session_id: SessionId::new(),
+            default_thread_id: ThreadId::new(),
+            force_mock_provider: false,
             execution_options,
-        )
+        })
         .await
     }
 
@@ -579,16 +592,16 @@ impl RuntimeHost {
                 )
             })?;
         let storage = RuntimeHostStorage::ephemeral_persistent(paths.clone())?;
-        Self::from_store(
+        Self::from_store(RuntimeHostBootstrap {
             store,
-            Some(paths.cwd.clone()),
+            workspace_root: Some(paths.cwd.clone()),
             storage,
             workspace_id,
-            latest_thread.session_id,
-            latest_thread.thread_id,
-            false,
-            RuntimeExecutionOptions::isolated(),
-        )
+            default_session_id: latest_thread.session_id,
+            default_thread_id: latest_thread.thread_id,
+            force_mock_provider: false,
+            execution_options: RuntimeExecutionOptions::isolated(),
+        })
         .await
     }
 
@@ -637,16 +650,16 @@ impl RuntimeHost {
             |thread| (thread.session_id, thread.thread_id),
         );
         let storage = RuntimeHostStorage::durable(paths.clone())?;
-        let host = Self::from_store(
+        let host = Self::from_store(RuntimeHostBootstrap {
             store,
-            Some(paths.cwd.clone()),
+            workspace_root: Some(paths.cwd.clone()),
             storage,
-            paths.workspace_id(),
+            workspace_id: paths.workspace_id(),
             default_session_id,
             default_thread_id,
-            false,
+            force_mock_provider: false,
             execution_options,
-        )
+        })
         .await?;
         host.synchronize_workspace_rollouts().await?;
         host.recover_orphaned_tasks().await?;
@@ -654,16 +667,17 @@ impl RuntimeHost {
         Ok(host)
     }
 
-    async fn from_store(
-        store: RuntimeStore,
-        workspace_root: Option<PathBuf>,
-        storage: RuntimeHostStorage,
-        workspace_id: WorkspaceId,
-        default_session_id: SessionId,
-        default_thread_id: ThreadId,
-        force_mock_provider: bool,
-        execution_options: RuntimeExecutionOptions,
-    ) -> Result<Arc<Self>, ClientError> {
+    async fn from_store(bootstrap: RuntimeHostBootstrap) -> Result<Arc<Self>, ClientError> {
+        let RuntimeHostBootstrap {
+            store,
+            workspace_root,
+            storage,
+            workspace_id,
+            default_session_id,
+            default_thread_id,
+            force_mock_provider,
+            execution_options,
+        } = bootstrap;
         let RuntimeHostStorage {
             runtime_paths,
             provider_config_paths,

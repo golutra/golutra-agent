@@ -194,6 +194,7 @@ impl AgentThread {
                 json!({
                     "prompt": prompt,
                     "_thread_id": self.thread.thread_id,
+                    "task_contract": options.task_contract.clone(),
                     "completion_criteria": options.completion_criteria.clone(),
                     "output_schema": options.output_schema.clone(),
                     "allow_network": options.allow_network,

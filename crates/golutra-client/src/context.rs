@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+use golutra_core::{TaskContract, VerificationRequirement};
 use golutra_memory::RetrievedMemory;
 use golutra_protocol::{RuntimeEvent, RuntimeEventType};
 use serde_json::Value;
@@ -10,6 +11,9 @@ use tokio::io::AsyncReadExt;
 use super::ClientError;
 
 pub(crate) fn conversation_history_line(event: &RuntimeEvent) -> Option<String> {
+    if !event.event_type.is_model_history_fact() {
+        return None;
+    }
     match event.event_type {
         RuntimeEventType::TaskCreated | RuntimeEventType::TurnQueued => event
             .payload
@@ -204,6 +208,30 @@ pub(crate) fn completion_criteria_from_payload(payload: &Value) -> Vec<String> {
         .collect()
 }
 
+pub(crate) fn task_contract_from_payload(payload: &Value) -> Result<TaskContract, ClientError> {
+    let mut contract: TaskContract = payload
+        .get("task_contract")
+        .filter(|value| !value.is_null())
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()?
+        .unwrap_or_default();
+    if contract.completion_criteria.is_empty() {
+        contract.completion_criteria = completion_criteria_from_payload(payload);
+    }
+    if payload
+        .get("external_verifiers")
+        .and_then(Value::as_array)
+        .is_some_and(|verifiers| !verifiers.is_empty())
+        && contract.verification == VerificationRequirement::BestEffort
+    {
+        contract.verification = VerificationRequirement::Independent;
+        contract.require_objective_validation = true;
+    }
+    contract.validate().map_err(ClientError::TaskExecution)?;
+    Ok(contract)
+}
+
 pub(crate) fn title_from_payload(payload: &Value) -> String {
     let compact = compact_prompt(payload);
     if compact.is_empty() {
@@ -226,4 +254,39 @@ pub(crate) fn compact_prompt(payload: &Value) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use golutra_core::{EventId, RUNTIME_EVENT_SCHEMA_VERSION, SessionId, TaskId, TurnId};
+    use golutra_protocol::{RuntimeEventSource, RuntimeEventType};
+
+    use super::*;
+
+    #[test]
+    fn history_line_rejects_offline_evaluation_facts_even_when_the_payload_has_text() {
+        let event = RuntimeEvent {
+            schema_version: RUNTIME_EVENT_SCHEMA_VERSION,
+            causal_context: Default::default(),
+            causal_links: Vec::new(),
+            id: EventId::new(),
+            sequence_no: 1,
+            session_id: SessionId::new(),
+            turn_id: Some(TurnId::new()),
+            task_id: Some(TaskId::new()),
+            parent_event_id: None,
+            event_type: RuntimeEventType::EvaluationCompleted,
+            timestamp: Utc::now(),
+            source: RuntimeEventSource::Evaluator,
+            payload: serde_json::json!({
+                "summary": "hidden evaluation assertion",
+                "content": "secret evaluator output",
+            }),
+            payload_ref: None,
+            durable: true,
+        };
+
+        assert_eq!(conversation_history_line(&event), None);
+    }
 }

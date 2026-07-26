@@ -3,6 +3,47 @@
 use super::*;
 
 impl RuntimeHost {
+    pub(super) async fn schedule_task_evaluation_best_effort(
+        &self,
+        task: &HostedAgentTask,
+        input: HostedTaskEvaluation<'_>,
+    ) {
+        let result = async {
+            let evaluation_input = self.evaluate_completed_task(task, input).await?;
+            self.enqueue_deep_task_evaluation(task, evaluation_input)
+                .await
+        }
+        .await;
+        if let Err(error) = result {
+            self.record_post_task_governance_failure(task, "evaluation_scheduling", true, &error)
+                .await;
+        }
+    }
+
+    pub(super) async fn record_post_task_governance_failure(
+        &self,
+        task: &HostedAgentTask,
+        phase: &str,
+        terminal: bool,
+        error: &ClientError,
+    ) {
+        let _ = self
+            .record_event(agent_event(
+                self.next_sequence_no(),
+                task,
+                RuntimeEventType::PostTaskStageFailed,
+                RuntimeEventSource::Evaluator,
+                json!({
+                    "summary": "post-task governance failed after runtime terminal decision",
+                    "phase": phase,
+                    "terminal": terminal,
+                    "error": compact_event_summary(&error.to_string()),
+                    "execution_outcome_unchanged": true,
+                }),
+            ))
+            .await;
+    }
+
     pub(super) async fn evaluate_completed_task(
         &self,
         task: &HostedAgentTask,
@@ -275,19 +316,100 @@ impl RuntimeHost {
 
     pub(super) async fn wait_for_deep_task_evaluation(&self, task_id: TaskId) {
         let deadline = Instant::now() + Duration::from_secs(10);
+
+        // TaskCompleted is deliberately published before post-task governance starts. If a
+        // settled observer arrives in that window, wait for the task supervisor to finish
+        // scheduling (or recording the scheduling failure) before treating an absent job as
+        // terminal. The user-visible task result remains independent of this barrier.
+        let mut task_completion = self
+            .task_controls
+            .lock()
+            .await
+            .values()
+            .find(|control| control.task_id == task_id)
+            .map(|control| control.completion.clone());
+        if let Some(completion) = task_completion.as_mut() {
+            while !*completion.borrow() && Instant::now() < deadline {
+                tokio::select! {
+                    changed = completion.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                    () = tokio::time::sleep(Duration::from_millis(POST_TASK_JOB_POLL_MILLIS)) => {}
+                }
+            }
+        }
+
+        let mut session_id = self
+            .task_controls
+            .lock()
+            .await
+            .iter()
+            .find(|(_, control)| control.task_id == task_id)
+            .map(|(session_id, _)| *session_id);
         loop {
             let job = self.repositories.jobs.get_for_task(task_id).await;
-            let terminal = match job {
-                Ok(Some(job)) => matches!(
-                    job.status,
-                    PostTaskJobStatus::Succeeded
-                        | PostTaskJobStatus::Failed
-                        | PostTaskJobStatus::Cancelled
-                ),
-                Ok(None) => true,
-                Err(_) => true,
+            if session_id.is_none() {
+                session_id = job
+                    .as_ref()
+                    .ok()
+                    .and_then(|job| job.as_ref())
+                    .and_then(|job| job.session_id.parse().ok());
+            }
+            if session_id.is_none() {
+                session_id = self
+                    .repositories
+                    .events
+                    .session_for_task(task_id)
+                    .await
+                    .ok()
+                    .flatten();
+            }
+            let events = match session_id {
+                Some(session_id) => self
+                    .repositories
+                    .events
+                    .load(session_id, Some(task_id), None)
+                    .await
+                    .unwrap_or_default(),
+                None => Vec::new(),
             };
-            if terminal || Instant::now() >= deadline {
+            let execution_terminal = events
+                .iter()
+                .any(|event| event.event_type.is_task_terminal());
+            let scheduling_queued = events
+                .iter()
+                .any(|event| event.event_type == RuntimeEventType::PostTaskJobQueued);
+            let scheduling_failed = events.iter().any(|event| {
+                event.event_type == RuntimeEventType::PostTaskStageFailed
+                    && event.payload.get("terminal").and_then(Value::as_bool) == Some(true)
+            });
+            let governance_pending = events
+                .iter()
+                .rev()
+                .find(|event| event.event_type.is_task_terminal())
+                .and_then(|event| {
+                    event
+                        .payload
+                        .pointer("/post_task_governance/status")
+                        .and_then(Value::as_str)
+                })
+                == Some("pending");
+            let job_terminal = matches!(
+                job,
+                Ok(Some(PostTaskJob {
+                    status: PostTaskJobStatus::Succeeded
+                        | PostTaskJobStatus::Failed
+                        | PostTaskJobStatus::Cancelled,
+                    ..
+                }))
+            );
+            if job_terminal
+                || (execution_terminal
+                    && (scheduling_failed || (!governance_pending && !scheduling_queued)))
+                || Instant::now() >= deadline
+            {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(POST_TASK_JOB_POLL_MILLIS)).await;
