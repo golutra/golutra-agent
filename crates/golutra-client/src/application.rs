@@ -11,9 +11,9 @@ use std::sync::Arc;
 pub use super::trace::TaskTraceService;
 use super::{
     ClientError, EventFilter, EventPage, EventPageRequest, PostTaskCoordinator, RuntimeEvent,
-    RuntimeEventStream, RuntimeHost, RuntimeHostInfo, RuntimeQuery, SessionCommand, SessionPage,
-    SessionPageRequest, SessionWindow, SessionWindowRequest, TaskTracePage, TaskTraceRequest,
-    ThreadId, ThreadRebindResult, ThreadRecord, TurnId, Value,
+    RuntimeEventStream, RuntimeExecutionOptions, RuntimeHost, RuntimeHostInfo, RuntimeQuery,
+    SessionCommand, SessionPage, SessionPageRequest, SessionWindow, SessionWindowRequest,
+    TaskTracePage, TaskTraceRequest, ThreadId, ThreadRebindResult, ThreadRecord, TurnId, Value,
 };
 use golutra_core::{PostTaskJob, SessionId, TaskId, WorkspaceId};
 use golutra_protocol::{
@@ -60,12 +60,49 @@ impl RuntimeApplication {
         Ok(Self::from_host(RuntimeHost::for_cwd(cwd).await?))
     }
 
+    pub async fn for_cwd_with_options(
+        cwd: impl AsRef<Path>,
+        execution_options: RuntimeExecutionOptions,
+    ) -> Result<Self, ClientError> {
+        Ok(Self::from_host(
+            RuntimeHost::for_cwd_with_options(cwd, execution_options).await?,
+        ))
+    }
+
+    pub async fn ephemeral_for_cwd(cwd: impl AsRef<Path>) -> Result<Self, ClientError> {
+        Ok(Self::from_host(RuntimeHost::ephemeral_for_cwd(cwd).await?))
+    }
+
+    pub async fn ephemeral_for_cwd_with_options(
+        cwd: impl AsRef<Path>,
+        execution_options: RuntimeExecutionOptions,
+    ) -> Result<Self, ClientError> {
+        Ok(Self::from_host(
+            RuntimeHost::ephemeral_for_cwd_with_options(cwd, execution_options).await?,
+        ))
+    }
+
     pub async fn ephemeral_persistent_for_cwd(
         cwd: impl AsRef<Path>,
         state_home: impl AsRef<Path>,
     ) -> Result<Self, ClientError> {
         Ok(Self::from_host(
             RuntimeHost::ephemeral_persistent_for_cwd(cwd, state_home).await?,
+        ))
+    }
+
+    pub async fn ephemeral_persistent_for_cwd_with_options(
+        cwd: impl AsRef<Path>,
+        state_home: impl AsRef<Path>,
+        execution_options: RuntimeExecutionOptions,
+    ) -> Result<Self, ClientError> {
+        Ok(Self::from_host(
+            RuntimeHost::ephemeral_persistent_for_cwd_with_options(
+                cwd,
+                state_home,
+                execution_options,
+            )
+            .await?,
         ))
     }
 

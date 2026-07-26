@@ -63,6 +63,7 @@ pub(crate) struct ProcessSnapshot {
     pub(crate) output_lost: bool,
     pub(crate) sandbox_backend: golutra_sandbox::SandboxBackendKind,
     pub(crate) sandbox_os_enforced: bool,
+    pub(crate) network_access: bool,
     pub(crate) changed_files: Vec<PathBuf>,
     pub(crate) before_images: Vec<super::FileBeforeImage>,
     pub(crate) after_images: Vec<super::FileBeforeImage>,
@@ -81,6 +82,7 @@ pub(crate) struct ProcessStartRequest<'a> {
     pub(crate) cancellation: CancellationToken,
     pub(crate) sandbox: &'a SystemSandbox,
     pub(crate) workspace_access: WorkspaceAccess,
+    pub(crate) allow_network: bool,
     pub(crate) workspace_before: workspace_scan::WorkspaceSnapshot,
 }
 
@@ -199,6 +201,7 @@ struct ManagedProcess {
     last_touched: Mutex<Instant>,
     sandbox_backend: golutra_sandbox::SandboxBackendKind,
     sandbox_os_enforced: bool,
+    network_access: bool,
 }
 
 impl std::fmt::Debug for ManagedProcess {
@@ -326,7 +329,7 @@ impl ProcessSupervisor {
                 scratch_dir: scratch.path().to_path_buf(),
                 read_only_roots: Vec::new(),
                 workspace_access: request.workspace_access,
-                allow_network: false,
+                allow_network: request.allow_network,
             })
             .map_err(|error| ToolError::Execution(error.to_string()))?;
         let mut command = Command::new(&launch.program);
@@ -375,6 +378,7 @@ impl ProcessSupervisor {
             last_touched: Mutex::new(Instant::now()),
             sandbox_backend: launch.backend,
             sandbox_os_enforced: launch.os_enforced,
+            network_access: request.allow_network,
         });
         let id = entry.id.clone();
         self.inner
@@ -682,6 +686,7 @@ async fn snapshot(entry: &ManagedProcess, cursor: u64) -> ProcessSnapshot {
         output_lost,
         sandbox_backend: entry.sandbox_backend,
         sandbox_os_enforced: entry.sandbox_os_enforced,
+        network_access: entry.network_access,
         changed_files,
         before_images,
         after_images,

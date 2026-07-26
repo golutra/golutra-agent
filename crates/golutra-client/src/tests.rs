@@ -48,6 +48,7 @@ fn system_prompt_explains_the_argv_only_shell_recovery_path() {
     assert!(prompt.contains("parsed as inert argv"));
     assert!(prompt.contains("include the program and every argument"));
     assert!(prompt.contains("git status --short"));
+    assert!(prompt.contains("explicitly invoke `bash -lc`"));
     assert!(prompt.contains("create a workspace file with write_file"));
     assert!(prompt.contains("required local dependency"));
     assert!(prompt.contains("instead of asking in prose"));
@@ -426,6 +427,7 @@ async fn runtime_host_reuses_one_process_supervisor_across_tool_executors() {
         .build_tool_executor(
             WorkspacePolicy::new(&root).expect("first policy"),
             root.clone(),
+            false,
         )
         .await
         .expect("first executor");
@@ -452,7 +454,11 @@ async fn runtime_host_reuses_one_process_supervisor_across_tool_executors() {
         .to_owned();
 
     let second = host
-        .build_tool_executor(WorkspacePolicy::new(&root).expect("second policy"), root)
+        .build_tool_executor(
+            WorkspacePolicy::new(&root).expect("second policy"),
+            root,
+            false,
+        )
         .await
         .expect("second executor");
     sleep(Duration::from_millis(100)).await;
@@ -482,6 +488,87 @@ async fn runtime_host_reuses_one_process_supervisor_across_tool_executors() {
 }
 
 #[tokio::test]
+async fn runtime_network_capability_requires_both_host_and_turn_grants() {
+    let workspace = tempdir().expect("workspace");
+    let root = workspace.path().to_path_buf();
+
+    let isolated = RuntimeHost::ephemeral_for_cwd(&root)
+        .await
+        .expect("isolated host");
+    let isolated_executor = isolated
+        .build_tool_executor(
+            WorkspacePolicy::new(&root).expect("isolated policy"),
+            root.clone(),
+            true,
+        )
+        .await
+        .expect("isolated executor");
+    let isolated_request = ToolRequest {
+        tool_call_id: ToolCallId::new(),
+        provider_tool_call_id: None,
+        session_id: isolated.default_session_id(),
+        turn_id: Some(TurnId::new()),
+        tool_name: "shell".to_owned(),
+        arguments: json!({"command": "echo isolated"}),
+    };
+    let isolated_policy = isolated_executor
+        .evaluate(&isolated_request)
+        .expect("isolated policy evaluation");
+    let isolated_report = isolated_executor
+        .execute_with_policy(
+            isolated_request,
+            isolated_policy,
+            true,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("isolated command");
+    assert_eq!(
+        isolated_report.envelope.structured_facts["network_access"],
+        false
+    );
+
+    let enabled = RuntimeHost::ephemeral_for_cwd_with_options(
+        &root,
+        RuntimeExecutionOptions::with_network_access(true),
+    )
+    .await
+    .expect("network-enabled host");
+    let enabled_executor = enabled
+        .build_tool_executor(
+            WorkspacePolicy::new(&root).expect("enabled policy"),
+            root,
+            true,
+        )
+        .await
+        .expect("enabled executor");
+    let enabled_request = ToolRequest {
+        tool_call_id: ToolCallId::new(),
+        provider_tool_call_id: None,
+        session_id: enabled.default_session_id(),
+        turn_id: Some(TurnId::new()),
+        tool_name: "shell".to_owned(),
+        arguments: json!({"command": "echo enabled"}),
+    };
+    let enabled_policy = enabled_executor
+        .evaluate(&enabled_request)
+        .expect("enabled policy evaluation");
+    let enabled_report = enabled_executor
+        .execute_with_policy(
+            enabled_request,
+            enabled_policy,
+            true,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("enabled command");
+    assert_eq!(
+        enabled_report.envelope.structured_facts["network_access"],
+        true
+    );
+}
+
+#[tokio::test]
 async fn dropping_runtime_host_terminates_its_background_processes() {
     let workspace = tempdir().expect("workspace");
     fs::write(
@@ -493,7 +580,11 @@ async fn dropping_runtime_host_terminates_its_background_processes() {
     let session_id = host.default_session_id();
     let root = workspace.path().to_path_buf();
     let executor = host
-        .build_tool_executor(WorkspacePolicy::new(&root).expect("policy"), root.clone())
+        .build_tool_executor(
+            WorkspacePolicy::new(&root).expect("policy"),
+            root.clone(),
+            false,
+        )
         .await
         .expect("executor");
     let start_request = ToolRequest {
@@ -4203,6 +4294,33 @@ async fn persisted_ephemeral_runtime_retains_isolated_state_and_full_run_bundle(
         )
         .await
         .expect("turn");
+    let selection = SessionWindowRequest {
+        anchor_thread_id: thread.thread_id(),
+        range: SessionRangeSpec {
+            direction: SessionRangeDirection::Single,
+            count: 1,
+        },
+    };
+    let checkpoint = RunBundleExporter::new(&runtime_transport)
+        .checkpoint(RunBundleExportRequest {
+            destination: state_dir.clone(),
+            selection: selection.clone(),
+            terminal_outcome: RunBundleTerminalOutcome::InProgress {
+                reason: "turn running".to_owned(),
+            },
+        })
+        .await
+        .expect("in-progress run checkpoint");
+    assert_eq!(checkpoint.session_count, 1);
+    assert_eq!(checkpoint.task_count, 1);
+    let checkpoint_manifest: RunBundleManifest = serde_json::from_slice(
+        &fs::read(state_dir.join("manifest.json")).expect("checkpoint manifest"),
+    )
+    .expect("parse checkpoint manifest");
+    assert!(matches!(
+        checkpoint_manifest.terminal_outcome,
+        RunBundleTerminalOutcome::InProgress { .. }
+    ));
     while handle.next_event().await.expect("turn event").is_some() {}
     let result = handle.wait().await.expect("turn result");
     let task_id = result.task_id.expect("task id");
@@ -4234,13 +4352,7 @@ async fn persisted_ephemeral_runtime_retains_isolated_state_and_full_run_bundle(
     let receipt = RunBundleExporter::new(&runtime_transport)
         .export(RunBundleExportRequest {
             destination: state_dir.clone(),
-            selection: SessionWindowRequest {
-                anchor_thread_id: thread.thread_id(),
-                range: SessionRangeSpec {
-                    direction: SessionRangeDirection::Single,
-                    count: 1,
-                },
-            },
+            selection,
             terminal_outcome: RunBundleTerminalOutcome::Result {
                 result: result.clone(),
             },
@@ -4929,6 +5041,8 @@ fn context_compaction_persists_a_redacted_baseline_outside_the_event_payload() {
         original_estimated_tokens: 120,
         replacement_estimated_tokens: 64,
         planned_tool_tokens: 8,
+        compaction_limit: 80,
+        target_input_tokens: 64,
         budget_limit: 80,
         summary: "provider call completed".to_owned(),
         checksum: "sha256:source".to_owned(),

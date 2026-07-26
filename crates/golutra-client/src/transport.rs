@@ -90,12 +90,36 @@ impl EmbeddedTransport {
         Ok(Self::new(RuntimeHost::ephemeral_for_cwd(cwd).await?))
     }
 
+    pub async fn ephemeral_for_cwd_with_options(
+        cwd: impl AsRef<Path>,
+        execution_options: RuntimeExecutionOptions,
+    ) -> Result<Self, ClientError> {
+        Ok(Self::new(
+            RuntimeHost::ephemeral_for_cwd_with_options(cwd, execution_options).await?,
+        ))
+    }
+
     pub async fn ephemeral_persistent_for_cwd(
         cwd: impl AsRef<Path>,
         state_home: impl AsRef<Path>,
     ) -> Result<Self, ClientError> {
         Ok(Self::new(
             RuntimeHost::ephemeral_persistent_for_cwd(cwd, state_home).await?,
+        ))
+    }
+
+    pub async fn ephemeral_persistent_for_cwd_with_options(
+        cwd: impl AsRef<Path>,
+        state_home: impl AsRef<Path>,
+        execution_options: RuntimeExecutionOptions,
+    ) -> Result<Self, ClientError> {
+        Ok(Self::new(
+            RuntimeHost::ephemeral_persistent_for_cwd_with_options(
+                cwd,
+                state_home,
+                execution_options,
+            )
+            .await?,
         ))
     }
 
@@ -110,6 +134,15 @@ impl EmbeddedTransport {
 
     pub async fn for_cwd(cwd: impl AsRef<Path>) -> Result<Self, ClientError> {
         Ok(Self::new(RuntimeHost::for_cwd(cwd).await?))
+    }
+
+    pub async fn for_cwd_with_options(
+        cwd: impl AsRef<Path>,
+        execution_options: RuntimeExecutionOptions,
+    ) -> Result<Self, ClientError> {
+        Ok(Self::new(
+            RuntimeHost::for_cwd_with_options(cwd, execution_options).await?,
+        ))
     }
 
     pub async fn from_home_and_cwd(
@@ -1015,6 +1048,15 @@ impl RuntimeTransport {
             .map(Self::Embedded)
     }
 
+    pub async fn ephemeral_for_cwd_with_options(
+        cwd: impl AsRef<Path>,
+        execution_options: RuntimeExecutionOptions,
+    ) -> Result<Self, ClientError> {
+        EmbeddedTransport::ephemeral_for_cwd_with_options(cwd, execution_options)
+            .await
+            .map(Self::Embedded)
+    }
+
     pub async fn ephemeral_persistent_for_cwd(
         cwd: impl AsRef<Path>,
         state_home: impl AsRef<Path>,
@@ -1022,6 +1064,20 @@ impl RuntimeTransport {
         EmbeddedTransport::ephemeral_persistent_for_cwd(cwd, state_home)
             .await
             .map(Self::Embedded)
+    }
+
+    pub async fn ephemeral_persistent_for_cwd_with_options(
+        cwd: impl AsRef<Path>,
+        state_home: impl AsRef<Path>,
+        execution_options: RuntimeExecutionOptions,
+    ) -> Result<Self, ClientError> {
+        EmbeddedTransport::ephemeral_persistent_for_cwd_with_options(
+            cwd,
+            state_home,
+            execution_options,
+        )
+        .await
+        .map(Self::Embedded)
     }
 
     pub async fn open_persisted_run(run_root: impl AsRef<Path>) -> Result<Self, ClientError> {
@@ -1037,6 +1093,15 @@ impl RuntimeTransport {
 
     pub async fn for_cwd(cwd: impl AsRef<Path>) -> Result<Self, ClientError> {
         EmbeddedTransport::for_cwd(cwd).await.map(Self::Embedded)
+    }
+
+    pub async fn for_cwd_with_options(
+        cwd: impl AsRef<Path>,
+        execution_options: RuntimeExecutionOptions,
+    ) -> Result<Self, ClientError> {
+        EmbeddedTransport::for_cwd_with_options(cwd, execution_options)
+            .await
+            .map(Self::Embedded)
     }
 
     pub async fn local_daemon(cwd: impl AsRef<Path>) -> Result<Self, ClientError> {

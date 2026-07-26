@@ -114,7 +114,7 @@ impl SystemSandbox {
             .iter()
             .map(|path| canonical_directory(path, false))
             .collect::<Result<Vec<_>, _>>()?;
-        let environment = sanitized_environment(&request.scratch_dir);
+        let environment = sanitized_environment(&request.scratch_dir, request.allow_network);
         match self.backend {
             SandboxBackendKind::MacOsSeatbelt => self.plan_macos(&request, environment),
             SandboxBackendKind::LinuxBubblewrap => self.plan_linux(&request, environment),
@@ -258,9 +258,9 @@ fn canonical_directory(path: &Path, working_directory: bool) -> Result<PathBuf, 
     }
 }
 
-fn sanitized_environment(scratch_dir: &Path) -> BTreeMap<OsString, OsString> {
+fn sanitized_environment(scratch_dir: &Path, allow_network: bool) -> BTreeMap<OsString, OsString> {
     let mut values = env::vars_os()
-        .filter(|(key, _)| environment_key_allowed(key))
+        .filter(|(key, _)| environment_key_allowed_for_network(key, allow_network))
         .collect::<BTreeMap<_, _>>();
     values.insert(OsString::from("TMPDIR"), scratch_dir.as_os_str().to_owned());
     values.insert(OsString::from("TMP"), scratch_dir.as_os_str().to_owned());
@@ -268,7 +268,12 @@ fn sanitized_environment(scratch_dir: &Path) -> BTreeMap<OsString, OsString> {
     values
 }
 
+#[cfg(test)]
 fn environment_key_allowed(key: &OsStr) -> bool {
+    environment_key_allowed_for_network(key, false)
+}
+
+fn environment_key_allowed_for_network(key: &OsStr, allow_network: bool) -> bool {
     let key = key.to_string_lossy().to_ascii_uppercase();
     if [
         "KEY",
@@ -282,6 +287,14 @@ fn environment_key_allowed(key: &OsStr) -> bool {
     .any(|fragment| key.contains(fragment))
     {
         return false;
+    }
+    if allow_network
+        && matches!(
+            key.as_str(),
+            "HTTP_PROXY" | "HTTPS_PROXY" | "ALL_PROXY" | "NO_PROXY"
+        )
+    {
+        return true;
     }
     matches!(
         key.as_str(),
@@ -439,6 +452,11 @@ mod tests {
         assert!(!environment_key_allowed(OsStr::new("DATABASE_PASSWORD")));
         assert!(environment_key_allowed(OsStr::new("PATH")));
         assert!(environment_key_allowed(OsStr::new("RUSTUP_HOME")));
+        assert!(!environment_key_allowed(OsStr::new("HTTPS_PROXY")));
+        assert!(environment_key_allowed_for_network(
+            OsStr::new("HTTPS_PROXY"),
+            true
+        ));
     }
 
     #[test]
@@ -654,5 +672,24 @@ mod tests {
         );
         assert!(args.iter().any(|value| value == "--chdir"));
         assert!(args.iter().any(|value| value == "--"));
+
+        let network_plan = sandbox
+            .plan(&SandboxRequest {
+                program: "/bin/echo".into(),
+                args: vec!["ok".into()],
+                cwd: workspace.path().to_path_buf(),
+                workspace_root: workspace.path().to_path_buf(),
+                scratch_dir: scratch.path().to_path_buf(),
+                read_only_roots: Vec::new(),
+                workspace_access: WorkspaceAccess::ReadWrite,
+                allow_network: true,
+            })
+            .expect("network bubblewrap plan");
+        let network_args = network_plan
+            .args
+            .iter()
+            .map(|value| value.to_string_lossy())
+            .collect::<Vec<_>>();
+        assert!(!network_args.iter().any(|value| value == "--unshare-net"));
     }
 }

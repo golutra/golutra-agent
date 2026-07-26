@@ -81,7 +81,7 @@ impl VerificationRunner {
                     true,
                 ));
                 assertions.push(assertion(
-                    "objective_validation",
+                    "workspace_validation",
                     VerificationAssertionKind::Diagnostic,
                     "objective",
                     "an objective validation command or check succeeds",
@@ -111,6 +111,34 @@ impl VerificationRunner {
                     true,
                 ));
             }
+        }
+        if input
+            .command_checks
+            .iter()
+            .any(|check| check.name == "objective:path:delivery")
+        {
+            assertions.push(assertion(
+                "delivery_paths",
+                VerificationAssertionKind::Delivery,
+                "requested delivery paths",
+                "all explicitly requested delivery paths are present in the workspace change",
+                true,
+            ));
+        }
+        if task_class == TaskClass::ReadOnlyAnalysis
+            && requires_objective_validation(&input.objective)
+            && !input.command_checks.iter().any(|check| {
+                check.kind == VerificationCheckKind::ObjectiveValidation
+                    && check.name != "objective:path:delivery"
+            })
+        {
+            assertions.push(assertion(
+                "effect_validation",
+                VerificationAssertionKind::Diagnostic,
+                "objective",
+                "a command independently validates the requested external or workspace effect",
+                true,
+            ));
         }
         for (index, criterion) in input.completion_criteria.iter().enumerate() {
             assertions.push(assertion(
@@ -539,17 +567,33 @@ fn assertion_status(
                     .into_iter()
                     .filter(|check| {
                         check.name == "objective:test:external_verifier"
-                            || assertion.criterion_id == "tests_or_diagnostics"
-                            || assertion.criterion_id == "analysis_objective"
-                            || match assertion.kind {
-                                VerificationAssertionKind::Test => {
-                                    check.name.starts_with("objective:test:")
-                                }
-                                VerificationAssertionKind::Diagnostic => {
-                                    !check.name.starts_with("objective:test:")
-                                }
-                                _ => false,
-                            }
+                            || (assertion.criterion_id == "tests_or_diagnostics"
+                                && (check.name.starts_with("objective:test:")
+                                    || check.name.starts_with("objective:diagnostic:")))
+                            || (assertion.criterion_id == "analysis_objective"
+                                && check.name.starts_with("objective:"))
+                            || (assertion.criterion_id == "effect_validation"
+                                && (check.name == "objective:test:external_verifier"
+                                    || check.name.starts_with("objective:test:")
+                                    || check.name.starts_with("objective:diagnostic:")))
+                            || (assertion.criterion_id == "workspace_validation"
+                                && (check.name == "objective:test:external_verifier"
+                                    || check.name.starts_with("objective:test:")
+                                    || check.name.starts_with("objective:diagnostic:")
+                                    || check.name.starts_with("objective:content:")))
+                            || (assertion.criterion_id != "tests_or_diagnostics"
+                                && assertion.criterion_id != "analysis_objective"
+                                && assertion.criterion_id != "effect_validation"
+                                && assertion.criterion_id != "workspace_validation"
+                                && match assertion.kind {
+                                    VerificationAssertionKind::Test => {
+                                        check.name.starts_with("objective:test:")
+                                    }
+                                    VerificationAssertionKind::Diagnostic => {
+                                        !check.name.starts_with("objective:test:")
+                                    }
+                                    _ => false,
+                                })
                     })
                     .collect::<Vec<_>>(),
             );
@@ -580,13 +624,24 @@ fn assertion_status(
             let matching_delivery_checks = input
                 .command_checks
                 .iter()
-                .filter(|check| {
-                    check.passed
-                        && !check.evidence_refs.is_empty()
-                        && delivery_check_matches(assertion, check)
-                })
+                .filter(|check| delivery_check_matches(assertion, check))
                 .collect::<Vec<_>>();
-            if has_evidence && !matching_delivery_checks.is_empty() {
+            if matching_delivery_checks.iter().any(|check| {
+                !check.passed && check.kind == VerificationCheckKind::ObjectiveValidation
+            }) {
+                (
+                    VerificationAssertionStatus::Fail,
+                    "a requested delivery check failed".to_owned(),
+                    matching_delivery_checks
+                        .iter()
+                        .flat_map(|check| check.evidence_refs.iter().copied())
+                        .collect(),
+                )
+            } else if has_evidence
+                && matching_delivery_checks
+                    .iter()
+                    .any(|check| check.passed && !check.evidence_refs.is_empty())
+            {
                 (
                     VerificationAssertionStatus::Pass,
                     "matching delivered evidence is available".to_owned(),
@@ -648,6 +703,9 @@ fn latest_distinct_checks(checks: Vec<&VerificationCheck>) -> Vec<&VerificationC
 }
 
 fn delivery_check_matches(assertion: &VerificationAssertion, check: &VerificationCheck) -> bool {
+    if assertion.criterion_id == "delivery_paths" {
+        return check.name == "objective:path:delivery";
+    }
     if assertion.criterion_id == "analysis_evidence" {
         return true;
     }
@@ -690,6 +748,68 @@ fn delivery_check_matches(assertion: &VerificationAssertion, check: &Verificatio
     }
     tokens.iter().any(|token| check_text.contains(token))
         || (!criterion.is_ascii() && check_text.contains(&criterion))
+}
+
+fn requires_objective_validation(objective: &str) -> bool {
+    const MUTATION_MARKERS: &[&str] = &[
+        "create",
+        "created",
+        "configure",
+        "configured",
+        "deploy",
+        "edit",
+        "enable",
+        "extract",
+        "fix",
+        "generate",
+        "implement",
+        "install",
+        "modify",
+        "move",
+        "rename",
+        "recover",
+        "remove",
+        "restart",
+        "save",
+        "setup",
+        "start",
+        "stop",
+        "update",
+        "upload",
+        "write",
+    ];
+    const CJK_MUTATION_MARKERS: &[&str] = &[
+        "创建",
+        "配置",
+        "部署",
+        "编辑",
+        "启用",
+        "提取",
+        "修复",
+        "生成",
+        "实现",
+        "安装",
+        "修改",
+        "移动",
+        "重命名",
+        "恢复",
+        "删除",
+        "重启",
+        "保存",
+        "启动",
+        "停止",
+        "更新",
+        "上传",
+        "写入",
+    ];
+    let lower = objective.to_ascii_lowercase();
+    MUTATION_MARKERS.iter().any(|marker| {
+        lower
+            .split(|character: char| !character.is_ascii_alphabetic())
+            .any(|word| word == *marker)
+    }) || CJK_MUTATION_MARKERS
+        .iter()
+        .any(|marker| objective.contains(marker))
 }
 
 fn passed_check(checks: &[VerificationCheck], kind: VerificationCheckKind) -> bool {
@@ -958,6 +1078,198 @@ mod tests {
                 .residual_risks
                 .contains(&"some objective checks failed".to_owned())
         );
+    }
+
+    #[test]
+    fn delivery_path_evidence_does_not_satisfy_code_diagnostics() {
+        let evidence = EvidenceId::new();
+        let input = VerificationInput {
+            task_id: TaskId::new(),
+            objective: "create src/lib.rs".to_owned(),
+            completion_criteria: Vec::new(),
+            evidence_refs: vec![evidence],
+            command_checks: vec![
+                VerificationCheck {
+                    kind: VerificationCheckKind::WorkspaceChange,
+                    name: "workspace_diff".to_owned(),
+                    command: None,
+                    passed: true,
+                    evidence_refs: vec![evidence],
+                    message: "code changed".to_owned(),
+                },
+                VerificationCheck {
+                    kind: VerificationCheckKind::ObjectiveValidation,
+                    name: "objective:path:delivery".to_owned(),
+                    command: None,
+                    passed: true,
+                    evidence_refs: vec![evidence],
+                    message: "src/lib.rs was delivered".to_owned(),
+                },
+                VerificationCheck {
+                    kind: VerificationCheckKind::ObjectiveValidation,
+                    name: "objective:file_state:shell".to_owned(),
+                    command: Some("test -f src/lib.rs".to_owned()),
+                    passed: true,
+                    evidence_refs: vec![evidence],
+                    message: "file-state command passed".to_owned(),
+                },
+            ],
+            requires_workspace_evidence: true,
+            code_files_changed: true,
+        };
+
+        let (record, plan) =
+            VerificationRunner.verify_with_plan(input.clone(), VerificationRunner.plan(&input));
+
+        assert_eq!(record.result, VerificationResult::Partial);
+        assert!(plan.assertions.iter().any(|assertion| {
+            assertion.criterion_id == "tests_or_diagnostics"
+                && assertion.status == VerificationAssertionStatus::Unknown
+        }));
+        assert!(plan.assertions.iter().any(|assertion| {
+            assertion.criterion_id == "delivery_paths"
+                && assertion.status == VerificationAssertionStatus::Pass
+        }));
+    }
+
+    #[test]
+    fn generic_tool_success_does_not_verify_an_external_mutation() {
+        let evidence = EvidenceId::new();
+        let input = VerificationInput {
+            task_id: TaskId::new(),
+            objective: "create the requested cloud bucket".to_owned(),
+            completion_criteria: Vec::new(),
+            evidence_refs: vec![evidence],
+            command_checks: vec![VerificationCheck {
+                kind: VerificationCheckKind::ToolExecution,
+                name: "tool:shell".to_owned(),
+                command: Some("aws --version".to_owned()),
+                passed: true,
+                evidence_refs: vec![evidence],
+                message: "command exited successfully".to_owned(),
+            }],
+            requires_workspace_evidence: true,
+            code_files_changed: false,
+        };
+
+        let (record, plan) =
+            VerificationRunner.verify_with_plan(input.clone(), VerificationRunner.plan(&input));
+
+        assert_eq!(record.result, VerificationResult::Partial);
+        assert!(plan.assertions.iter().any(|assertion| {
+            assertion.criterion_id == "effect_validation"
+                && assertion.status == VerificationAssertionStatus::Unknown
+        }));
+    }
+
+    #[test]
+    fn denied_generic_tool_is_unresolved_instead_of_a_delivery_failure() {
+        let evidence = EvidenceId::new();
+        let input = VerificationInput {
+            task_id: TaskId::new(),
+            objective: "sleep until the command finishes".to_owned(),
+            completion_criteria: Vec::new(),
+            evidence_refs: vec![evidence],
+            command_checks: vec![VerificationCheck {
+                kind: VerificationCheckKind::ToolExecution,
+                name: "tool:shell".to_owned(),
+                command: None,
+                passed: false,
+                evidence_refs: vec![evidence],
+                message: "tool execution was denied by the user".to_owned(),
+            }],
+            requires_workspace_evidence: false,
+            code_files_changed: false,
+        };
+
+        let (record, plan) =
+            VerificationRunner.verify_with_plan(input.clone(), VerificationRunner.plan(&input));
+
+        assert_eq!(record.result, VerificationResult::Partial);
+        assert!(plan.assertions.iter().any(|assertion| {
+            assertion.criterion_id == "analysis_evidence"
+                && assertion.status == VerificationAssertionStatus::Unknown
+        }));
+    }
+
+    #[test]
+    fn a_changed_delivery_path_alone_does_not_validate_workspace_behavior() {
+        let evidence = EvidenceId::new();
+        let input = VerificationInput {
+            task_id: TaskId::new(),
+            objective: "create process_data.sh".to_owned(),
+            completion_criteria: Vec::new(),
+            evidence_refs: vec![evidence],
+            command_checks: vec![
+                VerificationCheck {
+                    kind: VerificationCheckKind::WorkspaceChange,
+                    name: "workspace_diff".to_owned(),
+                    command: None,
+                    passed: true,
+                    evidence_refs: vec![evidence],
+                    message: "script changed".to_owned(),
+                },
+                VerificationCheck {
+                    kind: VerificationCheckKind::ObjectiveValidation,
+                    name: "objective:path:delivery".to_owned(),
+                    command: None,
+                    passed: true,
+                    evidence_refs: vec![evidence],
+                    message: "process_data.sh was delivered".to_owned(),
+                },
+            ],
+            requires_workspace_evidence: true,
+            code_files_changed: false,
+        };
+
+        let (record, plan) =
+            VerificationRunner.verify_with_plan(input.clone(), VerificationRunner.plan(&input));
+
+        assert_eq!(record.result, VerificationResult::Partial);
+        assert!(plan.assertions.iter().any(|assertion| {
+            assertion.criterion_id == "workspace_validation"
+                && assertion.status == VerificationAssertionStatus::Unknown
+        }));
+    }
+
+    #[test]
+    fn a_missing_requested_delivery_is_a_blocking_failure() {
+        let evidence = EvidenceId::new();
+        let input = VerificationInput {
+            task_id: TaskId::new(),
+            objective: "write /app/results.txt".to_owned(),
+            completion_criteria: Vec::new(),
+            evidence_refs: vec![evidence],
+            command_checks: vec![
+                VerificationCheck {
+                    kind: VerificationCheckKind::WorkspaceChange,
+                    name: "workspace_diff".to_owned(),
+                    command: None,
+                    passed: true,
+                    evidence_refs: vec![evidence],
+                    message: "another file changed".to_owned(),
+                },
+                VerificationCheck {
+                    kind: VerificationCheckKind::ObjectiveValidation,
+                    name: "objective:path:delivery".to_owned(),
+                    command: None,
+                    passed: false,
+                    evidence_refs: vec![evidence],
+                    message: "results.txt was not delivered".to_owned(),
+                },
+            ],
+            requires_workspace_evidence: true,
+            code_files_changed: false,
+        };
+
+        let (record, plan) =
+            VerificationRunner.verify_with_plan(input.clone(), VerificationRunner.plan(&input));
+
+        assert_eq!(record.result, VerificationResult::Fail);
+        assert!(plan.assertions.iter().any(|assertion| {
+            assertion.criterion_id == "delivery_paths"
+                && assertion.status == VerificationAssertionStatus::Fail
+        }));
     }
 
     #[test]

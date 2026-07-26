@@ -39,6 +39,7 @@ mod checkpoint;
 mod completion;
 mod context_guard;
 mod lane;
+mod objective_evidence;
 mod provider_retry;
 mod provider_session;
 mod step_machine;
@@ -521,10 +522,14 @@ where
             plan.budget_snapshot.planned_tool_tokens = planned_tool_tokens;
             plan.budget_snapshot.planned_input_tokens =
                 estimate_message_tokens(&messages).saturating_add(planned_tool_tokens);
-            if plan.budget_snapshot.planned_input_tokens > plan.budget_snapshot.budget_limit {
+            if let Some(compaction_limit) = context_window_manager.required_compaction_limit(
+                protected_prefix_len,
+                &messages,
+                planned_tool_tokens,
+            ) {
                 trace(AgentLoopTraceEvent::ContextCompactionStarted {
                     original_input_tokens: plan.budget_snapshot.planned_input_tokens,
-                    budget_limit: plan.budget_snapshot.budget_limit,
+                    budget_limit: compaction_limit,
                 });
                 match context_window_manager.compact_if_needed(
                     current_turn_id,
@@ -548,7 +553,7 @@ where
                     Err(error) => {
                         trace(AgentLoopTraceEvent::ContextCompactionFailed {
                             planned_input_tokens: plan.budget_snapshot.planned_input_tokens,
-                            budget_limit: plan.budget_snapshot.budget_limit,
+                            budget_limit: compaction_limit,
                             reason: error.to_string(),
                         });
                     }
@@ -1242,11 +1247,6 @@ where
             .iter()
             .flat_map(|report| report.changed_files.iter())
             .collect::<Vec<_>>();
-        let expected_delivery_path = request
-            .completion_criteria
-            .iter()
-            .find_map(|criterion| objective_path_hint(criterion))
-            .or_else(|| objective_path_hint(&current_objective));
         if !changed_files.is_empty() {
             command_checks.push(VerificationCheck {
                 kind: VerificationCheckKind::WorkspaceChange,
@@ -1260,27 +1260,26 @@ where
                 message: format!("{} workspace file(s) changed", changed_files.len()),
             });
         }
-        if !changed_files.is_empty()
-            && let Some(expected_path) = expected_delivery_path.as_deref()
-        {
-            let path_matches = changed_files
-                .iter()
-                .any(|path| path_matches_expected(path, expected_path));
+        let changed_paths = changed_files
+            .iter()
+            .map(|path| path.as_path())
+            .collect::<Vec<_>>();
+        if let Some(delivery_paths) = objective_evidence::evaluate_delivery_paths(
+            &current_objective,
+            &request.completion_criteria,
+            &changed_paths,
+        ) {
             command_checks.push(VerificationCheck {
                 kind: VerificationCheckKind::ObjectiveValidation,
                 name: "objective:path:delivery".to_owned(),
                 command: None,
-                passed: path_matches,
+                passed: delivery_paths.passed(),
                 evidence_refs: tool_reports
                     .iter()
                     .filter(|report| !report.changed_files.is_empty())
                     .flat_map(|report| report.envelope.evidence_refs.iter().copied())
                     .collect(),
-                message: if path_matches {
-                    format!("a changed file matches requested `{expected_path}`")
-                } else {
-                    format!("no changed file matches requested `{expected_path}`")
-                },
+                message: delivery_paths.message(),
             });
         }
         let code_files_changed = changed_files.iter().any(|path| is_code_file(path));
@@ -1664,31 +1663,56 @@ fn is_code_file(path: &Path) -> bool {
         path.extension().and_then(|extension| extension.to_str()),
         Some(
             "c" | "cc"
+                | "bash"
                 | "cpp"
                 | "cs"
+                | "dart"
+                | "erl"
+                | "ex"
+                | "exs"
+                | "fish"
+                | "fs"
+                | "fsx"
                 | "go"
                 | "h"
                 | "hpp"
+                | "hrl"
                 | "java"
                 | "js"
                 | "jsx"
                 | "kt"
                 | "kts"
                 | "php"
+                | "pl"
                 | "py"
+                | "r"
+                | "R"
                 | "rb"
                 | "rs"
+                | "scala"
+                | "sh"
+                | "sql"
                 | "swift"
                 | "ts"
                 | "tsx"
+                | "zsh"
         )
-    )
+    ) || path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            matches!(
+                name,
+                "Dockerfile" | "Justfile" | "Makefile" | "Rakefile" | "build.gradle"
+            )
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ObjectiveValidationKind {
     Test,
     Diagnostic,
+    FileState,
 }
 
 impl ObjectiveValidationKind {
@@ -1696,6 +1720,7 @@ impl ObjectiveValidationKind {
         match self {
             Self::Test => "test",
             Self::Diagnostic => "diagnostic",
+            Self::FileState => "file_state",
         }
     }
 }
@@ -1751,6 +1776,9 @@ fn objective_validation_report(report: &ToolExecutionReport) -> Option<Objective
             (ObjectiveValidationKind::Test, true, true) => {
                 "test command passed with executed tests".to_owned()
             }
+            (ObjectiveValidationKind::FileState, true, true) => {
+                "file-state command passed".to_owned()
+            }
             (_, true, true) => "diagnostic command passed".to_owned(),
             _ => "objective validation is unresolved".to_owned(),
         };
@@ -1769,14 +1797,46 @@ fn is_objective_validation_command(command: &str) -> bool {
 }
 
 fn objective_validation_command_kind(command: &str) -> Option<ObjectiveValidationKind> {
+    objective_validation_command_kind_with_depth(command, 0)
+}
+
+fn objective_validation_command_kind_with_depth(
+    command: &str,
+    wrapper_depth: u8,
+) -> Option<ObjectiveValidationKind> {
     let parts = shlex::split(command)?;
     let program = parts.first().map(String::as_str)?;
+    let program = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program);
+    if wrapper_depth < 2
+        && matches!(program, "bash" | "sh" | "zsh")
+        && parts.len() == 3
+        && matches!(parts[1].as_str(), "-c" | "-lc")
+    {
+        let script = parts[2].trim();
+        if script.contains(';') || script.contains('|') || script.contains('\n') {
+            return None;
+        }
+        let final_command = script.rsplit("&&").next().map(str::trim)?;
+        return objective_validation_command_kind_with_depth(
+            final_command,
+            wrapper_depth.saturating_add(1),
+        );
+    }
     match program {
         "cargo" if parts.iter().any(|part| part == "test") => Some(ObjectiveValidationKind::Test),
         "cargo"
             if parts
                 .iter()
-                .any(|part| matches!(part.as_str(), "check" | "clippy" | "build" | "fmt")) =>
+                .any(|part| matches!(part.as_str(), "check" | "clippy" | "build")) =>
+        {
+            Some(ObjectiveValidationKind::Diagnostic)
+        }
+        "cargo"
+            if parts.iter().any(|part| part == "fmt")
+                && parts.iter().any(|part| part == "--check") =>
         {
             Some(ObjectiveValidationKind::Diagnostic)
         }
@@ -1791,10 +1851,13 @@ fn objective_validation_command_kind(command: &str) -> Option<ObjectiveValidatio
             Some(ObjectiveValidationKind::Diagnostic)
         }
         "pytest" => Some(ObjectiveValidationKind::Test),
+        "python" | "python3" if python_module_runs_tests(&parts) => {
+            Some(ObjectiveValidationKind::Test)
+        }
         "cmp" | "diff" if comparison_has_two_operands(&parts) => {
             Some(ObjectiveValidationKind::Diagnostic)
         }
-        "test" if parts.len() >= 3 => Some(ObjectiveValidationKind::Diagnostic),
+        "test" if parts.len() >= 3 => Some(ObjectiveValidationKind::FileState),
         "git" if git_command_validates_result(&parts) => Some(ObjectiveValidationKind::Diagnostic),
         "go" if parts.get(1).is_some_and(|part| part == "test") => {
             Some(ObjectiveValidationKind::Test)
@@ -1818,6 +1881,12 @@ fn objective_validation_command_kind(command: &str) -> Option<ObjectiveValidatio
         }
         _ => None,
     }
+}
+
+fn python_module_runs_tests(parts: &[String]) -> bool {
+    parts
+        .windows(2)
+        .any(|window| window[0] == "-m" && matches!(window[1].as_str(), "pytest" | "unittest"))
 }
 
 fn comparison_has_two_operands(parts: &[String]) -> bool {
@@ -1982,37 +2051,6 @@ fn objective_requires_workspace_evidence(objective: &str) -> bool {
 
     ENGLISH_MARKERS.iter().any(|marker| lower.contains(marker))
         || CJK_MARKERS.iter().any(|marker| objective.contains(marker))
-}
-
-fn objective_path_hint(objective: &str) -> Option<String> {
-    objective
-        .split_whitespace()
-        .map(|token| {
-            token.trim_matches(|character: char| {
-                matches!(
-                    character,
-                    '`' | '\'' | '"' | ',' | '.' | ':' | ';' | '(' | ')' | '[' | ']'
-                )
-            })
-        })
-        .filter(|token| {
-            !token.is_empty()
-                && (token.contains('/')
-                    || token.contains('\\')
-                    || token.rsplit_once('.').is_some_and(|(_, extension)| {
-                        !extension.is_empty()
-                            && extension
-                                .chars()
-                                .all(|character| character.is_ascii_alphanumeric())
-                    }))
-        })
-        .max_by_key(|token| token.len())
-        .map(ToOwned::to_owned)
-}
-
-fn path_matches_expected(path: &Path, expected: &str) -> bool {
-    let observed = path.to_string_lossy();
-    observed.ends_with(expected) || expected.ends_with(observed.as_ref())
 }
 
 fn objective_content_hint(objective: &str) -> Option<String> {

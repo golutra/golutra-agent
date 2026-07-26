@@ -85,6 +85,23 @@ async fn registry_contains_p0_tools() {
     );
 }
 
+#[test]
+fn shell_contract_explains_how_to_submit_compound_commands() {
+    let registry = ToolRegistry::p0_default();
+    let description = registry
+        .contract("shell")
+        .and_then(|contract| {
+            contract
+                .input_schema
+                .pointer("/properties/command/description")
+        })
+        .and_then(Value::as_str)
+        .expect("shell command description");
+
+    assert!(description.contains("bash -lc"));
+    assert!(description.contains("Unquoted operators"));
+}
+
 #[tokio::test]
 async fn external_tools_require_approval_and_redact_output() {
     let workspace = tempdir().expect("workspace");
@@ -564,6 +581,27 @@ async fn shell_runs_simple_command_without_shell_interpreter() {
 }
 
 #[tokio::test]
+async fn shell_facts_record_the_executor_network_capability() {
+    let workspace = tempdir().expect("workspace");
+    let request = || request("shell", json!({"command": "echo ok"}));
+
+    let isolated = executor(workspace.path());
+    let isolated_report = execute_approved(&isolated, request(), CancellationToken::new()).await;
+    assert_eq!(
+        isolated_report.envelope.structured_facts["network_access"],
+        false
+    );
+
+    let network_enabled = executor(workspace.path()).with_network_access(true);
+    let enabled_report =
+        execute_approved(&network_enabled, request(), CancellationToken::new()).await;
+    assert_eq!(
+        enabled_report.envelope.structured_facts["network_access"],
+        true
+    );
+}
+
+#[tokio::test]
 async fn shell_parser_preserves_quoted_arguments() {
     let workspace = tempdir().expect("workspace");
     let executor = executor(workspace.path());
@@ -588,6 +626,17 @@ fn shell_parser_rejects_unclosed_quotes() {
         CommandLine::parse("printf 'unterminated"),
         Err(ToolError::InvalidArguments(_))
     ));
+}
+
+#[test]
+fn shell_parser_preserves_multiline_explicit_wrapper_scripts() {
+    let command = CommandLine::parse("bash -lc 'python - <<'PY'\nprint('ok')\nPY'")
+        .expect("explicit wrapper parser");
+
+    assert_eq!(command.program, "bash");
+    assert_eq!(command.args[0], "-lc");
+    assert!(command.args[1].contains("python - <<'PY'"));
+    assert!(command.args[1].contains("print('ok')"));
 }
 
 #[tokio::test]

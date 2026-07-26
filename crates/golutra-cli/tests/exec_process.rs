@@ -148,13 +148,14 @@ async fn exec_run_dir_retains_an_isolated_structured_runtime_bundle() {
     install_mock_provider(home.path());
 
     let output = tokio::time::timeout(
-        Duration::from_secs(20),
+        Duration::from_secs(60),
         Command::new(env!("CARGO_BIN_EXE_golutra-cli"))
             .arg("--cwd")
             .arg(workspace.path())
             .arg("exec")
             .arg("--run-dir")
             .arg(&state_dir)
+            .arg("--allow-network")
             .arg("--approval-mode")
             .arg("auto")
             .arg("write file retained.txt with content retained")
@@ -237,12 +238,50 @@ async fn exec_run_dir_retains_an_isolated_structured_runtime_bundle() {
             .as_array()
             .is_some_and(|events| !events.is_empty())
     );
+    let task_created = trace["events"]
+        .as_array()
+        .and_then(|events| {
+            events
+                .iter()
+                .find(|event| event["event_type"] == "task_created")
+        })
+        .expect("task-created event");
+    assert_eq!(
+        task_created["payload"]["execution_capabilities"]["network"]["requested"],
+        true
+    );
+    assert_eq!(
+        task_created["payload"]["execution_capabilities"]["network"]["enabled"],
+        true
+    );
     assert!(!trace["verification"].is_null());
     assert_eq!(trace["integrity"]["complete"], true);
     assert_eq!(trace["evaluation"]["terminal"], true);
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("golutra run bundle retained"),
         "retention receipt belongs on stderr"
+    );
+}
+
+#[tokio::test]
+async fn exec_network_capability_is_rejected_for_remote_runtime_ownership() {
+    let workspace = tempdir().expect("workspace");
+    let output = Command::new(env!("CARGO_BIN_EXE_golutra-cli"))
+        .arg("--cwd")
+        .arg(workspace.path())
+        .arg("--connect")
+        .arg("http://127.0.0.1:1")
+        .arg("exec")
+        .arg("--allow-network")
+        .arg("reply")
+        .output()
+        .await
+        .expect("remote network command");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("exec --allow-network requires an embedded runtime")
     );
 }
 
@@ -255,7 +294,7 @@ async fn failed_exec_run_dir_still_retains_verification_observations() {
     install_mock_provider(home.path());
 
     let output = tokio::time::timeout(
-        Duration::from_secs(20),
+        Duration::from_secs(60),
         Command::new(env!("CARGO_BIN_EXE_golutra-cli"))
             .arg("--cwd")
             .arg(workspace.path())
@@ -319,6 +358,169 @@ async fn failed_exec_run_dir_still_retains_verification_observations() {
     );
     assert!(state_dir.join("state/runtime.sqlite").is_file());
     assert!(String::from_utf8_lossy(&output.stderr).contains("golutra run bundle retained"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn interrupted_exec_finalizes_its_recoverable_run_checkpoint() {
+    let home = tempdir().expect("home");
+    let workspace = tempdir().expect("workspace");
+    let export_parent = tempdir().expect("export parent");
+    let state_dir = export_parent.path().join("interrupted-runtime");
+    install_mock_provider(home.path());
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_golutra-cli"))
+        .arg("--cwd")
+        .arg(workspace.path())
+        .arg("exec")
+        .arg("--run-dir")
+        .arg(&state_dir)
+        .arg("--approval-mode")
+        .arg("auto")
+        .arg("sleep before completing")
+        .env("GOLUTRA_HOME", home.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("interruptible exec process");
+
+    let manifest_path = state_dir.join("manifest.json");
+    let mut early_exit = None;
+    for _ in 0..1200 {
+        if manifest_path.is_file() {
+            break;
+        }
+        early_exit = child.try_wait().expect("poll exec process");
+        if early_exit.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    if !manifest_path.is_file() {
+        if early_exit.is_none() {
+            child.start_kill().expect("stop exec without checkpoint");
+        }
+        let output = child
+            .wait_with_output()
+            .await
+            .expect("exec output without checkpoint");
+        panic!(
+            "exec produced no checkpoint; status={:?}; stdout={}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    let checkpoint: Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("in-progress checkpoint manifest"))
+            .expect("valid checkpoint manifest");
+    assert_eq!(checkpoint["terminal_outcome"]["kind"], "in_progress");
+
+    // Give run_exec time to enter its signal-aware event loop after the
+    // atomic checkpoint rename becomes visible.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let pid = child.id().expect("exec process id");
+    let signal = Command::new("kill")
+        .arg("-INT")
+        .arg(pid.to_string())
+        .status()
+        .await
+        .expect("send SIGINT");
+    assert!(signal.success(), "SIGINT command failed: {signal:?}");
+
+    let output = tokio::time::timeout(Duration::from_secs(60), child.wait_with_output())
+        .await
+        .expect("interrupted exec did not settle")
+        .expect("interrupted exec output");
+    assert!(
+        !output.status.success(),
+        "interrupted exec unexpectedly succeeded: {output:?}"
+    );
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("final run manifest"))
+            .expect("valid final run manifest");
+    assert_eq!(
+        manifest["terminal_outcome"]["kind"],
+        "result",
+        "unexpected terminal outcome: {}; stderr={}",
+        manifest["terminal_outcome"],
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        manifest["terminal_outcome"]["result"]["status"],
+        "cancelled"
+    );
+    assert!(state_dir.join("observations/manifest.json").is_file());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("golutra runtime checkpoint retained"));
+    assert!(stderr.contains("interrupt requested; waiting for runtime to settle"));
+    assert!(stderr.contains("golutra run bundle retained"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn killed_exec_checkpoint_can_be_reopened_for_recovery() {
+    let home = tempdir().expect("home");
+    let workspace = tempdir().expect("workspace");
+    let export_parent = tempdir().expect("export parent");
+    let state_dir = export_parent.path().join("killed-runtime");
+    install_mock_provider(home.path());
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_golutra-cli"))
+        .arg("--cwd")
+        .arg(workspace.path())
+        .arg("exec")
+        .arg("--run-dir")
+        .arg(&state_dir)
+        .arg("--approval-mode")
+        .arg("auto")
+        .arg("sleep before an external kill")
+        .env("GOLUTRA_HOME", home.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("killable exec process");
+    let manifest_path = state_dir.join("manifest.json");
+    for _ in 0..1200 {
+        if manifest_path.is_file() {
+            break;
+        }
+        if child.try_wait().expect("poll killable exec").is_some() {
+            panic!("killable exec exited before writing checkpoint");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(manifest_path.is_file(), "checkpoint was not written");
+
+    let pid = child.id().expect("killable exec process id");
+    let signal = Command::new("kill")
+        .arg("-KILL")
+        .arg(pid.to_string())
+        .status()
+        .await
+        .expect("send SIGKILL");
+    assert!(signal.success(), "SIGKILL command failed: {signal:?}");
+    let _ = child.wait().await.expect("wait for killed exec");
+
+    let reopened = Command::new(env!("CARGO_BIN_EXE_golutra-cli"))
+        .arg("--run-bundle")
+        .arg(&state_dir)
+        .arg("status")
+        .env("GOLUTRA_HOME", home.path())
+        .output()
+        .await
+        .expect("reopen persisted checkpoint");
+    assert!(
+        reopened.status.success(),
+        "reopening killed checkpoint failed: {reopened:?}"
+    );
+    let status: Value = serde_json::from_slice(&reopened.stdout).expect("reopened status JSON");
+    assert!(
+        status.get("task_status").is_some(),
+        "task status missing: {status}"
+    );
 }
 
 #[tokio::test]

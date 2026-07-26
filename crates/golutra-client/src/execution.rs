@@ -285,6 +285,11 @@ impl RuntimeHost {
         let started_at = Instant::now();
         let objective = prompt_from_payload(&task.payload);
         let completion_criteria = completion_criteria_from_payload(&task.payload);
+        let requested_network = task
+            .payload
+            .get("allow_network")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let external_verifiers = task
             .payload
             .get("external_verifiers")
@@ -299,7 +304,7 @@ impl RuntimeHost {
         let policy = WorkspacePolicy::new(workspace_root.clone())
             .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
         let tool_executor = self
-            .build_tool_executor(policy, workspace_root.clone())
+            .build_tool_executor(policy, workspace_root.clone(), requested_network)
             .await?;
         let workspace_tool_names = tool_executor
             .registry()

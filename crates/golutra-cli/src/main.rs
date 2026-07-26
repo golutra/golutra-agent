@@ -4,8 +4,8 @@ use golutra_auth::{
 };
 use golutra_client::{
     AgentClient, DebugExportCoordinator, DebugExportRequest, RunBundleExportRequest,
-    RunBundleExporter, RunBundleTerminalOutcome, RuntimeClient, RuntimeTransport, TaskTraceClient,
-    parse_session_range,
+    RunBundleExporter, RunBundleTerminalOutcome, RuntimeClient, RuntimeExecutionOptions,
+    RuntimeTransport, TaskTraceClient, parse_session_range,
 };
 use golutra_config::{
     BuiltinOAuthMethod, ProviderConfigPaths, ProviderConfigScope, ProviderInstallPlan,
@@ -53,7 +53,7 @@ struct Cli {
     connect: Option<String>,
     #[arg(long, global = true, value_name = "UUID")]
     session_id: Option<String>,
-    /// Reopen a completed owner-only `exec --run-dir` bundle for evaluator ingestion.
+    /// Reopen a completed or checkpointed owner-only `exec --run-dir` bundle for evaluator ingestion.
     #[arg(
         long,
         global = true,
@@ -213,6 +213,9 @@ struct ExecArgs {
     /// Do not persist runtime state after this process exits.
     #[arg(long)]
     ephemeral: bool,
+    /// Allow this embedded run's child tools to access the network.
+    #[arg(long)]
+    allow_network: bool,
     /// Write isolated runtime state and full owner-only observations to this new directory.
     /// Implies --ephemeral. The legacy --ephemeral-state-dir spelling remains accepted.
     #[arg(
@@ -728,6 +731,7 @@ async fn main() -> miette::Result<()> {
     let opened_run_bundle = cli.run_bundle.clone();
     let ephemeral_exec =
         matches!(&cli.command, Command::Exec(args) if args.ephemeral || args.run_dir.is_some());
+    let allow_network = matches!(&cli.command, Command::Exec(args) if args.allow_network);
     let run_dir = match &cli.command {
         Command::Exec(args) => args.run_dir.clone(),
         _ => None,
@@ -742,18 +746,29 @@ async fn main() -> miette::Result<()> {
             "exec --ephemeral or --run-dir cannot be combined with --daemon or --connect"
         ));
     }
+    if allow_network && (cli.daemon || cli.connect.is_some()) {
+        return Err(miette::miette!(
+            "exec --allow-network requires an embedded runtime; configure network capability on the app-server host before using --daemon or --connect"
+        ));
+    }
+    let execution_options = RuntimeExecutionOptions::with_network_access(allow_network);
     let transport = if let Some(run_bundle) = cli.run_bundle.as_ref() {
         RuntimeTransport::open_persisted_run(run_bundle).await
     } else if let Some(state_dir) = run_dir.as_ref() {
-        RuntimeTransport::ephemeral_persistent_for_cwd(&cwd, state_dir).await
+        RuntimeTransport::ephemeral_persistent_for_cwd_with_options(
+            &cwd,
+            state_dir,
+            execution_options,
+        )
+        .await
     } else if ephemeral_exec {
-        RuntimeTransport::ephemeral_for_cwd(&cwd).await
+        RuntimeTransport::ephemeral_for_cwd_with_options(&cwd, execution_options).await
     } else if let Some(base_url) = cli.connect.clone() {
         RuntimeTransport::connect(base_url, &cwd).await
     } else if cli.daemon {
         RuntimeTransport::local_daemon(&cwd).await
     } else {
-        RuntimeTransport::for_cwd(&cwd).await
+        RuntimeTransport::for_cwd_with_options(&cwd, execution_options).await
     }
     .map_err(|error| miette::miette!("{error}"))?;
     let session_id = resolve_session_id(cli.session_id.as_deref(), &transport)?;
@@ -2521,14 +2536,56 @@ async fn run_exec(transport: &RuntimeTransport, args: ExecArgs) -> miette::Resul
             AgentTurnOptions {
                 output_schema,
                 completion_criteria: args.completion_criteria,
+                allow_network: args.allow_network,
                 external_verifiers,
             },
         )
         .await
         .map_err(|error| miette::miette!("{error}"))?;
 
+    // Leave a recoverable identity/event boundary before consuming the turn.
+    // An external harness can terminate the caller while the runtime is still
+    // working, so a later collector must be able to reopen this run.
+    if let Some(destination) = run_dir.as_ref() {
+        if let Err(error) =
+            checkpoint_exec_run_bundle(transport, thread.thread_id(), destination.clone()).await
+        {
+            let _ = handle.interrupt().await;
+            return Err(miette::miette!(
+                "initial runtime data checkpoint failed: {error}"
+            ));
+        }
+    }
+
     let turn_result = async {
-        while let Some(event) = handle.next_event().await? {
+        let mut interrupt_requested = false;
+        loop {
+            let next_event = tokio::select! {
+                event = handle.next_event() => event,
+                signal = tokio::signal::ctrl_c() => {
+                    signal.map_err(|error| golutra_client::ClientError::TaskExecution(
+                        format!("failed to listen for Ctrl+C: {error}"),
+                    ))?;
+                    if interrupt_requested {
+                        return Err(golutra_client::ClientError::TaskExecution(
+                            "exec interrupted while waiting for runtime abort".to_owned(),
+                        ));
+                    }
+                    let ack = handle.interrupt().await?;
+                    if !ack.accepted {
+                        return Err(golutra_client::ClientError::TaskExecution(format!(
+                            "runtime rejected interrupt: {}",
+                            ack.reason.unwrap_or_else(|| "unknown reason".to_owned())
+                        )));
+                    }
+                    interrupt_requested = true;
+                    eprintln!("interrupt requested; waiting for runtime to settle");
+                    continue;
+                }
+            }?;
+            let Some(event) = next_event else {
+                break;
+            };
             if json_output {
                 println!("{}", serde_json::to_string(&event)?);
             } else {
@@ -2540,8 +2597,20 @@ async fn run_exec(transport: &RuntimeTransport, args: ExecArgs) -> miette::Resul
                     .map_err(|error| {
                         golutra_client::ClientError::TaskExecution(error.to_string())
                     })?;
-                let ack = handle.resolve_approval(approval_id, approve).await?;
+                let ack = match handle.resolve_approval(approval_id, approve).await {
+                    Ok(ack) => ack,
+                    Err(error) if interrupt_requested => {
+                        eprintln!(
+                            "approval resolution stopped after interrupt; waiting for terminal runtime event: {error}"
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 if !ack.accepted {
+                    if interrupt_requested {
+                        continue;
+                    }
                     return Err(golutra_client::ClientError::TaskExecution(format!(
                         "runtime rejected approval resolution: {}",
                         ack.reason.unwrap_or_else(|| "unknown reason".to_owned())
@@ -2628,6 +2697,35 @@ async fn export_exec_run_bundle(
     if let Some(error) = receipt.debug_export_error {
         eprintln!("redacted debug export failed without losing raw observations: {error}");
     }
+    Ok(())
+}
+
+async fn checkpoint_exec_run_bundle(
+    transport: &RuntimeTransport,
+    thread_id: ThreadId,
+    destination: std::path::PathBuf,
+) -> Result<(), golutra_client::ClientError> {
+    let receipt = RunBundleExporter::new(transport)
+        .checkpoint(RunBundleExportRequest {
+            destination: destination.clone(),
+            selection: golutra_client::SessionWindowRequest {
+                anchor_thread_id: thread_id,
+                range: golutra_client::SessionRangeSpec {
+                    direction: golutra_client::SessionRangeDirection::Single,
+                    count: 1,
+                },
+            },
+            terminal_outcome: RunBundleTerminalOutcome::InProgress {
+                reason: "agent turn is still running; terminal outcome is pending".to_owned(),
+            },
+        })
+        .await?;
+    eprintln!(
+        "golutra runtime checkpoint retained at {}; observations: {}; complete: {}",
+        destination.display(),
+        destination.join(&receipt.observations_path).display(),
+        receipt.complete,
+    );
     Ok(())
 }
 

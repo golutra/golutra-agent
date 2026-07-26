@@ -196,6 +196,7 @@ impl AgentThread {
                     "_thread_id": self.thread.thread_id,
                     "completion_criteria": options.completion_criteria.clone(),
                     "output_schema": options.output_schema.clone(),
+                    "allow_network": options.allow_network,
                     "external_verifiers": options.external_verifiers.clone(),
                 }),
                 &self.client.actor,

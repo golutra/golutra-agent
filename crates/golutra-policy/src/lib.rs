@@ -95,7 +95,8 @@ impl WorkspacePolicy {
     }
 
     pub fn evaluate_shell(&self, command: &str) -> PolicyEvaluation {
-        let parsed = shlex::split(command);
+        let parsed = parse_shell_command(command);
+        let explicit_wrapper = parsed.as_deref().and_then(explicit_shell_script).is_some();
         let terminal_violation = self
             .denied_shell_fragments
             .iter()
@@ -103,7 +104,8 @@ impl WorkspacePolicy {
             || parsed
                 .as_deref()
                 .is_some_and(|parts| self.shell_command_is_blocked(parts));
-        let recoverable_violation = contains_shell_metacharacter(command) || parsed.is_none();
+        let recoverable_violation =
+            !explicit_wrapper && (contains_shell_metacharacter(command) || parsed.is_none());
         let blocked = terminal_violation || recoverable_violation;
         let decision = if blocked {
             PolicyDecision::Block
@@ -122,7 +124,7 @@ impl WorkspacePolicy {
                 "shell command matched P0 deny-list or sensitive-path guard"
             }
             PolicyDecision::Block => {
-                "shell command syntax is not permitted; submit one command and quote operators that belong inside an argument"
+                "shell command syntax is not permitted; submit one argv command, or explicitly invoke bash -lc with the complete script as one quoted argument"
             }
             PolicyDecision::Deny => "shell command denied by policy",
         };
@@ -180,6 +182,31 @@ impl WorkspacePolicy {
     }
 
     fn shell_command_is_blocked(&self, parts: &[String]) -> bool {
+        if let Some(script) = explicit_shell_script(parts) {
+            return self.shell_script_is_blocked(script);
+        }
+        self.shell_command_parts_are_blocked(parts)
+    }
+
+    fn shell_script_is_blocked(&self, script: &str) -> bool {
+        if self
+            .denied_shell_fragments
+            .iter()
+            .any(|fragment| script.contains(fragment))
+        {
+            return true;
+        }
+        shlex::split(script).map_or_else(
+            || {
+                self.sensitive_path_fragments
+                    .iter()
+                    .any(|fragment| script.to_ascii_lowercase().contains(fragment))
+            },
+            |parts| self.shell_command_parts_are_blocked(&parts),
+        )
+    }
+
+    fn shell_command_parts_are_blocked(&self, parts: &[String]) -> bool {
         let Some(program) = parts.first().map(String::as_str) else {
             return true;
         };
@@ -244,6 +271,68 @@ impl WorkspacePolicy {
 #[must_use]
 pub fn default_workspace_policy_name() -> &'static str {
     "workspace-path-guard"
+}
+
+/// Parse the shell tool's command field as argv without invoking a shell.
+///
+/// Most commands use ordinary `shlex` parsing.  Explicit interpreter wrappers
+/// get a narrow fallback because model-produced multiline scripts commonly
+/// contain quotes that conflict with the outer quote used to carry the script
+/// (for example a heredoc delimiter).  The fallback only accepts the complete
+/// `bash|sh|zsh -c|-lc <one argument>` shape and preserves that last argument
+/// verbatim for the real interpreter.
+#[must_use]
+pub fn parse_shell_command(command: &str) -> Option<Vec<String>> {
+    if let Some((parts, quote)) = parse_explicit_wrapper_raw(command)
+        && quote == '\''
+    {
+        // A single-quoted script is intentionally opaque to the outer argv
+        // parser.  Keeping it verbatim preserves heredoc delimiters and
+        // embedded Python/JSON quotes produced by model callers.
+        return Some(parts);
+    }
+    shlex::split(command).or_else(|| parse_explicit_wrapper_raw(command).map(|(parts, _)| parts))
+}
+
+/// Return the script argument for a deliberately invoked shell interpreter.
+#[must_use]
+pub fn explicit_shell_script(parts: &[String]) -> Option<&str> {
+    if parts.len() != 3 || !is_shell_program(&parts[0]) {
+        return None;
+    }
+    matches!(parts[1].as_str(), "-c" | "-lc").then_some(parts[2].as_str())
+}
+
+fn parse_explicit_wrapper_raw(command: &str) -> Option<(Vec<String>, char)> {
+    let trimmed = command.trim();
+    let program_end = trimmed.find(char::is_whitespace)?;
+    let program = &trimmed[..program_end];
+    if !is_shell_program(program) {
+        return None;
+    }
+    let rest = trimmed[program_end..].trim_start();
+    let option_end = rest.find(char::is_whitespace)?;
+    let option = &rest[..option_end];
+    if !matches!(option, "-c" | "-lc") {
+        return None;
+    }
+    let script = rest[option_end..].trim_start();
+    let quote = script.chars().next()?;
+    if !matches!(quote, '\'' | '"') || !script.ends_with(quote) {
+        return None;
+    }
+    let body = &script[quote.len_utf8()..script.len() - quote.len_utf8()];
+    Some((
+        vec![program.to_owned(), option.to_owned(), body.to_owned()],
+        quote,
+    ))
+}
+
+fn is_shell_program(program: &str) -> bool {
+    matches!(
+        program.rsplit(['/', '\\']).next(),
+        Some("bash" | "sh" | "zsh")
+    )
 }
 
 #[must_use]
@@ -379,6 +468,21 @@ mod tests {
     }
 
     #[test]
+    fn recoverable_shell_syntax_explains_the_explicit_bash_path() {
+        let workspace = tempdir().expect("workspace");
+        let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
+
+        let evaluation = policy.evaluate_shell("printf '%s\\n' one two | sort");
+
+        assert_eq!(evaluation.decision, PolicyDecision::Block);
+        assert_eq!(
+            evaluation.block_disposition,
+            Some(PolicyBlockDisposition::Recoverable)
+        );
+        assert!(evaluation.reason.contains("bash -lc"));
+    }
+
+    #[test]
     fn quoted_metacharacters_are_inert_but_unquoted_operators_remain_blocked() {
         let workspace = tempdir().expect("workspace");
         let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
@@ -411,6 +515,53 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[test]
+    fn explicit_shell_wrappers_allow_pipelines_and_multiline_scripts() {
+        let workspace = tempdir().expect("workspace");
+        let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
+
+        for command in [
+            "bash -lc 'printf one | sort'",
+            "sh -c \"printf one > result.txt\"",
+            "bash -lc 'python - <<\"PY\"\nprint(\"ok\")\nPY'",
+            "bash -lc 'python - <<'PY'\nprint(\"ok\")\nPY'",
+        ] {
+            let evaluation = policy.evaluate_shell(command);
+            assert_eq!(evaluation.decision, PolicyDecision::Ask, "{command}");
+            assert_eq!(evaluation.block_disposition, None, "{command}");
+        }
+    }
+
+    #[test]
+    fn explicit_shell_wrappers_still_apply_terminal_guards_to_script_contents() {
+        let workspace = tempdir().expect("workspace");
+        let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
+
+        for command in [
+            "bash -lc 'rm -rf /'",
+            "bash -lc 'find . -delete'",
+            "bash -lc 'cat .env'",
+        ] {
+            let evaluation = policy.evaluate_shell(command);
+            assert_eq!(evaluation.decision, PolicyDecision::Block, "{command}");
+            assert_eq!(
+                evaluation.block_disposition,
+                Some(PolicyBlockDisposition::Terminal),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_outer_quotes_are_recovered_for_explicit_wrappers_only() {
+        let parsed = parse_shell_command("bash -lc 'python - <<'PY'\nprint('ok')\nPY'")
+            .expect("wrapper parser should preserve the script");
+        assert_eq!(parsed[0], "bash");
+        assert_eq!(parsed[1], "-lc");
+        assert!(parsed[2].contains("python - <<'PY'"));
+        assert!(parse_shell_command("printf 'unterminated").is_none());
     }
 
     #[test]

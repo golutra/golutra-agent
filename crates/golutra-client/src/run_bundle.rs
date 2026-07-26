@@ -23,7 +23,7 @@ use super::{
     RuntimeObservationCollector, RuntimeObservationSnapshot, RuntimeTransport, set_owner_only_file,
 };
 
-const RUN_BUNDLE_FORMAT_VERSION: u32 = 1;
+const RUN_BUNDLE_FORMAT_VERSION: u32 = 2;
 const OBSERVATION_FORMAT_VERSION: u32 = 1;
 const MAX_PRIOR_TRACE_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -40,8 +40,16 @@ pub struct RunBundleExportRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RunBundleTerminalOutcome {
-    Result { result: AgentTurnResult },
-    Error { error: String },
+    /// A durable checkpoint written before the turn reaches a terminal state.
+    InProgress {
+        reason: String,
+    },
+    Result {
+        result: AgentTurnResult,
+    },
+    Error {
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,7 +176,23 @@ impl<'a> RunBundleExporter<'a> {
         &self,
         request: RunBundleExportRequest,
     ) -> Result<RunBundleReceipt, ClientError> {
-        self.export_with_mode(request, None).await
+        let prior_manifest = load_existing_manifest(&request.destination)?;
+        self.export_with_mode(request, prior_manifest, true).await
+    }
+
+    /// Persist a recoverable snapshot while an exec turn is still running.
+    ///
+    /// The runtime database is durable before this method is called, but an
+    /// external harness can terminate the CLI before the normal terminal
+    /// export runs.  Keeping this checkpoint append-only gives a later
+    /// evaluator process enough identity and event boundaries to reopen the
+    /// run and finish the export.
+    pub async fn checkpoint(
+        &self,
+        request: RunBundleExportRequest,
+    ) -> Result<RunBundleReceipt, ClientError> {
+        let prior_manifest = load_existing_manifest(&request.destination)?;
+        self.export_with_mode(request, prior_manifest, false).await
     }
 
     /// Rebuild derived observations after an evaluator overlay was appended
@@ -191,6 +215,7 @@ impl<'a> RunBundleExporter<'a> {
                 terminal_outcome: manifest.terminal_outcome.clone(),
             },
             Some(manifest),
+            true,
         )
         .await
     }
@@ -199,6 +224,7 @@ impl<'a> RunBundleExporter<'a> {
         &self,
         request: RunBundleExportRequest,
         prior_manifest: Option<RunBundleManifest>,
+        wait_for_evaluation: bool,
     ) -> Result<RunBundleReceipt, ClientError> {
         let replace_existing = prior_manifest.is_some();
         validate_run_root(&request.destination)?;
@@ -206,9 +232,12 @@ impl<'a> RunBundleExporter<'a> {
             recover_stale_directory_swap(&request.destination.join("observations"))?;
             recover_stale_directory_swap(&request.destination.join("debug-export"))?;
         }
-        let snapshot = RuntimeObservationCollector::new(self.transport)
-            .collect_settled(request.selection.clone())
-            .await?;
+        let collector = RuntimeObservationCollector::new(self.transport);
+        let snapshot = if wait_for_evaluation {
+            collector.collect_settled(request.selection.clone()).await?
+        } else {
+            collector.collect(request.selection.clone()).await?
+        };
         if let Some(prior_manifest) = &prior_manifest {
             validate_append_only_refresh(&request.destination, prior_manifest, &snapshot)?;
         }
@@ -297,6 +326,34 @@ impl<'a> RunBundleExporter<'a> {
             manifest_checksum: checksum(&manifest_bytes),
         })
     }
+}
+
+fn load_existing_manifest(destination: &Path) -> Result<Option<RunBundleManifest>, ClientError> {
+    let path = destination.join("manifest.json");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(bundle_io(&path, error)),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ClientError::Io(format!(
+            "run bundle manifest is not a regular file: {}",
+            path.display()
+        )));
+    }
+    if metadata.len() > 4 * 1024 * 1024 {
+        return Err(ClientError::Io(format!(
+            "run bundle manifest is too large: {}",
+            path.display()
+        )));
+    }
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => return Err(bundle_io(&path, error)),
+    };
+    let manifest = serde_json::from_slice(&bytes)
+        .map_err(|error| ClientError::Io(format!("{}: {error}", path.display())))?;
+    Ok(Some(manifest))
 }
 
 fn write_observations(

@@ -59,6 +59,9 @@ golutra --cwd "$PWD" exec \
   --run-dir /absolute/path/to/golutra-run \
   --approval-mode auto "run the benchmark task"
 golutra --cwd "$PWD" exec \
+  --run-dir /absolute/path/to/golutra-run \
+  --allow-network --approval-mode auto "run a task that needs a configured proxy"
+golutra --cwd "$PWD" exec \
   --completion-criterion "tests pass" \
   --verify-program cargo --verify-arg test --verify-arg --workspace \
   "implement the requested change"
@@ -75,6 +78,15 @@ Output rules:
   same runtime lane;
 - `--ephemeral` uses an isolated embedded runtime and cannot be combined with
   `--daemon` or `--connect`.
+
+Network access is a two-party capability. Child tools are isolated by default;
+`--allow-network` both grants the embedded host capability and requests it for
+this turn. The durable `TaskCreated` event records `requested`, `enabled` and a
+reason under `execution_capabilities.network`, while process tool facts record
+the capability actually used. A turn cannot enable network access when the host
+did not grant it. The flag is intentionally rejected for `--daemon`,
+`--connect` and persisted-bundle inspection because those runtimes are owned by
+another process.
 
 Ordinary `--ephemeral` discards its state when the process exits. `--run-dir`
 creates one new absolute, owner-only run directory for an isolated invocation;
@@ -121,6 +133,17 @@ run bundle, Golutra gives each discovered durable post-task evaluation a
 bounded opportunity to reach a terminal state, then reloads the event boundary
 and task trace. A job that exceeds that bound remains explicitly pending and
 marks the observation manifest incomplete.
+
+For an active `exec --run-dir` turn, Golutra first writes an atomic checkpoint
+whose top-level terminal outcome is `in_progress`. This checkpoint is not a
+success claim: it records the session/task identity, the event prefix and the
+raw state needed for recovery. The normal terminal export replaces it with a
+`result` or `error` outcome. If a supervisor or benchmark harness kills the
+CLI before that export, the checkpoint remains reopenable through
+`--run-bundle`; runtime recovery may append interruption facts, and a later
+evaluator can refresh the observations without guessing the missing terminal
+result. Such a bundle remains explicitly non-terminal until its manifest is
+refreshed.
 
 Golutra continues to read the active provider profile and credentials from
 the configured global `GOLUTRA_HOME`, and never copies them into the run
@@ -372,6 +395,18 @@ Terminal-Bench 只通过 `tools/terminal_bench/golutra_tbench_adapter.py`
 `--artifact-base`，使结果、pane 和命令记录可以被导入为不可变 evidence。找不到结果、manifest、
 collector 或 trace 时，保留 `golutra-evaluation.pending.json`，而不是丢掉
 原始 observation。
+
+当 adapter 配置 `proxy_url` 或 `GOLUTRA_TBENCH_PROXY` 时，它会把代理变量传入
+容器，并给嵌入式 `exec` 加上 `--allow-network`；没有代理配置时保持默认无网络。
+collector 的显式路径优先，自动选择时只考虑仓库内最新且不早于当前 Rust 源码的
+可执行 `golutra-cli`，避免用旧二进制解释新 observation。
+
+适配器在等待 agent 命令之前就启动 host-side collector。这样即使
+Terminal-Bench 的外部 timeout 放弃了正在运行的线程，后续写入
+`results.json` 后仍能找到 active checkpoint、从 observation index 恢复
+session/task identity，并让 `eval ingest` 对重新打开后的最终 trace 使用
+`auto` digest。旧版本没有 checkpoint 时仍会保留 pending 文件，不把缺失的
+bundle 伪装成成功。
 
 ## Shared Event and Projection Rules
 

@@ -132,7 +132,7 @@ ContextProjectionCache
 6. `CausalLedger` 在 canonical append 前补齐事件 provenance，并把 provider failure、tool completion、verification 和 external evaluation 连接到可审计的因果链；event append 失败会回滚 ledger 索引。
 7. deterministic replay 只消费带 source sequence boundary 的 owner-only artifact capsule；`ReplayExecution` 的 divergence/incomplete 不能伪装成 execution-backed regression。
 8. 外部评估按精确 `case × partition × provider × seed` 矩阵配对，`minimum_trusted_external_pairs` 的单位是 baseline/candidate pair；digest、runtime identity、trust 和 holdout gate 在 host 侧验证。
-9. `exec --run-dir` 的 raw state、full observations、debug export 和 evaluator overlay 可在进程退出后重开；刷新验证旧 event prefix 不变，并以 pending 文件表达未完成收集。
+9. `exec --run-dir` 在 turn 开始即写入 `in_progress` checkpoint；raw state、full observations、debug export 和 evaluator overlay 可在进程异常退出后重开。正常终态会原子替换 checkpoint，刷新验证旧 event prefix 不变，并以 pending 文件表达未完成收集。
 
 稳定扩展位：
 

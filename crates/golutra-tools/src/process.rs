@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use golutra_policy::parse_shell_command;
 use golutra_sandbox::{SandboxRequest, SystemSandbox, WorkspaceAccess};
 #[cfg(unix)]
 use nix::{
@@ -37,6 +38,7 @@ pub(crate) struct ShellOutput {
     pub(crate) output_bytes: u64,
     pub(crate) output_lines: u64,
     pub(crate) output_truncated: bool,
+    pub(crate) network_access: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +65,7 @@ pub(crate) struct ProcessExecutionRequest<'a> {
     pub(crate) cancellation: CancellationToken,
     pub(crate) sandbox: &'a SystemSandbox,
     pub(crate) workspace_access: WorkspaceAccess,
+    pub(crate) allow_network: bool,
 }
 
 #[derive(Debug)]
@@ -80,7 +83,7 @@ pub(crate) struct CommandLine {
 
 impl CommandLine {
     pub(crate) fn parse(command: &str) -> Result<Self, ToolError> {
-        let mut parts = shlex::split(command).ok_or_else(|| {
+        let mut parts = parse_shell_command(command).ok_or_else(|| {
             ToolError::InvalidArguments("shell command contains invalid quoting".to_owned())
         })?;
         if parts.is_empty() {
@@ -116,6 +119,7 @@ pub(crate) async fn run_process(
             cancellation,
             sandbox,
             workspace_access,
+            allow_network: false,
         },
         None,
     )
@@ -140,7 +144,7 @@ pub(crate) async fn run_process_with_progress(
             scratch_dir: scratch.path().to_path_buf(),
             read_only_roots: Vec::new(),
             workspace_access: request.workspace_access,
-            allow_network: false,
+            allow_network: request.allow_network,
         })
         .map_err(|error| ToolError::Execution(error.to_string()))?;
     let mut command = Command::new(&launch.program);
@@ -263,6 +267,7 @@ pub(crate) async fn run_process_with_progress(
         output_bytes,
         output_lines,
         output_truncated,
+        network_access: request.allow_network,
     })
 }
 

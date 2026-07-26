@@ -1213,6 +1213,23 @@ fn verification_command_classifier_rejects_arbitrary_shell_success() {
         "cargo test -p golutra-runtime"
     ));
     assert!(is_objective_validation_command("npm run typecheck"));
+    assert!(is_objective_validation_command("python -m pytest -q"));
+    assert!(is_objective_validation_command(
+        "/usr/bin/python3 -m unittest"
+    ));
+    assert!(is_objective_validation_command(
+        "bash -lc 'cargo check && python -m pytest -q'"
+    ));
+    assert!(!is_objective_validation_command(
+        "bash -lc 'pytest -q | tee results.txt'"
+    ));
+    assert!(!is_objective_validation_command("python verify.py"));
+    assert!(!is_objective_validation_command("cargo fmt"));
+    assert!(is_objective_validation_command("cargo fmt -- --check"));
+    assert_eq!(
+        objective_validation_command_kind("test -f result.txt"),
+        Some(ObjectiveValidationKind::FileState)
+    );
     assert!(!is_objective_validation_command("echo done"));
     assert!(!is_objective_validation_command("echo tests passed"));
     assert!(!is_objective_validation_command("git status --short"));
@@ -1231,6 +1248,14 @@ fn verification_command_classifier_rejects_arbitrary_shell_success() {
         "diff -q expected.txt actual.txt"
     ));
     assert!(!is_objective_validation_command("go version"));
+}
+
+#[test]
+fn code_file_classifier_includes_scripts_and_build_files() {
+    assert!(is_code_file(Path::new("process_data.sh")));
+    assert!(is_code_file(Path::new("Makefile")));
+    assert!(is_code_file(Path::new("schema.sql")));
+    assert!(!is_code_file(Path::new("result.txt")));
 }
 
 #[test]

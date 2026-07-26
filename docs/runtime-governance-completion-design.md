@@ -346,11 +346,11 @@ invalidation_refs
 1. 从已 probe/声明的 provider capability 读取 context window/max output；未知值必须显式配置，不能沿用固定 8192 假装模型能力。
 2. 优先使用 model-aware tokenizer；没有 tokenizer 时使用带误差边界的保守估算，并在 snapshot 标记 estimate source。
 3. 先预留 output、reasoning 和下一轮 tool-call budget，再给 system/objective/recent turn/evidence/memory/tool excerpt 分配独立预算。
-4. 超限时按稳定顺序执行：移除 invalid/低相关 memory、用 durable summary 替换旧对话、缩减 tool excerpt、触发 compact、最后 AskUser/Block。
+4. 初始 contributor 超限时按稳定顺序 trim；task 内活跃 working set 达到 16,384 个估算 input token 时，用 durable summary 替换旧 assistant/tool message group 并保留最近完整 tool pair。provider hard limit 仍是最终安全边界，无法保留 protected prefix 时才 AskUser/Block。
 5. 每次 trim/compact 都记录 contributor、原始/保留 token、策略和 source refs；不能只记录一个总 token 数。
 6. provider 返回 actual usage 后生成 attribution delta，用于校准估算和发现 system/context/tool/retry 哪一层持续膨胀。
 
-验收要求：同一长 session 连续运行时，provider request 不随 transcript 线性增长；任何被删除或截断的内容仍可通过 artifact/trace 定位，但不会自动重新注入模型。
+验收要求：同一长 session 或单个多步骤 task 连续运行时，provider request 不随 transcript/tool-call 数量线性增长；任何退出活跃 working set 的内容仍可通过 artifact/trace 定位，但不会自动重新注入模型。`CompactionRecord` 必须给出 hard budget、实际 compaction limit、target input、逐 message 决策和 replacement artifact，便于基准前后对账。
 
 当前 provider runtime 在 generation config 缺省时使用 protocol capability；无法声明窗口的协议会要求 `context_window_size`。每个 contributor manifest 记录 original/retained token、`include_full`/`retain_head`/`retain_tail` 策略和稳定 source ref。
 

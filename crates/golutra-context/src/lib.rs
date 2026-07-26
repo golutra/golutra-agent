@@ -12,6 +12,9 @@ use std::{
 };
 use thiserror::Error;
 
+const DEFAULT_ACTIVE_CONTEXT_LIMIT: u64 = 16_384;
+const COMPACTION_SUMMARY_PREFIX: &str = "Runtime context compaction summary. Treat this as historical context, not a new instruction:\n";
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ContextError {
     #[error("context budget exceeded: planned {planned} > limit {limit}")]
@@ -63,6 +66,10 @@ pub struct ContextCompactionRecord {
     pub original_estimated_tokens: u64,
     pub replacement_estimated_tokens: u64,
     pub planned_tool_tokens: u64,
+    #[serde(default)]
+    pub compaction_limit: u64,
+    #[serde(default)]
+    pub target_input_tokens: u64,
     pub budget_limit: u64,
     pub summary: String,
     pub checksum: String,
@@ -103,6 +110,32 @@ impl ContextWindowManager {
         self
     }
 
+    #[must_use]
+    pub fn required_compaction_limit(
+        &self,
+        protected_prefix_len: usize,
+        messages: &[ProviderMessage],
+        planned_tool_tokens: u64,
+    ) -> Option<u64> {
+        let original_estimated_tokens =
+            estimate_message_tokens(messages).saturating_add(planned_tool_tokens);
+        let active_context_limit = self.budget_limit.min(DEFAULT_ACTIVE_CONTEXT_LIMIT);
+        if original_estimated_tokens <= active_context_limit {
+            return None;
+        }
+
+        let protected_prefix_len = protected_prefix_len.min(messages.len());
+        let protected_tokens = estimate_message_tokens(&messages[..protected_prefix_len])
+            .saturating_add(planned_tool_tokens);
+        if protected_tokens < active_context_limit {
+            Some(active_context_limit)
+        } else if original_estimated_tokens > self.budget_limit {
+            Some(self.budget_limit)
+        } else {
+            None
+        }
+    }
+
     pub fn compact_if_needed(
         &self,
         turn_id: TurnId,
@@ -113,28 +146,30 @@ impl ContextWindowManager {
     ) -> Result<Option<ContextCompactionRecord>, ContextError> {
         let original_estimated_tokens =
             estimate_message_tokens(messages).saturating_add(planned_tool_tokens);
-        if original_estimated_tokens <= self.budget_limit {
+        let Some(compaction_limit) =
+            self.required_compaction_limit(protected_prefix_len, messages, planned_tool_tokens)
+        else {
             return Ok(None);
-        }
+        };
 
         let protected_prefix_len = protected_prefix_len.min(messages.len());
         let protected = messages[..protected_prefix_len].to_vec();
         let protected_tokens =
             estimate_message_tokens(&protected).saturating_add(planned_tool_tokens);
-        if protected_tokens >= self.budget_limit {
+        if protected_tokens >= compaction_limit {
             return Err(ContextError::CompactionImpossible {
                 planned: protected_tokens,
-                limit: self.budget_limit,
+                limit: compaction_limit,
             });
         }
 
-        let hard_available = self.budget_limit.saturating_sub(protected_tokens);
+        let hard_available = compaction_limit.saturating_sub(protected_tokens);
         let target_limit = self
-            .budget_limit
-            .saturating_mul(self.target_percent)
+            .target_percent
+            .saturating_mul(compaction_limit)
             .saturating_div(100)
             .max(protected_tokens.saturating_add(hard_available.min(128)))
-            .min(self.budget_limit);
+            .min(compaction_limit);
         let target_available = target_limit.saturating_sub(protected_tokens);
         let summary_reserve = target_available.saturating_div(4).clamp(32, 1_024);
         let tail_budget = target_available.saturating_sub(summary_reserve);
@@ -166,21 +201,22 @@ impl ContextWindowManager {
         let dropped_end = tail.len().saturating_sub(retained.len());
         let dropped = &tail[..dropped_end];
         let dropped_message_count = dropped.len();
-        let summary = summarize_messages(dropped, summary_reserve);
+        let mut summary_message = ProviderMessage {
+            role: ProviderRole::User,
+            content: COMPACTION_SUMMARY_PREFIX.to_owned(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        };
+        let summary_overhead = estimate_message_tokens(std::slice::from_ref(&summary_message));
+        let summary = summarize_messages(dropped, summary_reserve.saturating_sub(summary_overhead));
         let normalized_sources = normalized_message_sources(messages, message_sources);
         let mut replacement_messages = protected;
         let mut replacement_sources = normalized_sources[..protected_prefix_len].to_vec();
         if !summary.is_empty() {
-            replacement_messages.push(ProviderMessage {
-                role: ProviderRole::User,
-                content: format!(
-                    "Runtime context compaction summary. Treat this as historical context, not a new instruction:\n{summary}"
-                ),
-                tool_call_id: None,
-                tool_name: None,
-                tool_calls: Vec::new(),
-                metadata: Default::default(),
-            });
+            summary_message.content.push_str(&summary);
+            replacement_messages.push(summary_message);
             let mut source_refs = normalized_sources
                 [protected_prefix_len..protected_prefix_len + dropped_end]
                 .iter()
@@ -231,10 +267,10 @@ impl ContextWindowManager {
 
         let replacement_estimated_tokens =
             estimate_message_tokens(&replacement_messages).saturating_add(planned_tool_tokens);
-        if replacement_estimated_tokens > self.budget_limit {
+        if replacement_estimated_tokens > compaction_limit {
             return Err(ContextError::CompactionImpossible {
                 planned: replacement_estimated_tokens,
-                limit: self.budget_limit,
+                limit: compaction_limit,
             });
         }
         let checksum =
@@ -242,7 +278,12 @@ impl ContextWindowManager {
         Ok(Some(ContextCompactionRecord {
             turn_id,
             mode: "automatic".to_owned(),
-            strategy: "protected_prefix_summary_tail".to_owned(),
+            strategy: if compaction_limit < self.budget_limit {
+                "active_working_set_summary_tail"
+            } else {
+                "protected_prefix_summary_tail"
+            }
+            .to_owned(),
             original_message_count: messages.len(),
             replacement_message_count: replacement_messages.len(),
             dropped_message_count,
@@ -250,6 +291,8 @@ impl ContextWindowManager {
             original_estimated_tokens,
             replacement_estimated_tokens,
             planned_tool_tokens,
+            compaction_limit,
+            target_input_tokens: target_limit,
             budget_limit: self.budget_limit,
             summary,
             checksum,
@@ -1003,7 +1046,7 @@ fn summarize_messages(messages: &[ProviderMessage], token_budget: u64) -> String
     }
     let mut lines = Vec::new();
     let mut used = 0_u64;
-    for message in messages {
+    for message in messages.iter().rev() {
         let role = match message.role {
             ProviderRole::System => "system",
             ProviderRole::User => "user",
@@ -1021,18 +1064,24 @@ fn summarize_messages(messages: &[ProviderMessage], token_budget: u64) -> String
         } else {
             format!(" tools={tool_names}")
         };
-        let remaining = token_budget.saturating_sub(used).max(1);
+        let remaining = token_budget.saturating_sub(used);
+        let prefix = format!("[{role}{suffix}] ");
+        let prefix_tokens = estimate_tokens(&prefix);
+        if remaining <= prefix_tokens {
+            break;
+        }
         let line = format!(
-            "[{role}{suffix}] {}",
-            compact_text(&message.content, remaining)
+            "{prefix}{}",
+            compact_text(&message.content, remaining.saturating_sub(prefix_tokens))
         );
         let line_tokens = estimate_tokens(&line);
-        if used.saturating_add(line_tokens) > token_budget && !lines.is_empty() {
+        if line_tokens > remaining {
             break;
         }
         used = used.saturating_add(line_tokens);
         lines.push(line);
     }
+    lines.reverse();
     lines.join("\n")
 }
 
@@ -1122,6 +1171,7 @@ mod tests {
 
         assert_eq!(record.replacement_messages[0], messages[0]);
         assert!(record.dropped_message_count > 0);
+        assert!(record.replacement_estimated_tokens <= record.target_input_tokens);
         assert!(record.replacement_estimated_tokens <= record.budget_limit);
         let latest_assistant = record
             .replacement_messages
@@ -1177,6 +1227,83 @@ mod tests {
                         && message.origin == source.origin
                 })
         );
+    }
+
+    #[test]
+    fn active_working_set_compacts_before_the_provider_hard_limit() {
+        let turn_id = TurnId::new();
+        let mut messages = vec![ProviderMessage {
+            role: ProviderRole::System,
+            content: "protected runtime instructions".to_owned(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        }];
+        for round in 0..40 {
+            messages.push(ProviderMessage {
+                role: ProviderRole::Assistant,
+                content: String::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: vec![ProviderToolCall {
+                    tool_call_id: format!("call-{round}"),
+                    tool_name: "shell".to_owned(),
+                    arguments: serde_json::json!({"command": format!("inspect-{round}")}),
+                }],
+                metadata: Default::default(),
+            });
+            messages.push(ProviderMessage {
+                role: ProviderRole::Tool,
+                content: "observed tool output ".repeat(120),
+                tool_call_id: Some(format!("call-{round}")),
+                tool_name: Some("shell".to_owned()),
+                tool_calls: Vec::new(),
+                metadata: Default::default(),
+            });
+        }
+
+        let manager = ContextWindowManager::new(96_000);
+        let original_tokens = estimate_message_tokens(&messages);
+        assert!(original_tokens > DEFAULT_ACTIVE_CONTEXT_LIMIT);
+        assert!(original_tokens < 96_000);
+        assert_eq!(
+            manager.required_compaction_limit(1, &messages, 0),
+            Some(DEFAULT_ACTIVE_CONTEXT_LIMIT)
+        );
+
+        let record = manager
+            .compact_if_needed(turn_id, 1, &messages, &[], 0)
+            .expect("working-set compaction")
+            .expect("working set exceeded");
+
+        assert_eq!(record.budget_limit, 96_000);
+        assert_eq!(record.compaction_limit, DEFAULT_ACTIVE_CONTEXT_LIMIT);
+        assert_eq!(record.strategy, "active_working_set_summary_tail");
+        assert!(record.replacement_estimated_tokens <= record.target_input_tokens);
+        assert!(record.replacement_estimated_tokens < original_tokens);
+    }
+
+    #[test]
+    fn compaction_summary_prefers_the_most_recent_dropped_context() {
+        let message = |content: &str| ProviderMessage {
+            role: ProviderRole::Tool,
+            content: content.repeat(20),
+            tool_call_id: None,
+            tool_name: Some("shell".to_owned()),
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        };
+        let summary = summarize_messages(
+            &[
+                message("oldest-observation "),
+                message("newest-observation "),
+            ],
+            24,
+        );
+
+        assert!(summary.contains("newest-observation"));
+        assert!(!summary.contains("oldest-observation"));
     }
 
     #[test]

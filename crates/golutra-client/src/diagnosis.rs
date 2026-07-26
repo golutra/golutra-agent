@@ -912,6 +912,63 @@ fn classify_failure(
             85,
         );
     }
+    if let Some(path_check) = failed_verification_check(trigger, "objective:path:delivery") {
+        let message = path_check
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("requested delivery path did not match");
+        let expected_path = quoted_value(message).unwrap_or_default();
+        let malformed_expectation = expected_path.contains("</")
+            || expected_path.contains("${")
+            || expected_path.contains("class=")
+            || expected_path.contains("><");
+        let placeholder_mismatch = valid_placeholder_path(&expected_path)
+            && changed_paths_before(events, trigger_index)
+                .iter()
+                .any(|path| path_pattern_matches(path, &expected_path));
+        if malformed_expectation || placeholder_mismatch {
+            let (code, summary, counterfactual) = if malformed_expectation {
+                (
+                    "delivery_path_extraction_false_positive",
+                    format!("delivery-path extraction treated code or markup as a path: {message}"),
+                    "restrict delivery-path extraction to explicit output clauses and ignore embedded code, markup, URLs, and input paths",
+                )
+            } else {
+                (
+                    "delivery_path_placeholder_mismatch",
+                    format!(
+                        "delivery-path verification rejected a concrete placeholder match: {message}"
+                    ),
+                    "match valid path placeholders against concrete workspace paths while preserving path-component boundaries",
+                )
+            };
+            return (
+                FailureTaxonomy {
+                    domain: FailureDomain::Verification,
+                    code: code.to_owned(),
+                },
+                summary,
+                "explicit delivery paths are extracted and matched without false positives or placeholder false negatives"
+                    .to_owned(),
+                message.to_owned(),
+                counterfactual.to_owned(),
+                vec![CodeTargetRef {
+                    crate_name: "golutra-runtime".to_owned(),
+                    module_path: "objective_evidence".to_owned(),
+                    symbol: Some("evaluate_delivery_paths".to_owned()),
+                    source_path: Some(
+                        "crates/golutra-runtime/src/objective_evidence.rs".to_owned(),
+                    ),
+                    source_digest,
+                    owner: "runtime".to_owned(),
+                }],
+                vec![
+                    "cargo test -p golutra-runtime objective_evidence::tests".to_owned(),
+                ],
+                97,
+            );
+        }
+    }
     (
         FailureTaxonomy {
             domain: FailureDomain::Verification,
@@ -927,16 +984,120 @@ fn classify_failure(
             .to_owned(),
         "rerun the recorded fixture with the candidate verifier and runtime".to_owned(),
         vec![CodeTargetRef {
-            crate_name: "golutra-verify".to_owned(),
-            module_path: "verification".to_owned(),
-            symbol: Some("RuntimeVerificationService".to_owned()),
-            source_path: Some("crates/golutra-verify/src/lib.rs".to_owned()),
+            crate_name: "workspace".to_owned(),
+            module_path: "task-output".to_owned(),
+            symbol: None,
+            source_path: None,
             source_digest,
-            owner: "verification".to_owned(),
+            owner: "task-workspace".to_owned(),
         }],
-        vec!["cargo test -p golutra-verify".to_owned()],
+        vec!["rerun the recorded task fixture and its objective verifier".to_owned()],
         75,
     )
+}
+
+fn failed_verification_check<'a>(trigger: &'a RuntimeEvent, name: &str) -> Option<&'a Value> {
+    trigger
+        .payload
+        .pointer("/record/checks")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|check| {
+            check.get("name").and_then(Value::as_str) == Some(name)
+                && !check
+                    .get("passed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        })
+}
+
+fn quoted_value(message: &str) -> Option<String> {
+    let start = message.find('`')?.saturating_add(1);
+    let end = message[start..].find('`')?.saturating_add(start);
+    (end > start).then(|| message[start..end].to_owned())
+}
+
+fn changed_paths_before(events: &[RuntimeEvent], trigger_index: usize) -> Vec<String> {
+    events[..trigger_index]
+        .iter()
+        .filter(|event| event.event_type == RuntimeEventType::ToolCompleted)
+        .flat_map(|event| {
+            event
+                .payload
+                .get("changed_files")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .collect()
+}
+
+fn valid_placeholder_path(path: &str) -> bool {
+    let Some(start) = path.find('<') else {
+        return false;
+    };
+    let Some(end) = path[start.saturating_add(1)..].find('>') else {
+        return false;
+    };
+    let placeholder = &path[start.saturating_add(1)..start.saturating_add(1 + end)];
+    !placeholder.is_empty()
+        && placeholder
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+}
+
+fn path_pattern_matches(observed: &str, expected: &str) -> bool {
+    let observed = observed.replace('\\', "/");
+    let expected = expected.replace('\\', "/");
+    let observed_parts = observed
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let expected_parts = expected
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let minimum_parts = usize::from(expected_parts.len() > 1).saturating_add(1);
+    (0..expected_parts.len())
+        .filter(|start| expected_parts.len().saturating_sub(*start) >= minimum_parts)
+        .any(|expected_start| {
+            let pattern = expected_parts[expected_start..].join("/");
+            (0..observed_parts.len()).any(|observed_start| {
+                placeholder_pattern_matches(&observed_parts[observed_start..].join("/"), &pattern)
+            })
+        })
+}
+
+fn placeholder_pattern_matches(observed: &str, pattern: &str) -> bool {
+    let Some(start) = pattern.find('<') else {
+        return observed == pattern;
+    };
+    let Some(relative_end) = pattern[start.saturating_add(1)..].find('>') else {
+        return false;
+    };
+    let end = start.saturating_add(1 + relative_end);
+    let placeholder = &pattern[start.saturating_add(1)..end];
+    if placeholder.is_empty()
+        || !placeholder
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+        || !observed.starts_with(&pattern[..start])
+    {
+        return false;
+    }
+    let remaining = &observed[start..];
+    let suffix_pattern = &pattern[end.saturating_add(1)..];
+    for (split, character) in remaining.char_indices().skip(1) {
+        if placeholder_pattern_matches(&remaining[split..], suffix_pattern) {
+            return true;
+        }
+        if character == '/' {
+            break;
+        }
+    }
+    !remaining.is_empty() && !remaining.contains('/') && suffix_pattern.is_empty()
 }
 
 fn normalized_code(value: &str) -> String {
@@ -1544,6 +1705,93 @@ mod tests {
 
         assert_eq!(episodes.len(), 1);
         assert_eq!(episodes[0].status, FailureEpisodeStatus::Active);
+    }
+
+    #[test]
+    fn malformed_delivery_path_failure_targets_the_extractor() {
+        let task_id = TaskId::new();
+        let verification = event(
+            1,
+            task_id,
+            RuntimeEventType::VerificationCompleted,
+            json!({
+                "summary": "verification failed",
+                "record": {
+                    "result": "fail",
+                    "checks": [{
+                        "name": "objective:path:delivery",
+                        "passed": false,
+                        "message": "no changed file matches requested `class=\"book-price\">${price}</span>`"
+                    }]
+                }
+            }),
+        );
+
+        let analysis = diagnose_task(task_id, &[verification], None).expect("diagnosis");
+
+        assert_eq!(
+            analysis.diagnosis.taxonomy.code,
+            "delivery_path_extraction_false_positive"
+        );
+        assert_eq!(
+            analysis.diagnosis.code_targets[0].source_path.as_deref(),
+            Some("crates/golutra-runtime/src/objective_evidence.rs")
+        );
+        assert_eq!(analysis.candidate.target_type, "runtime_code");
+    }
+
+    #[test]
+    fn concrete_placeholder_delivery_targets_the_matcher() {
+        let task_id = TaskId::new();
+        let changed = event(
+            1,
+            task_id,
+            RuntimeEventType::ToolCompleted,
+            json!({
+                "changed_files": ["output/1.txt"],
+                "envelope": {"tool_name": "write_file", "status": "ok"}
+            }),
+        );
+        let verification = event(
+            2,
+            task_id,
+            RuntimeEventType::VerificationCompleted,
+            json!({
+                "summary": "verification failed",
+                "record": {
+                    "result": "fail",
+                    "checks": [{
+                        "name": "objective:path:delivery",
+                        "passed": false,
+                        "message": "no changed file matches requested `/app/output/<maze_id>.txt`"
+                    }]
+                }
+            }),
+        );
+
+        let analysis = diagnose_task(task_id, &[changed, verification], None).expect("diagnosis");
+
+        assert_eq!(
+            analysis.diagnosis.taxonomy.code,
+            "delivery_path_placeholder_mismatch"
+        );
+        assert_eq!(analysis.candidate.target_type, "runtime_code");
+    }
+
+    #[test]
+    fn ordinary_objective_failure_targets_task_workspace_not_runtime() {
+        let task_id = TaskId::new();
+        let verification = event(
+            1,
+            task_id,
+            RuntimeEventType::VerificationCompleted,
+            json!({"summary": "verification failed", "record": {"result": "fail"}}),
+        );
+
+        let analysis = diagnose_task(task_id, &[verification], None).expect("diagnosis");
+
+        assert_eq!(analysis.diagnosis.code_targets[0].owner, "task-workspace");
+        assert_eq!(analysis.candidate.target_type, "workspace_code");
     }
 
     #[test]

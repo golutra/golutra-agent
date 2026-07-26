@@ -44,6 +44,7 @@ const MAX_VERIFIER_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 
 mod process;
 mod process_supervisor;
+mod text_search;
 mod workspace_scan;
 
 pub(crate) use process::{
@@ -215,6 +216,7 @@ pub struct BasicToolExecutor {
     policy: WorkspacePolicy,
     registry: ToolRegistry,
     sandbox: SystemSandbox,
+    allow_network: bool,
     external_backend: Option<Arc<dyn ExternalToolBackend>>,
     replay_backend: Option<Arc<dyn ToolReplayBackend>>,
     process_supervisor: ProcessSupervisor,
@@ -227,6 +229,7 @@ impl BasicToolExecutor {
             policy,
             registry: ToolRegistry::p0_default(),
             sandbox: SystemSandbox::detect(),
+            allow_network: false,
             external_backend: None,
             replay_backend: None,
             process_supervisor: ProcessSupervisor::new(),
@@ -236,6 +239,14 @@ impl BasicToolExecutor {
     #[must_use]
     pub fn with_sandbox(mut self, sandbox: SystemSandbox) -> Self {
         self.sandbox = sandbox;
+        self
+    }
+
+    /// Enable network access for child tools only when the enclosing runtime
+    /// explicitly granted that capability. The default remains isolated.
+    #[must_use]
+    pub fn with_network_access(mut self, allow_network: bool) -> Self {
+        self.allow_network = allow_network;
         self
     }
 
@@ -331,6 +342,7 @@ impl BasicToolExecutor {
                 cancellation,
                 sandbox: &self.sandbox,
                 workspace_access: WorkspaceAccess::ReadWrite,
+                allow_network: false,
             },
             None,
         )
@@ -394,6 +406,9 @@ impl BasicToolExecutor {
                 "timed_out": output.timed_out,
                 "cancelled": output.cancelled,
                 "output_truncated": output.output_truncated || output.raw_output.len() > retained_limit,
+                "sandbox_backend": output.sandbox_backend,
+                "sandbox_os_enforced": output.sandbox_os_enforced,
+                "network_access": output.network_access,
             }),
             raw_output,
             Vec::new(),
@@ -1018,6 +1033,7 @@ impl BasicToolExecutor {
         let mut process_progress = |process: ProcessProgress| {
             emit_process_progress(progress, tool_call_id, &tool_name, started_at, process);
         };
+        let fallback_cancellation = cancellation.clone();
         let output = run_process_with_progress(
             ProcessExecutionRequest {
                 program: "rg",
@@ -1034,10 +1050,27 @@ impl BasicToolExecutor {
                 cancellation,
                 sandbox: &self.sandbox,
                 workspace_access: WorkspaceAccess::ReadOnly,
+                allow_network: false,
             },
             Some(&mut process_progress),
         )
-        .await?;
+        .await;
+        let output = match output {
+            Ok(output) => output,
+            Err(error) if error.to_string().contains("No such file or directory") => {
+                return self
+                    .native_rg_search(
+                        request,
+                        policy,
+                        pattern,
+                        resolved_path,
+                        fallback_cancellation,
+                        started_at,
+                    )
+                    .await;
+            }
+            Err(error) => return Err(error),
+        };
         let redacted_pattern = redact_sensitive_text(&pattern).0;
         let status = if output.cancelled {
             ToolResultStatus::Cancelled
@@ -1067,6 +1100,7 @@ impl BasicToolExecutor {
                     "cancelled": output.cancelled,
                     "sandbox_backend": output.sandbox_backend,
                     "sandbox_os_enforced": output.sandbox_os_enforced,
+                    "network_access": output.network_access,
                 }),
                 output.raw_output,
                 Vec::new(),
@@ -1074,6 +1108,81 @@ impl BasicToolExecutor {
             ),
             metrics,
         ))
+    }
+
+    async fn native_rg_search(
+        &self,
+        request: ToolRequest,
+        policy: PolicyEvaluation,
+        pattern: String,
+        resolved_path: PathBuf,
+        cancellation: CancellationToken,
+        started_at: Instant,
+    ) -> Result<ToolExecutionReport, ToolError> {
+        let workspace_root = self.policy.workspace_root().to_path_buf();
+        let root_for_search = resolved_path.clone();
+        let pattern_for_search = pattern.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            text_search::search(
+                &pattern_for_search,
+                root_for_search,
+                workspace_root,
+                DEFAULT_TIMEOUT_MS,
+                cancellation,
+            )
+        })
+        .await
+        .map_err(|error| ToolError::Execution(format!("native search task failed: {error}")))?
+        .map_err(ToolError::Execution)?;
+        let redacted_pattern = redact_sensitive_text(&pattern).0;
+        let status = if result.cancelled {
+            ToolResultStatus::Cancelled
+        } else if result.timed_out {
+            ToolResultStatus::Timeout
+        } else {
+            ToolResultStatus::Ok
+        };
+        let mut report = report(
+            request,
+            status,
+            "rg search completed with native workspace fallback",
+            json!({
+                "path": resolved_path,
+                "pattern": redacted_pattern,
+                "exit_code": if result.matches > 0 { 0 } else { 1 },
+                "matches": result.matches,
+                "scanned_files": result.scanned_files,
+                "output_bytes": result.output_bytes,
+                "output_lines": result.matches,
+                "output_truncated": result.output_truncated,
+                "scan_truncated": result.scan_truncated,
+                "timed_out": result.timed_out,
+                "cancelled": result.cancelled,
+                "native_fallback": true,
+                    "sandbox_backend": self.sandbox.backend(),
+                    "sandbox_os_enforced": self.sandbox.os_enforced(),
+                    "network_access": false,
+            }),
+            result.output,
+            Vec::new(),
+            policy,
+        );
+        report.metrics = ToolExecutionMetrics {
+            duration_ms: started_at
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            output_bytes: result.output_bytes,
+            output_lines: result.matches,
+            output_truncated: result.output_truncated,
+            exit_code: Some(if result.matches > 0 { 0 } else { 1 }),
+            match_count: Some(result.matches),
+            ..ToolExecutionMetrics::default()
+        };
+        report.envelope.verification_hint =
+            Some("native bounded workspace search evidence".to_owned());
+        Ok(report)
     }
 
     async fn symbol_search(
@@ -1208,6 +1317,7 @@ impl BasicToolExecutor {
                     cancellation,
                     sandbox: &self.sandbox,
                     workspace_access: WorkspaceAccess::ReadWrite,
+                    allow_network: self.allow_network,
                     workspace_before,
                 })
                 .await?;
@@ -1229,6 +1339,7 @@ impl BasicToolExecutor {
                     cancellation,
                     sandbox: &self.sandbox,
                     workspace_access: WorkspaceAccess::ReadWrite,
+                    allow_network: self.allow_network,
                 },
                 Some(&mut process_progress),
             )
@@ -1264,6 +1375,7 @@ impl BasicToolExecutor {
                     "workspace_change_count": workspace_changes.changed_files.len(),
                     "sandbox_backend": shell_output.sandbox_backend,
                     "sandbox_os_enforced": shell_output.sandbox_os_enforced,
+                    "network_access": shell_output.network_access,
                 }),
                 shell_output.raw_output,
                 workspace_changes.changed_files.clone(),
@@ -1513,7 +1625,8 @@ fn contract(tool_name: &str, side_effect_type: SideEffectType) -> ToolContract {
                 "command": {
                     "type": "string",
                     "minLength": 1,
-                    "maxLength": MAX_SHELL_COMMAND_CHARS
+                    "maxLength": MAX_SHELL_COMMAND_CHARS,
+                    "description": "A single argv command parsed without a shell. Unquoted operators such as |, >, &&, and ; are rejected. For a pipeline, redirection, or compound script, invoke bash -lc and pass the entire script as one quoted argument."
                 },
                 "timeout_ms": {
                     "type": "integer",
@@ -1942,8 +2055,9 @@ fn supervised_process_report(
             } else {
                 0
             },
-            "sandbox_backend": snapshot.sandbox_backend,
-            "sandbox_os_enforced": snapshot.sandbox_os_enforced,
+                    "sandbox_backend": snapshot.sandbox_backend,
+                    "sandbox_os_enforced": snapshot.sandbox_os_enforced,
+                    "network_access": snapshot.network_access,
         }),
         snapshot.output,
         if workspace_changes_known {

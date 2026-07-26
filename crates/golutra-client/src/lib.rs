@@ -80,6 +80,30 @@ const POST_TASK_JOB_LEASE_MINUTES: i64 = 5;
 const POST_TASK_JOB_POLL_MILLIS: u64 = 250;
 const POST_TASK_JOB_IDLE_POLL_MILLIS: u64 = 1_000;
 
+/// Capabilities granted by the process that owns an embedded runtime.
+///
+/// A turn can request a capability, but it can never grant itself a capability
+/// that the host did not enable. Keeping this separate from turn payloads also
+/// makes daemon and remote transports explicit about their ownership boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuntimeExecutionOptions {
+    pub allow_network: bool,
+}
+
+impl RuntimeExecutionOptions {
+    #[must_use]
+    pub const fn isolated() -> Self {
+        Self {
+            allow_network: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_network_access(allow_network: bool) -> Self {
+        Self { allow_network }
+    }
+}
+
 #[must_use]
 pub fn app_server_attachment_actor_id(attachment_id: &str) -> String {
     format!("{APP_SERVER_ATTACHMENT_ACTOR_PREFIX}{attachment_id}")
@@ -314,6 +338,7 @@ pub struct RuntimeHost {
     workspace_change_tracker: Mutex<change_tracker::WorkspaceChangeTracker>,
     deep_evaluation_inputs: Mutex<HashMap<PostTaskJobId, TaskEvaluationInput>>,
     force_mock_provider: bool,
+    execution_options: RuntimeExecutionOptions,
     _temporary_root: Option<Arc<tempfile::TempDir>>,
 }
 
@@ -411,6 +436,12 @@ impl BeforeSideEffectRecorder for HostedCheckpointRecorder {
 
 impl RuntimeHost {
     pub async fn in_memory() -> Result<Arc<Self>, ClientError> {
+        Self::in_memory_with_options(RuntimeExecutionOptions::isolated()).await
+    }
+
+    pub async fn in_memory_with_options(
+        execution_options: RuntimeExecutionOptions,
+    ) -> Result<Arc<Self>, ClientError> {
         let store = RuntimeStore::in_memory().await?;
         let default_session_id = SessionId::new();
         let default_thread_id = ThreadId::new();
@@ -422,6 +453,7 @@ impl RuntimeHost {
             default_session_id,
             default_thread_id,
             false,
+            execution_options,
         )
         .await
     }
@@ -430,6 +462,13 @@ impl RuntimeHost {
     /// state is kept below a process-owned temporary root, while provider
     /// credentials still come from the user's global configuration.
     pub async fn ephemeral_for_cwd(cwd: impl AsRef<Path>) -> Result<Arc<Self>, ClientError> {
+        Self::ephemeral_for_cwd_with_options(cwd, RuntimeExecutionOptions::isolated()).await
+    }
+
+    pub async fn ephemeral_for_cwd_with_options(
+        cwd: impl AsRef<Path>,
+        execution_options: RuntimeExecutionOptions,
+    ) -> Result<Arc<Self>, ClientError> {
         let storage = RuntimeHostStorage::ephemeral(cwd)?;
         let cwd = storage
             .runtime_paths
@@ -446,6 +485,7 @@ impl RuntimeHost {
             SessionId::new(),
             ThreadId::new(),
             false,
+            execution_options,
         )
         .await
     }
@@ -457,6 +497,19 @@ impl RuntimeHost {
     pub async fn ephemeral_persistent_for_cwd(
         cwd: impl AsRef<Path>,
         state_home: impl AsRef<Path>,
+    ) -> Result<Arc<Self>, ClientError> {
+        Self::ephemeral_persistent_for_cwd_with_options(
+            cwd,
+            state_home,
+            RuntimeExecutionOptions::isolated(),
+        )
+        .await
+    }
+
+    pub async fn ephemeral_persistent_for_cwd_with_options(
+        cwd: impl AsRef<Path>,
+        state_home: impl AsRef<Path>,
+        execution_options: RuntimeExecutionOptions,
     ) -> Result<Arc<Self>, ClientError> {
         let paths = RuntimePaths::for_ephemeral_state_dir(state_home, cwd)?;
         let store = RuntimeStore::connect_with_artifact_root(
@@ -474,13 +527,14 @@ impl RuntimeHost {
             SessionId::new(),
             ThreadId::new(),
             false,
+            execution_options,
         )
         .await
     }
 
-    /// Reopen a completed owner-only run bundle for appending evaluator
-    /// overlays. The recorded cwd may belong to a deleted container and is
-    /// therefore used as an identity boundary without filesystem access.
+    /// Reopen a completed or checkpointed owner-only run bundle for appending
+    /// evaluator overlays. The recorded cwd may belong to a deleted container
+    /// and is therefore used as an identity boundary without filesystem access.
     pub async fn open_persisted_run(run_root: impl AsRef<Path>) -> Result<Arc<Self>, ClientError> {
         let run_root = run_root.as_ref();
         let manifest_path = run_root.join("manifest.json");
@@ -497,7 +551,7 @@ impl RuntimeHost {
         let manifest_bytes = fs::read(&manifest_path)
             .map_err(|error| ClientError::Io(format!("{}: {error}", manifest_path.display())))?;
         let manifest: RunBundleManifest = serde_json::from_slice(&manifest_bytes)?;
-        if manifest.format != "golutra-run-bundle" || manifest.format_version != 1 {
+        if manifest.format != "golutra-run-bundle" || !matches!(manifest.format_version, 1 | 2) {
             return Err(ClientError::TaskExecution(
                 "persisted run manifest format is unsupported".to_owned(),
             ));
@@ -533,24 +587,43 @@ impl RuntimeHost {
             latest_thread.session_id,
             latest_thread.thread_id,
             false,
+            RuntimeExecutionOptions::isolated(),
         )
         .await
     }
 
     pub async fn for_cwd(cwd: impl AsRef<Path>) -> Result<Arc<Self>, ClientError> {
+        Self::for_cwd_with_options(cwd, RuntimeExecutionOptions::isolated()).await
+    }
+
+    pub async fn for_cwd_with_options(
+        cwd: impl AsRef<Path>,
+        execution_options: RuntimeExecutionOptions,
+    ) -> Result<Arc<Self>, ClientError> {
         let paths = RuntimePaths::for_cwd(cwd)?;
-        Self::from_runtime_paths(paths).await
+        Self::from_runtime_paths(paths, execution_options).await
     }
 
     pub async fn from_home_and_cwd(
         home: impl AsRef<Path>,
         cwd: impl AsRef<Path>,
     ) -> Result<Arc<Self>, ClientError> {
-        let paths = RuntimePaths::from_home_and_cwd(home, cwd)?;
-        Self::from_runtime_paths(paths).await
+        Self::from_home_and_cwd_with_options(home, cwd, RuntimeExecutionOptions::isolated()).await
     }
 
-    async fn from_runtime_paths(paths: RuntimePaths) -> Result<Arc<Self>, ClientError> {
+    pub async fn from_home_and_cwd_with_options(
+        home: impl AsRef<Path>,
+        cwd: impl AsRef<Path>,
+        execution_options: RuntimeExecutionOptions,
+    ) -> Result<Arc<Self>, ClientError> {
+        let paths = RuntimePaths::from_home_and_cwd(home, cwd)?;
+        Self::from_runtime_paths(paths, execution_options).await
+    }
+
+    async fn from_runtime_paths(
+        paths: RuntimePaths,
+        execution_options: RuntimeExecutionOptions,
+    ) -> Result<Arc<Self>, ClientError> {
         let store = RuntimeStore::connect_with_artifact_root(
             &paths.sqlite_url(),
             paths.artifacts_dir.clone(),
@@ -572,6 +645,7 @@ impl RuntimeHost {
             default_session_id,
             default_thread_id,
             false,
+            execution_options,
         )
         .await?;
         host.synchronize_workspace_rollouts().await?;
@@ -588,6 +662,7 @@ impl RuntimeHost {
         default_session_id: SessionId,
         default_thread_id: ThreadId,
         force_mock_provider: bool,
+        execution_options: RuntimeExecutionOptions,
     ) -> Result<Arc<Self>, ClientError> {
         let RuntimeHostStorage {
             runtime_paths,
@@ -655,6 +730,7 @@ impl RuntimeHost {
             workspace_change_tracker: Mutex::new(change_tracker::WorkspaceChangeTracker::default()),
             deep_evaluation_inputs: Mutex::new(HashMap::new()),
             force_mock_provider,
+            execution_options,
             _temporary_root: temporary_root,
         });
         host.repositories
@@ -683,6 +759,32 @@ impl RuntimeHost {
     #[must_use]
     pub fn workspace_id(&self) -> WorkspaceId {
         self.workspace_id
+    }
+
+    #[must_use]
+    pub fn execution_options(&self) -> RuntimeExecutionOptions {
+        self.execution_options
+    }
+
+    pub(crate) fn network_access_enabled(&self, requested: bool) -> bool {
+        requested && self.execution_options.allow_network
+    }
+
+    pub(crate) fn execution_capabilities(&self, requested_network: bool) -> Value {
+        let enabled = self.network_access_enabled(requested_network);
+        json!({
+            "network": {
+                "requested": requested_network,
+                "enabled": enabled,
+                "reason": if enabled {
+                    "enabled"
+                } else if requested_network {
+                    "runtime capability not enabled"
+                } else {
+                    "not requested"
+                }
+            }
+        })
     }
 
     fn capture_run_provenance(&self, task_id: TaskId) -> RunProvenance {

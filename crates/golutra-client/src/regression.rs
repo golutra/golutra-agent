@@ -868,6 +868,7 @@ impl RuntimeHost {
             session_id,
             ThreadId::new(),
             true,
+            RuntimeExecutionOptions::isolated(),
         )
         .await
     }

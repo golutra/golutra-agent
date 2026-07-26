@@ -712,9 +712,11 @@ impl RuntimeHost {
         &self,
         policy: WorkspacePolicy,
         workspace_root: PathBuf,
+        requested_network: bool,
     ) -> Result<BasicToolExecutor, ClientError> {
-        let executor =
-            BasicToolExecutor::new(policy).with_process_supervisor(self.process_supervisor.clone());
+        let executor = BasicToolExecutor::new(policy)
+            .with_network_access(self.network_access_enabled(requested_network))
+            .with_process_supervisor(self.process_supervisor.clone());
         let Some(paths) = self
             .runtime_paths
             .as_ref()

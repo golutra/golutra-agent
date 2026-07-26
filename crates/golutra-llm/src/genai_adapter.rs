@@ -748,7 +748,9 @@ fn tool_description(tool_name: &str) -> &'static str {
         "edit_file" => "Replace the first exact text match in a workspace-relative file.",
         "list_dir" => "List entries in a workspace-relative directory.",
         "rg_search" => "Search workspace files with ripgrep.",
-        "shell" => "Run a simple command without shell metacharacters in the workspace.",
+        "shell" => {
+            "Run a workspace command as argv; for pipes, redirection, or compound scripts, explicitly invoke bash -lc with the complete script as one argument."
+        }
         _ => "Golutra workspace tool.",
     }
 }

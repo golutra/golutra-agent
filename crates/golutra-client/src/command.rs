@@ -517,6 +517,12 @@ impl RuntimeHost {
         drop(lane_manager);
         let mut task_created =
             with_command_payload(transition.event, command.command_id, payload.clone());
+        let requested_network = payload
+            .get("allow_network")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        task_created.payload["execution_capabilities"] =
+            self.execution_capabilities(requested_network);
         task_created.payload["run_provenance"] =
             serde_json::to_value(self.capture_run_provenance(task_id))?;
         if let Err(error) = self.record_event(task_created).await {
