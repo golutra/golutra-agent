@@ -15,7 +15,7 @@ use golutra_core::{
     CorrectionEnvelope, LoopAction, LoopDecision, PolicyDecision, SessionId, SideEffectType,
     TaskContract, TaskId, ToolContract, ToolProgress, ToolProgressPhase, ToolResultStatus, TurnId,
     TurnState, VerificationCheck, VerificationCheckKind, VerificationPlan, VerificationRecord,
-    VerificationResult, WorkspaceChangeRequirement,
+    VerificationResult, WorkspaceChangeRequirement, infer_legacy_write_content,
 };
 use golutra_governor::{
     GoalLedger, GovernorAction, GovernorObservation, GovernorPhase, RuntimeGovernor,
@@ -2305,33 +2305,7 @@ fn estimate_tool_contract_tokens(tools: &[ToolContract]) -> u64 {
 }
 
 fn objective_content_hint(objective: &str) -> Option<String> {
-    let lower = objective.to_ascii_lowercase();
-    let english_markers = [" with content ", " content is "];
-    let english = english_markers.iter().find_map(|marker| {
-        lower
-            .find(marker)
-            .map(|start| &objective[start.saturating_add(marker.len())..])
-    });
-    let chinese_markers = ["内容为", "内容是", "内容：", "内容:"];
-    let chinese = chinese_markers.iter().find_map(|marker| {
-        objective
-            .find(marker)
-            .map(|start| &objective[start.saturating_add(marker.len())..])
-    });
-    english
-        .or(chinese)
-        .map(|value| {
-            value
-                .trim()
-                .trim_matches(|character: char| {
-                    matches!(
-                        character,
-                        '`' | '\'' | '"' | ',' | '.' | ':' | ';' | '，' | '。' | '：'
-                    )
-                })
-                .to_owned()
-        })
-        .filter(|value| !value.is_empty())
+    infer_legacy_write_content(objective)
 }
 
 fn elapsed_millis(started_at: Instant) -> u64 {

@@ -2,6 +2,26 @@
 
 use super::*;
 
+pub(super) fn is_security_policy_violation(evaluation: &PolicyEvaluation) -> bool {
+    match evaluation.decision {
+        PolicyDecision::Deny => true,
+        PolicyDecision::Block => {
+            evaluation.effective_block_disposition() == Some(PolicyBlockDisposition::Terminal)
+        }
+        PolicyDecision::Allow | PolicyDecision::Ask => false,
+    }
+}
+
+fn policy_violation_count(events: &[RuntimeEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| event.event_type == RuntimeEventType::PolicyEvaluated)
+        .filter_map(|event| event.payload.get("record").cloned())
+        .filter_map(|record| serde_json::from_value::<PolicyEvaluation>(record).ok())
+        .filter(is_security_policy_violation)
+        .count()
+}
+
 impl RuntimeHost {
     pub(super) async fn schedule_task_evaluation_best_effort(
         &self,
@@ -65,18 +85,7 @@ impl RuntimeHost {
             .filter_map(|event| event.payload.get("record").cloned())
             .filter_map(|record| serde_json::from_value::<TokenUsageRecord>(record).ok())
             .collect::<Vec<_>>();
-        let policy_violation_count = events
-            .iter()
-            .filter(|event| event.event_type == RuntimeEventType::PolicyEvaluated)
-            .filter_map(|event| event.payload.get("record").cloned())
-            .filter_map(|record| serde_json::from_value::<PolicyEvaluation>(record).ok())
-            .filter(|evaluation| {
-                matches!(
-                    evaluation.decision,
-                    PolicyDecision::Deny | PolicyDecision::Block
-                )
-            })
-            .count();
+        let policy_violation_count = policy_violation_count(&events);
         let provider_config_ref = token_usage.last().map_or_else(
             || "runtime-active-profile".to_owned(),
             |record| format!("{}:{}", record.provider_id, record.model_id),
@@ -299,18 +308,7 @@ impl RuntimeHost {
             .filter_map(|event| event.payload.get("record").cloned())
             .filter_map(|value| serde_json::from_value::<TokenUsageRecord>(value).ok())
             .collect::<Vec<_>>();
-        let policy_violation_count = events
-            .iter()
-            .filter(|event| event.event_type == RuntimeEventType::PolicyEvaluated)
-            .filter_map(|event| event.payload.get("record").cloned())
-            .filter_map(|value| serde_json::from_value::<PolicyEvaluation>(value).ok())
-            .filter(|evaluation| {
-                matches!(
-                    evaluation.decision,
-                    PolicyDecision::Deny | PolicyDecision::Block
-                )
-            })
-            .count();
+        let policy_violation_count = policy_violation_count(&events);
         let tool_events = events
             .iter()
             .filter(|event| event.event_type == RuntimeEventType::ToolCompleted)

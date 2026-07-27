@@ -6,7 +6,10 @@ use golutra_config::{
     ProviderConfigPaths, ProviderRuntimeEnv, load_provider_runtime_env_from_paths,
 };
 use golutra_context::{ContextBudgetPolicy, ContextBuilder};
-use golutra_core::{TaskContract, VerificationRequirement, WorkspaceChangeRequirement};
+use golutra_core::{
+    TaskContract, VerificationRequirement, WorkspaceChangeRequirement, infer_legacy_write_content,
+    infer_legacy_write_path,
+};
 use golutra_llm::{
     ConfiguredProvider, MockProvider, ProviderError, ProviderProtocol, protocol_capabilities,
 };
@@ -123,8 +126,7 @@ pub(crate) fn legacy_task_required_path(payload: &Value, objective: &str) -> Opt
     if !legacy_task_requests_workspace_change(payload, objective) {
         return None;
     }
-    non_empty_string_payload(payload, "path")
-        .or_else(|| parse_mock_write_file_prompt(objective).map(|args| args.path))
+    non_empty_string_payload(payload, "path").or_else(|| infer_legacy_write_path(objective))
 }
 
 /// Apply the compatibility contract once at the command boundary and reuse
@@ -489,53 +491,14 @@ pub(crate) struct MockWriteFileArgs {
 }
 
 pub(crate) fn mock_write_file_args(payload: &Value, objective: &str) -> MockWriteFileArgs {
-    let parsed = parse_mock_write_file_prompt(objective);
     MockWriteFileArgs {
         path: non_empty_string_payload(payload, "path")
-            .or_else(|| parsed.as_ref().map(|parsed| parsed.path.clone()))
+            .or_else(|| infer_legacy_write_path(objective))
             .unwrap_or_else(|| "golutra-agent-output.txt".to_owned()),
         content: non_empty_string_payload(payload, "content")
-            .or_else(|| parsed.map(|parsed| parsed.content))
+            .or_else(|| infer_legacy_write_content(objective))
             .unwrap_or_else(|| "done\n".to_owned()),
     }
-}
-
-fn parse_mock_write_file_prompt(objective: &str) -> Option<MockWriteFileArgs> {
-    let objective = objective.trim();
-    let lower = objective.to_ascii_lowercase();
-    let marker = " with content ";
-    let marker_index = lower.find(marker)?;
-    let (path_part, content_part_with_marker) = objective.split_at(marker_index);
-    let content = clean_mock_prompt_segment(&content_part_with_marker[marker.len()..]);
-    let path = parse_mock_write_path(path_part)?;
-    if content.is_empty() {
-        return None;
-    }
-    Some(MockWriteFileArgs { path, content })
-}
-
-fn parse_mock_write_path(path_part: &str) -> Option<String> {
-    let tokens = path_part.split_whitespace().collect::<Vec<_>>();
-    let command_index = tokens
-        .iter()
-        .position(|token| matches!(token.to_ascii_lowercase().as_str(), "write" | "create"))?;
-    let candidate = match tokens
-        .get(command_index + 1)
-        .map(|token| token.to_ascii_lowercase())
-    {
-        Some(value) if value == "file" => tokens.get(command_index + 2),
-        Some(_) => tokens.get(command_index + 1),
-        None => None,
-    }?;
-    let path = clean_mock_prompt_segment(candidate);
-    if path.is_empty() { None } else { Some(path) }
-}
-
-fn clean_mock_prompt_segment(value: &str) -> String {
-    value
-        .trim()
-        .trim_matches(|character| matches!(character, '"' | '\'' | '`' | ',' | ';' | ':'))
-        .to_owned()
 }
 
 fn resolve_configured_provider(

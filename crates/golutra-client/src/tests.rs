@@ -11,7 +11,7 @@ use golutra_context::{
 };
 use golutra_core::{
     Actor, ActorKind, ArtifactId, ArtifactRecord, CausalRelation, CommandId, EvidenceId,
-    FileChangeKind, FileChangeSummary, PostTaskJob, PostTaskJobId, PostTaskJobKind,
+    FileChangeKind, FileChangeSummary, PolicyId, PostTaskJob, PostTaskJobId, PostTaskJobKind,
     PostTaskJobStatus, QueryId, RedactionStatus, TaskId, TaskStatus, ToolCallId, TraceView,
     TurnChangeSummary, TurnId, VerificationId, VerificationRecord, VerificationResult,
     WorkspaceChangeRequirement, WorkspaceId,
@@ -5131,6 +5131,71 @@ async fn prompt_write_file_natural_language_uses_requested_path_and_content() {
         "ok"
     );
     assert!(!workspace.path().join("golutra-agent-output.txt").exists());
+}
+
+#[tokio::test]
+async fn prompt_named_file_with_quoted_content_is_verified_end_to_end() {
+    let workspace = tempdir().expect("workspace");
+    let _provider = IsolatedGlobalMockProvider::install().await;
+    let transport = EmbeddedTransport::for_cwd(workspace.path())
+        .await
+        .expect("transport");
+    let session_id = transport.default_session_id();
+    let prompt = "Create a file called hello.txt in the current directory. Write \"Hello, world!\" to it. Make sure it ends in a newline. Don't make any other files or folders.";
+
+    let ack = transport
+        .send_command(command(session_id, prompt))
+        .await
+        .expect("command");
+    let state = wait_for_status(&transport, session_id, TaskStatus::Completed).await;
+
+    assert!(ack.accepted);
+    assert_eq!(projection_status(&state), Some(TaskStatus::Completed));
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("hello.txt")).expect("file"),
+        "Hello, world!\n"
+    );
+    assert!(!workspace.path().join("golutra-agent-output.txt").exists());
+}
+
+#[test]
+fn security_policy_violations_exclude_recoverable_tool_contract_rejections() {
+    let evaluation = PolicyEvaluation {
+        policy_ref: PolicyId::new(),
+        subject: "tool".to_owned(),
+        action: "shell".to_owned(),
+        resource: "git status && git diff".to_owned(),
+        decision: PolicyDecision::Block,
+        reason: "submit one argv command".to_owned(),
+        evidence_refs: Vec::new(),
+        block_disposition: Some(PolicyBlockDisposition::Recoverable),
+    };
+
+    assert!(!super::task_governance::is_security_policy_violation(
+        &evaluation
+    ));
+}
+
+#[test]
+fn security_policy_violations_include_terminal_and_legacy_blocks() {
+    let mut evaluation = PolicyEvaluation {
+        policy_ref: PolicyId::new(),
+        subject: "tool".to_owned(),
+        action: "shell".to_owned(),
+        resource: "dangerous command".to_owned(),
+        decision: PolicyDecision::Block,
+        reason: "blocked by policy".to_owned(),
+        evidence_refs: Vec::new(),
+        block_disposition: Some(PolicyBlockDisposition::Terminal),
+    };
+
+    assert!(super::task_governance::is_security_policy_violation(
+        &evaluation
+    ));
+    evaluation.block_disposition = None;
+    assert!(super::task_governance::is_security_policy_violation(
+        &evaluation
+    ));
 }
 
 #[tokio::test]
