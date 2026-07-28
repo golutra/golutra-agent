@@ -434,6 +434,7 @@ mod tests {
 
     use super::*;
 
+    #[cfg(target_os = "macos")]
     fn execute(plan: SandboxLaunch, cwd: &Path) -> Output {
         let mut command = Command::new(plan.program);
         command
