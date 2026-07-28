@@ -1,4 +1,4 @@
-use std::{fs, path::Path, process::Stdio, time::Duration};
+use std::{fs, path::Path, process::Stdio, sync::OnceLock, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
 use golutra_client::{
@@ -12,6 +12,7 @@ use tempfile::tempdir;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
+    sync::Mutex,
 };
 use tokio_tungstenite::{
     connect_async,
@@ -22,8 +23,16 @@ use tokio_tungstenite::{
     },
 };
 
+// These tests each launch a real app-server and provider runtime. Serializing them keeps
+// the event-stream assertions independent of scheduler and CPU contention in CI.
+static RPC_PROCESS_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
 #[tokio::test]
 async fn http_json_rpc_streams_the_same_turn_over_agent_sse() {
+    let _test_lock = RPC_PROCESS_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .await;
     let home = tempdir().expect("home");
     let workspace = tempdir().expect("workspace");
     install_mock_provider(home.path());
@@ -201,6 +210,10 @@ async fn http_json_rpc_streams_the_same_turn_over_agent_sse() {
 
 #[tokio::test]
 async fn json_rpc_attach_requires_a_supported_protocol_version() {
+    let _test_lock = RPC_PROCESS_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .await;
     let home = tempdir().expect("home");
     let workspace = tempdir().expect("workspace");
     install_mock_provider(home.path());
@@ -263,6 +276,10 @@ async fn json_rpc_attach_requires_a_supported_protocol_version() {
 
 #[tokio::test]
 async fn http_json_rpc_notifications_return_no_content() {
+    let _test_lock = RPC_PROCESS_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .await;
     let home = tempdir().expect("home");
     let _daemon = spawn_daemon(home.path());
     let (info, token) = wait_for_endpoint(home.path()).await;
@@ -289,6 +306,10 @@ async fn http_json_rpc_notifications_return_no_content() {
 
 #[tokio::test]
 async fn http_json_rpc_binds_control_to_server_issued_attachments() {
+    let _test_lock = RPC_PROCESS_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .await;
     let home = tempdir().expect("home");
     let workspace = tempdir().expect("workspace");
     install_mock_provider(home.path());
@@ -419,6 +440,10 @@ async fn http_json_rpc_binds_control_to_server_issued_attachments() {
 
 #[tokio::test]
 async fn websocket_json_rpc_emits_incremental_agent_notifications() {
+    let _test_lock = RPC_PROCESS_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .await;
     let home = tempdir().expect("home");
     let workspace = tempdir().expect("workspace");
     install_mock_provider(home.path());
@@ -511,6 +536,10 @@ async fn websocket_json_rpc_emits_incremental_agent_notifications() {
 
 #[tokio::test]
 async fn stdio_json_rpc_uses_the_shared_dispatcher_and_resumes_threads() {
+    let _test_lock = RPC_PROCESS_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .await;
     let home = tempdir().expect("home");
     let workspace = tempdir().expect("workspace");
     install_mock_provider(home.path());
