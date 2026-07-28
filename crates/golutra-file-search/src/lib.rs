@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::Read,
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
@@ -9,6 +9,7 @@ use std::{
 };
 
 use golutra_policy::WorkspacePolicy;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
 use thiserror::Error;
@@ -201,16 +202,24 @@ impl FileSearch {
         path: impl AsRef<Path>,
         cancellation: &AtomicBool,
     ) -> Result<Vec<SearchMatch>, FileSearchError> {
+        self.search_with_program(pattern, path.as_ref(), cancellation, Path::new("rg"))
+    }
+
+    fn search_with_program(
+        &self,
+        pattern: &str,
+        path: &Path,
+        cancellation: &AtomicBool,
+        rg_program: &Path,
+    ) -> Result<Vec<SearchMatch>, FileSearchError> {
         let deadline = Instant::now() + DEFAULT_OPERATION_TIMEOUT;
         check_operation_state(cancellation, deadline)?;
-        let evaluation = self
-            .policy
-            .evaluate_path("file_search", path.as_ref(), true);
+        let evaluation = self.policy.evaluate_path("file_search", path, true);
         if evaluation.decision != golutra_core::PolicyDecision::Allow {
             return Err(FileSearchError::Policy(evaluation.reason));
         }
         let resolved_path = PathBuf::from(evaluation.resource);
-        let mut child = Command::new("rg")
+        let child = Command::new(rg_program)
             .arg("--json")
             .arg("--line-number")
             .arg("--no-heading")
@@ -219,8 +228,14 @@ impl FileSearch {
             .arg(&resolved_path)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .spawn()
-            .map_err(|error| FileSearchError::Rg(error.to_string()))?;
+            .spawn();
+        let mut child = match child {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return self.native_search(pattern, &resolved_path, cancellation, deadline);
+            }
+            Err(error) => return Err(FileSearchError::Rg(error.to_string())),
+        };
         let stdout = child
             .stdout
             .take()
@@ -264,6 +279,125 @@ impl FileSearch {
             .lines()
             .filter_map(|line| parse_rg_json_line(line, self.policy.workspace_root()))
             .collect()
+    }
+
+    fn native_search(
+        &self,
+        pattern: &str,
+        resolved_path: &Path,
+        cancellation: &AtomicBool,
+        deadline: Instant,
+    ) -> Result<Vec<SearchMatch>, FileSearchError> {
+        let regex = Regex::new(pattern)
+            .map_err(|error| FileSearchError::Rg(format!("invalid search pattern: {error}")))?;
+        let mut matches = Vec::new();
+        let mut pending_paths = vec![resolved_path.to_path_buf()];
+        let mut scanned_files = 0_usize;
+        let mut output_bytes = 0_u64;
+
+        while let Some(path) = pending_paths.pop() {
+            check_operation_state(cancellation, deadline)?;
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|error| FileSearchError::Io(error.to_string()))?;
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            if metadata.is_dir() {
+                for entry in
+                    fs::read_dir(&path).map_err(|error| FileSearchError::Io(error.to_string()))?
+                {
+                    check_operation_state(cancellation, deadline)?;
+                    let entry = entry.map_err(|error| FileSearchError::Io(error.to_string()))?;
+                    let entry_path = entry.path();
+                    if !should_skip(&entry_path) {
+                        pending_paths.push(entry_path);
+                    }
+                }
+                continue;
+            }
+            if !metadata.is_file() {
+                continue;
+            }
+            if scanned_files >= MAX_INDEXED_FILES {
+                return Err(FileSearchError::Limit(format!(
+                    "workspace contains more than {MAX_INDEXED_FILES} searchable files"
+                )));
+            }
+            scanned_files = scanned_files.saturating_add(1);
+            self.search_native_file(
+                &path,
+                &regex,
+                cancellation,
+                deadline,
+                &mut output_bytes,
+                &mut matches,
+            )?;
+        }
+
+        matches.sort_by(|left, right| {
+            left.relative_path
+                .cmp(&right.relative_path)
+                .then(left.line_number.cmp(&right.line_number))
+        });
+        Ok(matches)
+    }
+
+    fn search_native_file(
+        &self,
+        path: &Path,
+        regex: &Regex,
+        cancellation: &AtomicBool,
+        deadline: Instant,
+        output_bytes: &mut u64,
+        matches: &mut Vec<SearchMatch>,
+    ) -> Result<(), FileSearchError> {
+        let file = fs::File::open(path).map_err(|error| FileSearchError::Io(error.to_string()))?;
+        let mut reader = BufReader::new(file);
+        if reader
+            .fill_buf()
+            .map_err(|error| FileSearchError::Io(error.to_string()))?
+            .contains(&0)
+        {
+            return Ok(());
+        }
+
+        let relative_path = path
+            .strip_prefix(self.policy.workspace_root())
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        let mut line_number = 0_u64;
+        let mut line = Vec::new();
+        loop {
+            check_operation_state(cancellation, deadline)?;
+            line.clear();
+            let bytes_read = reader
+                .read_until(b'\n', &mut line)
+                .map_err(|error| FileSearchError::Io(error.to_string()))?;
+            if bytes_read == 0 {
+                break;
+            }
+            line_number = line_number.saturating_add(1);
+            let text = String::from_utf8_lossy(&line);
+            if !regex.is_match(&text) {
+                continue;
+            }
+            let record_bytes = u64::try_from(relative_path.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX));
+            *output_bytes = output_bytes.saturating_add(record_bytes);
+            if *output_bytes > MAX_RG_OUTPUT_BYTES {
+                return Err(FileSearchError::Limit(format!(
+                    "native search output exceeds {MAX_RG_OUTPUT_BYTES} bytes"
+                )));
+            }
+            matches.push(SearchMatch {
+                relative_path: relative_path.clone(),
+                line_number,
+                line: text.into_owned(),
+            });
+        }
+        Ok(())
     }
 
     fn collect_files(
@@ -461,6 +595,28 @@ mod tests {
 
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].relative_path, "README.md");
+    }
+
+    #[test]
+    fn searches_with_native_fallback_when_rg_is_unavailable() {
+        let workspace = tempdir().expect("workspace");
+        fs::write(workspace.path().join("README.md"), "hello\nworld\n").expect("readme");
+        let search = FileSearch::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+        let missing_rg = workspace.path().join("missing-rg-binary");
+
+        let matches = search
+            .search_with_program(
+                "world",
+                Path::new("."),
+                &AtomicBool::new(false),
+                &missing_rg,
+            )
+            .expect("native search");
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].relative_path, "README.md");
+        assert_eq!(matches[0].line_number, 2);
+        assert_eq!(matches[0].line, "world\n");
     }
 
     #[tokio::test]
