@@ -226,6 +226,44 @@ class GolutraAgent(BaseAgent):
         )
         thread.start()
 
+    def _record_adapter_observation(
+        self,
+        logging_dir: Path | None,
+        phase: str,
+        status: str,
+        code: str,
+        facts: dict[str, object] | None = None,
+    ) -> None:
+        if logging_dir is None:
+            return
+        _write_json_atomic(
+            logging_dir.parent / "golutra-adapter-observation.json",
+            {
+                "schema_version": 1,
+                "adapter": self.name(),
+                "phase": phase,
+                "status": status,
+                "code": code,
+                "facts": facts or {},
+                "observed_at": _now_rfc3339(),
+            },
+        )
+
+    def _installation_failure(
+        self,
+        logging_dir: Path | None,
+        code: str,
+        facts: dict[str, object] | None = None,
+    ) -> AgentResult:
+        self._record_adapter_observation(
+            logging_dir,
+            "setup",
+            "failed",
+            code,
+            facts,
+        )
+        return AgentResult(failure_mode=FailureMode.AGENT_INSTALLATION_FAILED)
+
     def _collect_result(self, trial_root: Path) -> None:
         deadline = time.monotonic() + self._result_collection_timeout_sec
         results_path: Path | None = None
@@ -424,8 +462,24 @@ class GolutraAgent(BaseAgent):
         architecture_result = session.container.exec_run(["uname", "-m"])
         architecture = architecture_result.output.decode(errors="replace").strip()
         binary = self._binaries.get(architecture)
-        if architecture_result.exit_code != 0 or binary is None or not binary.is_file():
-            return AgentResult(failure_mode=FailureMode.AGENT_INSTALLATION_FAILED)
+        if architecture_result.exit_code != 0:
+            return self._installation_failure(
+                logging_dir,
+                "architecture_detection_failed",
+                {"exit_code": architecture_result.exit_code},
+            )
+        if binary is None:
+            return self._installation_failure(
+                logging_dir,
+                "unsupported_architecture",
+                {"architecture": architecture},
+            )
+        if not binary.is_file():
+            return self._installation_failure(
+                logging_dir,
+                "agent_binary_missing",
+                {"architecture": architecture},
+            )
 
         try:
             with tempfile.TemporaryDirectory(prefix="golutra-tbench-auth-") as temp_dir:
@@ -433,8 +487,12 @@ class GolutraAgent(BaseAgent):
                 session.copy_to_container(binary, container_dir="/installed-agent", container_filename="golutra")
                 session.copy_to_container(provider_file, container_dir="/root/.golutra", container_filename="provider.json")
                 session.copy_to_container(credentials_file, container_dir="/root/.golutra", container_filename="credentials.json")
-        except (OSError, ValueError, json.JSONDecodeError):
-            return AgentResult(failure_mode=FailureMode.AGENT_INSTALLATION_FAILED)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            return self._installation_failure(
+                logging_dir,
+                "auth_material_unavailable",
+                {"error_type": type(error).__name__},
+            )
 
         setup_result = session.container.exec_run(
             [
@@ -447,12 +505,22 @@ class GolutraAgent(BaseAgent):
             ]
         )
         if setup_result.exit_code != 0:
-            return AgentResult(failure_mode=FailureMode.AGENT_INSTALLATION_FAILED)
+            return self._installation_failure(
+                logging_dir,
+                "agent_binary_preflight_failed",
+                {"exit_code": setup_result.exit_code, "architecture": architecture},
+            )
         if not self._configure_tmux_proxy(session):
-            return AgentResult(failure_mode=FailureMode.AGENT_INSTALLATION_FAILED)
+            return self._installation_failure(
+                logging_dir,
+                "proxy_configuration_failed",
+            )
         workspace_path = self._workspace_path(session)
         if workspace_path is None:
-            return AgentResult(failure_mode=FailureMode.AGENT_INSTALLATION_FAILED)
+            return self._installation_failure(
+                logging_dir,
+                "workspace_resolution_failed",
+            )
 
         rendered_instruction = self._render_instruction(instruction)
         environment = " ".join(
@@ -471,17 +539,45 @@ class GolutraAgent(BaseAgent):
         # Terminal-Bench's outer timeout abandons this call, the collector can
         # still ingest the checkpoint once the harness writes results.json.
         self._start_result_collector(logging_dir)
-        session.send_command(
-            TerminalCommand(
-                command=command,
-                min_timeout_sec=0.0,
-                max_timeout_sec=float("inf"),
-                block=True,
-                append_enter=True,
-            )
+        self._record_adapter_observation(
+            logging_dir,
+            "agent",
+            "running",
+            "runtime_command_dispatched",
+            {"architecture": architecture},
         )
+        try:
+            session.send_command(
+                TerminalCommand(
+                    command=command,
+                    min_timeout_sec=0.0,
+                    max_timeout_sec=float("inf"),
+                    block=True,
+                    append_enter=True,
+                )
+            )
+        except Exception as error:
+            self._record_adapter_observation(
+                logging_dir,
+                "agent",
+                "failed",
+                "runtime_command_failed",
+                {"error_type": type(error).__name__},
+            )
+            raise
         input_tokens, output_tokens = (
             _trace_token_usage(logging_dir.parent) if logging_dir is not None else (0, 0)
+        )
+        self._record_adapter_observation(
+            logging_dir,
+            "agent",
+            "completed",
+            "runtime_command_completed",
+            {
+                "architecture": architecture,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+            },
         )
         return AgentResult(
             total_input_tokens=input_tokens,
@@ -714,6 +810,7 @@ def _evaluation_phases(
 def _existing_evidence_refs(trial_root: Path) -> list[str]:
     candidates = [
         "results.json",
+        "golutra-adapter-observation.json",
         "panes/post-agent.txt",
         "panes/post-test.txt",
         "commands.txt",

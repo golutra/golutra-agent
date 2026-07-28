@@ -4,6 +4,8 @@
 //! older command surfaces and deterministic mock runs aligned when a caller
 //! has not supplied structured delivery fields.
 
+use crate::task_contract::is_valid_workspace_relative_path;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacyWriteObjectiveHint {
     pub path: String,
@@ -100,8 +102,13 @@ fn normalize_path(raw: &str) -> Option<String> {
     {
         token = without_period;
     }
-    (!token.is_empty() && token.len() <= 512 && !token.contains("://") && is_path_like(token))
-        .then(|| token.to_owned())
+    (!token.is_empty()
+        && token.len() <= 512
+        && !token.contains("://")
+        && !token.contains(['<', '>', '*'])
+        && is_path_like(token)
+        && is_valid_workspace_relative_path(token))
+    .then(|| token.to_owned())
 }
 
 fn is_path_like(value: &str) -> bool {
@@ -242,6 +249,23 @@ mod tests {
     #[test]
     fn broad_change_request_does_not_invent_a_delivery() {
         assert!(infer_legacy_write_objective("create a runtime module").is_none());
+    }
+
+    #[test]
+    fn unsafe_delivery_paths_are_not_inferred_from_objectives() {
+        for objective in [
+            "create a file named `/app/output/maze.txt`",
+            "save to `/var/log/nginx/benchmark-access.log`",
+            "write file ../outside.txt with content unsafe",
+            r"write file C:\workspace\result.txt with content unsafe",
+            r"write file \\server\share\result.txt with content unsafe",
+        ] {
+            assert_eq!(
+                infer_legacy_write_path(objective),
+                None,
+                "inferred an unsafe delivery path from {objective:?}"
+            );
+        }
     }
 
     #[test]

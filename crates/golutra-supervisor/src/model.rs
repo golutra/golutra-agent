@@ -245,6 +245,15 @@ pub struct TrustedEvaluationBuild {
     pub completed_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TrustedBootstrapBuild {
+    pub bootstrap_id: String,
+    pub report_ref: String,
+    pub report: BuildReport,
+    pub gate_accepted: bool,
+    pub completed_at: DateTime<Utc>,
+}
+
 /// Assertions remain in the trusted Supervisor and are never sent to the
 /// candidate runtime worker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -359,6 +368,8 @@ pub struct SupervisorState {
     pub deployment_observations: Vec<DeploymentObservation>,
     #[serde(default)]
     pub evaluation_builds: Vec<TrustedEvaluationBuild>,
+    #[serde(default)]
+    pub bootstrap_builds: Vec<TrustedBootstrapBuild>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

@@ -5373,6 +5373,20 @@ fn legacy_change_intent_handles_coding_verbs_without_inventing_delivery_paths() 
         WorkspaceChangeRequirement::Required
     );
     assert!(contract.required_paths.is_empty());
+
+    let absolute = json!({
+        "prompt": "create a file named `/app/output/maze.txt`",
+    });
+    let mut contract = golutra_core::TaskContract::default();
+    assert!(apply_legacy_task_contract(
+        &absolute,
+        absolute["prompt"].as_str().expect("prompt"),
+        &mut contract,
+    ));
+    assert!(contract.required_paths.is_empty());
+    contract
+        .validate()
+        .expect("legacy absolute path hint must not invalidate the task contract");
 }
 
 #[test]

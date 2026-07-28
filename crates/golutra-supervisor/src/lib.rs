@@ -835,10 +835,24 @@ impl EvolutionSupervisor {
         let report = TrustedBuilder::new()
             .run(&source_root, &artifact_root)
             .await?;
-        if !report.passed || !report.sandbox_enforced {
-            return Err(SupervisorError::GateRejected(
-                "bootstrap requires a passed OS-enforced trusted build".to_owned(),
-            ));
+        let bootstrap_build = self.record_bootstrap_build(&bootstrap_id, report.clone())?;
+        if !bootstrap_build.gate_accepted {
+            let failed_checks = report
+                .checks
+                .iter()
+                .filter(|check| check.status != golutra_release::BuildStatus::Pass)
+                .map(|check| check.name.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            return Err(SupervisorError::GateRejected(format!(
+                "bootstrap requires a passed OS-enforced trusted build; report={}; failed_checks={}",
+                bootstrap_build.report_ref,
+                if failed_checks.is_empty() {
+                    "none"
+                } else {
+                    &failed_checks
+                }
+            )));
         }
         evaluation_runner::evaluation_worker_artifact(&report)?;
         if self.release_store.pointer("stable")?.is_some() {
@@ -848,9 +862,7 @@ impl EvolutionSupervisor {
         }
         let dependency_lock_digest = digest_required_file(&source_root.join("Cargo.lock"))?;
         let toolchain_digest = digest_toolchain(&source_root)?;
-        let provenance_ref = self
-            .store
-            .store_artifact("build-report", &serde_json::to_vec(&report)?)?;
+        let provenance_ref = bootstrap_build.report_ref;
         let update_metadata_ref = self.store.store_artifact(
             "update-metadata",
             &serde_json::to_vec(&json!({
@@ -893,6 +905,57 @@ impl EvolutionSupervisor {
                 "source_digest": manifest.source_digest,
             }),
             move |_| Ok(event_manifest),
+        )
+    }
+
+    fn record_bootstrap_build(
+        &self,
+        bootstrap_id: &str,
+        report: BuildReport,
+    ) -> Result<TrustedBootstrapBuild, SupervisorError> {
+        let report_ref = self
+            .store
+            .store_artifact("build-report", &serde_json::to_vec(&report)?)?;
+        let gate_accepted = report.passed && report.sandbox_enforced;
+        let completed_at = report.completed_at;
+        let build = TrustedBootstrapBuild {
+            bootstrap_id: bootstrap_id.to_owned(),
+            report_ref,
+            report,
+            gate_accepted,
+            completed_at,
+        };
+        let event_build = build.clone();
+        self.store.transact(
+            "BootstrapTrustedBuildCompleted",
+            None,
+            None,
+            json!({
+                "bootstrap_id": build.bootstrap_id,
+                "report_ref": build.report_ref,
+                "source_digest": build.report.source_digest,
+                "sandbox_backend": build.report.sandbox_backend,
+                "sandbox_enforced": build.report.sandbox_enforced,
+                "passed": build.report.passed,
+                "gate_accepted": build.gate_accepted,
+                "failed_checks": build.report.checks.iter()
+                    .filter(|check| check.status != golutra_release::BuildStatus::Pass)
+                    .map(|check| check.name.as_str())
+                    .collect::<Vec<_>>(),
+            }),
+            move |state| {
+                if state
+                    .bootstrap_builds
+                    .iter()
+                    .any(|existing| existing.bootstrap_id == event_build.bootstrap_id)
+                {
+                    return Err(SupervisorError::Integrity(
+                        "bootstrap build identifier is already recorded".to_owned(),
+                    ));
+                }
+                state.bootstrap_builds.push(event_build.clone());
+                Ok(event_build)
+            },
         )
     }
 
@@ -2318,6 +2381,52 @@ mod tests {
                 },
             )
             .expect("evaluation build");
+    }
+
+    #[test]
+    fn failed_bootstrap_build_remains_queryable_and_verifiable() {
+        let (supervisor, _root, _releases) = setup();
+        let report = golutra_release::BuildReport {
+            builder_version: "test-builder".to_owned(),
+            source_digest: "sha256:bootstrap-source".to_owned(),
+            sandbox_backend: "test-os-sandbox".to_owned(),
+            sandbox_enforced: true,
+            checks: vec![golutra_release::BuildCheck {
+                name: "test".to_owned(),
+                command: vec!["cargo test --workspace".to_owned()],
+                status: golutra_release::BuildStatus::Fail,
+                exit_code: Some(101),
+                duration_ms: 1,
+                output_digest: "sha256:failed-output".to_owned(),
+            }],
+            binary_artifacts: Vec::new(),
+            passed: false,
+            completed_at: Utc::now(),
+        };
+
+        let build = supervisor
+            .record_bootstrap_build("bootstrap-test", report.clone())
+            .expect("record failed bootstrap build");
+
+        assert!(!build.gate_accepted);
+        supervisor
+            .store()
+            .verify_artifact(
+                "build-report",
+                &build.report_ref,
+                &serde_json::to_vec(&report).expect("report bytes"),
+            )
+            .expect("stored report remains verifiable");
+        let snapshot = supervisor.store().snapshot().expect("snapshot");
+        assert_eq!(snapshot.bootstrap_builds, vec![build]);
+        assert!(
+            supervisor
+                .store()
+                .verify_control_log()
+                .expect("control log")
+                .iter()
+                .any(|event| event.event_type == "BootstrapTrustedBuildCompleted")
+        );
     }
 
     #[test]

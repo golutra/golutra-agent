@@ -74,6 +74,28 @@ class AdapterHelpersTest(unittest.TestCase):
 
         self.assertEqual(agent._result_collection_timeout_sec, 3600.0)
 
+    def test_installation_failure_is_retained_before_runtime_exists(self):
+        with TemporaryDirectory() as temporary:
+            trial_root = Path(temporary)
+            logging_dir = trial_root / "sessions"
+            agent = ADAPTER.GolutraAgent.__new__(ADAPTER.GolutraAgent)
+
+            result = agent._installation_failure(
+                logging_dir,
+                "unsupported_architecture",
+                {"architecture": "s390x"},
+            )
+
+            self.assertEqual(result.failure_mode, "agent_installation_failed")
+            observation = json.loads(
+                (trial_root / "golutra-adapter-observation.json").read_text()
+            )
+            self.assertEqual(observation["schema_version"], 1)
+            self.assertEqual(observation["phase"], "setup")
+            self.assertEqual(observation["status"], "failed")
+            self.assertEqual(observation["code"], "unsupported_architecture")
+            self.assertEqual(observation["facts"], {"architecture": "s390x"})
+
     def test_collector_resolution_is_explicit_and_repository_local(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)

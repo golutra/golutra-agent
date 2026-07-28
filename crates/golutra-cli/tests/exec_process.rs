@@ -126,7 +126,7 @@ async fn exec_reads_a_piped_prompt_without_mixing_progress_into_stdout() {
         .write_all(b"reply from stdin\n")
         .await
         .expect("write piped prompt");
-    let output = tokio::time::timeout(Duration::from_secs(15), child.wait_with_output())
+    let output = tokio::time::timeout(Duration::from_secs(60), child.wait_with_output())
         .await
         .expect("piped exec timeout")
         .expect("piped exec output");

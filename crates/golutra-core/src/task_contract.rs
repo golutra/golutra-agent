@@ -113,19 +113,11 @@ impl TaskContract {
         if self.completion_criteria.len() > 32 {
             return Err("task contract contains too many completion criteria".to_owned());
         }
-        if self.required_paths.iter().any(|path| {
-            let trimmed = path.trim();
-            trimmed.is_empty()
-                || trimmed.chars().count() > MAX_TASK_CONTRACT_PATH_CHARS
-                || path.contains('\0')
-                || !is_portable_workspace_relative_path(path)
-                || Path::new(path).components().any(|component| {
-                    matches!(
-                        component,
-                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                    )
-                })
-        }) {
+        if self
+            .required_paths
+            .iter()
+            .any(|path| !is_valid_workspace_relative_path(path))
+        {
             return Err(
                 "task contract paths must be non-empty workspace-relative paths".to_owned(),
             );
@@ -145,6 +137,20 @@ impl TaskContract {
         }
         Ok(())
     }
+}
+
+pub(crate) fn is_valid_workspace_relative_path(path: &str) -> bool {
+    let trimmed = path.trim();
+    !trimmed.is_empty()
+        && trimmed.chars().count() <= MAX_TASK_CONTRACT_PATH_CHARS
+        && !path.contains('\0')
+        && is_portable_workspace_relative_path(path)
+        && !Path::new(path).components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
 }
 
 fn is_portable_workspace_relative_path(path: &str) -> bool {
