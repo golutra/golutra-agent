@@ -430,6 +430,7 @@ fn find_on_path(program: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
     use std::process::{Command, Output};
 
     use super::*;
