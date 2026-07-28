@@ -9,7 +9,7 @@ use crate::{
     ImprovementCandidate, PostTaskReview, PromotionDecision, PromotionDecisionKind,
     PromotionGateFacts, PromotionReviewer, RegressionResult, RegressionVerdict, ReviewMode,
     SecurityUtilityResult, SkillCandidate, TaskEvaluationBundle, TaskEvaluationInput,
-    TrajectoryReplay,
+    TrajectoryReplay, TrajectorySummary,
 };
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -248,6 +248,10 @@ impl EvaluationRunner {
             .iter()
             .map(|candidate| candidate.id.clone())
             .collect();
+        let context_issues = trajectory_context_issues(&input.trajectory_summary);
+        let tool_issues = trajectory_tool_issues(&input.trajectory_summary);
+        let suggested_improvements =
+            trajectory_improvements(successful, &input.trajectory_summary, &failure_taxonomy);
         let review = PostTaskReview {
             task_id: input.task_id,
             mode,
@@ -270,15 +274,12 @@ impl EvaluationRunner {
                 "durable".to_owned()
             },
             policy_issues: taxonomy_matches(&failure_taxonomy, "PolicyFailure"),
-            context_issues: taxonomy_matches(&failure_taxonomy, "ContextFailure"),
-            tool_issues: taxonomy_matches(&failure_taxonomy, "ToolFailure"),
+            context_issues,
+            tool_issues,
             provider_issues: taxonomy_matches(&failure_taxonomy, "ProviderFailure"),
-            suggested_improvements: if successful {
-                Vec::new()
-            } else {
-                vec!["run the generated regression fixture before promotion".to_owned()]
-            },
+            suggested_improvements,
             promotion_candidates,
+            trajectory_summary: input.trajectory_summary.clone(),
         };
         let benchmark_run =
             benchmark_run_from_evaluation(&input, &run, &result, &replay, security_utility);
@@ -297,6 +298,78 @@ impl EvaluationRunner {
             benchmark_run,
         }
     }
+}
+
+fn trajectory_context_issues(summary: &TrajectorySummary) -> Vec<String> {
+    summary
+        .context_pressure
+        .then(|| {
+            format!(
+                "provider context grew by {} tokens to a maximum of {}",
+                summary.context_growth_tokens,
+                summary.max_context_tokens.unwrap_or_default()
+            )
+        })
+        .into_iter()
+        .collect()
+}
+
+fn trajectory_tool_issues(summary: &TrajectorySummary) -> Vec<String> {
+    let mut issues = Vec::new();
+    if summary.failed_tool_calls > 0 {
+        issues.push(format!(
+            "{} of {} tool calls failed",
+            summary.failed_tool_calls, summary.tool_calls
+        ));
+    }
+    issues.extend(
+        summary
+            .failure_clusters
+            .iter()
+            .filter(|cluster| cluster.failures > 1)
+            .map(|cluster| {
+                format!(
+                    "failure family `{}` repeated {} times",
+                    cluster.family, cluster.failures
+                )
+            }),
+    );
+    issues
+}
+
+fn trajectory_improvements(
+    successful: bool,
+    summary: &TrajectorySummary,
+    failure_taxonomy: &[String],
+) -> Vec<String> {
+    if successful {
+        return Vec::new();
+    }
+    let mut improvements = Vec::new();
+    if summary.context_pressure {
+        improvements
+            .push("compact superseded tool results before the next provider call".to_owned());
+    }
+    improvements.extend(
+        summary
+            .failure_clusters
+            .iter()
+            .filter(|cluster| cluster.failures > 1)
+            .map(|cluster| {
+                format!(
+                    "block failure family `{}` and require a materially different strategy",
+                    cluster.family
+                )
+            }),
+    );
+    if !summary.workspace_changes_observed {
+        improvements
+            .push("require objective artifact evidence before claiming completion".to_owned());
+    }
+    if improvements.is_empty() && !failure_taxonomy.is_empty() {
+        improvements.push("run the generated regression fixture before promotion".to_owned());
+    }
+    improvements
 }
 
 pub(crate) fn runtime_candidate_from_improvement(

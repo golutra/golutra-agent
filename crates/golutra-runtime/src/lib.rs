@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::Path,
     sync::{Arc, Mutex as StdMutex},
     time::Instant,
@@ -499,6 +499,7 @@ where
         let mut guard_reason = None;
         let mut repeated_failure_signature = None;
         let mut repeated_failure_count = 0_u32;
+        let mut failure_families = FailureFamilyLedger::default();
         let mut empty_response_count = 0_u32;
         let started_at = Instant::now();
         let mut tool_call_count = 0_u32;
@@ -578,6 +579,16 @@ where
                 let iteration = step_snapshot.step_no;
                 trace(AgentLoopTraceEvent::StepStarted(step_snapshot.clone()));
                 control.wait_until_runnable().await?;
+                let tool_history_before = estimate_message_tokens(&messages);
+                let compacted_tool_results =
+                    compact_tool_result_history(&mut messages, &mut message_sources);
+                if compacted_tool_results > 0 {
+                    trace(AgentLoopTraceEvent::ContextCompacted {
+                        original_input_tokens: tool_history_before,
+                        planned_input_tokens: estimate_message_tokens(&messages),
+                        trimmed_contributors: vec!["tool_result_history".to_owned()],
+                    });
+                }
                 let mut plan = base_plan.clone();
                 plan.messages = messages.clone();
                 plan.message_sources = message_sources.clone();
@@ -902,6 +913,7 @@ where
                         tool_reports.clear();
                         repeated_failure_signature = None;
                         repeated_failure_count = 0;
+                        failure_families = FailureFamilyLedger::default();
                         turn_state = TurnState::new(current_turn_id);
                         goal_ledger.original_objective = current_objective.clone();
                         goal_ledger.success_criteria = current_completion_criteria.clone();
@@ -1014,6 +1026,9 @@ where
                     let provider_tool_call_id = tool_call.tool_call_id.clone();
                     let failure_signature =
                         format!("{}:{}", tool_call.tool_name, tool_call.arguments);
+                    let failure_family =
+                        semantic_failure_family(&tool_call.tool_name, &tool_call.arguments);
+                    let blocked_family_failures = failure_families.failures(&failure_family);
                     let tool_request = ToolRequest {
                         tool_call_id: golutra_core::ToolCallId::new(),
                         provider_tool_call_id: Some(provider_tool_call_id.clone()),
@@ -1044,7 +1059,30 @@ where
                                 "task contract forbids side-effecting tools",
                             )
                         });
-                    let report = if let Some(report) = contract_blocked_report {
+                    let strategy_blocked_report = (blocked_family_failures >= 2).then(|| {
+                        self.tool_executor.invalid_request_report(
+                            tool_request.clone(),
+                            format!(
+                                "strategy `{failure_family}` is blocked after {blocked_family_failures} failures; choose a materially different approach"
+                            ),
+                        )
+                    });
+                    let strategy_was_blocked = strategy_blocked_report.is_some();
+                    let report = if let Some(report) = strategy_blocked_report {
+                        trace(AgentLoopTraceEvent::PolicyEvaluated(
+                            report.policy_evaluation.clone(),
+                        ));
+                        trace(AgentLoopTraceEvent::ToolProgress(ToolProgress {
+                            tool_call_id: report.envelope.tool_call_id,
+                            tool_name: report.envelope.tool_name.clone(),
+                            phase: ToolProgressPhase::Completed,
+                            elapsed_ms: report.metrics.duration_ms,
+                            output_bytes: report.metrics.output_bytes,
+                            output_lines: report.metrics.output_lines,
+                            detail: Some("strategy_blocked".to_owned()),
+                        }));
+                        report
+                    } else if let Some(report) = contract_blocked_report {
                         trace(AgentLoopTraceEvent::PolicyEvaluated(
                             report.policy_evaluation.clone(),
                         ));
@@ -1184,6 +1222,7 @@ where
                         &mut failed_tool_call_count,
                         &mut consecutive_failed_tool_call_count,
                     );
+                    failure_families.observe(&failure_family, report.envelope.status);
                     if report.envelope.status == ToolResultStatus::Ok {
                         successful_signatures_this_step.insert(failure_signature);
                     } else {
@@ -1229,6 +1268,24 @@ where
                         visibility: ModelInputVisibility::ModelVisible,
                     });
                     tool_reports.push(report);
+                    if strategy_was_blocked && blocked_family_failures >= 3 {
+                        let reason = format!(
+                            "strategy `{failure_family}` remained selected after a bounded correction"
+                        );
+                        trace(AgentLoopTraceEvent::LoopGuardTriggered {
+                            trigger: golutra_core::LoopGuardTrigger::RepeatedToolFailure,
+                            reason: reason.clone(),
+                        });
+                        guard_reason = Some(reason);
+                        finish_runtime_step(
+                            &mut step_machine,
+                            step_snapshot.clone(),
+                            step_fingerprint.clone(),
+                            false,
+                            &mut trace,
+                        );
+                        break 'agent_loop;
+                    }
                     if !permits_continuation {
                         finish_runtime_step(
                             &mut step_machine,
@@ -1407,9 +1464,10 @@ where
                     command_checks.push(VerificationCheck {
                         kind: VerificationCheckKind::ObjectiveValidation,
                         name: format!(
-                            "objective:{}:{}",
+                            "objective:{}:{}:identity:{}",
                             validation.kind.label(),
-                            report.envelope.tool_name
+                            report.envelope.tool_name,
+                            validation.identity
                         ),
                         command: report
                             .envelope
@@ -1755,6 +1813,87 @@ fn update_tool_failure_counts(status: ToolResultStatus, total: &mut u32, consecu
     }
 }
 
+#[derive(Debug, Default)]
+struct FailureFamilyLedger {
+    failures: HashMap<String, u32>,
+}
+
+impl FailureFamilyLedger {
+    fn failures(&self, family: &str) -> u32 {
+        self.failures.get(family).copied().unwrap_or_default()
+    }
+
+    fn observe(&mut self, family: &str, status: ToolResultStatus) {
+        if status == ToolResultStatus::Ok {
+            self.failures.remove(family);
+        } else {
+            let count = self.failures.entry(family.to_owned()).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
+}
+
+fn semantic_failure_family(tool_name: &str, arguments: &Value) -> String {
+    golutra_core::semantic_tool_failure_family(tool_name, arguments)
+        .unwrap_or_else(|| format!("{tool_name}:{}", digest_value(arguments)))
+}
+
+fn digest_value(value: &Value) -> String {
+    let mut digest = Sha256::new();
+    digest.update(serde_json::to_vec(value).unwrap_or_default());
+    format!("{:x}", digest.finalize())
+}
+
+const MAX_MODEL_TOOL_HISTORY_TOKENS: u64 = 2_048;
+
+fn compact_tool_result_history(
+    messages: &mut [ProviderMessage],
+    sources: &mut [ContextMessageSource],
+) -> usize {
+    let mut retained_tokens = 0_u64;
+    let mut compacted = 0_usize;
+    for index in (0..messages.len()).rev() {
+        if messages[index].role != ProviderRole::Tool {
+            continue;
+        }
+        let message_tokens = estimate_message_tokens(std::slice::from_ref(&messages[index]));
+        if retained_tokens == 0
+            || retained_tokens.saturating_add(message_tokens) <= MAX_MODEL_TOOL_HISTORY_TOKENS
+        {
+            retained_tokens = retained_tokens.saturating_add(message_tokens);
+            continue;
+        }
+        if sources
+            .get(index)
+            .is_some_and(|source| source.origin == "tool_result_compaction")
+        {
+            retained_tokens = retained_tokens.saturating_add(message_tokens);
+            continue;
+        }
+        messages[index].content = compacted_tool_result_message(&messages[index].content);
+        if let Some(source) = sources.get_mut(index) {
+            source.origin = "tool_result_compaction".to_owned();
+        }
+        retained_tokens = retained_tokens.saturating_add(estimate_message_tokens(
+            std::slice::from_ref(&messages[index]),
+        ));
+        compacted = compacted.saturating_add(1);
+    }
+    compacted
+}
+
+fn compacted_tool_result_message(content: &str) -> String {
+    let parsed = serde_json::from_str::<serde_json::Value>(content).unwrap_or_default();
+    serde_json::to_string(&serde_json::json!({
+        "tool_name": parsed.get("tool_name").and_then(serde_json::Value::as_str),
+        "status": parsed.get("status").cloned().unwrap_or(serde_json::Value::Null),
+        "summary": parsed.get("summary").and_then(serde_json::Value::as_str),
+        "history_state": "compacted",
+        "detail": "full result remains available in runtime artifacts",
+    }))
+    .unwrap_or_else(|_| "{\"history_state\":\"compacted\"}".to_owned())
+}
+
 fn update_repeated_failure_streak(
     failed_signatures_this_step: &HashSet<String>,
     repeated_signature: &mut Option<String>,
@@ -1895,6 +2034,7 @@ impl ObjectiveValidationKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ObjectiveValidationOutcome {
     kind: ObjectiveValidationKind,
+    identity: String,
     passed: bool,
     message: String,
 }
@@ -1903,6 +2043,7 @@ fn objective_validation_report(report: &ToolExecutionReport) -> Option<Objective
     if report.envelope.tool_name == "external_verifier" {
         return Some(ObjectiveValidationOutcome {
             kind: ObjectiveValidationKind::Test,
+            identity: "external-verifier".to_owned(),
             passed: report.envelope.status == ToolResultStatus::Ok,
             message: report.envelope.summary.clone(),
         });
@@ -1914,6 +2055,7 @@ fn objective_validation_report(report: &ToolExecutionReport) -> Option<Objective
             .get("command")
             .and_then(serde_json::Value::as_str)?;
         let kind = objective_validation_command_kind(command)?;
+        let identity = objective_validation_command_identity(command)?;
         let exited_cleanly = report.envelope.status == ToolResultStatus::Ok
             && report
                 .envelope
@@ -1951,6 +2093,7 @@ fn objective_validation_report(report: &ToolExecutionReport) -> Option<Objective
         };
         return Some(ObjectiveValidationOutcome {
             kind,
+            identity,
             passed,
             message,
         });
@@ -1965,6 +2108,94 @@ fn is_objective_validation_command(command: &str) -> bool {
 
 fn objective_validation_command_kind(command: &str) -> Option<ObjectiveValidationKind> {
     objective_validation_command_kind_with_depth(command, 0)
+}
+
+fn objective_validation_command_identity(command: &str) -> Option<String> {
+    let atoms = objective_validation_command_atoms_with_depth(command, 0)?;
+    if atoms.is_empty() {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    for atom in atoms {
+        digest.update((atom.len() as u64).to_le_bytes());
+        digest.update(atom.as_bytes());
+    }
+    Some(format!("{:x}", digest.finalize()))
+}
+
+fn objective_validation_command_atoms_with_depth(
+    command: &str,
+    wrapper_depth: u8,
+) -> Option<Vec<String>> {
+    let mut parts = shlex::split(command)?;
+    let program = parts.first().map(String::as_str)?;
+    let program = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program)
+        .to_owned();
+    if wrapper_depth < 2
+        && matches!(program.as_str(), "bash" | "sh" | "zsh")
+        && parts.len() == 3
+        && matches!(parts[1].as_str(), "-c" | "-lc")
+    {
+        return objective_validation_shell_script_atoms(
+            parts[2].trim(),
+            wrapper_depth.saturating_add(1),
+        );
+    }
+    objective_validation_command_kind_with_depth(command, wrapper_depth)?;
+    parts[0] = program;
+    Some(vec![serde_json::to_string(&parts).ok()?])
+}
+
+fn objective_validation_shell_script_atoms(script: &str, wrapper_depth: u8) -> Option<Vec<String>> {
+    objective_validation_shell_script_kind(script, wrapper_depth)?;
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_bash::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(script, None)?;
+    let root = tree.root_node();
+    let mut atoms = Vec::new();
+    if !collect_objective_validation_atoms(root, script.as_bytes(), wrapper_depth, &mut atoms)
+        || atoms.is_empty()
+    {
+        return None;
+    }
+    Some(atoms)
+}
+
+fn collect_objective_validation_atoms(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    wrapper_depth: u8,
+    atoms: &mut Vec<String>,
+) -> bool {
+    match node.kind() {
+        "program" | "list" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if !collect_objective_validation_atoms(child, source, wrapper_depth, atoms) {
+                    return false;
+                }
+            }
+            true
+        }
+        "command" => {
+            let Ok(command) = node.utf8_text(source) else {
+                return false;
+            };
+            if let Some(mut command_atoms) =
+                objective_validation_command_atoms_with_depth(command.trim(), wrapper_depth)
+            {
+                atoms.append(&mut command_atoms);
+            }
+            true
+        }
+        "comment" | "test_command" | "variable_assignment" => true,
+        _ => false,
+    }
 }
 
 fn objective_validation_command_kind_with_depth(
@@ -1982,13 +2213,8 @@ fn objective_validation_command_kind_with_depth(
         && parts.len() == 3
         && matches!(parts[1].as_str(), "-c" | "-lc")
     {
-        let script = parts[2].trim();
-        if script.contains(';') || script.contains('|') || script.contains('\n') {
-            return None;
-        }
-        let final_command = script.rsplit("&&").next().map(str::trim)?;
-        return objective_validation_command_kind_with_depth(
-            final_command,
+        return objective_validation_shell_script_kind(
+            parts[2].trim(),
             wrapper_depth.saturating_add(1),
         );
     }
@@ -2021,10 +2247,15 @@ fn objective_validation_command_kind_with_depth(
         "python" | "python3" if python_module_runs_tests(&parts) => {
             Some(ObjectiveValidationKind::Test)
         }
+        "python" | "python3" if python_inline_asserts_runtime_state(&parts) => {
+            Some(ObjectiveValidationKind::Diagnostic)
+        }
         "cmp" | "diff" if comparison_has_two_operands(&parts) => {
             Some(ObjectiveValidationKind::Diagnostic)
         }
-        "test" if parts.len() >= 3 => Some(ObjectiveValidationKind::FileState),
+        "test" if test_command_validates_file_state(&parts) => {
+            Some(ObjectiveValidationKind::FileState)
+        }
         "git" if git_command_validates_result(&parts) => Some(ObjectiveValidationKind::Diagnostic),
         "go" if parts.get(1).is_some_and(|part| part == "test") => {
             Some(ObjectiveValidationKind::Test)
@@ -2050,10 +2281,331 @@ fn objective_validation_command_kind_with_depth(
     }
 }
 
+fn objective_validation_shell_script_kind(
+    script: &str,
+    wrapper_depth: u8,
+) -> Option<ObjectiveValidationKind> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_bash::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(script, None)?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+
+    let source = script.as_bytes();
+    if root.named_child_count() == 1 {
+        let statement = root.named_child(0)?;
+        if statement.kind() == "list" {
+            return objective_validation_and_chain_kind(statement, source, wrapper_depth);
+        }
+        if statement.kind() == "command" && !shell_script_has_unsafe_control_flow(statement) {
+            let command = statement.utf8_text(source).ok()?.trim();
+            let parts = shlex::split(command)?;
+            if shell_command_can_change_or_skip_validation(&parts) {
+                return None;
+            }
+            return objective_validation_command_kind_with_depth(command, wrapper_depth);
+        }
+    }
+    if shell_script_has_unsafe_control_flow(root) {
+        return None;
+    }
+
+    let mut fail_fast = false;
+    let mut validation = None;
+    let mut cursor = root.walk();
+    for node in root.named_children(&mut cursor) {
+        match node.kind() {
+            "comment" => {}
+            "command" => {
+                let command = node.utf8_text(source).ok()?.trim();
+                let parts = shlex::split(command)?;
+                if !fail_fast {
+                    if !shell_command_enables_errexit(&parts) {
+                        return None;
+                    }
+                    fail_fast = true;
+                    continue;
+                }
+                if shell_command_can_change_or_skip_validation(&parts) {
+                    return None;
+                }
+                if let Some(kind) =
+                    objective_validation_command_kind_with_depth(command, wrapper_depth)
+                {
+                    validation = Some(stronger_validation_kind(validation, kind));
+                }
+            }
+            "variable_assignment" if fail_fast && shell_assignment_is_safe(node, source) => {}
+            // A bracket test is a fail-fast guard. It is safe to retain, but it does not
+            // independently establish objective validation without a recognized check.
+            "test_command" if fail_fast => {}
+            _ => return None,
+        }
+    }
+    fail_fast.then_some(validation).flatten()
+}
+
+fn objective_validation_and_chain_kind(
+    list: tree_sitter::Node<'_>,
+    source: &[u8],
+    wrapper_depth: u8,
+) -> Option<ObjectiveValidationKind> {
+    let mut validation = None;
+    if !collect_validation_and_chain(list, source, wrapper_depth, &mut validation) {
+        return None;
+    }
+    validation
+}
+
+fn collect_validation_and_chain(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    wrapper_depth: u8,
+    validation: &mut Option<ObjectiveValidationKind>,
+) -> bool {
+    match node.kind() {
+        "list" => {
+            for index in 0..node.child_count() {
+                let Some(child) = node.child(index) else {
+                    return false;
+                };
+                if child.is_named() {
+                    if !collect_validation_and_chain(child, source, wrapper_depth, validation) {
+                        return false;
+                    }
+                } else if child
+                    .utf8_text(source)
+                    .is_ok_and(|operator| operator.trim() != "&&")
+                {
+                    return false;
+                }
+            }
+            true
+        }
+        "command" if !shell_script_has_unsafe_control_flow(node) => {
+            let Ok(command) = node.utf8_text(source) else {
+                return false;
+            };
+            let Some(parts) = shlex::split(command.trim()) else {
+                return false;
+            };
+            if shell_command_can_change_or_skip_validation(&parts) {
+                return false;
+            }
+            if let Some(kind) =
+                objective_validation_command_kind_with_depth(command.trim(), wrapper_depth)
+            {
+                *validation = Some(stronger_validation_kind(*validation, kind));
+            }
+            true
+        }
+        "test_command" => true,
+        _ => false,
+    }
+}
+
+fn shell_script_has_unsafe_control_flow(root: tree_sitter::Node<'_>) -> bool {
+    let mut nodes = vec![root];
+    while let Some(node) = nodes.pop() {
+        if matches!(
+            node.kind(),
+            "case"
+                | "case_statement"
+                | "compound_statement"
+                | "c_style_for_statement"
+                | "file_redirect"
+                | "for"
+                | "for_statement"
+                | "function"
+                | "function_definition"
+                | "heredoc_redirect"
+                | "herestring_redirect"
+                | "if"
+                | "if_statement"
+                | "list"
+                | "negated_command"
+                | "pipeline"
+                | "process_substitution"
+                | "redirected_statement"
+                | "subshell"
+                | "until_statement"
+                | "while"
+                | "while_statement"
+        ) {
+            return true;
+        }
+        let mut cursor = node.walk();
+        nodes.extend(node.named_children(&mut cursor));
+    }
+    false
+}
+
+fn shell_command_enables_errexit(parts: &[String]) -> bool {
+    if parts.first().map(String::as_str) != Some("set") {
+        return false;
+    }
+    let mut enables_errexit = false;
+    let mut index = 1;
+    while let Some(part) = parts.get(index) {
+        if part == "+e" || (part.starts_with('+') && part[1..].contains('e')) {
+            return false;
+        }
+        if part == "-o" && parts.get(index + 1).map(String::as_str) == Some("errexit") {
+            enables_errexit = true;
+            index += 2;
+            continue;
+        }
+        if part == "-e" || (part.starts_with('-') && part[1..].contains('e')) {
+            enables_errexit = true;
+        }
+        index += 1;
+    }
+    enables_errexit
+}
+
+fn shell_command_can_change_or_skip_validation(parts: &[String]) -> bool {
+    let Some(program) = parts.first().map(String::as_str) else {
+        return true;
+    };
+    matches!(
+        Path::new(program)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(program),
+        "." | "alias"
+            | "bash"
+            | "break"
+            | "builtin"
+            | "command"
+            | "continue"
+            | "enable"
+            | "eval"
+            | "exec"
+            | "exit"
+            | "hash"
+            | "return"
+            | "set"
+            | "sh"
+            | "source"
+            | "trap"
+            | "unalias"
+            | "zsh"
+    )
+}
+
+fn shell_assignment_is_safe(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let Some(name) = node.child_by_field_name("name") else {
+        return false;
+    };
+    let Ok(name) = name.utf8_text(source) else {
+        return false;
+    };
+    !matches!(
+        name,
+        "BASHOPTS" | "BASH_ENV" | "CDPATH" | "ENV" | "GIT_EXEC_PATH" | "IFS" | "PATH" | "SHELLOPTS"
+    ) && !name.starts_with("GIT_CONFIG_")
+}
+
+const fn stronger_validation_kind(
+    current: Option<ObjectiveValidationKind>,
+    candidate: ObjectiveValidationKind,
+) -> ObjectiveValidationKind {
+    match (current, candidate) {
+        (Some(ObjectiveValidationKind::Test), _) | (_, ObjectiveValidationKind::Test) => {
+            ObjectiveValidationKind::Test
+        }
+        (Some(ObjectiveValidationKind::Diagnostic), _)
+        | (_, ObjectiveValidationKind::Diagnostic) => ObjectiveValidationKind::Diagnostic,
+        _ => ObjectiveValidationKind::FileState,
+    }
+}
+
+fn test_command_validates_file_state(parts: &[String]) -> bool {
+    parts.get(1).is_some_and(|argument| {
+        matches!(
+            argument.as_str(),
+            "-b" | "-c"
+                | "-d"
+                | "-e"
+                | "-f"
+                | "-g"
+                | "-h"
+                | "-L"
+                | "-p"
+                | "-r"
+                | "-s"
+                | "-S"
+                | "-u"
+                | "-w"
+                | "-x"
+        )
+    }) && parts.get(2).is_some_and(|path| !path.is_empty())
+}
+
 fn python_module_runs_tests(parts: &[String]) -> bool {
     parts
         .windows(2)
         .any(|window| window[0] == "-m" && matches!(window[1].as_str(), "pytest" | "unittest"))
+}
+
+fn python_inline_asserts_runtime_state(parts: &[String]) -> bool {
+    let Some(command_index) = parts.iter().position(|part| part == "-c") else {
+        return false;
+    };
+    if parts
+        .iter()
+        .take(command_index)
+        .skip(1)
+        .any(|part| matches!(part.as_str(), "-O" | "-OO"))
+    {
+        return false;
+    }
+    let Some(source) = parts.get(command_index.saturating_add(1)) else {
+        return false;
+    };
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .is_err()
+    {
+        return false;
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return false;
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        return false;
+    }
+    let mut nodes = vec![root];
+    while let Some(node) = nodes.pop() {
+        if node.kind() == "assert_statement"
+            && node
+                .named_child(0)
+                .is_some_and(python_assertion_is_not_constant_true)
+        {
+            return true;
+        }
+        let mut cursor = node.walk();
+        nodes.extend(node.named_children(&mut cursor));
+    }
+    false
+}
+
+fn python_assertion_is_not_constant_true(node: tree_sitter::Node<'_>) -> bool {
+    if node.kind() == "true" {
+        return false;
+    }
+    if node.kind() == "parenthesized_expression" {
+        return node
+            .named_child(0)
+            .is_none_or(python_assertion_is_not_constant_true);
+    }
+    true
 }
 
 fn comparison_has_two_operands(parts: &[String]) -> bool {
@@ -2085,7 +2637,13 @@ fn git_command_validates_result(parts: &[String]) -> bool {
         .take_while(|part| part.as_str() != "--")
         .filter(|part| !part.starts_with('-'))
         .collect::<Vec<_>>();
-    revisions.len() >= 2 || revisions.iter().any(|revision| revision.contains(".."))
+    let has_explicit_pathspec = parts
+        .iter()
+        .position(|part| part == "--")
+        .is_some_and(|separator| separator + 1 < parts.len());
+    revisions.len() >= 2
+        || revisions.iter().any(|revision| revision.contains(".."))
+        || (revisions.len() == 1 && has_explicit_pathspec)
 }
 
 fn test_report_executed_tests(report: &ToolExecutionReport) -> bool {

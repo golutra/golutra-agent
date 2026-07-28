@@ -88,3 +88,73 @@ pub struct ToolResultEnvelope {
     pub risk: String,
     pub verification_hint: Option<String>,
 }
+
+/// Returns a stable operational family for strategies that should share retry
+/// and diagnosis state across superficially different tool calls.
+#[must_use]
+pub fn semantic_tool_failure_family(tool_name: &str, facts: &Value) -> Option<String> {
+    let command = facts
+        .get("command")
+        .map(|command| match command {
+            Value::String(command) => command.clone(),
+            Value::Array(parts) => parts
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" "),
+            _ => String::new(),
+        })
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if tool_name == "shell" {
+        if command.contains("apt-get") && command.contains("install") {
+            return Some("dependency_install:apt".to_owned());
+        }
+        if (command.contains("pip install") || command.contains("pip3 install"))
+            || (command.contains("-m pip") && command.contains("install"))
+        {
+            return Some("dependency_install:pip".to_owned());
+        }
+        if command.contains("apt-get") && command.contains("update") {
+            return Some("dependency_index:apt".to_owned());
+        }
+    }
+    if matches!(tool_name, "process_poll" | "process_reconnect") {
+        let process_id = facts
+            .get("process_id")
+            .map(|value| match value {
+                Value::String(value) => value.clone(),
+                value => value.to_string(),
+            })
+            .unwrap_or_else(|| "unknown".to_owned());
+        return Some(format!("process_wait:{process_id}"));
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::semantic_tool_failure_family;
+
+    #[test]
+    fn semantic_failure_family_accepts_string_and_argv_commands() {
+        assert_eq!(
+            semantic_tool_failure_family(
+                "shell",
+                &json!({"command": "sudo apt-get install parquet-tools"}),
+            )
+            .as_deref(),
+            Some("dependency_install:apt")
+        );
+        assert_eq!(
+            semantic_tool_failure_family(
+                "shell",
+                &json!({"command": ["python", "-m", "pip", "install", "pyarrow"]}),
+            )
+            .as_deref(),
+            Some("dependency_install:pip")
+        );
+    }
+}

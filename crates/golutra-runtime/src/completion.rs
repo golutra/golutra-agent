@@ -4,9 +4,11 @@
 //! model's final wording from deciding task status.  Only the fixed
 //! `VerificationRecord` and governor output may choose a terminal action.
 
+use std::collections::BTreeMap;
+
 use golutra_core::{
-    BudgetState, LoopAction, LoopDecision, LoopDecisionId, PolicyId, TaskId, TurnId,
-    VerificationRecord, VerificationResult,
+    BudgetState, LoopAction, LoopDecision, LoopDecisionId, PolicyId, TaskId, ToolResultStatus,
+    TurnId, VerificationRecord, VerificationResult, semantic_tool_failure_family,
 };
 use golutra_tools::ToolExecutionReport;
 
@@ -44,12 +46,6 @@ pub(crate) fn final_message(
     tool_reports: &[ToolExecutionReport],
     verification: &VerificationRecord,
 ) -> Option<String> {
-    let summaries = tool_reports
-        .iter()
-        .map(|report| report.envelope.summary.trim())
-        .filter(|summary| !summary.is_empty())
-        .collect::<Vec<_>>();
-
     if verification.result == VerificationResult::Pass
         && assistant_message
             .as_ref()
@@ -58,25 +54,82 @@ pub(crate) fn final_message(
         return assistant_message;
     }
 
-    if summaries.is_empty() {
-        return match verification.result {
-            VerificationResult::Pass => Some("Completed.".to_owned()),
-            VerificationResult::Partial
-            | VerificationResult::Fail
-            | VerificationResult::Unknown => {
-                Some("Task finished without enough evidence to verify completion.".to_owned())
-            }
-        };
-    }
-
     match verification.result {
-        VerificationResult::Pass => Some(format!("Completed: {}", summaries.join("; "))),
-        VerificationResult::Partial | VerificationResult::Fail | VerificationResult::Unknown => {
-            Some(format!(
-                "Could not fully complete: {}",
-                summaries.join("; ")
-            ))
+        VerificationResult::Pass => {
+            let summary = tool_reports
+                .iter()
+                .rev()
+                .map(|report| report.envelope.summary.trim())
+                .find(|summary| !summary.is_empty())
+                .unwrap_or("verified completion");
+            Some(format!("Completed: {summary}"))
         }
+        VerificationResult::Partial | VerificationResult::Fail | VerificationResult::Unknown => {
+            Some(evidence_backed_failure_message(tool_reports, verification))
+        }
+    }
+}
+
+fn evidence_backed_failure_message(
+    tool_reports: &[ToolExecutionReport],
+    verification: &VerificationRecord,
+) -> String {
+    let failed_check = verification
+        .checks
+        .iter()
+        .find(|check| !check.passed)
+        .map(|check| check.message.trim())
+        .filter(|message| !message.is_empty())
+        .or_else(|| verification.residual_risks.first().map(String::as_str))
+        .unwrap_or("completion criteria were not proven");
+    let failed_reports = tool_reports
+        .iter()
+        .filter(|report| report.envelope.status != ToolResultStatus::Ok)
+        .collect::<Vec<_>>();
+    let mut families = BTreeMap::<String, usize>::new();
+    for report in &failed_reports {
+        let family = semantic_tool_failure_family(
+            &report.envelope.tool_name,
+            &report.envelope.structured_facts,
+        )
+        .unwrap_or_else(|| format!("tool:{}", report.envelope.tool_name));
+        *families.entry(family).or_default() += 1;
+    }
+    let dominant_family = families.into_iter().max_by_key(|(_, failures)| *failures);
+    let evidence = verification
+        .evidence_refs
+        .iter()
+        .take(3)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let mut message = format!(
+        "Could not complete. Verification {:?}: {}.",
+        verification.result,
+        bounded_text(failed_check, 240)
+    );
+    if let Some((family, failures)) = dominant_family {
+        message.push_str(&format!(
+            " Root cause: `{family}`; failed tool attempts: {failures}."
+        ));
+    }
+    if evidence.is_empty() {
+        message.push_str(&format!(
+            " Verification record: {}.",
+            verification.verification_id
+        ));
+    } else {
+        message.push_str(&format!(" Evidence: {}.", evidence.join(", ")));
+    }
+    message
+}
+
+fn bounded_text(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let bounded = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{bounded}...")
+    } else {
+        bounded
     }
 }
 

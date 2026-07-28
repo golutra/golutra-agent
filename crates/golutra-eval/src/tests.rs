@@ -49,6 +49,7 @@ fn failed_input(task_id: TaskId, evidence_id: EvidenceId) -> TaskEvaluationInput
         provider_config_ref: "provider:test".to_owned(),
         runtime_config_ref: "runtime:test".to_owned(),
         policy_violation_count: 0,
+        trajectory_summary: TrajectorySummary::default(),
     }
 }
 
@@ -124,6 +125,55 @@ fn complete_coverage() -> RegressionCoverage {
         completed_cells: 1,
         ..RegressionCoverage::default()
     }
+}
+
+#[test]
+fn trajectory_summary_surfaces_context_and_repeated_tool_failures() {
+    let task_id = TaskId::new();
+    let mut input = failed_input(task_id, EvidenceId::new());
+    input.trajectory_summary = TrajectorySummary {
+        provider_calls: 21,
+        tool_calls: 21,
+        failed_tool_calls: 12,
+        initial_context_tokens: Some(45),
+        final_context_tokens: Some(5_314),
+        max_context_tokens: Some(5_314),
+        context_growth_tokens: 5_269,
+        context_pressure: true,
+        workspace_changes_observed: false,
+        failure_clusters: vec![TrajectoryFailureCluster {
+            family: "dependency_install:apt".to_owned(),
+            failures: 4,
+            duration_ms: 120_000,
+            output_bytes: 8_000,
+        }],
+        ..TrajectorySummary::default()
+    };
+
+    let bundle = EvaluationRunner.evaluate_task(input);
+
+    assert!(!bundle.review.context_issues.is_empty());
+    assert!(
+        bundle
+            .review
+            .tool_issues
+            .iter()
+            .any(|issue| issue.contains("dependency_install:apt"))
+    );
+    assert!(
+        bundle
+            .review
+            .suggested_improvements
+            .iter()
+            .any(|improvement| improvement.contains("compact superseded tool results"))
+    );
+    assert!(
+        bundle
+            .review
+            .suggested_improvements
+            .iter()
+            .any(|improvement| improvement.contains("materially different strategy"))
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -375,13 +425,14 @@ fn failed_improvement_candidate_settles_as_review_without_an_executable_patch() 
     let regression = store
         .record_blocked_regression(&candidate_id, "no frozen candidate patch")
         .expect("blocked regression");
-    let decision = store
-        .decide_after_regression(&candidate_id)
-        .expect("promotion decision");
+    let decision = store.decide_after_regression(&candidate_id);
     let state = store.snapshot().expect("state");
 
     assert_eq!(regression.verdict, RegressionVerdict::NeedsReview);
-    assert_eq!(decision.decision, PromotionDecisionKind::NeedsHumanReview);
+    assert!(matches!(
+        decision,
+        Err(EvaluationError::RegressionExecutionRequired(id)) if id == candidate_id
+    ));
     assert!(state.improvement_candidates.iter().any(|candidate| {
         candidate.id == candidate_id && candidate.status == CandidateStatus::NeedsHumanReview
     }));

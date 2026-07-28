@@ -2,10 +2,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use golutra_core::{ArtifactId, CausalRelation, EventId, EvidenceId, ProviderRequestId, TaskId};
 use golutra_eval::{
-    CandidateRisk, CandidateStatus, CodeTargetRef, DiagnosticSlice, DiagnosticSliceContinuation,
-    FailureDiagnosis, FailureDomain, FailureEpisode, FailureEpisodeStatus, FailureRecovery,
-    FailureSignalKind, FailureSignalRef, FailureTaxonomy, ImprovementCandidate, ReplayCapsule,
-    ReplayMode, ReplayProviderExchange, ReplayToolResult,
+    CandidateRisk, CandidateStatus, CodeTargetRef, DiagnosisLayer, DiagnosticSlice,
+    DiagnosticSliceContinuation, FailureDiagnosis, FailureDomain, FailureEpisode,
+    FailureEpisodeStatus, FailureRecovery, FailureSignalKind, FailureSignalRef, FailureTaxonomy,
+    ImprovementCandidate, ReplayCapsule, ReplayMode, ReplayProviderExchange, ReplayToolResult,
 };
 use golutra_protocol::{RuntimeEvent, RuntimeEventType};
 use serde_json::Value;
@@ -29,12 +29,18 @@ pub(crate) fn diagnose_task(
         .filter(|episode| episode.status == FailureEpisodeStatus::Active)
         .max_by_key(|episode| episode_priority(episode))?;
     let primary_episode_id = primary_episode.episode_id.clone();
+    let primary_signal_kind = primary_episode.primary_signal.kind;
     let trigger = events
         .iter()
         .find(|event| event.id == primary_episode.primary_signal.event_ref)?;
     let trigger_index = events.iter().position(|event| event.id == trigger.id)?;
     let (taxonomy, summary, expected, actual, counterfactual, targets, commands, confidence) =
         classify_failure(events, trigger_index, trigger, source_digest);
+    let layer = if taxonomy.domain == FailureDomain::ExternalEvaluation {
+        DiagnosisLayer::Outcome
+    } else {
+        DiagnosisLayer::Causal
+    };
     let selected = diagnostic_slice_events(events, trigger.id, &episodes, 512);
     let mut artifact_refs = HashSet::new();
     let mut evidence_refs = HashSet::new();
@@ -78,9 +84,15 @@ pub(crate) fn diagnose_task(
             .iter()
             .rev()
             .find(|event| event.event_type == RuntimeEventType::FailureDiagnosed)
-            .and_then(|event| event.payload.pointer("/record/diagnosis_id"))
-            .and_then(Value::as_str)
+            .filter(|event| diagnosis_layer(event) == layer)
+            .and_then(|event| {
+                event
+                    .payload
+                    .pointer("/record/diagnosis_id")
+                    .and_then(Value::as_str)
+            })
             .map(ToOwned::to_owned),
+        layer,
         created_at: chrono::Utc::now(),
     };
     let (continuation_pages, continuation_pages_truncated) =
@@ -109,7 +121,9 @@ pub(crate) fn diagnose_task(
             episode.diagnosis_refs.push(diagnosis_id.clone());
             episode.diagnosis_refs.sort();
             episode.diagnosis_refs.dedup();
-        } else if episode.status == FailureEpisodeStatus::Active {
+        } else if episode.status == FailureEpisodeStatus::Active
+            && episode.primary_signal.kind == primary_signal_kind
+        {
             episode.status = FailureEpisodeStatus::Superseded;
             episode.superseded_by = Some(primary_episode_id.clone());
             episode.updated_at = diagnosis.created_at;
@@ -122,6 +136,15 @@ pub(crate) fn diagnose_task(
         episodes,
         candidate,
     })
+}
+
+fn diagnosis_layer(event: &RuntimeEvent) -> DiagnosisLayer {
+    event
+        .payload
+        .pointer("/record/layer")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default()
 }
 
 pub(crate) fn task_failure_episodes(
@@ -827,6 +850,32 @@ fn classify_failure(
             98,
         );
     }
+    if trigger_kind == Some("repeated_tool_failure")
+        && let Some((family, failures)) = dominant_failure_family(events, trigger_index)
+    {
+        return (
+            FailureTaxonomy {
+                domain: FailureDomain::RuntimeControlFlow,
+                code: "repeated_failure_strategy".to_owned(),
+            },
+            format!("agent repeated failure strategy `{family}` {failures} times"),
+            "the runtime blocks a failed strategy family and requires a materially different approach"
+                .to_owned(),
+            format!("failure family `{family}` exhausted bounded retries"),
+            "retain failures across unrelated diagnostic successes and inject a structured strategy correction"
+                .to_owned(),
+            vec![CodeTargetRef {
+                crate_name: "golutra-runtime".to_owned(),
+                module_path: "failure_family".to_owned(),
+                symbol: Some("FailureFamilyLedger".to_owned()),
+                source_path: Some("crates/golutra-runtime/src/lib.rs".to_owned()),
+                source_digest,
+                owner: "runtime".to_owned(),
+            }],
+            vec!["cargo test -p golutra-runtime semantic_failure_families".to_owned()],
+            96,
+        );
+    }
     if let Some(trigger_kind) = trigger_kind {
         return (
             FailureTaxonomy {
@@ -994,6 +1043,30 @@ fn classify_failure(
         vec!["rerun the recorded task fixture and its objective verifier".to_owned()],
         75,
     )
+}
+
+fn dominant_failure_family(events: &[RuntimeEvent], trigger_index: usize) -> Option<(String, u32)> {
+    let mut failures = HashMap::<String, u32>::new();
+    for event in &events[..trigger_index] {
+        if event.event_type != RuntimeEventType::ToolCompleted {
+            continue;
+        }
+        let status = event
+            .payload
+            .pointer("/envelope/status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        if status == "ok" {
+            continue;
+        }
+        let family = super::task_governance::trajectory_failure_family(&event.payload, status);
+        let count = failures.entry(family).or_default();
+        *count = count.saturating_add(1);
+    }
+    failures
+        .into_iter()
+        .filter(|(_, failures)| *failures > 1)
+        .max_by_key(|(_, failures)| *failures)
 }
 
 fn failed_verification_check<'a>(trigger: &'a RuntimeEvent, name: &str) -> Option<&'a Value> {
@@ -1795,7 +1868,61 @@ mod tests {
     }
 
     #[test]
-    fn external_failure_revises_and_supersedes_the_self_check_diagnosis() {
+    fn repeated_dependency_install_failure_targets_runtime_control() {
+        let task_id = TaskId::new();
+        let failed_install = |sequence_no| {
+            event(
+                sequence_no,
+                task_id,
+                RuntimeEventType::ToolCompleted,
+                json!({
+                    "envelope": {
+                        "tool_name": "shell",
+                        "status": "error",
+                        "summary": "apt install failed",
+                        "structured_facts": {"command": "apt-get install parquet-tools"}
+                    }
+                }),
+            )
+        };
+        let guard = event(
+            3,
+            task_id,
+            RuntimeEventType::LoopGuardTriggered,
+            json!({
+                "trigger": "repeated_tool_failure",
+                "summary": "dependency installation strategy exhausted"
+            }),
+        );
+
+        let analysis = diagnose_task(
+            task_id,
+            &[failed_install(1), failed_install(2), guard],
+            None,
+        )
+        .expect("diagnosis");
+
+        assert_eq!(analysis.diagnosis.layer, DiagnosisLayer::Causal);
+        assert_eq!(
+            analysis.diagnosis.taxonomy.code,
+            "repeated_failure_strategy"
+        );
+        assert_eq!(analysis.diagnosis.code_targets[0].owner, "runtime");
+        assert_eq!(
+            analysis.diagnosis.code_targets[0].symbol.as_deref(),
+            Some("FailureFamilyLedger")
+        );
+        assert!(
+            analysis
+                .diagnosis
+                .regression_commands
+                .iter()
+                .any(|command| command.contains("semantic_failure_families"))
+        );
+    }
+
+    #[test]
+    fn external_failure_adds_outcome_diagnosis_without_superseding_causal_diagnosis() {
         let task_id = TaskId::new();
         let verification = event(
             1,
@@ -1849,15 +1976,17 @@ mod tests {
             revised.diagnosis.taxonomy.domain,
             FailureDomain::ExternalEvaluation
         );
+        assert_eq!(first.diagnosis.layer, DiagnosisLayer::Causal);
+        assert_eq!(revised.diagnosis.layer, DiagnosisLayer::Outcome);
         assert_eq!(revised.diagnosis.revision, 2);
-        assert_eq!(
-            revised.diagnosis.supersedes_diagnosis_id.as_deref(),
-            Some(first.diagnosis.diagnosis_id.as_str())
-        );
+        assert_eq!(revised.diagnosis.supersedes_diagnosis_id, None);
         let active = revised
             .episodes
             .iter()
-            .find(|episode| episode.status == FailureEpisodeStatus::Active)
+            .find(|episode| {
+                episode.status == FailureEpisodeStatus::Active
+                    && episode.primary_signal.kind == FailureSignalKind::ExternalAssertion
+            })
             .expect("active external episode");
         assert!(!active.external_assertion_failures.is_empty());
         assert_eq!(
@@ -1865,8 +1994,8 @@ mod tests {
             vec![evidence_id]
         );
         assert!(revised.episodes.iter().any(|episode| {
-            episode.status == FailureEpisodeStatus::Superseded
-                && episode.superseded_by.as_deref() == Some(active.episode_id.as_str())
+            episode.primary_signal.kind == FailureSignalKind::SelfCheck
+                && episode.status == FailureEpisodeStatus::Active
         }));
         assert!(revised.candidate.evidence_refs.contains(&evidence_id));
         assert!(revised.slice.artifact_refs.contains(&artifact_id));

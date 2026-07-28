@@ -22,6 +22,104 @@ fn policy_violation_count(events: &[RuntimeEvent]) -> usize {
         .count()
 }
 
+fn trajectory_summary(events: &[RuntimeEvent]) -> TrajectorySummary {
+    let mut summary = TrajectorySummary::default();
+    let mut context_tokens = Vec::new();
+    let mut failures = HashMap::<String, TrajectoryFailureCluster>::new();
+    for event in events {
+        match event.event_type {
+            RuntimeEventType::ProviderCompleted => {
+                summary.provider_calls = summary.provider_calls.saturating_add(1);
+            }
+            RuntimeEventType::ApprovalRequested => {
+                summary.approval_requests = summary.approval_requests.saturating_add(1);
+            }
+            RuntimeEventType::ContextBuilt => {
+                if let Some(tokens) = event
+                    .payload
+                    .get("planned_input_tokens")
+                    .and_then(Value::as_u64)
+                {
+                    context_tokens.push(tokens);
+                }
+            }
+            RuntimeEventType::ToolCompleted => {
+                summary.tool_calls = summary.tool_calls.saturating_add(1);
+                let status = event
+                    .payload
+                    .pointer("/envelope/status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let duration_ms = event
+                    .payload
+                    .pointer("/metrics/duration_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                let output_bytes = event
+                    .payload
+                    .pointer("/metrics/output_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                summary.tool_duration_ms = summary.tool_duration_ms.saturating_add(duration_ms);
+                summary.tool_output_bytes = summary.tool_output_bytes.saturating_add(output_bytes);
+                summary.workspace_changes_observed |= event
+                    .payload
+                    .get("changed_files")
+                    .and_then(Value::as_array)
+                    .is_some_and(|files| !files.is_empty());
+                if status != "ok" {
+                    summary.failed_tool_calls = summary.failed_tool_calls.saturating_add(1);
+                    let family = trajectory_failure_family(&event.payload, status);
+                    let cluster = failures.entry(family.clone()).or_insert_with(|| {
+                        TrajectoryFailureCluster {
+                            family,
+                            ..TrajectoryFailureCluster::default()
+                        }
+                    });
+                    cluster.failures = cluster.failures.saturating_add(1);
+                    cluster.duration_ms = cluster.duration_ms.saturating_add(duration_ms);
+                    cluster.output_bytes = cluster.output_bytes.saturating_add(output_bytes);
+                }
+            }
+            _ => {}
+        }
+    }
+    summary.initial_context_tokens = context_tokens.first().copied();
+    summary.final_context_tokens = context_tokens.last().copied();
+    summary.max_context_tokens = context_tokens.iter().copied().max();
+    summary.context_growth_tokens = summary
+        .final_context_tokens
+        .unwrap_or_default()
+        .saturating_sub(summary.initial_context_tokens.unwrap_or_default());
+    summary.context_pressure = summary.context_growth_tokens >= 2_048;
+    summary.failure_clusters = failures.into_values().collect();
+    summary.failure_clusters.sort_by(|left, right| {
+        right
+            .failures
+            .cmp(&left.failures)
+            .then_with(|| left.family.cmp(&right.family))
+    });
+    summary
+}
+
+pub(super) fn trajectory_failure_family(payload: &Value, status: &str) -> String {
+    let tool_name = payload
+        .pointer("/envelope/tool_name")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let facts = payload
+        .pointer("/envelope/structured_facts")
+        .unwrap_or(&Value::Null);
+    if let Some(family) = golutra_core::semantic_tool_failure_family(tool_name, facts) {
+        return family;
+    }
+    let summary = payload
+        .get("summary")
+        .and_then(Value::as_str)
+        .unwrap_or("tool failure");
+    format!("{tool_name}:{status}:{}", compact_event_summary(summary))
+}
+
 impl RuntimeHost {
     pub(super) async fn schedule_task_evaluation_best_effort(
         &self,
@@ -104,6 +202,7 @@ impl RuntimeHost {
             provider_config_ref,
             runtime_config_ref: format!("golutra-runtime:{}", env!("CARGO_PKG_VERSION")),
             policy_violation_count: u32::try_from(policy_violation_count).unwrap_or(u32::MAX),
+            trajectory_summary: trajectory_summary(&events),
         };
         let bundle = self.governance.evaluate_minimal(evaluation_input.clone());
         // Post-task governance is durable but does not rewrite the already-decided user task
@@ -356,6 +455,7 @@ impl RuntimeHost {
             provider_config_ref,
             runtime_config_ref: format!("golutra-runtime:{}", env!("CARGO_PKG_VERSION")),
             policy_violation_count: u32::try_from(policy_violation_count).unwrap_or(u32::MAX),
+            trajectory_summary: trajectory_summary(&events),
         });
         Ok((task, input))
     }

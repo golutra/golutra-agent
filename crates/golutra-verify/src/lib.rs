@@ -717,11 +717,18 @@ fn latest_distinct_checks(checks: Vec<&VerificationCheck>) -> Vec<&VerificationC
     let mut seen = HashSet::new();
     let mut latest = Vec::new();
     for check in checks.into_iter().rev() {
-        let identity = format!(
-            "{}\0{}",
-            check.name,
-            check.command.as_deref().unwrap_or_default()
-        );
+        let identity = if check.kind == VerificationCheckKind::ObjectiveValidation
+            && check.name.starts_with("objective:")
+            && check.name.contains(":identity:")
+        {
+            check.name.clone()
+        } else {
+            format!(
+                "{}\0{}",
+                check.name,
+                check.command.as_deref().unwrap_or_default()
+            )
+        };
         if seen.insert(identity) {
             latest.push(check);
         }
@@ -960,10 +967,10 @@ mod tests {
     #[test]
     fn successful_validation_rerun_supersedes_its_failed_attempt_and_tool_failure() {
         let evidence = EvidenceId::new();
-        let validation = |passed, message: &str| VerificationCheck {
+        let validation = |passed, command: &str, message: &str| VerificationCheck {
             kind: VerificationCheckKind::ObjectiveValidation,
-            name: "objective:test:shell".to_owned(),
-            command: Some("cargo test".to_owned()),
+            name: "objective:test:shell:identity:test-suite".to_owned(),
+            command: Some(command.to_owned()),
             passed,
             evidence_refs: vec![evidence],
             message: message.to_owned(),
@@ -990,8 +997,8 @@ mod tests {
                     evidence_refs: vec![evidence],
                     message: "code changed".to_owned(),
                 },
-                validation(false, "tests failed"),
-                validation(true, "tests passed after the fix"),
+                validation(false, "cargo test before-fix", "tests failed"),
+                validation(true, "cargo test after-fix", "tests passed after the fix"),
             ],
             requires_workspace_evidence: true,
             code_files_changed: true,

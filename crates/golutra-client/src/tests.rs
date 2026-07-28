@@ -1792,7 +1792,7 @@ async fn successful_task_quarantines_reviews_retrieves_and_rolls_back_project_me
 }
 
 #[tokio::test]
-async fn failed_task_reaches_rejected_promotion_without_polluting_memory() {
+async fn failed_task_blocks_unfrozen_regression_without_polluting_memory() {
     let _provider = IsolatedGlobalMockProvider::install().await;
     let application = RuntimeApplication::in_memory().await.expect("application");
     let session_id = application.session_service().default_session_id();
@@ -1870,6 +1870,7 @@ async fn failed_task_reaches_rejected_promotion_without_polluting_memory() {
         provider_config_ref: "provider:test".to_owned(),
         runtime_config_ref: "runtime:test".to_owned(),
         policy_violation_count: 0,
+        trajectory_summary: TrajectorySummary::default(),
     });
     let second_case_ref = second_bundle.case.case_id.clone();
     evaluation_store
@@ -2022,10 +2023,13 @@ async fn failed_task_reaches_rejected_promotion_without_polluting_memory() {
         regression.candidate_id == runtime_candidate_id
             && regression.verdict == golutra_eval::RegressionVerdict::NeedsReview
     }));
-    assert!(trace.evaluation.promotion_decisions.iter().any(|decision| {
-        decision.candidate_id == runtime_candidate_id
-            && decision.decision == PromotionDecisionKind::NeedsHumanReview
-    }));
+    assert!(
+        !trace
+            .evaluation
+            .promotion_decisions
+            .iter()
+            .any(|decision| { decision.candidate_id == runtime_candidate_id })
+    );
     assert!(
         !evaluation_store
             .snapshot()
@@ -2035,13 +2039,12 @@ async fn failed_task_reaches_rejected_promotion_without_polluting_memory() {
             .any(|candidate| candidate.candidate_id == runtime_candidate_id)
     );
     assert!(trace.events.iter().any(|event| {
-        event.event_type == RuntimeEventType::RegressionCompleted
+        event.event_type == RuntimeEventType::RegressionBlocked
             && event.payload["automatic"] == true
             && event.payload["record"]["candidate_id"] == runtime_candidate_id
     }));
-    assert!(trace.events.iter().any(|event| {
+    assert!(!trace.events.iter().any(|event| {
         event.event_type == RuntimeEventType::PromotionDecided
-            && event.payload["automatic"] == true
             && event.payload["record"]["candidate_id"] == runtime_candidate_id
     }));
     assert!(!trace.events.iter().any(|event| {
@@ -2234,6 +2237,7 @@ async fn evaluation_persistence_failure_is_reported_to_the_durable_worker() {
         provider_config_ref: "provider:test".to_owned(),
         runtime_config_ref: "runtime:test".to_owned(),
         policy_violation_count: 0,
+        trajectory_summary: TrajectorySummary::default(),
     });
 
     assert!(

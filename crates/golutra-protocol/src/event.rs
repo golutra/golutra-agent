@@ -104,6 +104,7 @@ pub enum RuntimeEventType {
     ImprovementCandidateCreated,
     AutomationCandidateCreated,
     CandidatePatchFrozen,
+    RegressionBlocked,
     RegressionCompleted,
     PromotionDecided,
     CandidateApplied,
@@ -209,6 +210,7 @@ impl RuntimeEventType {
             Self::ImprovementCandidateCreated
             | Self::AutomationCandidateCreated
             | Self::CandidatePatchFrozen
+            | Self::RegressionBlocked
             | Self::RegressionCompleted
             | Self::PromotionDecided
             | Self::CandidateApplied

@@ -355,12 +355,14 @@ impl RuntimeHost {
         };
         let evaluation_store = self.evaluation_store.clone();
         let analysis_for_store = analysis.clone();
+        let outcome_only =
+            analysis_for_store.diagnosis.layer == golutra_eval::DiagnosisLayer::Outcome;
         let update = run_blocking(move || {
             evaluation_store.record_failure_products(
                 analysis_for_store.diagnosis,
                 analysis_for_store.slice,
                 analysis_for_store.episodes,
-                Some(analysis_for_store.candidate),
+                (!outcome_only).then_some(analysis_for_store.candidate),
             )
         })
         .await??;

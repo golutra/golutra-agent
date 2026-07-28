@@ -25,7 +25,8 @@ use golutra_core::{
 use golutra_eval::EvaluationRunner;
 use golutra_eval::{
     BenchmarkRun, CandidateStatus, EvaluationError, EvaluationStore, PromotionDecisionKind,
-    ReviewMode, TaskEvaluationBundle, TaskEvaluationInput,
+    ReviewMode, TaskEvaluationBundle, TaskEvaluationInput, TrajectoryFailureCluster,
+    TrajectorySummary,
 };
 use golutra_evolution::{EvolutionError, EvolutionStore};
 use golutra_llm::{ConfiguredProvider, ProviderError, ProviderRole, protocol_capabilities};

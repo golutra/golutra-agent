@@ -78,6 +78,69 @@ fn duplicate_failures_in_one_provider_round_count_as_one_retry() {
     assert_eq!(count, 0);
 }
 
+#[test]
+fn old_tool_results_are_compacted_without_breaking_tool_message_identity() {
+    let large_result = serde_json::to_string(&json!({
+        "tool_name": "shell",
+        "status": "error",
+        "summary": "dependency installation failed",
+        "model_visible_excerpt": "package output ".repeat(4_000),
+    }))
+    .expect("tool result");
+    let mut messages = (0..3)
+        .map(|index| ProviderMessage {
+            role: ProviderRole::Tool,
+            content: large_result.clone(),
+            tool_call_id: Some(format!("call-{index}")),
+            tool_name: Some("shell".to_owned()),
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        })
+        .collect::<Vec<_>>();
+    let mut sources = (0..3)
+        .map(|index| ContextMessageSource {
+            contributor: "tool_result_excerpt".to_owned(),
+            source_refs: vec![format!("tool-call:{index}")],
+            origin: "tool_result".to_owned(),
+            visibility: ModelInputVisibility::ModelVisible,
+        })
+        .collect::<Vec<_>>();
+
+    let compacted = compact_tool_result_history(&mut messages, &mut sources);
+
+    assert_eq!(compacted, 2);
+    assert!(messages[0].content.contains("history_state"));
+    assert!(messages[1].content.contains("history_state"));
+    assert_eq!(messages[2].content, large_result);
+    assert_eq!(messages[0].tool_call_id.as_deref(), Some("call-0"));
+    assert_eq!(sources[0].origin, "tool_result_compaction");
+}
+
+#[test]
+fn semantic_failure_families_survive_unrelated_successes() {
+    let apt = semantic_failure_family(
+        "shell",
+        &json!({"command": "bash -lc 'apt-get install -y python3-pip'"}),
+    );
+    let apt_variant = semantic_failure_family(
+        "shell",
+        &json!({"command": "DEBIAN_FRONTEND=noninteractive apt-get install python3-pip"}),
+    );
+    let diagnostic =
+        semantic_failure_family("shell", &json!({"command": "python3 -m pip --version"}));
+    assert_eq!(apt, "dependency_install:apt");
+    assert_eq!(apt, apt_variant);
+    assert_ne!(apt, diagnostic);
+
+    let mut ledger = FailureFamilyLedger::default();
+    ledger.observe(&apt, ToolResultStatus::Timeout);
+    ledger.observe(&diagnostic, ToolResultStatus::Ok);
+    ledger.observe(&apt_variant, ToolResultStatus::Error);
+
+    assert_eq!(ledger.failures(&apt), 2);
+    assert_eq!(ledger.failures(&diagnostic), 0);
+}
+
 #[derive(Debug, Clone)]
 enum FallbackTestProvider {
     Failing(Box<golutra_core::ProviderContract>),
@@ -241,7 +304,9 @@ impl LlmProvider for ValidationGateProvider {
                     vec![ProviderToolCall {
                         tool_call_id: "compare-result".to_owned(),
                         tool_name: "shell".to_owned(),
-                        arguments: json!({"command": "cmp source.txt recovered.txt"}),
+                        arguments: json!({
+                            "command": "python3 -c \"from pathlib import Path; assert Path('source.txt').read_bytes() == Path('recovered.txt').read_bytes()\""
+                        }),
                     }],
                     ProviderFinishReason::ToolCalls,
                 )
@@ -1136,7 +1201,10 @@ async fn workspace_change_is_returned_to_the_model_until_fresh_validation_passes
     assert_eq!(outcome.loop_decision.action, LoopAction::StopSuccess);
     assert!(outcome.verification.checks.iter().any(|check| {
         check.kind == golutra_core::VerificationCheckKind::ObjectiveValidation
-            && check.command.as_deref() == Some("cmp source.txt recovered.txt")
+            && check.command.as_deref()
+                == Some(
+                    "python3 -c \"from pathlib import Path; assert Path('source.txt').read_bytes() == Path('recovered.txt').read_bytes()\""
+                )
             && check.passed
     }));
     assert!(trace.iter().any(|event| matches!(
@@ -1308,8 +1376,89 @@ fn verification_command_classifier_rejects_arbitrary_shell_success() {
     assert!(is_objective_validation_command(
         "/usr/bin/python3 -m unittest"
     ));
+    assert_eq!(
+        objective_validation_command_kind(
+            "python3 -c \"from pathlib import Path; actual = Path('result.txt').read_text(); assert actual == 'expected'\""
+        ),
+        Some(ObjectiveValidationKind::Diagnostic)
+    );
+    assert!(!is_objective_validation_command(
+        "python3 -c \"print('passed')\""
+    ));
+    assert!(!is_objective_validation_command(
+        "python3 -c \"assert True\""
+    ));
+    assert!(!is_objective_validation_command(
+        "python3 -c \"assert (True)\""
+    ));
+    assert_eq!(
+        objective_validation_command_kind("python3 -c \"assert False\""),
+        Some(ObjectiveValidationKind::Diagnostic)
+    );
+    assert!(!is_objective_validation_command(
+        "python3 -c \"print('assert actual == expected')\""
+    ));
+    assert!(!is_objective_validation_command(
+        "python3 -O -c \"assert actual == expected\""
+    ));
     assert!(is_objective_validation_command(
         "bash -lc 'cargo check && python -m pytest -q'"
+    ));
+    let git_validation = "bash -lc 'set -euo pipefail
+branch=$(git branch --show-current)
+test \"$branch\" = master
+git diff --quiet
+git diff --cached --quiet
+git merge-base --is-ancestor recovered-move-to-stanford master
+git diff --exit-code recovered-move-to-stanford -- _includes/about.md _layouts/default.html
+printf \"validation passed\\n\"'";
+    assert_eq!(
+        objective_validation_command_kind(git_validation),
+        Some(ObjectiveValidationKind::Diagnostic)
+    );
+    let final_git_validation = "bash -lc 'set -euo pipefail
+merge_parent=$(git rev-parse HEAD^2)
+recovered=$(git rev-parse 268903d)
+[ \"$merge_parent\" = \"$recovered\" ]
+git diff --quiet 268903d -- _includes/about.md _layouts/default.html
+git diff --quiet HEAD --
+test -z \"$(git status --porcelain)\"'";
+    assert_eq!(
+        objective_validation_command_kind(final_git_validation),
+        Some(ObjectiveValidationKind::Diagnostic)
+    );
+    assert_eq!(
+        objective_validation_command_kind(
+            "bash -lc 'git diff --quiet 268903d HEAD && test -z \"$(git status --porcelain)\"'"
+        ),
+        Some(ObjectiveValidationKind::Diagnostic)
+    );
+    let failed_git_validation = "bash -lc 'git status --short --branch && git diff --exit-code 268903d..HEAD -- _layouts/default.html _includes/about.md && git log --oneline -3'";
+    let repaired_git_validation = "bash -lc 'git checkout 268903d -- _includes/about.md _layouts/default.html && git add _includes/about.md _layouts/default.html && git commit --amend --no-edit && git diff --exit-code 268903d..HEAD -- _layouts/default.html _includes/about.md'";
+    assert_eq!(
+        objective_validation_command_identity(failed_git_validation),
+        objective_validation_command_identity(repaired_git_validation)
+    );
+    assert!(!is_objective_validation_command(
+        "bash -lc 'git diff --quiet 268903d HEAD || true'"
+    ));
+    assert!(!is_objective_validation_command(
+        "bash -lc 'git merge-base --is-ancestor source HEAD\nprintf done'"
+    ));
+    assert!(!is_objective_validation_command(
+        "bash -lc 'set -e\ngit merge-base --is-ancestor source HEAD || true'"
+    ));
+    assert!(!is_objective_validation_command(
+        "bash -lc 'set -e\ngit merge-base --is-ancestor source HEAD | cat'"
+    ));
+    assert!(!is_objective_validation_command(
+        "bash -lc 'set -e\nset +e\ngit merge-base --is-ancestor source HEAD'"
+    ));
+    assert!(!is_objective_validation_command(
+        "bash -lc 'set -e\nprintf \"validation passed\\n\"'"
+    ));
+    assert!(!is_objective_validation_command(
+        "bash -lc 'set -e\n[ \"$actual\" = \"$expected\" ]'"
     ));
     assert!(!is_objective_validation_command(
         "bash -lc 'pytest -q | tee results.txt'"
@@ -1321,11 +1470,16 @@ fn verification_command_classifier_rejects_arbitrary_shell_success() {
         objective_validation_command_kind("test -f result.txt"),
         Some(ObjectiveValidationKind::FileState)
     );
+    assert!(!is_objective_validation_command("test expected = expected"));
     assert!(!is_objective_validation_command("echo done"));
     assert!(!is_objective_validation_command("echo tests passed"));
     assert!(!is_objective_validation_command("git status --short"));
     assert!(!is_objective_validation_command("git log --oneline -2"));
     assert!(!is_objective_validation_command("git diff --exit-code"));
+    assert!(!is_objective_validation_command("git diff --quiet HEAD --"));
+    assert!(is_objective_validation_command(
+        "git diff --quiet 268903d -- _includes/about.md _layouts/default.html"
+    ));
     assert!(is_objective_validation_command(
         "git diff --exit-code source HEAD -- src/lib.rs"
     ));
@@ -1558,10 +1712,10 @@ async fn agent_loop_blocks_without_evidence() {
         .expect("loop runs");
 
     assert_eq!(outcome.loop_decision.action, LoopAction::StopFailed);
-    assert_eq!(
-        outcome.final_message,
-        Some("Task finished without enough evidence to verify completion.".to_owned())
-    );
+    let final_message = outcome.final_message.expect("failure message");
+    assert!(final_message.contains("Verification Fail"));
+    assert!(final_message.contains("objective evidence"));
+    assert!(final_message.contains("Verification record:"));
 }
 
 #[tokio::test]

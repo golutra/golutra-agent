@@ -384,6 +384,16 @@ impl RuntimeHost {
                 };
                 regression
             };
+            if regression.cases_run == 0 {
+                return self
+                    .record_automatic_improvement_events(
+                        session_id,
+                        candidate.source_task_id,
+                        &regression,
+                        None,
+                    )
+                    .await;
+            }
             let evaluation_store = self.evaluation_store.clone();
             let state = run_blocking(move || evaluation_store.snapshot()).await??;
             let decision = if let Some(decision) = state
@@ -406,7 +416,7 @@ impl RuntimeHost {
                 session_id,
                 candidate.source_task_id,
                 &regression,
-                &decision,
+                Some(&decision),
             )
             .await
         }
@@ -418,15 +428,20 @@ impl RuntimeHost {
         session_id: SessionId,
         source_task_id: TaskId,
         regression: &RegressionResult,
-        decision: &golutra_eval::PromotionDecision,
+        decision: Option<&golutra_eval::PromotionDecision>,
     ) -> Result<(), ClientError> {
         let events = self
             .repositories
             .events
             .load(session_id, Some(source_task_id), None)
             .await?;
+        let regression_event_type = if regression.cases_run == 0 {
+            RuntimeEventType::RegressionBlocked
+        } else {
+            RuntimeEventType::RegressionCompleted
+        };
         let has_regression = events.iter().any(|event| {
-            event.event_type == RuntimeEventType::RegressionCompleted
+            event.event_type == regression_event_type
                 && event.payload["record"]["regression_id"] == regression.regression_id
         });
         if !has_regression {
@@ -434,19 +449,30 @@ impl RuntimeHost {
                 self.next_sequence_no(),
                 session_id,
                 Some(source_task_id),
-                RuntimeEventType::RegressionCompleted,
+                regression_event_type,
                 RuntimeEventSource::Evaluator,
                 json!({
-                    "summary": format!(
-                        "candidate {} automatic regression settled",
-                        regression.candidate_id
-                    ),
+                    "summary": if regression.cases_run == 0 {
+                        format!(
+                            "candidate {} regression blocked: {}",
+                            regression.candidate_id,
+                            regression.regressions.join("; ")
+                        )
+                    } else {
+                        format!(
+                            "candidate {} automatic regression settled",
+                            regression.candidate_id
+                        )
+                    },
                     "record": regression,
                     "automatic": true,
                 }),
             ))
             .await?;
         }
+        let Some(decision) = decision else {
+            return Ok(());
+        };
         let has_decision = events.iter().any(|event| {
             event.event_type == RuntimeEventType::PromotionDecided
                 && event.payload["record"]["decision_id"] == decision.decision_id

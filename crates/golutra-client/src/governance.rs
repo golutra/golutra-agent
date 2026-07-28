@@ -351,14 +351,15 @@ impl GovernanceService {
             }
         }
         for regression in &regressions {
-            if !event_contains_id(
-                RuntimeEventType::RegressionCompleted,
-                "regression_id",
-                &regression.regression_id,
-            ) {
+            let event_type = if regression.cases_run == 0 {
+                RuntimeEventType::RegressionBlocked
+            } else {
+                RuntimeEventType::RegressionCompleted
+            };
+            if !event_contains_id(event_type, "regression_id", &regression.regression_id) {
                 integrity_warnings.push(format!(
-                    "RegressionResult {} has no canonical event",
-                    regression.regression_id
+                    "RegressionResult {} has no canonical {:?} event",
+                    regression.regression_id, event_type
                 ));
             }
         }

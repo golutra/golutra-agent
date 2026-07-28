@@ -864,6 +864,7 @@ fn attributed_contributor_manifest(
     let mut grouped = BTreeMap::<String, ContextContributorSnapshot>::new();
     for (index, (message, source)) in request.messages.iter().zip(sources).enumerate() {
         let estimated_tokens = estimate_message_tokens(std::slice::from_ref(message));
+        let has_base_contributor = base.contains_key(source.contributor.as_str());
         let entry = grouped
             .entry(source.contributor.clone())
             .or_insert_with(|| {
@@ -894,12 +895,15 @@ fn attributed_contributor_manifest(
                     },
                 )
             });
+        let first_attributed_message = entry.message_indexes.is_empty();
         entry.retained_estimated_tokens = entry
             .retained_estimated_tokens
             .saturating_add(estimated_tokens);
         entry.estimated_tokens = entry.retained_estimated_tokens;
-        if entry.original_estimated_tokens == 0 {
-            entry.original_estimated_tokens = entry.retained_estimated_tokens;
+        if !has_base_contributor || !first_attributed_message {
+            entry.original_estimated_tokens = entry
+                .original_estimated_tokens
+                .saturating_add(estimated_tokens);
         }
         entry
             .message_indexes
@@ -1852,5 +1856,62 @@ mod tests {
         );
 
         assert!(matches!(result, Err(ContextError::BudgetExceeded { .. })));
+    }
+
+    #[test]
+    fn attributed_manifest_sums_original_tokens_for_grouped_runtime_messages() {
+        let task_id = TaskId::new();
+        let turn_id = TurnId::new();
+        let plan = ContextBuilder::default()
+            .build(task_id, turn_id, Vec::new())
+            .expect("empty context");
+        let mut request = provider_request_from_plan(
+            &plan,
+            task_id,
+            turn_id,
+            "test-provider",
+            "test-model",
+            Vec::new(),
+        );
+        request.messages = [
+            ("call-1", "first tool result"),
+            ("call-2", "second tool result is longer"),
+        ]
+        .into_iter()
+        .map(|(tool_call_id, content)| ProviderMessage {
+            role: ProviderRole::Tool,
+            content: content.to_owned(),
+            tool_call_id: Some(tool_call_id.to_owned()),
+            tool_name: Some("shell".to_owned()),
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        })
+        .collect();
+        let sources = vec![
+            ContextMessageSource {
+                contributor: "tool_result_excerpt".to_owned(),
+                source_refs: vec!["tool-call:1".to_owned()],
+                origin: "tool_result".to_owned(),
+                visibility: ModelInputVisibility::ModelVisible,
+            },
+            ContextMessageSource {
+                contributor: "tool_result_excerpt".to_owned(),
+                source_refs: vec!["tool-call:2".to_owned()],
+                origin: "tool_result".to_owned(),
+                visibility: ModelInputVisibility::ModelVisible,
+            },
+        ];
+
+        let manifest = attributed_contributor_manifest(&plan, &request, &sources, &[]);
+        let tool_results = manifest
+            .iter()
+            .find(|entry| entry.name == "tool_result_excerpt")
+            .expect("tool result attribution");
+
+        assert_eq!(
+            tool_results.original_estimated_tokens,
+            tool_results.retained_estimated_tokens
+        );
+        assert_eq!(tool_results.message_indexes, vec![0, 1]);
     }
 }

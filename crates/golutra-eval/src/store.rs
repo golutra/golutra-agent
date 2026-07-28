@@ -1091,6 +1091,11 @@ impl EvaluationStore {
                 .rev()
                 .find(|regression| regression.candidate_id == candidate_id)
                 .ok_or_else(|| EvaluationError::RegressionRequired(candidate_id.to_owned()))?;
+            if regression.cases_run == 0 {
+                return Err(EvaluationError::RegressionExecutionRequired(
+                    candidate_id.to_owned(),
+                ));
+            }
             let (decision, reason) = match (candidate.status, regression.verdict) {
                 (CandidateStatus::Rejected, RegressionVerdict::Fail) => (
                     PromotionDecisionKind::Reject,

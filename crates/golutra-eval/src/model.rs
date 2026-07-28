@@ -144,7 +144,17 @@ pub struct FailureDiagnosis {
     pub revision: u32,
     #[serde(default)]
     pub supersedes_diagnosis_id: Option<String>,
+    #[serde(default)]
+    pub layer: DiagnosisLayer,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosisLayer {
+    #[default]
+    Causal,
+    Outcome,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -940,6 +950,33 @@ pub struct PostTaskReview {
     pub provider_issues: Vec<String>,
     pub suggested_improvements: Vec<String>,
     pub promotion_candidates: Vec<String>,
+    #[serde(default)]
+    pub trajectory_summary: TrajectorySummary,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TrajectoryFailureCluster {
+    pub family: String,
+    pub failures: u32,
+    pub duration_ms: u64,
+    pub output_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TrajectorySummary {
+    pub provider_calls: u32,
+    pub tool_calls: u32,
+    pub failed_tool_calls: u32,
+    pub approval_requests: u32,
+    pub tool_duration_ms: u64,
+    pub tool_output_bytes: u64,
+    pub initial_context_tokens: Option<u64>,
+    pub final_context_tokens: Option<u64>,
+    pub max_context_tokens: Option<u64>,
+    pub context_growth_tokens: u64,
+    pub context_pressure: bool,
+    pub workspace_changes_observed: bool,
+    pub failure_clusters: Vec<TrajectoryFailureCluster>,
 }
 
 #[derive(Debug, Clone)]
@@ -957,6 +994,7 @@ pub struct TaskEvaluationInput {
     pub provider_config_ref: String,
     pub runtime_config_ref: String,
     pub policy_violation_count: u32,
+    pub trajectory_summary: TrajectorySummary,
 }
 
 #[derive(Debug, Clone)]
