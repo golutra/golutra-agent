@@ -503,8 +503,16 @@ class GolutraAgent(BaseAgent):
             with tempfile.TemporaryDirectory(prefix="golutra-tbench-auth-") as temp_dir:
                 provider_file, credentials_file = self._active_auth_files(Path(temp_dir))
                 session.copy_to_container(binary, container_dir="/installed-agent", container_filename="golutra")
-                session.copy_to_container(provider_file, container_dir="/root/.golutra", container_filename="provider.json")
-                session.copy_to_container(credentials_file, container_dir="/root/.golutra", container_filename="credentials.json")
+                session.copy_to_container(
+                    provider_file,
+                    container_dir="/installed-agent/auth",
+                    container_filename="provider.json",
+                )
+                session.copy_to_container(
+                    credentials_file,
+                    container_dir="/installed-agent/auth",
+                    container_filename="credentials.json",
+                )
         except (OSError, ValueError, json.JSONDecodeError) as error:
             return self._installation_failure(
                 logging_dir,
@@ -512,16 +520,17 @@ class GolutraAgent(BaseAgent):
                 {"error_type": type(error).__name__},
             )
 
-        setup_result = session.container.exec_run(
-            [
-                "sh",
-                "-c",
-                "chmod 755 /installed-agent/golutra && "
-                "chmod 700 /root/.golutra && "
-                "chmod 600 /root/.golutra/provider.json /root/.golutra/credentials.json && "
-                "/installed-agent/golutra --help >/dev/null",
-            ]
+        setup_command = (
+            "trap 'rm -rf /installed-agent/auth' EXIT; "
+            "mkdir -p /root/.golutra && "
+            "cp /installed-agent/auth/provider.json /root/.golutra/provider.json && "
+            "cp /installed-agent/auth/credentials.json /root/.golutra/credentials.json && "
+            "chmod 755 /installed-agent/golutra && "
+            "chmod 700 /root/.golutra && "
+            "chmod 600 /root/.golutra/provider.json /root/.golutra/credentials.json && "
+            "/installed-agent/golutra --help >/dev/null"
         )
+        setup_result = session.container.exec_run(["sh", "-c", setup_command])
         if setup_result.exit_code != 0:
             return self._installation_failure(
                 logging_dir,

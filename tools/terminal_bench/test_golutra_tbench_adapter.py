@@ -133,7 +133,11 @@ class AdapterHelpersTest(unittest.TestCase):
                 self.output = output
 
         class Container:
+            def __init__(self):
+                self.commands = []
+
             def exec_run(self, command):
+                self.commands.append(command)
                 if command == ["uname", "-m"]:
                     return Result(b"aarch64\n")
                 if command == ["pwd"]:
@@ -144,10 +148,13 @@ class AdapterHelpersTest(unittest.TestCase):
             def __init__(self):
                 self.container = Container()
                 self.command = None
+                self.copy_calls = []
                 self.sent_keys = []
 
-            def copy_to_container(self, *_args, **_kwargs):
-                pass
+            def copy_to_container(self, *args, **kwargs):
+                self.copy_calls.append((args, kwargs))
+                if kwargs.get("container_dir") == "/root/.golutra":
+                    raise OSError("archive API cannot write to a tmpfs path")
 
             def send_command(self, command):
                 self.command = command
@@ -207,6 +214,23 @@ class AdapterHelpersTest(unittest.TestCase):
             self.assertGreater(session.command.max_timeout_sec, 14.0)
             self.assertLessEqual(session.command.max_timeout_sec, 15.0)
             self.assertEqual(session.sent_keys, [(["C-c"], 0.1)])
+            self.assertEqual(
+                [call[1]["container_dir"] for call in session.copy_calls],
+                ["/installed-agent", "/installed-agent/auth", "/installed-agent/auth"],
+            )
+            setup_command = next(
+                command[2]
+                for command in session.container.commands
+                if command[:2] == ["sh", "-c"]
+            )
+            self.assertIn(
+                "cp /installed-agent/auth/provider.json /root/.golutra/provider.json",
+                setup_command,
+            )
+            self.assertIn(
+                "trap 'rm -rf /installed-agent/auth' EXIT",
+                setup_command,
+            )
             observation = json.loads(
                 (logging_dir.parent / "golutra-adapter-observation.json").read_text()
             )
