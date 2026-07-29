@@ -17,6 +17,9 @@ def _load_adapter():
         def __init__(self, **_kwargs):
             pass
 
+        def _render_instruction(self, instruction):
+            return instruction
+
     class AgentResult:
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
@@ -73,6 +76,147 @@ class AdapterHelpersTest(unittest.TestCase):
         agent = ADAPTER.GolutraAgent()
 
         self.assertEqual(agent._result_collection_timeout_sec, 3600.0)
+        self.assertEqual(agent._agent_command_timeout_sec(None), 600.0)
+
+    def test_agent_timeout_follows_run_config_and_task_metadata(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dataset = root / "dataset"
+            run_root = root / "runs/run"
+            logging_dir = run_root / "task/task.1-of-1.run/sessions"
+            (dataset / "task").mkdir(parents=True)
+            logging_dir.mkdir(parents=True)
+            (run_root / "run_metadata.json").write_text(
+                json.dumps({"dataset_path": str(dataset)}), encoding="utf-8"
+            )
+            (run_root / "tb.lock").write_text(
+                json.dumps(
+                    {
+                        "run_config": {
+                            "global_agent_timeout_sec": None,
+                            "global_timeout_multiplier": 1.5,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (dataset / "task/task.yaml").write_text(
+                "max_agent_timeout_sec: 360.0\n", encoding="utf-8"
+            )
+            yaml = types.ModuleType("yaml")
+            yaml.safe_load = lambda _content: {"max_agent_timeout_sec": 360.0}
+
+            with patch.dict(sys.modules, {"yaml": yaml}):
+                self.assertEqual(
+                    ADAPTER._terminal_bench_agent_timeout_sec(logging_dir), 540.0
+                )
+
+            (run_root / "tb.lock").write_text(
+                json.dumps(
+                    {
+                        "run_config": {
+                            "global_agent_timeout_sec": 120.0,
+                            "global_timeout_multiplier": 3.0,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                ADAPTER._terminal_bench_agent_timeout_sec(logging_dir), 120.0
+            )
+
+    def test_agent_command_timeout_interrupts_the_runtime(self):
+        class Result:
+            def __init__(self, output: bytes = b""):
+                self.exit_code = 0
+                self.output = output
+
+        class Container:
+            def exec_run(self, command):
+                if command == ["uname", "-m"]:
+                    return Result(b"aarch64\n")
+                if command == ["pwd"]:
+                    return Result(b"/app\n")
+                return Result()
+
+        class Session:
+            def __init__(self):
+                self.container = Container()
+                self.command = None
+                self.sent_keys = []
+
+            def copy_to_container(self, *_args, **_kwargs):
+                pass
+
+            def send_command(self, command):
+                self.command = command
+                raise TimeoutError("command timed out")
+
+            def send_keys(self, *, keys, min_timeout_sec):
+                self.sent_keys.append((keys, min_timeout_sec))
+
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "golutra"
+            provider = root / "provider.json"
+            credentials = root / "credentials.json"
+            logging_dir = root / "run/task/trial/sessions"
+            binary.write_text("binary", encoding="utf-8")
+            provider.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "active_profile": "test",
+                        "profiles": [
+                            {
+                                "name": "test",
+                                "credential_ref": {"id": "credential"},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            credentials.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "credentials": {"credential": {"api_key": "secret"}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            logging_dir.mkdir(parents=True)
+            session = Session()
+            with patch.dict(ADAPTER.os.environ, {"GOLUTRA_TBENCH_PROXY": ""}):
+                agent = ADAPTER.GolutraAgent(
+                    arm64_binary=str(binary),
+                    provider_path=str(provider),
+                    credentials_path=str(credentials),
+                    collector_binary=str(root / "missing-collector"),
+                    agent_command_timeout_sec=10.0,
+                )
+            with (
+                patch.object(agent, "_start_result_collector"),
+                self.assertRaises(TimeoutError),
+            ):
+                agent.perform_task("do work", session, logging_dir)
+
+            self.assertIsNotNone(session.command)
+            self.assertGreater(session.command.max_timeout_sec, 14.0)
+            self.assertLessEqual(session.command.max_timeout_sec, 15.0)
+            self.assertEqual(session.sent_keys, [(["C-c"], 0.1)])
+            observation = json.loads(
+                (logging_dir.parent / "golutra-adapter-observation.json").read_text()
+            )
+            self.assertEqual(observation["status"], "failed")
+            self.assertEqual(observation["code"], "runtime_command_timeout")
+            self.assertEqual(observation["facts"]["agent_timeout_sec"], 10.0)
+
+    def test_agent_command_timeout_rejects_unbounded_values(self):
+        with self.assertRaises(ValueError):
+            ADAPTER.GolutraAgent(agent_command_timeout_sec=float("inf"))
 
     def test_installation_failure_is_retained_before_runtime_exists(self):
         with TemporaryDirectory() as temporary:

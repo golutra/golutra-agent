@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -22,6 +23,8 @@ from terminal_bench.terminal.models import TerminalCommand
 from terminal_bench.terminal.tmux_session import TmuxSession
 
 _DEFAULT_RESULT_COLLECTION_TIMEOUT_SEC = 3600.0
+_DEFAULT_AGENT_COMMAND_TIMEOUT_SEC = 600.0
+_AGENT_COMMAND_TIMEOUT_GRACE_SEC = 5.0
 _FAILURE_LOG_SCAN_BYTES = 1024 * 1024
 _FAILURE_DETAIL_MAX_BYTES = 2048
 _FAILURE_LINE_MAX_BYTES = 512
@@ -71,6 +74,7 @@ class GolutraAgent(BaseAgent):
         dataset_id: str = "terminal-bench",
         dataset_version: str = "unknown",
         result_collection_timeout_sec: float = _DEFAULT_RESULT_COLLECTION_TIMEOUT_SEC,
+        agent_command_timeout_sec: float | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -95,6 +99,11 @@ class GolutraAgent(BaseAgent):
         self._dataset_id = dataset_id
         self._dataset_version = dataset_version
         self._result_collection_timeout_sec = result_collection_timeout_sec
+        self._agent_command_timeout_override = (
+            _positive_timeout(agent_command_timeout_sec)
+            if agent_command_timeout_sec is not None
+            else None
+        )
 
     @staticmethod
     def name() -> str:
@@ -286,6 +295,13 @@ class GolutraAgent(BaseAgent):
         )
         return AgentResult(failure_mode=FailureMode.AGENT_INSTALLATION_FAILED)
 
+    def _agent_command_timeout_sec(self, logging_dir: Path | None) -> float:
+        return (
+            self._agent_command_timeout_override
+            or _terminal_bench_agent_timeout_sec(logging_dir)
+            or _DEFAULT_AGENT_COMMAND_TIMEOUT_SEC
+        )
+
     def _collect_result(self, trial_root: Path) -> None:
         deadline = time.monotonic() + self._result_collection_timeout_sec
         results_path: Path | None = None
@@ -459,6 +475,8 @@ class GolutraAgent(BaseAgent):
         session: TmuxSession,
         logging_dir: Path | None = None,
     ) -> AgentResult:
+        task_started_at = time.monotonic()
+        agent_timeout_sec = self._agent_command_timeout_sec(logging_dir)
         architecture_result = session.container.exec_run(["uname", "-m"])
         architecture = architecture_result.output.decode(errors="replace").strip()
         binary = self._binaries.get(architecture)
@@ -535,6 +553,12 @@ class GolutraAgent(BaseAgent):
             f"{network_flag}--approval-mode auto -- "
             f"{shlex.quote(rendered_instruction)}"
         )
+        command_timeout_sec = max(
+            1.0,
+            agent_timeout_sec
+            + _AGENT_COMMAND_TIMEOUT_GRACE_SEC
+            - (time.monotonic() - task_started_at),
+        )
         # Start collection before waiting on the agent command.  If
         # Terminal-Bench's outer timeout abandons this call, the collector can
         # still ingest the checkpoint once the harness writes results.json.
@@ -544,18 +568,41 @@ class GolutraAgent(BaseAgent):
             "agent",
             "running",
             "runtime_command_dispatched",
-            {"architecture": architecture},
+            {
+                "architecture": architecture,
+                "agent_timeout_sec": agent_timeout_sec,
+                "command_timeout_sec": command_timeout_sec,
+            },
         )
         try:
             session.send_command(
                 TerminalCommand(
                     command=command,
                     min_timeout_sec=0.0,
-                    max_timeout_sec=float("inf"),
+                    max_timeout_sec=command_timeout_sec,
                     block=True,
                     append_enter=True,
                 )
             )
+        except TimeoutError as error:
+            interrupt_error = None
+            try:
+                session.send_keys(keys=["C-c"], min_timeout_sec=0.1)
+            except Exception as interruption_error:  # noqa: BLE001
+                interrupt_error = type(interruption_error).__name__
+            self._record_adapter_observation(
+                logging_dir,
+                "agent",
+                "failed",
+                "runtime_command_timeout",
+                {
+                    "error_type": type(error).__name__,
+                    "agent_timeout_sec": agent_timeout_sec,
+                    "command_timeout_sec": command_timeout_sec,
+                    "interrupt_error_type": interrupt_error,
+                },
+            )
+            raise
         except Exception as error:
             self._record_adapter_observation(
                 logging_dir,
@@ -583,6 +630,41 @@ class GolutraAgent(BaseAgent):
             total_input_tokens=input_tokens,
             total_output_tokens=output_tokens,
         )
+
+
+def _positive_timeout(value: object) -> float:
+    timeout = float(value)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("timeout must be a finite positive number")
+    return timeout
+
+
+def _terminal_bench_agent_timeout_sec(logging_dir: Path | None) -> float | None:
+    if logging_dir is None:
+        return None
+    trial_root = logging_dir.parent
+    task_root = trial_root.parent
+    run_root = task_root.parent
+    try:
+        run_metadata = json.loads((run_root / "run_metadata.json").read_text())
+        run_lock = json.loads((run_root / "tb.lock").read_text())
+        run_config = run_lock.get("run_config", run_lock)
+        configured_timeout = run_config.get("global_agent_timeout_sec")
+        if configured_timeout:
+            return _positive_timeout(configured_timeout)
+
+        dataset_path = Path(run_metadata["dataset_path"])
+        task_config_path = dataset_path / task_root.name / "task.yaml"
+        from yaml import safe_load
+
+        task_config = safe_load(task_config_path.read_text())
+        if not isinstance(task_config, dict):
+            return None
+        task_timeout = _positive_timeout(task_config["max_agent_timeout_sec"])
+        multiplier = _positive_timeout(run_config.get("global_timeout_multiplier", 1.0))
+        return task_timeout * multiplier
+    except (ImportError, KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
 
 
 def _find_trial_results(trial_root: Path) -> Path | None:

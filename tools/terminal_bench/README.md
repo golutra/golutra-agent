@@ -30,6 +30,14 @@ timeouts from long Terminal-Bench cases can still be attached to that bundle.
 Override `result_collection_timeout_sec` only when the dataset has a longer
 combined agent/test horizon or a deliberately shorter local feedback loop.
 
+The blocking tmux command is also bounded. The adapter reads the trial's
+`max_agent_timeout_sec`, global timeout override, and timeout multiplier from
+the active Terminal-Bench run, then gives tmux a short grace period to interrupt
+Golutra after the harness deadline. This keeps Terminal-Bench's synchronous
+executor from waiting forever after its outer asyncio timeout. Use the
+`agent_command_timeout_sec` agent kwarg only when run metadata is unavailable;
+it defaults to 600 seconds as a bounded fallback.
+
 Build or copy the architecture-specific Golutra agent binaries before running:
 
 ```bash
