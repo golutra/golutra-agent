@@ -7,7 +7,8 @@
 use golutra_context::ContextCompactionRecord;
 use golutra_core::{
     ApprovalRequest, ApprovalResolution, ContextSnapshot, CorrectionEnvelope, ProviderRequestId,
-    ToolCallId, ToolProgress, TurnId, VerificationAssertion, VerificationPlan, VerificationRecord,
+    ToolCallId, ToolProgress, ToolRecoveryPolicy, TurnId, VerificationAssertion, VerificationPlan,
+    VerificationRecord,
 };
 use golutra_governor::RuntimeGovernorDecision;
 use golutra_llm::{ProviderRequest, ProviderResponse, ProviderStreamEvent};
@@ -81,6 +82,7 @@ pub enum AgentLoopTraceEvent {
         provider_tool_call_id: Option<String>,
         tool_name: String,
         display_arguments: serde_json::Value,
+        recovery_policy: ToolRecoveryPolicy,
     },
     ToolProgress(ToolProgress),
     ToolCompleted(ToolExecutionReport),

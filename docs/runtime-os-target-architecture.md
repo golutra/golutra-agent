@@ -58,8 +58,9 @@ Application Plane
                          v
 Execution Plane
   RuntimeHost
-    RuntimeLane + AgentLoop + Cancellation/Approval
-    ContextBuilder + ProviderRouter + ToolExecutor + Policy
+    RuntimeLane + AgentHarness + Cancellation/Approval
+    AgentLoop (private orchestration implementation)
+    ContextBuilder + ProviderRouter + ToolRuntime + Policy
     RuntimeVerificationService + trace adapter
                          |
                          v
@@ -112,9 +113,13 @@ Projection Plane                 Improvement Plane
 `RuntimeHost` 是执行 owner：
 
 - 持有 `RuntimeLaneManager`、任务 handle、`CancellationToken`、pending turn queue、approval waiter 和 EventBus。
+- `AgentHarness` 是 provider/tool loop 的唯一公开执行 seam：`AgentRun` 同时携带 request、`TaskContract` 和可选 replay context；`execute` 复用 Host 已持有的 control channel，`start` 返回可 steer/pause/interrupt/wait 的 `RunningTurn`。`AgentLoop` 保持 crate-private，Host、replay 和独立调用方不再各自组合内部入口。
 - 在执行前校验显式 `TaskContract`，包括 workspace change、delivery path、verification independence 和 correction 上限；兼容旧客户端的 prompt 推断只存在于 application adapter，不能进入核心终态判断。
+- 每个 queued turn 独立携带 `TaskContract` 和 external verifier 列表；普通 follow-up 不继承上一 turn 的写入或验证要求。没有显式 verifier 字段的代码任务会在 command 边界保守发现 Cargo、Node、Python、Go 项目检查；显式空列表关闭发现。
 - 将每个 provider/tool/context/verification 阶段转成 `AgentLoopTraceEvent`，由 host adapter 写入 `RuntimeEvent` 和 artifact。
+- `ToolRuntime::invoke(ToolInvocation)` 统一 policy、approval、before-image、sandbox、progress 和 terminal report。`apply_patch` 通过隔离配置的 `git apply` 原子修改多文件；`/app`、`/workspace` 只映射到当前 workspace，其他绝对路径仍被拒绝。
 - `RuntimeVerificationService` 只接受结构化 `VerificationInput`，由 `golutra-verify` 产生 assertion status；模型不能直接写 Pass。
+- crash recovery 由 durable provider/tool lifecycle reducer 重建；`ToolStarted` 固化 `ToolRecoveryPolicy`，区分 replay-safe、reconcile-before-retry 和 replay-forbidden，并单独记录未闭合 provider request。工具名称启发式只用于读取旧事件。
 - context guard、completion policy、provider retry/fallback 和 trace adapter 在 `golutra-runtime` 的独立模块中，loop orchestration 只负责顺序和控制流。
 
 ### 2.4 Canonical Fact Plane
@@ -225,7 +230,7 @@ compaction summary 中也必须保持 hidden。
 | --- | --- | --- |
 | domain facts | `golutra-core`, `golutra-protocol` | ID、event、command/query、verification/eval schema |
 | fact storage | `golutra-store` | SQLite migrations 和五类 repository |
-| execution | `golutra-runtime` | lane、AgentLoop、control、trace adapter、verification service |
+| execution | `golutra-runtime` | lane、AgentHarness/AgentRun、private AgentLoop、control、trace adapter、verification service |
 | application | `golutra-client` | RuntimeApplication、RuntimeHost 生命周期、post-task/evolution/regression use cases |
 | provider | `golutra-llm`, `golutra-auth`, `golutra-config` | protocol adapter、OAuth、disk SecretRef、probe/rollback |
 | tools/policy | `golutra-tools`, `golutra-policy`, `golutra-sandbox`, `golutra-mcp` | contract、approval、sandbox、artifact/evidence |
@@ -250,6 +255,11 @@ compaction summary 中也必须保持 hidden。
 
 本轮已完成：
 
+- `AgentHarness -> AgentRun -> RunningTurn` 成为唯一公开 loop seam；RuntimeHost 与 replay 已迁移，旧的多组 `AgentLoop::run_*` 入口不再暴露。
+- `ToolRuntime -> ToolInvocation -> invoke` 成为唯一主执行 seam，`BasicToolExecutor` 仅保留兼容别名；新增原子 `apply_patch`、项目 verifier 发现和容器 workspace alias。
+- legacy prompt/path/content 推断集中到 client `LegacyTaskAdapter`，Runtime 只执行已经类型化并校验的 `TaskContract`；`required_file_contents` 通过 workspace policy 解析和有界读取验证。
+- Governor 将弱目标对齐、可恢复 policy block 和接近预算作为 advisory，hard budget/security/policy 决策仍单独控制流程；普通执行仅对语义等价的重复动作在 3 次给出 advisory、6 次硬停止。verification correction 另有无实质进展窗口，默认 16 步或 5 分钟，文件变更或成功客观验证会重置窗口，因此不会给正常探索阶段增加固定总步数上限。
+- recovery 使用 durable lifecycle reducer，持久化 tool recovery policy 和未闭合 provider request；排队 turn 的 contract/verifier 不再跨 turn 泄漏。
 - `RuntimeApplication/GovernedRuntime` facade 和 command/query/session/trace/governance service seam。
 - Embedded transport 主路径迁移到 facade。
 - `TaskTraceService` 从 client 巨型 host 文件中独立出来，并通过 repository 读取事实。
@@ -301,3 +311,4 @@ just py-check
 9. Supervisor 中断事务可由 pending journal 恢复，release source/manifest/binary 任一磁盘篡改都会阻止 launcher、preview、promotion 或 rollback。
 10. 模型 boundary 测试证明 Evaluation/Governance facts、DebugProjection 和 hidden context 不会进入 provider request；compaction 不会把 hidden fact 升格为 model-visible。
 11. `TaskCompleted` 先于 post-task governance 持久化；治理调度/worker 失败不会改写已验证的 runtime terminal status，settled export 不会因竞态丢失后置 job。
+12. crash recovery 只使用事件中固化的 recovery policy；read-only 中断不升级为 `TaskUncertain`，未闭合副作用和后台进程必须进入 reconciliation。

@@ -51,6 +51,56 @@ fn run_directory_implies_ephemeral_exec_and_keeps_legacy_alias() {
 }
 
 #[test]
+fn exec_can_disable_project_verifier_discovery() {
+    let cli = Cli::try_parse_from([
+        "golutra",
+        "exec",
+        "--no-project-verifier-discovery",
+        "inspect the workspace",
+    ])
+    .expect("exec verifier discovery opt-out");
+
+    assert!(matches!(
+        cli.command,
+        Command::Exec(ExecArgs {
+            no_project_verifier_discovery: true,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn repeated_external_evaluation_uses_its_original_trace_binding() {
+    let mut value = serde_json::json!({
+        "base_trace_digest": "auto",
+        "runtime_identity": "auto",
+    });
+
+    apply_external_evaluation_binding_defaults(
+        &mut value,
+        "sha256:current-overlay-trace",
+        "build:current",
+        Some(("sha256:original-source-trace", "build:original")),
+    );
+
+    assert_eq!(value["base_trace_digest"], "sha256:original-source-trace");
+    assert_eq!(value["runtime_identity"], "build:original");
+
+    let mut first_ingest = serde_json::json!({});
+    apply_external_evaluation_binding_defaults(
+        &mut first_ingest,
+        "sha256:current-source-trace",
+        "build:current",
+        None,
+    );
+    assert_eq!(
+        first_ingest["base_trace_digest"],
+        "sha256:current-source-trace"
+    );
+    assert_eq!(first_ingest["runtime_identity"], "build:current");
+}
+
+#[test]
 fn evolution_commands_parse_governed_budget_and_skill_review() {
     let plan = Cli::try_parse_from([
         "golutra",

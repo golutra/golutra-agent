@@ -261,6 +261,9 @@ struct ExecArgs {
     verify_expected_exit_code: i32,
     #[arg(long, default_value_t = 256 * 1024, requires = "verify_program")]
     verify_max_output_bytes: usize,
+    /// Disable conservative project verifier discovery when no verifier is supplied.
+    #[arg(long)]
+    no_project_verifier_discovery: bool,
     /// How exec resolves runtime requests already classified as requiring approval.
     #[arg(long, value_enum, default_value_t = ExecApprovalModeArg::Prompt)]
     approval_mode: ExecApprovalModeArg,
@@ -1758,21 +1761,28 @@ async fn main() -> miette::Result<()> {
                     })
                     .await
                     .map_err(|error| miette::miette!("{error}"))?;
-                if value
-                    .get("base_trace_digest")
+                let existing_binding = value
+                    .get("evaluation_id")
                     .and_then(serde_json::Value::as_str)
-                    .is_none_or(|value| value.is_empty() || value == "auto")
-                {
-                    value["base_trace_digest"] =
-                        serde_json::Value::String(trace.integrity.event_chain_digest);
-                }
-                if value
-                    .get("runtime_identity")
-                    .and_then(serde_json::Value::as_str)
-                    .is_none_or(|value| value.is_empty() || value == "auto")
-                {
-                    value["runtime_identity"] = serde_json::Value::String(trace.runtime_identity);
-                }
+                    .and_then(|evaluation_id| {
+                        trace
+                            .evaluation
+                            .external_evaluations
+                            .iter()
+                            .find(|record| record.evaluation_id == evaluation_id)
+                    })
+                    .map(|record| {
+                        (
+                            record.base_trace_digest.as_str(),
+                            record.runtime_identity.as_str(),
+                        )
+                    });
+                apply_external_evaluation_binding_defaults(
+                    &mut value,
+                    &trace.integrity.event_chain_digest,
+                    &trace.runtime_identity,
+                    existing_binding,
+                );
                 if value.get("trust").is_none() {
                     value["trust"] = serde_json::Value::String("owner_local".to_owned());
                 }
@@ -2563,6 +2573,7 @@ async fn run_exec(transport: &RuntimeTransport, args: ExecArgs) -> miette::Resul
                 completion_criteria: args.completion_criteria,
                 allow_network: args.allow_network,
                 external_verifiers,
+                discover_project_verifiers: !args.no_project_verifier_discovery,
             },
         )
         .await
@@ -3043,6 +3054,30 @@ fn evaluation_artifact_base_path(
         ));
     }
     Ok(canonical)
+}
+
+fn apply_external_evaluation_binding_defaults(
+    value: &mut serde_json::Value,
+    current_trace_digest: &str,
+    current_runtime_identity: &str,
+    existing_binding: Option<(&str, &str)>,
+) {
+    let (trace_digest, runtime_identity) =
+        existing_binding.unwrap_or((current_trace_digest, current_runtime_identity));
+    if value
+        .get("base_trace_digest")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|value| value.is_empty() || value == "auto")
+    {
+        value["base_trace_digest"] = serde_json::Value::String(trace_digest.to_owned());
+    }
+    if value
+        .get("runtime_identity")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|value| value.is_empty() || value == "auto")
+    {
+        value["runtime_identity"] = serde_json::Value::String(runtime_identity.to_owned());
+    }
 }
 
 fn run_plugin_command(command: &PluginCommand) -> miette::Result<()> {

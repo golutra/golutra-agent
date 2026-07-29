@@ -274,6 +274,69 @@ class AdapterHelpersTest(unittest.TestCase):
         self.assertFalse(resolved)
         self.assertEqual(failure_mode, "test_timeout")
 
+    def test_failure_detail_prefers_root_causes_deduplicates_and_redacts(self):
+        with TemporaryDirectory() as temporary:
+            trial_root = Path(temporary)
+            panes = trial_root / "panes"
+            panes.mkdir()
+            (panes / "post-test.txt").write_text(
+                "\n".join(
+                    [
+                        "routine setup output",
+                        "\x1b[31mfatal: branch has no commit\x1b[0m",
+                        "fatal: branch has no commit",
+                        "error: authorization=Bearer top-secret-value",
+                        "E       AssertionError: expected ready, got empty",
+                        "FAILED tests/test_output.py::test_output",
+                        "x" * 10_000,
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            detail = ADAPTER._failure_detail(trial_root)
+
+            self.assertIsNotNone(detail)
+            self.assertTrue(detail.startswith("fatal: branch has no commit"))
+            self.assertEqual(detail.count("fatal: branch has no commit"), 1)
+            self.assertIn("AssertionError: expected ready, got empty", detail)
+            self.assertIn("authorization=[REDACTED]", detail)
+            self.assertNotIn("top-secret-value", detail)
+            self.assertNotIn("routine setup output", detail)
+            self.assertLessEqual(
+                len(detail.encode("utf-8")), ADAPTER._FAILURE_DETAIL_MAX_BYTES
+            )
+
+    def test_failed_assertions_and_terminal_cause_include_failure_detail(self):
+        detail = "fatal: branch has no commit\nerror: refspec main does not exist"
+        assertions = ADAPTER._evaluation_assertions(
+            {"failed_test": "failed", "passing_test": "passed"},
+            False,
+            None,
+            ["panes/post-test.txt"],
+            detail,
+        )
+
+        failed = next(item for item in assertions if item["name"] == "failed_test")
+        passed = next(item for item in assertions if item["name"] == "passing_test")
+        self.assertIn(detail, failed["message"])
+        self.assertEqual(passed["message"], "passed")
+
+        _, terminal_cause = ADAPTER._evaluation_phases(
+            {"task_id": "target"},
+            "target",
+            assertions,
+            False,
+            None,
+            ["panes/post-test.txt"],
+            detail,
+        )
+        self.assertIn(detail, terminal_cause["message"])
+        self.assertLessEqual(
+            len(terminal_cause["message"].encode("utf-8")),
+            ADAPTER._FAILURE_DETAIL_MAX_BYTES,
+        )
+
     def test_evaluation_phases_preserve_timing_and_terminal_cause(self):
         assertions = [
             {
@@ -410,7 +473,7 @@ class AdapterHelpersTest(unittest.TestCase):
 
             self.assertEqual(ADAPTER._trace_token_usage(trial_root), (30, 5))
 
-    def test_collector_retains_timeout_as_a_failed_assertion(self):
+    def test_collector_failure_mode_overrides_resolved_verdict(self):
         with TemporaryDirectory() as temporary:
             trial_root = Path(temporary)
             run_dir = trial_root / "sessions/golutra-runtime"
@@ -454,7 +517,7 @@ class AdapterHelpersTest(unittest.TestCase):
                     {
                         "id": "trial",
                         "task_id": "csv-to-parquet",
-                        "is_resolved": None,
+                        "is_resolved": True,
                         "failure_mode": "test_timeout",
                         "parser_results": None,
                     }

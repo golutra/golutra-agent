@@ -14,10 +14,11 @@
 - `ToolContract` 使用唯一的 JSON Schema 校验输入；必填 path/pattern/edit search 拒绝空串，校验错误隐藏实例值，summary、structured facts 和 raw output 在持久化前统一脱敏；policy、workspace guard、approval、execution、artifact/evidence 顺序固定。
 - shell 使用 `shlex` 解析结构化 argv，不经过 shell 解释器；policy 会阻断敏感路径、`find -exec/-delete`、`rg --pre` 等执行型参数，把 `sed -i`、`cargo run`、未知脚本等降为 Ask；执行器支持 timeout、`CancellationToken`、每管道 2 MiB 上限，并在 Unix 上终止整个进程组后排空管道。`golutra-sandbox` 在 macOS 使用 Seatbelt、Linux 检测 bubblewrap，外部 MCP 没有 OS-enforced sandbox 时拒绝执行。
 - `PolicyEvaluation.block_disposition` 把当前调用阻断区分为 `recoverable` 和 `terminal`：参数/schema 错误、缺失路径和可纠正的 shell 语法只生成 durable blocked/error tool result，回送模型后受连续失败预算约束；敏感路径、workspace escape、破坏性命令及旧事件中未分类的 Block 仍立即终止任务。Runtime 不通过 reason 文本猜测处置级别。
-- `RuntimeHost` 保存 task handle、pending turn queue 和 durable command ack；pause/resume/abort 影响真实执行，不是 UI 标记。终态 lane 拒绝控制转换。owner 退出后，新 host 取得 session lease 才能分析 durable event chain：只有未闭合读操作时写 `TaskInterrupted`，存在未闭合副作用工具或后台进程时写 `TaskUncertain`；两者都明确 `safe_to_replay=false`，已经 `TurnStarted` 的输入永不自动重放。`TaskUncertain` 会冻结新 prompt 和未开始的 pending turn，直到 `ReconcileTask` 写入结构化 `TaskReconciliationRecord`；对账不能把任务伪造成 `Completed`。
-- `AgentLoop` 支持多轮 assistant/tool message、LoopGuard、有限 retry/fallback 和 verification-backed terminal state。初始或工具消息累积导致的 context overflow 会产生 `LoopGuardTriggered` 和 Blocked/AskUser `LoopDecision`，不会降级成笼统执行错误。
+- `RuntimeHost` 保存 task handle、pending turn queue 和 durable command ack；pause/resume/abort 影响真实执行，不是 UI 标记。终态 lane 拒绝控制转换。owner 退出后，新 host 取得 session lease 才能通过 durable reducer 分析 provider/tool lifecycle：`ToolStarted` 固化的 `ToolRecoveryPolicy` 决定 replay-safe、reconcile-before-retry 或 replay-forbidden，未闭合 provider request 单独记录。只有未闭合只读操作/provider request 时写 `TaskInterrupted`，存在未闭合副作用工具或后台进程时写 `TaskUncertain`；两者都明确 `safe_to_replay=false`，已经 `TurnStarted` 的输入永不自动重放。`TaskUncertain` 会冻结新 prompt 和未开始的 pending turn，直到 `ReconcileTask` 写入结构化 `TaskReconciliationRecord`；对账不能把任务伪造成 `Completed`。
+- `AgentHarness` 是公开执行 seam，封装 crate-private `AgentLoop` 的多轮 assistant/tool message、LoopGuard、有限 retry/fallback 和 verification-backed terminal state。初始或工具消息累积导致的 context overflow 会产生 `LoopGuardTriggered` 和 Blocked/AskUser `LoopDecision`，不会降级成笼统执行错误。
+- 普通探索阶段没有固定总步数上限，只对语义等价的重复动作应用 progress guard。verification correction 使用独立的无实质进展步骤/耗时窗口；文件变更或成功 objective validation 会重置窗口，耗尽时在 `StepCompleted`、`StepCheckpointed` 和 `LoopGuardTriggered` 中保留计数、耗时与停止原因。
 - 工作区写入、编辑或一次成功工具调用只证明发生了动作，不构成 objective validation。最后一次未验证修改之后必须出现新的测试、诊断、`cmp`/`diff` 或严格 Git 比较；模型在缺少该证据时提前结束，Runtime 最多两次写入 durable `RetryScheduled` 并把验证要求回送模型。clean status、log 和目录列表不能满足该门禁。
-- caller-owned external verifier 在模型停止后通过受限 argv runner 执行，因此已声明 verifier 的任务不再要求模型重复运行 shell。相同 `(check name, command)` 的失败后重跑只保留最新结果：成功重跑可以覆盖同一检查及其已恢复的探索性工具失败，其他不同检查的未解决失败仍保留。
+- caller-owned external verifier 在模型停止后通过受限 argv runner 执行，因此已声明 verifier 的任务不再要求模型重复运行 shell。相同逻辑 identity 的失败后重跑只保留最新结果；独立 verifier 存在时，它对同类本地 test/diagnostic 具有判定优先级，但不能覆盖显式 delivery path、required content 或 policy 失败。失败的探索性 `ToolExecution` 始终保留为观测事实，却不会在已有成功证据或权威 objective validation 时污染最终断言；断言 evidence ref 只链接实际通过的检查。
 - 文件工具和 shell 等可产生工作区副作用的工具在修改前捕获并持久化有界 before-image；checkpoint manifest 与 owner-only artifact blob 带 checksum、redaction 状态和 rollback metadata，持久化失败时不执行文件副作用。无法覆盖完整工作区时仍记录 checkpoint，但明确标记 `before_image_complete=false` 和 `omitted_before_image_count`，不得把它当作完整回滚保证；shell 的部分快照可以省略 gitignored/sensitive image，直接文件工具仍严格拒绝无法 checkpoint 的目标。
 - Embedded、Unix IPC 与 HTTP/SSE transport 使用同一 `SessionCommand`、`RuntimeQuery`、`RuntimeEvent` 语义和 protocol version；加入 phase-aware external evaluation、causal diagnostic continuation、`CandidatePatchFrozen` 和冻结补丁投影后的当前 runtime protocol 为 v7，旧 reader 不与新事件流协商。用户级 daemon 通过 attachment 路由多个 cwd，Unix socket owner-only，HTTP 仅允许安全 endpoint 并校验 bearer/Host/Origin。SQLite 在 event append 事务内原子分配全局 sequence，host 再按提交顺序 publish；command lease 与 durable ack 负责重试去重，但 command ack 与后续业务事件仍不是一个跨运行时事务。
 - 外部 MCP 工具必须来自 checksum 未变化的 reviewed/enabled plugin revision，远端 `tools/list` schema 必须与 manifest 一致；默认 Ask，批准前不启动进程，批准后继续经过 timeout/cancel/redaction/artifact/evidence，远端 annotation 不参与权限决策。
@@ -324,7 +325,9 @@ RolloutEnvelope
 - fallback 不会绕过 `LoopDecision`。
 - stop_success 不会绕过 `VerificationRecord`。
 - 工作区 mutation 后没有 fresh objective validation 时不能 stop_success；同一检查成功重跑后不再被它已取代的失败尝试永久降级。
+- exploratory `ToolExecution` 失败不会在成功证据或独立 verifier 通过后污染 objective assertion，同时失败事实仍完整保留在 record/trace 中。
 - running task 中的新输入不会绕过 `RuntimeLaneContract`。
+- queued turn 不继承上一 turn 的 TaskContract 或 external verifier。
 - crash recovery 不会重放已经开始的 turn；不确定副作用未显式 reconciliation 前不能继续 session。
 - loop guard 不允许重复工具失败、空回复、context overflow 或 max iteration 形成无界循环。
 - workspace checkpoint 不污染用户 `.git`，且敏感文件排除策略可验证。

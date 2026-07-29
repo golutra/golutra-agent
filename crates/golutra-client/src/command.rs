@@ -357,16 +357,77 @@ impl RuntimeHost {
         let explicit_task_contract = payload
             .get("task_contract")
             .is_some_and(|value| !value.is_null());
+        let requested_network = match payload.get("allow_network") {
+            None => None,
+            Some(Value::Bool(allow_network)) => Some(*allow_network),
+            Some(_) => {
+                return Err(ClientError::TaskExecution(
+                    "allow_network must be a boolean".to_owned(),
+                ));
+            }
+        };
         let mut task_contract = task_contract_from_payload(&payload)?;
         let contract_origin = if explicit_task_contract {
             "explicit"
         } else {
-            provider_runtime::apply_legacy_task_contract(&payload, &prompt, &mut task_contract);
+            LegacyTaskAdapter::new(&payload, &prompt).apply_to(&mut task_contract);
             "legacy_adapter"
         };
+        let mut discovered_project_verifiers = false;
+        let discover_project_verifiers_enabled = match payload.get("discover_project_verifiers") {
+            None => true,
+            Some(Value::Bool(enabled)) => *enabled,
+            Some(_) => {
+                return Err(ClientError::TaskExecution(
+                    "discover_project_verifiers must be a boolean".to_owned(),
+                ));
+            }
+        };
+        if discover_project_verifiers_enabled
+            && payload.get("external_verifiers").is_none()
+            && (task_contract.require_objective_validation
+                || task_contract.requires_workspace_evidence())
+        {
+            let workspace_root = self.execution_workspace_root()?;
+            let discovered = discover_project_verifiers(&workspace_root)
+                .into_iter()
+                .map(|verifier| ExternalVerificationSpec {
+                    program: verifier.program,
+                    args: verifier.args,
+                    cwd: verifier.cwd,
+                    timeout_ms: verifier.timeout_ms,
+                    expected_exit_code: verifier.expected_exit_code,
+                    max_output_bytes: verifier.max_output_bytes,
+                })
+                .collect::<Vec<_>>();
+            if !discovered.is_empty() {
+                payload["external_verifiers"] = serde_json::to_value(discovered)?;
+                discovered_project_verifiers = true;
+            }
+        }
+        if discovered_project_verifiers {
+            task_contract = task_contract_from_payload(&payload)?;
+            if !explicit_task_contract {
+                LegacyTaskAdapter::new(&payload, &prompt).apply_to(&mut task_contract);
+            }
+        }
+        payload[EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY] =
+            Value::Bool(discovered_project_verifiers);
+        if payload.get("external_verifiers").is_none() {
+            payload["external_verifiers"] = json!([]);
+        }
         task_contract
             .validate()
             .map_err(ClientError::TaskExecution)?;
+        let external_verifiers = payload
+            .get("external_verifiers")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| {
+                ClientError::TaskExecution(format!("invalid external verifier contract: {error}"))
+            })?
+            .unwrap_or_default();
         payload["task_contract"] = serde_json::to_value(&task_contract)?;
         payload["_task_contract_origin"] = Value::String(contract_origin.to_owned());
         let busy_decision = {
@@ -392,46 +453,74 @@ impl RuntimeHost {
             let mut reason = decision.reason.clone();
             let mut retry_as_new_task = false;
             if accepted {
-                self.upsert_current_thread(session_id, &payload).await?;
                 let control = self.task_controls.lock().await.get(&session_id).cloned();
                 match control {
                     Some(control) if control.task_id == active_task_id => {
-                        match control
-                            .execution
-                            .append_turn(PendingAgentTurn {
-                                command_id: command.command_id,
-                                turn_id,
-                                content: prompt.clone(),
-                                task_contract: Some(task_contract.clone()),
-                                steer: payload
-                                    .get("steer")
-                                    .and_then(Value::as_bool)
-                                    .unwrap_or(false),
-                            })
-                            .await
+                        if requested_network
+                            .is_some_and(|requested| control.allow_network != requested)
                         {
-                            Ok(()) => {
-                                let transition = self.lane_manager.lock().await.queue_turn(
-                                    session_id,
+                            accepted = false;
+                            reason =
+                                "queued prompt cannot change network capability while a task is active"
+                                    .to_owned();
+                        } else {
+                            let allow_network = requested_network.unwrap_or(control.allow_network);
+                            payload["allow_network"] = Value::Bool(allow_network);
+                            self.upsert_current_thread(session_id, &payload).await?;
+                            match control
+                                .execution
+                                .reserve_turn(PendingAgentTurn {
+                                    command_id: command.command_id,
                                     turn_id,
-                                    self.next_sequence_no(),
-                                )?;
-                                self.record_event(with_command_payload(
-                                    transition.event,
-                                    command.command_id,
-                                    payload.clone(),
-                                ))
-                                .await?;
-                            }
-                            Err(AgentLoopError::PendingTurnQueueClosed) => {
-                                retry_as_new_task = true;
-                            }
-                            Err(AgentLoopError::PendingTurnQueueFull) => {
-                                accepted = false;
-                                reason = "active task pending turn queue is full".to_owned();
-                            }
-                            Err(error) => {
-                                return Err(ClientError::TaskExecution(error.to_string()));
+                                    content: prompt.clone(),
+                                    task_contract: Some(task_contract.clone()),
+                                    output_schema: payload.get("output_schema").cloned(),
+                                    external_verifiers,
+                                    external_verifiers_require_os_sandbox: payload
+                                        .get(EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY)
+                                        .and_then(Value::as_bool)
+                                        .unwrap_or(false),
+                                    allow_network,
+                                    steer: payload
+                                        .get("steer")
+                                        .and_then(Value::as_bool)
+                                        .unwrap_or(false),
+                                })
+                                .await
+                            {
+                                Ok(reservation) => {
+                                    let transition = self.lane_manager.lock().await.queue_turn(
+                                        session_id,
+                                        turn_id,
+                                        self.next_sequence_no(),
+                                    )?;
+                                    if let Err(error) = self
+                                        .record_event(with_command_payload(
+                                            transition.event,
+                                            command.command_id,
+                                            payload.clone(),
+                                        ))
+                                        .await
+                                    {
+                                        let _ = self
+                                            .lane_manager
+                                            .lock()
+                                            .await
+                                            .discard_queued_turn(session_id, turn_id);
+                                        return Err(error);
+                                    }
+                                    reservation.commit();
+                                }
+                                Err(AgentLoopError::PendingTurnQueueClosed) => {
+                                    retry_as_new_task = true;
+                                }
+                                Err(AgentLoopError::PendingTurnQueueFull) => {
+                                    accepted = false;
+                                    reason = "active task pending turn queue is full".to_owned();
+                                }
+                                Err(error) => {
+                                    return Err(ClientError::TaskExecution(error.to_string()));
+                                }
                             }
                         }
                     }
@@ -454,7 +543,7 @@ impl RuntimeHost {
                     },
                     RuntimeEventSource::Runtime,
                     json!({
-                        "summary": reason,
+                        "summary": reason.clone(),
                         "command_id": command.command_id.to_string(),
                         "decision": decision,
                         "payload": payload,
@@ -467,11 +556,13 @@ impl RuntimeHost {
                     reason: Some(if accepted {
                         "prompt appended to active runtime lane".to_owned()
                     } else {
-                        "prompt rejected by runtime lane busy policy".to_owned()
+                        reason
                     }),
                 });
             }
         }
+        let requested_network = requested_network.unwrap_or(false);
+        payload["allow_network"] = Value::Bool(requested_network);
         self.wait_for_finishing_task_control(session_id).await?;
         let session_lease = match self.try_acquire_session_lease(session_id)? {
             SessionLeaseAttempt::Acquired(lease) => lease,
@@ -533,10 +624,6 @@ impl RuntimeHost {
         drop(lane_manager);
         let mut task_created =
             with_command_payload(transition.event, command.command_id, payload.clone());
-        let requested_network = payload
-            .get("allow_network")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
         task_created.payload["execution_capabilities"] =
             self.execution_capabilities(requested_network);
         task_created.payload["run_provenance"] =

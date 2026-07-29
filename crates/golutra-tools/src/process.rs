@@ -16,8 +16,8 @@ use nix::{
 #[cfg(test)]
 use tokio::task::JoinHandle;
 use tokio::{
-    io::AsyncReadExt,
-    process::Command,
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::{ChildStdin, Command},
     sync::mpsc::{Sender, channel},
 };
 use tokio_util::sync::CancellationToken;
@@ -32,6 +32,7 @@ pub(crate) struct ShellOutput {
     pub(crate) exit_code: Option<i32>,
     pub(crate) timed_out: bool,
     pub(crate) cancelled: bool,
+    pub(crate) stdin_error: Option<String>,
     pub(crate) raw_output: String,
     pub(crate) sandbox_backend: golutra_sandbox::SandboxBackendKind,
     pub(crate) sandbox_os_enforced: bool,
@@ -66,6 +67,8 @@ pub(crate) struct ProcessExecutionRequest<'a> {
     pub(crate) sandbox: &'a SystemSandbox,
     pub(crate) workspace_access: WorkspaceAccess,
     pub(crate) allow_network: bool,
+    pub(crate) stdin: Option<&'a [u8]>,
+    pub(crate) isolated_home: bool,
 }
 
 #[derive(Debug)]
@@ -120,6 +123,8 @@ pub(crate) async fn run_process(
             sandbox,
             workspace_access,
             allow_network: false,
+            stdin: None,
+            isolated_home: false,
         },
         None,
     )
@@ -153,14 +158,38 @@ pub(crate) async fn run_process_with_progress(
         .current_dir(request.cwd)
         .env_clear()
         .envs(&launch.environment)
+        .stdin(if request.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if request.isolated_home {
+        command
+            .env("HOME", scratch.path())
+            .env("CFFIXED_USER_HOME", scratch.path())
+            .env("XDG_CONFIG_HOME", scratch.path())
+            .env("XDG_CACHE_HOME", scratch.path())
+            .env("DARWIN_USER_CACHE_DIR", scratch.path())
+            .env("GIT_CONFIG_GLOBAL", scratch.path().join(".gitconfig"))
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+    }
     #[cfg(unix)]
     command.process_group(0);
     let mut child = command
         .spawn()
         .map_err(|error| ToolError::Execution(error.to_string()))?;
+    let input = request.stdin;
+    let stdin =
+        if input.is_some() {
+            Some(child.stdin.take().ok_or_else(|| {
+                ToolError::Execution("process stdin pipe is unavailable".to_owned())
+            })?)
+        } else {
+            None
+        };
     let stdout = child
         .stdout
         .take()
@@ -174,6 +203,8 @@ pub(crate) async fn run_process_with_progress(
     spawn_stream_reader(stderr, ProcessStream::Stderr, progress_tx);
     let timeout = tokio::time::sleep(Duration::from_millis(request.timeout_ms));
     tokio::pin!(timeout);
+    let stdin_write = write_process_stdin(stdin, input);
+    tokio::pin!(stdin_write);
 
     let child_id = child.id();
     let mut child_wait = Box::pin(child.wait());
@@ -181,12 +212,14 @@ pub(crate) async fn run_process_with_progress(
     let mut timed_out = false;
     let mut cancelled = false;
     let mut termination_requested = false;
+    let mut stdin_done = input.is_none();
+    let mut stdin_error = None;
     let mut readers_done = 0_u8;
     let mut stdout = OutputBuffer::default();
     let mut stderr = OutputBuffer::default();
     let mut last_progress = Instant::now();
 
-    while status.is_none() || readers_done < 2 {
+    while status.is_none() || readers_done < 2 || !stdin_done {
         tokio::select! {
             biased;
             _ = request.cancellation.cancelled(), if status.is_none() && !termination_requested => {
@@ -201,6 +234,14 @@ pub(crate) async fn run_process_with_progress(
             }
             result = &mut child_wait, if status.is_none() => {
                 status = Some(result.map_err(|error| ToolError::Execution(error.to_string()))?);
+            }
+            result = &mut stdin_write, if !stdin_done => {
+                stdin_done = true;
+                if let Err(error) = result
+                    && !termination_requested
+                {
+                    stdin_error = Some(error.to_string());
+                }
             }
             message = progress_rx.recv(), if readers_done < 2 => {
                 match message {
@@ -261,6 +302,7 @@ pub(crate) async fn run_process_with_progress(
         exit_code: status.code(),
         timed_out,
         cancelled,
+        stdin_error,
         raw_output,
         sandbox_backend: launch.backend,
         sandbox_os_enforced: launch.os_enforced,
@@ -269,6 +311,17 @@ pub(crate) async fn run_process_with_progress(
         output_truncated,
         network_access: request.allow_network,
     })
+}
+
+async fn write_process_stdin(
+    stdin: Option<ChildStdin>,
+    input: Option<&[u8]>,
+) -> std::io::Result<()> {
+    let (Some(mut stdin), Some(input)) = (stdin, input) else {
+        return Ok(());
+    };
+    stdin.write_all(input).await?;
+    stdin.shutdown().await
 }
 
 pub(crate) fn terminate_process_group(process_id: Option<u32>) {

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
@@ -30,6 +30,7 @@ const MAX_PATH_ARGUMENT_CHARS: usize = 4 * 1024;
 const MAX_PATTERN_ARGUMENT_CHARS: usize = 64 * 1024;
 const MAX_SHELL_COMMAND_CHARS: usize = 64 * 1024;
 const MAX_PROCESS_INPUT_CHARS: usize = 64 * 1024;
+const MAX_PATCH_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BACKGROUND_PROCESS_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
 const MAX_TOOL_ERROR_CHARS: usize = 4 * 1024;
 const MAX_AUDIT_RESOURCE_CHARS: usize = 64 * 1024;
@@ -48,9 +49,12 @@ const MAX_MODEL_TOOL_RESULT_DEPTH: usize = 5;
 const EXTERNAL_TOOL_TIMEOUT_MS: u64 = if cfg!(test) { 100 } else { 30_000 };
 const MAX_VERIFIER_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
 const MAX_VERIFIER_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+pub const CONTRACT_FILE_CONTENT_VERIFIER_TOOL: &str = "contract_file_content_verifier";
+pub const CONTRACT_PATH_VERIFIER_TOOL: &str = "contract_path_verifier";
 
 mod process;
 mod process_supervisor;
+mod project_verifier;
 mod text_search;
 mod workspace_scan;
 
@@ -64,6 +68,7 @@ pub(crate) use process_supervisor::{
     ProcessSnapshot, ProcessStartRequest, ProcessState, default_poll_wait_ms,
     default_start_wait_ms, max_poll_wait_ms,
 };
+pub use project_verifier::{DiscoveredProjectVerifier, discover_project_verifiers};
 
 #[derive(Debug, Error)]
 pub enum ToolError {
@@ -122,6 +127,32 @@ pub struct SideEffectPreparation {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ToolInvocation {
+    pub request: ToolRequest,
+    pub policy: PolicyEvaluation,
+    pub approved: bool,
+    preparation: Option<SideEffectPreparation>,
+}
+
+impl ToolInvocation {
+    #[must_use]
+    pub fn new(request: ToolRequest, policy: PolicyEvaluation, approved: bool) -> Self {
+        Self {
+            request,
+            policy,
+            approved,
+            preparation: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_preparation(mut self, preparation: SideEffectPreparation) -> Self {
+        self.preparation = Some(preparation);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExternalToolOutput {
     pub summary: String,
     pub content: String,
@@ -162,8 +193,9 @@ impl ToolRegistry {
             contract("read_file", SideEffectType::None),
             contract("write_file", SideEffectType::File),
             contract("edit_file", SideEffectType::File),
+            contract("apply_patch", SideEffectType::File),
             contract("list_dir", SideEffectType::None),
-            contract("rg_search", SideEffectType::Process),
+            contract("rg_search", SideEffectType::None),
             contract("symbol_search", SideEffectType::None),
             contract("find_references", SideEffectType::None),
             contract("shell", SideEffectType::Process),
@@ -219,7 +251,7 @@ impl Default for ToolRegistry {
 }
 
 #[derive(Debug, Clone)]
-pub struct BasicToolExecutor {
+pub struct ToolRuntime {
     policy: WorkspacePolicy,
     registry: ToolRegistry,
     sandbox: SystemSandbox,
@@ -229,7 +261,7 @@ pub struct BasicToolExecutor {
     process_supervisor: ProcessSupervisor,
 }
 
-impl BasicToolExecutor {
+impl ToolRuntime {
     #[must_use]
     pub fn new(policy: WorkspacePolicy) -> Self {
         Self {
@@ -246,6 +278,194 @@ impl BasicToolExecutor {
     #[must_use]
     pub fn workspace_root(&self) -> &Path {
         self.policy.workspace_root()
+    }
+
+    #[must_use]
+    pub fn sandbox_os_enforced(&self) -> bool {
+        self.sandbox.os_enforced()
+    }
+
+    /// Resolve and compare a required workspace file without bypassing the
+    /// workspace policy or reading more bytes than the expected value.
+    pub async fn compare_workspace_file_content(
+        &self,
+        path: impl AsRef<Path>,
+        expected: &[u8],
+    ) -> Result<(PathBuf, bool), ToolError> {
+        let resolved_path = self.resolve_tool_path("verify_file_content", path, true)?;
+        let comparison = compare_file_content(&resolved_path, expected).await?;
+        Ok((resolved_path, comparison.matches))
+    }
+
+    /// Verify an exact-content task contract as a durable internal tool step.
+    /// The report records only sizes and digests, never the required content.
+    pub async fn verify_workspace_file_content(
+        &self,
+        request: ToolRequest,
+        expected: &[u8],
+    ) -> ToolExecutionReport {
+        let Some(path) = optional_string_arg(&request.arguments, "path") else {
+            let policy = execution_policy(
+                &request,
+                PolicyDecision::Block,
+                "required file content verification requires a path",
+            );
+            return report(
+                request,
+                ToolResultStatus::Error,
+                "required file content verification is missing a path",
+                json!({"matches": false, "error": "path is required"}),
+                r#"{"matches":false,"error":"path is required"}"#.to_owned(),
+                Vec::new(),
+                policy,
+            );
+        };
+        let policy = self
+            .policy
+            .evaluate_path("verify_file_content", &path, true);
+        if policy.decision != PolicyDecision::Allow {
+            let facts = json!({
+                "path": path,
+                "matches": false,
+                "error": policy.reason,
+                "expected_bytes": expected.len(),
+                "expected_checksum": checksum(expected),
+            });
+            return file_content_verification_report(
+                request,
+                ToolResultStatus::Blocked,
+                "required file content could not be inspected",
+                facts,
+                policy,
+            );
+        }
+        let resolved_path = PathBuf::from(&policy.resource);
+        match compare_file_content(&resolved_path, expected).await {
+            Ok(comparison) => {
+                let facts = json!({
+                    "path": path,
+                    "resolved_path": resolved_path,
+                    "matches": comparison.matches,
+                    "expected_bytes": expected.len(),
+                    "actual_bytes": comparison.actual_bytes,
+                    "expected_checksum": checksum(expected),
+                    "actual_checksum": comparison.actual_checksum,
+                });
+                file_content_verification_report(
+                    request,
+                    ToolResultStatus::Ok,
+                    if comparison.matches {
+                        "required file content matches the task contract"
+                    } else {
+                        "required file content does not match the task contract"
+                    },
+                    facts,
+                    policy,
+                )
+            }
+            Err(error) => {
+                let facts = json!({
+                    "path": path,
+                    "resolved_path": resolved_path,
+                    "matches": false,
+                    "expected_bytes": expected.len(),
+                    "expected_checksum": checksum(expected),
+                    "error": error.to_string(),
+                });
+                file_content_verification_report(
+                    request,
+                    ToolResultStatus::Error,
+                    "required file content inspection failed",
+                    facts,
+                    policy,
+                )
+            }
+        }
+    }
+
+    /// Verify a required task-contract path as a durable internal tool step.
+    /// The report records bounded metadata and its digest without reading file
+    /// contents or traversing directories.
+    pub async fn verify_workspace_path(&self, request: ToolRequest) -> ToolExecutionReport {
+        let Some(path) = optional_string_arg(&request.arguments, "path") else {
+            let policy = execution_policy(
+                &request,
+                PolicyDecision::Block,
+                "required path verification requires a path",
+            );
+            return path_verification_report(
+                request,
+                ToolResultStatus::Error,
+                "required path verification is missing a path",
+                json!({"exists": false, "error": "path is required"}),
+                policy,
+            );
+        };
+        let policy = self.policy.evaluate_path("verify_path", &path, true);
+        if policy.decision != PolicyDecision::Allow {
+            let reason = policy.reason.clone();
+            return path_verification_report(
+                request,
+                ToolResultStatus::Blocked,
+                "required path could not be inspected",
+                json!({"path": path, "exists": false, "error": reason}),
+                policy,
+            );
+        }
+
+        let resolved_path = PathBuf::from(&policy.resource);
+        match tokio::fs::metadata(&resolved_path).await {
+            Ok(metadata) => {
+                let file_type = if metadata.is_file() {
+                    "file"
+                } else if metadata.is_dir() {
+                    "directory"
+                } else {
+                    "other"
+                };
+                let modified_unix_ms = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                    .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+                let metadata_facts = json!({
+                    "file_type": file_type,
+                    "size_bytes": metadata.len(),
+                    "readonly": metadata.permissions().readonly(),
+                    "modified_unix_ms": modified_unix_ms,
+                });
+                let metadata_checksum = checksum(
+                    serde_json::to_string(&metadata_facts)
+                        .unwrap_or_default()
+                        .as_bytes(),
+                );
+                path_verification_report(
+                    request,
+                    ToolResultStatus::Ok,
+                    "required workspace path exists",
+                    json!({
+                        "path": path,
+                        "resolved_path": resolved_path,
+                        "exists": true,
+                        "metadata": metadata_facts,
+                        "metadata_checksum": metadata_checksum,
+                    }),
+                    policy,
+                )
+            }
+            Err(error) => path_verification_report(
+                request,
+                ToolResultStatus::Error,
+                "required path inspection failed",
+                json!({
+                    "path": path,
+                    "resolved_path": resolved_path,
+                    "exists": false,
+                    "error": error.to_string(),
+                }),
+                policy,
+            ),
+        }
     }
 
     #[must_use]
@@ -295,6 +515,40 @@ impl BasicToolExecutor {
             .await
     }
 
+    pub async fn invoke(
+        &self,
+        invocation: ToolInvocation,
+        cancellation: CancellationToken,
+        progress: Option<&mut (dyn FnMut(ToolProgress) + Send)>,
+    ) -> Result<ToolExecutionReport, ToolError> {
+        let ToolInvocation {
+            request,
+            policy,
+            approved,
+            preparation,
+        } = invocation;
+        let may_execute = !cancellation.is_cancelled()
+            && match policy.decision {
+                PolicyDecision::Allow => true,
+                PolicyDecision::Ask => approved,
+                PolicyDecision::Deny | PolicyDecision::Block => false,
+            };
+        let preparation = match preparation {
+            Some(preparation) => preparation,
+            None if may_execute => self.prepare_side_effect_snapshot(&request).await?,
+            None => SideEffectPreparation::default(),
+        };
+        self.invoke_prepared(
+            request,
+            policy,
+            approved,
+            cancellation,
+            preparation,
+            progress,
+        )
+        .await
+    }
+
     /// Execute a caller-declared verification command without shell parsing.
     /// The command remains sandboxed, cancellable and scoped to this executor's
     /// workspace, but it does not require model-tool approval.
@@ -303,26 +557,49 @@ impl BasicToolExecutor {
         request: VerifierExecutionRequest,
         cancellation: CancellationToken,
     ) -> Result<ToolExecutionReport, ToolError> {
+        let preparation = self.prepare_verifier_side_effect(&request).await?;
+        self.execute_verifier_with_preparation(request, cancellation, preparation)
+            .await
+    }
+
+    /// Capture the workspace state that must be persisted before a verifier
+    /// process receives write access to the workspace.
+    pub async fn prepare_verifier_side_effect(
+        &self,
+        request: &VerifierExecutionRequest,
+    ) -> Result<SideEffectPreparation, ToolError> {
         if request.program.trim().is_empty() {
             return Err(ToolError::InvalidArguments(
                 "verifier program cannot be empty".to_owned(),
             ));
         }
         if self.replay_backend.is_some() {
-            let tool_request = ToolRequest {
-                tool_call_id: ToolCallId::new(),
-                provider_tool_call_id: None,
-                session_id: request.session_id,
-                turn_id: request.turn_id,
-                tool_name: "external_verifier".to_owned(),
-                arguments: json!({
-                    "program": request.program,
-                    "args": request.args,
-                    "cwd": request.cwd,
-                    "timeout_ms": request.timeout_ms,
-                    "expected_exit_code": request.expected_exit_code,
-                }),
-            };
+            return Ok(SideEffectPreparation::default());
+        }
+        self.resolve_verifier_cwd(request)?;
+        let snapshot = workspace_scan::capture(self.policy.workspace_root()).await;
+        Ok(SideEffectPreparation {
+            before_images: snapshot.before_images(),
+            complete: snapshot.is_complete(),
+            workspace_snapshot: Some(snapshot),
+        })
+    }
+
+    /// Execute a verifier using a workspace snapshot already persisted by the
+    /// runtime host.
+    pub async fn execute_verifier_with_preparation(
+        &self,
+        request: VerifierExecutionRequest,
+        cancellation: CancellationToken,
+        preparation: SideEffectPreparation,
+    ) -> Result<ToolExecutionReport, ToolError> {
+        if request.program.trim().is_empty() {
+            return Err(ToolError::InvalidArguments(
+                "verifier program cannot be empty".to_owned(),
+            ));
+        }
+        let tool_request = request.as_tool_request();
+        if self.replay_backend.is_some() {
             let policy = execution_policy(
                 &tool_request,
                 PolicyDecision::Allow,
@@ -332,18 +609,12 @@ impl BasicToolExecutor {
                 .execute_with_policy(tool_request, policy, false, cancellation)
                 .await;
         }
-        let cwd = self
-            .policy
-            .resolve_path(&request.cwd, true)
-            .map_err(|error| {
-                ToolError::InvalidArguments(format!("invalid verifier cwd: {error}"))
-            })?;
-        if !cwd.starts_with(self.policy.workspace_root()) || !cwd.is_dir() {
-            return Err(ToolError::InvalidArguments(
-                "verifier cwd must be a directory inside the workspace".to_owned(),
-            ));
-        }
+        let cwd = self.resolve_verifier_cwd(&request)?;
         let timeout_ms = request.timeout_ms.clamp(1, MAX_VERIFIER_TIMEOUT_MS);
+        let workspace_before = match preparation.workspace_snapshot {
+            Some(snapshot) => snapshot,
+            None => workspace_scan::capture(self.policy.workspace_root()).await,
+        };
         let output = run_process_with_progress(
             ProcessExecutionRequest {
                 program: &request.program,
@@ -355,15 +626,21 @@ impl BasicToolExecutor {
                 sandbox: &self.sandbox,
                 workspace_access: WorkspaceAccess::ReadWrite,
                 allow_network: false,
+                stdin: None,
+                isolated_home: false,
             },
             None,
         )
         .await?;
+        let workspace_changes =
+            workspace_scan::compare(self.policy.workspace_root(), workspace_before).await;
         let retained_limit = request.max_output_bytes.clamp(1, MAX_VERIFIER_OUTPUT_BYTES);
         let raw_output = bounded_text(&output.raw_output, retained_limit);
-        let passed = !output.cancelled
+        let process_passed = !output.cancelled
             && !output.timed_out
             && output.exit_code == Some(request.expected_exit_code);
+        let workspace_mutation_detected = !workspace_changes.changed_files.is_empty();
+        let passed = process_passed && !workspace_mutation_detected;
         let status = if output.cancelled {
             ToolResultStatus::Cancelled
         } else if output.timed_out {
@@ -372,20 +649,6 @@ impl BasicToolExecutor {
             ToolResultStatus::Ok
         } else {
             ToolResultStatus::Error
-        };
-        let tool_request = ToolRequest {
-            tool_call_id: ToolCallId::new(),
-            provider_tool_call_id: None,
-            session_id: request.session_id,
-            turn_id: request.turn_id,
-            tool_name: "external_verifier".to_owned(),
-            arguments: json!({
-                "program": request.program,
-                "args": request.args,
-                "cwd": request.cwd,
-                "timeout_ms": timeout_ms,
-                "expected_exit_code": request.expected_exit_code,
-            }),
         };
         let command = command_display(
             tool_request.arguments["program"]
@@ -405,7 +668,9 @@ impl BasicToolExecutor {
         let mut report = report(
             tool_request,
             status,
-            if passed {
+            if workspace_mutation_detected {
+                "external verification modified tracked workspace files"
+            } else if passed {
                 "external verification passed"
             } else {
                 "external verification failed"
@@ -418,19 +683,83 @@ impl BasicToolExecutor {
                 "timed_out": output.timed_out,
                 "cancelled": output.cancelled,
                 "output_truncated": output.output_truncated || output.raw_output.len() > retained_limit,
+                "workspace_changes_known": workspace_changes.complete,
+                "workspace_change_count": workspace_changes.changed_files.len(),
+                "workspace_mutation_detected": workspace_mutation_detected,
                 "sandbox_backend": output.sandbox_backend,
                 "sandbox_os_enforced": output.sandbox_os_enforced,
                 "network_access": output.network_access,
             }),
             raw_output,
-            Vec::new(),
+            workspace_changes.changed_files.clone(),
             policy,
         );
+        report.before_images = workspace_changes.before_images;
+        report.after_images = workspace_changes.after_images;
         report.metrics = process_metrics(&output);
         report.envelope.risk = "caller_declared_workspace_verifier".to_owned();
         report.envelope.verification_hint =
             Some("objective test result from a caller-declared command".to_owned());
         Ok(report)
+    }
+
+    /// Convert a verifier setup or launch failure into the same durable report
+    /// shape as a verifier process result.
+    #[must_use]
+    pub fn verifier_execution_error_report(
+        &self,
+        request: VerifierExecutionRequest,
+        error: impl Into<String>,
+    ) -> ToolExecutionReport {
+        let command = command_display(&request.program, request.args.iter().map(String::as_str));
+        let tool_request = request.as_tool_request();
+        let reason = bounded_text(&error.into(), MAX_TOOL_ERROR_CHARS);
+        let policy = execution_policy(
+            &tool_request,
+            PolicyDecision::Allow,
+            "caller-declared verifier failed before producing a process result",
+        );
+        let mut report = error_report(
+            tool_request,
+            "external verification could not run",
+            json!({
+                "command": command,
+                "error": reason,
+                "exit_code": null,
+                "expected_exit_code": request.expected_exit_code,
+                "timed_out": false,
+                "cancelled": false,
+                "workspace_changes_known": false,
+                "workspace_change_count": 0,
+                "workspace_mutation_detected": false,
+                "sandbox_backend": self.sandbox.backend(),
+                "sandbox_os_enforced": self.sandbox.os_enforced(),
+            }),
+            reason,
+            policy,
+        );
+        report.envelope.risk = "caller_declared_workspace_verifier".to_owned();
+        report.envelope.verification_hint =
+            Some("objective test result from a caller-declared command".to_owned());
+        report
+    }
+
+    fn resolve_verifier_cwd(
+        &self,
+        request: &VerifierExecutionRequest,
+    ) -> Result<PathBuf, ToolError> {
+        let cwd = self
+            .policy
+            .resolve_path(&request.cwd, true)
+            .map_err(|error| {
+                ToolError::InvalidArguments(format!("invalid verifier cwd: {error}"))
+            })?;
+        if !cwd.starts_with(self.policy.workspace_root()) || !cwd.is_dir() {
+            return Err(ToolError::InvalidArguments(
+                "verifier cwd must be a directory inside the workspace".to_owned(),
+            ));
+        }
+        Ok(cwd)
     }
 
     pub fn evaluate(&self, request: &ToolRequest) -> Result<PolicyEvaluation, ToolError> {
@@ -463,6 +792,7 @@ impl BasicToolExecutor {
                 string_arg(&request.arguments, "path")?,
                 true,
             ),
+            "apply_patch" => self.policy.evaluate_path("apply_patch", ".", true),
             "list_dir" => self.policy.evaluate_path(
                 "list_dir",
                 optional_string_arg(&request.arguments, "path").unwrap_or_else(|| ".".to_owned()),
@@ -548,6 +878,19 @@ impl BasicToolExecutor {
                     workspace_snapshot: None,
                 })
             }
+            "apply_patch" => {
+                let patch = string_arg(&request.arguments, "patch")?;
+                let paths = self.resolved_patch_paths(&patch).await?;
+                let mut before_images = Vec::with_capacity(paths.len());
+                for path in paths {
+                    before_images.push(read_optional_file(&path).await?);
+                }
+                Ok(SideEffectPreparation {
+                    before_images,
+                    complete: true,
+                    workspace_snapshot: None,
+                })
+            }
             "shell" => {
                 let snapshot = workspace_scan::capture(self.policy.workspace_root()).await;
                 Ok(SideEffectPreparation {
@@ -578,23 +921,9 @@ impl BasicToolExecutor {
         approved: bool,
         cancellation: CancellationToken,
     ) -> Result<ToolExecutionReport, ToolError> {
-        let may_execute = !cancellation.is_cancelled()
-            && match policy.decision {
-                PolicyDecision::Allow => true,
-                PolicyDecision::Ask => approved,
-                PolicyDecision::Deny | PolicyDecision::Block => false,
-            };
-        let preparation = if may_execute {
-            self.prepare_side_effect_snapshot(&request).await?
-        } else {
-            SideEffectPreparation::default()
-        };
-        self.execute_with_policy_and_preparation_with_progress(
-            request,
-            policy,
-            approved,
+        self.invoke(
+            ToolInvocation::new(request, policy, approved),
             cancellation,
-            preparation,
             None,
         )
         .await
@@ -628,22 +957,21 @@ impl BasicToolExecutor {
         before_images: Vec<FileBeforeImage>,
         progress: Option<&mut (dyn FnMut(ToolProgress) + Send)>,
     ) -> Result<ToolExecutionReport, ToolError> {
-        self.execute_with_policy_and_preparation_with_progress(
-            request,
-            policy,
-            approved,
+        self.invoke(
+            ToolInvocation::new(request, policy, approved).with_preparation(
+                SideEffectPreparation {
+                    before_images,
+                    complete: true,
+                    workspace_snapshot: None,
+                },
+            ),
             cancellation,
-            SideEffectPreparation {
-                before_images,
-                complete: true,
-                workspace_snapshot: None,
-            },
             progress,
         )
         .await
     }
 
-    pub async fn execute_with_policy_and_preparation_with_progress(
+    async fn invoke_prepared(
         &self,
         request: ToolRequest,
         policy: PolicyEvaluation,
@@ -737,6 +1065,10 @@ impl BasicToolExecutor {
                 "read_file" => self.read_file(request, policy).await,
                 "write_file" => self.write_file(request, policy, before_images).await,
                 "edit_file" => self.edit_file(request, policy, before_images).await,
+                "apply_patch" => {
+                    self.apply_patch(request, policy, before_images, cancellation)
+                        .await
+                }
                 "list_dir" => self.list_dir(request, policy).await,
                 "rg_search" => {
                     self.rg_search(request, policy, cancellation, started_at, &mut progress)
@@ -1005,6 +1337,189 @@ impl BasicToolExecutor {
         Ok(report)
     }
 
+    async fn patch_paths(&self, patch: &str) -> Result<Vec<PathBuf>, ToolError> {
+        validate_patch_input(patch)?;
+        let args = vec![
+            "apply".to_owned(),
+            "--numstat".to_owned(),
+            "-z".to_owned(),
+            "--whitespace=nowarn".to_owned(),
+            "-".to_owned(),
+        ];
+        let output = self
+            .run_patch_command(
+                &args,
+                patch,
+                WorkspaceAccess::ReadOnly,
+                CancellationToken::new(),
+            )
+            .await?;
+        if output.exit_code != Some(0) || output.stdin_error.is_some() {
+            return Err(ToolError::InvalidArguments(format!(
+                "patch is invalid: {}",
+                bounded_text(
+                    output.stdin_error.as_deref().unwrap_or(&output.raw_output),
+                    MAX_TOOL_ERROR_CHARS,
+                )
+            )));
+        }
+        parse_git_numstat_paths(&output.raw_output, output.output_truncated)
+    }
+
+    async fn resolved_patch_paths(&self, patch: &str) -> Result<Vec<PathBuf>, ToolError> {
+        self.patch_paths(patch)
+            .await?
+            .into_iter()
+            .map(|path| self.resolve_tool_path("apply_patch", path, false))
+            .collect::<Result<BTreeSet<_>, _>>()
+            .map(|paths| paths.into_iter().collect())
+    }
+
+    async fn apply_patch(
+        &self,
+        request: ToolRequest,
+        policy: PolicyEvaluation,
+        before_images: Vec<FileBeforeImage>,
+        cancellation: CancellationToken,
+    ) -> Result<ToolExecutionReport, ToolError> {
+        let patch = string_arg(&request.arguments, "patch")?;
+        validate_patch_input(&patch)?;
+        let checkpointed_paths = before_images
+            .iter()
+            .map(|image| image.path.clone())
+            .collect::<BTreeSet<_>>();
+        let resolved_paths = self
+            .resolved_patch_paths(&patch)
+            .await?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if resolved_paths != checkpointed_paths {
+            let mut report = error_report(
+                request,
+                "patch target paths changed after checkpoint",
+                json!({
+                    "conflict": true,
+                    "checkpointed_paths": checkpointed_paths,
+                    "resolved_paths": resolved_paths,
+                }),
+                String::new(),
+                policy,
+            );
+            report.before_images = before_images;
+            return Ok(report);
+        }
+        for before_image in &before_images {
+            if !before_image_still_current(&before_image.path, &before_images).await? {
+                return Ok(error_report(
+                    request,
+                    "patch target changed after checkpoint",
+                    json!({"path": before_image.path, "conflict": true}),
+                    String::new(),
+                    policy,
+                ));
+            }
+        }
+        let args = vec![
+            "apply".to_owned(),
+            "--whitespace=nowarn".to_owned(),
+            "-".to_owned(),
+        ];
+        let output = self
+            .run_patch_command(&args, &patch, WorkspaceAccess::ReadWrite, cancellation)
+            .await?;
+        let (changed_files, after_images) = file_changes_since(&before_images).await?;
+        let changed_count = changed_files.len();
+        if output.cancelled {
+            let mut report = report(
+                request,
+                ToolResultStatus::Cancelled,
+                "patch application cancelled",
+                json!({
+                    "cancelled": true,
+                    "workspace_changes_known": true,
+                    "workspace_change_count": changed_count,
+                    "workspace_mutation_detected": changed_count > 0,
+                    "changed_files": &changed_files,
+                }),
+                bounded_text(&output.raw_output, MAX_TOOL_ERROR_CHARS),
+                changed_files,
+                policy,
+            );
+            report.before_images = before_images;
+            report.after_images = after_images;
+            report.metrics = process_metrics(&output);
+            return Ok(report);
+        }
+        if output.timed_out || output.exit_code != Some(0) || output.stdin_error.is_some() {
+            let mut report = report(
+                request,
+                ToolResultStatus::Error,
+                "patch could not be applied atomically",
+                json!({
+                    "exit_code": output.exit_code,
+                    "timed_out": output.timed_out,
+                    "stdin_error": &output.stdin_error,
+                    "workspace_changes_known": true,
+                    "workspace_change_count": changed_count,
+                    "workspace_mutation_detected": changed_count > 0,
+                    "changed_files": &changed_files,
+                }),
+                bounded_text(&output.raw_output, MAX_TOOL_ERROR_CHARS),
+                changed_files,
+                policy,
+            );
+            report.before_images = before_images;
+            report.after_images = after_images;
+            report.metrics = process_metrics(&output);
+            return Ok(report);
+        }
+
+        let summary = format!("patch applied to {changed_count} file(s)");
+        let mut report = success_report(
+            request,
+            "patch applied",
+            json!({
+                "changed_files": &changed_files,
+                "changed_file_count": changed_count,
+                "workspace_changes_known": true,
+            }),
+            summary,
+            changed_files,
+            policy,
+        );
+        report.before_images = before_images;
+        report.after_images = after_images;
+        report.metrics = process_metrics(&output);
+        report.metrics.item_count = Some(u64::try_from(changed_count).unwrap_or(u64::MAX));
+        Ok(report)
+    }
+
+    async fn run_patch_command(
+        &self,
+        args: &[String],
+        patch: &str,
+        workspace_access: WorkspaceAccess,
+        cancellation: CancellationToken,
+    ) -> Result<process::ShellOutput, ToolError> {
+        run_process_with_progress(
+            ProcessExecutionRequest {
+                program: "git",
+                args,
+                cwd: self.policy.workspace_root(),
+                workspace_root: self.policy.workspace_root(),
+                timeout_ms: 30_000,
+                cancellation,
+                sandbox: &self.sandbox,
+                workspace_access,
+                allow_network: false,
+                stdin: Some(patch.as_bytes()),
+                isolated_home: true,
+            },
+            None,
+        )
+        .await
+    }
+
     async fn list_dir(
         &self,
         request: ToolRequest,
@@ -1063,6 +1578,8 @@ impl BasicToolExecutor {
                 sandbox: &self.sandbox,
                 workspace_access: WorkspaceAccess::ReadOnly,
                 allow_network: false,
+                stdin: None,
+                isolated_home: false,
             },
             Some(&mut process_progress),
         )
@@ -1302,6 +1819,7 @@ impl BasicToolExecutor {
             } else {
                 DEFAULT_TIMEOUT_MS
             });
+        let effective_timeout_ms = effective_shell_timeout(timeout_ms);
         let command_line = CommandLine::parse(&command)?;
         let workspace_before = match workspace_before {
             Some(snapshot) => snapshot,
@@ -1324,7 +1842,7 @@ impl BasicToolExecutor {
                     args: &command_line.args,
                     command_display: redact_sensitive_text(&command).0,
                     cwd: self.policy.workspace_root(),
-                    timeout_ms: timeout_ms.min(MAX_BACKGROUND_PROCESS_TIMEOUT_MS),
+                    timeout_ms: effective_timeout_ms,
                     wait_ms,
                     cancellation,
                     sandbox: &self.sandbox,
@@ -1347,11 +1865,13 @@ impl BasicToolExecutor {
                     args: &command_line.args,
                     cwd: self.policy.workspace_root(),
                     workspace_root: self.policy.workspace_root(),
-                    timeout_ms: timeout_ms.min(30_000),
+                    timeout_ms: effective_timeout_ms,
                     cancellation,
                     sandbox: &self.sandbox,
                     workspace_access: WorkspaceAccess::ReadWrite,
                     allow_network: self.allow_network,
+                    stdin: None,
+                    isolated_home: false,
                 },
                 Some(&mut process_progress),
             )
@@ -1377,6 +1897,8 @@ impl BasicToolExecutor {
                 "shell command completed",
                 json!({
                     "command": redacted_command,
+                    "requested_timeout_ms": timeout_ms,
+                    "effective_timeout_ms": effective_timeout_ms,
                     "exit_code": shell_output.exit_code,
                     "timed_out": shell_output.timed_out,
                     "cancelled": shell_output.cancelled,
@@ -1545,8 +2067,21 @@ impl BasicToolExecutor {
     }
 }
 
+const fn effective_shell_timeout(requested_timeout_ms: u64) -> u64 {
+    if requested_timeout_ms > MAX_BACKGROUND_PROCESS_TIMEOUT_MS {
+        MAX_BACKGROUND_PROCESS_TIMEOUT_MS
+    } else {
+        requested_timeout_ms
+    }
+}
+
+/// Compatibility name for integrations compiled against the original tool
+/// executor. New runtime code should use [`ToolRuntime`] and [`ToolInvocation`].
+pub type BasicToolExecutor = ToolRuntime;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifierExecutionRequest {
+    pub tool_call_id: ToolCallId,
     pub session_id: SessionId,
     pub turn_id: Option<TurnId>,
     pub program: String,
@@ -1557,12 +2092,112 @@ pub struct VerifierExecutionRequest {
     pub max_output_bytes: usize,
 }
 
+impl VerifierExecutionRequest {
+    #[must_use]
+    pub fn as_tool_request(&self) -> ToolRequest {
+        ToolRequest {
+            tool_call_id: self.tool_call_id,
+            provider_tool_call_id: None,
+            session_id: self.session_id,
+            turn_id: self.turn_id,
+            tool_name: "external_verifier".to_owned(),
+            arguments: json!({
+                "program": self.program,
+                "args": self.args,
+                "cwd": self.cwd,
+                "timeout_ms": self.timeout_ms.clamp(1, MAX_VERIFIER_TIMEOUT_MS),
+                "expected_exit_code": self.expected_exit_code,
+            }),
+        }
+    }
+}
+
 fn command_display<'a>(program: &'a str, args: impl Iterator<Item = &'a str>) -> String {
     std::iter::once(program)
         .chain(args)
         .map(|part| shlex::try_quote(part).map_or_else(|_| part.to_owned(), Into::into))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn validate_patch_input(patch: &str) -> Result<(), ToolError> {
+    if patch.trim().is_empty() {
+        return Err(ToolError::InvalidArguments(
+            "patch cannot be empty".to_owned(),
+        ));
+    }
+    if patch.len() > MAX_PATCH_BYTES {
+        return Err(ToolError::InvalidArguments(format!(
+            "patch exceeds {MAX_PATCH_BYTES} bytes"
+        )));
+    }
+    if patch.contains('\0') {
+        return Err(ToolError::InvalidArguments(
+            "patch cannot contain NUL bytes".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_git_numstat_paths(
+    output: &str,
+    output_truncated: bool,
+) -> Result<Vec<PathBuf>, ToolError> {
+    if output_truncated {
+        return Err(ToolError::InvalidArguments(
+            "patch touches too many paths to checkpoint safely".to_owned(),
+        ));
+    }
+    let records = output.split('\0').collect::<Vec<_>>();
+    let mut paths = BTreeSet::new();
+    let mut index = 0_usize;
+    while index < records.len() {
+        let record = records[index];
+        index = index.saturating_add(1);
+        if record.is_empty() {
+            continue;
+        }
+        let mut fields = record.splitn(3, '\t');
+        let added = fields.next();
+        let deleted = fields.next();
+        let path = fields.next();
+        if !added.is_some_and(is_git_numstat_count)
+            || !deleted.is_some_and(is_git_numstat_count)
+            || path.is_none()
+        {
+            // The bounded process collector merges stderr after stdout. Ignore
+            // diagnostics that are not NUL-delimited numstat records.
+            continue;
+        }
+        let path = path.unwrap_or_default();
+        if path.is_empty() {
+            let old_path = records.get(index).copied().unwrap_or_default();
+            let new_path = records
+                .get(index.saturating_add(1))
+                .copied()
+                .unwrap_or_default();
+            if old_path.is_empty() || new_path.is_empty() {
+                return Err(ToolError::InvalidArguments(
+                    "git returned incomplete rename metadata".to_owned(),
+                ));
+            }
+            paths.insert(PathBuf::from(old_path));
+            paths.insert(PathBuf::from(new_path));
+            index = index.saturating_add(2);
+        } else {
+            paths.insert(PathBuf::from(path));
+        }
+    }
+    if paths.is_empty() {
+        return Err(ToolError::InvalidArguments(
+            "patch does not contain any file changes".to_owned(),
+        ));
+    }
+    Ok(paths.into_iter().collect())
+}
+
+fn is_git_numstat_count(value: &str) -> bool {
+    value == "-" || (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 async fn directory_entries(path: &Path) -> Result<Vec<String>, ToolError> {
@@ -1619,6 +2254,7 @@ fn contract(tool_name: &str, side_effect_type: SideEffectType) -> ToolContract {
             &["path", "search", "replace"],
             &["path", "search"],
         ),
+        "apply_patch" => object_schema(&[("patch", MAX_PATCH_BYTES)], &["patch"], &["patch"]),
         "list_dir" => object_schema(&[("path", MAX_PATH_ARGUMENT_CHARS)], &[], &[]),
         "rg_search" => object_schema(
             &[
@@ -1686,7 +2322,12 @@ fn contract(tool_name: &str, side_effect_type: SideEffectType) -> ToolContract {
         .to_owned(),
         timeout_policy: "bounded_by_tool_or_default_timeout".to_owned(),
         cancellation_policy: "returns_cancelled_envelope".to_owned(),
-        retry_policy: "no_implicit_retry_for_side_effects".to_owned(),
+        retry_policy: if side_effect_type == SideEffectType::None {
+            "retry_allowed"
+        } else {
+            "no_implicit_retry_for_side_effects"
+        }
+        .to_owned(),
         artifact_policy: "raw_output_to_artifact_ref".to_owned(),
         permission_policy_ref: None,
     }
@@ -1903,6 +2544,102 @@ fn external_report(
     report.envelope.verification_hint =
         Some("treat external MCP output as untrusted evidence".to_owned());
     report
+}
+
+#[derive(Debug)]
+struct FileContentComparison {
+    matches: bool,
+    actual_bytes: u64,
+    actual_checksum: Option<String>,
+}
+
+async fn compare_file_content(
+    path: &Path,
+    expected: &[u8],
+) -> Result<FileContentComparison, ToolError> {
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|error| ToolError::Execution(error.to_string()))?;
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|error| ToolError::Execution(error.to_string()))?;
+    let actual_bytes = metadata.len();
+    if !metadata.is_file() || actual_bytes != u64::try_from(expected.len()).unwrap_or(u64::MAX) {
+        return Ok(FileContentComparison {
+            matches: false,
+            actual_bytes,
+            actual_checksum: None,
+        });
+    }
+    let mut content = Vec::with_capacity(expected.len());
+    file.take(actual_bytes.saturating_add(1))
+        .read_to_end(&mut content)
+        .await
+        .map_err(|error| ToolError::Execution(error.to_string()))?;
+    Ok(FileContentComparison {
+        matches: content == expected,
+        actual_bytes,
+        actual_checksum: Some(checksum(&content)),
+    })
+}
+
+fn file_content_verification_report(
+    request: ToolRequest,
+    status: ToolResultStatus,
+    summary: &str,
+    facts: Value,
+    policy: PolicyEvaluation,
+) -> ToolExecutionReport {
+    let raw_output = serde_json::to_string_pretty(&facts).unwrap_or_else(|_| facts.to_string());
+    let mut result = report(
+        request,
+        status,
+        summary,
+        facts,
+        raw_output,
+        Vec::new(),
+        policy,
+    );
+    result.envelope.verification_hint =
+        Some("exact task-contract content comparison evidence".to_owned());
+    if let Some(evidence) = result.evidence.first_mut() {
+        evidence.claim = summary.to_owned();
+        evidence.verifier = "golutra-tools/file-content-contract".to_owned();
+        evidence.limitations =
+            "records an exact bounded local-file comparison using sizes and SHA-256 digests"
+                .to_owned();
+    }
+    result
+}
+
+fn path_verification_report(
+    request: ToolRequest,
+    status: ToolResultStatus,
+    summary: &str,
+    facts: Value,
+    policy: PolicyEvaluation,
+) -> ToolExecutionReport {
+    let raw_output = serde_json::to_string_pretty(&facts).unwrap_or_else(|_| facts.to_string());
+    let mut result = report(
+        request,
+        status,
+        summary,
+        facts,
+        raw_output,
+        Vec::new(),
+        policy,
+    );
+    result.envelope.verification_hint =
+        Some("task-contract path existence and bounded metadata evidence".to_owned());
+    if let Some(evidence) = result.evidence.first_mut() {
+        evidence.claim = summary.to_owned();
+        evidence.verifier = "golutra-tools/path-contract".to_owned();
+        evidence.limitations =
+            "records path existence and bounded metadata without reading file contents or traversing directories"
+                .to_owned();
+    }
+    result
 }
 
 fn report(
@@ -2547,8 +3284,8 @@ fn sensitive_json_key(key: &str) -> bool {
 }
 
 async fn read_optional_file(path: &Path) -> Result<FileBeforeImage, ToolError> {
-    let mut file = match tokio::fs::File::open(path).await {
-        Ok(file) => file,
+    let path_metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(FileBeforeImage {
                 path: path.to_path_buf(),
@@ -2559,6 +3296,38 @@ async fn read_optional_file(path: &Path) -> Result<FileBeforeImage, ToolError> {
         }
         Err(error) => return Err(ToolError::Execution(error.to_string())),
     };
+
+    if path_metadata.file_type().is_symlink() {
+        let target = tokio::fs::read_link(path)
+            .await
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        let content = target.as_os_str().as_encoded_bytes().to_vec();
+        if content.len() as u64 > MAX_FILE_CONTENT_BYTES {
+            return Err(ToolError::Execution(format!(
+                "symlink target {} exceeds {MAX_FILE_CONTENT_BYTES} byte limit",
+                path.display()
+            )));
+        }
+        let unix_mode = unix_mode(&path_metadata);
+        let file_metadata = file_state_metadata(&content, unix_mode, true);
+        return Ok(FileBeforeImage {
+            path: path.to_path_buf(),
+            content: Some(content),
+            unix_mode,
+            metadata: Some(file_metadata),
+        });
+    }
+
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(nix::libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    let mut file = options
+        .open(path)
+        .await
+        .map_err(|error| ToolError::Execution(error.to_string()))?;
     let metadata = file
         .metadata()
         .await
@@ -2619,6 +3388,23 @@ async fn before_image_still_current(
     };
     let current = read_optional_file(path).await?;
     Ok(current.content == expected.content && current.unix_mode == expected.unix_mode)
+}
+
+async fn file_changes_since(
+    before_images: &[FileBeforeImage],
+) -> Result<(Vec<PathBuf>, Vec<FileBeforeImage>), ToolError> {
+    let mut changed_files = Vec::new();
+    let mut after_images = Vec::with_capacity(before_images.len());
+    for before_image in before_images {
+        let after_image = read_optional_file(&before_image.path).await?;
+        if after_image.content != before_image.content
+            || after_image.unix_mode != before_image.unix_mode
+        {
+            changed_files.push(before_image.path.clone());
+        }
+        after_images.push(after_image);
+    }
+    Ok((changed_files, after_images))
 }
 
 #[cfg(unix)]

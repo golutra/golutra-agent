@@ -32,6 +32,21 @@ Rust Runtime Kernel
 + reviewed Plugin / sandboxed MCP
 ```
 
+对 Pi 的“相信模型能力”不等于减少 Runtime 的客观边界。本轮采用的是小接口、深实现：
+
+```text
+AgentHarness.execute/start(AgentRun) -> private AgentLoop
+ToolRuntime.invoke(ToolInvocation)   -> policy/checkpoint/sandbox/report
+```
+
+`AgentHarness::execute` is for a host that already owns the execution control
+channel. `AgentHarness::start` consumes the configured harness and returns a
+`RunningTurn`; the returned handle owns steering, pause/resume, approval,
+interrupt and wait, so a running turn cannot be reconfigured through the
+original harness.
+
+模型仍自由规划和选择工具；Runtime 不增加另一套语义 planner。确定性的安全、预算、恢复和验证留在上述两个 seam 后面，弱对齐与接近预算只形成 advisory，不抢夺模型控制流。这样既接近 Pi 的开放 loop，也保留 Codex/Claude Code 已证明必要的长期运行和工具治理。
+
 ## Codex 的工程骨架影响
 
 Codex 最值得吸收的不是某个单库，而是一组已经被工程化验证过的骨架：

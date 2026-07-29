@@ -154,7 +154,7 @@ pub struct AgentTurnResult {
     pub last_sequence_no: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentTurnOptions {
     /// Explicit runtime completion/verification contract.  `None` keeps wire
     /// compatibility for older clients; the application adapter supplies a
@@ -174,6 +174,27 @@ pub struct AgentTurnOptions {
     /// interpreted by a shell.
     #[serde(default)]
     pub external_verifiers: Vec<ExternalVerificationSpec>,
+    /// Discover conservative project checks when no explicit verifier list is
+    /// supplied. Set this to false to send an explicit empty list.
+    #[serde(default = "default_project_verifier_discovery")]
+    pub discover_project_verifiers: bool,
+}
+
+impl Default for AgentTurnOptions {
+    fn default() -> Self {
+        Self {
+            task_contract: None,
+            output_schema: None,
+            completion_criteria: Vec::new(),
+            allow_network: false,
+            external_verifiers: Vec::new(),
+            discover_project_verifiers: true,
+        }
+    }
+}
+
+const fn default_project_verifier_discovery() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

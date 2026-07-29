@@ -341,6 +341,11 @@ impl RuntimeHost {
                 "thread `{thread_id}` cannot be rebound while its task is active"
             )));
         }
+        // The terminal event is persisted by the worker before its supervisor removes the
+        // in-process control and releases the session lease. Wait for that local cleanup so a
+        // caller that observes the terminal projection cannot race its own runtime's lease.
+        self.wait_for_finishing_task_control(thread.session_id)
+            .await?;
         let SessionLeaseAttempt::Acquired(_lease) =
             self.try_acquire_session_lease(thread.session_id)?
         else {

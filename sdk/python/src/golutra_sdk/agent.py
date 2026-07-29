@@ -28,7 +28,8 @@ class Thread:
         task_contract: TaskContract | None = None,
         allow_network: bool = False,
         completion_criteria: Iterable[str] = (),
-        external_verifiers: Iterable[dict[str, Any]] = (),
+        external_verifiers: Iterable[dict[str, Any]] | None = None,
+        discover_project_verifiers: bool = True,
     ) -> TurnHandle:
         if not prompt.strip():
             raise ValueError("turn prompt cannot be empty")
@@ -37,8 +38,11 @@ class Thread:
             "prompt": prompt,
             "allow_network": allow_network,
             "completion_criteria": [item for item in completion_criteria if item.strip()],
-            "external_verifiers": [dict(item) for item in external_verifiers],
         }
+        if external_verifiers is not None or not discover_project_verifiers:
+            params["external_verifiers"] = [
+                dict(item) for item in (external_verifiers or ())
+            ]
         if task_contract is not None:
             params["task_contract"] = dict(task_contract)
         if output_schema is not None:
@@ -56,7 +60,8 @@ class Thread:
         task_contract: TaskContract | None = None,
         allow_network: bool = False,
         completion_criteria: Iterable[str] = (),
-        external_verifiers: Iterable[dict[str, Any]] = (),
+        external_verifiers: Iterable[dict[str, Any]] | None = None,
+        discover_project_verifiers: bool = True,
     ) -> TurnHandle:
         return self.run(
             prompt,
@@ -65,6 +70,7 @@ class Thread:
             allow_network=allow_network,
             completion_criteria=completion_criteria,
             external_verifiers=external_verifiers,
+            discover_project_verifiers=discover_project_verifiers,
         )
 
     def steer(self, prompt: str) -> dict[str, Any]:

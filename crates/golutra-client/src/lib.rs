@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
     sync::{
@@ -36,18 +36,21 @@ use golutra_plugin::PluginStore;
 use golutra_policy::WorkspacePolicy;
 use golutra_protocol::{
     ArtifactChunk, ArtifactReadRequest, CommandAck, EventFilter, EventPage, EventPageDirection,
-    EventPageRequest, ProtocolVersionRange, RUNTIME_PROTOCOL_VERSION, RuntimeEvent,
-    RuntimeEventSource, RuntimeEventType, RuntimeQuery, RuntimeQueryKind, SessionCommand,
-    SessionCommandKind, StorageMaintenanceReport, StorageStats, TaskTracePage, TaskTraceRequest,
+    EventPageRequest, ExternalVerificationSpec, ProtocolVersionRange, RUNTIME_PROTOCOL_VERSION,
+    RuntimeEvent, RuntimeEventSource, RuntimeEventType, RuntimeQuery, RuntimeQueryKind,
+    SessionCommand, SessionCommandKind, StorageMaintenanceReport, StorageStats, TaskTracePage,
+    TaskTraceRequest,
 };
 use golutra_runtime::{
-    AgentExecutionControl, AgentExecutionHandle, AgentLoop, AgentLoopError, AgentLoopTraceEvent,
-    AgentTaskRequest, BeforeSideEffectRecorder, PendingAgentTurn, RuntimeLaneError,
+    AgentExecutionControl, AgentExecutionHandle, AgentHarness, AgentLoopError, AgentLoopTraceEvent,
+    AgentRun, AgentTaskRequest, BeforeSideEffectRecorder, PendingAgentTurn, RuntimeLaneError,
     RuntimeLaneManager, RuntimeObservation, RuntimeObservationSink, RuntimeVerificationService,
     WorkspaceCheckpointManager, agent_execution_channel, is_active_status,
 };
 use golutra_store::{CommandClaim, RuntimeRepositories, RuntimeStore, StoreError, ThreadRecord};
-use golutra_tools::{BasicToolExecutor, FileBeforeImage, ProcessSupervisor, ToolRequest};
+use golutra_tools::{
+    FileBeforeImage, ProcessSupervisor, ToolRequest, ToolRuntime, discover_project_verifiers,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -81,6 +84,8 @@ const POST_TASK_JOB_MAX_ATTEMPTS: u32 = 3;
 const POST_TASK_JOB_LEASE_MINUTES: i64 = 5;
 const POST_TASK_JOB_POLL_MILLIS: u64 = 250;
 const POST_TASK_JOB_IDLE_POLL_MILLIS: u64 = 1_000;
+const EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY: &str = "_external_verifiers_require_os_sandbox";
+const TASK_CONTROL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Capabilities granted by the process that owns an embedded runtime.
 ///
@@ -141,6 +146,7 @@ mod execution_trace;
 mod external_evaluation;
 mod governance;
 mod governance_commands;
+mod legacy_task;
 mod observation;
 mod paths;
 mod post_task;
@@ -189,6 +195,9 @@ pub use golutra_protocol::{
     SessionCursor, SessionPage, SessionPageRequest, SessionRangeDirection, SessionRangeSpec,
     SessionSummary, SessionWindow, SessionWindowRequest,
 };
+pub(crate) use legacy_task::LegacyTaskAdapter;
+#[cfg(test)]
+pub(crate) use legacy_task::LegacyWriteFileArgs;
 pub use observation::{
     ConversationEntry, ConversationRole, ObservedSession, ObservedTask,
     RuntimeObservationCollector, RuntimeObservationSnapshot,
@@ -196,13 +205,10 @@ pub use observation::{
 pub use paths::{AppServerPaths, RuntimePaths};
 pub(crate) use paths::{ensure_private_dir, set_owner_only_file, workspace_hash};
 pub use post_task::PostTaskCoordinator;
+#[cfg(test)]
+pub(crate) use provider_runtime::configured_provider_plan;
 pub(crate) use provider_runtime::{
     MockProviderPlan, isolated_mock_provider_plan, mock_provider_plan,
-};
-#[cfg(test)]
-pub(crate) use provider_runtime::{
-    MockWriteFileArgs, apply_legacy_task_contract, configured_provider_plan,
-    legacy_task_requests_workspace_change, legacy_task_required_path, mock_write_file_args,
 };
 pub use rollout::{RolloutEnvelope, RolloutExport, ThreadRebindResult, redact_runtime_value};
 pub(crate) use rollout::{
@@ -259,10 +265,27 @@ pub enum ClientError {
     Evolution(#[from] EvolutionError),
 }
 
+async fn wait_for_task_control_cleanup(
+    completion: &mut watch::Receiver<bool>,
+    timeout: Duration,
+) -> Result<(), ClientError> {
+    match tokio::time::timeout(timeout, completion.changed()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(ClientError::TaskExecution(
+            "previous task supervisor stopped before releasing the session".to_owned(),
+        )),
+        Err(_) => Err(ClientError::TaskExecution(format!(
+            "previous task supervisor did not release the session within {} milliseconds",
+            timeout.as_millis()
+        ))),
+    }
+}
+
 #[derive(Debug)]
 struct RuntimeHostStorage {
     runtime_paths: Option<RuntimePaths>,
     provider_config_paths: Option<ProviderConfigPaths>,
+    checkpoint_evaluation_tasks: HashSet<TaskId>,
     temporary_root: Option<Arc<tempfile::TempDir>>,
 }
 
@@ -274,6 +297,7 @@ impl RuntimeHostStorage {
         Ok(Self {
             runtime_paths: None,
             provider_config_paths: None,
+            checkpoint_evaluation_tasks: HashSet::new(),
             temporary_root: Some(temporary_root),
         })
     }
@@ -284,6 +308,7 @@ impl RuntimeHostStorage {
         Ok(Self {
             runtime_paths: Some(runtime_paths),
             provider_config_paths: Some(provider_config_paths),
+            checkpoint_evaluation_tasks: HashSet::new(),
             temporary_root: None,
         })
     }
@@ -298,6 +323,7 @@ impl RuntimeHostStorage {
         Ok(Self {
             runtime_paths: Some(runtime_paths),
             provider_config_paths: Some(provider_config_paths),
+            checkpoint_evaluation_tasks: HashSet::new(),
             temporary_root: Some(temporary_root),
         })
     }
@@ -308,8 +334,18 @@ impl RuntimeHostStorage {
         Ok(Self {
             runtime_paths: Some(runtime_paths),
             provider_config_paths: Some(provider_config_paths),
+            checkpoint_evaluation_tasks: HashSet::new(),
             temporary_root: None,
         })
+    }
+
+    fn opened_persisted_run(
+        runtime_paths: RuntimePaths,
+        checkpoint_evaluation_tasks: HashSet<TaskId>,
+    ) -> Result<Self, ClientError> {
+        let mut storage = Self::ephemeral_persistent(runtime_paths)?;
+        storage.checkpoint_evaluation_tasks = checkpoint_evaluation_tasks;
+        Ok(storage)
     }
 }
 
@@ -354,6 +390,7 @@ pub struct RuntimeHost {
     deep_evaluation_inputs: Mutex<HashMap<PostTaskJobId, TaskEvaluationInput>>,
     force_mock_provider: bool,
     execution_options: RuntimeExecutionOptions,
+    checkpoint_evaluation_tasks: HashSet<TaskId>,
     _temporary_root: Option<Arc<tempfile::TempDir>>,
 }
 
@@ -391,6 +428,7 @@ struct HostedTaskEvaluation<'a> {
 #[derive(Debug, Clone)]
 struct HostedTaskControl {
     task_id: TaskId,
+    allow_network: bool,
     execution: AgentExecutionHandle,
     abort_handle: AbortHandle,
     completion: watch::Receiver<bool>,
@@ -585,6 +623,27 @@ impl RuntimeHost {
         .await?;
         set_owner_only_file(&paths.runtime_db)?;
         run_bundle::validate_persisted_run_store(run_root, &manifest, &store).await?;
+        let checkpoint_evaluation_tasks = if matches!(
+            &manifest.terminal_outcome,
+            RunBundleTerminalOutcome::InProgress { .. }
+        ) {
+            manifest
+                .observations
+                .sessions
+                .iter()
+                .flat_map(|session| &session.tasks)
+                .filter(|task| !task.complete)
+                .map(|task| {
+                    task.task_id.parse::<TaskId>().map_err(|error| {
+                        ClientError::TaskExecution(format!(
+                            "persisted run checkpoint task id is invalid: {error}"
+                        ))
+                    })
+                })
+                .collect::<Result<HashSet<_>, _>>()?
+        } else {
+            HashSet::new()
+        };
         let latest_thread = store
             .list_threads(Some(&manifest.workspace_root), 1)
             .await?
@@ -595,7 +654,8 @@ impl RuntimeHost {
                     "persisted run has no thread for its recorded workspace".to_owned(),
                 )
             })?;
-        let storage = RuntimeHostStorage::ephemeral_persistent(paths.clone())?;
+        let storage =
+            RuntimeHostStorage::opened_persisted_run(paths.clone(), checkpoint_evaluation_tasks)?;
         let host = Self::from_store(RuntimeHostBootstrap {
             store,
             workspace_root: Some(paths.cwd.clone()),
@@ -687,6 +747,7 @@ impl RuntimeHost {
         let RuntimeHostStorage {
             runtime_paths,
             provider_config_paths,
+            checkpoint_evaluation_tasks,
             temporary_root,
         } = storage;
         let (event_bus, _) = broadcast::channel(512);
@@ -751,6 +812,7 @@ impl RuntimeHost {
             deep_evaluation_inputs: Mutex::new(HashMap::new()),
             force_mock_provider,
             execution_options,
+            checkpoint_evaluation_tasks,
             _temporary_root: temporary_root,
         });
         host.repositories
@@ -1010,18 +1072,24 @@ impl RuntimeHost {
                         .flatten()
                         .filter_map(Value::as_u64)
                         .collect::<Vec<_>>();
+                    let is_pending_transfer_event = !referenced_sequences.is_empty()
+                        && event.turn_id.is_none()
+                        && event.payload.get("payload").is_none();
                     for sequence_no in referenced_sequences {
-                        if let Some(referenced) = self
+                        if let Some(referenced_event) = self
                             .repositories
                             .events
                             .load_by_sequence(session_id, sequence_no)
                             .await?
-                            .and_then(|event| recovered_pending_turn_from_event(&event))
+                            && let Some(referenced) =
+                                recovered_pending_turn_from_event(&referenced_event)?
                         {
                             pending.insert(referenced.pending.turn_id, referenced);
                         }
                     }
-                    if let Some(recovered) = recovered_pending_turn_from_event(&event) {
+                    if !is_pending_transfer_event
+                        && let Some(recovered) = recovered_pending_turn_from_event(&event)?
+                    {
                         pending.insert(recovered.pending.turn_id, recovered);
                     }
                 }
@@ -1046,6 +1114,15 @@ impl RuntimeHost {
     ) -> Result<(), ClientError> {
         if pending_turns.is_empty() {
             return Ok(());
+        }
+        let recovered_network_capability = pending_turns[0].pending.allow_network;
+        if pending_turns
+            .iter()
+            .any(|turn| turn.pending.allow_network != recovered_network_capability)
+        {
+            return Err(ClientError::TaskExecution(
+                "durable pending turn batch changes network capability".to_owned(),
+            ));
         }
         let first = pending_turns.remove(0);
         let task_id = TaskId::new();
@@ -1447,11 +1524,7 @@ impl RuntimeHost {
             return Ok(());
         };
         if !*completion.borrow() {
-            completion.changed().await.map_err(|_| {
-                ClientError::TaskExecution(
-                    "previous task supervisor stopped before releasing the session".to_owned(),
-                )
-            })?;
+            wait_for_task_control_cleanup(completion, TASK_CONTROL_CLEANUP_TIMEOUT).await?;
         }
         Ok(())
     }

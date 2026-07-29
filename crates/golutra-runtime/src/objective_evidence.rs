@@ -17,25 +17,6 @@ impl DeliveryPathEvaluation {
     pub(crate) fn passed(&self) -> bool {
         self.missing.is_empty()
     }
-
-    pub(crate) fn message(&self) -> String {
-        if self.missing.is_empty() {
-            if self.expected.len() == 1 {
-                return format!("a changed file matches requested `{}`", self.expected[0]);
-            }
-            return format!(
-                "changed files match all requested deliveries: {}",
-                quoted_paths(&self.expected)
-            );
-        }
-        if self.expected.len() == 1 {
-            return format!("no changed file matches requested `{}`", self.expected[0]);
-        }
-        format!(
-            "changed files do not match requested deliveries: {}",
-            quoted_paths(&self.missing)
-        )
-    }
 }
 
 pub(crate) fn evaluate_delivery_paths(
@@ -289,14 +270,6 @@ fn path_matches_expected(path: &Path, expected: &str) -> bool {
 fn deduplicate(paths: &mut Vec<String>) {
     let mut seen = HashSet::new();
     paths.retain(|path| seen.insert(path.clone()));
-}
-
-fn quoted_paths(paths: &[String]) -> String {
-    paths
-        .iter()
-        .map(|path| format!("`{path}`"))
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 #[cfg(test)]

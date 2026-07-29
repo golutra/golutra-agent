@@ -185,21 +185,25 @@ impl AgentThread {
                 after_sequence_no: cursor,
             })
             .await?;
+        let mut payload = json!({
+            "prompt": prompt,
+            "_thread_id": self.thread.thread_id,
+            "task_contract": options.task_contract.clone(),
+            "completion_criteria": options.completion_criteria.clone(),
+            "output_schema": options.output_schema.clone(),
+            "allow_network": options.allow_network,
+        });
+        if !options.external_verifiers.is_empty() || !options.discover_project_verifiers {
+            payload["external_verifiers"] =
+                serde_json::to_value(options.external_verifiers.clone())?;
+        }
         let ack = self
             .client
             .transport
             .send_command(command(
                 self.thread.session_id,
                 SessionCommandKind::Prompt,
-                json!({
-                    "prompt": prompt,
-                    "_thread_id": self.thread.thread_id,
-                    "task_contract": options.task_contract.clone(),
-                    "completion_criteria": options.completion_criteria.clone(),
-                    "output_schema": options.output_schema.clone(),
-                    "allow_network": options.allow_network,
-                    "external_verifiers": options.external_verifiers.clone(),
-                }),
+                payload,
                 &self.client.actor,
             ))
             .await?;

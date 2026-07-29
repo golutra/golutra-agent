@@ -6,15 +6,13 @@ use golutra_config::{
     ProviderConfigPaths, ProviderRuntimeEnv, load_provider_runtime_env_from_paths,
 };
 use golutra_context::{ContextBudgetPolicy, ContextBuilder};
-use golutra_core::{
-    TaskContract, VerificationRequirement, WorkspaceChangeRequirement, infer_legacy_write_content,
-    infer_legacy_write_path,
-};
 use golutra_llm::{
     ConfiguredProvider, MockProvider, ProviderError, ProviderProtocol, protocol_capabilities,
 };
 use golutra_runtime::ProviderSessionPolicy;
 use serde_json::{Value, json};
+
+use crate::LegacyTaskAdapter;
 
 #[derive(Debug, Clone)]
 pub(crate) struct MockProviderPlan {
@@ -47,12 +45,13 @@ pub(crate) fn mock_provider_plan(
             provider_env.as_ref(),
             MockProvider::failure("forced mock provider failure"),
             false,
-            prompt_requests_workspace_tools(payload, objective),
+            LegacyTaskAdapter::new(payload, objective).requests_workspace_tools(),
         );
     }
     let lower = objective.to_ascii_lowercase();
-    if legacy_task_requests_workspace_change(payload, objective) {
-        let write_args = mock_write_file_args(payload, objective);
+    let legacy = LegacyTaskAdapter::new(payload, objective);
+    if legacy.requests_workspace_change() {
+        let write_args = legacy.write_file_args();
         return configured_provider_plan(
             provider_env.as_ref(),
             MockProvider::tool_call(
@@ -104,97 +103,8 @@ pub(crate) fn mock_provider_plan(
         provider_env.as_ref(),
         MockProvider::text_response("mock provider completed without tool calls"),
         false,
-        prompt_requests_workspace_tools(payload, objective),
+        legacy.requests_workspace_tools(),
     )
-}
-
-/// Preserve the old adapter behavior for clients that do not send a
-/// `TaskContract`, while recognizing the coding verbs used by non-English
-/// clients as well. This is only a compatibility adapter: explicit contracts
-/// remain authoritative.
-pub(crate) fn legacy_task_requests_workspace_change(payload: &Value, objective: &str) -> bool {
-    payload.get("content").is_some()
-        || payload.get("patch").is_some()
-        || payload.get("replacement").is_some()
-        || contains_change_verb(objective)
-}
-
-/// Return a delivery path only when the legacy request makes it explicit.
-/// Broad requests such as "refactor the runtime" still require a workspace
-/// change, but must not invent `golutra-agent-output.txt` as a contract path.
-pub(crate) fn legacy_task_required_path(payload: &Value, objective: &str) -> Option<String> {
-    if !legacy_task_requests_workspace_change(payload, objective) {
-        return None;
-    }
-    non_empty_string_payload(payload, "path").or_else(|| infer_legacy_write_path(objective))
-}
-
-/// Apply the compatibility contract once at the command boundary and reuse
-/// the same rule for recovered tasks and deterministic replay.
-pub(crate) fn apply_legacy_task_contract(
-    payload: &Value,
-    objective: &str,
-    contract: &mut TaskContract,
-) -> bool {
-    if !legacy_task_requests_workspace_change(payload, objective) {
-        return false;
-    }
-    contract.workspace_change = WorkspaceChangeRequirement::Required;
-    contract.require_objective_validation = true;
-    if let Some(requested_path) = legacy_task_required_path(payload, objective)
-        && !contract.required_paths.contains(&requested_path)
-    {
-        contract.required_paths.push(requested_path);
-    }
-    if contract.verification == VerificationRequirement::BestEffort {
-        contract.verification = VerificationRequirement::Required;
-    }
-    true
-}
-
-fn contains_change_verb(objective: &str) -> bool {
-    const ENGLISH_CHANGE_VERBS: &[&str] = &[
-        "add",
-        "change",
-        "create",
-        "delete",
-        "edit",
-        "fix",
-        "implement",
-        "modify",
-        "move",
-        "patch",
-        "refactor",
-        "remove",
-        "rename",
-        "rewrite",
-        "update",
-        "write",
-    ];
-    const CJK_CHANGE_MARKERS: &[&str] = &[
-        "添加",
-        "创建",
-        "修复",
-        "修改",
-        "实现",
-        "删除",
-        "重构",
-        "重命名",
-        "更改",
-        "更新",
-        "移除",
-        "移动",
-        "补丁",
-        "改代码",
-        "写入",
-    ];
-    let lower = objective.to_ascii_lowercase();
-    lower
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .any(|token| ENGLISH_CHANGE_VERBS.contains(&token))
-        || CJK_CHANGE_MARKERS
-            .iter()
-            .any(|marker| objective.contains(marker))
 }
 
 pub(crate) fn isolated_mock_provider_plan(
@@ -203,8 +113,8 @@ pub(crate) fn isolated_mock_provider_plan(
 ) -> Result<MockProviderPlan, ProviderError> {
     let lower = objective.to_ascii_lowercase();
     let (mock, touched_code, workspace_tools_enabled) =
-        if legacy_task_requests_workspace_change(payload, objective) {
-            let write_args = mock_write_file_args(payload, objective);
+        if LegacyTaskAdapter::new(payload, objective).requests_workspace_change() {
+            let write_args = LegacyTaskAdapter::new(payload, objective).write_file_args();
             (
                 MockProvider::tool_call(
                     "write_file",
@@ -235,7 +145,7 @@ pub(crate) fn isolated_mock_provider_plan(
             (
                 MockProvider::text_response("isolated mock provider completed the generated task"),
                 false,
-                prompt_requests_workspace_tools(payload, objective),
+                LegacyTaskAdapter::new(payload, objective).requests_workspace_tools(),
             )
         };
     Ok(MockProviderPlan {
@@ -420,84 +330,6 @@ fn missing_context_window_error() -> ProviderError {
     ProviderError::NotConfigured {
         message: "provider context window is unknown; configure context_window_size explicitly"
             .to_owned(),
-    }
-}
-
-pub(crate) fn prompt_requests_workspace_tools(payload: &Value, objective: &str) -> bool {
-    if payload.get("path").is_some()
-        || payload.get("content").is_some()
-        || payload.get("command").is_some()
-    {
-        return true;
-    }
-
-    let lower = objective.to_ascii_lowercase();
-    const ENGLISH_MARKERS: &[&str] = &[
-        "write",
-        "create",
-        "edit",
-        "modify",
-        "update",
-        "delete",
-        "read",
-        "list",
-        "search",
-        "find",
-        "inspect",
-        "run",
-        "test",
-        "build",
-        "fix",
-        "debug",
-        "refactor",
-        "file",
-        "code",
-        "workspace",
-        "diff",
-        "commit",
-        "shell",
-    ];
-    const CJK_MARKERS: &[&str] = &[
-        "写",
-        "创建",
-        "修改",
-        "更新",
-        "删除",
-        "读取",
-        "读",
-        "列出",
-        "搜索",
-        "查找",
-        "检查",
-        "运行",
-        "测试",
-        "构建",
-        "修复",
-        "重构",
-        "文件",
-        "代码",
-        "工作区",
-        "提交",
-    ];
-
-    ENGLISH_MARKERS.iter().any(|marker| lower.contains(marker))
-        || CJK_MARKERS.iter().any(|marker| objective.contains(marker))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MockWriteFileArgs {
-    pub(crate) path: String,
-    pub(crate) content: String,
-}
-
-pub(crate) fn mock_write_file_args(payload: &Value, objective: &str) -> MockWriteFileArgs {
-    MockWriteFileArgs {
-        path: non_empty_string_payload(payload, "path")
-            .or_else(|| infer_legacy_write_path(objective))
-            .unwrap_or_else(|| "golutra-agent-output.txt".to_owned()),
-        content: non_empty_string_payload(payload, "content")
-            .or_else(|| infer_legacy_write_content(objective))
-            .unwrap_or_else(|| "done\n".to_owned()),
     }
 }
 

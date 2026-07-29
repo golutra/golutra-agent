@@ -216,6 +216,11 @@ impl RuntimeHost {
             task.session_id,
             HostedTaskControl {
                 task_id: task.task_id,
+                allow_network: task
+                    .payload
+                    .get("allow_network")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
                 execution,
                 abort_handle,
                 completion,
@@ -290,11 +295,15 @@ impl RuntimeHost {
             .get("task_contract")
             .is_some_and(|value| !value.is_null());
         let mut task_contract = task_contract_from_payload(&task.payload)?;
-        let requested_network = task
-            .payload
-            .get("allow_network")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let requested_network = match task.payload.get("allow_network") {
+            None => false,
+            Some(Value::Bool(allow_network)) => *allow_network,
+            Some(_) => {
+                return Err(ClientError::TaskExecution(
+                    "allow_network must be a boolean".to_owned(),
+                ));
+            }
+        };
         let external_verifiers = task
             .payload
             .get("external_verifiers")
@@ -328,28 +337,25 @@ impl RuntimeHost {
             context_builder,
             provider_session_policy,
         } = provider_plan;
-        if !explicit_task_contract
-            && (touched_code
-                || provider_runtime::legacy_task_requests_workspace_change(
-                    &task.payload,
-                    &objective,
-                ))
-        {
-            provider_runtime::apply_legacy_task_contract(
-                &task.payload,
-                &objective,
-                &mut task_contract,
-            );
+        let legacy_task = LegacyTaskAdapter::new(&task.payload, &objective);
+        if !explicit_task_contract && (touched_code || legacy_task.requests_workspace_change()) {
+            legacy_task.apply_to(&mut task_contract);
         }
         task_contract
             .validate()
             .map_err(ClientError::TaskExecution)?;
-        let agent_loop = AgentLoop::new(provider, context_builder, tool_executor)
+        let harness = AgentHarness::new(provider, context_builder, tool_executor)
             .with_provider_session_policy(provider_session_policy)
-            .with_external_verifiers(external_verifiers);
-        let agent_loop = match fallback_provider {
-            Some(fallback) => agent_loop.with_fallback(fallback),
-            None => agent_loop,
+            .with_external_verifiers(external_verifiers)
+            .require_os_sandbox_for_external_verifiers(
+                task.payload
+                    .get(EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY)
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            );
+        let harness = match fallback_provider {
+            Some(fallback) => harness.with_fallback(fallback),
+            None => harness,
         };
         let contributors = self
             .context_contributors_for_task(
@@ -374,18 +380,18 @@ impl RuntimeHost {
             }
             Ok::<(), ClientError>(())
         });
-        let agent_loop = if self.workspace_root.is_some() {
-            agent_loop.with_before_side_effect_recorder(Arc::new(HostedCheckpointRecorder {
+        let harness = if self.workspace_root.is_some() {
+            harness.with_before_side_effect_recorder(Arc::new(HostedCheckpointRecorder {
                 host: self.clone(),
                 task: task.clone(),
                 trace_sender: trace_tx.clone(),
             }))
         } else {
-            agent_loop
+            harness
         };
-        let outcome = agent_loop
-            .run_with_task_contract_and_observation_sink(
-                AgentTaskRequest {
+        let outcome = harness
+            .execute(
+                AgentRun::new(AgentTaskRequest {
                     session_id: task.session_id,
                     task_id: task.task_id,
                     turn_id: task.turn_id,
@@ -399,8 +405,8 @@ impl RuntimeHost {
                     } else {
                         Vec::new()
                     },
-                },
-                task_contract,
+                })
+                .with_task_contract(task_contract),
                 control,
                 ChannelObservationSink {
                     sender: trace_tx.clone(),
@@ -411,7 +417,7 @@ impl RuntimeHost {
                 AgentLoopError::Cancelled => ClientError::TaskCancelled,
                 error => ClientError::TaskExecution(error.to_string()),
             });
-        drop(agent_loop);
+        drop(harness);
         drop(trace_tx);
         trace_recorder
             .await

@@ -43,6 +43,21 @@ fn hosted_tasks_use_only_explicit_completion_criteria() {
     );
 }
 
+#[tokio::test]
+async fn task_control_cleanup_wait_has_a_deadline() {
+    let (_completion_sender, mut completion) = watch::channel(false);
+
+    let error = wait_for_task_control_cleanup(&mut completion, Duration::from_millis(1))
+        .await
+        .expect_err("stalled supervisor cleanup must time out");
+
+    assert!(matches!(
+        error,
+        ClientError::TaskExecution(message)
+            if message.contains("did not release the session within 1 milliseconds")
+    ));
+}
+
 #[test]
 fn system_prompt_explains_the_argv_only_shell_recovery_path() {
     let prompt = system_prompt();
@@ -56,6 +71,9 @@ fn system_prompt_explains_the_argv_only_shell_recovery_path() {
     assert!(prompt.contains("runtime will request any required approval"));
     assert!(prompt.contains("exits non-zero"));
     assert!(prompt.contains("status, log, or listing commands alone are not validation"));
+    assert!(prompt.contains("same public interface a fresh consumer will use"));
+    assert!(prompt.contains("exercise the requested setup or client flow from a clean location"));
+    assert!(prompt.contains("shortcut that bypasses the user-facing path"));
     assert!(prompt.contains("preserve the source blobs"));
     assert!(prompt.contains("compare the recovered result with the source commit"));
 }
@@ -77,6 +95,9 @@ fn observation_catalog_classifies_loop_facts_before_persistence() {
         provider_tool_call_id: None,
         tool_name: "read_file".to_owned(),
         display_arguments: json!({"path": "README.md"}),
+        recovery_policy: golutra_core::ToolRecoveryPolicy::for_side_effect(
+            golutra_core::SideEffectType::None,
+        ),
     });
     assert_eq!(required.event_type, RuntimeEventType::ToolStarted);
     assert_eq!(required.source, RuntimeEventSource::Tool);
@@ -4083,7 +4104,7 @@ async fn prompt_runs_mock_agent_loop_and_writes_file() {
 }
 
 #[tokio::test]
-async fn shell_checkpoint_records_partial_coverage_without_persisting_ignored_images() {
+async fn opaque_process_checkpoints_filter_ignored_before_images() {
     let workspace = tempdir().expect("workspace");
     fs::write(
         workspace.path().join(".gitignore"),
@@ -4102,14 +4123,6 @@ async fn shell_checkpoint_records_partial_coverage_without_persisting_ignored_im
         task_id: TaskId::new(),
         turn_id: TurnId::new(),
         payload: json!({"prompt": "inspect workspace"}),
-    };
-    let request = ToolRequest {
-        tool_call_id: ToolCallId::new(),
-        provider_tool_call_id: None,
-        session_id,
-        turn_id: Some(task.turn_id),
-        tool_name: "shell".to_owned(),
-        arguments: json!({"command": "git status --short"}),
     };
     let before_images = vec![
         FileBeforeImage {
@@ -4132,11 +4145,21 @@ async fn shell_checkpoint_records_partial_coverage_without_persisting_ignored_im
         },
     ];
 
-    transport
-        .host
-        .persist_checkpoint_before_side_effect(&task, &request, &before_images, false)
-        .await
-        .expect("partial checkpoint");
+    for tool_name in ["shell", "external_verifier"] {
+        let request = ToolRequest {
+            tool_call_id: ToolCallId::new(),
+            provider_tool_call_id: None,
+            session_id,
+            turn_id: Some(task.turn_id),
+            tool_name: tool_name.to_owned(),
+            arguments: json!({"program": "test"}),
+        };
+        transport
+            .host
+            .persist_checkpoint_before_side_effect(&task, &request, &before_images, false)
+            .await
+            .expect("partial process checkpoint");
+    }
     let events = transport
         .replay_events(EventFilter {
             session_id,
@@ -4145,24 +4168,27 @@ async fn shell_checkpoint_records_partial_coverage_without_persisting_ignored_im
         })
         .await
         .expect("checkpoint events");
-    let checkpoint = events
+    let checkpoints = events
         .iter()
-        .find(|event| event["event_type"] == json!(RuntimeEventType::CheckpointCreated))
-        .expect("checkpoint event");
+        .filter(|event| event["event_type"] == json!(RuntimeEventType::CheckpointCreated))
+        .collect::<Vec<_>>();
 
-    assert_eq!(checkpoint["payload"]["before_image_complete"], false);
-    assert_eq!(checkpoint["payload"]["omitted_before_image_count"], 2);
-    assert_eq!(
-        checkpoint["payload"]["checkpoint"]["changed_files"],
-        json!(["safe.txt"])
-    );
-    assert_eq!(
-        checkpoint["payload"]["checkpoint"]["artifact_refs"]
-            .as_array()
-            .map(Vec::len),
-        Some(0)
-    );
-    assert_eq!(checkpoint["payload"]["candidate_before_image_count"], 1);
+    assert_eq!(checkpoints.len(), 2);
+    for checkpoint in checkpoints {
+        assert_eq!(checkpoint["payload"]["before_image_complete"], false);
+        assert_eq!(checkpoint["payload"]["omitted_before_image_count"], 2);
+        assert_eq!(
+            checkpoint["payload"]["checkpoint"]["changed_files"],
+            json!(["safe.txt"])
+        );
+        assert_eq!(
+            checkpoint["payload"]["checkpoint"]["artifact_refs"]
+                .as_array()
+                .map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(checkpoint["payload"]["candidate_before_image_count"], 1);
+    }
 }
 
 #[tokio::test]
@@ -4879,6 +4905,204 @@ async fn persisted_ephemeral_runtime_retains_isolated_state_and_full_run_bundle(
 }
 
 #[tokio::test]
+async fn persisted_checkpoint_accepts_a_prefix_bound_owner_evaluation() {
+    let workspace = tempdir().expect("workspace");
+    let state_parent = tempdir().expect("state parent");
+    let state_dir = state_parent.path().join("checkpoint-run");
+    let _provider = IsolatedGlobalMockProvider::empty().await;
+    let transport = EmbeddedTransport::ephemeral_persistent_for_cwd(workspace.path(), &state_dir)
+        .await
+        .expect("persisted ephemeral transport");
+    let host = transport.host.clone();
+    let session_id = host.default_session_id();
+    let task_id = TaskId::new();
+    let turn_id = TurnId::new();
+    let run_provenance =
+        super::provenance::run_provenance(task_id, host.workspace_id, Some(workspace.path()), None);
+    host.upsert_current_thread(session_id, &json!({"prompt": "checkpointed task"}))
+        .await
+        .expect("thread");
+    let mut task_created = host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(task_id),
+        RuntimeEventType::TaskCreated,
+        RuntimeEventSource::Runtime,
+        json!({
+            "summary": "checkpointed task",
+            "runtime_identity": run_provenance.runtime_identity.clone(),
+            "run_provenance": run_provenance,
+        }),
+    );
+    task_created.turn_id = Some(turn_id);
+    host.record_event(task_created).await.expect("task event");
+
+    let runtime_transport = RuntimeTransport::Embedded(transport.clone());
+    RunBundleExporter::new(&runtime_transport)
+        .checkpoint(RunBundleExportRequest {
+            destination: state_dir.clone(),
+            selection: SessionWindowRequest {
+                anchor_thread_id: host.default_thread_id,
+                range: SessionRangeSpec {
+                    direction: SessionRangeDirection::Single,
+                    count: 1,
+                },
+            },
+            terminal_outcome: RunBundleTerminalOutcome::InProgress {
+                reason: "external harness stopped the active task".to_owned(),
+            },
+        })
+        .await
+        .expect("checkpoint bundle");
+    let manifest_path = state_dir.join("manifest.json");
+    let original_manifest_bytes = fs::read(&manifest_path).expect("checkpoint manifest");
+    let original_manifest: RunBundleManifest =
+        serde_json::from_slice(&original_manifest_bytes).expect("checkpoint manifest json");
+    assert!(
+        original_manifest
+            .observations
+            .sessions
+            .iter()
+            .flat_map(|session| &session.tasks)
+            .any(|task| task.task_id == task_id.to_string() && !task.complete)
+    );
+    drop(runtime_transport);
+    drop(transport);
+    drop(host);
+
+    let evaluation_for = |trace: &golutra_protocol::TaskTracePage| {
+        let mut record = golutra_eval::ExternalEvaluationRecord {
+            evaluation_id: "checkpoint-prefix-test".to_owned(),
+            source_task_id: task_id,
+            evaluator_id: "test-evaluator".to_owned(),
+            evaluator_version: "1".to_owned(),
+            harness_id: "test-harness".to_owned(),
+            harness_version: "1".to_owned(),
+            dataset_id: "test-dataset".to_owned(),
+            dataset_version: "1".to_owned(),
+            case_id: "checkpoint-prefix".to_owned(),
+            verdict: golutra_eval::EvaluationVerdict::Fail,
+            score: Some(0.0),
+            score_max: Some(1.0),
+            assertions: Vec::new(),
+            phases: Vec::new(),
+            terminal_cause: None,
+            artifact_refs: Vec::new(),
+            imported_artifacts: Vec::new(),
+            imported_evidence_refs: Vec::new(),
+            partition: golutra_eval::EvaluationPartitionKind::Source,
+            seed: None,
+            provider_variant: Some("mock".to_owned()),
+            holdout_protected: false,
+            comparison_group_id: None,
+            candidate_id: None,
+            campaign_id: None,
+            role: None,
+            base_trace_digest: trace.integrity.event_chain_digest.clone(),
+            runtime_identity: trace.runtime_identity.clone(),
+            result_digest: String::new(),
+            trust: golutra_eval::ExternalEvaluationTrust::OwnerLocal,
+            attestation: None,
+            ingested_at: chrono::Utc::now(),
+        };
+        record.result_digest = golutra_eval::external_evaluation_result_digest(&record);
+        record
+    };
+
+    let mut non_checkpoint_manifest = original_manifest.clone();
+    non_checkpoint_manifest.terminal_outcome = RunBundleTerminalOutcome::Error {
+        error: "ordinary failed bundle".to_owned(),
+    };
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&non_checkpoint_manifest).expect("non-checkpoint manifest"),
+    )
+    .expect("write non-checkpoint manifest");
+    let ordinary = RuntimeTransport::open_persisted_run(&state_dir)
+        .await
+        .expect("open ordinary incomplete bundle");
+    let ordinary_trace = ordinary
+        .complete_task_trace(TaskTraceRequest {
+            session_id,
+            task_id,
+            view: TraceView::Full,
+            cursor: None,
+            limit: 512,
+            wait_for_evaluation: true,
+        })
+        .await
+        .expect("ordinary incomplete trace");
+    assert!(!ordinary_trace.integrity.complete);
+    let error = ordinary
+        .send_command(runtime_command(
+            session_id,
+            SessionCommandKind::IngestExternalEvaluation,
+            json!({"record": evaluation_for(&ordinary_trace)}),
+        ))
+        .await
+        .expect_err("ordinary incomplete bundle must reject evaluator overlay");
+    assert!(error.to_string().contains("base trace is incomplete"));
+    drop(ordinary);
+
+    fs::write(&manifest_path, original_manifest_bytes).expect("restore checkpoint manifest");
+    let checkpoint = RuntimeTransport::open_persisted_run(&state_dir)
+        .await
+        .expect("open checkpoint bundle");
+    let checkpoint_trace = checkpoint
+        .complete_task_trace(TaskTraceRequest {
+            session_id,
+            task_id,
+            view: TraceView::Full,
+            cursor: None,
+            limit: 512,
+            wait_for_evaluation: true,
+        })
+        .await
+        .expect("checkpoint trace");
+    assert!(!checkpoint_trace.integrity.complete);
+    assert!(
+        super::external_evaluation::checkpoint_trace_has_only_expected_incompleteness(
+            &checkpoint_trace
+        ),
+        "checkpoint trace integrity: {:#?}",
+        checkpoint_trace.integrity
+    );
+    let mut untrusted = evaluation_for(&checkpoint_trace);
+    untrusted.trust = golutra_eval::ExternalEvaluationTrust::UntrustedLocal;
+    untrusted.result_digest = golutra_eval::external_evaluation_result_digest(&untrusted);
+    let error = checkpoint
+        .send_command(runtime_command(
+            session_id,
+            SessionCommandKind::IngestExternalEvaluation,
+            json!({"record": untrusted}),
+        ))
+        .await
+        .expect_err("untrusted evaluator cannot bind to an incomplete checkpoint");
+    assert!(error.to_string().contains("base trace is incomplete"));
+    let accepted = checkpoint
+        .send_command(runtime_command(
+            session_id,
+            SessionCommandKind::IngestExternalEvaluation,
+            json!({"record": evaluation_for(&checkpoint_trace)}),
+        ))
+        .await
+        .expect("checkpoint evaluator overlay");
+    assert!(accepted.accepted);
+    let refreshed = checkpoint
+        .complete_task_trace(TaskTraceRequest {
+            session_id,
+            task_id,
+            view: TraceView::Full,
+            cursor: None,
+            limit: 512,
+            wait_for_evaluation: false,
+        })
+        .await
+        .expect("trace with evaluator overlay");
+    assert_eq!(refreshed.evaluation.external_evaluations.len(), 1);
+}
+
+#[tokio::test]
 async fn external_evaluation_ingestion_rejects_trace_and_runtime_identity_mismatches() {
     let host = RuntimeHost::in_memory().await.expect("host");
     let transport = EmbeddedTransport::new(host.clone());
@@ -5276,6 +5500,306 @@ async fn task_contract_is_normalized_into_task_and_queued_turn_events() {
 }
 
 #[tokio::test]
+async fn discovered_project_verifier_is_normalized_as_independent_on_a_queued_turn() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("cargo manifest");
+    let _provider = IsolatedGlobalMockProvider::install().await;
+    let transport = EmbeddedTransport::for_cwd(workspace.path())
+        .await
+        .expect("transport");
+    let session_id = transport.default_session_id();
+
+    transport
+        .send_command(command(session_id, "sleep"))
+        .await
+        .expect("blocking task");
+    wait_for_status(&transport, session_id, TaskStatus::WaitingApproval).await;
+
+    let queued = transport
+        .send_command(command(
+            session_id,
+            "write file queued.txt with content queued",
+        ))
+        .await
+        .expect("queued task");
+    assert!(queued.accepted);
+
+    let events = transport
+        .host
+        .repositories
+        .events
+        .load(session_id, None, None)
+        .await
+        .expect("events");
+    let queued_payload = events
+        .iter()
+        .find(|event| event.event_type == RuntimeEventType::TurnQueued)
+        .and_then(|event| event.payload.get("payload"))
+        .expect("queued payload");
+
+    assert_eq!(queued_payload["external_verifiers"][0]["program"], "cargo");
+    assert_eq!(
+        queued_payload[EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY],
+        true
+    );
+    assert_eq!(
+        queued_payload["task_contract"]["verification"],
+        "independent"
+    );
+    assert_eq!(
+        queued_payload["task_contract"]["require_objective_validation"],
+        true
+    );
+
+    transport
+        .send_command(runtime_command(
+            session_id,
+            SessionCommandKind::Abort,
+            json!({}),
+        ))
+        .await
+        .expect("release blocking task");
+    if let Some(control) = transport.host.task_controls.lock().await.get(&session_id) {
+        control.abort_handle.abort();
+    }
+    sleep(Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn direct_protocol_can_disable_project_verifier_discovery() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("cargo manifest");
+    let _provider = IsolatedGlobalMockProvider::install().await;
+    let transport = EmbeddedTransport::for_cwd(workspace.path())
+        .await
+        .expect("transport");
+    let session_id = transport.default_session_id();
+
+    transport
+        .send_command(command(session_id, "sleep"))
+        .await
+        .expect("blocking task");
+    wait_for_status(&transport, session_id, TaskStatus::WaitingApproval).await;
+
+    let queued = transport
+        .send_command(command_with_payload(
+            session_id,
+            json!({
+                "prompt": "write file queued.txt with content queued",
+                "discover_project_verifiers": false,
+            }),
+        ))
+        .await
+        .expect("queued task");
+    assert!(queued.accepted);
+
+    let events = transport
+        .host
+        .repositories
+        .events
+        .load(session_id, None, None)
+        .await
+        .expect("events");
+    let queued_payload = events
+        .iter()
+        .find(|event| event.event_type == RuntimeEventType::TurnQueued)
+        .and_then(|event| event.payload.get("payload"))
+        .expect("queued payload");
+
+    assert_eq!(queued_payload["external_verifiers"], json!([]));
+    assert_eq!(
+        queued_payload[EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY],
+        false
+    );
+
+    transport
+        .send_command(runtime_command(
+            session_id,
+            SessionCommandKind::Abort,
+            json!({}),
+        ))
+        .await
+        .expect("release blocking task");
+    if let Some(control) = transport.host.task_controls.lock().await.get(&session_id) {
+        control.abort_handle.abort();
+    }
+    sleep(Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn direct_protocol_rejects_non_boolean_project_verifier_discovery() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let session_id = host.default_session_id();
+
+    let error = host
+        .handle_command(command_with_payload(
+            session_id,
+            json!({
+                "prompt": "do not start",
+                "discover_project_verifiers": "false",
+            }),
+        ))
+        .await
+        .expect_err("malformed verifier discovery flag must be rejected");
+
+    assert!(matches!(
+        error,
+        ClientError::TaskExecution(message)
+            if message == "discover_project_verifiers must be a boolean"
+    ));
+}
+
+#[tokio::test]
+async fn queued_turn_cannot_change_the_active_network_capability() {
+    let workspace = tempdir().expect("workspace");
+    let _provider = IsolatedGlobalMockProvider::install().await;
+    let transport = EmbeddedTransport::for_cwd(workspace.path())
+        .await
+        .expect("transport");
+    let session_id = transport.default_session_id();
+
+    transport
+        .send_command(command(session_id, "sleep"))
+        .await
+        .expect("blocking task");
+    wait_for_status(&transport, session_id, TaskStatus::WaitingApproval).await;
+
+    let queued = transport
+        .send_command(command_with_payload(
+            session_id,
+            json!({
+                "prompt": "inspect the workspace",
+                "allow_network": true,
+            }),
+        ))
+        .await
+        .expect("queued command is governed");
+
+    assert!(!queued.accepted);
+    assert_eq!(
+        queued.reason.as_deref(),
+        Some("queued prompt cannot change network capability while a task is active")
+    );
+    let events = transport
+        .host
+        .repositories
+        .events
+        .load(session_id, None, None)
+        .await
+        .expect("events");
+    assert!(!events.iter().any(|event| {
+        event.event_type == RuntimeEventType::TurnQueued
+            && event
+                .payload
+                .pointer("/payload/prompt")
+                .and_then(Value::as_str)
+                == Some("inspect the workspace")
+    }));
+
+    transport
+        .send_command(runtime_command(
+            session_id,
+            SessionCommandKind::Abort,
+            json!({}),
+        ))
+        .await
+        .expect("release blocking task");
+    if let Some(control) = transport.host.task_controls.lock().await.get(&session_id) {
+        control.abort_handle.abort();
+    }
+    sleep(Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn queued_turn_inherits_and_persists_the_active_network_capability() {
+    let workspace = tempdir().expect("workspace");
+    let _provider = IsolatedGlobalMockProvider::install().await;
+    let transport = EmbeddedTransport::for_cwd(workspace.path())
+        .await
+        .expect("transport");
+    let session_id = transport.default_session_id();
+
+    transport
+        .send_command(command_with_payload(
+            session_id,
+            json!({"prompt": "sleep", "allow_network": true}),
+        ))
+        .await
+        .expect("blocking task");
+    wait_for_status(&transport, session_id, TaskStatus::WaitingApproval).await;
+
+    let queued = transport
+        .send_command(command(session_id, "inspect the workspace"))
+        .await
+        .expect("queued command");
+    assert!(queued.accepted);
+
+    let events = transport
+        .host
+        .repositories
+        .events
+        .load(session_id, None, None)
+        .await
+        .expect("events");
+    let queued_payload = events
+        .iter()
+        .find(|event| {
+            event.event_type == RuntimeEventType::TurnQueued
+                && event
+                    .payload
+                    .pointer("/payload/prompt")
+                    .and_then(Value::as_str)
+                    == Some("inspect the workspace")
+        })
+        .and_then(|event| event.payload.get("payload"))
+        .expect("durable queued payload");
+    assert_eq!(queued_payload["allow_network"], true);
+
+    transport
+        .send_command(runtime_command(
+            session_id,
+            SessionCommandKind::Abort,
+            json!({}),
+        ))
+        .await
+        .expect("release blocking task");
+    if let Some(control) = transport.host.task_controls.lock().await.get(&session_id) {
+        control.abort_handle.abort();
+    }
+    sleep(Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn direct_protocol_rejects_non_boolean_network_capability() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let session_id = host.default_session_id();
+
+    let error = host
+        .handle_command(command_with_payload(
+            session_id,
+            json!({
+                "prompt": "do not start",
+                "allow_network": "true",
+            }),
+        ))
+        .await
+        .expect_err("malformed network capability must be rejected");
+
+    assert!(matches!(
+        error,
+        ClientError::TaskExecution(message) if message == "allow_network must be a boolean"
+    ));
+}
+
+#[tokio::test]
 async fn forbidden_workspace_contract_blocks_provider_side_effects() {
     let workspace = tempdir().expect("workspace");
     let _provider = IsolatedGlobalMockProvider::install().await;
@@ -5324,50 +5848,52 @@ async fn forbidden_workspace_contract_blocks_provider_side_effects() {
 
 #[test]
 fn mock_write_file_args_prefers_payload_over_prompt() {
-    let args = mock_write_file_args(
-        &json!({
-            "path": "explicit.txt",
-            "content": "explicit",
-        }),
-        "write file prompt.txt with content prompt",
-    );
+    let payload = json!({
+        "path": "explicit.txt",
+        "content": "explicit",
+    });
+    let args = LegacyTaskAdapter::new(&payload, "write file prompt.txt with content prompt")
+        .write_file_args();
 
     assert_eq!(
         args,
-        MockWriteFileArgs {
+        LegacyWriteFileArgs {
             path: "explicit.txt".to_owned(),
             content: "explicit".to_owned(),
         }
+    );
+    let mut contract = golutra_core::TaskContract::default();
+    LegacyTaskAdapter::new(&payload, "write file prompt.txt with content prompt")
+        .apply_to(&mut contract);
+    assert_eq!(
+        contract.required_file_contents,
+        vec![golutra_core::RequiredFileContent {
+            path: "explicit.txt".to_owned(),
+            content: "explicit".to_owned(),
+        }]
     );
 }
 
 #[test]
 fn legacy_change_intent_handles_coding_verbs_without_inventing_delivery_paths() {
     let chinese = json!({"prompt": "修改 runtime 代码，修复验证链路"});
-    assert!(legacy_task_requests_workspace_change(
-        &chinese,
-        chinese["prompt"].as_str().expect("prompt"),
-    ));
-    assert_eq!(
-        legacy_task_required_path(&chinese, chinese["prompt"].as_str().expect("prompt"),),
-        None
-    );
+    let chinese_adapter =
+        LegacyTaskAdapter::new(&chinese, chinese["prompt"].as_str().expect("prompt"));
+    assert!(chinese_adapter.requests_workspace_change());
+    assert_eq!(chinese_adapter.required_path(), None);
 
     let explicit = json!({
         "prompt": "refactor the runtime",
         "path": "src/runtime.rs",
     });
     assert_eq!(
-        legacy_task_required_path(&explicit, explicit["prompt"].as_str().expect("prompt"),),
+        LegacyTaskAdapter::new(&explicit, explicit["prompt"].as_str().expect("prompt"))
+            .required_path(),
         Some("src/runtime.rs".to_owned())
     );
 
     let mut contract = golutra_core::TaskContract::default();
-    assert!(apply_legacy_task_contract(
-        &chinese,
-        chinese["prompt"].as_str().expect("prompt"),
-        &mut contract,
-    ));
+    assert!(chinese_adapter.apply_to(&mut contract));
     assert_eq!(
         contract.workspace_change,
         WorkspaceChangeRequirement::Required
@@ -5378,15 +5904,14 @@ fn legacy_change_intent_handles_coding_verbs_without_inventing_delivery_paths() 
         "prompt": "create a file named `/app/output/maze.txt`",
     });
     let mut contract = golutra_core::TaskContract::default();
-    assert!(apply_legacy_task_contract(
-        &absolute,
-        absolute["prompt"].as_str().expect("prompt"),
-        &mut contract,
-    ));
-    assert!(contract.required_paths.is_empty());
+    assert!(
+        LegacyTaskAdapter::new(&absolute, absolute["prompt"].as_str().expect("prompt"))
+            .apply_to(&mut contract)
+    );
+    assert_eq!(contract.required_paths, vec!["output/maze.txt"]);
     contract
         .validate()
-        .expect("legacy absolute path hint must not invalidate the task contract");
+        .expect("container workspace aliases must normalize into the task contract");
 }
 
 #[test]
@@ -6246,6 +6771,7 @@ async fn task_supervisor_converts_worker_panic_to_terminal_failure_and_cleans_co
         task.session_id,
         HostedTaskControl {
             task_id: task.task_id,
+            allow_network: false,
             execution,
             abort_handle,
             completion,

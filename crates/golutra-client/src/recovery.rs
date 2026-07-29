@@ -7,7 +7,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use golutra_core::{
-    IncompleteToolCall, TaskId, TaskRecoveryDisposition, TaskRecoveryRecord, ToolCallId, TurnId,
+    IncompleteToolCall, InterruptedToolAction, ProviderRequestId, SideEffectType, TaskId,
+    TaskRecoveryDisposition, TaskRecoveryRecord, ToolCallId, ToolRecoveryPolicy, TurnId,
 };
 use golutra_protocol::{RuntimeEvent, RuntimeEventType as ProtocolRuntimeEventType};
 use serde_json::Value;
@@ -23,76 +24,14 @@ pub(crate) fn analyze_task(
     task_id: TaskId,
     recovering_runtime_identity: &str,
 ) -> TaskRecoveryRecord {
-    let mut started_tools = BTreeMap::<ToolCallId, IncompleteToolCall>::new();
-    let mut completed_tools = BTreeSet::<ToolCallId>::new();
-    let mut interrupted_turn_ids = BTreeSet::<TurnId>::new();
-    let mut running_process_ids = BTreeSet::<String>::new();
-    let mut checkpoint_event_refs = Vec::new();
-    let mut previous_runtime_identity = None;
-    let mut unparseable_incomplete_tools = 0_u32;
-
-    for event in events {
-        if previous_runtime_identity.is_none() {
-            previous_runtime_identity = runtime_identity_from_event(event);
-        }
-        if matches!(
-            event.event_type,
-            ProtocolRuntimeEventType::TaskCreated | ProtocolRuntimeEventType::TurnStarted
-        ) && let Some(turn_id) = event.turn_id
-        {
-            interrupted_turn_ids.insert(turn_id);
-        }
-        if event.event_type == ProtocolRuntimeEventType::CheckpointCreated {
-            checkpoint_event_refs.push(event.id);
-        }
-        match event.event_type {
-            ProtocolRuntimeEventType::ToolStarted => {
-                let Some(tool_name) = event.payload.get("tool_name").and_then(Value::as_str) else {
-                    unparseable_incomplete_tools = unparseable_incomplete_tools.saturating_add(1);
-                    continue;
-                };
-                let Some(raw_tool_call_id) =
-                    event.payload.get("tool_call_id").and_then(Value::as_str)
-                else {
-                    unparseable_incomplete_tools = unparseable_incomplete_tools.saturating_add(1);
-                    continue;
-                };
-                let Ok(tool_call_id) = raw_tool_call_id.parse::<ToolCallId>() else {
-                    unparseable_incomplete_tools = unparseable_incomplete_tools.saturating_add(1);
-                    continue;
-                };
-                started_tools.insert(
-                    tool_call_id,
-                    IncompleteToolCall {
-                        tool_call_id,
-                        tool_name: tool_name.to_owned(),
-                        side_effect_possible: side_effect_possible(tool_name),
-                        started_event_ref: event.id,
-                    },
-                );
-            }
-            ProtocolRuntimeEventType::ToolCompleted => {
-                if let Some(tool_call_id) = tool_call_id_from_completed(event) {
-                    completed_tools.insert(tool_call_id);
-                    started_tools.remove(&tool_call_id);
-                }
-                update_running_processes(&mut running_process_ids, event);
-            }
-            _ => {}
-        }
-    }
-
-    // A completion can be loaded before its corresponding start in a damaged
-    // or partially migrated event stream. Remove those IDs defensively.
-    for tool_call_id in completed_tools {
-        started_tools.remove(&tool_call_id);
-    }
-    let incomplete_tool_calls = started_tools.into_values().collect::<Vec<_>>();
-    let uncertain = unparseable_incomplete_tools > 0
-        || !running_process_ids.is_empty()
-        || incomplete_tool_calls
-            .iter()
-            .any(|tool| tool.side_effect_possible);
+    let journal = DurableTurnJournal::reduce(events);
+    let incomplete_tool_calls = journal.incomplete_tool_calls();
+    let incomplete_provider_request_ids = journal.incomplete_provider_requests();
+    let uncertain = journal.unparseable_incomplete_tools > 0
+        || !journal.running_process_ids.is_empty()
+        || incomplete_tool_calls.iter().any(|tool| {
+            tool.recovery_policy.interrupted_action != InterruptedToolAction::ReplaySafe
+        });
     let disposition = if uncertain {
         TaskRecoveryDisposition::Uncertain
     } else {
@@ -100,7 +39,9 @@ pub(crate) fn analyze_task(
     };
     let reconciliation_required = uncertain;
     let reason = if uncertain {
-        "runtime host stopped while a side-effecting tool or process could not be reconciled"
+        "runtime host stopped while an interrupted tool or process requires reconciliation"
+    } else if !incomplete_provider_request_ids.is_empty() {
+        "runtime host stopped with an incomplete provider request and no uncertain side effect"
     } else {
         "runtime host stopped before the active task reached a durable terminal event"
     };
@@ -108,12 +49,13 @@ pub(crate) fn analyze_task(
     TaskRecoveryRecord {
         task_id,
         disposition,
-        interrupted_turn_ids: interrupted_turn_ids.into_iter().collect(),
+        interrupted_turn_ids: journal.interrupted_turn_ids.into_iter().collect(),
         incomplete_tool_calls,
-        running_process_ids: running_process_ids.into_iter().collect(),
-        checkpoint_event_refs,
+        incomplete_provider_request_ids,
+        running_process_ids: journal.running_process_ids.into_iter().collect(),
+        checkpoint_event_refs: journal.checkpoint_event_refs,
         last_event_ref: events.last().map(|event| event.id),
-        previous_runtime_identity,
+        previous_runtime_identity: journal.previous_runtime_identity,
         recovering_runtime_identity: recovering_runtime_identity.to_owned(),
         safe_to_replay: false,
         reconciliation_required,
@@ -122,8 +64,120 @@ pub(crate) fn analyze_task(
     }
 }
 
-fn side_effect_possible(tool_name: &str) -> bool {
-    !matches!(
+#[derive(Debug, Default)]
+struct DurableTurnJournal {
+    started_tools: BTreeMap<ToolCallId, IncompleteToolCall>,
+    completed_tools: BTreeSet<ToolCallId>,
+    active_provider_requests: BTreeMap<ProviderRequestId, ()>,
+    completed_provider_requests: BTreeSet<ProviderRequestId>,
+    interrupted_turn_ids: BTreeSet<TurnId>,
+    running_process_ids: BTreeSet<String>,
+    checkpoint_event_refs: Vec<golutra_core::EventId>,
+    previous_runtime_identity: Option<String>,
+    unparseable_incomplete_tools: u32,
+}
+
+impl DurableTurnJournal {
+    fn reduce(events: &[RuntimeEvent]) -> Self {
+        let mut journal = Self::default();
+        for event in events {
+            journal.apply(event);
+        }
+        journal
+    }
+
+    fn apply(&mut self, event: &RuntimeEvent) {
+        if self.previous_runtime_identity.is_none() {
+            self.previous_runtime_identity = runtime_identity_from_event(event);
+        }
+        if matches!(
+            event.event_type,
+            ProtocolRuntimeEventType::TaskCreated | ProtocolRuntimeEventType::TurnStarted
+        ) && let Some(turn_id) = event.turn_id
+        {
+            self.interrupted_turn_ids.insert(turn_id);
+        }
+        if event.event_type == ProtocolRuntimeEventType::CheckpointCreated {
+            self.checkpoint_event_refs.push(event.id);
+        }
+        match event.event_type {
+            ProtocolRuntimeEventType::ProviderStarted => {
+                if let Some(request_id) = provider_request_id(event) {
+                    self.active_provider_requests.insert(request_id, ());
+                }
+            }
+            ProtocolRuntimeEventType::ProviderCompleted
+            | ProtocolRuntimeEventType::ProviderFailed => {
+                if let Some(request_id) = provider_request_id(event) {
+                    self.completed_provider_requests.insert(request_id);
+                    self.active_provider_requests.remove(&request_id);
+                }
+            }
+            ProtocolRuntimeEventType::ToolStarted => {
+                let Some(tool_name) = event.payload.get("tool_name").and_then(Value::as_str) else {
+                    self.unparseable_incomplete_tools =
+                        self.unparseable_incomplete_tools.saturating_add(1);
+                    return;
+                };
+                let Some(raw_tool_call_id) =
+                    event.payload.get("tool_call_id").and_then(Value::as_str)
+                else {
+                    self.unparseable_incomplete_tools =
+                        self.unparseable_incomplete_tools.saturating_add(1);
+                    return;
+                };
+                let Ok(tool_call_id) = raw_tool_call_id.parse::<ToolCallId>() else {
+                    self.unparseable_incomplete_tools =
+                        self.unparseable_incomplete_tools.saturating_add(1);
+                    return;
+                };
+                let recovery_policy = event
+                    .payload
+                    .get("recovery_policy")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value(value).ok())
+                    .unwrap_or_else(|| legacy_recovery_policy(tool_name));
+                self.started_tools.insert(
+                    tool_call_id,
+                    IncompleteToolCall {
+                        tool_call_id,
+                        tool_name: tool_name.to_owned(),
+                        side_effect_possible: recovery_policy.side_effect_possible(),
+                        recovery_policy,
+                        started_event_ref: event.id,
+                    },
+                );
+            }
+            ProtocolRuntimeEventType::ToolCompleted => {
+                if let Some(tool_call_id) = tool_call_id_from_completed(event) {
+                    self.completed_tools.insert(tool_call_id);
+                    self.started_tools.remove(&tool_call_id);
+                }
+                update_running_processes(&mut self.running_process_ids, event);
+            }
+            _ => {}
+        }
+    }
+
+    fn incomplete_tool_calls(&self) -> Vec<IncompleteToolCall> {
+        self.started_tools
+            .iter()
+            .filter(|(tool_call_id, _)| !self.completed_tools.contains(tool_call_id))
+            .map(|(_, tool)| tool.clone())
+            .collect()
+    }
+
+    fn incomplete_provider_requests(&self) -> Vec<ProviderRequestId> {
+        self.active_provider_requests
+            .keys()
+            .filter(|request_id| !self.completed_provider_requests.contains(request_id))
+            .copied()
+            .collect()
+    }
+}
+
+fn legacy_recovery_policy(tool_name: &str) -> ToolRecoveryPolicy {
+    let side_effect_type = if matches!(
         tool_name,
         "read_file"
             | "list_dir"
@@ -132,7 +186,20 @@ fn side_effect_possible(tool_name: &str) -> bool {
             | "find_references"
             | "process_poll"
             | "process_reconnect"
-    )
+    ) {
+        SideEffectType::None
+    } else {
+        SideEffectType::ExternalSystem
+    };
+    ToolRecoveryPolicy::for_side_effect(side_effect_type)
+}
+
+fn provider_request_id(event: &RuntimeEvent) -> Option<ProviderRequestId> {
+    event
+        .payload
+        .get("provider_request_id")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse().ok())
 }
 
 fn tool_call_id_from_completed(event: &RuntimeEvent) -> Option<ToolCallId> {
@@ -234,6 +301,12 @@ mod tests {
         assert!(!record.reconciliation_required);
         assert!(!record.safe_to_replay);
         assert_eq!(record.previous_runtime_identity.as_deref(), Some("old"));
+        assert_eq!(
+            record.incomplete_tool_calls[0]
+                .recovery_policy
+                .interrupted_action,
+            InterruptedToolAction::ReplaySafe
+        );
     }
 
     #[test]
@@ -300,5 +373,70 @@ mod tests {
 
         assert_eq!(record.disposition, TaskRecoveryDisposition::Interrupted);
         assert!(record.incomplete_tool_calls.is_empty());
+    }
+
+    #[test]
+    fn durable_recovery_policy_is_authoritative_over_legacy_tool_names() {
+        let task_id = TaskId::new();
+        let tool_call_id = ToolCallId::new();
+        let recovery_policy = ToolRecoveryPolicy::for_side_effect(SideEffectType::Process);
+        let mut started = event(
+            1,
+            RuntimeEventType::ToolStarted,
+            Some(TurnId::new()),
+            json!({
+                "tool_call_id": tool_call_id,
+                "tool_name": "read_file",
+                "recovery_policy": recovery_policy,
+            }),
+        );
+        started.task_id = Some(task_id);
+
+        let record = analyze_task(&[started], task_id, "new");
+
+        assert_eq!(record.disposition, TaskRecoveryDisposition::Uncertain);
+        assert!(record.reconciliation_required);
+        assert_eq!(
+            record.incomplete_tool_calls[0]
+                .recovery_policy
+                .interrupted_action,
+            InterruptedToolAction::ReconcileBeforeRetry
+        );
+    }
+
+    #[test]
+    fn provider_lifecycle_reduces_to_incomplete_requests_deterministically() {
+        let task_id = TaskId::new();
+        let incomplete_id = ProviderRequestId::new();
+        let completed_id = ProviderRequestId::new();
+        let mut events = vec![
+            event(
+                1,
+                RuntimeEventType::ProviderStarted,
+                Some(TurnId::new()),
+                json!({"provider_request_id": incomplete_id}),
+            ),
+            event(
+                2,
+                RuntimeEventType::ProviderStarted,
+                Some(TurnId::new()),
+                json!({"provider_request_id": completed_id}),
+            ),
+            event(
+                3,
+                RuntimeEventType::ProviderCompleted,
+                Some(TurnId::new()),
+                json!({"provider_request_id": completed_id}),
+            ),
+        ];
+        for event in &mut events {
+            event.task_id = Some(task_id);
+        }
+
+        let record = analyze_task(&events, task_id, "new");
+
+        assert_eq!(record.incomplete_provider_request_ids, vec![incomplete_id]);
+        assert_eq!(record.disposition, TaskRecoveryDisposition::Interrupted);
+        assert!(!record.reconciliation_required);
     }
 }

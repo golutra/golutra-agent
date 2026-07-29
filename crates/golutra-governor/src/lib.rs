@@ -43,6 +43,12 @@ pub enum GovernorPhase {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GovernorAdvisory {
+    pub code: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GovernorLimits {
     pub max_iterations: u32,
     pub max_tool_calls: u32,
@@ -52,6 +58,12 @@ pub struct GovernorLimits {
     pub max_planned_input_tokens: u64,
     pub max_elapsed_ms: u64,
     pub max_estimated_cost_microusd: u64,
+    /// Maximum verification-correction steps without a workspace change or
+    /// successful objective validation. Zero disables the step limit.
+    pub max_correction_no_progress_steps: u32,
+    /// Maximum wall-clock time in one verification correction without
+    /// material progress. Zero disables the elapsed-time limit.
+    pub max_correction_no_progress_ms: u64,
 }
 
 impl Default for GovernorLimits {
@@ -65,6 +77,8 @@ impl Default for GovernorLimits {
             max_planned_input_tokens: 96_000,
             max_elapsed_ms: 4 * 60 * 60 * 1_000,
             max_estimated_cost_microusd: 25_000_000,
+            max_correction_no_progress_steps: 16,
+            max_correction_no_progress_ms: 5 * 60 * 1_000,
         }
     }
 }
@@ -98,6 +112,8 @@ pub struct RuntimeGovernorDecision {
     pub failed_tool_calls: u32,
     pub consecutive_failed_tool_calls: u32,
     pub alignment: GoalAlignmentCheck,
+    #[serde(default)]
+    pub advisories: Vec<GovernorAdvisory>,
 }
 
 impl RuntimeGovernorDecision {
@@ -131,6 +147,43 @@ impl RuntimeGovernor {
     ) -> RuntimeGovernorDecision {
         let alignment = check_goal_alignment(ledger, &observation.latest_action);
         let normalized_security_risk = observation.security_risk.trim().to_ascii_lowercase();
+        let mut advisories = Vec::new();
+        if observation.policy_decision == Some(PolicyDecision::Deny)
+            || (observation.policy_decision == Some(PolicyDecision::Block)
+                && observation.policy_block_disposition
+                    == Some(PolicyBlockDisposition::Recoverable))
+        {
+            advisories.push(GovernorAdvisory {
+                code: "recoverable_policy_block".to_owned(),
+                reason: "policy rejected the current tool call; the loop may recover with a safer action"
+                    .to_owned(),
+            });
+        }
+        if !alignment.aligned
+            && matches!(
+                observation.phase,
+                GovernorPhase::Tool | GovernorPhase::Completion
+            )
+        {
+            advisories.push(GovernorAdvisory {
+                code: "weak_goal_alignment".to_owned(),
+                reason: "action has weak lexical alignment with the goal; this signal is advisory"
+                    .to_owned(),
+            });
+        }
+        let approaching_budget = (self.limits.max_iterations > 0
+            && at_or_above_percent(observation.iteration, self.limits.max_iterations, 80))
+            || at_or_above_percent(observation.tool_calls, self.limits.max_tool_calls, 80)
+            || observation.estimated_cost_microusd.is_some_and(|cost| {
+                at_or_above_percent(cost, self.limits.max_estimated_cost_microusd, 80)
+            });
+        if approaching_budget {
+            advisories.push(GovernorAdvisory {
+                code: "approaching_budget".to_owned(),
+                reason: "runtime consumption has reached at least 80% of a configured hard limit"
+                    .to_owned(),
+            });
+        }
         let (action, reason, budget_risk) = if ledger.original_objective.trim().is_empty() {
             (GovernorAction::Block, "runtime objective is empty", "low")
         } else if normalized_security_risk == "critical"
@@ -187,50 +240,20 @@ impl RuntimeGovernor {
                 "planned provider input exceeds the runtime token budget",
                 "exceeded",
             )
-        } else if observation.elapsed_ms > self.limits.max_elapsed_ms {
+        } else if observation.elapsed_ms >= self.limits.max_elapsed_ms {
             (
                 GovernorAction::AskUser,
                 "runtime wall-clock budget exceeded",
                 "exceeded",
             )
-        } else if matches!(
-            observation.policy_decision,
-            Some(PolicyDecision::Deny | PolicyDecision::Block)
-        ) {
-            (
-                GovernorAction::Warn,
-                "policy rejected the current tool call; the loop may recover with a safer action",
-                "low",
-            )
-        } else if !alignment.aligned
-            && matches!(
-                observation.phase,
-                GovernorPhase::Tool | GovernorPhase::Completion
-            )
-        {
-            (
-                GovernorAction::Warn,
-                "action has weak lexical alignment with the goal; execution remains auditable",
-                "low",
-            )
         } else {
             (
                 GovernorAction::Allow,
-                "runtime action is within goal and budget boundaries",
+                "runtime action is within hard policy and budget boundaries",
                 "low",
             )
         };
-        let iteration_risk = self.limits.max_iterations > 0
-            && observation.iteration.saturating_mul(100)
-                >= self.limits.max_iterations.saturating_mul(80);
-        let budget_risk = if budget_risk == "low"
-            && (iteration_risk
-                || observation.tool_calls.saturating_mul(100)
-                    >= self.limits.max_tool_calls.saturating_mul(80)
-                || observation.estimated_cost_microusd.is_some_and(|cost| {
-                    cost.saturating_mul(100)
-                        >= self.limits.max_estimated_cost_microusd.saturating_mul(80)
-                })) {
+        let budget_risk = if budget_risk == "low" && approaching_budget {
             "high"
         } else {
             budget_risk
@@ -251,8 +274,18 @@ impl RuntimeGovernor {
             failed_tool_calls: observation.failed_tool_calls,
             consecutive_failed_tool_calls: observation.consecutive_failed_tool_calls,
             alignment,
+            advisories,
         }
     }
+}
+
+fn at_or_above_percent<T>(value: T, limit: T, percent: u8) -> bool
+where
+    T: Into<u128>,
+{
+    let value = value.into();
+    let limit = limit.into();
+    limit > 0 && value.saturating_mul(100) >= limit.saturating_mul(u128::from(percent))
 }
 
 impl Default for RuntimeGovernor {
@@ -399,7 +432,35 @@ mod tests {
     }
 
     #[test]
-    fn weak_alignment_warns_without_blocking_safe_execution() {
+    fn wall_clock_budget_blocks_at_the_exact_deadline() {
+        let governor = RuntimeGovernor::new(GovernorLimits {
+            max_elapsed_ms: 100,
+            ..GovernorLimits::default()
+        });
+        let decision = governor.evaluate(
+            &ledger(),
+            &GovernorObservation {
+                phase: GovernorPhase::Tool,
+                iteration: 1,
+                tool_calls: 1,
+                failed_tool_calls: 0,
+                consecutive_failed_tool_calls: 0,
+                planned_input_tokens: 10,
+                elapsed_ms: 100,
+                latest_action: "run a command".to_owned(),
+                estimated_cost_microusd: None,
+                policy_decision: None,
+                policy_block_disposition: None,
+                security_risk: "medium".to_owned(),
+            },
+        );
+
+        assert_eq!(decision.action, GovernorAction::AskUser);
+        assert_eq!(decision.reason, "runtime wall-clock budget exceeded");
+    }
+
+    #[test]
+    fn weak_alignment_is_advisory_without_changing_control_flow() {
         let decision = RuntimeGovernor::default().evaluate(
             &ledger(),
             &GovernorObservation {
@@ -418,8 +479,14 @@ mod tests {
             },
         );
 
-        assert_eq!(decision.action, GovernorAction::Warn);
+        assert_eq!(decision.action, GovernorAction::Allow);
         assert!(decision.permits_execution());
+        assert!(
+            decision
+                .advisories
+                .iter()
+                .any(|advisory| advisory.code == "weak_goal_alignment")
+        );
     }
 
     #[test]
@@ -482,8 +549,14 @@ mod tests {
 
         assert_eq!(blocked.action, GovernorAction::Block);
         assert_eq!(blocked.security_risk, "high");
-        assert_eq!(recoverable.action, GovernorAction::Warn);
+        assert_eq!(recoverable.action, GovernorAction::Allow);
         assert!(recoverable.permits_execution());
+        assert!(
+            recoverable
+                .advisories
+                .iter()
+                .any(|advisory| advisory.code == "recoverable_policy_block")
+        );
         assert_eq!(costly.action, GovernorAction::AskUser);
         assert_eq!(costly.budget_risk, "exceeded");
     }

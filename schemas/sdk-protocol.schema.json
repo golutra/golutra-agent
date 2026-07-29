@@ -695,6 +695,11 @@
             "type": "string"
           }
         },
+        "discover_project_verifiers": {
+          "description": "Discover conservative project checks when no explicit verifier list is\nsupplied. Set this to false to send an explicit empty list.",
+          "type": "boolean",
+          "default": true
+        },
         "external_verifiers": {
           "description": "Caller-owned commands that objectively verify the candidate workspace\nafter the model stops. These commands are argv-based and are never\ninterpreted by a shell.",
           "type": "array",
@@ -2518,6 +2523,13 @@
         "artifacts",
         "evidence",
         "loop_decisions"
+      ]
+    },
+    "DiagnosisLayer": {
+      "type": "string",
+      "enum": [
+        "causal",
+        "outcome"
       ]
     },
     "DiagnosticSlice": {
@@ -4857,6 +4869,10 @@
           ],
           "default": null
         },
+        "layer": {
+          "$ref": "#/$defs/DiagnosisLayer",
+          "default": "causal"
+        },
         "regression_commands": {
           "type": "array",
           "items": {
@@ -5306,6 +5322,21 @@
         "block"
       ]
     },
+    "GovernorAdvisory": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "reason"
+      ]
+    },
     "GovernorPhase": {
       "type": "string",
       "enum": [
@@ -5441,6 +5472,15 @@
     "IncompleteToolCall": {
       "type": "object",
       "properties": {
+        "recovery_policy": {
+          "$ref": "#/$defs/ToolRecoveryPolicy",
+          "default": {
+            "idempotency_key_policy": "blocked",
+            "interrupted_action": "replay_forbidden",
+            "retry_policy": "no_implicit_retry_for_side_effects",
+            "side_effect_type": "external_system"
+          }
+        },
         "side_effect_possible": {
           "type": "boolean"
         },
@@ -5461,6 +5501,14 @@
         "tool_name",
         "side_effect_possible",
         "started_event_ref"
+      ]
+    },
+    "InterruptedToolAction": {
+      "type": "string",
+      "enum": [
+        "replay_safe",
+        "reconcile_before_retry",
+        "replay_forbidden"
       ]
     },
     "JsonRpcErrorObject": {
@@ -6179,6 +6227,24 @@
           "type": "array",
           "items": {
             "type": "string"
+          }
+        },
+        "trajectory_summary": {
+          "$ref": "#/$defs/TrajectorySummary",
+          "default": {
+            "approval_requests": 0,
+            "context_growth_tokens": 0,
+            "context_pressure": false,
+            "failed_tool_calls": 0,
+            "failure_clusters": [],
+            "final_context_tokens": null,
+            "initial_context_tokens": null,
+            "max_context_tokens": null,
+            "provider_calls": 0,
+            "tool_calls": 0,
+            "tool_duration_ms": 0,
+            "tool_output_bytes": 0,
+            "workspace_changes_observed": false
           }
         }
       },
@@ -7103,6 +7169,21 @@
         "result_artifact_ref"
       ]
     },
+    "RequiredFileContent": {
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "content"
+      ]
+    },
     "ReviewMode": {
       "type": "string",
       "enum": [
@@ -7382,6 +7463,7 @@
         "improvement_candidate_created",
         "automation_candidate_created",
         "candidate_patch_frozen",
+        "regression_blocked",
         "regression_completed",
         "promotion_decided",
         "candidate_applied",
@@ -7426,6 +7508,13 @@
       "properties": {
         "action": {
           "$ref": "#/$defs/GovernorAction"
+        },
+        "advisories": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/GovernorAdvisory"
+          }
         },
         "alignment": {
           "$ref": "#/$defs/GoalAlignmentCheck"
@@ -7919,6 +8008,16 @@
         "range"
       ]
     },
+    "SideEffectType": {
+      "type": "string",
+      "enum": [
+        "none",
+        "file",
+        "process",
+        "network",
+        "external_system"
+      ]
+    },
     "SkillCandidate": {
       "type": "object",
       "properties": {
@@ -8340,6 +8439,13 @@
           "type": "boolean",
           "default": false
         },
+        "required_file_contents": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/RequiredFileContent"
+          }
+        },
         "required_paths": {
           "type": "array",
           "default": [],
@@ -8438,6 +8544,14 @@
         },
         "disposition": {
           "$ref": "#/$defs/TaskRecoveryDisposition"
+        },
+        "incomplete_provider_request_ids": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
         },
         "incomplete_tool_calls": {
           "type": "array",
@@ -8743,6 +8857,29 @@
         "action_if_exceeded"
       ]
     },
+    "ToolRecoveryPolicy": {
+      "type": "object",
+      "properties": {
+        "idempotency_key_policy": {
+          "type": "string"
+        },
+        "interrupted_action": {
+          "$ref": "#/$defs/InterruptedToolAction"
+        },
+        "retry_policy": {
+          "type": "string"
+        },
+        "side_effect_type": {
+          "$ref": "#/$defs/SideEffectType"
+        }
+      },
+      "required": [
+        "side_effect_type",
+        "idempotency_key_policy",
+        "retry_policy",
+        "interrupted_action"
+      ]
+    },
     "ToolResultEnvelope": {
       "type": "object",
       "properties": {
@@ -8923,6 +9060,123 @@
         "summary",
         "full",
         "forensic"
+      ]
+    },
+    "TrajectoryFailureCluster": {
+      "type": "object",
+      "properties": {
+        "duration_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "failures": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "family": {
+          "type": "string"
+        },
+        "output_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "family",
+        "failures",
+        "duration_ms",
+        "output_bytes"
+      ]
+    },
+    "TrajectorySummary": {
+      "type": "object",
+      "properties": {
+        "approval_requests": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "context_growth_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "context_pressure": {
+          "type": "boolean"
+        },
+        "failed_tool_calls": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "failure_clusters": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TrajectoryFailureCluster"
+          }
+        },
+        "final_context_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "initial_context_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_context_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "provider_calls": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "tool_calls": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "tool_duration_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "tool_output_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "workspace_changes_observed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "provider_calls",
+        "tool_calls",
+        "failed_tool_calls",
+        "approval_requests",
+        "tool_duration_ms",
+        "tool_output_bytes",
+        "context_growth_tokens",
+        "context_pressure",
+        "workspace_changes_observed",
+        "failure_clusters"
       ]
     },
     "TuiDriverProtocolBundle": {

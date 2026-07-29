@@ -14,8 +14,10 @@ use golutra_core::{
 use golutra_eval::{ReplayCapsule, ReplayExecution, ReplayExecutionStatus};
 use golutra_llm::{LlmProvider, ProviderError, ProviderRequest, ProviderResponse};
 use golutra_protocol::{RuntimeEvent, RuntimeEventSource, RuntimeEventType};
-use golutra_runtime::{AgentLoop, AgentReplayContext, AgentTaskRequest};
-use golutra_tools::{BasicToolExecutor, ToolError, ToolReplayBackend, ToolRequest};
+use golutra_runtime::{
+    AgentHarness, AgentReplayContext, AgentRun, AgentTaskRequest, agent_execution_channel,
+};
+use golutra_tools::{ToolError, ToolReplayBackend, ToolRequest, ToolRuntime};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -382,7 +384,7 @@ impl RuntimeHost {
         let policy = WorkspacePolicy::new(workspace_root)
             .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
         let tool_executor =
-            BasicToolExecutor::new(policy).with_replay_backend(Arc::new(tool_backend.clone()));
+            ToolRuntime::new(policy).with_replay_backend(Arc::new(tool_backend.clone()));
         let context_builder = replay_context_builder(
             self.repositories
                 .artifacts
@@ -417,11 +419,12 @@ impl RuntimeHost {
                         .and_then(Value::as_array)
                         .is_some_and(|files| !files.is_empty())
             });
-        let agent_loop = AgentLoop::new(provider.clone(), context_builder, tool_executor)
+        let harness = AgentHarness::new(provider.clone(), context_builder, tool_executor)
             .with_external_verifiers(external_verifiers);
-        let outcome = agent_loop
-            .replay_with_trace_and_task_contract(
-                AgentTaskRequest {
+        let (_control_handle, execution_control) = agent_execution_channel(1);
+        let outcome = harness
+            .execute(
+                AgentRun::new(AgentTaskRequest {
                     session_id,
                     task_id: source_task_id,
                     turn_id: first_request.turn_id,
@@ -435,12 +438,13 @@ impl RuntimeHost {
                         .iter()
                         .map(|contract| contract.tool_name.clone())
                         .collect(),
-                },
-                AgentReplayContext {
+                })
+                .with_replay_context(AgentReplayContext {
                     initial_messages: first_request.messages,
                     tools: first_request.tools,
-                },
-                task_contract,
+                })
+                .with_task_contract(task_contract),
+                execution_control,
                 |_| {},
             )
             .await;
@@ -568,7 +572,7 @@ fn replay_task_contract(payload: &Value, objective: &str) -> Result<TaskContract
         .is_some_and(|value| !value.is_null());
     let mut contract = task_contract_from_payload(payload)?;
     if !explicit {
-        provider_runtime::apply_legacy_task_contract(payload, objective, &mut contract);
+        LegacyTaskAdapter::new(payload, objective).apply_to(&mut contract);
         contract.validate().map_err(ClientError::TaskExecution)?;
     }
     Ok(contract)

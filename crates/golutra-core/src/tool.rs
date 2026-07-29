@@ -16,6 +16,59 @@ pub enum SideEffectType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+pub enum InterruptedToolAction {
+    ReplaySafe,
+    ReconcileBeforeRetry,
+    ReplayForbidden,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ToolRecoveryPolicy {
+    pub side_effect_type: SideEffectType,
+    pub idempotency_key_policy: String,
+    pub retry_policy: String,
+    pub interrupted_action: InterruptedToolAction,
+}
+
+impl ToolRecoveryPolicy {
+    #[must_use]
+    pub fn for_side_effect(side_effect_type: SideEffectType) -> Self {
+        let (idempotency_key_policy, interrupted_action) = match side_effect_type {
+            SideEffectType::None => ("not_required", InterruptedToolAction::ReplaySafe),
+            SideEffectType::File | SideEffectType::Process => (
+                "required_for_retry",
+                InterruptedToolAction::ReconcileBeforeRetry,
+            ),
+            SideEffectType::Network | SideEffectType::ExternalSystem => {
+                ("blocked", InterruptedToolAction::ReplayForbidden)
+            }
+        };
+        Self {
+            side_effect_type,
+            idempotency_key_policy: idempotency_key_policy.to_owned(),
+            retry_policy: if side_effect_type == SideEffectType::None {
+                "retry_allowed".to_owned()
+            } else {
+                "no_implicit_retry_for_side_effects".to_owned()
+            },
+            interrupted_action,
+        }
+    }
+
+    #[must_use]
+    pub const fn side_effect_possible(&self) -> bool {
+        !matches!(self.side_effect_type, SideEffectType::None)
+    }
+}
+
+impl Default for ToolRecoveryPolicy {
+    fn default() -> Self {
+        Self::for_side_effect(SideEffectType::ExternalSystem)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolResultStatus {
     Ok,
     Error,
@@ -73,6 +126,15 @@ pub struct ToolContract {
     pub retry_policy: String,
     pub artifact_policy: String,
     pub permission_policy_ref: Option<PolicyId>,
+}
+
+impl From<&ToolContract> for ToolRecoveryPolicy {
+    fn from(contract: &ToolContract) -> Self {
+        let mut policy = Self::for_side_effect(contract.side_effect_type);
+        policy.idempotency_key_policy = contract.idempotency_key_policy.clone();
+        policy.retry_policy = contract.retry_policy.clone();
+        policy
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

@@ -187,6 +187,19 @@ impl RuntimeLaneManager {
         Ok(())
     }
 
+    pub fn discard_queued_turn(
+        &mut self,
+        session_id: SessionId,
+        turn_id: TurnId,
+    ) -> Result<(), RuntimeLaneError> {
+        let lane = self
+            .lanes_by_session
+            .get_mut(&session_id)
+            .ok_or(RuntimeLaneError::LaneNotFound)?;
+        lane.pending_turns.retain(|pending| *pending != turn_id);
+        Ok(())
+    }
+
     pub fn abort(
         &mut self,
         session_id: SessionId,

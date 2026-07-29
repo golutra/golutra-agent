@@ -142,6 +142,7 @@ export type RuntimeEventType =
   | "improvement_candidate_created"
   | "automation_candidate_created"
   | "candidate_patch_frozen"
+  | "regression_blocked"
   | "regression_completed"
   | "promotion_decided"
   | "candidate_applied"
@@ -349,6 +350,8 @@ export type SessionRangeDirection = "single" | "newer" | "older";
 export type TaskReconciliationDecision =
   "no_side_effect_observed" | "side_effect_observed" | "abandon";
 export type TaskRecoveryDisposition = "interrupted" | "uncertain";
+export type InterruptedToolAction = "replay_safe" | "reconcile_before_retry" | "replay_forbidden";
+export type SideEffectType = "none" | "file" | "process" | "network" | "external_system";
 export type VerificationDimensionStatus = "pass" | "fail" | "partial" | "unknown";
 export type TaskClass =
   "plain_conversation" | "read_only_analysis" | "workspace_change" | "code_change";
@@ -815,6 +818,11 @@ export interface AgentTurnOptions {
   allow_network?: boolean;
   completion_criteria?: string[];
   /**
+   * Discover conservative project checks when no explicit verifier list is
+   * supplied. Set this to false to send an explicit empty list.
+   */
+  discover_project_verifiers?: boolean;
+  /**
    * Caller-owned commands that objectively verify the candidate workspace
    * after the model stops. These commands are argv-based and are never
    * interpreted by a shell.
@@ -844,6 +852,7 @@ export interface TaskContract {
   completion_criteria?: string[];
   max_correction_rounds?: number;
   require_objective_validation?: boolean;
+  required_file_contents?: RequiredFileContent[];
   required_paths?: string[];
   schema_version?: number;
   verification?: "best_effort" | "required" | "independent";
@@ -853,6 +862,11 @@ export interface TaskContract {
    * wording.
    */
   workspace_change?: "optional" | "required" | "forbidden";
+  [k: string]: unknown;
+}
+export interface RequiredFileContent {
+  content: string;
+  path: string;
   [k: string]: unknown;
 }
 export interface AgentTurnResult {
@@ -1198,6 +1212,7 @@ export interface FailureDiagnosis {
   diagnosis_id: string;
   expected_behavior: string;
   failure_episode_id?: string | null;
+  layer?: "causal" | "outcome";
   regression_commands: string[];
   revision?: number;
   source_task_id: string;
@@ -1648,6 +1663,30 @@ export interface PostTaskReview {
   suggested_improvements: string[];
   task_id: string;
   tool_issues: string[];
+  trajectory_summary?: TrajectorySummary;
+  [k: string]: unknown;
+}
+export interface TrajectorySummary {
+  approval_requests: number;
+  context_growth_tokens: number;
+  context_pressure: boolean;
+  failed_tool_calls: number;
+  failure_clusters: TrajectoryFailureCluster[];
+  final_context_tokens?: number | null;
+  initial_context_tokens?: number | null;
+  max_context_tokens?: number | null;
+  provider_calls: number;
+  tool_calls: number;
+  tool_duration_ms: number;
+  tool_output_bytes: number;
+  workspace_changes_observed: boolean;
+  [k: string]: unknown;
+}
+export interface TrajectoryFailureCluster {
+  duration_ms: number;
+  failures: number;
+  family: string;
+  output_bytes: number;
   [k: string]: unknown;
 }
 export interface EvaluationRun {
@@ -1808,6 +1847,7 @@ export interface SkillManifest {
 }
 export interface RuntimeGovernorDecision {
   action: GovernorAction;
+  advisories?: GovernorAdvisory[];
   alignment: GoalAlignmentCheck;
   budget_risk: string;
   consecutive_failed_tool_calls: number;
@@ -1818,6 +1858,11 @@ export interface RuntimeGovernorDecision {
   security_risk: string;
   task_id: string;
   tool_calls: number;
+  [k: string]: unknown;
+}
+export interface GovernorAdvisory {
+  code: string;
+  reason: string;
   [k: string]: unknown;
 }
 export interface GoalAlignmentCheck {
@@ -2078,6 +2123,7 @@ export interface TaskRecoveryRecord {
   checkpoint_event_refs: string[];
   detected_at: string;
   disposition: TaskRecoveryDisposition;
+  incomplete_provider_request_ids?: string[];
   incomplete_tool_calls: IncompleteToolCall[];
   interrupted_turn_ids: string[];
   last_event_ref?: string | null;
@@ -2091,10 +2137,18 @@ export interface TaskRecoveryRecord {
   [k: string]: unknown;
 }
 export interface IncompleteToolCall {
+  recovery_policy?: ToolRecoveryPolicy;
   side_effect_possible: boolean;
   started_event_ref: string;
   tool_call_id: string;
   tool_name: string;
+  [k: string]: unknown;
+}
+export interface ToolRecoveryPolicy {
+  idempotency_key_policy: string;
+  interrupted_action: InterruptedToolAction;
+  retry_policy: string;
+  side_effect_type: SideEffectType;
   [k: string]: unknown;
 }
 export interface TaskTracePage {

@@ -360,15 +360,7 @@ async fn turn_start(
     };
     let prompt = required_string(params, "prompt")?;
     let cursor = session_cursor(&transport, thread.session_id).await?;
-    let payload = json!({
-        "prompt": prompt,
-        "_thread_id": thread.thread_id,
-        "task_contract": params.get("task_contract").cloned().unwrap_or(Value::Null),
-        "output_schema": params.get("output_schema").cloned(),
-        "allow_network": params.get("allow_network").cloned().unwrap_or(Value::Bool(false)),
-        "completion_criteria": params.get("completion_criteria").cloned().unwrap_or_else(|| json!([])),
-        "external_verifiers": params.get("external_verifiers").cloned().unwrap_or_else(|| json!([])),
-    });
+    let payload = turn_payload_from_params(params, thread.thread_id, prompt);
     let ack = transport
         .send_command(rpc_command(
             thread.session_id,
@@ -386,6 +378,32 @@ async fn turn_start(
         reason: ack.reason,
         cursor,
     }))
+}
+
+fn turn_payload_from_params(params: &Value, thread_id: ThreadId, prompt: &str) -> Value {
+    let mut payload = json!({
+        "prompt": prompt,
+        "_thread_id": thread_id,
+        "task_contract": params.get("task_contract").cloned().unwrap_or(Value::Null),
+        "output_schema": params.get("output_schema").cloned(),
+        "completion_criteria": params.get("completion_criteria").cloned().unwrap_or_else(|| json!([])),
+    });
+    if let Some(allow_network) = params.get("allow_network") {
+        payload["allow_network"] = allow_network.clone();
+    }
+    if let Some(discover_project_verifiers) = params.get("discover_project_verifiers") {
+        payload["discover_project_verifiers"] = discover_project_verifiers.clone();
+    }
+    if let Some(external_verifiers) = params.get("external_verifiers") {
+        payload["external_verifiers"] = external_verifiers.clone();
+    } else if params
+        .get("discover_project_verifiers")
+        .and_then(Value::as_bool)
+        == Some(false)
+    {
+        payload["external_verifiers"] = json!([]);
+    }
+    payload
 }
 
 async fn turn_control(
@@ -825,5 +843,61 @@ impl RpcDispatchError {
 
     fn from_app(error: AppError) -> Self {
         Self::new(-32001, format!("{error:?}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn turn_payload_forwards_an_empty_verifier_list_when_discovery_is_disabled() {
+        let params = json!({
+            "discover_project_verifiers": false,
+            "completion_criteria": ["tests pass"],
+        });
+
+        let payload = turn_payload_from_params(&params, ThreadId::new(), "fix the tests");
+
+        assert_eq!(payload["discover_project_verifiers"], false);
+        assert_eq!(payload["external_verifiers"], json!([]));
+    }
+
+    #[test]
+    fn turn_payload_forwards_malformed_discovery_flag_for_central_validation() {
+        let payload = turn_payload_from_params(
+            &json!({"discover_project_verifiers": "false"}),
+            ThreadId::new(),
+            "fix the tests",
+        );
+
+        assert_eq!(payload["discover_project_verifiers"], "false");
+        assert!(payload.get("external_verifiers").is_none());
+    }
+
+    #[test]
+    fn turn_payload_preserves_default_discovery_and_explicit_verifiers() {
+        let default_payload =
+            turn_payload_from_params(&json!({}), ThreadId::new(), "fix the tests");
+        assert!(default_payload.get("external_verifiers").is_none());
+        assert!(default_payload.get("allow_network").is_none());
+
+        let explicit = json!([{"program": "cargo", "args": ["test"]}]);
+        let explicit_payload = turn_payload_from_params(
+            &json!({
+                "discover_project_verifiers": false,
+                "external_verifiers": explicit,
+            }),
+            ThreadId::new(),
+            "fix the tests",
+        );
+        assert_eq!(explicit_payload["external_verifiers"], explicit);
+
+        let network_payload = turn_payload_from_params(
+            &json!({"allow_network": true}),
+            ThreadId::new(),
+            "fetch dependencies",
+        );
+        assert_eq!(network_payload["allow_network"], true);
     }
 }

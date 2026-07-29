@@ -66,6 +66,9 @@ golutra --cwd "$PWD" exec \
   --verify-program cargo --verify-arg test --verify-arg --workspace \
   "implement the requested change"
 golutra --cwd "$PWD" exec \
+  --no-project-verifier-discovery \
+  "make the requested change without running a discovered project check"
+golutra --cwd "$PWD" exec \
   --task-contract /absolute/path/to/task-contract.json \
   "implement the requested change"
 ```
@@ -163,6 +166,21 @@ produces the same artifact, evidence, tool event and `VerificationRecord` facts
 as built-in checks. A failed verifier prevents `completed`, even when the model
 claims success.
 
+When no explicit verifier field is supplied and the task contract requires
+objective validation or workspace evidence, Golutra conservatively discovers
+one project check from trusted, workspace-local manifests. Supported project
+families are Cargo, Node, Python and Go; discovery never scans arbitrary shell
+scripts, follows manifest symlinks or reads oversized manifests. An explicit
+verifier always wins. An explicit empty verifier list disables discovery, as
+does `exec --no-project-verifier-discovery`. This omission-versus-empty rule is
+the same through App Server and both SDKs. MCP sends an explicit empty list so
+an agent invoking Golutra cannot cause project code to run implicitly.
+Discovery happens before the turn is queued: the command boundary serializes
+the selected verifier list and the normalized `TaskContract` into the durable
+task/queued-turn payload. The execution worker therefore consumes an
+independent contract snapshot for every turn, including legacy callers, rather
+than rediscovering or inheriting verifier state halfway through execution.
+
 `--task-contract` accepts a JSON object that makes the completion boundary
 explicit for CI, SDK and other-agent callers:
 
@@ -171,6 +189,9 @@ explicit for CI, SDK and other-agent callers:
   "schema_version": 1,
   "workspace_change": "required",
   "required_paths": ["crates/example/src/lib.rs"],
+  "required_file_contents": [
+    {"path": "crates/example/src/generated.txt", "content": "ready\n"}
+  ],
   "completion_criteria": ["the workspace tests pass"],
   "require_objective_validation": true,
   "verification": "independent",
@@ -180,6 +201,9 @@ explicit for CI, SDK and other-agent callers:
 
 Required paths must be portable workspace-relative paths; absolute paths,
 drive-prefixed paths and parent traversal are rejected before execution. The
+`required_file_contents` entries require an exact bounded file value. Runtime
+verification resolves them through workspace policy, rejects symlink escapes
+and never performs an unbounded read. The
 same `task_contract` field is available through App Server, MCP, Rust,
 TypeScript and Python turn options. Older callers remain supported by an
 application-boundary compatibility adapter, while the runtime terminal gate
@@ -294,7 +318,10 @@ not vary by language.
 `Thread.run` also accepts `external_verifiers` in Python and
 `externalVerifiers` in TypeScript. These fields use the generated
 `ExternalVerificationSpec` contract and reach the same Runtime verifier path as
-headless exec and App Server JSON-RPC.
+headless exec and App Server JSON-RPC. Omitting the field enables conservative
+project verifier discovery for qualifying task contracts. Passing an empty
+list disables it. Python also exposes `discover_project_verifiers=False`, and
+TypeScript exposes `discoverProjectVerifiers: false`, as explicit opt-outs.
 
 SDK connection steps are fixed:
 

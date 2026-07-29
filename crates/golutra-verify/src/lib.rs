@@ -273,7 +273,7 @@ impl VerificationRunner {
 
     fn verify_legacy(&self, input: VerificationInput) -> VerificationRecord {
         let has_evidence = !input.evidence_refs.is_empty();
-        let latest_objective_checks = latest_distinct_checks(
+        let latest_objective_checks = authoritative_objective_checks(
             input
                 .command_checks
                 .iter()
@@ -286,8 +286,7 @@ impl VerificationRunner {
             || input
                 .command_checks
                 .iter()
-                .filter(|check| check.kind == VerificationCheckKind::ToolExecution)
-                .all(|check| check.passed);
+                .any(|check| check.kind == VerificationCheckKind::ToolExecution && check.passed);
         let change_recorded = passed_check(
             &input.command_checks,
             VerificationCheckKind::WorkspaceChange,
@@ -590,7 +589,7 @@ fn assertion_status(
             }
         }
         VerificationAssertionKind::Test | VerificationAssertionKind::Diagnostic => {
-            let checks = latest_distinct_checks(
+            let checks = authoritative_objective_checks(
                 matching_checks(&[VerificationCheckKind::ObjectiveValidation])
                     .into_iter()
                     .filter(|check| {
@@ -675,6 +674,7 @@ fn assertion_status(
                     "matching delivered evidence is available".to_owned(),
                     matching_delivery_checks
                         .iter()
+                        .filter(|check| check.passed)
                         .flat_map(|check| check.evidence_refs.iter().copied())
                         .collect(),
                 )
@@ -735,6 +735,39 @@ fn latest_distinct_checks(checks: Vec<&VerificationCheck>) -> Vec<&VerificationC
     }
     latest.reverse();
     latest
+}
+
+fn authoritative_objective_checks(checks: Vec<&VerificationCheck>) -> Vec<&VerificationCheck> {
+    let latest = latest_distinct_checks(checks);
+    if !latest.iter().any(|check| is_external_verifier(check)) {
+        return latest;
+    }
+
+    let external_commands = latest
+        .iter()
+        .filter(|check| is_external_verifier(check))
+        .filter_map(|check| check.command.as_deref())
+        .collect::<HashSet<_>>();
+
+    latest
+        .into_iter()
+        .filter(|check| {
+            is_external_verifier(check)
+                || is_contract_objective_check(check)
+                || check
+                    .command
+                    .as_deref()
+                    .is_none_or(|command| !external_commands.contains(command))
+        })
+        .collect()
+}
+
+fn is_external_verifier(check: &VerificationCheck) -> bool {
+    check.name == "objective:test:external_verifier"
+}
+
+fn is_contract_objective_check(check: &VerificationCheck) -> bool {
+    check.name.starts_with("objective:path:") || check.name.starts_with("objective:content:")
 }
 
 fn delivery_check_matches(assertion: &VerificationAssertion, check: &VerificationCheck) -> bool {
@@ -962,6 +995,242 @@ mod tests {
                 check.kind == VerificationCheckKind::ToolExecution && !check.passed
             })
         );
+    }
+
+    #[test]
+    fn successful_exploration_is_not_poisoned_by_an_unrelated_tool_failure() {
+        let successful_evidence = EvidenceId::new();
+        let failed_evidence = EvidenceId::new();
+        let input = VerificationInput {
+            task_id: TaskId::new(),
+            objective: "inspect the workspace layout".to_owned(),
+            completion_criteria: Vec::new(),
+            evidence_refs: vec![successful_evidence, failed_evidence],
+            command_checks: vec![
+                VerificationCheck {
+                    kind: VerificationCheckKind::ToolExecution,
+                    name: "tool:read_file".to_owned(),
+                    command: None,
+                    passed: true,
+                    evidence_refs: vec![successful_evidence],
+                    message: "the requested file was read".to_owned(),
+                },
+                VerificationCheck {
+                    kind: VerificationCheckKind::ToolExecution,
+                    name: "tool:read_file".to_owned(),
+                    command: None,
+                    passed: false,
+                    evidence_refs: vec![failed_evidence],
+                    message: "an optional file was absent".to_owned(),
+                },
+                VerificationCheck {
+                    kind: VerificationCheckKind::AssistantResponse,
+                    name: "assistant_response".to_owned(),
+                    command: None,
+                    passed: true,
+                    evidence_refs: Vec::new(),
+                    message: "assistant response produced".to_owned(),
+                },
+            ],
+            requires_workspace_evidence: false,
+            code_files_changed: false,
+        };
+
+        let (record, plan) =
+            VerificationRunner.verify_with_plan(input.clone(), VerificationRunner.plan(&input));
+
+        assert_eq!(record.result, VerificationResult::Pass);
+        assert!(record.checks.iter().any(|check| !check.passed));
+        let evidence_assertion = plan
+            .assertions
+            .iter()
+            .find(|assertion| assertion.criterion_id == "analysis_evidence")
+            .expect("analysis evidence assertion");
+        assert_eq!(evidence_assertion.status, VerificationAssertionStatus::Pass);
+        assert_eq!(evidence_assertion.evidence_refs, vec![successful_evidence]);
+    }
+
+    #[test]
+    fn external_verifier_does_not_supersede_an_unrelated_runtime_validation() {
+        let evidence = EvidenceId::new();
+        let input = VerificationInput {
+            task_id: TaskId::new(),
+            objective: "change code and run tests".to_owned(),
+            completion_criteria: vec!["tests pass".to_owned()],
+            evidence_refs: vec![evidence],
+            command_checks: vec![
+                VerificationCheck {
+                    kind: VerificationCheckKind::WorkspaceChange,
+                    name: "workspace_diff".to_owned(),
+                    command: None,
+                    passed: true,
+                    evidence_refs: vec![evidence],
+                    message: "code changed".to_owned(),
+                },
+                VerificationCheck {
+                    kind: VerificationCheckKind::ObjectiveValidation,
+                    name: "objective:test:shell:identity:local".to_owned(),
+                    command: Some("pytest".to_owned()),
+                    passed: false,
+                    evidence_refs: vec![evidence],
+                    message: "the local environment could not import a dependency".to_owned(),
+                },
+                VerificationCheck {
+                    kind: VerificationCheckKind::ObjectiveValidation,
+                    name: "objective:test:external_verifier".to_owned(),
+                    command: Some("official-evaluator".to_owned()),
+                    passed: true,
+                    evidence_refs: vec![evidence],
+                    message: "independent verification passed".to_owned(),
+                },
+            ],
+            requires_workspace_evidence: true,
+            code_files_changed: true,
+        };
+
+        let (record, plan) =
+            VerificationRunner.verify_with_plan(input.clone(), VerificationRunner.plan(&input));
+
+        assert_eq!(record.result, VerificationResult::Fail);
+        assert_eq!(record.source, VerificationSource::ExternalVerifier);
+        assert!(plan.assertions.iter().any(|assertion| {
+            assertion.criterion_id == "tests_or_diagnostics"
+                && assertion.status == VerificationAssertionStatus::Fail
+        }));
+    }
+
+    #[test]
+    fn external_verifier_supersedes_an_equivalent_runtime_validation() {
+        let evidence = EvidenceId::new();
+        let input = VerificationInput {
+            task_id: TaskId::new(),
+            objective: "change code and run tests".to_owned(),
+            completion_criteria: vec!["tests pass".to_owned()],
+            evidence_refs: vec![evidence],
+            command_checks: vec![
+                VerificationCheck {
+                    kind: VerificationCheckKind::WorkspaceChange,
+                    name: "workspace_diff".to_owned(),
+                    command: None,
+                    passed: true,
+                    evidence_refs: vec![evidence],
+                    message: "code changed".to_owned(),
+                },
+                VerificationCheck {
+                    kind: VerificationCheckKind::ObjectiveValidation,
+                    name: "objective:test:shell:identity:local".to_owned(),
+                    command: Some("pytest".to_owned()),
+                    passed: false,
+                    evidence_refs: vec![evidence],
+                    message: "the initial run failed".to_owned(),
+                },
+                VerificationCheck {
+                    kind: VerificationCheckKind::ObjectiveValidation,
+                    name: "objective:test:external_verifier".to_owned(),
+                    command: Some("pytest".to_owned()),
+                    passed: true,
+                    evidence_refs: vec![evidence],
+                    message: "the equivalent independent run passed".to_owned(),
+                },
+            ],
+            requires_workspace_evidence: true,
+            code_files_changed: true,
+        };
+
+        let (record, plan) =
+            VerificationRunner.verify_with_plan(input.clone(), VerificationRunner.plan(&input));
+
+        assert_eq!(record.result, VerificationResult::Pass);
+        assert!(plan.assertions.iter().any(|assertion| {
+            assertion.criterion_id == "tests_or_diagnostics"
+                && assertion.status == VerificationAssertionStatus::Pass
+        }));
+    }
+
+    #[test]
+    fn external_verifier_does_not_override_a_failed_delivery_contract() {
+        let evidence = EvidenceId::new();
+        let input = VerificationInput {
+            task_id: TaskId::new(),
+            objective: "write result.txt".to_owned(),
+            completion_criteria: Vec::new(),
+            evidence_refs: vec![evidence],
+            command_checks: vec![
+                VerificationCheck {
+                    kind: VerificationCheckKind::WorkspaceChange,
+                    name: "workspace_diff".to_owned(),
+                    command: None,
+                    passed: true,
+                    evidence_refs: vec![evidence],
+                    message: "a different file changed".to_owned(),
+                },
+                VerificationCheck {
+                    kind: VerificationCheckKind::ObjectiveValidation,
+                    name: "objective:path:delivery".to_owned(),
+                    command: None,
+                    passed: false,
+                    evidence_refs: vec![evidence],
+                    message: "result.txt was not delivered".to_owned(),
+                },
+                VerificationCheck {
+                    kind: VerificationCheckKind::ObjectiveValidation,
+                    name: "objective:test:external_verifier".to_owned(),
+                    command: Some("official-evaluator".to_owned()),
+                    passed: true,
+                    evidence_refs: vec![evidence],
+                    message: "independent behavioral checks passed".to_owned(),
+                },
+            ],
+            requires_workspace_evidence: true,
+            code_files_changed: false,
+        };
+
+        let record = VerificationRunner.verify(input);
+
+        assert_eq!(record.result, VerificationResult::Fail);
+    }
+
+    #[test]
+    fn failed_external_verifier_is_not_hidden_by_local_success() {
+        let evidence = EvidenceId::new();
+        let input = VerificationInput {
+            task_id: TaskId::new(),
+            objective: "change code and run tests".to_owned(),
+            completion_criteria: vec!["tests pass".to_owned()],
+            evidence_refs: vec![evidence],
+            command_checks: vec![
+                VerificationCheck {
+                    kind: VerificationCheckKind::WorkspaceChange,
+                    name: "workspace_diff".to_owned(),
+                    command: None,
+                    passed: true,
+                    evidence_refs: vec![evidence],
+                    message: "code changed".to_owned(),
+                },
+                VerificationCheck {
+                    kind: VerificationCheckKind::ObjectiveValidation,
+                    name: "objective:test:shell:identity:local".to_owned(),
+                    command: Some("pytest".to_owned()),
+                    passed: true,
+                    evidence_refs: vec![evidence],
+                    message: "local tests passed".to_owned(),
+                },
+                VerificationCheck {
+                    kind: VerificationCheckKind::ObjectiveValidation,
+                    name: "objective:test:external_verifier".to_owned(),
+                    command: Some("official-evaluator".to_owned()),
+                    passed: false,
+                    evidence_refs: vec![evidence],
+                    message: "independent verification failed".to_owned(),
+                },
+            ],
+            requires_workspace_evidence: true,
+            code_files_changed: true,
+        };
+
+        let record = VerificationRunner.verify(input);
+
+        assert_eq!(record.result, VerificationResult::Fail);
     }
 
     #[test]

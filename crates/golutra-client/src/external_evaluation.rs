@@ -490,7 +490,12 @@ impl RuntimeHost {
                 wait_for_evaluation: true,
             })
             .await?;
-        if !trace.integrity.complete {
+        let checkpoint_prefix = self
+            .checkpoint_evaluation_tasks
+            .contains(&record.source_task_id)
+            && !matches!(record.trust, ExternalEvaluationTrust::UntrustedLocal)
+            && checkpoint_trace_has_only_expected_incompleteness(&trace);
+        if !trace.integrity.complete && !checkpoint_prefix {
             return Err(ClientError::TaskExecution(format!(
                 "external evaluation base trace is incomplete: {:?}",
                 trace.integrity.missing_sections
@@ -558,6 +563,40 @@ impl RuntimeHost {
                 )
             })
     }
+}
+
+pub(super) fn checkpoint_trace_has_only_expected_incompleteness(trace: &TaskTracePage) -> bool {
+    const EXPECTED_MISSING_SECTIONS: [&str; 6] = [
+        "context_snapshot",
+        "verification_plan",
+        "verification_record",
+        "post_task_job",
+        "post_task_job_terminal",
+        "evaluation_terminal",
+    ];
+
+    trace.integrity.event_count > 0
+        && trace.integrity.first_sequence.is_some()
+        && trace.integrity.last_sequence.is_some()
+        && trace.integrity.event_chain_digest.starts_with("sha256:")
+        && !trace.has_more
+        && trace.integrity.unresolved_refs.is_empty()
+        && trace.integrity.retention_losses.is_empty()
+        && trace.integrity.missing_causal_links.is_empty()
+        && trace.integrity.orphan_events.is_empty()
+        && trace.integrity.provenance_mismatches.is_empty()
+        && trace.integrity.artifact_checksum_failures.is_empty()
+        && trace.integrity.external_overlay_failures.is_empty()
+        && trace
+            .integrity
+            .missing_sections
+            .iter()
+            .all(|section| EXPECTED_MISSING_SECTIONS.contains(&section.as_str()))
+        && trace.integrity.broken_lifecycle_pairs.iter().all(|pair| {
+            pair == "verification:planned_without_record"
+                || ((pair.starts_with("provider_request:") || pair.starts_with("tool_call:"))
+                    && pair.ends_with(":not_completed"))
+        })
 }
 
 fn external_evidence_path(

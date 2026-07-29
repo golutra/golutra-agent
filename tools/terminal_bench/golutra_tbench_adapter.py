@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -21,6 +22,27 @@ from terminal_bench.terminal.models import TerminalCommand
 from terminal_bench.terminal.tmux_session import TmuxSession
 
 _DEFAULT_RESULT_COLLECTION_TIMEOUT_SEC = 3600.0
+_FAILURE_LOG_SCAN_BYTES = 1024 * 1024
+_FAILURE_DETAIL_MAX_BYTES = 2048
+_FAILURE_LINE_MAX_BYTES = 512
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+_BEARER_CREDENTIAL_RE = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
+_URL_CREDENTIAL_RE = re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)[^\s/@:]+:[^\s/@]+@")
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|authorization|"
+    r"password|passwd|secret|token)(\s*[:=]\s*)"
+    r"(\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+)
+_ROOT_CAUSE_LINE_RE = re.compile(
+    r"(?i)^(?:fatal|error)\s*:|\b(?:AssertionError|[A-Za-z][A-Za-z0-9_.]*(?:Error|Exception))\b"
+)
+_PYTEST_DETAIL_LINE_RE = re.compile(
+    r"(?i)^E(?:\s|$)|^(?:expected|actual|got)\b"
+)
+_FAILURE_SUMMARY_LINE_RE = re.compile(
+    r"(?i)^(?:FAILED|FAILURES?\b|TESTS? FAILED\b)"
+)
 
 
 class GolutraAgent(BaseAgent):
@@ -319,37 +341,14 @@ class GolutraAgent(BaseAgent):
                 return
             parser_results, resolved, failure_mode = _extract_trial_result(results, task_id)
             evidence_refs = _existing_evidence_refs(trial_root)
-            assertions = [
-                {
-                    "assertion_id": f"terminal-bench:{name}",
-                    "name": name,
-                    "passed": str(status).lower() in {"pass", "passed"},
-                    "message": str(status),
-                    "evidence_refs": evidence_refs,
-                }
-                for name, status in sorted(parser_results.items())
-            ]
-            if failure_mode not in {None, "none", "unset"}:
-                assertions.append(
-                    {
-                        "assertion_id": "terminal-bench:harness_failure_mode",
-                        "name": "harness_failure_mode",
-                        "passed": False,
-                        "message": failure_mode,
-                        "evidence_refs": evidence_refs,
-                    }
-                )
-            if not assertions or (not resolved and all(item["passed"] for item in assertions)):
-                assertions = [
-                    *assertions,
-                    {
-                        "assertion_id": "terminal-bench:resolved",
-                        "name": "resolved",
-                        "passed": resolved,
-                        "message": str(resolved),
-                        "evidence_refs": evidence_refs,
-                    }
-                ]
+            failure_detail = _failure_detail(trial_root)
+            assertions = _evaluation_assertions(
+                parser_results,
+                resolved,
+                failure_mode,
+                evidence_refs,
+                failure_detail,
+            )
             passed = sum(assertion["passed"] for assertion in assertions)
             total = len(assertions)
             phases, terminal_cause = _evaluation_phases(
@@ -359,6 +358,7 @@ class GolutraAgent(BaseAgent):
                 resolved,
                 failure_mode,
                 evidence_refs,
+                failure_detail,
             )
             harness_version = _terminal_bench_version()
             # Recovery may append lifecycle events after an external timeout,
@@ -379,7 +379,7 @@ class GolutraAgent(BaseAgent):
                 "dataset_id": self._dataset_id,
                 "dataset_version": self._dataset_version,
                 "case_id": str(results.get("task_id", task_id)),
-                "verdict": "pass" if resolved else "fail",
+                "verdict": "pass" if resolved and passed == total else "fail",
                 "score": float(passed),
                 "score_max": float(total) if total else 1.0,
                 "assertions": assertions,
@@ -656,6 +656,149 @@ def _extract_trial_result(results: dict, task_id: str) -> tuple[dict, bool, str 
     )
 
 
+def _evaluation_assertions(
+    parser_results: dict,
+    resolved: bool,
+    failure_mode: str | None,
+    evidence_refs: list[str],
+    failure_detail: str | None,
+) -> list[dict]:
+    assertions = []
+    for name, status in sorted(parser_results.items()):
+        passed = str(status).lower() in {"pass", "passed"}
+        status_message = _sanitize_failure_line(str(status)) or str(status)
+        assertions.append(
+            {
+                "assertion_id": f"terminal-bench:{name}",
+                "name": name,
+                "passed": passed,
+                "message": (
+                    status_message
+                    if passed
+                    else _failure_message(status_message, failure_detail)
+                ),
+                "evidence_refs": evidence_refs,
+            }
+        )
+    if failure_mode not in {None, "none", "unset"}:
+        assertions.append(
+            {
+                "assertion_id": "terminal-bench:harness_failure_mode",
+                "name": "harness_failure_mode",
+                "passed": False,
+                "message": _failure_message(str(failure_mode), failure_detail),
+                "evidence_refs": evidence_refs,
+            }
+        )
+    if not assertions or (not resolved and all(item["passed"] for item in assertions)):
+        assertions.append(
+            {
+                "assertion_id": "terminal-bench:resolved",
+                "name": "resolved",
+                "passed": resolved,
+                "message": (
+                    str(resolved)
+                    if resolved
+                    else _failure_message(str(resolved), failure_detail)
+                ),
+                "evidence_refs": evidence_refs,
+            }
+        )
+    return assertions
+
+
+def _failure_detail(trial_root: Path) -> str | None:
+    log_path = trial_root / "panes" / "post-test.txt"
+    try:
+        with log_path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            start = max(0, size - _FAILURE_LOG_SCAN_BYTES)
+            stream.seek(start)
+            raw = stream.read(_FAILURE_LOG_SCAN_BYTES)
+    except OSError:
+        return None
+
+    if start > 0 and b"\n" in raw:
+        raw = raw.split(b"\n", 1)[1]
+    lines_by_priority: list[list[str]] = [[], [], []]
+    fallback_lines: list[str] = []
+    seen: set[str] = set()
+    for raw_line in raw.decode("utf-8", errors="replace").splitlines():
+        line = _sanitize_failure_line(raw_line)
+        if not line:
+            continue
+        key = line.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        fallback_lines.append(line)
+        if _ROOT_CAUSE_LINE_RE.search(line):
+            lines_by_priority[0].append(line)
+        elif _PYTEST_DETAIL_LINE_RE.search(line):
+            lines_by_priority[1].append(line)
+        elif _FAILURE_SUMMARY_LINE_RE.search(line):
+            lines_by_priority[2].append(line)
+
+    preferred = [line for group in lines_by_priority for line in group]
+    candidates = preferred or fallback_lines[-8:]
+    detail = _join_bounded_lines(candidates, _FAILURE_DETAIL_MAX_BYTES)
+    return detail or None
+
+
+def _sanitize_failure_line(value: str) -> str:
+    sanitized = _ANSI_ESCAPE_RE.sub("", value)
+    sanitized = "".join(
+        character
+        if character == "\t" or (ord(character) >= 32 and ord(character) != 127)
+        else " "
+        for character in sanitized
+    )
+    sanitized = _BEARER_CREDENTIAL_RE.sub("Bearer [REDACTED]", sanitized)
+    sanitized = _URL_CREDENTIAL_RE.sub(r"\1[REDACTED]@", sanitized)
+    sanitized = _SECRET_ASSIGNMENT_RE.sub(r"\1\2[REDACTED]", sanitized)
+    sanitized = re.sub(r"\s+", " ", sanitized).strip()
+    return _truncate_utf8(sanitized, _FAILURE_LINE_MAX_BYTES)
+
+
+def _failure_message(summary: str, detail: str | None) -> str:
+    summary = _sanitize_failure_line(summary)
+    if not detail:
+        return _truncate_utf8(summary, _FAILURE_DETAIL_MAX_BYTES)
+    return _truncate_utf8(
+        f"{summary}\nEvaluator output:\n{detail}",
+        _FAILURE_DETAIL_MAX_BYTES,
+    )
+
+
+def _join_bounded_lines(lines: list[str], limit: int) -> str:
+    selected: list[str] = []
+    used = 0
+    for line in lines:
+        separator_bytes = 1 if selected else 0
+        remaining = limit - used - separator_bytes
+        if remaining <= 0:
+            break
+        bounded = _truncate_utf8(line, remaining)
+        if not bounded:
+            continue
+        selected.append(bounded)
+        used += separator_bytes + len(bounded.encode("utf-8"))
+        if len(bounded.encode("utf-8")) < len(line.encode("utf-8")):
+            break
+    return "\n".join(selected)
+
+
+def _truncate_utf8(value: str, limit: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= limit:
+        return value
+    if limit <= 3:
+        return encoded[:limit].decode("utf-8", errors="ignore")
+    prefix = encoded[: limit - 3].decode("utf-8", errors="ignore").rstrip()
+    return f"{prefix}..."
+
+
 def _parse_timestamp(value: object) -> datetime | None:
     if not isinstance(value, str) or not value.strip():
         return None
@@ -716,6 +859,7 @@ def _evaluation_phases(
     resolved: bool,
     failure_mode: str | None,
     evidence_refs: list[str],
+    failure_detail: str | None = None,
 ) -> tuple[list[dict], dict | None]:
     selected = _select_trial_result(results, task_id)
     normalized_failure = (
@@ -789,7 +933,10 @@ def _evaluation_phases(
         terminal_cause = {
             "code": normalized_failure,
             "phase_id": failure_phase,
-            "message": f"Terminal-Bench stopped with {normalized_failure}",
+            "message": _failure_message(
+                f"Terminal-Bench stopped with {normalized_failure}",
+                failure_detail,
+            ),
             "retryable": "timeout" in normalized_failure,
             "evidence_refs": evidence_refs,
         }
@@ -798,7 +945,10 @@ def _evaluation_phases(
         terminal_cause = {
             "code": "assertion_failed",
             "phase_id": failure_phase,
-            "message": f"failed evaluator assertions: {names}",
+            "message": _failure_message(
+                f"failed evaluator assertions: {names}",
+                failure_detail,
+            ),
             "retryable": False,
             "evidence_refs": evidence_refs,
         }

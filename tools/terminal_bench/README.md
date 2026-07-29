@@ -62,6 +62,14 @@ Terminal-Bench. Harness failures such as `test_timeout` are also retained as a
 failed external-evaluation assertion instead of being collapsed into a generic
 unresolved result.
 
+For failed evaluator assertions, the adapter scans only the tail of
+`panes/post-test.txt` and attaches a bounded, deduplicated failure excerpt to
+the assertion and terminal cause. Root-cause lines such as `fatal:`, `error:`,
+`AssertionError`, and pytest diagnostics are preferred; ANSI/control sequences
+and common credential assignments are removed. The excerpt is capped at 2 KiB,
+while the complete test log remains available only through its artifact
+reference.
+
 The provider config and credentials copied into the container are not included
 in the retained runtime directory. Raw runtime data can still contain prompts,
 tool output and workspace-derived content, so store benchmark logs accordingly.

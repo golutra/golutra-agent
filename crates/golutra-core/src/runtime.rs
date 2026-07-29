@@ -2,8 +2,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CommandId, DecisionId, EventId, LaneId, SessionId, TaskId, Timestamp, ToolCallId, TurnId,
-    WorkspaceId,
+    CommandId, DecisionId, EventId, LaneId, ProviderRequestId, SessionId, TaskId, Timestamp,
+    ToolCallId, ToolRecoveryPolicy, TurnId, WorkspaceId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -90,6 +90,8 @@ pub struct IncompleteToolCall {
     pub tool_call_id: ToolCallId,
     pub tool_name: String,
     pub side_effect_possible: bool,
+    #[serde(default)]
+    pub recovery_policy: ToolRecoveryPolicy,
     pub started_event_ref: EventId,
 }
 
@@ -99,6 +101,8 @@ pub struct TaskRecoveryRecord {
     pub disposition: TaskRecoveryDisposition,
     pub interrupted_turn_ids: Vec<TurnId>,
     pub incomplete_tool_calls: Vec<IncompleteToolCall>,
+    #[serde(default)]
+    pub incomplete_provider_request_ids: Vec<ProviderRequestId>,
     pub running_process_ids: Vec<String>,
     pub checkpoint_event_refs: Vec<EventId>,
     pub last_event_ref: Option<EventId>,

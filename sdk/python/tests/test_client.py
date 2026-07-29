@@ -623,6 +623,18 @@ class ClientTest(unittest.TestCase):
             1,
         )
 
+        thread.run("use project discovery")
+        default_params = [
+            params for name, params in calls if name == "turn/start"
+        ][-1]
+        self.assertNotIn("external_verifiers", default_params)
+
+        thread.run("disable project discovery", discover_project_verifiers=False)
+        disabled_params = [
+            params for name, params in calls if name == "turn/start"
+        ][-1]
+        self.assertEqual(disabled_params["external_verifiers"], [])
+
         self.assertEqual(thread.steer("continue")["accepted"], True)
         self.assertEqual(thread.interrupt()["accepted"], True)
         self.assertEqual(thread.takeover()["accepted"], True)

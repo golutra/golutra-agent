@@ -163,6 +163,7 @@ export interface ThreadRunOptions {
   completionCriteria?: readonly string[];
   allowNetwork?: boolean;
   externalVerifiers?: readonly ExternalVerificationSpec[];
+  discoverProjectVerifiers?: boolean;
 }
 
 export interface ReconcileTaskOptions {
@@ -206,8 +207,10 @@ export class Thread {
       prompt,
       allow_network: options.allowNetwork ?? false,
       completion_criteria: [...(options.completionCriteria ?? [])].filter((value) => value.trim()),
-      external_verifiers: [...(options.externalVerifiers ?? [])],
     };
+    if (options.externalVerifiers !== undefined || options.discoverProjectVerifiers === false) {
+      params.external_verifiers = [...(options.externalVerifiers ?? [])];
+    }
     if (options.taskContract !== undefined) {
       params.task_contract = options.taskContract;
     }

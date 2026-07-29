@@ -102,13 +102,17 @@ fn normalize_path(raw: &str) -> Option<String> {
     {
         token = without_period;
     }
-    (!token.is_empty()
-        && token.len() <= 512
-        && !token.contains("://")
-        && !token.contains(['<', '>', '*'])
-        && is_path_like(token)
-        && is_valid_workspace_relative_path(token))
-    .then(|| token.to_owned())
+    let aliased = token
+        .strip_prefix("/app/")
+        .or_else(|| token.strip_prefix("/workspace/"))
+        .unwrap_or(token);
+    (!aliased.is_empty()
+        && aliased.len() <= 512
+        && !aliased.contains("://")
+        && !aliased.contains(['<', '>', '*'])
+        && is_path_like(aliased)
+        && is_valid_workspace_relative_path(aliased))
+    .then(|| aliased.to_owned())
 }
 
 fn is_path_like(value: &str) -> bool {
@@ -253,8 +257,11 @@ mod tests {
 
     #[test]
     fn unsafe_delivery_paths_are_not_inferred_from_objectives() {
+        assert_eq!(
+            infer_legacy_write_path("create a file named `/app/output/maze.txt`"),
+            Some("output/maze.txt".to_owned())
+        );
         for objective in [
-            "create a file named `/app/output/maze.txt`",
             "save to `/var/log/nginx/benchmark-access.log`",
             "write file ../outside.txt with content unsafe",
             r"write file C:\workspace\result.txt with content unsafe",

@@ -160,7 +160,8 @@ impl RuntimeHost {
         let task_id = task.task_id;
         let turn_id = request.turn_id.unwrap_or(task.turn_id);
         let tool_call_id = request.tool_call_id;
-        let partial_checkpoint = request.tool_name == "shell";
+        let partial_checkpoint =
+            matches!(request.tool_name.as_str(), "shell" | "external_verifier");
         let owned_before_images = before_images.to_vec();
         let checkpoint_result = run_blocking(move || {
             let (checkpoint_before_images, excluded_count) = if partial_checkpoint {
@@ -611,7 +612,7 @@ impl RuntimeHost {
         reason: &str,
     ) -> Result<golutra_core::VerificationRecord, ClientError> {
         let requires_workspace_evidence =
-            provider_runtime::prompt_requests_workspace_tools(&task.payload, objective);
+            LegacyTaskAdapter::new(&task.payload, objective).requests_workspace_tools();
         let (verification, plan) = RuntimeVerificationService::default().verify_runtime_failure(
             task.task_id,
             objective,
@@ -709,8 +710,8 @@ impl RuntimeHost {
         policy: WorkspacePolicy,
         workspace_root: PathBuf,
         requested_network: bool,
-    ) -> Result<BasicToolExecutor, ClientError> {
-        let executor = BasicToolExecutor::new(policy)
+    ) -> Result<ToolRuntime, ClientError> {
+        let executor = ToolRuntime::new(policy)
             .with_network_access(self.network_access_enabled(requested_network))
             .with_process_supervisor(self.process_supervisor.clone());
         let Some(paths) = self

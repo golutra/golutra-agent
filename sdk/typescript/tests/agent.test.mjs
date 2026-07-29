@@ -144,6 +144,39 @@ test("Thread and TurnHandle preserve the shared agent lifecycle", async () => {
   await assert.rejects(thread.eventPage({ limit: 0 }), /between 1 and 512/);
 });
 
+test("project verifier discovery distinguishes omission from an explicit opt-out", async () => {
+  const calls = [];
+  const client = {
+    async rpc(method, params) {
+      calls.push([method, params]);
+      return {
+        accepted: true,
+        command_id: `command-${calls.length}`,
+        cursor: 0,
+        thread: threadReference,
+      };
+    },
+    subscribeAgent(_request, onEvent) {
+      onEvent({
+        type: "turn.completed",
+        status: "completed",
+        task_id: "task-1",
+        turn_id: "turn-1",
+        final_message: "done",
+        last_sequence_no: 1,
+      });
+      return { done: Promise.resolve(), close() {} };
+    },
+  };
+  const thread = new Thread(client, threadReference);
+
+  await thread.run("discover checks");
+  await thread.run("disable discovery", { discoverProjectVerifiers: false });
+
+  assert.equal("external_verifiers" in calls[0][1], false);
+  assert.deepEqual(calls[1][1].external_verifiers, []);
+});
+
 test("TurnHandle ends or fails when the backing subscription settles", async () => {
   const client = {
     async rpc() {

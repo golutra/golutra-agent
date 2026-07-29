@@ -18,8 +18,56 @@ pub enum PolicyError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspacePolicy {
     workspace_root: PathBuf,
+    path_mapper: WorkspacePathMapper,
     sensitive_path_fragments: Vec<String>,
-    denied_shell_fragments: Vec<String>,
+}
+
+/// Maps well-known model/container workspace roots onto the host workspace.
+/// Unrecognized absolute paths remain absolute and are rejected by the normal
+/// workspace boundary check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspacePathMapper {
+    workspace_root: PathBuf,
+    aliases: Vec<PathBuf>,
+}
+
+impl WorkspacePathMapper {
+    #[must_use]
+    pub fn new(workspace_root: PathBuf) -> Self {
+        Self {
+            workspace_root,
+            aliases: vec![PathBuf::from("/app"), PathBuf::from("/workspace")],
+        }
+    }
+
+    #[must_use]
+    pub fn map(&self, path: &Path) -> PathBuf {
+        if !path.is_absolute() || path.starts_with(&self.workspace_root) {
+            return path.to_path_buf();
+        }
+        self.aliases
+            .iter()
+            .find_map(|alias| {
+                path.strip_prefix(alias)
+                    .ok()
+                    .map(|relative| self.workspace_root.join(relative))
+            })
+            .unwrap_or_else(|| path.to_path_buf())
+    }
+
+    pub fn add_alias(&mut self, alias: impl Into<PathBuf>) -> Result<(), PolicyError> {
+        let alias = alias.into();
+        if !alias.is_absolute() {
+            return Err(PolicyError::Canonicalization(format!(
+                "workspace path alias must be absolute: {}",
+                alias.display()
+            )));
+        }
+        if !self.aliases.contains(&alias) {
+            self.aliases.push(alias);
+        }
+        Ok(())
+    }
 }
 
 impl WorkspacePolicy {
@@ -31,8 +79,10 @@ impl WorkspacePolicy {
             ));
         }
 
+        let workspace_root = canonicalize_existing(&workspace_root)?;
         Ok(Self {
-            workspace_root: canonicalize_existing(&workspace_root)?,
+            path_mapper: WorkspacePathMapper::new(workspace_root.clone()),
+            workspace_root,
             sensitive_path_fragments: vec![
                 ".env".to_owned(),
                 "id_rsa".to_owned(),
@@ -40,18 +90,17 @@ impl WorkspacePolicy {
                 ".ssh".to_owned(),
                 "secrets".to_owned(),
             ],
-            denied_shell_fragments: vec![
-                "rm -rf /".to_owned(),
-                "mkfs".to_owned(),
-                "shutdown".to_owned(),
-                "reboot".to_owned(),
-            ],
         })
     }
 
     #[must_use]
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
+    }
+
+    pub fn with_path_alias(mut self, alias: impl Into<PathBuf>) -> Result<Self, PolicyError> {
+        self.path_mapper.add_alias(alias)?;
+        Ok(self)
     }
 
     pub fn evaluate_path(
@@ -97,13 +146,9 @@ impl WorkspacePolicy {
     pub fn evaluate_shell(&self, command: &str) -> PolicyEvaluation {
         let parsed = parse_shell_command(command);
         let explicit_wrapper = parsed.as_deref().and_then(explicit_shell_script).is_some();
-        let terminal_violation = self
-            .denied_shell_fragments
-            .iter()
-            .any(|fragment| command.contains(fragment))
-            || parsed
-                .as_deref()
-                .is_some_and(|parts| self.shell_command_is_blocked(parts));
+        let terminal_violation = parsed
+            .as_deref()
+            .is_some_and(|parts| self.shell_command_is_blocked(parts));
         let recoverable_violation =
             !explicit_wrapper && (contains_shell_metacharacter(command) || parsed.is_none());
         let blocked = terminal_violation || recoverable_violation;
@@ -151,7 +196,8 @@ impl WorkspacePolicy {
         path: impl AsRef<Path>,
         requires_existing_path: bool,
     ) -> Result<PathBuf, PolicyError> {
-        let path = path.as_ref();
+        let mapped_path = self.path_mapper.map(path.as_ref());
+        let path = mapped_path.as_path();
         let candidate = if path.is_absolute() {
             path.to_path_buf()
         } else {
@@ -189,58 +235,347 @@ impl WorkspacePolicy {
     }
 
     fn shell_script_is_blocked(&self, script: &str) -> bool {
-        if self
-            .denied_shell_fragments
-            .iter()
-            .any(|fragment| script.contains(fragment))
+        let mut parser = tree_sitter::Parser::new();
+        if parser
+            .set_language(&tree_sitter_bash::LANGUAGE.into())
+            .is_err()
         {
             return true;
         }
-        shlex::split(script).map_or_else(
-            || {
-                self.sensitive_path_fragments
-                    .iter()
-                    .any(|fragment| script.to_ascii_lowercase().contains(fragment))
-            },
-            |parts| self.shell_command_parts_are_blocked(&parts),
-        )
+        let Some(tree) = parser.parse(script, None) else {
+            return true;
+        };
+        let root = tree.root_node();
+        root.has_error() || self.shell_ast_is_blocked(root, script.as_bytes())
+    }
+
+    fn shell_ast_is_blocked(&self, node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+        if node.kind() == "variable_assignment"
+            && node
+                .utf8_text(source)
+                .is_ok_and(|assignment| self.references_sensitive_path(assignment))
+        {
+            return true;
+        }
+        if node.kind() == "command"
+            && node
+                .utf8_text(source)
+                .ok()
+                .and_then(shlex::split)
+                .is_none_or(|parts| self.shell_script_command_parts_are_blocked(&parts))
+        {
+            return true;
+        }
+
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .any(|child| self.shell_ast_is_blocked(child, source))
+    }
+
+    fn shell_script_command_parts_are_blocked(&self, parts: &[String]) -> bool {
+        let command_start = parts
+            .iter()
+            .position(|part| !is_shell_variable_assignment(part))
+            .unwrap_or(parts.len());
+        self.shell_command_parts_are_blocked(&parts[command_start..])
     }
 
     fn shell_command_parts_are_blocked(&self, parts: &[String]) -> bool {
-        let Some(program) = parts.first().map(String::as_str) else {
-            return true;
-        };
-        let arguments = &parts[1..];
-        let sensitive_argument = arguments.iter().any(|argument| {
-            let lower = argument.to_ascii_lowercase();
-            argument
-                .split(['/', '\\'])
-                .any(|component| matches!(component, ".git" | ".golutra"))
+        let mut command = parts;
+        for _ in 0..8 {
+            let Some(program) = command
+                .first()
+                .and_then(|program| program.rsplit(['/', '\\']).next())
+            else {
+                return true;
+            };
+            let arguments = &command[1..];
+            let sensitive_argument = arguments
+                .iter()
+                .any(|argument| self.references_sensitive_path(argument));
+            match program {
+                "command" => {
+                    let Some(target) = command_builtin_target(arguments) else {
+                        return sensitive_argument;
+                    };
+                    command = target;
+                }
+                "env" => {
+                    if sensitive_argument {
+                        return true;
+                    }
+                    if arguments.iter().any(|argument| {
+                        argument.starts_with("-S")
+                            || argument == "--split-string"
+                            || argument.starts_with("--split-string=")
+                    }) {
+                        return true;
+                    }
+                    match env_command_target(arguments) {
+                        Ok(Some(target)) => command = target,
+                        Ok(None) => return false,
+                        Err(()) => return true,
+                    }
+                }
+                "busybox" => {
+                    let Some(target) = busybox_command_target(arguments) else {
+                        return sensitive_argument;
+                    };
+                    command = target;
+                }
+                "sudo" => {
+                    if sensitive_argument {
+                        return true;
+                    }
+                    match sudo_command_target(arguments) {
+                        Ok(Some(target)) => command = target,
+                        Ok(None) => return false,
+                        Err(()) => return true,
+                    }
+                }
+                "bash" | "sh" | "zsh" => {
+                    return explicit_shell_script(command).map_or_else(
+                        || sensitive_argument || shell_uses_unparsed_inline_script(arguments),
+                        |script| self.shell_script_is_blocked(script),
+                    );
+                }
+                "find" => {
+                    return sensitive_argument
+                        || arguments.iter().any(|argument| {
+                            matches!(
+                                argument.as_str(),
+                                "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir"
+                            )
+                        });
+                }
+                "rg" => return self.rg_references_sensitive_input(arguments),
+                "grep" => return self.grep_references_sensitive_input(arguments),
+                "rm" => return sensitive_argument || recursive_force_rm_targets_root(arguments),
+                "doas" | "pkexec" | "shutdown" | "reboot" => return true,
+                _ if program == "mkfs" || program.starts_with("mkfs.") => return true,
+                _ => return sensitive_argument,
+            }
+        }
+        true
+    }
+
+    fn references_sensitive_path(&self, value: &str) -> bool {
+        path_like_components(value).any(|component| {
+            matches_sensitive_component(component, ".git")
+                || matches_sensitive_component(component, ".golutra")
                 || self
                     .sensitive_path_fragments
                     .iter()
-                    .any(|fragment| lower.contains(fragment))
-        });
-        let dangerous_program_option = match program {
-            "find" => arguments.iter().any(|argument| {
-                matches!(
-                    argument.as_str(),
-                    "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir"
-                )
-            }),
-            "rg" => arguments
-                .iter()
-                .any(|argument| argument == "--pre" || argument.starts_with("--pre=")),
-            "rm" => {
-                let recursive_force = arguments.iter().any(|argument| {
-                    argument.starts_with('-') && argument.contains('r') && argument.contains('f')
-                });
-                recursive_force && arguments.iter().any(|argument| argument == "/")
+                    .any(|fragment| matches_sensitive_component(component, fragment))
+        })
+    }
+
+    fn grep_references_sensitive_input(&self, arguments: &[String]) -> bool {
+        let mut index = 0_usize;
+        let mut options = true;
+        let mut pattern_supplied = false;
+
+        while let Some(argument) = arguments.get(index) {
+            if options && argument == "--" {
+                options = false;
+                index = index.saturating_add(1);
+                continue;
             }
-            "mkfs" | "shutdown" | "reboot" => true,
-            _ => false,
-        };
-        sensitive_argument || dangerous_program_option
+
+            if options {
+                if matches!(argument.as_str(), "-e" | "--regexp") {
+                    pattern_supplied = true;
+                    index = index.saturating_add(2);
+                    continue;
+                }
+                if argument.starts_with("--regexp=") {
+                    pattern_supplied = true;
+                    index = index.saturating_add(1);
+                    continue;
+                }
+                if matches!(argument.as_str(), "--exclude" | "--exclude-dir") {
+                    index = index.saturating_add(2);
+                    continue;
+                }
+                if argument.starts_with("--exclude=") || argument.starts_with("--exclude-dir=") {
+                    index = index.saturating_add(1);
+                    continue;
+                }
+                if matches!(argument.as_str(), "-f" | "--file" | "--exclude-from") {
+                    let sensitive = arguments
+                        .get(index.saturating_add(1))
+                        .is_some_and(|path| self.references_sensitive_path(path));
+                    if sensitive {
+                        return true;
+                    }
+                    pattern_supplied |= argument != "--exclude-from";
+                    index = index.saturating_add(2);
+                    continue;
+                }
+                if let Some(path) = argument
+                    .strip_prefix("--file=")
+                    .or_else(|| argument.strip_prefix("--exclude-from="))
+                {
+                    if self.references_sensitive_path(path) {
+                        return true;
+                    }
+                    pattern_supplied |= argument.starts_with("--file=");
+                    index = index.saturating_add(1);
+                    continue;
+                }
+                if let Some((option, value)) = grep_short_pattern_option(argument) {
+                    if option == 'f' && self.references_sensitive_path(value) {
+                        return true;
+                    }
+                    pattern_supplied = true;
+                    index = index.saturating_add(1);
+                    continue;
+                }
+                if argument.starts_with('-') && argument != "-" {
+                    if self.references_sensitive_path(argument) {
+                        return true;
+                    }
+                    index = index.saturating_add(1);
+                    continue;
+                }
+            }
+
+            if pattern_supplied {
+                if self.references_sensitive_path(argument) {
+                    return true;
+                }
+            } else {
+                pattern_supplied = true;
+            }
+            index = index.saturating_add(1);
+        }
+
+        false
+    }
+
+    fn rg_references_sensitive_input(&self, arguments: &[String]) -> bool {
+        let mut index = 0_usize;
+        let mut options = true;
+        let mut pattern_supplied = false;
+
+        while let Some(argument) = arguments.get(index) {
+            if options && argument == "--" {
+                options = false;
+                index = index.saturating_add(1);
+                continue;
+            }
+
+            if options {
+                if argument == "--pre" || argument.starts_with("--pre=") {
+                    return true;
+                }
+                if matches!(argument.as_str(), "-e" | "--regexp") {
+                    pattern_supplied = true;
+                    index = index.saturating_add(2);
+                    continue;
+                }
+                if argument.starts_with("--regexp=") {
+                    pattern_supplied = true;
+                    index = index.saturating_add(1);
+                    continue;
+                }
+                if argument == "--files" {
+                    pattern_supplied = true;
+                    index = index.saturating_add(1);
+                    continue;
+                }
+                if matches!(argument.as_str(), "-f" | "--file") {
+                    if arguments
+                        .get(index.saturating_add(1))
+                        .is_some_and(|path| self.references_sensitive_path(path))
+                    {
+                        return true;
+                    }
+                    pattern_supplied = true;
+                    index = index.saturating_add(2);
+                    continue;
+                }
+                if let Some(path) = argument.strip_prefix("--file=") {
+                    if self.references_sensitive_path(path) {
+                        return true;
+                    }
+                    pattern_supplied = true;
+                    index = index.saturating_add(1);
+                    continue;
+                }
+                if let Some((option, value)) = grep_short_pattern_option(argument) {
+                    if option == 'f' && self.references_sensitive_path(value) {
+                        return true;
+                    }
+                    pattern_supplied = true;
+                    index = index.saturating_add(1);
+                    continue;
+                }
+                if matches!(argument.as_str(), "-g" | "--glob") {
+                    if arguments
+                        .get(index.saturating_add(1))
+                        .is_some_and(|glob| self.rg_glob_reads_sensitive_path(glob))
+                    {
+                        return true;
+                    }
+                    index = index.saturating_add(2);
+                    continue;
+                }
+                if let Some(glob) = argument.strip_prefix("--glob=") {
+                    if self.rg_glob_reads_sensitive_path(glob) {
+                        return true;
+                    }
+                    index = index.saturating_add(1);
+                    continue;
+                }
+                if let Some(glob) = argument.strip_prefix("-g").filter(|glob| !glob.is_empty()) {
+                    if self.rg_glob_reads_sensitive_path(glob) {
+                        return true;
+                    }
+                    index = index.saturating_add(1);
+                    continue;
+                }
+                if matches!(argument.as_str(), "--ignore-file") {
+                    if arguments
+                        .get(index.saturating_add(1))
+                        .is_some_and(|path| self.references_sensitive_path(path))
+                    {
+                        return true;
+                    }
+                    index = index.saturating_add(2);
+                    continue;
+                }
+                if let Some(path) = argument.strip_prefix("--ignore-file=") {
+                    if self.references_sensitive_path(path) {
+                        return true;
+                    }
+                    index = index.saturating_add(1);
+                    continue;
+                }
+                if argument.starts_with('-') && argument != "-" {
+                    if self.references_sensitive_path(argument) {
+                        return true;
+                    }
+                    index = index.saturating_add(1);
+                    continue;
+                }
+            }
+
+            if pattern_supplied {
+                if self.references_sensitive_path(argument) {
+                    return true;
+                }
+            } else {
+                pattern_supplied = true;
+            }
+            index = index.saturating_add(1);
+        }
+
+        false
+    }
+
+    fn rg_glob_reads_sensitive_path(&self, glob: &str) -> bool {
+        !glob.starts_with('!') && self.references_sensitive_path(glob)
     }
 
     fn shell_command_is_preapproved(&self, parts: &[String]) -> bool {
@@ -387,6 +722,272 @@ fn has_internal_runtime_component(path: &Path) -> bool {
     })
 }
 
+fn path_like_components(value: &str) -> impl Iterator<Item = &str> {
+    value.split(|character: char| {
+        !character.is_ascii_alphanumeric() && !matches!(character, '.' | '_' | '-')
+    })
+}
+
+fn matches_sensitive_component(component: &str, fragment: &str) -> bool {
+    let component = component.to_ascii_lowercase();
+    let fragment = fragment.to_ascii_lowercase();
+    component == fragment
+        || component
+            .strip_prefix(&fragment)
+            .is_some_and(|suffix| suffix.starts_with(['.', '-', '_']))
+}
+
+fn grep_short_pattern_option(argument: &str) -> Option<(char, &str)> {
+    if !argument.starts_with('-') || argument.starts_with("--") {
+        return None;
+    }
+    argument[1..].char_indices().find_map(|(offset, option)| {
+        if !matches!(option, 'e' | 'f') {
+            return None;
+        }
+        let value_start = 1 + offset + option.len_utf8();
+        argument
+            .get(value_start..)
+            .filter(|value| !value.is_empty())
+            .map(|value| (option, value))
+    })
+}
+
+fn recursive_force_rm_targets_root(arguments: &[String]) -> bool {
+    let mut recursive = false;
+    let mut force = false;
+    let mut options = true;
+    let mut targets_root = false;
+
+    for argument in arguments {
+        if options && argument == "--" {
+            options = false;
+            continue;
+        }
+        if options && argument.starts_with("--") {
+            recursive |= argument == "--recursive";
+            force |= argument == "--force";
+            continue;
+        }
+        if options && argument.starts_with('-') && argument.len() > 1 {
+            recursive |= argument[1..].contains(['r', 'R']);
+            force |= argument[1..].contains('f');
+            continue;
+        }
+        targets_root |= shell_path_resolves_to_root(argument) || shell_path_is_dynamic(argument);
+    }
+
+    recursive && force && targets_root
+}
+
+fn is_shell_variable_assignment(value: &str) -> bool {
+    let Some((name, _)) = value.split_once('=') else {
+        return false;
+    };
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn command_builtin_target(arguments: &[String]) -> Option<&[String]> {
+    let mut index = 0_usize;
+    while let Some(argument) = arguments.get(index) {
+        if argument == "--" {
+            index = index.saturating_add(1);
+            break;
+        }
+        if !argument.starts_with('-') || argument == "-" {
+            break;
+        }
+        if argument[1..].contains(['v', 'V']) {
+            return None;
+        }
+        if !argument[1..].chars().all(|character| character == 'p') {
+            return None;
+        }
+        index = index.saturating_add(1);
+    }
+    arguments.get(index..).filter(|target| !target.is_empty())
+}
+
+fn env_command_target(arguments: &[String]) -> Result<Option<&[String]>, ()> {
+    let mut index = 0_usize;
+    let mut options = true;
+    while let Some(argument) = arguments.get(index) {
+        if options && argument == "--" {
+            options = false;
+            index = index.saturating_add(1);
+            continue;
+        }
+        if options
+            && matches!(
+                argument.as_str(),
+                "-u" | "--unset" | "-C" | "--chdir" | "-P" | "-a" | "--argv0"
+            )
+        {
+            if arguments.get(index.saturating_add(1)).is_none() {
+                return Err(());
+            }
+            index = index.saturating_add(2);
+            continue;
+        }
+        if options
+            && (argument.starts_with("--unset=")
+                || argument.starts_with("--chdir=")
+                || argument.starts_with("--argv0="))
+        {
+            index = index.saturating_add(1);
+            continue;
+        }
+        if options && argument.starts_with('-') && argument != "-" {
+            if !matches!(
+                argument.as_str(),
+                "-i" | "--ignore-environment" | "-0" | "--null" | "--debug" | "-v"
+            ) {
+                return Err(());
+            }
+            index = index.saturating_add(1);
+            continue;
+        }
+        if is_shell_variable_assignment(argument) {
+            index = index.saturating_add(1);
+            continue;
+        }
+        break;
+    }
+    Ok(arguments.get(index..).filter(|target| !target.is_empty()))
+}
+
+fn busybox_command_target(arguments: &[String]) -> Option<&[String]> {
+    let target = arguments.first()?;
+    (!target.starts_with('-') && target != "busybox").then_some(arguments)
+}
+
+fn sudo_command_target(arguments: &[String]) -> Result<Option<&[String]>, ()> {
+    const FLAGS: &[&str] = &[
+        "--askpass",
+        "--background",
+        "--bell",
+        "--edit",
+        "--help",
+        "--login",
+        "--non-interactive",
+        "--preserve-env",
+        "--remove-timestamp",
+        "--reset-timestamp",
+        "--set-home",
+        "--stdin",
+        "--validate",
+        "--version",
+    ];
+    const VALUE_OPTIONS: &[&str] = &[
+        "--chdir",
+        "--chroot",
+        "--close-from",
+        "--command-timeout",
+        "--group",
+        "--host",
+        "--other-user",
+        "--prompt",
+        "--role",
+        "--type",
+        "--user",
+    ];
+    const SHORT_VALUE_OPTIONS: &[char] = &['C', 'D', 'g', 'h', 'p', 'R', 'r', 'T', 't', 'U', 'u'];
+    const SHORT_FLAGS: &[char] = &[
+        'A', 'b', 'E', 'e', 'H', 'K', 'k', 'l', 'n', 'S', 's', 'V', 'v',
+    ];
+
+    let mut index = 0_usize;
+    while let Some(argument) = arguments.get(index) {
+        if argument == "--" {
+            index = index.saturating_add(1);
+            break;
+        }
+        if !argument.starts_with('-') || argument == "-" {
+            break;
+        }
+        if let Some((option, _value)) = argument.split_once('=') {
+            if VALUE_OPTIONS.contains(&option) || option == "--preserve-env" {
+                index = index.saturating_add(1);
+                continue;
+            }
+            return Err(());
+        }
+        if VALUE_OPTIONS.contains(&argument.as_str()) {
+            if arguments.get(index.saturating_add(1)).is_none() {
+                return Err(());
+            }
+            index = index.saturating_add(2);
+            continue;
+        }
+        if FLAGS.contains(&argument.as_str()) {
+            index = index.saturating_add(1);
+            continue;
+        }
+        let Some(options) = argument.strip_prefix('-') else {
+            return Err(());
+        };
+        let mut characters = options.chars();
+        let Some(first) = characters.next() else {
+            return Err(());
+        };
+        if SHORT_VALUE_OPTIONS.contains(&first) {
+            if characters.as_str().is_empty() {
+                if arguments.get(index.saturating_add(1)).is_none() {
+                    return Err(());
+                }
+                index = index.saturating_add(2);
+            } else {
+                index = index.saturating_add(1);
+            }
+            continue;
+        }
+        if std::iter::once(first)
+            .chain(characters)
+            .all(|option| SHORT_FLAGS.contains(&option))
+        {
+            index = index.saturating_add(1);
+            continue;
+        }
+        return Err(());
+    }
+    while arguments
+        .get(index)
+        .is_some_and(|argument| is_shell_variable_assignment(argument))
+    {
+        index = index.saturating_add(1);
+    }
+    Ok(arguments.get(index..).filter(|target| !target.is_empty()))
+}
+
+fn shell_uses_unparsed_inline_script(arguments: &[String]) -> bool {
+    arguments.iter().any(|argument| {
+        argument.starts_with('-') && !argument.starts_with("--") && argument[1..].contains('c')
+    })
+}
+
+fn shell_path_resolves_to_root(value: &str) -> bool {
+    if !value.starts_with('/') {
+        return false;
+    }
+    let mut depth = 0_usize;
+    for component in value.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => depth = depth.saturating_sub(1),
+            _ => depth = depth.saturating_add(1),
+        }
+    }
+    depth == 0
+}
+
+fn shell_path_is_dynamic(value: &str) -> bool {
+    value.contains(['$', '`', '*', '?', '[', ']'])
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -406,6 +1007,26 @@ mod tests {
         let evaluation = policy.evaluate_path("read_file", &outside_file, true);
 
         assert_eq!(evaluation.decision, PolicyDecision::Block);
+    }
+
+    #[test]
+    fn maps_container_workspace_aliases_without_weakening_the_boundary() {
+        let workspace = tempdir().expect("workspace");
+        let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
+
+        let mapped = policy.evaluate_path("write_file", "/app/result.txt", false);
+        let traversal = policy.evaluate_path("write_file", "/app/../outside.txt", false);
+
+        assert_eq!(mapped.decision, PolicyDecision::Allow);
+        assert_eq!(
+            PathBuf::from(mapped.resource),
+            workspace
+                .path()
+                .canonicalize()
+                .expect("canonical workspace")
+                .join("result.txt")
+        );
+        assert_eq!(traversal.decision, PolicyDecision::Block);
     }
 
     #[test]
@@ -543,11 +1164,232 @@ mod tests {
             "bash -lc 'rm -rf /'",
             "bash -lc 'find . -delete'",
             "bash -lc 'cat .env'",
+            "bash -lc 'echo ok && /bin/rm -r -f /tmp/..'",
+            "bash -lc 'printf ok; /bin/rm --recursive --force /usr/..'",
+            "bash -lc 'echo \"$(/bin/rm -rf /opt/..)\"'",
+            "bash -lc 'command /bin/rm -r -f /tmp/..'",
+            "bash -lc 'env -i MODE=test /bin/rm --recursive --force /usr/..'",
+            "sudo /bin/rm -r -f /tmp/..",
+            "sudo -n -u root /bin/rm -r -f /tmp/..",
+            "sudo --user=root env MODE=test rm --recursive --force /usr/..",
+            "doas rm --recursive --force /usr/..",
+            "pkexec rm -r -f /var/..",
+            "busybox rm -r -f /tmp/..",
+            "busybox env MODE=test rm --recursive --force /usr/..",
+            "busybox sh -c 'rm -r -f /tmp/..'",
+            "busybox sh -xc 'rm -r -f /tmp/..'",
+            r#"bash -lc "env -S 'rm -r -f /tmp/..'""#,
+            "env -Srm -rf /",
+            "env -a harmless sh -c 'rm -rf /'",
+            "env --chdir .git cat config",
+            "sudo -e .git/config",
+            "env --definitely-unknown printf ok",
+            r#"bash -lc 'target=/; rm -r -f "$target"'"#,
         ] {
             let evaluation = policy.evaluate_shell(command);
             assert_eq!(evaluation.decision, PolicyDecision::Block, "{command}");
             assert_eq!(
                 evaluation.block_disposition,
+                Some(PolicyBlockDisposition::Terminal),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_shell_guards_do_not_treat_quoted_commands_as_executable() {
+        let workspace = tempdir().expect("workspace");
+        let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
+
+        for command in [
+            r#"bash -lc "printf '%s\n' '/bin/rm -rf /tmp/..'""#,
+            r#"bash -lc "printf '%s\n' 'rm -rf /'""#,
+            r#"bash -lc "echo 'find . -delete'""#,
+            "bash -lc 'command -v rm'",
+            "bash -lc 'env MODE=test printf ok'",
+            "printf '%s' shutdown",
+            "touch reboot-notes.txt",
+            "printf '%s' mkfs.ext4",
+            "busybox rm -rf /tmp/cache",
+            "busybox sh -c 'printf ok'",
+            "busybox --list",
+            "sh script.sh",
+            "sudo -n -u root env MODE=test printf ok",
+            "env -a harmless printf ok",
+        ] {
+            let evaluation = policy.evaluate_shell(command);
+            assert_eq!(evaluation.decision, PolicyDecision::Ask, "{command}");
+            assert_eq!(evaluation.block_disposition, None, "{command}");
+        }
+    }
+
+    #[test]
+    fn grep_exclusion_patterns_do_not_count_as_sensitive_inputs() {
+        let workspace = tempdir().expect("workspace");
+        let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
+
+        for command in [
+            r#"grep -R "token" -n src --exclude-dir=.git"#,
+            r#"grep -R --exclude-dir .git "token" src"#,
+            r#"grep ".git" README.md"#,
+            r#"grep -e ".git" README.md"#,
+            r#"bash -lc 'grep -R "token" -n src --exclude-dir=.git | head -20'"#,
+        ] {
+            let evaluation = policy.evaluate_shell(command);
+            assert_eq!(evaluation.decision, PolicyDecision::Ask, "{command}");
+            assert_eq!(evaluation.block_disposition, None, "{command}");
+        }
+    }
+
+    #[test]
+    fn grep_still_blocks_sensitive_input_and_pattern_files() {
+        let workspace = tempdir().expect("workspace");
+        let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
+
+        for command in [
+            r#"grep token .git/config"#,
+            r#"grep token .env"#,
+            r#"grep -f .env README.md"#,
+            r#"grep --file=.git/patterns README.md"#,
+            r#"bash -lc 'target=.env; grep token "$target"'"#,
+        ] {
+            let evaluation = policy.evaluate_shell(command);
+            assert_eq!(evaluation.decision, PolicyDecision::Block, "{command}");
+            assert_eq!(
+                evaluation.block_disposition,
+                Some(PolicyBlockDisposition::Terminal),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_exclusion_globs_do_not_count_as_sensitive_inputs() {
+        let workspace = tempdir().expect("workspace");
+        let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
+
+        for command in [
+            r#"rg token src --glob '!.git/**'"#,
+            r#"rg --glob !.git/** token src"#,
+            r#"rg -g!.git/** token src"#,
+            r#"bash -lc 'rg token src --glob "!.git/**" | head -20'"#,
+        ] {
+            let evaluation = policy.evaluate_shell(command);
+            assert_eq!(evaluation.decision, PolicyDecision::Ask, "{command}");
+            assert_eq!(evaluation.block_disposition, None, "{command}");
+        }
+    }
+
+    #[test]
+    fn search_options_and_paths_cannot_include_sensitive_inputs() {
+        let workspace = tempdir().expect("workspace");
+        let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
+
+        for command in [
+            r#"rg token .git/config"#,
+            r#"rg --hidden token .git"#,
+            r#"rg --glob .git/** token ."#,
+            r#"rg -g.git/** token ."#,
+            r#"rg --files .git"#,
+            r#"rg --ignore-file .env token src"#,
+            r#"rg -f .git/config token src"#,
+            r#"rg -f.git/config token src"#,
+            r#"rg --file=.git/config token src"#,
+            r#"grep --include=.git/config token ."#,
+        ] {
+            let evaluation = policy.evaluate_shell(command);
+            assert_eq!(evaluation.decision, PolicyDecision::Block, "{command}");
+            assert_eq!(
+                evaluation.block_disposition,
+                Some(PolicyBlockDisposition::Terminal),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn root_delete_guard_does_not_match_absolute_subpaths() {
+        let workspace = tempdir().expect("workspace");
+        let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
+
+        for command in [
+            "bash -lc 'rm -rf /git/project'",
+            "bash -lc 'rm -rf /var/www/staging && mkdir -p /var/www/staging'",
+        ] {
+            let evaluation = policy.evaluate_shell(command);
+            assert_eq!(evaluation.decision, PolicyDecision::Ask, "{command}");
+            assert_eq!(evaluation.block_disposition, None, "{command}");
+        }
+    }
+
+    #[test]
+    fn root_delete_guard_normalizes_absolute_root_aliases() {
+        let workspace = tempdir().expect("workspace");
+        let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
+
+        for command in [
+            "rm -rf //",
+            "rm -rf /./",
+            "rm -rf /tmp/..",
+            "rm -r -f /var/../",
+            "rm --recursive --force /usr/..",
+            "/bin/rm -rf -- /tmp/..",
+            "bash -lc 'rm -rf /opt/..'",
+        ] {
+            let evaluation = policy.evaluate_shell(command);
+            assert_eq!(evaluation.decision, PolicyDecision::Block, "{command}");
+            assert_eq!(
+                evaluation.block_disposition,
+                Some(PolicyBlockDisposition::Terminal),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn root_delete_guard_allows_normalized_absolute_subpaths() {
+        let workspace = tempdir().expect("workspace");
+        let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
+
+        for command in [
+            "rm -rf /git/project/./cache",
+            "rm -rf /git/project/tmp/../cache",
+            "bash -lc 'rm -r -f /var/www/../staging'",
+        ] {
+            let evaluation = policy.evaluate_shell(command);
+            assert_eq!(evaluation.decision, PolicyDecision::Ask, "{command}");
+            assert_eq!(evaluation.block_disposition, None, "{command}");
+        }
+    }
+
+    #[test]
+    fn sensitive_path_guard_matches_path_components_without_blocking_identifiers() {
+        let workspace = tempdir().expect("workspace");
+        let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
+
+        for command in [
+            r#"python -c "import os; print(os.environ)""#,
+            "bash -lc 'python3 - <<\"PY\"\nimport os\nenv=os.environ.copy()\nprint(env)\nPY'",
+        ] {
+            assert_eq!(
+                policy.evaluate_shell(command).decision,
+                PolicyDecision::Ask,
+                "{command}"
+            );
+        }
+
+        for command in [
+            "bash -lc 'cat .env.production'",
+            "bash -lc 'cat \"$HOME/.ssh/id_rsa\"'",
+            "bash -lc 'cat --config=/tmp/secrets.json'",
+        ] {
+            assert_eq!(
+                policy.evaluate_shell(command).decision,
+                PolicyDecision::Block,
+                "{command}"
+            );
+            assert_eq!(
+                policy.evaluate_shell(command).block_disposition,
                 Some(PolicyBlockDisposition::Terminal),
                 "{command}"
             );

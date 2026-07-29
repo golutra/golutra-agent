@@ -6,6 +6,7 @@ pub const TASK_CONTRACT_SCHEMA_VERSION: u32 = 1;
 pub const MAX_TASK_CORRECTION_ROUNDS: u32 = 8;
 const MAX_TASK_CONTRACT_PATH_CHARS: usize = 1_024;
 const MAX_TASK_CONTRACT_CRITERION_CHARS: usize = 4_096;
+const MAX_REQUIRED_FILE_CONTENT_BYTES: usize = 1024 * 1024;
 
 /// Explicitly describes what a turn must deliver.  The runtime uses this
 /// contract for verification; it never infers the requirement from prompt
@@ -29,6 +30,12 @@ pub enum VerificationRequirement {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RequiredFileContent {
+    pub path: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TaskContract {
     #[serde(default = "default_task_contract_schema_version")]
     pub schema_version: u32,
@@ -36,6 +43,8 @@ pub struct TaskContract {
     pub workspace_change: WorkspaceChangeRequirement,
     #[serde(default)]
     pub required_paths: Vec<String>,
+    #[serde(default)]
+    pub required_file_contents: Vec<RequiredFileContent>,
     #[serde(default)]
     pub completion_criteria: Vec<String>,
     #[serde(default)]
@@ -60,6 +69,7 @@ impl Default for TaskContract {
             schema_version: default_task_contract_schema_version(),
             workspace_change: WorkspaceChangeRequirement::Optional,
             required_paths: Vec::new(),
+            required_file_contents: Vec::new(),
             completion_criteria: Vec::new(),
             require_objective_validation: false,
             verification: VerificationRequirement::BestEffort,
@@ -82,6 +92,7 @@ impl TaskContract {
     pub fn requires_workspace_evidence(&self) -> bool {
         matches!(self.workspace_change, WorkspaceChangeRequirement::Required)
             || !self.required_paths.is_empty()
+            || !self.required_file_contents.is_empty()
     }
 
     #[must_use]
@@ -110,6 +121,9 @@ impl TaskContract {
         if self.required_paths.len() > 64 {
             return Err("task contract contains too many required paths".to_owned());
         }
+        if self.required_file_contents.len() > 64 {
+            return Err("task contract contains too many required file contents".to_owned());
+        }
         if self.completion_criteria.len() > 32 {
             return Err("task contract contains too many completion criteria".to_owned());
         }
@@ -122,6 +136,14 @@ impl TaskContract {
                 "task contract paths must be non-empty workspace-relative paths".to_owned(),
             );
         }
+        if self.required_file_contents.iter().any(|requirement| {
+            !is_valid_workspace_relative_path(&requirement.path)
+                || requirement.content.len() > MAX_REQUIRED_FILE_CONTENT_BYTES
+        }) {
+            return Err(format!(
+                "required file contents must use workspace-relative paths and contain at most {MAX_REQUIRED_FILE_CONTENT_BYTES} bytes"
+            ));
+        }
         if self.completion_criteria.iter().any(|criterion| {
             criterion.trim().is_empty()
                 || criterion.chars().count() > MAX_TASK_CONTRACT_CRITERION_CHARS
@@ -131,7 +153,7 @@ impl TaskContract {
             ));
         }
         if matches!(self.workspace_change, WorkspaceChangeRequirement::Forbidden)
-            && !self.required_paths.is_empty()
+            && (!self.required_paths.is_empty() || !self.required_file_contents.is_empty())
         {
             return Err("forbidden workspace changes cannot require delivery paths".to_owned());
         }

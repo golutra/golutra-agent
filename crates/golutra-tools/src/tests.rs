@@ -12,6 +12,17 @@ use tokio::process::Command;
 
 use super::*;
 
+#[test]
+fn shell_timeout_contract_honors_long_foreground_requests() {
+    let requested = 120_000_u64;
+
+    assert_eq!(effective_shell_timeout(requested), requested);
+    assert_eq!(
+        effective_shell_timeout(u64::MAX),
+        MAX_BACKGROUND_PROCESS_TIMEOUT_MS
+    );
+}
+
 #[derive(Debug)]
 struct FakeExternalBackend {
     calls: AtomicUsize,
@@ -70,6 +81,7 @@ async fn registry_contains_p0_tools() {
     assert_eq!(
         names,
         vec![
+            "apply_patch",
             "edit_file",
             "find_references",
             "list_dir",
@@ -84,6 +96,9 @@ async fn registry_contains_p0_tools() {
             "write_file"
         ]
     );
+    let search = registry.contract("rg_search").expect("rg contract");
+    assert_eq!(search.side_effect_type, SideEffectType::None);
+    assert_eq!(search.retry_policy, "retry_allowed");
 }
 
 #[test]
@@ -392,6 +407,321 @@ async fn write_file_records_changed_file() {
         fs::read_to_string(workspace.path().join("src.txt")).unwrap(),
         "new"
     );
+}
+
+#[tokio::test]
+async fn tool_runtime_invokes_a_governed_call_through_one_public_seam() {
+    let workspace = tempdir().expect("workspace");
+    let runtime = ToolRuntime::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let request = request(
+        "write_file",
+        json!({"path": "result.txt", "content": "done"}),
+    );
+    let policy = runtime.evaluate(&request).expect("policy");
+
+    let report = runtime
+        .invoke(
+            ToolInvocation::new(request, policy, false),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("tool invocation");
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("result.txt")).expect("result"),
+        "done"
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_changes_multiple_files_through_one_atomic_tool_call() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("one.txt"), "old\n").expect("fixture");
+    let executor = executor(workspace.path());
+    let patch = concat!(
+        "diff --git a/one.txt b/one.txt\n",
+        "--- a/one.txt\n",
+        "+++ b/one.txt\n",
+        "@@ -1 +1 @@\n",
+        "-old\n",
+        "+new\n",
+        "diff --git a/two.txt b/two.txt\n",
+        "new file mode 100644\n",
+        "--- /dev/null\n",
+        "+++ b/two.txt\n",
+        "@@ -0,0 +1 @@\n",
+        "+second\n",
+    );
+
+    let report = executor
+        .execute(
+            request("apply_patch", json!({"patch": patch})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("patch execution");
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("one.txt")).expect("one"),
+        "new\n"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("two.txt")).expect("two"),
+        "second\n"
+    );
+    assert_eq!(report.changed_files.len(), 2);
+    assert_eq!(report.before_images.len(), 2);
+    assert_eq!(report.after_images.len(), 2);
+}
+
+#[test]
+fn apply_patch_rejects_truncated_path_discovery() {
+    let error = parse_git_numstat_paths("1\t0\tfirst.txt\0", true)
+        .expect_err("truncated path output must not produce a partial checkpoint");
+
+    assert!(matches!(
+        error,
+        ToolError::InvalidArguments(message) if message.contains("checkpoint safely")
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn apply_patch_records_a_symlink_target_without_reading_its_destination() {
+    let workspace = tempdir().expect("workspace");
+    let outside = tempdir().expect("outside");
+    let outside_file = outside.path().join("secret.txt");
+    fs::write(&outside_file, "outside-secret-content").expect("outside fixture");
+    let link_target = outside_file.to_string_lossy();
+    let patch = format!(
+        concat!(
+            "diff --git a/link.txt b/link.txt\n",
+            "new file mode 120000\n",
+            "--- /dev/null\n",
+            "+++ b/link.txt\n",
+            "@@ -0,0 +1 @@\n",
+            "+{}\n",
+            "\\ No newline at end of file\n",
+        ),
+        link_target
+    );
+
+    let report = executor(workspace.path())
+        .execute(
+            request("apply_patch", json!({"patch": patch})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("patch execution");
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+    assert_eq!(
+        fs::read_link(workspace.path().join("link.txt")).expect("symlink"),
+        outside_file
+    );
+    let after = report.after_images.first().expect("post image");
+    assert_eq!(
+        after.content.as_deref(),
+        Some(link_target.as_bytes()),
+        "the post image must contain the link target, not destination bytes"
+    );
+    assert_ne!(
+        after.content.as_deref(),
+        Some(b"outside-secret-content".as_slice())
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_rejects_the_whole_patch_when_one_file_conflicts() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("one.txt"), "old\n").expect("fixture");
+    fs::write(workspace.path().join("two.txt"), "actual\n").expect("fixture");
+    let executor = executor(workspace.path());
+    let patch = concat!(
+        "diff --git a/one.txt b/one.txt\n",
+        "--- a/one.txt\n",
+        "+++ b/one.txt\n",
+        "@@ -1 +1 @@\n",
+        "-old\n",
+        "+new\n",
+        "diff --git a/two.txt b/two.txt\n",
+        "--- a/two.txt\n",
+        "+++ b/two.txt\n",
+        "@@ -1 +1 @@\n",
+        "-expected\n",
+        "+changed\n",
+    );
+
+    let report = executor
+        .execute(
+            request("apply_patch", json!({"patch": patch})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("patch execution");
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Error);
+    assert!(report.envelope.summary.contains("atomically"));
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("one.txt")).expect("one"),
+        "old\n"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("two.txt")).expect("two"),
+        "actual\n"
+    );
+    assert_eq!(report.before_images.len(), 2);
+    assert_eq!(report.after_images.len(), 2);
+    assert!(report.changed_files.is_empty());
+    assert_eq!(
+        report.envelope.structured_facts["workspace_changes_known"],
+        true
+    );
+    assert_eq!(
+        report.envelope.structured_facts["workspace_change_count"],
+        0
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn apply_patch_rejects_a_symlink_parent_changed_after_checkpoint() {
+    use std::os::unix::fs::symlink;
+
+    let workspace = tempdir().expect("workspace");
+    let first = workspace.path().join("first");
+    let second = workspace.path().join("second");
+    fs::create_dir(&first).expect("first");
+    fs::create_dir(&second).expect("second");
+    let link = workspace.path().join("target");
+    symlink(&first, &link).expect("first symlink");
+    let executor = executor(workspace.path());
+    let patch = concat!(
+        "diff --git a/target/output.txt b/target/output.txt\n",
+        "new file mode 100644\n",
+        "--- /dev/null\n",
+        "+++ b/target/output.txt\n",
+        "@@ -0,0 +1 @@\n",
+        "+blocked\n",
+    );
+    let request = request("apply_patch", json!({"patch": patch}));
+    let policy = executor.evaluate(&request).expect("policy");
+    let before_images = executor
+        .prepare_side_effect(&request)
+        .await
+        .expect("checkpoint");
+    fs::remove_file(&link).expect("remove symlink");
+    symlink(&second, &link).expect("second symlink");
+
+    let report = executor
+        .execute_with_policy_and_before_images(
+            request,
+            policy,
+            false,
+            CancellationToken::new(),
+            before_images,
+        )
+        .await
+        .expect("conflict report");
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Error);
+    assert_eq!(
+        report.envelope.summary,
+        "patch target paths changed after checkpoint"
+    );
+    assert!(!first.join("output.txt").exists());
+    assert!(!second.join("output.txt").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn apply_patch_rechecks_a_symlink_parent_before_an_outside_write() {
+    use std::os::unix::fs::symlink;
+
+    let workspace = tempdir().expect("workspace");
+    let outside = tempdir().expect("outside");
+    let inside = workspace.path().join("inside");
+    fs::create_dir(&inside).expect("inside");
+    let link = workspace.path().join("target");
+    symlink(&inside, &link).expect("inside symlink");
+    let executor = executor(workspace.path());
+    let patch = concat!(
+        "diff --git a/target/output.txt b/target/output.txt\n",
+        "new file mode 100644\n",
+        "--- /dev/null\n",
+        "+++ b/target/output.txt\n",
+        "@@ -0,0 +1 @@\n",
+        "+blocked\n",
+    );
+    let request = request("apply_patch", json!({"patch": patch}));
+    let policy = executor.evaluate(&request).expect("policy");
+    let before_images = executor
+        .prepare_side_effect(&request)
+        .await
+        .expect("checkpoint");
+    fs::remove_file(&link).expect("remove symlink");
+    symlink(outside.path(), &link).expect("outside symlink");
+
+    let result = executor
+        .execute_with_policy_and_before_images(
+            request,
+            policy,
+            false,
+            CancellationToken::new(),
+            before_images,
+        )
+        .await;
+
+    assert!(matches!(result, Err(ToolError::Execution(_))));
+    assert!(!outside.path().join("output.txt").exists());
+}
+
+#[tokio::test]
+async fn container_workspace_paths_map_to_the_active_workspace() {
+    let workspace = tempdir().expect("workspace");
+    let executor = executor(workspace.path());
+
+    let report = executor
+        .execute(
+            request(
+                "write_file",
+                json!({"path": "/app/mapped.txt", "content": "mapped"}),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("write execution");
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("mapped.txt")).expect("mapped"),
+        "mapped"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn required_content_comparison_rejects_workspace_symlink_escape() {
+    use std::os::unix::fs::symlink;
+
+    let workspace = tempdir().expect("workspace");
+    let outside = tempdir().expect("outside");
+    fs::write(outside.path().join("secret.txt"), "secret").expect("outside file");
+    symlink(
+        outside.path().join("secret.txt"),
+        workspace.path().join("linked.txt"),
+    )
+    .expect("outside symlink");
+    let executor = executor(workspace.path());
+
+    let comparison = executor
+        .compare_workspace_file_content("linked.txt", b"secret")
+        .await;
+
+    assert!(matches!(comparison, Err(ToolError::Execution(_))));
 }
 
 #[tokio::test]
@@ -839,12 +1169,9 @@ async fn shell_reuses_the_persisted_preparation_as_its_diff_baseline() {
 
     fs::write(workspace.path().join("tracked.txt"), "between").expect("concurrent mutation");
     let report = executor
-        .execute_with_policy_and_preparation_with_progress(
-            request,
-            policy,
-            true,
+        .invoke(
+            ToolInvocation::new(request, policy, true).with_preparation(preparation),
             CancellationToken::new(),
-            preparation,
             None,
         )
         .await
@@ -1156,6 +1483,87 @@ async fn process_cancellation_terminates_descendants_and_drains_pipes() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn process_timeout_interrupts_a_blocked_stdin_write() {
+    let workspace = tempdir().expect("workspace");
+    let input = vec![b'x'; 16 * 1024 * 1024];
+    let args = ["-c".to_owned(), "sleep 5".to_owned()];
+    let sandbox = golutra_sandbox::SystemSandbox::detect();
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(1),
+        run_process_with_progress(
+            ProcessExecutionRequest {
+                program: "sh",
+                args: &args,
+                cwd: workspace.path(),
+                workspace_root: workspace.path(),
+                timeout_ms: 20,
+                cancellation: CancellationToken::new(),
+                sandbox: &sandbox,
+                workspace_access: golutra_sandbox::WorkspaceAccess::ReadWrite,
+                allow_network: false,
+                stdin: Some(&input),
+                isolated_home: false,
+            },
+            None,
+        ),
+    )
+    .await
+    .expect("blocked stdin write respects the process timeout")
+    .expect("process result");
+
+    assert!(output.timed_out);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_stdin_failure_preserves_the_child_exit_and_output() {
+    let workspace = tempdir().expect("workspace");
+    let input = vec![b'x'; 16 * 1024 * 1024];
+    let args = [
+        "-c".to_owned(),
+        concat!(
+            "exec 0<&-; ",
+            "printf 'stdout-before-exit\\n'; ",
+            "sleep 0.05; ",
+            "printf 'stderr-before-exit\\n' >&2; ",
+            "exit 2"
+        )
+        .to_owned(),
+    ];
+    let sandbox = golutra_sandbox::SystemSandbox::process_only();
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(2),
+        run_process_with_progress(
+            ProcessExecutionRequest {
+                program: "sh",
+                args: &args,
+                cwd: workspace.path(),
+                workspace_root: workspace.path(),
+                timeout_ms: 1_000,
+                cancellation: CancellationToken::new(),
+                sandbox: &sandbox,
+                workspace_access: golutra_sandbox::WorkspaceAccess::ReadWrite,
+                allow_network: false,
+                stdin: Some(&input),
+                isolated_home: false,
+            },
+            None,
+        ),
+    )
+    .await
+    .expect("child cleanup remains bounded")
+    .expect("process result survives stdin failure");
+
+    assert_eq!(output.exit_code, Some(2));
+    assert!(output.stdin_error.is_some());
+    assert!(output.raw_output.contains("stdout-before-exit"));
+    assert!(output.raw_output.contains("stderr-before-exit"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn process_output_is_bounded_while_pipe_is_drained() {
     let workspace = tempdir().expect("workspace");
     let output = tokio::time::timeout(
@@ -1345,6 +1753,7 @@ async fn caller_declared_verifier_records_pass_and_failure_as_evidence() {
     let workspace = tempdir().expect("workspace");
     let executor = executor(workspace.path());
     let request = |expected_exit_code| VerifierExecutionRequest {
+        tool_call_id: ToolCallId::new(),
         session_id: SessionId::new(),
         turn_id: Some(TurnId::new()),
         program: "sh".to_owned(),
@@ -1372,12 +1781,77 @@ async fn caller_declared_verifier_records_pass_and_failure_as_evidence() {
 }
 
 #[tokio::test]
+async fn caller_declared_verifier_records_workspace_mutations() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("tracked.txt"), "before").expect("tracked fixture");
+    let tool_call_id = ToolCallId::new();
+    let report = executor(workspace.path())
+        .with_sandbox(SystemSandbox::process_only())
+        .execute_verifier(
+            VerifierExecutionRequest {
+                tool_call_id,
+                session_id: SessionId::new(),
+                turn_id: Some(TurnId::new()),
+                program: "sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    "printf after > tracked.txt; printf created > created.txt".to_owned(),
+                ],
+                cwd: PathBuf::from("."),
+                timeout_ms: 5_000,
+                expected_exit_code: 0,
+                max_output_bytes: 1024,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("verifier runs");
+
+    assert_eq!(report.envelope.tool_call_id, tool_call_id);
+    assert_eq!(report.envelope.status, ToolResultStatus::Error);
+    assert_eq!(
+        report.envelope.structured_facts["workspace_mutation_detected"],
+        true
+    );
+    assert_eq!(
+        report.envelope.structured_facts["workspace_changes_known"],
+        true
+    );
+    assert_eq!(
+        report.envelope.structured_facts["workspace_change_count"],
+        2
+    );
+    let changed_names = report
+        .changed_files
+        .iter()
+        .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        changed_names,
+        BTreeSet::from(["created.txt", "tracked.txt"])
+    );
+    assert!(report.before_images.iter().any(|image| {
+        image.path.ends_with("tracked.txt") && image.content.as_deref() == Some(b"before")
+    }));
+    assert!(report.after_images.iter().any(|image| {
+        image.path.ends_with("tracked.txt") && image.content.as_deref() == Some(b"after")
+    }));
+    assert!(
+        report
+            .before_images
+            .iter()
+            .any(|image| { image.path.ends_with("created.txt") && image.content.is_none() })
+    );
+}
+
+#[tokio::test]
 async fn caller_declared_verifier_rejects_cwd_outside_workspace() {
     let workspace = tempdir().expect("workspace");
     let outside = tempdir().expect("outside");
     let error = executor(workspace.path())
         .execute_verifier(
             VerifierExecutionRequest {
+                tool_call_id: ToolCallId::new(),
                 session_id: SessionId::new(),
                 turn_id: Some(TurnId::new()),
                 program: "true".to_owned(),

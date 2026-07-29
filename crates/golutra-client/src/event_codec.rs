@@ -3,7 +3,7 @@
 use golutra_context::ContextCompactionRecord;
 use golutra_core::{
     Actor, ActorKind, ArtifactId, ArtifactRecord, CommandId, ContextSnapshot, EventId, LoopAction,
-    RedactionStatus, SessionId, TaskId, TaskStatus, ThreadId, TurnId,
+    RedactionStatus, SessionId, TaskContract, TaskId, TaskStatus, ThreadId, TurnId,
 };
 use golutra_llm::{ProviderRequest, ProviderResponse, ProviderStreamEvent};
 use golutra_protocol::{EventFilter, RuntimeEvent, RuntimeEventSource, RuntimeEventType};
@@ -14,7 +14,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::{
-    ClientError, HostedAgentTask, RecoveredPendingTurn, compact_event_summary, prompt_from_payload,
+    ClientError, EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY, HostedAgentTask, LegacyTaskAdapter,
+    RecoveredPendingTurn, compact_event_summary, prompt_from_payload, task_contract_from_payload,
     title_from_payload,
 };
 
@@ -66,22 +67,85 @@ pub(crate) fn event_matches_filter(
 
 pub(crate) fn recovered_pending_turn_from_event(
     event: &RuntimeEvent,
-) -> Option<RecoveredPendingTurn> {
-    let turn_id = event.turn_id?;
-    let payload = event.payload.get("payload")?.clone();
+) -> Result<Option<RecoveredPendingTurn>, ClientError> {
+    let turn_id = event.turn_id.ok_or_else(|| {
+        ClientError::TaskExecution(format!(
+            "durable queued turn event {} is missing turn_id",
+            event.id
+        ))
+    })?;
+    let payload = event.payload.get("payload").cloned().ok_or_else(|| {
+        ClientError::TaskExecution(format!(
+            "durable queued turn event {} is missing payload",
+            event.id
+        ))
+    })?;
     let content = prompt_from_payload(&payload);
     if content.trim().is_empty() {
-        return None;
+        return Err(ClientError::TaskExecution(format!(
+            "durable queued turn event {} has an empty prompt",
+            event.id
+        )));
     }
     let steer = payload
         .get("steer")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let task_contract = payload
+    let task_contract = if payload
         .get("task_contract")
-        .filter(|value| !value.is_null())
-        .cloned()
-        .and_then(|value| serde_json::from_value(value).ok());
+        .is_some_and(|value| !value.is_null())
+    {
+        let contract: TaskContract = serde_json::from_value(payload["task_contract"].clone())
+            .map_err(|error| {
+                ClientError::TaskExecution(format!(
+                    "durable queued turn event {} has an invalid task contract: {error}",
+                    event.id
+                ))
+            })?;
+        Some(contract)
+    } else {
+        let mut contract = task_contract_from_payload(&payload)?;
+        LegacyTaskAdapter::new(&payload, &content).apply_to(&mut contract);
+        Some(contract)
+    };
+    if let Some(contract) = &task_contract {
+        contract.validate().map_err(|error| {
+            ClientError::TaskExecution(format!(
+                "durable queued turn event {} has an invalid task contract: {error}",
+                event.id
+            ))
+        })?;
+    }
+    let external_verifiers = match payload.get("external_verifiers") {
+        Some(value) => serde_json::from_value(value.clone()).map_err(|error| {
+            ClientError::TaskExecution(format!(
+                "durable queued turn event {} has invalid external verifiers: {error}",
+                event.id
+            ))
+        })?,
+        None => Vec::new(),
+    };
+    let allow_network = match payload.get("allow_network") {
+        None => false,
+        Some(Value::Bool(allow_network)) => *allow_network,
+        Some(_) => {
+            return Err(ClientError::TaskExecution(format!(
+                "durable queued turn event {} has non-boolean allow_network",
+                event.id
+            )));
+        }
+    };
+    let external_verifiers_require_os_sandbox =
+        match payload.get(EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY) {
+            None => false,
+            Some(Value::Bool(required)) => *required,
+            Some(_) => {
+                return Err(ClientError::TaskExecution(format!(
+                    "durable queued turn event {} has an invalid verifier sandbox requirement",
+                    event.id
+                )));
+            }
+        };
     let command_id = event
         .payload
         .get("command_id")
@@ -98,7 +162,8 @@ pub(crate) fn recovered_pending_turn_from_event(
             kind: ActorKind::Runtime,
             id: "runtime-pending-turn-recovery".to_owned(),
         });
-    Some(RecoveredPendingTurn {
+    let output_schema = payload.get("output_schema").cloned();
+    Ok(Some(RecoveredPendingTurn {
         sequence_no: event.sequence_no,
         actor,
         payload,
@@ -107,9 +172,13 @@ pub(crate) fn recovered_pending_turn_from_event(
             turn_id,
             content,
             task_contract,
+            output_schema,
+            external_verifiers,
+            external_verifiers_require_os_sandbox,
+            allow_network,
             steer,
         },
-    })
+    }))
 }
 
 pub(crate) fn provider_raw_artifact(
@@ -553,8 +622,13 @@ pub(crate) fn trace_event_payload(
                 "step": completion.snapshot,
                 "fingerprint": completion.fingerprint,
                 "made_progress": completion.made_progress,
+                "made_material_progress": completion.made_material_progress,
                 "repeated_no_progress": completion.repeated_no_progress,
+                "correction_no_progress_steps": completion.correction_no_progress_steps,
+                "correction_no_progress_elapsed_ms": completion.correction_no_progress_elapsed_ms,
+                "advisory": completion.advisory,
                 "should_stop": completion.should_stop,
+                "stop_reason": completion.stop_reason,
             }),
         )),
         AgentLoopTraceEvent::StepCheckpointed(checkpoint) => Some((
@@ -793,6 +867,7 @@ pub(crate) fn trace_event_payload(
             provider_tool_call_id,
             tool_name,
             display_arguments,
+            recovery_policy,
         } => Some((
             RuntimeEventType::ToolStarted,
             RuntimeEventSource::Tool,
@@ -802,6 +877,7 @@ pub(crate) fn trace_event_payload(
                 "provider_tool_call_id": provider_tool_call_id,
                 "tool_name": tool_name,
                 "arguments": display_arguments,
+                "recovery_policy": recovery_policy,
             }),
         )),
         AgentLoopTraceEvent::ToolProgress(progress) => Some((
@@ -1008,4 +1084,86 @@ pub(crate) fn with_command_payload(
         "runtime": event.payload,
     });
     event
+}
+
+#[cfg(test)]
+mod tests {
+    use golutra_core::WorkspaceChangeRequirement;
+
+    use super::*;
+
+    #[test]
+    fn legacy_pending_turn_recovery_rebuilds_its_task_contract() {
+        let turn_id = TurnId::new();
+        let mut event = host_event(
+            7,
+            SessionId::new(),
+            Some(TaskId::new()),
+            RuntimeEventType::TurnQueued,
+            RuntimeEventSource::Runtime,
+            json!({
+                "payload": {
+                    "prompt": "write the requested content to result.txt",
+                    "path": "result.txt",
+                    "content": "recovered\n",
+                    "output_schema": {"type": "object"},
+                    "allow_network": true,
+                    "_external_verifiers_require_os_sandbox": true
+                }
+            }),
+        );
+        event.turn_id = Some(turn_id);
+
+        let recovered = recovered_pending_turn_from_event(&event)
+            .expect("valid durable turn")
+            .expect("pending turn");
+        let contract = recovered.pending.task_contract.expect("adapted contract");
+
+        assert_eq!(
+            contract.workspace_change,
+            WorkspaceChangeRequirement::Required
+        );
+        assert_eq!(contract.required_paths, ["result.txt"]);
+        assert_eq!(contract.required_file_contents.len(), 1);
+        assert_eq!(contract.required_file_contents[0].path, "result.txt");
+        assert_eq!(contract.required_file_contents[0].content, "recovered\n");
+        assert_eq!(
+            recovered.pending.output_schema,
+            Some(json!({"type": "object"}))
+        );
+        assert!(recovered.pending.allow_network);
+        assert!(recovered.pending.external_verifiers_require_os_sandbox);
+    }
+
+    #[test]
+    fn pending_turn_recovery_rejects_malformed_or_invalid_contracts() {
+        for payload in [
+            json!({
+                "prompt": "run a recovered turn",
+                "task_contract": {"verification": "not-a-verification-mode"}
+            }),
+            json!({
+                "prompt": "run a recovered turn",
+                "external_verifiers": "cargo test"
+            }),
+            json!({
+                "prompt": "run a recovered turn",
+                "task_contract": {"schema_version": 999}
+            }),
+        ] {
+            let mut event = host_event(
+                7,
+                SessionId::new(),
+                Some(TaskId::new()),
+                RuntimeEventType::TurnQueued,
+                RuntimeEventSource::Runtime,
+                json!({"payload": payload}),
+            );
+            event.turn_id = Some(TurnId::new());
+
+            let error = recovered_pending_turn_from_event(&event)
+                .expect_err("malformed durable verification data must fail recovery");
+            assert!(error.to_string().contains("durable queued turn event"));
+        }
+    }
 }

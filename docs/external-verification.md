@@ -10,7 +10,7 @@ terminal task state.
 ```text
 model/tool loop
 -> candidate workspace
--> caller-declared external verifier
+-> caller-declared or command-boundary-discovered external verifier
 -> artifact + evidence + objective:test check
 -> VerificationRecord
 -> StopSuccess / StopFailed / StopPartial
@@ -28,16 +28,26 @@ supersedes failed delivery-path, content, schema, policy or verifier assertions.
 Delivery-path checks apply to turns that changed files; a resume turn may verify
 an unchanged existing delivery without manufacturing another write.
 
+When a code/workspace task omits the `external_verifiers` field, the command
+adapter conservatively discovers project checks from regular, bounded manifest
+files: Cargo workspace tests, one meaningful Node script, pytest for an
+identifiable Python project, and Go package tests. Manifest symlinks and
+oversized files are ignored. An explicitly supplied list remains authoritative;
+an explicit empty list disables discovery. Each queued turn owns its own list,
+so a conversational follow-up never inherits a previous verifier.
+
 ## Entry Points
 
 - `golutra exec`: `--completion-criterion`, `--verify-program`, repeated
-  `--verify-arg`, `--verify-cwd`, timeout/exit/output controls.
+  `--verify-arg`, `--verify-cwd`, timeout/exit/output controls. With no explicit
+  verifier it uses project discovery; `--no-project-verifier-discovery` opts out.
 - App Server and Rust SDK: `AgentTurnOptions.external_verifiers`.
 - Python SDK: `Thread.run(..., external_verifiers=[...])`.
 - TypeScript SDK: `Thread.run(..., { externalVerifiers: [...] })`.
 
-MCP tools intentionally do not expose this field because their arguments may
-be model-generated rather than trusted operator configuration.
+MCP tools intentionally disable project discovery and do not expose this field
+because their arguments may be model-generated rather than trusted operator
+configuration.
 
 For bounded repair loops, `scripts/run_agent_benchmark.py` starts an exec turn,
 captures its thread id from JSONL, runs the same verifier independently for
@@ -46,8 +56,9 @@ adapter does not add benchmark-specific behavior to Runtime.
 
 ## Trust Boundary
 
-The caller owns verifier argv and is responsible for its code. A verifier may
-execute untrusted workspace content, so CI should run Golutra in an isolated
-machine or container. Explicit exec `--approval-mode auto` only resolves model
+Explicit verifier argv is caller-owned. Discovered commands are selected only
+from the fixed project catalog, but they can still execute untrusted workspace
+scripts, so CI should run Golutra in an isolated machine or container. Explicit
+exec `--approval-mode auto` only resolves model
 actions already classified as `Ask`; it cannot approve `Block`/`Deny` actions or
 disable workspace, secret, metacharacter, network and sandbox controls.
