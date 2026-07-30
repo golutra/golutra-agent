@@ -491,6 +491,23 @@ impl RuntimeHost {
         task: &HostedAgentTask,
         status: TaskStatus,
     ) -> Result<(), ClientError> {
+        self.finish_lane_with_outcome(
+            task,
+            status,
+            golutra_core::TaskOutcome::from_status(
+                status,
+                golutra_core::VerificationResult::Unknown,
+            ),
+        )
+        .await
+    }
+
+    pub(super) async fn finish_lane_with_outcome(
+        &self,
+        task: &HostedAgentTask,
+        status: TaskStatus,
+        outcome: golutra_core::TaskOutcome,
+    ) -> Result<(), ClientError> {
         self.workspace_change_tracker
             .lock()
             .await
@@ -503,6 +520,7 @@ impl RuntimeHost {
                 transition.event.payload["summary"] =
                     json!(format!("runtime task finished with {status:?}"));
                 transition.event.payload["status"] = json!(status);
+                transition.event.payload["outcome"] = json!(outcome);
                 transition.event.payload["post_task_governance"] = json!({"status": "pending"});
                 self.record_event(transition.event).await
             }
@@ -516,6 +534,7 @@ impl RuntimeHost {
                     json!({
                         "summary": format!("persisted runtime task finished with {status:?}"),
                         "status": status,
+                        "outcome": outcome,
                         "post_task_governance": {"status": "pending"},
                     }),
                 ))
@@ -550,8 +569,12 @@ impl RuntimeHost {
                     "task cancelled by controller",
                 )
                 .await?;
-            self.finish_lane(&failure_task, TaskStatus::Cancelled)
-                .await?;
+            self.finish_lane_with_outcome(
+                &failure_task,
+                TaskStatus::Cancelled,
+                golutra_core::TaskOutcome::from_verification(TaskStatus::Cancelled, &verification),
+            )
+            .await?;
             self.schedule_task_evaluation_best_effort(
                 &failure_task,
                 HostedTaskEvaluation {
@@ -594,7 +617,12 @@ impl RuntimeHost {
             }),
         ))
         .await?;
-        self.finish_lane(&failure_task, TaskStatus::Failed).await?;
+        self.finish_lane_with_outcome(
+            &failure_task,
+            TaskStatus::Failed,
+            golutra_core::TaskOutcome::from_verification(TaskStatus::Failed, &verification),
+        )
+        .await?;
         self.schedule_task_evaluation_best_effort(
             &failure_task,
             HostedTaskEvaluation {

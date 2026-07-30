@@ -4,10 +4,11 @@ use std::{collections::HashMap, fs, io::Read, path::Path};
 
 use base64::Engine;
 use golutra_core::{
-    ActorKind, EvidenceId, EvidenceRecord, EvidenceStrength, RedactionStatus, TraceView,
+    ActorKind, EvidenceId, EvidenceRecord, EvidenceStrength, ExternalVerificationStatus,
+    RedactionStatus, TaskOutcome, TaskStatus, TraceView, VerificationResult,
 };
 use golutra_eval::{
-    EvaluationAttestation, EvaluationPartitionKind, ExternalEvaluationRecord,
+    EvaluationAttestation, EvaluationPartitionKind, EvaluationVerdict, ExternalEvaluationRecord,
     ExternalEvaluationTrust, ImportedEvaluationArtifact, external_evaluation_result_digest,
 };
 use golutra_protocol::{RuntimeEventSource, RuntimeEventType};
@@ -154,6 +155,14 @@ impl RuntimeHost {
                 .first()
                 .map(|artifact| artifact.artifact_ref);
             self.record_event(ingestion_event).await?;
+            self.close_deferred_external_verification(
+                session_id,
+                record.source_task_id,
+                record.verdict,
+                record.evaluation_id.clone(),
+                record.imported_evidence_refs.clone(),
+            )
+            .await?;
             if let Some(comparison) = comparison {
                 self.record_event(host_event(
                     self.next_sequence_no(),
@@ -190,6 +199,87 @@ impl RuntimeHost {
                 )
             }),
         })
+    }
+
+    async fn close_deferred_external_verification(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+        verdict: EvaluationVerdict,
+        evaluation_id: String,
+        imported_evidence_refs: Vec<EvidenceId>,
+    ) -> Result<(), ClientError> {
+        let events = self
+            .repositories
+            .events
+            .load(session_id, Some(task_id), None)
+            .await?;
+        let terminal = events
+            .iter()
+            .rev()
+            .find(|event| event.event_type.is_task_terminal());
+        let Some(terminal) = terminal else {
+            return Ok(());
+        };
+        let deferred = terminal
+            .payload
+            .get("outcome")
+            .and_then(|value| value.get("external_verification"))
+            .and_then(Value::as_str)
+            == Some("pending");
+        if !deferred {
+            return Ok(());
+        }
+        let status = terminal
+            .payload
+            .get("status")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<TaskStatus>(value).ok())
+            .unwrap_or(TaskStatus::Completed);
+        let mut evidence_refs = terminal
+            .payload
+            .get("outcome")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<TaskOutcome>(value).ok())
+            .map(|outcome| outcome.evidence_refs)
+            .unwrap_or_default();
+        evidence_refs.extend(imported_evidence_refs);
+        evidence_refs.sort();
+        evidence_refs.dedup();
+        let external_status = match verdict {
+            EvaluationVerdict::Pass => ExternalVerificationStatus::Pass,
+            EvaluationVerdict::Partial => ExternalVerificationStatus::Partial,
+            EvaluationVerdict::Fail => ExternalVerificationStatus::Fail,
+            EvaluationVerdict::Unknown => ExternalVerificationStatus::Unknown,
+        };
+        let outcome = terminal
+            .payload
+            .get("outcome")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<TaskOutcome>(value).ok())
+            .unwrap_or_else(|| TaskOutcome::from_status(status, VerificationResult::Unknown))
+            .with_evidence_refs(evidence_refs)
+            .with_external_verification(external_status);
+        self.record_event(agent_event_for_turn(
+            self.next_sequence_no(),
+            &HostedAgentTask {
+                session_id,
+                task_id,
+                turn_id: terminal.turn_id.unwrap_or_default(),
+                payload: Value::Null,
+            },
+            terminal.turn_id.unwrap_or_default(),
+            RuntimeEventType::TaskCompleted,
+            RuntimeEventSource::Evaluator,
+            json!({
+                "summary": format!("external evaluator closed deferred task verification as {verdict:?}"),
+                "status": status,
+                "outcome": outcome,
+                "external_evaluation_id": evaluation_id,
+                "post_task_governance": {"status": "pending"},
+            }),
+        ))
+        .await
     }
 
     async fn import_external_evidence(

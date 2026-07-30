@@ -201,6 +201,7 @@ impl GolutraMcpServer {
                 completion_criteria: parameters.completion_criteria,
                 allow_network: false,
                 yolo: false,
+                defer_external_verification: false,
                 external_verifiers: Vec::new(),
                 discover_project_verifiers: false,
             },

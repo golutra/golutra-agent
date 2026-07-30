@@ -90,6 +90,7 @@ class AgentThreadRef(TypedDict, total=False):
 class AgentTurnOptions(TypedDict, total=False):
     allow_network: NotRequired[bool]
     completion_criteria: NotRequired[list[str]]
+    defer_external_verification: NotRequired[bool]
     discover_project_verifiers: NotRequired[bool]
     external_verifiers: NotRequired[list[ExternalVerificationSpec]]
     output_schema: NotRequired[Any]
@@ -99,6 +100,7 @@ class AgentTurnOptions(TypedDict, total=False):
 class AgentTurnResult(TypedDict, total=False):
     final_message: NotRequired[str | None]
     last_sequence_no: NotRequired[int | None]
+    outcome: NotRequired[TaskOutcome | None]
     session_id: Required[str]
     status: Required[TaskStatus]
     task_id: NotRequired[str | None]
@@ -834,6 +836,8 @@ class EvolutionState(TypedDict, total=False):
     runs: Required[list[OpenEndedRun]]
     skills: Required[list[SkillLifecycleRecord]]
 
+ExecutionOutcome: TypeAlias = Literal['running', 'candidate_ready', 'completed', 'partial', 'failed', 'aborted', 'blocked', 'cancelled', 'interrupted', 'uncertain']
+
 class ExternalEvaluationAssertion(TypedDict, total=False):
     assertion_id: Required[str]
     evidence_refs: Required[list[str]]
@@ -905,6 +909,10 @@ class ExternalVerificationSpec(TypedDict, total=False):
     max_output_bytes: NotRequired[int]
     program: Required[str]
     timeout_ms: NotRequired[int]
+
+ExternalVerificationStatus: TypeAlias = Literal['not_requested', 'pending', 'pass', 'partial', 'fail', 'unknown']
+
+FailureClass: TypeAlias = Literal['runtime_control_flow', 'context', 'provider', 'tool', 'policy', 'verification', 'external_evaluation', 'environment', 'timeout', 'unknown']
 
 class FailureDiagnosis(TypedDict, total=False):
     actual_behavior: Required[str]
@@ -1586,6 +1594,16 @@ class TaskContract(TypedDict, total=False):
     verification: NotRequired[VerificationRequirement]
     workspace_change: NotRequired[WorkspaceChangeRequirement]
 
+class TaskOutcome(TypedDict, total=False):
+    confidence: Required[int]
+    evidence_refs: NotRequired[list[str]]
+    execution: Required[ExecutionOutcome]
+    external_verification: NotRequired[ExternalVerificationStatus]
+    failure_class: NotRequired[FailureClass | None]
+    next_action: NotRequired[str | None]
+    scorable: Required[bool]
+    verification: Required[VerificationResult]
+
 TaskReconciliationDecision: TypeAlias = Literal['no_side_effect_observed', 'side_effect_observed', 'abandon']
 
 class TaskReconciliationRecord(TypedDict, total=False):
@@ -1806,7 +1824,7 @@ class VerificationCheck(TypedDict, total=False):
     name: Required[str]
     passed: Required[bool]
 
-VerificationCheckKind: TypeAlias = Literal['tool_execution', 'workspace_change', 'objective_validation', 'assistant_response', 'schema']
+VerificationCheckKind: TypeAlias = Literal['tool_execution', 'workspace_change', 'objective_validation', 'assistant_response', 'schema', 'policy']
 
 VerificationDimensionStatus: TypeAlias = Literal['pass', 'fail', 'partial', 'unknown']
 
@@ -2004,6 +2022,7 @@ __all__ = [
     "EvidenceRecord",
     "EvidenceStrength",
     "EvolutionState",
+    "ExecutionOutcome",
     "ExternalEvaluationAssertion",
     "ExternalEvaluationPhase",
     "ExternalEvaluationPhaseKind",
@@ -2012,6 +2031,8 @@ __all__ = [
     "ExternalEvaluationTerminalCause",
     "ExternalEvaluationTrust",
     "ExternalVerificationSpec",
+    "ExternalVerificationStatus",
+    "FailureClass",
     "FailureDiagnosis",
     "FailureDomain",
     "FailureEpisode",
@@ -2104,6 +2125,7 @@ __all__ = [
     "StorageStats",
     "TaskClass",
     "TaskContract",
+    "TaskOutcome",
     "TaskReconciliationDecision",
     "TaskReconciliationRecord",
     "TaskRecoveryDisposition",

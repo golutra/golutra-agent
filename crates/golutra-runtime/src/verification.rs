@@ -6,8 +6,9 @@
 //! result from assistant text.
 
 use golutra_core::{
-    TaskContract, TaskId, VerificationCheck, VerificationCheckKind, VerificationIndependence,
-    VerificationPlan, VerificationRecord, VerificationResult, WorkspaceChangeRequirement,
+    TaskContract, TaskId, VerificationAssertionStatus, VerificationCheck, VerificationCheckKind,
+    VerificationIndependence, VerificationPlan, VerificationRecord, VerificationResult,
+    WorkspaceChangeRequirement,
 };
 use golutra_verify::{VerificationInput, VerificationRunner};
 
@@ -58,6 +59,33 @@ impl RuntimeVerificationService {
         let (mut record, plan) = self.runner.verify_with_plan(input, plan);
         record.environment_digest = Some(environment_digest);
 
+        let policy_status = plan
+            .policy_assertions
+            .iter()
+            .find(|assertion| assertion.criterion_id == "policy")
+            .map(|assertion| assertion.status);
+        match policy_status {
+            Some(VerificationAssertionStatus::Fail) => {
+                record.result = VerificationResult::Fail;
+                record.policy_status = "policy_blocked".to_owned();
+                record
+                    .residual_risks
+                    .push("a blocking policy decision was recorded".to_owned());
+            }
+            Some(VerificationAssertionStatus::Unknown) | None => {
+                if record.result == VerificationResult::Pass {
+                    record.result = VerificationResult::Partial;
+                }
+                record.policy_status = "policy_unknown".to_owned();
+                record
+                    .residual_risks
+                    .push("policy decision evidence is missing".to_owned());
+            }
+            Some(VerificationAssertionStatus::Pass)
+            | Some(VerificationAssertionStatus::Pending)
+            | Some(VerificationAssertionStatus::NotApplicable) => {}
+        }
+
         let mut contract_failures = Vec::new();
         match contract.workspace_change {
             WorkspaceChangeRequirement::Required if !workspace_changed => {
@@ -83,6 +111,10 @@ impl RuntimeVerificationService {
             record
                 .residual_risks
                 .extend(contract_failures.into_iter().map(ToOwned::to_owned));
+        } else if record.policy_status == "policy_unknown" {
+            record
+                .residual_risks
+                .push("task contract cannot be satisfied without policy evidence".to_owned());
         } else {
             record.policy_status = "task_contract_satisfied".to_owned();
             if contract.requires_independent_verification() {

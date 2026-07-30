@@ -212,6 +212,7 @@ class AdapterHelpersTest(unittest.TestCase):
 
             self.assertIsNotNone(session.command)
             self.assertIn("--yolo", session.command.command)
+            self.assertIn("--defer-external-verification", session.command.command)
             self.assertGreater(session.command.max_timeout_sec, 14.0)
             self.assertLessEqual(session.command.max_timeout_sec, 15.0)
             self.assertEqual(session.sent_keys, [(["C-c"], 0.1)])

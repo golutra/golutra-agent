@@ -456,7 +456,22 @@ impl RuntimeHost {
             ..task.clone()
         };
         let final_objective = outcome.verification.objective.clone();
-        self.finish_lane(&final_task, terminal_status).await?;
+        let task_outcome =
+            golutra_core::TaskOutcome::from_verification(terminal_status, &outcome.verification)
+                .with_external_verification(
+                    if task
+                        .payload
+                        .get("defer_external_verification")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        golutra_core::ExternalVerificationStatus::Pending
+                    } else {
+                        golutra_core::ExternalVerificationStatus::NotRequested
+                    },
+                );
+        self.finish_lane_with_outcome(&final_task, terminal_status, task_outcome)
+            .await?;
         if let Err(error) = self
             .promote_successful_task_memory(
                 &final_task,

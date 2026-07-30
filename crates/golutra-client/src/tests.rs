@@ -4285,7 +4285,7 @@ async fn approval_command_unblocks_waiting_tool_and_records_resolution() {
         })
         .await
         .expect("approval resolution");
-    wait_for_status(&transport, session_id, TaskStatus::Partial).await;
+    wait_for_status(&transport, session_id, TaskStatus::Failed).await;
     let events = transport
         .host
         .store
@@ -4355,7 +4355,7 @@ async fn observer_must_take_over_before_controlling_or_approving_a_task() {
         ))
         .await
         .expect("new controller deny");
-    wait_for_status(&transport, session_id, TaskStatus::Partial).await;
+    wait_for_status(&transport, session_id, TaskStatus::Failed).await;
 
     assert!(!denied.accepted);
     assert!(!abort.accepted);
@@ -4542,7 +4542,10 @@ async fn persisted_ephemeral_runtime_retains_isolated_state_and_full_run_bundle(
     let mut handle = thread
         .start_turn(
             "write file persisted.txt with content retained state",
-            golutra_protocol::AgentTurnOptions::default(),
+            golutra_protocol::AgentTurnOptions {
+                defer_external_verification: true,
+                ..golutra_protocol::AgentTurnOptions::default()
+            },
         )
         .await
         .expect("turn");
@@ -4777,6 +4780,21 @@ async fn persisted_ephemeral_runtime_retains_isolated_state_and_full_run_bundle(
         .await
         .expect("ingest external result into reopened run");
     assert!(ack.accepted);
+    let post_evaluation_events = reopened
+        .load_events(result.session_id, Some(task_id), None)
+        .await
+        .expect("post-evaluation events");
+    let post_evaluation_terminal = post_evaluation_events
+        .iter()
+        .rev()
+        .find(|event| event.event_type.is_task_terminal())
+        .expect("post-evaluation terminal event");
+    assert_eq!(
+        post_evaluation_terminal
+            .payload
+            .pointer("/outcome/external_verification"),
+        Some(&json!("pass"))
+    );
     fs::write(
         state_dir.join("results.json"),
         b"source changed after ingestion",

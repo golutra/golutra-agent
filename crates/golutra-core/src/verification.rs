@@ -38,6 +38,7 @@ pub enum VerificationCheckKind {
     ObjectiveValidation,
     AssistantResponse,
     Schema,
+    Policy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
@@ -93,6 +94,8 @@ fn infer_legacy_verification_check_kind(name: &str) -> VerificationCheckKind {
         VerificationCheckKind::ObjectiveValidation
     } else if name.starts_with("tool:") {
         VerificationCheckKind::ToolExecution
+    } else if name.starts_with("policy:") {
+        VerificationCheckKind::Policy
     } else {
         VerificationCheckKind::ObjectiveValidation
     }

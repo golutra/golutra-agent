@@ -221,6 +221,9 @@ struct ExecArgs {
     /// OS-level network isolation.
     #[arg(long, global = true)]
     yolo: bool,
+    /// Keep the typed task outcome open for a later external evaluator.
+    #[arg(long)]
+    defer_external_verification: bool,
     /// Write isolated runtime state and full owner-only observations to this new directory.
     /// Implies --ephemeral. The legacy --ephemeral-state-dir spelling remains accepted.
     #[arg(
@@ -2585,6 +2588,7 @@ async fn run_exec(transport: &RuntimeTransport, args: ExecArgs) -> miette::Resul
                 completion_criteria: args.completion_criteria,
                 allow_network: args.allow_network || args.yolo,
                 yolo: args.yolo,
+                defer_external_verification: args.defer_external_verification,
                 external_verifiers,
                 discover_project_verifiers: !args.no_project_verifier_discovery,
             },

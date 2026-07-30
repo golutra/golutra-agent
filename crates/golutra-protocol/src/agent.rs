@@ -5,8 +5,8 @@
 //! clients; adapters must never create a second task state machine.
 
 use golutra_core::{
-    CommandId, SessionId, TaskContract, TaskId, TaskStatus, ThreadId, Timestamp, TurnId,
-    VerificationRecord,
+    CommandId, SessionId, TaskContract, TaskId, TaskOutcome, TaskStatus, ThreadId, Timestamp,
+    TurnId, VerificationRecord,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -151,6 +151,8 @@ pub struct AgentTurnResult {
     pub status: TaskStatus,
     pub final_message: Option<String>,
     pub verification: Option<VerificationRecord>,
+    #[serde(default)]
+    pub outcome: Option<TaskOutcome>,
     pub last_sequence_no: Option<u64>,
 }
 
@@ -183,6 +185,9 @@ pub struct AgentTurnOptions {
     /// supplied. Set this to false to send an explicit empty list.
     #[serde(default = "default_project_verifier_discovery")]
     pub discover_project_verifiers: bool,
+    /// Keep the typed outcome open for a later evaluator overlay.
+    #[serde(default)]
+    pub defer_external_verification: bool,
 }
 
 impl Default for AgentTurnOptions {
@@ -195,6 +200,7 @@ impl Default for AgentTurnOptions {
             yolo: false,
             external_verifiers: Vec::new(),
             discover_project_verifiers: true,
+            defer_external_verification: false,
         }
     }
 }

@@ -346,12 +346,17 @@ impl RuntimeHost {
         // caller that observes the terminal projection cannot race its own runtime's lease.
         self.wait_for_finishing_task_control(thread.session_id)
             .await?;
-        let SessionLeaseAttempt::Acquired(_lease) =
-            self.try_acquire_session_lease(thread.session_id)?
-        else {
-            return Err(ClientError::InvalidSession(format!(
-                "thread `{thread_id}` is owned by another runtime"
-            )));
+        let lease_deadline = Instant::now() + TASK_CONTROL_CLEANUP_TIMEOUT;
+        let _lease = loop {
+            match self.try_acquire_session_lease(thread.session_id)? {
+                SessionLeaseAttempt::Acquired(lease) => break lease,
+                SessionLeaseAttempt::Busy if Instant::now() >= lease_deadline => {
+                    return Err(ClientError::InvalidSession(format!(
+                        "thread `{thread_id}` is owned by another runtime"
+                    )));
+                }
+                SessionLeaseAttempt::Busy => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
         };
         let expected_old_rollout_path = self.runtime_paths.as_ref().map(|paths| {
             rollout_path_for_workspace(paths, &source_workspace_root, thread.thread_id)

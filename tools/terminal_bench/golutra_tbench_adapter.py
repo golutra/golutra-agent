@@ -559,7 +559,7 @@ class GolutraAgent(BaseAgent):
             f"{environment} "
             f"/installed-agent/golutra --cwd {shlex.quote(workspace_path)} exec "
             "--run-dir /logs/golutra-runtime "
-            f"{network_flag}--yolo --approval-mode auto -- "
+            f"{network_flag}--yolo --approval-mode auto --defer-external-verification -- "
             f"{shlex.quote(rendered_instruction)}"
         )
         command_timeout_sec = max(

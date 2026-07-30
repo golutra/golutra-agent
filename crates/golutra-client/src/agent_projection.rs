@@ -5,7 +5,10 @@
 //! a queued turn must not finish when the task that was active before it is
 //! completed.
 
-use golutra_core::{CommandId, TaskId, TaskStatus, ToolResultStatus, TurnId, VerificationRecord};
+use golutra_core::{
+    CommandId, TaskId, TaskOutcome, TaskStatus, ToolResultStatus, TurnId, VerificationRecord,
+    VerificationResult,
+};
 use golutra_protocol::{
     AgentItem, AgentItemKind, AgentItemStatus, AgentStreamEvent, AgentThreadRef, AgentTurnResult,
     RuntimeEvent, RuntimeEventType,
@@ -20,6 +23,7 @@ pub struct AgentEventProjector {
     turn_id: Option<TurnId>,
     final_message: Option<String>,
     verification: Option<VerificationRecord>,
+    outcome: Option<TaskOutcome>,
     last_sequence_no: Option<u64>,
     terminal_status: Option<TaskStatus>,
     turn_started: bool,
@@ -36,6 +40,7 @@ impl AgentEventProjector {
             turn_id: None,
             final_message: None,
             verification: None,
+            outcome: None,
             last_sequence_no: None,
             terminal_status: None,
             turn_started: false,
@@ -90,7 +95,12 @@ impl AgentEventProjector {
 
     /// Project one fact. `None` means the fact belongs to another turn.
     pub fn project(&mut self, event: RuntimeEvent) -> Option<AgentStreamEvent> {
-        if self.finished || !self.accepts(&event) {
+        let late_evaluation_update = self.finished
+            && event.source == golutra_protocol::RuntimeEventSource::Evaluator
+            && event.event_type == RuntimeEventType::TaskCompleted
+            && event.task_id == self.task_id
+            && event.payload.get("outcome").is_some();
+        if (!late_evaluation_update && self.finished) || !self.accepts(&event) {
             return None;
         }
         self.last_sequence_no = Some(event.sequence_no);
@@ -112,6 +122,14 @@ impl AgentEventProjector {
                 .cloned()
                 .or_else(|| Some(event.payload.clone()))
                 .and_then(|value| serde_json::from_value(value).ok());
+        }
+        if let Some(outcome) = event
+            .payload
+            .get("outcome")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+        {
+            self.outcome = Some(outcome);
         }
 
         let timestamp = event.timestamp;
@@ -149,8 +167,19 @@ impl AgentEventProjector {
                     .and_then(|value| serde_json::from_value(value).ok())
                     .unwrap_or(TaskStatus::Failed);
                 self.terminal_status = Some(status);
+                if self.outcome.is_none() {
+                    self.outcome = Some(TaskOutcome::from_status(
+                        status,
+                        self.verification
+                            .as_ref()
+                            .map(|record| record.result)
+                            .unwrap_or(VerificationResult::Unknown),
+                    ));
+                }
                 self.finished = true;
-                if status == TaskStatus::Completed {
+                if late_evaluation_update {
+                    AgentStreamEvent::RuntimeEvent { event }
+                } else if status == TaskStatus::Completed {
                     AgentStreamEvent::TurnCompleted {
                         thread_id: self.thread.thread_id,
                         session_id: self.thread.session_id,
@@ -215,6 +244,7 @@ impl AgentEventProjector {
             status,
             final_message: self.final_message.clone(),
             verification: self.verification.clone(),
+            outcome: self.outcome.clone(),
             last_sequence_no: self.last_sequence_no,
         })
     }
@@ -656,6 +686,77 @@ mod tests {
             projector.result().and_then(|result| result.verification),
             Some(verification)
         );
+    }
+
+    #[test]
+    fn late_external_evaluation_replaces_pending_outcome_in_replayed_projection() {
+        let thread = thread_ref();
+        let command_id = CommandId::new();
+        let task_id = TaskId::new();
+        let turn_id = TurnId::new();
+        let mut projector = AgentEventProjector::new(thread.clone(), Some(command_id));
+        projector.project(event(
+            &thread,
+            1,
+            Some(task_id),
+            Some(turn_id),
+            RuntimeEventType::TurnStarted,
+            json!({"command_id": command_id}),
+        ));
+        projector.project(event(
+            &thread,
+            2,
+            Some(task_id),
+            None,
+            RuntimeEventType::TaskCompleted,
+            json!({
+                "status": "completed",
+                "outcome": {
+                    "execution": "completed",
+                    "verification": "pass",
+                    "evidence_refs": [],
+                    "external_verification": "pending",
+                    "failure_class": null,
+                    "scorable": false,
+                    "confidence": 50,
+                    "next_action": "await the external evaluator result"
+                }
+            }),
+        ));
+
+        let mut update = event(
+            &thread,
+            3,
+            Some(task_id),
+            Some(turn_id),
+            RuntimeEventType::TaskCompleted,
+            json!({
+                "status": "completed",
+                "outcome": {
+                    "execution": "completed",
+                    "verification": "pass",
+                    "evidence_refs": [],
+                    "external_verification": "pass",
+                    "failure_class": null,
+                    "scorable": true,
+                    "confidence": 100,
+                    "next_action": null
+                }
+            }),
+        );
+        update.source = RuntimeEventSource::Evaluator;
+        assert!(matches!(
+            projector.project(update),
+            Some(AgentStreamEvent::RuntimeEvent { .. })
+        ));
+        assert_eq!(
+            projector
+                .result()
+                .and_then(|result| result.outcome)
+                .map(|outcome| outcome.external_verification),
+            Some(golutra_core::ExternalVerificationStatus::Pass)
+        );
+        assert_eq!(projector.last_sequence_no(), Some(3));
     }
 
     #[test]

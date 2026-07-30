@@ -242,15 +242,14 @@ impl VerificationRunner {
             .any(|assertion| {
                 assertion.blocking && assertion.status == VerificationAssertionStatus::Fail
             });
-        let blocking_unresolved = plan
-            .assertions
-            .iter()
-            .chain(plan.policy_assertions.iter())
-            .any(|assertion| {
-                assertion.blocking
-                    && assertion.status != VerificationAssertionStatus::Pass
-                    && assertion.status != VerificationAssertionStatus::Fail
-            });
+        // Policy evidence is enforced by the runtime-owned governed adapter.
+        // Keeping it out of this legacy aggregate preserves the distinction
+        // between an objective result and a missing policy observation.
+        let blocking_unresolved = plan.assertions.iter().any(|assertion| {
+            assertion.blocking
+                && assertion.status != VerificationAssertionStatus::Pass
+                && assertion.status != VerificationAssertionStatus::Fail
+        });
         if blocking_failed {
             record.result = VerificationResult::Fail;
             record
@@ -420,7 +419,9 @@ fn classify_task(input: &VerificationInput) -> TaskClass {
         && input.command_checks.iter().all(|check| {
             matches!(
                 check.kind,
-                VerificationCheckKind::AssistantResponse | VerificationCheckKind::Schema
+                VerificationCheckKind::AssistantResponse
+                    | VerificationCheckKind::Schema
+                    | VerificationCheckKind::Policy
             )
         })
     {
@@ -687,20 +688,35 @@ fn assertion_status(
             }
         }
         VerificationAssertionKind::Policy => {
-            let policy_failed = input
+            let policy_checks = input
                 .command_checks
                 .iter()
-                .any(|check| check.name.starts_with("policy:") && !check.passed);
-            if policy_failed {
+                .filter(|check| {
+                    check.kind == VerificationCheckKind::Policy || check.name.starts_with("policy:")
+                })
+                .collect::<Vec<_>>();
+            if policy_checks.iter().any(|check| !check.passed) {
                 (
                     VerificationAssertionStatus::Fail,
                     "a policy assertion failed".to_owned(),
-                    refs,
+                    policy_checks
+                        .iter()
+                        .flat_map(|check| check.evidence_refs.iter().copied())
+                        .collect(),
+                )
+            } else if !policy_checks.is_empty() {
+                (
+                    VerificationAssertionStatus::Pass,
+                    "all recorded policy decisions allowed execution".to_owned(),
+                    policy_checks
+                        .iter()
+                        .flat_map(|check| check.evidence_refs.iter().copied())
+                        .collect(),
                 )
             } else {
                 (
-                    VerificationAssertionStatus::Pass,
-                    "no blocking policy fact was recorded".to_owned(),
+                    VerificationAssertionStatus::Unknown,
+                    "no policy decision fact was recorded".to_owned(),
                     refs,
                 )
             }
@@ -941,6 +957,97 @@ mod tests {
         let record = VerificationRunner.verify(input);
 
         assert_eq!(record.result, VerificationResult::Pass);
+    }
+
+    #[test]
+    fn policy_block_fails_and_missing_policy_evidence_is_unknown() {
+        let task_id = TaskId::new();
+        let blocked = VerificationInput {
+            task_id,
+            objective: "read a protected file".to_owned(),
+            completion_criteria: Vec::new(),
+            evidence_refs: vec![EvidenceId::new()],
+            command_checks: vec![VerificationCheck {
+                kind: VerificationCheckKind::Policy,
+                name: "policy:read_file".to_owned(),
+                command: None,
+                passed: false,
+                evidence_refs: Vec::new(),
+                message: "terminal policy block".to_owned(),
+            }],
+            requires_workspace_evidence: false,
+            code_files_changed: false,
+        };
+        let (record, plan) =
+            VerificationRunner.verify_with_plan(blocked.clone(), VerificationRunner.plan(&blocked));
+        assert_eq!(record.result, VerificationResult::Fail);
+        assert_eq!(
+            plan.policy_assertions[0].status,
+            VerificationAssertionStatus::Fail
+        );
+
+        let missing = VerificationInput {
+            task_id,
+            objective: "answer the question".to_owned(),
+            completion_criteria: Vec::new(),
+            evidence_refs: Vec::new(),
+            command_checks: vec![VerificationCheck {
+                kind: VerificationCheckKind::AssistantResponse,
+                name: "assistant_response".to_owned(),
+                command: None,
+                passed: true,
+                evidence_refs: Vec::new(),
+                message: "answer emitted".to_owned(),
+            }],
+            requires_workspace_evidence: false,
+            code_files_changed: false,
+        };
+        let (_, plan) =
+            VerificationRunner.verify_with_plan(missing.clone(), VerificationRunner.plan(&missing));
+        assert_eq!(
+            plan.policy_assertions[0].status,
+            VerificationAssertionStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn policy_fact_does_not_reclassify_plain_conversation_as_analysis() {
+        let input = VerificationInput {
+            task_id: TaskId::new(),
+            objective: "answer the question".to_owned(),
+            completion_criteria: Vec::new(),
+            evidence_refs: Vec::new(),
+            command_checks: vec![
+                VerificationCheck {
+                    kind: VerificationCheckKind::AssistantResponse,
+                    name: "assistant_response".to_owned(),
+                    command: None,
+                    passed: true,
+                    evidence_refs: Vec::new(),
+                    message: "answer emitted".to_owned(),
+                },
+                VerificationCheck {
+                    kind: VerificationCheckKind::Policy,
+                    name: "policy:no_tool_calls".to_owned(),
+                    command: None,
+                    passed: true,
+                    evidence_refs: Vec::new(),
+                    message: "no side-effecting tool call was requested".to_owned(),
+                },
+            ],
+            requires_workspace_evidence: false,
+            code_files_changed: false,
+        };
+
+        let (record, plan) =
+            VerificationRunner.verify_with_plan(input.clone(), VerificationRunner.plan(&input));
+
+        assert_eq!(plan.task_class, TaskClass::PlainConversation);
+        assert_eq!(record.result, VerificationResult::Pass);
+        assert_eq!(
+            plan.policy_assertions[0].status,
+            VerificationAssertionStatus::Pass
+        );
     }
 
     #[test]

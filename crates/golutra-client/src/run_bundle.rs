@@ -12,7 +12,9 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use golutra_core::{SessionId, TaskId};
+use golutra_core::{
+    RunProvenance, SessionId, TaskId, TaskOutcome, TaskStatus, ThreadId, VerificationResult,
+};
 use golutra_protocol::{AgentTurnResult, RuntimeEvent, SessionWindowRequest, TaskTracePage};
 use golutra_store::RuntimeStore;
 use serde::{Deserialize, Serialize};
@@ -44,6 +46,9 @@ pub enum RunBundleTerminalOutcome {
     InProgress {
         reason: String,
     },
+    Aborted {
+        reason: String,
+    },
     Result {
         result: AgentTurnResult,
     },
@@ -72,6 +77,8 @@ pub struct RunBundleManifest {
     pub mode: String,
     pub workspace_id: String,
     pub workspace_root: String,
+    #[serde(default)]
+    pub provenance: Option<RunProvenance>,
     pub selection: SessionWindowRequest,
     pub terminal_outcome: RunBundleTerminalOutcome,
     pub raw_state: RawStateManifest,
@@ -128,6 +135,8 @@ pub struct ObservationTaskManifest {
     pub unresolved_refs: Vec<String>,
     pub missing_sections: Vec<String>,
     pub retention_losses: Vec<String>,
+    #[serde(default)]
+    pub outcome: Option<TaskOutcome>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -238,6 +247,7 @@ impl<'a> RunBundleExporter<'a> {
         } else {
             collector.collect(request.selection.clone()).await?
         };
+        let terminal_outcome = infer_terminal_outcome(&request.terminal_outcome, &snapshot);
         if let Some(prior_manifest) = &prior_manifest {
             validate_append_only_refresh(&request.destination, prior_manifest, &snapshot)?;
         }
@@ -291,8 +301,13 @@ impl<'a> RunBundleExporter<'a> {
                 .cwd()
                 .map(|path| path.display().to_string())
                 .unwrap_or_default(),
+            provenance: snapshot
+                .sessions
+                .iter()
+                .flat_map(|session| session.tasks.iter())
+                .find_map(|task| task.trace.run_provenance.clone()),
             selection: request.selection,
-            terminal_outcome: request.terminal_outcome,
+            terminal_outcome,
             raw_state: raw_state_manifest(&request.destination)?,
             observations,
             debug_export,
@@ -920,6 +935,7 @@ fn write_session_observations(
             unresolved_refs: task.trace.integrity.unresolved_refs.clone(),
             missing_sections: task.trace.integrity.missing_sections.clone(),
             retention_losses: task.trace.integrity.retention_losses.clone(),
+            outcome: task_outcome(&task.trace.events, task.trace.verification.as_ref()),
         });
     }
     Ok(ObservationSessionManifest {
@@ -931,6 +947,111 @@ fn write_session_observations(
         events_complete: session.events_complete,
         tasks,
     })
+}
+
+fn task_outcome(
+    events: &[RuntimeEvent],
+    verification: Option<&golutra_core::VerificationRecord>,
+) -> Option<TaskOutcome> {
+    let terminal = events
+        .iter()
+        .rev()
+        .find(|event| event.event_type.is_task_terminal())?;
+    terminal
+        .payload
+        .get("outcome")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .or_else(|| {
+            let status = terminal
+                .payload
+                .get("status")
+                .cloned()
+                .and_then(|value| serde_json::from_value::<TaskStatus>(value).ok())?;
+            Some(TaskOutcome::from_status(
+                status,
+                verification
+                    .map(|record| record.result)
+                    .unwrap_or(VerificationResult::Unknown),
+            ))
+        })
+}
+
+fn infer_terminal_outcome(
+    requested: &RunBundleTerminalOutcome,
+    snapshot: &RuntimeObservationSnapshot,
+) -> RunBundleTerminalOutcome {
+    if !matches!(requested, RunBundleTerminalOutcome::InProgress { .. }) {
+        return requested.clone();
+    }
+    // An external harness can time out after the runtime has already persisted
+    // its own terminal event. The harness outcome is the stronger fact for the
+    // run-level score, so inspect it before projecting a runtime result.
+    for session in &snapshot.sessions {
+        for task in &session.tasks {
+            if let Some(evaluation) = task.trace.evaluation.external_evaluations.last()
+                && evaluation.verdict == golutra_eval::EvaluationVerdict::Fail
+                && evaluation
+                    .terminal_cause
+                    .as_ref()
+                    .is_some_and(|cause| cause.code.contains("timeout"))
+            {
+                return RunBundleTerminalOutcome::Aborted {
+                    reason: evaluation
+                        .terminal_cause
+                        .as_ref()
+                        .map(|cause| cause.message.clone())
+                        .unwrap_or_else(|| "external harness timed out the task".to_owned()),
+                };
+            }
+        }
+    }
+    for session in &snapshot.sessions {
+        for task in &session.tasks {
+            if let Some(event) = task
+                .trace
+                .events
+                .iter()
+                .rev()
+                .find(|event| event.event_type.is_task_terminal())
+                && let Some(status) = event
+                    .payload
+                    .get("status")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<TaskStatus>(value).ok())
+                && let Ok(thread_id) = session.thread.thread_id.to_string().parse::<ThreadId>()
+            {
+                let result = AgentTurnResult {
+                    thread_id,
+                    session_id: task.trace.session_id,
+                    task_id: Some(task.trace.task_id),
+                    turn_id: event.turn_id,
+                    status,
+                    final_message: task
+                        .trace
+                        .events
+                        .iter()
+                        .rev()
+                        .find(|candidate| {
+                            candidate.event_type
+                                == golutra_protocol::RuntimeEventType::AssistantMessage
+                        })
+                        .and_then(|candidate| {
+                            candidate
+                                .payload
+                                .get("content")
+                                .and_then(|value| value.as_str())
+                        })
+                        .map(ToOwned::to_owned),
+                    verification: task.trace.verification.clone(),
+                    outcome: task_outcome(&task.trace.events, task.trace.verification.as_ref()),
+                    last_sequence_no: Some(event.sequence_no),
+                };
+                return RunBundleTerminalOutcome::Result { result };
+            }
+        }
+    }
+    requested.clone()
 }
 
 fn raw_state_manifest(run_root: &Path) -> Result<RawStateManifest, ClientError> {

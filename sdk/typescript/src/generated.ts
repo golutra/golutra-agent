@@ -219,8 +219,35 @@ export type VerificationAssertionKind =
 export type VerificationAssertionStatus =
   "pending" | "pass" | "fail" | "unknown" | "not_applicable";
 export type VerificationCheckKind =
-  "tool_execution" | "workspace_change" | "objective_validation" | "assistant_response" | "schema";
+  | "tool_execution"
+  | "workspace_change"
+  | "objective_validation"
+  | "assistant_response"
+  | "schema"
+  | "policy";
 export type VerificationResult = "pass" | "fail" | "partial" | "unknown";
+export type ExecutionOutcome =
+  | "running"
+  | "candidate_ready"
+  | "completed"
+  | "partial"
+  | "failed"
+  | "aborted"
+  | "blocked"
+  | "cancelled"
+  | "interrupted"
+  | "uncertain";
+export type FailureClass =
+  | "runtime_control_flow"
+  | "context"
+  | "provider"
+  | "tool"
+  | "policy"
+  | "verification"
+  | "external_evaluation"
+  | "environment"
+  | "timeout"
+  | "unknown";
 export type AutomationCandidateKind = "benchmark" | "generated_task" | "skill" | "runtime_change";
 export type CandidateRisk = "low" | "medium" | "high" | "critical";
 export type CandidateStatus =
@@ -818,6 +845,10 @@ export interface AgentTurnOptions {
   allow_network?: boolean;
   completion_criteria?: string[];
   /**
+   * Keep the typed outcome open for a later evaluator overlay.
+   */
+  defer_external_verification?: boolean;
+  /**
    * Discover conservative project checks when no explicit verifier list is
    * supplied. Set this to false to send an explicit empty list.
    */
@@ -878,12 +909,24 @@ export interface RequiredFileContent {
 export interface AgentTurnResult {
   final_message?: string | null;
   last_sequence_no?: number | null;
+  outcome?: TaskOutcome | null;
   session_id: string;
   status: TaskStatus;
   task_id?: string | null;
   thread_id: string;
   turn_id?: string | null;
   verification?: VerificationRecord | null;
+  [k: string]: unknown;
+}
+export interface TaskOutcome {
+  confidence: number;
+  evidence_refs?: string[];
+  execution: ExecutionOutcome;
+  external_verification?: "not_requested" | "pending" | "pass" | "partial" | "fail" | "unknown";
+  failure_class?: FailureClass | null;
+  next_action?: string | null;
+  scorable: boolean;
+  verification: VerificationResult;
   [k: string]: unknown;
 }
 export interface AgentTurnStart {

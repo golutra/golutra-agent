@@ -12,10 +12,11 @@ use golutra_context::{
 };
 use golutra_core::{
     ApprovalDecision, ApprovalId, ApprovalRequest, ApprovalResolution, BudgetState, CommandId,
-    CorrectionEnvelope, LoopAction, LoopDecision, PolicyDecision, SessionId, SideEffectType,
-    TaskContract, TaskId, ToolContract, ToolProgress, ToolProgressPhase, ToolRecoveryPolicy,
-    ToolResultStatus, TurnId, TurnState, VerificationCheck, VerificationCheckKind,
-    VerificationPlan, VerificationRecord, VerificationResult, WorkspaceChangeRequirement,
+    CorrectionEnvelope, LoopAction, LoopDecision, PolicyBlockDisposition, PolicyDecision,
+    SessionId, SideEffectType, TaskContract, TaskId, ToolContract, ToolProgress, ToolProgressPhase,
+    ToolRecoveryPolicy, ToolResultStatus, TurnId, TurnState, VerificationCheck,
+    VerificationCheckKind, VerificationPlan, VerificationRecord, VerificationResult,
+    WorkspaceChangeRequirement,
 };
 #[cfg(test)]
 use golutra_core::{RequiredFileContent, infer_legacy_write_objective};
@@ -1682,6 +1683,35 @@ where
                 .collect::<Vec<_>>();
             command_checks.extend(contract_path_checks);
             command_checks.extend(contract_content_checks);
+            command_checks.extend(tool_reports.iter().map(|report| {
+                let passed = match report.policy_evaluation.decision {
+                    PolicyDecision::Allow => true,
+                    PolicyDecision::Ask => report.envelope.status == ToolResultStatus::Ok,
+                    PolicyDecision::Deny => false,
+                    PolicyDecision::Block => {
+                        report.policy_evaluation.effective_block_disposition()
+                            != Some(PolicyBlockDisposition::Terminal)
+                    }
+                };
+                VerificationCheck {
+                    kind: VerificationCheckKind::Policy,
+                    name: format!("policy:{}", report.envelope.tool_name),
+                    command: None,
+                    passed,
+                    evidence_refs: report.policy_evaluation.evidence_refs.clone(),
+                    message: report.policy_evaluation.reason.clone(),
+                }
+            }));
+            if tool_reports.is_empty() {
+                command_checks.push(VerificationCheck {
+                    kind: VerificationCheckKind::Policy,
+                    name: "policy:no_tool_calls".to_owned(),
+                    command: None,
+                    passed: true,
+                    evidence_refs: Vec::new(),
+                    message: "no side-effecting tool call was requested".to_owned(),
+                });
+            }
             let changed_files = tool_reports
                 .iter()
                 .take(candidate_tool_report_count)
@@ -1788,14 +1818,24 @@ where
                     objective: current_objective.clone(),
                     completion_criteria: current_completion_criteria.clone(),
                     evidence_refs: Vec::new(),
-                    command_checks: vec![VerificationCheck {
-                        kind: VerificationCheckKind::AssistantResponse,
-                        name: "assistant_response".to_owned(),
-                        command: None,
-                        passed: true,
-                        evidence_refs: Vec::new(),
-                        message: "assistant response produced".to_owned(),
-                    }],
+                    command_checks: vec![
+                        VerificationCheck {
+                            kind: VerificationCheckKind::AssistantResponse,
+                            name: "assistant_response".to_owned(),
+                            command: None,
+                            passed: true,
+                            evidence_refs: Vec::new(),
+                            message: "assistant response produced".to_owned(),
+                        },
+                        VerificationCheck {
+                            kind: VerificationCheckKind::Policy,
+                            name: "policy:no_tool_calls".to_owned(),
+                            command: None,
+                            passed: true,
+                            evidence_refs: Vec::new(),
+                            message: "no side-effecting tool call was requested".to_owned(),
+                        },
+                    ],
                     requires_workspace_evidence: false,
                     code_files_changed: false,
                 }

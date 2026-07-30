@@ -3374,6 +3374,7 @@ async fn agent_loop_stops_after_a_terminal_sensitive_path_block() {
         1,
         "terminal policy blocks must not start another provider turn"
     );
+    assert_eq!(outcome.verification.result, VerificationResult::Fail);
 }
 
 #[tokio::test]

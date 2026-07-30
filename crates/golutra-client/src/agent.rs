@@ -193,6 +193,7 @@ impl AgentThread {
             "output_schema": options.output_schema.clone(),
             "allow_network": options.allow_network,
             "yolo": options.yolo,
+            "defer_external_verification": options.defer_external_verification,
         });
         if !options.external_verifiers.is_empty() || !options.discover_project_verifiers {
             payload["external_verifiers"] =

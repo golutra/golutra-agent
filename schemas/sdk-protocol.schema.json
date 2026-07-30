@@ -695,6 +695,11 @@
             "type": "string"
           }
         },
+        "defer_external_verification": {
+          "description": "Keep the typed outcome open for a later evaluator overlay.",
+          "type": "boolean",
+          "default": false
+        },
         "discover_project_verifiers": {
           "description": "Discover conservative project checks when no explicit verifier list is\nsupplied. Set this to false to send an explicit empty list.",
           "type": "boolean",
@@ -746,6 +751,17 @@
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "outcome": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskOutcome"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "session_id": {
           "type": "string",
@@ -4439,6 +4455,21 @@
         "skills"
       ]
     },
+    "ExecutionOutcome": {
+      "type": "string",
+      "enum": [
+        "running",
+        "candidate_ready",
+        "completed",
+        "partial",
+        "failed",
+        "aborted",
+        "blocked",
+        "cancelled",
+        "interrupted",
+        "uncertain"
+      ]
+    },
     "ExternalEvaluationAssertion": {
       "type": "object",
       "properties": {
@@ -4824,6 +4855,32 @@
       },
       "required": [
         "program"
+      ]
+    },
+    "ExternalVerificationStatus": {
+      "type": "string",
+      "enum": [
+        "not_requested",
+        "pending",
+        "pass",
+        "partial",
+        "fail",
+        "unknown"
+      ]
+    },
+    "FailureClass": {
+      "type": "string",
+      "enum": [
+        "runtime_control_flow",
+        "context",
+        "provider",
+        "tool",
+        "policy",
+        "verification",
+        "external_evaluation",
+        "environment",
+        "timeout",
+        "unknown"
       ]
     },
     "FailureDiagnosis": {
@@ -8474,6 +8531,62 @@
         }
       }
     },
+    "TaskOutcome": {
+      "type": "object",
+      "properties": {
+        "confidence": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "evidence_refs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "execution": {
+          "$ref": "#/$defs/ExecutionOutcome"
+        },
+        "external_verification": {
+          "$ref": "#/$defs/ExternalVerificationStatus",
+          "default": "not_requested"
+        },
+        "failure_class": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FailureClass"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "next_action": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "scorable": {
+          "type": "boolean"
+        },
+        "verification": {
+          "$ref": "#/$defs/VerificationResult"
+        }
+      },
+      "required": [
+        "execution",
+        "verification",
+        "scorable",
+        "confidence"
+      ]
+    },
     "TaskReconciliationDecision": {
       "type": "string",
       "enum": [
@@ -9630,7 +9743,8 @@
         "workspace_change",
         "objective_validation",
         "assistant_response",
-        "schema"
+        "schema",
+        "policy"
       ]
     },
     "VerificationDimensionStatus": {
