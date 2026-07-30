@@ -20,6 +20,14 @@ pub struct WorkspacePolicy {
     workspace_root: PathBuf,
     path_mapper: WorkspacePathMapper,
     sensitive_path_fragments: Vec<String>,
+    mode: WorkspacePolicyMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WorkspacePolicyMode {
+    #[default]
+    Guarded,
+    Unrestricted,
 }
 
 /// Maps well-known model/container workspace roots onto the host workspace.
@@ -90,12 +98,28 @@ impl WorkspacePolicy {
                 ".ssh".to_owned(),
                 "secrets".to_owned(),
             ],
+            mode: WorkspacePolicyMode::Guarded,
         })
     }
 
     #[must_use]
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
+    }
+
+    #[must_use]
+    pub fn mode(&self) -> WorkspacePolicyMode {
+        self.mode
+    }
+
+    #[must_use]
+    pub fn with_unrestricted_access(mut self, enabled: bool) -> Self {
+        self.mode = if enabled {
+            WorkspacePolicyMode::Unrestricted
+        } else {
+            WorkspacePolicyMode::Guarded
+        };
+        self
     }
 
     pub fn with_path_alias(mut self, alias: impl Into<PathBuf>) -> Result<Self, PolicyError> {
@@ -111,6 +135,13 @@ impl WorkspacePolicy {
     ) -> PolicyEvaluation {
         let path = path.as_ref();
         match self.resolve_path(path, requires_existing_path) {
+            Ok(resolved_path) if self.mode == WorkspacePolicyMode::Unrestricted => self.evaluation(
+                action,
+                &resolved_path,
+                PolicyDecision::Allow,
+                None,
+                "unrestricted workspace policy enabled",
+            ),
             Ok(resolved_path) if self.is_sensitive_path(&resolved_path) => self.evaluation(
                 action,
                 &resolved_path,
@@ -144,6 +175,18 @@ impl WorkspacePolicy {
     }
 
     pub fn evaluate_shell(&self, command: &str) -> PolicyEvaluation {
+        if self.mode == WorkspacePolicyMode::Unrestricted {
+            return PolicyEvaluation {
+                policy_ref: PolicyId::new(),
+                subject: "tool".to_owned(),
+                action: "shell".to_owned(),
+                resource: command.to_owned(),
+                decision: PolicyDecision::Allow,
+                block_disposition: None,
+                reason: "unrestricted workspace policy enabled".to_owned(),
+                evidence_refs: Vec::new(),
+            };
+        }
         let parsed = parse_shell_command(command);
         let explicit_wrapper = parsed.as_deref().and_then(explicit_shell_script).is_some();
         let terminal_violation = parsed
@@ -1007,6 +1050,57 @@ mod tests {
         let evaluation = policy.evaluate_path("read_file", &outside_file, true);
 
         assert_eq!(evaluation.decision, PolicyDecision::Block);
+    }
+
+    #[test]
+    fn unrestricted_mode_allows_outside_sensitive_paths_and_shell_commands() {
+        let workspace = tempdir().expect("workspace");
+        let outside = tempdir().expect("outside");
+        let sensitive_file = outside.path().join("secrets.7z");
+        fs::write(&sensitive_file, "secret").expect("outside file");
+        let policy = WorkspacePolicy::new(workspace.path())
+            .expect("policy")
+            .with_unrestricted_access(true);
+
+        assert_eq!(policy.mode(), WorkspacePolicyMode::Unrestricted);
+        assert_eq!(
+            policy
+                .evaluate_path("write_file", &sensitive_file, true)
+                .decision,
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            PathBuf::from(
+                policy
+                    .evaluate_path("write_file", &sensitive_file, true)
+                    .resource
+            ),
+            sensitive_file
+                .canonicalize()
+                .expect("canonical outside file")
+        );
+        assert_eq!(
+            PathBuf::from(
+                policy
+                    .evaluate_path("write_file", "/app/result.txt", false)
+                    .resource
+            ),
+            workspace
+                .path()
+                .canonicalize()
+                .expect("canonical workspace")
+                .join("result.txt")
+        );
+        for command in [
+            "cat ~/.ssh/id_ed25519",
+            "rm -rf /",
+            "printf changed > /tmp/golutra-yolo-test",
+            "bash -lc 'cat .git/config; touch /tmp/golutra-yolo-test'",
+        ] {
+            let evaluation = policy.evaluate_shell(command);
+            assert_eq!(evaluation.decision, PolicyDecision::Allow, "{command}");
+            assert_eq!(evaluation.block_disposition, None, "{command}");
+        }
     }
 
     #[test]

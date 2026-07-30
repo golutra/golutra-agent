@@ -722,6 +722,11 @@
             }
           ],
           "default": null
+        },
+        "yolo": {
+          "description": "Disable workspace, sensitive-path, shell and OS sandbox restrictions\nfor this turn. Network environment remains a separate host capability,\nbut process-only execution cannot enforce OS-level network isolation.",
+          "type": "boolean",
+          "default": false
         }
       }
     },

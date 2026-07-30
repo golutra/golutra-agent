@@ -161,7 +161,12 @@ impl RuntimeHost {
         let turn_id = request.turn_id.unwrap_or(task.turn_id);
         let tool_call_id = request.tool_call_id;
         let partial_checkpoint =
-            matches!(request.tool_name.as_str(), "shell" | "external_verifier");
+            matches!(request.tool_name.as_str(), "shell" | "external_verifier")
+                || task
+                    .payload
+                    .get("yolo")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
         let owned_before_images = before_images.to_vec();
         let checkpoint_result = run_blocking(move || {
             let (checkpoint_before_images, excluded_count) = if partial_checkpoint {
@@ -710,9 +715,11 @@ impl RuntimeHost {
         policy: WorkspacePolicy,
         workspace_root: PathBuf,
         requested_network: bool,
+        yolo: bool,
     ) -> Result<ToolRuntime, ClientError> {
         let executor = ToolRuntime::new(policy)
             .with_network_access(self.network_access_enabled(requested_network))
+            .with_unrestricted_access(yolo)
             .with_process_supervisor(self.process_supervisor.clone());
         let Some(paths) = self
             .runtime_paths
@@ -726,8 +733,12 @@ impl RuntimeHost {
         let backend = run_blocking(move || {
             let store = PluginStore::new(home)
                 .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
-            McpToolBackend::from_store(store, workspace_root, scratch_root)
-                .map_err(|error| ClientError::TaskExecution(error.to_string()))
+            let backend = if yolo {
+                McpToolBackend::from_store_unrestricted(store, workspace_root, scratch_root)
+            } else {
+                McpToolBackend::from_store(store, workspace_root, scratch_root)
+            };
+            backend.map_err(|error| ClientError::TaskExecution(error.to_string()))
         })
         .await??;
         match backend {

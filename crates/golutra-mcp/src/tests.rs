@@ -48,6 +48,46 @@ async fn process_only_hosts_refuse_to_execute_plugins() {
 }
 
 #[tokio::test]
+async fn unrestricted_hosts_execute_plugins_without_an_os_sandbox() {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_err()
+    {
+        return;
+    }
+    let home = tempdir().expect("home");
+    let workspace = tempdir().expect("workspace");
+    let package = fixture_package();
+    let store = enabled_store(home.path(), package.path());
+    let backend = McpToolBackend::from_store_unrestricted(
+        store,
+        workspace.path(),
+        home.path().join("scratch"),
+    )
+    .expect("backend")
+    .expect("enabled plugin");
+    let executor =
+        BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("workspace policy"))
+            .with_unrestricted_access(true)
+            .with_external_backend(Arc::new(backend))
+            .expect("register backend");
+    let request = request("mcp__fixture__echo", json!({"text": "hello"}));
+    let policy = executor.evaluate(&request).expect("policy");
+    assert_eq!(policy.decision, golutra_core::PolicyDecision::Allow);
+
+    let report = executor
+        .execute_with_policy(request, policy, false, CancellationToken::new())
+        .await
+        .expect("execution report");
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+    assert_eq!(report.envelope.structured_facts["echo"], "hello");
+}
+
+#[tokio::test]
 async fn approved_stdio_plugin_is_discovered_verified_and_called() {
     if std::process::Command::new("python3")
         .arg("--version")

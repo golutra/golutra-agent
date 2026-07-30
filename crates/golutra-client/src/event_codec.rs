@@ -135,6 +135,16 @@ pub(crate) fn recovered_pending_turn_from_event(
             )));
         }
     };
+    let yolo = match payload.get("yolo") {
+        None => false,
+        Some(Value::Bool(yolo)) => *yolo,
+        Some(_) => {
+            return Err(ClientError::TaskExecution(format!(
+                "durable queued turn event {} has non-boolean yolo",
+                event.id
+            )));
+        }
+    };
     let external_verifiers_require_os_sandbox =
         match payload.get(EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY) {
             None => false,
@@ -176,6 +186,7 @@ pub(crate) fn recovered_pending_turn_from_event(
             external_verifiers,
             external_verifiers_require_os_sandbox,
             allow_network,
+            yolo,
             steer,
         },
     }))
@@ -1108,6 +1119,7 @@ mod tests {
                     "content": "recovered\n",
                     "output_schema": {"type": "object"},
                     "allow_network": true,
+                    "yolo": true,
                     "_external_verifiers_require_os_sandbox": true
                 }
             }),
@@ -1132,6 +1144,7 @@ mod tests {
             Some(json!({"type": "object"}))
         );
         assert!(recovered.pending.allow_network);
+        assert!(recovered.pending.yolo);
         assert!(recovered.pending.external_verifiers_require_os_sandbox);
     }
 
@@ -1149,6 +1162,10 @@ mod tests {
             json!({
                 "prompt": "run a recovered turn",
                 "task_contract": {"schema_version": 999}
+            }),
+            json!({
+                "prompt": "run a recovered turn",
+                "yolo": "true"
             }),
         ] {
             let mut event = host_event(

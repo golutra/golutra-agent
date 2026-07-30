@@ -970,6 +970,7 @@ async fn pending_turn_queue_closes_atomically_when_the_loop_becomes_idle() {
         external_verifiers: Vec::new(),
         external_verifiers_require_os_sandbox: false,
         allow_network: false,
+        yolo: false,
         steer: false,
     };
 
@@ -990,6 +991,7 @@ async fn pending_turn_queue_closes_atomically_when_the_loop_becomes_idle() {
                 external_verifiers: Vec::new(),
                 external_verifiers_require_os_sandbox: false,
                 allow_network: false,
+                yolo: false,
                 steer: false,
             })
             .await,
@@ -1009,6 +1011,7 @@ async fn reserved_pending_turn_is_not_visible_until_its_event_is_durable() {
         external_verifiers: Vec::new(),
         external_verifiers_require_os_sandbox: false,
         allow_network: false,
+        yolo: false,
         steer: false,
     };
     let reservation = handle
@@ -3037,6 +3040,7 @@ async fn queued_plain_turn_does_not_inherit_workspace_or_verifier_requirements()
             external_verifiers: Vec::new(),
             external_verifiers_require_os_sandbox: false,
             allow_network: false,
+            yolo: false,
             steer: false,
         })
         .await
@@ -3091,6 +3095,7 @@ async fn queued_turn_uses_its_own_schema_and_completion_criteria() {
             external_verifiers: Vec::new(),
             external_verifiers_require_os_sandbox: false,
             allow_network: false,
+            yolo: false,
             steer: false,
         })
         .await
@@ -3850,6 +3855,7 @@ fn checkpoint_rejects_gitignored_before_images() {
 #[test]
 fn partial_checkpoint_filter_omits_ignored_images_but_keeps_safe_files() {
     let workspace = tempdir().expect("workspace");
+    let outside = tempdir().expect("outside");
     let checkpoint_root = tempdir().expect("checkpoint");
     fs::write(
         workspace.path().join(".gitignore"),
@@ -3858,6 +3864,7 @@ fn partial_checkpoint_filter_omits_ignored_images_but_keeps_safe_files() {
     .expect("gitignore");
     fs::write(workspace.path().join("safe.txt"), "safe").expect("safe file");
     fs::write(workspace.path().join("token.secret"), "secret").expect("ignored file");
+    fs::write(outside.path().join("external.txt"), "external").expect("outside file");
     let manager = WorkspaceCheckpointManager::new(workspace.path(), checkpoint_root.path());
     let before_images = [
         FileBeforeImage {
@@ -3878,6 +3885,12 @@ fn partial_checkpoint_filter_omits_ignored_images_but_keeps_safe_files() {
             unix_mode: None,
             metadata: None,
         },
+        FileBeforeImage {
+            path: outside.path().join("external.txt"),
+            content: Some(b"external".to_vec()),
+            unix_mode: None,
+            metadata: None,
+        },
     ];
 
     let (retained, excluded_count) = manager
@@ -3893,7 +3906,7 @@ fn partial_checkpoint_filter_omits_ignored_images_but_keeps_safe_files() {
         )
         .expect("partial checkpoint");
 
-    assert_eq!(excluded_count, 2);
+    assert_eq!(excluded_count, 3);
     assert_eq!(retained.len(), 1);
     assert_eq!(checkpoint.changed_files, vec!["safe.txt"]);
 }

@@ -162,6 +162,7 @@ export interface ThreadRunOptions {
   taskContract?: TaskContract;
   completionCriteria?: readonly string[];
   allowNetwork?: boolean;
+  yolo?: boolean;
   externalVerifiers?: readonly ExternalVerificationSpec[];
   discoverProjectVerifiers?: boolean;
 }
@@ -206,6 +207,7 @@ export class Thread {
       thread_id: this.threadId,
       prompt,
       allow_network: options.allowNetwork ?? false,
+      yolo: options.yolo ?? false,
       completion_criteria: [...(options.completionCriteria ?? [])].filter((value) => value.trim()),
     };
     if (options.externalVerifiers !== undefined || options.discoverProjectVerifiers === false) {

@@ -583,6 +583,7 @@ class ClientTest(unittest.TestCase):
                 "max_correction_rounds": 1,
             },
             allow_network=True,
+            yolo=True,
             completion_criteria=[" verified ", ""],
             external_verifiers=[{"program": "pytest", "args": ["-q"]}],
         )
@@ -601,6 +602,7 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(calls[0][0], "turn/start")
         self.assertEqual(calls[0][1]["completion_criteria"], [" verified "])
         self.assertEqual(calls[0][1]["allow_network"], True)
+        self.assertEqual(calls[0][1]["yolo"], True)
         self.assertEqual(calls[0][1]["output_schema"], {"type": "object"})
         self.assertEqual(
             calls[0][1]["task_contract"],

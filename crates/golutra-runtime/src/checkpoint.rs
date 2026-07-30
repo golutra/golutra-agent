@@ -125,10 +125,11 @@ impl WorkspaceCheckpointManager {
     ///
     /// Opaque process tools take a bounded workspace snapshot before execution.
     /// That snapshot can contain gitignored files while already being marked
-    /// incomplete because internal or generated subtrees were omitted. Callers
-    /// may use this selection for that partial-checkpoint path. Direct file
-    /// tools must continue to call `create_checkpoint` with their original
-    /// before-images so excluded targets fail closed.
+    /// incomplete because internal or generated subtrees were omitted. An
+    /// unrestricted task can also report paths outside the workspace; those
+    /// paths are observable but cannot be represented by a workspace rollback
+    /// checkpoint. Callers may use this selection only when they explicitly
+    /// accept an incomplete checkpoint.
     pub fn filter_checkpointable_before_images(
         &self,
         before_images: &[FileBeforeImage],
@@ -142,7 +143,7 @@ impl WorkspaceCheckpointManager {
             }
             match self.relative_checkpoint_path(&before_image.path) {
                 Ok(_) => retained.push(before_image.clone()),
-                Err(CheckpointError::Excluded(_)) => {
+                Err(CheckpointError::Excluded(_) | CheckpointError::OutsideWorkspace(_)) => {
                     excluded_count = excluded_count.saturating_add(1);
                 }
                 Err(error) => return Err(error),

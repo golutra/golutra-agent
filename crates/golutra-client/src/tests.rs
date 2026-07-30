@@ -12,8 +12,8 @@ use golutra_context::{
 use golutra_core::{
     Actor, ActorKind, ArtifactId, ArtifactRecord, CausalRelation, CommandId, EvidenceId,
     FileChangeKind, FileChangeSummary, PolicyId, PostTaskJob, PostTaskJobId, PostTaskJobKind,
-    PostTaskJobStatus, QueryId, RedactionStatus, TaskId, TaskStatus, ToolCallId, TraceView,
-    TurnChangeSummary, TurnId, VerificationId, VerificationRecord, VerificationResult,
+    PostTaskJobStatus, QueryId, RedactionStatus, TaskContract, TaskId, TaskStatus, ToolCallId,
+    TraceView, TurnChangeSummary, TurnId, VerificationId, VerificationRecord, VerificationResult,
     WorkspaceChangeRequirement, WorkspaceId,
 };
 use golutra_llm::{ConfiguredProvider, MockProvider, ProviderError, ProviderMessage, ProviderRole};
@@ -450,6 +450,7 @@ async fn runtime_host_reuses_one_process_supervisor_across_tool_executors() {
             WorkspacePolicy::new(&root).expect("first policy"),
             root.clone(),
             false,
+            false,
         )
         .await
         .expect("first executor");
@@ -479,6 +480,7 @@ async fn runtime_host_reuses_one_process_supervisor_across_tool_executors() {
         .build_tool_executor(
             WorkspacePolicy::new(&root).expect("second policy"),
             root,
+            false,
             false,
         )
         .await
@@ -522,6 +524,7 @@ async fn runtime_network_capability_requires_both_host_and_turn_grants() {
             WorkspacePolicy::new(&root).expect("isolated policy"),
             root.clone(),
             true,
+            false,
         )
         .await
         .expect("isolated executor");
@@ -561,6 +564,7 @@ async fn runtime_network_capability_requires_both_host_and_turn_grants() {
             WorkspacePolicy::new(&root).expect("enabled policy"),
             root,
             true,
+            false,
         )
         .await
         .expect("enabled executor");
@@ -605,6 +609,7 @@ async fn dropping_runtime_host_terminates_its_background_processes() {
         .build_tool_executor(
             WorkspacePolicy::new(&root).expect("policy"),
             root.clone(),
+            false,
             false,
         )
         .await
@@ -5800,6 +5805,192 @@ async fn direct_protocol_rejects_non_boolean_network_capability() {
 }
 
 #[tokio::test]
+async fn queued_turn_cannot_change_the_active_yolo_capability() {
+    let workspace = tempdir().expect("workspace");
+    let _provider = IsolatedGlobalMockProvider::install().await;
+    let transport = EmbeddedTransport::for_cwd(workspace.path())
+        .await
+        .expect("transport");
+    let session_id = transport.default_session_id();
+
+    transport
+        .send_command(command(session_id, "sleep"))
+        .await
+        .expect("blocking task");
+    wait_for_status(&transport, session_id, TaskStatus::WaitingApproval).await;
+
+    let queued = transport
+        .send_command(command_with_payload(
+            session_id,
+            json!({"prompt": "inspect the workspace", "yolo": true}),
+        ))
+        .await
+        .expect("queued command is governed");
+    assert!(!queued.accepted);
+    assert_eq!(
+        queued.reason.as_deref(),
+        Some("queued prompt cannot change yolo capability while a task is active")
+    );
+
+    transport
+        .send_command(runtime_command(
+            session_id,
+            SessionCommandKind::Abort,
+            json!({}),
+        ))
+        .await
+        .expect("release blocking task");
+    if let Some(control) = transport.host.task_controls.lock().await.get(&session_id) {
+        control.abort_handle.abort();
+    }
+    sleep(Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn queued_turn_inherits_and_persists_the_active_yolo_capability() {
+    let workspace = tempdir().expect("workspace");
+    let _provider = IsolatedGlobalMockProvider::install().await;
+    let transport = EmbeddedTransport::for_cwd(workspace.path())
+        .await
+        .expect("transport");
+    let session_id = transport.default_session_id();
+
+    transport
+        .send_command(command_with_payload(
+            session_id,
+            json!({"prompt": "sleep", "yolo": true}),
+        ))
+        .await
+        .expect("blocking task");
+    wait_for_status(&transport, session_id, TaskStatus::Running).await;
+
+    let queued = transport
+        .send_command(command(session_id, "inspect the workspace"))
+        .await
+        .expect("queued command");
+    assert!(queued.accepted);
+
+    let events = transport
+        .host
+        .repositories
+        .events
+        .load(session_id, None, None)
+        .await
+        .expect("events");
+    let queued_payload = events
+        .iter()
+        .find(|event| {
+            event.event_type == RuntimeEventType::TurnQueued
+                && event
+                    .payload
+                    .pointer("/payload/prompt")
+                    .and_then(Value::as_str)
+                    == Some("inspect the workspace")
+        })
+        .and_then(|event| event.payload.get("payload"))
+        .expect("durable queued payload");
+    assert_eq!(queued_payload["yolo"], true);
+
+    transport
+        .send_command(runtime_command(
+            session_id,
+            SessionCommandKind::Abort,
+            json!({}),
+        ))
+        .await
+        .expect("release blocking task");
+    if let Some(control) = transport.host.task_controls.lock().await.get(&session_id) {
+        control.abort_handle.abort();
+    }
+    sleep(Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn direct_protocol_rejects_non_boolean_yolo_capability() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let session_id = host.default_session_id();
+
+    let error = host
+        .handle_command(command_with_payload(
+            session_id,
+            json!({"prompt": "do not start", "yolo": "true"}),
+        ))
+        .await
+        .expect_err("malformed yolo capability must be rejected");
+
+    assert!(matches!(
+        error,
+        ClientError::TaskExecution(message) if message == "yolo must be a boolean"
+    ));
+}
+
+#[tokio::test]
+async fn yolo_turn_writes_outside_the_workspace_without_approval() {
+    let workspace = tempdir().expect("workspace");
+    let outside = tempdir().expect("outside");
+    let target = outside.path().join("secrets.7z");
+    let _provider = IsolatedGlobalMockProvider::install().await;
+    let transport = EmbeddedTransport::for_cwd(workspace.path())
+        .await
+        .expect("transport");
+    let session_id = transport.default_session_id();
+
+    let ack = transport
+        .send_command(command_with_payload(
+            session_id,
+            json!({
+                "prompt": "write the requested file",
+                "path": target,
+                "content": "unrestricted",
+                "yolo": true,
+                "discover_project_verifiers": false,
+                "task_contract": {
+                    "workspace_change": "optional",
+                    "verification": "best_effort",
+                    "max_correction_rounds": 0
+                }
+            }),
+        ))
+        .await
+        .expect("yolo command");
+    assert!(ack.accepted);
+    wait_for_status(&transport, session_id, TaskStatus::Partial).await;
+
+    assert_eq!(
+        fs::read_to_string(&target).expect("outside result"),
+        "unrestricted"
+    );
+    let events = transport
+        .host
+        .repositories
+        .events
+        .load(session_id, None, None)
+        .await
+        .expect("events");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.event_type == RuntimeEventType::ApprovalRequested)
+    );
+    let task_created = events
+        .iter()
+        .find(|event| event.event_type == RuntimeEventType::TaskCreated)
+        .expect("task created");
+    assert_eq!(
+        task_created
+            .payload
+            .pointer("/execution_capabilities/policy/mode"),
+        Some(&json!("unrestricted"))
+    );
+    assert_eq!(
+        task_created
+            .payload
+            .pointer("/execution_capabilities/policy/tool_sandbox_mode"),
+        Some(&json!("process_only"))
+    );
+}
+
+#[tokio::test]
 async fn forbidden_workspace_contract_blocks_provider_side_effects() {
     let workspace = tempdir().expect("workspace");
     let _provider = IsolatedGlobalMockProvider::install().await;
@@ -6532,6 +6723,54 @@ async fn runtime_recovery_restarts_durable_unstarted_pending_turns() {
 }
 
 #[tokio::test]
+async fn runtime_recovery_rejects_a_pending_batch_that_changes_yolo_capability() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let session_id = host.default_session_id();
+    let actor = Actor {
+        kind: ActorKind::Runtime,
+        id: "pending-recovery-test".to_owned(),
+    };
+    let recovered = [false, true]
+        .into_iter()
+        .enumerate()
+        .map(|(index, yolo)| {
+            let prompt = format!("pending turn {index}");
+            RecoveredPendingTurn {
+                sequence_no: u64::try_from(index).expect("sequence"),
+                actor: actor.clone(),
+                payload: json!({
+                    "prompt": prompt,
+                    "allow_network": false,
+                    "yolo": yolo,
+                }),
+                pending: PendingAgentTurn {
+                    command_id: CommandId::new(),
+                    turn_id: TurnId::new(),
+                    content: prompt,
+                    task_contract: Some(TaskContract::default()),
+                    output_schema: None,
+                    external_verifiers: Vec::new(),
+                    external_verifiers_require_os_sandbox: false,
+                    allow_network: false,
+                    yolo,
+                    steer: false,
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let error = host
+        .restart_pending_turns(session_id, recovered, None)
+        .await
+        .expect_err("mixed yolo recovery batch must fail");
+    assert!(matches!(
+        error,
+        ClientError::TaskExecution(message)
+            if message == "durable pending turn batch changes yolo capability"
+    ));
+}
+
+#[tokio::test]
 async fn uncertain_recovery_holds_pending_turns_until_reconciled() {
     let workspace = tempdir().expect("workspace");
     let _provider = IsolatedGlobalMockProvider::install().await;
@@ -6772,6 +7011,7 @@ async fn task_supervisor_converts_worker_panic_to_terminal_failure_and_cleans_co
         HostedTaskControl {
             task_id: task.task_id,
             allow_network: false,
+            yolo: false,
             execution,
             abort_handle,
             completion,

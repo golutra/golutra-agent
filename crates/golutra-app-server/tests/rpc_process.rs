@@ -64,7 +64,8 @@ async fn http_json_rpc_streams_the_same_turn_over_agent_sse() {
             "params": {
                 "cwd": workspace.path(),
                 "prompt": "reply with a short acknowledgement",
-                "allow_network": true
+                "allow_network": true,
+                "yolo": true
             }
         }),
     )
@@ -153,6 +154,10 @@ async fn http_json_rpc_streams_the_same_turn_over_agent_sse() {
     assert_eq!(
         task_created.pointer("/payload/execution_capabilities/network/enabled"),
         Some(&Value::Bool(false))
+    );
+    assert_eq!(
+        task_created.pointer("/payload/execution_capabilities/policy/mode"),
+        Some(&Value::String("unrestricted".to_owned()))
     );
     assert!(
         events

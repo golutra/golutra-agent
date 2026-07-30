@@ -94,6 +94,7 @@ class AgentTurnOptions(TypedDict, total=False):
     external_verifiers: NotRequired[list[ExternalVerificationSpec]]
     output_schema: NotRequired[Any]
     task_contract: NotRequired[TaskContract | None]
+    yolo: NotRequired[bool]
 
 class AgentTurnResult(TypedDict, total=False):
     final_message: NotRequired[str | None]

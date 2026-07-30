@@ -474,6 +474,17 @@ impl ToolRuntime {
         self
     }
 
+    /// Remove workspace and command policy restrictions for this task while
+    /// retaining tool validation, cancellation, timeouts and observations.
+    #[must_use]
+    pub fn with_unrestricted_access(mut self, enabled: bool) -> Self {
+        self.policy = self.policy.with_unrestricted_access(enabled);
+        if enabled {
+            self.sandbox = SystemSandbox::process_only();
+        }
+        self
+    }
+
     /// Enable network access for child tools only when the enclosing runtime
     /// explicitly granted that capability. The default remains isolated.
     #[must_use]
@@ -754,7 +765,10 @@ impl ToolRuntime {
             .map_err(|error| {
                 ToolError::InvalidArguments(format!("invalid verifier cwd: {error}"))
             })?;
-        if !cwd.starts_with(self.policy.workspace_root()) || !cwd.is_dir() {
+        if (self.policy.mode() != golutra_policy::WorkspacePolicyMode::Unrestricted
+            && !cwd.starts_with(self.policy.workspace_root()))
+            || !cwd.is_dir()
+        {
             return Err(ToolError::InvalidArguments(
                 "verifier cwd must be a directory inside the workspace".to_owned(),
             ));
@@ -823,6 +837,11 @@ impl ToolRuntime {
             }
             _ => return Err(ToolError::UnknownTool(request.tool_name.clone())),
         };
+        if self.policy.mode() == golutra_policy::WorkspacePolicyMode::Unrestricted {
+            policy.decision = PolicyDecision::Allow;
+            policy.block_disposition = None;
+            policy.reason = "unrestricted workspace policy enabled".to_owned();
+        }
         policy.resource = bounded_text(
             &redact_sensitive_text(&policy.resource).0,
             MAX_AUDIT_RESOURCE_CHARS,
@@ -1339,13 +1358,16 @@ impl ToolRuntime {
 
     async fn patch_paths(&self, patch: &str) -> Result<Vec<PathBuf>, ToolError> {
         validate_patch_input(patch)?;
-        let args = vec![
-            "apply".to_owned(),
+        let mut args = vec!["apply".to_owned()];
+        if self.policy.mode() == golutra_policy::WorkspacePolicyMode::Unrestricted {
+            args.push("--unsafe-paths".to_owned());
+        }
+        args.extend([
             "--numstat".to_owned(),
             "-z".to_owned(),
             "--whitespace=nowarn".to_owned(),
             "-".to_owned(),
-        ];
+        ]);
         let output = self
             .run_patch_command(
                 &args,
@@ -1419,11 +1441,11 @@ impl ToolRuntime {
                 ));
             }
         }
-        let args = vec![
-            "apply".to_owned(),
-            "--whitespace=nowarn".to_owned(),
-            "-".to_owned(),
-        ];
+        let mut args = vec!["apply".to_owned()];
+        if self.policy.mode() == golutra_policy::WorkspacePolicyMode::Unrestricted {
+            args.push("--unsafe-paths".to_owned());
+        }
+        args.extend(["--whitespace=nowarn".to_owned(), "-".to_owned()]);
         let output = self
             .run_patch_command(&args, &patch, WorkspaceAccess::ReadWrite, cancellation)
             .await?;

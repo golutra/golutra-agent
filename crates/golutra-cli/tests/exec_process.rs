@@ -30,7 +30,7 @@ async fn exec_and_exec_resume_work_across_independent_processes() {
         workspace.path(),
         &info,
         &token,
-        &["exec", "reply with a short acknowledgement"],
+        &["exec", "--yolo", "reply with a short acknowledgement"],
     )
     .await;
     assert!(first.status.success(), "first exec failed: {first:?}");
@@ -55,11 +55,20 @@ async fn exec_and_exec_resume_work_across_independent_processes() {
         workspace.path(),
         &info,
         &token,
-        &["exec", "resume", &thread_id, "reply again"],
+        &["exec", "resume", &thread_id, "--yolo", "reply again"],
     )
     .await;
     assert!(resumed.status.success(), "exec resume failed: {resumed:?}");
     assert!(String::from_utf8_lossy(&resumed.stdout).contains("mock provider completed"));
+
+    let daemon = run_daemon_cli(
+        home.path(),
+        workspace.path(),
+        &["exec", "--yolo", "reply through the local daemon"],
+    )
+    .await;
+    assert!(daemon.status.success(), "daemon exec failed: {daemon:?}");
+    assert!(String::from_utf8_lossy(&daemon.stdout).contains("mock provider completed"));
 
     let json_output = run_cli(
         home.path(),
@@ -606,6 +615,18 @@ async fn run_cli(
         .output()
         .await
         .expect("CLI process output")
+}
+
+async fn run_daemon_cli(home: &Path, workspace: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_golutra-cli"))
+        .arg("--cwd")
+        .arg(workspace)
+        .arg("--daemon")
+        .args(args)
+        .env("GOLUTRA_HOME", home)
+        .output()
+        .await
+        .expect("daemon CLI process output")
 }
 
 async fn wait_for_runtime(

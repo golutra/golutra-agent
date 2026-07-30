@@ -221,6 +221,11 @@ impl RuntimeHost {
                     .get("allow_network")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                yolo: task
+                    .payload
+                    .get("yolo")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
                 execution,
                 abort_handle,
                 completion,
@@ -304,6 +309,15 @@ impl RuntimeHost {
                 ));
             }
         };
+        let yolo = match task.payload.get("yolo") {
+            None => false,
+            Some(Value::Bool(yolo)) => *yolo,
+            Some(_) => {
+                return Err(ClientError::TaskExecution(
+                    "yolo must be a boolean".to_owned(),
+                ));
+            }
+        };
         let external_verifiers = task
             .payload
             .get("external_verifiers")
@@ -318,7 +332,7 @@ impl RuntimeHost {
         let policy = WorkspacePolicy::new(workspace_root.clone())
             .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
         let tool_executor = self
-            .build_tool_executor(policy, workspace_root.clone(), requested_network)
+            .build_tool_executor(policy, workspace_root.clone(), requested_network, yolo)
             .await?;
         let workspace_tool_names = tool_executor
             .registry()
@@ -351,7 +365,8 @@ impl RuntimeHost {
                 task.payload
                     .get(EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY)
                     .and_then(Value::as_bool)
-                    .unwrap_or(false),
+                    .unwrap_or(false)
+                    && !yolo,
             );
         let harness = match fallback_provider {
             Some(fallback) => harness.with_fallback(fallback),

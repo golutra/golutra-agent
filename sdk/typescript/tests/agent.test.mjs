@@ -70,6 +70,7 @@ test("Thread and TurnHandle preserve the shared agent lifecycle", async () => {
       max_correction_rounds: 1,
     },
     allowNetwork: true,
+    yolo: true,
     completionCriteria: [" verified ", ""],
     externalVerifiers: [{ program: "pytest", args: ["-q"] }],
   });
@@ -92,6 +93,7 @@ test("Thread and TurnHandle preserve the shared agent lifecycle", async () => {
       thread_id: "thread-1",
       prompt: "inspect the workspace",
       allow_network: true,
+      yolo: true,
       completion_criteria: [" verified "],
       external_verifiers: [{ program: "pytest", args: ["-q"] }],
       output_schema: { type: "object" },

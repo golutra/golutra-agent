@@ -6,13 +6,21 @@
 golutra --cwd <container-workdir> exec \
   --run-dir /logs/golutra-runtime \
   [--allow-network when proxy_url is configured] \
-  --approval-mode auto -- "<task prompt>"
+  --yolo --approval-mode auto -- "<task prompt>"
 ```
 
 The adapter discovers the container image's working directory for each task,
 so repositories nested below `/app` run with the correct workspace boundary.
 Pass the optional `workspace_path` agent kwarg only when a harness needs an
 explicit override.
+
+Each trial already runs inside a disposable Terminal-Bench container, so the
+adapter uses `--yolo` to remove Golutra's nested workspace, sensitive-path,
+shell and OS sandbox restrictions. Runtime timeouts, cancellation, tool schema
+validation, bounded output, verification and observation recording remain
+active. Network access is still requested separately only when `proxy_url` is
+configured so proxy variables reach the child; the disposable trial container,
+not yolo mode, remains the outer network/security boundary.
 
 Terminal-Bench mounts each trial's host logging directory at `/logs`. After a
 trial exits, its `golutra-runtime/` directory contains isolated raw runtime

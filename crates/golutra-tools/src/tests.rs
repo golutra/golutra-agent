@@ -410,6 +410,43 @@ async fn write_file_records_changed_file() {
 }
 
 #[tokio::test]
+async fn unrestricted_runtime_writes_outside_workspace_without_disabling_validation() {
+    let workspace = tempdir().expect("workspace");
+    let outside = tempdir().expect("outside");
+    let target = outside.path().join("secrets.7z");
+    let runtime = ToolRuntime::new(WorkspacePolicy::new(workspace.path()).expect("policy"))
+        .with_unrestricted_access(true);
+
+    assert!(!runtime.sandbox_os_enforced());
+    let write_request = request(
+        "write_file",
+        json!({"path": target, "content": "unrestricted"}),
+    );
+    assert_eq!(
+        runtime
+            .evaluate(&write_request)
+            .expect("unrestricted policy")
+            .decision,
+        PolicyDecision::Allow
+    );
+    let report = runtime
+        .execute(write_request, CancellationToken::new())
+        .await
+        .expect("outside write");
+    assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+    assert_eq!(
+        fs::read_to_string(&target).expect("outside file"),
+        "unrestricted"
+    );
+
+    let malformed = request("write_file", json!({"path": target}));
+    assert!(matches!(
+        runtime.evaluate(&malformed),
+        Err(ToolError::InvalidArguments(_))
+    ));
+}
+
+#[tokio::test]
 async fn tool_runtime_invokes_a_governed_call_through_one_public_seam() {
     let workspace = tempdir().expect("workspace");
     let runtime = ToolRuntime::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
@@ -475,6 +512,60 @@ async fn apply_patch_changes_multiple_files_through_one_atomic_tool_call() {
     assert_eq!(report.changed_files.len(), 2);
     assert_eq!(report.before_images.len(), 2);
     assert_eq!(report.after_images.len(), 2);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unrestricted_apply_patch_can_modify_an_outside_path() {
+    let workspace = tempdir().expect("workspace");
+    let outside = tempfile::tempdir_in(workspace.path().parent().expect("workspace parent"))
+        .expect("outside");
+    let relative_target = format!(
+        "../{}/external.txt",
+        outside
+            .path()
+            .file_name()
+            .expect("outside directory name")
+            .to_string_lossy()
+    );
+    let patch = format!(
+        concat!(
+            "diff --git a/{0} b/{0}\n",
+            "new file mode 100644\n",
+            "--- /dev/null\n",
+            "+++ b/{0}\n",
+            "@@ -0,0 +1 @@\n",
+            "+outside\n",
+        ),
+        relative_target
+    );
+    let executor =
+        ToolRuntime::new(WorkspacePolicy::new(workspace.path()).expect("workspace policy"))
+            .with_unrestricted_access(true);
+
+    let report = executor
+        .execute(
+            request("apply_patch", json!({"patch": patch})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("outside patch execution");
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+    assert_eq!(
+        fs::read_to_string(outside.path().join("external.txt")).expect("outside file"),
+        "outside\n"
+    );
+    assert_eq!(
+        report.changed_files,
+        vec![
+            outside
+                .path()
+                .join("external.txt")
+                .canonicalize()
+                .expect("canonical outside file")
+        ]
+    );
 }
 
 #[test]

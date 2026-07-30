@@ -366,6 +366,15 @@ impl RuntimeHost {
                 ));
             }
         };
+        let requested_yolo = match payload.get("yolo") {
+            None => None,
+            Some(Value::Bool(yolo)) => Some(*yolo),
+            Some(_) => {
+                return Err(ClientError::TaskExecution(
+                    "yolo must be a boolean".to_owned(),
+                ));
+            }
+        };
         let mut task_contract = task_contract_from_payload(&payload)?;
         let contract_origin = if explicit_task_contract {
             "explicit"
@@ -463,9 +472,24 @@ impl RuntimeHost {
                             reason =
                                 "queued prompt cannot change network capability while a task is active"
                                     .to_owned();
+                        } else if requested_yolo.is_some_and(|requested| control.yolo != requested)
+                        {
+                            accepted = false;
+                            reason =
+                                "queued prompt cannot change yolo capability while a task is active"
+                                    .to_owned();
                         } else {
                             let allow_network = requested_network.unwrap_or(control.allow_network);
+                            let yolo = requested_yolo.unwrap_or(control.yolo);
                             payload["allow_network"] = Value::Bool(allow_network);
+                            payload["yolo"] = Value::Bool(yolo);
+                            payload[EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY] = Value::Bool(
+                                payload
+                                    .get(EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY)
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false)
+                                    && !yolo,
+                            );
                             self.upsert_current_thread(session_id, &payload).await?;
                             match control
                                 .execution
@@ -481,6 +505,7 @@ impl RuntimeHost {
                                         .and_then(Value::as_bool)
                                         .unwrap_or(false),
                                     allow_network,
+                                    yolo,
                                     steer: payload
                                         .get("steer")
                                         .and_then(Value::as_bool)
@@ -562,7 +587,16 @@ impl RuntimeHost {
             }
         }
         let requested_network = requested_network.unwrap_or(false);
+        let yolo = requested_yolo.unwrap_or(false);
         payload["allow_network"] = Value::Bool(requested_network);
+        payload["yolo"] = Value::Bool(yolo);
+        payload[EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY] = Value::Bool(
+            payload
+                .get(EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY)
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                && !yolo,
+        );
         self.wait_for_finishing_task_control(session_id).await?;
         let session_lease = match self.try_acquire_session_lease(session_id)? {
             SessionLeaseAttempt::Acquired(lease) => lease,
@@ -625,7 +659,7 @@ impl RuntimeHost {
         let mut task_created =
             with_command_payload(transition.event, command.command_id, payload.clone());
         task_created.payload["execution_capabilities"] =
-            self.execution_capabilities(requested_network);
+            self.execution_capabilities(requested_network, yolo);
         task_created.payload["run_provenance"] =
             serde_json::to_value(self.capture_run_provenance(task_id))?;
         if let Err(error) = self.record_event(task_created).await {

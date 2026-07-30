@@ -135,6 +135,8 @@ pub struct PendingAgentTurn {
     pub external_verifiers_require_os_sandbox: bool,
     /// A queued turn cannot change the active tool runtime's network grant.
     pub allow_network: bool,
+    /// A queued turn cannot change the active tool runtime's policy mode.
+    pub yolo: bool,
     /// A steer is a continuation of the active turn for stream projection;
     /// an ordinary queued prompt remains an independent turn.
     pub steer: bool,

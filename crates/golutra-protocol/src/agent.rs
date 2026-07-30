@@ -169,6 +169,11 @@ pub struct AgentTurnOptions {
     /// reject this request when its capability is disabled.
     #[serde(default)]
     pub allow_network: bool,
+    /// Disable workspace, sensitive-path, shell and OS sandbox restrictions
+    /// for this turn. Network environment remains a separate host capability,
+    /// but process-only execution cannot enforce OS-level network isolation.
+    #[serde(default)]
+    pub yolo: bool,
     /// Caller-owned commands that objectively verify the candidate workspace
     /// after the model stops. These commands are argv-based and are never
     /// interpreted by a shell.
@@ -187,6 +192,7 @@ impl Default for AgentTurnOptions {
             output_schema: None,
             completion_criteria: Vec::new(),
             allow_network: false,
+            yolo: false,
             external_verifiers: Vec::new(),
             discover_project_verifiers: true,
         }

@@ -837,6 +837,12 @@ export interface AgentTurnOptions {
    * normalized default before execution.
    */
   task_contract?: TaskContract | null;
+  /**
+   * Disable workspace, sensitive-path, shell and OS sandbox restrictions
+   * for this turn. Network environment remains a separate host capability,
+   * but process-only execution cannot enforce OS-level network isolation.
+   */
+  yolo?: boolean;
   [k: string]: unknown;
 }
 export interface ExternalVerificationSpec {

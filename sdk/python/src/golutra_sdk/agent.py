@@ -27,6 +27,7 @@ class Thread:
         output_schema: dict[str, Any] | None = None,
         task_contract: TaskContract | None = None,
         allow_network: bool = False,
+        yolo: bool = False,
         completion_criteria: Iterable[str] = (),
         external_verifiers: Iterable[dict[str, Any]] | None = None,
         discover_project_verifiers: bool = True,
@@ -37,6 +38,7 @@ class Thread:
             "thread_id": self.thread_id,
             "prompt": prompt,
             "allow_network": allow_network,
+            "yolo": yolo,
             "completion_criteria": [item for item in completion_criteria if item.strip()],
         }
         if external_verifiers is not None or not discover_project_verifiers:
@@ -59,6 +61,7 @@ class Thread:
         output_schema: dict[str, Any] | None = None,
         task_contract: TaskContract | None = None,
         allow_network: bool = False,
+        yolo: bool = False,
         completion_criteria: Iterable[str] = (),
         external_verifiers: Iterable[dict[str, Any]] | None = None,
         discover_project_verifiers: bool = True,
@@ -68,6 +71,7 @@ class Thread:
             output_schema=output_schema,
             task_contract=task_contract,
             allow_network=allow_network,
+            yolo=yolo,
             completion_criteria=completion_criteria,
             external_verifiers=external_verifiers,
             discover_project_verifiers=discover_project_verifiers,

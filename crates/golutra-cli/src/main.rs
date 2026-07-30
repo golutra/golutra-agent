@@ -216,6 +216,11 @@ struct ExecArgs {
     /// Allow this embedded run's child tools to access the network.
     #[arg(long)]
     allow_network: bool,
+    /// Disable workspace, sensitive-path, shell and OS sandbox restrictions.
+    /// Proxy/network environment remains controlled by --allow-network, but
+    /// process-only execution cannot enforce OS-level network isolation.
+    #[arg(long, global = true)]
+    yolo: bool,
     /// Write isolated runtime state and full owner-only observations to this new directory.
     /// Implies --ephemeral. The legacy --ephemeral-state-dir spelling remains accepted.
     #[arg(
@@ -2541,7 +2546,11 @@ async fn run_exec(transport: &RuntimeTransport, args: ExecArgs) -> miette::Resul
     let json_output = args.json;
     let output_last_message = args.output_last_message;
     let run_dir = args.run_dir;
-    let approval_mode = args.approval_mode;
+    let approval_mode = if args.yolo {
+        ExecApprovalModeArg::Auto
+    } else {
+        args.approval_mode
+    };
     let client = AgentClient::new(transport.clone());
     let (thread, prompt) = match args.command {
         Some(ExecCommand::Resume { thread_id, .. }) => {
@@ -2572,6 +2581,7 @@ async fn run_exec(transport: &RuntimeTransport, args: ExecArgs) -> miette::Resul
                 output_schema,
                 completion_criteria: args.completion_criteria,
                 allow_network: args.allow_network,
+                yolo: args.yolo,
                 external_verifiers,
                 discover_project_verifiers: !args.no_project_verifier_discovery,
             },

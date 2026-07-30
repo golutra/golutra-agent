@@ -200,6 +200,7 @@ impl GolutraMcpServer {
                 output_schema: parameters.output_schema,
                 completion_criteria: parameters.completion_criteria,
                 allow_network: false,
+                yolo: false,
                 external_verifiers: Vec::new(),
                 discover_project_verifiers: false,
             },

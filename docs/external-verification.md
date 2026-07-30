@@ -62,3 +62,8 @@ scripts, so CI should run Golutra in an isolated machine or container. Explicit
 exec `--approval-mode auto` only resolves model
 actions already classified as `Ask`; it cannot approve `Block`/`Deny` actions or
 disable workspace, secret, metacharacter, network and sandbox controls.
+`exec --yolo` is the separate explicit escape hatch for trusted disposable
+environments: it removes those local modification and sandbox controls while
+leaving network environment configuration, verifier results and runtime bounds
+intact. Since process-only execution has no OS network isolation, use it only
+behind an appropriate outer machine or container boundary.

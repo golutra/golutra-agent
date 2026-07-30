@@ -391,6 +391,9 @@ fn turn_payload_from_params(params: &Value, thread_id: ThreadId, prompt: &str) -
     if let Some(allow_network) = params.get("allow_network") {
         payload["allow_network"] = allow_network.clone();
     }
+    if let Some(yolo) = params.get("yolo") {
+        payload["yolo"] = yolo.clone();
+    }
     if let Some(discover_project_verifiers) = params.get("discover_project_verifiers") {
         payload["discover_project_verifiers"] = discover_project_verifiers.clone();
     }
@@ -899,5 +902,12 @@ mod tests {
             "fetch dependencies",
         );
         assert_eq!(network_payload["allow_network"], true);
+
+        let yolo_payload = turn_payload_from_params(
+            &json!({"yolo": true}),
+            ThreadId::new(),
+            "modify an external path",
+        );
+        assert_eq!(yolo_payload["yolo"], true);
     }
 }

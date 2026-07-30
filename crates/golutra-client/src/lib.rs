@@ -429,6 +429,7 @@ struct HostedTaskEvaluation<'a> {
 struct HostedTaskControl {
     task_id: TaskId,
     allow_network: bool,
+    yolo: bool,
     execution: AgentExecutionHandle,
     abort_handle: AbortHandle,
     completion: watch::Receiver<bool>,
@@ -852,7 +853,7 @@ impl RuntimeHost {
         requested && self.execution_options.allow_network
     }
 
-    pub(crate) fn execution_capabilities(&self, requested_network: bool) -> Value {
+    pub(crate) fn execution_capabilities(&self, requested_network: bool, yolo: bool) -> Value {
         let enabled = self.network_access_enabled(requested_network);
         json!({
             "network": {
@@ -865,6 +866,10 @@ impl RuntimeHost {
                 } else {
                     "not requested"
                 }
+            },
+            "policy": {
+                "mode": if yolo { "unrestricted" } else { "guarded" },
+                "tool_sandbox_mode": if yolo { "process_only" } else { "detected" },
             }
         })
     }
@@ -1122,6 +1127,15 @@ impl RuntimeHost {
         {
             return Err(ClientError::TaskExecution(
                 "durable pending turn batch changes network capability".to_owned(),
+            ));
+        }
+        let recovered_yolo_capability = pending_turns[0].pending.yolo;
+        if pending_turns
+            .iter()
+            .any(|turn| turn.pending.yolo != recovered_yolo_capability)
+        {
+            return Err(ClientError::TaskExecution(
+                "durable pending turn batch changes yolo capability".to_owned(),
             ));
         }
         let first = pending_turns.remove(0);

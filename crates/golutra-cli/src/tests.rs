@@ -70,6 +70,36 @@ fn exec_can_disable_project_verifier_discovery() {
 }
 
 #[test]
+fn yolo_parses_for_embedded_daemon_connect_and_resume_exec() {
+    for arguments in [
+        vec!["golutra", "exec", "--yolo", "modify files"],
+        vec!["golutra", "--daemon", "exec", "--yolo", "modify files"],
+        vec![
+            "golutra",
+            "--connect",
+            "http://127.0.0.1:47831",
+            "exec",
+            "--yolo",
+            "modify files",
+        ],
+        vec![
+            "golutra",
+            "exec",
+            "resume",
+            "00000000-0000-0000-0000-000000000001",
+            "--yolo",
+            "modify files",
+        ],
+    ] {
+        let cli = Cli::try_parse_from(&arguments).expect("yolo exec");
+        assert!(
+            matches!(cli.command, Command::Exec(ExecArgs { yolo: true, .. })),
+            "{arguments:?}"
+        );
+    }
+}
+
+#[test]
 fn repeated_external_evaluation_uses_its_original_trace_binding() {
     let mut value = serde_json::json!({
         "base_trace_digest": "auto",

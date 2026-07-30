@@ -192,6 +192,7 @@ impl AgentThread {
             "completion_criteria": options.completion_criteria.clone(),
             "output_schema": options.output_schema.clone(),
             "allow_network": options.allow_network,
+            "yolo": options.yolo,
         });
         if !options.external_verifiers.is_empty() || !options.discover_project_verifiers {
             payload["external_verifiers"] =

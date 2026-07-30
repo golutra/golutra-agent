@@ -60,6 +60,7 @@ pub struct McpToolBackend {
     workspace_root: PathBuf,
     scratch_root: PathBuf,
     sandbox: SystemSandbox,
+    require_os_sandbox: bool,
     targets: Arc<HashMap<String, ToolTarget>>,
 }
 
@@ -72,11 +73,37 @@ impl McpToolBackend {
         Self::with_sandbox(store, workspace_root, scratch_root, SystemSandbox::detect())
     }
 
+    /// Load enabled plugins without requiring an OS-enforced child-process sandbox.
+    /// Callers must provide an appropriate outer isolation boundary.
+    pub fn from_store_unrestricted(
+        store: PluginStore,
+        workspace_root: impl AsRef<Path>,
+        scratch_root: impl AsRef<Path>,
+    ) -> Result<Option<Self>, McpError> {
+        Self::build(
+            store,
+            workspace_root,
+            scratch_root,
+            SystemSandbox::process_only(),
+            false,
+        )
+    }
+
     pub fn with_sandbox(
         store: PluginStore,
         workspace_root: impl AsRef<Path>,
         scratch_root: impl AsRef<Path>,
         sandbox: SystemSandbox,
+    ) -> Result<Option<Self>, McpError> {
+        Self::build(store, workspace_root, scratch_root, sandbox, true)
+    }
+
+    fn build(
+        store: PluginStore,
+        workspace_root: impl AsRef<Path>,
+        scratch_root: impl AsRef<Path>,
+        sandbox: SystemSandbox,
+        require_os_sandbox: bool,
     ) -> Result<Option<Self>, McpError> {
         let enabled = store.enabled()?;
         if enabled.is_empty() {
@@ -92,6 +119,7 @@ impl McpToolBackend {
             workspace_root,
             scratch_root,
             sandbox,
+            require_os_sandbox,
             targets: Arc::new(targets),
         }))
     }
@@ -107,7 +135,7 @@ impl McpToolBackend {
         request: &ToolRequest,
         cancellation: CancellationToken,
     ) -> Result<ExternalToolOutput, McpError> {
-        if !self.sandbox.os_enforced() {
+        if self.require_os_sandbox && !self.sandbox.os_enforced() {
             return Err(McpError::Sandbox(
                 "external plugins require an OS-enforced sandbox".to_owned(),
             ));
