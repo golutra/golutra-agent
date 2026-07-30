@@ -217,8 +217,8 @@ struct ExecArgs {
     #[arg(long)]
     allow_network: bool,
     /// Disable workspace, sensitive-path, shell and OS sandbox restrictions.
-    /// Proxy/network environment remains controlled by --allow-network, but
-    /// process-only execution cannot enforce OS-level network isolation.
+    /// This also requests network access; process-only execution cannot enforce
+    /// OS-level network isolation.
     #[arg(long, global = true)]
     yolo: bool,
     /// Write isolated runtime state and full owner-only observations to this new directory.
@@ -277,8 +277,10 @@ struct ExecArgs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ExecApprovalModeArg {
     /// Ask on a terminal; deny when stdin is not interactive.
+    #[value(alias = "on-request", alias = "on_request", alias = "granular")]
     Prompt,
     /// Deny every approval request.
+    #[value(alias = "never")]
     Deny,
     /// Approve `Ask` decisions. Policy-blocked actions remain blocked.
     Auto,
@@ -743,6 +745,7 @@ async fn main() -> miette::Result<()> {
     let ephemeral_exec =
         matches!(&cli.command, Command::Exec(args) if args.ephemeral || args.run_dir.is_some());
     let allow_network = matches!(&cli.command, Command::Exec(args) if args.allow_network);
+    let yolo = matches!(&cli.command, Command::Exec(args) if args.yolo);
     let run_dir = match &cli.command {
         Command::Exec(args) => args.run_dir.clone(),
         _ => None,
@@ -762,7 +765,7 @@ async fn main() -> miette::Result<()> {
             "exec --allow-network requires an embedded runtime; configure network capability on the app-server host before using --daemon or --connect"
         ));
     }
-    let execution_options = RuntimeExecutionOptions::with_network_access(allow_network);
+    let execution_options = RuntimeExecutionOptions::with_network_access(allow_network || yolo);
     let transport = if let Some(run_bundle) = cli.run_bundle.as_ref() {
         RuntimeTransport::open_persisted_run(run_bundle).await
     } else if let Some(state_dir) = run_dir.as_ref() {
@@ -2580,7 +2583,7 @@ async fn run_exec(transport: &RuntimeTransport, args: ExecArgs) -> miette::Resul
                 task_contract,
                 output_schema,
                 completion_criteria: args.completion_criteria,
-                allow_network: args.allow_network,
+                allow_network: args.allow_network || args.yolo,
                 yolo: args.yolo,
                 external_verifiers,
                 discover_project_verifiers: !args.no_project_verifier_discovery,

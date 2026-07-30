@@ -80,6 +80,10 @@ fn yolo_is_added_only_to_unrestricted_tui_prompts() {
         unrestricted.runtime_prompt_payload("modify files".to_owned())["yolo"],
         json!(true)
     );
+    assert_eq!(
+        unrestricted.runtime_prompt_payload("modify files".to_owned())["allow_network"],
+        json!(true)
+    );
     assert!(
         guarded
             .runtime_prompt_payload("inspect files".to_owned())

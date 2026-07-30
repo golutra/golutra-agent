@@ -100,6 +100,22 @@ fn yolo_parses_for_embedded_daemon_connect_and_resume_exec() {
 }
 
 #[test]
+fn approval_mode_accepts_codex_style_aliases() {
+    for (value, expected) in [
+        ("on-request", ExecApprovalModeArg::Prompt),
+        ("granular", ExecApprovalModeArg::Prompt),
+        ("never", ExecApprovalModeArg::Deny),
+    ] {
+        let cli = Cli::try_parse_from(["golutra", "exec", "--approval-mode", value, "inspect"])
+            .expect("approval mode alias");
+        assert!(matches!(
+            cli.command,
+            Command::Exec(ExecArgs { approval_mode, .. }) if approval_mode == expected
+        ));
+    }
+}
+
+#[test]
 fn repeated_external_evaluation_uses_its_original_trace_binding() {
     let mut value = serde_json::json!({
         "base_trace_digest": "auto",

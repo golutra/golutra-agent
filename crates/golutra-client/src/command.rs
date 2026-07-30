@@ -375,6 +375,12 @@ impl RuntimeHost {
                 ));
             }
         };
+        // Yolo is the trusted full-access profile: it also requests network
+        // access, while the host still decides whether that capability exists.
+        let requested_network = requested_network
+            .map_or(requested_yolo.filter(|enabled| *enabled), |requested| {
+                Some(requested || requested_yolo.unwrap_or(false))
+            });
         let mut task_contract = task_contract_from_payload(&payload)?;
         let contract_origin = if explicit_task_contract {
             "explicit"
@@ -465,18 +471,17 @@ impl RuntimeHost {
                 let control = self.task_controls.lock().await.get(&session_id).cloned();
                 match control {
                     Some(control) if control.task_id == active_task_id => {
-                        if requested_network
+                        if requested_yolo.is_some_and(|requested| control.yolo != requested) {
+                            accepted = false;
+                            reason =
+                                "queued prompt cannot change yolo capability while a task is active"
+                                    .to_owned();
+                        } else if requested_network
                             .is_some_and(|requested| control.allow_network != requested)
                         {
                             accepted = false;
                             reason =
                                 "queued prompt cannot change network capability while a task is active"
-                                    .to_owned();
-                        } else if requested_yolo.is_some_and(|requested| control.yolo != requested)
-                        {
-                            accepted = false;
-                            reason =
-                                "queued prompt cannot change yolo capability while a task is active"
                                     .to_owned();
                         } else {
                             let allow_network = requested_network.unwrap_or(control.allow_network);

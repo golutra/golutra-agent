@@ -5,7 +5,7 @@ use std::{
 };
 
 use fs2::FileExt;
-use golutra_client::RuntimeTransport;
+use golutra_client::{RuntimeExecutionOptions, RuntimeTransport};
 use golutra_protocol::{
     DriverEnvelope, DriverNotification, DriverNotificationKind, DriverRequest, DriverResponse,
     DriverResponseEnvelope, RowRange, SnapshotDetail, SnapshotPanes, SnapshotRequest,
@@ -155,7 +155,11 @@ async fn driver_transport(
         ));
     }
     let transport = if embedded {
-        RuntimeTransport::for_cwd(cwd).await
+        RuntimeTransport::for_cwd_with_options(
+            cwd,
+            RuntimeExecutionOptions::with_network_access(args.yolo),
+        )
+        .await
     } else if let Some(base_url) = args.connect.clone() {
         RuntimeTransport::connect(base_url, cwd).await
     } else {

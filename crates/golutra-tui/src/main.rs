@@ -20,8 +20,8 @@ use golutra_auth::{
     CredentialRef, CredentialSource, OAuthFlow, OAuthProviderDescriptor, SecretKind,
 };
 use golutra_client::{
-    DebugExportCoordinator, DebugExportRequest, RuntimeClient, RuntimeTransport,
-    parse_session_range,
+    DebugExportCoordinator, DebugExportRequest, RuntimeClient, RuntimeExecutionOptions,
+    RuntimeTransport, parse_session_range,
 };
 use golutra_config::{
     BuiltinOAuthMethod, ProviderConfigPaths, ProviderConfigScope, ProviderInstallPlan,
@@ -766,6 +766,7 @@ impl TuiApp {
         });
         if self.yolo {
             payload["yolo"] = json!(true);
+            payload["allow_network"] = json!(true);
         }
         payload
     }
@@ -1651,7 +1652,11 @@ async fn async_main() -> miette::Result<()> {
     } else if args.daemon {
         RuntimeTransport::local_daemon(&cwd).await
     } else {
-        RuntimeTransport::for_cwd(&cwd).await
+        RuntimeTransport::for_cwd_with_options(
+            &cwd,
+            RuntimeExecutionOptions::with_network_access(args.yolo),
+        )
+        .await
     }
     .map_err(|error| miette::miette!("{error}"))?;
     run_interactive(&args, cwd, transport).await

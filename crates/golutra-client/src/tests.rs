@@ -5988,6 +5988,24 @@ async fn yolo_turn_writes_outside_the_workspace_without_approval() {
             .pointer("/execution_capabilities/policy/tool_sandbox_mode"),
         Some(&json!("process_only"))
     );
+    assert_eq!(
+        task_created
+            .payload
+            .pointer("/execution_capabilities/policy/permission_profile"),
+        Some(&json!("full_access"))
+    );
+    assert_eq!(
+        task_created
+            .payload
+            .pointer("/execution_capabilities/policy/approval_mode"),
+        Some(&json!("never"))
+    );
+    assert_eq!(
+        task_created
+            .payload
+            .pointer("/execution_capabilities/network/requested"),
+        Some(&json!(true))
+    );
 }
 
 #[tokio::test]

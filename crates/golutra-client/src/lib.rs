@@ -870,6 +870,8 @@ impl RuntimeHost {
             "policy": {
                 "mode": if yolo { "unrestricted" } else { "guarded" },
                 "tool_sandbox_mode": if yolo { "process_only" } else { "detected" },
+                "permission_profile": if yolo { "full_access" } else { "workspace" },
+                "approval_mode": if yolo { "never" } else { "on_request" },
             }
         })
     }
