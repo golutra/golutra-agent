@@ -89,8 +89,10 @@ Output rules:
 
 `--yolo` is an explicit per-task unrestricted modification mode. It is
 available to embedded, `--daemon` and `--connect` exec transports, including
-`exec resume`. It bypasses workspace and sensitive-path checks, shell/P0
-blocks, approval requests and child-tool OS sandboxing. It does not enable
+`exec resume`. `golutra-tui --yolo` applies the same capability to prompts from
+the interactive, `remote`, `inspect` and `driver` TUI entrypoints. It bypasses
+workspace and sensitive-path checks, shell/P0 blocks, approval requests and
+child-tool OS sandboxing. It does not enable
 the runtime's network/proxy environment, disable tool argument validation,
 remove timeout or cancellation bounds, skip verification, or suppress
 observations. Because the child runs process-only, callers must not treat

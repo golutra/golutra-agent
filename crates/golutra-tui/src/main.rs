@@ -108,6 +108,10 @@ struct Args {
     task_id: Option<String>,
     #[arg(long, global = true)]
     debug: bool,
+    /// Disable workspace, sensitive-path, shell and OS sandbox restrictions
+    /// for prompts submitted by this TUI.
+    #[arg(long, global = true)]
+    yolo: bool,
     #[command(subcommand)]
     command: Option<TuiCommand>,
 }
@@ -197,6 +201,7 @@ struct TuiApp {
     provider_model: String,
     workspace_path: PathBuf,
     debug_mode: bool,
+    yolo: bool,
     activity_projection: ActivityProjection,
     change_projection: ChangeProjection,
     expanded_operations: HashSet<OperationId>,
@@ -248,6 +253,7 @@ impl TuiApp {
             provider_model,
             workspace_path,
             debug_mode,
+            yolo: false,
             activity_projection: ActivityProjection::default(),
             change_projection: ChangeProjection::default(),
             expanded_operations: HashSet::new(),
@@ -281,6 +287,11 @@ impl TuiApp {
     ) -> Self {
         self.workspace_path = workspace_path.into();
         self.provider_model = provider_model.into();
+        self
+    }
+
+    fn with_yolo(mut self, enabled: bool) -> Self {
+        self.yolo = enabled;
         self
     }
 
@@ -731,10 +742,7 @@ impl TuiApp {
             .send_command(session_command(
                 self.session_id,
                 SessionCommandKind::Prompt,
-                json!({
-                    "prompt": prompt,
-                    "_thread_id": self.thread_id.to_string(),
-                }),
+                self.runtime_prompt_payload(prompt),
             ))
             .await
             .map_err(|error| miette::miette!("{error}"))?;
@@ -749,6 +757,17 @@ impl TuiApp {
         self.refresh(transport).await?;
         self.last_prompt_ack = Some(ack.clone());
         Ok(Some(ack))
+    }
+
+    fn runtime_prompt_payload(&self, prompt: String) -> serde_json::Value {
+        let mut payload = json!({
+            "prompt": prompt,
+            "_thread_id": self.thread_id.to_string(),
+        });
+        if self.yolo {
+            payload["yolo"] = json!(true);
+        }
+        payload
     }
 
     fn take_last_prompt_ack(&mut self) -> Option<CommandAck> {
@@ -1663,6 +1682,7 @@ async fn run_interactive(
         provider_status.message,
         auth_dialog,
     )
+    .with_yolo(args.yolo)
     .with_footer_context(runtime_cwd, provider_status.model);
     let mut terminal = setup_terminal()?;
     let result = run_app(&mut terminal, app, transport).await;

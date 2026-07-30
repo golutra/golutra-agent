@@ -35,6 +35,7 @@ pub(crate) async fn run_inspect_command(args: &Args, command: InspectArgs) -> mi
         command.session.as_deref().or(args.session_id.as_deref()),
         args.task_id.as_deref(),
         args.debug,
+        args.yolo,
         command.width,
         command.height,
     )
@@ -116,6 +117,7 @@ pub(crate) async fn run_driver_command(args: &Args, command: DriverArgs) -> miet
         command.session.as_deref().or(args.session_id.as_deref()),
         args.task_id.as_deref(),
         args.debug,
+        args.yolo,
         command.width,
         command.height,
     )

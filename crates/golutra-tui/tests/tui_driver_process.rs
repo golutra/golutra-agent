@@ -239,6 +239,7 @@ async fn inspect_and_stdio_driver_execute_real_offscreen_tui() {
         .arg("inspect")
         .args([
             "--embedded",
+            "--yolo",
             "--session",
             "new",
             "--prompt",
@@ -801,6 +802,30 @@ async fn inspect_and_stdio_driver_execute_real_offscreen_tui() {
         .await;
     assert_eq!(driver.receive("quit-slash").await["type"], "closed");
     driver.wait_for_exit().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inspect_accepts_yolo_and_marks_the_full_screen() {
+    let (_lock, home, workspace, _env) = process_test_context().await;
+    let output = tui_command(home.path(), workspace.path())
+        .arg("inspect")
+        .args([
+            "--embedded",
+            "--session",
+            "new",
+            "--yolo",
+            "--view",
+            "screen",
+            "--format",
+            "json",
+        ])
+        .output()
+        .await
+        .expect("run yolo inspect");
+    assert_command_success(&output, "yolo inspect");
+    let inspect_json = String::from_utf8(output.stdout).expect("inspect UTF-8");
+
+    assert!(inspect_json.contains("[yolo]"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

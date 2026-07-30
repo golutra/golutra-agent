@@ -16,6 +16,12 @@ cargo run -p golutra-cli -- --cwd "$PWD" mcp-server
 cargo run -p golutra-tui -- --cwd "$PWD" remote --url http://127.0.0.1:47831
 ```
 
+Cargo 参数后的 `--` 会把后续选项传给 TUI；启用 unrestricted 模式：
+
+```bash
+cargo run -p golutra-tui -- --yolo
+```
+
 Agent 或自动化测试可以直接驱动真实离屏 TUI：
 
 ```bash

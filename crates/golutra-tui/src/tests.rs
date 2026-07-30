@@ -30,6 +30,64 @@ fn remote_subcommand_is_an_explicit_app_server_transport() {
     assert_eq!(args.cwd, Some(PathBuf::from("/tmp")));
 }
 
+#[test]
+fn yolo_is_global_for_every_tui_entrypoint() {
+    for arguments in [
+        &["golutra-tui", "--yolo"][..],
+        &["golutra-tui", "--daemon", "--yolo"][..],
+        &[
+            "golutra-tui",
+            "--connect",
+            "http://127.0.0.1:47831",
+            "--yolo",
+        ][..],
+        &[
+            "golutra-tui",
+            "remote",
+            "--url",
+            "https://runtime.example",
+            "--yolo",
+        ][..],
+        &["golutra-tui", "inspect", "--embedded", "--yolo"][..],
+        &["golutra-tui", "driver", "--embedded", "--stdio", "--yolo"][..],
+    ] {
+        let args = Args::try_parse_from(arguments).expect("yolo TUI arguments");
+        assert!(args.yolo, "{arguments:?}");
+    }
+}
+
+#[test]
+fn yolo_is_added_only_to_unrestricted_tui_prompts() {
+    let unrestricted = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_yolo(true);
+    let guarded = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+
+    assert_eq!(
+        unrestricted.runtime_prompt_payload("modify files".to_owned())["yolo"],
+        json!(true)
+    );
+    assert!(
+        guarded
+            .runtime_prompt_payload("inspect files".to_owned())
+            .get("yolo")
+            .is_none()
+    );
+}
+
 #[tokio::test]
 async fn remote_transport_attaches_to_the_real_app_server_and_resolves_a_session() {
     let _guard = env_lock_guard().await;
@@ -762,6 +820,25 @@ fn footer_context_shows_model_and_home_relative_workspace_without_wrapping() {
     assert!(display_width(&narrow) <= 30);
     assert!(narrow.contains(" · "));
     assert!(narrow.ends_with("agent"));
+}
+
+#[test]
+fn footer_context_marks_yolo_mode() {
+    let app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (custom)".to_owned(),
+        None,
+    )
+    .with_yolo(true)
+    .with_footer_context("/workspace", "gpt-5.6-sol");
+
+    assert_eq!(
+        footer_context_text(&app, 80),
+        "[yolo] gpt-5.6-sol · /workspace"
+    );
 }
 
 #[test]

@@ -92,6 +92,7 @@ impl TuiDriver {
         session: Option<&str>,
         task_id: Option<&str>,
         debug: bool,
+        yolo: bool,
         width: u16,
         height: u16,
     ) -> miette::Result<Self> {
@@ -117,6 +118,7 @@ impl TuiDriver {
             provider_status.message,
             auth_dialog,
         )
+        .with_yolo(yolo)
         .with_footer_context(runtime_cwd, provider_status.model);
         let controller = TuiRuntimeController::attach(&mut app, transport).await?;
         let last_notified_cursor = app.cursor;

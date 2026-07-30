@@ -1268,8 +1268,13 @@ pub(crate) fn footer_context_text(app: &TuiApp, max_width: usize) -> String {
     } else {
         app.provider_model.trim()
     };
+    let model = if app.yolo {
+        format!("[yolo] {model}")
+    } else {
+        model.to_owned()
+    };
     let workspace = workspace_path_label(&app.workspace_path);
-    fit_model_and_workspace(model, &workspace, max_width)
+    fit_model_and_workspace(&model, &workspace, max_width)
 }
 
 pub(crate) fn fit_model_and_workspace(model: &str, workspace: &str, max_width: usize) -> String {
