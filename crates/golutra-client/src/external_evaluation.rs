@@ -158,6 +158,7 @@ impl RuntimeHost {
             self.close_deferred_external_verification(
                 session_id,
                 record.source_task_id,
+                &record,
                 record.verdict,
                 record.evaluation_id.clone(),
                 record.imported_evidence_refs.clone(),
@@ -205,6 +206,7 @@ impl RuntimeHost {
         &self,
         session_id: SessionId,
         task_id: TaskId,
+        record: &ExternalEvaluationRecord,
         verdict: EvaluationVerdict,
         evaluation_id: String,
         imported_evidence_refs: Vec<EvidenceId>,
@@ -277,6 +279,48 @@ impl RuntimeHost {
                 "outcome": outcome,
                 "external_evaluation_id": evaluation_id,
                 "post_task_governance": {"status": "pending"},
+            }),
+        ))
+        .await?;
+        let failed_assertions = record
+            .assertions
+            .iter()
+            .filter(|assertion| !assertion.passed)
+            .map(|assertion| {
+                json!({
+                    "name": assertion.name,
+                    "message": assertion.message,
+                    "evidence_refs": assertion.evidence_refs,
+                })
+            })
+            .collect::<Vec<_>>();
+        let correctable = matches!(verdict, EvaluationVerdict::Fail)
+            && record
+                .terminal_cause
+                .as_ref()
+                .is_none_or(|cause| cause.code == "assertion_failed");
+        self.record_event(agent_event_for_turn(
+            self.next_sequence_no(),
+            &HostedAgentTask {
+                session_id,
+                task_id,
+                turn_id: terminal.turn_id.unwrap_or_default(),
+                payload: Value::Null,
+            },
+            terminal.turn_id.unwrap_or_default(),
+            RuntimeEventType::ExternalVerificationFeedback,
+            RuntimeEventSource::Evaluator,
+            json!({
+                "summary": "external evaluator feedback attached to the completed candidate",
+                "evaluation_id": evaluation_id,
+                "verdict": verdict,
+                "failed_assertions": failed_assertions,
+                "correction_available": correctable,
+                "suggested_action": if correctable {
+                    "resume the thread with the failed assertions and rerun the evaluator"
+                } else {
+                    "classify the evaluator failure before attempting a model correction"
+                },
             }),
         ))
         .await

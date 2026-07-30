@@ -8,7 +8,7 @@ use golutra_context::ContextCompactionRecord;
 use golutra_core::{
     ApprovalRequest, ApprovalResolution, ContextSnapshot, CorrectionEnvelope, ProviderRequestId,
     ToolCallId, ToolProgress, ToolRecoveryPolicy, TurnId, VerificationAssertion, VerificationPlan,
-    VerificationRecord,
+    VerificationPlanId, VerificationRecord,
 };
 use golutra_governor::RuntimeGovernorDecision;
 use golutra_llm::{ProviderRequest, ProviderResponse, ProviderStreamEvent};
@@ -45,6 +45,14 @@ pub enum AgentLoopTraceEvent {
     ContextSnapshotCaptured {
         snapshot: ContextSnapshot,
         request: ProviderRequest,
+    },
+    CandidateReady {
+        turn_id: TurnId,
+        tool_count: usize,
+        has_assistant_message: bool,
+    },
+    VerificationReady {
+        plan_id: VerificationPlanId,
     },
     VerificationPlanned(VerificationPlan),
     VerificationAssertionCompleted(VerificationAssertion),

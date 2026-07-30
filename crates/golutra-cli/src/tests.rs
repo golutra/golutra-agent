@@ -51,6 +51,27 @@ fn run_directory_implies_ephemeral_exec_and_keeps_legacy_alias() {
 }
 
 #[test]
+fn persisted_run_accepts_thread_resume_for_external_correction() {
+    let cli = Cli::try_parse_from([
+        "golutra",
+        "--run-bundle",
+        "/tmp/golutra-run",
+        "exec",
+        "resume",
+        "00000000-0000-0000-0000-000000000001",
+        "fix the failed assertion",
+    ])
+    .expect("persisted run resume");
+    assert!(matches!(
+        cli.command,
+        Command::Exec(ExecArgs {
+            command: Some(ExecCommand::Resume { .. }),
+            ..
+        })
+    ));
+}
+
+#[test]
 fn exec_can_disable_project_verifier_discovery() {
     let cli = Cli::try_parse_from([
         "golutra",

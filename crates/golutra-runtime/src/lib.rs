@@ -1025,7 +1025,12 @@ where
                         });
                         guard_reason = Some(reason);
                     }
-                    turn_state.candidate_complete();
+                    turn_state.candidate_ready();
+                    trace(AgentLoopTraceEvent::CandidateReady {
+                        turn_id: current_turn_id,
+                        tool_count: tool_reports.len(),
+                        has_assistant_message: last_assistant_message.is_some(),
+                    });
                     candidate_complete = true;
                     break;
                 }
@@ -1851,6 +1856,10 @@ where
                 }
             };
             let verification_plan = self.verifier.plan(&verification_input);
+            turn_state.verification_ready();
+            trace(AgentLoopTraceEvent::VerificationReady {
+                plan_id: verification_plan.plan_id,
+            });
             trace(AgentLoopTraceEvent::VerificationPlanned(
                 verification_plan.clone(),
             ));

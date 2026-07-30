@@ -103,6 +103,19 @@ fn observation_catalog_classifies_loop_facts_before_persistence() {
     assert_eq!(required.source, RuntimeEventSource::Tool);
     assert_eq!(required.integrity, ObservationIntegrityClass::Supporting);
 
+    let candidate = observation_descriptor(&RuntimeObservation::CandidateReady {
+        turn_id: TurnId::new(),
+        tool_count: 1,
+        has_assistant_message: true,
+    });
+    assert_eq!(candidate.event_type, RuntimeEventType::CandidateReady);
+    assert_eq!(candidate.integrity, ObservationIntegrityClass::Required);
+
+    let verification = observation_descriptor(&RuntimeObservation::VerificationReady {
+        plan_id: golutra_core::VerificationPlanId::new(),
+    });
+    assert_eq!(verification.event_type, RuntimeEventType::VerificationReady);
+
     let diagnostic = observation_descriptor(&RuntimeObservation::ProviderStreamed {
         request_id: golutra_core::ProviderRequestId::new(),
         provider_id: "provider".to_owned(),
@@ -4848,6 +4861,18 @@ async fn persisted_ephemeral_runtime_retains_isolated_state_and_full_run_bundle(
             .events
             .iter()
             .any(|event| { event.event_type == RuntimeEventType::ExternalEvaluationIngested })
+    );
+    assert!(
+        refreshed_trace
+            .events
+            .iter()
+            .any(|event| { event.event_type == RuntimeEventType::ExternalVerificationRequested })
+    );
+    assert!(
+        refreshed_trace
+            .events
+            .iter()
+            .any(|event| { event.event_type == RuntimeEventType::ExternalVerificationFeedback })
     );
     assert!(!global_runtime_db.exists());
     drop(reopened_transport);

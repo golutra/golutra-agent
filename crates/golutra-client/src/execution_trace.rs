@@ -508,6 +508,10 @@ impl RuntimeHost {
         status: TaskStatus,
         outcome: golutra_core::TaskOutcome,
     ) -> Result<(), ClientError> {
+        let awaiting_external = matches!(
+            outcome.external_verification,
+            golutra_core::ExternalVerificationStatus::Pending
+        );
         self.workspace_change_tracker
             .lock()
             .await
@@ -520,9 +524,9 @@ impl RuntimeHost {
                 transition.event.payload["summary"] =
                     json!(format!("runtime task finished with {status:?}"));
                 transition.event.payload["status"] = json!(status);
-                transition.event.payload["outcome"] = json!(outcome);
+                transition.event.payload["outcome"] = json!(outcome.clone());
                 transition.event.payload["post_task_governance"] = json!({"status": "pending"});
-                self.record_event(transition.event).await
+                self.record_event(transition.event).await?
             }
             Err(RuntimeLaneError::LaneNotFound) => {
                 let event_type = RuntimeEventType::for_terminal_status(status);
@@ -534,14 +538,31 @@ impl RuntimeHost {
                     json!({
                         "summary": format!("persisted runtime task finished with {status:?}"),
                         "status": status,
-                        "outcome": outcome,
+                        "outcome": outcome.clone(),
                         "post_task_governance": {"status": "pending"},
                     }),
                 ))
-                .await
+                .await?
             }
-            Err(error) => Err(error.into()),
+            Err(error) => return Err(error.into()),
+        };
+        if awaiting_external {
+            self.record_event(agent_event(
+                self.next_sequence_no(),
+                task,
+                RuntimeEventType::ExternalVerificationRequested,
+                RuntimeEventSource::Evaluator,
+                json!({
+                    "summary": "runtime candidate is awaiting an external evaluator",
+                    "status": status,
+                    "outcome": outcome,
+                    "resume_supported": true,
+                    "next_action": "ingest the evaluator record, then resume with structured feedback if assertions fail",
+                }),
+            ))
+            .await?;
         }
+        Ok(())
     }
 
     pub(super) async fn record_task_execution_failure(

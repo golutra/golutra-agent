@@ -494,6 +494,16 @@ pub(crate) fn observation_descriptor(observation: &RuntimeObservation) -> Observ
             RuntimeEventSource::Runtime,
             ObservationIntegrityClass::Required,
         ),
+        RuntimeObservation::CandidateReady { .. } => (
+            RuntimeEventType::CandidateReady,
+            RuntimeEventSource::Runtime,
+            ObservationIntegrityClass::Required,
+        ),
+        RuntimeObservation::VerificationReady { .. } => (
+            RuntimeEventType::VerificationReady,
+            RuntimeEventSource::Verifier,
+            ObservationIntegrityClass::Required,
+        ),
         RuntimeObservation::VerificationPlanned(_) => (
             RuntimeEventType::VerificationPlanned,
             RuntimeEventSource::Verifier,
@@ -737,6 +747,28 @@ pub(crate) fn trace_event_payload(
             json!({
                 "summary": "provider request context snapshot created",
                 "snapshot": snapshot,
+            }),
+        )),
+        AgentLoopTraceEvent::CandidateReady {
+            turn_id,
+            tool_count,
+            has_assistant_message,
+        } => Some((
+            RuntimeEventType::CandidateReady,
+            RuntimeEventSource::Runtime,
+            json!({
+                "summary": "agent produced a candidate ready for verification",
+                "turn_id": turn_id,
+                "tool_count": tool_count,
+                "has_assistant_message": has_assistant_message,
+            }),
+        )),
+        AgentLoopTraceEvent::VerificationReady { plan_id } => Some((
+            RuntimeEventType::VerificationReady,
+            RuntimeEventSource::Verifier,
+            json!({
+                "summary": "verification plan is ready to execute",
+                "plan_id": plan_id,
             }),
         )),
         AgentLoopTraceEvent::VerificationPlanned(plan) => Some((

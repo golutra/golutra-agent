@@ -142,6 +142,10 @@ pub enum RuntimeEventType {
     ReplayExecuted,
     ExternalEvaluationIngested,
     ExternalEvaluationCompared,
+    CandidateReady,
+    VerificationReady,
+    ExternalVerificationRequested,
+    ExternalVerificationFeedback,
 }
 
 impl RuntimeEventType {
@@ -205,6 +209,7 @@ impl RuntimeEventType {
             | Self::ReplayExecuted
             | Self::ExternalEvaluationIngested
             | Self::ExternalEvaluationCompared
+            | Self::ExternalVerificationFeedback
             | Self::RegressionCampaignStarted
             | Self::RegressionExecutionCompleted => RuntimeEventClass::Evaluation,
             Self::ImprovementCandidateCreated
@@ -251,6 +256,9 @@ impl RuntimeEventType {
             | Self::VerificationPlanned
             | Self::VerificationAssertionCompleted
             | Self::ContinuationDecided => RuntimeEventClass::Execution,
+            Self::CandidateReady
+            | Self::VerificationReady
+            | Self::ExternalVerificationRequested => RuntimeEventClass::Execution,
         }
     }
 
@@ -268,6 +276,8 @@ impl RuntimeEventType {
                 | Self::TaskAborted
                 | Self::TaskInterrupted
                 | Self::TaskUncertain
+                | Self::CandidateReady
+                | Self::VerificationReady
         )
     }
 
@@ -310,6 +320,9 @@ impl RuntimeEventType {
                 | Self::CompactionCompleted
                 | Self::CompactionFailed
                 | Self::ContinuationDecided
+                | Self::CandidateReady
+                | Self::VerificationReady
+                | Self::ExternalVerificationRequested
         )
     }
 

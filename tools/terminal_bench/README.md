@@ -120,3 +120,11 @@ If the result file, runtime identity, trace, or collector is unavailable, it
 keeps a `golutra-evaluation.pending.json` file with the reason and the original
 record instead of dropping the structured observation. This makes a later
 offline ingestion possible without rerunning the trial.
+
+When an ingested assertion failure is correctable, the adapter writes
+`external-correction-1.json` with bounded evaluator feedback and an explicit
+`exec resume` command. It does not execute that command after Terminal-Bench
+has finalized the trial: doing so would mutate the workspace after the scored
+state and would not rerun the upstream evaluator. Execute the recorded command
+as a separate continuation, then run the task evaluator again and ingest its
+new record.

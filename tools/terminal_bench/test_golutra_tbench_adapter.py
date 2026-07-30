@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import sqlite3
 import sys
 import types
 import unittest
@@ -203,6 +204,7 @@ class AdapterHelpersTest(unittest.TestCase):
                     credentials_path=str(credentials),
                     collector_binary=str(root / "missing-collector"),
                     agent_command_timeout_sec=10.0,
+                    graceful_drain_timeout_sec=0.01,
                 )
             with (
                 patch.object(agent, "_start_result_collector"),
@@ -237,12 +239,63 @@ class AdapterHelpersTest(unittest.TestCase):
                 (logging_dir.parent / "golutra-adapter-observation.json").read_text()
             )
             self.assertEqual(observation["status"], "failed")
-            self.assertEqual(observation["code"], "runtime_command_timeout")
+            self.assertEqual(observation["code"], "agent_timeout")
             self.assertEqual(observation["facts"]["agent_timeout_sec"], 10.0)
+            self.assertEqual(
+                observation["facts"]["timeout_class"], "agent_timeout"
+            )
+
+    def test_runtime_readiness_reads_candidate_event_from_durable_sqlite(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            trial_root = root / "trial"
+            run_dir = trial_root / "golutra-runtime"
+            (run_dir / "state").mkdir(parents=True)
+            (run_dir / "manifest.json").write_text(
+                json.dumps({"terminal_outcome": {"kind": "in_progress"}}),
+                encoding="utf-8",
+            )
+            connection = sqlite3.connect(run_dir / "state" / "runtime.sqlite")
+            connection.execute(
+                "CREATE TABLE runtime_events (sequence_no INTEGER, event_type TEXT, payload_json TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO runtime_events VALUES (1, 'CandidateReady', '{}')"
+            )
+            connection.commit()
+            connection.close()
+            agent = ADAPTER.GolutraAgent(graceful_drain_timeout_sec=0.01)
+
+            readiness = agent._runtime_readiness(trial_root)
+
+            self.assertEqual(readiness["state"], "candidate_ready")
+            self.assertEqual(readiness["event_type"], "CandidateReady")
 
     def test_agent_command_timeout_rejects_unbounded_values(self):
         with self.assertRaises(ValueError):
             ADAPTER.GolutraAgent(agent_command_timeout_sec=float("inf"))
+
+    def test_failure_mode_aliases_keep_timeout_ownership_precise(self):
+        self.assertEqual(
+            ADAPTER._normalized_failure_mode("runtime_command_timeout"),
+            "agent_timeout",
+        )
+        self.assertEqual(
+            ADAPTER._normalized_failure_mode("docker_timeout"),
+            "environment_timeout",
+        )
+        self.assertEqual(
+            ADAPTER._normalized_failure_mode("test_timeout"), "test_timeout"
+        )
+
+    def test_collector_database_race_is_retryable(self):
+        self.assertTrue(
+            ADAPTER._collector_failure_is_transient(
+                "database disk image is malformed"
+            )
+        )
+        self.assertTrue(ADAPTER._collector_failure_is_transient("database is locked"))
+        self.assertFalse(ADAPTER._collector_failure_is_transient("invalid record"))
 
     def test_installation_failure_is_retained_before_runtime_exists(self):
         with TemporaryDirectory() as temporary:
@@ -413,6 +466,57 @@ class AdapterHelpersTest(unittest.TestCase):
         self.assertEqual(
             ADAPTER._external_result_digest(left),
             ADAPTER._external_result_digest(right),
+        )
+
+    def test_external_failure_writes_manual_resume_plan_without_running_it(self):
+        with TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "golutra-runtime"
+            run_dir.mkdir()
+            collector = Path(temporary) / "golutra-cli"
+            collector.write_text("#!/bin/sh\n", encoding="utf-8")
+            collector.chmod(0o755)
+            agent = ADAPTER.GolutraAgent(
+                collector_binary=str(collector),
+                max_external_correction_rounds=1,
+            )
+            record = {
+                "verdict": "fail",
+                "terminal_cause": {"code": "assertion_failed"},
+                "assertions": [
+                    {"name": "test_output", "passed": False, "message": "missing output"},
+                    {"name": "test_other", "passed": True, "message": "ok"},
+                ],
+            }
+
+            plan = agent._external_correction_plan(run_dir, record, "thread-1")
+
+            self.assertIsNotNone(plan)
+            assert plan is not None
+            self.assertEqual(plan["status"], "manual_resume_required")
+            self.assertEqual(plan["thread_id"], "thread-1")
+            self.assertEqual(
+                plan["command"],
+                [
+                    str(collector.resolve()),
+                    "--run-bundle",
+                    str(run_dir),
+                    "exec",
+                    "--yolo",
+                    "resume",
+                    "thread-1",
+                    "External evaluator feedback. Correct the workspace and rerun the evaluator.\n- test_output: missing output",
+                ],
+            )
+            self.assertTrue((run_dir / "external-correction-1.json").is_file())
+
+    def test_external_correction_ignores_non_assertion_failures(self):
+        agent = ADAPTER.GolutraAgent(max_external_correction_rounds=1)
+        self.assertIsNone(
+            agent._external_correction_plan(
+                Path("/tmp/run"),
+                {"verdict": "fail", "terminal_cause": {"code": "test_timeout"}},
+                "thread-1",
+            )
         )
 
     def test_trial_result_supports_aggregate_task_records(self):
@@ -705,10 +809,19 @@ class AdapterHelpersTest(unittest.TestCase):
             agent._dataset_version = "0.1.1"
             agent._model_name = "test/model"
             agent._collector_binary = Path("/bin/golutra")
+            agent._graceful_drain_timeout_sec = 0.01
 
             completed = types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
-            with patch.object(ADAPTER.subprocess, "run", return_value=completed):
+            transient_failure = types.SimpleNamespace(
+                returncode=1, stdout="", stderr="database is locked"
+            )
+            with patch.object(
+                ADAPTER.subprocess,
+                "run",
+                side_effect=[transient_failure, completed],
+            ) as collector:
                 agent._collect_result(trial_root)
+            self.assertEqual(collector.call_count, 2)
 
             record = json.loads(
                 (run_dir / "terminal-bench-evaluation.json").read_text()

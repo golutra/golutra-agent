@@ -53,7 +53,8 @@ struct Cli {
     connect: Option<String>,
     #[arg(long, global = true, value_name = "UUID")]
     session_id: Option<String>,
-    /// Reopen a completed or checkpointed owner-only `exec --run-dir` bundle for evaluator ingestion.
+    /// Reopen a completed or checkpointed owner-only `exec --run-dir` bundle
+    /// for evaluation commands or a bounded `exec resume`.
     #[arg(
         long,
         global = true,
@@ -811,7 +812,7 @@ async fn main() -> miette::Result<()> {
                 );
             }
         }
-        Command::Exec(args) => run_exec(&transport, args).await?,
+        Command::Exec(args) => run_exec(&transport, args, opened_run_bundle.as_deref()).await?,
         Command::McpServer(_) => unreachable!("mcp-server exits before runtime setup"),
         Command::Status => {
             let state = transport
@@ -2069,6 +2070,10 @@ fn command_allows_persisted_run(command: &Command) -> bool {
                     | EvalCommand::Ingest { .. }
                     | EvalCommand::CompareCounterfactual { .. },
             }
+            | Command::Exec(ExecArgs {
+                command: Some(ExecCommand::Resume { .. }),
+                ..
+            })
     )
 }
 
@@ -2493,7 +2498,11 @@ fn approval_payload(approval_id: Option<String>) -> serde_json::Value {
     )
 }
 
-async fn run_exec(transport: &RuntimeTransport, args: ExecArgs) -> miette::Result<()> {
+async fn run_exec(
+    transport: &RuntimeTransport,
+    args: ExecArgs,
+    opened_run_bundle: Option<&std::path::Path>,
+) -> miette::Result<()> {
     let external_verifiers = args
         .verify_program
         .clone()
@@ -2551,7 +2560,9 @@ async fn run_exec(transport: &RuntimeTransport, args: ExecArgs) -> miette::Resul
     };
     let json_output = args.json;
     let output_last_message = args.output_last_message;
-    let run_dir = args.run_dir;
+    let run_dir = args
+        .run_dir
+        .or_else(|| opened_run_bundle.map(std::path::Path::to_path_buf));
     let approval_mode = if args.yolo {
         ExecApprovalModeArg::Auto
     } else {

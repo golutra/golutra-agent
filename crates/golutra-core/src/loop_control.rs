@@ -95,7 +95,12 @@ pub enum ContinuationReason {
 #[serde(rename_all = "snake_case")]
 pub enum TurnPhase {
     Running,
-    CandidateComplete,
+    /// The model has produced a candidate response and the runtime has
+    /// enough evidence to begin an independent completion check.
+    CandidateReady,
+    /// The runtime has materialized the verification plan but has not started
+    /// executing it yet.
+    VerificationReady,
     Verifying,
     Correcting,
     Terminal,
@@ -122,9 +127,18 @@ impl TurnState {
         }
     }
 
-    pub fn candidate_complete(&mut self) {
-        self.phase = TurnPhase::CandidateComplete;
+    pub fn candidate_ready(&mut self) {
+        self.phase = TurnPhase::CandidateReady;
         self.continuation_reason = None;
+    }
+
+    /// Compatibility name for callers that used the pre-lifecycle API.
+    pub fn candidate_complete(&mut self) {
+        self.candidate_ready();
+    }
+
+    pub fn verification_ready(&mut self) {
+        self.phase = TurnPhase::VerificationReady;
     }
 
     pub fn begin_verification(&mut self, verification_id: VerificationId) {
@@ -182,6 +196,9 @@ mod tests {
         let verification_id = VerificationId::new();
         let mut state = TurnState::new(turn_id);
         state.candidate_complete();
+        assert_eq!(state.phase, TurnPhase::CandidateReady);
+        state.verification_ready();
+        assert_eq!(state.phase, TurnPhase::VerificationReady);
         state.begin_verification(verification_id);
         state.issue_correction(ContinuationReason::VerificationFailed);
 

@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import sqlite3
 import shlex
 import shutil
 import subprocess
@@ -25,6 +26,9 @@ from terminal_bench.terminal.tmux_session import TmuxSession
 _DEFAULT_RESULT_COLLECTION_TIMEOUT_SEC = 3600.0
 _DEFAULT_AGENT_COMMAND_TIMEOUT_SEC = 600.0
 _AGENT_COMMAND_TIMEOUT_GRACE_SEC = 5.0
+_DEFAULT_GRACEFUL_DRAIN_TIMEOUT_SEC = 20.0
+_COLLECTOR_RETRY_LIMIT = 8
+_COLLECTOR_RETRY_DELAY_SEC = 0.5
 _FAILURE_LOG_SCAN_BYTES = 1024 * 1024
 _FAILURE_DETAIL_MAX_BYTES = 2048
 _FAILURE_LINE_MAX_BYTES = 512
@@ -75,6 +79,8 @@ class GolutraAgent(BaseAgent):
         dataset_version: str = "unknown",
         result_collection_timeout_sec: float = _DEFAULT_RESULT_COLLECTION_TIMEOUT_SEC,
         agent_command_timeout_sec: float | None = None,
+        graceful_drain_timeout_sec: float = _DEFAULT_GRACEFUL_DRAIN_TIMEOUT_SEC,
+        max_external_correction_rounds: int = 1,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -99,6 +105,10 @@ class GolutraAgent(BaseAgent):
         self._dataset_id = dataset_id
         self._dataset_version = dataset_version
         self._result_collection_timeout_sec = result_collection_timeout_sec
+        self._graceful_drain_timeout_sec = _positive_timeout(graceful_drain_timeout_sec)
+        if max_external_correction_rounds < 0 or max_external_correction_rounds > 2:
+            raise ValueError("max_external_correction_rounds must be between 0 and 2")
+        self._max_external_correction_rounds = max_external_correction_rounds
         self._agent_command_timeout_override = (
             _positive_timeout(agent_command_timeout_sec)
             if agent_command_timeout_sec is not None
@@ -302,6 +312,107 @@ class GolutraAgent(BaseAgent):
             or _DEFAULT_AGENT_COMMAND_TIMEOUT_SEC
         )
 
+    def _runtime_readiness(self, trial_root: Path) -> dict[str, object]:
+        """Read the latest durable lifecycle fact without requiring a live CLI."""
+        run_dir = _find_run_bundle(trial_root)
+        if run_dir is None:
+            return {"state": "unavailable"}
+        manifest_path = run_dir / "manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            manifest = {}
+        terminal = manifest.get("terminal_outcome", {})
+        if terminal.get("kind") == "result":
+            return {"state": "terminal", "event_type": "TaskCompleted"}
+
+        database = run_dir / "state" / "runtime.sqlite"
+        if not database.is_file():
+            return {"state": "unavailable"}
+        try:
+            connection = sqlite3.connect(
+                f"file:{database}?mode=ro", uri=True, timeout=0.2
+            )
+            row = connection.execute(
+                "SELECT event_type, payload_json FROM runtime_events "
+                "ORDER BY sequence_no DESC LIMIT 64"
+            ).fetchall()
+            connection.close()
+        except sqlite3.Error:
+            return {"state": "unavailable"}
+        for event_type, payload_json in row:
+            if event_type == "ExternalVerificationRequested":
+                return {"state": "external_pending", "event_type": event_type}
+            if event_type == "VerificationReady":
+                return {"state": "verification_ready", "event_type": event_type}
+            if event_type == "CandidateReady":
+                return {"state": "candidate_ready", "event_type": event_type}
+            if event_type in {"TaskCompleted", "TaskAborted", "TaskInterrupted"}:
+                return {"state": "terminal", "event_type": event_type}
+        return {"state": "running"}
+
+    def _graceful_drain(self, logging_dir: Path | None) -> dict[str, object]:
+        if logging_dir is None:
+            return {"state": "unavailable", "elapsed_sec": 0.0}
+        started = time.monotonic()
+        trial_root = logging_dir.parent
+        last = {"state": "unavailable"}
+        deadline = started + self._graceful_drain_timeout_sec
+        while time.monotonic() < deadline:
+            last = self._runtime_readiness(trial_root)
+            if last.get("state") in {"terminal", "external_pending"}:
+                break
+            time.sleep(0.25)
+        last = dict(last)
+        last["elapsed_sec"] = round(time.monotonic() - started, 3)
+        last["deadline_sec"] = self._graceful_drain_timeout_sec
+        return last
+
+    def _external_correction_plan(
+        self, run_dir: Path, record: dict, thread_id: str | None
+    ) -> dict[str, object] | None:
+        """Prepare a bounded, explicit resume without mutating a scored trial."""
+        if getattr(self, "_max_external_correction_rounds", 1) == 0 or not thread_id:
+            return None
+        if record.get("verdict") != "fail":
+            return None
+        cause = record.get("terminal_cause") or {}
+        if cause.get("code") != "assertion_failed":
+            return None
+        marker = run_dir / "external-correction-1.json"
+        if marker.is_file():
+            return json.loads(marker.read_text())
+        failed = [
+            f"{item.get('name')}: {item.get('message')}"
+            for item in record.get("assertions", [])
+            if not item.get("passed")
+        ]
+        feedback = _truncate_utf8(
+            "External evaluator feedback. Correct the workspace and rerun the evaluator.\n"
+            + "\n".join(f"- {item}" for item in failed),
+            _FAILURE_DETAIL_MAX_BYTES,
+        )
+        command = [
+            str(self._collector_binary),
+            "--run-bundle",
+            str(run_dir),
+            "exec",
+            "--yolo",
+            "resume",
+            thread_id,
+            feedback,
+        ]
+        result = {
+            "status": "manual_resume_required",
+            "round": 1,
+            "thread_id": thread_id,
+            "feedback": feedback,
+            "command": command,
+            "reason": "the Terminal-Bench evaluator has already finalized this trial; resume and rerun the evaluator in a separate continuation",
+        }
+        _write_json_atomic(marker, result)
+        return result
+
     def _collect_result(self, trial_root: Path) -> None:
         deadline = time.monotonic() + self._result_collection_timeout_sec
         results_path: Path | None = None
@@ -330,11 +441,12 @@ class GolutraAgent(BaseAgent):
             assert run_dir is not None
             _remove_if_exists(trial_root / "golutra-evaluation.pending.json")
             results = json.loads(results_path.read_text())
-            manifest = json.loads((run_dir / "manifest.json").read_text())
+            manifest = self._wait_for_terminal_manifest(run_dir, deadline)
             checkpoint_only = manifest.get("terminal_outcome", {}).get("kind") == "in_progress"
             terminal_result = manifest.get("terminal_outcome", {}).get("result", {})
             task_id = terminal_result.get("task_id")
             session_id = terminal_result.get("session_id")
+            thread_id = terminal_result.get("thread_id")
             if not task_id or not session_id:
                 # A harness timeout can leave the in-progress checkpoint as
                 # the last manifest. Its observation index still contains the
@@ -345,6 +457,7 @@ class GolutraAgent(BaseAgent):
                     tasks = sessions[0].get("tasks", [])
                     if len(tasks) == 1 and isinstance(tasks[0], dict):
                         task_id = tasks[0].get("task_id")
+                        thread_id = tasks[0].get("thread_id")
             if not task_id or not session_id:
                 _write_json_atomic(
                     run_dir / "terminal-bench-evaluation.pending.json",
@@ -428,19 +541,29 @@ class GolutraAgent(BaseAgent):
                     },
                 )
                 return
-            completed = subprocess.run(
-                _collector_command(
-                    self._collector_binary,
-                    run_dir,
-                    session_id,
-                    record_path,
-                    trial_root,
-                ),
-                capture_output=True,
-                text=True,
-                timeout=120,
-                check=False,
+            collector_command = _collector_command(
+                self._collector_binary,
+                run_dir,
+                session_id,
+                record_path,
+                trial_root,
             )
+            completed = None
+            for attempt in range(_COLLECTOR_RETRY_LIMIT):
+                completed = subprocess.run(
+                    collector_command,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    check=False,
+                )
+                if completed.returncode == 0 or not _collector_failure_is_transient(
+                    completed.stderr
+                ):
+                    break
+                if attempt + 1 < _COLLECTOR_RETRY_LIMIT:
+                    time.sleep(_COLLECTOR_RETRY_DELAY_SEC)
+            assert completed is not None
             _write_json_atomic(
                 run_dir / "terminal-bench-evaluation.log",
                 {
@@ -451,7 +574,15 @@ class GolutraAgent(BaseAgent):
                 },
             )
             if completed.returncode == 0:
+                correction = self._external_correction_plan(
+                    run_dir, record, thread_id
+                )
                 _remove_if_exists(run_dir / "terminal-bench-evaluation.pending.json")
+                if correction is not None:
+                    _write_json_atomic(
+                        run_dir / "terminal-bench-evaluation-correction.json",
+                        correction,
+                    )
             else:
                 _write_json_atomic(
                     run_dir / "terminal-bench-evaluation.pending.json",
@@ -468,6 +599,40 @@ class GolutraAgent(BaseAgent):
                 target / "terminal-bench-evaluation.pending.json",
                 {"status": "collector_error", "reason": str(error)},
             )
+
+    def _wait_for_terminal_manifest(
+        self, run_dir: Path, collection_deadline: float
+    ) -> dict:
+        """Do not ingest while the CLI is still exporting the live SQLite store."""
+        wait_budget = min(
+            max(
+                0.01,
+                float(
+                    getattr(
+                        self,
+                        "_graceful_drain_timeout_sec",
+                        _DEFAULT_GRACEFUL_DRAIN_TIMEOUT_SEC,
+                    )
+                ),
+            ),
+            max(0.01, collection_deadline - time.monotonic()),
+        )
+        deadline = time.monotonic() + wait_budget
+        manifest_path = run_dir / "manifest.json"
+        last_manifest: dict = {}
+        while time.monotonic() < deadline:
+            try:
+                candidate = json.loads(manifest_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                candidate = None
+            if isinstance(candidate, dict):
+                last_manifest = candidate
+                if candidate.get("terminal_outcome", {}).get("kind") != "in_progress":
+                    return candidate
+            time.sleep(0.25)
+        if last_manifest:
+            return last_manifest
+        return json.loads(manifest_path.read_text())
 
     def perform_task(
         self,
@@ -594,6 +759,14 @@ class GolutraAgent(BaseAgent):
                 )
             )
         except TimeoutError as error:
+            self._record_adapter_observation(
+                logging_dir,
+                "agent",
+                "draining",
+                "graceful_drain_started",
+                {"timeout_class": "agent_timeout"},
+            )
+            drain = self._graceful_drain(logging_dir)
             interrupt_error = None
             try:
                 session.send_keys(keys=["C-c"], min_timeout_sec=0.1)
@@ -603,11 +776,13 @@ class GolutraAgent(BaseAgent):
                 logging_dir,
                 "agent",
                 "failed",
-                "runtime_command_timeout",
+                "agent_timeout",
                 {
                     "error_type": type(error).__name__,
+                    "timeout_class": "agent_timeout",
                     "agent_timeout_sec": agent_timeout_sec,
                     "command_timeout_sec": command_timeout_sec,
+                    "graceful_drain": drain,
                     "interrupt_error_type": interrupt_error,
                 },
             )
@@ -953,17 +1128,20 @@ def _evaluation_phases(
     failure_detail: str | None = None,
 ) -> tuple[list[dict], dict | None]:
     selected = _select_trial_result(results, task_id)
-    normalized_failure = (
-        failure_mode if failure_mode not in {None, "none", "unset"} else None
-    )
+    normalized_failure = _normalized_failure_mode(failure_mode)
     failed_assertions = [item for item in assertions if not item["passed"]]
     failure_phase = None
     if normalized_failure:
-        if "install" in normalized_failure or "setup" in normalized_failure:
+        if normalized_failure in {
+            "agent_installation_failed",
+            "setup_failure",
+            "docker_build_failure",
+            "environment_timeout",
+        } or "install" in normalized_failure or "setup" in normalized_failure:
             failure_phase = "terminal-bench:setup"
-        elif "agent" in normalized_failure:
+        elif normalized_failure in {"agent_timeout", "provider_timeout", "parse_error"} or "agent" in normalized_failure:
             failure_phase = "terminal-bench:agent"
-        elif "test" in normalized_failure or "timeout" in normalized_failure:
+        elif normalized_failure in {"test_timeout", "external_verifier_failure"} or "test" in normalized_failure:
             failure_phase = "terminal-bench:test"
         else:
             failure_phase = "terminal-bench:assertions"
@@ -1028,7 +1206,12 @@ def _evaluation_phases(
                 f"Terminal-Bench stopped with {normalized_failure}",
                 failure_detail,
             ),
-            "retryable": "timeout" in normalized_failure,
+            "retryable": normalized_failure in {
+                "agent_timeout",
+                "provider_timeout",
+                "test_timeout",
+                "environment_timeout",
+            },
             "evidence_refs": evidence_refs,
         }
     elif failed_assertions or not resolved:
@@ -1046,6 +1229,38 @@ def _evaluation_phases(
     else:
         terminal_cause = None
     return phases, terminal_cause
+
+
+def _normalized_failure_mode(value: object) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in {"", "none", "unset"}:
+        return None
+    aliases = {
+        "runtime_command_timeout": "agent_timeout",
+        "agent_timeout": "agent_timeout",
+        "provider_timeout": "provider_timeout",
+        "test_timeout": "test_timeout",
+        "setup_timeout": "environment_timeout",
+        "docker_timeout": "environment_timeout",
+        "docker_build": "docker_build_failure",
+        "parse": "parse_error",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _collector_failure_is_transient(stderr: str) -> bool:
+    normalized = stderr.lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "database disk image is malformed",
+            "database is locked",
+            "database table is locked",
+            "database is busy",
+        )
+    )
 
 
 def _existing_evidence_refs(trial_root: Path) -> list[str]:
