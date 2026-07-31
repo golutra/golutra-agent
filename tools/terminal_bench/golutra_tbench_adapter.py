@@ -32,6 +32,7 @@ _COLLECTOR_RETRY_DELAY_SEC = 0.5
 _FAILURE_LOG_SCAN_BYTES = 1024 * 1024
 _FAILURE_DETAIL_MAX_BYTES = 2048
 _FAILURE_LINE_MAX_BYTES = 512
+_EXTERNAL_CORRECTION_SCHEMA_VERSION = 2
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 _BEARER_CREDENTIAL_RE = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
@@ -371,7 +372,7 @@ class GolutraAgent(BaseAgent):
     def _external_correction_plan(
         self, run_dir: Path, record: dict, thread_id: str | None
     ) -> dict[str, object] | None:
-        """Prepare a bounded, explicit resume without mutating a scored trial."""
+        """Retain evaluator feedback for an isolated, unscored continuation."""
         if getattr(self, "_max_external_correction_rounds", 1) == 0 or not thread_id:
             return None
         if record.get("verdict") != "fail":
@@ -381,34 +382,58 @@ class GolutraAgent(BaseAgent):
             return None
         marker = run_dir / "external-correction-1.json"
         if marker.is_file():
-            return json.loads(marker.read_text())
+            try:
+                existing = json.loads(marker.read_text())
+            except (OSError, json.JSONDecodeError):
+                existing = {}
+            if not isinstance(existing, dict):
+                existing = {}
+            source = existing.get("source_evaluation", {})
+            if (
+                existing.get("schema_version") == _EXTERNAL_CORRECTION_SCHEMA_VERSION
+                and existing.get("status") == "isolated_continuation_required"
+                and existing.get("thread_id") == thread_id
+                and isinstance(source, dict)
+                and source.get("evaluation_id") == record.get("evaluation_id")
+                and source.get("result_digest") == record.get("result_digest")
+            ):
+                return existing
+        failure_groups: dict[str, list[str]] = {}
+        for item in record.get("assertions", []):
+            if item.get("passed"):
+                continue
+            name = str(item.get("name") or "unnamed assertion")
+            message = str(item.get("message") or "failed")
+            failure_groups.setdefault(message, []).append(name)
         failed = [
-            f"{item.get('name')}: {item.get('message')}"
-            for item in record.get("assertions", [])
-            if not item.get("passed")
+            f"{', '.join(names)}: {message}"
+            for message, names in failure_groups.items()
         ]
         feedback = _truncate_utf8(
             "External evaluator feedback. Correct the workspace and rerun the evaluator.\n"
             + "\n".join(f"- {item}" for item in failed),
             _FAILURE_DETAIL_MAX_BYTES,
         )
-        command = [
-            str(self._collector_binary),
-            "--run-bundle",
-            str(run_dir),
-            "exec",
-            "--yolo",
-            "resume",
-            thread_id,
-            feedback,
-        ]
         result = {
-            "status": "manual_resume_required",
+            "schema_version": _EXTERNAL_CORRECTION_SCHEMA_VERSION,
+            "status": "isolated_continuation_required",
             "round": 1,
             "thread_id": thread_id,
             "feedback": feedback,
-            "command": command,
-            "reason": "the Terminal-Bench evaluator has already finalized this trial; resume and rerun the evaluator in a separate continuation",
+            "source_evaluation": {
+                "evaluation_id": record.get("evaluation_id"),
+                "result_digest": record.get("result_digest"),
+                "run_bundle": ".",
+            },
+            "isolation": {
+                "mode": "unscored_diagnostic",
+                "source_trial_immutable": True,
+                "requires_cloned_workspace": True,
+                "requires_cloned_run_bundle": True,
+                "may_replace_source_score": False,
+                "promotion_requires_independent_evaluation": True,
+            },
+            "reason": "the scored Terminal-Bench trial is immutable; consume this feedback only after rehydrating a cloned workspace and run bundle as a separate unscored diagnostic continuation",
         }
         _write_json_atomic(marker, result)
         return result

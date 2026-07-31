@@ -46,6 +46,12 @@ executor from waiting forever after its outer asyncio timeout. Use the
 `agent_command_timeout_sec` agent kwarg only when run metadata is unavailable;
 it defaults to 600 seconds as a bounded fallback.
 
+The adapter does not copy `/tests`, run `run-tests.sh`, or expose evaluator
+output during `perform_task`. Terminal-Bench owns that hidden test boundary and
+copies its evaluator only after the agent returns. Golutra may run verifiers
+already visible in the task workspace, but hidden assertions never extend the
+agent timeout or mutate the workspace before its scored state is captured.
+
 Build or copy the architecture-specific Golutra agent binaries before running:
 
 ```bash
@@ -121,10 +127,11 @@ keeps a `golutra-evaluation.pending.json` file with the reason and the original
 record instead of dropping the structured observation. This makes a later
 offline ingestion possible without rerunning the trial.
 
-When an ingested assertion failure is correctable, the adapter writes
-`external-correction-1.json` with bounded evaluator feedback and an explicit
-`exec resume` command. It does not execute that command after Terminal-Bench
-has finalized the trial: doing so would mutate the workspace after the scored
-state and would not rerun the upstream evaluator. Execute the recorded command
-as a separate continuation, then run the task evaluator again and ingest its
-new record.
+When an ingested assertion failure is correctable, the adapter writes a
+schema-versioned `external-correction-1.json` with bounded evaluator feedback.
+It deliberately contains no executable resume command. The request requires a
+cloned workspace and cloned run bundle, marks the continuation as an unscored
+diagnostic, and forbids replacing the source score. A later optimizer may
+rehydrate that isolated continuation, but promotion still requires an
+independent evaluation rather than another attempt against the same hidden
+test case.

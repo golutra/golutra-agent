@@ -146,11 +146,12 @@ class AdapterHelpersTest(unittest.TestCase):
                 return Result()
 
         class Session:
-            def __init__(self):
+            def __init__(self, *, times_out: bool = True):
                 self.container = Container()
                 self.command = None
                 self.copy_calls = []
                 self.sent_keys = []
+                self.times_out = times_out
 
             def copy_to_container(self, *args, **kwargs):
                 self.copy_calls.append((args, kwargs))
@@ -159,7 +160,8 @@ class AdapterHelpersTest(unittest.TestCase):
 
             def send_command(self, command):
                 self.command = command
-                raise TimeoutError("command timed out")
+                if self.times_out:
+                    raise TimeoutError("command timed out")
 
             def send_keys(self, *, keys, min_timeout_sec):
                 self.sent_keys.append((keys, min_timeout_sec))
@@ -222,6 +224,11 @@ class AdapterHelpersTest(unittest.TestCase):
                 [call[1]["container_dir"] for call in session.copy_calls],
                 ["/installed-agent", "/installed-agent/auth", "/installed-agent/auth"],
             )
+            self.assertNotIn(
+                "/tests",
+                [call[1]["container_dir"] for call in session.copy_calls],
+                "Terminal-Bench tests must remain hidden until the harness test phase",
+            )
             setup_command = next(
                 command[2]
                 for command in session.container.commands
@@ -243,6 +250,22 @@ class AdapterHelpersTest(unittest.TestCase):
             self.assertEqual(observation["facts"]["agent_timeout_sec"], 10.0)
             self.assertEqual(
                 observation["facts"]["timeout_class"], "agent_timeout"
+            )
+
+            success_session = Session(times_out=False)
+            with patch.object(agent, "_start_result_collector"):
+                result = agent.perform_task("do work", success_session, logging_dir)
+
+            self.assertEqual(result.total_input_tokens, 0)
+            self.assertEqual(result.total_output_tokens, 0)
+            self.assertEqual(
+                [call[1]["container_dir"] for call in success_session.copy_calls],
+                ["/installed-agent", "/installed-agent/auth", "/installed-agent/auth"],
+            )
+            self.assertNotIn(
+                "/tests",
+                [call[1]["container_dir"] for call in success_session.copy_calls],
+                "successful agent execution must not expose hidden evaluator files",
             )
 
     def test_runtime_readiness_reads_candidate_event_from_durable_sqlite(self):
@@ -468,7 +491,7 @@ class AdapterHelpersTest(unittest.TestCase):
             ADAPTER._external_result_digest(right),
         )
 
-    def test_external_failure_writes_manual_resume_plan_without_running_it(self):
+    def test_external_failure_writes_an_isolated_unscored_continuation_plan(self):
         with TemporaryDirectory() as temporary:
             run_dir = Path(temporary) / "golutra-runtime"
             run_dir.mkdir()
@@ -480,6 +503,8 @@ class AdapterHelpersTest(unittest.TestCase):
                 max_external_correction_rounds=1,
             )
             record = {
+                "evaluation_id": "terminal-bench:run:task",
+                "result_digest": "sha256:evaluation",
                 "verdict": "fail",
                 "terminal_cause": {"code": "assertion_failed"},
                 "assertions": [
@@ -492,22 +517,87 @@ class AdapterHelpersTest(unittest.TestCase):
 
             self.assertIsNotNone(plan)
             assert plan is not None
-            self.assertEqual(plan["status"], "manual_resume_required")
+            self.assertEqual(plan["schema_version"], 2)
+            self.assertEqual(plan["status"], "isolated_continuation_required")
             self.assertEqual(plan["thread_id"], "thread-1")
             self.assertEqual(
-                plan["command"],
-                [
-                    str(collector.resolve()),
-                    "--run-bundle",
-                    str(run_dir),
-                    "exec",
-                    "--yolo",
-                    "resume",
-                    "thread-1",
-                    "External evaluator feedback. Correct the workspace and rerun the evaluator.\n- test_output: missing output",
-                ],
+                plan["feedback"],
+                "External evaluator feedback. Correct the workspace and rerun the evaluator.\n- test_output: missing output",
+            )
+            self.assertNotIn("command", plan)
+            self.assertEqual(
+                plan["source_evaluation"],
+                {
+                    "evaluation_id": "terminal-bench:run:task",
+                    "result_digest": "sha256:evaluation",
+                    "run_bundle": ".",
+                },
+            )
+            self.assertEqual(plan["isolation"]["mode"], "unscored_diagnostic")
+            self.assertTrue(plan["isolation"]["source_trial_immutable"])
+            self.assertTrue(plan["isolation"]["requires_cloned_workspace"])
+            self.assertTrue(plan["isolation"]["requires_cloned_run_bundle"])
+            self.assertFalse(plan["isolation"]["may_replace_source_score"])
+            self.assertTrue(
+                plan["isolation"]["promotion_requires_independent_evaluation"]
             )
             self.assertTrue((run_dir / "external-correction-1.json").is_file())
+
+    def test_external_failure_replaces_a_legacy_in_place_resume_plan(self):
+        with TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            marker = run_dir / "external-correction-1.json"
+            marker.write_text(
+                json.dumps(
+                    {
+                        "status": "manual_resume_required",
+                        "thread_id": "thread-1",
+                        "command": ["golutra", "exec", "resume", "thread-1"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            agent = ADAPTER.GolutraAgent(max_external_correction_rounds=1)
+            record = {
+                "evaluation_id": "terminal-bench:run:task",
+                "result_digest": "sha256:new-evaluation",
+                "verdict": "fail",
+                "terminal_cause": {"code": "assertion_failed"},
+                "assertions": [
+                    {"name": "test_output", "passed": False, "message": "missing output"}
+                ],
+            }
+
+            plan = agent._external_correction_plan(run_dir, record, "thread-1")
+
+            assert plan is not None
+            self.assertEqual(plan["schema_version"], 2)
+            self.assertEqual(plan["status"], "isolated_continuation_required")
+            self.assertNotIn("command", plan)
+            self.assertEqual(json.loads(marker.read_text()), plan)
+
+    def test_external_failure_deduplicates_shared_evaluator_detail(self):
+        with TemporaryDirectory() as temporary:
+            agent = ADAPTER.GolutraAgent(max_external_correction_rounds=1)
+            shared_detail = "failed\nEvaluator output:\nFAILED shared evaluator output"
+            record = {
+                "evaluation_id": "terminal-bench:run:task",
+                "result_digest": "sha256:evaluation",
+                "verdict": "fail",
+                "terminal_cause": {"code": "assertion_failed"},
+                "assertions": [
+                    {"name": "test_one", "passed": False, "message": shared_detail},
+                    {"name": "test_two", "passed": False, "message": shared_detail},
+                ],
+            }
+
+            plan = agent._external_correction_plan(
+                Path(temporary), record, "thread-1"
+            )
+
+            assert plan is not None
+            self.assertIn("test_one, test_two", plan["feedback"])
+            self.assertEqual(plan["feedback"].count("Evaluator output:"), 1)
 
     def test_external_correction_ignores_non_assertion_failures(self):
         agent = ADAPTER.GolutraAgent(max_external_correction_rounds=1)
