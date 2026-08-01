@@ -70,7 +70,25 @@ fn system_prompt_explains_the_argv_only_shell_recovery_path() {
     assert!(prompt.contains("instead of asking in prose"));
     assert!(prompt.contains("runtime will request any required approval"));
     assert!(prompt.contains("exits non-zero"));
+    assert!(prompt.contains("every explicit success threshold"));
+    assert!(prompt.contains("with `&&` or enable `set -e`"));
+    assert!(prompt.contains("earlier failed check cannot be masked"));
     assert!(prompt.contains("status, log, or listing commands alone are not validation"));
+    assert!(prompt.contains("named source identity or provenance"));
+    assert!(prompt.contains("relationships across files"));
+    assert!(prompt.contains("allowed modification boundaries"));
+    assert!(prompt.contains("public consumer interface"));
+    assert!(prompt.contains("expected magic bytes prove only structure"));
+    assert!(prompt.contains("insufficient when the request also specifies content or behavior"));
+    assert!(prompt.contains("load the output with a real consumer"));
+    assert!(prompt.contains("compare its decoded data with the named source"));
+    assert!(prompt.contains("Keep every file explicitly requested by the user"));
+    assert!(prompt.contains("must not delete or move a requested output"));
+    assert!(prompt.contains("native daemon mode"));
+    assert!(prompt.contains("detached session such as setsid"));
+    assert!(prompt.contains("not a durable handoff"));
+    assert!(prompt.contains("probe its loopback endpoint from a separate client"));
+    assert!(prompt.contains("framework test clients and mocked handlers do not prove"));
     assert!(prompt.contains("same public interface a fresh consumer will use"));
     assert!(prompt.contains("exercise the requested setup or client flow from a clean location"));
     assert!(prompt.contains("shortcut that bypasses the user-facing path"));
@@ -1560,6 +1578,7 @@ async fn queued_prompt_records_each_user_and_assistant_turn() {
         terminal.payload.pointer("/outcome/external_verification"),
         Some(&json!("pending"))
     );
+    let task_id = terminal.task_id.expect("task id");
     let started = events
         .iter()
         .find(|event| event.event_type == RuntimeEventType::TurnStarted)
@@ -1577,8 +1596,22 @@ async fn queued_prompt_records_each_user_and_assistant_turn() {
     }) {
         assert_eq!(event.turn_id, Some(queued_turn_id));
     }
+    transport.host.wait_for_deep_task_evaluation(task_id).await;
+    let settled_events = transport
+        .host
+        .repositories
+        .events
+        .load(session_id, Some(task_id), None)
+        .await
+        .expect("settled events");
+    assert!(settled_events.iter().any(|event| {
+        matches!(
+            event.event_type,
+            RuntimeEventType::PostTaskReviewed | RuntimeEventType::EvaluationCompleted
+        ) && event.turn_id == Some(queued_turn_id)
+    }));
     assert!(
-        events
+        settled_events
             .iter()
             .filter(|event| matches!(
                 event.event_type,
@@ -4890,7 +4923,7 @@ async fn persisted_ephemeral_runtime_retains_isolated_state_and_full_run_bundle(
     drop(host);
     workspace.close().expect("remove original workspace");
 
-    let reopened = RuntimeStore::connect_with_artifact_root(
+    let reopened = RuntimeStore::connect_single_writer_with_artifact_root(
         &runtime_paths.sqlite_url(),
         runtime_paths.artifacts_dir.clone(),
     )
@@ -5058,9 +5091,38 @@ async fn persisted_ephemeral_runtime_retains_isolated_state_and_full_run_bundle(
     );
     assert!(!global_runtime_db.exists());
     drop(reopened_transport);
+    drop(reopened);
 
     let refreshed_manifest_path = state_dir.join("manifest.json");
     let original_manifest_bytes = fs::read(&refreshed_manifest_path).expect("refreshed manifest");
+    let refreshed_manifest: RunBundleManifest =
+        serde_json::from_slice(&original_manifest_bytes).expect("refreshed manifest json");
+    let runtime_database = fs::read(&runtime_paths.runtime_db).expect("runtime database bytes");
+    let runtime_database_checksum = format!("sha256:{:x}", Sha256::digest(&runtime_database));
+    assert_eq!(
+        refreshed_manifest.raw_state.runtime_database.bytes,
+        Some(runtime_database.len() as u64)
+    );
+    assert_eq!(
+        refreshed_manifest
+            .raw_state
+            .runtime_database
+            .checksum
+            .as_deref(),
+        Some(runtime_database_checksum.as_str())
+    );
+    assert!(
+        !runtime_paths
+            .runtime_db
+            .with_extension("sqlite-wal")
+            .exists()
+    );
+    assert!(
+        !runtime_paths
+            .runtime_db
+            .with_extension("sqlite-shm")
+            .exists()
+    );
     let trace_path = observation_root.join(format!(
         "sessions/{}/tasks/{task_id}/trace.json",
         result.session_id
@@ -5135,7 +5197,7 @@ async fn persisted_ephemeral_runtime_retains_isolated_state_and_full_run_bundle(
 }
 
 #[tokio::test]
-async fn persisted_checkpoint_accepts_a_prefix_bound_owner_evaluation() {
+async fn persisted_interruption_accepts_a_prefix_bound_owner_evaluation() {
     let workspace = tempdir().expect("workspace");
     let state_parent = tempdir().expect("state parent");
     let state_dir = state_parent.path().join("checkpoint-run");
@@ -5145,6 +5207,7 @@ async fn persisted_checkpoint_accepts_a_prefix_bound_owner_evaluation() {
         .expect("persisted ephemeral transport");
     let host = transport.host.clone();
     let session_id = host.default_session_id();
+    let thread_id = host.default_thread_id;
     let task_id = TaskId::new();
     let turn_id = TurnId::new();
     let run_provenance =
@@ -5274,10 +5337,28 @@ async fn persisted_checkpoint_accepts_a_prefix_bound_owner_evaluation() {
     assert!(error.to_string().contains("base trace is incomplete"));
     drop(ordinary);
 
-    fs::write(&manifest_path, original_manifest_bytes).expect("restore checkpoint manifest");
+    let mut interrupted_manifest = original_manifest;
+    interrupted_manifest.terminal_outcome = RunBundleTerminalOutcome::Result {
+        result: golutra_protocol::AgentTurnResult {
+            thread_id,
+            session_id,
+            task_id: Some(task_id),
+            turn_id: Some(turn_id),
+            status: TaskStatus::Cancelled,
+            final_message: None,
+            verification: None,
+            outcome: None,
+            last_sequence_no: None,
+        },
+    };
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&interrupted_manifest).expect("interrupted manifest"),
+    )
+    .expect("write interrupted manifest");
     let checkpoint = RuntimeTransport::open_persisted_run(&state_dir)
         .await
-        .expect("open checkpoint bundle");
+        .expect("open interrupted bundle");
     let checkpoint_trace = checkpoint
         .complete_task_trace(TaskTraceRequest {
             session_id,
@@ -5294,7 +5375,7 @@ async fn persisted_checkpoint_accepts_a_prefix_bound_owner_evaluation() {
         super::external_evaluation::checkpoint_trace_has_only_expected_incompleteness(
             &checkpoint_trace
         ),
-        "checkpoint trace integrity: {:#?}",
+        "interrupted trace integrity: {:#?}",
         checkpoint_trace.integrity
     );
     let mut untrusted = evaluation_for(&checkpoint_trace);
@@ -5307,7 +5388,7 @@ async fn persisted_checkpoint_accepts_a_prefix_bound_owner_evaluation() {
             json!({"record": untrusted}),
         ))
         .await
-        .expect_err("untrusted evaluator cannot bind to an incomplete checkpoint");
+        .expect_err("untrusted evaluator cannot bind to an incomplete interruption");
     assert!(error.to_string().contains("base trace is incomplete"));
     let accepted = checkpoint
         .send_command(runtime_command(
@@ -5316,7 +5397,7 @@ async fn persisted_checkpoint_accepts_a_prefix_bound_owner_evaluation() {
             json!({"record": evaluation_for(&checkpoint_trace)}),
         ))
         .await
-        .expect("checkpoint evaluator overlay");
+        .expect("interrupted evaluator overlay");
     assert!(accepted.accepted);
     let refreshed = checkpoint
         .complete_task_trace(TaskTraceRequest {
@@ -6482,6 +6563,124 @@ fn legacy_change_intent_handles_coding_verbs_without_inventing_delivery_paths() 
     contract
         .validate()
         .expect("container workspace aliases must normalize into the task contract");
+}
+
+#[test]
+fn legacy_change_intent_retains_every_explicit_delivery_path() {
+    let payload = json!({
+        "prompt": r#"Create a Python scraper.
+Save the collected data to a CSV file named 'books.csv'.
+<span class="book-price">${price}</span>
+The report should be saved to a file named 'report.txt'."#,
+    });
+    let mut contract = golutra_core::TaskContract::default();
+
+    assert!(
+        LegacyTaskAdapter::new(&payload, payload["prompt"].as_str().expect("prompt"))
+            .apply_to(&mut contract)
+    );
+
+    assert_eq!(contract.required_paths, vec!["books.csv", "report.txt"]);
+    contract.validate().expect("inferred delivery contract");
+}
+
+#[test]
+fn legacy_contract_distinguishes_inputs_conversions_and_imperative_deliveries() {
+    let tmux_prompt = "Fix the bug in project/src/process_data.py. Finally, use less to examine the final output.csv and verify it processed correctly.";
+    let tmux_payload = json!({"prompt": tmux_prompt});
+    let tmux = LegacyTaskAdapter::new(&tmux_payload, tmux_prompt);
+    assert!(tmux.requests_workspace_change());
+    assert!(tmux.required_paths().is_empty());
+
+    let conversion_prompt =
+        "Convert the file '/app/data.csv' into a Parquet file named '/app/data.parquet'.";
+    let conversion_payload = json!({"prompt": conversion_prompt});
+    let mut conversion_contract = golutra_core::TaskContract::default();
+    assert!(
+        LegacyTaskAdapter::new(&conversion_payload, conversion_prompt)
+            .apply_to(&mut conversion_contract)
+    );
+    assert_eq!(conversion_contract.required_paths, vec!["data.parquet"]);
+    assert!(conversion_contract.require_objective_validation);
+    conversion_contract
+        .validate()
+        .expect("conversion delivery contract");
+
+    let reshard_prompt = "Call this folder \"c4_reshard/\". Please call the script \"revert.py\" and place it in the parent directory of c4_sample/.";
+    let reshard_payload = json!({"prompt": reshard_prompt});
+    let mut reshard_contract = golutra_core::TaskContract::default();
+    assert!(
+        LegacyTaskAdapter::new(&reshard_payload, reshard_prompt).apply_to(&mut reshard_contract)
+    );
+    assert_eq!(
+        reshard_contract.required_paths,
+        vec!["c4_reshard", "revert.py"]
+    );
+    reshard_contract
+        .validate()
+        .expect("reshard delivery contract");
+}
+
+#[test]
+fn legacy_external_effects_do_not_invent_a_workspace_diff_contract() {
+    for prompt in [
+        "Create an S3 bucket named sample-bucket and set it to public read.",
+        "Create a spreadsheet named Financial Report and add a sheet named Q1 Data.",
+        "For some reason I cannot curl example.com; figure out why and what I should do to fix it.",
+        r#"Configure a git server so I can run:
+    git add index.html
+    git commit -m "add index"
+    git push origin webserver"#,
+    ] {
+        let payload = json!({"prompt": prompt});
+        let adapter = LegacyTaskAdapter::new(&payload, prompt);
+        assert!(!adapter.requests_workspace_change(), "{prompt}");
+        assert!(adapter.required_paths().is_empty(), "{prompt}");
+    }
+}
+
+#[test]
+fn legacy_installed_environment_repairs_require_validation_without_workspace_diff() {
+    for prompt in [
+        "Fix the installed Python package so it works with the default Python interpreter.",
+        "Patch the dependency in site-packages to support the system Python runtime.",
+        "Fix the existing fasttext code so the Python package works with the default Python interpreter.",
+    ] {
+        let payload = json!({"prompt": prompt});
+        let adapter = LegacyTaskAdapter::new(&payload, prompt);
+        let mut contract = golutra_core::TaskContract::default();
+
+        assert!(!adapter.requests_workspace_change(), "{prompt}");
+        assert!(adapter.apply_to(&mut contract), "{prompt}");
+        assert_eq!(
+            contract.workspace_change,
+            WorkspaceChangeRequirement::Optional,
+            "{prompt}"
+        );
+        assert!(contract.require_objective_validation, "{prompt}");
+        assert_eq!(
+            contract.verification,
+            golutra_core::VerificationRequirement::Required,
+            "{prompt}"
+        );
+    }
+}
+
+#[test]
+fn legacy_code_and_service_implementation_still_require_workspace_evidence() {
+    for prompt in [
+        "Implement the parser.",
+        "Fix the bug in the source code.",
+        "Fix the Python package in this repository.",
+        "Create and run a server on port 3000.",
+        "修改 runtime 代码，修复验证链路",
+    ] {
+        let payload = json!({"prompt": prompt});
+        assert!(
+            LegacyTaskAdapter::new(&payload, prompt).requests_workspace_change(),
+            "{prompt}"
+        );
+    }
 }
 
 #[test]

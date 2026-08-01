@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use golutra_core::EvidenceId;
+use golutra_core::{EvidenceId, PolicyId};
 use golutra_policy::WorkspacePolicy;
 use tempfile::tempdir;
 use tokio::process::Command;
@@ -113,6 +113,7 @@ fn shell_contract_explains_how_to_submit_compound_commands() {
 
     assert!(description.contains("bash -lc"));
     assert!(description.contains("Unquoted operators"));
+    assert!(description.contains("Python heredoc"));
     let timeout = contract.input_schema["properties"]["timeout_ms"]["description"]
         .as_str()
         .expect("timeout description");
@@ -459,6 +460,23 @@ async fn unrestricted_runtime_writes_outside_workspace_without_disabling_validat
     assert!(matches!(
         runtime.evaluate(&malformed),
         Err(ToolError::InvalidArguments(_))
+    ));
+
+    let pipeline = request(
+        "shell",
+        json!({"command": "pip install fasttext-wheel 2>&1 | tail -60"}),
+    );
+    assert_eq!(
+        runtime
+            .evaluate(&pipeline)
+            .expect("unrestricted shell policy")
+            .decision,
+        PolicyDecision::Allow
+    );
+    assert!(matches!(
+        runtime.execute(pipeline, CancellationToken::new()).await,
+        Err(ToolError::InvalidArguments(message))
+            if message.contains("explicit bash -lc wrapper")
     ));
 }
 
@@ -1124,6 +1142,24 @@ fn shell_parser_rejects_unclosed_quotes() {
 }
 
 #[test]
+fn shell_parser_rejects_unwrapped_compound_commands() {
+    for command in [
+        "pip install fasttext-wheel 2>&1 | tail -60",
+        "printf ok > result.txt",
+        "true && echo done",
+    ] {
+        assert!(
+            matches!(
+                CommandLine::parse(command),
+                Err(ToolError::InvalidArguments(message))
+                    if message.contains("explicit bash -lc wrapper")
+            ),
+            "{command}"
+        );
+    }
+}
+
+#[test]
 fn shell_parser_preserves_multiline_explicit_wrapper_scripts() {
     let command = CommandLine::parse("bash -lc 'python - <<'PY'\nprint('ok')\nPY'")
         .expect("explicit wrapper parser");
@@ -1132,6 +1168,80 @@ fn shell_parser_preserves_multiline_explicit_wrapper_scripts() {
     assert_eq!(command.args[0], "-lc");
     assert!(command.args[1].contains("python - <<'PY'"));
     assert!(command.args[1].contains("print('ok')"));
+    assert_eq!(command.stdin, None);
+}
+
+#[test]
+fn shell_parser_extracts_quoted_python_heredoc_stdin() {
+    let command = CommandLine::parse("python - <<'PY'\nprint('direct stdin')\nPY")
+        .expect("direct Python heredoc");
+
+    assert_eq!(command.program, "python");
+    assert_eq!(command.args, ["-"]);
+    assert_eq!(
+        command.stdin.as_deref(),
+        Some(b"print('direct stdin')\n".as_slice())
+    );
+}
+
+#[tokio::test]
+async fn foreground_python_heredoc_executes_its_body_without_a_shell() {
+    let workspace = tempdir().expect("workspace");
+    let executor = executor(workspace.path());
+    let report = execute_approved(
+        &executor,
+        request(
+            "shell",
+            json!({"command": "python3 - <<'PY'\nfrom pathlib import Path\nPath('direct.txt').write_text('executed')\nprint('done')\nPY"}),
+        ),
+        CancellationToken::new(),
+    )
+    .await;
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("direct.txt")).expect("direct output"),
+        "executed"
+    );
+    assert_eq!(
+        report.envelope.model_visible_excerpt.as_deref(),
+        Some("done\n")
+    );
+}
+
+#[tokio::test]
+async fn background_python_heredoc_is_rejected_before_launch() {
+    let workspace = tempdir().expect("workspace");
+    let executor = executor(workspace.path());
+    let error = executor
+        .invoke(
+            ToolInvocation::new(
+                request(
+                    "shell",
+                    json!({
+                        "command": "python - <<'PY'\nprint('no background')\nPY",
+                        "background": true
+                    }),
+                ),
+                PolicyEvaluation {
+                    policy_ref: PolicyId::new(),
+                    subject: "tool".to_owned(),
+                    action: "shell".to_owned(),
+                    resource: "python heredoc".to_owned(),
+                    decision: PolicyDecision::Allow,
+                    block_disposition: None,
+                    reason: "test approval".to_owned(),
+                    evidence_refs: Vec::new(),
+                },
+                true,
+            ),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("background heredoc must be rejected");
+
+    assert!(error.to_string().contains("foreground commands"));
 }
 
 #[tokio::test]
@@ -1443,8 +1553,11 @@ async fn background_process_supports_cursor_reconnect_stdin_and_terminal_diff() 
 #[tokio::test]
 async fn background_process_terminate_timeout_and_cancellation_are_terminal() {
     let workspace = tempdir().expect("workspace");
-    fs::write(workspace.path().join("descendants.sh"), "sleep 5 &\nwait\n")
-        .expect("descendant script");
+    fs::write(
+        workspace.path().join("descendants.sh"),
+        "printf 'ready\\n'\nsleep 5 &\nwait\n",
+    )
+    .expect("descendant script");
     let executor = executor(workspace.path());
     let session_id = SessionId::new();
     let running = execute_approved(
@@ -1455,12 +1568,17 @@ async fn background_process_terminate_timeout_and_cancellation_are_terminal() {
             json!({
                 "command": "sh descendants.sh",
                 "background": true,
-                "yield_time_ms": 0,
+                "yield_time_ms": 1_000,
             }),
         ),
         CancellationToken::new(),
     )
     .await;
+    assert!(
+        running.envelope.structured_facts["output_cursor"]
+            .as_u64()
+            .is_some_and(|cursor| cursor > 0)
+    );
     let process_id = running.envelope.structured_facts["process_id"]
         .as_str()
         .expect("process id");
@@ -1482,7 +1600,7 @@ async fn background_process_terminate_timeout_and_cancellation_are_terminal() {
         terminated.envelope.structured_facts["process_state"],
         "terminated"
     );
-    assert_eq!(terminated.envelope.status, ToolResultStatus::Cancelled);
+    assert_eq!(terminated.envelope.status, ToolResultStatus::Ok);
 
     let timed_out = execute_approved(
         &executor,

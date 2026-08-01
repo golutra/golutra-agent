@@ -474,7 +474,14 @@ impl ProcessSupervisor {
     ) -> Result<ProcessSnapshot, ToolError> {
         let entry = self.entry(session_id, process_id).await?;
         entry.control.cancel();
-        self.poll_for(&entry, cursor, 5_000).await
+        let snapshot = self.wait_for_terminal(&entry, cursor, 5_000).await;
+        if snapshot.state.is_terminal() {
+            Ok(snapshot)
+        } else {
+            Err(ToolError::Execution(format!(
+                "process `{process_id}` did not terminate within 5000 ms"
+            )))
+        }
     }
 
     async fn entry(
@@ -520,6 +527,27 @@ impl ProcessSupervisor {
             tokio::select! {
                 _ = notification => {}
                 _ = tokio::time::sleep_until(deadline) => return Ok(snapshot),
+            }
+        }
+    }
+
+    async fn wait_for_terminal(
+        &self,
+        entry: &Arc<ManagedProcess>,
+        cursor: u64,
+        wait_ms: u64,
+    ) -> ProcessSnapshot {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
+        loop {
+            self.touch(entry).await;
+            let notification = entry.notify.notified();
+            let current_snapshot = snapshot(entry, cursor).await;
+            if current_snapshot.state.is_terminal() || tokio::time::Instant::now() >= deadline {
+                return current_snapshot;
+            }
+            tokio::select! {
+                _ = notification => {}
+                _ = tokio::time::sleep_until(deadline) => return snapshot(entry, cursor).await,
             }
         }
     }

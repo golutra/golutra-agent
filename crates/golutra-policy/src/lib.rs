@@ -187,20 +187,28 @@ impl WorkspacePolicy {
                 evidence_refs: Vec::new(),
             };
         }
-        let parsed = parse_shell_command(command);
-        let explicit_wrapper = parsed.as_deref().and_then(explicit_shell_script).is_some();
-        let terminal_violation = parsed
-            .as_deref()
-            .is_some_and(|parts| self.shell_command_is_blocked(parts));
-        let recoverable_violation =
-            !explicit_wrapper && (contains_shell_metacharacter(command) || parsed.is_none());
+        let parsed = parse_shell_command_with_input(command);
+        let explicit_wrapper = parsed
+            .as_ref()
+            .and_then(|parsed| explicit_shell_script(&parsed.parts))
+            .is_some();
+        let direct_stdin = parsed.as_ref().is_some_and(|parsed| parsed.stdin.is_some());
+        let terminal_violation = parsed.as_ref().is_some_and(|parsed| {
+            self.shell_command_is_blocked(&parsed.parts)
+                || parsed
+                    .stdin
+                    .as_deref()
+                    .is_some_and(|stdin| self.references_sensitive_path(stdin))
+        });
+        let recoverable_violation = !explicit_wrapper
+            && !direct_stdin
+            && (contains_shell_metacharacter(command) || parsed.is_none());
         let blocked = terminal_violation || recoverable_violation;
         let decision = if blocked {
             PolicyDecision::Block
-        } else if parsed
-            .as_deref()
-            .is_some_and(|parts| self.shell_command_is_preapproved(parts))
-        {
+        } else if parsed.as_ref().is_some_and(|parsed| {
+            parsed.stdin.is_none() && self.shell_command_is_preapproved(&parsed.parts)
+        }) {
             PolicyDecision::Allow
         } else {
             PolicyDecision::Ask
@@ -212,7 +220,7 @@ impl WorkspacePolicy {
                 "shell command matched P0 deny-list or sensitive-path guard"
             }
             PolicyDecision::Block => {
-                "shell command syntax is not permitted; submit one argv command, or explicitly invoke bash -lc with the complete script as one quoted argument"
+                "shell command syntax is not permitted; submit one argv command, a quoted foreground Python heredoc, or explicitly invoke bash -lc with the complete script as one quoted argument"
             }
             PolicyDecision::Deny => "shell command denied by policy",
         };
@@ -651,6 +659,12 @@ pub fn default_workspace_policy_name() -> &'static str {
     "workspace-path-guard"
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedShellCommand {
+    pub parts: Vec<String>,
+    pub stdin: Option<String>,
+}
+
 /// Parse the shell tool's command field as argv without invoking a shell.
 ///
 /// Most commands use ordinary `shlex` parsing.  Explicit interpreter wrappers
@@ -661,15 +675,132 @@ pub fn default_workspace_policy_name() -> &'static str {
 /// verbatim for the real interpreter.
 #[must_use]
 pub fn parse_shell_command(command: &str) -> Option<Vec<String>> {
+    parse_shell_command_with_input(command).map(|parsed| parsed.parts)
+}
+
+/// Parse one inert argv command and its optional, explicitly quoted Python stdin.
+///
+/// The only non-argv surface accepted here is a complete foreground
+/// `python - <<'DELIMITER'` command. Tree-sitter establishes that the input is
+/// exactly one redirected command; the quoted delimiter prevents shell
+/// expansion before the body is passed directly to the child process.
+#[must_use]
+pub fn parse_shell_command_with_input(command: &str) -> Option<ParsedShellCommand> {
+    if let Some(parsed) = parse_direct_quoted_python_heredoc(command) {
+        return Some(parsed);
+    }
     if let Some((parts, quote)) = parse_explicit_wrapper_raw(command)
         && quote == '\''
     {
         // A single-quoted script is intentionally opaque to the outer argv
         // parser.  Keeping it verbatim preserves heredoc delimiters and
         // embedded Python/JSON quotes produced by model callers.
-        return Some(parts);
+        return Some(ParsedShellCommand { parts, stdin: None });
     }
-    shlex::split(command).or_else(|| parse_explicit_wrapper_raw(command).map(|(parts, _)| parts))
+    shlex::split(command)
+        .or_else(|| parse_explicit_wrapper_raw(command).map(|(parts, _)| parts))
+        .map(|parts| ParsedShellCommand { parts, stdin: None })
+}
+
+fn parse_direct_quoted_python_heredoc(command: &str) -> Option<ParsedShellCommand> {
+    let command = command.trim();
+    let source = command.as_bytes();
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_bash::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(command, None)?;
+    let root = tree.root_node();
+    if root.has_error() || root.named_child_count() != 1 {
+        return None;
+    }
+    let statement = root.named_child(0)?;
+    if statement.kind() != "redirected_statement" {
+        return None;
+    }
+    let body = statement.child_by_field_name("body")?;
+    if body.kind() != "command" {
+        return None;
+    }
+    let mut cursor = statement.walk();
+    let redirects = statement
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "heredoc_redirect")
+        .collect::<Vec<_>>();
+    let [redirect] = redirects.as_slice() else {
+        return None;
+    };
+    if ["descriptor", "operator", "redirect", "right"]
+        .iter()
+        .any(|field| redirect.child_by_field_name(field).is_some())
+    {
+        return None;
+    }
+
+    let mut parts = shlex::split(body.utf8_text(source).ok()?.trim())?;
+    parts.extend(shlex::split(
+        std::str::from_utf8(&source[body.end_byte()..redirect.start_byte()])
+            .ok()?
+            .trim(),
+    )?);
+    let program = parts
+        .first()
+        .and_then(|program| program.rsplit(['/', '\\']).next())?;
+    if !matches!(program, "python" | "python3")
+        || parts.get(1).map(String::as_str) != Some("-")
+        || parts.len() != 2
+    {
+        return None;
+    }
+
+    let mut cursor = redirect.walk();
+    let children = redirect.named_children(&mut cursor).collect::<Vec<_>>();
+    let start = children
+        .iter()
+        .find(|child| child.kind() == "heredoc_start")?;
+    let heredoc_body = children
+        .iter()
+        .find(|child| child.kind() == "heredoc_body")?;
+    let end = children
+        .iter()
+        .find(|child| child.kind() == "heredoc_end")?;
+    if !source[..start.start_byte()].ends_with(b"<<") {
+        return None;
+    }
+    let start_text = start.utf8_text(source).ok()?;
+    let delimiter = start_text
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+        .or_else(|| {
+            start_text
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+        })?;
+    if delimiter.is_empty()
+        || delimiter.len() > 64
+        || !delimiter
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        || end.utf8_text(source).ok()?.trim() != delimiter
+    {
+        return None;
+    }
+    let mut nodes = vec![*heredoc_body];
+    while let Some(node) = nodes.pop() {
+        if matches!(
+            node.kind(),
+            "command_substitution" | "expansion" | "simple_expansion"
+        ) {
+            return None;
+        }
+        let mut cursor = node.walk();
+        nodes.extend(node.named_children(&mut cursor));
+    }
+
+    Some(ParsedShellCommand {
+        parts,
+        stdin: Some(heredoc_body.utf8_text(source).ok()?.to_owned()),
+    })
 }
 
 /// Return the script argument for a deliberately invoked shell interpreter.
@@ -1246,6 +1377,58 @@ mod tests {
             let evaluation = policy.evaluate_shell(command);
             assert_eq!(evaluation.decision, PolicyDecision::Ask, "{command}");
             assert_eq!(evaluation.block_disposition, None, "{command}");
+        }
+    }
+
+    #[test]
+    fn quoted_python_heredoc_is_parsed_as_direct_stdin() {
+        let source =
+            "python3 - <<'PY'\nfrom pathlib import Path\nprint(Path('result.txt').read_text())\nPY";
+        let parsed = parse_shell_command_with_input(source).expect("quoted Python heredoc");
+
+        assert_eq!(parsed.parts, ["python3", "-"]);
+        assert_eq!(
+            parsed.stdin.as_deref(),
+            Some("from pathlib import Path\nprint(Path('result.txt').read_text())\n")
+        );
+    }
+
+    #[test]
+    fn quoted_python_heredoc_requires_approval_and_keeps_sensitive_guards() {
+        let workspace = tempdir().expect("workspace");
+        let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
+        let allowed = "python - <<'PY'\nprint('ok')\nPY";
+        let sensitive = "python - <<'PY'\nprint(open('.env').read())\nPY";
+
+        assert_eq!(policy.evaluate_shell(allowed).decision, PolicyDecision::Ask);
+        assert_eq!(
+            policy.evaluate_shell(sensitive).decision,
+            PolicyDecision::Block
+        );
+        assert_eq!(
+            policy.evaluate_shell(sensitive).block_disposition,
+            Some(PolicyBlockDisposition::Terminal)
+        );
+    }
+
+    #[test]
+    fn malformed_or_expanding_direct_heredocs_remain_recoverable_blocks() {
+        let workspace = tempdir().expect("workspace");
+        let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
+
+        for command in [
+            "python - <<PY\nprint('ok')\nPY",
+            "python - <<'PY'\nprint('ok')\nWRONG",
+            "python - <<'PY'\nprint('ok')\nPY\necho extra",
+            "python - <<-'PY'\nprint('ok')\nPY",
+        ] {
+            let evaluation = policy.evaluate_shell(command);
+            assert_eq!(evaluation.decision, PolicyDecision::Block, "{command}");
+            assert_eq!(
+                evaluation.block_disposition,
+                Some(PolicyBlockDisposition::Recoverable),
+                "{command}"
+            );
         }
     }
 

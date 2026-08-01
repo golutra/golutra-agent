@@ -28,6 +28,50 @@ use tempfile::tempdir;
 
 use super::*;
 
+fn objective_test_report(tool_name: &str, command: Option<&str>) -> ToolExecutionReport {
+    ToolExecutionReport {
+        envelope: golutra_core::ToolResultEnvelope {
+            tool_call_id: ToolCallId::new(),
+            tool_name: tool_name.to_owned(),
+            status: ToolResultStatus::Ok,
+            summary: format!("{tool_name} completed"),
+            structured_facts: command.map_or_else(
+                || json!({}),
+                |command| {
+                    json!({
+                        "command": command,
+                        "exit_code": 0,
+                        "timed_out": false,
+                        "cancelled": false,
+                    })
+                },
+            ),
+            model_visible_excerpt: None,
+            raw_artifact_ref: None,
+            evidence_refs: Vec::new(),
+            risk: "p0_local_tool".to_owned(),
+            verification_hint: None,
+        },
+        policy_evaluation: golutra_core::PolicyEvaluation {
+            policy_ref: golutra_core::PolicyId::new(),
+            subject: "tool".to_owned(),
+            action: tool_name.to_owned(),
+            resource: command.unwrap_or(tool_name).to_owned(),
+            decision: PolicyDecision::Allow,
+            block_disposition: None,
+            reason: "test".to_owned(),
+            evidence_refs: Vec::new(),
+        },
+        artifacts: Vec::new(),
+        evidence: Vec::new(),
+        artifact_contents: Vec::new(),
+        metrics: Default::default(),
+        changed_files: Vec::new(),
+        before_images: Vec::new(),
+        after_images: Vec::new(),
+    }
+}
+
 #[test]
 fn agent_run_preserves_legacy_touched_code_contract() {
     let run = AgentRun::new(AgentTaskRequest {
@@ -79,6 +123,15 @@ fn shell_timeout_is_clamped_to_the_remaining_governor_budget() {
     request.arguments["timeout_ms"] = json!("invalid");
     clamp_shell_timeout_to_budget(&mut request, 40);
     assert_eq!(request.arguments["timeout_ms"], "invalid");
+}
+
+#[test]
+fn shell_execution_budget_preserves_the_first_deadline_advisory_window() {
+    assert_eq!(shell_execution_budget(600_000, 0, false), 480_000);
+    assert_eq!(shell_execution_budget(600_000, 243_000, false), 237_000);
+    assert_eq!(shell_execution_budget(600_000, 500_000, false), 50_000);
+    assert_eq!(shell_execution_budget(600_000, 500_000, true), 70_000);
+    assert_eq!(shell_execution_budget(600_000, 580_000, true), 10_000);
 }
 
 #[test]
@@ -134,27 +187,51 @@ fn duplicate_failures_in_one_provider_round_count_as_one_retry() {
 }
 
 #[test]
-fn progress_fingerprint_groups_repeated_inspection_of_the_same_file() {
+fn progress_fingerprint_only_groups_the_same_inspection_of_a_file() {
     let first = semantic_tool_action_fingerprint(
         "shell",
         &json!({"command": "bash -lc 'sed -n \"1,120p\" src/runtime.rs'"}),
     );
-    let second = semantic_tool_action_fingerprint(
+    let repeated = semantic_tool_action_fingerprint(
         "shell",
-        &json!({"command": "bash -lc 'nl -ba src/runtime.rs | sed -n \"80,220p\"'"}),
+        &json!({"command": "bash -lc 'sed -n \"1,120p\" src/runtime.rs'"}),
+    );
+    let next_slice = semantic_tool_action_fingerprint(
+        "shell",
+        &json!({"command": "bash -lc 'sed -n \"121,240p\" src/runtime.rs'"}),
     );
     let other = semantic_tool_action_fingerprint(
         "shell",
         &json!({"command": "bash -lc 'sed -n \"1,120p\" src/policy.rs'"}),
     );
+    let first_experiment = semantic_tool_action_fingerprint(
+        "shell",
+        &json!({"command": "bash -lc 'cat > /tmp/probe.c <<EOF\nint x;\nEOF\ngcc /tmp/probe.c'"}),
+    );
+    let revised_experiment = semantic_tool_action_fingerprint(
+        "shell",
+        &json!({"command": "bash -lc 'cat > /tmp/probe.c <<EOF\nint main(void) { return 0; }\nEOF\ngcc /tmp/probe.c'"}),
+    );
 
-    assert_eq!(first, second);
+    assert_eq!(first, repeated);
+    assert_ne!(first, next_slice);
     assert_ne!(first, other);
+    assert_ne!(first_experiment, revised_experiment);
+}
+
+#[test]
+fn directory_delivery_paths_accept_changed_descendants_only_for_directories() {
+    let changed = HashSet::from(["agent.py".to_owned(), "trained_model/policy.pt".to_owned()]);
+
+    assert!(delivery_path_was_changed("agent.py", false, &changed));
+    assert!(delivery_path_was_changed("trained_model", true, &changed));
+    assert!(!delivery_path_was_changed("trained_model", false, &changed));
+    assert!(!delivery_path_was_changed("trained", true, &changed));
 }
 
 #[test]
 fn successful_objective_validation_is_material_progress() {
-    let report = ToolExecutionReport {
+    let mut report = ToolExecutionReport {
         envelope: golutra_core::ToolResultEnvelope {
             tool_call_id: ToolCallId::new(),
             tool_name: "shell".to_owned(),
@@ -192,6 +269,548 @@ fn successful_objective_validation_is_material_progress() {
     };
 
     assert!(objective_validation_report(&report).is_some_and(|outcome| outcome.passed));
+
+    let objective = "The artifact must be less than 150MB and get at least 0.62 accuracy.";
+    assert_eq!(
+        explicit_numeric_thresholds(objective, &[])
+            .into_iter()
+            .map(|threshold| threshold.display)
+            .collect::<Vec<_>>(),
+        vec!["150mb", "0.62"]
+    );
+    assert_eq!(
+        explicit_numeric_thresholds(
+            "Get at least 0.62 accuracy on a fixed test set of 1000 examples.",
+            &[],
+        )
+        .into_iter()
+        .map(|threshold| threshold.display)
+        .collect::<Vec<_>>(),
+        vec!["0.62"]
+    );
+    let size_thresholds =
+        explicit_numeric_thresholds("The compressed artifact must remain under 100KB.", &[]);
+    assert_eq!(size_thresholds.len(), 1);
+    assert_eq!(size_thresholds[0].display, "100kb");
+    assert_eq!(
+        size_thresholds[0].accepted_values,
+        vec![100.0, 100_000.0, 102_400.0]
+    );
+    let byte_limit_objective = "The maximum filesize must be 15MB.";
+    report.envelope.structured_facts["command"] = json!(
+        "python -c \"from pathlib import Path; size = Path('part.bin').stat().st_size; assert size <= 15 * 1024 * 1024\""
+    );
+    assert!(
+        objective_validation_report_for_objective(&report, byte_limit_objective, &[])
+            .is_some_and(|outcome| outcome.passed)
+    );
+    assert_eq!(
+        explicit_numeric_thresholds(
+            "The score must be over 300 after training over 100 episodes.",
+            &[],
+        )
+        .into_iter()
+        .map(|threshold| threshold.display)
+        .collect::<Vec<_>>(),
+        vec!["300"]
+    );
+    report.envelope.structured_facts["command"] =
+        json!("python -c \"size = 100; assert size < 150\"");
+    let incomplete = objective_validation_report_for_objective(&report, objective, &[])
+        .expect("recognized diagnostic");
+    assert!(!incomplete.passed);
+    assert!(incomplete.message.contains("0.62"));
+
+    report.envelope.structured_facts["command"] = json!(
+        "python -c \"size = 100; accuracy = 0.7; assert size < 150; assert accuracy >= 0.62\""
+    );
+    let complete = objective_validation_report_for_objective(&report, objective, &[])
+        .expect("recognized constrained diagnostic");
+    assert!(complete.passed);
+    assert_ne!(complete.identity, incomplete.identity);
+
+    let accuracy_objective = "The measured accuracy must be at least 0.62.";
+    report.envelope.structured_facts["command"] =
+        json!("python -c \"accuracy = 0.7; assert 0.62 <= accuracy\"");
+    assert!(
+        objective_validation_report_for_objective(&report, accuracy_objective, &[])
+            .is_some_and(|outcome| outcome.passed)
+    );
+
+    report.envelope.structured_facts["command"] =
+        json!("python -c \"accuracy = 0.7; assert accuracy <= 0.62\"");
+    assert!(
+        objective_validation_report_for_objective(&report, accuracy_objective, &[])
+            .is_some_and(|outcome| !outcome.passed)
+    );
+
+    let commented_threshold =
+        "python - <<'PY'\naccuracy = 0.7\n# target is accuracy >= 0.62\nassert accuracy >= 0.5\nPY";
+    assert_eq!(
+        numeric_validation_comparisons(commented_threshold),
+        vec![NumericValidationComparison {
+            literal: 0.5,
+            relation: NumericComparisonRelation::GreaterOrEqual,
+        }]
+    );
+    report.envelope.structured_facts["command"] = json!(commented_threshold);
+    assert!(
+        objective_validation_report_for_objective(&report, accuracy_objective, &[])
+            .is_some_and(|outcome| !outcome.passed)
+    );
+
+    let strict_objective = "The measured accuracy must be above 0.62.";
+    report.envelope.structured_facts["command"] =
+        json!("python -c \"accuracy = 0.7; assert accuracy >= 0.62\"");
+    assert!(
+        objective_validation_report_for_objective(&report, strict_objective, &[])
+            .is_some_and(|outcome| !outcome.passed)
+    );
+    report.envelope.structured_facts["command"] =
+        json!("python -c \"accuracy = 0.7; assert accuracy > 0.62\"");
+    assert!(
+        objective_validation_report_for_objective(&report, strict_objective, &[])
+            .is_some_and(|outcome| outcome.passed)
+    );
+}
+
+#[test]
+fn objective_validation_uses_prepared_metadata_after_command_redaction() {
+    let secret = "sk-runtime-validation-secret-1234567890";
+    let command = format!(
+        "python - <<'PY'\nfrom pathlib import Path\ntoken = \"{secret}\"\nassert Path('result.txt').read_text() == 'expected'\nPY"
+    );
+    let request = ToolRequest {
+        tool_call_id: ToolCallId::new(),
+        provider_tool_call_id: None,
+        session_id: SessionId::new(),
+        turn_id: Some(TurnId::new()),
+        tool_name: "shell".to_owned(),
+        arguments: json!({"command": command}),
+    };
+    let metadata = prepare_objective_validation_metadata(&request, "validate result.txt", &[])
+        .expect("prepared validation metadata");
+    assert!(!metadata.to_string().contains(secret));
+
+    let mut report = objective_test_report("shell", Some("<redacted command is not parseable>"));
+    attach_prepared_objective_validation(&mut report, Some(metadata));
+
+    let outcome = objective_validation_report_for_objective(&report, "validate result.txt", &[])
+        .expect("prepared validation outcome");
+    assert!(outcome.passed);
+    assert_eq!(outcome.kind, ObjectiveValidationKind::Diagnostic);
+}
+
+#[test]
+fn conversion_validation_requires_source_and_output_semantics() {
+    let objective =
+        "Convert the file '/app/data.csv' into a Parquet file named '/app/data.parquet'.";
+    let structural_command = concat!(
+        "python - <<'PY'\n",
+        "from pathlib import Path\n",
+        "data = Path('/app/data.parquet').read_bytes()\n",
+        "assert data[:4] == b'PAR1' and data[-4:] == b'PAR1'\n",
+        "PY",
+    );
+    let request = ToolRequest {
+        tool_call_id: ToolCallId::new(),
+        provider_tool_call_id: None,
+        session_id: SessionId::new(),
+        turn_id: Some(TurnId::new()),
+        tool_name: "shell".to_owned(),
+        arguments: json!({"command": structural_command}),
+    };
+    let metadata = prepare_objective_validation_metadata(&request, objective, &[])
+        .expect("prepared conversion validation");
+    assert_eq!(
+        metadata["missing_semantic_requirements"],
+        json!(["conversion source `data.csv`"])
+    );
+    let mut redacted = objective_test_report("shell", Some("<redacted>"));
+    attach_prepared_objective_validation(&mut redacted, Some(metadata));
+    let structural = objective_validation_report_for_objective(&redacted, objective, &[])
+        .expect("structural validation outcome");
+    assert!(!structural.passed);
+    assert!(structural.message.contains("conversion source `data.csv`"));
+
+    let threshold_objective = format!("{objective} The output must contain at least 10 rows.");
+    let metadata = prepare_objective_validation_metadata(&request, &threshold_objective, &[])
+        .expect("prepared conversion threshold validation");
+    let mut redacted = objective_test_report("shell", Some("<redacted>"));
+    attach_prepared_objective_validation(&mut redacted, Some(metadata));
+    let incomplete =
+        objective_validation_report_for_objective(&redacted, &threshold_objective, &[])
+            .expect("incomplete prepared validation outcome");
+    assert!(!incomplete.passed);
+    assert!(incomplete.message.contains("threshold"));
+    assert!(incomplete.message.contains("conversion source `data.csv`"));
+
+    let comment_only_source = concat!(
+        "python - <<'PY'\n",
+        "# Compare /app/data.csv with /app/data.parquet.\n",
+        "from pathlib import Path\n",
+        "data = Path('/app/data.parquet').read_bytes()\n",
+        "assert data[:4] == b'PAR1' and data[-4:] == b'PAR1'\n",
+        "PY",
+    );
+    let comment_only = objective_test_report("shell", Some(comment_only_source));
+    let outcome = objective_validation_report_for_objective(&comment_only, objective, &[])
+        .expect("comment-only source validation outcome");
+    assert!(!outcome.passed);
+    assert!(outcome.message.contains("conversion source `data.csv`"));
+
+    let suffix_only_source = concat!(
+        "python - <<'PY'\n",
+        "from pathlib import Path\n",
+        "source_backup = Path('/app/data.csv.bak').read_bytes()\n",
+        "output = Path('/app/data.parquet').read_bytes()\n",
+        "assert source_backup and output[:4] == b'PAR1'\n",
+        "PY",
+    );
+    let suffix_only = objective_test_report("shell", Some(suffix_only_source));
+    let outcome = objective_validation_report_for_objective(&suffix_only, objective, &[])
+        .expect("suffix-only source validation outcome");
+    assert!(!outcome.passed);
+    assert!(outcome.message.contains("conversion source `data.csv`"));
+
+    let semantic_command = concat!(
+        "python - <<'PY'\n",
+        "import csv\n",
+        "import pyarrow.parquet as pq\n",
+        "with open('/app/data.csv', newline='') as source_file:\n",
+        "    source = list(csv.DictReader(source_file))\n",
+        "output = pq.read_table('/app/data.parquet').to_pylist()\n",
+        "assert output == source\n",
+        "PY",
+    );
+    let semantic = objective_test_report("shell", Some(semantic_command));
+    assert!(
+        objective_validation_report_for_objective(&semantic, objective, &[])
+            .is_some_and(|outcome| outcome.passed)
+    );
+    let external = objective_test_report("external_verifier", None);
+    assert!(
+        objective_validation_report_for_objective(&external, objective, &[])
+            .is_some_and(|outcome| outcome.passed)
+    );
+}
+
+#[test]
+fn live_service_validation_requires_an_independent_loopback_probe() {
+    let objective = "Run the server on port 5000 and keep it running for clients.";
+    assert!(objective_requires_live_service_probe(objective, &[]));
+    assert!(objective_requires_live_service_probe(
+        "The server should not exit and must remain running on port 5000.",
+        &[]
+    ));
+    assert!(!objective_requires_live_service_probe(
+        "Do not start the server during this task.",
+        &[]
+    ));
+    assert!(!objective_requires_live_service_probe(
+        "Create a script to start the server on port 5000 without running it.",
+        &[]
+    ));
+    assert!(!objective_requires_live_service_probe(
+        "Write documentation explaining how to run the server on port 5000.",
+        &[]
+    ));
+    let in_process = objective_test_report(
+        "shell",
+        Some(concat!(
+            "python - <<'PY'\n",
+            "from service import app\n",
+            "response = app.test_client().get('/status')\n",
+            "assert response.status_code == 200\n",
+            "PY",
+        )),
+    );
+    let outcome = objective_validation_report_for_objective(&in_process, objective, &[])
+        .expect("in-process validation outcome");
+    assert!(!outcome.passed);
+    assert!(
+        outcome
+            .message
+            .contains("independent loopback service probe")
+    );
+
+    let comment_spoof = objective_test_report(
+        "shell",
+        Some(concat!(
+            "python - <<'PY'\n",
+            "# curl --fail http://127.0.0.1:5000/status\n",
+            "from service import app\n",
+            "response = app.test_client().get('/status')\n",
+            "assert response.status_code == 200\n",
+            "PY",
+        )),
+    );
+    let outcome = objective_validation_report_for_objective(&comment_spoof, objective, &[])
+        .expect("comment-spoofed validation outcome");
+    assert!(!outcome.passed);
+    assert!(
+        outcome
+            .message
+            .contains("independent loopback service probe")
+    );
+
+    let loopback = objective_test_report("shell", Some("curl --fail http://127.0.0.1:5000/status"));
+    assert!(
+        objective_validation_report_for_objective(&loopback, objective, &[])
+            .is_some_and(|outcome| outcome.passed)
+    );
+
+    let python_loopback = objective_test_report(
+        "shell",
+        Some(concat!(
+            "python - <<'PY'\n",
+            "import requests\n",
+            "url = 'http://localhost:5000/status'\n",
+            "response = requests.get(url, timeout=2)\n",
+            "assert response.status_code == 200\n",
+            "PY",
+        )),
+    );
+    assert!(
+        objective_validation_report_for_objective(&python_loopback, objective, &[])
+            .is_some_and(|outcome| outcome.passed)
+    );
+
+    let workspace = tempdir().expect("workspace");
+    let mut runtime_scoped = objective_test_report("shell", None);
+    runtime_scoped.envelope.structured_facts = json!({
+        "process_id": "proc-service",
+        "process_lifetime_scope": "runtime",
+        "process_state": "running",
+        "survives_runtime_exit": false,
+    });
+    let reports = vec![runtime_scoped.clone(), loopback.clone()];
+    let outcome = objective_validation_report_for_objective_in_turn(
+        &reports[1],
+        objective,
+        &[],
+        &reports,
+        1,
+        workspace.path(),
+    )
+    .expect("runtime-scoped validation outcome");
+    assert!(!outcome.passed);
+    assert!(outcome.message.contains("post-runtime service lifetime"));
+
+    let mut terminated = objective_test_report("process_terminate", None);
+    terminated.envelope.structured_facts = json!({
+        "process_id": "proc-service",
+        "process_lifetime_scope": "runtime",
+        "process_state": "terminated",
+        "survives_runtime_exit": false,
+    });
+    let reports = vec![runtime_scoped, terminated, loopback];
+    assert!(
+        objective_validation_report_for_objective_in_turn(
+            &reports[2],
+            objective,
+            &[],
+            &reports,
+            2,
+            workspace.path(),
+        )
+        .is_some_and(|outcome| outcome.passed)
+    );
+}
+
+#[test]
+fn turn_local_python_verifier_is_source_bound_and_threshold_aware() {
+    let workspace = tempdir().expect("workspace");
+    let verifier_path = workspace.path().join("verify.py");
+    let source = concat!(
+        "from pathlib import Path\n",
+        "score = float(Path('score.txt').read_text())\n",
+        "assert score >= 0.62\n",
+    );
+    fs::write(&verifier_path, source).expect("verifier source");
+    let verifier_path = fs::canonicalize(verifier_path).expect("canonical verifier");
+
+    let mut write_report = objective_test_report("write_file", None);
+    write_report.changed_files.push(verifier_path.clone());
+    write_report.after_images.push(FileBeforeImage {
+        path: verifier_path.clone(),
+        content: Some(source.as_bytes().to_vec()),
+        unix_mode: None,
+        metadata: None,
+    });
+    let validation_report = objective_test_report("shell", Some("python verify.py"));
+    let reports = vec![write_report.clone(), validation_report.clone()];
+
+    assert!(objective_validation_report(&validation_report).is_none());
+    let outcome = objective_validation_report_for_objective_in_turn(
+        &reports[1],
+        "The score must be at least 0.62.",
+        &[],
+        &reports,
+        1,
+        workspace.path(),
+    )
+    .expect("turn-local verifier");
+    assert!(outcome.passed);
+    assert!(outcome.identity.contains("python-file:verify.py:sha256:"));
+
+    let missing_threshold = objective_validation_report_for_objective_in_turn(
+        &reports[1],
+        "The score must be at least 0.90.",
+        &[],
+        &reports,
+        1,
+        workspace.path(),
+    )
+    .expect("threshold-aware verifier");
+    assert!(!missing_threshold.passed);
+    assert!(missing_threshold.message.contains("0.90"));
+
+    assert!(
+        objective_validation_report_for_objective_in_turn(
+            &validation_report,
+            "The score must be at least 0.62.",
+            &[],
+            std::slice::from_ref(&validation_report),
+            0,
+            workspace.path(),
+        )
+        .is_none()
+    );
+
+    let mut later_write = objective_test_report("write_file", None);
+    later_write.changed_files.push(verifier_path.clone());
+    later_write.after_images.push(FileBeforeImage {
+        path: verifier_path.clone(),
+        content: Some(source.as_bytes().to_vec()),
+        unix_mode: None,
+        metadata: None,
+    });
+    let reports_with_later_change = vec![write_report, validation_report, later_write];
+    assert!(
+        objective_validation_report_for_objective_in_turn(
+            &reports_with_later_change[1],
+            "The score must be at least 0.62.",
+            &[],
+            &reports_with_later_change,
+            1,
+            workspace.path(),
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn turn_local_python_verifier_identity_changes_with_source() {
+    let workspace = tempdir().expect("workspace");
+    let verifier_path = workspace.path().join("verify.py");
+    let validation_report = objective_test_report("shell", Some("python3 verify.py"));
+    let identity_for = |source: &str| {
+        fs::write(&verifier_path, source).expect("verifier source");
+        let canonical_path = fs::canonicalize(&verifier_path).expect("canonical verifier");
+        let mut write_report = objective_test_report("apply_patch", None);
+        write_report.changed_files.push(canonical_path.clone());
+        write_report.after_images.push(FileBeforeImage {
+            path: canonical_path,
+            content: Some(source.as_bytes().to_vec()),
+            unix_mode: None,
+            metadata: None,
+        });
+        let reports = vec![write_report, validation_report.clone()];
+        objective_validation_report_for_objective_in_turn(
+            &reports[1],
+            "validate the result",
+            &[],
+            &reports,
+            1,
+            workspace.path(),
+        )
+        .expect("turn-local verifier")
+        .identity
+    };
+
+    let first = identity_for("from pathlib import Path\nassert Path('one').exists()\n");
+    let second = identity_for("from pathlib import Path\nassert Path('two').exists()\n");
+    assert_ne!(first, second);
+}
+
+#[test]
+fn inspection_validation_is_limited_to_pure_analysis_contracts() {
+    let workspace = tempdir().expect("workspace");
+    let path = workspace.path().join("input.txt");
+    fs::write(&path, "input").expect("input");
+    let report = ToolExecutionReport {
+        envelope: golutra_core::ToolResultEnvelope {
+            tool_call_id: ToolCallId::new(),
+            tool_name: "read_file".to_owned(),
+            status: ToolResultStatus::Ok,
+            summary: "file read".to_owned(),
+            structured_facts: json!({"path": path.clone()}),
+            model_visible_excerpt: None,
+            raw_artifact_ref: None,
+            evidence_refs: Vec::new(),
+            risk: "p0_local_tool".to_owned(),
+            verification_hint: None,
+        },
+        policy_evaluation: golutra_core::PolicyEvaluation {
+            policy_ref: golutra_core::PolicyId::new(),
+            subject: "tool".to_owned(),
+            action: "read_file".to_owned(),
+            resource: path.display().to_string(),
+            decision: PolicyDecision::Allow,
+            block_disposition: None,
+            reason: "test".to_owned(),
+            evidence_refs: Vec::new(),
+        },
+        artifacts: Vec::new(),
+        evidence: Vec::new(),
+        artifact_contents: Vec::new(),
+        metrics: Default::default(),
+        changed_files: Vec::new(),
+        before_images: Vec::new(),
+        after_images: Vec::new(),
+    };
+    let objective = "inspect input.txt";
+
+    assert!(
+        explicitly_requested_inspection_validation(
+            &report,
+            objective,
+            &[],
+            &TaskContract::default(),
+            workspace.path(),
+        )
+        .is_some()
+    );
+    for contract in [
+        TaskContract {
+            workspace_change: WorkspaceChangeRequirement::Required,
+            ..TaskContract::default()
+        },
+        TaskContract {
+            require_objective_validation: true,
+            ..TaskContract::default()
+        },
+        TaskContract {
+            verification: VerificationRequirement::Required,
+            ..TaskContract::default()
+        },
+        TaskContract {
+            verification: VerificationRequirement::Independent,
+            ..TaskContract::default()
+        },
+    ] {
+        assert!(
+            explicitly_requested_inspection_validation(
+                &report,
+                objective,
+                &[],
+                &contract,
+                workspace.path(),
+            )
+            .is_none()
+        );
+    }
 }
 
 #[test]
@@ -244,7 +863,7 @@ fn semantic_failure_families_survive_unrelated_successes() {
     );
     let diagnostic =
         semantic_failure_family("shell", &json!({"command": "python3 -m pip --version"}));
-    assert_eq!(apt, "dependency_install:apt");
+    assert_eq!(apt, "dependency_install:apt:python3-pip");
     assert_eq!(apt, apt_variant);
     assert_ne!(apt, diagnostic);
 
@@ -2528,12 +3147,61 @@ fn verification_command_classifier_rejects_arbitrary_shell_success() {
     assert!(is_objective_validation_command(
         "/usr/bin/python3 -m unittest"
     ));
+    assert!(is_objective_validation_command(
+        "curl -fsS http://127.0.0.1:5000/status"
+    ));
+    assert!(!is_objective_validation_command(
+        "curl http://127.0.0.1:5000/status"
+    ));
     assert_eq!(
         objective_validation_command_kind(
             "python3 -c \"from pathlib import Path; actual = Path('result.txt').read_text(); assert actual == 'expected'\""
         ),
         Some(ObjectiveValidationKind::Diagnostic)
     );
+    assert_eq!(
+        objective_validation_command_kind(
+            r#"bash -lc 'python3 - <<"PY"
+import json
+from pathlib import Path
+actual = json.loads(Path("result.json").read_text())
+assert actual["status"] == "ready"
+PY'"#
+        ),
+        Some(ObjectiveValidationKind::Diagnostic)
+    );
+    let direct_heredoc = "python - <<'PY'\nfrom pathlib import Path\nassert Path('result.txt').read_text() == 'expected'\nPY";
+    assert_eq!(
+        objective_validation_command_kind(direct_heredoc),
+        Some(ObjectiveValidationKind::Diagnostic)
+    );
+    assert_ne!(
+        objective_validation_command_identity(direct_heredoc),
+        objective_validation_command_identity(
+            "python - <<'PY'\nfrom pathlib import Path\nassert Path('result.txt').read_text() == 'different'\nPY"
+        )
+    );
+    let fail_fast_heredoc = r#"bash -lc 'set -e
+python3 - <<"PY"
+from pathlib import Path
+assert Path("result.txt").read_text() == "expected"
+PY'"#;
+    assert_eq!(
+        objective_validation_command_kind(fail_fast_heredoc),
+        Some(ObjectiveValidationKind::Diagnostic)
+    );
+    assert!(!is_objective_validation_command(
+        r#"bash -lc 'python3 - <<"PY"
+assert True
+PY'"#
+    ));
+    assert!(!is_objective_validation_command(
+        r#"bash -lc 'touch changed.txt
+python3 - <<"PY"
+from pathlib import Path
+assert Path("changed.txt").exists()
+PY'"#
+    ));
     assert!(!is_objective_validation_command(
         "python3 -c \"print('passed')\""
     ));
@@ -2542,6 +3210,31 @@ fn verification_command_classifier_rejects_arbitrary_shell_success() {
     ));
     assert!(!is_objective_validation_command(
         "python3 -c \"assert (True)\""
+    ));
+    assert!(!is_objective_validation_command("python3 -c \"assert 1\""));
+    assert!(!is_objective_validation_command(
+        "python3 -c \"assert 1 == 1\""
+    ));
+    assert!(!is_objective_validation_command(
+        "python3 -c \"assert float('300') >= 300\""
+    ));
+    assert!(!is_objective_validation_command(
+        "python3 -c \"def validate():\\n    assert actual == expected\""
+    ));
+    assert!(!is_objective_validation_command(
+        "python3 -c \"if True: raise RuntimeError('constant')\""
+    ));
+    assert!(!is_objective_validation_command(
+        "python3 -c \"if False: raise RuntimeError('constant')\""
+    ));
+    assert!(!is_objective_validation_command(
+        "python3 -c \"if failed: raise SystemExit(0)\""
+    ));
+    assert!(is_objective_validation_command(
+        "python3 -c \"if actual != expected: raise RuntimeError('mismatch')\""
+    ));
+    assert!(is_objective_validation_command(
+        "python3 -c \"import sys\nif actual != expected:\n    sys.exit(1)\""
     ));
     assert_eq!(
         objective_validation_command_kind("python3 -c \"assert False\""),
@@ -2555,6 +3248,20 @@ fn verification_command_classifier_rejects_arbitrary_shell_success() {
     ));
     assert!(is_objective_validation_command(
         "bash -lc 'cargo check && python -m pytest -q'"
+    ));
+    let chained_heredoc_validation = r#"bash -lc 'grep -q expected result.txt && python3 - <<"PY"
+from pathlib import Path
+assert Path("result.txt").read_text() == "expected"
+PY'"#;
+    assert_eq!(
+        objective_validation_command_kind(chained_heredoc_validation),
+        Some(ObjectiveValidationKind::Diagnostic)
+    );
+    assert!(!is_objective_validation_command(
+        r#"bash -lc 'grep -q expected result.txt || python3 - <<"PY"
+from pathlib import Path
+assert Path("result.txt").read_text() == "expected"
+PY'"#
     ));
     let git_validation = "bash -lc 'set -euo pipefail
 branch=$(git branch --show-current)
@@ -2583,6 +3290,37 @@ test -z \"$(git status --porcelain)\"'";
         objective_validation_command_kind(
             "bash -lc 'git diff --quiet 268903d HEAD && test -z \"$(git status --porcelain)\"'"
         ),
+        Some(ObjectiveValidationKind::Diagnostic)
+    );
+    let tmux_validation = r##"bash -lc 'set -euo pipefail
+[ "$(tmux list-panes -t workflow:0 | wc -l)" -eq 3 ]
+tmux list-panes -t workflow:0 -F "#{pane_index}:#{pane_current_command}" | grep -q "^0:python$"
+tmux capture-pane -t workflow:0.0 -p | grep -q "Monitoring"
+python - <<"PY"
+from pathlib import Path
+assert Path("/app/project/src/process_data.py").is_file()
+PY'"##;
+    assert!(shell_command_is_read_only(
+        &shlex::split(
+            r##"tmux list-panes -t workflow:0 -F "#{pane_index}:#{pane_current_command}""##
+        )
+        .expect("tmux command")
+    ));
+    assert_eq!(
+        objective_validation_command_kind(
+            r##"bash -lc 'set -e
+tmux list-panes -t workflow:0 -F "#{pane_index}:#{pane_current_command}" | grep -q "^0:python$"'"##
+        ),
+        Some(ObjectiveValidationKind::Diagnostic)
+    );
+    assert_eq!(
+        objective_validation_command_kind(
+            "bash -lc 'set -e\ntmux capture-pane -t workflow:0.0 -p | grep -q Monitoring'"
+        ),
+        Some(ObjectiveValidationKind::Diagnostic)
+    );
+    assert_eq!(
+        objective_validation_command_kind(tmux_validation),
         Some(ObjectiveValidationKind::Diagnostic)
     );
     let failed_git_validation = "bash -lc 'git status --short --branch && git diff --exit-code 268903d..HEAD -- _layouts/default.html _includes/about.md && git log --oneline -3'";
@@ -2615,6 +3353,71 @@ test -z \"$(git status --porcelain)\"'";
     assert!(!is_objective_validation_command(
         "bash -lc 'pytest -q | tee results.txt'"
     ));
+    assert!(is_objective_validation_command("test \"$size\" -lt 100000"));
+    assert!(!is_objective_validation_command("test 1 -lt 100000"));
+    assert!(is_objective_validation_command(
+        "bash -lc 'strings artifact.bin | grep -Fq expected'"
+    ));
+    assert!(is_objective_validation_command(
+        "bash -lc 'set -e\npython3 -c \"assert actual == expected\"\nprintf \"validated\\n\"'"
+    ));
+    assert!(!is_objective_validation_command(
+        "bash -lc 'set -e\npython3 -c \"assert actual == expected\"\ntouch validation-marker'"
+    ));
+    assert!(!is_objective_validation_command(
+        "bash -lc 'python3 -c \"assert actual == expected\"\nprintf done'"
+    ));
+    let fail_fast_setup_pipeline = r#"bash -lc 'set -e
+python test.py | tee /tmp/test-output.txt
+avg=$(grep Average /tmp/test-output.txt | head -1)
+test "$avg" -ge 300
+size=$(du -sb trained_model | cut -f1)
+test "$size" -lt 100000
+printf "validated\n"'"#;
+    assert_eq!(
+        objective_validation_command_kind(fail_fast_setup_pipeline),
+        Some(ObjectiveValidationKind::Diagnostic)
+    );
+    assert!(objective_validation_command_identity(fail_fast_setup_pipeline).is_some());
+    let fail_fast_nested_build_chain = r#"bash -lc 'set -e
+make clean && make
+./public-cli input.json > result.txt
+python - <<"PY"
+from pathlib import Path
+actual = Path("result.txt").read_text()
+assert actual == "expected\n"
+PY'"#;
+    assert_eq!(
+        objective_validation_command_kind(fail_fast_nested_build_chain),
+        Some(ObjectiveValidationKind::Diagnostic)
+    );
+    assert!(objective_validation_command_identity(fail_fast_nested_build_chain).is_some());
+    let mutating_heredoc_then_validation = r#"bash -lc "set -e
+python - <<'PY'
+from pathlib import Path
+Path('prepared.txt').write_text('ready')
+PY
+python - <<'PY'
+from pathlib import Path
+assert Path('prepared.txt').read_text() == 'ready'
+PY""#;
+    assert_eq!(
+        objective_validation_command_kind(mutating_heredoc_then_validation),
+        Some(ObjectiveValidationKind::Diagnostic)
+    );
+    assert!(objective_validation_command_identity(mutating_heredoc_then_validation).is_some());
+    let terminal_heredoc_validation = r#"bash -lc 'cat > recovered.txt <<"EOF"
+recovered
+EOF
+python3 - <<"PY"
+from pathlib import Path
+assert Path("recovered.txt").read_text() == "recovered\n"
+PY'"#;
+    assert_eq!(
+        objective_validation_command_kind(terminal_heredoc_validation),
+        Some(ObjectiveValidationKind::Diagnostic)
+    );
+    assert!(objective_validation_command_identity(terminal_heredoc_validation).is_some());
     assert!(!is_objective_validation_command("python verify.py"));
     assert!(!is_objective_validation_command("cargo fmt"));
     assert!(is_objective_validation_command("cargo fmt -- --check"));
@@ -4429,4 +5232,38 @@ fn partial_checkpoint_filter_omits_ignored_images_but_keeps_safe_files() {
     assert_eq!(excluded_count, 3);
     assert_eq!(retained.len(), 1);
     assert_eq!(checkpoint.changed_files, vec!["safe.txt"]);
+}
+
+#[test]
+fn partial_checkpoint_filter_bounds_large_workspace_snapshots() {
+    let workspace = tempdir().expect("workspace");
+    let checkpoint_root = tempdir().expect("checkpoint");
+    let manager = WorkspaceCheckpointManager::new(workspace.path(), checkpoint_root.path());
+    let before_images = (0..130)
+        .map(|index| {
+            let path = workspace.path().join(format!("file-{index:03}.txt"));
+            fs::write(&path, index.to_string()).expect("workspace file");
+            FileBeforeImage {
+                path,
+                content: Some(index.to_string().into_bytes()),
+                unix_mode: None,
+                metadata: None,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let (retained, excluded_count) = manager
+        .filter_checkpointable_before_images(&before_images)
+        .expect("bounded partial selection");
+
+    assert_eq!(retained.len(), 128);
+    assert_eq!(excluded_count, 2);
+    assert_eq!(
+        retained.first().map(|image| &image.path),
+        Some(&before_images[0].path)
+    );
+    assert_eq!(
+        retained.last().map(|image| &image.path),
+        Some(&before_images[127].path)
+    );
 }

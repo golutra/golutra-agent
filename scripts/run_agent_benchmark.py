@@ -127,9 +127,11 @@ def main() -> int:
     args.workspace = args.workspace.resolve(strict=True)
     initial_prompt = prompt_text(args).strip()
     execution_constraints = (
-        "Execution constraints: shell commands are argv-only. Do not use pipes, "
-        "redirection, chained commands, command substitution, or inline code. "
-        "Create a script with write_file and run it with a simple command when needed."
+        "Execution constraints: shell commands are argv-only. A complete quoted "
+        "foreground Python heredoc such as python - <<'PY' is passed directly on "
+        "stdin. For other pipes, redirection, chained commands, or command "
+        "substitution, explicitly invoke bash -lc with the complete script as one "
+        "quoted argument. Create a workspace script for reusable code."
     )
     thread_id = None
     attempts: list[Attempt] = []

@@ -314,11 +314,7 @@ impl<'a> RunBundleExporter<'a> {
         };
         let manifest_path = request.destination.join("manifest.json");
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
-        if replace_existing {
-            write_atomic_file(&manifest_path, &manifest_bytes)?;
-        } else {
-            write_new_file(&manifest_path, &manifest_bytes)?;
-        }
+        write_atomic_file(&manifest_path, &manifest_bytes, replace_existing)?;
         sync_directory(&request.destination)?;
 
         let (debug_export_path, debug_export_error) = match &manifest.debug_export {
@@ -464,7 +460,16 @@ fn swap_directory(staging: &Path, destination: &Path) -> Result<(), ClientError>
     Ok(())
 }
 
-fn write_atomic_file(path: &Path, bytes: &[u8]) -> Result<(), ClientError> {
+fn write_atomic_file(path: &Path, bytes: &[u8], replace_existing: bool) -> Result<(), ClientError> {
+    write_atomic_file_with(path, bytes, replace_existing, |_| Ok(()))
+}
+
+fn write_atomic_file_with(
+    path: &Path,
+    bytes: &[u8],
+    replace_existing: bool,
+    before_publish: impl FnOnce(&Path) -> Result<(), ClientError>,
+) -> Result<(), ClientError> {
     let temporary = path.with_file_name(format!(
         ".{}-{}-tmp",
         path.file_name()
@@ -473,6 +478,18 @@ fn write_atomic_file(path: &Path, bytes: &[u8]) -> Result<(), ClientError> {
         uuid::Uuid::now_v7()
     ));
     write_new_file(&temporary, bytes)?;
+    if let Err(error) = before_publish(&temporary) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if !replace_existing {
+        if let Err(error) = fs::hard_link(&temporary, path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(bundle_io(path, error));
+        }
+        let _ = fs::remove_file(&temporary);
+        return Ok(());
+    }
     let backup = path.with_file_name(format!(
         ".{}-backup-{}",
         path.file_name()
@@ -489,15 +506,26 @@ fn write_atomic_file(path: &Path, bytes: &[u8]) -> Result<(), ClientError> {
             )));
         }
         Ok(_) => {
-            fs::rename(path, &backup).map_err(|error| bundle_io(path, error))?;
+            if let Err(error) = fs::rename(path, &backup) {
+                let _ = fs::remove_file(&temporary);
+                return Err(bundle_io(path, error));
+            }
             true
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => return Err(bundle_io(path, error)),
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(bundle_io(path, error));
+        }
     };
     if let Err(error) = fs::rename(&temporary, path) {
-        if had_destination {
-            let _ = fs::rename(&backup, path);
+        if had_destination && let Err(restore_error) = fs::rename(&backup, path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(ClientError::Io(format!(
+                "{}: {error}; failed to restore {}: {restore_error}",
+                path.display(),
+                backup.display()
+            )));
         }
         let _ = fs::remove_file(&temporary);
         return Err(bundle_io(path, error));
@@ -1339,5 +1367,58 @@ mod tests {
         assert!(destination.is_dir());
         assert!(!second_backup.exists());
         assert!(!second_staging.exists());
+    }
+
+    #[test]
+    fn atomic_file_publication_hides_the_destination_until_staging_is_complete() {
+        let root = tempdir().expect("run root");
+        let destination = root.path().join("manifest.json");
+        let bytes = br#"{"format":"golutra-run-bundle"}"#;
+
+        write_atomic_file_with(&destination, bytes, false, |temporary| {
+            assert!(!destination.exists());
+            assert_eq!(fs::read(temporary).expect("staged manifest"), bytes);
+            Ok(())
+        })
+        .expect("publish manifest");
+
+        assert_eq!(fs::read(destination).expect("published manifest"), bytes);
+    }
+
+    #[test]
+    fn atomic_initial_publication_does_not_replace_a_concurrent_manifest() {
+        let root = tempdir().expect("run root");
+        let destination = root.path().join("manifest.json");
+        let concurrent = br#"{"writer":"concurrent"}"#;
+
+        let error = write_atomic_file_with(&destination, br#"{"writer":"staged"}"#, false, |_| {
+            fs::write(&destination, concurrent).expect("concurrent manifest");
+            Ok(())
+        })
+        .expect_err("initial publication must retain create-new semantics");
+
+        assert!(error.to_string().contains("manifest.json"));
+        assert_eq!(
+            fs::read(&destination).expect("winning manifest"),
+            concurrent
+        );
+    }
+
+    #[test]
+    fn atomic_replacement_restores_the_prior_manifest_when_publication_fails() {
+        let root = tempdir().expect("run root");
+        let destination = root.path().join("manifest.json");
+        let prior = br#"{"writer":"prior"}"#;
+        fs::write(&destination, prior).expect("prior manifest");
+
+        let error =
+            write_atomic_file_with(&destination, br#"{"writer":"staged"}"#, true, |temporary| {
+                fs::remove_file(temporary).expect("remove staged manifest");
+                Ok(())
+            })
+            .expect_err("missing staged file must fail publication");
+
+        assert!(error.to_string().contains("manifest.json"));
+        assert_eq!(fs::read(&destination).expect("restored manifest"), prior);
     }
 }

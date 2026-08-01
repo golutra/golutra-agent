@@ -188,6 +188,7 @@ fn openai_tool_parameters_come_from_the_runtime_tool_contract() {
 fn shell_provider_description_distinguishes_lifetime_from_initial_wait() {
     let description = provider_tool_description("shell");
 
+    assert!(description.contains("Python heredoc"));
     assert!(description.contains("timeout_ms is the absolute process lifetime"));
     assert!(description.contains("yield"));
     assert!(description.contains("only controls the initial wait"));

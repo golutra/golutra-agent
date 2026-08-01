@@ -13,6 +13,7 @@ golutra-context = { path = "../golutra-context" }
 golutra-core.workspace = true
 golutra-governor = { path = "../golutra-governor" }
 golutra-llm = { path = "../golutra-llm" }
+golutra-policy = { path = "../golutra-policy" }
 golutra-protocol.workspace = true
 golutra-tools = { path = "../golutra-tools" }
 golutra-verify = { path = "../golutra-verify" }
@@ -33,6 +34,5 @@ tree-sitter-python.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-golutra-policy = { path = "../golutra-policy" }
 golutra-sandbox.workspace = true
 tokio.workspace = true

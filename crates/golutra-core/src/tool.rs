@@ -170,12 +170,18 @@ pub fn semantic_tool_failure_family(tool_name: &str, facts: &Value) -> Option<St
         .to_ascii_lowercase();
     if tool_name == "shell" {
         if command.contains("apt-get") && command.contains("install") {
-            return Some("dependency_install:apt".to_owned());
+            return Some(format!(
+                "dependency_install:apt:{}",
+                dependency_install_scope(&command, &["apt-get", "apt"])
+            ));
         }
         if (command.contains("pip install") || command.contains("pip3 install"))
             || (command.contains("-m pip") && command.contains("install"))
         {
-            return Some("dependency_install:pip".to_owned());
+            return Some(format!(
+                "dependency_install:pip:{}",
+                dependency_install_scope(&command, &["pip", "pip3"])
+            ));
         }
         if command.contains("apt-get") && command.contains("update") {
             return Some("dependency_index:apt".to_owned());
@@ -194,6 +200,110 @@ pub fn semantic_tool_failure_family(tool_name: &str, facts: &Value) -> Option<St
     None
 }
 
+fn dependency_install_scope(command: &str, managers: &[&str]) -> String {
+    const MAX_TARGETS: usize = 8;
+    const MAX_TARGET_CHARS: usize = 64;
+
+    let tokens = command.split_whitespace().collect::<Vec<_>>();
+    let Some(manager_index) = tokens.iter().position(|token| {
+        let token = token.trim_matches(|character: char| matches!(character, '\'' | '"'));
+        token
+            .rsplit(['/', '\\'])
+            .next()
+            .is_some_and(|program| managers.contains(&program))
+    }) else {
+        return "unspecified".to_owned();
+    };
+    let Some(install_index) = tokens[manager_index.saturating_add(1)..]
+        .iter()
+        .position(|token| token.trim_matches(['\'', '"']) == "install")
+        .map(|index| manager_index.saturating_add(index).saturating_add(1))
+    else {
+        return "unspecified".to_owned();
+    };
+
+    let mut targets = Vec::new();
+    let mut index = install_index.saturating_add(1);
+    while let Some(raw) = tokens.get(index) {
+        if raw.starts_with(['|', '&', ';', '>', '<']) {
+            break;
+        }
+        let terminal = raw.ends_with(['|', '&', ';']);
+        let target = raw.trim_matches(|character: char| {
+            matches!(character, '\'' | '"' | ',' | ';' | '|' | '&')
+        });
+        if dependency_option_takes_value(target) {
+            index = index.saturating_add(2);
+            continue;
+        }
+        if !target.starts_with('-')
+            && targets.len() < MAX_TARGETS
+            && let Some(target) = normalized_dependency_target(target, MAX_TARGET_CHARS)
+            && !targets.contains(&target)
+        {
+            targets.push(target);
+        }
+        if terminal {
+            break;
+        }
+        index = index.saturating_add(1);
+    }
+    targets.sort();
+    if targets.is_empty() {
+        "unspecified".to_owned()
+    } else {
+        targets.join(",")
+    }
+}
+
+fn dependency_option_takes_value(option: &str) -> bool {
+    matches!(
+        option,
+        "-c" | "--cert"
+            | "--client-cert"
+            | "--config-settings"
+            | "--constraint"
+            | "--extra-index-url"
+            | "-f"
+            | "--find-links"
+            | "--global-option"
+            | "-i"
+            | "--index-url"
+            | "--install-option"
+            | "-o"
+            | "--option"
+            | "--prefix"
+            | "--proxy"
+            | "-r"
+            | "--requirement"
+            | "--root"
+            | "--target"
+            | "--trusted-host"
+    )
+}
+
+fn normalized_dependency_target(raw: &str, max_chars: usize) -> Option<String> {
+    if raw.is_empty() || raw.contains("://") || raw.contains(['/', '\\']) || raw.starts_with('.') {
+        return None;
+    }
+    let direct_name = raw.split_once('@').map_or(raw, |(name, _)| name);
+    let name = direct_name
+        .split(['<', '>', '=', '!', '~'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    if name.is_empty()
+        || !name.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '.' | '_' | '-' | '[' | ']' | ':')
+        })
+    {
+        return None;
+    }
+    let bounded = name.chars().take(max_chars).collect::<String>();
+    (!bounded.is_empty()).then_some(bounded)
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -208,7 +318,7 @@ mod tests {
                 &json!({"command": "sudo apt-get install parquet-tools"}),
             )
             .as_deref(),
-            Some("dependency_install:apt")
+            Some("dependency_install:apt:parquet-tools")
         );
         assert_eq!(
             semantic_tool_failure_family(
@@ -216,7 +326,41 @@ mod tests {
                 &json!({"command": ["python", "-m", "pip", "install", "pyarrow"]}),
             )
             .as_deref(),
-            Some("dependency_install:pip")
+            Some("dependency_install:pip:pyarrow")
         );
+    }
+
+    #[test]
+    fn dependency_failure_families_distinguish_alternative_package_targets() {
+        let git = semantic_tool_failure_family(
+            "shell",
+            &json!({"command": "apt-get install -y git build-essential"}),
+        );
+        let same_git = semantic_tool_failure_family(
+            "shell",
+            &json!({"command": "apt-get -qq install build-essential git -y"}),
+        );
+        let simh = semantic_tool_failure_family(
+            "shell",
+            &json!({"command": "dpkg -l simh || apt-get -qq install -y simh"}),
+        );
+
+        assert_eq!(git, same_git);
+        assert_ne!(git, simh);
+        assert_eq!(simh.as_deref(), Some("dependency_install:apt:simh"));
+    }
+
+    #[test]
+    fn dependency_failure_family_excludes_repository_options_and_credentials() {
+        let family = semantic_tool_failure_family(
+            "shell",
+            &json!({
+                "command": "pip install --index-url https://user:secret@packages.example/simple --trusted-host packages.example 'pyarrow>=18.0'"
+            }),
+        );
+
+        assert_eq!(family.as_deref(), Some("dependency_install:pip:pyarrow"));
+        assert!(!family.as_deref().unwrap_or_default().contains("secret"));
+        assert!(!family.as_deref().unwrap_or_default().contains("example"));
     }
 }

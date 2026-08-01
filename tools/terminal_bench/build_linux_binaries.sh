@@ -6,6 +6,7 @@ output_dir="${GOLUTRA_TBENCH_BIN_DIR:-/tmp/golutra-terminal-bench/bin}"
 build_dir="${GOLUTRA_TBENCH_BUILD_DIR:-/tmp/golutra-terminal-bench/build}"
 rust_image="${GOLUTRA_TBENCH_RUST_IMAGE:-rust:1.93-bookworm}"
 verify_image="${GOLUTRA_TBENCH_VERIFY_IMAGE:-debian:bullseye-slim}"
+rustup_dist_server="${GOLUTRA_TBENCH_RUSTUP_DIST_SERVER:-${RUSTUP_DIST_SERVER:-https://static.rust-lang.org}}"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -57,6 +58,7 @@ build_binary() {
     -e HTTPS_PROXY="$proxy" \
     -e ALL_PROXY="$proxy" \
     -e NO_PROXY="$no_proxy" \
+    -e RUSTUP_DIST_SERVER="$rustup_dist_server" \
     -e TARGET="$target" \
     -e TARGET_CC_ENV="$cc_environment" \
     -e OUTPUT_NAME="golutra-cli-$architecture.candidate" \
@@ -66,10 +68,16 @@ build_binary() {
     -w /src \
     "$rust_image" \
     bash -euc '
-      apt-get update
-      apt-get install -y --no-install-recommends musl-tools
+      apt-get -o Acquire::Retries=5 update
+      apt-get -o Acquire::Retries=5 install -y --no-install-recommends musl-tools
       rm -rf /var/lib/apt/lists/*
-      rustup target add "$TARGET"
+      for attempt in 1 2 3; do
+        if rustup target add "$TARGET"; then
+          break
+        fi
+        [ "$attempt" -lt 3 ] || exit 1
+        sleep $((attempt * 5))
+      done
       export "$TARGET_CC_ENV=musl-gcc"
       CARGO_TARGET_DIR=/target \
         cargo build --locked --release --target "$TARGET" -p golutra-cli

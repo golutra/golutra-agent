@@ -8,7 +8,7 @@
 use std::collections::{BTreeSet, HashSet};
 
 use chrono::{DateTime, Utc};
-use golutra_core::{SessionId, TaskId, TraceView};
+use golutra_core::{SessionId, TaskId, TraceIntegrity, TraceView};
 use golutra_protocol::{
     EventPageDirection, EventPageRequest, RuntimeEvent, RuntimeEventType, SessionSummary,
     SessionWindowRequest, TaskTracePage, TaskTraceRequest,
@@ -119,19 +119,11 @@ impl<'a> RuntimeObservationCollector<'a> {
         for summary in window.sessions {
             let observed = self.collect_session(summary, wait_for_evaluation).await?;
             for task in &observed.tasks {
-                missing_data.extend(
-                    task.trace
-                        .integrity
-                        .unresolved_refs
-                        .iter()
-                        .map(|value| format!("task:{}:{value}", task.task_id)),
-                );
-                missing_data.extend(
-                    task.trace
-                        .integrity
-                        .missing_sections
-                        .iter()
-                        .map(|value| format!("task:{}:{value}", task.task_id)),
+                append_trace_incompleteness(
+                    task.task_id,
+                    &task.trace.integrity,
+                    task.trace.has_more,
+                    &mut missing_data,
                 );
                 retention_losses.extend(
                     task.trace
@@ -249,6 +241,55 @@ impl<'a> RuntimeObservationCollector<'a> {
             tasks,
             events_complete,
         })
+    }
+}
+
+fn append_trace_incompleteness(
+    task_id: TaskId,
+    integrity: &TraceIntegrity,
+    has_more: bool,
+    missing_data: &mut Vec<String>,
+) {
+    let start = missing_data.len();
+    missing_data.extend(
+        integrity
+            .unresolved_refs
+            .iter()
+            .map(|value| format!("task:{task_id}:{value}")),
+    );
+    missing_data.extend(
+        integrity
+            .missing_sections
+            .iter()
+            .map(|value| format!("task:{task_id}:{value}")),
+    );
+    for (kind, values) in [
+        ("missing_causal_link", &integrity.missing_causal_links),
+        ("orphan_event", &integrity.orphan_events),
+        ("broken_lifecycle", &integrity.broken_lifecycle_pairs),
+        ("provenance_mismatch", &integrity.provenance_mismatches),
+        (
+            "artifact_checksum_failure",
+            &integrity.artifact_checksum_failures,
+        ),
+        (
+            "external_overlay_failure",
+            &integrity.external_overlay_failures,
+        ),
+    ] {
+        missing_data.extend(
+            values
+                .iter()
+                .map(|value| format!("task:{task_id}:{kind}:{value}")),
+        );
+    }
+    if has_more {
+        missing_data.push(format!("task:{task_id}:trace_has_more"));
+    }
+    if !integrity.complete && integrity.retention_losses.is_empty() && missing_data.len() == start {
+        missing_data.push(format!(
+            "task:{task_id}:integrity_incomplete_without_details"
+        ));
     }
 }
 
@@ -370,11 +411,79 @@ pub(crate) fn event_snapshot_is_stable(before: Option<u64>, after: Option<u64>) 
 mod tests {
     use super::*;
 
+    fn complete_integrity() -> TraceIntegrity {
+        TraceIntegrity {
+            event_count: 0,
+            first_sequence: None,
+            last_sequence: None,
+            event_chain_digest: String::new(),
+            unresolved_refs: Vec::new(),
+            missing_sections: Vec::new(),
+            retention_losses: Vec::new(),
+            redacted_fields: Vec::new(),
+            missing_causal_links: Vec::new(),
+            orphan_events: Vec::new(),
+            broken_lifecycle_pairs: Vec::new(),
+            provenance_mismatches: Vec::new(),
+            artifact_checksum_failures: Vec::new(),
+            external_overlay_failures: Vec::new(),
+            complete: true,
+        }
+    }
+
     #[test]
     fn event_snapshot_detects_concurrent_session_growth() {
         assert!(event_snapshot_is_stable(Some(10), Some(10)));
         assert!(event_snapshot_is_stable(None, None));
         assert!(!event_snapshot_is_stable(Some(10), Some(11)));
         assert!(!event_snapshot_is_stable(None, Some(1)));
+    }
+
+    #[test]
+    fn incomplete_trace_integrity_always_exposes_a_structured_reason() {
+        let task_id = TaskId::new();
+        let mut integrity = complete_integrity();
+        integrity.complete = false;
+        integrity.broken_lifecycle_pairs = vec!["tool_call:example:not_completed".to_owned()];
+        let mut missing_data = Vec::new();
+
+        append_trace_incompleteness(task_id, &integrity, false, &mut missing_data);
+
+        assert_eq!(
+            missing_data,
+            vec![format!(
+                "task:{task_id}:broken_lifecycle:tool_call:example:not_completed"
+            )]
+        );
+
+        let mut missing_data = Vec::new();
+        append_trace_incompleteness(
+            task_id,
+            &TraceIntegrity {
+                complete: false,
+                ..complete_integrity()
+            },
+            false,
+            &mut missing_data,
+        );
+        assert_eq!(
+            missing_data,
+            vec![format!(
+                "task:{task_id}:integrity_incomplete_without_details"
+            )]
+        );
+
+        let mut missing_data = Vec::new();
+        append_trace_incompleteness(
+            task_id,
+            &TraceIntegrity {
+                retention_losses: vec!["artifact_blob:missing".to_owned()],
+                complete: false,
+                ..complete_integrity()
+            },
+            false,
+            &mut missing_data,
+        );
+        assert!(missing_data.is_empty());
     }
 }

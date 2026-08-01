@@ -141,6 +141,32 @@ async fn event_sequence_is_atomic_across_store_connections() {
 }
 
 #[tokio::test]
+async fn single_writer_store_uses_a_self_contained_rollback_journal() {
+    let directory = tempdir().expect("directory");
+    let database_url = format!(
+        "sqlite://{}",
+        directory.path().join("runtime.sqlite").display()
+    );
+    let store = RuntimeStore::connect_single_writer_with_artifact_root(
+        &database_url,
+        directory.path().join("artifacts"),
+    )
+    .await
+    .expect("single-writer store");
+
+    let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+        .fetch_one(&store.pool)
+        .await
+        .expect("journal mode");
+    assert_eq!(journal_mode, "delete");
+    let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_one(&store.pool)
+        .await
+        .expect("integrity check");
+    assert_eq!(integrity, "ok");
+}
+
+#[tokio::test]
 async fn event_pages_advance_from_the_last_sequence_cursor() {
     let store = RuntimeStore::in_memory().await.expect("store");
     let session_id = SessionId::new();
@@ -756,6 +782,30 @@ async fn storage_maintenance_preserves_evidence_backed_artifacts() {
             .await
             .expect("protected blob"),
         Some(bytes.to_vec())
+    );
+}
+
+#[tokio::test]
+async fn temporary_artifact_pruning_tolerates_writer_cleanup_after_directory_scan() {
+    let root = tempdir().expect("artifact root");
+    let path = root.path().join("artifact.tmp-writer");
+    tokio::fs::write(&path, b"in flight")
+        .await
+        .expect("temporary artifact");
+    let mut entries = tokio::fs::read_dir(root.path())
+        .await
+        .expect("artifact directory");
+    let entry = entries
+        .next_entry()
+        .await
+        .expect("directory entry")
+        .expect("temporary entry");
+    tokio::fs::remove_file(&path).await.expect("writer cleanup");
+
+    assert!(
+        !prune_temporary_artifact_entry(entry)
+            .await
+            .expect("concurrent cleanup is benign")
     );
 }
 

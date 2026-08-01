@@ -72,6 +72,92 @@ ADAPTER = _load_adapter()
 
 
 class AdapterHelpersTest(unittest.TestCase):
+    def test_no_proxy_merge_skips_oversized_entries_without_losing_services(self):
+        merged = ADAPTER._merge_no_proxy(
+            f"localhost,{'x' * 4097},LOCALHOST",
+            ["server", "SERVER", "book-api"],
+        )
+
+        self.assertEqual(merged, "localhost,server,book-api")
+
+    def test_proxy_bypasses_compose_service_names_and_aliases(self):
+        class Result:
+            exit_code = 0
+            output = b""
+
+        class Container:
+            def __init__(self):
+                self.commands = []
+
+            def exec_run(self, command):
+                self.commands.append(command)
+                return Result()
+
+        class Session:
+            def __init__(self):
+                self.container = Container()
+
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dataset = root / "dataset"
+            run_root = root / "runs/run"
+            logging_dir = run_root / "scraper/scraper.1-of-1.run/sessions"
+            task_root = dataset / "scraper"
+            logging_dir.mkdir(parents=True)
+            task_root.mkdir(parents=True)
+            (run_root / "run_metadata.json").write_text(
+                json.dumps({"dataset_path": str(dataset)}), encoding="utf-8"
+            )
+            (task_root / "docker-compose.yaml").write_text(
+                json.dumps(
+                    {
+                        "services": {
+                            "client": {},
+                            "server": {
+                                "hostname": "books.internal",
+                                "container_name": "books-server",
+                                "networks": {
+                                    "default": {
+                                        "aliases": [
+                                            "book-api",
+                                            "bad alias",
+                                            "${UNEXPANDED_ALIAS}",
+                                        ]
+                                    }
+                                },
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            yaml = types.ModuleType("yaml")
+            yaml.safe_load = json.loads
+            agent = ADAPTER.GolutraAgent(
+                proxy_url="http://proxy.internal:7897",
+                no_proxy="localhost,127.0.0.1",
+            )
+            session = Session()
+
+            with patch.dict(sys.modules, {"yaml": yaml}):
+                environment = agent._runtime_environment(logging_dir)
+                self.assertTrue(agent._configure_tmux_proxy(session, logging_dir))
+
+            expected = (
+                "localhost,127.0.0.1,client,server,books.internal,"
+                "books-server,book-api"
+            )
+            self.assertEqual(environment["NO_PROXY"], expected)
+            self.assertEqual(environment["no_proxy"], expected)
+            self.assertIn(
+                ["tmux", "set-environment", "-g", "NO_PROXY", expected],
+                session.container.commands,
+            )
+            self.assertIn(
+                ["tmux", "set-environment", "-g", "no_proxy", expected],
+                session.container.commands,
+            )
+
     def test_default_collector_horizon_covers_long_agent_and_test_timeouts(self):
         agent = ADAPTER.GolutraAgent()
 
@@ -610,8 +696,10 @@ class AdapterHelpersTest(unittest.TestCase):
             agent._collector_binary = Path("/bin/golutra")
             agent._graceful_drain_timeout_sec = 0.01
             agent._max_external_correction_rounds = 1
+            collector_timeouts = []
 
-            def ingest(*_args, **_kwargs):
+            def ingest(*_args, **kwargs):
+                collector_timeouts.append(kwargs["timeout"])
                 submitted = json.loads(
                     (run_dir / "terminal-bench-evaluation.json").read_text()
                 )
@@ -626,6 +714,12 @@ class AdapterHelpersTest(unittest.TestCase):
             with patch.object(ADAPTER.subprocess, "run", side_effect=ingest):
                 agent._collect_result(trial_root)
 
+            self.assertEqual(len(collector_timeouts), 1)
+            self.assertGreater(collector_timeouts[0], 0)
+            self.assertLessEqual(
+                collector_timeouts[0], agent._result_collection_timeout_sec
+            )
+
             submitted = json.loads(
                 (run_dir / "terminal-bench-evaluation.json").read_text()
             )
@@ -636,6 +730,28 @@ class AdapterHelpersTest(unittest.TestCase):
             self.assertEqual(
                 correction["source_evaluation"]["result_digest"],
                 "sha256:rust-canonical",
+            )
+
+            def collector_timeout(command, **kwargs):
+                raise ADAPTER.subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+            with patch.object(
+                ADAPTER.subprocess, "run", side_effect=collector_timeout
+            ):
+                agent._collect_result(trial_root)
+            timeout_pending = json.loads(
+                (run_dir / "terminal-bench-evaluation.pending.json").read_text()
+            )
+            self.assertEqual(timeout_pending["status"], "collector_timeout")
+            self.assertEqual(timeout_pending["error_type"], "TimeoutExpired")
+            self.assertEqual(
+                timeout_pending["record_path"],
+                str(run_dir / "terminal-bench-evaluation.json"),
+            )
+            self.assertGreater(timeout_pending["timeout_sec"], 0)
+            self.assertIn("timed out", timeout_pending["detail"])
+            self.assertFalse(
+                (run_dir / "terminal-bench-evaluation-correction.json").exists()
             )
 
             trace = json.loads(trace_path.read_text())

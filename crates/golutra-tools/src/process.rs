@@ -6,7 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use golutra_policy::parse_shell_command;
+use golutra_policy::{
+    contains_shell_metacharacter, explicit_shell_script, parse_shell_command_with_input,
+};
 use golutra_sandbox::{SandboxRequest, SystemSandbox, WorkspaceAccess};
 #[cfg(unix)]
 use nix::{
@@ -82,13 +84,23 @@ enum PipeMessage {
 pub(crate) struct CommandLine {
     pub(crate) program: String,
     pub(crate) args: Vec<String>,
+    pub(crate) stdin: Option<Vec<u8>>,
 }
 
 impl CommandLine {
     pub(crate) fn parse(command: &str) -> Result<Self, ToolError> {
-        let mut parts = parse_shell_command(command).ok_or_else(|| {
+        let parsed = parse_shell_command_with_input(command).ok_or_else(|| {
             ToolError::InvalidArguments("shell command contains invalid quoting".to_owned())
         })?;
+        if parsed.stdin.is_none()
+            && explicit_shell_script(&parsed.parts).is_none()
+            && contains_shell_metacharacter(command)
+        {
+            return Err(ToolError::InvalidArguments(
+                "unquoted shell operators require an explicit bash -lc wrapper".to_owned(),
+            ));
+        }
+        let mut parts = parsed.parts;
         if parts.is_empty() {
             return Err(ToolError::InvalidArguments(
                 "shell command cannot be empty".to_owned(),
@@ -98,6 +110,7 @@ impl CommandLine {
         Ok(Self {
             program,
             args: parts,
+            stdin: parsed.stdin.map(String::into_bytes),
         })
     }
 }

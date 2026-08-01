@@ -566,7 +566,7 @@ impl RuntimeHost {
         execution_options: RuntimeExecutionOptions,
     ) -> Result<Arc<Self>, ClientError> {
         let paths = RuntimePaths::for_ephemeral_state_dir(state_home, cwd)?;
-        let store = RuntimeStore::connect_with_artifact_root(
+        let store = RuntimeStore::connect_single_writer_with_artifact_root(
             &paths.sqlite_url(),
             paths.artifacts_dir.clone(),
         )
@@ -617,17 +617,27 @@ impl RuntimeHost {
             .parse::<WorkspaceId>()
             .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
         let paths = RuntimePaths::open_ephemeral_state_dir(run_root, &manifest.workspace_root)?;
-        let store = RuntimeStore::connect_with_artifact_root(
+        let store = RuntimeStore::connect_single_writer_with_artifact_root(
             &paths.sqlite_url(),
             paths.artifacts_dir.clone(),
         )
         .await?;
         set_owner_only_file(&paths.runtime_db)?;
         run_bundle::validate_persisted_run_store(run_root, &manifest, &store).await?;
-        let checkpoint_evaluation_tasks = if matches!(
+        let permits_prefix_evaluation = matches!(
             &manifest.terminal_outcome,
             RunBundleTerminalOutcome::InProgress { .. }
-        ) {
+                | RunBundleTerminalOutcome::Aborted { .. }
+                | RunBundleTerminalOutcome::Result {
+                    result: golutra_protocol::AgentTurnResult {
+                        status: TaskStatus::Cancelled
+                            | TaskStatus::Interrupted
+                            | TaskStatus::Uncertain,
+                        ..
+                    }
+                }
+        );
+        let checkpoint_evaluation_tasks = if permits_prefix_evaluation {
             manifest
                 .observations
                 .sessions

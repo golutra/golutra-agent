@@ -31,6 +31,8 @@ _FAILURE_LOG_SCAN_BYTES = 1024 * 1024
 _FAILURE_DETAIL_MAX_BYTES = 2048
 _FAILURE_LINE_MAX_BYTES = 512
 _EXTERNAL_CORRECTION_SCHEMA_VERSION = 2
+_MAX_NO_PROXY_ENTRIES = 128
+_MAX_NO_PROXY_BYTES = 4096
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 _BEARER_CREDENTIAL_RE = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
@@ -49,6 +51,7 @@ _PYTEST_DETAIL_LINE_RE = re.compile(
 _FAILURE_SUMMARY_LINE_RE = re.compile(
     r"(?i)^(?:FAILED|FAILURES?\b|TESTS? FAILED\b)"
 )
+_COMPOSE_HOST_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?$")
 
 
 class GolutraAgent(BaseAgent):
@@ -164,22 +167,34 @@ class GolutraAgent(BaseAgent):
         credentials_file.chmod(0o600)
         return provider_file, credentials_file
 
-    def _runtime_environment(self) -> dict[str, str]:
+    def _runtime_environment(self, logging_dir: Path | None = None) -> dict[str, str]:
         environment = {"HOME": "/root", "GOLUTRA_HOME": "/root/.golutra"}
         if self._proxy_url:
+            no_proxy = _merge_no_proxy(
+                self._no_proxy,
+                _terminal_bench_service_names(logging_dir),
+            )
             environment.update(
                 {name: self._proxy_url for name in self._PROXY_ENV_NAMES}
             )
-            environment.update({"NO_PROXY": self._no_proxy, "no_proxy": self._no_proxy})
+            environment.update({"NO_PROXY": no_proxy, "no_proxy": no_proxy})
         return environment
 
-    def _configure_tmux_proxy(self, session: TmuxSession) -> bool:
+    def _configure_tmux_proxy(
+        self,
+        session: TmuxSession,
+        logging_dir: Path | None = None,
+    ) -> bool:
         if not self._proxy_url:
             return True
+        no_proxy = _merge_no_proxy(
+            self._no_proxy,
+            _terminal_bench_service_names(logging_dir),
+        )
         proxy_environment = {
             name: self._proxy_url for name in self._PROXY_ENV_NAMES
         }
-        proxy_environment.update({"NO_PROXY": self._no_proxy, "no_proxy": self._no_proxy})
+        proxy_environment.update({"NO_PROXY": no_proxy, "no_proxy": no_proxy})
         for name, value in proxy_environment.items():
             result = session.container.exec_run(
                 ["tmux", "set-environment", "-g", name, value]
@@ -430,12 +445,13 @@ class GolutraAgent(BaseAgent):
         deadline = time.monotonic() + self._result_collection_timeout_sec
         results_path: Path | None = None
         run_dir: Path | None = None
+        record_path: Path | None = None
         while time.monotonic() < deadline:
             results_path = _find_trial_results(trial_root)
             run_dir = _find_run_bundle(trial_root)
             if results_path is not None and run_dir is not None:
                 break
-            time.sleep(0.25)
+            time.sleep(min(0.25, _remaining_deadline_seconds(deadline)))
         else:
             _write_json_atomic(
                 trial_root / "golutra-evaluation.pending.json",
@@ -572,19 +588,52 @@ class GolutraAgent(BaseAgent):
             )
             completed = None
             for attempt in range(_COLLECTOR_RETRY_LIMIT):
-                completed = subprocess.run(
-                    collector_command,
-                    capture_output=True,
-                    text=True,
-                    timeout=120,
-                    check=False,
-                )
+                collector_timeout = _remaining_deadline_seconds(deadline)
+                if collector_timeout <= 0:
+                    _write_collector_timeout_evidence(
+                        run_dir,
+                        record_path,
+                        "CollectionDeadlineExceeded",
+                        0.0,
+                        "the result collection deadline expired before the collector could finish",
+                    )
+                    return
+                try:
+                    completed = subprocess.run(
+                        collector_command,
+                        capture_output=True,
+                        text=True,
+                        timeout=collector_timeout,
+                        check=False,
+                    )
+                except subprocess.TimeoutExpired as error:
+                    _write_collector_timeout_evidence(
+                        run_dir,
+                        record_path,
+                        type(error).__name__,
+                        collector_timeout,
+                        str(error),
+                    )
+                    return
                 if completed.returncode == 0 or not _collector_failure_is_transient(
                     completed.stderr
                 ):
                     break
                 if attempt + 1 < _COLLECTOR_RETRY_LIMIT:
-                    time.sleep(_COLLECTOR_RETRY_DELAY_SEC)
+                    retry_delay = min(
+                        _COLLECTOR_RETRY_DELAY_SEC,
+                        _remaining_deadline_seconds(deadline),
+                    )
+                    if retry_delay <= 0:
+                        _write_collector_timeout_evidence(
+                            run_dir,
+                            record_path,
+                            "CollectionDeadlineExceeded",
+                            0.0,
+                            "the result collection deadline expired before a collector retry",
+                        )
+                        return
+                    time.sleep(retry_delay)
             assert completed is not None
             bound_record = (
                 _trace_external_evaluation(
@@ -640,15 +689,21 @@ class GolutraAgent(BaseAgent):
                 )
         except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as error:
             target = run_dir or trial_root
+            pending = {"status": "collector_error", "reason": str(error)}
+            if record_path is not None:
+                pending["record_path"] = str(record_path)
             _write_json_atomic(
                 target / "terminal-bench-evaluation.pending.json",
-                {"status": "collector_error", "reason": str(error)},
+                pending,
             )
 
     def _wait_for_terminal_manifest(
         self, run_dir: Path, collection_deadline: float
     ) -> dict:
         """Do not ingest while the CLI still owns an in-progress run bundle."""
+        remaining_collection_budget = _remaining_deadline_seconds(collection_deadline)
+        if remaining_collection_budget <= 0:
+            return json.loads((run_dir / "manifest.json").read_text())
         wait_budget = min(
             max(
                 0.01,
@@ -660,7 +715,7 @@ class GolutraAgent(BaseAgent):
                     )
                 ),
             ),
-            max(0.01, collection_deadline - time.monotonic()),
+            remaining_collection_budget,
         )
         deadline = time.monotonic() + wait_budget
         manifest_path = run_dir / "manifest.json"
@@ -674,7 +729,7 @@ class GolutraAgent(BaseAgent):
                 last_manifest = candidate
                 if candidate.get("terminal_outcome", {}).get("kind") != "in_progress":
                     return candidate
-            time.sleep(0.25)
+            time.sleep(min(0.25, _remaining_deadline_seconds(deadline)))
         if last_manifest:
             return last_manifest
         return json.loads(manifest_path.read_text())
@@ -751,7 +806,7 @@ class GolutraAgent(BaseAgent):
                     "loader_output": _bounded_diagnostic_output(setup_result.output),
                 },
             )
-        if not self._configure_tmux_proxy(session):
+        if not self._configure_tmux_proxy(session, logging_dir):
             return self._installation_failure(
                 logging_dir,
                 "proxy_configuration_failed",
@@ -766,7 +821,7 @@ class GolutraAgent(BaseAgent):
         rendered_instruction = self._render_instruction(instruction)
         environment = " ".join(
             f"{name}={shlex.quote(value)}"
-            for name, value in self._runtime_environment().items()
+            for name, value in self._runtime_environment(logging_dir).items()
         )
         network_flag = "--allow-network " if self._proxy_url else ""
         setup_elapsed_sec = max(0.0, time.monotonic() - task_started_at)
@@ -878,11 +933,98 @@ class GolutraAgent(BaseAgent):
         )
 
 
+def _terminal_bench_service_names(logging_dir: Path | None) -> list[str]:
+    if logging_dir is None:
+        return []
+
+    trial_root = logging_dir.parent
+    task_root = trial_root.parent
+    run_root = task_root.parent
+    try:
+        run_metadata = json.loads((run_root / "run_metadata.json").read_text())
+        dataset_path = Path(run_metadata["dataset_path"])
+        if not dataset_path.is_absolute():
+            dataset_path = run_root / dataset_path
+        compose_path = dataset_path / task_root.name / "docker-compose.yaml"
+        if not compose_path.is_file():
+            compose_path = compose_path.with_suffix(".yml")
+
+        from yaml import safe_load
+
+        compose = safe_load(compose_path.read_text())
+        services = compose.get("services") if isinstance(compose, dict) else None
+        if not isinstance(services, dict):
+            return []
+    except (ImportError, KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return []
+
+    candidates: list[object] = []
+    for service_name, service in services.items():
+        candidates.append(service_name)
+        if not isinstance(service, dict):
+            continue
+        candidates.extend((service.get("hostname"), service.get("container_name")))
+        networks = service.get("networks")
+        if not isinstance(networks, dict):
+            continue
+        for network in networks.values():
+            if not isinstance(network, dict):
+                continue
+            aliases = network.get("aliases")
+            if isinstance(aliases, list):
+                candidates.extend(aliases)
+
+    names: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        candidate = candidate.strip()
+        key = candidate.casefold()
+        if not _is_compose_hostname(candidate) or key in seen:
+            continue
+        seen.add(key)
+        names.append(candidate)
+    return names
+
+
+def _is_compose_hostname(value: str) -> bool:
+    if not value or len(value) > 253:
+        return False
+    labels = value.split(".")
+    return all(_COMPOSE_HOST_LABEL_RE.fullmatch(label) for label in labels)
+
+
+def _merge_no_proxy(configured: str, discovered: list[str]) -> str:
+    entries: list[str] = []
+    seen: set[str] = set()
+    byte_count = 0
+    for candidate in [*configured.split(","), *discovered]:
+        entry = candidate.strip()
+        key = entry.casefold()
+        if not entry or key in seen or "\x00" in entry or "\n" in entry or "\r" in entry:
+            continue
+        separator_bytes = 1 if entries else 0
+        entry_bytes = len(entry.encode("utf-8"))
+        if len(entries) >= _MAX_NO_PROXY_ENTRIES:
+            break
+        if byte_count + separator_bytes + entry_bytes > _MAX_NO_PROXY_BYTES:
+            continue
+        entries.append(entry)
+        seen.add(key)
+        byte_count += separator_bytes + entry_bytes
+    return ",".join(entries)
+
+
 def _positive_timeout(value: object) -> float:
     timeout = float(value)
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout must be a finite positive number")
     return timeout
+
+
+def _remaining_deadline_seconds(deadline: float) -> float:
+    return max(0.0, deadline - time.monotonic())
 
 
 def _runtime_elapsed_budget_ms(
@@ -1493,6 +1635,26 @@ def _write_json_atomic(path: Path, value: object) -> None:
         os.replace(temporary, path)
     finally:
         _remove_if_exists(temporary)
+
+
+def _write_collector_timeout_evidence(
+    run_dir: Path,
+    record_path: Path,
+    error_type: str,
+    timeout_sec: float,
+    detail: str,
+) -> None:
+    _write_json_atomic(
+        run_dir / "terminal-bench-evaluation.pending.json",
+        {
+            "status": "collector_timeout",
+            "reason": "Golutra collector did not finish before the result collection deadline",
+            "record_path": str(record_path),
+            "error_type": error_type,
+            "timeout_sec": timeout_sec,
+            "detail": detail,
+        },
+    )
 
 
 def _remove_if_exists(path: Path) -> None:

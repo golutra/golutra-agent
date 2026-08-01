@@ -6,7 +6,7 @@
 
 use golutra_core::{
     RequiredFileContent, TaskContract, VerificationRequirement, WorkspaceChangeRequirement,
-    infer_legacy_write_content, infer_legacy_write_path,
+    infer_legacy_write_content, infer_legacy_write_path, infer_legacy_write_paths,
 };
 use serde_json::Value;
 
@@ -24,44 +24,63 @@ impl<'a> LegacyTaskAdapter<'a> {
 
     #[must_use]
     pub(crate) fn requests_workspace_change(self) -> bool {
-        self.payload.get("content").is_some()
+        let explicit_workspace_delivery = self.payload.get("content").is_some()
             || self.payload.get("patch").is_some()
             || self.payload.get("replacement").is_some()
-            || contains_change_verb(self.objective)
+            || self.payload.get("path").is_some()
+            || !infer_legacy_write_paths(self.objective).is_empty();
+        explicit_workspace_delivery
+            || (contains_workspace_change_intent(self.objective)
+                && !contains_installed_environment_change_intent(self.objective))
     }
 
     /// Return a delivery path only when the legacy request makes it explicit.
     /// Broad coding requests must not invent a path for verification.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn required_path(self) -> Option<String> {
-        if !self.requests_workspace_change() {
-            return None;
+        self.required_paths().into_iter().next()
+    }
+
+    #[must_use]
+    pub(crate) fn required_paths(self) -> Vec<String> {
+        if let Some(path) =
+            non_empty_string_payload(self.payload, "path").and_then(normalize_legacy_contract_path)
+        {
+            return vec![path];
         }
-        non_empty_string_payload(self.payload, "path")
-            .and_then(normalize_legacy_contract_path)
-            .or_else(|| infer_legacy_write_path(self.objective))
+        infer_legacy_write_paths(self.objective)
     }
 
     /// Adapt an unstructured request once at the command boundary.
     /// Explicit task contracts bypass this adapter and remain authoritative.
     pub(crate) fn apply_to(self, contract: &mut TaskContract) -> bool {
-        if !self.requests_workspace_change() {
+        let requests_workspace_change = self.requests_workspace_change();
+        if !requests_workspace_change
+            && !contains_installed_environment_change_intent(self.objective)
+        {
             return false;
         }
-        contract.workspace_change = WorkspaceChangeRequirement::Required;
+        if requests_workspace_change {
+            contract.workspace_change = WorkspaceChangeRequirement::Required;
+        }
         contract.require_objective_validation = true;
-        if let Some(requested_path) = self.required_path() {
-            if !contract.required_paths.contains(&requested_path) {
-                contract.required_paths.push(requested_path.clone());
+        if requests_workspace_change {
+            let requested_paths = self.required_paths();
+            for requested_path in &requested_paths {
+                if !contract.required_paths.contains(requested_path) {
+                    contract.required_paths.push(requested_path.clone());
+                }
             }
-            if let Some(content) = self.required_content()
+            if let Some(requested_path) = requested_paths.first()
+                && let Some(content) = self.required_content()
                 && !contract
                     .required_file_contents
                     .iter()
-                    .any(|requirement| requirement.path == requested_path)
+                    .any(|requirement| requirement.path == requested_path.as_str())
             {
                 contract.required_file_contents.push(RequiredFileContent {
-                    path: requested_path,
+                    path: requested_path.clone(),
                     content,
                 });
             }
@@ -160,49 +179,182 @@ pub(crate) struct LegacyWriteFileArgs {
     pub(crate) content: String,
 }
 
-fn contains_change_verb(objective: &str) -> bool {
-    const ENGLISH_CHANGE_VERBS: &[&str] = &[
-        "add",
-        "change",
-        "create",
-        "delete",
-        "edit",
-        "fix",
+fn contains_workspace_change_intent(objective: &str) -> bool {
+    const STRONG_CHANGE_VERBS: &[&str] = &[
         "implement",
-        "modify",
-        "move",
+        "implemented",
         "patch",
+        "patched",
         "refactor",
-        "remove",
-        "rename",
+        "refactored",
         "rewrite",
-        "update",
-        "write",
+        "rewritten",
     ];
-    const CJK_CHANGE_MARKERS: &[&str] = &[
+    const AMBIGUOUS_CHANGE_VERBS: &[&str] = &[
+        "add", "change", "create", "delete", "edit", "fix", "modify", "move", "remove", "rename",
+        "update", "write",
+    ];
+    const WORKSPACE_TARGETS: &[&str] = &[
+        "api",
+        "application",
+        "bug",
+        "class",
+        "code",
+        "crate",
+        "file",
+        "files",
+        "function",
+        "method",
+        "module",
+        "program",
+        "programs",
+        "project",
+        "repo",
+        "repository",
+        "script",
+        "scripts",
+        "server",
+        "source",
+        "test",
+        "tests",
+        "webpage",
+        "website",
+    ];
+    const CJK_STRONG_CHANGE_MARKERS: &[&str] = &["实现", "重构", "补丁", "重写"];
+    const CJK_AMBIGUOUS_CHANGE_MARKERS: &[&str] = &[
         "添加",
         "创建",
         "修复",
         "修改",
-        "实现",
         "删除",
-        "重构",
         "重命名",
         "更改",
         "更新",
         "移除",
         "移动",
-        "补丁",
-        "改代码",
         "写入",
     ];
-    let lower = objective.to_ascii_lowercase();
-    lower
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .any(|token| ENGLISH_CHANGE_VERBS.contains(&token))
-        || CJK_CHANGE_MARKERS
+    const CJK_WORKSPACE_TARGETS: &[&str] = &[
+        "代码", "文件", "函数", "方法", "模块", "项目", "仓库", "脚本", "程序", "测试", "服务",
+    ];
+
+    let mut in_fence = false;
+    for raw_line in objective.lines() {
+        let trimmed = raw_line.trim_start();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence
+            || raw_line.starts_with('\t')
+            || raw_line.len().saturating_sub(trimmed.len()) >= 4
+        {
+            continue;
+        }
+
+        let prose = strip_inline_code(trimmed);
+        let lower = prose.to_ascii_lowercase();
+        let tokens = lower
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .filter(|token| !token.is_empty())
+            .collect::<Vec<_>>();
+        if tokens
             .iter()
-            .any(|marker| objective.contains(marker))
+            .any(|token| STRONG_CHANGE_VERBS.contains(token))
+        {
+            return true;
+        }
+        if tokens
+            .iter()
+            .any(|token| AMBIGUOUS_CHANGE_VERBS.contains(token))
+            && tokens.iter().any(|token| WORKSPACE_TARGETS.contains(token))
+        {
+            return true;
+        }
+        if CJK_STRONG_CHANGE_MARKERS
+            .iter()
+            .any(|marker| prose.contains(marker))
+            || (CJK_AMBIGUOUS_CHANGE_MARKERS
+                .iter()
+                .any(|marker| prose.contains(marker))
+                && CJK_WORKSPACE_TARGETS
+                    .iter()
+                    .any(|target| prose.contains(target)))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn contains_installed_environment_change_intent(objective: &str) -> bool {
+    let prose = prose_without_code(objective).to_ascii_lowercase();
+    let tokens = prose
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let requests_change = tokens.iter().any(|token| {
+        matches!(
+            *token,
+            "change" | "configure" | "fix" | "modify" | "patch" | "repair" | "replace" | "update"
+        )
+    });
+    let installed_runtime = prose.contains("site-packages")
+        || prose.contains("site packages")
+        || prose.contains("default python interpreter")
+        || prose.contains("system python")
+        || (tokens
+            .iter()
+            .any(|token| matches!(*token, "installed" | "installation"))
+            && tokens
+                .iter()
+                .any(|token| matches!(*token, "dependency" | "package" | "python")))
+        || (tokens.contains(&"package") && tokens.contains(&"interpreter"));
+    let explicitly_scoped_to_workspace = tokens.iter().any(|token| {
+        matches!(
+            *token,
+            "crate" | "project" | "repo" | "repository" | "source" | "workspace"
+        )
+    });
+
+    requests_change && installed_runtime && !explicitly_scoped_to_workspace
+}
+
+fn prose_without_code(objective: &str) -> String {
+    let mut prose = String::with_capacity(objective.len());
+    let mut in_fence = false;
+    for raw_line in objective.lines() {
+        let trimmed = raw_line.trim_start();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence
+            || raw_line.starts_with('\t')
+            || raw_line.len().saturating_sub(trimmed.len()) >= 4
+        {
+            continue;
+        }
+        prose.push_str(&strip_inline_code(trimmed));
+        prose.push('\n');
+    }
+    prose
+}
+
+fn strip_inline_code(line: &str) -> String {
+    let mut prose = String::with_capacity(line.len());
+    let mut in_code = false;
+    for character in line.chars() {
+        if character == '`' {
+            in_code = !in_code;
+            prose.push(' ');
+        } else if in_code {
+            prose.push(' ');
+        } else {
+            prose.push(character);
+        }
+    }
+    prose
 }
 
 fn non_empty_string_payload(payload: &Value, key: &str) -> Option<String> {

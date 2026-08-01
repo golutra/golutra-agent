@@ -128,9 +128,36 @@ impl RuntimeStore {
         database_url: &str,
         artifact_root: impl Into<PathBuf>,
     ) -> StoreResult<Self> {
+        Self::connect_with_artifact_root_and_journal(
+            database_url,
+            artifact_root,
+            SqliteJournalMode::Wal,
+        )
+        .await
+    }
+
+    /// Open a single-writer store whose database must remain self-contained and movable.
+    /// Rollback journaling avoids relying on shared-memory WAL files in mounted run bundles.
+    pub async fn connect_single_writer_with_artifact_root(
+        database_url: &str,
+        artifact_root: impl Into<PathBuf>,
+    ) -> StoreResult<Self> {
+        Self::connect_with_artifact_root_and_journal(
+            database_url,
+            artifact_root,
+            SqliteJournalMode::Delete,
+        )
+        .await
+    }
+
+    async fn connect_with_artifact_root_and_journal(
+        database_url: &str,
+        artifact_root: impl Into<PathBuf>,
+        journal_mode: SqliteJournalMode,
+    ) -> StoreResult<Self> {
         let options = SqliteConnectOptions::from_str(database_url)?
             .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
+            .journal_mode(journal_mode)
             .busy_timeout(Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -1751,30 +1778,7 @@ impl RuntimeStore {
             .await
             .map_err(|error| StoreError::ArtifactIo(error.to_string()))?
         {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            if !name.contains(".tmp-") {
-                continue;
-            }
-            let metadata = entry
-                .metadata()
-                .await
-                .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
-            let old_enough = metadata
-                .modified()
-                .ok()
-                .and_then(|modified| modified.elapsed().ok())
-                .is_some_and(|age| {
-                    age >= Duration::from_secs(
-                        TEMPORARY_ARTIFACT_RETENTION_HOURS.saturating_mul(60 * 60),
-                    )
-                });
-            if metadata.is_file() && old_enough {
-                tokio::fs::remove_file(entry.path())
-                    .await
-                    .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
+            if prune_temporary_artifact_entry(entry).await? {
                 removed = removed.saturating_add(1);
             }
         }
@@ -2094,6 +2098,45 @@ impl RuntimeStore {
             .into_iter()
             .filter(|record| evidence_ids.contains(&record.evidence_id))
             .collect())
+    }
+}
+
+async fn prune_temporary_artifact_entry(entry: tokio::fs::DirEntry) -> StoreResult<bool> {
+    let name = entry.file_name();
+    let Some(name) = name.to_str() else {
+        return Ok(false);
+    };
+    if !name.contains(".tmp-") {
+        return Ok(false);
+    }
+    let path = entry.path();
+    let metadata = match entry.metadata().await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(StoreError::ArtifactIo(format!(
+                "{}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let old_enough = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| {
+            age >= Duration::from_secs(TEMPORARY_ARTIFACT_RETENTION_HOURS.saturating_mul(60 * 60))
+        });
+    if !metadata.is_file() || !old_enough {
+        return Ok(false);
+    }
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(StoreError::ArtifactIo(format!(
+            "{}: {error}",
+            path.display()
+        ))),
     }
 }
 

@@ -1843,6 +1843,11 @@ impl ToolRuntime {
             });
         let effective_timeout_ms = effective_shell_timeout(timeout_ms);
         let command_line = CommandLine::parse(&command)?;
+        if background && command_line.stdin.is_some() {
+            return Err(ToolError::InvalidArguments(
+                "quoted Python heredocs are supported only for foreground commands".to_owned(),
+            ));
+        }
         let workspace_before = match workspace_before {
             Some(snapshot) => snapshot,
             None => workspace_scan::capture(self.policy.workspace_root()).await,
@@ -1892,7 +1897,7 @@ impl ToolRuntime {
                     sandbox: &self.sandbox,
                     workspace_access: WorkspaceAccess::ReadWrite,
                     allow_network: self.allow_network,
-                    stdin: None,
+                    stdin: command_line.stdin.as_deref(),
                     isolated_home: false,
                 },
                 Some(&mut process_progress),
@@ -2296,7 +2301,7 @@ fn contract(tool_name: &str, side_effect_type: SideEffectType) -> ToolContract {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": MAX_SHELL_COMMAND_CHARS,
-                    "description": "A single argv command parsed without a shell. Unquoted operators such as |, >, &&, and ; are rejected. For a pipeline, redirection, or compound script, invoke bash -lc and pass the entire script as one quoted argument."
+                    "description": "A single argv command parsed without a shell. A complete quoted foreground Python heredoc such as python - <<'PY' is passed directly on stdin. Unquoted operators such as |, >, &&, and ; are otherwise rejected; for a pipeline, redirection, or compound script, invoke bash -lc and pass the entire script as one quoted argument."
                 },
                 "timeout_ms": {
                     "type": "integer",
@@ -2798,10 +2803,12 @@ fn supervised_process_report(
     snapshot: ProcessSnapshot,
 ) -> ToolExecutionReport {
     let state = process_state_name(snapshot.state);
+    let requested_termination = request.tool_name == "process_terminate";
     let status = match snapshot.state {
         ProcessState::Running | ProcessState::Exited => ToolResultStatus::Ok,
         ProcessState::Failed => ToolResultStatus::Error,
         ProcessState::TimedOut => ToolResultStatus::Timeout,
+        ProcessState::Terminated if requested_termination => ToolResultStatus::Ok,
         ProcessState::Cancelled | ProcessState::Terminated => ToolResultStatus::Cancelled,
     };
     let workspace_changes_known = snapshot.workspace_changes_known;

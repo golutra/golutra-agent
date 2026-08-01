@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    fs,
     path::Path,
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
@@ -15,8 +16,8 @@ use golutra_core::{
     CorrectionEnvelope, LoopAction, LoopDecision, PolicyBlockDisposition, PolicyDecision,
     SessionId, SideEffectType, TaskContract, TaskId, ToolContract, ToolProgress, ToolProgressPhase,
     ToolRecoveryPolicy, ToolResultStatus, TurnId, TurnState, VerificationCheck,
-    VerificationCheckKind, VerificationPlan, VerificationRecord, VerificationResult,
-    WorkspaceChangeRequirement,
+    VerificationCheckKind, VerificationPlan, VerificationRecord, VerificationRequirement,
+    VerificationResult, WorkspaceChangeRequirement, infer_explicit_conversion_objectives,
 };
 #[cfg(test)]
 use golutra_core::{RequiredFileContent, infer_legacy_write_objective};
@@ -26,11 +27,12 @@ use golutra_governor::{
 use golutra_llm::{
     LlmProvider, ProviderError, ProviderMessage, ProviderRequest, ProviderResponse, ProviderRole,
 };
+use golutra_policy::parse_shell_command_with_input;
 use golutra_protocol::ExternalVerificationSpec;
 use golutra_tools::{
     CONTRACT_FILE_CONTENT_VERIFIER_TOOL, CONTRACT_PATH_VERIFIER_TOOL, FileBeforeImage, ToolError,
     ToolExecutionReport, ToolInvocation, ToolRequest, ToolRuntime, VerifierExecutionRequest,
-    model_visible_tool_result, redact_tool_arguments,
+    model_visible_tool_result, redact_sensitive_text, redact_tool_arguments,
 };
 use golutra_verify::VerificationInput;
 use serde_json::Value;
@@ -1189,6 +1191,11 @@ where
                         tool_name: tool_call.tool_name,
                         arguments: tool_call.arguments,
                     };
+                    let prepared_objective_validation = prepare_objective_validation_metadata(
+                        &tool_request,
+                        &current_objective,
+                        &current_completion_criteria,
+                    );
                     let recovery_policy = self
                         .tool_executor
                         .registry()
@@ -1227,7 +1234,7 @@ where
                         )
                     });
                     let strategy_was_blocked = strategy_blocked_report.is_some();
-                    let report = if let Some(report) = strategy_blocked_report {
+                    let mut report = if let Some(report) = strategy_blocked_report {
                         trace(AgentLoopTraceEvent::PolicyEvaluated(
                             report.policy_evaluation.clone(),
                         ));
@@ -1338,15 +1345,17 @@ where
                                             )
                                         } else {
                                             control.wait_until_runnable().await?;
+                                            let max_elapsed_ms =
+                                                current_governor.limits().max_elapsed_ms;
+                                            let elapsed_ms =
+                                                elapsed_millis(current_turn_started_at);
                                             clamp_shell_timeout_to_budget(
                                                 &mut tool_request,
-                                                current_governor
-                                                    .limits()
-                                                    .max_elapsed_ms
-                                                    .saturating_sub(elapsed_millis(
-                                                        current_turn_started_at,
-                                                    ))
-                                                    .max(1),
+                                                shell_execution_budget(
+                                                    max_elapsed_ms,
+                                                    elapsed_ms,
+                                                    deadline_advisory_emitted,
+                                                ),
                                             );
                                             let mut progress = |progress| {
                                                 trace(AgentLoopTraceEvent::ToolProgress(progress));
@@ -1400,6 +1409,10 @@ where
                             }
                         }
                     };
+                    attach_prepared_objective_validation(
+                        &mut report,
+                        prepared_objective_validation,
+                    );
                     trace(AgentLoopTraceEvent::ToolCompleted(report.clone()));
                     update_tool_failure_counts(
                         report.envelope.status,
@@ -1505,10 +1518,18 @@ where
                 );
                 let made_progress = tool_reports[tool_reports_before_step..]
                     .iter()
-                    .any(|report| {
+                    .enumerate()
+                    .any(|(offset, report)| {
                         !report.changed_files.is_empty()
-                            || objective_validation_report(report)
-                                .is_some_and(|validation| validation.passed)
+                            || objective_validation_report_for_objective_in_turn(
+                                report,
+                                &current_objective,
+                                &current_completion_criteria,
+                                &tool_reports,
+                                tool_reports_before_step.saturating_add(offset),
+                                self.tool_executor.workspace_root(),
+                            )
+                            .is_some_and(|validation| validation.passed)
                     });
                 let step_completion = finish_runtime_step(
                     &mut step_machine,
@@ -1714,10 +1735,17 @@ where
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 let normalized = required.replace('\\', "/");
-                let changed_when_required = !matches!(
-                    current_task_contract.workspace_change,
-                    WorkspaceChangeRequirement::Required
-                ) || changed_relative.contains(&normalized);
+                let is_directory = report
+                    .envelope
+                    .structured_facts
+                    .pointer("/metadata/file_type")
+                    .and_then(Value::as_str)
+                    == Some("directory");
+                let changed_when_required =
+                    !matches!(
+                        current_task_contract.workspace_change,
+                        WorkspaceChangeRequirement::Required
+                    ) || delivery_path_was_changed(&normalized, is_directory, &changed_relative);
                 contract_path_checks.push(VerificationCheck {
                     kind: VerificationCheckKind::ObjectiveValidation,
                     name: "objective:path:delivery".to_owned(),
@@ -1852,7 +1880,7 @@ where
                 });
             }
             let code_files_changed = changed_files.iter().any(|path| is_code_file(path));
-            for report in &tool_reports {
+            for (report_index, report) in tool_reports.iter().enumerate() {
                 if report.envelope.tool_name == "external_verifier" {
                     command_checks.push(VerificationCheck {
                         kind: VerificationCheckKind::ObjectiveValidation,
@@ -1869,11 +1897,20 @@ where
                     });
                     continue;
                 }
-                if let Some(validation) = objective_validation_report(report).or_else(|| {
+                if let Some(validation) = objective_validation_report_for_objective_in_turn(
+                    report,
+                    &current_objective,
+                    &current_completion_criteria,
+                    &tool_reports,
+                    report_index,
+                    self.tool_executor.workspace_root(),
+                )
+                .or_else(|| {
                     explicitly_requested_inspection_validation(
                         report,
                         &current_objective,
                         &current_completion_criteria,
+                        &current_task_contract,
                         self.tool_executor.workspace_root(),
                     )
                 }) {
@@ -2460,6 +2497,23 @@ fn is_code_file(path: &Path) -> bool {
         })
 }
 
+fn delivery_path_was_changed(
+    normalized: &str,
+    is_directory: bool,
+    changed_relative: &HashSet<String>,
+) -> bool {
+    if changed_relative.contains(normalized) {
+        return true;
+    }
+    if !is_directory {
+        return false;
+    }
+    let prefix = format!("{}/", normalized.trim_end_matches('/'));
+    changed_relative
+        .iter()
+        .any(|changed| changed.starts_with(&prefix))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ObjectiveValidationKind {
     Test,
@@ -2475,7 +2529,18 @@ impl ObjectiveValidationKind {
             Self::FileState => "file_state",
         }
     }
+
+    fn from_label(value: &str) -> Option<Self> {
+        match value {
+            "test" => Some(Self::Test),
+            "diagnostic" => Some(Self::Diagnostic),
+            "file_state" => Some(Self::FileState),
+            _ => None,
+        }
+    }
 }
+
+const PREPARED_OBJECTIVE_VALIDATION_FACT: &str = "runtime_objective_validation";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ObjectiveValidationOutcome {
@@ -2495,6 +2560,9 @@ fn objective_validation_report(report: &ToolExecutionReport) -> Option<Objective
         });
     }
     if report.envelope.tool_name == "shell" {
+        if let Some(outcome) = prepared_objective_validation_report(report) {
+            return Some(outcome);
+        }
         let command = report
             .envelope
             .structured_facts
@@ -2502,25 +2570,7 @@ fn objective_validation_report(report: &ToolExecutionReport) -> Option<Objective
             .and_then(serde_json::Value::as_str)?;
         let kind = objective_validation_command_kind(command)?;
         let identity = objective_validation_command_identity(command)?;
-        let exited_cleanly = report.envelope.status == ToolResultStatus::Ok
-            && report
-                .envelope
-                .structured_facts
-                .get("exit_code")
-                .and_then(Value::as_i64)
-                == Some(0)
-            && !report
-                .envelope
-                .structured_facts
-                .get("timed_out")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            && !report
-                .envelope
-                .structured_facts
-                .get("cancelled")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+        let exited_cleanly = shell_report_exited_cleanly(report);
         let passed = exited_cleanly
             && (kind != ObjectiveValidationKind::Test || test_report_executed_tests(report));
         let message = match (kind, exited_cleanly, passed) {
@@ -2547,12 +2597,1662 @@ fn objective_validation_report(report: &ToolExecutionReport) -> Option<Objective
     None
 }
 
+fn objective_validation_report_for_objective(
+    report: &ToolExecutionReport,
+    objective: &str,
+    completion_criteria: &[String],
+) -> Option<ObjectiveValidationOutcome> {
+    let outcome = objective_validation_report(report)?;
+    if report
+        .envelope
+        .structured_facts
+        .get(PREPARED_OBJECTIVE_VALIDATION_FACT)
+        .is_some()
+    {
+        return Some(outcome);
+    }
+    let validation_source = report
+        .envelope
+        .structured_facts
+        .get("command")
+        .and_then(Value::as_str);
+    constrain_objective_validation_to_thresholds(
+        outcome,
+        objective,
+        completion_criteria,
+        validation_source,
+    )
+}
+
+fn prepare_objective_validation_metadata(
+    request: &ToolRequest,
+    objective: &str,
+    completion_criteria: &[String],
+) -> Option<Value> {
+    if request.tool_name != "shell" {
+        return None;
+    }
+    let command = request.arguments.get("command").and_then(Value::as_str)?;
+    let kind = objective_validation_command_kind(command)?;
+    let mut identity = safe_objective_validation_command_identity(command)?;
+    let thresholds = explicit_numeric_thresholds(objective, completion_criteria);
+    if !thresholds.is_empty()
+        && matches!(
+            kind,
+            ObjectiveValidationKind::Test | ObjectiveValidationKind::Diagnostic
+        )
+    {
+        identity = format!(
+            "{identity}:thresholds:{}",
+            explicit_numeric_threshold_digest(&thresholds)
+        );
+    }
+    let missing_thresholds = if kind == ObjectiveValidationKind::Diagnostic {
+        missing_numeric_thresholds(&thresholds, &numeric_validation_comparisons(command))
+    } else {
+        Vec::new()
+    };
+    let missing_semantic_requirements = missing_semantic_validation_requirements(
+        objective,
+        completion_criteria,
+        kind,
+        &identity,
+        Some(command),
+    );
+    Some(serde_json::json!({
+        "kind": kind.label(),
+        "identity": identity,
+        "missing_thresholds": missing_thresholds,
+        "missing_semantic_requirements": missing_semantic_requirements,
+    }))
+}
+
+fn attach_prepared_objective_validation(report: &mut ToolExecutionReport, metadata: Option<Value>) {
+    let Some(metadata) = metadata else {
+        return;
+    };
+    if let Some(facts) = report.envelope.structured_facts.as_object_mut() {
+        facts.insert(PREPARED_OBJECTIVE_VALIDATION_FACT.to_owned(), metadata);
+    }
+}
+
+fn prepared_objective_validation_report(
+    report: &ToolExecutionReport,
+) -> Option<ObjectiveValidationOutcome> {
+    let metadata = report
+        .envelope
+        .structured_facts
+        .get(PREPARED_OBJECTIVE_VALIDATION_FACT)?;
+    let kind = ObjectiveValidationKind::from_label(metadata.get("kind")?.as_str()?)?;
+    let identity = metadata.get("identity")?.as_str()?.to_owned();
+    let missing_thresholds = metadata
+        .get("missing_thresholds")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let missing_semantic_requirements = metadata
+        .get("missing_semantic_requirements")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let exited_cleanly = shell_report_exited_cleanly(report);
+    let executed_tests =
+        kind != ObjectiveValidationKind::Test || test_report_executed_tests(report);
+    let passed = exited_cleanly
+        && executed_tests
+        && missing_thresholds.is_empty()
+        && missing_semantic_requirements.is_empty();
+    let message = if !exited_cleanly {
+        "validation command did not exit successfully".to_owned()
+    } else if kind == ObjectiveValidationKind::Test && !executed_tests {
+        "test command exited successfully but no executed test was observed".to_owned()
+    } else if !missing_thresholds.is_empty() || !missing_semantic_requirements.is_empty() {
+        let mut omissions = Vec::new();
+        if !missing_thresholds.is_empty() {
+            omissions.push(format!(
+                "diagnostic command omitted explicit objective threshold(s): {}",
+                missing_thresholds.join(", ")
+            ));
+        }
+        if !missing_semantic_requirements.is_empty() {
+            omissions.push(format!(
+                "validation command omitted required semantic evidence: {}",
+                missing_semantic_requirements.join(", ")
+            ));
+        }
+        omissions.join("; ")
+    } else {
+        match kind {
+            ObjectiveValidationKind::Test => "test command passed with executed tests".to_owned(),
+            ObjectiveValidationKind::FileState => "file-state command passed".to_owned(),
+            ObjectiveValidationKind::Diagnostic => "diagnostic command passed".to_owned(),
+        }
+    };
+    Some(ObjectiveValidationOutcome {
+        kind,
+        identity,
+        passed,
+        message,
+    })
+}
+
+fn objective_validation_report_for_objective_in_turn(
+    report: &ToolExecutionReport,
+    objective: &str,
+    completion_criteria: &[String],
+    turn_reports: &[ToolExecutionReport],
+    report_index: usize,
+    workspace_root: &Path,
+) -> Option<ObjectiveValidationOutcome> {
+    let outcome = if let Some(verifier) =
+        turn_local_python_verifier(report, turn_reports, report_index, workspace_root)
+    {
+        let passed = shell_report_exited_cleanly(report);
+        let outcome = ObjectiveValidationOutcome {
+            kind: ObjectiveValidationKind::Diagnostic,
+            identity: format!(
+                "python-file:{}:sha256:{}",
+                verifier.relative_path, verifier.source_digest
+            ),
+            passed,
+            message: if passed {
+                "turn-local Python verifier passed".to_owned()
+            } else {
+                "turn-local Python verifier did not exit successfully".to_owned()
+            },
+        };
+        constrain_objective_validation_to_thresholds(
+            outcome,
+            objective,
+            completion_criteria,
+            Some(&verifier.source),
+        )
+    } else {
+        objective_validation_report_for_objective(report, objective, completion_criteria)
+    }?;
+
+    Some(constrain_live_service_process_lifetime(
+        outcome,
+        objective,
+        completion_criteria,
+        turn_reports,
+        report_index,
+    ))
+}
+
+fn constrain_live_service_process_lifetime(
+    mut outcome: ObjectiveValidationOutcome,
+    objective: &str,
+    completion_criteria: &[String],
+    turn_reports: &[ToolExecutionReport],
+    report_index: usize,
+) -> ObjectiveValidationOutcome {
+    if !objective_requires_live_service_probe(objective, completion_criteria)
+        || !runtime_scoped_process_is_running(turn_reports, report_index)
+    {
+        return outcome;
+    }
+
+    let lifetime_requirement =
+        "validation command omitted required semantic evidence: post-runtime service lifetime";
+    outcome.passed = false;
+    outcome.message = if outcome
+        .message
+        .contains("omitted required semantic evidence")
+    {
+        format!("{}; post-runtime service lifetime", outcome.message)
+    } else if outcome.message.ends_with("passed") {
+        lifetime_requirement.to_owned()
+    } else {
+        format!("{}; {lifetime_requirement}", outcome.message)
+    };
+    outcome
+}
+
+fn runtime_scoped_process_is_running(
+    turn_reports: &[ToolExecutionReport],
+    report_index: usize,
+) -> bool {
+    let mut states = HashMap::new();
+    for report in turn_reports.iter().take(report_index.saturating_add(1)) {
+        let facts = &report.envelope.structured_facts;
+        if facts.get("process_lifetime_scope").and_then(Value::as_str) != Some("runtime") {
+            continue;
+        }
+        let Some(process_id) = facts.get("process_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(process_state) = facts.get("process_state").and_then(Value::as_str) else {
+            continue;
+        };
+        states.insert(process_id, process_state);
+    }
+    states.values().any(|state| *state == "running")
+}
+
+fn constrain_objective_validation_to_thresholds(
+    mut outcome: ObjectiveValidationOutcome,
+    objective: &str,
+    completion_criteria: &[String],
+    validation_source: Option<&str>,
+) -> Option<ObjectiveValidationOutcome> {
+    let missing_semantic_requirements = missing_semantic_validation_requirements(
+        objective,
+        completion_criteria,
+        outcome.kind,
+        &outcome.identity,
+        validation_source,
+    );
+    if !missing_semantic_requirements.is_empty() {
+        outcome.passed = false;
+        outcome.message = format!(
+            "validation command omitted required semantic evidence: {}",
+            missing_semantic_requirements.join(", ")
+        );
+    }
+    if !matches!(
+        outcome.kind,
+        ObjectiveValidationKind::Test | ObjectiveValidationKind::Diagnostic
+    ) {
+        return Some(outcome);
+    }
+    let thresholds = explicit_numeric_thresholds(objective, completion_criteria);
+    if thresholds.is_empty() {
+        return Some(outcome);
+    }
+
+    outcome.identity = format!(
+        "{}:thresholds:{}",
+        outcome.identity,
+        explicit_numeric_threshold_digest(&thresholds)
+    );
+    if outcome.kind == ObjectiveValidationKind::Test {
+        return Some(outcome);
+    }
+
+    let missing = missing_numeric_thresholds(
+        &thresholds,
+        &numeric_validation_comparisons(validation_source?),
+    );
+    if !missing.is_empty() {
+        outcome.passed = false;
+        let threshold_message = format!(
+            "diagnostic command omitted explicit objective threshold(s): {}",
+            missing.join(", ")
+        );
+        outcome.message = if missing_semantic_requirements.is_empty() {
+            threshold_message
+        } else {
+            format!("{}; {threshold_message}", outcome.message)
+        };
+    }
+    Some(outcome)
+}
+
+fn missing_semantic_validation_requirements(
+    objective: &str,
+    completion_criteria: &[String],
+    kind: ObjectiveValidationKind,
+    identity: &str,
+    validation_source: Option<&str>,
+) -> Vec<String> {
+    if identity == "external-verifier" {
+        return Vec::new();
+    }
+
+    let mut missing = Vec::new();
+    if kind != ObjectiveValidationKind::Test {
+        for text in std::iter::once(objective).chain(completion_criteria.iter().map(String::as_str))
+        {
+            for conversion in infer_explicit_conversion_objectives(text) {
+                if !validation_source.is_some_and(|source| {
+                    validation_source_uses_path(source, identity, &conversion.source_path)
+                }) {
+                    let requirement = format!("conversion source `{}`", conversion.source_path);
+                    if !missing.contains(&requirement) {
+                        missing.push(requirement);
+                    }
+                }
+                if !validation_source.is_some_and(|source| {
+                    validation_source_uses_path(source, identity, &conversion.output_path)
+                }) {
+                    let requirement = format!("conversion output `{}`", conversion.output_path);
+                    if !missing.contains(&requirement) {
+                        missing.push(requirement);
+                    }
+                }
+            }
+        }
+    }
+
+    if objective_requires_live_service_probe(objective, completion_criteria)
+        && !validation_source.is_some_and(validation_uses_independent_loopback_probe)
+    {
+        missing.push("independent loopback service probe".to_owned());
+    }
+    missing
+}
+
+fn validation_source_uses_path(source: &str, identity: &str, path: &str) -> bool {
+    if identity.starts_with("python-file:") {
+        return python_source_uses_path(source, path);
+    }
+    validation_command_uses_path(source, path, 0)
+}
+
+fn validation_command_uses_path(command: &str, path: &str, wrapper_depth: u8) -> bool {
+    if wrapper_depth > 2 {
+        return false;
+    }
+    let Some(parsed) = parse_shell_command_with_input(command) else {
+        return false;
+    };
+    let Some(program) = parsed.parts.first().and_then(|program| {
+        Path::new(program)
+            .file_name()
+            .and_then(|name| name.to_str())
+    }) else {
+        return false;
+    };
+    if matches!(program, "bash" | "sh" | "zsh")
+        && parsed.parts.len() == 3
+        && matches!(parsed.parts[1].as_str(), "-c" | "-lc")
+    {
+        return shell_validation_script_uses_path(
+            &parsed.parts[2],
+            path,
+            wrapper_depth.saturating_add(1),
+        );
+    }
+    if matches!(program, "python" | "python3") {
+        let source = parsed.stdin.as_deref().or_else(|| {
+            parsed
+                .parts
+                .iter()
+                .position(|part| part == "-c")
+                .and_then(|index| parsed.parts.get(index.saturating_add(1)))
+                .map(String::as_str)
+        });
+        return source.is_some_and(|source| python_source_uses_path(source, path));
+    }
+    parsed
+        .parts
+        .iter()
+        .skip(1)
+        .any(|argument| validation_text_mentions_path(argument, path))
+}
+
+fn shell_validation_script_uses_path(script: &str, path: &str, wrapper_depth: u8) -> bool {
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_bash::LANGUAGE.into())
+        .is_err()
+    {
+        return false;
+    }
+    let Some(tree) = parser.parse(script, None) else {
+        return false;
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        return false;
+    }
+    let source = script.as_bytes();
+    let mut nodes = vec![root];
+    while let Some(node) = nodes.pop() {
+        match node.kind() {
+            "comment" | "heredoc_body" | "heredoc_redirect" => continue,
+            "redirected_statement" => {
+                if let Some((_, python_source)) =
+                    objective_validation_python_heredoc_source(node, source, wrapper_depth)
+                    && python_source_uses_path(python_source, path)
+                {
+                    return true;
+                }
+                if let Some(body) = node.child_by_field_name("body") {
+                    nodes.push(body);
+                }
+                continue;
+            }
+            "command" => {
+                if node.utf8_text(source).ok().is_some_and(|command| {
+                    validation_command_uses_path(command.trim(), path, wrapper_depth)
+                }) {
+                    return true;
+                }
+                continue;
+            }
+            "test_command" => {
+                if node
+                    .utf8_text(source)
+                    .ok()
+                    .is_some_and(|command| validation_text_mentions_path(command, path))
+                {
+                    return true;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        nodes.extend(node.named_children(&mut cursor));
+    }
+    false
+}
+
+fn python_source_uses_path(source: &str, path: &str) -> bool {
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .is_err()
+    {
+        return false;
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return false;
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        return false;
+    }
+    let source_bytes = source.as_bytes();
+    let mut path_bindings = HashSet::new();
+    let mut nodes = vec![root];
+    while let Some(node) = nodes.pop() {
+        if node.kind() == "assignment"
+            && let (Some(left), Some(right)) = (
+                node.child_by_field_name("left"),
+                node.child_by_field_name("right"),
+            )
+            && left.kind() == "identifier"
+            && python_node_mentions_path_literal(right, source_bytes, path)
+            && let Ok(identifier) = left.utf8_text(source_bytes)
+        {
+            path_bindings.insert(identifier.to_owned());
+        }
+        let mut cursor = node.walk();
+        nodes.extend(node.named_children(&mut cursor));
+    }
+
+    let mut nodes = vec![root];
+    while let Some(node) = nodes.pop() {
+        if node.kind() == "call" && python_call_uses_path(node, source_bytes, path, &path_bindings)
+        {
+            return true;
+        }
+        let mut cursor = node.walk();
+        nodes.extend(node.named_children(&mut cursor));
+    }
+    false
+}
+
+fn python_call_uses_path(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    path: &str,
+    path_bindings: &HashSet<String>,
+) -> bool {
+    let function = node
+        .child_by_field_name("function")
+        .and_then(|function| function.utf8_text(source).ok())
+        .unwrap_or_default();
+    if matches!(function, "Path" | "PurePath" | "print" | "repr" | "str") {
+        return false;
+    }
+    python_node_uses_path(node, source, path, path_bindings)
+}
+
+fn python_node_uses_path(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    path: &str,
+    path_bindings: &HashSet<String>,
+) -> bool {
+    if node.kind() == "comment" {
+        return false;
+    }
+    if node.kind() == "string"
+        && node
+            .utf8_text(source)
+            .ok()
+            .is_some_and(|literal| validation_text_mentions_path(literal, path))
+    {
+        return true;
+    }
+    if node.kind() == "identifier"
+        && node
+            .utf8_text(source)
+            .is_ok_and(|identifier| path_bindings.contains(identifier))
+    {
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| python_node_uses_path(child, source, path, path_bindings))
+}
+
+fn python_node_mentions_path_literal(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    path: &str,
+) -> bool {
+    if node.kind() == "comment" {
+        return false;
+    }
+    if node.kind() == "string"
+        && node
+            .utf8_text(source)
+            .ok()
+            .is_some_and(|literal| validation_text_mentions_path(literal, path))
+    {
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| python_node_mentions_path_literal(child, source, path))
+}
+
+fn validation_text_mentions_path(text: &str, path: &str) -> bool {
+    let text = text.replace('\\', "/").to_ascii_lowercase();
+    let path = path.replace('\\', "/").to_ascii_lowercase();
+    if path.is_empty() {
+        return false;
+    }
+
+    text.match_indices(&path).any(|(start, matched)| {
+        let previous = text[..start].chars().next_back();
+        let next = text[start.saturating_add(matched.len())..].chars().next();
+        previous.is_none_or(|character| {
+            character == '/' || !is_workspace_path_component_character(character)
+        }) && next.is_none_or(|character| !is_workspace_path_component_character(character))
+    })
+}
+
+fn is_workspace_path_component_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | '/')
+}
+
+fn objective_requires_live_service_probe(objective: &str, completion_criteria: &[String]) -> bool {
+    std::iter::once(objective)
+        .chain(completion_criteria.iter().map(String::as_str))
+        .flat_map(|text| text.split(['\n', '.', ';']))
+        .map(str::trim)
+        .filter(|clause| !clause.is_empty())
+        .any(|clause| {
+            let lower = clause.to_ascii_lowercase();
+            let service = lower.contains("server") || lower.contains("service");
+            let explicitly_not_live = [
+                "do not start",
+                "don't start",
+                "do not launch",
+                "don't launch",
+                "must not start",
+                "should not start",
+                "do not run the server",
+                "don't run the server",
+                "without running",
+                "without starting",
+                "does not need to be running",
+                "doesn't need to be running",
+                "need not be running",
+                "not required to be running",
+                "server must not be running",
+                "server should not be running",
+                "service must not be running",
+                "service should not be running",
+            ]
+            .iter()
+            .any(|negation| lower.contains(negation));
+            if !service || explicitly_not_live {
+                return false;
+            }
+            let documentation_only = ["documentation", "document how", "instructions", "guide"]
+                .iter()
+                .any(|marker| lower.contains(marker))
+                && !["start it", "run it", "launch it", "keep it", "leave it"]
+                    .iter()
+                    .any(|marker| lower.contains(marker));
+            if documentation_only {
+                return false;
+            }
+            (lower.contains("running")
+                || (lower.contains("start") && lower.contains("server"))
+                || (lower.contains("run") && lower.contains("server") && lower.contains("port")))
+                && (lower.contains("port")
+                    || lower.contains("localhost")
+                    || lower.contains("accessible")
+                    || lower.contains("background")
+                    || lower.contains("running"))
+        })
+}
+
+fn validation_uses_independent_loopback_probe(source: &str) -> bool {
+    validation_command_uses_independent_loopback_probe(source, 0)
+        || python_source_uses_independent_loopback_probe(source)
+}
+
+fn validation_command_uses_independent_loopback_probe(command: &str, wrapper_depth: u8) -> bool {
+    if wrapper_depth > 2 {
+        return false;
+    }
+    let Some(parsed) = parse_shell_command_with_input(command) else {
+        return false;
+    };
+    let Some(program) = parsed.parts.first().and_then(|program| {
+        Path::new(program)
+            .file_name()
+            .and_then(|name| name.to_str())
+    }) else {
+        return false;
+    };
+    if matches!(program, "bash" | "sh" | "zsh")
+        && parsed.parts.len() == 3
+        && matches!(parsed.parts[1].as_str(), "-c" | "-lc")
+    {
+        return shell_validation_script_uses_independent_loopback_probe(
+            &parsed.parts[2],
+            wrapper_depth.saturating_add(1),
+        );
+    }
+    if matches!(program, "python" | "python3") {
+        let source = parsed.stdin.as_deref().or_else(|| {
+            parsed
+                .parts
+                .iter()
+                .position(|part| part == "-c")
+                .and_then(|index| parsed.parts.get(index.saturating_add(1)))
+                .map(String::as_str)
+        });
+        return source.is_some_and(python_source_uses_independent_loopback_probe);
+    }
+    matches!(program, "curl" | "wget")
+        && parsed
+            .parts
+            .iter()
+            .skip(1)
+            .any(|argument| is_loopback_endpoint(argument))
+}
+
+fn shell_validation_script_uses_independent_loopback_probe(
+    script: &str,
+    wrapper_depth: u8,
+) -> bool {
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_bash::LANGUAGE.into())
+        .is_err()
+    {
+        return false;
+    }
+    let Some(tree) = parser.parse(script, None) else {
+        return false;
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        return false;
+    }
+    let source = script.as_bytes();
+    let mut nodes = vec![root];
+    while let Some(node) = nodes.pop() {
+        match node.kind() {
+            "comment" | "heredoc_body" | "heredoc_redirect" => continue,
+            "redirected_statement" => {
+                if let Some((_, python_source)) =
+                    objective_validation_python_heredoc_source(node, source, wrapper_depth)
+                    && python_source_uses_independent_loopback_probe(python_source)
+                {
+                    return true;
+                }
+            }
+            "command" => {
+                if node.utf8_text(source).ok().is_some_and(|command| {
+                    validation_command_uses_independent_loopback_probe(
+                        command.trim(),
+                        wrapper_depth,
+                    )
+                }) {
+                    return true;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        nodes.extend(node.named_children(&mut cursor));
+    }
+    false
+}
+
+fn python_source_uses_independent_loopback_probe(source: &str) -> bool {
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .is_err()
+    {
+        return false;
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return false;
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        return false;
+    }
+    let source = source.as_bytes();
+    let mut endpoint_bindings = HashSet::new();
+    let mut client_bindings = HashSet::new();
+    let mut nodes = vec![root];
+    while let Some(node) = nodes.pop() {
+        if node.kind() == "assignment"
+            && let (Some(left), Some(right)) = (
+                node.child_by_field_name("left"),
+                node.child_by_field_name("right"),
+            )
+            && left.kind() == "identifier"
+            && let Ok(identifier) = left.utf8_text(source)
+        {
+            if python_node_contains_loopback_endpoint(right, source, &HashSet::new()) {
+                endpoint_bindings.insert(identifier.to_owned());
+            }
+            if python_node_constructs_http_client(right, source) {
+                client_bindings.insert(identifier.to_owned());
+            }
+        }
+        let mut cursor = node.walk();
+        nodes.extend(node.named_children(&mut cursor));
+    }
+
+    let mut nodes = vec![root];
+    while let Some(node) = nodes.pop() {
+        if node.kind() == "call"
+            && python_call_uses_independent_loopback_probe(
+                node,
+                source,
+                &endpoint_bindings,
+                &client_bindings,
+            )
+        {
+            return true;
+        }
+        let mut cursor = node.walk();
+        nodes.extend(node.named_children(&mut cursor));
+    }
+    false
+}
+
+fn python_call_uses_independent_loopback_probe(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    endpoint_bindings: &HashSet<String>,
+    client_bindings: &HashSet<String>,
+) -> bool {
+    let function = node
+        .child_by_field_name("function")
+        .and_then(|function| function.utf8_text(source).ok())
+        .unwrap_or_default();
+    let direct_client = matches!(
+        function,
+        "requests.get"
+            | "requests.request"
+            | "urllib.request.urlopen"
+            | "http.client.HTTPConnection"
+            | "http.client.HTTPSConnection"
+    ) || ((function.starts_with("requests.")
+        || function.starts_with("httpx.")
+        || function.starts_with("aiohttp."))
+        && matches!(
+            function.rsplit('.').next(),
+            Some("get" | "head" | "request")
+        ));
+    let bound_client = function.rsplit_once('.').is_some_and(|(receiver, method)| {
+        client_bindings.contains(receiver) && matches!(method, "get" | "head" | "request")
+    });
+    if !direct_client && !bound_client {
+        return false;
+    }
+    node.child_by_field_name("arguments")
+        .is_some_and(|arguments| {
+            python_node_contains_loopback_endpoint(arguments, source, endpoint_bindings)
+        })
+}
+
+fn python_node_constructs_http_client(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    if node.kind() == "call"
+        && node
+            .child_by_field_name("function")
+            .and_then(|function| function.utf8_text(source).ok())
+            .is_some_and(|function| {
+                matches!(
+                    function,
+                    "requests.Session"
+                        | "httpx.Client"
+                        | "httpx.AsyncClient"
+                        | "aiohttp.ClientSession"
+                )
+            })
+    {
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| python_node_constructs_http_client(child, source))
+}
+
+fn python_node_contains_loopback_endpoint(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    endpoint_bindings: &HashSet<String>,
+) -> bool {
+    if node.kind() == "comment" {
+        return false;
+    }
+    if node.kind() == "string"
+        && node
+            .utf8_text(source)
+            .ok()
+            .is_some_and(is_loopback_endpoint)
+    {
+        return true;
+    }
+    if node.kind() == "identifier"
+        && node
+            .utf8_text(source)
+            .is_ok_and(|identifier| endpoint_bindings.contains(identifier))
+    {
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| python_node_contains_loopback_endpoint(child, source, endpoint_bindings))
+}
+
+fn is_loopback_endpoint(raw: &str) -> bool {
+    let mut value = raw.trim().to_ascii_lowercase();
+    while value
+        .chars()
+        .next()
+        .is_some_and(|character| matches!(character, 'r' | 'b' | 'u' | 'f'))
+        && value
+            .chars()
+            .nth(1)
+            .is_some_and(|character| matches!(character, '\'' | '"'))
+    {
+        value.remove(0);
+    }
+    let value = value.trim_matches(|character| matches!(character, '\'' | '"'));
+    let authority = value
+        .strip_prefix("http://")
+        .or_else(|| value.strip_prefix("https://"))
+        .unwrap_or(value);
+    ["localhost", "127.0.0.1", "[::1]", "::1"]
+        .iter()
+        .any(|host| {
+            authority.strip_prefix(host).is_some_and(|remainder| {
+                remainder.is_empty()
+                    || remainder.starts_with(':')
+                    || remainder.starts_with('/')
+                    || remainder.starts_with('?')
+                    || remainder.starts_with('#')
+            })
+        })
+}
+
+fn explicit_numeric_threshold_digest(thresholds: &[ExplicitNumericThreshold]) -> String {
+    let mut digest = Sha256::new();
+    for threshold in thresholds {
+        digest.update((threshold.display.len() as u64).to_le_bytes());
+        digest.update(threshold.display.as_bytes());
+        digest.update([threshold.bound.identity_byte()]);
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn missing_numeric_thresholds(
+    thresholds: &[ExplicitNumericThreshold],
+    comparisons: &[NumericValidationComparison],
+) -> Vec<String> {
+    thresholds
+        .iter()
+        .filter(|threshold| {
+            !threshold.accepted_values.iter().any(|expected| {
+                comparisons.iter().any(|comparison| {
+                    numeric_values_match(comparison.literal, *expected)
+                        && threshold.bound.is_enforced_by(comparison.relation)
+                })
+            })
+        })
+        .map(|threshold| threshold.display.clone())
+        .collect()
+}
+
+fn shell_report_exited_cleanly(report: &ToolExecutionReport) -> bool {
+    report.envelope.tool_name == "shell"
+        && report.envelope.status == ToolResultStatus::Ok
+        && report
+            .envelope
+            .structured_facts
+            .get("exit_code")
+            .and_then(Value::as_i64)
+            == Some(0)
+        && !report
+            .envelope
+            .structured_facts
+            .get("timed_out")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        && !report
+            .envelope
+            .structured_facts
+            .get("cancelled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
+const MAX_TURN_LOCAL_PYTHON_VERIFIER_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TurnLocalPythonVerifier {
+    relative_path: String,
+    source: String,
+    source_digest: String,
+}
+
+fn turn_local_python_verifier(
+    report: &ToolExecutionReport,
+    turn_reports: &[ToolExecutionReport],
+    report_index: usize,
+    workspace_root: &Path,
+) -> Option<TurnLocalPythonVerifier> {
+    if report.envelope.tool_name != "shell" || report_index >= turn_reports.len() {
+        return None;
+    }
+    let command = report
+        .envelope
+        .structured_facts
+        .get("command")
+        .and_then(Value::as_str)?;
+    let parsed = parse_shell_command_with_input(command)?;
+    if parsed.stdin.is_some() || parsed.parts.len() != 2 {
+        return None;
+    }
+    let program = parsed.parts.first().map(String::as_str)?;
+    let program = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program);
+    if !matches!(program, "python" | "python3") {
+        return None;
+    }
+    let requested_path = Path::new(parsed.parts.get(1)?);
+    if requested_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        != Some("py")
+    {
+        return None;
+    }
+
+    let canonical_root = fs::canonicalize(workspace_root).ok()?;
+    let candidate = if requested_path.is_absolute() {
+        requested_path.to_path_buf()
+    } else {
+        canonical_root.join(requested_path)
+    };
+    let metadata = fs::symlink_metadata(&candidate).ok()?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    let canonical_path = fs::canonicalize(&candidate).ok()?;
+    let relative_path = canonical_path.strip_prefix(&canonical_root).ok()?;
+    if relative_path.as_os_str().is_empty() {
+        return None;
+    }
+
+    let changed_before_execution =
+        turn_reports[..report_index]
+            .iter()
+            .rev()
+            .find(|candidate_report| {
+                candidate_report
+                    .changed_files
+                    .iter()
+                    .any(|path| paths_resolve_to_same_file(path, &canonical_path))
+            })?;
+    let source_bytes = changed_before_execution
+        .after_images
+        .iter()
+        .find(|image| paths_resolve_to_same_file(&image.path, &canonical_path))?
+        .content
+        .as_deref()?;
+    if source_bytes.len() > MAX_TURN_LOCAL_PYTHON_VERIFIER_BYTES {
+        return None;
+    }
+    if turn_reports[report_index..].iter().any(|candidate_report| {
+        candidate_report
+            .changed_files
+            .iter()
+            .any(|path| paths_resolve_to_same_file(path, &canonical_path))
+    }) {
+        return None;
+    }
+    let current_bytes = fs::read(&canonical_path).ok()?;
+    if current_bytes != source_bytes {
+        return None;
+    }
+    let source = std::str::from_utf8(source_bytes).ok()?.to_owned();
+    if !python_source_asserts_runtime_state(&source) {
+        return None;
+    }
+
+    Some(TurnLocalPythonVerifier {
+        relative_path: relative_path.to_string_lossy().replace('\\', "/"),
+        source_digest: format!("{:x}", Sha256::digest(source_bytes)),
+        source,
+    })
+}
+
+fn paths_resolve_to_same_file(path: &Path, canonical_path: &Path) -> bool {
+    path == canonical_path || fs::canonicalize(path).is_ok_and(|path| path == canonical_path)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ExplicitNumericThreshold {
+    display: String,
+    accepted_values: Vec<f64>,
+    bound: NumericBound,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NumericBound {
+    LowerInclusive,
+    LowerExclusive,
+    UpperInclusive,
+    UpperExclusive,
+}
+
+impl NumericBound {
+    const fn identity_byte(self) -> u8 {
+        match self {
+            Self::LowerInclusive => 0,
+            Self::LowerExclusive => 1,
+            Self::UpperInclusive => 2,
+            Self::UpperExclusive => 3,
+        }
+    }
+
+    const fn is_enforced_by(self, relation: NumericComparisonRelation) -> bool {
+        match self {
+            Self::LowerInclusive => matches!(
+                relation,
+                NumericComparisonRelation::Greater
+                    | NumericComparisonRelation::GreaterOrEqual
+                    | NumericComparisonRelation::Equal
+            ),
+            Self::LowerExclusive => matches!(relation, NumericComparisonRelation::Greater),
+            Self::UpperInclusive => matches!(
+                relation,
+                NumericComparisonRelation::Less
+                    | NumericComparisonRelation::LessOrEqual
+                    | NumericComparisonRelation::Equal
+            ),
+            Self::UpperExclusive => matches!(relation, NumericComparisonRelation::Less),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NumericComparisonRelation {
+    Less,
+    LessOrEqual,
+    Equal,
+    GreaterOrEqual,
+    Greater,
+}
+
+impl NumericComparisonRelation {
+    const fn reversed(self) -> Self {
+        match self {
+            Self::Less => Self::Greater,
+            Self::LessOrEqual => Self::GreaterOrEqual,
+            Self::Equal => Self::Equal,
+            Self::GreaterOrEqual => Self::LessOrEqual,
+            Self::Greater => Self::Less,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct NumericValidationComparison {
+    literal: f64,
+    relation: NumericComparisonRelation,
+}
+
+fn explicit_numeric_thresholds(
+    objective: &str,
+    completion_criteria: &[String],
+) -> Vec<ExplicitNumericThreshold> {
+    let mut thresholds = Vec::new();
+    for text in std::iter::once(objective).chain(completion_criteria.iter().map(String::as_str)) {
+        let lower = text.to_ascii_lowercase();
+        for (start, literal) in numeric_literal_spans(&lower) {
+            let before = &lower[..start];
+            let context_start = before.rfind(['\n', '.', '!', '?', ';']).map_or_else(
+                || {
+                    before
+                        .char_indices()
+                        .rev()
+                        .nth(119)
+                        .map_or(0, |(index, _)| index)
+                },
+                |index| index.saturating_add(1),
+            );
+            let context = &before[context_start..];
+            let comparator = [
+                "at least",
+                "at most",
+                "above",
+                "below",
+                "greater than",
+                "larger than",
+                "less than",
+                "maximum",
+                "minimum",
+                "more than",
+                "no less than",
+                "no more than",
+                "not exceed",
+                "over",
+                "smaller than",
+                "under",
+                "up to",
+            ]
+            .iter()
+            .filter_map(|marker| context.rfind(marker).map(|position| (position, *marker)))
+            .max_by_key(|(position, _)| *position);
+            let symbol_position = [">=", "<=", ">", "<"]
+                .iter()
+                .find(|symbol| context.trim_end().ends_with(**symbol))
+                .and_then(|symbol| context.rfind(symbol))
+                .map(|position| (position, context[position..].trim()));
+            let comparator = match (comparator, symbol_position) {
+                (Some(words), Some(symbol)) if symbol.0 > words.0 => Some(symbol),
+                (Some(words), _) => Some(words),
+                (None, symbol) => symbol,
+            };
+            let Some((position, marker)) = comparator else {
+                continue;
+            };
+            if !numeric_literals(&context[position..]).is_empty() {
+                continue;
+            }
+            let end = start.saturating_add(literal.len());
+            let following_word = lower[end..]
+                .trim_start()
+                .chars()
+                .take_while(|character| character.is_ascii_alphabetic())
+                .collect::<String>();
+            if marker == "over"
+                && matches!(
+                    following_word.as_str(),
+                    "episode" | "episodes" | "iteration" | "iterations" | "runs" | "steps"
+                )
+            {
+                continue;
+            }
+            let unit = numeric_threshold_unit(&following_word);
+            let display = unit.map_or_else(|| literal.clone(), |unit| format!("{literal}{unit}"));
+            let bound = match marker {
+                "at least" | "minimum" | "no less than" | ">=" => NumericBound::LowerInclusive,
+                "above" | "greater than" | "larger than" | "more than" | "over" | ">" => {
+                    NumericBound::LowerExclusive
+                }
+                "at most" | "maximum" | "no more than" | "not exceed" | "up to" | "<=" => {
+                    NumericBound::UpperInclusive
+                }
+                "below" | "less than" | "smaller than" | "under" | "<" => {
+                    NumericBound::UpperExclusive
+                }
+                _ => continue,
+            };
+            if thresholds
+                .iter()
+                .any(|threshold: &ExplicitNumericThreshold| {
+                    threshold.display == display && threshold.bound == bound
+                })
+            {
+                continue;
+            }
+            if let Ok(value) = literal.parse::<f64>() {
+                thresholds.push(ExplicitNumericThreshold {
+                    display,
+                    accepted_values: numeric_threshold_values(value, unit),
+                    bound,
+                });
+            }
+        }
+    }
+    thresholds
+}
+
+fn numeric_threshold_unit(word: &str) -> Option<&'static str> {
+    match word {
+        "k" => Some("k"),
+        "kb" => Some("kb"),
+        "kib" => Some("kib"),
+        "m" => Some("m"),
+        "mb" => Some("mb"),
+        "mib" => Some("mib"),
+        "g" => Some("g"),
+        "gb" => Some("gb"),
+        "gib" => Some("gib"),
+        _ => None,
+    }
+}
+
+fn numeric_threshold_values(value: f64, unit: Option<&str>) -> Vec<f64> {
+    let mut values = vec![value];
+    let multipliers = match unit {
+        Some("k" | "kb" | "kib") => Some((1_000.0, 1_024.0)),
+        Some("m" | "mb" | "mib") => Some((1_000_000.0, 1_048_576.0)),
+        Some("g" | "gb" | "gib") => Some((1_000_000_000.0, 1_073_741_824.0)),
+        _ => None,
+    };
+    if let Some((decimal, binary)) = multipliers {
+        values.push(value * decimal);
+        values.push(value * binary);
+    }
+    values
+}
+
+fn numeric_literals(text: &str) -> Vec<String> {
+    numeric_literal_spans(text)
+        .into_iter()
+        .map(|(_, literal)| literal)
+        .collect()
+}
+
+fn numeric_literal_spans(text: &str) -> Vec<(usize, String)> {
+    let bytes = text.as_bytes();
+    let mut literals = Vec::new();
+    let mut index = 0_usize;
+    while index < bytes.len() {
+        if !bytes[index].is_ascii_digit() {
+            index = index.saturating_add(1);
+            continue;
+        }
+        if index > 0 && (bytes[index - 1].is_ascii_alphanumeric() || bytes[index - 1] == b'_') {
+            index = index.saturating_add(1);
+            continue;
+        }
+        let start = index;
+        let mut decimal_seen = false;
+        while index < bytes.len()
+            && (bytes[index].is_ascii_digit() || (!decimal_seen && bytes[index] == b'.'))
+        {
+            if bytes[index] == b'.' {
+                decimal_seen = true;
+            }
+            index = index.saturating_add(1);
+        }
+        let end = if index > start && bytes[index.saturating_sub(1)] == b'.' {
+            index.saturating_sub(1)
+        } else {
+            index
+        };
+        if end > start {
+            literals.push((start, text[start..end].to_owned()));
+        }
+    }
+    literals
+}
+
+fn numeric_values_match(actual: f64, expected: f64) -> bool {
+    let scale = actual.abs().max(expected.abs()).max(1.0);
+    (actual - expected).abs() <= f64::EPSILON * scale * 8.0
+}
+
+fn numeric_validation_comparisons(command: &str) -> Vec<NumericValidationComparison> {
+    let mut comparisons = Vec::new();
+    collect_numeric_validation_command(command, 0, &mut comparisons);
+    if comparisons.is_empty() {
+        collect_python_numeric_comparisons(command, &mut comparisons);
+    }
+    comparisons
+}
+
+fn collect_numeric_validation_command(
+    command: &str,
+    wrapper_depth: u8,
+    comparisons: &mut Vec<NumericValidationComparison>,
+) {
+    let Some(parsed) = parse_shell_command_with_input(command) else {
+        return;
+    };
+    let parts = &parsed.parts;
+    let Some(program) = parts.first().and_then(|program| {
+        Path::new(program)
+            .file_name()
+            .and_then(|name| name.to_str())
+    }) else {
+        return;
+    };
+    if wrapper_depth < 2
+        && matches!(program, "bash" | "sh" | "zsh")
+        && parts.len() == 3
+        && matches!(parts[1].as_str(), "-c" | "-lc")
+    {
+        collect_numeric_shell_script_comparisons(
+            parts[2].trim(),
+            wrapper_depth.saturating_add(1),
+            comparisons,
+        );
+        return;
+    }
+    if matches!(program, "python" | "python3") {
+        if let Some(source) = parsed.stdin.as_deref() {
+            collect_python_numeric_comparisons(source, comparisons);
+            return;
+        }
+        if let Some(command_index) = parts.iter().position(|part| part == "-c")
+            && let Some(source) = parts.get(command_index.saturating_add(1))
+        {
+            collect_python_numeric_comparisons(source, comparisons);
+        }
+        return;
+    }
+    if program == "test" {
+        collect_shell_test_numeric_comparison(parts, comparisons);
+    }
+}
+
+fn collect_numeric_shell_script_comparisons(
+    script: &str,
+    wrapper_depth: u8,
+    comparisons: &mut Vec<NumericValidationComparison>,
+) {
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_bash::LANGUAGE.into())
+        .is_err()
+    {
+        return;
+    }
+    let Some(tree) = parser.parse(script, None) else {
+        return;
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        return;
+    }
+    collect_numeric_shell_node_comparisons(root, script.as_bytes(), wrapper_depth, comparisons);
+}
+
+fn collect_numeric_shell_node_comparisons(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    wrapper_depth: u8,
+    comparisons: &mut Vec<NumericValidationComparison>,
+) {
+    match node.kind() {
+        "comment" | "heredoc_body" | "heredoc_redirect" => return,
+        "redirected_statement" => {
+            if let Some((_, python_source)) =
+                objective_validation_python_heredoc_source(node, source, wrapper_depth)
+            {
+                collect_python_numeric_comparisons(python_source, comparisons);
+            }
+            return;
+        }
+        "test_command" => {
+            let Some(text) = node.utf8_text(source).ok().map(str::trim) else {
+                return;
+            };
+            let Some(inner) = text
+                .strip_prefix("[[")
+                .and_then(|value| value.strip_suffix("]]"))
+                .or_else(|| {
+                    text.strip_prefix('[')
+                        .and_then(|value| value.strip_suffix(']'))
+                })
+            else {
+                return;
+            };
+            let mut parts = vec!["test".to_owned()];
+            let Some(mut operands) = shlex::split(inner.trim()) else {
+                return;
+            };
+            parts.append(&mut operands);
+            collect_shell_test_numeric_comparison(&parts, comparisons);
+            return;
+        }
+        "command" => {
+            if let Ok(command) = node.utf8_text(source) {
+                collect_numeric_validation_command(command.trim(), wrapper_depth, comparisons);
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_numeric_shell_node_comparisons(child, source, wrapper_depth, comparisons);
+    }
+}
+
+fn collect_shell_test_numeric_comparison(
+    parts: &[String],
+    comparisons: &mut Vec<NumericValidationComparison>,
+) {
+    let [program, left, operator, right] = parts else {
+        return;
+    };
+    if program != "test" {
+        return;
+    }
+    let Some(relation) = numeric_shell_relation(operator) else {
+        return;
+    };
+    if let Some(literal) = parse_numeric_validation_literal(right)
+        && shell_operand_depends_on_runtime(left)
+    {
+        comparisons.push(NumericValidationComparison { literal, relation });
+    } else if let Some(literal) = parse_numeric_validation_literal(left)
+        && shell_operand_depends_on_runtime(right)
+    {
+        comparisons.push(NumericValidationComparison {
+            literal,
+            relation: relation.reversed(),
+        });
+    }
+}
+
+fn numeric_shell_relation(operator: &str) -> Option<NumericComparisonRelation> {
+    match operator {
+        "-lt" => Some(NumericComparisonRelation::Less),
+        "-le" => Some(NumericComparisonRelation::LessOrEqual),
+        "-eq" => Some(NumericComparisonRelation::Equal),
+        "-ge" => Some(NumericComparisonRelation::GreaterOrEqual),
+        "-gt" => Some(NumericComparisonRelation::Greater),
+        _ => None,
+    }
+}
+
+fn parse_numeric_validation_literal(value: &str) -> Option<f64> {
+    value.replace('_', "").parse::<f64>().ok()
+}
+
+fn collect_python_numeric_comparisons(
+    source: &str,
+    comparisons: &mut Vec<NumericValidationComparison>,
+) {
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .is_err()
+    {
+        return;
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return;
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        return;
+    }
+
+    let source = source.as_bytes();
+    let mut cursor = root.walk();
+    for statement in root.named_children(&mut cursor) {
+        let expression = match statement.kind() {
+            "assert_statement" => statement.named_child(0),
+            "if_statement" if python_if_has_runtime_failure(statement, source) => {
+                statement.child_by_field_name("condition")
+            }
+            _ => None,
+        };
+        if let Some(expression) = expression {
+            collect_python_expression_numeric_comparisons(expression, source, comparisons);
+        }
+    }
+}
+
+fn collect_python_expression_numeric_comparisons(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    comparisons: &mut Vec<NumericValidationComparison>,
+) {
+    if node.kind() == "comparison_operator" {
+        let mut operands = Vec::new();
+        let mut operators = Vec::new();
+        for index in 0..node.child_count() {
+            let Some(child) = node.child(index) else {
+                continue;
+            };
+            if child.is_named() {
+                operands.push(child);
+            } else if let Ok(operator) = child.utf8_text(source)
+                && let Some(relation) = numeric_python_relation(operator.trim())
+            {
+                operators.push(relation);
+            }
+        }
+        for (operands, relation) in operands.windows(2).zip(operators) {
+            let [left, right] = operands else {
+                continue;
+            };
+            if let Some(literal) = python_numeric_literal(*right, source)
+                && python_expression_depends_on_runtime_state(*left, source)
+            {
+                comparisons.push(NumericValidationComparison { literal, relation });
+            } else if let Some(literal) = python_numeric_literal(*left, source)
+                && python_expression_depends_on_runtime_state(*right, source)
+            {
+                comparisons.push(NumericValidationComparison {
+                    literal,
+                    relation: relation.reversed(),
+                });
+            }
+        }
+        return;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_python_expression_numeric_comparisons(child, source, comparisons);
+    }
+}
+
+fn numeric_python_relation(operator: &str) -> Option<NumericComparisonRelation> {
+    match operator {
+        "<" => Some(NumericComparisonRelation::Less),
+        "<=" => Some(NumericComparisonRelation::LessOrEqual),
+        "==" => Some(NumericComparisonRelation::Equal),
+        ">=" => Some(NumericComparisonRelation::GreaterOrEqual),
+        ">" => Some(NumericComparisonRelation::Greater),
+        _ => None,
+    }
+}
+
+fn python_numeric_literal(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<f64> {
+    python_numeric_literal_with_depth(node, source, 0)
+}
+
+fn python_numeric_literal_with_depth(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    depth: u8,
+) -> Option<f64> {
+    const MAX_CONSTANT_EXPRESSION_DEPTH: u8 = 16;
+    const MAX_CONSTANT_MAGNITUDE: f64 = 1.0e18;
+
+    if depth > MAX_CONSTANT_EXPRESSION_DEPTH {
+        return None;
+    }
+    match node.kind() {
+        "integer" | "float" | "unary_operator" => node
+            .utf8_text(source)
+            .ok()
+            .and_then(parse_numeric_validation_literal),
+        "parenthesized_expression" => {
+            python_numeric_literal_with_depth(node.named_child(0)?, source, depth.saturating_add(1))
+        }
+        "binary_operator" => {
+            let left = python_numeric_literal_with_depth(
+                node.child_by_field_name("left")?,
+                source,
+                depth.saturating_add(1),
+            )?;
+            let right = python_numeric_literal_with_depth(
+                node.child_by_field_name("right")?,
+                source,
+                depth.saturating_add(1),
+            )?;
+            let operator = node
+                .child_by_field_name("operator")?
+                .utf8_text(source)
+                .ok()?;
+            let value = match operator {
+                "+" => left + right,
+                "-" => left - right,
+                "*" => left * right,
+                "/" if right != 0.0 => left / right,
+                _ => return None,
+            };
+            (value.is_finite() && value.abs() <= MAX_CONSTANT_MAGNITUDE).then_some(value)
+        }
+        _ => None,
+    }
+}
+
 fn explicitly_requested_inspection_validation(
     report: &ToolExecutionReport,
     objective: &str,
     completion_criteria: &[String],
+    contract: &TaskContract,
     workspace_root: &Path,
 ) -> Option<ObjectiveValidationOutcome> {
+    if contract.requires_workspace_evidence()
+        || contract.require_objective_validation
+        || matches!(
+            contract.verification,
+            VerificationRequirement::Required | VerificationRequirement::Independent
+        )
+    {
+        return None;
+    }
     if !matches!(report.envelope.tool_name.as_str(), "read_file" | "list_dir") {
         return None;
     }
@@ -2623,11 +4323,26 @@ fn objective_validation_command_identity(command: &str) -> Option<String> {
     Some(format!("{:x}", digest.finalize()))
 }
 
+fn safe_objective_validation_command_identity(command: &str) -> Option<String> {
+    let atoms = objective_validation_command_atoms_with_depth(command, 0)?;
+    if atoms.is_empty() {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    for atom in atoms {
+        let redacted = redact_sensitive_text(&atom).0;
+        digest.update((redacted.len() as u64).to_le_bytes());
+        digest.update(redacted.as_bytes());
+    }
+    Some(format!("{:x}", digest.finalize()))
+}
+
 fn objective_validation_command_atoms_with_depth(
     command: &str,
     wrapper_depth: u8,
 ) -> Option<Vec<String>> {
-    let mut parts = shlex::split(command)?;
+    let parsed = parse_shell_command_with_input(command)?;
+    let mut parts = parsed.parts;
     let program = parts.first().map(String::as_str)?;
     let program = Path::new(program)
         .file_name()
@@ -2643,6 +4358,12 @@ fn objective_validation_command_atoms_with_depth(
             parts[2].trim(),
             wrapper_depth.saturating_add(1),
         );
+    }
+    if let Some(stdin) = parsed.stdin {
+        objective_validation_command_kind_with_depth(command, wrapper_depth)?;
+        return Some(vec![
+            serde_json::to_string(&(program, "stdin", stdin)).ok()?,
+        ]);
     }
     objective_validation_command_kind_with_depth(command, wrapper_depth)?;
     parts[0] = program;
@@ -2693,7 +4414,27 @@ fn collect_objective_validation_atoms(
             }
             true
         }
-        "comment" | "test_command" | "variable_assignment" => true,
+        "redirected_statement" => {
+            if let Some((_, atom)) =
+                objective_validation_python_heredoc(node, source, wrapper_depth)
+            {
+                atoms.push(atom);
+            }
+            true
+        }
+        "pipeline" | "test_command" => {
+            if objective_validation_statement_kind(node, source, wrapper_depth).is_some() {
+                let Ok(statement) = node.utf8_text(source) else {
+                    return false;
+                };
+                let Ok(atom) = serde_json::to_string(&(node.kind(), statement.trim())) else {
+                    return false;
+                };
+                atoms.push(atom);
+            }
+            true
+        }
+        "comment" | "variable_assignment" => true,
         _ => false,
     }
 }
@@ -2702,7 +4443,8 @@ fn objective_validation_command_kind_with_depth(
     command: &str,
     wrapper_depth: u8,
 ) -> Option<ObjectiveValidationKind> {
-    let parts = shlex::split(command)?;
+    let parsed = parse_shell_command_with_input(command)?;
+    let parts = parsed.parts;
     let program = parts.first().map(String::as_str)?;
     let program = Path::new(program)
         .file_name()
@@ -2717,6 +4459,13 @@ fn objective_validation_command_kind_with_depth(
             parts[2].trim(),
             wrapper_depth.saturating_add(1),
         );
+    }
+    if let Some(stdin) = parsed.stdin {
+        return (matches!(program, "python" | "python3")
+            && parts.get(1).map(String::as_str) == Some("-")
+            && parts.len() == 2
+            && python_source_asserts_runtime_state(&stdin))
+        .then_some(ObjectiveValidationKind::Diagnostic);
     }
     match program {
         "cargo" if parts.iter().any(|part| part == "test") => Some(ObjectiveValidationKind::Test),
@@ -2750,11 +4499,18 @@ fn objective_validation_command_kind_with_depth(
         "python" | "python3" if python_inline_asserts_runtime_state(&parts) => {
             Some(ObjectiveValidationKind::Diagnostic)
         }
+        "curl" if curl_is_fail_fast_http_probe(&parts) => Some(ObjectiveValidationKind::Diagnostic),
         "cmp" | "diff" if comparison_has_two_operands(&parts) => {
             Some(ObjectiveValidationKind::Diagnostic)
         }
         "test" if test_command_validates_file_state(&parts) => {
             Some(ObjectiveValidationKind::FileState)
+        }
+        "test" if test_command_validates_runtime_comparison(&parts) => {
+            Some(ObjectiveValidationKind::Diagnostic)
+        }
+        "grep" | "rg" if quiet_content_check(&parts, false) => {
+            Some(ObjectiveValidationKind::Diagnostic)
         }
         "git" if git_command_validates_result(&parts) => Some(ObjectiveValidationKind::Diagnostic),
         "go" if parts.get(1).is_some_and(|part| part == "test") => {
@@ -2781,6 +4537,20 @@ fn objective_validation_command_kind_with_depth(
     }
 }
 
+fn curl_is_fail_fast_http_probe(parts: &[String]) -> bool {
+    let fail_fast = parts.iter().skip(1).any(|part| {
+        matches!(part.as_str(), "--fail" | "--fail-with-body")
+            || (part.starts_with('-')
+                && !part.starts_with("--")
+                && part.chars().skip(1).any(|flag| flag == 'f'))
+    });
+    fail_fast
+        && parts
+            .iter()
+            .skip(1)
+            .any(|part| part.starts_with("http://") || part.starts_with("https://"))
+}
+
 fn objective_validation_shell_script_kind(
     script: &str,
     wrapper_depth: u8,
@@ -2798,6 +4568,11 @@ fn objective_validation_shell_script_kind(
     let source = script.as_bytes();
     if root.named_child_count() == 1 {
         let statement = root.named_child(0)?;
+        if let Some((kind, _)) =
+            objective_validation_python_heredoc(statement, source, wrapper_depth)
+        {
+            return Some(kind);
+        }
         if statement.kind() == "list" {
             return objective_validation_and_chain_kind(statement, source, wrapper_depth);
         }
@@ -2810,43 +4585,385 @@ fn objective_validation_shell_script_kind(
             return objective_validation_command_kind_with_depth(command, wrapper_depth);
         }
     }
-    if shell_script_has_unsafe_control_flow(root) {
+    let mut validation = None;
+    if collect_fail_fast_validation(root, source, wrapper_depth, &mut validation)
+        && validation.is_some()
+    {
+        return validation;
+    }
+    collect_terminal_statement_validation(root, source, wrapper_depth)
+}
+
+fn collect_fail_fast_validation(
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    wrapper_depth: u8,
+    validation: &mut Option<ObjectiveValidationKind>,
+) -> bool {
+    let mut fail_fast = false;
+    collect_fail_fast_nodes(root, source, wrapper_depth, &mut fail_fast, validation) && fail_fast
+}
+
+fn collect_fail_fast_nodes(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    wrapper_depth: u8,
+    fail_fast: &mut bool,
+    validation: &mut Option<ObjectiveValidationKind>,
+) -> bool {
+    if matches!(node.kind(), "program" | "list") {
+        for index in 0..node.child_count() {
+            let Some(child) = node.child(index) else {
+                return false;
+            };
+            if child.is_named() {
+                if !collect_fail_fast_nodes(child, source, wrapper_depth, fail_fast, validation) {
+                    return false;
+                }
+                continue;
+            }
+            let Ok(operator) = child.utf8_text(source) else {
+                return false;
+            };
+            if !matches!(operator.trim(), "" | ";" | "&&") {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    match node.kind() {
+        "comment" => true,
+        "command" => {
+            let Ok(command) = node.utf8_text(source) else {
+                return false;
+            };
+            let Some(parts) = shlex::split(command.trim()) else {
+                return false;
+            };
+            if !*fail_fast {
+                if !shell_command_enables_errexit(&parts) {
+                    return false;
+                }
+                *fail_fast = true;
+                return true;
+            }
+            if shell_command_can_change_or_skip_validation(&parts) {
+                return false;
+            }
+            if let Some(kind) = objective_validation_statement_kind(node, source, wrapper_depth) {
+                *validation = Some(stronger_validation_kind(*validation, kind));
+                true
+            } else {
+                validation.is_none() || shell_statement_is_read_only(node, source)
+            }
+        }
+        "variable_assignment" => *fail_fast && shell_assignment_is_safe(node, source),
+        "test_command" if *fail_fast => {
+            if let Some(kind) = objective_validation_statement_kind(node, source, wrapper_depth) {
+                *validation = Some(stronger_validation_kind(*validation, kind));
+            }
+            true
+        }
+        "redirected_statement" if *fail_fast => {
+            if let Some(kind) = objective_validation_statement_kind(node, source, wrapper_depth) {
+                *validation = Some(stronger_validation_kind(*validation, kind));
+                true
+            } else {
+                validation.is_none() && shell_setup_statement_is_allowed(node, source)
+            }
+        }
+        "pipeline" if *fail_fast => {
+            if let Some(kind) = objective_validation_statement_kind(node, source, wrapper_depth) {
+                *validation = Some(stronger_validation_kind(*validation, kind));
+                true
+            } else if validation.is_some() {
+                shell_statement_is_read_only(node, source)
+            } else {
+                shell_setup_statement_is_allowed(node, source)
+            }
+        }
+        _ => false,
+    }
+}
+
+fn collect_terminal_statement_validation(
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    wrapper_depth: u8,
+) -> Option<ObjectiveValidationKind> {
+    for index in 0..root.child_count() {
+        let child = root.child(index)?;
+        if !child.is_named()
+            && !child
+                .utf8_text(source)
+                .is_ok_and(|operator| matches!(operator.trim(), "" | ";"))
+        {
+            return None;
+        }
+    }
+    let mut cursor = root.walk();
+    let statements = root
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() != "comment")
+        .collect::<Vec<_>>();
+    let (last, setup) = statements.split_last()?;
+    if setup
+        .iter()
+        .any(|node| !shell_terminal_setup_statement_is_allowed(*node, source))
+    {
+        return None;
+    }
+    objective_validation_statement_kind(*last, source, wrapper_depth)
+}
+
+fn shell_terminal_setup_statement_is_allowed(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    match node.kind() {
+        "comment" => true,
+        "variable_assignment" => shell_assignment_is_safe(node, source),
+        "command" | "pipeline" => shell_statement_is_read_only(node, source),
+        "redirected_statement" => node
+            .child_by_field_name("body")
+            .is_some_and(|body| shell_setup_statement_is_allowed(body, source)),
+        _ => false,
+    }
+}
+
+fn objective_validation_statement_kind(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    wrapper_depth: u8,
+) -> Option<ObjectiveValidationKind> {
+    match node.kind() {
+        "command" if !shell_script_has_unsafe_control_flow(node) => {
+            objective_validation_command_kind_with_depth(
+                node.utf8_text(source).ok()?.trim(),
+                wrapper_depth,
+            )
+        }
+        "redirected_statement" => {
+            objective_validation_python_heredoc(node, source, wrapper_depth).map(|(kind, _)| kind)
+        }
+        "pipeline" => objective_validation_pipeline_kind(node, source),
+        "test_command" => objective_validation_test_node_kind(node, source),
+        _ => None,
+    }
+}
+
+fn objective_validation_pipeline_kind(
+    pipeline: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<ObjectiveValidationKind> {
+    let mut cursor = pipeline.walk();
+    let commands = pipeline
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "command")
+        .collect::<Vec<_>>();
+    let (last, inputs) = commands.split_last()?;
+    if inputs.is_empty()
+        || inputs
+            .iter()
+            .any(|command| !shell_statement_is_read_only(*command, source))
+    {
+        return None;
+    }
+    let parts = shlex::split(last.utf8_text(source).ok()?.trim())?;
+    quiet_content_check(&parts, true).then_some(ObjectiveValidationKind::Diagnostic)
+}
+
+fn objective_validation_test_node_kind(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<ObjectiveValidationKind> {
+    let text = node.utf8_text(source).ok()?.trim();
+    let inner = text
+        .strip_prefix("[[")
+        .and_then(|value| value.strip_suffix("]]"))
+        .or_else(|| {
+            text.strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+        })?;
+    let mut parts = vec!["test".to_owned()];
+    parts.extend(shlex::split(inner.trim())?);
+    if test_command_validates_file_state(&parts) {
+        Some(ObjectiveValidationKind::FileState)
+    } else if test_command_validates_runtime_comparison(&parts) {
+        Some(ObjectiveValidationKind::Diagnostic)
+    } else {
+        None
+    }
+}
+
+fn shell_setup_statement_is_allowed(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    match node.kind() {
+        "comment" => true,
+        "variable_assignment" => shell_assignment_is_safe(node, source),
+        "command" => shlex::split(node.utf8_text(source).unwrap_or_default().trim())
+            .is_some_and(|parts| !shell_command_can_change_or_skip_validation(&parts)),
+        "redirected_statement" => node
+            .child_by_field_name("body")
+            .is_some_and(|body| shell_setup_statement_is_allowed(body, source)),
+        "pipeline" => {
+            let mut cursor = node.walk();
+            let commands = node.named_children(&mut cursor).collect::<Vec<_>>();
+            !commands.is_empty()
+                && commands
+                    .iter()
+                    .all(|command| shell_setup_statement_is_allowed(*command, source))
+        }
+        _ => false,
+    }
+}
+
+fn shell_statement_is_read_only(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    match node.kind() {
+        "command" => shlex::split(node.utf8_text(source).unwrap_or_default().trim())
+            .is_some_and(|parts| shell_command_is_read_only(&parts)),
+        "pipeline" => {
+            let mut cursor = node.walk();
+            let commands = node.named_children(&mut cursor).collect::<Vec<_>>();
+            !commands.is_empty()
+                && commands
+                    .iter()
+                    .all(|command| shell_statement_is_read_only(*command, source))
+        }
+        _ => false,
+    }
+}
+
+fn shell_command_is_read_only(parts: &[String]) -> bool {
+    let Some(program) = parts.first().and_then(|program| {
+        Path::new(program)
+            .file_name()
+            .and_then(|name| name.to_str())
+    }) else {
+        return false;
+    };
+    match program {
+        "cat" | "cut" | "du" | "file" | "grep" | "head" | "ls" | "printf" | "pwd" | "readlink"
+        | "rg" | "sort" | "stat" | "strings" | "tail" | "tr" | "uniq" | "wc" => true,
+        "find" => !parts.iter().any(|part| {
+            matches!(
+                part.as_str(),
+                "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir"
+            )
+        }),
+        "git" => match parts.get(1).map(String::as_str) {
+            Some("branch") => parts.iter().skip(2).all(|part| part == "--show-current"),
+            Some("diff" | "log" | "merge-base" | "rev-parse" | "show" | "status") => true,
+            _ => false,
+        },
+        "tmux" => match parts.get(1).map(String::as_str) {
+            Some("capture-pane") => {
+                parts.iter().any(|part| part == "-p") && !parts.iter().any(|part| part == "-b")
+            }
+            Some("display-message") => parts.iter().any(|part| part == "-p"),
+            Some(
+                "has-session"
+                | "list-buffers"
+                | "list-clients"
+                | "list-commands"
+                | "list-keys"
+                | "list-panes"
+                | "list-sessions"
+                | "list-windows"
+                | "server-info"
+                | "show-environment"
+                | "show-hooks"
+                | "show-messages"
+                | "show-options"
+                | "show-window-options",
+            ) => true,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn objective_validation_python_heredoc(
+    statement: tree_sitter::Node<'_>,
+    source: &[u8],
+    wrapper_depth: u8,
+) -> Option<(ObjectiveValidationKind, String)> {
+    let (program, python_source) =
+        objective_validation_python_heredoc_source(statement, source, wrapper_depth)?;
+    if !python_source_asserts_runtime_state(python_source) {
+        return None;
+    }
+    let atom = serde_json::to_string(&(program, "stdin", python_source)).ok()?;
+    Some((ObjectiveValidationKind::Diagnostic, atom))
+}
+
+fn objective_validation_python_heredoc_source<'a>(
+    statement: tree_sitter::Node<'_>,
+    source: &'a [u8],
+    wrapper_depth: u8,
+) -> Option<(String, &'a str)> {
+    if statement.kind() != "redirected_statement" {
+        return None;
+    }
+    let body = statement.child_by_field_name("body")?;
+    let statement_text = statement.utf8_text(source).ok()?;
+    let command_prefix = statement_text
+        .lines()
+        .find_map(|line| line.split_once("<<").map(|(command, _)| command.trim()))?;
+    let command = match body.kind() {
+        "command" => command_prefix,
+        "list" => {
+            let mut validation = None;
+            if !collect_validation_and_chain(body, source, wrapper_depth, &mut validation)
+                && !collect_fail_fast_validation(body, source, wrapper_depth, &mut validation)
+            {
+                return None;
+            }
+            command_prefix
+                .rsplit_once("&&")
+                .map_or(command_prefix, |(_, command)| command.trim())
+        }
+        _ => return None,
+    };
+    let parts = shlex::split(command)?;
+    let program = parts.first().map(String::as_str)?;
+    let program = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program)
+        .to_owned();
+    if !matches!(program.as_str(), "python" | "python3")
+        || parts.get(1).map(String::as_str) != Some("-")
+        || parts.len() != 2
+    {
         return None;
     }
 
-    let mut fail_fast = false;
-    let mut validation = None;
-    let mut cursor = root.walk();
-    for node in root.named_children(&mut cursor) {
-        match node.kind() {
-            "comment" => {}
-            "command" => {
-                let command = node.utf8_text(source).ok()?.trim();
-                let parts = shlex::split(command)?;
-                if !fail_fast {
-                    if !shell_command_enables_errexit(&parts) {
-                        return None;
-                    }
-                    fail_fast = true;
-                    continue;
-                }
-                if shell_command_can_change_or_skip_validation(&parts) {
-                    return None;
-                }
-                if let Some(kind) =
-                    objective_validation_command_kind_with_depth(command, wrapper_depth)
-                {
-                    validation = Some(stronger_validation_kind(validation, kind));
-                }
-            }
-            "variable_assignment" if fail_fast && shell_assignment_is_safe(node, source) => {}
-            // A bracket test is a fail-fast guard. It is safe to retain, but it does not
-            // independently establish objective validation without a recognized check.
-            "test_command" if fail_fast => {}
-            _ => return None,
+    let mut cursor = statement.walk();
+    let redirects = statement
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "heredoc_redirect")
+        .collect::<Vec<_>>();
+    let [redirect] = redirects.as_slice() else {
+        return None;
+    };
+    let mut bodies = Vec::new();
+    let mut nodes = vec![*redirect];
+    while let Some(node) = nodes.pop() {
+        if matches!(
+            node.kind(),
+            "command_substitution" | "expansion" | "simple_expansion"
+        ) {
+            return None;
         }
+        if node.kind() == "heredoc_body" {
+            bodies.push(node);
+            continue;
+        }
+        let mut cursor = node.walk();
+        nodes.extend(node.named_children(&mut cursor));
     }
-    fail_fast.then_some(validation).flatten()
+    let [python_body] = bodies.as_slice() else {
+        return None;
+    };
+    Some((program, python_body.utf8_text(source).ok()?))
 }
 
 fn objective_validation_and_chain_kind(
@@ -2901,6 +5018,14 @@ fn collect_validation_and_chain(
             {
                 *validation = Some(stronger_validation_kind(*validation, kind));
             }
+            true
+        }
+        "redirected_statement" => {
+            let Some((kind, _)) = objective_validation_python_heredoc(node, source, wrapper_depth)
+            else {
+                return false;
+            };
+            *validation = Some(stronger_validation_kind(*validation, kind));
             true
         }
         "test_command" => true,
@@ -3046,6 +5171,61 @@ fn test_command_validates_file_state(parts: &[String]) -> bool {
     }) && parts.get(2).is_some_and(|path| !path.is_empty())
 }
 
+fn test_command_validates_runtime_comparison(parts: &[String]) -> bool {
+    match parts {
+        [program, operator, operand]
+            if program == "test"
+                && matches!(operator.as_str(), "-n" | "-z")
+                && shell_operand_depends_on_runtime(operand) =>
+        {
+            true
+        }
+        [program, left, operator, right] => {
+            program == "test"
+                && matches!(
+                    operator.as_str(),
+                    "-eq" | "-ne" | "-gt" | "-ge" | "-lt" | "-le"
+                )
+                && left != right
+                && (shell_operand_depends_on_runtime(left)
+                    || shell_operand_depends_on_runtime(right))
+        }
+        _ => false,
+    }
+}
+
+fn shell_operand_depends_on_runtime(operand: &str) -> bool {
+    operand.contains('$') || operand.contains('`')
+}
+
+fn quiet_content_check(parts: &[String], piped_input: bool) -> bool {
+    let Some(program) = parts.first().and_then(|program| {
+        Path::new(program)
+            .file_name()
+            .and_then(|name| name.to_str())
+    }) else {
+        return false;
+    };
+    if !matches!(program, "grep" | "rg") {
+        return false;
+    }
+    let quiet = parts.iter().skip(1).any(|part| {
+        matches!(part.as_str(), "--quiet" | "--silent")
+            || (part.starts_with('-')
+                && !part.starts_with("--")
+                && part.chars().skip(1).any(|option| option == 'q'))
+    });
+    if !quiet {
+        return false;
+    }
+    let operands = parts
+        .iter()
+        .skip(1)
+        .filter(|part| !part.starts_with('-'))
+        .count();
+    operands >= if piped_input { 1 } else { 2 }
+}
+
 fn python_module_runs_tests(parts: &[String]) -> bool {
     parts
         .windows(2)
@@ -3067,6 +5247,10 @@ fn python_inline_asserts_runtime_state(parts: &[String]) -> bool {
     let Some(source) = parts.get(command_index.saturating_add(1)) else {
         return false;
     };
+    python_source_asserts_runtime_state(source)
+}
+
+fn python_source_asserts_runtime_state(source: &str) -> bool {
     let mut parser = tree_sitter::Parser::new();
     if parser
         .set_language(&tree_sitter_python::LANGUAGE.into())
@@ -3081,31 +5265,171 @@ fn python_inline_asserts_runtime_state(parts: &[String]) -> bool {
     if root.has_error() {
         return false;
     }
-    let mut nodes = vec![root];
-    while let Some(node) = nodes.pop() {
-        if node.kind() == "assert_statement"
-            && node
+    let source = source.as_bytes();
+    let mut cursor = root.walk();
+    root.named_children(&mut cursor).any(|statement| {
+        (statement.kind() == "assert_statement"
+            && statement
                 .named_child(0)
-                .is_some_and(python_assertion_is_not_constant_true)
-        {
-            return true;
-        }
-        let mut cursor = node.walk();
-        nodes.extend(node.named_children(&mut cursor));
-    }
-    false
+                .is_some_and(|assertion| python_assertion_is_runtime_check(assertion, source)))
+            || (statement.kind() == "if_statement"
+                && python_if_has_runtime_failure(statement, source))
+    })
 }
 
-fn python_assertion_is_not_constant_true(node: tree_sitter::Node<'_>) -> bool {
-    if node.kind() == "true" {
+fn python_assertion_is_runtime_check(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    match python_constant_truthiness(node, source) {
+        Some(true) => false,
+        Some(false) => true,
+        None => python_expression_depends_on_runtime_state(node, source),
+    }
+}
+
+fn python_if_has_runtime_failure(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let Some(condition) = node.child_by_field_name("condition") else {
+        return false;
+    };
+    if python_constant_truthiness(condition, source).is_some()
+        || !python_expression_depends_on_runtime_state(condition, source)
+    {
         return false;
     }
-    if node.kind() == "parenthesized_expression" {
-        return node
-            .named_child(0)
-            .is_none_or(python_assertion_is_not_constant_true);
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| child.id() != condition.id())
+        .any(|child| python_suite_has_failure(child, source))
+}
+
+fn python_expression_depends_on_runtime_state(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    match node.kind() {
+        "true" | "false" | "none" | "integer" | "float" | "string" => false,
+        "identifier" | "attribute" | "subscript" => true,
+        "call" => {
+            let function = node
+                .child_by_field_name("function")
+                .and_then(|function| function.utf8_text(source).ok())
+                .unwrap_or_default();
+            if !matches!(
+                function,
+                "abs"
+                    | "all"
+                    | "any"
+                    | "bool"
+                    | "bytes"
+                    | "dict"
+                    | "float"
+                    | "frozenset"
+                    | "int"
+                    | "len"
+                    | "list"
+                    | "max"
+                    | "min"
+                    | "round"
+                    | "set"
+                    | "sorted"
+                    | "str"
+                    | "sum"
+                    | "tuple"
+            ) {
+                return true;
+            }
+            let Some(arguments) = node.child_by_field_name("arguments") else {
+                return false;
+            };
+            let mut cursor = arguments.walk();
+            arguments
+                .named_children(&mut cursor)
+                .any(|argument| python_expression_depends_on_runtime_state(argument, source))
+        }
+        "class_definition" | "function_definition" | "lambda" => false,
+        _ => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .any(|child| python_expression_depends_on_runtime_state(child, source))
+        }
     }
-    true
+}
+
+fn python_suite_has_failure(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    match node.kind() {
+        "raise_statement" => return python_raise_is_failure(node, source),
+        "call" => return python_call_exits_nonzero(node, source),
+        "if_statement" => return python_if_has_runtime_failure(node, source),
+        "class_definition"
+        | "for_statement"
+        | "function_definition"
+        | "lambda"
+        | "try_statement"
+        | "while_statement" => return false,
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| python_suite_has_failure(child, source))
+}
+
+fn python_raise_is_failure(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let Some(expression) = node.named_child(0) else {
+        return true;
+    };
+    if expression.kind() != "call" {
+        return true;
+    }
+    let function = expression
+        .child_by_field_name("function")
+        .and_then(|function| function.utf8_text(source).ok())
+        .unwrap_or_default();
+    function != "SystemExit" || python_call_exits_nonzero(expression, source)
+}
+
+fn python_call_exits_nonzero(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let function = node
+        .child_by_field_name("function")
+        .and_then(|function| function.utf8_text(source).ok())
+        .unwrap_or_default();
+    if !matches!(function, "exit" | "quit" | "sys.exit" | "SystemExit") {
+        return false;
+    }
+    let Some(arguments) = node.child_by_field_name("arguments") else {
+        return false;
+    };
+    let mut cursor = arguments.walk();
+    let values = arguments.named_children(&mut cursor).collect::<Vec<_>>();
+    let [value] = values.as_slice() else {
+        return false;
+    };
+    match python_constant_truthiness(*value, source) {
+        Some(true) => true,
+        Some(false) | None => false,
+    }
+}
+
+fn python_constant_truthiness(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<bool> {
+    match node.kind() {
+        "true" => Some(true),
+        "false" | "none" => Some(false),
+        "parenthesized_expression" => python_constant_truthiness(node.named_child(0)?, source),
+        "integer" | "float" => node
+            .utf8_text(source)
+            .ok()?
+            .replace('_', "")
+            .parse::<f64>()
+            .ok()
+            .map(|value| value != 0.0),
+        "string" => {
+            let text = node.utf8_text(source).ok()?;
+            Some(!matches!(text, "''" | "\"\"" | "''''''" | "\"\"\"\"\"\""))
+        }
+        "list" | "dictionary" | "set" | "tuple" => Some(node.named_child_count() > 0),
+        "unary_operator" => node
+            .utf8_text(source)
+            .ok()?
+            .replace('_', "")
+            .parse::<f64>()
+            .ok()
+            .map(|value| value != 0.0),
+        _ => None,
+    }
 }
 
 fn comparison_has_two_operands(parts: &[String]) -> bool {
@@ -3334,7 +5658,7 @@ fn deadline_from_budget(max_elapsed_ms: u64) -> Option<tokio::time::Instant> {
 
 fn runtime_deadline_advisory(max_elapsed_ms: u64, elapsed_ms: u64) -> Option<String> {
     let remaining_ms = max_elapsed_ms.saturating_sub(elapsed_ms);
-    let warning_window_ms = (max_elapsed_ms / 5).clamp(1, 120_000);
+    let warning_window_ms = runtime_deadline_warning_window_ms(max_elapsed_ms);
     if remaining_ms > warning_window_ms {
         return None;
     }
@@ -3342,6 +5666,38 @@ fn runtime_deadline_advisory(max_elapsed_ms: u64, elapsed_ms: u64) -> Option<Str
     Some(format!(
         "Runtime deadline advisory: about {remaining_seconds} seconds remain. Stop broad exploration, preserve and verify the best available deliverable, and return a final response before the deadline. Do not start work that cannot finish within the remaining time."
     ))
+}
+
+fn runtime_deadline_warning_window_ms(max_elapsed_ms: u64) -> u64 {
+    (max_elapsed_ms / 5).clamp(1, 120_000)
+}
+
+fn shell_execution_budget(
+    max_elapsed_ms: u64,
+    elapsed_ms: u64,
+    deadline_advisory_emitted: bool,
+) -> u64 {
+    const FINAL_RESPONSE_RESERVE_MS: u64 = 30_000;
+
+    let remaining_ms = max_elapsed_ms.saturating_sub(elapsed_ms).max(1);
+    if deadline_advisory_emitted {
+        return if remaining_ms > FINAL_RESPONSE_RESERVE_MS {
+            remaining_ms.saturating_sub(FINAL_RESPONSE_RESERVE_MS)
+        } else {
+            remaining_ms.div_ceil(2)
+        }
+        .max(1);
+    }
+
+    let warning_window_ms = runtime_deadline_warning_window_ms(max_elapsed_ms);
+    if remaining_ms > warning_window_ms {
+        return remaining_ms.saturating_sub(warning_window_ms).max(1);
+    }
+
+    // A checkpoint can cross into the warning window before the model has seen
+    // the advisory. Preserve a response window instead of letting that pending
+    // tool call consume the entire task deadline.
+    remaining_ms.div_ceil(2).max(1)
 }
 
 fn clamp_shell_timeout_to_budget(request: &mut ToolRequest, remaining_ms: u64) {
@@ -3459,6 +5815,7 @@ fn semantic_tool_action_fingerprint(tool_name: &str, arguments: &Value) -> Value
         return serde_json::json!({
             "tool_name": "inspect",
             "resources": resources,
+            "command_digest": digest_value(&Value::String(command)),
         });
     }
     serde_json::json!({

@@ -15,6 +15,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+// Opaque commands can touch an unbounded tree. Once recovery is already partial,
+// cap durable before-images so checkpoint I/O cannot consume the task deadline.
+const MAX_PARTIAL_CHECKPOINT_FILES: usize = 128;
+
 #[derive(Debug, Error)]
 pub enum CheckpointError {
     #[error("checkpoint io failed: {0}")]
@@ -134,9 +138,15 @@ impl WorkspaceCheckpointManager {
         &self,
         before_images: &[FileBeforeImage],
     ) -> Result<(Vec<FileBeforeImage>, usize), CheckpointError> {
-        let mut retained = Vec::with_capacity(before_images.len());
+        let mut retained =
+            Vec::with_capacity(before_images.len().min(MAX_PARTIAL_CHECKPOINT_FILES));
         let mut excluded_count = 0_usize;
-        for before_image in before_images {
+        for (index, before_image) in before_images.iter().enumerate() {
+            if retained.len() >= MAX_PARTIAL_CHECKPOINT_FILES {
+                excluded_count =
+                    excluded_count.saturating_add(before_images.len().saturating_sub(index));
+                break;
+            }
             if before_image.content.is_none() && before_image.metadata.is_some() {
                 excluded_count = excluded_count.saturating_add(1);
                 continue;

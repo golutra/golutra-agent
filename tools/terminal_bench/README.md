@@ -92,7 +92,11 @@ evaluation in a pending file for later ingestion.
 variables to Golutra, adds `--allow-network` to the embedded `exec` invocation,
 and updates
 the tmux server environment so the separate Terminal-Bench test session uses
-the same proxy. For a proxy listening on the host loopback interface, use
+the same proxy. It also reads the current task's Compose service names,
+hostnames, container names and network aliases and adds validated entries to
+both `NO_PROXY` variants. This keeps task-local services on the Compose network
+instead of routing them through the host proxy. The merged value is
+deduplicated and bounded before injection. For a proxy listening on the host loopback interface, use
 `host.docker.internal` rather than `127.0.0.1`. The
 `GOLUTRA_TBENCH_PROXY` host environment variable provides the same setting.
 
@@ -133,7 +137,9 @@ the runtime manifest, derives only evidence files that actually exist, and
 invokes `<collector> --run-bundle ... eval ingest`
 with the trial directory as the explicit `--artifact-base`. The evaluation JSON
 therefore stays in the run bundle while its relative evidence references remain
-portable and resolve against the harness-owned trial output.
+portable and resolve against the harness-owned trial output. Each collector
+attempt receives the remaining overall result-collection deadline instead of a
+fixed per-process timeout; retries and retry delays consume that same budget.
 It resolves that host collector from the explicit `collector_binary` agent
 argument or `GOLUTRA_TBENCH_COLLECTOR` first. Those settings are authoritative.
 Without either override it considers only this repository's release/debug
@@ -143,7 +149,8 @@ command from the host `PATH`.
 If the result file, runtime identity, trace, or collector is unavailable, it
 keeps a `golutra-evaluation.pending.json` file with the reason and the original
 record instead of dropping the structured observation. This makes a later
-offline ingestion possible without rerunning the trial.
+offline ingestion possible without rerunning the trial. Collector timeouts also
+retain the record path, error type, attempted timeout, and subprocess detail.
 
 When an ingested assertion failure is correctable, the adapter writes a
 schema-versioned `external-correction-1.json` with bounded evaluator feedback.
