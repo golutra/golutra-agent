@@ -307,7 +307,14 @@ pub(crate) async fn run_producer_process(
             "external producer timed out".to_owned(),
         ));
     }
-    stdin_result.map_err(|error| SupervisorError::Producer(error.to_string()))?;
+    // A completed producer may close stdin without consuming the full request. Its exit
+    // status and bounded output remain authoritative once the process group is settled.
+    if let Err(error) = stdin_result
+        && !(stop_reason == ProcessStopReason::Completed
+            && error.kind() == io::ErrorKind::BrokenPipe)
+    {
+        return Err(SupervisorError::Producer(error.to_string()));
+    }
     Ok(ProducerProcessOutput {
         status,
         stdout: stdout.bytes,
@@ -502,6 +509,7 @@ mod tests {
     async fn completed_producer_does_not_leave_pipe_holding_descendants() {
         let workspace = tempfile::tempdir().expect("workspace");
         let child_pid_path = workspace.path().join("producer-child.pid");
+        let request = vec![b'x'; 256 * 1024];
         let script = format!(
             "/bin/sleep 30 & printf '%s' $! > '{}'",
             child_pid_path.display()
@@ -510,7 +518,7 @@ mod tests {
         let output = run_producer_process(
             plain_launch("/bin/sh", &["-c", &script]),
             workspace.path(),
-            b"request",
+            &request,
             Duration::from_secs(2),
             1_024,
         )
