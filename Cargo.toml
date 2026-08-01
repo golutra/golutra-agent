@@ -52,7 +52,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 crossterm = "0.28"
 fs2 = "0.4"
 futures-util = "0.3"
-genai = "=0.7.0-beta.12"
+genai = { version = "=0.7.0-beta.12", default-features = false }
 eventsource-stream = "0.2.3"
 ignore = "0.4"
 jsonschema = { version = "0.47", default-features = false }
@@ -62,7 +62,9 @@ oauth2 = { version = "5.0", default-features = false, features = ["reqwest", "ru
 ratatui = "0.28"
 regex = "1.11"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest13 = { package = "reqwest", version = "0.13.4", default-features = false, features = ["rustls-no-provider"] }
 ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rmcp = { version = "2.2.0", default-features = false, features = ["client", "macros", "server", "transport-child-process", "transport-io"] }
 schemars = { version = "1.0", features = ["chrono04", "uuid1"] }
 secrecy = "0.10"

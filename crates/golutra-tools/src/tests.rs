@@ -104,18 +104,30 @@ async fn registry_contains_p0_tools() {
 #[test]
 fn shell_contract_explains_how_to_submit_compound_commands() {
     let registry = ToolRegistry::p0_default();
-    let description = registry
-        .contract("shell")
-        .and_then(|contract| {
-            contract
-                .input_schema
-                .pointer("/properties/command/description")
-        })
+    let contract = registry.contract("shell").expect("shell contract");
+    let description = contract
+        .input_schema
+        .pointer("/properties/command/description")
         .and_then(Value::as_str)
         .expect("shell command description");
 
     assert!(description.contains("bash -lc"));
     assert!(description.contains("Unquoted operators"));
+    let timeout = contract.input_schema["properties"]["timeout_ms"]["description"]
+        .as_str()
+        .expect("timeout description");
+    let background = contract.input_schema["properties"]["background"]["description"]
+        .as_str()
+        .expect("background description");
+    let yield_time = contract.input_schema["properties"]["yield_time_ms"]["description"]
+        .as_str()
+        .expect("yield time description");
+    assert!(timeout.contains("absolute process lifetime"));
+    assert!(background.contains("runtime-scoped"));
+    assert!(background.contains("do not use background=true"));
+    assert!(background.contains("verify it before returning"));
+    assert!(yield_time.contains("initial wait"));
+    assert!(yield_time.contains("does not extend"));
 }
 
 #[tokio::test]
@@ -237,6 +249,8 @@ fn tool_started_arguments_preserve_invocation_fields_and_redact_secrets() {
         "query": "runtime host",
         "symbol": "RuntimeHost::run",
         "timeout_ms": 5_000,
+        "background": true,
+        "yield-time_ms": 1_000,
         "api_key": "plain-secret-value",
     }));
 
@@ -245,6 +259,8 @@ fn tool_started_arguments_preserve_invocation_fields_and_redact_secrets() {
     assert_eq!(projected["query"], "runtime host");
     assert_eq!(projected["symbol"], "RuntimeHost::run");
     assert_eq!(projected["timeout_ms"], 5_000);
+    assert_eq!(projected["background"], true);
+    assert_eq!(projected["yield-time_ms"], 1_000);
     assert_eq!(projected["api_key"], "<redacted-secret>");
     let serialized = serde_json::to_string(&projected).expect("serialize projected arguments");
     assert!(!serialized.contains("plain-secret-value"));
@@ -1313,6 +1329,16 @@ async fn background_process_supports_cursor_reconnect_stdin_and_terminal_diff() 
     )
     .await;
     assert_eq!(start.envelope.structured_facts["process_state"], "running");
+    assert_eq!(
+        start.envelope.structured_facts["process_lifetime_scope"],
+        "runtime"
+    );
+    assert_eq!(
+        start.envelope.structured_facts["survives_runtime_exit"],
+        false
+    );
+    assert!(start.envelope.summary.contains("post-runtime consumers"));
+    assert!(start.envelope.summary.contains("detached process"));
     let process_id = start.envelope.structured_facts["process_id"]
         .as_str()
         .expect("process id")
@@ -1396,6 +1422,14 @@ async fn background_process_supports_cursor_reconnect_stdin_and_terminal_diff() 
     assert_eq!(
         terminal.envelope.structured_facts["workspace_changes_known"],
         true
+    );
+    assert_eq!(
+        terminal.envelope.structured_facts["process_lifetime_scope"],
+        "runtime"
+    );
+    assert_eq!(
+        terminal.envelope.structured_facts["survives_runtime_exit"],
+        false
     );
     assert!(
         terminal

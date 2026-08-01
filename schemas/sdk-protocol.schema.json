@@ -713,6 +713,16 @@
             "$ref": "#/$defs/ExternalVerificationSpec"
           }
         },
+        "max_elapsed_ms": {
+          "description": "Optional wall-clock budget for this turn. Active provider sessions and\nnewly scheduled provider, tool, verifier, or correction work are\nbounded by this deadline so callers can retain a terminal candidate\nbefore an outer harness timeout.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 1
+        },
         "output_schema": {
           "default": null
         },
@@ -7562,7 +7572,11 @@
         "replay_capsule_created",
         "replay_executed",
         "external_evaluation_ingested",
-        "external_evaluation_compared"
+        "external_evaluation_compared",
+        "candidate_ready",
+        "verification_ready",
+        "external_verification_requested",
+        "external_verification_feedback"
       ]
     },
     "RuntimeGovernorDecision": {

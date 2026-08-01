@@ -125,6 +125,26 @@ pub(crate) fn recovered_pending_turn_from_event(
         })?,
         None => Vec::new(),
     };
+    let max_elapsed_ms = match payload.get("max_elapsed_ms") {
+        None | Some(Value::Null) => None,
+        Some(value) if value.as_u64().is_some_and(|value| value > 0) => value.as_u64(),
+        Some(_) => {
+            return Err(ClientError::TaskExecution(format!(
+                "durable queued turn event {} has an invalid max_elapsed_ms",
+                event.id
+            )));
+        }
+    };
+    let defer_external_verification = match payload.get("defer_external_verification") {
+        None => false,
+        Some(Value::Bool(deferred)) => *deferred,
+        Some(_) => {
+            return Err(ClientError::TaskExecution(format!(
+                "durable queued turn event {} has non-boolean defer_external_verification",
+                event.id
+            )));
+        }
+    };
     let allow_network = match payload.get("allow_network") {
         None => false,
         Some(Value::Bool(allow_network)) => *allow_network,
@@ -184,6 +204,8 @@ pub(crate) fn recovered_pending_turn_from_event(
             task_contract,
             output_schema,
             external_verifiers,
+            max_elapsed_ms,
+            defer_external_verification,
             external_verifiers_require_os_sandbox,
             allow_network,
             yolo,

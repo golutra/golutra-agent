@@ -28,6 +28,8 @@ class Thread:
         task_contract: TaskContract | None = None,
         allow_network: bool = False,
         yolo: bool = False,
+        max_elapsed_ms: int | None = None,
+        defer_external_verification: bool = False,
         completion_criteria: Iterable[str] = (),
         external_verifiers: Iterable[dict[str, Any]] | None = None,
         discover_project_verifiers: bool = True,
@@ -39,8 +41,11 @@ class Thread:
             "prompt": prompt,
             "allow_network": allow_network,
             "yolo": yolo,
+            "defer_external_verification": defer_external_verification,
             "completion_criteria": [item for item in completion_criteria if item.strip()],
         }
+        if max_elapsed_ms is not None:
+            params["max_elapsed_ms"] = max_elapsed_ms
         if external_verifiers is not None or not discover_project_verifiers:
             params["external_verifiers"] = [
                 dict(item) for item in (external_verifiers or ())
@@ -62,6 +67,8 @@ class Thread:
         task_contract: TaskContract | None = None,
         allow_network: bool = False,
         yolo: bool = False,
+        max_elapsed_ms: int | None = None,
+        defer_external_verification: bool = False,
         completion_criteria: Iterable[str] = (),
         external_verifiers: Iterable[dict[str, Any]] | None = None,
         discover_project_verifiers: bool = True,
@@ -72,6 +79,8 @@ class Thread:
             task_contract=task_contract,
             allow_network=allow_network,
             yolo=yolo,
+            max_elapsed_ms=max_elapsed_ms,
+            defer_external_verification=defer_external_verification,
             completion_criteria=completion_criteria,
             external_verifiers=external_verifiers,
             discover_project_verifiers=discover_project_verifiers,

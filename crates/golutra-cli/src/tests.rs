@@ -91,6 +91,36 @@ fn exec_can_disable_project_verifier_discovery() {
 }
 
 #[test]
+fn exec_accepts_a_positive_per_turn_elapsed_budget() {
+    let cli = Cli::try_parse_from([
+        "golutra",
+        "exec",
+        "--max-elapsed-ms",
+        "345000",
+        "inspect the workspace",
+    ])
+    .expect("exec elapsed budget");
+
+    assert!(matches!(
+        cli.command,
+        Command::Exec(ExecArgs {
+            max_elapsed_ms: Some(value),
+            ..
+        }) if value.get() == 345_000
+    ));
+    assert!(
+        Cli::try_parse_from([
+            "golutra",
+            "exec",
+            "--max-elapsed-ms",
+            "0",
+            "inspect the workspace",
+        ])
+        .is_err()
+    );
+}
+
+#[test]
 fn yolo_parses_for_embedded_daemon_connect_and_resume_exec() {
     for arguments in [
         vec!["golutra", "exec", "--yolo", "modify files"],

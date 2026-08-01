@@ -394,6 +394,12 @@ fn turn_payload_from_params(params: &Value, thread_id: ThreadId, prompt: &str) -
     if let Some(yolo) = params.get("yolo") {
         payload["yolo"] = yolo.clone();
     }
+    if let Some(max_elapsed_ms) = params.get("max_elapsed_ms") {
+        payload["max_elapsed_ms"] = max_elapsed_ms.clone();
+    }
+    if let Some(defer_external_verification) = params.get("defer_external_verification") {
+        payload["defer_external_verification"] = defer_external_verification.clone();
+    }
     if let Some(discover_project_verifiers) = params.get("discover_project_verifiers") {
         payload["discover_project_verifiers"] = discover_project_verifiers.clone();
     }
@@ -909,5 +915,16 @@ mod tests {
             "modify an external path",
         );
         assert_eq!(yolo_payload["yolo"], true);
+
+        let bounded_payload = turn_payload_from_params(
+            &json!({
+                "max_elapsed_ms": 345_000,
+                "defer_external_verification": true,
+            }),
+            ThreadId::new(),
+            "finish before the harness deadline",
+        );
+        assert_eq!(bounded_payload["max_elapsed_ms"], 345_000);
+        assert_eq!(bounded_payload["defer_external_verification"], true);
     }
 }

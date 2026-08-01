@@ -318,6 +318,16 @@ impl RuntimeHost {
                 ));
             }
         };
+        let max_elapsed_ms = task
+            .payload
+            .get("max_elapsed_ms")
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0);
+        let defer_external_verification = task
+            .payload
+            .get("defer_external_verification")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let external_verifiers = task
             .payload
             .get("external_verifiers")
@@ -404,24 +414,30 @@ impl RuntimeHost {
         } else {
             harness
         };
+        let run = AgentRun::new(AgentTaskRequest {
+            session_id: task.session_id,
+            task_id: task.task_id,
+            turn_id: task.turn_id,
+            objective: objective.clone(),
+            completion_criteria: task_contract.completion_criteria.clone(),
+            output_schema: task.payload.get("output_schema").cloned(),
+            touched_code,
+            contributors,
+            tools: if workspace_tools_enabled {
+                workspace_tool_names
+            } else {
+                Vec::new()
+            },
+        })
+        .with_task_contract(task_contract)
+        .with_deferred_external_verification(defer_external_verification);
+        let run = match max_elapsed_ms {
+            Some(max_elapsed_ms) => run.with_max_elapsed_ms(max_elapsed_ms),
+            None => run,
+        };
         let outcome = harness
             .execute(
-                AgentRun::new(AgentTaskRequest {
-                    session_id: task.session_id,
-                    task_id: task.task_id,
-                    turn_id: task.turn_id,
-                    objective: objective.clone(),
-                    completion_criteria: task_contract.completion_criteria.clone(),
-                    output_schema: task.payload.get("output_schema").cloned(),
-                    touched_code,
-                    contributors,
-                    tools: if workspace_tools_enabled {
-                        workspace_tool_names
-                    } else {
-                        Vec::new()
-                    },
-                })
-                .with_task_contract(task_contract),
+                run,
                 control,
                 ChannelObservationSink {
                     sender: trace_tx.clone(),
@@ -456,20 +472,11 @@ impl RuntimeHost {
             ..task.clone()
         };
         let final_objective = outcome.verification.objective.clone();
-        let task_outcome =
-            golutra_core::TaskOutcome::from_verification(terminal_status, &outcome.verification)
-                .with_external_verification(
-                    if task
-                        .payload
-                        .get("defer_external_verification")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false)
-                    {
-                        golutra_core::ExternalVerificationStatus::Pending
-                    } else {
-                        golutra_core::ExternalVerificationStatus::NotRequested
-                    },
-                );
+        let task_outcome = super::execution_trace::task_outcome_with_external_verification(
+            terminal_status,
+            &outcome.verification,
+            outcome.defer_external_verification,
+        );
         self.finish_lane_with_outcome(&final_task, terminal_status, task_outcome)
             .await?;
         if let Err(error) = self

@@ -13,6 +13,7 @@ pub(crate) fn outcome<F>(
     request: &AgentTaskRequest,
     error: ContextError,
     trace: &mut F,
+    defer_external_verification: bool,
 ) -> AgentLoopOutcome
 where
     F: FnMut(AgentLoopTraceEvent) + Send,
@@ -130,5 +131,6 @@ where
         tool_reports: Vec::new(),
         final_message: Some(final_message),
         final_turn_id: request.turn_id,
+        defer_external_verification,
     }
 }

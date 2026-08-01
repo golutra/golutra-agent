@@ -14,8 +14,8 @@ use tokio::task::JoinHandle;
 
 use super::{
     AgentExecutionControl, AgentExecutionHandle, AgentLoop, AgentLoopError, AgentLoopOutcome,
-    AgentReplayContext, AgentTaskRequest, PendingAgentTurn, RuntimeObservationSink,
-    agent_execution_channel,
+    AgentReplayContext, AgentTaskRequest, AgentTurnOverrides, PendingAgentTurn,
+    RuntimeObservationSink, agent_execution_channel,
 };
 
 const DEFAULT_PENDING_TURN_CAPACITY: usize = 32;
@@ -25,6 +25,8 @@ pub struct AgentRun {
     pub request: AgentTaskRequest,
     pub task_contract: TaskContract,
     pub replay_context: Option<AgentReplayContext>,
+    pub max_elapsed_ms: Option<u64>,
+    pub defer_external_verification: Option<bool>,
 }
 
 impl AgentRun {
@@ -40,6 +42,8 @@ impl AgentRun {
             request,
             task_contract,
             replay_context: None,
+            max_elapsed_ms: None,
+            defer_external_verification: None,
         }
     }
 
@@ -52,6 +56,22 @@ impl AgentRun {
     #[must_use]
     pub fn with_replay_context(mut self, replay_context: AgentReplayContext) -> Self {
         self.replay_context = Some(replay_context);
+        self
+    }
+
+    /// Override the wall-clock budget for this run's initial turn. Queued
+    /// turns carry and reset their own budget independently.
+    #[must_use]
+    pub fn with_max_elapsed_ms(mut self, max_elapsed_ms: u64) -> Self {
+        self.max_elapsed_ms = Some(max_elapsed_ms.max(1));
+        self
+    }
+
+    /// Override deferred external verification for this run's initial turn.
+    /// Queued turns carry their own setting independently.
+    #[must_use]
+    pub fn with_deferred_external_verification(mut self, deferred: bool) -> Self {
+        self.defer_external_verification = Some(deferred);
         self
     }
 }
@@ -115,6 +135,20 @@ where
     }
 
     #[must_use]
+    pub fn with_max_elapsed_ms(mut self, max_elapsed_ms: u64) -> Self {
+        let mut limits = self.loop_core.governor.limits().clone();
+        limits.max_elapsed_ms = max_elapsed_ms.max(1);
+        self.loop_core_mut().governor = golutra_governor::RuntimeGovernor::new(limits);
+        self
+    }
+
+    #[must_use]
+    pub fn with_deferred_external_verification(mut self, deferred: bool) -> Self {
+        self.loop_core_mut().defer_external_verification = deferred;
+        self
+    }
+
+    #[must_use]
     pub fn require_os_sandbox_for_external_verifiers(mut self, required: bool) -> Self {
         self.loop_core_mut().external_verifiers_require_os_sandbox = required;
         self
@@ -142,6 +176,10 @@ where
                 move |observation| sink.emit(observation),
                 run.task_contract,
                 run.replay_context,
+                AgentTurnOverrides {
+                    max_elapsed_ms: run.max_elapsed_ms,
+                    defer_external_verification: run.defer_external_verification,
+                },
             )
             .await
     }

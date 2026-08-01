@@ -584,6 +584,8 @@ class ClientTest(unittest.TestCase):
             },
             allow_network=True,
             yolo=True,
+            max_elapsed_ms=345_000,
+            defer_external_verification=True,
             completion_criteria=[" verified ", ""],
             external_verifiers=[{"program": "pytest", "args": ["-q"]}],
         )
@@ -603,6 +605,8 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(calls[0][1]["completion_criteria"], [" verified "])
         self.assertEqual(calls[0][1]["allow_network"], True)
         self.assertEqual(calls[0][1]["yolo"], True)
+        self.assertEqual(calls[0][1]["max_elapsed_ms"], 345_000)
+        self.assertEqual(calls[0][1]["defer_external_verification"], True)
         self.assertEqual(calls[0][1]["output_schema"], {"type": "object"})
         self.assertEqual(
             calls[0][1]["task_contract"],

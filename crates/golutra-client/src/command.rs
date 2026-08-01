@@ -375,6 +375,24 @@ impl RuntimeHost {
                 ));
             }
         };
+        let max_elapsed_ms = match payload.get("max_elapsed_ms") {
+            None | Some(Value::Null) => None,
+            Some(value) if value.as_u64().is_some_and(|value| value > 0) => value.as_u64(),
+            Some(_) => {
+                return Err(ClientError::TaskExecution(
+                    "max_elapsed_ms must be a positive integer".to_owned(),
+                ));
+            }
+        };
+        let defer_external_verification = match payload.get("defer_external_verification") {
+            None => false,
+            Some(Value::Bool(deferred)) => *deferred,
+            Some(_) => {
+                return Err(ClientError::TaskExecution(
+                    "defer_external_verification must be a boolean".to_owned(),
+                ));
+            }
+        };
         // Yolo is the trusted full-access profile: it also requests network
         // access, while the host still decides whether that capability exists.
         let requested_network = requested_network
@@ -505,6 +523,8 @@ impl RuntimeHost {
                                     task_contract: Some(task_contract.clone()),
                                     output_schema: payload.get("output_schema").cloned(),
                                     external_verifiers,
+                                    max_elapsed_ms,
+                                    defer_external_verification,
                                     external_verifiers_require_os_sandbox: payload
                                         .get(EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY)
                                         .and_then(Value::as_bool)

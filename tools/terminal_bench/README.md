@@ -6,7 +6,9 @@
 golutra --cwd <container-workdir> exec \
   --run-dir /logs/golutra-runtime \
   [--allow-network when proxy_url is configured] \
-  --yolo --approval-mode auto -- "<task prompt>"
+  --yolo --approval-mode auto \
+  --max-elapsed-ms <remaining-agent-budget> \
+  --defer-external-verification -- "<task prompt>"
 ```
 
 The adapter discovers the container image's working directory for each task,
@@ -38,11 +40,13 @@ timeouts from long Terminal-Bench cases can still be attached to that bundle.
 Override `result_collection_timeout_sec` only when the dataset has a longer
 combined agent/test horizon or a deliberately shorter local feedback loop.
 
-The blocking tmux command is also bounded. The adapter reads the trial's
+The blocking tmux command and the runtime itself are both bounded. The adapter reads the trial's
 `max_agent_timeout_sec`, global timeout override, and timeout multiplier from
-the active Terminal-Bench run, then gives tmux a short grace period to interrupt
-Golutra after the harness deadline. This keeps Terminal-Bench's synchronous
-executor from waiting forever after its outer asyncio timeout. Use the
+the active Terminal-Bench run. It subtracts setup and finalization reserves,
+passes the remaining budget through `--max-elapsed-ms`, and gives tmux a short
+grace period to interrupt Golutra after the harness deadline. This lets Golutra
+write a governed terminal state before Terminal-Bench's outer asyncio timeout
+abandons the call. Use the
 `agent_command_timeout_sec` agent kwarg only when run metadata is unavailable;
 it defaults to 600 seconds as a bounded fallback.
 
@@ -52,12 +56,26 @@ copies its evaluator only after the agent returns. Golutra may run verifiers
 already visible in the task workspace, but hidden assertions never extend the
 agent timeout or mutate the workspace before its scored state is captured.
 
-Build or copy the architecture-specific Golutra agent binaries before running:
+Build the architecture-specific Golutra agent binaries before running. The
+builder targets static musl for both architectures and executes each result in
+a Debian bullseye container, which catches accidental dependencies on a newer
+glibc before a benchmark starts:
+
+```bash
+tools/terminal_bench/build_linux_binaries.sh \
+  --output-dir /tmp/golutra-terminal-bench/bin
+```
+
+When a host proxy uses loopback, the script rewrites it to
+`host.docker.internal`. Set `GOLUTRA_TBENCH_DOCKER_PROXY` to override that
+value. Then run Terminal-Bench with the generated paths:
 
 ```bash
 tb run \
   --agent-import-path tools.terminal_bench.golutra_tbench_adapter:GolutraAgent \
   --dataset terminal-bench-core==0.1.1 \
+  --agent-kwarg arm64_binary=/tmp/golutra-terminal-bench/bin/golutra-cli-arm64 \
+  --agent-kwarg amd64_binary=/tmp/golutra-terminal-bench/bin/golutra-cli-amd64 \
   --agent-kwarg proxy_url=http://host.docker.internal:7897 \
   --output-path /tmp/terminal-bench/runs
 ```

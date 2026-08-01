@@ -32,7 +32,10 @@ use golutra_protocol::{
     TaskTraceRequest,
 };
 use secrecy::SecretString;
-use std::io::{IsTerminal, Write};
+use std::{
+    io::{IsTerminal, Write},
+    num::NonZeroU64,
+};
 use tokio::io::AsyncReadExt;
 use tokio::time::{Duration, sleep};
 use uuid::Uuid;
@@ -245,6 +248,9 @@ struct ExecArgs {
     /// Add an objective completion criterion. May be repeated.
     #[arg(long = "completion-criterion", value_name = "TEXT")]
     completion_criteria: Vec<String>,
+    /// Stop scheduling new turn work after this many milliseconds.
+    #[arg(long, value_name = "MILLISECONDS")]
+    max_elapsed_ms: Option<NonZeroU64>,
     /// Run this caller-trusted program after the agent stops. No shell is used.
     #[arg(long, value_name = "PROGRAM")]
     verify_program: Option<String>,
@@ -2597,6 +2603,7 @@ async fn run_exec(
                 task_contract,
                 output_schema,
                 completion_criteria: args.completion_criteria,
+                max_elapsed_ms: args.max_elapsed_ms.map(NonZeroU64::get),
                 allow_network: args.allow_network || args.yolo,
                 yolo: args.yolo,
                 defer_external_verification: args.defer_external_verification,

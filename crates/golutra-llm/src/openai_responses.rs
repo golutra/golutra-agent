@@ -454,17 +454,7 @@ fn normalize_reasoning_replay_item(item: &Value) -> Result<Value, ProviderError>
 }
 
 fn responses_tool_schema(contract: &ToolContract) -> Value {
-    let description = match contract.tool_name.as_str() {
-        "read_file" => "Read a UTF-8 text file from the current workspace.",
-        "write_file" => "Write UTF-8 text content to a workspace-relative file.",
-        "edit_file" => "Replace the first exact text match in a workspace-relative file.",
-        "list_dir" => "List entries in a workspace-relative directory.",
-        "rg_search" => "Search workspace files with ripgrep.",
-        "shell" => {
-            "Run a workspace command as argv; for pipes, redirection, or compound scripts, explicitly invoke bash -lc with the complete script as one argument."
-        }
-        _ => "Golutra workspace tool.",
-    };
+    let description = crate::provider_tool_description(&contract.tool_name);
     json!({
         "type": "function",
         "name": contract.tool_name,

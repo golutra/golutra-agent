@@ -2301,13 +2301,18 @@ fn contract(tool_name: &str, side_effect_type: SideEffectType) -> ToolContract {
                 "timeout_ms": {
                     "type": "integer",
                     "minimum": 1,
-                    "maximum": MAX_BACKGROUND_PROCESS_TIMEOUT_MS
+                    "maximum": MAX_BACKGROUND_PROCESS_TIMEOUT_MS,
+                    "description": "The absolute process lifetime from launch in milliseconds, not an initial wait. Expiry terminates the process with a timed_out state. Defaults to 5000 for foreground commands and 3600000 for background commands."
                 },
-                "background": {"type": "boolean"},
+                "background": {
+                    "type": "boolean",
+                    "description": "When true, start a runtime-scoped managed process and return its process_id after yield_time_ms. The process stops when the runtime ends. If another process or evaluator must connect after the final response, do not use background=true; launch a self-daemonizing service with background omitted, redirect all stdio, and verify it before returning."
+                },
                 "yield_time_ms": {
                     "type": "integer",
                     "minimum": 0,
-                    "maximum": max_poll_wait_ms()
+                    "maximum": max_poll_wait_ms(),
+                    "description": "For a background command, wait at most this long for initial output or termination before returning. This only controls the initial wait and does not extend timeout_ms or the process lifetime."
                 }
             },
             "required": ["command"]
@@ -2804,7 +2809,9 @@ fn supervised_process_report(
         request,
         status,
         match snapshot.state {
-            ProcessState::Running => "background process is running",
+            ProcessState::Running => {
+                "background process is running, but it is runtime-scoped and will stop when the runtime exits; post-runtime consumers require a detached process"
+            }
             ProcessState::Exited => "background process exited successfully",
             ProcessState::Failed => "background process exited with an error",
             ProcessState::TimedOut => "background process timed out",
@@ -2821,6 +2828,8 @@ fn supervised_process_report(
             "output_truncated": snapshot.output_truncated,
             "output_lost": snapshot.output_lost,
             "workspace_changes_known": workspace_changes_known,
+            "process_lifetime_scope": "runtime",
+            "survives_runtime_exit": false,
             "workspace_change_count": if workspace_changes_known {
                 snapshot.changed_files.len()
             } else {
@@ -3127,6 +3136,8 @@ const PREFERRED_TOOL_ARGUMENT_KEYS: &[&str] = &[
     "query",
     "symbol",
     "timeout_ms",
+    "background",
+    "yield-time_ms",
     "cwd",
     "glob",
     "url",

@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import os
 import re
-import sqlite3
 import shlex
 import shutil
 import subprocess
@@ -278,15 +276,24 @@ class GolutraAgent(BaseAgent):
     ) -> None:
         if logging_dir is None:
             return
+        observation_path = logging_dir.parent / "golutra-adapter-observation.json"
+        existing_facts: dict[str, object] = {}
+        try:
+            existing = json.loads(observation_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+        if isinstance(existing, dict) and isinstance(existing.get("facts"), dict):
+            existing_facts.update(existing["facts"])
+        existing_facts.update(facts or {})
         _write_json_atomic(
-            logging_dir.parent / "golutra-adapter-observation.json",
+            observation_path,
             {
                 "schema_version": 1,
                 "adapter": self.name(),
                 "phase": phase,
                 "status": status,
                 "code": code,
-                "facts": facts or {},
+                "facts": existing_facts,
                 "observed_at": _now_rfc3339(),
             },
         )
@@ -314,7 +321,7 @@ class GolutraAgent(BaseAgent):
         )
 
     def _runtime_readiness(self, trial_root: Path) -> dict[str, object]:
-        """Read the latest durable lifecycle fact without requiring a live CLI."""
+        """Read lifecycle state only from the atomically replaced run manifest."""
         run_dir = _find_run_bundle(trial_root)
         if run_dir is None:
             return {"state": "unavailable"}
@@ -323,34 +330,15 @@ class GolutraAgent(BaseAgent):
             manifest = json.loads(manifest_path.read_text())
         except (OSError, json.JSONDecodeError):
             manifest = {}
-        terminal = manifest.get("terminal_outcome", {})
-        if terminal.get("kind") == "result":
-            return {"state": "terminal", "event_type": "TaskCompleted"}
-
-        database = run_dir / "state" / "runtime.sqlite"
-        if not database.is_file():
+        terminal = manifest.get("terminal_outcome")
+        if not isinstance(terminal, dict):
             return {"state": "unavailable"}
-        try:
-            connection = sqlite3.connect(
-                f"file:{database}?mode=ro", uri=True, timeout=0.2
-            )
-            row = connection.execute(
-                "SELECT event_type, payload_json FROM runtime_events "
-                "ORDER BY sequence_no DESC LIMIT 64"
-            ).fetchall()
-            connection.close()
-        except sqlite3.Error:
-            return {"state": "unavailable"}
-        for event_type, payload_json in row:
-            if event_type == "ExternalVerificationRequested":
-                return {"state": "external_pending", "event_type": event_type}
-            if event_type == "VerificationReady":
-                return {"state": "verification_ready", "event_type": event_type}
-            if event_type == "CandidateReady":
-                return {"state": "candidate_ready", "event_type": event_type}
-            if event_type in {"TaskCompleted", "TaskAborted", "TaskInterrupted"}:
-                return {"state": "terminal", "event_type": event_type}
-        return {"state": "running"}
+        kind = terminal.get("kind")
+        if kind == "in_progress":
+            return {"state": "running", "terminal_outcome_kind": kind}
+        if kind in {"result", "error"}:
+            return {"state": "terminal", "terminal_outcome_kind": kind}
+        return {"state": "unavailable"}
 
     def _graceful_drain(self, logging_dir: Path | None) -> dict[str, object]:
         if logging_dir is None:
@@ -551,10 +539,19 @@ class GolutraAgent(BaseAgent):
                 "attestation": None,
                 "ingested_at": _now_rfc3339(),
             }
-            if record["base_trace_digest"] != "auto" and record["runtime_identity"] != "auto":
-                record["result_digest"] = _external_result_digest(record)
             record_path = run_dir / "terminal-bench-evaluation.json"
             _write_json_atomic(record_path, record)
+            _remove_if_exists(run_dir / "terminal-bench-evaluation-correction.json")
+            if checkpoint_only:
+                _write_json_atomic(
+                    run_dir / "terminal-bench-evaluation.pending.json",
+                    {
+                        "status": "pending_runtime_terminal",
+                        "reason": "the evaluator result is retained, but the Golutra run manifest is still in progress; ingestion must wait for a terminal bundle",
+                        "record_path": str(record_path),
+                    },
+                )
+                return
             if self._collector_binary is None:
                 _write_json_atomic(
                     run_dir / "terminal-bench-evaluation.pending.json",
@@ -589,6 +586,16 @@ class GolutraAgent(BaseAgent):
                 if attempt + 1 < _COLLECTOR_RETRY_LIMIT:
                     time.sleep(_COLLECTOR_RETRY_DELAY_SEC)
             assert completed is not None
+            bound_record = (
+                _trace_external_evaluation(
+                    run_dir,
+                    task_id,
+                    session_id,
+                    record["evaluation_id"],
+                )
+                if completed.returncode == 0
+                else None
+            )
             _write_json_atomic(
                 run_dir / "terminal-bench-evaluation.log",
                 {
@@ -596,11 +603,14 @@ class GolutraAgent(BaseAgent):
                     "stdout": completed.stdout,
                     "stderr": completed.stderr,
                     "record_path": str(record_path),
+                    "bound_result_digest": (
+                        bound_record.get("result_digest") if bound_record else None
+                    ),
                 },
             )
-            if completed.returncode == 0:
+            if completed.returncode == 0 and bound_record is not None:
                 correction = self._external_correction_plan(
-                    run_dir, record, thread_id
+                    run_dir, bound_record, thread_id
                 )
                 _remove_if_exists(run_dir / "terminal-bench-evaluation.pending.json")
                 if correction is not None:
@@ -608,6 +618,16 @@ class GolutraAgent(BaseAgent):
                         run_dir / "terminal-bench-evaluation-correction.json",
                         correction,
                     )
+            elif completed.returncode == 0:
+                _write_json_atomic(
+                    run_dir / "terminal-bench-evaluation.pending.json",
+                    {
+                        "status": "pending_trace_binding",
+                        "reason": "Golutra collector returned success, but the exported trace does not contain the bound external evaluation",
+                        "record_path": str(record_path),
+                        "evaluation_id": record["evaluation_id"],
+                    },
+                )
             else:
                 _write_json_atomic(
                     run_dir / "terminal-bench-evaluation.pending.json",
@@ -628,7 +648,7 @@ class GolutraAgent(BaseAgent):
     def _wait_for_terminal_manifest(
         self, run_dir: Path, collection_deadline: float
     ) -> dict:
-        """Do not ingest while the CLI is still exporting the live SQLite store."""
+        """Do not ingest while the CLI still owns an in-progress run bundle."""
         wait_budget = min(
             max(
                 0.01,
@@ -725,7 +745,11 @@ class GolutraAgent(BaseAgent):
             return self._installation_failure(
                 logging_dir,
                 "agent_binary_preflight_failed",
-                {"exit_code": setup_result.exit_code, "architecture": architecture},
+                {
+                    "exit_code": setup_result.exit_code,
+                    "architecture": architecture,
+                    "loader_output": _bounded_diagnostic_output(setup_result.output),
+                },
             )
         if not self._configure_tmux_proxy(session):
             return self._installation_failure(
@@ -745,11 +769,22 @@ class GolutraAgent(BaseAgent):
             for name, value in self._runtime_environment().items()
         )
         network_flag = "--allow-network " if self._proxy_url else ""
+        setup_elapsed_sec = max(0.0, time.monotonic() - task_started_at)
+        finalization_reserve_sec = (
+            self._graceful_drain_timeout_sec + _AGENT_COMMAND_TIMEOUT_GRACE_SEC
+        )
+        runtime_elapsed_budget_ms = _runtime_elapsed_budget_ms(
+            agent_timeout_sec=agent_timeout_sec,
+            setup_elapsed_sec=setup_elapsed_sec,
+            finalization_reserve_sec=finalization_reserve_sec,
+        )
         command = (
             f"{environment} "
             f"/installed-agent/golutra --cwd {shlex.quote(workspace_path)} exec "
             "--run-dir /logs/golutra-runtime "
-            f"{network_flag}--yolo --approval-mode auto --defer-external-verification -- "
+            f"{network_flag}--yolo --approval-mode auto "
+            f"--max-elapsed-ms {runtime_elapsed_budget_ms} "
+            "--defer-external-verification -- "
             f"{shlex.quote(rendered_instruction)}"
         )
         command_timeout_sec = max(
@@ -771,6 +806,8 @@ class GolutraAgent(BaseAgent):
                 "architecture": architecture,
                 "agent_timeout_sec": agent_timeout_sec,
                 "command_timeout_sec": command_timeout_sec,
+                "runtime_max_elapsed_ms": runtime_elapsed_budget_ms,
+                "finalization_reserve_sec": finalization_reserve_sec,
             },
         )
         try:
@@ -846,6 +883,16 @@ def _positive_timeout(value: object) -> float:
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout must be a finite positive number")
     return timeout
+
+
+def _runtime_elapsed_budget_ms(
+    *,
+    agent_timeout_sec: float,
+    setup_elapsed_sec: float,
+    finalization_reserve_sec: float,
+) -> int:
+    available_sec = agent_timeout_sec - setup_elapsed_sec - finalization_reserve_sec
+    return max(1_000, math.floor(available_sec * 1_000))
 
 
 def _terminal_bench_agent_timeout_sec(logging_dir: Path | None) -> float | None:
@@ -1050,6 +1097,19 @@ def _sanitize_failure_line(value: str) -> str:
     sanitized = _SECRET_ASSIGNMENT_RE.sub(r"\1\2[REDACTED]", sanitized)
     sanitized = re.sub(r"\s+", " ", sanitized).strip()
     return _truncate_utf8(sanitized, _FAILURE_LINE_MAX_BYTES)
+
+
+def _bounded_diagnostic_output(value: object) -> str:
+    if isinstance(value, bytes):
+        rendered = value.decode(errors="replace")
+    else:
+        rendered = str(value or "")
+    lines: list[str] = []
+    for raw_line in rendered.splitlines():
+        line = _sanitize_failure_line(raw_line)
+        if line and line not in lines:
+            lines.append(line)
+    return _join_bounded_lines(lines, _FAILURE_DETAIL_MAX_BYTES)
 
 
 def _failure_message(summary: str, detail: str | None) -> str:
@@ -1386,53 +1446,33 @@ def _trace_identity(run_dir: Path, task_id: str, session_id: str) -> tuple[str |
     return None, None
 
 
-def _external_result_digest(record: dict) -> str:
-    facts = {
-        key: record.get(key)
-        for key in (
-            "evaluation_id",
-            "source_task_id",
-            "evaluator_id",
-            "evaluator_version",
-            "harness_id",
-            "harness_version",
-            "dataset_id",
-            "dataset_version",
-            "case_id",
-            "verdict",
-            "score",
-            "score_max",
-            "assertions",
-            "phases",
-            "terminal_cause",
-            "artifact_refs",
-            "partition",
-            "seed",
-            "provider_variant",
-            "holdout_protected",
-            "comparison_group_id",
-            "candidate_id",
-            "campaign_id",
-            "role",
-            "base_trace_digest",
-            "runtime_identity",
-            "trust",
-        )
-    }
-    encoded = json.dumps(
-        _canonical_json(facts),
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
-
-
-def _canonical_json(value):
-    if isinstance(value, dict):
-        return {key: _canonical_json(value[key]) for key in sorted(value)}
-    if isinstance(value, list):
-        return [_canonical_json(item) for item in value]
-    return value
+def _trace_external_evaluation(
+    run_dir: Path,
+    task_id: str,
+    session_id: str,
+    evaluation_id: str,
+) -> dict | None:
+    try:
+        manifest = json.loads((run_dir / "manifest.json").read_text())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    trace_paths: list[Path] = []
+    for session in manifest.get("observations", {}).get("sessions", []):
+        if str(session.get("session_id")) != str(session_id):
+            continue
+        for task in session.get("tasks", []):
+            if str(task.get("task_id")) == str(task_id) and task.get("trace_path"):
+                trace_paths.append(run_dir / str(task["trace_path"]))
+    for path in trace_paths:
+        try:
+            trace = json.loads(path.read_text())
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        records = trace.get("evaluation", {}).get("external_evaluations", [])
+        for record in records:
+            if isinstance(record, dict) and record.get("evaluation_id") == evaluation_id:
+                return record
+    return None
 
 
 def _now_rfc3339() -> str:

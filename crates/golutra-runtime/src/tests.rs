@@ -65,8 +65,16 @@ fn shell_timeout_is_clamped_to_the_remaining_governor_budget() {
     assert_eq!(request.arguments["timeout_ms"], 125);
 
     request.arguments = json!({"command": "sleep 10"});
-    clamp_shell_timeout_to_budget(&mut request, 80);
-    assert_eq!(request.arguments["timeout_ms"], 80);
+    clamp_shell_timeout_to_budget(&mut request, 30_000);
+    assert_eq!(request.arguments["timeout_ms"], 5_000);
+
+    request.arguments = json!({"command": "sleep 10", "background": true});
+    clamp_shell_timeout_to_budget(&mut request, 30_000);
+    assert_eq!(request.arguments["timeout_ms"], 30_000);
+
+    request.arguments = json!({"command": "sleep 10", "background": true});
+    clamp_shell_timeout_to_budget(&mut request, 2 * 60 * 60 * 1_000);
+    assert_eq!(request.arguments["timeout_ms"], 60 * 60 * 1_000);
 
     request.arguments["timeout_ms"] = json!("invalid");
     clamp_shell_timeout_to_budget(&mut request, 40);
@@ -252,6 +260,7 @@ fn semantic_failure_families_survive_unrelated_successes() {
 #[derive(Debug, Clone)]
 enum FallbackTestProvider {
     Failing(Box<golutra_core::ProviderContract>),
+    Endless(Box<golutra_core::ProviderContract>),
     Success(Box<MockProvider>),
 }
 
@@ -313,6 +322,142 @@ struct AssistantOnlyCorrectionProvider {
 struct RequiredReadProvider {
     calls: Arc<AtomicUsize>,
     contract: golutra_core::ProviderContract,
+}
+
+#[derive(Debug, Clone)]
+struct EndlessProgressProvider {
+    contract: golutra_core::ProviderContract,
+}
+
+#[derive(Debug, Clone)]
+struct SequencedTextProvider {
+    calls: Arc<AtomicUsize>,
+    delay: Duration,
+    block_from_call: Option<usize>,
+    contract: golutra_core::ProviderContract,
+}
+
+#[derive(Debug, Clone)]
+struct QueuedWriteCorrectionProvider {
+    calls: Arc<AtomicUsize>,
+    contract: golutra_core::ProviderContract,
+}
+
+#[async_trait]
+impl LlmProvider for QueuedWriteCorrectionProvider {
+    async fn complete(&self, _request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let (message, tool_calls, finish_reason) = if call == 1 {
+            (
+                None,
+                vec![ProviderToolCall {
+                    tool_call_id: "queued-write".to_owned(),
+                    tool_name: "write_file".to_owned(),
+                    arguments: json!({"path": "result.py", "content": "value = 1\n"}),
+                }],
+                ProviderFinishReason::ToolCalls,
+            )
+        } else {
+            (
+                Some(ProviderMessage {
+                    role: ProviderRole::Assistant,
+                    content: format!("response {call}"),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: Vec::new(),
+                    metadata: Default::default(),
+                }),
+                Vec::new(),
+                ProviderFinishReason::Stop,
+            )
+        };
+        Ok(ProviderResponse {
+            response_id: golutra_core::ProviderResponseId::new(),
+            message,
+            tool_calls,
+            usage: ProviderUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                reasoning_tokens: None,
+                cached_input_tokens: None,
+                total_tokens: Some(15),
+                usage_source: UsageSource::Estimated,
+                raw: json!({"round": call}),
+            },
+            finish_reason,
+            raw_metadata: json!({"round": call}),
+        })
+    }
+
+    fn contract(&self) -> golutra_core::ProviderContract {
+        self.contract.clone()
+    }
+}
+
+#[async_trait]
+impl LlmProvider for SequencedTextProvider {
+    async fn complete(&self, _request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.block_from_call.is_some_and(|limit| call >= limit) {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        }
+        tokio::time::sleep(self.delay).await;
+        Ok(ProviderResponse {
+            response_id: golutra_core::ProviderResponseId::new(),
+            message: Some(ProviderMessage {
+                role: ProviderRole::Assistant,
+                content: format!("response {call}"),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+                metadata: Default::default(),
+            }),
+            tool_calls: Vec::new(),
+            usage: ProviderUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                reasoning_tokens: None,
+                cached_input_tokens: None,
+                total_tokens: Some(15),
+                usage_source: UsageSource::Estimated,
+                raw: json!({"round": call}),
+            },
+            finish_reason: ProviderFinishReason::Stop,
+            raw_metadata: json!({"round": call}),
+        })
+    }
+
+    fn contract(&self) -> golutra_core::ProviderContract {
+        self.contract.clone()
+    }
+}
+
+#[async_trait]
+impl LlmProvider for EndlessProgressProvider {
+    async fn complete(&self, _request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    }
+
+    async fn complete_stream(
+        &self,
+        _request: ProviderRequest,
+        on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
+    ) -> Result<ProviderResponse, ProviderError> {
+        loop {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            on_event(ProviderStreamEvent::ReasoningDelta {
+                text: ".".to_owned(),
+            });
+        }
+    }
+
+    fn contract(&self) -> golutra_core::ProviderContract {
+        self.contract.clone()
+    }
 }
 
 #[async_trait]
@@ -915,13 +1060,16 @@ impl LlmProvider for FallbackTestProvider {
             Self::Failing(_) => Err(ProviderError::Failed {
                 message: "primary failed".to_owned(),
             }),
+            Self::Endless(_) => loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            },
             Self::Success(provider) => provider.complete(request).await,
         }
     }
 
     fn contract(&self) -> golutra_core::ProviderContract {
         match self {
-            Self::Failing(contract) => contract.as_ref().clone(),
+            Self::Failing(contract) | Self::Endless(contract) => contract.as_ref().clone(),
             Self::Success(provider) => provider.contract(),
         }
     }
@@ -968,6 +1116,8 @@ async fn pending_turn_queue_closes_atomically_when_the_loop_becomes_idle() {
         task_contract: None,
         output_schema: None,
         external_verifiers: Vec::new(),
+        max_elapsed_ms: None,
+        defer_external_verification: false,
         external_verifiers_require_os_sandbox: false,
         allow_network: false,
         yolo: false,
@@ -989,6 +1139,8 @@ async fn pending_turn_queue_closes_atomically_when_the_loop_becomes_idle() {
                 task_contract: None,
                 output_schema: None,
                 external_verifiers: Vec::new(),
+                max_elapsed_ms: None,
+                defer_external_verification: false,
                 external_verifiers_require_os_sandbox: false,
                 allow_network: false,
                 yolo: false,
@@ -1009,6 +1161,8 @@ async fn reserved_pending_turn_is_not_visible_until_its_event_is_durable() {
         task_contract: None,
         output_schema: None,
         external_verifiers: Vec::new(),
+        max_elapsed_ms: None,
+        defer_external_verification: false,
         external_verifiers_require_os_sandbox: false,
         allow_network: false,
         yolo: false,
@@ -1238,6 +1392,162 @@ async fn agent_harness_starts_and_settles_a_turn_through_one_public_seam() {
 
     assert_eq!(outcome.final_message.as_deref(), Some("harness completed"));
     assert_eq!(outcome.loop_decision.action, LoopAction::StopSuccess);
+}
+
+#[tokio::test]
+async fn deferred_external_verification_does_not_correct_missing_runtime_proof() {
+    let workspace = tempdir().expect("workspace");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = AssistantOnlyCorrectionProvider {
+        calls: calls.clone(),
+        contract: MockProvider::text_response("unused").contract(),
+    };
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let harness = AgentHarness::new(provider, ContextBuilder::default(), executor)
+        .with_deferred_external_verification(true);
+    let run = AgentRun::new(AgentTaskRequest {
+        session_id: SessionId::new(),
+        task_id: TaskId::new(),
+        turn_id: TurnId::new(),
+        objective: "change result.py and leave final validation to the evaluator".to_owned(),
+        completion_criteria: Vec::new(),
+        output_schema: None,
+        touched_code: true,
+        contributors: Vec::new(),
+        tools: vec!["write_file".to_owned()],
+    });
+    let (_handle, control) = agent_execution_channel(1);
+    let mut trace = Vec::new();
+
+    let outcome = harness
+        .execute(run, control, |event| trace.push(event))
+        .await
+        .expect("deferred candidate");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_ne!(outcome.verification.result, VerificationResult::Pass);
+    assert!(
+        !trace
+            .iter()
+            .any(|event| matches!(event, AgentLoopTraceEvent::CorrectionIssued(_)))
+    );
+}
+
+#[test]
+fn runtime_deadline_advisory_appears_once_the_final_budget_window_begins() {
+    assert!(runtime_deadline_advisory(600_000, 479_999).is_none());
+
+    let advisory = runtime_deadline_advisory(600_000, 480_000).expect("deadline advisory");
+    assert!(advisory.contains("about 120 seconds remain"));
+    assert!(advisory.contains("preserve and verify"));
+    assert!(advisory.contains("return a final response"));
+}
+
+#[tokio::test]
+async fn active_provider_session_reaches_verification_at_the_runtime_deadline() {
+    let workspace = tempdir().expect("workspace");
+    let provider = EndlessProgressProvider {
+        contract: MockProvider::text_response("unused").contract(),
+    };
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let limits = GovernorLimits {
+        max_elapsed_ms: 40,
+        ..GovernorLimits::default()
+    };
+    let agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor)
+        .with_governor(RuntimeGovernor::new(limits));
+    let mut trace = Vec::new();
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(1),
+        agent_loop.run_with_trace(
+            AgentTaskRequest {
+                session_id: SessionId::new(),
+                task_id: TaskId::new(),
+                turn_id: TurnId::new(),
+                objective: "return the best bounded result".to_owned(),
+                completion_criteria: Vec::new(),
+                output_schema: None,
+                touched_code: false,
+                contributors: Vec::new(),
+                tools: Vec::new(),
+            },
+            |event| trace.push(event),
+        ),
+    )
+    .await
+    .expect("runtime deadline must bound an active provider")
+    .expect("runtime deadline must produce an outcome");
+
+    assert_eq!(outcome.loop_decision.action, LoopAction::AskUser);
+    assert!(trace.iter().any(|event| matches!(
+        event,
+        AgentLoopTraceEvent::LoopGuardTriggered {
+            trigger: golutra_core::LoopGuardTrigger::RuntimeDeadline,
+            ..
+        }
+    )));
+    assert!(trace.iter().any(|event| matches!(
+        event,
+        AgentLoopTraceEvent::VerificationCompleted { terminal: true, .. }
+    )));
+    assert!(trace.iter().any(|event| matches!(
+        event,
+        AgentLoopTraceEvent::ProviderFailed { error, .. }
+            if error.contains("runtime wall-clock deadline")
+    )));
+}
+
+#[tokio::test]
+async fn fallback_deadline_failure_is_attributed_to_the_active_provider() {
+    let workspace = tempdir().expect("workspace");
+    let mut primary_contract = MockProvider::text_response("unused").contract();
+    primary_contract.provider_id = "primary".to_owned();
+    primary_contract.model_id = "primary-model".to_owned();
+    let mut fallback_contract = primary_contract.clone();
+    fallback_contract.provider_id = "fallback".to_owned();
+    fallback_contract.model_id = "fallback-model".to_owned();
+    let provider = FallbackTestProvider::Failing(Box::new(primary_contract));
+    let fallback = FallbackTestProvider::Endless(Box::new(fallback_contract));
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let limits = GovernorLimits {
+        max_elapsed_ms: 40,
+        ..GovernorLimits::default()
+    };
+    let agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor)
+        .with_fallback(fallback)
+        .with_governor(RuntimeGovernor::new(limits));
+    let mut trace = Vec::new();
+
+    agent_loop
+        .run_with_trace(
+            AgentTaskRequest {
+                session_id: SessionId::new(),
+                task_id: TaskId::new(),
+                turn_id: TurnId::new(),
+                objective: "return the best bounded fallback result".to_owned(),
+                completion_criteria: Vec::new(),
+                output_schema: None,
+                touched_code: false,
+                contributors: Vec::new(),
+                tools: Vec::new(),
+            },
+            |event| trace.push(event),
+        )
+        .await
+        .expect("deadline outcome");
+
+    assert!(trace.iter().any(|event| matches!(
+        event,
+        AgentLoopTraceEvent::ProviderFailed {
+            provider_id,
+            model_id,
+            error,
+            ..
+        } if provider_id == "fallback"
+            && model_id == "fallback-model"
+            && error.contains("runtime wall-clock deadline")
+    )));
 }
 
 #[tokio::test]
@@ -3038,6 +3348,8 @@ async fn queued_plain_turn_does_not_inherit_workspace_or_verifier_requirements()
             task_contract: None,
             output_schema: None,
             external_verifiers: Vec::new(),
+            max_elapsed_ms: None,
+            defer_external_verification: false,
             external_verifiers_require_os_sandbox: false,
             allow_network: false,
             yolo: false,
@@ -3093,6 +3405,8 @@ async fn queued_turn_uses_its_own_schema_and_completion_criteria() {
                 "required": ["answer"]
             })),
             external_verifiers: Vec::new(),
+            max_elapsed_ms: None,
+            defer_external_verification: false,
             external_verifiers_require_os_sandbox: false,
             allow_network: false,
             yolo: false,
@@ -3130,6 +3444,211 @@ async fn queued_turn_uses_its_own_schema_and_completion_criteria() {
             .any(|check| { check.kind == VerificationCheckKind::Schema && !check.passed })
     );
     assert_ne!(outcome.verification.result, VerificationResult::Pass);
+}
+
+#[tokio::test]
+async fn queued_turn_uses_its_own_elapsed_budget() {
+    let workspace = tempdir().expect("workspace");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = SequencedTextProvider {
+        calls: calls.clone(),
+        delay: Duration::ZERO,
+        block_from_call: Some(1),
+        contract: MockProvider::text_response("unused").contract(),
+    };
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let harness =
+        AgentHarness::new(provider, ContextBuilder::default(), executor).with_max_elapsed_ms(1_000);
+    let (handle, control) = agent_execution_channel(2);
+    let queued_turn_id = TurnId::new();
+    handle
+        .append_turn(PendingAgentTurn {
+            command_id: CommandId::new(),
+            turn_id: queued_turn_id,
+            content: "finish within the queued budget".to_owned(),
+            task_contract: Some(TaskContract::conversational(Vec::new())),
+            output_schema: None,
+            external_verifiers: Vec::new(),
+            max_elapsed_ms: Some(40),
+            defer_external_verification: true,
+            external_verifiers_require_os_sandbox: false,
+            allow_network: false,
+            yolo: false,
+            steer: false,
+        })
+        .await
+        .expect("queued turn");
+    let mut trace = Vec::new();
+
+    let outcome = tokio::time::timeout(
+        Duration::from_millis(500),
+        harness.execute(
+            AgentRun::new(AgentTaskRequest {
+                session_id: SessionId::new(),
+                task_id: TaskId::new(),
+                turn_id: TurnId::new(),
+                objective: "complete the initial turn".to_owned(),
+                completion_criteria: Vec::new(),
+                output_schema: None,
+                touched_code: false,
+                contributors: Vec::new(),
+                tools: Vec::new(),
+            }),
+            control,
+            |event| trace.push(event),
+        ),
+    )
+    .await
+    .expect("queued budget must bound the active provider")
+    .expect("deadline outcome");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(outcome.final_turn_id, queued_turn_id);
+    assert!(trace.iter().any(|event| matches!(
+        event,
+        AgentLoopTraceEvent::PendingTurnStarted(turn)
+            if turn.max_elapsed_ms == Some(40) && turn.defer_external_verification
+    )));
+    assert!(trace.iter().any(|event| matches!(
+        event,
+        AgentLoopTraceEvent::LoopGuardTriggered {
+            trigger: golutra_core::LoopGuardTrigger::RuntimeDeadline,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn queued_turn_without_override_restores_the_runtime_elapsed_budget() {
+    let workspace = tempdir().expect("workspace");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = SequencedTextProvider {
+        calls: calls.clone(),
+        delay: Duration::from_millis(60),
+        block_from_call: None,
+        contract: MockProvider::text_response("unused").contract(),
+    };
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let harness =
+        AgentHarness::new(provider, ContextBuilder::default(), executor).with_max_elapsed_ms(500);
+    let (handle, control) = agent_execution_channel(2);
+    let queued_turn_id = TurnId::new();
+    handle
+        .append_turn(PendingAgentTurn {
+            command_id: CommandId::new(),
+            turn_id: queued_turn_id,
+            content: "use the default runtime budget".to_owned(),
+            task_contract: Some(TaskContract::conversational(Vec::new())),
+            output_schema: None,
+            external_verifiers: Vec::new(),
+            max_elapsed_ms: None,
+            defer_external_verification: false,
+            external_verifiers_require_os_sandbox: false,
+            allow_network: false,
+            yolo: false,
+            steer: false,
+        })
+        .await
+        .expect("queued turn");
+    let run = AgentRun::new(AgentTaskRequest {
+        session_id: SessionId::new(),
+        task_id: TaskId::new(),
+        turn_id: TurnId::new(),
+        objective: "complete the initial turn".to_owned(),
+        completion_criteria: Vec::new(),
+        output_schema: None,
+        touched_code: false,
+        contributors: Vec::new(),
+        tools: Vec::new(),
+    })
+    .with_max_elapsed_ms(100);
+    let mut trace = Vec::new();
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(1),
+        harness.execute(run, control, |event| trace.push(event)),
+    )
+    .await
+    .expect("queued turn must receive a fresh default budget")
+    .expect("queued turn outcome");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(outcome.final_turn_id, queued_turn_id);
+    assert_eq!(outcome.loop_decision.action, LoopAction::StopSuccess);
+    assert!(!trace.iter().any(|event| matches!(
+        event,
+        AgentLoopTraceEvent::LoopGuardTriggered {
+            trigger: golutra_core::LoopGuardTrigger::RuntimeDeadline,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn queued_turn_resets_deferred_external_verification() {
+    let workspace = tempdir().expect("workspace");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = QueuedWriteCorrectionProvider {
+        calls: calls.clone(),
+        contract: MockProvider::text_response("unused").contract(),
+    };
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let harness = AgentHarness::new(provider, ContextBuilder::default(), executor)
+        .with_deferred_external_verification(true);
+    let (handle, control) = agent_execution_channel(2);
+    let queued_turn_id = TurnId::new();
+    let queued_contract = TaskContract {
+        workspace_change: WorkspaceChangeRequirement::Required,
+        require_objective_validation: true,
+        max_correction_rounds: 1,
+        ..TaskContract::default()
+    };
+    handle
+        .append_turn(PendingAgentTurn {
+            command_id: CommandId::new(),
+            turn_id: queued_turn_id,
+            content: "write and verify result.py".to_owned(),
+            task_contract: Some(queued_contract),
+            output_schema: None,
+            external_verifiers: Vec::new(),
+            max_elapsed_ms: None,
+            defer_external_verification: false,
+            external_verifiers_require_os_sandbox: false,
+            allow_network: false,
+            yolo: false,
+            steer: false,
+        })
+        .await
+        .expect("queued turn");
+    let mut trace = Vec::new();
+
+    let outcome = harness
+        .execute(
+            AgentRun::new(AgentTaskRequest {
+                session_id: SessionId::new(),
+                task_id: TaskId::new(),
+                turn_id: TurnId::new(),
+                objective: "complete the initial turn".to_owned(),
+                completion_criteria: Vec::new(),
+                output_schema: None,
+                touched_code: false,
+                contributors: Vec::new(),
+                tools: vec!["write_file".to_owned()],
+            })
+            .with_deferred_external_verification(true),
+            control,
+            |event| trace.push(event),
+        )
+        .await
+        .expect("queued turn outcome");
+
+    assert_eq!(outcome.final_turn_id, queued_turn_id);
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    assert!(
+        trace
+            .iter()
+            .any(|event| matches!(event, AgentLoopTraceEvent::CorrectionIssued(_)))
+    );
 }
 
 #[tokio::test]

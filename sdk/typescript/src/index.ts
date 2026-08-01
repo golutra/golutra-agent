@@ -163,6 +163,8 @@ export interface ThreadRunOptions {
   completionCriteria?: readonly string[];
   allowNetwork?: boolean;
   yolo?: boolean;
+  maxElapsedMs?: number;
+  deferExternalVerification?: boolean;
   externalVerifiers?: readonly ExternalVerificationSpec[];
   discoverProjectVerifiers?: boolean;
 }
@@ -208,8 +210,12 @@ export class Thread {
       prompt,
       allow_network: options.allowNetwork ?? false,
       yolo: options.yolo ?? false,
+      defer_external_verification: options.deferExternalVerification ?? false,
       completion_criteria: [...(options.completionCriteria ?? [])].filter((value) => value.trim()),
     };
+    if (options.maxElapsedMs !== undefined) {
+      params.max_elapsed_ms = options.maxElapsedMs;
+    }
     if (options.externalVerifiers !== undefined || options.discoverProjectVerifiers === false) {
       params.external_verifiers = [...(options.externalVerifiers ?? [])];
     }

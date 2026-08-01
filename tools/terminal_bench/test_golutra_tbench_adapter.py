@@ -1,7 +1,6 @@
 import importlib.util
 import json
 import os
-import sqlite3
 import sys
 import types
 import unittest
@@ -127,6 +126,24 @@ class AdapterHelpersTest(unittest.TestCase):
                 ADAPTER._terminal_bench_agent_timeout_sec(logging_dir), 120.0
             )
 
+    def test_runtime_budget_reserves_setup_and_finalization_time(self):
+        self.assertEqual(
+            ADAPTER._runtime_elapsed_budget_ms(
+                agent_timeout_sec=600.0,
+                setup_elapsed_sec=40.0,
+                finalization_reserve_sec=25.0,
+            ),
+            535_000,
+        )
+        self.assertEqual(
+            ADAPTER._runtime_elapsed_budget_ms(
+                agent_timeout_sec=10.0,
+                setup_elapsed_sec=8.0,
+                finalization_reserve_sec=25.0,
+            ),
+            1_000,
+        )
+
     def test_agent_command_timeout_interrupts_the_runtime(self):
         class Result:
             def __init__(self, output: bytes = b""):
@@ -217,6 +234,13 @@ class AdapterHelpersTest(unittest.TestCase):
             self.assertIsNotNone(session.command)
             self.assertIn("--yolo", session.command.command)
             self.assertIn("--defer-external-verification", session.command.command)
+            budget_match = ADAPTER.re.search(
+                r"--max-elapsed-ms (\d+)", session.command.command
+            )
+            self.assertIsNotNone(budget_match)
+            assert budget_match is not None
+            self.assertGreaterEqual(int(budget_match.group(1)), 1_000)
+            self.assertLessEqual(int(budget_match.group(1)), 5_000)
             self.assertGreater(session.command.max_timeout_sec, 14.0)
             self.assertLessEqual(session.command.max_timeout_sec, 15.0)
             self.assertEqual(session.sent_keys, [(["C-c"], 0.1)])
@@ -251,6 +275,8 @@ class AdapterHelpersTest(unittest.TestCase):
             self.assertEqual(
                 observation["facts"]["timeout_class"], "agent_timeout"
             )
+            self.assertIn("runtime_max_elapsed_ms", observation["facts"])
+            self.assertEqual(observation["facts"]["finalization_reserve_sec"], 5.01)
 
             success_session = Session(times_out=False)
             with patch.object(agent, "_start_result_collector"):
@@ -267,8 +293,18 @@ class AdapterHelpersTest(unittest.TestCase):
                 [call[1]["container_dir"] for call in success_session.copy_calls],
                 "successful agent execution must not expose hidden evaluator files",
             )
+            completed_observation = json.loads(
+                (logging_dir.parent / "golutra-adapter-observation.json").read_text()
+            )
+            self.assertEqual(completed_observation["status"], "completed")
+            self.assertEqual(
+                completed_observation["facts"]["agent_timeout_sec"], 10.0
+            )
+            self.assertIn(
+                "runtime_max_elapsed_ms", completed_observation["facts"]
+            )
 
-    def test_runtime_readiness_reads_candidate_event_from_durable_sqlite(self):
+    def test_runtime_readiness_uses_manifest_without_opening_live_sqlite(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             trial_root = root / "trial"
@@ -278,21 +314,26 @@ class AdapterHelpersTest(unittest.TestCase):
                 json.dumps({"terminal_outcome": {"kind": "in_progress"}}),
                 encoding="utf-8",
             )
-            connection = sqlite3.connect(run_dir / "state" / "runtime.sqlite")
-            connection.execute(
-                "CREATE TABLE runtime_events (sequence_no INTEGER, event_type TEXT, payload_json TEXT)"
+            (run_dir / "state" / "runtime.sqlite").write_bytes(
+                b"not a readable SQLite database"
             )
-            connection.execute(
-                "INSERT INTO runtime_events VALUES (1, 'CandidateReady', '{}')"
-            )
-            connection.commit()
-            connection.close()
             agent = ADAPTER.GolutraAgent(graceful_drain_timeout_sec=0.01)
 
             readiness = agent._runtime_readiness(trial_root)
 
-            self.assertEqual(readiness["state"], "candidate_ready")
-            self.assertEqual(readiness["event_type"], "CandidateReady")
+            self.assertEqual(
+                readiness,
+                {"state": "running", "terminal_outcome_kind": "in_progress"},
+            )
+
+            (run_dir / "manifest.json").write_text(
+                json.dumps({"terminal_outcome": {"kind": "result"}}),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                agent._runtime_readiness(trial_root),
+                {"state": "terminal", "terminal_outcome_kind": "result"},
+            )
 
     def test_agent_command_timeout_rejects_unbounded_values(self):
         with self.assertRaises(ValueError):
@@ -341,6 +382,23 @@ class AdapterHelpersTest(unittest.TestCase):
             self.assertEqual(observation["status"], "failed")
             self.assertEqual(observation["code"], "unsupported_architecture")
             self.assertEqual(observation["facts"], {"architecture": "s390x"})
+
+    def test_preflight_diagnostic_is_bounded_and_redacted(self):
+        raw = (
+            b"/installed-agent/golutra: /lib/aarch64-linux-gnu/libc.so.6: "
+            b"version `GLIBC_2.34' not found\n"
+            b"authorization=Bearer top-secret-value\n"
+            + b"x" * 10_000
+        )
+
+        detail = ADAPTER._bounded_diagnostic_output(raw)
+
+        self.assertIn("GLIBC_2.34", detail)
+        self.assertIn("authorization=[REDACTED]", detail)
+        self.assertNotIn("top-secret-value", detail)
+        self.assertLessEqual(
+            len(detail.encode("utf-8")), ADAPTER._FAILURE_DETAIL_MAX_BYTES
+        )
 
     def test_collector_resolution_is_explicit_and_repository_local(self):
         with TemporaryDirectory() as temporary:
@@ -483,13 +541,121 @@ class AdapterHelpersTest(unittest.TestCase):
                 ("sha256:trace", "runtime:test"),
             )
 
-    def test_external_digest_is_stable_for_mapping_order(self):
-        left = {"evaluation_id": "one", "assertions": [{"passed": True}]}
-        right = {"assertions": [{"passed": True}], "evaluation_id": "one"}
-        self.assertEqual(
-            ADAPTER._external_result_digest(left),
-            ADAPTER._external_result_digest(right),
-        )
+    def test_collector_owns_digest_canonicalization_and_correction_uses_bound_record(self):
+        with TemporaryDirectory() as temporary:
+            trial_root = Path(temporary)
+            run_dir = trial_root / "sessions/golutra-runtime"
+            trace_path = run_dir / "observations/session/task/trace.json"
+            trace_path.parent.mkdir(parents=True)
+            trace_path.write_text(
+                json.dumps(
+                    {
+                        "integrity": {"event_chain_digest": "sha256:trace"},
+                        "runtime_identity": "runtime:test",
+                        "evaluation": {"external_evaluations": []},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "terminal_outcome": {
+                            "kind": "result",
+                            "result": {
+                                "task_id": "task",
+                                "session_id": "session",
+                                "thread_id": "thread",
+                            },
+                        },
+                        "observations": {
+                            "sessions": [
+                                {
+                                    "session_id": "session",
+                                    "tasks": [
+                                        {
+                                            "task_id": "task",
+                                            "trace_path": "observations/session/task/trace.json",
+                                        }
+                                    ],
+                                }
+                            ]
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (trial_root / "results.json").write_text(
+                json.dumps(
+                    {
+                        "id": "trial",
+                        "task_id": "task",
+                        "is_resolved": False,
+                        "parser_results": {"test_output": "failed"},
+                        "trial_started_at": "2026-07-31T18:40:48.120000+00:00",
+                        "agent_started_at": "2026-07-31T18:40:49.120000+00:00",
+                        "agent_ended_at": "2026-07-31T18:40:50.120000+00:00",
+                        "test_started_at": "2026-07-31T18:40:51.120000+00:00",
+                        "test_ended_at": "2026-07-31T18:40:52.120000+00:00",
+                        "trial_ended_at": "2026-07-31T18:40:53.120000+00:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            agent = ADAPTER.GolutraAgent.__new__(ADAPTER.GolutraAgent)
+            agent._result_collection_timeout_sec = 0.1
+            agent._dataset_id = "terminal-bench"
+            agent._dataset_version = "local"
+            agent._model_name = "test/model"
+            agent._collector_binary = Path("/bin/golutra")
+            agent._graceful_drain_timeout_sec = 0.01
+            agent._max_external_correction_rounds = 1
+
+            def ingest(*_args, **_kwargs):
+                submitted = json.loads(
+                    (run_dir / "terminal-bench-evaluation.json").read_text()
+                )
+                self.assertEqual(submitted["result_digest"], "auto")
+                bound = dict(submitted)
+                bound["result_digest"] = "sha256:rust-canonical"
+                trace = json.loads(trace_path.read_text())
+                trace["evaluation"]["external_evaluations"] = [bound]
+                trace_path.write_text(json.dumps(trace), encoding="utf-8")
+                return types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+            with patch.object(ADAPTER.subprocess, "run", side_effect=ingest):
+                agent._collect_result(trial_root)
+
+            submitted = json.loads(
+                (run_dir / "terminal-bench-evaluation.json").read_text()
+            )
+            self.assertEqual(submitted["result_digest"], "auto")
+            correction = json.loads(
+                (run_dir / "terminal-bench-evaluation-correction.json").read_text()
+            )
+            self.assertEqual(
+                correction["source_evaluation"]["result_digest"],
+                "sha256:rust-canonical",
+            )
+
+            trace = json.loads(trace_path.read_text())
+            trace["evaluation"]["external_evaluations"] = []
+            trace_path.write_text(json.dumps(trace), encoding="utf-8")
+            completed = types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
+            with patch.object(ADAPTER.subprocess, "run", return_value=completed):
+                agent._collect_result(trial_root)
+
+            pending = json.loads(
+                (run_dir / "terminal-bench-evaluation.pending.json").read_text()
+            )
+            self.assertEqual(pending["status"], "pending_trace_binding")
+            self.assertEqual(
+                pending["evaluation_id"],
+                "terminal-bench:trial:task",
+            )
+            self.assertFalse(
+                (run_dir / "terminal-bench-evaluation-correction.json").exists()
+            )
 
     def test_external_failure_writes_an_isolated_unscored_continuation_plan(self):
         with TemporaryDirectory() as temporary:
@@ -837,7 +1003,7 @@ class AdapterHelpersTest(unittest.TestCase):
 
             self.assertEqual(ADAPTER._trace_token_usage(trial_root), (30, 5))
 
-    def test_collector_failure_mode_overrides_resolved_verdict(self):
+    def test_collector_retains_result_without_ingesting_an_in_progress_bundle(self):
         with TemporaryDirectory() as temporary:
             trial_root = Path(temporary)
             run_dir = trial_root / "sessions/golutra-runtime"
@@ -901,17 +1067,9 @@ class AdapterHelpersTest(unittest.TestCase):
             agent._collector_binary = Path("/bin/golutra")
             agent._graceful_drain_timeout_sec = 0.01
 
-            completed = types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
-            transient_failure = types.SimpleNamespace(
-                returncode=1, stdout="", stderr="database is locked"
-            )
-            with patch.object(
-                ADAPTER.subprocess,
-                "run",
-                side_effect=[transient_failure, completed],
-            ) as collector:
+            with patch.object(ADAPTER.subprocess, "run") as collector:
                 agent._collect_result(trial_root)
-            self.assertEqual(collector.call_count, 2)
+            collector.assert_not_called()
 
             record = json.loads(
                 (run_dir / "terminal-bench-evaluation.json").read_text()
@@ -931,8 +1089,13 @@ class AdapterHelpersTest(unittest.TestCase):
                 ],
                 "timed_out",
             )
-            self.assertFalse(
-                (run_dir / "terminal-bench-evaluation.pending.json").exists()
+            pending = json.loads(
+                (run_dir / "terminal-bench-evaluation.pending.json").read_text()
+            )
+            self.assertEqual(pending["status"], "pending_runtime_terminal")
+            self.assertEqual(
+                pending["record_path"],
+                str(run_dir / "terminal-bench-evaluation.json"),
             )
             self.assertFalse(stale_pending.exists())
 

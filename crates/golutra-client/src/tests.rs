@@ -1182,7 +1182,7 @@ async fn storage_maintenance_command_records_a_report_and_exposes_stats() {
 }
 
 #[tokio::test]
-async fn failure_objective_uses_the_started_queued_turn() {
+async fn failure_payload_uses_the_started_queued_turn() {
     let host = RuntimeHost::in_memory().await.expect("host");
     let task = HostedAgentTask {
         session_id: host.default_session_id(),
@@ -1202,12 +1202,92 @@ async fn failure_objective_uses_the_started_queued_turn() {
     .await
     .expect("turn event");
 
-    let objective = host
-        .objective_for_task_turn(&task, queued_turn_id)
+    let payload = host
+        .payload_for_task_turn(&task, queued_turn_id)
         .await
-        .expect("objective");
+        .expect("payload");
 
-    assert_eq!(objective, "second turn");
+    assert_eq!(prompt_from_payload(&payload), "second turn");
+}
+
+#[tokio::test]
+async fn queued_turn_options_drive_failure_outcome() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let session_id = host.default_session_id();
+    let task = HostedAgentTask {
+        session_id,
+        task_id: TaskId::new(),
+        turn_id: TurnId::new(),
+        payload: json!({
+            "prompt": "first turn",
+            "defer_external_verification": false,
+        }),
+    };
+    let queued_turn_id = TurnId::new();
+    let started = host
+        .lane_manager
+        .lock()
+        .await
+        .start_task(
+            host.workspace_id,
+            session_id,
+            task.task_id,
+            task.turn_id,
+            Actor {
+                kind: ActorKind::Cli,
+                id: "queued-failure-test".to_owned(),
+            },
+            host.next_sequence_no(),
+        )
+        .expect("task starts");
+    host.record_event(started.event).await.expect("task event");
+    let queued = host
+        .lane_manager
+        .lock()
+        .await
+        .queue_turn(session_id, queued_turn_id, host.next_sequence_no())
+        .expect("turn queues");
+    host.record_event(with_command_payload(
+        queued.event,
+        CommandId::new(),
+        json!({
+            "prompt": "queued turn",
+            "max_elapsed_ms": 345_000,
+            "defer_external_verification": true,
+        }),
+    ))
+    .await
+    .expect("queued event");
+    host.lane_manager
+        .lock()
+        .await
+        .start_queued_turn(session_id, queued_turn_id)
+        .expect("queued turn starts");
+
+    host.record_task_execution_failure(&task, ClientError::TaskCancelled)
+        .await
+        .expect("failure outcome");
+    let events = host
+        .repositories
+        .events
+        .load(session_id, Some(task.task_id), None)
+        .await
+        .expect("events");
+    let terminal = events
+        .iter()
+        .rev()
+        .find(|event| event.event_type.is_task_terminal())
+        .expect("terminal event");
+
+    assert_eq!(terminal.turn_id, Some(queued_turn_id));
+    assert_eq!(
+        terminal.payload.pointer("/outcome/external_verification"),
+        Some(&json!("pending"))
+    );
+    assert!(events.iter().any(|event| {
+        event.event_type == RuntimeEventType::ExternalVerificationRequested
+            && event.turn_id == Some(queued_turn_id)
+    }));
 }
 
 #[cfg(unix)]
@@ -1421,7 +1501,13 @@ async fn queued_prompt_records_each_user_and_assistant_turn() {
         .to_owned();
 
     let queued = transport
-        .send_command(command(session_id, "what happened next"))
+        .send_command(command_with_payload(
+            session_id,
+            json!({
+                "prompt": "what happened next",
+                "defer_external_verification": true,
+            }),
+        ))
         .await
         .expect("queued prompt");
     let mut deny = command(session_id, "unused");
@@ -1465,6 +1551,15 @@ async fn queued_prompt_records_each_user_and_assistant_turn() {
     assistant_turns.sort_unstable();
     assistant_turns.dedup();
     assert_eq!(assistant_turns, user_turns);
+    let terminal = events
+        .iter()
+        .rev()
+        .find(|event| event.event_type.is_task_terminal())
+        .expect("terminal event");
+    assert_eq!(
+        terminal.payload.pointer("/outcome/external_verification"),
+        Some(&json!("pending"))
+    );
     let started = events
         .iter()
         .find(|event| event.event_type == RuntimeEventType::TurnStarted)
@@ -1828,6 +1923,93 @@ async fn successful_task_quarantines_reviews_retrieves_and_rolls_back_project_me
     assert!(!retrieved_before_review);
     assert!(retrieved_after_review);
     assert!(rollback.accepted);
+}
+
+#[tokio::test]
+async fn deferred_external_verification_survives_provider_failure() {
+    let _provider = IsolatedGlobalMockProvider::install().await;
+    let transport = EmbeddedTransport::in_memory().await.expect("transport");
+    let session_id = transport.default_session_id();
+    let mut prompt = command(session_id, "reproduce provider failure");
+    prompt.payload["mock_provider_failure"] = json!(true);
+    prompt.payload["defer_external_verification"] = json!(true);
+
+    transport.send_command(prompt).await.expect("failed task");
+    wait_for_status(&transport, session_id, TaskStatus::Failed).await;
+    let events = transport
+        .host
+        .repositories
+        .events
+        .load(session_id, None, None)
+        .await
+        .expect("events");
+    let terminal = events
+        .iter()
+        .rev()
+        .find(|event| event.event_type.is_task_terminal())
+        .expect("terminal event");
+
+    assert_eq!(
+        terminal.payload.pointer("/outcome/external_verification"),
+        Some(&json!("pending"))
+    );
+    assert!(events.iter().any(|event| {
+        event.event_type == RuntimeEventType::ExternalVerificationRequested
+            && event.payload.pointer("/outcome/external_verification") == Some(&json!("pending"))
+    }));
+}
+
+#[tokio::test]
+async fn deferred_external_verification_survives_abort() {
+    let workspace = tempdir().expect("workspace");
+    let _provider = IsolatedGlobalMockProvider::install().await;
+    let transport = EmbeddedTransport::for_cwd(workspace.path())
+        .await
+        .expect("transport");
+    let session_id = transport.default_session_id();
+
+    transport
+        .send_command(command_with_payload(
+            session_id,
+            json!({
+                "prompt": "sleep",
+                "defer_external_verification": true,
+            }),
+        ))
+        .await
+        .expect("running task");
+    wait_for_status(&transport, session_id, TaskStatus::WaitingApproval).await;
+    let abort = transport
+        .send_command(runtime_command(
+            session_id,
+            SessionCommandKind::Abort,
+            json!({}),
+        ))
+        .await
+        .expect("abort");
+    assert!(abort.accepted);
+    wait_for_status(&transport, session_id, TaskStatus::Cancelled).await;
+    let events = transport
+        .host
+        .repositories
+        .events
+        .load(session_id, None, None)
+        .await
+        .expect("events");
+    let terminal = events
+        .iter()
+        .rev()
+        .find(|event| event.event_type.is_task_terminal())
+        .expect("terminal event");
+
+    assert_eq!(
+        terminal.payload.pointer("/outcome/external_verification"),
+        Some(&json!("pending"))
+    );
+    assert!(events.iter().any(|event| {
+        event.event_type == RuntimeEventType::ExternalVerificationRequested
+            && event.payload.pointer("/outcome/external_verification") == Some(&json!("pending"))
+    }));
 }
 
 #[tokio::test]
@@ -5968,6 +6150,142 @@ async fn direct_protocol_rejects_non_boolean_yolo_capability() {
 }
 
 #[tokio::test]
+async fn direct_protocol_rejects_invalid_elapsed_budgets() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let session_id = host.default_session_id();
+
+    for value in [json!(0), json!("1000"), json!(-1)] {
+        let error = host
+            .clone()
+            .handle_command(command_with_payload(
+                session_id,
+                json!({"prompt": "do not start", "max_elapsed_ms": value}),
+            ))
+            .await
+            .expect_err("invalid elapsed budget must be rejected");
+
+        assert!(matches!(
+            error,
+            ClientError::TaskExecution(message)
+                if message == "max_elapsed_ms must be a positive integer"
+        ));
+    }
+}
+
+#[tokio::test]
+async fn queued_turn_persists_its_runtime_and_evaluator_options() {
+    let workspace = tempdir().expect("workspace");
+    let _provider = IsolatedGlobalMockProvider::install().await;
+    let transport = EmbeddedTransport::for_cwd(workspace.path())
+        .await
+        .expect("transport");
+    let session_id = transport.default_session_id();
+
+    transport
+        .send_command(command(session_id, "sleep"))
+        .await
+        .expect("blocking task");
+    wait_for_status(&transport, session_id, TaskStatus::WaitingApproval).await;
+
+    let queued = transport
+        .send_command(command_with_payload(
+            session_id,
+            json!({
+                "prompt": "finish under the queued deadline",
+                "max_elapsed_ms": 345_000,
+                "defer_external_verification": true,
+            }),
+        ))
+        .await
+        .expect("queued command");
+    assert!(queued.accepted);
+
+    let events = transport
+        .host
+        .repositories
+        .events
+        .load(session_id, None, None)
+        .await
+        .expect("events");
+    let queued_payload = events
+        .iter()
+        .find(|event| {
+            event.event_type == RuntimeEventType::TurnQueued
+                && event
+                    .payload
+                    .pointer("/payload/prompt")
+                    .and_then(Value::as_str)
+                    == Some("finish under the queued deadline")
+        })
+        .and_then(|event| event.payload.get("payload"))
+        .expect("durable queued payload");
+    assert_eq!(queued_payload["max_elapsed_ms"], 345_000);
+    assert_eq!(queued_payload["defer_external_verification"], true);
+
+    transport
+        .send_command(runtime_command(
+            session_id,
+            SessionCommandKind::Abort,
+            json!({}),
+        ))
+        .await
+        .expect("release blocking task");
+    if let Some(control) = transport.host.task_controls.lock().await.get(&session_id) {
+        control.abort_handle.abort();
+    }
+    sleep(Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn per_turn_elapsed_budget_clamps_shell_execution() {
+    let workspace = tempdir().expect("workspace");
+    let _provider = IsolatedGlobalMockProvider::install().await;
+    let transport = EmbeddedTransport::for_cwd(workspace.path())
+        .await
+        .expect("transport");
+    let session_id = transport.default_session_id();
+
+    let ack = transport
+        .send_command(command_with_payload(
+            session_id,
+            json!({
+                "prompt": "sleep",
+                "yolo": true,
+                "max_elapsed_ms": 20,
+                "task_contract": {"max_correction_rounds": 0}
+            }),
+        ))
+        .await
+        .expect("bounded turn");
+    assert!(ack.accepted);
+    let state = wait_for_status(&transport, session_id, TaskStatus::Blocked).await;
+    let task_id = state["active_task_id"]
+        .as_str()
+        .expect("task id")
+        .parse::<TaskId>()
+        .expect("task id format");
+    let events = transport
+        .host
+        .repositories
+        .events
+        .load(session_id, Some(task_id), None)
+        .await
+        .expect("events");
+
+    assert!(events.iter().any(|event| {
+        event.event_type == RuntimeEventType::ToolCompleted
+            && event.payload["envelope"]["structured_facts"]["timed_out"] == true
+            && event.payload["envelope"]["structured_facts"]["requested_timeout_ms"]
+                .as_u64()
+                .is_some_and(|timeout| timeout <= 20)
+    }));
+    assert!(events.iter().any(|event| {
+        event.event_type == RuntimeEventType::LoopGuardTriggered
+            && event.payload["trigger"] == "runtime_deadline"
+    }));
+}
+
+#[tokio::test]
 async fn yolo_turn_writes_outside_the_workspace_without_approval() {
     let workspace = tempdir().expect("workspace");
     let outside = tempdir().expect("outside");
@@ -6811,6 +7129,8 @@ async fn runtime_recovery_rejects_a_pending_batch_that_changes_yolo_capability()
                     task_contract: Some(TaskContract::default()),
                     output_schema: None,
                     external_verifiers: Vec::new(),
+                    max_elapsed_ms: None,
+                    defer_external_verification: false,
                     external_verifiers_require_os_sandbox: false,
                     allow_network: false,
                     yolo,

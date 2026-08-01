@@ -1534,10 +1534,10 @@ async fn daemon_driver_enforces_binding_and_survives_disconnect_and_restart() {
     close_socket_driver(&mut driver_b, &mut child_b, "close-b").await;
     close_socket_driver(&mut driver_a, &mut child_a, "close-a").await;
     let terminal = wait_for_terminal_projection(&transport, session_id).await;
-    assert!(matches!(
-        terminal.status,
-        TaskStatus::Completed | TaskStatus::Partial
-    ));
+    assert!(
+        matches!(terminal.status, TaskStatus::Completed | TaskStatus::Partial),
+        "unexpected terminal projection after approval: {terminal:?}"
+    );
     let terminal_status = terminal.status;
     assert_eq!(
         terminal.task_id.map(|id| id.to_string()),

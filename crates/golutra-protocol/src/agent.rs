@@ -167,6 +167,13 @@ pub struct AgentTurnOptions {
     pub output_schema: Option<Value>,
     #[serde(default)]
     pub completion_criteria: Vec<String>,
+    /// Optional wall-clock budget for this turn. Active provider sessions and
+    /// newly scheduled provider, tool, verifier, or correction work are
+    /// bounded by this deadline so callers can retain a terminal candidate
+    /// before an outer harness timeout.
+    #[serde(default)]
+    #[schemars(range(min = 1))]
+    pub max_elapsed_ms: Option<u64>,
     /// Request network access for child tools. The runtime host may still
     /// reject this request when its capability is disabled.
     #[serde(default)]
@@ -196,6 +203,7 @@ impl Default for AgentTurnOptions {
             task_contract: None,
             output_schema: None,
             completion_criteria: Vec::new(),
+            max_elapsed_ms: None,
             allow_network: false,
             yolo: false,
             external_verifiers: Vec::new(),

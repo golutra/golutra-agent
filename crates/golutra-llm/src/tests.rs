@@ -80,7 +80,10 @@ async fn provider_response_rejects_oversized_content_length_before_buffering() {
                 .await
                 .expect("response");
     });
-    let response = reqwest::Client::new()
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("client")
         .get(format!("http://{address}"))
         .send()
         .await
@@ -91,6 +94,58 @@ async fn provider_response_rejects_oversized_content_length_before_buffering() {
         .expect_err("oversized response must be rejected");
 
     assert!(matches!(error, ProviderError::Malformed { .. }));
+}
+
+#[tokio::test]
+async fn truncated_provider_response_body_is_retryable() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut request = [0_u8; 1024];
+        let _ = socket.read(&mut request).await.expect("request");
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 128\r\nconnection: close\r\n\r\n{\"choices\":[]}",
+            )
+            .await
+            .expect("truncated response");
+    });
+    let response = reqwest::Client::new()
+        .get(format!("http://{address}"))
+        .send()
+        .await
+        .expect("HTTP response headers");
+
+    let error = response_json_or_error(response)
+        .await
+        .expect_err("truncated body must remain retryable");
+
+    assert!(
+        matches!(error, ProviderError::Unavailable { .. }),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn provider_request_transport_failure_is_retryable() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    drop(listener);
+
+    let error = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("client")
+        .get(format!("http://{address}"))
+        .send()
+        .await
+        .expect_err("closed listener must reject the request");
+
+    assert!(matches!(
+        provider_transport_error(error),
+        ProviderError::Unavailable { .. }
+    ));
 }
 
 #[tokio::test]
@@ -127,6 +182,19 @@ fn openai_tool_parameters_come_from_the_runtime_tool_contract() {
     let schema = openai_tool_schema(&contract);
 
     assert_eq!(schema["function"]["parameters"], input_schema);
+}
+
+#[test]
+fn shell_provider_description_distinguishes_lifetime_from_initial_wait() {
+    let description = provider_tool_description("shell");
+
+    assert!(description.contains("timeout_ms is the absolute process lifetime"));
+    assert!(description.contains("yield"));
+    assert!(description.contains("only controls the initial wait"));
+    assert!(description.contains("runtime-scoped"));
+    assert!(description.contains("do not use background=true"));
+    assert!(description.contains("nohup"));
+    assert!(description.contains("verify it before returning"));
 }
 
 #[test]

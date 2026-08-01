@@ -399,6 +399,14 @@ impl RuntimeHost {
             .unwrap_or(Value::Null);
         let objective = prompt_from_payload(&task_payload);
         let task_contract = replay_task_contract(&task_payload, &objective)?;
+        let max_elapsed_ms = task_payload
+            .get("max_elapsed_ms")
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0);
+        let defer_external_verification = task_payload
+            .get("defer_external_verification")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let external_verifiers = task_payload
             .get("external_verifiers")
             .cloned()
@@ -422,32 +430,32 @@ impl RuntimeHost {
         let harness = AgentHarness::new(provider.clone(), context_builder, tool_executor)
             .with_external_verifiers(external_verifiers);
         let (_control_handle, execution_control) = agent_execution_channel(1);
-        let outcome = harness
-            .execute(
-                AgentRun::new(AgentTaskRequest {
-                    session_id,
-                    task_id: source_task_id,
-                    turn_id: first_request.turn_id,
-                    objective,
-                    completion_criteria: completion_criteria_from_payload(&task_payload),
-                    output_schema: task_payload.get("output_schema").cloned(),
-                    touched_code,
-                    contributors: Vec::new(),
-                    tools: first_request
-                        .tools
-                        .iter()
-                        .map(|contract| contract.tool_name.clone())
-                        .collect(),
-                })
-                .with_replay_context(AgentReplayContext {
-                    initial_messages: first_request.messages,
-                    tools: first_request.tools,
-                })
-                .with_task_contract(task_contract),
-                execution_control,
-                |_| {},
-            )
-            .await;
+        let run = AgentRun::new(AgentTaskRequest {
+            session_id,
+            task_id: source_task_id,
+            turn_id: first_request.turn_id,
+            objective,
+            completion_criteria: completion_criteria_from_payload(&task_payload),
+            output_schema: task_payload.get("output_schema").cloned(),
+            touched_code,
+            contributors: Vec::new(),
+            tools: first_request
+                .tools
+                .iter()
+                .map(|contract| contract.tool_name.clone())
+                .collect(),
+        })
+        .with_replay_context(AgentReplayContext {
+            initial_messages: first_request.messages,
+            tools: first_request.tools,
+        })
+        .with_task_contract(task_contract)
+        .with_deferred_external_verification(defer_external_verification);
+        let run = match max_elapsed_ms {
+            Some(max_elapsed_ms) => run.with_max_elapsed_ms(max_elapsed_ms),
+            None => run,
+        };
+        let outcome = harness.execute(run, execution_control, |_| {}).await;
         let (provider_consumed, provider_remaining, mut mismatches) = provider.snapshot();
         let (tool_consumed, tool_remaining, tool_mismatches) = tool_backend.snapshot();
         mismatches.extend(tool_mismatches);

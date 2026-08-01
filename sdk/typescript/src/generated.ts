@@ -179,7 +179,11 @@ export type RuntimeEventType =
   | "replay_capsule_created"
   | "replay_executed"
   | "external_evaluation_ingested"
-  | "external_evaluation_compared";
+  | "external_evaluation_compared"
+  | "candidate_ready"
+  | "verification_ready"
+  | "external_verification_requested"
+  | "external_verification_feedback";
 export type RuntimeEventSource =
   | "runtime"
   | "provider"
@@ -859,6 +863,13 @@ export interface AgentTurnOptions {
    * interpreted by a shell.
    */
   external_verifiers?: ExternalVerificationSpec[];
+  /**
+   * Optional wall-clock budget for this turn. Active provider sessions and
+   * newly scheduled provider, tool, verifier, or correction work are
+   * bounded by this deadline so callers can retain a terminal candidate
+   * before an outer harness timeout.
+   */
+  max_elapsed_ms?: number | null;
   output_schema?: {
     [k: string]: unknown;
   };

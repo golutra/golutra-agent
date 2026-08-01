@@ -7,6 +7,33 @@ use super::*;
 const MAX_INLINE_CHANGE_FILES: usize = 32;
 const MAX_INLINE_DIFF_PREVIEWS: usize = 8;
 
+pub(super) fn task_outcome_from_verification(
+    task: &HostedAgentTask,
+    status: TaskStatus,
+    verification: &golutra_core::VerificationRecord,
+) -> golutra_core::TaskOutcome {
+    let defer_external_verification = task
+        .payload
+        .get("defer_external_verification")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    task_outcome_with_external_verification(status, verification, defer_external_verification)
+}
+
+pub(super) fn task_outcome_with_external_verification(
+    status: TaskStatus,
+    verification: &golutra_core::VerificationRecord,
+    defer_external_verification: bool,
+) -> golutra_core::TaskOutcome {
+    let external_verification = if defer_external_verification {
+        golutra_core::ExternalVerificationStatus::Pending
+    } else {
+        golutra_core::ExternalVerificationStatus::NotRequested
+    };
+    golutra_core::TaskOutcome::from_verification(status, verification)
+        .with_external_verification(external_verification)
+}
+
 #[derive(Clone)]
 pub(crate) struct CanonicalFactRecorder {
     host: Arc<RuntimeHost>,
@@ -577,11 +604,13 @@ impl RuntimeHost {
             .lane(task.session_id)
             .and_then(|lane| lane.active_turn_id)
             .unwrap_or(task.turn_id);
+        let active_payload = self.payload_for_task_turn(task, active_turn_id).await?;
         let failure_task = HostedAgentTask {
             turn_id: active_turn_id,
+            payload: active_payload,
             ..task.clone()
         };
-        let objective = self.objective_for_task_turn(task, active_turn_id).await?;
+        let objective = prompt_from_payload(&failure_task.payload);
         if matches!(error, ClientError::TaskCancelled) {
             let verification = self
                 .record_failed_verification(
@@ -593,7 +622,7 @@ impl RuntimeHost {
             self.finish_lane_with_outcome(
                 &failure_task,
                 TaskStatus::Cancelled,
-                golutra_core::TaskOutcome::from_verification(TaskStatus::Cancelled, &verification),
+                task_outcome_from_verification(&failure_task, TaskStatus::Cancelled, &verification),
             )
             .await?;
             self.schedule_task_evaluation_best_effort(
@@ -641,7 +670,7 @@ impl RuntimeHost {
         self.finish_lane_with_outcome(
             &failure_task,
             TaskStatus::Failed,
-            golutra_core::TaskOutcome::from_verification(TaskStatus::Failed, &verification),
+            task_outcome_from_verification(&failure_task, TaskStatus::Failed, &verification),
         )
         .await?;
         self.schedule_task_evaluation_best_effort(
@@ -723,25 +752,32 @@ impl RuntimeHost {
         Ok(verification)
     }
 
-    pub(super) async fn objective_for_task_turn(
+    pub(super) async fn payload_for_task_turn(
         &self,
         task: &HostedAgentTask,
         turn_id: TurnId,
-    ) -> Result<String, ClientError> {
+    ) -> Result<Value, ClientError> {
         if turn_id == task.turn_id {
-            return Ok(prompt_from_payload(&task.payload));
+            return Ok(task.payload.clone());
         }
         let events = self
             .repositories
             .events
-            .load_recent(
-                task.session_id,
-                Some(task.task_id),
-                None,
-                MAX_HISTORY_SOURCE_EVENTS,
-            )
+            .load(task.session_id, Some(task.task_id), None)
             .await?;
-        Ok(events
+        if let Some(payload) = events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.turn_id == Some(turn_id) && event.event_type == RuntimeEventType::TurnQueued
+            })
+            .and_then(|event| event.payload.get("payload"))
+            .filter(|payload| payload.is_object())
+        {
+            return Ok(payload.clone());
+        }
+        let mut payload = task.payload.clone();
+        if let Some(prompt) = events
             .iter()
             .rev()
             .find(|event| {
@@ -749,8 +785,10 @@ impl RuntimeHost {
             })
             .and_then(|event| event.payload.get("prompt"))
             .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| prompt_from_payload(&task.payload)))
+        {
+            payload["prompt"] = Value::String(prompt.to_owned());
+        }
+        Ok(payload)
     }
 
     pub(super) fn execution_workspace_root(&self) -> Result<PathBuf, ClientError> {

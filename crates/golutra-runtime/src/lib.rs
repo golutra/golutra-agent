@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::Path,
     sync::{Arc, Mutex as StdMutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -108,6 +108,7 @@ pub struct AgentLoopOutcome {
     pub tool_reports: Vec<ToolExecutionReport>,
     pub final_message: Option<String>,
     pub final_turn_id: TurnId,
+    pub defer_external_verification: bool,
 }
 
 /// Captured provider inputs used to re-enter the ordinary AgentLoop without
@@ -116,6 +117,12 @@ pub struct AgentLoopOutcome {
 pub struct AgentReplayContext {
     pub initial_messages: Vec<ProviderMessage>,
     pub tools: Vec<ToolContract>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AgentTurnOverrides {
+    pub max_elapsed_ms: Option<u64>,
+    pub defer_external_verification: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +138,12 @@ pub struct PendingAgentTurn {
     pub output_schema: Option<Value>,
     /// Verifiers belong to this turn and must not leak across queued prompts.
     pub external_verifiers: Vec<ExternalVerificationSpec>,
+    /// Optional wall-clock budget for this queued turn. `None` restores the
+    /// runtime default instead of inheriting the active turn's override.
+    pub max_elapsed_ms: Option<u64>,
+    /// Deferred evaluator closure belongs to this queued turn and must not
+    /// leak from the active turn.
+    pub defer_external_verification: bool,
     /// Auto-discovered repository commands are untrusted until the caller has
     /// explicitly opted in, so they require an OS-enforced sandbox.
     pub external_verifiers_require_os_sandbox: bool,
@@ -394,6 +407,7 @@ pub(crate) struct AgentLoop<P> {
     before_side_effect_recorder: Option<Arc<dyn BeforeSideEffectRecorder>>,
     external_verifiers: Vec<ExternalVerificationSpec>,
     external_verifiers_require_os_sandbox: bool,
+    defer_external_verification: bool,
 }
 
 impl<P> AgentLoop<P>
@@ -417,6 +431,7 @@ where
             before_side_effect_recorder: None,
             external_verifiers: Vec::new(),
             external_verifiers_require_os_sandbox: false,
+            defer_external_verification: false,
         }
     }
 
@@ -492,6 +507,7 @@ where
             move |observation| sink.emit(observation),
             task_contract,
             None,
+            AgentTurnOverrides::default(),
         )
         .await
     }
@@ -513,6 +529,7 @@ where
             trace,
             task_contract,
             None,
+            AgentTurnOverrides::default(),
         )
         .await
     }
@@ -524,6 +541,7 @@ where
         mut trace: F,
         task_contract: TaskContract,
         replay_context: Option<AgentReplayContext>,
+        turn_overrides: AgentTurnOverrides,
     ) -> Result<AgentLoopOutcome, AgentLoopError>
     where
         F: FnMut(AgentLoopTraceEvent) + Send,
@@ -548,10 +566,23 @@ where
         let mut repeated_failure_count = 0_u32;
         let mut failure_families = FailureFamilyLedger::default();
         let mut empty_response_count = 0_u32;
-        let started_at = Instant::now();
+        let default_max_elapsed_ms = self.governor.limits().max_elapsed_ms;
+        let mut current_max_elapsed_ms = turn_overrides
+            .max_elapsed_ms
+            .unwrap_or(default_max_elapsed_ms)
+            .max(1);
+        let mut current_defer_external_verification = turn_overrides
+            .defer_external_verification
+            .unwrap_or(self.defer_external_verification);
+        let mut current_governor =
+            governor_with_max_elapsed_ms(&self.governor, current_max_elapsed_ms);
+        let mut current_turn_started_at = Instant::now();
+        let mut runtime_deadline = deadline_from_budget(current_max_elapsed_ms);
         let mut tool_call_count = 0_u32;
         let mut failed_tool_call_count = 0_u32;
         let mut consecutive_failed_tool_call_count = 0_u32;
+        let mut deadline_advisory_emitted = false;
+        let mut runtime_deadline_guard_emitted = false;
         let mut estimated_cost_microusd: Option<u64> = None;
         let mut governor_action = None;
         let mut goal_ledger = GoalLedger {
@@ -611,7 +642,14 @@ where
         };
         let base_plan = match base_plan_result {
             Ok(plan) => plan,
-            Err(error) => return Ok(context_guard::outcome(&request, error, &mut trace)),
+            Err(error) => {
+                return Ok(context_guard::outcome(
+                    &request,
+                    error,
+                    &mut trace,
+                    current_defer_external_verification,
+                ));
+            }
         };
         if !base_plan.trimmed_contributors.is_empty() {
             trace(AgentLoopTraceEvent::ContextCompacted {
@@ -712,7 +750,7 @@ where
                         step_snapshot.clone(),
                         "context-overflow",
                         false,
-                        elapsed_millis(started_at),
+                        elapsed_millis(current_turn_started_at),
                         &mut trace,
                     );
                     guard_reason = Some(reason);
@@ -723,7 +761,8 @@ where
                     contributors: plan.contributors.clone(),
                     planned_input_tokens: plan.budget_snapshot.planned_input_tokens,
                 });
-                let governance = self.governor.evaluate(
+                let provider_elapsed_ms = elapsed_millis(current_turn_started_at);
+                let governance = current_governor.evaluate(
                     &goal_ledger,
                     &GovernorObservation {
                         phase: GovernorPhase::Provider,
@@ -732,7 +771,7 @@ where
                         failed_tool_calls: failed_tool_call_count,
                         consecutive_failed_tool_calls: consecutive_failed_tool_call_count,
                         planned_input_tokens: plan.budget_snapshot.planned_input_tokens,
-                        elapsed_ms: elapsed_millis(started_at),
+                        elapsed_ms: provider_elapsed_ms,
                         latest_action: current_objective.clone(),
                         estimated_cost_microusd,
                         policy_decision: None,
@@ -747,14 +786,18 @@ where
                 }
                 trace(AgentLoopTraceEvent::GovernorDecided(governance));
                 if !permits_execution {
+                    let trigger = if provider_elapsed_ms >= current_max_elapsed_ms {
+                        runtime_deadline_guard_emitted = true;
+                        golutra_core::LoopGuardTrigger::RuntimeDeadline
+                    } else if current_governor.limits().max_iterations > 0
+                        && iteration >= current_governor.limits().max_iterations
+                    {
+                        golutra_core::LoopGuardTrigger::MaxIteration
+                    } else {
+                        golutra_core::LoopGuardTrigger::ContextOverflow
+                    };
                     trace(AgentLoopTraceEvent::LoopGuardTriggered {
-                        trigger: if self.governor.limits().max_iterations > 0
-                            && iteration >= self.governor.limits().max_iterations
-                        {
-                            golutra_core::LoopGuardTrigger::MaxIteration
-                        } else {
-                            golutra_core::LoopGuardTrigger::ContextOverflow
-                        },
+                        trigger,
                         reason: guard_reason
                             .clone()
                             .unwrap_or_else(|| "runtime governor blocked execution".to_owned()),
@@ -764,7 +807,7 @@ where
                         step_snapshot.clone(),
                         "governor-blocked",
                         false,
-                        elapsed_millis(started_at),
+                        elapsed_millis(current_turn_started_at),
                         &mut trace,
                     );
                     break;
@@ -790,11 +833,29 @@ where
                     model_id: provider_request.model_id.clone(),
                 });
                 let provider_result = self
-                    .complete_with_retry(provider_request.clone(), &mut control, &mut trace)
+                    .complete_with_retry(
+                        provider_request.clone(),
+                        runtime_deadline,
+                        &mut control,
+                        &mut trace,
+                    )
                     .await;
                 let (provider_response, completed_request) = match provider_result {
                     Ok(result) => result,
-                    Err(error) => {
+                    Err(provider_session::ProviderSessionError::DeadlineExceeded { reason }) => {
+                        runtime_deadline_guard_emitted = true;
+                        finish_runtime_step(
+                            &mut step_machine,
+                            step_snapshot.clone(),
+                            "runtime-deadline",
+                            false,
+                            elapsed_millis(current_turn_started_at),
+                            &mut trace,
+                        );
+                        guard_reason = Some(reason);
+                        break 'agent_loop;
+                    }
+                    Err(provider_session::ProviderSessionError::Provider(error)) => {
                         trace(AgentLoopTraceEvent::ProviderFailed {
                             request_id: provider_request.request_id,
                             provider_id: provider_request.provider_id.clone(),
@@ -806,7 +867,7 @@ where
                             step_snapshot.clone(),
                             format!("provider-error:{error}"),
                             false,
-                            elapsed_millis(started_at),
+                            elapsed_millis(current_turn_started_at),
                             &mut trace,
                         );
                         return Err(if error == ProviderError::Cancelled {
@@ -902,7 +963,7 @@ where
                                 step_snapshot.clone(),
                                 "empty-response",
                                 false,
-                                elapsed_millis(started_at),
+                                elapsed_millis(current_turn_started_at),
                                 &mut trace,
                             );
                             trace(AgentLoopTraceEvent::RetryScheduled {
@@ -936,7 +997,7 @@ where
                             step_snapshot.clone(),
                             "empty-response",
                             false,
-                            elapsed_millis(started_at),
+                            elapsed_millis(current_turn_started_at),
                             &mut trace,
                         );
                         guard_reason = Some(reason);
@@ -944,6 +1005,7 @@ where
                     }
 
                     if let Some(pending_turn) = control.pending_turns.take_or_close().await {
+                        let completed_turn_elapsed_ms = elapsed_millis(current_turn_started_at);
                         current_turn_id = pending_turn.turn_id;
                         current_objective = pending_turn.content.clone();
                         current_task_contract = pending_turn
@@ -954,6 +1016,18 @@ where
                         current_external_verifiers = pending_turn.external_verifiers.clone();
                         current_external_verifiers_require_os_sandbox =
                             pending_turn.external_verifiers_require_os_sandbox;
+                        current_max_elapsed_ms = pending_turn
+                            .max_elapsed_ms
+                            .unwrap_or(default_max_elapsed_ms)
+                            .max(1);
+                        current_defer_external_verification =
+                            pending_turn.defer_external_verification;
+                        current_governor =
+                            governor_with_max_elapsed_ms(&self.governor, current_max_elapsed_ms);
+                        current_turn_started_at = Instant::now();
+                        runtime_deadline = deadline_from_budget(current_max_elapsed_ms);
+                        deadline_advisory_emitted = false;
+                        runtime_deadline_guard_emitted = false;
                         current_task_contract
                             .validate()
                             .map_err(AgentLoopError::TaskContract)?;
@@ -1001,7 +1075,7 @@ where
                             step_snapshot.clone(),
                             step_fingerprint.clone(),
                             true,
-                            elapsed_millis(started_at),
+                            completed_turn_elapsed_ms,
                             &mut trace,
                         );
                         continue;
@@ -1012,7 +1086,7 @@ where
                         step_fingerprint,
                         true,
                         false,
-                        elapsed_millis(started_at),
+                        elapsed_millis(current_turn_started_at),
                         &mut trace,
                     );
                     if step_completion.should_stop {
@@ -1066,7 +1140,7 @@ where
                 for tool_call in provider_response.tool_calls {
                     control.wait_until_runnable().await?;
                     let tool_action = format!("{} {}", tool_call.tool_name, tool_call.arguments);
-                    let governance = self.governor.evaluate(
+                    let governance = current_governor.evaluate(
                         &goal_ledger,
                         &GovernorObservation {
                             phase: GovernorPhase::Tool,
@@ -1075,7 +1149,7 @@ where
                             failed_tool_calls: failed_tool_call_count,
                             consecutive_failed_tool_calls: consecutive_failed_tool_call_count,
                             planned_input_tokens: plan.budget_snapshot.planned_input_tokens,
-                            elapsed_ms: elapsed_millis(started_at),
+                            elapsed_ms: elapsed_millis(current_turn_started_at),
                             latest_action: tool_action,
                             estimated_cost_microusd,
                             policy_decision: None,
@@ -1095,7 +1169,7 @@ where
                             step_snapshot.clone(),
                             step_fingerprint.clone(),
                             false,
-                            elapsed_millis(started_at),
+                            elapsed_millis(current_turn_started_at),
                             &mut trace,
                         );
                         break 'agent_loop;
@@ -1266,10 +1340,12 @@ where
                                             control.wait_until_runnable().await?;
                                             clamp_shell_timeout_to_budget(
                                                 &mut tool_request,
-                                                self.governor
+                                                current_governor
                                                     .limits()
                                                     .max_elapsed_ms
-                                                    .saturating_sub(elapsed_millis(started_at))
+                                                    .saturating_sub(elapsed_millis(
+                                                        current_turn_started_at,
+                                                    ))
                                                     .max(1),
                                             );
                                             let mut progress = |progress| {
@@ -1336,7 +1412,8 @@ where
                     } else {
                         failed_signatures_this_step.insert(failure_signature);
                     }
-                    let result_governance = self.governor.evaluate(
+                    let tool_result_elapsed_ms = elapsed_millis(current_turn_started_at);
+                    let result_governance = current_governor.evaluate(
                         &goal_ledger,
                         &GovernorObservation {
                             phase: GovernorPhase::ToolResult,
@@ -1345,7 +1422,7 @@ where
                             failed_tool_calls: failed_tool_call_count,
                             consecutive_failed_tool_calls: consecutive_failed_tool_call_count,
                             planned_input_tokens: plan.budget_snapshot.planned_input_tokens,
-                            elapsed_ms: elapsed_millis(started_at),
+                            elapsed_ms: tool_result_elapsed_ms,
                             latest_action: report.envelope.summary.clone(),
                             estimated_cost_microusd,
                             policy_decision: Some(report.policy_evaluation.decision),
@@ -1361,6 +1438,18 @@ where
                         governor_action = Some(result_governance.action);
                     }
                     trace(AgentLoopTraceEvent::GovernorDecided(result_governance));
+                    if !permits_continuation
+                        && !runtime_deadline_guard_emitted
+                        && tool_result_elapsed_ms >= current_max_elapsed_ms
+                    {
+                        trace(AgentLoopTraceEvent::LoopGuardTriggered {
+                            trigger: golutra_core::LoopGuardTrigger::RuntimeDeadline,
+                            reason: guard_reason
+                                .clone()
+                                .unwrap_or_else(|| "runtime wall-clock budget exceeded".to_owned()),
+                        });
+                        runtime_deadline_guard_emitted = true;
+                    }
                     messages.push(ProviderMessage {
                         role: ProviderRole::Tool,
                         content: model_visible_tool_result(&report.envelope),
@@ -1390,7 +1479,7 @@ where
                             step_snapshot.clone(),
                             step_fingerprint.clone(),
                             false,
-                            elapsed_millis(started_at),
+                            elapsed_millis(current_turn_started_at),
                             &mut trace,
                         );
                         break 'agent_loop;
@@ -1401,7 +1490,7 @@ where
                             step_snapshot.clone(),
                             step_fingerprint.clone(),
                             false,
-                            elapsed_millis(started_at),
+                            elapsed_millis(current_turn_started_at),
                             &mut trace,
                         );
                         break 'agent_loop;
@@ -1426,9 +1515,35 @@ where
                     step_snapshot.clone(),
                     step_fingerprint,
                     made_progress,
-                    elapsed_millis(started_at),
+                    elapsed_millis(current_turn_started_at),
                     &mut trace,
                 );
+                if !deadline_advisory_emitted
+                    && !step_completion.should_stop
+                    && let Some(advisory) = runtime_deadline_advisory(
+                        current_max_elapsed_ms,
+                        elapsed_millis(current_turn_started_at),
+                    )
+                {
+                    messages.push(ProviderMessage {
+                        role: ProviderRole::User,
+                        content: advisory,
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls: Vec::new(),
+                        metadata: Default::default(),
+                    });
+                    message_sources.push(ContextMessageSource {
+                        contributor: "runtime_context".to_owned(),
+                        source_refs: vec![format!(
+                            "runtime:deadline-advisory:{}",
+                            step_completion.snapshot.step_no
+                        )],
+                        origin: "runtime_deadline_advisory".to_owned(),
+                        visibility: ModelInputVisibility::ModelVisible,
+                    });
+                    deadline_advisory_emitted = true;
+                }
                 if let Some(advisory) = step_completion.advisory.as_deref() {
                     messages.push(ProviderMessage {
                         role: ProviderRole::User,
@@ -1484,10 +1599,10 @@ where
                     args: verifier.args.clone(),
                     cwd: verifier.cwd.clone().into(),
                     timeout_ms: verifier.timeout_ms.min(
-                        self.governor
+                        current_governor
                             .limits()
                             .max_elapsed_ms
-                            .saturating_sub(elapsed_millis(started_at))
+                            .saturating_sub(elapsed_millis(current_turn_started_at))
                             .max(1),
                     ),
                     expected_exit_code: verifier.expected_exit_code,
@@ -1883,7 +1998,8 @@ where
                     assertion.clone(),
                 ));
             }
-            let completion_governance = self.governor.evaluate(
+            let completion_elapsed_ms = elapsed_millis(current_turn_started_at);
+            let completion_governance = current_governor.evaluate(
                 &goal_ledger,
                 &GovernorObservation {
                     phase: GovernorPhase::Completion,
@@ -1894,7 +2010,7 @@ where
                     planned_input_tokens: last_budget_state
                         .planned_input_tokens
                         .unwrap_or_default(),
-                    elapsed_ms: elapsed_millis(started_at),
+                    elapsed_ms: completion_elapsed_ms,
                     latest_action: last_assistant_message
                         .clone()
                         .unwrap_or_else(|| current_objective.clone()),
@@ -1904,11 +2020,23 @@ where
                     security_risk: "low".to_owned(),
                 },
             );
-            if !completion_governance.permits_execution() {
+            let permits_completion = completion_governance.permits_execution();
+            if !permits_completion {
                 guard_reason = Some(completion_governance.reason.clone());
                 governor_action = Some(completion_governance.action);
             }
             trace(AgentLoopTraceEvent::GovernorDecided(completion_governance));
+            if !permits_completion
+                && !runtime_deadline_guard_emitted
+                && completion_elapsed_ms >= current_max_elapsed_ms
+            {
+                trace(AgentLoopTraceEvent::LoopGuardTriggered {
+                    trigger: golutra_core::LoopGuardTrigger::RuntimeDeadline,
+                    reason: guard_reason
+                        .clone()
+                        .unwrap_or_else(|| "runtime wall-clock budget exceeded".to_owned()),
+                });
+            }
             if let Some(reason) = &guard_reason {
                 if verification.result == VerificationResult::Pass {
                     verification.result = VerificationResult::Partial;
@@ -1918,10 +2046,16 @@ where
             let independent_verifier_unavailable = current_task_contract
                 .requires_independent_verification()
                 && current_external_verifiers.is_empty();
+            let deferred_without_actionable_failure = current_defer_external_verification
+                && !verification.assertions.iter().any(|assertion| {
+                    assertion.blocking
+                        && assertion.status == golutra_core::VerificationAssertionStatus::Fail
+                });
             if candidate_complete
                 && guard_reason.is_none()
                 && verification.result != VerificationResult::Pass
                 && !independent_verifier_unavailable
+                && !deferred_without_actionable_failure
                 && current_task_contract.allows_correction(turn_state.correction_attempt)
             {
                 let correction = correction_envelope(
@@ -1936,7 +2070,7 @@ where
                     terminal: false,
                 });
                 turn_state.issue_correction(golutra_core::ContinuationReason::VerificationFailed);
-                step_machine.begin_correction(elapsed_millis(started_at));
+                step_machine.begin_correction(elapsed_millis(current_turn_started_at));
                 trace(AgentLoopTraceEvent::CorrectionIssued(correction.clone()));
                 messages.push(ProviderMessage {
                     role: ProviderRole::User,
@@ -2013,6 +2147,7 @@ where
                 loop_decision,
                 tool_reports,
                 final_turn_id: current_turn_id,
+                defer_external_verification: current_defer_external_verification,
             });
         }
     }
@@ -2020,21 +2155,23 @@ where
     async fn complete_with_retry<F>(
         &self,
         request: ProviderRequest,
+        deadline: Option<tokio::time::Instant>,
         control: &mut AgentExecutionControl,
         trace: &mut F,
-    ) -> Result<(ProviderResponse, ProviderRequest), ProviderError>
+    ) -> Result<(ProviderResponse, ProviderRequest), provider_session::ProviderSessionError>
     where
         F: FnMut(AgentLoopTraceEvent) + Send,
     {
-        control
-            .wait_until_runnable()
-            .await
-            .map_err(|_| ProviderError::Cancelled)?;
+        control.wait_until_runnable().await.map_err(|_| {
+            provider_session::ProviderSessionError::Provider(ProviderError::Cancelled)
+        })?;
         let fallback_model_id = self
             .fallback_provider
             .as_ref()
             .map(|provider| provider.contract().model_id);
         let request_id = request.request_id;
+        let mut active_provider_id = request.provider_id.clone();
+        let mut active_model_id = request.model_id.clone();
         let mut on_event = |event| match event {
             provider_session::ProviderSessionEvent::Streamed {
                 provider_id,
@@ -2074,6 +2211,8 @@ where
                 to_provider,
                 reason,
             } => {
+                active_provider_id = to_provider.clone();
+                active_model_id = fallback_model_id.clone().unwrap_or_default();
                 trace(AgentLoopTraceEvent::ProviderFallback {
                     from_provider,
                     to_provider: to_provider.clone(),
@@ -2082,7 +2221,7 @@ where
                 trace(AgentLoopTraceEvent::ProviderStarted {
                     request_id,
                     provider_id: to_provider,
-                    model_id: fallback_model_id.clone().unwrap_or_default(),
+                    model_id: active_model_id.clone(),
                 });
             }
         };
@@ -2090,10 +2229,24 @@ where
             &self.provider,
             self.fallback_provider.as_ref(),
             self.provider_session_policy,
-        );
-        session
+        )
+        .with_deadline(deadline);
+        let result = session
             .complete(request, &control.cancellation, &mut on_event)
-            .await
+            .await;
+        if let Err(provider_session::ProviderSessionError::DeadlineExceeded { reason }) = &result {
+            trace(AgentLoopTraceEvent::ProviderFailed {
+                request_id,
+                provider_id: active_provider_id,
+                model_id: active_model_id,
+                error: reason.clone(),
+            });
+            trace(AgentLoopTraceEvent::LoopGuardTriggered {
+                trigger: golutra_core::LoopGuardTrigger::RuntimeDeadline,
+                reason: reason.clone(),
+            });
+        }
+        result
     }
 }
 
@@ -3166,7 +3319,35 @@ fn elapsed_millis(started_at: Instant) -> u64 {
     u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+fn governor_with_max_elapsed_ms(
+    governor: &RuntimeGovernor,
+    max_elapsed_ms: u64,
+) -> RuntimeGovernor {
+    let mut limits = governor.limits().clone();
+    limits.max_elapsed_ms = max_elapsed_ms.max(1);
+    RuntimeGovernor::new(limits)
+}
+
+fn deadline_from_budget(max_elapsed_ms: u64) -> Option<tokio::time::Instant> {
+    tokio::time::Instant::now().checked_add(Duration::from_millis(max_elapsed_ms.max(1)))
+}
+
+fn runtime_deadline_advisory(max_elapsed_ms: u64, elapsed_ms: u64) -> Option<String> {
+    let remaining_ms = max_elapsed_ms.saturating_sub(elapsed_ms);
+    let warning_window_ms = (max_elapsed_ms / 5).clamp(1, 120_000);
+    if remaining_ms > warning_window_ms {
+        return None;
+    }
+    let remaining_seconds = remaining_ms.div_ceil(1_000);
+    Some(format!(
+        "Runtime deadline advisory: about {remaining_seconds} seconds remain. Stop broad exploration, preserve and verify the best available deliverable, and return a final response before the deadline. Do not start work that cannot finish within the remaining time."
+    ))
+}
+
 fn clamp_shell_timeout_to_budget(request: &mut ToolRequest, remaining_ms: u64) {
+    const DEFAULT_FOREGROUND_TIMEOUT_MS: u64 = 5_000;
+    const DEFAULT_BACKGROUND_TIMEOUT_MS: u64 = 60 * 60 * 1_000;
+
     if request.tool_name != "shell" {
         return;
     }
@@ -3178,10 +3359,21 @@ fn clamp_shell_timeout_to_budget(request: &mut ToolRequest, remaining_ms: u64) {
             let Some(requested) = value.as_u64() else {
                 return;
             };
-            requested.min(remaining_ms)
+            requested
         }
-        None => remaining_ms,
-    };
+        None => {
+            if arguments
+                .get("background")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                DEFAULT_BACKGROUND_TIMEOUT_MS
+            } else {
+                DEFAULT_FOREGROUND_TIMEOUT_MS
+            }
+        }
+    }
+    .min(remaining_ms);
     arguments.insert("timeout_ms".to_owned(), Value::from(timeout_ms));
 }
 

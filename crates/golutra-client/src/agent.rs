@@ -195,6 +195,9 @@ impl AgentThread {
             "yolo": options.yolo,
             "defer_external_verification": options.defer_external_verification,
         });
+        if let Some(max_elapsed_ms) = options.max_elapsed_ms {
+            payload["max_elapsed_ms"] = json!(max_elapsed_ms);
+        }
         if !options.external_verifiers.is_empty() || !options.discover_project_verifiers {
             payload["external_verifiers"] =
                 serde_json::to_value(options.external_verifiers.clone())?;

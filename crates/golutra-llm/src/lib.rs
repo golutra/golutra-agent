@@ -1554,18 +1554,22 @@ fn is_sensitive_header(name: &str) -> bool {
         || name == "cookie"
 }
 
-fn openai_tool_schema(contract: &ToolContract) -> Value {
-    let description = match contract.tool_name.as_str() {
+pub(crate) fn provider_tool_description(tool_name: &str) -> &'static str {
+    match tool_name {
         "read_file" => "Read a UTF-8 text file from the current workspace.",
         "write_file" => "Write UTF-8 text content to a workspace-relative file.",
         "edit_file" => "Replace the first exact text match in a workspace-relative file.",
         "list_dir" => "List entries in a workspace-relative directory.",
         "rg_search" => "Search workspace files with ripgrep.",
         "shell" => {
-            "Run a workspace command as argv; for pipes, redirection, or compound scripts, explicitly invoke bash -lc with the complete script as one argument."
+            "Run a workspace command as argv; for pipes, redirection, or compound scripts, explicitly invoke bash -lc with the complete script as one argument. With background=true, timeout_ms is the absolute process lifetime and yield_time_ms only controls the initial wait. Managed background processes are runtime-scoped and stop when the runtime ends. If another process or evaluator must connect after the final response, do not use background=true; launch a self-daemonizing service with background omitted, for example bash -lc 'nohup ... </dev/null >service.log 2>&1 &', and verify it before returning."
         }
         _ => "Golutra workspace tool.",
-    };
+    }
+}
+
+fn openai_tool_schema(contract: &ToolContract) -> Value {
+    let description = provider_tool_description(&contract.tool_name);
     json!({
         "type": "function",
         "function": {
@@ -2001,7 +2005,7 @@ fn provider_transport_error(error: reqwest::Error) -> ProviderError {
         ProviderError::Timeout {
             message: sanitize_provider_error(&error.to_string()),
         }
-    } else if error.is_connect() {
+    } else if error.is_connect() || error.is_request() || error.is_body() || error.is_decode() {
         ProviderError::Unavailable {
             message: sanitize_provider_error(&error.to_string()),
         }

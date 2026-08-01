@@ -10,7 +10,7 @@ use golutra_llm::{
     LlmProvider, ProviderError, ProviderRequest, ProviderResponse, ProviderStreamEvent,
 };
 use tokio::sync::mpsc;
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant, sleep, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 use super::provider_retry;
@@ -94,10 +94,17 @@ pub enum ProviderSessionEvent {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProviderSessionError {
+    Provider(ProviderError),
+    DeadlineExceeded { reason: String },
+}
+
 pub(crate) struct ProviderSession<'a, P> {
     primary: &'a P,
     fallback: Option<&'a P>,
     policy: ProviderSessionPolicy,
+    deadline: Option<Instant>,
 }
 
 impl<'a, P> ProviderSession<'a, P>
@@ -113,10 +120,45 @@ where
             primary,
             fallback,
             policy: policy.bounded(),
+            deadline: None,
         }
     }
 
+    #[must_use]
+    pub(crate) fn with_deadline(mut self, deadline: Option<Instant>) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
     pub(crate) async fn complete<E>(
+        &self,
+        request: ProviderRequest,
+        cancellation: &CancellationToken,
+        on_event: &mut E,
+    ) -> Result<(ProviderResponse, ProviderRequest), ProviderSessionError>
+    where
+        E: FnMut(ProviderSessionEvent) + Send,
+    {
+        let Some(deadline) = self.deadline else {
+            return self
+                .complete_without_deadline(request, cancellation, on_event)
+                .await
+                .map_err(ProviderSessionError::Provider);
+        };
+        match timeout_at(
+            deadline,
+            self.complete_without_deadline(request, cancellation, on_event),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(ProviderSessionError::Provider),
+            Err(_) => Err(ProviderSessionError::DeadlineExceeded {
+                reason: "provider session exceeded the runtime wall-clock deadline".to_owned(),
+            }),
+        }
+    }
+
+    async fn complete_without_deadline<E>(
         &self,
         request: ProviderRequest,
         cancellation: &CancellationToken,
@@ -540,7 +582,10 @@ mod tests {
             .await
             .expect_err("idle timeout");
 
-        assert!(matches!(error, ProviderError::Timeout { .. }));
+        assert!(matches!(
+            error,
+            ProviderSessionError::Provider(ProviderError::Timeout { .. })
+        ));
         assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1);
     }
 
@@ -599,7 +644,46 @@ mod tests {
         .await
         .expect("cancellation must not wait for the idle deadline");
 
-        assert!(matches!(result, Err(ProviderError::Cancelled)));
+        assert!(matches!(
+            result,
+            Err(ProviderSessionError::Provider(ProviderError::Cancelled))
+        ));
+    }
+
+    #[tokio::test]
+    async fn absolute_deadline_stops_a_stream_that_keeps_resetting_idle_timeout() {
+        let provider = ProgressingStreamProvider {
+            success: MockProvider::text_response("done"),
+            event_interval: Duration::from_millis(10),
+            event_count: 100,
+        };
+        let policy = ProviderSessionPolicy {
+            max_stream_retries: 10,
+            max_request_retries: 10,
+            enable_transport_fallback: true,
+            stream_idle_timeout: Duration::from_millis(50),
+            request_timeout: Duration::from_secs(1),
+        };
+        let session = ProviderSession::new(&provider, None, policy)
+            .with_deadline(Some(Instant::now() + Duration::from_millis(45)));
+        let mut events = Vec::new();
+
+        let error = session
+            .complete(request(), &CancellationToken::new(), &mut |event| {
+                events.push(event)
+            })
+            .await
+            .expect_err("absolute deadline");
+
+        assert!(matches!(
+            error,
+            ProviderSessionError::DeadlineExceeded { .. }
+        ));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ProviderSessionEvent::Streamed { .. }))
+        );
     }
 
     #[tokio::test]

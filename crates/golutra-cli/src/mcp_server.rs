@@ -199,6 +199,7 @@ impl GolutraMcpServer {
                 task_contract: parameters.task_contract,
                 output_schema: parameters.output_schema,
                 completion_criteria: parameters.completion_criteria,
+                max_elapsed_ms: None,
                 allow_network: false,
                 yolo: false,
                 defer_external_verification: false,

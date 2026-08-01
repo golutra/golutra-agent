@@ -71,6 +71,8 @@ test("Thread and TurnHandle preserve the shared agent lifecycle", async () => {
     },
     allowNetwork: true,
     yolo: true,
+    maxElapsedMs: 345_000,
+    deferExternalVerification: true,
     completionCriteria: [" verified ", ""],
     externalVerifiers: [{ program: "pytest", args: ["-q"] }],
   });
@@ -94,6 +96,8 @@ test("Thread and TurnHandle preserve the shared agent lifecycle", async () => {
       prompt: "inspect the workspace",
       allow_network: true,
       yolo: true,
+      max_elapsed_ms: 345_000,
+      defer_external_verification: true,
       completion_criteria: [" verified "],
       external_verifiers: [{ program: "pytest", args: ["-q"] }],
       output_schema: { type: "object" },

@@ -81,7 +81,9 @@ pub(crate) fn mock_provider_plan(
     if lower.contains("sleep") {
         return configured_provider_plan(
             provider_env.as_ref(),
-            MockProvider::tool_call("shell", json!({"command": "sleep 5"})),
+            // Keep the deterministic mock below the shell tool's five-second
+            // default instead of racing process completion against its timeout.
+            MockProvider::tool_call("shell", json!({"command": "sleep 1"})),
             false,
             true,
         );
