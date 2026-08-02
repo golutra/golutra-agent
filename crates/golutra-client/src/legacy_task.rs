@@ -24,6 +24,8 @@ impl<'a> LegacyTaskAdapter<'a> {
 
     #[must_use]
     pub(crate) fn requests_workspace_change(self) -> bool {
+        let non_workspace_environment_change =
+            contains_explicit_non_workspace_environment_change(self.objective);
         let explicit_workspace_delivery = self.payload.get("content").is_some()
             || self.payload.get("patch").is_some()
             || self.payload.get("replacement").is_some()
@@ -31,7 +33,7 @@ impl<'a> LegacyTaskAdapter<'a> {
             || !infer_legacy_write_paths(self.objective).is_empty();
         explicit_workspace_delivery
             || (contains_workspace_change_intent(self.objective)
-                && !contains_installed_environment_change_intent(self.objective))
+                && !non_workspace_environment_change)
     }
 
     /// Return a delivery path only when the legacy request makes it explicit.
@@ -57,7 +59,7 @@ impl<'a> LegacyTaskAdapter<'a> {
     pub(crate) fn apply_to(self, contract: &mut TaskContract) -> bool {
         let requests_workspace_change = self.requests_workspace_change();
         if !requests_workspace_change
-            && !contains_installed_environment_change_intent(self.objective)
+            && !contains_explicit_non_workspace_environment_change(self.objective)
         {
             return false;
         }
@@ -239,7 +241,21 @@ fn contains_workspace_change_intent(objective: &str) -> bool {
         "写入",
     ];
     const CJK_WORKSPACE_TARGETS: &[&str] = &[
-        "代码", "文件", "函数", "方法", "模块", "项目", "仓库", "脚本", "程序", "测试", "服务",
+        "代码",
+        "客户端",
+        "文件",
+        "函数",
+        "方法",
+        "集成",
+        "模块",
+        "插件",
+        "项目",
+        "仓库",
+        "脚本",
+        "程序",
+        "测试",
+        "服务",
+        "适配器",
     ];
 
     let mut in_fence = false;
@@ -361,37 +377,141 @@ fn contains_explicit_local_scope(lower: &str, tokens: &[&str]) -> bool {
             .any(|token| matches!(*token, "checkout" | "codebase" | "workspace"))
 }
 
-fn contains_installed_environment_change_intent(objective: &str) -> bool {
+fn contains_explicit_non_workspace_environment_change(objective: &str) -> bool {
+    const CHANGE_VERBS: &[&str] = &[
+        "change",
+        "configure",
+        "fix",
+        "install",
+        "modify",
+        "patch",
+        "reinstall",
+        "remove",
+        "repair",
+        "replace",
+        "uninstall",
+        "update",
+        "upgrade",
+    ];
+    const ENVIRONMENT_SCOPES: &[&str] = &[
+        "global",
+        "globally",
+        "host",
+        "installed",
+        "machine",
+        "operating-system",
+        "system",
+        "system-wide",
+        "systemwide",
+    ];
+    const ENVIRONMENT_TARGETS: &[&str] = &[
+        "binary",
+        "command",
+        "compiler",
+        "configuration",
+        "dependency",
+        "environment",
+        "installation",
+        "interpreter",
+        "library",
+        "package",
+        "runtime",
+        "service",
+        "tool",
+    ];
+    const LOCAL_ARTIFACTS: &[&str] = &[
+        "adapter",
+        "client",
+        "component",
+        "crate",
+        "handler",
+        "integration",
+        "method",
+        "module",
+        "parser",
+        "plugin",
+        "source",
+        "test",
+        "workflow",
+    ];
+
     let prose = prose_without_code(objective).to_ascii_lowercase();
     let tokens = prose
-        .split(|character: char| !character.is_ascii_alphanumeric())
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '-')
         .filter(|token| !token.is_empty())
         .collect::<Vec<_>>();
-    let requests_change = tokens.iter().any(|token| {
-        matches!(
-            *token,
-            "change" | "configure" | "fix" | "modify" | "patch" | "repair" | "replace" | "update"
-        )
-    });
-    let installed_runtime = prose.contains("site-packages")
-        || prose.contains("site packages")
-        || prose.contains("default python interpreter")
-        || prose.contains("system python")
-        || (tokens
-            .iter()
-            .any(|token| matches!(*token, "installed" | "installation"))
-            && tokens
-                .iter()
-                .any(|token| matches!(*token, "dependency" | "package" | "python")))
-        || (tokens.contains(&"package") && tokens.contains(&"interpreter"));
-    let explicitly_scoped_to_workspace = tokens.iter().any(|token| {
-        matches!(
-            *token,
-            "crate" | "project" | "repo" | "repository" | "source" | "workspace"
-        )
-    });
+    if contains_explicit_local_scope(&prose, &tokens)
+        || [
+            "代码库",
+            "工作区",
+            "当前项目",
+            "本仓库",
+            "本项目",
+            "项目源码",
+        ]
+        .iter()
+        .any(|scope| objective.contains(scope))
+    {
+        return false;
+    }
 
-    requests_change && installed_runtime && !explicitly_scoped_to_workspace
+    let english_scope = tokens.iter().enumerate().any(|(target_index, target)| {
+        if !ENVIRONMENT_TARGETS.contains(target) {
+            return false;
+        }
+        if tokens[target_index.saturating_add(1)..tokens.len().min(target_index.saturating_add(3))]
+            .iter()
+            .any(|token| LOCAL_ARTIFACTS.contains(token))
+        {
+            return false;
+        }
+        let change_index = tokens[..target_index]
+            .iter()
+            .rposition(|token| CHANGE_VERBS.contains(token));
+        let scope_start = target_index.saturating_sub(4);
+        change_index.is_some_and(|index| target_index.saturating_sub(index) <= 6)
+            && tokens[scope_start..target_index]
+                .iter()
+                .any(|token| ENVIRONMENT_SCOPES.contains(token))
+    });
+    if english_scope {
+        return true;
+    }
+
+    let cjk_change = [
+        "修复", "修改", "卸载", "安装", "替换", "更新", "升级", "移除", "配置", "重装",
+    ]
+    .iter()
+    .any(|marker| objective.contains(marker));
+    let cjk_scope = ["全局安装", "宿主机", "操作系统", "系统安装", "系统环境"]
+        .iter()
+        .any(|marker| objective.contains(marker));
+    let cjk_target = [
+        "依赖",
+        "二进制",
+        "服务",
+        "环境",
+        "解释器",
+        "命令",
+        "软件包",
+        "运行时",
+        "工具",
+        "编译器",
+    ]
+    .iter()
+    .any(|marker| objective.contains(marker));
+    let cjk_local_artifact = [
+        "代码",
+        "客户端",
+        "模块",
+        "插件",
+        "测试",
+        "适配器",
+        "项目源码",
+    ]
+    .iter()
+    .any(|marker| objective.contains(marker));
+    cjk_change && cjk_scope && cjk_target && !cjk_local_artifact
 }
 
 fn prose_without_code(objective: &str) -> String {

@@ -6644,11 +6644,12 @@ fn legacy_external_effects_do_not_invent_a_workspace_diff_contract() {
 }
 
 #[test]
-fn legacy_installed_environment_repairs_require_validation_without_workspace_diff() {
+fn legacy_explicit_environment_repairs_require_validation_without_workspace_diff() {
     for prompt in [
-        "Fix the installed Python package so it works with the default Python interpreter.",
-        "Patch the dependency in site-packages to support the system Python runtime.",
-        "Fix the existing fasttext code so the Python package works with the default Python interpreter.",
+        "Fix the globally installed package.",
+        "Patch the system dependency installation.",
+        "Repair the host service configuration.",
+        "升级系统环境中的编译器工具。",
     ] {
         let payload = json!({"prompt": prompt});
         let adapter = LegacyTaskAdapter::new(&payload, prompt);
@@ -6676,6 +6677,12 @@ fn legacy_code_and_service_implementation_still_require_workspace_evidence() {
         "Implement the parser.",
         "Fix the bug in the source code.",
         "Fix the Python package in this repository.",
+        "Fix the existing parser code so the package works with the default interpreter.",
+        "Update this library to support the system runtime.",
+        "Fix the system runtime adapter.",
+        "Update the global package client.",
+        "Patch the runtime adapter for globally installed tool compatibility.",
+        "Fix the globally installed tool adapter in this repository.",
         "Fix the GitHub integration in this repository.",
         "Implement a GitHub repository adapter.",
         "Implement a cloud API client.",
@@ -6687,6 +6694,7 @@ fn legacy_code_and_service_implementation_still_require_workspace_evidence() {
         "Implement and run a server on port 3000.",
         "Update the API gateway configuration in this workspace.",
         "修改 runtime 代码，修复验证链路",
+        "修复系统运行时适配器。",
     ] {
         let payload = json!({"prompt": prompt});
         assert!(
