@@ -437,6 +437,27 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn process_is_running(pid: Pid) -> bool {
+        let Ok(stat) = fs::read_to_string(format!("/proc/{}/stat", pid.as_raw())) else {
+            return false;
+        };
+        let Some(command_end) = stat.rfind(')') else {
+            return true;
+        };
+        !matches!(
+            stat[command_end.saturating_add(1)..]
+                .split_whitespace()
+                .next(),
+            Some("Z" | "X")
+        )
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn process_is_running(pid: Pid) -> bool {
+        nix::sys::signal::kill(pid, None).is_ok()
+    }
+
     #[tokio::test]
     async fn process_only_candidate_producer_is_rejected() {
         let workspace = tempfile::tempdir().expect("workspace");
@@ -531,7 +552,7 @@ mod tests {
             .expect("child pid")
             .parse::<i32>()
             .expect("numeric child pid");
-        assert!(nix::sys::signal::kill(Pid::from_raw(child_pid), None).is_err());
+        assert!(!process_is_running(Pid::from_raw(child_pid)));
     }
 
     #[cfg(unix)]
