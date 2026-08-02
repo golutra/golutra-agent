@@ -84,11 +84,11 @@ fn system_prompt_explains_the_argv_only_shell_recovery_path() {
     assert!(prompt.contains("compare its decoded data with the named source"));
     assert!(prompt.contains("Keep every file explicitly requested by the user"));
     assert!(prompt.contains("must not delete or move a requested output"));
-    assert!(prompt.contains("native daemon mode"));
-    assert!(prompt.contains("detached session such as setsid"));
+    assert!(prompt.contains("platform-appropriate lifecycle mechanism"));
+    assert!(prompt.contains("outlives runtime ownership"));
     assert!(prompt.contains("not a durable handoff"));
-    assert!(prompt.contains("probe its loopback endpoint from a separate client"));
-    assert!(prompt.contains("framework test clients and mocked handlers do not prove"));
+    assert!(prompt.contains("public protocol from a separate client"));
+    assert!(prompt.contains("in-process test clients and mocked handlers do not prove"));
     assert!(prompt.contains("same public interface a fresh consumer will use"));
     assert!(prompt.contains("exercise the requested setup or client flow from a clean location"));
     assert!(prompt.contains("shortcut that bypasses the user-facing path"));
@@ -6626,6 +6626,10 @@ fn legacy_external_effects_do_not_invent_a_workspace_diff_contract() {
     for prompt in [
         "Create an S3 bucket named sample-bucket and set it to public read.",
         "Create a spreadsheet named Financial Report and add a sheet named Q1 Data.",
+        "Create a GitHub repository named sample-project.",
+        "Create a managed database server in AWS.",
+        "Update the API gateway in the cloud account.",
+        "Implement a managed cloud service for a remote account.",
         "For some reason I cannot curl example.com; figure out why and what I should do to fix it.",
         r#"Configure a git server so I can run:
     git add index.html
@@ -6672,7 +6676,16 @@ fn legacy_code_and_service_implementation_still_require_workspace_evidence() {
         "Implement the parser.",
         "Fix the bug in the source code.",
         "Fix the Python package in this repository.",
-        "Create and run a server on port 3000.",
+        "Fix the GitHub integration in this repository.",
+        "Implement a GitHub repository adapter.",
+        "Implement a cloud API client.",
+        "Implement a cloudish repository parser.",
+        "Fix the GitHub Actions workflow.",
+        "Fix the GitLab repository code.",
+        "Implement an AWS client in this workspace.",
+        "Update the cloud deployment module in this codebase.",
+        "Implement and run a server on port 3000.",
+        "Update the API gateway configuration in this workspace.",
         "修改 runtime 代码，修复验证链路",
     ] {
         let payload = json!({"prompt": prompt});

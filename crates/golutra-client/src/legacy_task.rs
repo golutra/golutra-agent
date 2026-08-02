@@ -194,32 +194,36 @@ fn contains_workspace_change_intent(objective: &str) -> bool {
         "add", "change", "create", "delete", "edit", "fix", "modify", "move", "remove", "rename",
         "update", "write",
     ];
-    const WORKSPACE_TARGETS: &[&str] = &[
-        "api",
-        "application",
-        "bug",
+    const CONCRETE_LOCAL_ARTIFACTS: &[&str] = &[
+        "adapter",
         "class",
+        "client",
         "code",
+        "component",
         "crate",
         "file",
         "files",
         "function",
+        "handler",
+        "integration",
+        "library",
         "method",
         "module",
-        "program",
-        "programs",
-        "project",
-        "repo",
-        "repository",
+        "package",
+        "parser",
+        "plugin",
         "script",
         "scripts",
-        "server",
         "source",
         "test",
         "tests",
-        "webpage",
-        "website",
+        "workflow",
     ];
+    const LOCAL_WORKSPACE_TARGETS: &[&str] = &[
+        "bug", "program", "programs", "project", "webpage", "website",
+    ];
+    const AMBIGUOUS_WORKSPACE_TARGETS: &[&str] =
+        &["api", "application", "repo", "repository", "server"];
     const CJK_STRONG_CHANGE_MARKERS: &[&str] = &["实现", "重构", "补丁", "重写"];
     const CJK_AMBIGUOUS_CHANGE_MARKERS: &[&str] = &[
         "添加",
@@ -258,6 +262,16 @@ fn contains_workspace_change_intent(objective: &str) -> bool {
             .split(|character: char| !character.is_ascii_alphanumeric())
             .filter(|token| !token.is_empty())
             .collect::<Vec<_>>();
+        let explicit_local_scope = contains_explicit_local_scope(&lower, &tokens);
+        let concrete_local_artifact = tokens
+            .iter()
+            .any(|token| CONCRETE_LOCAL_ARTIFACTS.contains(token));
+        if !explicit_local_scope
+            && !concrete_local_artifact
+            && contains_external_system_scope(&prose, &tokens)
+        {
+            continue;
+        }
         if tokens
             .iter()
             .any(|token| STRONG_CHANGE_VERBS.contains(token))
@@ -267,7 +281,14 @@ fn contains_workspace_change_intent(objective: &str) -> bool {
         if tokens
             .iter()
             .any(|token| AMBIGUOUS_CHANGE_VERBS.contains(token))
-            && tokens.iter().any(|token| WORKSPACE_TARGETS.contains(token))
+            && (concrete_local_artifact
+                || tokens
+                    .iter()
+                    .any(|token| LOCAL_WORKSPACE_TARGETS.contains(token))
+                || (tokens
+                    .iter()
+                    .any(|token| AMBIGUOUS_WORKSPACE_TARGETS.contains(token))
+                    && explicit_local_scope))
         {
             return true;
         }
@@ -285,6 +306,59 @@ fn contains_workspace_change_intent(objective: &str) -> bool {
         }
     }
     false
+}
+
+fn contains_external_system_scope(prose: &str, tokens: &[&str]) -> bool {
+    const EXTERNAL_SCOPE_TOKENS: &[&str] = &[
+        "aws",
+        "azure",
+        "bitbucket",
+        "cloud",
+        "gcp",
+        "github",
+        "gitlab",
+        "hosted",
+        "managed",
+        "remote",
+        "saas",
+    ];
+    const EXTERNAL_RESOURCES: &[&str] = &[
+        "account",
+        "bucket",
+        "cluster",
+        "database",
+        "gateway",
+        "issue",
+        "repository",
+        "service",
+        "tenant",
+    ];
+    const CJK_MARKERS: &[&str] = &["云账号", "云服务", "远程仓库", "托管服务"];
+
+    let external_scope = tokens
+        .iter()
+        .any(|token| EXTERNAL_SCOPE_TOKENS.contains(token));
+    (external_scope
+        && tokens
+            .iter()
+            .any(|token| EXTERNAL_RESOURCES.contains(token)))
+        || CJK_MARKERS.iter().any(|marker| prose.contains(marker))
+}
+
+fn contains_explicit_local_scope(lower: &str, tokens: &[&str]) -> bool {
+    [
+        "this checkout",
+        "this codebase",
+        "this project",
+        "this repo",
+        "this repository",
+        "working tree",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+        || tokens
+            .iter()
+            .any(|token| matches!(*token, "checkout" | "codebase" | "workspace"))
 }
 
 fn contains_installed_environment_change_intent(objective: &str) -> bool {

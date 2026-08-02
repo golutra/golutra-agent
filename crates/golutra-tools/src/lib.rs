@@ -2311,7 +2311,7 @@ fn contract(tool_name: &str, side_effect_type: SideEffectType) -> ToolContract {
                 },
                 "background": {
                     "type": "boolean",
-                    "description": "When true, start a runtime-scoped managed process and return its process_id after yield_time_ms. The process stops when the runtime ends. If another process or evaluator must connect after the final response, do not use background=true; launch a self-daemonizing service with background omitted, redirect all stdio, and verify it before returning."
+                    "description": "When true, start a runtime-scoped managed process and return its process_id after yield_time_ms. The process stops when the runtime ends. If another process or evaluator must connect after the final response, do not use background=true; use a platform-appropriate lifecycle mechanism outside runtime ownership, detach standard streams as required, and verify availability before returning."
                 },
                 "yield_time_ms": {
                     "type": "integer",

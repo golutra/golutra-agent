@@ -126,7 +126,8 @@ fn shell_contract_explains_how_to_submit_compound_commands() {
     assert!(timeout.contains("absolute process lifetime"));
     assert!(background.contains("runtime-scoped"));
     assert!(background.contains("do not use background=true"));
-    assert!(background.contains("verify it before returning"));
+    assert!(background.contains("platform-appropriate lifecycle mechanism"));
+    assert!(background.contains("verify availability before returning"));
     assert!(yield_time.contains("initial wait"));
     assert!(yield_time.contains("does not extend"));
 }

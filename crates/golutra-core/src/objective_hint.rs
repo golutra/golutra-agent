@@ -1,8 +1,8 @@
 //! Conservative facts derived from natural-language objectives.
 //!
 //! Explicit `TaskContract` values remain authoritative. Legacy write hints only
-//! fill missing delivery fields at older command boundaries; explicit conversion
-//! pairs can also constrain runtime validation without changing the contract.
+//! fill missing delivery fields at older command boundaries; conversion pairs
+//! help identify an explicitly named output without adding runtime requirements.
 
 use crate::task_contract::is_valid_workspace_relative_path;
 
@@ -43,12 +43,11 @@ pub fn infer_legacy_write_paths(objective: &str) -> Vec<String> {
             .map(|token| normalized_word(token))
             .collect::<Vec<_>>();
 
-        infer_strong_delivery_paths(clause, &tokens, &words, &mut paths, MAX_INFERRED_PATHS);
+        infer_strong_delivery_paths(&tokens, &words, &mut paths, MAX_INFERRED_PATHS);
         for (index, word) in words.iter().enumerate() {
             if is_delivery_noun(word)
-                && words[index.saturating_sub(DELIVERY_NOUN_LOOKBACK)..index]
-                    .iter()
-                    .any(|candidate| is_write_verb(candidate))
+                && (index.saturating_sub(DELIVERY_NOUN_LOOKBACK)..index)
+                    .any(|candidate| is_write_verb_at(&words, candidate))
                 && nearest_intent_is_delivery(&words, index)
             {
                 let candidate = skip_delivery_connectors(&words, index.saturating_add(1));
@@ -60,7 +59,7 @@ pub fn infer_legacy_write_paths(objective: &str) -> Vec<String> {
                 }
             }
 
-            if !is_write_verb(word) {
+            if !is_write_verb_at(&words, index) {
                 continue;
             }
             if let Some(path) = delivery_path_after_verb(&tokens, &words, index) {
@@ -100,7 +99,7 @@ pub fn infer_explicit_conversion_objectives(
             }
             let Some(connector_index) = words[verb_index.saturating_add(1)..]
                 .iter()
-                .position(|word| matches!(word.as_str(), "into" | "to"))
+                .position(|word| matches!(word.as_str(), "as" | "into" | "to"))
                 .map(|index| index.saturating_add(verb_index).saturating_add(1))
             else {
                 continue;
@@ -309,9 +308,9 @@ fn delivery_path_after_verb(
 }
 
 fn nearest_intent_is_delivery(words: &[String], path_index: usize) -> bool {
-    let latest_delivery = words[..path_index]
-        .iter()
-        .rposition(|word| is_write_verb(word));
+    let latest_delivery = (0..path_index)
+        .rev()
+        .find(|index| is_write_verb_at(words, *index));
     let latest_input = words[..path_index]
         .iter()
         .rposition(|word| is_input_marker(word));
@@ -319,22 +318,20 @@ fn nearest_intent_is_delivery(words: &[String], path_index: usize) -> bool {
 }
 
 fn infer_strong_delivery_paths(
-    clause: &str,
     tokens: &[&str],
     words: &[String],
     paths: &mut Vec<String>,
     limit: usize,
 ) {
-    let lower = clause.to_ascii_lowercase();
-    let strong_final_context = declares_final_output(words)
-        || lower.contains("final trained")
-        || lower.contains("final artifact")
-        || lower.contains("final directory")
-        || lower.contains("output directory");
-    let has_write_context = strong_final_context || words.iter().any(|word| is_write_verb(word));
+    let final_declaration_start = final_output_declaration_start(words);
+    let strong_final_context = final_declaration_start
+        .is_some_and(|start| output_declaration_has_write_intent(tokens, words, start));
+    let has_write_context =
+        strong_final_context || (0..words.len()).any(|index| is_write_verb_at(words, index));
     if !has_write_context {
         return;
     }
+    let mut accepted_final_path = false;
 
     for (index, token) in tokens.iter().enumerate() {
         if matches!(words[index].as_str(), "called" | "named") {
@@ -356,9 +353,15 @@ fn infer_strong_delivery_paths(
                 .filter(|_| executable_name || declared_delivery)
             {
                 push_inferred_path(paths, path, limit);
+                if final_declaration_start.is_some_and(|start| index >= start) {
+                    accepted_final_path = true;
+                }
             }
         }
         if strong_final_context
+            && final_declaration_start.is_some_and(|start| {
+                strong_final_path_is_delivery(tokens, words, start, index, accepted_final_path)
+            })
             && let Some(path) = normalize_path(token).or_else(|| {
                 let directory = token.trim_end_matches(['.', ',', ';', ':']);
                 directory
@@ -368,27 +371,155 @@ fn infer_strong_delivery_paths(
             })
         {
             push_inferred_path(paths, path, limit);
+            accepted_final_path = true;
         }
     }
 }
 
-fn declares_final_output(words: &[String]) -> bool {
-    words.iter().enumerate().any(|(index, word)| {
-        if word != "final"
-            || words.get(index.saturating_add(1)).map(String::as_str) != Some("output")
-        {
-            return false;
-        }
-        let declaration = &words[index.saturating_add(2)..words.len().min(index.saturating_add(8))];
-        declaration
-            .iter()
-            .position(|word| matches!(word.as_str(), "must" | "should"))
-            .is_some_and(|modal| {
-                declaration[modal.saturating_add(1)..]
-                    .iter()
-                    .any(|word| word == "be")
+fn final_output_declaration_start(words: &[String]) -> Option<usize> {
+    words.iter().enumerate().find_map(|(index, word)| {
+        if word == "final"
+            && words.get(index.saturating_add(1)).is_some_and(|next| {
+                matches!(
+                    next.as_str(),
+                    "artifact" | "directory" | "model" | "output" | "trained"
+                )
             })
+        {
+            return Some(index.saturating_add(2));
+        }
+        (word == "output"
+            && words.get(index.saturating_add(1)).map(String::as_str) == Some("directory"))
+        .then_some(index.saturating_add(2))
     })
+}
+
+fn output_declaration_has_write_intent(tokens: &[&str], words: &[String], start: usize) -> bool {
+    let latest_write = (0..start)
+        .rev()
+        .find(|index| is_write_verb_at(words, *index));
+    let latest_read = words[..start].iter().rposition(|word| {
+        is_input_marker(word) || matches!(word.as_str(), "examine" | "inspect" | "list")
+    });
+    let write_precedes_declaration =
+        latest_write.is_some_and(|write| latest_read.is_none_or(|read| write > read));
+    let explicitly_assigned = words[start..words.len().min(start.saturating_add(8))]
+        .iter()
+        .any(|word| {
+            matches!(
+                word.as_str(),
+                "are"
+                    | "called"
+                    | "can"
+                    | "is"
+                    | "located"
+                    | "must"
+                    | "named"
+                    | "placed"
+                    | "should"
+                    | "will"
+            )
+        });
+    let explicitly_labeled = start
+        .checked_sub(1)
+        .and_then(|index| tokens.get(index))
+        .is_some_and(|token| token.ends_with(':'));
+    write_precedes_declaration || explicitly_assigned || explicitly_labeled
+}
+
+fn strong_final_path_is_delivery(
+    tokens: &[&str],
+    words: &[String],
+    declaration_start: usize,
+    path_index: usize,
+    accepted_final_path: bool,
+) -> bool {
+    if path_index < declaration_start {
+        return false;
+    }
+    let list_boundary = (declaration_start..path_index).rev().find(|index| {
+        matches!(words[*index].as_str(), "and" | "plus") || tokens[*index].ends_with(',')
+    });
+    let segment_start = list_boundary.map_or(declaration_start, |index| index.saturating_add(1));
+    let segment = words[segment_start..path_index]
+        .iter()
+        .map(String::as_str)
+        .filter(|word| {
+            !matches!(
+                *word,
+                "a" | "an" | "can" | "final" | "may" | "must" | "should" | "the" | "will"
+            )
+        })
+        .collect::<Vec<_>>();
+    if segment.iter().any(|word| is_input_marker(word)) {
+        return false;
+    }
+    if segment.is_empty() {
+        return list_boundary.is_none() || accepted_final_path;
+    }
+
+    let last = segment.last().copied().unwrap_or_default();
+    if matches!(
+        last,
+        "are"
+            | "as"
+            | "be"
+            | "is"
+            | "called"
+            | "contain"
+            | "containing"
+            | "contains"
+            | "include"
+            | "includes"
+            | "including"
+            | "name"
+            | "named"
+    ) || matches!(
+        last,
+        "artifact"
+            | "binary"
+            | "directory"
+            | "executable"
+            | "file"
+            | "folder"
+            | "model"
+            | "output"
+            | "program"
+            | "report"
+            | "result"
+            | "script"
+    ) {
+        return true;
+    }
+    if last == "of" && segment.iter().rev().take(3).any(|word| *word == "consist") {
+        return true;
+    }
+    if matches!(last, "at" | "in" | "under")
+        && segment.iter().rev().take(4).any(|word| {
+            matches!(
+                *word,
+                "delivered" | "located" | "placed" | "saved" | "stored" | "written"
+            )
+        })
+    {
+        return true;
+    }
+    last == "to"
+        && segment.iter().rev().take(4).any(|word| {
+            matches!(
+                *word,
+                "deliver"
+                    | "delivered"
+                    | "output"
+                    | "place"
+                    | "save"
+                    | "saved"
+                    | "store"
+                    | "stored"
+                    | "write"
+                    | "written"
+            )
+        })
 }
 
 fn infer_imperative_named_deliveries(
@@ -398,7 +529,7 @@ fn infer_imperative_named_deliveries(
     limit: usize,
 ) {
     for (index, word) in words.iter().enumerate() {
-        if word != "call"
+        if !matches!(word.as_str(), "call" | "name")
             || (index > 0
                 && !matches!(
                     words[index.saturating_sub(1)].as_str(),
@@ -462,7 +593,7 @@ fn infer_declared_delivery_lists(objective: &str, paths: &mut Vec<String>, limit
             DeclaredDeliveryKind::Script,
         ] {
             if let Some(remaining) = declared_delivery_count(&words, kind)
-                && words.iter().any(|word| is_write_verb(word))
+                && (0..words.len()).any(|index| is_write_verb_at(&words, index))
             {
                 pending.push(PendingDeliveryList { kind, remaining });
             }
@@ -473,7 +604,7 @@ fn infer_declared_delivery_lists(objective: &str, paths: &mut Vec<String>, limit
             {
                 continue;
             }
-            let candidate = tokens.iter().find_map(|token| normalize_path(token));
+            let candidate = declared_delivery_item_path(&tokens, &words, declaration.kind);
             if let Some(path) = candidate {
                 push_inferred_path(paths, path, limit);
                 declaration.remaining = declaration.remaining.saturating_sub(1);
@@ -481,6 +612,43 @@ fn infer_declared_delivery_lists(objective: &str, paths: &mut Vec<String>, limit
         }
         pending.retain(|declaration| declaration.remaining > 0);
     }
+}
+
+fn declared_delivery_item_path(
+    tokens: &[&str],
+    words: &[String],
+    kind: DeclaredDeliveryKind,
+) -> Option<String> {
+    let candidates = tokens
+        .iter()
+        .enumerate()
+        .filter_map(|(index, token)| normalize_path(token).map(|path| (index, path)))
+        .collect::<Vec<_>>();
+
+    for (index, path) in &candidates {
+        let latest_delivery = words[..*index]
+            .iter()
+            .rposition(|word| is_declared_item_delivery_marker(word, kind));
+        let latest_input = words[..*index]
+            .iter()
+            .rposition(|word| is_input_marker(word));
+        if latest_delivery.is_some_and(|delivery| latest_input.is_none_or(|input| delivery > input))
+        {
+            return Some(path.clone());
+        }
+    }
+
+    (candidates.len() == 1).then(|| candidates[0].1.clone())
+}
+
+fn is_declared_item_delivery_marker(word: &str, kind: DeclaredDeliveryKind) -> bool {
+    is_write_verb(word)
+        || matches!(word, "artifact" | "deliverable" | "output" | "result")
+        || match kind {
+            DeclaredDeliveryKind::File => word == "file",
+            DeclaredDeliveryKind::Program => word == "program",
+            DeclaredDeliveryKind::Script => word == "script",
+        }
 }
 
 fn declared_delivery_count(words: &[String], kind: DeclaredDeliveryKind) -> Option<usize> {
@@ -525,8 +693,20 @@ fn objective_clauses(objective: &str) -> Vec<&str> {
     let mut start = 0_usize;
     for (index, character) in objective.char_indices() {
         let end = index.saturating_add(character.len_utf8());
+        let ordinal_period = character == '.'
+            && objective[..index]
+                .split_whitespace()
+                .next_back()
+                .is_some_and(|token| {
+                    !token.is_empty() && token.chars().all(|value| value.is_ascii_digit())
+                })
+            && objective[end..]
+                .chars()
+                .next()
+                .is_some_and(char::is_whitespace);
         let boundary = matches!(character, '\n' | ';' | '；')
             || (matches!(character, '.' | '!' | '?')
+                && !ordinal_period
                 && objective[end..]
                     .chars()
                     .next()
@@ -725,6 +905,30 @@ fn is_write_verb(word: &str) -> bool {
     )
 }
 
+fn is_write_verb_at(words: &[String], index: usize) -> bool {
+    let Some(word) = words.get(index).map(String::as_str) else {
+        return false;
+    };
+    if word != "output" {
+        return is_write_verb(word);
+    }
+    let output_has_named_container = words
+        .get(index.saturating_add(1))
+        .is_some_and(|next| matches!(next.as_str(), "directory" | "file" | "folder"));
+    let imperative_output = index == 0
+        || index
+            .checked_sub(1)
+            .and_then(|prior| words.get(prior))
+            .is_some_and(|prior| {
+                matches!(
+                    prior.as_str(),
+                    "and" | "can" | "must" | "please" | "should" | "then" | "to" | "will"
+                )
+            });
+    let output_noun = output_has_named_container && !imperative_output;
+    !output_noun
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -857,6 +1061,59 @@ The report should be saved to a file named 'report.txt'.
     }
 
     #[test]
+    fn final_output_context_does_not_promote_inputs_versions_or_destinations() {
+        assert_eq!(
+            infer_legacy_write_paths(
+                "Your final output should be report.pdf generated from source.csv."
+            ),
+            vec!["report.pdf"]
+        );
+        assert_eq!(
+            infer_legacy_write_paths(
+                "Your final output should be report.txt and support Python 3.12."
+            ),
+            vec!["report.txt"]
+        );
+        assert_eq!(
+            infer_legacy_write_paths(
+                "Your final output should be report.txt and be uploaded to example.com."
+            ),
+            vec!["report.txt"]
+        );
+        assert_eq!(
+            infer_legacy_write_paths(
+                "Your final output should run on Ubuntu 24.04 and be report.txt."
+            ),
+            vec!["report.txt"]
+        );
+        assert!(
+            infer_legacy_write_paths(
+                "Your final output should compare expected.json and actual.json."
+            )
+            .is_empty()
+        );
+        for objective in [
+            "Inspect the output directory build/results/.",
+            "Inspect output directory build/results/.",
+            "Inspect the final output file report.txt.",
+            "Compare the final output file report.txt with expected.txt.",
+        ] {
+            assert!(
+                infer_legacy_write_paths(objective).is_empty(),
+                "{objective}"
+            );
+        }
+        assert_eq!(
+            infer_legacy_write_paths("The output directory is build/results/"),
+            vec!["build/results"]
+        );
+        assert_eq!(
+            infer_legacy_write_paths("The final output file is report.txt."),
+            vec!["report.txt"]
+        );
+    }
+
+    #[test]
     fn declared_delivery_lists_retain_numbered_files_and_ordinal_scripts() {
         let objective = "Create two shell scripts to handle the workflow.\nThe first script, detector.sh, reads input.log.\nGenerate two JSON files:\n1. alert.json with alerts\n2. report.json with statistics\nThe second script, response.sh, handles an address.";
 
@@ -870,6 +1127,59 @@ The report should be saved to a file named 'report.txt'.
             ),
             vec!["import_data.sh", "export_data.sh"]
         );
+    }
+
+    #[test]
+    fn declared_delivery_lists_choose_labeled_outputs_instead_of_inputs() {
+        for objective in [
+            "Create two files:\n1. source input.csv and result output.csv\n2. source source.json and result result.json",
+            "Create two files:\n1. Source input.csv and result output.csv\n2. Source source.json and result result.json",
+        ] {
+            assert_eq!(
+                infer_legacy_write_paths(objective),
+                vec!["output.csv", "result.json"],
+                "{objective}"
+            );
+        }
+    }
+
+    #[test]
+    fn equivalent_explicit_naming_and_conversion_phrases_are_supported() {
+        assert_eq!(
+            infer_legacy_write_paths("Name the folder artifacts/ and name the script build.py."),
+            vec!["artifacts", "build.py"]
+        );
+        for objective in [
+            "Convert input.csv as output.parquet.",
+            "Transform input.csv to output.parquet.",
+        ] {
+            assert_eq!(
+                infer_explicit_conversion_objectives(objective),
+                vec![ExplicitConversionObjectiveHint {
+                    source_path: "input.csv".to_owned(),
+                    output_path: "output.parquet".to_owned(),
+                }],
+                "{objective}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_exports_and_system_migrations_do_not_invent_delivery_paths() {
+        for objective in [
+            "Export report.csv to analytics.example.com.",
+            "Migrate schema.sql to PostgreSQL 16.2.",
+            "Serialize payload.json as JSON 3.0.",
+        ] {
+            assert!(
+                infer_legacy_write_paths(objective).is_empty(),
+                "{objective}"
+            );
+            assert!(
+                infer_explicit_conversion_objectives(objective).is_empty(),
+                "{objective}"
+            );
+        }
     }
 
     #[test]

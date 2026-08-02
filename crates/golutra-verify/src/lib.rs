@@ -763,19 +763,6 @@ fn latest_distinct_checks(checks: Vec<&VerificationCheck>) -> Vec<&VerificationC
 
 fn authoritative_objective_checks(checks: Vec<&VerificationCheck>) -> Vec<&VerificationCheck> {
     let latest = latest_distinct_checks(checks);
-    let comprehensive_families = latest
-        .iter()
-        .filter(|check| check.passed)
-        .filter_map(|check| objective_validation_family(check))
-        .collect::<HashSet<_>>();
-    let latest = latest
-        .into_iter()
-        .filter(|check| {
-            !is_incomplete_validation_probe(check)
-                || objective_validation_family(check)
-                    .is_none_or(|family| !comprehensive_families.contains(&family))
-        })
-        .collect::<Vec<_>>();
     if !latest.iter().any(|check| is_external_verifier(check)) {
         return latest;
     }
@@ -797,21 +784,6 @@ fn authoritative_objective_checks(checks: Vec<&VerificationCheck>) -> Vec<&Verif
                     .is_none_or(|command| !external_commands.contains(command))
         })
         .collect()
-}
-
-fn objective_validation_family(check: &VerificationCheck) -> Option<String> {
-    let mut components = check.name.strip_prefix("objective:")?.split(':');
-    let kind = components.next()?;
-    let tool = components.next()?;
-    (!matches!(kind, "path" | "content")).then(|| format!("{kind}:{tool}"))
-}
-
-fn is_incomplete_validation_probe(check: &VerificationCheck) -> bool {
-    !check.passed
-        && (check
-            .message
-            .contains("omitted explicit objective threshold(s)")
-            || check.message.contains("omitted required semantic evidence"))
 }
 
 fn is_external_verifier(check: &VerificationCheck) -> bool {
@@ -1434,7 +1406,7 @@ mod tests {
     }
 
     #[test]
-    fn comprehensive_validation_supersedes_incomplete_probes_only() {
+    fn distinct_validation_failure_is_not_hidden_by_a_later_success() {
         let evidence = EvidenceId::new();
         let workspace_change = VerificationCheck {
             kind: VerificationCheckKind::WorkspaceChange,
@@ -1454,21 +1426,12 @@ mod tests {
         };
         let input = VerificationInput {
             task_id: TaskId::new(),
-            objective: "change code and validate a limit of 10".to_owned(),
+            objective: "change code and validate the result".to_owned(),
             completion_criteria: Vec::new(),
             evidence_refs: vec![evidence],
             command_checks: vec![
                 workspace_change.clone(),
-                validation(
-                    "partial-a",
-                    false,
-                    "diagnostic command omitted explicit objective threshold(s): 10",
-                ),
-                validation(
-                    "partial-b",
-                    false,
-                    "validation command omitted required semantic evidence: live service",
-                ),
+                validation("first", false, "first validation failed"),
                 validation("complete", true, "diagnostic command passed"),
             ],
             requires_workspace_evidence: true,
@@ -1477,7 +1440,7 @@ mod tests {
 
         assert_eq!(
             VerificationRunner.verify(input).result,
-            VerificationResult::Pass
+            VerificationResult::Fail
         );
 
         let input_with_real_failure = VerificationInput {

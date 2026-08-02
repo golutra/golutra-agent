@@ -231,151 +231,13 @@ fn directory_delivery_paths_accept_changed_descendants_only_for_directories() {
 
 #[test]
 fn successful_objective_validation_is_material_progress() {
-    let mut report = ToolExecutionReport {
-        envelope: golutra_core::ToolResultEnvelope {
-            tool_call_id: ToolCallId::new(),
-            tool_name: "shell".to_owned(),
-            status: ToolResultStatus::Ok,
-            summary: "shell command completed".to_owned(),
-            structured_facts: json!({
-                "command": "test -f result.txt",
-                "exit_code": 0,
-                "timed_out": false,
-                "cancelled": false,
-            }),
-            model_visible_excerpt: None,
-            raw_artifact_ref: None,
-            evidence_refs: Vec::new(),
-            risk: "p0_local_tool".to_owned(),
-            verification_hint: None,
-        },
-        policy_evaluation: golutra_core::PolicyEvaluation {
-            policy_ref: golutra_core::PolicyId::new(),
-            subject: "tool".to_owned(),
-            action: "shell".to_owned(),
-            resource: "test -f result.txt".to_owned(),
-            decision: PolicyDecision::Allow,
-            block_disposition: None,
-            reason: "test".to_owned(),
-            evidence_refs: Vec::new(),
-        },
-        artifacts: Vec::new(),
-        evidence: Vec::new(),
-        artifact_contents: Vec::new(),
-        metrics: Default::default(),
-        changed_files: Vec::new(),
-        before_images: Vec::new(),
-        after_images: Vec::new(),
-    };
+    let report = objective_test_report("shell", Some("test -f result.txt"));
 
     assert!(objective_validation_report(&report).is_some_and(|outcome| outcome.passed));
-
-    let objective = "The artifact must be less than 150MB and get at least 0.62 accuracy.";
-    assert_eq!(
-        explicit_numeric_thresholds(objective, &[])
-            .into_iter()
-            .map(|threshold| threshold.display)
-            .collect::<Vec<_>>(),
-        vec!["150mb", "0.62"]
-    );
-    assert_eq!(
-        explicit_numeric_thresholds(
-            "Get at least 0.62 accuracy on a fixed test set of 1000 examples.",
-            &[],
-        )
-        .into_iter()
-        .map(|threshold| threshold.display)
-        .collect::<Vec<_>>(),
-        vec!["0.62"]
-    );
-    let size_thresholds =
-        explicit_numeric_thresholds("The compressed artifact must remain under 100KB.", &[]);
-    assert_eq!(size_thresholds.len(), 1);
-    assert_eq!(size_thresholds[0].display, "100kb");
-    assert_eq!(
-        size_thresholds[0].accepted_values,
-        vec![100.0, 100_000.0, 102_400.0]
-    );
-    let byte_limit_objective = "The maximum filesize must be 15MB.";
-    report.envelope.structured_facts["command"] = json!(
-        "python -c \"from pathlib import Path; size = Path('part.bin').stat().st_size; assert size <= 15 * 1024 * 1024\""
-    );
-    assert!(
-        objective_validation_report_for_objective(&report, byte_limit_objective, &[])
-            .is_some_and(|outcome| outcome.passed)
-    );
-    assert_eq!(
-        explicit_numeric_thresholds(
-            "The score must be over 300 after training over 100 episodes.",
-            &[],
-        )
-        .into_iter()
-        .map(|threshold| threshold.display)
-        .collect::<Vec<_>>(),
-        vec!["300"]
-    );
-    report.envelope.structured_facts["command"] =
-        json!("python -c \"size = 100; assert size < 150\"");
-    let incomplete = objective_validation_report_for_objective(&report, objective, &[])
-        .expect("recognized diagnostic");
-    assert!(!incomplete.passed);
-    assert!(incomplete.message.contains("0.62"));
-
-    report.envelope.structured_facts["command"] = json!(
-        "python -c \"size = 100; accuracy = 0.7; assert size < 150; assert accuracy >= 0.62\""
-    );
-    let complete = objective_validation_report_for_objective(&report, objective, &[])
-        .expect("recognized constrained diagnostic");
-    assert!(complete.passed);
-    assert_ne!(complete.identity, incomplete.identity);
-
-    let accuracy_objective = "The measured accuracy must be at least 0.62.";
-    report.envelope.structured_facts["command"] =
-        json!("python -c \"accuracy = 0.7; assert 0.62 <= accuracy\"");
-    assert!(
-        objective_validation_report_for_objective(&report, accuracy_objective, &[])
-            .is_some_and(|outcome| outcome.passed)
-    );
-
-    report.envelope.structured_facts["command"] =
-        json!("python -c \"accuracy = 0.7; assert accuracy <= 0.62\"");
-    assert!(
-        objective_validation_report_for_objective(&report, accuracy_objective, &[])
-            .is_some_and(|outcome| !outcome.passed)
-    );
-
-    let commented_threshold =
-        "python - <<'PY'\naccuracy = 0.7\n# target is accuracy >= 0.62\nassert accuracy >= 0.5\nPY";
-    assert_eq!(
-        numeric_validation_comparisons(commented_threshold),
-        vec![NumericValidationComparison {
-            literal: 0.5,
-            relation: NumericComparisonRelation::GreaterOrEqual,
-        }]
-    );
-    report.envelope.structured_facts["command"] = json!(commented_threshold);
-    assert!(
-        objective_validation_report_for_objective(&report, accuracy_objective, &[])
-            .is_some_and(|outcome| !outcome.passed)
-    );
-
-    let strict_objective = "The measured accuracy must be above 0.62.";
-    report.envelope.structured_facts["command"] =
-        json!("python -c \"accuracy = 0.7; assert accuracy >= 0.62\"");
-    assert!(
-        objective_validation_report_for_objective(&report, strict_objective, &[])
-            .is_some_and(|outcome| !outcome.passed)
-    );
-    report.envelope.structured_facts["command"] =
-        json!("python -c \"accuracy = 0.7; assert accuracy > 0.62\"");
-    assert!(
-        objective_validation_report_for_objective(&report, strict_objective, &[])
-            .is_some_and(|outcome| outcome.passed)
-    );
 }
 
 #[test]
-fn objective_validation_uses_prepared_metadata_after_command_redaction() {
+fn prepared_validation_metadata_contains_only_observed_command_facts() {
     let secret = "sk-runtime-validation-secret-1234567890";
     let command = format!(
         "python - <<'PY'\nfrom pathlib import Path\ntoken = \"{secret}\"\nassert Path('result.txt').read_text() == 'expected'\nPY"
@@ -388,238 +250,53 @@ fn objective_validation_uses_prepared_metadata_after_command_redaction() {
         tool_name: "shell".to_owned(),
         arguments: json!({"command": command}),
     };
-    let metadata = prepare_objective_validation_metadata(&request, "validate result.txt", &[])
-        .expect("prepared validation metadata");
+    let metadata =
+        prepare_objective_validation_metadata(&request).expect("prepared validation metadata");
     assert!(!metadata.to_string().contains(secret));
+    assert_eq!(
+        metadata.as_object().map(|value| value.len()),
+        Some(2),
+        "objective text must not add inferred validation requirements"
+    );
 
     let mut report = objective_test_report("shell", Some("<redacted command is not parseable>"));
     attach_prepared_objective_validation(&mut report, Some(metadata));
 
-    let outcome = objective_validation_report_for_objective(&report, "validate result.txt", &[])
-        .expect("prepared validation outcome");
+    let outcome = objective_validation_report(&report).expect("prepared validation outcome");
     assert!(outcome.passed);
     assert_eq!(outcome.kind, ObjectiveValidationKind::Diagnostic);
 }
 
 #[test]
-fn conversion_validation_requires_source_and_output_semantics() {
-    let objective =
-        "Convert the file '/app/data.csv' into a Parquet file named '/app/data.parquet'.";
-    let structural_command = concat!(
-        "python - <<'PY'\n",
-        "from pathlib import Path\n",
-        "data = Path('/app/data.parquet').read_bytes()\n",
-        "assert data[:4] == b'PAR1' and data[-4:] == b'PAR1'\n",
-        "PY",
-    );
-    let request = ToolRequest {
-        tool_call_id: ToolCallId::new(),
-        provider_tool_call_id: None,
-        session_id: SessionId::new(),
-        turn_id: Some(TurnId::new()),
-        tool_name: "shell".to_owned(),
-        arguments: json!({"command": structural_command}),
-    };
-    let metadata = prepare_objective_validation_metadata(&request, objective, &[])
-        .expect("prepared conversion validation");
-    assert_eq!(
-        metadata["missing_semantic_requirements"],
-        json!(["conversion source `data.csv`"])
-    );
-    let mut redacted = objective_test_report("shell", Some("<redacted>"));
-    attach_prepared_objective_validation(&mut redacted, Some(metadata));
-    let structural = objective_validation_report_for_objective(&redacted, objective, &[])
-        .expect("structural validation outcome");
-    assert!(!structural.passed);
-    assert!(structural.message.contains("conversion source `data.csv`"));
+fn python_validation_requires_observed_runtime_state() {
+    for command in [
+        r#"python3 -c "accuracy = 0.7; assert accuracy >= 0.62""#,
+        r#"python3 -c "actual = {'status': 'ready'}; assert actual['status'] == 'ready'""#,
+        r#"python3 -c "from pathlib import Path; actual = Path('result.txt').read_text(); actual = 'expected'; assert actual == 'expected'""#,
+        r#"python3 -c "import json; actual = json.loads('{\"status\": \"ready\"}'); assert actual['status'] == 'ready'""#,
+        r#"python3 -c "import hashlib; actual = hashlib.sha256(b'constant').hexdigest(); assert len(actual) == 64""#,
+        r#"python3 -c "import re; assert re.fullmatch('ready', 'ready')""#,
+        r#"python3 -c "assert actual == expected""#,
+        r#"python3 -c "if actual != expected: raise RuntimeError('mismatch')""#,
+    ] {
+        assert!(!is_objective_validation_command(command), "{command}");
+    }
 
-    let threshold_objective = format!("{objective} The output must contain at least 10 rows.");
-    let metadata = prepare_objective_validation_metadata(&request, &threshold_objective, &[])
-        .expect("prepared conversion threshold validation");
-    let mut redacted = objective_test_report("shell", Some("<redacted>"));
-    attach_prepared_objective_validation(&mut redacted, Some(metadata));
-    let incomplete =
-        objective_validation_report_for_objective(&redacted, &threshold_objective, &[])
-            .expect("incomplete prepared validation outcome");
-    assert!(!incomplete.passed);
-    assert!(incomplete.message.contains("threshold"));
-    assert!(incomplete.message.contains("conversion source `data.csv`"));
-
-    let comment_only_source = concat!(
-        "python - <<'PY'\n",
-        "# Compare /app/data.csv with /app/data.parquet.\n",
-        "from pathlib import Path\n",
-        "data = Path('/app/data.parquet').read_bytes()\n",
-        "assert data[:4] == b'PAR1' and data[-4:] == b'PAR1'\n",
-        "PY",
-    );
-    let comment_only = objective_test_report("shell", Some(comment_only_source));
-    let outcome = objective_validation_report_for_objective(&comment_only, objective, &[])
-        .expect("comment-only source validation outcome");
-    assert!(!outcome.passed);
-    assert!(outcome.message.contains("conversion source `data.csv`"));
-
-    let suffix_only_source = concat!(
-        "python - <<'PY'\n",
-        "from pathlib import Path\n",
-        "source_backup = Path('/app/data.csv.bak').read_bytes()\n",
-        "output = Path('/app/data.parquet').read_bytes()\n",
-        "assert source_backup and output[:4] == b'PAR1'\n",
-        "PY",
-    );
-    let suffix_only = objective_test_report("shell", Some(suffix_only_source));
-    let outcome = objective_validation_report_for_objective(&suffix_only, objective, &[])
-        .expect("suffix-only source validation outcome");
-    assert!(!outcome.passed);
-    assert!(outcome.message.contains("conversion source `data.csv`"));
-
-    let semantic_command = concat!(
-        "python - <<'PY'\n",
-        "import csv\n",
-        "import pyarrow.parquet as pq\n",
-        "with open('/app/data.csv', newline='') as source_file:\n",
-        "    source = list(csv.DictReader(source_file))\n",
-        "output = pq.read_table('/app/data.parquet').to_pylist()\n",
-        "assert output == source\n",
-        "PY",
-    );
-    let semantic = objective_test_report("shell", Some(semantic_command));
-    assert!(
-        objective_validation_report_for_objective(&semantic, objective, &[])
-            .is_some_and(|outcome| outcome.passed)
-    );
-    let external = objective_test_report("external_verifier", None);
-    assert!(
-        objective_validation_report_for_objective(&external, objective, &[])
-            .is_some_and(|outcome| outcome.passed)
-    );
+    for command in [
+        r#"python3 -c "from pathlib import Path; actual = Path('result.txt').read_text(); assert actual == 'expected'""#,
+        r#"python3 -c "from pathlib import Path; score = float(Path('score.txt').read_text()); assert score >= 0.62""#,
+        r#"python3 -c "from pathlib import Path; actual = Path('result.txt').read_text(); actual += '\n'; assert actual.endswith('\n')""#,
+        r#"python3 -c "from pathlib import Path; assert Path('result.txt').exists()""#,
+        r#"python3 -c "import json; from pathlib import Path; actual = json.loads(Path('result.json').read_text()); assert actual['status'] == 'ready'""#,
+        r#"python3 -c "import requests; response = requests.get('https://example.com/status'); assert response.status_code == 200""#,
+        r#"python3 -c "artifact = load_artifact('result.bin'); assert artifact.valid""#,
+    ] {
+        assert!(is_objective_validation_command(command), "{command}");
+    }
 }
 
 #[test]
-fn live_service_validation_requires_an_independent_loopback_probe() {
-    let objective = "Run the server on port 5000 and keep it running for clients.";
-    assert!(objective_requires_live_service_probe(objective, &[]));
-    assert!(objective_requires_live_service_probe(
-        "The server should not exit and must remain running on port 5000.",
-        &[]
-    ));
-    assert!(!objective_requires_live_service_probe(
-        "Do not start the server during this task.",
-        &[]
-    ));
-    assert!(!objective_requires_live_service_probe(
-        "Create a script to start the server on port 5000 without running it.",
-        &[]
-    ));
-    assert!(!objective_requires_live_service_probe(
-        "Write documentation explaining how to run the server on port 5000.",
-        &[]
-    ));
-    let in_process = objective_test_report(
-        "shell",
-        Some(concat!(
-            "python - <<'PY'\n",
-            "from service import app\n",
-            "response = app.test_client().get('/status')\n",
-            "assert response.status_code == 200\n",
-            "PY",
-        )),
-    );
-    let outcome = objective_validation_report_for_objective(&in_process, objective, &[])
-        .expect("in-process validation outcome");
-    assert!(!outcome.passed);
-    assert!(
-        outcome
-            .message
-            .contains("independent loopback service probe")
-    );
-
-    let comment_spoof = objective_test_report(
-        "shell",
-        Some(concat!(
-            "python - <<'PY'\n",
-            "# curl --fail http://127.0.0.1:5000/status\n",
-            "from service import app\n",
-            "response = app.test_client().get('/status')\n",
-            "assert response.status_code == 200\n",
-            "PY",
-        )),
-    );
-    let outcome = objective_validation_report_for_objective(&comment_spoof, objective, &[])
-        .expect("comment-spoofed validation outcome");
-    assert!(!outcome.passed);
-    assert!(
-        outcome
-            .message
-            .contains("independent loopback service probe")
-    );
-
-    let loopback = objective_test_report("shell", Some("curl --fail http://127.0.0.1:5000/status"));
-    assert!(
-        objective_validation_report_for_objective(&loopback, objective, &[])
-            .is_some_and(|outcome| outcome.passed)
-    );
-
-    let python_loopback = objective_test_report(
-        "shell",
-        Some(concat!(
-            "python - <<'PY'\n",
-            "import requests\n",
-            "url = 'http://localhost:5000/status'\n",
-            "response = requests.get(url, timeout=2)\n",
-            "assert response.status_code == 200\n",
-            "PY",
-        )),
-    );
-    assert!(
-        objective_validation_report_for_objective(&python_loopback, objective, &[])
-            .is_some_and(|outcome| outcome.passed)
-    );
-
-    let workspace = tempdir().expect("workspace");
-    let mut runtime_scoped = objective_test_report("shell", None);
-    runtime_scoped.envelope.structured_facts = json!({
-        "process_id": "proc-service",
-        "process_lifetime_scope": "runtime",
-        "process_state": "running",
-        "survives_runtime_exit": false,
-    });
-    let reports = vec![runtime_scoped.clone(), loopback.clone()];
-    let outcome = objective_validation_report_for_objective_in_turn(
-        &reports[1],
-        objective,
-        &[],
-        &reports,
-        1,
-        workspace.path(),
-    )
-    .expect("runtime-scoped validation outcome");
-    assert!(!outcome.passed);
-    assert!(outcome.message.contains("post-runtime service lifetime"));
-
-    let mut terminated = objective_test_report("process_terminate", None);
-    terminated.envelope.structured_facts = json!({
-        "process_id": "proc-service",
-        "process_lifetime_scope": "runtime",
-        "process_state": "terminated",
-        "survives_runtime_exit": false,
-    });
-    let reports = vec![runtime_scoped, terminated, loopback];
-    assert!(
-        objective_validation_report_for_objective_in_turn(
-            &reports[2],
-            objective,
-            &[],
-            &reports,
-            2,
-            workspace.path(),
-        )
-        .is_some_and(|outcome| outcome.passed)
-    );
-}
-
-#[test]
-fn turn_local_python_verifier_is_source_bound_and_threshold_aware() {
+fn turn_local_python_verifier_is_source_bound_and_observes_runtime_state() {
     let workspace = tempdir().expect("workspace");
     let verifier_path = workspace.path().join("verify.py");
     let source = concat!(
@@ -642,35 +319,14 @@ fn turn_local_python_verifier_is_source_bound_and_threshold_aware() {
     let reports = vec![write_report.clone(), validation_report.clone()];
 
     assert!(objective_validation_report(&validation_report).is_none());
-    let outcome = objective_validation_report_for_objective_in_turn(
-        &reports[1],
-        "The score must be at least 0.62.",
-        &[],
-        &reports,
-        1,
-        workspace.path(),
-    )
-    .expect("turn-local verifier");
+    let outcome = objective_validation_report_in_turn(&reports[1], &reports, 1, workspace.path())
+        .expect("turn-local verifier");
     assert!(outcome.passed);
     assert!(outcome.identity.contains("python-file:verify.py:sha256:"));
 
-    let missing_threshold = objective_validation_report_for_objective_in_turn(
-        &reports[1],
-        "The score must be at least 0.90.",
-        &[],
-        &reports,
-        1,
-        workspace.path(),
-    )
-    .expect("threshold-aware verifier");
-    assert!(!missing_threshold.passed);
-    assert!(missing_threshold.message.contains("0.90"));
-
     assert!(
-        objective_validation_report_for_objective_in_turn(
+        objective_validation_report_in_turn(
             &validation_report,
-            "The score must be at least 0.62.",
-            &[],
             std::slice::from_ref(&validation_report),
             0,
             workspace.path(),
@@ -688,15 +344,37 @@ fn turn_local_python_verifier_is_source_bound_and_threshold_aware() {
     });
     let reports_with_later_change = vec![write_report, validation_report, later_write];
     assert!(
-        objective_validation_report_for_objective_in_turn(
+        objective_validation_report_in_turn(
             &reports_with_later_change[1],
-            "The score must be at least 0.62.",
-            &[],
             &reports_with_later_change,
             1,
             workspace.path(),
         )
         .is_none()
+    );
+}
+
+#[test]
+fn turn_local_python_verifier_rejects_constant_self_reports() {
+    let workspace = tempdir().expect("workspace");
+    let verifier_path = workspace.path().join("verify.py");
+    let source = "accuracy = 0.7\nassert accuracy >= 0.62\n";
+    fs::write(&verifier_path, source).expect("verifier source");
+    let verifier_path = fs::canonicalize(verifier_path).expect("canonical verifier");
+
+    let mut write_report = objective_test_report("write_file", None);
+    write_report.changed_files.push(verifier_path.clone());
+    write_report.after_images.push(FileBeforeImage {
+        path: verifier_path,
+        content: Some(source.as_bytes().to_vec()),
+        unix_mode: None,
+        metadata: None,
+    });
+    let validation_report = objective_test_report("shell", Some("python verify.py"));
+    let reports = vec![write_report, validation_report];
+
+    assert!(
+        objective_validation_report_in_turn(&reports[1], &reports, 1, workspace.path()).is_none()
     );
 }
 
@@ -717,16 +395,9 @@ fn turn_local_python_verifier_identity_changes_with_source() {
             metadata: None,
         });
         let reports = vec![write_report, validation_report.clone()];
-        objective_validation_report_for_objective_in_turn(
-            &reports[1],
-            "validate the result",
-            &[],
-            &reports,
-            1,
-            workspace.path(),
-        )
-        .expect("turn-local verifier")
-        .identity
+        objective_validation_report_in_turn(&reports[1], &reports, 1, workspace.path())
+            .expect("turn-local verifier")
+            .identity
     };
 
     let first = identity_for("from pathlib import Path\nassert Path('one').exists()\n");
@@ -3231,10 +2902,10 @@ PY'"#
         "python3 -c \"if failed: raise SystemExit(0)\""
     ));
     assert!(is_objective_validation_command(
-        "python3 -c \"if actual != expected: raise RuntimeError('mismatch')\""
+        "python3 -c \"from pathlib import Path\nactual = Path('result.txt').read_text()\nif actual != 'expected': raise RuntimeError('mismatch')\""
     ));
     assert!(is_objective_validation_command(
-        "python3 -c \"import sys\nif actual != expected:\n    sys.exit(1)\""
+        "python3 -c \"import sys\nfrom pathlib import Path\nactual = Path('result.txt').read_text()\nif actual != 'expected':\n    sys.exit(1)\""
     ));
     assert_eq!(
         objective_validation_command_kind("python3 -c \"assert False\""),
@@ -3359,7 +3030,7 @@ tmux list-panes -t workflow:0 -F "#{pane_index}:#{pane_current_command}" | grep 
         "bash -lc 'strings artifact.bin | grep -Fq expected'"
     ));
     assert!(is_objective_validation_command(
-        "bash -lc 'set -e\npython3 -c \"assert actual == expected\"\nprintf \"validated\\n\"'"
+        "bash -lc 'set -e\npython3 -c \"from pathlib import Path; actual = Path(\\\"result.txt\\\").read_text(); assert actual == \\\"expected\\\"\"\nprintf \"validated\\n\"'"
     ));
     assert!(!is_objective_validation_command(
         "bash -lc 'set -e\npython3 -c \"assert actual == expected\"\ntouch validation-marker'"

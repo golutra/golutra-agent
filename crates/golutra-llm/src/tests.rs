@@ -194,8 +194,9 @@ fn shell_provider_description_distinguishes_lifetime_from_initial_wait() {
     assert!(description.contains("only controls the initial wait"));
     assert!(description.contains("runtime-scoped"));
     assert!(description.contains("do not use background=true"));
-    assert!(description.contains("nohup"));
-    assert!(description.contains("verify it before returning"));
+    assert!(description.contains("platform-appropriate lifecycle mechanism"));
+    assert!(description.contains("verify availability before returning"));
+    assert!(!description.contains("nohup"));
 }
 
 #[test]
