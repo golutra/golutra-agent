@@ -1,6 +1,8 @@
 use chrono::Utc;
 use golutra_core::{EventId, SessionId, ThreadId};
-use golutra_protocol::{RuntimeEvent, RuntimeEventSource, RuntimeEventType, VisibleStep};
+use golutra_protocol::{
+    RuntimeEvent, RuntimeEventSource, RuntimeEventType, UserProjection, VisibleStep,
+};
 use serde_json::json;
 
 use super::*;
@@ -92,6 +94,116 @@ fn submission_anchor_resolves_only_its_own_command() {
     let resolved = WaitFacts::from_app(&app).resolve_anchor(anchor);
     assert_eq!(resolved.task_id, Some(first_task));
     assert_eq!(resolved.turn_id, Some(first_turn));
+}
+
+#[test]
+fn submission_scoped_wait_state_does_not_reuse_a_stale_projection_task() {
+    let first_task = TaskId::new();
+    let first_turn = TurnId::new();
+    let second_task = TaskId::new();
+    let second_turn = TurnId::new();
+    let command_id = CommandId::new();
+    let mut created = terminal_event(11, second_task, second_turn);
+    created.event_type = RuntimeEventType::TaskCreated;
+    created.payload = json!({"command_id": command_id});
+    let mut second_terminal = terminal_event(12, second_task, second_turn);
+    second_terminal.payload = json!({"status": TaskStatus::Failed});
+
+    let mut app = test_app(None, None);
+    app.projection = Some(UserProjection {
+        session_id: app.session_id,
+        task_id: Some(first_task),
+        status: TaskStatus::Completed,
+        visible_steps: Vec::new(),
+        pending_approval: None,
+        final_message: Some("first task".to_owned()),
+        residual_risks: Vec::new(),
+    });
+    app.events = vec![
+        terminal_event(9, first_task, first_turn),
+        created,
+        second_terminal,
+    ];
+    let anchor = SubmissionAnchor {
+        command_id,
+        after_sequence_no: Some(10),
+        task_id: None,
+        turn_id: None,
+    };
+    let facts = WaitFacts::from_app(&app);
+    let resolved_scope = facts.response_scope(&WaitCondition::TaskTerminal, Some(anchor));
+    assert!(facts.condition_met(&WaitCondition::Idle, Some(anchor)));
+    assert!(matches!(
+        resolved_scope,
+        WaitResponseScope::Submission {
+            status: Some(TaskStatus::Failed),
+            ..
+        }
+    ));
+
+    let (projected_task, projected_turn) =
+        task_and_turn_for_scope(&app, WaitResponseScope::Current);
+    assert_eq!(projected_task, Some(first_task));
+    assert_eq!(projected_turn, Some(first_turn));
+
+    let (task_id, turn_id) = task_and_turn_for_scope(&app, resolved_scope);
+    assert_eq!(task_id, Some(second_task));
+    assert_eq!(turn_id, Some(second_turn));
+
+    let unresolved = SubmissionAnchor {
+        command_id: CommandId::new(),
+        after_sequence_no: Some(12),
+        task_id: None,
+        turn_id: None,
+    };
+    let unresolved_scope = facts.response_scope(&WaitCondition::TaskStarted, Some(unresolved));
+    assert!(!facts.condition_met(&WaitCondition::Idle, Some(unresolved)));
+    assert!(matches!(
+        unresolved_scope,
+        WaitResponseScope::Submission { status: None, .. }
+    ));
+    assert_eq!(
+        task_and_turn_for_scope(&app, unresolved_scope),
+        (None, None)
+    );
+}
+
+#[test]
+fn submission_scoped_status_uses_projection_at_a_truncated_history_boundary() {
+    let task_id = TaskId::new();
+    let turn_id = TurnId::new();
+    let command_id = CommandId::new();
+    let mut queued = terminal_event(21, task_id, turn_id);
+    queued.event_type = RuntimeEventType::TurnQueued;
+    queued.payload = json!({"command_id": command_id});
+
+    let mut app = test_app(None, None);
+    app.projection = Some(UserProjection {
+        session_id: app.session_id,
+        task_id: Some(task_id),
+        status: TaskStatus::Running,
+        visible_steps: Vec::new(),
+        pending_approval: None,
+        final_message: None,
+        residual_risks: Vec::new(),
+    });
+    app.events = vec![queued];
+    let anchor = SubmissionAnchor {
+        command_id,
+        after_sequence_no: Some(20),
+        task_id: None,
+        turn_id: None,
+    };
+
+    let facts = WaitFacts::from_app(&app);
+    assert!(facts.condition_met(&WaitCondition::TaskStarted, Some(anchor)));
+    assert!(matches!(
+        facts.response_scope(&WaitCondition::TaskStarted, Some(anchor)),
+        WaitResponseScope::Submission {
+            status: Some(TaskStatus::Running),
+            ..
+        }
+    ));
 }
 
 #[test]

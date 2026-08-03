@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use golutra_core::{TaskId, TaskStatus, TurnId};
-use golutra_protocol::{RuntimeEvent, RuntimeEventType, WaitCondition};
+use golutra_protocol::{RuntimeEvent, RuntimeEventType, WaitCondition, task_status_after_event};
 
 use super::session::{event_type_name, is_terminal_status, runtime_events};
 use super::{SubmissionAnchor, TuiApp};
@@ -11,6 +11,15 @@ struct AnchorEvent {
     sequence_no: u64,
     task_id: Option<TaskId>,
     turn_id: Option<TurnId>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum WaitResponseScope {
+    Current,
+    Submission {
+        anchor: SubmissionAnchor,
+        status: Option<TaskStatus>,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -72,6 +81,7 @@ struct EvaluationJobs {
 pub(super) struct WaitFacts {
     projection_ready: bool,
     status: Option<TaskStatus>,
+    projection_task_id: Option<TaskId>,
     current_task_id: Option<TaskId>,
     current_turn_id: Option<TurnId>,
     command_anchors: HashMap<String, AnchorEvent>,
@@ -82,18 +92,19 @@ pub(super) struct WaitFacts {
     event_high_watermarks: HashMap<String, u64>,
     evaluation_jobs: HashMap<TaskId, EvaluationJobs>,
     evaluation_stage_failures: HashSet<TaskId>,
+    task_statuses: HashMap<TaskId, TaskStatus>,
 }
 
 impl WaitFacts {
     pub(super) fn from_app(app: &TuiApp) -> Self {
         let events = runtime_events(app);
+        let projection_task_id = app
+            .projection
+            .as_ref()
+            .and_then(|projection| projection.task_id);
         let current_task_id = app
             .task_id
-            .or_else(|| {
-                app.projection
-                    .as_ref()
-                    .and_then(|projection| projection.task_id)
-            })
+            .or(projection_task_id)
             .or_else(|| events.iter().rev().find_map(|event| event.task_id));
         let current_turn_id = current_task_id
             .and_then(|task_id| {
@@ -107,6 +118,7 @@ impl WaitFacts {
         let mut facts = Self {
             projection_ready: app.projection.is_some(),
             status: app.projection.as_ref().map(|projection| projection.status),
+            projection_task_id,
             current_task_id,
             current_turn_id,
             command_anchors: HashMap::new(),
@@ -117,6 +129,7 @@ impl WaitFacts {
             event_high_watermarks: HashMap::new(),
             evaluation_jobs: HashMap::new(),
             evaluation_stage_failures: HashSet::new(),
+            task_statuses: HashMap::new(),
         };
         for event in events {
             facts.record(event);
@@ -125,6 +138,15 @@ impl WaitFacts {
     }
 
     fn record(&mut self, event: &RuntimeEvent) {
+        if let Some(task_id) = event.task_id {
+            let current = self
+                .task_statuses
+                .get(&task_id)
+                .copied()
+                .unwrap_or(TaskStatus::Idle);
+            self.task_statuses
+                .insert(task_id, task_status_after_event(current, event));
+        }
         record_max(
             &mut self.event_high_watermarks,
             event_type_name(event.event_type),
@@ -220,25 +242,24 @@ impl WaitFacts {
         condition: &WaitCondition,
         submission: Option<SubmissionAnchor>,
     ) -> bool {
-        let submission = submission.map(|anchor| self.resolve_anchor(anchor));
+        let submission = self.scoped_submission(condition, submission);
         match condition {
             WaitCondition::Ready => self.projection_ready,
-            WaitCondition::Idle => self
-                .status
-                .is_some_and(|status| status == TaskStatus::Idle || is_terminal_status(status)),
+            WaitCondition::Idle => submission.map_or_else(
+                || {
+                    self.status.is_some_and(|status| {
+                        status == TaskStatus::Idle || is_terminal_status(status)
+                    })
+                },
+                |anchor| self.task_terminal_matches(anchor),
+            ),
             WaitCondition::TaskStarted => submission.map_or_else(
                 || self.status.is_some_and(|status| status != TaskStatus::Idle),
                 |anchor| anchor.task_id.is_some(),
             ),
             WaitCondition::TaskTerminal => submission.map_or_else(
                 || self.status.is_some_and(is_terminal_status),
-                |anchor| {
-                    anchor.task_id.is_some_and(|task_id| {
-                        self.task_terminal
-                            .get(&task_id)
-                            .is_some_and(|sequence_no| sequence_after_anchor(*sequence_no, anchor))
-                    })
-                },
+                |anchor| self.task_terminal_matches(anchor),
             ),
             WaitCondition::TurnTerminal => submission.map_or_else(
                 || {
@@ -278,6 +299,51 @@ impl WaitFacts {
                             .is_none_or(|anchor| sequence_after_anchor(*sequence_no, anchor))
                 }),
         }
+    }
+
+    pub(super) fn response_scope(
+        &self,
+        condition: &WaitCondition,
+        submission: Option<SubmissionAnchor>,
+    ) -> WaitResponseScope {
+        self.scoped_submission(condition, submission)
+            .map_or(WaitResponseScope::Current, |anchor| {
+                WaitResponseScope::Submission {
+                    status: anchor
+                        .task_id
+                        .and_then(|task_id| self.status_for_task(task_id)),
+                    anchor,
+                }
+            })
+    }
+
+    fn status_for_task(&self, task_id: TaskId) -> Option<TaskStatus> {
+        let observed = self.task_statuses.get(&task_id).copied();
+        match observed {
+            Some(status) if status != TaskStatus::Idle => Some(status),
+            _ if self.projection_task_id == Some(task_id) => self.status.or(observed),
+            _ => observed,
+        }
+    }
+
+    fn scoped_submission(
+        &self,
+        condition: &WaitCondition,
+        submission: Option<SubmissionAnchor>,
+    ) -> Option<SubmissionAnchor> {
+        if matches!(condition, WaitCondition::Ready) {
+            None
+        } else {
+            submission.map(|anchor| self.resolve_anchor(anchor))
+        }
+    }
+
+    fn task_terminal_matches(&self, anchor: SubmissionAnchor) -> bool {
+        anchor.task_id.is_some_and(|task_id| {
+            self.task_terminal
+                .get(&task_id)
+                .is_some_and(|sequence_no| sequence_after_anchor(*sequence_no, anchor))
+        })
     }
 
     pub(super) fn evaluation_terminal(&self, task_id: TaskId) -> bool {

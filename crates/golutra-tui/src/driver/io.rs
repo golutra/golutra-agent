@@ -289,24 +289,22 @@ where
                                     true => {
                                         let started_at = driver.start_wait_metrics();
                                         driver.finish_wait_metrics(started_at, false);
+                                        let response_value =
+                                            wait_response(driver, until, false, submission);
                                         write_response(
                                             &mut writer,
-                                            response(
-                                                request_id,
-                                                wait_response(driver, until, false),
-                                            ),
+                                            response(request_id, response_value),
                                         )
                                         .await?;
                                     }
                                     false if timeout_ms == 0 => {
                                         let started_at = driver.start_wait_metrics();
                                         driver.finish_wait_metrics(started_at, true);
+                                        let response_value =
+                                            wait_response(driver, until, true, submission);
                                         write_response(
                                             &mut writer,
-                                            response(
-                                                request_id,
-                                                wait_response(driver, until, true),
-                                            ),
+                                            response(request_id, response_value),
                                         )
                                         .await?;
                                     }
@@ -428,12 +426,15 @@ where
                         if met || timed_out {
                             let pending = pending_waits.remove(index);
                             driver.finish_wait_metrics(pending.started_at, !met);
+                            let response_value = wait_response(
+                                driver,
+                                pending.condition,
+                                !met,
+                                pending.submission,
+                            );
                             write_response(
                                 &mut writer,
-                                response(
-                                    pending.request_id,
-                                    wait_response(driver, pending.condition, !met),
-                                ),
+                                response(pending.request_id, response_value),
                             )
                             .await?;
                         } else {
@@ -498,8 +499,9 @@ fn wait_response(
     driver: &mut TuiDriver,
     condition: WaitCondition,
     timed_out: bool,
+    submission: Option<super::SubmissionAnchor>,
 ) -> DriverResponse {
-    let state = driver.cached_state();
+    let state = driver.wait_state(&condition, submission);
     if timed_out {
         DriverResponse::WaitTimeout { condition, state }
     } else {

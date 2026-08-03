@@ -45,6 +45,52 @@ pub struct UserProjection {
     pub residual_risks: Vec<String>,
 }
 
+/// Applies the task-status portion of a runtime event projection.
+///
+/// Keeping this reducer beside the protocol types lets durable projections and
+/// event-backed clients agree on status while their full read models reconcile.
+#[must_use]
+pub fn task_status_after_event(current: TaskStatus, event: &RuntimeEvent) -> TaskStatus {
+    match event.event_type {
+        crate::RuntimeEventType::TaskCreated
+        | crate::RuntimeEventType::TurnStarted
+        | crate::RuntimeEventType::TaskResumed => TaskStatus::Running,
+        crate::RuntimeEventType::TaskCompleted => {
+            event_task_status(event).unwrap_or(TaskStatus::Completed)
+        }
+        crate::RuntimeEventType::TaskAbortRequested => TaskStatus::Aborting,
+        crate::RuntimeEventType::TaskAborted => {
+            event_task_status(event).unwrap_or(TaskStatus::Cancelled)
+        }
+        crate::RuntimeEventType::TaskInterrupted => TaskStatus::Interrupted,
+        crate::RuntimeEventType::TaskUncertain => TaskStatus::Uncertain,
+        crate::RuntimeEventType::TaskReconciled => {
+            event_task_status(event).unwrap_or(TaskStatus::Interrupted)
+        }
+        crate::RuntimeEventType::TaskPaused => TaskStatus::Paused,
+        crate::RuntimeEventType::ApprovalRequested => TaskStatus::WaitingApproval,
+        crate::RuntimeEventType::ApprovalResolved if current == TaskStatus::WaitingApproval => {
+            TaskStatus::Running
+        }
+        crate::RuntimeEventType::ProviderAuthRequired => TaskStatus::WaitingAuthentication,
+        crate::RuntimeEventType::ProviderAuthSubmitted
+            if current == TaskStatus::WaitingAuthentication =>
+        {
+            TaskStatus::Running
+        }
+        crate::RuntimeEventType::ProviderAuthCancelled => TaskStatus::Blocked,
+        _ => current,
+    }
+}
+
+fn event_task_status(event: &RuntimeEvent) -> Option<TaskStatus> {
+    event
+        .payload
+        .get("status")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct DebugProjection {
     pub session_id: SessionId,

@@ -167,26 +167,48 @@ impl TuiDriver {
     }
 
     fn cached_state(&self) -> DriverState {
-        let (task_id, turn_id) = current_task_and_turn(&self.app);
-        DriverState {
-            instance_id: self.instance_id.clone(),
-            thread_id: self.app.thread_id.to_string(),
-            session_id: self.app.session_id.to_string(),
-            task_id: task_id.map(|id| id.to_string()),
-            turn_id: turn_id.map(|id| id.to_string()),
-            status: self
+        self.cached_state_for_scope(WaitResponseScope::Current)
+    }
+
+    fn cached_state_for_scope(&self, scope: WaitResponseScope) -> DriverState {
+        let (task_id, turn_id) = task_and_turn_for_scope(&self.app, scope);
+        let status = match scope {
+            WaitResponseScope::Current => self
                 .app
                 .projection
                 .as_ref()
                 .map_or(DriverTaskStatus::Connecting, |projection| {
                     projection.status.into()
                 }),
+            WaitResponseScope::Submission { status, .. } => status
+                .map(Into::into)
+                .unwrap_or(DriverTaskStatus::Connecting),
+        };
+        DriverState {
+            instance_id: self.instance_id.clone(),
+            thread_id: self.app.thread_id.to_string(),
+            session_id: self.app.session_id.to_string(),
+            task_id: task_id.map(|id| id.to_string()),
+            turn_id: turn_id.map(|id| id.to_string()),
+            status,
             width: self.width,
             height: self.height,
             facts_expanded: self.app.developer_facts_expanded,
             controller_mode: self.last_controller_mode,
             closed: self.closed,
         }
+    }
+
+    fn wait_state(
+        &mut self,
+        condition: &WaitCondition,
+        submission: Option<SubmissionAnchor>,
+    ) -> DriverState {
+        let scope = {
+            let facts = self.wait_facts();
+            facts.response_scope(condition, submission)
+        };
+        self.cached_state_for_scope(scope)
     }
 
     async fn controller_mode(&self) -> miette::Result<DriverControllerMode> {
@@ -580,9 +602,10 @@ impl TuiDriver {
         loop {
             let now = tokio::time::Instant::now();
             if now >= deadline {
+                let state = self.wait_state(&until, submission);
                 return Ok(DriverResponse::WaitTimeout {
                     condition: until,
-                    state: self.cached_state(),
+                    state,
                 });
             }
             let sync_budget = deadline
@@ -593,15 +616,17 @@ impl TuiDriver {
                 Err(_) => continue,
             }
             if self.condition_met_for(&until, submission) {
+                let state = self.wait_state(&until, submission);
                 return Ok(DriverResponse::WaitResult {
                     condition: until,
-                    state: self.cached_state(),
+                    state,
                 });
             }
             if tokio::time::Instant::now() >= deadline {
+                let state = self.wait_state(&until, submission);
                 return Ok(DriverResponse::WaitTimeout {
                     condition: until,
-                    state: self.cached_state(),
+                    state,
                 });
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -977,6 +1002,16 @@ fn pending_slash_completion(app: &TuiApp) -> Option<SlashCommandCandidate> {
         .trim()
         .starts_with(&format!("{} ", candidate.command));
     (!already_has_arguments).then_some(candidate)
+}
+
+fn task_and_turn_for_scope(
+    app: &TuiApp,
+    scope: WaitResponseScope,
+) -> (Option<TaskId>, Option<TurnId>) {
+    match scope {
+        WaitResponseScope::Current => current_task_and_turn(app),
+        WaitResponseScope::Submission { anchor, .. } => (anchor.task_id, anchor.turn_id),
+    }
 }
 
 fn ensure_slash_input_is_valid(text: &str) -> miette::Result<()> {

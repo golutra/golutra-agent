@@ -357,6 +357,7 @@ async fn inspect_and_stdio_driver_execute_real_offscreen_tui() {
         .as_str()
         .expect("second task")
         .to_owned();
+    assert_eq!(second["state"]["status"], "completed");
     assert_ne!(
         second_task, first_task,
         "wait reused the previous terminal task"

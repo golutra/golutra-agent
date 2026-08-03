@@ -1,7 +1,9 @@
 //! RuntimeEvent 到 StateProjection 的纯归约逻辑。
 
 use golutra_core::{LoopDecision, SessionId, TaskStatus, VerificationRecord};
-use golutra_protocol::{RuntimeEvent, RuntimeEventType, StateProjection, VisibleStep};
+use golutra_protocol::{
+    RuntimeEvent, RuntimeEventType, StateProjection, VisibleStep, task_status_after_event,
+};
 
 const MAX_PROJECTION_VISIBLE_STEPS: usize = 512;
 
@@ -32,65 +34,34 @@ pub(crate) fn apply_event_to_projection(projection: &mut StateProjection, event:
     if let Some(runtime_lane) = runtime_lane_from_event(event) {
         projection.runtime_lane = Some(runtime_lane);
     }
+    projection.task_status = task_status_after_event(projection.task_status, event);
     match event.event_type {
         RuntimeEventType::TaskCreated => {
-            projection.task_status = TaskStatus::Running;
             projection.pending_approval = None;
             projection.final_message = None;
             projection.last_loop_decision = None;
             projection.last_verification = None;
         }
         RuntimeEventType::TurnStarted => {
-            projection.task_status = TaskStatus::Running;
             projection.pending_approval = None;
             projection.final_message = None;
         }
-        RuntimeEventType::TaskResumed => {
-            projection.task_status = TaskStatus::Running;
-        }
         RuntimeEventType::TaskCompleted => {
-            projection.task_status = event
-                .payload
-                .get("status")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok())
-                .unwrap_or(TaskStatus::Completed);
             projection.pending_approval = None;
         }
-        RuntimeEventType::TaskAbortRequested => {
-            projection.task_status = TaskStatus::Aborting;
-        }
         RuntimeEventType::TaskAborted => {
-            projection.task_status = event
-                .payload
-                .get("status")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok())
-                .unwrap_or(TaskStatus::Cancelled);
             projection.pending_approval = None;
         }
         RuntimeEventType::TaskInterrupted => {
-            projection.task_status = TaskStatus::Interrupted;
             projection.pending_approval = None;
         }
         RuntimeEventType::TaskUncertain => {
-            projection.task_status = TaskStatus::Uncertain;
             projection.pending_approval = None;
         }
         RuntimeEventType::TaskReconciled => {
-            projection.task_status = event
-                .payload
-                .get("status")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok())
-                .unwrap_or(TaskStatus::Interrupted);
             projection.pending_approval = None;
         }
-        RuntimeEventType::TaskPaused => {
-            projection.task_status = TaskStatus::Paused;
-        }
         RuntimeEventType::ApprovalRequested => {
-            projection.task_status = TaskStatus::WaitingApproval;
             projection.pending_approval = event
                 .payload
                 .get("approval_id")
@@ -99,20 +70,6 @@ pub(crate) fn apply_event_to_projection(projection: &mut StateProjection, event:
         }
         RuntimeEventType::ApprovalResolved => {
             projection.pending_approval = None;
-            if projection.task_status == TaskStatus::WaitingApproval {
-                projection.task_status = TaskStatus::Running;
-            }
-        }
-        RuntimeEventType::ProviderAuthRequired => {
-            projection.task_status = TaskStatus::WaitingAuthentication;
-        }
-        RuntimeEventType::ProviderAuthSubmitted => {
-            if projection.task_status == TaskStatus::WaitingAuthentication {
-                projection.task_status = TaskStatus::Running;
-            }
-        }
-        RuntimeEventType::ProviderAuthCancelled => {
-            projection.task_status = TaskStatus::Blocked;
         }
         RuntimeEventType::VerificationCompleted => {
             projection.last_verification = verification_from_event(event);
