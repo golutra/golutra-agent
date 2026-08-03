@@ -438,19 +438,28 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn process_is_running(pid: Pid) -> bool {
-        let Ok(stat) = fs::read_to_string(format!("/proc/{}/stat", pid.as_raw())) else {
-            return false;
-        };
+    // Linux sets PF_EXITING before the task state visible in /proc changes to zombie.
+    const LINUX_PROCESS_FLAG_EXITING: u64 = 0x0000_0004;
+
+    #[cfg(target_os = "linux")]
+    fn linux_process_is_running(stat: &str) -> bool {
         let Some(command_end) = stat.rfind(')') else {
             return true;
         };
-        !matches!(
-            stat[command_end.saturating_add(1)..]
-                .split_whitespace()
-                .next(),
-            Some("Z" | "X")
-        )
+        let mut fields = stat[command_end.saturating_add(1)..].split_whitespace();
+        if matches!(fields.next(), Some("Z" | "X")) {
+            return false;
+        }
+        let Some(flags) = fields.nth(5).and_then(|value| value.parse::<u64>().ok()) else {
+            return true;
+        };
+        flags & LINUX_PROCESS_FLAG_EXITING == 0
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_is_running(pid: Pid) -> bool {
+        fs::read_to_string(format!("/proc/{}/stat", pid.as_raw()))
+            .is_ok_and(|stat| linux_process_is_running(&stat))
     }
 
     #[cfg(all(unix, not(target_os = "linux")))]
@@ -553,6 +562,20 @@ mod tests {
             .parse::<i32>()
             .expect("numeric child pid");
         assert!(!process_is_running(Pid::from_raw(child_pid)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_process_state_treats_exit_in_progress_as_stopped() {
+        assert!(linux_process_is_running(
+            "45 (sleep worker) S 1 44 1 0 -1 4194304"
+        ));
+        assert!(!linux_process_is_running(
+            "45 (sleep worker) R 1 44 1 0 -1 4195340"
+        ));
+        assert!(!linux_process_is_running(
+            "45 (sleep worker) Z 1 44 1 0 -1 4194304"
+        ));
     }
 
     #[cfg(unix)]
