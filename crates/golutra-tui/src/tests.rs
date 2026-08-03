@@ -1996,6 +1996,19 @@ fn developer_panel_exposes_governance_without_leaking_into_normal_view() {
         &mut app,
     );
     assert!(!app.developer_facts_expanded);
+
+    let padded_toggle = developer_facts_toggle_hit_rect(developer_area);
+    assert!(padded_toggle.x < toggle.x);
+    handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: padded_toggle.x,
+            row: padded_toggle.y,
+            modifiers: KeyModifiers::NONE,
+        },
+        &mut app,
+    );
+    assert!(app.developer_facts_expanded);
 }
 
 #[test]
@@ -3113,6 +3126,181 @@ fn mouse_wheel_routes_to_the_pane_under_the_pointer() {
         )
         .start,
         0
+    );
+}
+
+#[tokio::test]
+async fn clicking_developer_pane_routes_page_keys_to_developer() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let session_id = SessionId::new();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        None,
+        true,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.command_messages = (0..40)
+        .map(|index| TranscriptItem {
+            role: TranscriptRole::System,
+            title: format!("message-{index}"),
+            body: vec!["history".to_owned()],
+        })
+        .collect();
+    app.developer_projection = Some(debug_projection_with_events(
+        session_id,
+        None,
+        (1..=40)
+            .map(|sequence_no| RuntimeEvent {
+                schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+                causal_context: Default::default(),
+                causal_links: Vec::new(),
+                id: golutra_core::EventId::new(),
+                sequence_no,
+                session_id,
+                turn_id: None,
+                task_id: None,
+                parent_event_id: None,
+                event_type: RuntimeEventType::CommandAccepted,
+                timestamp: chrono::Utc::now(),
+                source: golutra_protocol::RuntimeEventSource::Runtime,
+                payload: json!({"summary": "developer paging detail ".repeat(8)}),
+                payload_ref: None,
+                durable: true,
+            })
+            .collect(),
+    ));
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw");
+    let toggle = developer_facts_toggle_rect(app.layout.developer.expect("developer area"));
+
+    handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: toggle.x,
+            row: toggle.y,
+            modifiers: KeyModifiers::NONE,
+        },
+        &mut app,
+    );
+    handle_key(
+        KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("page developer events");
+
+    assert!(app.developer_facts_expanded);
+    assert!(app.developer_scroll.offset_from_bottom > 0);
+    assert_eq!(app.transcript_scroll.offset_from_bottom, 0);
+    assert!(app.status_message.starts_with("developer facts"));
+}
+
+#[tokio::test]
+async fn session_pickers_support_page_boundary_and_wheel_navigation() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    let items = (0..30)
+        .map(|index| ResumeThreadItem {
+            thread_id: ThreadId::new(),
+            session_id: SessionId::new(),
+            title: format!("session-{index}"),
+            preview: format!("preview-{index}"),
+        })
+        .collect::<Vec<_>>();
+    app.resume_picker = Some(ResumePickerState {
+        items: items.clone(),
+        selected: 0,
+    });
+    let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("terminal");
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw picker");
+
+    handle_key(
+        KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("page down");
+    let page_size = resume_picker_page_size(app.layout.transcript);
+    assert_eq!(
+        app.resume_picker.as_ref().expect("picker").selected,
+        page_size
+    );
+
+    handle_key(
+        KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("page up");
+    assert_eq!(app.resume_picker.as_ref().expect("picker").selected, 0);
+
+    handle_key(
+        KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("picker end");
+    assert_eq!(app.resume_picker.as_ref().expect("picker").selected, 29);
+
+    handle_key(
+        KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("picker home");
+    assert_eq!(app.resume_picker.as_ref().expect("picker").selected, 0);
+
+    handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: app.layout.transcript.x.saturating_add(1),
+            row: app.layout.transcript.y.saturating_add(1),
+            modifiers: KeyModifiers::NONE,
+        },
+        &mut app,
+    );
+    assert_eq!(app.resume_picker.as_ref().expect("picker").selected, 1);
+
+    app.resume_picker = None;
+    app.export_flow = Some(ExportFlowState {
+        picker: ResumePickerState { items, selected: 0 },
+        step: ExportFlowStep::SelectSession,
+        range_input: "1".to_owned(),
+        destination_input: String::new(),
+        error: None,
+        receipt: None,
+    });
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw export picker");
+    handle_key(
+        KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("export page down");
+    assert_eq!(
+        app.export_flow.as_ref().expect("export").picker.selected,
+        resume_picker_page_size(app.layout.transcript)
     );
 }
 

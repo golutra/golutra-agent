@@ -589,6 +589,78 @@ async fn inspect_and_stdio_driver_execute_real_offscreen_tui() {
     assert!(!screen_json.contains(composer_secret));
     assert!(screen_json.contains("redacted-secret"));
     assert!(screen_json.contains("Developer runtime"));
+    let facts_toggle = screen["hit_regions"]
+        .as_array()
+        .and_then(|regions| {
+            regions
+                .iter()
+                .find(|region| region["id"] == "developer_facts_toggle")
+        })
+        .expect("developer facts hit region");
+    let facts_x = facts_toggle["x"].as_u64().expect("facts x")
+        + facts_toggle["width"].as_u64().expect("facts width") / 2;
+    let facts_y = facts_toggle["y"].as_u64().expect("facts y");
+    driver
+        .send(json!({
+            "request_id": "expand-developer-facts",
+            "type": "input_mouse",
+            "event": {"kind": "left_click", "column": facts_x, "row": facts_y}
+        }))
+        .await;
+    assert_eq!(
+        driver.receive("expand-developer-facts").await["type"],
+        "accepted"
+    );
+    driver
+        .send(json!({
+            "request_id": "developer-facts-end",
+            "type": "input_key",
+            "key": "end"
+        }))
+        .await;
+    assert_eq!(
+        driver.receive("developer-facts-end").await["type"],
+        "accepted"
+    );
+    driver
+        .send(json!({
+            "request_id": "expanded-developer-before-page",
+            "type": "snapshot",
+            "scope": "screen",
+            "panes": "developer",
+            "width": 100,
+            "height": 24
+        }))
+        .await;
+    let before_page = driver.receive("expanded-developer-before-page").await;
+    let before_page_json = serde_json::to_string(&before_page).expect("expanded developer JSON");
+    assert!(before_page_json.contains("▾ facts"));
+    driver
+        .send(json!({
+            "request_id": "page-developer-facts",
+            "type": "input_key",
+            "key": "page_up"
+        }))
+        .await;
+    assert_eq!(
+        driver.receive("page-developer-facts").await["type"],
+        "accepted"
+    );
+    driver
+        .send(json!({
+            "request_id": "expanded-developer-after-page",
+            "type": "snapshot",
+            "scope": "screen",
+            "panes": "developer",
+            "width": 100,
+            "height": 24
+        }))
+        .await;
+    let after_page = driver.receive("expanded-developer-after-page").await;
+    assert_ne!(
+        after_page["lines"], before_page["lines"],
+        "PageUp did not move the active developer pane"
+    );
     driver
         .send(json!({
             "request_id": "clear-composer",

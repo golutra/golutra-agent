@@ -182,6 +182,13 @@ struct DriverArgs {
     heartbeat_secs: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ScrollablePane {
+    #[default]
+    Transcript,
+    Developer,
+}
+
 #[derive(Debug)]
 struct TuiApp {
     thread_id: ThreadId,
@@ -214,6 +221,7 @@ struct TuiApp {
     developer_facts_expanded: bool,
     transcript_scroll: PaneScrollState,
     developer_scroll: PaneScrollState,
+    active_scroll_pane: ScrollablePane,
     developer_event_layout: DeveloperEventLayout,
     developer_top_row_override: Option<usize>,
     developer_load_requested: bool,
@@ -276,6 +284,7 @@ impl TuiApp {
                 follow_tail: true,
                 ..PaneScrollState::default()
             },
+            active_scroll_pane: ScrollablePane::Transcript,
             developer_event_layout: DeveloperEventLayout::default(),
             developer_top_row_override: None,
             developer_load_requested: false,
@@ -683,6 +692,26 @@ impl TuiApp {
 
     fn max_transcript_scroll_offset(&self, visible_rows: usize) -> usize {
         self.transcript_scroll.max_offset(visible_rows)
+    }
+
+    fn activate_scroll_pane(&mut self, target: UiHitTarget) {
+        match target {
+            UiHitTarget::Transcript => self.active_scroll_pane = ScrollablePane::Transcript,
+            UiHitTarget::Developer => self.active_scroll_pane = ScrollablePane::Developer,
+            UiHitTarget::Bottom | UiHitTarget::Overlay | UiHitTarget::None => {}
+        }
+    }
+
+    fn scroll_active_pane(&mut self, action: TranscriptScrollAction) {
+        if self.active_scroll_pane == ScrollablePane::Developer
+            && let Some(area) = self.layout.developer
+        {
+            let rows = developer_event_page_rows(self, area);
+            self.scroll_developer(action, rows);
+        } else {
+            let rows = self.layout.transcript.height.saturating_sub(1).max(1) as usize;
+            self.scroll_transcript(action, rows);
+        }
     }
 
     fn sync_developer_row_count(&mut self) {
@@ -1353,6 +1382,18 @@ impl TuiApp {
         }
     }
 
+    fn move_overlay_selection(&mut self, direction: ResumeSelectionDirection) {
+        if let Some(picker) = &mut self.resume_picker {
+            picker.move_selection(direction);
+        } else if let Some(flow) = &mut self.export_flow
+            && flow.step == ExportFlowStep::SelectSession
+        {
+            flow.picker.move_selection(direction);
+        } else if let Some(dialog) = &mut self.auth_dialog {
+            dialog.move_selection(direction);
+        }
+    }
+
     fn close_resume_picker(&mut self) {
         self.resume_picker = None;
         self.status_message = "resume cancelled".to_owned();
@@ -2007,21 +2048,21 @@ async fn handle_key(
             app.move_slash_selection(ResumeSelectionDirection::Next);
         }
         KeyCode::PageUp => {
-            app.scroll_transcript(TranscriptScrollAction::PageUp, transcript_page_rows(app));
+            app.scroll_active_pane(TranscriptScrollAction::PageUp);
         }
         KeyCode::PageDown => {
-            app.scroll_transcript(TranscriptScrollAction::PageDown, transcript_page_rows(app));
+            app.scroll_active_pane(TranscriptScrollAction::PageDown);
         }
         KeyCode::Home => {
             if app.input.is_empty() {
-                app.scroll_transcript(TranscriptScrollAction::Top, transcript_page_rows(app));
+                app.scroll_active_pane(TranscriptScrollAction::Top);
             } else {
                 app.input.move_to_start();
             }
         }
         KeyCode::End => {
             if app.input.is_empty() {
-                app.scroll_transcript(TranscriptScrollAction::Bottom, transcript_page_rows(app));
+                app.scroll_active_pane(TranscriptScrollAction::Bottom);
             } else {
                 app.input.move_to_end();
             }
@@ -2080,6 +2121,30 @@ async fn handle_export_key(
             KeyCode::Down | KeyCode::Char('j') => {
                 if let Some(flow) = &mut app.export_flow {
                     flow.picker.move_selection(ResumeSelectionDirection::Next);
+                }
+            }
+            KeyCode::PageUp => {
+                let page_size = resume_picker_page_size(app.layout.transcript);
+                if let Some(flow) = &mut app.export_flow {
+                    flow.picker
+                        .move_selection_by_page(ResumeSelectionDirection::Previous, page_size);
+                }
+            }
+            KeyCode::PageDown => {
+                let page_size = resume_picker_page_size(app.layout.transcript);
+                if let Some(flow) = &mut app.export_flow {
+                    flow.picker
+                        .move_selection_by_page(ResumeSelectionDirection::Next, page_size);
+                }
+            }
+            KeyCode::Home => {
+                if let Some(flow) = &mut app.export_flow {
+                    flow.picker.select_first();
+                }
+            }
+            KeyCode::End => {
+                if let Some(flow) = &mut app.export_flow {
+                    flow.picker.select_last();
                 }
             }
             KeyCode::Enter => app.handle_export_enter(transport).await?,
@@ -2171,13 +2236,15 @@ fn handle_paste(pasted: &str, app: &mut TuiApp) {
 
 fn handle_mouse(mouse: MouseEvent, app: &mut TuiApp) {
     let target = app.layout.hit_test(mouse.column, mouse.row, app);
-    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-        && target == UiHitTarget::Transcript
-        && let Some(operation_id) =
-            transcript_toggle_at(app, app.layout.transcript, mouse.column, mouse.row)
-    {
-        app.toggle_operation(operation_id);
-        return;
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        app.activate_scroll_pane(target);
+        if target == UiHitTarget::Transcript
+            && let Some(operation_id) =
+                transcript_toggle_at(app, app.layout.transcript, mouse.column, mouse.row)
+        {
+            app.toggle_operation(operation_id);
+            return;
+        }
     }
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left)
@@ -2185,38 +2252,33 @@ fn handle_mouse(mouse: MouseEvent, app: &mut TuiApp) {
                 .layout
                 .developer_facts_toggle_hit(mouse.column, mouse.row) =>
         {
+            app.active_scroll_pane = ScrollablePane::Developer;
             app.toggle_developer_facts();
         }
-        MouseEventKind::ScrollUp => match target {
-            UiHitTarget::Developer => {
-                let rows = app
-                    .layout
-                    .developer
-                    .map(|area| developer_event_page_rows(app, area))
-                    .unwrap_or(1);
-                app.scroll_developer(TranscriptScrollAction::LineUp, rows);
+        MouseEventKind::ScrollUp => {
+            app.activate_scroll_pane(target);
+            match target {
+                UiHitTarget::Developer | UiHitTarget::Transcript => {
+                    app.scroll_active_pane(TranscriptScrollAction::LineUp);
+                }
+                UiHitTarget::Overlay => {
+                    app.move_overlay_selection(ResumeSelectionDirection::Previous);
+                }
+                UiHitTarget::Bottom | UiHitTarget::None => {}
             }
-            UiHitTarget::Transcript => {
-                let rows = app.layout.transcript.height.saturating_sub(1) as usize;
-                app.scroll_transcript(TranscriptScrollAction::LineUp, rows);
+        }
+        MouseEventKind::ScrollDown => {
+            app.activate_scroll_pane(target);
+            match target {
+                UiHitTarget::Developer | UiHitTarget::Transcript => {
+                    app.scroll_active_pane(TranscriptScrollAction::LineDown);
+                }
+                UiHitTarget::Overlay => {
+                    app.move_overlay_selection(ResumeSelectionDirection::Next);
+                }
+                UiHitTarget::Bottom | UiHitTarget::None => {}
             }
-            _ => {}
-        },
-        MouseEventKind::ScrollDown => match target {
-            UiHitTarget::Developer => {
-                let rows = app
-                    .layout
-                    .developer
-                    .map(|area| developer_event_page_rows(app, area))
-                    .unwrap_or(1);
-                app.scroll_developer(TranscriptScrollAction::LineDown, rows);
-            }
-            UiHitTarget::Transcript => {
-                let rows = app.layout.transcript.height.saturating_sub(1) as usize;
-                app.scroll_transcript(TranscriptScrollAction::LineDown, rows);
-            }
-            _ => {}
-        },
+        }
         _ => {}
     }
 }
@@ -2233,6 +2295,28 @@ async fn handle_resume_picker_key(
         }
         KeyCode::Down | KeyCode::Char('j') => {
             app.move_resume_selection(ResumeSelectionDirection::Next);
+        }
+        KeyCode::PageUp => {
+            let page_size = resume_picker_page_size(app.layout.transcript);
+            if let Some(picker) = &mut app.resume_picker {
+                picker.move_selection_by_page(ResumeSelectionDirection::Previous, page_size);
+            }
+        }
+        KeyCode::PageDown => {
+            let page_size = resume_picker_page_size(app.layout.transcript);
+            if let Some(picker) = &mut app.resume_picker {
+                picker.move_selection_by_page(ResumeSelectionDirection::Next, page_size);
+            }
+        }
+        KeyCode::Home => {
+            if let Some(picker) = &mut app.resume_picker {
+                picker.select_first();
+            }
+        }
+        KeyCode::End => {
+            if let Some(picker) = &mut app.resume_picker {
+                picker.select_last();
+            }
         }
         KeyCode::Enter => {
             app.resume_selected_thread(transport).await?;

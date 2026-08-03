@@ -470,3 +470,86 @@ fn rejected_runtime_ack_is_not_reported_as_accepted() {
     };
     assert!(ensure_command_accepted(&accepted, "fallback").is_ok());
 }
+
+#[tokio::test]
+async fn snapshot_render_does_not_mutate_the_active_pane_layout() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let transport = RuntimeTransport::ephemeral_for_cwd(workspace.path())
+        .await
+        .expect("transport");
+    let mut driver = TuiDriver::launch(transport, None, None, true, false, 100, 24)
+        .await
+        .expect("driver");
+    driver.app.auth_dialog = None;
+    let session_id = driver.app.session_id;
+    driver.app.developer_projection = Some(golutra_protocol::DebugProjection {
+        session_id,
+        task_id: None,
+        event_window: golutra_protocol::DebugEventWindow {
+            start_cursor: Some(1),
+            end_cursor: Some(30),
+            has_more_before: false,
+            limit: 256,
+        },
+        events: (1..=30)
+            .map(|sequence_no| RuntimeEvent {
+                schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+                causal_context: Default::default(),
+                causal_links: Vec::new(),
+                id: EventId::new(),
+                sequence_no,
+                session_id,
+                turn_id: None,
+                task_id: None,
+                parent_event_id: None,
+                event_type: RuntimeEventType::StepCompleted,
+                timestamp: Utc::now(),
+                source: RuntimeEventSource::Runtime,
+                payload: json!({"summary": "wrapped developer detail ".repeat(12)}),
+                payload_ref: None,
+                durable: true,
+            })
+            .collect(),
+        busy_policy_decisions: Vec::new(),
+        tool_results: Vec::new(),
+        artifacts: Vec::new(),
+        evidence: Vec::new(),
+        verification: None,
+        loop_decisions: Vec::new(),
+        post_task_jobs: Vec::new(),
+        failure_diagnosis: None,
+        failure_episodes: Vec::new(),
+        diagnostic_slice: None,
+        replay_execution: None,
+        external_evaluations: Vec::new(),
+        causal_comparisons: Vec::new(),
+        trace_complete: true,
+        missing_sections: Vec::new(),
+        retention_losses: Vec::new(),
+    });
+    driver.app.developer_facts_expanded = true;
+    driver.refresh_active_layout().expect("active layout");
+    driver.app.developer_top_row_override = Some(3);
+
+    let expected_layout = driver.app.layout;
+    let expected_event_layout = driver.app.developer_event_layout.clone();
+    let expected_top_row = driver.app.developer_top_row_override;
+    let expected_scroll = driver.app.developer_scroll;
+
+    driver
+        .render_frame(&SnapshotRequest {
+            scope: SnapshotScope::Screen,
+            panes: SnapshotPanes::Transcript,
+            width: 100,
+            height: 24,
+            rows: None,
+            frame_id: None,
+            detail: SnapshotDetail::Text,
+        })
+        .expect("transcript snapshot");
+
+    assert_eq!(driver.app.layout, expected_layout);
+    assert_eq!(driver.app.developer_event_layout, expected_event_layout);
+    assert_eq!(driver.app.developer_top_row_override, expected_top_row);
+    assert_eq!(driver.app.developer_scroll, expected_scroll);
+}

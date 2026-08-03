@@ -705,6 +705,8 @@ impl TuiDriver {
             return result;
         }
         self.sync().await?;
+        let saved_developer_projection = self.app.developer_projection.clone();
+        let saved_developer_error = self.app.developer_error.clone();
         if panes_include_developer(request.panes, self.app.debug_mode) {
             let projection_task = if matches!(
                 request.scope,
@@ -725,7 +727,12 @@ impl TuiDriver {
             );
             self.app.developer_error = None;
         }
-        let full_frame = self.render_frame(&request)?;
+        let rendered = self.render_frame(&request);
+        self.app.developer_projection = saved_developer_projection;
+        self.app.developer_error = saved_developer_error;
+        let active_layout = self.refresh_active_layout();
+        let full_frame = rendered?;
+        active_layout?;
         self.metrics.record_snapshot_render();
         cache_frame(
             &mut self.frame_cache,
@@ -776,6 +783,8 @@ impl TuiDriver {
         let saved_debug = self.app.debug_mode;
         let saved_transcript_scroll = self.app.transcript_scroll;
         let saved_developer_scroll = self.app.developer_scroll;
+        let saved_developer_event_layout = self.app.developer_event_layout.clone();
+        let saved_developer_top_row_override = self.app.developer_top_row_override;
         let saved_layout = self.app.layout;
         let saved_input = self.app.input.clone();
         let saved_activity_projection = self.app.activity_projection.clone();
@@ -830,7 +839,7 @@ impl TuiDriver {
             let hit_regions = frame_hit_regions(layout, area, &self.app);
             let scope_ids = current_task_and_turn(&self.app);
             let completeness = snapshot_completeness(&self.app, request.scope, request.panes);
-            Ok((lines, cells, hit_regions, scope_ids, completeness, layout))
+            Ok((lines, cells, hit_regions, scope_ids, completeness))
         })();
 
         self.app.events = saved_events;
@@ -845,21 +854,16 @@ impl TuiDriver {
         self.app.developer_error = saved_developer_error;
         self.app.transcript_scroll = saved_transcript_scroll;
         self.app.developer_scroll = saved_developer_scroll;
+        self.app.developer_event_layout = saved_developer_event_layout;
+        self.app.developer_top_row_override = saved_developer_top_row_override;
         self.app.debug_mode = saved_debug;
         self.app.layout = saved_layout;
         self.app.input = saved_input;
         self.app.activity_projection = saved_activity_projection;
         self.app.change_projection = saved_change_projection;
 
-        let (
-            lines,
-            cells,
-            hit_regions,
-            (task_id, turn_id),
-            (complete, mut missing_sections),
-            rendered_layout,
-        ) = rendered?;
-        self.app.layout = rendered_layout;
+        let (lines, cells, hit_regions, (task_id, turn_id), (complete, mut missing_sections)) =
+            rendered?;
         if matches!(request.scope, SnapshotScope::CurrentTurn) && turn_id.is_none() {
             missing_sections.push("current_turn".to_owned());
         }

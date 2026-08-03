@@ -133,6 +133,21 @@ pub(crate) fn developer_facts_toggle_rect(area: Rect) -> Rect {
     )
 }
 
+pub(crate) fn developer_facts_toggle_hit_rect(area: Rect) -> Rect {
+    let toggle = developer_facts_toggle_rect(area);
+    if toggle.width == 0 {
+        return toggle;
+    }
+    let left = toggle.x.saturating_sub(1).max(area.x);
+    let area_right = area.x.saturating_add(area.width);
+    let right = toggle
+        .x
+        .saturating_add(toggle.width)
+        .saturating_add(1)
+        .min(area_right);
+    Rect::new(left, toggle.y, right.saturating_sub(left), toggle.height)
+}
+
 pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let content_width = area.width.saturating_sub(2);
     let visible_rows = area.height.saturating_sub(1) as usize;

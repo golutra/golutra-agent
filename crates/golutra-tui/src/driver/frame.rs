@@ -12,7 +12,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::super::{
-    TuiApp, UiLayoutSnapshot, developer_facts_toggle_rect, display_width, transcript_toggle_regions,
+    TuiApp, UiLayoutSnapshot, developer_facts_toggle_hit_rect, display_width,
+    transcript_toggle_regions,
 };
 
 pub(super) fn scoped_runtime_events(
@@ -280,7 +281,7 @@ pub(super) fn frame_hit_regions(
             &mut regions,
             "developer_facts_toggle",
             TuiHitPane::Developer,
-            developer_facts_toggle_rect(developer),
+            developer_facts_toggle_hit_rect(developer),
             area,
         );
     }

@@ -34,7 +34,7 @@ pub(crate) enum UiHitTarget {
 
 impl UiLayoutSnapshot {
     pub(crate) fn hit_test(self, x: u16, y: u16, app: &TuiApp) -> UiHitTarget {
-        if app.auth_dialog.is_some() || app.resume_picker.is_some() {
+        if app.auth_dialog.is_some() || app.resume_picker.is_some() || app.export_flow.is_some() {
             if rect_contains(self.transcript, x, y) || rect_contains(self.bottom, x, y) {
                 return UiHitTarget::Overlay;
             }
@@ -53,7 +53,7 @@ impl UiLayoutSnapshot {
 
     pub(crate) fn developer_facts_toggle_hit(self, x: u16, y: u16) -> bool {
         self.developer
-            .map(developer_facts_toggle_rect)
+            .map(developer_facts_toggle_hit_rect)
             .is_some_and(|area| rect_contains(area, x, y))
     }
 }
@@ -749,8 +749,7 @@ pub(crate) fn draw_resume_picker(
     picker: &ResumePickerState,
     current_thread_id: ThreadId,
 ) {
-    let visible_rows = area.height.saturating_sub(1) as usize;
-    let visible_count = visible_rows.max(1);
+    let visible_count = resume_picker_page_size(area);
     let offset = resume_picker_offset(picker.selected, visible_count, picker.items.len());
     let items = picker
         .items
@@ -943,8 +942,7 @@ fn draw_resume_picker_with_title(
     current_thread_id: ThreadId,
     title: &str,
 ) {
-    let visible_rows = area.height.saturating_sub(1) as usize;
-    let visible_count = visible_rows.max(1);
+    let visible_count = resume_picker_page_size(area);
     let offset = resume_picker_offset(picker.selected, visible_count, picker.items.len());
     let items = picker
         .items
@@ -1015,6 +1013,12 @@ pub(crate) fn resume_picker_offset(
         .saturating_add(1)
         .saturating_sub(visible_count)
         .min(last_window_start)
+}
+
+pub(crate) fn resume_picker_page_size(area: Rect) -> usize {
+    usize::from(area.height.saturating_sub(1))
+        .saturating_div(2)
+        .max(1)
 }
 
 pub(crate) fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
@@ -1435,17 +1439,6 @@ pub(crate) fn transcript_visible_window(
     let offset = scroll_offset.min(max_offset);
     let end = total_rows.saturating_sub(offset);
     end.saturating_sub(visible_rows)..end
-}
-
-pub(crate) fn transcript_page_rows(app: &TuiApp) -> usize {
-    let (terminal_width, terminal_height) = size().unwrap_or((80, 24));
-    usize::from(
-        terminal_height
-            .saturating_sub(1)
-            .saturating_sub(bottom_pane_height_for_width(app, terminal_width))
-            .saturating_sub(1)
-            .max(1),
-    )
 }
 
 pub(crate) fn transcript_scroll_status(scroll_offset: usize, unseen_rows: usize) -> String {

@@ -82,6 +82,33 @@ impl ResumePickerState {
             }
         };
     }
+
+    pub(crate) fn move_selection_by_page(
+        &mut self,
+        direction: ResumeSelectionDirection,
+        page_size: usize,
+    ) {
+        if self.items.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        let page_size = page_size.max(1);
+        self.selected = match direction {
+            ResumeSelectionDirection::Previous => self.selected.saturating_sub(page_size),
+            ResumeSelectionDirection::Next => self
+                .selected
+                .saturating_add(page_size)
+                .min(self.items.len().saturating_sub(1)),
+        };
+    }
+
+    pub(crate) fn select_first(&mut self) {
+        self.selected = 0;
+    }
+
+    pub(crate) fn select_last(&mut self) {
+        self.selected = self.items.len().saturating_sub(1);
+    }
 }
 
 pub(crate) fn session_command(
