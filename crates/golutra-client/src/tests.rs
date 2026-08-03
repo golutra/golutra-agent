@@ -59,7 +59,7 @@ async fn task_control_cleanup_wait_has_a_deadline() {
 }
 
 #[test]
-fn system_prompt_explains_the_argv_only_shell_recovery_path() {
+fn system_prompt_exposes_general_tool_and_validation_contracts() {
     let prompt = system_prompt();
     assert!(prompt.contains("parsed as inert argv"));
     assert!(prompt.contains("include the program and every argument"));
@@ -70,30 +70,15 @@ fn system_prompt_explains_the_argv_only_shell_recovery_path() {
     assert!(prompt.contains("instead of asking in prose"));
     assert!(prompt.contains("runtime will request any required approval"));
     assert!(prompt.contains("exits non-zero"));
-    assert!(prompt.contains("every explicit success threshold"));
-    assert!(prompt.contains("with `&&` or enable `set -e`"));
-    assert!(prompt.contains("earlier failed check cannot be masked"));
-    assert!(prompt.contains("status, log, or listing commands alone are not validation"));
-    assert!(prompt.contains("named source identity or provenance"));
-    assert!(prompt.contains("relationships across files"));
-    assert!(prompt.contains("allowed modification boundaries"));
-    assert!(prompt.contains("public consumer interface"));
-    assert!(prompt.contains("expected magic bytes prove only structure"));
-    assert!(prompt.contains("insufficient when the request also specifies content or behavior"));
-    assert!(prompt.contains("load the output with a real consumer"));
-    assert!(prompt.contains("compare its decoded data with the named source"));
-    assert!(prompt.contains("Keep every file explicitly requested by the user"));
-    assert!(prompt.contains("must not delete or move a requested output"));
-    assert!(prompt.contains("platform-appropriate lifecycle mechanism"));
+    assert!(prompt.contains("any explicit acceptance criterion"));
+    assert!(prompt.contains("semantic behavior and content"));
+    assert!(prompt.contains("keep every requested deliverable intact"));
+    assert!(prompt.contains("user-facing interface"));
+    assert!(prompt.contains("independent consumer or clean context"));
+    assert!(prompt.contains("internal shortcut is not equivalent evidence"));
+    assert!(prompt.contains("lifecycle mechanism"));
     assert!(prompt.contains("outlives runtime ownership"));
-    assert!(prompt.contains("not a durable handoff"));
-    assert!(prompt.contains("public protocol from a separate client"));
-    assert!(prompt.contains("in-process test clients and mocked handlers do not prove"));
-    assert!(prompt.contains("same public interface a fresh consumer will use"));
-    assert!(prompt.contains("exercise the requested setup or client flow from a clean location"));
-    assert!(prompt.contains("shortcut that bypasses the user-facing path"));
-    assert!(prompt.contains("preserve the source blobs"));
-    assert!(prompt.contains("compare the recovered result with the source commit"));
+    assert!(prompt.contains("verify the handoff independently"));
 }
 
 #[test]
@@ -3889,6 +3874,8 @@ async fn first_prompt_sets_thread_title_from_prompt() {
             transport.default_session_id(),
             json!({
                 "prompt": "write file chain.txt with content ok",
+                "path": "chain.txt",
+                "content": "ok",
             }),
         ))
         .await
@@ -3922,6 +3909,8 @@ async fn resumed_session_context_includes_previous_conversation_summary() {
             transport.default_session_id(),
             json!({
                 "prompt": "write file first.txt with content done",
+                "path": "first.txt",
+                "content": "done",
             }),
         ))
         .await
@@ -4072,6 +4061,8 @@ async fn prompt_with_explicit_thread_id_does_not_persist_bootstrap_default() {
             tui_session_id,
             json!({
                 "prompt": "write file tui.txt with content ok",
+                "path": "tui.txt",
+                "content": "ok",
                 "_thread_id": tui_thread_id.to_string(),
             }),
         ))
@@ -4808,7 +4799,19 @@ async fn persisted_ephemeral_runtime_retains_isolated_state_and_full_run_bundle(
     let result = handle.wait().await.expect("turn result");
     let task_id = result.task_id.expect("task id");
 
-    assert_eq!(result.status, TaskStatus::Completed);
+    assert_eq!(result.status, TaskStatus::Partial);
+    assert_eq!(
+        result.outcome.as_ref().map(|outcome| outcome.execution),
+        Some(golutra_core::ExecutionOutcome::CandidateReady)
+    );
+    assert_eq!(
+        result
+            .outcome
+            .as_ref()
+            .map(|outcome| outcome.external_verification),
+        Some(golutra_core::ExternalVerificationStatus::Pending)
+    );
+    assert!(!result.outcome.as_ref().expect("candidate outcome").scorable);
     assert_eq!(
         fs::read_to_string(workspace.path().join("persisted.txt")).expect("written file"),
         "retained state"
@@ -4822,14 +4825,30 @@ async fn persisted_ephemeral_runtime_retains_isolated_state_and_full_run_bundle(
             .is_some(),
         "persisted ephemeral writes must keep checkpoints"
     );
+    let runtime_events = host
+        .store
+        .load_events(result.session_id, Some(task_id), None)
+        .await
+        .expect("runtime events");
     assert!(
-        !host
-            .store
-            .load_events(result.session_id, Some(task_id), None)
-            .await
-            .expect("runtime events")
-            .is_empty(),
+        !runtime_events.is_empty(),
         "runtime events must remain queryable before shutdown"
+    );
+    let task_created = runtime_events
+        .iter()
+        .find(|event| event.event_type == RuntimeEventType::TaskCreated)
+        .expect("task created event");
+    assert_eq!(
+        task_created
+            .payload
+            .pointer("/payload/task_contract/require_objective_validation"),
+        Some(&json!(false)),
+        "an explicitly deferred legacy task delegates final objective proof"
+    );
+    assert!(
+        !runtime_events
+            .iter()
+            .any(|event| event.event_type == RuntimeEventType::MemoryCandidateQuarantined)
     );
 
     let receipt = RunBundleExporter::new(&runtime_transport)
@@ -5022,6 +5041,22 @@ async fn persisted_ephemeral_runtime_retains_isolated_state_and_full_run_bundle(
             .payload
             .pointer("/outcome/external_verification"),
         Some(&json!("pass"))
+    );
+    assert_eq!(
+        post_evaluation_terminal
+            .payload
+            .pointer("/outcome/execution"),
+        Some(&json!("completed"))
+    );
+    assert_eq!(
+        post_evaluation_terminal.payload.get("status"),
+        Some(&json!("completed"))
+    );
+    assert_eq!(
+        post_evaluation_terminal
+            .payload
+            .pointer("/outcome/scorable"),
+        Some(&json!(true))
     );
     fs::write(
         state_dir.join("results.json"),
@@ -5649,7 +5684,7 @@ async fn provider_auth_cancellation_stops_the_waiting_task() {
 }
 
 #[tokio::test]
-async fn prompt_write_file_natural_language_uses_requested_path_and_content() {
+async fn natural_language_mock_write_preserves_delivery_without_claiming_unverified_success() {
     let workspace = tempdir().expect("workspace");
     let _provider = IsolatedGlobalMockProvider::install().await;
     let transport = EmbeddedTransport::for_cwd(workspace.path())
@@ -5673,7 +5708,7 @@ async fn prompt_write_file_natural_language_uses_requested_path_and_content() {
 }
 
 #[tokio::test]
-async fn prompt_named_file_with_quoted_content_is_verified_end_to_end() {
+async fn natural_language_quoted_write_preserves_content_without_inventing_verification() {
     let workspace = tempdir().expect("workspace");
     let _provider = IsolatedGlobalMockProvider::install().await;
     let transport = EmbeddedTransport::for_cwd(workspace.path())
@@ -5794,6 +5829,10 @@ async fn task_contract_is_normalized_into_task_and_queued_turn_events() {
     assert_eq!(
         queued_payload["task_contract"]["required_paths"],
         json!(["queued.txt"])
+    );
+    assert_eq!(
+        queued_payload["task_contract"]["require_objective_validation"],
+        json!(true)
     );
 
     transport
@@ -6396,7 +6435,7 @@ async fn yolo_turn_writes_outside_the_workspace_without_approval() {
         .await
         .expect("yolo command");
     assert!(ack.accepted);
-    wait_for_status(&transport, session_id, TaskStatus::Partial).await;
+    wait_for_status(&transport, session_id, TaskStatus::Completed).await;
 
     assert_eq!(
         fs::read_to_string(&target).expect("outside result"),
@@ -6550,28 +6589,39 @@ fn legacy_change_intent_handles_coding_verbs_without_inventing_delivery_paths() 
         WorkspaceChangeRequirement::Required
     );
     assert!(contract.required_paths.is_empty());
+    assert!(contract.require_objective_validation);
 
     let absolute = json!({
-        "prompt": "create a file named `/app/output/maze.txt`",
+        "prompt": "create a file named `/app/output/result.txt`",
     });
     let mut contract = golutra_core::TaskContract::default();
     assert!(
         LegacyTaskAdapter::new(&absolute, absolute["prompt"].as_str().expect("prompt"))
             .apply_to(&mut contract)
     );
-    assert_eq!(contract.required_paths, vec!["output/maze.txt"]);
+    assert!(contract.required_paths.is_empty());
     contract
         .validate()
-        .expect("container workspace aliases must normalize into the task contract");
+        .expect("legacy prose must not create a blocking path contract");
+
+    let direct_write = json!({"prompt": "write result.txt with content alpha"});
+    let direct_write_adapter = LegacyTaskAdapter::new(
+        &direct_write,
+        direct_write["prompt"].as_str().expect("prompt"),
+    );
+    assert!(direct_write_adapter.requests_workspace_change());
+    assert_eq!(
+        direct_write_adapter.required_paths(),
+        vec!["result.txt".to_owned()]
+    );
 }
 
 #[test]
-fn legacy_change_intent_retains_every_explicit_delivery_path() {
+fn legacy_delivery_prose_requires_change_without_inventing_blocking_paths() {
     let payload = json!({
-        "prompt": r#"Create a Python scraper.
-Save the collected data to a CSV file named 'books.csv'.
-<span class="book-price">${price}</span>
-The report should be saved to a file named 'report.txt'."#,
+        "prompt": r#"Create a report generator.
+Save the collected records to a CSV file named 'export.csv'.
+The summary should be saved to a file named 'summary.txt'."#,
     });
     let mut contract = golutra_core::TaskContract::default();
 
@@ -6580,8 +6630,13 @@ The report should be saved to a file named 'report.txt'."#,
             .apply_to(&mut contract)
     );
 
-    assert_eq!(contract.required_paths, vec!["books.csv", "report.txt"]);
-    contract.validate().expect("inferred delivery contract");
+    assert!(contract.required_paths.is_empty());
+    assert_eq!(
+        contract.workspace_change,
+        WorkspaceChangeRequirement::Required
+    );
+    assert!(contract.require_objective_validation);
+    contract.validate().expect("coarse legacy contract");
 }
 
 #[test]
@@ -6600,25 +6655,20 @@ fn legacy_contract_distinguishes_inputs_conversions_and_imperative_deliveries() 
         LegacyTaskAdapter::new(&conversion_payload, conversion_prompt)
             .apply_to(&mut conversion_contract)
     );
-    assert_eq!(conversion_contract.required_paths, vec!["data.parquet"]);
+    assert!(conversion_contract.required_paths.is_empty());
     assert!(conversion_contract.require_objective_validation);
     conversion_contract
         .validate()
-        .expect("conversion delivery contract");
+        .expect("conversion change contract");
 
-    let reshard_prompt = "Call this folder \"c4_reshard/\". Please call the script \"revert.py\" and place it in the parent directory of c4_sample/.";
-    let reshard_payload = json!({"prompt": reshard_prompt});
-    let mut reshard_contract = golutra_core::TaskContract::default();
-    assert!(
-        LegacyTaskAdapter::new(&reshard_payload, reshard_prompt).apply_to(&mut reshard_contract)
-    );
-    assert_eq!(
-        reshard_contract.required_paths,
-        vec!["c4_reshard", "revert.py"]
-    );
-    reshard_contract
+    let layout_prompt = "Call this folder \"processed_chunks/\". Name the script \"migrate.py\" and place it next to input_chunks/.";
+    let layout_payload = json!({"prompt": layout_prompt});
+    let mut layout_contract = golutra_core::TaskContract::default();
+    assert!(LegacyTaskAdapter::new(&layout_payload, layout_prompt).apply_to(&mut layout_contract));
+    assert!(layout_contract.required_paths.is_empty());
+    layout_contract
         .validate()
-        .expect("reshard delivery contract");
+        .expect("named delivery change contract");
 }
 
 #[test]
@@ -6630,11 +6680,8 @@ fn legacy_external_effects_do_not_invent_a_workspace_diff_contract() {
         "Create a managed database server in AWS.",
         "Update the API gateway in the cloud account.",
         "Implement a managed cloud service for a remote account.",
-        "For some reason I cannot curl example.com; figure out why and what I should do to fix it.",
-        r#"Configure a git server so I can run:
-    git add index.html
-    git commit -m "add index"
-    git push origin webserver"#,
+        "Diagnose why a remote status endpoint is unreachable and explain how to repair it.",
+        "Configure a hosted repository so clients can push updates to it.",
     ] {
         let payload = json!({"prompt": prompt});
         let adapter = LegacyTaskAdapter::new(&payload, prompt);

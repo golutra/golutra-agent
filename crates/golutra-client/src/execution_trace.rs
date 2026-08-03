@@ -17,21 +17,31 @@ pub(super) fn task_outcome_from_verification(
         .get("defer_external_verification")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    task_outcome_with_external_verification(status, verification, defer_external_verification)
+    task_outcome_with_external_verification(
+        status,
+        verification,
+        defer_external_verification,
+        false,
+    )
 }
 
 pub(super) fn task_outcome_with_external_verification(
     status: TaskStatus,
     verification: &golutra_core::VerificationRecord,
     defer_external_verification: bool,
+    candidate_ready_for_external_verification: bool,
 ) -> golutra_core::TaskOutcome {
     let external_verification = if defer_external_verification {
         golutra_core::ExternalVerificationStatus::Pending
     } else {
         golutra_core::ExternalVerificationStatus::NotRequested
     };
-    golutra_core::TaskOutcome::from_verification(status, verification)
-        .with_external_verification(external_verification)
+    let outcome = if defer_external_verification && candidate_ready_for_external_verification {
+        golutra_core::TaskOutcome::candidate_ready(verification)
+    } else {
+        golutra_core::TaskOutcome::from_verification(status, verification)
+    };
+    outcome.with_external_verification(external_verification)
 }
 
 #[derive(Clone)]
@@ -574,17 +584,27 @@ impl RuntimeHost {
             Err(error) => return Err(error.into()),
         };
         if awaiting_external {
+            let candidate_ready =
+                outcome.execution == golutra_core::ExecutionOutcome::CandidateReady;
             self.record_event(agent_event(
                 self.next_sequence_no(),
                 task,
                 RuntimeEventType::ExternalVerificationRequested,
                 RuntimeEventSource::Evaluator,
                 json!({
-                    "summary": "runtime candidate is awaiting an external evaluator",
+                    "summary": if candidate_ready {
+                        "runtime candidate is awaiting an external evaluator"
+                    } else {
+                        "external evaluation requested for the terminal runtime outcome"
+                    },
                     "status": status,
                     "outcome": outcome,
-                    "resume_supported": true,
-                    "next_action": "ingest the evaluator record, then resume with structured feedback if assertions fail",
+                    "resume_supported": candidate_ready,
+                    "next_action": if candidate_ready {
+                        "ingest the evaluator record, then resume with structured feedback if assertions fail"
+                    } else {
+                        "ingest the evaluator record without replacing the runtime failure"
+                    },
                 }),
             ))
             .await?;

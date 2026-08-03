@@ -417,6 +417,7 @@ impl RuntimeHost {
             }
         };
         if discover_project_verifiers_enabled
+            && !defer_external_verification
             && payload.get("external_verifiers").is_none()
             && (task_contract.require_objective_validation
                 || task_contract.requires_workspace_evidence())
@@ -443,6 +444,9 @@ impl RuntimeHost {
             if !explicit_task_contract {
                 LegacyTaskAdapter::new(&payload, &prompt).apply_to(&mut task_contract);
             }
+        }
+        if !explicit_task_contract && defer_external_verification {
+            task_contract.require_objective_validation = false;
         }
         payload[EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY] =
             Value::Bool(discovered_project_verifiers);

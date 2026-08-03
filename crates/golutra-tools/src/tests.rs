@@ -465,7 +465,7 @@ async fn unrestricted_runtime_writes_outside_workspace_without_disabling_validat
 
     let pipeline = request(
         "shell",
-        json!({"command": "pip install fasttext-wheel 2>&1 | tail -60"}),
+        json!({"command": "pip install sample-package 2>&1 | tail -60"}),
     );
     assert_eq!(
         runtime
@@ -1145,7 +1145,7 @@ fn shell_parser_rejects_unclosed_quotes() {
 #[test]
 fn shell_parser_rejects_unwrapped_compound_commands() {
     for command in [
-        "pip install fasttext-wheel 2>&1 | tail -60",
+        "pip install sample-package 2>&1 | tail -60",
         "printf ok > result.txt",
         "true && echo done",
     ] {

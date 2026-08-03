@@ -4,8 +4,9 @@ use std::{collections::HashMap, fs, io::Read, path::Path};
 
 use base64::Engine;
 use golutra_core::{
-    ActorKind, EvidenceId, EvidenceRecord, EvidenceStrength, ExternalVerificationStatus,
-    RedactionStatus, TaskOutcome, TaskStatus, TraceView, VerificationResult,
+    ActorKind, EvidenceId, EvidenceRecord, EvidenceStrength, ExecutionOutcome,
+    ExternalVerificationStatus, RedactionStatus, TaskOutcome, TaskStatus, TraceView,
+    VerificationResult,
 };
 use golutra_eval::{
     EvaluationAttestation, EvaluationPartitionKind, EvaluationVerdict, ExternalEvaluationRecord,
@@ -254,14 +255,27 @@ impl RuntimeHost {
             EvaluationVerdict::Fail => ExternalVerificationStatus::Fail,
             EvaluationVerdict::Unknown => ExternalVerificationStatus::Unknown,
         };
-        let outcome = terminal
+        let pending_outcome = terminal
             .payload
             .get("outcome")
             .cloned()
             .and_then(|value| serde_json::from_value::<TaskOutcome>(value).ok())
-            .unwrap_or_else(|| TaskOutcome::from_status(status, VerificationResult::Unknown))
+            .unwrap_or_else(|| TaskOutcome::from_status(status, VerificationResult::Unknown));
+        let was_candidate = pending_outcome.execution == ExecutionOutcome::CandidateReady;
+        let outcome = pending_outcome
             .with_evidence_refs(evidence_refs)
             .with_external_verification(external_status);
+        let status = if was_candidate {
+            match outcome.execution {
+                ExecutionOutcome::Completed => TaskStatus::Completed,
+                ExecutionOutcome::Partial => TaskStatus::Partial,
+                ExecutionOutcome::Failed => TaskStatus::Failed,
+                ExecutionOutcome::Uncertain => TaskStatus::Uncertain,
+                _ => status,
+            }
+        } else {
+            status
+        };
         self.record_event(agent_event_for_turn(
             self.next_sequence_no(),
             &HostedAgentTask {
@@ -294,7 +308,8 @@ impl RuntimeHost {
                 })
             })
             .collect::<Vec<_>>();
-        let correctable = matches!(verdict, EvaluationVerdict::Fail)
+        let correctable = was_candidate
+            && matches!(verdict, EvaluationVerdict::Fail)
             && record
                 .terminal_cause
                 .as_ref()
@@ -311,7 +326,11 @@ impl RuntimeHost {
             RuntimeEventType::ExternalVerificationFeedback,
             RuntimeEventSource::Evaluator,
             json!({
-                "summary": "external evaluator feedback attached to the completed candidate",
+                "summary": if was_candidate {
+                    "external evaluator feedback attached to the candidate"
+                } else {
+                    "external evaluator feedback attached to the terminal runtime outcome"
+                },
                 "evaluation_id": evaluation_id,
                 "verdict": verdict,
                 "failed_assertions": failed_assertions,

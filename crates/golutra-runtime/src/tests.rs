@@ -1716,6 +1716,7 @@ async fn deferred_external_verification_does_not_correct_missing_runtime_proof()
 
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_ne!(outcome.verification.result, VerificationResult::Pass);
+    assert!(outcome.candidate_ready_for_external_verification);
     assert!(
         !trace
             .iter()
@@ -3548,14 +3549,15 @@ async fn agent_loop_accepts_plain_conversation_response_without_tool_evidence() 
 }
 
 #[tokio::test]
-async fn explicit_task_contract_blocks_model_claim_without_required_delivery() {
+async fn explicit_task_contract_blocks_deferred_candidate_without_required_delivery() {
     let workspace = tempdir().expect("workspace");
     let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
-    let agent_loop = AgentLoop::new(
+    let mut agent_loop = AgentLoop::new(
         MockProvider::text_response("implemented everything"),
         ContextBuilder::default(),
         executor,
     );
+    agent_loop.defer_external_verification = true;
     let (_handle, control) = agent_execution_channel(1);
     let mut trace = Vec::new();
 
@@ -3587,6 +3589,7 @@ async fn explicit_task_contract_blocks_model_claim_without_required_delivery() {
 
     assert_eq!(outcome.verification.result, VerificationResult::Fail);
     assert_ne!(outcome.loop_decision.action, LoopAction::StopSuccess);
+    assert!(!outcome.candidate_ready_for_external_verification);
     assert!(
         outcome
             .verification

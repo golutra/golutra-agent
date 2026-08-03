@@ -826,7 +826,9 @@ impl RuntimeHost {
         outcome: &golutra_runtime::AgentLoopOutcome,
         terminal_status: TaskStatus,
     ) -> Result<(), ClientError> {
-        if terminal_status != TaskStatus::Completed || outcome.verification.evidence_refs.is_empty()
+        if terminal_status != TaskStatus::Completed
+            || outcome.candidate_ready_for_external_verification
+            || outcome.verification.evidence_refs.is_empty()
         {
             return Ok(());
         }

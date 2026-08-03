@@ -68,10 +68,12 @@ tools/terminal_bench/build_linux_binaries.sh \
 
 When a host proxy uses loopback, the script rewrites it to
 `host.docker.internal`. Set `GOLUTRA_TBENCH_DOCKER_PROXY` to override that
-value. Then run Terminal-Bench with the generated paths:
+value. Then run Terminal-Bench with the generated paths. Pin both the harness
+and its LiteLLM dependency so a transitive release cannot silently change the
+runner's Python/Rust toolchain requirements:
 
 ```bash
-tb run \
+uvx --from 'terminal-bench==0.2.18' --with 'litellm==1.93.0' tb run \
   --agent-import-path tools.terminal_bench.golutra_tbench_adapter:GolutraAgent \
   --dataset terminal-bench-core==0.1.1 \
   --agent-kwarg arm64_binary=/tmp/golutra-terminal-bench/bin/golutra-cli-arm64 \

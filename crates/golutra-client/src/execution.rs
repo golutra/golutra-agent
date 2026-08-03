@@ -365,6 +365,9 @@ impl RuntimeHost {
         if !explicit_task_contract && (touched_code || legacy_task.requests_workspace_change()) {
             legacy_task.apply_to(&mut task_contract);
         }
+        if !explicit_task_contract && defer_external_verification {
+            task_contract.require_objective_validation = false;
+        }
         task_contract
             .validate()
             .map_err(ClientError::TaskExecution)?;
@@ -454,7 +457,11 @@ impl RuntimeHost {
             .await
             .map_err(|error| ClientError::TaskExecution(error.to_string()))??;
         let outcome = outcome?;
-        let terminal_status = task_status_from_loop_action(outcome.loop_decision.action);
+        let terminal_status = if outcome.candidate_ready_for_external_verification {
+            TaskStatus::Partial
+        } else {
+            task_status_from_loop_action(outcome.loop_decision.action)
+        };
         self.record_event(agent_event_for_turn(
             self.next_sequence_no(),
             &task,
@@ -476,6 +483,7 @@ impl RuntimeHost {
             terminal_status,
             &outcome.verification,
             outcome.defer_external_verification,
+            outcome.candidate_ready_for_external_verification,
         );
         self.finish_lane_with_outcome(&final_task, terminal_status, task_outcome)
             .await?;

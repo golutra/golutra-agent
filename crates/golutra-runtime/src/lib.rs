@@ -20,7 +20,9 @@ use golutra_core::{
     VerificationResult, WorkspaceChangeRequirement,
 };
 #[cfg(test)]
-use golutra_core::{RequiredFileContent, infer_legacy_write_objective};
+use golutra_core::{
+    RequiredFileContent, infer_direct_legacy_write_path, infer_legacy_write_objective,
+};
 use golutra_governor::{
     GoalLedger, GovernorAction, GovernorObservation, GovernorPhase, RuntimeGovernor,
 };
@@ -46,8 +48,6 @@ mod completion;
 mod context_guard;
 mod harness;
 mod lane;
-#[cfg(test)]
-mod objective_evidence;
 mod provider_retry;
 mod provider_session;
 mod step_machine;
@@ -111,6 +111,10 @@ pub struct AgentLoopOutcome {
     pub final_message: Option<String>,
     pub final_turn_id: TurnId,
     pub defer_external_verification: bool,
+    /// The provider produced a candidate without a runtime, policy, or
+    /// governor failure, and final authority was deliberately delegated to an
+    /// external evaluator.
+    pub candidate_ready_for_external_verification: bool,
 }
 
 /// Captured provider inputs used to re-enter the ordinary AgentLoop without
@@ -2000,7 +2004,9 @@ where
                     code_files_changed,
                 }
             };
-            let verification_plan = self.verifier.plan(&verification_input);
+            let verification_plan = self
+                .verifier
+                .plan_governed(&verification_input, &current_task_contract);
             turn_state.verification_ready();
             trace(AgentLoopTraceEvent::VerificationReady {
                 plan_id: verification_plan.plan_id,
@@ -2076,7 +2082,19 @@ where
             let independent_verifier_unavailable = current_task_contract
                 .requires_independent_verification()
                 && current_external_verifiers.is_empty();
-            let deferred_without_actionable_failure = current_defer_external_verification
+            let policy_verified = verification.assertions.iter().any(|assertion| {
+                assertion.blocking
+                    && assertion.kind == golutra_core::VerificationAssertionKind::Policy
+                    && matches!(
+                        assertion.status,
+                        golutra_core::VerificationAssertionStatus::Pass
+                            | golutra_core::VerificationAssertionStatus::NotApplicable
+                    )
+            });
+            let candidate_ready_for_external_verification = candidate_complete
+                && guard_reason.is_none()
+                && current_defer_external_verification
+                && policy_verified
                 && !verification.assertions.iter().any(|assertion| {
                     assertion.blocking
                         && assertion.status == golutra_core::VerificationAssertionStatus::Fail
@@ -2085,7 +2103,7 @@ where
                 && guard_reason.is_none()
                 && verification.result != VerificationResult::Pass
                 && !independent_verifier_unavailable
-                && !deferred_without_actionable_failure
+                && !candidate_ready_for_external_verification
                 && current_task_contract.allows_correction(turn_state.correction_attempt)
             {
                 let correction = correction_envelope(
@@ -2178,6 +2196,7 @@ where
                 tool_reports,
                 final_turn_id: current_turn_id,
                 defer_external_verification: current_defer_external_verification,
+                candidate_ready_for_external_verification,
             });
         }
     }
@@ -4371,6 +4390,11 @@ fn legacy_task_contract(request: &AgentTaskRequest) -> TaskContract {
                 content,
             });
         }
+    }
+    if let Some(path) = infer_direct_legacy_write_path(&request.objective)
+        && !contract.required_paths.contains(&path)
+    {
+        contract.required_paths.push(path);
     }
     contract
 }

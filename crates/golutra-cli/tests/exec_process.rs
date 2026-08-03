@@ -154,6 +154,24 @@ async fn exec_run_dir_retains_an_isolated_structured_runtime_bundle() {
     let workspace = tempdir().expect("workspace");
     let export_parent = tempdir().expect("export parent");
     let state_dir = export_parent.path().join("runtime");
+    let task_contract = export_parent.path().join("task-contract.json");
+    fs::write(
+        &task_contract,
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "workspace_change": "required",
+            "required_paths": ["retained.txt"],
+            "required_file_contents": [{
+                "path": "retained.txt",
+                "content": "retained"
+            }],
+            "require_objective_validation": true,
+            "verification": "required",
+            "max_correction_rounds": 1
+        }))
+        .expect("task contract JSON"),
+    )
+    .expect("task contract");
     install_mock_provider(home.path());
 
     let output = tokio::time::timeout(
@@ -164,6 +182,8 @@ async fn exec_run_dir_retains_an_isolated_structured_runtime_bundle() {
             .arg("exec")
             .arg("--run-dir")
             .arg(&state_dir)
+            .arg("--task-contract")
+            .arg(&task_contract)
             .arg("--allow-network")
             .arg("--approval-mode")
             .arg("auto")

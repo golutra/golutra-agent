@@ -6,7 +6,8 @@
 
 use golutra_core::{
     RequiredFileContent, TaskContract, VerificationRequirement, WorkspaceChangeRequirement,
-    infer_legacy_write_content, infer_legacy_write_path, infer_legacy_write_paths,
+    infer_direct_legacy_write_path, infer_legacy_write_content, infer_legacy_write_objective,
+    infer_legacy_write_path, infer_legacy_write_paths,
 };
 use serde_json::Value;
 
@@ -51,7 +52,11 @@ impl<'a> LegacyTaskAdapter<'a> {
         {
             return vec![path];
         }
-        infer_legacy_write_paths(self.objective)
+        infer_legacy_write_objective(self.objective)
+            .map(|hint| hint.path)
+            .or_else(|| infer_direct_legacy_write_path(self.objective))
+            .into_iter()
+            .collect()
     }
 
     /// Adapt an unstructured request once at the command boundary.
@@ -66,9 +71,13 @@ impl<'a> LegacyTaskAdapter<'a> {
         if requests_workspace_change {
             contract.workspace_change = WorkspaceChangeRequirement::Required;
         }
+        let requested_paths = if requests_workspace_change {
+            self.required_paths()
+        } else {
+            Vec::new()
+        };
         contract.require_objective_validation = true;
         if requests_workspace_change {
-            let requested_paths = self.required_paths();
             for requested_path in &requested_paths {
                 if !contract.required_paths.contains(requested_path) {
                     contract.required_paths.push(requested_path.clone());
@@ -91,6 +100,11 @@ impl<'a> LegacyTaskAdapter<'a> {
             contract.verification = VerificationRequirement::Required;
         }
         true
+    }
+
+    fn required_content(self) -> Option<String> {
+        non_empty_string_payload(self.payload, "content")
+            .or_else(|| infer_legacy_write_objective(self.objective).and_then(|hint| hint.content))
     }
 
     #[must_use]
@@ -168,11 +182,6 @@ impl<'a> LegacyTaskAdapter<'a> {
                 .unwrap_or_else(|| "done\n".to_owned()),
         }
     }
-
-    fn required_content(self) -> Option<String> {
-        non_empty_string_payload(self.payload, "content")
-            .or_else(|| infer_legacy_write_content(self.objective))
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,8 +202,27 @@ fn contains_workspace_change_intent(objective: &str) -> bool {
         "rewritten",
     ];
     const AMBIGUOUS_CHANGE_VERBS: &[&str] = &[
-        "add", "change", "create", "delete", "edit", "fix", "modify", "move", "remove", "rename",
-        "update", "write",
+        "add",
+        "change",
+        "convert",
+        "create",
+        "delete",
+        "edit",
+        "fix",
+        "generate",
+        "modify",
+        "move",
+        "output",
+        "place",
+        "produce",
+        "remove",
+        "rename",
+        "save",
+        "store",
+        "transcode",
+        "transform",
+        "update",
+        "write",
     ];
     const CONCRETE_LOCAL_ARTIFACTS: &[&str] = &[
         "adapter",
@@ -239,6 +267,10 @@ fn contains_workspace_change_intent(objective: &str) -> bool {
         "移除",
         "移动",
         "写入",
+        "保存",
+        "生成",
+        "输出",
+        "交付",
     ];
     const CJK_WORKSPACE_TARGETS: &[&str] = &[
         "代码",

@@ -710,10 +710,10 @@ mod tests {
             None,
             RuntimeEventType::TaskCompleted,
             json!({
-                "status": "completed",
+                "status": "partial",
                 "outcome": {
-                    "execution": "completed",
-                    "verification": "pass",
+                    "execution": "candidate_ready",
+                    "verification": "partial",
                     "evidence_refs": [],
                     "external_verification": "pending",
                     "failure_class": null,
@@ -734,7 +734,7 @@ mod tests {
                 "status": "completed",
                 "outcome": {
                     "execution": "completed",
-                    "verification": "pass",
+                    "verification": "partial",
                     "evidence_refs": [],
                     "external_verification": "pass",
                     "failure_class": null,
@@ -750,12 +750,19 @@ mod tests {
             Some(AgentStreamEvent::RuntimeEvent { .. })
         ));
         assert_eq!(
-            projector
-                .result()
-                .and_then(|result| result.outcome)
-                .map(|outcome| outcome.external_verification),
-            Some(golutra_core::ExternalVerificationStatus::Pass)
+            projector.result().as_ref().map(|result| result.status),
+            Some(TaskStatus::Completed)
         );
+        let outcome = projector
+            .result()
+            .and_then(|result| result.outcome)
+            .expect("closed candidate outcome");
+        assert_eq!(
+            outcome.external_verification,
+            golutra_core::ExternalVerificationStatus::Pass
+        );
+        assert_eq!(outcome.execution, golutra_core::ExecutionOutcome::Completed);
+        assert!(outcome.scorable);
         assert_eq!(projector.last_sequence_no(), Some(3));
     }
 

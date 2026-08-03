@@ -132,5 +132,6 @@ where
         final_message: Some(final_message),
         final_turn_id: request.turn_id,
         defer_external_verification,
+        candidate_ready_for_external_verification: false,
     }
 }
