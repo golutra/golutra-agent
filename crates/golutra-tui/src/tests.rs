@@ -668,6 +668,7 @@ fn active_task_renders_ephemeral_status_above_composer() {
         RuntimeEventType::TaskCreated,
         json!({"payload": {"prompt": "work"}}),
     ));
+    app.refresh_activity_snapshot();
 
     let mut terminal = Terminal::new(TestBackend::new(100, 6)).expect("terminal");
     terminal
@@ -697,6 +698,75 @@ fn active_task_renders_ephemeral_status_above_composer() {
         .collect::<String>();
     assert_eq!(separator_row, "─".repeat(100));
     assert_eq!(bottom_pane_height(&app), 4);
+}
+
+#[test]
+fn activity_rate_is_stable_between_status_samples() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let turn_id = golutra_core::TurnId::new();
+    let base = chrono::Utc::now();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.projection = Some(UserProjection {
+        session_id,
+        task_id: Some(task_id),
+        status: golutra_core::TaskStatus::Running,
+        visible_steps: Vec::new(),
+        pending_approval: None,
+        final_message: None,
+        residual_risks: Vec::new(),
+    });
+
+    let mut created = transcript_event(
+        1,
+        session_id,
+        task_id,
+        RuntimeEventType::TaskCreated,
+        json!({"payload": {"prompt": "work"}}),
+    );
+    created.turn_id = Some(turn_id);
+    created.timestamp = base;
+    app.apply_runtime_event(created);
+    let mut first_delta = transcript_event(
+        2,
+        session_id,
+        task_id,
+        RuntimeEventType::ProviderStreamed,
+        json!({"delta": {"kind": "text_delta", "text": "abcdefgh"}}),
+    );
+    first_delta.turn_id = Some(turn_id);
+    first_delta.timestamp = base + chrono::Duration::milliseconds(100);
+    app.apply_runtime_event(first_delta);
+    app.refresh_activity_snapshot_at(base + chrono::Duration::milliseconds(1_100));
+    let sampled = live_status_text(&app, 80).expect("sampled status");
+
+    let mut burst = transcript_event(
+        3,
+        session_id,
+        task_id,
+        RuntimeEventType::ProviderStreamed,
+        json!({"delta": {"kind": "text_delta", "text": "x".repeat(400)}}),
+    );
+    burst.turn_id = Some(turn_id);
+    burst.timestamp = base + chrono::Duration::milliseconds(1_200);
+    app.apply_runtime_event(burst);
+
+    assert_eq!(
+        live_status_text(&app, 80).as_deref(),
+        Some(sampled.as_str())
+    );
+    app.refresh_activity_snapshot_at(base + chrono::Duration::milliseconds(2_100));
+    assert_ne!(
+        live_status_text(&app, 80).as_deref(),
+        Some(sampled.as_str())
+    );
 }
 
 #[tokio::test]
@@ -2556,6 +2626,37 @@ fn transcript_coalesces_provider_deltas_and_replaces_them_with_final_message() {
 
     assert_eq!(final_items.len(), 1);
     assert_eq!(final_items[0].body, vec!["Hello world."]);
+}
+
+#[test]
+fn interactive_poll_interval_does_not_stall_streaming_frames() {
+    assert!(
+        MIN_FRAME_INTERVAL <= Duration::from_millis(16),
+        "interactive runtime updates can wait {MIN_FRAME_INTERVAL:?} before rendering"
+    );
+}
+
+#[test]
+fn provider_deltas_skip_full_refresh_but_final_messages_reconcile() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let streamed = transcript_event(
+        1,
+        session_id,
+        task_id,
+        RuntimeEventType::ProviderStreamed,
+        json!({"delta": {"kind": "text_delta", "text": "partial"}}),
+    );
+    let completed = transcript_event(
+        2,
+        session_id,
+        task_id,
+        RuntimeEventType::AssistantMessage,
+        json!({"content": "authoritative"}),
+    );
+
+    assert!(!event_requires_full_refresh(&streamed));
+    assert!(event_requires_full_refresh(&completed));
 }
 
 #[test]

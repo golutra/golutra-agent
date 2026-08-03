@@ -49,7 +49,7 @@ axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
-crossterm = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
 fs2 = "0.4"
 futures-util = "0.3"
 genai = { version = "=0.7.0-beta.12", default-features = false }

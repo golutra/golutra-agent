@@ -10,12 +10,13 @@ use clap::{Args as ClapArgs, Parser, Subcommand};
 use crossterm::{
     cursor::SetCursorStyle,
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event as CrosstermEvent, KeyCode,
-        KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        self, DisableBracketedPaste, EnableBracketedPaste, Event as CrosstermEvent, EventStream,
+        KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use futures_util::StreamExt;
 use golutra_auth::{
     CredentialRef, CredentialSource, OAuthFlow, OAuthProviderDescriptor, SecretKind,
 };
@@ -67,6 +68,7 @@ mod developer_query;
 mod developer_view;
 mod developer_widget;
 mod driver;
+mod frame_scheduler;
 mod live_status;
 mod provider_status;
 mod render;
@@ -84,6 +86,7 @@ pub(crate) use developer_projection::*;
 pub(crate) use developer_query::*;
 pub(crate) use developer_view::*;
 pub(crate) use developer_widget::*;
+pub(crate) use frame_scheduler::*;
 pub(crate) use live_status::*;
 pub(crate) use provider_status::*;
 pub(crate) use render::*;
@@ -203,6 +206,8 @@ struct TuiApp {
     debug_mode: bool,
     yolo: bool,
     activity_projection: ActivityProjection,
+    activity_snapshot: Option<ActivitySnapshot>,
+    activity_snapshot_captured: bool,
     change_projection: ChangeProjection,
     expanded_operations: HashSet<OperationId>,
     transcript_details_expanded: bool,
@@ -255,6 +260,8 @@ impl TuiApp {
             debug_mode,
             yolo: false,
             activity_projection: ActivityProjection::default(),
+            activity_snapshot: None,
+            activity_snapshot_captured: false,
             change_projection: ChangeProjection::default(),
             expanded_operations: HashSet::new(),
             transcript_details_expanded: false,
@@ -363,6 +370,7 @@ impl TuiApp {
             self.developer_scroll.reset(0);
             self.developer_load_requested = false;
         }
+        self.refresh_activity_snapshot();
         self.sync_transcript_row_count(previous_row_count);
         self.sync_developer_row_count();
         Ok(())
@@ -458,7 +466,25 @@ impl TuiApp {
 
     fn rebuild_event_projections(&mut self) {
         self.activity_projection.rebuild(&self.events);
+        self.invalidate_activity_snapshot();
         self.change_projection.rebuild(&self.events);
+    }
+
+    fn refresh_activity_snapshot(&mut self) {
+        self.refresh_activity_snapshot_at(chrono::Utc::now());
+    }
+
+    fn refresh_activity_snapshot_at(&mut self, now: chrono::DateTime<chrono::Utc>) {
+        self.activity_snapshot = self.activity_projection.snapshot(
+            self.projection.as_ref().map(|projection| projection.status),
+            now,
+        );
+        self.activity_snapshot_captured = true;
+    }
+
+    fn invalidate_activity_snapshot(&mut self) {
+        self.activity_snapshot = None;
+        self.activity_snapshot_captured = false;
     }
 
     async fn send_prompt(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
@@ -587,6 +613,14 @@ impl TuiApp {
 
     fn sync_transcript_row_count(&mut self, previous_row_count: usize) {
         let current_row_count = transcript_rows(self).len();
+        self.sync_transcript_row_count_to(previous_row_count, current_row_count);
+    }
+
+    fn sync_transcript_row_count_to(
+        &mut self,
+        previous_row_count: usize,
+        current_row_count: usize,
+    ) {
         if !self.transcript_scroll.follow_tail && current_row_count > previous_row_count {
             let added = current_row_count - previous_row_count;
             self.transcript_scroll.offset_from_bottom = self
@@ -870,6 +904,7 @@ impl TuiApp {
                 self.developer_load_requested = false;
                 self.events.clear();
                 self.activity_projection = ActivityProjection::default();
+                self.invalidate_activity_snapshot();
                 self.change_projection = ChangeProjection::default();
                 self.command_messages.clear();
                 self.input.clear();
@@ -1161,6 +1196,7 @@ impl TuiApp {
         self.developer_load_requested = false;
         self.events.clear();
         self.activity_projection = ActivityProjection::default();
+        self.invalidate_activity_snapshot();
         self.change_projection = ChangeProjection::default();
         self.command_messages.clear();
         self.input.clear();
@@ -1191,6 +1227,7 @@ impl TuiApp {
         self.developer_load_requested = false;
         self.events.clear();
         self.activity_projection = ActivityProjection::default();
+        self.invalidate_activity_snapshot();
         self.change_projection = ChangeProjection::default();
         self.command_messages.clear();
         self.input.clear();
@@ -1701,16 +1738,40 @@ async fn run_app(
     transport: RuntimeTransport,
 ) -> miette::Result<()> {
     let mut controller = TuiRuntimeController::attach(&mut app, transport).await?;
-    let tick_rate = Duration::from_millis(250);
+    let mut terminal_events = EventStream::new();
+    let mut maintenance = tokio::time::interval(INTERACTIVE_MAINTENANCE_INTERVAL);
+    maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    maintenance.tick().await;
+    let mut activity_status = tokio::time::interval(ACTIVITY_STATUS_INTERVAL);
+    activity_status.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    activity_status.tick().await;
+    let mut frames = FrameScheduler::default();
+
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .map_err(|error| miette::miette!("{error}"))?;
+    frames.mark_drawn_at(Instant::now());
 
     while !app.should_quit {
-        terminal
-            .draw(|frame| draw_ui(frame, &mut app))
-            .map_err(|error| miette::miette!("{error}"))?;
-
-        if event::poll(tick_rate).map_err(|error| miette::miette!("{error}"))? {
-            let event = event::read().map_err(|error| miette::miette!("{error}"))?;
-            match event {
+        let frame_deadline = frames
+            .deadline()
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
+        tokio::select! {
+            _ = tokio::time::sleep_until(frame_deadline.into()), if frames.deadline().is_some() => {
+                terminal
+                    .draw(|frame| draw_ui(frame, &mut app))
+                    .map_err(|error| miette::miette!("{error}"))?;
+                frames.mark_drawn_at(Instant::now());
+            }
+            runtime_event = controller.recv() => {
+                controller.apply_received(&mut app, runtime_event).await?;
+                frames.request_at(Instant::now());
+            }
+            terminal_event = terminal_events.next() => {
+                let event = terminal_event
+                    .ok_or_else(|| miette::miette!("terminal input stream closed"))?
+                    .map_err(|error| miette::miette!("{error}"))?;
+                match event {
                 CrosstermEvent::Key(key) => {
                     handle_key(key, &mut app, controller.transport()).await?;
                     if app.last_prompt_ack.as_ref().is_some_and(|ack| ack.accepted) {
@@ -1725,14 +1786,30 @@ async fn run_app(
                     handle_paste(&pasted, &mut app);
                 }
                 _ => {}
+                }
+                frames.request_at(Instant::now());
+            }
+            _ = maintenance.tick() => {
+                let changed = controller.sync(&mut app).await?;
+                if changed
+                    || app.auth_operation.is_some()
+                    || app.export_operation.is_some()
+                {
+                    frames.request_at(Instant::now());
+                }
+            }
+            _ = activity_status.tick(), if has_active_task(&app) => {
+                app.refresh_activity_snapshot();
+                frames.request_at(Instant::now());
             }
         }
-
-        controller.sync(&mut app).await?;
     }
 
     Ok(())
 }
+
+const INTERACTIVE_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(80);
+const ACTIVITY_STATUS_INTERVAL: Duration = Duration::from_millis(250);
 
 async fn handle_key(
     key: KeyEvent,

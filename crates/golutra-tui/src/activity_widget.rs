@@ -11,12 +11,15 @@ pub(crate) fn live_status_text(app: &TuiApp, width: usize) -> Option<String> {
     if app.auth_dialog.is_some() || app.resume_picker.is_some() || app.export_flow.is_some() {
         return None;
     }
-    app.activity_projection
-        .snapshot(
+    let snapshot = if app.activity_snapshot_captured {
+        app.activity_snapshot
+    } else {
+        app.activity_projection.snapshot(
             app.projection.as_ref().map(|projection| projection.status),
             chrono::Utc::now(),
         )
-        .map(|snapshot| activity_status_text(snapshot, width))
+    };
+    snapshot.map(|snapshot| activity_status_text(snapshot, width))
 }
 
 pub(crate) fn live_status_line(app: &TuiApp, width: usize) -> Option<Line<'static>> {

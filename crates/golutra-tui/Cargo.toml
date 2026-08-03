@@ -11,6 +11,7 @@ chrono.workspace = true
 clap.workspace = true
 crossterm.workspace = true
 fs2.workspace = true
+futures-util.workspace = true
 golutra-auth = { path = "../golutra-auth" }
 golutra-client = { path = "../golutra-client" }
 golutra-config = { path = "../golutra-config" }

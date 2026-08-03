@@ -93,12 +93,13 @@ pub(crate) fn ui_layout(area: Rect, app: &TuiApp) -> UiLayoutSnapshot {
 }
 
 pub(crate) fn draw_ui(frame: &mut Frame<'_>, app: &mut TuiApp) {
-    app.sync_transcript_row_count(app.transcript_scroll.row_count);
+    let transcript_rows = transcript_rows(app);
+    app.sync_transcript_row_count_to(app.transcript_scroll.row_count, transcript_rows.len());
     app.sync_developer_row_count();
     app.layout = ui_layout(frame.area(), app);
     let layout = app.layout;
     draw_header(frame, layout.header, app);
-    draw_transcript(frame, layout.transcript, app);
+    draw_transcript(frame, layout.transcript, app, transcript_rows);
     if let Some(developer) = layout.developer {
         draw_developer_panel(frame, developer, app);
         draw_bottom_pane(frame, layout.bottom, app);
@@ -176,7 +177,12 @@ pub(crate) fn header_mode(app: &TuiApp) -> String {
     }
 }
 
-pub(crate) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+pub(crate) fn draw_transcript(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &TuiApp,
+    mut items: Vec<ListItem<'static>>,
+) {
     if let Some(dialog) = &app.auth_dialog {
         draw_auth_dialog(frame, area, dialog);
         return;
@@ -190,7 +196,6 @@ pub(crate) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         return;
     }
 
-    let mut items = transcript_rows(app);
     let visible_rows = area.height.saturating_sub(1) as usize;
     let window = transcript_visible_window(
         items.len(),

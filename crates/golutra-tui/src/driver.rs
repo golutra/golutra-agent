@@ -233,7 +233,7 @@ impl TuiDriver {
         let started_at = self.metrics.start_sync();
         let result = self.controller.sync(&mut self.app).await;
         self.metrics.finish_sync(started_at, result.is_ok());
-        result
+        result.map(|_| ())
     }
 
     fn metrics(&mut self, pending_waits: usize) -> DriverMetrics {
