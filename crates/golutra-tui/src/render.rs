@@ -93,20 +93,21 @@ pub(crate) fn ui_layout(area: Rect, app: &TuiApp) -> UiLayoutSnapshot {
 }
 
 pub(crate) fn draw_ui(frame: &mut Frame<'_>, app: &mut TuiApp) {
-    let transcript_rows = transcript_rows(app);
-    app.sync_transcript_row_count_to(app.transcript_scroll.row_count, transcript_rows.len());
     let next_layout = ui_layout(frame.area(), app);
+    let transcript_layout = transcript_layout(app, next_layout.transcript);
+    app.sync_transcript_row_count_to(app.transcript_scroll.row_count, transcript_layout.row_count);
     if let Some(developer) = next_layout.developer {
         let developer_layout = developer_event_layout(app, developer);
         app.sync_developer_layout(developer_layout);
     } else {
         app.developer_scroll.reset(0);
         app.developer_event_layout = DeveloperEventLayout::default();
+        app.developer_top_row_override = None;
     }
     app.layout = next_layout;
     let layout = app.layout;
     draw_header(frame, layout.header, app);
-    draw_transcript(frame, layout.transcript, app, transcript_rows);
+    draw_transcript(frame, layout.transcript, app, transcript_layout);
     if let Some(developer) = layout.developer {
         draw_developer_panel(frame, developer, app);
         draw_bottom_pane(frame, layout.bottom, app);
@@ -188,7 +189,7 @@ pub(crate) fn draw_transcript(
     frame: &mut Frame<'_>,
     area: Rect,
     app: &TuiApp,
-    mut items: Vec<ListItem<'static>>,
+    layout: TranscriptLayout,
 ) {
     if let Some(dialog) = &app.auth_dialog {
         draw_auth_dialog(frame, area, dialog);
@@ -204,19 +205,18 @@ pub(crate) fn draw_transcript(
     }
 
     let visible_rows = area.height.saturating_sub(1) as usize;
-    let window = transcript_visible_window(
-        items.len(),
-        visible_rows,
-        app.transcript_scroll.offset_from_bottom,
+    let window = layout.visible_window(visible_rows, app.transcript_scroll.offset_from_bottom);
+    frame.render_widget(Block::default().borders(Borders::TOP), area);
+    let content = Rect::new(
+        area.x,
+        area.y.saturating_add(1),
+        area.width,
+        area.height.saturating_sub(1),
     );
-    if window.end < items.len() {
-        items.drain(window.end..);
-    }
-    if window.start > 0 {
-        items.drain(..window.start);
-    }
-    let list = List::new(items).block(Block::default().borders(Borders::TOP));
-    frame.render_widget(list, area);
+    let paragraph = Paragraph::new(layout.lines)
+        .wrap(Wrap { trim: false })
+        .scroll((u16::try_from(window.start).unwrap_or(u16::MAX), 0));
+    frame.render_widget(paragraph, content);
 }
 
 pub(crate) fn draw_auth_dialog(frame: &mut Frame<'_>, area: Rect, dialog: &AuthDialogState) {

@@ -4,7 +4,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::ListItem,
+    widgets::{Paragraph, Wrap},
 };
 
 use super::{
@@ -14,16 +14,60 @@ use super::{
 
 #[derive(Debug, Clone)]
 pub(crate) struct TranscriptRenderRow {
-    pub(crate) item: ListItem<'static>,
+    pub(crate) line: Line<'static>,
     pub(crate) operation_id: Option<OperationId>,
     pub(crate) toggle: bool,
 }
 
-pub(crate) fn transcript_rows(app: &TuiApp) -> Vec<ListItem<'static>> {
-    transcript_render_rows(app)
-        .into_iter()
-        .map(|row| row.item)
-        .collect()
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TranscriptLayout {
+    pub(crate) lines: Vec<Line<'static>>,
+    pub(crate) row_count: usize,
+    rows: Vec<TranscriptRowLayout>,
+}
+
+#[derive(Debug, Clone)]
+struct TranscriptRowLayout {
+    start: usize,
+    end: usize,
+    operation_id: Option<OperationId>,
+    toggle: bool,
+}
+
+impl TranscriptLayout {
+    pub(crate) fn visible_window(
+        &self,
+        visible_rows: usize,
+        offset_from_bottom: usize,
+    ) -> std::ops::Range<usize> {
+        transcript_visible_window(self.row_count, visible_rows, offset_from_bottom)
+    }
+}
+
+pub(crate) fn transcript_layout(app: &TuiApp, area: Rect) -> TranscriptLayout {
+    let rendered = transcript_render_rows(app);
+    let mut lines = Vec::with_capacity(rendered.len());
+    let mut rows = Vec::with_capacity(rendered.len());
+    let mut row_count = 0_usize;
+
+    for row in rendered {
+        let visual_rows = wrapped_line_count(&row.line, area.width);
+        let start = row_count;
+        row_count = row_count.saturating_add(visual_rows);
+        rows.push(TranscriptRowLayout {
+            start,
+            end: row_count,
+            operation_id: row.operation_id,
+            toggle: row.toggle,
+        });
+        lines.push(row.line);
+    }
+
+    TranscriptLayout {
+        lines,
+        row_count,
+        rows,
+    }
 }
 
 pub(crate) fn transcript_render_rows(app: &TuiApp) -> Vec<TranscriptRenderRow> {
@@ -51,17 +95,17 @@ pub(crate) fn transcript_toggle_at(
     if column < area.x || column >= area.x.saturating_add(4) || row <= area.y {
         return None;
     }
-    let rows = transcript_render_rows(app);
+    let layout = transcript_layout(app, area);
     let visible_rows = area.height.saturating_sub(1) as usize;
-    let window = transcript_visible_window(
-        rows.len(),
-        visible_rows,
-        app.transcript_scroll.offset_from_bottom,
-    );
+    let window = layout.visible_window(visible_rows, app.transcript_scroll.offset_from_bottom);
     let offset = usize::from(row.saturating_sub(area.y + 1));
-    let index = window.start.saturating_add(offset);
-    rows.get(index)
-        .filter(|rendered| rendered.toggle)
+    let visual_row = window.start.saturating_add(offset);
+    layout
+        .rows
+        .iter()
+        .find(|rendered| {
+            rendered.toggle && visual_row >= rendered.start && visual_row < rendered.end
+        })
         .and_then(|rendered| rendered.operation_id.clone())
 }
 
@@ -69,30 +113,32 @@ pub(crate) fn transcript_toggle_regions(app: &TuiApp, area: Rect) -> Vec<(String
     if area.width == 0 || area.height < 2 {
         return Vec::new();
     }
-    let rows = transcript_render_rows(app);
+    let layout = transcript_layout(app, area);
     let visible_rows = area.height.saturating_sub(1) as usize;
-    let window = transcript_visible_window(
-        rows.len(),
-        visible_rows,
-        app.transcript_scroll.offset_from_bottom,
-    );
-    rows.iter()
-        .enumerate()
-        .skip(window.start)
-        .take(window.len())
-        .filter_map(|(index, rendered)| {
+    let window = layout.visible_window(visible_rows, app.transcript_scroll.offset_from_bottom);
+    layout
+        .rows
+        .iter()
+        .filter_map(|rendered| {
             let operation_id = rendered.operation_id.as_ref()?;
-            if !rendered.toggle {
+            let start = rendered.start.max(window.start);
+            let end = rendered.end.min(window.end);
+            if !rendered.toggle || start >= end {
                 return None;
             }
-            let row_offset = index.saturating_sub(window.start);
+            let row_offset = start.saturating_sub(window.start);
             let y = area
                 .y
                 .saturating_add(1)
                 .saturating_add(u16::try_from(row_offset).unwrap_or(u16::MAX));
             Some((
                 format!("transcript_operation_toggle:{}", operation_id.as_str()),
-                Rect::new(area.x, y, area.width.min(4), 1),
+                Rect::new(
+                    area.x,
+                    y,
+                    area.width.min(4),
+                    u16::try_from(end.saturating_sub(start)).unwrap_or(u16::MAX),
+                ),
             ))
         })
         .collect()
@@ -111,30 +157,40 @@ fn render_item_rows(
         role_marker(&item.role)
     };
     let mut rows = vec![TranscriptRenderRow {
-        item: ListItem::new(Line::from(vec![
+        line: Line::from(vec![
             Span::styled(marker, Style::default().fg(color)),
             Span::styled(
                 item.title.clone(),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
-        ])),
+        ]),
         operation_id: operation_id.clone(),
         toggle,
     }];
     rows.extend(item.body.into_iter().map(|line| TranscriptRenderRow {
-        item: ListItem::new(Line::from(vec![
+        line: Line::from(vec![
             Span::raw("  "),
             Span::styled(line, Style::default().fg(Color::White)),
-        ])),
+        ]),
         operation_id: None,
         toggle: false,
     }));
     rows.push(TranscriptRenderRow {
-        item: ListItem::new(Line::from("")),
+        line: Line::from(""),
         operation_id: None,
         toggle: false,
     });
     rows
+}
+
+fn wrapped_line_count(line: &Line<'static>, width: u16) -> usize {
+    if width == 0 {
+        return 0;
+    }
+    Paragraph::new(line.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(width)
+        .max(1)
 }
 
 pub(crate) fn role_marker(role: &TranscriptRole) -> &'static str {

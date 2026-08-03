@@ -24,10 +24,30 @@ pub(crate) struct DeveloperEventLayout {
 }
 
 impl DeveloperEventLayout {
-    pub(crate) fn first_visible_sequence(&self, offset_from_bottom: usize) -> Option<u64> {
-        let row =
-            transcript_visible_window(self.row_count, self.page_rows.max(1), offset_from_bottom)
-                .start;
+    pub(crate) fn visible_window(
+        &self,
+        offset_from_bottom: usize,
+        top_row_override: Option<usize>,
+    ) -> std::ops::Range<usize> {
+        if self.row_count == 0 || self.page_rows == 0 {
+            return 0..0;
+        }
+        let normal =
+            transcript_visible_window(self.row_count, self.page_rows.max(1), offset_from_bottom);
+        let start = top_row_override
+            .unwrap_or(normal.start)
+            .min(self.row_count.saturating_sub(1));
+        start..start.saturating_add(self.page_rows).min(self.row_count)
+    }
+
+    pub(crate) fn first_visible_sequence(
+        &self,
+        offset_from_bottom: usize,
+        top_row_override: Option<usize>,
+    ) -> Option<u64> {
+        let row = self
+            .visible_window(offset_from_bottom, top_row_override)
+            .start;
         self.event_starts
             .iter()
             .rev()
@@ -35,14 +55,11 @@ impl DeveloperEventLayout {
             .map(|(sequence_no, _)| *sequence_no)
     }
 
-    pub(crate) fn offset_for_sequence(&self, sequence_no: u64) -> Option<usize> {
-        let event_start = self
-            .event_starts
+    pub(crate) fn row_for_sequence(&self, sequence_no: u64) -> Option<usize> {
+        self.event_starts
             .iter()
             .find(|(candidate, _)| *candidate == sequence_no)
-            .map(|(_, start)| *start)?;
-        let max_start = self.row_count.saturating_sub(self.page_rows.max(1));
-        Some(max_start.saturating_sub(event_start.min(max_start)))
+            .map(|(_, start)| *start)
     }
 
     pub(crate) fn has_same_flow_as(&self, other: &Self) -> bool {
@@ -208,10 +225,9 @@ pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiA
             .saturating_sub(u16::try_from(summary_count).unwrap_or(u16::MAX)),
     );
     let layout = &app.developer_event_layout;
-    let window = transcript_visible_window(
-        layout.row_count,
-        layout.page_rows,
+    let window = layout.visible_window(
         app.developer_scroll.offset_from_bottom,
+        app.developer_top_row_override,
     );
     let mut events =
         Paragraph::new(event_lines).scroll((u16::try_from(window.start).unwrap_or(u16::MAX), 0));

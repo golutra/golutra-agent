@@ -2094,14 +2094,12 @@ fn developer_detail_reflow_keeps_the_first_visible_event_as_anchor() {
         app.scroll_developer(TranscriptScrollAction::LineUp, page_rows);
     }
     let collapsed_anchor = app
-        .developer_event_layout
-        .first_visible_sequence(app.developer_scroll.offset_from_bottom)
+        .first_visible_developer_sequence()
         .expect("collapsed anchor");
 
     app.toggle_developer_facts();
     let expanded_anchor = app
-        .developer_event_layout
-        .first_visible_sequence(app.developer_scroll.offset_from_bottom)
+        .first_visible_developer_sequence()
         .expect("expanded anchor");
     assert_eq!(expanded_anchor, collapsed_anchor);
 
@@ -2110,17 +2108,80 @@ fn developer_detail_reflow_keeps_the_first_visible_event_as_anchor() {
         .draw(|frame| draw_ui(frame, &mut app))
         .expect("reflow expanded developer events");
     let narrow_anchor = app
-        .developer_event_layout
-        .first_visible_sequence(app.developer_scroll.offset_from_bottom)
+        .first_visible_developer_sequence()
         .expect("narrow anchor");
     assert_eq!(narrow_anchor, collapsed_anchor);
 
     app.toggle_developer_facts();
     let collapsed_again_anchor = app
-        .developer_event_layout
-        .first_visible_sequence(app.developer_scroll.offset_from_bottom)
+        .first_visible_developer_sequence()
         .expect("collapsed-again anchor");
     assert_eq!(collapsed_again_anchor, collapsed_anchor);
+}
+
+#[test]
+fn developer_detail_collapse_keeps_a_tail_event_at_the_top() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let events = (1..=30)
+        .map(|sequence_no| {
+            transcript_event(
+                sequence_no,
+                session_id,
+                task_id,
+                RuntimeEventType::StepCompleted,
+                json!({
+                    "summary": format!(
+                        "event {sequence_no} {}",
+                        "has enough detail to wrap across several visual lines ".repeat(4)
+                    )
+                }),
+            )
+        })
+        .collect();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        true,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.developer_projection = Some(debug_projection_with_events(
+        session_id,
+        Some(task_id),
+        events,
+    ));
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw collapsed developer events");
+    app.toggle_developer_facts();
+    let top_row = app
+        .developer_event_layout
+        .row_for_sequence(27)
+        .expect("expanded event row");
+    let layout = app.developer_event_layout.clone();
+    app.set_developer_top_row(&layout, top_row);
+    let tail_anchor = app.first_visible_developer_sequence().expect("tail anchor");
+    assert_eq!(tail_anchor, 27);
+
+    app.toggle_developer_facts();
+    assert_eq!(app.first_visible_developer_sequence(), Some(tail_anchor));
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("redraw collapsed tail anchor");
+    let developer = app.layout.developer.expect("developer area");
+    let first_event_row = (developer.x..developer.x.saturating_add(developer.width))
+        .filter_map(|x| {
+            terminal
+                .backend()
+                .buffer()
+                .cell((x, developer.y.saturating_add(1)))
+        })
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(first_event_row.contains("#27 "), "{first_event_row}");
 }
 
 #[test]
@@ -2154,26 +2215,61 @@ fn expanded_developer_event_scrolls_by_visual_line() {
 
     let page_rows = app.developer_event_layout.page_rows.max(1);
     assert!(app.developer_event_layout.row_count > page_rows);
-    let before = transcript_visible_window(
-        app.developer_event_layout.row_count,
-        page_rows,
-        app.developer_scroll.offset_from_bottom,
-    )
-    .start;
+    let before = app
+        .developer_event_layout
+        .visible_window(
+            app.developer_scroll.offset_from_bottom,
+            app.developer_top_row_override,
+        )
+        .start;
     app.scroll_developer(TranscriptScrollAction::LineDown, page_rows);
-    let after = transcript_visible_window(
-        app.developer_event_layout.row_count,
-        page_rows,
-        app.developer_scroll.offset_from_bottom,
-    )
-    .start;
+    let after = app
+        .developer_event_layout
+        .visible_window(
+            app.developer_scroll.offset_from_bottom,
+            app.developer_top_row_override,
+        )
+        .start;
 
     assert_eq!(after, before + 1);
-    assert_eq!(
-        app.developer_event_layout
-            .first_visible_sequence(app.developer_scroll.offset_from_bottom),
-        Some(1)
+    assert_eq!(app.first_visible_developer_sequence(), Some(1));
+}
+
+#[test]
+fn transcript_wraps_long_body_lines_to_the_available_width() {
+    let head_marker = "transcript-head-remains-reachable";
+    let marker = "transcript-tail-remains-visible";
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
     );
+    app.command_messages.push(TranscriptItem {
+        role: TranscriptRole::Assistant,
+        title: "Long response".to_owned(),
+        body: vec![format!(
+            "{head_marker} {} {marker}",
+            "visible response content ".repeat(24)
+        )],
+    });
+    let mut terminal = Terminal::new(TestBackend::new(64, 24)).expect("terminal");
+
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw wrapped transcript");
+
+    assert!(terminal_buffer_text(&terminal).contains(marker));
+    assert!(app.transcript_scroll.row_count > transcript_render_rows(&app).len());
+
+    let visible_rows = app.layout.transcript.height.saturating_sub(1) as usize;
+    app.scroll_transcript(TranscriptScrollAction::Top, visible_rows);
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw transcript from the top");
+    assert!(terminal_buffer_text(&terminal).contains(head_marker));
 }
 
 #[tokio::test]
