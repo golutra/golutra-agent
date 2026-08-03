@@ -14,6 +14,7 @@ pub(crate) enum DeveloperPanelRow {
     },
 }
 
+#[cfg(test)]
 pub(crate) fn developer_panel_rows(
     projection: &DebugProjection,
     recent_event_limit: usize,
@@ -145,20 +146,17 @@ fn developer_event_row(event: &RuntimeEvent) -> DeveloperPanelRow {
     DeveloperPanelRow::Event {
         sequence_no: event.sequence_no,
         label: format!("{:?}/{:?}", event.event_type, event.source),
-        summary: event_summary(event),
+        summary: developer_event_summary(event),
     }
 }
 
-fn event_summary(event: &RuntimeEvent) -> String {
+pub(crate) fn developer_event_summary(event: &RuntimeEvent) -> String {
     event
         .payload
         .get("summary")
         .and_then(|value| value.as_str())
         .or_else(|| event.payload.get("error").and_then(|value| value.as_str()))
-        .map_or_else(
-            || "runtime event recorded".to_owned(),
-            |value| compact_text(value, 96),
-        )
+        .map_or_else(|| "runtime event recorded".to_owned(), str::to_owned)
 }
 
 fn compact_text(value: &str, max_chars: usize) -> String {

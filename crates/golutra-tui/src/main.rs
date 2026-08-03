@@ -214,6 +214,7 @@ struct TuiApp {
     developer_facts_expanded: bool,
     transcript_scroll: PaneScrollState,
     developer_scroll: PaneScrollState,
+    developer_event_layout: DeveloperEventLayout,
     developer_load_requested: bool,
     layout: UiLayoutSnapshot,
     cursor: Option<u64>,
@@ -274,6 +275,7 @@ impl TuiApp {
                 follow_tail: true,
                 ..PaneScrollState::default()
             },
+            developer_event_layout: DeveloperEventLayout::default(),
             developer_load_requested: false,
             layout: UiLayoutSnapshot::default(),
             cursor: None,
@@ -368,6 +370,7 @@ impl TuiApp {
             self.developer_projection = None;
             self.developer_error = None;
             self.developer_scroll.reset(0);
+            self.developer_event_layout = DeveloperEventLayout::default();
             self.developer_load_requested = false;
         }
         self.refresh_activity_snapshot();
@@ -444,6 +447,7 @@ impl TuiApp {
             self.developer_projection = None;
             self.developer_error = None;
             self.developer_scroll.reset(0);
+            self.developer_event_layout = DeveloperEventLayout::default();
             self.developer_load_requested = false;
             self.status_message = "developer runtime view hidden".to_owned();
         }
@@ -673,21 +677,33 @@ impl TuiApp {
     }
 
     fn sync_developer_row_count(&mut self) {
-        let row_count = self
-            .developer_projection
-            .as_ref()
-            .map(|projection| {
-                developer_panel_rows_with_changes(
-                    projection,
-                    self.change_projection.summary(),
-                    usize::MAX,
-                )
-                .into_iter()
-                .filter(|row| matches!(row, DeveloperPanelRow::Event { .. }))
-                .count()
+        let Some(area) = self.layout.developer else {
+            return;
+        };
+        let layout = developer_event_layout(self, area);
+        self.sync_developer_layout(layout);
+    }
+
+    fn sync_developer_layout(&mut self, layout: DeveloperEventLayout) {
+        let anchor = (!self.developer_event_layout.has_same_flow_as(&layout))
+            .then(|| {
+                self.developer_event_layout
+                    .first_visible_sequence(self.developer_scroll.offset_from_bottom)
             })
-            .unwrap_or(0);
-        self.developer_scroll.set_row_count(row_count);
+            .flatten();
+
+        if let Some(offset_from_bottom) =
+            anchor.and_then(|sequence_no| layout.offset_for_sequence(sequence_no))
+        {
+            self.developer_scroll.row_count = layout.row_count;
+            self.developer_scroll.offset_from_bottom = offset_from_bottom;
+            self.developer_scroll.follow_tail = offset_from_bottom == 0;
+            self.developer_scroll.clamp(layout.page_rows.max(1));
+        } else {
+            self.developer_scroll.set_row_count(layout.row_count);
+            self.developer_scroll.clamp(layout.page_rows.max(1));
+        }
+        self.developer_event_layout = layout;
     }
 
     fn scroll_developer(&mut self, action: TranscriptScrollAction, visible_rows: usize) {
@@ -719,8 +735,8 @@ impl TuiApp {
     fn toggle_developer_facts(&mut self) {
         self.developer_facts_expanded = !self.developer_facts_expanded;
         if let Some(area) = self.layout.developer {
-            self.developer_scroll
-                .clamp(developer_event_page_rows(self, area));
+            let layout = developer_event_layout(self, area);
+            self.sync_developer_layout(layout);
         }
         self.status_message = if self.developer_facts_expanded {
             "developer facts expanded"
@@ -738,16 +754,17 @@ impl TuiApp {
             self.developer_load_requested = false;
             return Ok(());
         };
-        load_older_debug_events(transport, projection)
+        let loaded = load_older_debug_events(transport, projection)
             .await
             .map_err(|error| miette::miette!("{error}"))?;
         self.developer_load_requested = false;
-        let current_rows = developer_panel_rows(projection, usize::MAX)
-            .into_iter()
-            .filter(|row| matches!(row, DeveloperPanelRow::Event { .. }))
-            .count();
-        self.developer_scroll
-            .set_row_count_after_prepend(current_rows);
+        if loaded && let Some(area) = self.layout.developer {
+            let layout = developer_event_layout(self, area);
+            self.developer_scroll
+                .set_row_count_after_prepend(layout.row_count);
+            self.developer_scroll.clamp(layout.page_rows.max(1));
+            self.developer_event_layout = layout;
+        }
         Ok(())
     }
 
@@ -901,6 +918,7 @@ impl TuiApp {
                 self.developer_projection = None;
                 self.developer_error = None;
                 self.developer_scroll.reset(0);
+                self.developer_event_layout = DeveloperEventLayout::default();
                 self.developer_load_requested = false;
                 self.events.clear();
                 self.activity_projection = ActivityProjection::default();
@@ -1193,6 +1211,7 @@ impl TuiApp {
         self.developer_projection = None;
         self.developer_error = None;
         self.developer_scroll.reset(0);
+        self.developer_event_layout = DeveloperEventLayout::default();
         self.developer_load_requested = false;
         self.events.clear();
         self.activity_projection = ActivityProjection::default();
@@ -1224,6 +1243,7 @@ impl TuiApp {
         self.developer_projection = None;
         self.developer_error = None;
         self.developer_scroll.reset(0);
+        self.developer_event_layout = DeveloperEventLayout::default();
         self.developer_load_requested = false;
         self.events.clear();
         self.activity_projection = ActivityProjection::default();

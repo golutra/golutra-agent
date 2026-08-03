@@ -20,7 +20,7 @@ golutra-llm = { path = "../golutra-llm" }
 golutra-protocol.workspace = true
 miette.workspace = true
 nix = { workspace = true, features = ["user"] }
-ratatui.workspace = true
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 serde.workspace = true
 serde_json.workspace = true
 secrecy.workspace = true

@@ -95,8 +95,15 @@ pub(crate) fn ui_layout(area: Rect, app: &TuiApp) -> UiLayoutSnapshot {
 pub(crate) fn draw_ui(frame: &mut Frame<'_>, app: &mut TuiApp) {
     let transcript_rows = transcript_rows(app);
     app.sync_transcript_row_count_to(app.transcript_scroll.row_count, transcript_rows.len());
-    app.sync_developer_row_count();
-    app.layout = ui_layout(frame.area(), app);
+    let next_layout = ui_layout(frame.area(), app);
+    if let Some(developer) = next_layout.developer {
+        let developer_layout = developer_event_layout(app, developer);
+        app.sync_developer_layout(developer_layout);
+    } else {
+        app.developer_scroll.reset(0);
+        app.developer_event_layout = DeveloperEventLayout::default();
+    }
+    app.layout = next_layout;
     let layout = app.layout;
     draw_header(frame, layout.header, app);
     draw_transcript(frame, layout.transcript, app, transcript_rows);

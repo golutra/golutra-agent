@@ -1998,6 +1998,184 @@ fn developer_panel_exposes_governance_without_leaking_into_normal_view() {
     assert!(!app.developer_facts_expanded);
 }
 
+#[test]
+fn developer_event_details_toggle_between_ellipsis_and_complete_wrapped_text() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let tail = "developer-event-tail-marker";
+    let summary = format!("{} {tail}", "complete runtime event detail ".repeat(12));
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        true,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.developer_projection = Some(debug_projection_with_events(
+        session_id,
+        Some(task_id),
+        vec![transcript_event(
+            1,
+            session_id,
+            task_id,
+            RuntimeEventType::StepCompleted,
+            json!({"summary": summary}),
+        )],
+    ));
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw collapsed developer event");
+    let collapsed = terminal_buffer_text(&terminal);
+    assert!(collapsed.contains("▸ facts"));
+    assert!(collapsed.contains('…'));
+    assert!(!collapsed.contains(tail));
+
+    app.toggle_developer_facts();
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw expanded developer event");
+    let expanded = terminal_buffer_text(&terminal);
+    assert!(expanded.contains("▾ facts"));
+    assert!(expanded.contains(tail));
+    assert!(app.developer_event_layout.row_count > 1);
+
+    app.toggle_developer_facts();
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("redraw collapsed developer event");
+    let collapsed_again = terminal_buffer_text(&terminal);
+    assert!(collapsed_again.contains("▸ facts"));
+    assert!(collapsed_again.contains('…'));
+    assert!(!collapsed_again.contains(tail));
+}
+
+#[test]
+fn developer_detail_reflow_keeps_the_first_visible_event_as_anchor() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let events = (1..=30)
+        .map(|sequence_no| {
+            transcript_event(
+                sequence_no,
+                session_id,
+                task_id,
+                RuntimeEventType::StepCompleted,
+                json!({
+                    "summary": format!(
+                        "event {sequence_no} {}",
+                        "has complete detail that wraps at the developer pane width ".repeat(3)
+                    )
+                }),
+            )
+        })
+        .collect();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        true,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.developer_projection = Some(debug_projection_with_events(
+        session_id,
+        Some(task_id),
+        events,
+    ));
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw collapsed developer events");
+    let page_rows = app.developer_event_layout.page_rows.max(1);
+    for _ in 0..5 {
+        app.scroll_developer(TranscriptScrollAction::LineUp, page_rows);
+    }
+    let collapsed_anchor = app
+        .developer_event_layout
+        .first_visible_sequence(app.developer_scroll.offset_from_bottom)
+        .expect("collapsed anchor");
+
+    app.toggle_developer_facts();
+    let expanded_anchor = app
+        .developer_event_layout
+        .first_visible_sequence(app.developer_scroll.offset_from_bottom)
+        .expect("expanded anchor");
+    assert_eq!(expanded_anchor, collapsed_anchor);
+
+    let mut narrow_terminal = Terminal::new(TestBackend::new(90, 24)).expect("narrow terminal");
+    narrow_terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("reflow expanded developer events");
+    let narrow_anchor = app
+        .developer_event_layout
+        .first_visible_sequence(app.developer_scroll.offset_from_bottom)
+        .expect("narrow anchor");
+    assert_eq!(narrow_anchor, collapsed_anchor);
+
+    app.toggle_developer_facts();
+    let collapsed_again_anchor = app
+        .developer_event_layout
+        .first_visible_sequence(app.developer_scroll.offset_from_bottom)
+        .expect("collapsed-again anchor");
+    assert_eq!(collapsed_again_anchor, collapsed_anchor);
+}
+
+#[test]
+fn expanded_developer_event_scrolls_by_visual_line() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        true,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.developer_projection = Some(debug_projection_with_events(
+        session_id,
+        Some(task_id),
+        vec![transcript_event(
+            1,
+            session_id,
+            task_id,
+            RuntimeEventType::StepCompleted,
+            json!({"summary": "visual line scrolling ".repeat(80)}),
+        )],
+    ));
+    let mut terminal = Terminal::new(TestBackend::new(120, 18)).expect("terminal");
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw collapsed long event");
+    app.toggle_developer_facts();
+
+    let page_rows = app.developer_event_layout.page_rows.max(1);
+    assert!(app.developer_event_layout.row_count > page_rows);
+    let before = transcript_visible_window(
+        app.developer_event_layout.row_count,
+        page_rows,
+        app.developer_scroll.offset_from_bottom,
+    )
+    .start;
+    app.scroll_developer(TranscriptScrollAction::LineDown, page_rows);
+    let after = transcript_visible_window(
+        app.developer_event_layout.row_count,
+        page_rows,
+        app.developer_scroll.offset_from_bottom,
+    )
+    .start;
+
+    assert_eq!(after, before + 1);
+    assert_eq!(
+        app.developer_event_layout
+            .first_visible_sequence(app.developer_scroll.offset_from_bottom),
+        Some(1)
+    );
+}
+
 #[tokio::test]
 async fn developer_projection_is_only_loaded_in_explicit_debug_mode() {
     let transport = RuntimeTransport::in_memory().await.expect("transport");
@@ -2285,6 +2463,50 @@ fn transcript_event(
         payload_ref: None,
         durable: true,
     }
+}
+
+fn debug_projection_with_events(
+    session_id: SessionId,
+    task_id: Option<TaskId>,
+    events: Vec<RuntimeEvent>,
+) -> golutra_protocol::DebugProjection {
+    golutra_protocol::DebugProjection {
+        session_id,
+        task_id,
+        event_window: golutra_protocol::DebugEventWindow {
+            start_cursor: events.first().map(|event| event.sequence_no),
+            end_cursor: events.last().map(|event| event.sequence_no),
+            has_more_before: false,
+            limit: 256,
+        },
+        events,
+        busy_policy_decisions: Vec::new(),
+        tool_results: Vec::new(),
+        artifacts: Vec::new(),
+        evidence: Vec::new(),
+        verification: None,
+        loop_decisions: Vec::new(),
+        post_task_jobs: Vec::new(),
+        failure_diagnosis: None,
+        failure_episodes: Vec::new(),
+        diagnostic_slice: None,
+        replay_execution: None,
+        external_evaluations: Vec::new(),
+        causal_comparisons: Vec::new(),
+        trace_complete: true,
+        missing_sections: Vec::new(),
+        retention_losses: Vec::new(),
+    }
+}
+
+fn terminal_buffer_text(terminal: &Terminal<TestBackend>) -> String {
+    terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect()
 }
 
 #[tokio::test]
