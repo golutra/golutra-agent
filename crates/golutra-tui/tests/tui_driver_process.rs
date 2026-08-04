@@ -678,10 +678,28 @@ async fn inspect_and_stdio_driver_execute_real_offscreen_tui() {
         }))
         .await;
     let after_page = driver.receive("expanded-developer-after-page").await;
-    assert_eq!(
-        after_page["lines"], before_page["lines"],
-        "PageUp changed the fixed debug view instead of leaving scrollback to the terminal"
+    let before_watermark = before_page["event_high_watermark"]
+        .as_u64()
+        .expect("before PageUp event watermark");
+    let after_watermark = after_page["event_high_watermark"]
+        .as_u64()
+        .expect("after PageUp event watermark");
+    assert!(
+        after_watermark >= before_watermark,
+        "PageUp moved the debug view behind the runtime event tail"
     );
+    assert!(
+        serde_json::to_string(&after_page)
+            .expect("after PageUp JSON")
+            .contains("▾ facts"),
+        "PageUp collapsed developer facts: {after_page}"
+    );
+    if after_watermark == before_watermark {
+        assert_eq!(
+            after_page["lines"], before_page["lines"],
+            "PageUp changed the fixed debug view without any new runtime events"
+        );
+    }
     driver
         .send(json!({
             "request_id": "clear-composer",
