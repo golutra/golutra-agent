@@ -594,8 +594,20 @@ async fn inspect_and_stdio_driver_execute_real_offscreen_tui() {
     assert!(!screen_json.contains(stdio_secret));
     assert!(!screen_json.contains(composer_secret));
     assert!(screen_json.contains("redacted-secret"));
+    let has_debug_event = screen["lines"].as_array().is_some_and(|lines| {
+        lines.iter().any(|line| {
+            line["text"].as_str().is_some_and(|text| {
+                text.trim_start()
+                    .strip_prefix('#')
+                    .and_then(|event| event.split_once(' '))
+                    .is_some_and(|(sequence, event)| {
+                        sequence.parse::<u64>().is_ok() && event.contains('/')
+                    })
+            })
+        })
+    });
     assert!(
-        screen_json.contains("/Runtime"),
+        has_debug_event,
         "debug events missing from full-screen snapshot: {screen}"
     );
     assert!(
