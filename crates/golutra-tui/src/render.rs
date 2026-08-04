@@ -18,14 +18,13 @@ const QUESTION_FREE_TEXT_PREFIX: &str = "    ";
 const QUESTION_FREE_TEXT_PREFIX_WIDTH: u16 = 4;
 const MAX_QUESTION_FREE_TEXT_ROWS: u16 = 4;
 const SETTINGS_MODEL_PREFIX_WIDTH: u16 = 9;
-const MIN_SPLIT_PANE_WIDTH: u16 = 100;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum BodyLayoutMode {
     #[default]
     Transcript,
     Developer,
-    Split,
+    ResponseAndDeveloper,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -65,10 +64,9 @@ impl UiLayoutSnapshot {
         }
     }
 
-    pub(crate) fn developer_facts_toggle_hit(self, x: u16, y: u16) -> bool {
-        self.developer
-            .map(developer_facts_toggle_hit_rect)
-            .is_some_and(|area| rect_contains(area, x, y))
+    pub(crate) fn developer_facts_toggle_hit(self, x: u16, y: u16, app: &TuiApp) -> bool {
+        developer_facts_indicator(app).is_some()
+            && rect_contains(developer_facts_toggle_hit_rect(self.bottom), x, y)
     }
 }
 
@@ -91,17 +89,12 @@ pub(crate) fn ui_layout(area: Rect, app: &TuiApp) -> UiLayoutSnapshot {
     } else {
         match app.body_view_mode {
             BodyViewMode::Transcript => BodyLayoutMode::Transcript,
-            BodyViewMode::Developer => BodyLayoutMode::Developer,
-            BodyViewMode::Split => BodyLayoutMode::Split,
-            BodyViewMode::Auto if area.width >= MIN_SPLIT_PANE_WIDTH => BodyLayoutMode::Split,
-            BodyViewMode::Auto if app.active_scroll_pane == ScrollablePane::Developer => {
-                BodyLayoutMode::Developer
-            }
-            BodyViewMode::Auto => BodyLayoutMode::Transcript,
+            BodyViewMode::Auto | BodyViewMode::Developer => BodyLayoutMode::Developer,
+            BodyViewMode::Split => BodyLayoutMode::ResponseAndDeveloper,
         }
     };
     let (transcript, developer) = match body_mode {
-        BodyLayoutMode::Split => {
+        BodyLayoutMode::ResponseAndDeveloper => {
             let body = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -130,14 +123,6 @@ pub(crate) fn draw_ui(frame: &mut Frame<'_>, app: &mut TuiApp) {
             .as_ref()
             .map_or(0, |cache| cache.layout.row_count);
         app.sync_transcript_row_count_to(app.transcript_scroll.row_count, row_count);
-    }
-    if let Some(developer) = next_layout.developer {
-        let developer_layout = developer_event_layout(app, developer);
-        app.sync_developer_layout(developer_layout);
-    } else {
-        app.developer_scroll.reset(0);
-        app.developer_event_layout = DeveloperEventLayout::default();
-        app.developer_top_row_override = None;
     }
     app.layout = next_layout;
     let layout = app.layout;
@@ -2745,11 +2730,6 @@ pub(crate) fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
         }
         lines.extend(queued_prompt_lines(app, usize::from(area.width)));
     }
-    if overlay_help.is_some() {
-        lines.push(footer_status_line(app));
-    } else {
-        lines.push(footer_context_line(app, usize::from(area.width)));
-    }
     if let Some(provider_line) = provider_footer_line(app) {
         lines.push(Line::from(Span::styled(
             provider_line,
@@ -2761,6 +2741,11 @@ pub(crate) fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
             help,
             Style::default().fg(palette.muted),
         )));
+    }
+    if overlay_help.is_some() {
+        lines.push(footer_status_line(app));
+    } else {
+        lines.push(footer_context_line(app, usize::from(area.width)));
     }
     let status = live_status_line(app, usize::from(area.width));
     let composer_area = if let Some(status) = status {
@@ -3059,24 +3044,101 @@ pub(crate) fn auth_composer_line(dialog: &AuthDialogState) -> String {
 pub(crate) fn footer_context_line(app: &TuiApp, max_width: usize) -> Line<'static> {
     const INDENT_WIDTH: usize = 2;
     let indent_width = INDENT_WIDTH.min(max_width);
-    let content_width = max_width.saturating_sub(indent_width);
     let indent = " ".repeat(indent_width);
-    if app.quit_shortcut_is_active() && !app.status_message.trim().is_empty() {
-        return Line::from(vec![
-            Span::raw(indent),
-            Span::styled(
-                truncate_end_to_width(&app.status_message, content_width),
-                Style::default().fg(app.palette().warning),
-            ),
-        ]);
-    }
-    Line::from(vec![
+    let right = developer_facts_indicator(app);
+    let right_width = right.as_ref().map_or(0, |value| display_width(value));
+    let right_padding = usize::from(right.is_some()) * 2;
+    let gap = usize::from(right.is_some()) * 2;
+    let content_width = max_width
+        .saturating_sub(indent_width)
+        .saturating_sub(right_width)
+        .saturating_sub(right_padding)
+        .saturating_sub(gap);
+    let (left, style) = if app.quit_shortcut_is_active() && !app.status_message.trim().is_empty() {
+        (
+            &app.status_message,
+            Style::default().fg(app.palette().warning),
+        )
+    } else {
+        return footer_context_line_with_right(app, max_width, right);
+    };
+    let left = truncate_end_to_width(left, content_width);
+    let padding = " ".repeat(
+        max_width
+            .saturating_sub(indent_width)
+            .saturating_sub(display_width(&left))
+            .saturating_sub(right_width)
+            .saturating_sub(right_padding),
+    );
+    let mut spans = vec![
         Span::raw(indent),
-        Span::styled(
-            footer_context_text(app, content_width),
-            Style::default().fg(app.palette().muted),
-        ),
-    ])
+        Span::styled(left, style),
+        Span::raw(padding),
+    ];
+    if let Some(right) = right {
+        spans.push(Span::styled(
+            right,
+            Style::default().fg(app.palette().accent),
+        ));
+        spans.push(Span::raw(" ".repeat(right_padding)));
+    }
+    Line::from(spans)
+}
+
+fn footer_context_line_with_right(
+    app: &TuiApp,
+    max_width: usize,
+    right: Option<&'static str>,
+) -> Line<'static> {
+    const INDENT_WIDTH: usize = 2;
+    let indent_width = INDENT_WIDTH.min(max_width);
+    let indent = " ".repeat(indent_width);
+    let right_width = right.map_or(0, display_width);
+    let right_padding = usize::from(right.is_some()) * 2;
+    let gap = usize::from(right.is_some()) * 2;
+    let content_width = max_width
+        .saturating_sub(indent_width)
+        .saturating_sub(right_width)
+        .saturating_sub(right_padding)
+        .saturating_sub(gap);
+    let left = footer_context_text(app, content_width);
+    let padding = " ".repeat(
+        max_width
+            .saturating_sub(indent_width)
+            .saturating_sub(display_width(&left))
+            .saturating_sub(right_width)
+            .saturating_sub(right_padding),
+    );
+    let mut spans = vec![
+        Span::raw(indent),
+        Span::styled(left, Style::default().fg(app.palette().muted)),
+        Span::raw(padding),
+    ];
+    if let Some(right) = right {
+        spans.push(Span::styled(
+            right,
+            Style::default().fg(app.palette().accent),
+        ));
+        spans.push(Span::raw(" ".repeat(right_padding)));
+    }
+    Line::from(spans)
+}
+
+pub(crate) fn developer_facts_indicator(app: &TuiApp) -> Option<&'static str> {
+    if !app.debug_mode || app.overlay_surface().is_some() {
+        return None;
+    }
+    Some(if app.preferences.screen_reader {
+        if app.developer_facts_expanded {
+            "v facts"
+        } else {
+            "> facts"
+        }
+    } else if app.developer_facts_expanded {
+        "▾ facts"
+    } else {
+        "▸ facts"
+    })
 }
 
 pub(crate) fn footer_context_text(app: &TuiApp, max_width: usize) -> String {
@@ -3266,16 +3328,6 @@ pub(crate) fn transcript_scroll_status(scroll_offset: usize, unseen_rows: usize)
         format!("history offset {scroll_offset} rows from latest · {unseen_rows} new")
     } else {
         format!("history offset {scroll_offset} rows from latest")
-    }
-}
-
-pub(crate) fn developer_scroll_status(scroll_offset: usize, unseen_rows: usize) -> String {
-    if scroll_offset == 0 {
-        "developer facts at latest".to_owned()
-    } else if unseen_rows > 0 {
-        format!("developer facts offset {scroll_offset} rows from latest · {unseen_rows} new")
-    } else {
-        format!("developer facts offset {scroll_offset} rows from latest")
     }
 }
 

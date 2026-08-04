@@ -905,13 +905,9 @@ async fn snapshot_render_does_not_mutate_the_active_pane_layout() {
     driver.app.developer_facts_expanded = true;
     driver.refresh_active_layout().expect("active layout");
     driver.app.transcript_top_row_override = Some(3);
-    driver.app.developer_top_row_override = Some(3);
 
     let expected_layout = driver.app.layout;
-    let expected_event_layout = driver.app.developer_event_layout.clone();
     let expected_transcript_top_row = driver.app.transcript_top_row_override;
-    let expected_top_row = driver.app.developer_top_row_override;
-    let expected_scroll = driver.app.developer_scroll;
 
     driver
         .render_frame(&SnapshotRequest {
@@ -926,11 +922,8 @@ async fn snapshot_render_does_not_mutate_the_active_pane_layout() {
         .expect("transcript snapshot");
 
     assert_eq!(driver.app.layout, expected_layout);
-    assert_eq!(driver.app.developer_event_layout, expected_event_layout);
     assert_eq!(
         driver.app.transcript_top_row_override,
         expected_transcript_top_row
     );
-    assert_eq!(driver.app.developer_top_row_override, expected_top_row);
-    assert_eq!(driver.app.developer_scroll, expected_scroll);
 }

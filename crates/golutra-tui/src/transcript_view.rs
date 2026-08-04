@@ -1,8 +1,8 @@
 //! Pure mapping from runtime/user projections to transcript view models.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use golutra_core::{FileChangeKind, FileChangeSummary, TaskId, ToolResultStatus, TurnId};
+use golutra_core::{EventId, FileChangeKind, FileChangeSummary, TaskId, ToolResultStatus, TurnId};
 use golutra_protocol::{RuntimeEvent, RuntimeEventType, UserProjection, VisibleStep};
 use serde_json::Value;
 
@@ -112,29 +112,33 @@ pub(crate) fn transcript_items(app: &TuiApp) -> Vec<TranscriptItem> {
 }
 
 pub(crate) fn transcript_operation_projections(app: &TuiApp) -> Vec<OperationProjection> {
-    transcript_operation_projections_after(app, 0)
+    transcript_operation_projections_after(app, None)
 }
 
 pub(crate) fn rendered_transcript_operation_projections(app: &TuiApp) -> Vec<OperationProjection> {
-    let committed = if app.inline_history_enabled && app.transcript_search.is_none() {
-        app.inline_history_committed_event_projections
-    } else {
-        0
-    };
+    let committed = (app.inline_history_enabled && app.transcript_search.is_none())
+        .then_some(&app.inline_history_committed_event_ids);
     transcript_operation_projections_after(app, committed)
 }
 
 fn transcript_operation_projections_after(
     app: &TuiApp,
-    committed_event_projections: usize,
+    committed_event_ids: Option<&HashSet<EventId>>,
 ) -> Vec<OperationProjection> {
     if app.auth_dialog.is_some() {
         return Vec::new();
     }
     let mut items: Vec<OperationProjection> = Vec::new();
-    let event_items = event_operation_projections(&app.events);
+    let event_items = event_operation_entries(&app.events);
     let has_event_items = !event_items.is_empty();
-    items.extend(event_items.into_iter().skip(committed_event_projections));
+    items.extend(
+        event_items
+            .into_iter()
+            .filter(|entry| {
+                committed_event_ids.is_none_or(|committed| !committed.contains(&entry.id))
+            })
+            .map(|entry| entry.projection),
+    );
     items.extend(app.command_messages.iter().cloned().map(notice_projection));
     if let Some(projection) = &app.projection {
         if has_event_items {
@@ -169,30 +173,33 @@ pub(crate) fn event_transcript_items(events: &[RuntimeEvent]) -> Vec<TranscriptI
 }
 
 pub(crate) fn event_operation_projections(events: &[RuntimeEvent]) -> Vec<OperationProjection> {
-    event_operation_records(events)
+    event_operation_entries(events)
         .into_iter()
-        .map(|record| record.projection)
+        .map(|entry| entry.projection)
         .collect()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn stable_event_operation_projection_count(events: &[RuntimeEvent]) -> usize {
-    event_operation_records(events)
+    event_operation_entries(events)
         .into_iter()
-        .take_while(|record| record.stable)
+        .take_while(|entry| entry.stable)
         .count()
 }
 
 #[derive(Debug, Clone)]
-struct EventOperationRecord {
-    projection: OperationProjection,
+pub(crate) struct EventOperationEntry {
+    pub(crate) id: EventId,
+    pub(crate) projection: OperationProjection,
+    pub(crate) stable: bool,
     task_id: Option<TaskId>,
     turn_id: Option<TurnId>,
-    stable: bool,
 }
 
-impl EventOperationRecord {
+impl EventOperationEntry {
     fn new(event: &RuntimeEvent, projection: OperationProjection, stable: bool) -> Self {
         Self {
+            id: event.id,
             projection,
             task_id: event.task_id,
             turn_id: event.turn_id,
@@ -201,11 +208,11 @@ impl EventOperationRecord {
     }
 }
 
-fn event_operation_records(events: &[RuntimeEvent]) -> Vec<EventOperationRecord> {
+pub(crate) fn event_operation_entries(events: &[RuntimeEvent]) -> Vec<EventOperationEntry> {
     let mut typed_events = events.iter().collect::<Vec<_>>();
     typed_events.sort_by_key(|event| event.sequence_no);
 
-    let mut items: Vec<EventOperationRecord> = Vec::new();
+    let mut items: Vec<EventOperationEntry> = Vec::new();
     let mut visible_user_turns = HashMap::<TurnId, usize>::new();
     let mut streamed_assistant_items: HashMap<TurnId, usize> = HashMap::new();
     let mut active_tools = HashMap::<OperationId, usize>::new();
@@ -230,7 +237,7 @@ fn event_operation_records(events: &[RuntimeEvent]) -> Vec<EventOperationRecord>
                     if let Some(turn_id) = event.turn_id {
                         visible_user_turns.insert(turn_id, items.len());
                     }
-                    items.push(EventOperationRecord::new(
+                    items.push(EventOperationEntry::new(
                         event,
                         message_projection(item),
                         true,
@@ -245,7 +252,7 @@ fn event_operation_records(events: &[RuntimeEvent]) -> Vec<EventOperationRecord>
                     if let Some(turn_id) = event.turn_id {
                         visible_user_turns.insert(turn_id, items.len());
                     }
-                    items.push(EventOperationRecord::new(
+                    items.push(EventOperationEntry::new(
                         event,
                         message_projection(item),
                         false,
@@ -310,7 +317,7 @@ fn event_operation_records(events: &[RuntimeEvent]) -> Vec<EventOperationRecord>
                     }
                 } else {
                     let index = items.len();
-                    items.push(EventOperationRecord::new(
+                    items.push(EventOperationEntry::new(
                         event,
                         message_projection(TranscriptItem {
                             role: TranscriptRole::Assistant,
@@ -334,7 +341,7 @@ fn event_operation_records(events: &[RuntimeEvent]) -> Vec<EventOperationRecord>
                         record.stable = true;
                     }
                 } else if let Some(item) = assistant_event_transcript_item(event) {
-                    items.push(EventOperationRecord::new(
+                    items.push(EventOperationEntry::new(
                         event,
                         message_projection(item),
                         true,
@@ -347,7 +354,7 @@ fn event_operation_records(events: &[RuntimeEvent]) -> Vec<EventOperationRecord>
                     if let Some(id) = projection.id().cloned() {
                         active_tools.insert(id, index);
                     }
-                    items.push(EventOperationRecord::new(event, projection, false));
+                    items.push(EventOperationEntry::new(event, projection, false));
                 }
             }
             RuntimeEventType::ToolProgress => {
@@ -366,13 +373,13 @@ fn event_operation_records(events: &[RuntimeEvent]) -> Vec<EventOperationRecord>
                         items[index].projection = projection;
                         items[index].stable = true;
                     } else {
-                        items.push(EventOperationRecord::new(event, projection, true));
+                        items.push(EventOperationEntry::new(event, projection, true));
                     }
                 }
             }
             _ => {
                 if let Some(item) = status_event_transcript_item(event) {
-                    items.push(EventOperationRecord::new(
+                    items.push(EventOperationEntry::new(
                         event,
                         notice_projection(item),
                         true,

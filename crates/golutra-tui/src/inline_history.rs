@@ -1,8 +1,8 @@
 //! Native terminal scrollback for finalized transcript content.
 
-use std::io;
+use std::{collections::HashSet, io};
 
-use golutra_core::SessionId;
+use golutra_core::{EventId, SessionId};
 use ratatui::{
     Terminal,
     backend::Backend,
@@ -15,48 +15,132 @@ use super::*;
 
 const SESSION_CARD_MAX_WIDTH: usize = 60;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InlineHistoryMode {
+    Transcript,
+    Developer { facts_expanded: bool },
+}
+
+impl InlineHistoryMode {
+    fn from_app(app: &TuiApp) -> Self {
+        if app.debug_mode && app.body_view_mode != BodyViewMode::Transcript {
+            Self::Developer {
+                facts_expanded: app.developer_facts_expanded,
+            }
+        } else {
+            Self::Transcript
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RenderedHistoryEntry {
+    id: EventId,
+    lines: Vec<Line<'static>>,
+}
+
 #[derive(Debug)]
 pub(crate) struct InlineHistoryState {
     session_id: SessionId,
+    generation: u64,
+    mode: InlineHistoryMode,
+    rendered_width: u16,
+    initialized: bool,
     header_emitted: bool,
-    committed_event_projections: usize,
+    committed_event_ids: HashSet<EventId>,
 }
 
 impl InlineHistoryState {
     pub(crate) fn new(session_id: SessionId) -> Self {
         Self {
             session_id,
+            generation: 0,
+            mode: InlineHistoryMode::Transcript,
+            rendered_width: 0,
+            initialized: false,
             header_emitted: false,
-            committed_event_projections: 0,
+            committed_event_ids: HashSet::new(),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn flush<B: Backend>(
         &mut self,
         terminal: &mut Terminal<B>,
         app: &mut TuiApp,
     ) -> io::Result<bool> {
-        if self.session_id != app.session_id {
+        self.flush_with_rebuild(terminal, app, clear_history_terminal)
+    }
+
+    pub(crate) fn flush_interactive(
+        &mut self,
+        terminal: &mut InteractiveTerminal,
+        app: &mut TuiApp,
+    ) -> io::Result<bool> {
+        self.flush_with_rebuild(terminal, app, clear_inline_scrollback)
+    }
+
+    fn flush_with_rebuild<B: Backend>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+        app: &mut TuiApp,
+        rebuild_terminal: impl FnOnce(&mut Terminal<B>) -> io::Result<()>,
+    ) -> io::Result<bool> {
+        let mode = InlineHistoryMode::from_app(app);
+        let width = terminal.size()?.width.max(1);
+        let target_changed = self.initialized
+            && (self.session_id != app.session_id
+                || self.generation != app.history_replay_generation
+                || self.mode != mode
+                || self.rendered_width != width);
+        let clear_previous_history =
+            target_changed && (self.header_emitted || !self.committed_event_ids.is_empty());
+
+        if clear_previous_history {
+            rebuild_terminal(terminal)?;
+        }
+        if !self.initialized || target_changed {
             self.session_id = app.session_id;
+            self.generation = app.history_replay_generation;
+            self.mode = mode;
+            self.rendered_width = width;
+            self.initialized = true;
             self.header_emitted = false;
-            self.committed_event_projections = 0;
-            app.set_inline_history_committed_event_projections(0);
+            self.committed_event_ids.clear();
+            app.set_inline_history_committed_event_ids(HashSet::new());
         }
 
-        let width = terminal.size()?.width.max(1);
-        let stable_count = stable_event_operation_projection_count(&app.events);
+        let source_ready = app.history_replay_ready
+            && (!matches!(mode, InlineHistoryMode::Developer { .. })
+                || app.developer_projection.is_some()
+                || app.developer_error.is_some());
+        if !source_ready {
+            return Ok(clear_previous_history);
+        }
+
+        let all_stable_entries = rendered_history_entries(app, width, mode);
+        let stable_entries = all_stable_entries
+            .iter()
+            .filter(|entry| !self.committed_event_ids.contains(&entry.id))
+            .cloned()
+            .collect::<Vec<_>>();
         let mut lines = Vec::new();
         let emit_header = !self.header_emitted;
         if emit_header {
             lines.extend(session_history_lines(app, width));
+            if matches!(
+                mode,
+                InlineHistoryMode::Developer {
+                    facts_expanded: true
+                }
+            ) {
+                lines.extend(developer_fact_history_lines(app, width));
+                lines.push(Line::default());
+            }
         }
 
-        if stable_count > self.committed_event_projections {
-            let projections = event_operation_projections(&app.events);
-            lines.extend(render_operation_projection_lines(
-                app,
-                projections[self.committed_event_projections..stable_count].to_vec(),
-            ));
+        if !stable_entries.is_empty() {
+            lines.extend(stable_entries.iter().flat_map(|entry| entry.lines.clone()));
         }
 
         if lines.is_empty() {
@@ -70,11 +154,55 @@ impl InlineHistoryState {
                 .render(buffer.area, buffer);
         })?;
 
-        self.header_emitted |= emit_header;
-        self.committed_event_projections = stable_count.max(self.committed_event_projections);
-        app.set_inline_history_committed_event_projections(self.committed_event_projections);
+        self.header_emitted = true;
+        self.committed_event_ids
+            .extend(stable_entries.into_iter().map(|entry| entry.id));
+        app.set_inline_history_committed_event_ids(self.committed_event_ids.clone());
         Ok(true)
     }
+}
+
+fn rendered_history_entries(
+    app: &TuiApp,
+    width: u16,
+    mode: InlineHistoryMode,
+) -> Vec<RenderedHistoryEntry> {
+    match mode {
+        InlineHistoryMode::Transcript => event_operation_entries(&app.events)
+            .into_iter()
+            .take_while(|entry| entry.stable)
+            .map(|entry| RenderedHistoryEntry {
+                id: entry.id,
+                lines: render_operation_projection_lines(app, vec![entry.projection]),
+            })
+            .collect(),
+        InlineHistoryMode::Developer { facts_expanded } => {
+            let mut events = app.events.iter().collect::<Vec<_>>();
+            events.sort_by_key(|event| event.sequence_no);
+            events
+                .into_iter()
+                .map(|event| RenderedHistoryEntry {
+                    id: event.id,
+                    lines: developer_event_history_lines(
+                        event,
+                        width,
+                        facts_expanded,
+                        app.palette(),
+                    ),
+                })
+                .collect()
+        }
+    }
+}
+
+#[cfg(test)]
+fn clear_history_terminal<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
+    let size = terminal.size()?;
+    terminal.set_cursor_position(ratatui::layout::Position::ORIGIN)?;
+    terminal
+        .backend_mut()
+        .clear_region(ratatui::backend::ClearType::All)?;
+    terminal.resize(ratatui::layout::Rect::new(0, 0, size.width, size.height))
 }
 
 pub(crate) fn inline_viewport_height(app: &TuiApp, width: u16, screen_height: u16) -> u16 {

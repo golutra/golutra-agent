@@ -119,36 +119,17 @@ pub(crate) fn merge_debug_projection(
     previous
 }
 
-pub(crate) async fn load_older_debug_events(
-    transport: &RuntimeTransport,
+pub(crate) fn replace_debug_event_history(
     projection: &mut DebugProjection,
-) -> Result<bool, String> {
-    if !projection.event_window.has_more_before {
-        return Ok(false);
-    }
-    let page = transport
-        .event_page(EventPageRequest {
-            session_id: projection.session_id,
-            task_id: projection.task_id,
-            cursor: projection.event_window.start_cursor,
-            direction: EventPageDirection::Backward,
-            limit: projection.event_window.limit.max(1),
-        })
-        .await
-        .map_err(|error| error.to_string())?;
-    if page.events.is_empty() {
-        projection.event_window.has_more_before = false;
-        return Ok(false);
-    }
-    let mut older = page.events;
-    older.append(&mut projection.events);
-    older.sort_by_key(|event| event.sequence_no);
-    older.dedup_by_key(|event| event.sequence_no);
-    projection.events = older;
-    projection.event_window.start_cursor = page.start_cursor;
-    projection.event_window.has_more_before = page.has_more;
+    mut events: Vec<golutra_protocol::RuntimeEvent>,
+) {
+    events.sort_by_key(|event| event.sequence_no);
+    events.dedup_by_key(|event| event.sequence_no);
+    projection.events = events;
+    projection.event_window.start_cursor = projection.events.first().map(|event| event.sequence_no);
+    projection.event_window.end_cursor = projection.events.last().map(|event| event.sequence_no);
+    projection.event_window.has_more_before = false;
     refresh_debug_completeness(projection);
-    Ok(true)
 }
 
 fn refresh_debug_completeness(projection: &mut DebugProjection) {

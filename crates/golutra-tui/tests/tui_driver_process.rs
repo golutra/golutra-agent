@@ -269,7 +269,13 @@ async fn inspect_and_stdio_driver_execute_real_offscreen_tui() {
         frame
             .lines
             .iter()
-            .any(|line| line.text.contains("Developer runtime"))
+            .any(|line| line.text.contains('#') && line.text.contains("/Runtime"))
+    );
+    assert!(
+        frame
+            .lines
+            .iter()
+            .all(|line| !line.text.contains("Developer runtime"))
     );
     assert!(
         frame
@@ -588,7 +594,18 @@ async fn inspect_and_stdio_driver_execute_real_offscreen_tui() {
     assert!(!screen_json.contains(stdio_secret));
     assert!(!screen_json.contains(composer_secret));
     assert!(screen_json.contains("redacted-secret"));
-    assert!(screen_json.contains("Developer runtime"));
+    assert!(
+        screen_json.contains("/Runtime"),
+        "debug events missing from full-screen snapshot: {screen}"
+    );
+    assert!(
+        !screen_json.contains("Developer runtime"),
+        "removed developer title returned: {screen}"
+    );
+    assert!(
+        screen_json.contains("▸ facts"),
+        "collapsed facts control missing from footer: {screen}"
+    );
     let facts_toggle = screen["hit_regions"]
         .as_array()
         .and_then(|regions| {
@@ -597,6 +614,10 @@ async fn inspect_and_stdio_driver_execute_real_offscreen_tui() {
                 .find(|region| region["id"] == "developer_facts_toggle")
         })
         .expect("developer facts hit region");
+    assert!(
+        facts_toggle["x"].as_u64().is_some_and(|x| x >= 90),
+        "facts control is not right-aligned: {facts_toggle}"
+    );
     let facts_x = facts_toggle["x"].as_u64().expect("facts x")
         + facts_toggle["width"].as_u64().expect("facts width") / 2;
     let facts_y = facts_toggle["y"].as_u64().expect("facts y");
@@ -627,7 +648,7 @@ async fn inspect_and_stdio_driver_execute_real_offscreen_tui() {
             "request_id": "expanded-developer-before-page",
             "type": "snapshot",
             "scope": "screen",
-            "panes": "developer",
+            "panes": "full_screen",
             "width": 100,
             "height": 24
         }))
@@ -651,15 +672,15 @@ async fn inspect_and_stdio_driver_execute_real_offscreen_tui() {
             "request_id": "expanded-developer-after-page",
             "type": "snapshot",
             "scope": "screen",
-            "panes": "developer",
+            "panes": "full_screen",
             "width": 100,
             "height": 24
         }))
         .await;
     let after_page = driver.receive("expanded-developer-after-page").await;
-    assert_ne!(
+    assert_eq!(
         after_page["lines"], before_page["lines"],
-        "PageUp did not move the active developer pane"
+        "PageUp changed the fixed debug view instead of leaving scrollback to the terminal"
     );
     driver
         .send(json!({
@@ -1380,8 +1401,12 @@ async fn live_provider_driver_smoke_is_isolated_and_opt_in() {
         "provider reply missing: {frame}"
     );
     assert!(
-        frame_json.contains("Developer runtime"),
-        "developer pane missing: {frame}"
+        frame_json.contains("/Runtime"),
+        "debug events missing from response+developer frame: {frame}"
+    );
+    assert!(
+        !frame_json.contains("Developer runtime"),
+        "removed developer title returned: {frame}"
     );
     assert!(
         !frame_json.contains(&api_key),

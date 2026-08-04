@@ -12,8 +12,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::super::{
-    TuiApp, UiLayoutSnapshot, UiMousePress, developer_facts_toggle_hit_rect, display_width,
-    overlay_mouse_regions, transcript_toggle_regions,
+    TuiApp, UiLayoutSnapshot, UiMousePress, developer_facts_indicator,
+    developer_facts_toggle_hit_rect, display_width, overlay_mouse_regions,
+    transcript_toggle_regions,
 };
 
 pub(super) fn scoped_runtime_events(
@@ -289,19 +290,12 @@ pub(super) fn frame_hit_regions(
             );
         }
     }
-    if let Some(developer) = layout.developer {
-        push_hit_region(
-            &mut regions,
-            "developer",
-            TuiHitPane::Developer,
-            developer,
-            area,
-        );
+    if developer_facts_indicator(app).is_some() {
         push_hit_region(
             &mut regions,
             "developer_facts_toggle",
-            TuiHitPane::Developer,
-            developer_facts_toggle_hit_rect(developer),
+            TuiHitPane::Bottom,
+            developer_facts_toggle_hit_rect(layout.bottom),
             area,
         );
     }

@@ -36,8 +36,8 @@ use golutra_config::{
     update_provider_settings_verified,
 };
 use golutra_core::{
-    ActorKind, ApprovalRequest, ApprovalScope, QueryId, SessionId, TaskId, ThreadId, TurnId,
-    UserQuestionRequest, UserQuestionResolution,
+    ActorKind, ApprovalRequest, ApprovalScope, EventId, QueryId, SessionId, TaskId, ThreadId,
+    TurnId, UserQuestionRequest, UserQuestionResolution,
 };
 use golutra_llm::{
     ProviderGenerationConfig, ProviderHeaderConfig, ProviderHeaderValue, ProviderProtocol,
@@ -80,6 +80,7 @@ mod developer_widget;
 mod driver;
 mod frame_scheduler;
 mod help;
+mod history_source;
 mod inline_history;
 mod interaction;
 mod live_status;
@@ -109,6 +110,7 @@ pub(crate) use developer_view::*;
 pub(crate) use developer_widget::*;
 pub(crate) use frame_scheduler::*;
 pub(crate) use help::*;
+pub(crate) use history_source::*;
 pub(crate) use inline_history::*;
 pub(crate) use interaction::*;
 pub(crate) use live_status::*;
@@ -214,13 +216,6 @@ struct DriverArgs {
     heartbeat_secs: u64,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-enum ScrollablePane {
-    #[default]
-    Transcript,
-    Developer,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OverlaySurface {
     Help,
@@ -317,16 +312,13 @@ struct TuiApp {
     transcript_revision: u64,
     transcript_layout_cache: Option<TranscriptLayoutCache>,
     inline_history_enabled: bool,
-    inline_history_committed_event_projections: usize,
-    developer_scroll: PaneScrollState,
-    active_scroll_pane: ScrollablePane,
+    inline_history_committed_event_ids: HashSet<EventId>,
+    history_replay_generation: u64,
+    history_replay_ready: bool,
     body_view_mode: BodyViewMode,
     transcript_presentation: TranscriptPresentation,
     transcript_search: Option<TranscriptSearchState>,
     search_restore_body_view: Option<BodyViewMode>,
-    developer_event_layout: DeveloperEventLayout,
-    developer_top_row_override: Option<usize>,
-    developer_load_requested: bool,
     layout: UiLayoutSnapshot,
     cursor: Option<u64>,
     history_start_cursor: Option<u64>,
@@ -490,19 +482,13 @@ impl TuiApp {
             transcript_revision: 0,
             transcript_layout_cache: None,
             inline_history_enabled: false,
-            inline_history_committed_event_projections: 0,
-            developer_scroll: PaneScrollState {
-                follow_tail: true,
-                ..PaneScrollState::default()
-            },
-            active_scroll_pane: ScrollablePane::Transcript,
+            inline_history_committed_event_ids: HashSet::new(),
+            history_replay_generation: 0,
+            history_replay_ready: true,
             body_view_mode: BodyViewMode::Auto,
             transcript_presentation: TranscriptPresentation::Rich,
             transcript_search: None,
             search_restore_body_view: None,
-            developer_event_layout: DeveloperEventLayout::default(),
-            developer_top_row_override: None,
-            developer_load_requested: false,
             layout: UiLayoutSnapshot::default(),
             cursor: None,
             history_start_cursor: None,
@@ -684,10 +670,14 @@ impl TuiApp {
         if self.debug_mode {
             match snapshot.developer_projection {
                 Some(Ok(projection)) => {
-                    self.developer_projection = Some(match self.developer_projection.take() {
+                    let mut projection = match self.developer_projection.take() {
                         Some(previous) => merge_debug_projection(previous, projection),
                         None => projection,
-                    });
+                    };
+                    if !self.events.is_empty() {
+                        replace_debug_event_history(&mut projection, self.events.clone());
+                    }
+                    self.developer_projection = Some(projection);
                     self.developer_error = None;
                 }
                 Some(Err(error)) => {
@@ -699,14 +689,9 @@ impl TuiApp {
         } else {
             self.developer_projection = None;
             self.developer_error = None;
-            self.developer_scroll.reset(0);
-            self.developer_event_layout = DeveloperEventLayout::default();
-            self.developer_top_row_override = None;
-            self.developer_load_requested = false;
         }
         self.refresh_activity_snapshot();
         self.sync_transcript_row_count(previous_row_count);
-        self.sync_developer_row_count();
         true
     }
 
@@ -719,25 +704,19 @@ impl TuiApp {
     }
 
     async fn load_recent_history(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
-        let page = transport
-            .event_page(EventPageRequest {
-                session_id: self.session_id,
-                task_id: self.task_id,
-                cursor: None,
-                direction: EventPageDirection::Backward,
-                limit: TUI_HISTORY_PAGE_SIZE,
-            })
+        let history = load_complete_event_history(transport, self.session_id, self.task_id)
             .await
             .map_err(|error| miette::miette!("{error}"))?;
-        self.events = page.events;
+        self.events = history.events;
         self.invalidate_transcript_layout();
         self.rebuild_event_projections();
-        self.history_start_cursor = page.start_cursor;
-        self.cursor = page.end_cursor;
-        self.history_has_more_before = page.has_more;
+        self.history_start_cursor = history.start_cursor;
+        self.cursor = history.end_cursor;
+        self.history_has_more_before = false;
         self.history_load_requested = false;
         self.sync_transcript_row_count(0);
         self.clamp_transcript_scroll();
+        self.history_replay_ready = true;
         Ok(())
     }
 
@@ -783,21 +762,18 @@ impl TuiApp {
     }
 
     fn set_debug_mode(&mut self, enabled: bool) {
+        if self.debug_mode == enabled {
+            return;
+        }
         self.debug_mode = enabled;
+        self.body_view_mode = BodyViewMode::Auto;
+        self.request_history_rebuild();
         if enabled {
             self.developer_error = None;
             self.status_message = "developer runtime view visible".to_owned();
         } else {
             self.developer_projection = None;
             self.developer_error = None;
-            self.developer_scroll.reset(0);
-            self.developer_event_layout = DeveloperEventLayout::default();
-            self.developer_top_row_override = None;
-            self.developer_load_requested = false;
-            if self.body_view_mode == BodyViewMode::Developer {
-                self.body_view_mode = BodyViewMode::Auto;
-            }
-            self.active_scroll_pane = ScrollablePane::Transcript;
             self.status_message = "developer runtime view hidden".to_owned();
         }
     }
@@ -1605,9 +1581,20 @@ impl TuiApp {
         }
     }
 
-    fn set_inline_history_committed_event_projections(&mut self, count: usize) {
-        if self.inline_history_committed_event_projections != count {
-            self.inline_history_committed_event_projections = count;
+    fn begin_history_replay(&mut self) {
+        self.history_replay_generation = self.history_replay_generation.wrapping_add(1);
+        self.history_replay_ready = false;
+        self.set_inline_history_committed_event_ids(HashSet::new());
+    }
+
+    fn request_history_rebuild(&mut self) {
+        self.history_replay_generation = self.history_replay_generation.wrapping_add(1);
+        self.set_inline_history_committed_event_ids(HashSet::new());
+    }
+
+    fn set_inline_history_committed_event_ids(&mut self, ids: HashSet<EventId>) {
+        if self.inline_history_committed_event_ids != ids {
+            self.inline_history_committed_event_ids = ids;
             self.invalidate_transcript_layout();
         }
     }
@@ -1763,29 +1750,12 @@ impl TuiApp {
         self.transcript_scroll.max_offset(visible_rows)
     }
 
-    fn activate_scroll_pane(&mut self, target: UiHitTarget) {
-        match target {
-            UiHitTarget::Transcript => self.active_scroll_pane = ScrollablePane::Transcript,
-            UiHitTarget::Developer => self.active_scroll_pane = ScrollablePane::Developer,
-            UiHitTarget::Bottom | UiHitTarget::Overlay | UiHitTarget::None => {}
-        }
-    }
-
     fn cycle_scroll_pane(&mut self) {
-        if !self.debug_mode {
-            self.active_scroll_pane = ScrollablePane::Transcript;
-            self.status_message = "transcript focused".to_owned();
-            return;
+        if self.debug_mode {
+            self.toggle_developer_facts();
+        } else {
+            self.status_message = "history active".to_owned();
         }
-        self.active_scroll_pane = match self.active_scroll_pane {
-            ScrollablePane::Transcript => ScrollablePane::Developer,
-            ScrollablePane::Developer => ScrollablePane::Transcript,
-        };
-        self.status_message = match self.active_scroll_pane {
-            ScrollablePane::Transcript => "transcript focused",
-            ScrollablePane::Developer => "developer runtime focused",
-        }
-        .to_owned();
     }
 
     fn toggle_transcript_fullscreen(&mut self) {
@@ -1794,11 +1764,13 @@ impl TuiApp {
         } else {
             BodyViewMode::Transcript
         };
-        self.active_scroll_pane = ScrollablePane::Transcript;
+        if self.debug_mode {
+            self.request_history_rebuild();
+        }
         self.status_message = if self.body_view_mode == BodyViewMode::Transcript {
-            "transcript full screen"
+            "transcript view"
         } else {
-            "responsive pane layout"
+            "developer event view"
         }
         .to_owned();
     }
@@ -1809,7 +1781,9 @@ impl TuiApp {
             TranscriptPresentation::Raw => TranscriptPresentation::Rich,
         };
         self.body_view_mode = BodyViewMode::Transcript;
-        self.active_scroll_pane = ScrollablePane::Transcript;
+        if self.debug_mode {
+            self.request_history_rebuild();
+        }
         self.status_message = match self.transcript_presentation {
             TranscriptPresentation::Rich => "rich transcript view",
             TranscriptPresentation::Raw => "raw transcript view",
@@ -1823,7 +1797,9 @@ impl TuiApp {
             self.transcript_search = Some(TranscriptSearchState::default());
         }
         self.body_view_mode = BodyViewMode::Transcript;
-        self.active_scroll_pane = ScrollablePane::Transcript;
+        if self.debug_mode {
+            self.request_history_rebuild();
+        }
         self.rebuild_transcript_search();
         self.status_message = "transcript search".to_owned();
     }
@@ -1831,6 +1807,9 @@ impl TuiApp {
     fn close_transcript_search(&mut self) {
         self.transcript_search = None;
         self.body_view_mode = self.search_restore_body_view.take().unwrap_or_default();
+        if self.debug_mode {
+            self.request_history_rebuild();
+        }
         self.status_message = "transcript search closed".to_owned();
     }
 
@@ -1899,174 +1878,23 @@ impl TuiApp {
     }
 
     fn scroll_active_pane(&mut self, action: TranscriptScrollAction) {
-        if self.active_scroll_pane == ScrollablePane::Developer
-            && let Some(area) = self.layout.developer
-        {
-            let rows = developer_event_page_rows(self, area);
-            self.scroll_developer(action, rows);
-        } else {
-            let rows = self.layout.transcript.height.max(1) as usize;
-            self.scroll_transcript(action, rows);
-        }
-    }
-
-    fn sync_developer_row_count(&mut self) {
-        let Some(area) = self.layout.developer else {
-            return;
-        };
-        let layout = developer_event_layout(self, area);
-        self.sync_developer_layout(layout);
-    }
-
-    fn sync_developer_layout(&mut self, layout: DeveloperEventLayout) {
-        let anchor = (!self.developer_event_layout.has_same_flow_as(&layout))
-            .then(|| self.first_visible_developer_sequence())
-            .flatten();
-
-        if let Some(top_row) = anchor.and_then(|sequence_no| layout.row_for_sequence(sequence_no)) {
-            self.developer_scroll.row_count = layout.row_count;
-            self.set_developer_top_row(&layout, top_row);
-        } else {
-            self.developer_scroll.set_row_count(layout.row_count);
-            self.developer_scroll.clamp(layout.page_rows.max(1));
-            self.developer_top_row_override = self
-                .developer_top_row_override
-                .filter(|top_row| *top_row < layout.row_count);
-            if self.developer_top_row_override.is_some() {
-                self.developer_scroll.follow_tail = false;
-            }
-        }
-        self.developer_event_layout = layout;
-    }
-
-    fn first_visible_developer_sequence(&self) -> Option<u64> {
-        self.developer_event_layout.first_visible_sequence(
-            self.developer_scroll.offset_from_bottom,
-            self.developer_top_row_override,
-        )
-    }
-
-    fn set_developer_top_row(&mut self, layout: &DeveloperEventLayout, top_row: usize) {
-        if layout.row_count == 0 {
-            self.developer_scroll.reset(0);
-            self.developer_top_row_override = None;
+        if self.debug_mode {
             return;
         }
-        let top_row = top_row.min(layout.row_count.saturating_sub(1));
-        let normal_max_start = layout.row_count.saturating_sub(layout.page_rows.max(1));
-        if top_row > normal_max_start {
-            self.developer_scroll.offset_from_bottom = 0;
-            self.developer_scroll.follow_tail = false;
-            self.developer_top_row_override = Some(top_row);
-        } else {
-            let offset_from_bottom = normal_max_start.saturating_sub(top_row);
-            self.developer_scroll.offset_from_bottom = offset_from_bottom;
-            self.developer_scroll.follow_tail = offset_from_bottom == 0;
-            self.developer_top_row_override = None;
-            self.developer_scroll.clamp(layout.page_rows.max(1));
-        }
-    }
-
-    fn scroll_developer(&mut self, action: TranscriptScrollAction, visible_rows: usize) {
-        if self.overlay_surface().is_some() {
-            return;
-        }
-        if let Some(top_row) = self.developer_top_row_override {
-            match action {
-                TranscriptScrollAction::Top | TranscriptScrollAction::Bottom => {
-                    self.developer_top_row_override = None;
-                    self.developer_scroll.scroll(action, visible_rows);
-                }
-                TranscriptScrollAction::LineUp
-                | TranscriptScrollAction::LineDown
-                | TranscriptScrollAction::PageUp
-                | TranscriptScrollAction::PageDown => {
-                    let page = visible_rows.max(1);
-                    let max_top = self
-                        .developer_event_layout
-                        .row_count
-                        .saturating_sub(visible_rows.max(1));
-                    let next_top = match action {
-                        TranscriptScrollAction::LineUp => top_row.saturating_sub(1),
-                        TranscriptScrollAction::LineDown => top_row.saturating_add(1).min(max_top),
-                        TranscriptScrollAction::PageUp => top_row.saturating_sub(page),
-                        TranscriptScrollAction::PageDown => {
-                            top_row.saturating_add(page).min(max_top)
-                        }
-                        TranscriptScrollAction::Top | TranscriptScrollAction::Bottom => {
-                            unreachable!()
-                        }
-                    };
-                    let layout = self.developer_event_layout.clone();
-                    self.set_developer_top_row(&layout, next_top);
-                }
-            }
-        } else {
-            self.developer_scroll.scroll(action, visible_rows);
-        }
-        if self.developer_scroll.offset_from_bottom
-            == self.developer_scroll.max_offset(visible_rows)
-            && self
-                .developer_projection
-                .as_ref()
-                .is_some_and(|projection| projection.event_window.has_more_before)
-            && matches!(
-                action,
-                TranscriptScrollAction::LineUp
-                    | TranscriptScrollAction::PageUp
-                    | TranscriptScrollAction::Top
-            )
-        {
-            self.developer_load_requested = true;
-        }
-        self.status_message = developer_scroll_status(
-            self.developer_scroll.offset_from_bottom,
-            self.developer_scroll.unseen_rows,
-        );
+        let rows = self.layout.transcript.height.max(1) as usize;
+        self.scroll_transcript(action, rows);
     }
 
     fn toggle_developer_facts(&mut self) {
+        self.body_view_mode = BodyViewMode::Auto;
         self.developer_facts_expanded = !self.developer_facts_expanded;
-        if let Some(area) = self.layout.developer {
-            let layout = developer_event_layout(self, area);
-            self.sync_developer_layout(layout);
-        }
+        self.request_history_rebuild();
         self.status_message = if self.developer_facts_expanded {
             "developer facts expanded"
         } else {
             "developer facts collapsed"
         }
         .to_owned();
-    }
-
-    async fn load_older_debug_history(
-        &mut self,
-        transport: &RuntimeTransport,
-    ) -> miette::Result<()> {
-        let anchor = self.first_visible_developer_sequence();
-        let Some(projection) = &mut self.developer_projection else {
-            self.developer_load_requested = false;
-            return Ok(());
-        };
-        let loaded = load_older_debug_events(transport, projection)
-            .await
-            .map_err(|error| miette::miette!("{error}"))?;
-        self.developer_load_requested = false;
-        if loaded && let Some(area) = self.layout.developer {
-            let layout = developer_event_layout(self, area);
-            if let Some(top_row) =
-                anchor.and_then(|sequence_no| layout.row_for_sequence(sequence_no))
-            {
-                self.developer_scroll.row_count = layout.row_count;
-                self.set_developer_top_row(&layout, top_row);
-            } else {
-                self.developer_scroll
-                    .set_row_count_after_prepend(layout.row_count);
-                self.developer_scroll.clamp(layout.page_rows.max(1));
-            }
-            self.developer_event_layout = layout;
-        }
-        Ok(())
     }
 
     async fn send_runtime_prompt(
@@ -2276,14 +2104,11 @@ impl TuiApp {
                     .map_err(|error| miette::miette!("{error}"))?;
                 self.thread_id = thread.thread_id;
                 self.session_id = thread.session_id;
+                self.begin_history_replay();
                 self.task_id = None;
                 self.projection = None;
                 self.developer_projection = None;
                 self.developer_error = None;
-                self.developer_scroll.reset(0);
-                self.developer_event_layout = DeveloperEventLayout::default();
-                self.developer_top_row_override = None;
-                self.developer_load_requested = false;
                 self.events.clear();
                 self.activity_projection = ActivityProjection::default();
                 self.invalidate_activity_snapshot();
@@ -2634,14 +2459,11 @@ impl TuiApp {
     fn start_new_session(&mut self) {
         self.thread_id = ThreadId::new();
         self.session_id = SessionId::new();
+        self.begin_history_replay();
         self.task_id = None;
         self.projection = None;
         self.developer_projection = None;
         self.developer_error = None;
-        self.developer_scroll.reset(0);
-        self.developer_event_layout = DeveloperEventLayout::default();
-        self.developer_top_row_override = None;
-        self.developer_load_requested = false;
         self.events.clear();
         self.activity_projection = ActivityProjection::default();
         self.invalidate_activity_snapshot();
@@ -2676,14 +2498,11 @@ impl TuiApp {
             .map_err(|error| miette::miette!("{error}"))?;
         self.thread_id = thread.thread_id;
         self.session_id = thread.session_id;
+        self.begin_history_replay();
         self.task_id = None;
         self.projection = None;
         self.developer_projection = None;
         self.developer_error = None;
-        self.developer_scroll.reset(0);
-        self.developer_event_layout = DeveloperEventLayout::default();
-        self.developer_top_row_override = None;
-        self.developer_load_requested = false;
         self.events.clear();
         self.activity_projection = ActivityProjection::default();
         self.invalidate_activity_snapshot();
@@ -3561,7 +3380,7 @@ fn draw_interactive_frame(
     inline_history: &mut InlineHistoryState,
 ) -> miette::Result<()> {
     inline_history
-        .flush(terminal, app)
+        .flush_interactive(terminal, app)
         .map_err(|error| miette::miette!("write terminal history: {error}"))?;
     terminal
         .draw(|frame| draw_ui(frame, app))
@@ -4822,7 +4641,6 @@ fn handle_mouse(mouse: MouseEvent, app: &mut TuiApp) -> Option<UiMouseActivation
             return None;
         }
         app.mouse_press = None;
-        app.activate_scroll_pane(target);
         if target == UiHitTarget::Transcript
             && let Some(operation_id) =
                 transcript_toggle_at(app, app.layout.transcript, mouse.column, mouse.row)
@@ -4887,14 +4705,12 @@ fn handle_mouse(mouse: MouseEvent, app: &mut TuiApp) -> Option<UiMouseActivation
         MouseEventKind::Down(MouseButton::Left)
             if app
                 .layout
-                .developer_facts_toggle_hit(mouse.column, mouse.row) =>
+                .developer_facts_toggle_hit(mouse.column, mouse.row, app) =>
         {
-            app.active_scroll_pane = ScrollablePane::Developer;
             app.toggle_developer_facts();
         }
         MouseEventKind::ScrollUp => {
             app.mouse_press = None;
-            app.activate_scroll_pane(target);
             match target {
                 UiHitTarget::Developer | UiHitTarget::Transcript => {
                     app.scroll_active_pane(TranscriptScrollAction::LineUp);
@@ -4907,7 +4723,6 @@ fn handle_mouse(mouse: MouseEvent, app: &mut TuiApp) -> Option<UiMouseActivation
         }
         MouseEventKind::ScrollDown => {
             app.mouse_press = None;
-            app.activate_scroll_pane(target);
             match target {
                 UiHitTarget::Developer | UiHitTarget::Transcript => {
                     app.scroll_active_pane(TranscriptScrollAction::LineDown);

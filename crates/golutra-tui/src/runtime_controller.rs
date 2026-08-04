@@ -69,6 +69,9 @@ impl TuiRuntimeController {
     ) -> miette::Result<()> {
         let reconnect_subscription = match received {
             Some(Ok(event)) => {
+                if event.session_id != app.session_id {
+                    return Ok(());
+                }
                 self.observe_refresh_event(&event);
                 self.pending_events.push(event);
                 false
@@ -104,11 +107,6 @@ impl TuiRuntimeController {
             app.load_older_history(&self.transport).await?;
             changed = true;
         }
-        if app.developer_load_requested {
-            app.load_older_debug_history(&self.transport).await?;
-            changed = true;
-        }
-
         if app.session_id != self.subscribed_session || app.task_id != self.subscribed_task {
             self.pending_events.clear();
             app.load_recent_history(&self.transport).await?;
@@ -162,11 +160,6 @@ impl TuiRuntimeController {
             app.load_older_history(&self.transport).await?;
             changed = true;
         }
-        if app.developer_load_requested {
-            app.load_older_debug_history(&self.transport).await?;
-            changed = true;
-        }
-
         if app.session_id != self.subscribed_session || app.task_id != self.subscribed_task {
             self.pending_events.clear();
             app.load_recent_history(&self.transport).await?;
@@ -312,7 +305,9 @@ impl TuiRuntimeController {
         reconcile_projection: bool,
     ) -> miette::Result<()> {
         for event in self.pending_events.drain(..) {
-            app.apply_runtime_event(event);
+            if event.session_id == app.session_id {
+                app.apply_runtime_event(event);
+            }
         }
         if reconnect_subscription {
             self.replay_from_cursor(app).await?;
@@ -353,9 +348,79 @@ async fn subscribe(
 mod tests {
     use std::time::Duration;
 
-    use golutra_core::ThreadId;
+    use golutra_core::{EventId, RUNTIME_EVENT_SCHEMA_VERSION, ThreadId};
+    use golutra_protocol::{RuntimeEventSource, RuntimeEventType};
+    use serde_json::json;
 
     use super::*;
+
+    fn runtime_event(sequence_no: u64, session_id: SessionId) -> RuntimeEvent {
+        RuntimeEvent {
+            schema_version: RUNTIME_EVENT_SCHEMA_VERSION,
+            causal_context: Default::default(),
+            causal_links: Vec::new(),
+            id: EventId::new(),
+            sequence_no,
+            session_id,
+            turn_id: None,
+            task_id: None,
+            parent_event_id: None,
+            event_type: RuntimeEventType::CommandAccepted,
+            timestamp: chrono::Utc::now(),
+            source: RuntimeEventSource::Runtime,
+            payload: json!({"summary": sequence_no.to_string()}),
+            payload_ref: None,
+            durable: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_cursor_accepts_one_live_event_once_and_rejects_old_session_events() {
+        let transport = RuntimeTransport::in_memory().await.expect("transport");
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            SessionId::new(),
+            None,
+            false,
+            "ready (mock)".to_owned(),
+            None,
+        );
+        let mut controller = TuiRuntimeController::attach(&mut app, transport)
+            .await
+            .expect("controller");
+        let replay_cursor = app.cursor.unwrap_or(0);
+        let live = runtime_event(replay_cursor + 1, app.session_id);
+
+        controller
+            .apply_received(&mut app, Some(Ok(live.clone())))
+            .await
+            .expect("live event");
+        controller
+            .apply_received(&mut app, Some(Ok(live)))
+            .await
+            .expect("duplicate live event");
+        controller
+            .apply_received(
+                &mut app,
+                Some(Ok(runtime_event(replay_cursor + 2, SessionId::new()))),
+            )
+            .await
+            .expect("stale session event");
+
+        assert_eq!(app.cursor, Some(replay_cursor + 1));
+        assert_eq!(
+            app.events
+                .iter()
+                .filter(|event| event.sequence_no == replay_cursor + 1)
+                .count(),
+            1
+        );
+        assert!(
+            app.events
+                .iter()
+                .all(|event| event.session_id == app.session_id)
+        );
+    }
 
     #[tokio::test]
     async fn interactive_sync_does_not_await_an_inflight_refresh() {

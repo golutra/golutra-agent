@@ -3,135 +3,22 @@
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Modifier, Style},
+    style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Paragraph, Wrap},
 };
 
 use super::*;
 
-const DEVELOPER_TITLE_PREFIX: &str = "Developer runtime  ";
-const DEVELOPER_FACTS_COLLAPSED: &str = "▸ facts";
-const DEVELOPER_FACTS_EXPANDED: &str = "▾ facts";
-const DEVELOPER_FACTS_COLLAPSED_ASCII: &str = "> facts";
-const DEVELOPER_FACTS_EXPANDED_ASCII: &str = "v facts";
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct DeveloperEventLayout {
-    pub(crate) row_count: usize,
-    pub(crate) page_rows: usize,
-    content_width: u16,
-    expanded: bool,
-    event_starts: Vec<(u64, usize)>,
-}
-
-impl DeveloperEventLayout {
-    pub(crate) fn visible_window(
-        &self,
-        offset_from_bottom: usize,
-        top_row_override: Option<usize>,
-    ) -> std::ops::Range<usize> {
-        if self.row_count == 0 || self.page_rows == 0 {
-            return 0..0;
-        }
-        let normal =
-            transcript_visible_window(self.row_count, self.page_rows.max(1), offset_from_bottom);
-        let start = top_row_override
-            .unwrap_or(normal.start)
-            .min(self.row_count.saturating_sub(1));
-        start..start.saturating_add(self.page_rows).min(self.row_count)
-    }
-
-    pub(crate) fn first_visible_sequence(
-        &self,
-        offset_from_bottom: usize,
-        top_row_override: Option<usize>,
-    ) -> Option<u64> {
-        let row = self
-            .visible_window(offset_from_bottom, top_row_override)
-            .start;
-        self.event_starts
-            .iter()
-            .rev()
-            .find(|(_, start)| *start <= row)
-            .map(|(sequence_no, _)| *sequence_no)
-    }
-
-    pub(crate) fn row_for_sequence(&self, sequence_no: u64) -> Option<usize> {
-        self.event_starts
-            .iter()
-            .find(|(candidate, _)| *candidate == sequence_no)
-            .map(|(_, start)| *start)
-    }
-
-    pub(crate) fn has_same_flow_as(&self, other: &Self) -> bool {
-        self.content_width == other.content_width
-            && self.page_rows == other.page_rows
-            && self.expanded == other.expanded
-    }
-}
-
-pub(crate) fn developer_event_layout(app: &TuiApp, area: Rect) -> DeveloperEventLayout {
-    let content_width = area.width.saturating_sub(2);
-    let visible_rows = area.height.saturating_sub(1) as usize;
-    let rows = developer_rows(app);
-    let event_count = rows
-        .iter()
-        .filter(|row| matches!(row, DeveloperPanelRow::Event { .. }))
-        .count();
-    let summary_count = visible_summary_count(app, &rows, visible_rows, event_count);
-    let page_rows = visible_rows.saturating_sub(summary_count);
-    let mut row_count = 0_usize;
-    let mut event_starts = Vec::with_capacity(event_count);
-
-    for row in rows {
-        let DeveloperPanelRow::Event {
-            sequence_no,
-            label,
-            summary,
-        } = row
-        else {
-            continue;
-        };
-        event_starts.push((sequence_no, row_count));
-        let lines = event_lines(
-            sequence_no,
-            &label,
-            &summary,
-            usize::from(content_width),
-            app.developer_facts_expanded,
-            app.palette(),
-        );
-        row_count = row_count.saturating_add(event_line_count(
-            lines,
-            content_width,
-            app.developer_facts_expanded,
-        ));
-    }
-
-    DeveloperEventLayout {
-        row_count,
-        page_rows,
-        content_width,
-        expanded: app.developer_facts_expanded,
-        event_starts,
-    }
-}
-
-pub(crate) fn developer_event_page_rows(app: &TuiApp, area: Rect) -> usize {
-    developer_event_layout(app, area).page_rows.max(1)
-}
-
 pub(crate) fn developer_facts_toggle_rect(area: Rect) -> Rect {
-    let toggle_x = area
-        .x
-        .saturating_add(1)
-        .saturating_add(u16::try_from(display_width(DEVELOPER_TITLE_PREFIX)).unwrap_or(u16::MAX));
-    let right = area.x.saturating_add(area.width);
+    let width = 7.min(area.width);
+    let right_padding = 2.min(area.width.saturating_sub(width));
     Rect::new(
-        toggle_x,
-        area.y,
-        right.saturating_sub(toggle_x).min(7),
+        area.right()
+            .saturating_sub(width)
+            .saturating_sub(right_padding),
+        area.bottom().saturating_sub(1),
+        width,
         u16::from(area.height > 0),
     )
 }
@@ -153,9 +40,13 @@ pub(crate) fn developer_facts_toggle_hit_rect(area: Rect) -> Rect {
 
 pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let palette = app.palette();
-    let content_width = area.width.saturating_sub(2);
-    let visible_rows = area.height.saturating_sub(1) as usize;
-    let rows = developer_rows(app);
+    let content_width = area.width;
+    let visible_rows = area.height as usize;
+    let rows = if app.inline_history_enabled {
+        developer_live_rows(app)
+    } else {
+        developer_rows(app)
+    };
     let event_count = rows
         .iter()
         .filter(|row| matches!(row, DeveloperPanelRow::Event { .. }))
@@ -190,61 +81,7 @@ pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiA
             ),
         })
         .collect::<Vec<_>>();
-    let facts_toggle = if app.preferences.screen_reader && app.developer_facts_expanded {
-        DEVELOPER_FACTS_EXPANDED_ASCII
-    } else if app.preferences.screen_reader {
-        DEVELOPER_FACTS_COLLAPSED_ASCII
-    } else if app.developer_facts_expanded {
-        DEVELOPER_FACTS_EXPANDED
-    } else {
-        DEVELOPER_FACTS_COLLAPSED
-    };
-    let title = Line::from(vec![
-        Span::styled(
-            DEVELOPER_TITLE_PREFIX,
-            Style::default()
-                .fg(palette.text)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            facts_toggle,
-            Style::default()
-                .fg(palette.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            if app.active_scroll_pane == ScrollablePane::Developer {
-                if app.preferences.screen_reader {
-                    "  *"
-                } else {
-                    "  •"
-                }
-            } else {
-                ""
-            },
-            Style::default().fg(palette.accent),
-        ),
-    ]);
-    frame.render_widget(
-        Block::default()
-            .title(title)
-            .borders(Borders::TOP | Borders::LEFT)
-            .border_style(Style::default().fg(
-                if app.active_scroll_pane == ScrollablePane::Developer {
-                    palette.accent
-                } else {
-                    palette.muted
-                },
-            )),
-        area,
-    );
-
-    let content = Rect::new(
-        area.x.saturating_add(1),
-        area.y.saturating_add(1),
-        content_width,
-        area.height.saturating_sub(1),
-    );
+    let content = area;
     if !summary_lines.is_empty() {
         frame.render_widget(
             Paragraph::new(summary_lines),
@@ -267,17 +104,75 @@ pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiA
             .height
             .saturating_sub(u16::try_from(summary_count).unwrap_or(u16::MAX)),
     );
-    let layout = &app.developer_event_layout;
-    let window = layout.visible_window(
-        app.developer_scroll.offset_from_bottom,
-        app.developer_top_row_override,
-    );
-    let mut events =
-        Paragraph::new(event_lines).scroll((u16::try_from(window.start).unwrap_or(u16::MAX), 0));
+    let mut events = Paragraph::new(event_lines);
     if app.developer_facts_expanded {
         events = events.wrap(Wrap { trim: false });
     }
+    let event_rows = events.line_count(event_area.width.max(1));
+    let scroll = event_rows.saturating_sub(usize::from(event_area.height));
+    events = events.scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0));
     frame.render_widget(events, event_area);
+}
+
+fn developer_live_rows(app: &TuiApp) -> Vec<DeveloperPanelRow> {
+    if let Some(error) = &app.developer_error {
+        return vec![DeveloperPanelRow::Summary(format!("error {error}"))];
+    }
+    app.events
+        .iter()
+        .filter(|event| !app.inline_history_committed_event_ids.contains(&event.id))
+        .map(|event| DeveloperPanelRow::Event {
+            sequence_no: event.sequence_no,
+            label: format!("{:?}/{:?}", event.event_type, event.source),
+            summary: developer_event_summary(event),
+        })
+        .collect()
+}
+
+pub(crate) fn developer_fact_history_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
+    let palette = app.palette();
+    let Some(projection) = &app.developer_projection else {
+        return app
+            .developer_error
+            .as_ref()
+            .map(|error| {
+                vec![Line::from(Span::styled(
+                    format!("error {error}"),
+                    Style::default().fg(palette.warning),
+                ))]
+            })
+            .unwrap_or_default();
+    };
+    let mut projection = projection.clone();
+    if !app.events.is_empty() {
+        replace_debug_event_history(&mut projection, app.events.clone());
+    }
+    developer_panel_rows_with_changes(&projection, app.change_projection.summary(), 0)
+        .into_iter()
+        .filter_map(|row| match row {
+            DeveloperPanelRow::Summary(summary) => Some(Line::from(Span::styled(
+                truncate_end_to_width(&summary, usize::from(width)),
+                Style::default().fg(palette.accent),
+            ))),
+            DeveloperPanelRow::Event { .. } => None,
+        })
+        .collect()
+}
+
+pub(crate) fn developer_event_history_lines(
+    event: &golutra_protocol::RuntimeEvent,
+    width: u16,
+    expanded: bool,
+    palette: TuiPalette,
+) -> Vec<Line<'static>> {
+    event_lines(
+        event.sequence_no,
+        &format!("{:?}/{:?}", event.event_type, event.source),
+        &developer_event_summary(event),
+        usize::from(width),
+        expanded,
+        palette,
+    )
 }
 
 fn developer_rows(app: &TuiApp) -> Vec<DeveloperPanelRow> {
@@ -355,12 +250,4 @@ fn event_lines(
         );
     }
     lines
-}
-
-fn event_line_count(lines: Vec<Line<'static>>, content_width: u16, expanded: bool) -> usize {
-    let mut paragraph = Paragraph::new(lines);
-    if expanded {
-        paragraph = paragraph.wrap(Wrap { trim: false });
-    }
-    paragraph.line_count(content_width).max(1)
 }

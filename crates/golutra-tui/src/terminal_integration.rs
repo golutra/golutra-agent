@@ -19,6 +19,8 @@ use ratatui::{
     layout::{Position, Size},
 };
 
+use crate::InteractiveTerminal;
+
 const MAX_OSC52_BYTES: usize = 100 * 1024;
 static ALTERNATE_SCREEN_ACTIVE: AtomicBool = AtomicBool::new(true);
 
@@ -115,6 +117,15 @@ impl<B: Backend> Backend for CursorFallbackBackend<B> {
 
 pub(crate) fn set_alternate_screen_active(active: bool) {
     ALTERNATE_SCREEN_ACTIVE.store(active, Ordering::Relaxed);
+}
+
+pub(crate) fn clear_inline_scrollback(terminal: &mut InteractiveTerminal) -> io::Result<()> {
+    let size = terminal.size()?;
+    terminal.set_cursor_position(Position::ORIGIN)?;
+    let backend = terminal.backend_mut();
+    Write::write_all(backend, b"\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[H")?;
+    Write::flush(backend)?;
+    terminal.resize(ratatui::layout::Rect::new(0, 0, size.width, size.height))
 }
 
 pub(crate) fn copy_to_terminal_clipboard(value: &str) -> io::Result<(usize, bool)> {

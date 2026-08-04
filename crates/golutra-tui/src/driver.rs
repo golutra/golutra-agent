@@ -802,15 +802,15 @@ impl TuiDriver {
             } else {
                 self.app.task_id
             };
-            self.app.developer_projection = Some(
-                load_debug_projection(
-                    self.controller.transport(),
-                    self.app.session_id,
-                    projection_task,
-                )
-                .await
-                .map_err(|error| miette::miette!("debug_projection: {error}"))?,
-            );
+            let mut projection = load_debug_projection(
+                self.controller.transport(),
+                self.app.session_id,
+                projection_task,
+            )
+            .await
+            .map_err(|error| miette::miette!("debug_projection: {error}"))?;
+            replace_debug_event_history(&mut projection, self.app.events.clone());
+            self.app.developer_projection = Some(projection);
             self.app.developer_error = None;
         }
         let rendered = self.render_frame(&request);
@@ -866,9 +866,6 @@ impl TuiDriver {
         let saved_transcript_top_row_override = self.app.transcript_top_row_override;
         let saved_transcript_revision = self.app.transcript_revision;
         let saved_transcript_layout_cache = self.app.transcript_layout_cache.clone();
-        let saved_developer_scroll = self.app.developer_scroll;
-        let saved_developer_event_layout = self.app.developer_event_layout.clone();
-        let saved_developer_top_row_override = self.app.developer_top_row_override;
         let saved_layout = self.app.layout;
         let saved_activity_projection = self.app.activity_projection.clone();
         let saved_change_projection = self.app.change_projection.clone();
@@ -906,7 +903,6 @@ impl TuiDriver {
         self.app.invalidate_transcript_layout();
         if !matches!(request.scope, SnapshotScope::Screen) {
             self.app.transcript_scroll.reset(0);
-            self.app.developer_scroll.reset(0);
         }
 
         let rendered = (|| -> miette::Result<_> {
@@ -934,9 +930,6 @@ impl TuiDriver {
         self.app.transcript_top_row_override = saved_transcript_top_row_override;
         self.app.transcript_revision = saved_transcript_revision;
         self.app.transcript_layout_cache = saved_transcript_layout_cache;
-        self.app.developer_scroll = saved_developer_scroll;
-        self.app.developer_event_layout = saved_developer_event_layout;
-        self.app.developer_top_row_override = saved_developer_top_row_override;
         self.app.debug_mode = saved_debug;
         self.app.body_view_mode = saved_body_view_mode;
         self.app.layout = saved_layout;

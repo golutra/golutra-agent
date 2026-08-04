@@ -827,6 +827,229 @@ fn inline_session_history_is_inserted_only_once() {
         terminal_buffer_text(&terminal).matches("Golutra").count(),
         1
     );
+
+    app.request_history_rebuild();
+    assert!(history.flush(&mut terminal, &mut app).expect("rebuild"));
+    assert_eq!(
+        terminal_buffer_text(&terminal).matches("Golutra").count(),
+        1
+    );
+}
+
+#[test]
+fn session_switch_clears_previous_history_while_replay_is_loading() {
+    let first_session = SessionId::new();
+    let first_task = TaskId::new();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        first_session,
+        Some(first_task),
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_footer_context("/workspace", "gpt-test");
+    app.events = vec![transcript_event(
+        1,
+        first_session,
+        first_task,
+        RuntimeEventType::AssistantMessage,
+        json!({"content": "old-session-only"}),
+    )];
+    app.enable_inline_history();
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(80, 40),
+        TerminalOptions {
+            viewport: Viewport::Inline(12),
+        },
+    )
+    .expect("inline terminal");
+    let mut history = InlineHistoryState::new(first_session);
+
+    history
+        .flush(&mut terminal, &mut app)
+        .expect("initial history");
+    assert!(terminal_buffer_text(&terminal).contains("old-session-only"));
+
+    let next_session = SessionId::new();
+    let next_task = TaskId::new();
+    app.session_id = next_session;
+    app.task_id = Some(next_task);
+    app.begin_history_replay();
+    app.events.clear();
+
+    assert!(
+        history
+            .flush(&mut terminal, &mut app)
+            .expect("clear old history")
+    );
+    assert!(!terminal_buffer_text(&terminal).contains("old-session-only"));
+    assert!(
+        !history
+            .flush(&mut terminal, &mut app)
+            .expect("loading redraw")
+    );
+
+    app.events = vec![transcript_event(
+        1,
+        next_session,
+        next_task,
+        RuntimeEventType::AssistantMessage,
+        json!({"content": "new-session-only"}),
+    )];
+    app.history_replay_ready = true;
+    assert!(
+        history
+            .flush(&mut terminal, &mut app)
+            .expect("replayed history")
+    );
+    let replayed = terminal_buffer_text(&terminal);
+    assert!(replayed.contains("new-session-only"));
+    assert!(!replayed.contains("old-session-only"));
+}
+
+#[test]
+fn debug_switch_clears_transcript_before_projection_finishes() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let events = vec![transcript_event(
+        1,
+        session_id,
+        task_id,
+        RuntimeEventType::AssistantMessage,
+        json!({"content": "transcript-projection-only"}),
+    )];
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_footer_context("/workspace", "gpt-test");
+    app.events = events.clone();
+    app.enable_inline_history();
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(80, 40),
+        TerminalOptions {
+            viewport: Viewport::Inline(12),
+        },
+    )
+    .expect("inline terminal");
+    let mut history = InlineHistoryState::new(session_id);
+
+    history
+        .flush(&mut terminal, &mut app)
+        .expect("initial transcript");
+    app.set_debug_mode(true);
+    assert!(app.developer_projection.is_none());
+
+    assert!(
+        history
+            .flush(&mut terminal, &mut app)
+            .expect("clear transcript")
+    );
+    assert!(!terminal_buffer_text(&terminal).contains("transcript-projection-only"));
+    assert!(
+        !history
+            .flush(&mut terminal, &mut app)
+            .expect("debug loading redraw")
+    );
+
+    app.developer_error = Some("debug projection unavailable".to_owned());
+    assert!(
+        history
+            .flush(&mut terminal, &mut app)
+            .expect("failed debug projection")
+    );
+    let failed = terminal_buffer_text(&terminal);
+    assert_eq!(failed.matches("#1 AssistantMessage/Runtime").count(), 1);
+    assert!(!failed.contains("transcript-projection-only"));
+}
+
+#[test]
+fn repeated_debug_facts_and_transcript_switches_do_not_duplicate_history() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let events = vec![
+        transcript_event(
+            1,
+            session_id,
+            task_id,
+            RuntimeEventType::TaskCreated,
+            json!({"payload": {"prompt": "unique-replay-prompt"}}),
+        ),
+        transcript_event(
+            2,
+            session_id,
+            task_id,
+            RuntimeEventType::AssistantMessage,
+            json!({"content": "unique-replay-answer"}),
+        ),
+    ];
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_footer_context("/workspace", "gpt-test");
+    app.events = events.clone();
+    app.developer_projection = Some(debug_projection_with_events(
+        session_id,
+        Some(task_id),
+        events,
+    ));
+    app.enable_inline_history();
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(80, 80),
+        TerminalOptions {
+            viewport: Viewport::Inline(12),
+        },
+    )
+    .expect("inline terminal");
+    let mut history = InlineHistoryState::new(session_id);
+
+    history.flush(&mut terminal, &mut app).expect("transcript");
+    assert_eq!(
+        terminal_buffer_text(&terminal)
+            .matches("unique-replay-prompt")
+            .count(),
+        1
+    );
+
+    app.set_debug_mode(true);
+    history.flush(&mut terminal, &mut app).expect("debug");
+    let debug = terminal_buffer_text(&terminal);
+    assert_eq!(debug.matches("#1 TaskCreated/Runtime").count(), 1);
+    assert_eq!(debug.matches("#2 AssistantMessage/Runtime").count(), 1);
+
+    app.toggle_developer_facts();
+    history
+        .flush(&mut terminal, &mut app)
+        .expect("expanded facts");
+    let expanded = terminal_buffer_text(&terminal);
+    assert_eq!(expanded.matches("#1 TaskCreated/Runtime").count(), 1);
+    assert_eq!(expanded.matches("#2 AssistantMessage/Runtime").count(), 1);
+
+    app.toggle_transcript_fullscreen();
+    history
+        .flush(&mut terminal, &mut app)
+        .expect("transcript switch");
+    let transcript = terminal_buffer_text(&terminal);
+    assert_eq!(transcript.matches("unique-replay-prompt").count(), 1);
+    assert!(!transcript.contains("#1 TaskCreated/Runtime"));
+
+    app.toggle_transcript_fullscreen();
+    history
+        .flush(&mut terminal, &mut app)
+        .expect("debug switch");
+    let debug_again = terminal_buffer_text(&terminal);
+    assert_eq!(debug_again.matches("#1 TaskCreated/Runtime").count(), 1);
+    assert_eq!(debug_again.matches("Golutra").count(), 1);
 }
 
 #[test]
@@ -1444,6 +1667,105 @@ fn bottom_pane_renders_context_instead_of_task_status() {
     assert!(footer.contains(expected));
     assert_eq!(footer.find(expected), Some(2));
     assert!(!footer.contains("ready"));
+}
+
+#[test]
+fn debug_facts_is_right_aligned_without_overlapping_footer_context() {
+    for width in [40_u16, 80, 120] {
+        let app = TuiApp::new(
+            ThreadId::new(),
+            SessionId::new(),
+            None,
+            true,
+            "ready (mock)".to_owned(),
+            None,
+        )
+        .with_footer_context(
+            "/workspace/with/a/long/path/that/must/shrink/first",
+            "gpt-5.6-sol-max-with-a-long-model-name",
+        );
+        let mut terminal = Terminal::new(TestBackend::new(width, 3)).expect("terminal");
+
+        terminal
+            .draw(|frame| draw_bottom_pane(frame, frame.area(), &app))
+            .expect("draw debug footer");
+
+        let footer = (0..width)
+            .filter_map(|x| terminal.backend().buffer().cell((x, 2)))
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        let facts = footer.find("▸ facts").expect("facts indicator");
+        assert_eq!(display_width(&footer[..facts]), usize::from(width - 9));
+        assert_eq!(display_width(&footer), usize::from(width));
+        assert!(footer[..facts].ends_with("  "), "{width}: {footer:?}");
+    }
+}
+
+#[test]
+fn normal_mode_does_not_expose_the_footer_facts_hit_target() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("terminal");
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw normal footer");
+    let toggle = developer_facts_toggle_rect(app.layout.bottom);
+    let generation = app.history_replay_generation;
+
+    handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: toggle.x,
+            row: toggle.y,
+            modifiers: KeyModifiers::NONE,
+        },
+        &mut app,
+    );
+
+    assert!(!app.developer_facts_expanded);
+    assert_eq!(app.history_replay_generation, generation);
+}
+
+#[test]
+fn modal_does_not_expose_the_hidden_footer_facts_hit_target() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        true,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.help_dialog = Some(HelpDialogState::new(
+        HelpTopic::Overview,
+        "developer runtime",
+    ));
+    let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("terminal");
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw help modal");
+    let toggle = developer_facts_toggle_rect(app.layout.bottom);
+    let generation = app.history_replay_generation;
+
+    handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: toggle.x,
+            row: toggle.y,
+            modifiers: KeyModifiers::NONE,
+        },
+        &mut app,
+    );
+
+    assert!(developer_facts_indicator(&app).is_none());
+    assert!(!app.developer_facts_expanded);
+    assert_eq!(app.history_replay_generation, generation);
 }
 
 #[test]
@@ -2502,8 +2824,8 @@ fn new_idle_session_has_empty_transcript() {
 }
 
 #[test]
-fn debug_layout_is_split_only_when_both_panes_remain_readable() {
-    let mut app = TuiApp::new(
+fn debug_layout_uses_one_unframed_body_at_every_width() {
+    let app = TuiApp::new(
         ThreadId::new(),
         SessionId::new(),
         None,
@@ -2513,24 +2835,18 @@ fn debug_layout_is_split_only_when_both_panes_remain_readable() {
     );
 
     let wide = ui_layout(Rect::new(0, 0, 120, 30), &app);
-    assert_eq!(wide.body_mode, BodyLayoutMode::Split);
-    assert_eq!(wide.transcript.width, 60);
-    assert_eq!(wide.developer.expect("developer pane").width, 60);
+    assert_eq!(wide.body_mode, BodyLayoutMode::Developer);
+    assert_eq!(wide.developer, Some(wide.body));
+    assert_eq!(wide.transcript, Rect::default());
 
     let narrow = ui_layout(Rect::new(0, 0, 80, 30), &app);
-    assert_eq!(narrow.body_mode, BodyLayoutMode::Transcript);
-    assert_eq!(narrow.transcript, narrow.body);
-    assert!(narrow.developer.is_none());
-
-    app.active_scroll_pane = ScrollablePane::Developer;
-    let developer = ui_layout(Rect::new(0, 0, 80, 30), &app);
-    assert_eq!(developer.body_mode, BodyLayoutMode::Developer);
-    assert_eq!(developer.developer, Some(developer.body));
-    assert_eq!(developer.transcript, Rect::default());
+    assert_eq!(narrow.body_mode, BodyLayoutMode::Developer);
+    assert_eq!(narrow.developer, Some(narrow.body));
+    assert_eq!(narrow.transcript, Rect::default());
 }
 
 #[test]
-fn pane_focus_and_fullscreen_preserve_transcript_scroll_position() {
+fn debug_transcript_switch_requests_a_source_backed_rebuild() {
     let mut app = TuiApp::new(
         ThreadId::new(),
         SessionId::new(),
@@ -2539,32 +2855,23 @@ fn pane_focus_and_fullscreen_preserve_transcript_scroll_position() {
         "ready (mock)".to_owned(),
         None,
     );
-    app.command_messages = (0..20)
-        .map(|index| TranscriptItem {
-            role: TranscriptRole::System,
-            title: format!("message {index}"),
-            body: vec!["body".to_owned()],
-        })
-        .collect();
     let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
     terminal
         .draw(|frame| draw_ui(frame, &mut app))
-        .expect("draw split panes");
-    app.scroll_transcript(TranscriptScrollAction::PageUp, 10);
-    let offset = app.transcript_scroll.offset_from_bottom;
-    assert!(offset > 0);
+        .expect("draw debug events");
+    assert_eq!(app.layout.body_mode, BodyLayoutMode::Developer);
+    let initial_generation = app.history_replay_generation;
 
     app.toggle_transcript_fullscreen();
     terminal
         .draw(|frame| draw_ui(frame, &mut app))
         .expect("draw full transcript");
     assert_eq!(app.layout.body_mode, BodyLayoutMode::Transcript);
-    assert_eq!(app.transcript_scroll.offset_from_bottom, offset);
-    assert!(!terminal_buffer_text(&terminal).contains("Transcript •"));
+    assert_eq!(app.history_replay_generation, initial_generation + 1);
 
     app.toggle_transcript_fullscreen();
     assert_eq!(app.body_view_mode, BodyViewMode::Auto);
-    assert_eq!(app.transcript_scroll.offset_from_bottom, offset);
+    assert_eq!(app.history_replay_generation, initial_generation + 2);
 }
 
 #[test]
@@ -2919,21 +3226,16 @@ fn developer_panel_exposes_governance_without_leaking_into_normal_view() {
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>();
-    assert!(developer_text.contains("Developer runtime"));
+    assert!(!developer_text.contains("Developer runtime"));
     assert!(developer_text.contains("▸ facts"));
     assert!(!developer_text.contains("verify Pass"));
 
     let layout = app.layout;
     let developer_area = layout.developer.expect("developer area");
-    assert_eq!(layout.transcript.y, developer_area.y);
-    assert_eq!(layout.transcript.height, developer_area.height);
-    assert_eq!(layout.transcript.width, developer_area.width);
-    assert_eq!(
-        developer_area.x,
-        layout.transcript.x + layout.transcript.width
-    );
+    assert_eq!(developer_area, layout.body);
+    assert_eq!(layout.transcript, Rect::default());
 
-    let toggle = developer_facts_toggle_rect(developer_area);
+    let toggle = developer_facts_toggle_rect(layout.bottom);
     assert_eq!(
         developer_terminal
             .backend()
@@ -2985,7 +3287,7 @@ fn developer_panel_exposes_governance_without_leaking_into_normal_view() {
     );
     assert!(!app.developer_facts_expanded);
 
-    let padded_toggle = developer_facts_toggle_hit_rect(developer_area);
+    let padded_toggle = developer_facts_toggle_hit_rect(layout.bottom);
     assert!(padded_toggle.x < toggle.x);
     handle_mouse(
         MouseEvent {
@@ -3034,6 +3336,7 @@ fn developer_event_details_toggle_between_ellipsis_and_complete_wrapped_text() {
     assert!(collapsed.contains('…'));
     assert!(!collapsed.contains(tail));
 
+    let generation = app.history_replay_generation;
     app.toggle_developer_facts();
     terminal
         .draw(|frame| draw_ui(frame, &mut app))
@@ -3041,7 +3344,7 @@ fn developer_event_details_toggle_between_ellipsis_and_complete_wrapped_text() {
     let expanded = terminal_buffer_text(&terminal);
     assert!(expanded.contains("▾ facts"));
     assert!(expanded.contains(tail));
-    assert!(app.developer_event_layout.row_count > 1);
+    assert_eq!(app.history_replay_generation, generation + 1);
 
     app.toggle_developer_facts();
     terminal
@@ -3054,7 +3357,7 @@ fn developer_event_details_toggle_between_ellipsis_and_complete_wrapped_text() {
 }
 
 #[test]
-fn developer_detail_reflow_keeps_the_first_visible_event_as_anchor() {
+fn developer_live_surface_follows_the_latest_event() {
     let session_id = SessionId::new();
     let task_id = TaskId::new();
     let events = (1..=30)
@@ -3065,14 +3368,11 @@ fn developer_detail_reflow_keeps_the_first_visible_event_as_anchor() {
                 task_id,
                 RuntimeEventType::StepCompleted,
                 json!({
-                    "summary": format!(
-                        "event {sequence_no} {}",
-                        "has complete detail that wraps at the developer pane width ".repeat(3)
-                    )
+                    "summary": format!("event-{sequence_no} {}", "detail ".repeat(20))
                 }),
             )
         })
-        .collect();
+        .collect::<Vec<_>>();
     let mut app = TuiApp::new(
         ThreadId::new(),
         session_id,
@@ -3081,160 +3381,33 @@ fn developer_detail_reflow_keeps_the_first_visible_event_as_anchor() {
         "ready (mock)".to_owned(),
         None,
     );
+    app.events = events.clone();
     app.developer_projection = Some(debug_projection_with_events(
         session_id,
         Some(task_id),
         events,
     ));
-    let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
+    app.enable_inline_history();
+    let mut terminal = Terminal::new(TestBackend::new(80, 10)).expect("terminal");
     terminal
         .draw(|frame| draw_ui(frame, &mut app))
-        .expect("draw collapsed developer events");
-    let page_rows = app.developer_event_layout.page_rows.max(1);
-    for _ in 0..5 {
-        app.scroll_developer(TranscriptScrollAction::LineUp, page_rows);
-    }
-    let collapsed_anchor = app
-        .first_visible_developer_sequence()
-        .expect("collapsed anchor");
-
-    app.toggle_developer_facts();
-    let expanded_anchor = app
-        .first_visible_developer_sequence()
-        .expect("expanded anchor");
-    assert_eq!(expanded_anchor, collapsed_anchor);
-
-    let mut narrow_terminal = Terminal::new(TestBackend::new(90, 24)).expect("narrow terminal");
-    app.active_scroll_pane = ScrollablePane::Developer;
-    narrow_terminal
-        .draw(|frame| draw_ui(frame, &mut app))
-        .expect("reflow expanded developer events");
-    let narrow_anchor = app
-        .first_visible_developer_sequence()
-        .expect("narrow anchor");
-    assert_eq!(narrow_anchor, collapsed_anchor);
-
-    app.toggle_developer_facts();
-    let collapsed_again_anchor = app
-        .first_visible_developer_sequence()
-        .expect("collapsed-again anchor");
-    assert_eq!(collapsed_again_anchor, collapsed_anchor);
-}
-
-#[test]
-fn developer_detail_collapse_keeps_a_tail_event_at_the_top() {
-    let session_id = SessionId::new();
-    let task_id = TaskId::new();
-    let events = (1..=30)
-        .map(|sequence_no| {
-            transcript_event(
-                sequence_no,
-                session_id,
-                task_id,
-                RuntimeEventType::StepCompleted,
-                json!({
-                    "summary": format!(
-                        "event {sequence_no} {}",
-                        "has enough detail to wrap across several visual lines ".repeat(4)
-                    )
-                }),
-            )
-        })
-        .collect();
-    let mut app = TuiApp::new(
-        ThreadId::new(),
-        session_id,
-        Some(task_id),
-        true,
-        "ready (mock)".to_owned(),
-        None,
+        .expect("draw latest developer events");
+    let collapsed = terminal_buffer_text(&terminal);
+    assert!(
+        collapsed.contains("#30 StepCompleted/Runtime"),
+        "{collapsed}"
     );
-    app.developer_projection = Some(debug_projection_with_events(
-        session_id,
-        Some(task_id),
-        events,
-    ));
-    let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
-    terminal
-        .draw(|frame| draw_ui(frame, &mut app))
-        .expect("draw collapsed developer events");
-    app.toggle_developer_facts();
-    let top_row = app
-        .developer_event_layout
-        .row_for_sequence(27)
-        .expect("expanded event row");
-    let layout = app.developer_event_layout.clone();
-    app.set_developer_top_row(&layout, top_row);
-    let tail_anchor = app.first_visible_developer_sequence().expect("tail anchor");
-    assert_eq!(tail_anchor, 27);
-
-    app.toggle_developer_facts();
-    assert_eq!(app.first_visible_developer_sequence(), Some(tail_anchor));
-    terminal
-        .draw(|frame| draw_ui(frame, &mut app))
-        .expect("redraw collapsed tail anchor");
-    let developer = app.layout.developer.expect("developer area");
-    let first_event_row = (developer.x..developer.x.saturating_add(developer.width))
-        .filter_map(|x| {
-            terminal
-                .backend()
-                .buffer()
-                .cell((x, developer.y.saturating_add(1)))
-        })
-        .map(|cell| cell.symbol())
-        .collect::<String>();
-    assert!(first_event_row.contains("#27 "), "{first_event_row}");
-}
-
-#[test]
-fn expanded_developer_event_scrolls_by_visual_line() {
-    let session_id = SessionId::new();
-    let task_id = TaskId::new();
-    let mut app = TuiApp::new(
-        ThreadId::new(),
-        session_id,
-        Some(task_id),
-        true,
-        "ready (mock)".to_owned(),
-        None,
+    assert!(
+        !collapsed.contains("#1 StepCompleted/Runtime"),
+        "{collapsed}"
     );
-    app.developer_projection = Some(debug_projection_with_events(
-        session_id,
-        Some(task_id),
-        vec![transcript_event(
-            1,
-            session_id,
-            task_id,
-            RuntimeEventType::StepCompleted,
-            json!({"summary": "visual line scrolling ".repeat(80)}),
-        )],
-    ));
-    let mut terminal = Terminal::new(TestBackend::new(120, 18)).expect("terminal");
+
+    app.toggle_developer_facts();
     terminal
         .draw(|frame| draw_ui(frame, &mut app))
-        .expect("draw collapsed long event");
-    app.toggle_developer_facts();
-
-    let page_rows = app.developer_event_layout.page_rows.max(1);
-    assert!(app.developer_event_layout.row_count > page_rows);
-    let before = app
-        .developer_event_layout
-        .visible_window(
-            app.developer_scroll.offset_from_bottom,
-            app.developer_top_row_override,
-        )
-        .start;
-    app.scroll_developer(TranscriptScrollAction::LineDown, page_rows);
-    let after = app
-        .developer_event_layout
-        .visible_window(
-            app.developer_scroll.offset_from_bottom,
-            app.developer_top_row_override,
-        )
-        .start;
-
-    assert_eq!(after, before + 1);
-    assert_eq!(app.first_visible_developer_sequence(), Some(1));
+        .expect("draw expanded latest developer event");
+    let expanded = terminal_buffer_text(&terminal);
+    assert!(expanded.contains("event-30"), "{expanded}");
 }
 
 #[test]
@@ -3946,14 +4119,14 @@ fn cancelling_an_earlier_turn_keeps_the_visible_projection_anchored() {
 }
 
 #[test]
-fn override_paging_stops_at_the_last_full_viewport() {
+fn transcript_override_paging_stops_at_the_last_full_viewport() {
     let session_id = SessionId::new();
     let task_id = TaskId::new();
     let mut app = TuiApp::new(
         ThreadId::new(),
         session_id,
         Some(task_id),
-        true,
+        false,
         "ready (mock)".to_owned(),
         None,
     );
@@ -3968,21 +4141,6 @@ fn override_paging_stops_at_the_last_full_viewport() {
             )
         })
         .collect();
-    app.developer_projection = Some(debug_projection_with_events(
-        session_id,
-        Some(task_id),
-        (1..=30)
-            .map(|sequence_no| {
-                transcript_event(
-                    sequence_no,
-                    session_id,
-                    task_id,
-                    RuntimeEventType::StepCompleted,
-                    json!({"summary": format!("developer row {sequence_no}")}),
-                )
-            })
-            .collect(),
-    ));
     let mut terminal = Terminal::new(TestBackend::new(120, 22)).expect("terminal");
     terminal
         .draw(|frame| draw_ui(frame, &mut app))
@@ -4005,22 +4163,6 @@ fn override_paging_stops_at_the_last_full_viewport() {
     assert_eq!(
         transcript_window.start,
         transcript_layout.row_count.saturating_sub(transcript_rows)
-    );
-
-    let developer_layout = app.developer_event_layout.clone();
-    let developer_rows = developer_layout.page_rows.max(1);
-    app.set_developer_top_row(
-        &developer_layout,
-        developer_layout.row_count.saturating_sub(1),
-    );
-    app.scroll_developer(TranscriptScrollAction::PageDown, developer_rows);
-    let developer_window = developer_layout.visible_window(
-        app.developer_scroll.offset_from_bottom,
-        app.developer_top_row_override,
-    );
-    assert_eq!(
-        developer_window.start,
-        developer_layout.row_count.saturating_sub(developer_rows)
     );
 }
 
@@ -4304,7 +4446,7 @@ fn inline_history_commits_only_the_stable_projection_prefix() {
 
     assert_eq!(stable_event_operation_projection_count(&app.events), 1);
     app.enable_inline_history();
-    app.set_inline_history_committed_event_projections(1);
+    app.set_inline_history_committed_event_ids(HashSet::from([app.events[0].id]));
     let live = transcript_render_rows(&app)
         .into_iter()
         .map(|row| row.line.to_string())
@@ -4430,7 +4572,7 @@ fn transcript_visible_window_pages_from_bottom_and_round_trips() {
 }
 
 #[test]
-fn mouse_wheel_routes_to_the_pane_under_the_pointer() {
+fn debug_mouse_wheel_leaves_history_scrolling_to_the_terminal() {
     let session_id = SessionId::new();
     let mut app = TuiApp::new(
         ThreadId::new(),
@@ -4440,102 +4582,25 @@ fn mouse_wheel_routes_to_the_pane_under_the_pointer() {
         "ready (mock)".to_owned(),
         None,
     );
-    app.command_messages = (0..40)
-        .map(|index| TranscriptItem {
-            role: TranscriptRole::System,
-            title: format!("message-{index}"),
-            body: vec!["history".to_owned()],
-        })
-        .collect();
-    app.developer_projection = Some(golutra_protocol::DebugProjection {
-        session_id,
-        task_id: None,
-        events: (0..40)
-            .map(|sequence_no| RuntimeEvent {
-                schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
-                causal_context: Default::default(),
-                causal_links: Vec::new(),
-                id: golutra_core::EventId::new(),
-                sequence_no,
-                session_id,
-                turn_id: None,
-                task_id: None,
-                parent_event_id: None,
-                event_type: RuntimeEventType::CommandAccepted,
-                timestamp: chrono::Utc::now(),
-                source: golutra_protocol::RuntimeEventSource::Runtime,
-                payload: json!({"summary": "fact"}),
-                payload_ref: None,
-                durable: true,
-            })
-            .collect(),
-        event_window: golutra_protocol::DebugEventWindow {
-            start_cursor: Some(1),
-            end_cursor: Some(40),
-            has_more_before: false,
-            limit: 256,
-        },
-        busy_policy_decisions: Vec::new(),
-        tool_results: Vec::new(),
-        artifacts: Vec::new(),
-        evidence: Vec::new(),
-        verification: None,
-        loop_decisions: Vec::new(),
-        post_task_jobs: Vec::new(),
-        failure_diagnosis: None,
-        failure_episodes: Vec::new(),
-        diagnostic_slice: None,
-        replay_execution: None,
-        external_evaluations: Vec::new(),
-        causal_comparisons: Vec::new(),
-        trace_complete: true,
-        missing_sections: Vec::new(),
-        retention_losses: Vec::new(),
-    });
+    app.developer_projection = Some(debug_projection_with_events(session_id, None, Vec::new()));
     let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
     terminal
         .draw(|frame| draw_ui(frame, &mut app))
         .expect("draw");
-    let layout = app.layout;
-    let developer_area = layout.developer.expect("developer area");
-    let developer_y = developer_area.y + 1;
-    let transcript_y = layout.transcript.y + 1;
+    let developer_area = app.layout.developer.expect("developer area");
+    let generation = app.history_replay_generation;
 
     handle_mouse(
         MouseEvent {
             kind: MouseEventKind::ScrollUp,
             column: developer_area.x + 1,
-            row: developer_y,
+            row: developer_area.y + 1,
             modifiers: KeyModifiers::NONE,
         },
         &mut app,
     );
-    assert!(app.developer_scroll.offset_from_bottom > 0);
     assert_eq!(app.transcript_scroll.offset_from_bottom, 0);
-
-    handle_mouse(
-        MouseEvent {
-            kind: MouseEventKind::ScrollUp,
-            column: layout.transcript.x + 1,
-            row: transcript_y,
-            modifiers: KeyModifiers::NONE,
-        },
-        &mut app,
-    );
-    assert!(app.transcript_scroll.offset_from_bottom > 0);
-    assert!(app.developer_scroll.offset_from_bottom > 0);
-
-    let event_rows = developer_event_page_rows(&app, developer_area);
-    app.scroll_developer(TranscriptScrollAction::Top, event_rows);
-    assert_eq!(
-        transcript_visible_window(
-            app.developer_scroll.row_count,
-            event_rows,
-            app.developer_scroll.offset_from_bottom,
-        )
-        .start,
-        0
-    );
+    assert_eq!(app.history_replay_generation, generation);
 }
 
 #[test]
@@ -5156,7 +5221,7 @@ fn resume_item(title: &str) -> ResumeThreadItem {
 }
 
 #[tokio::test]
-async fn clicking_developer_pane_routes_page_keys_to_developer() {
+async fn clicking_footer_facts_rebuilds_debug_history_and_page_keys_are_ignored() {
     let transport = RuntimeTransport::in_memory().await.expect("transport");
     let session_id = SessionId::new();
     let mut app = TuiApp::new(
@@ -5167,13 +5232,6 @@ async fn clicking_developer_pane_routes_page_keys_to_developer() {
         "ready (mock)".to_owned(),
         None,
     );
-    app.command_messages = (0..40)
-        .map(|index| TranscriptItem {
-            role: TranscriptRole::System,
-            title: format!("message-{index}"),
-            body: vec!["history".to_owned()],
-        })
-        .collect();
     app.developer_projection = Some(debug_projection_with_events(
         session_id,
         None,
@@ -5201,7 +5259,8 @@ async fn clicking_developer_pane_routes_page_keys_to_developer() {
     terminal
         .draw(|frame| draw_ui(frame, &mut app))
         .expect("draw");
-    let toggle = developer_facts_toggle_rect(app.layout.developer.expect("developer area"));
+    let toggle = developer_facts_toggle_rect(app.layout.bottom);
+    let generation = app.history_replay_generation;
 
     handle_mouse(
         MouseEvent {
@@ -5218,11 +5277,11 @@ async fn clicking_developer_pane_routes_page_keys_to_developer() {
         &transport,
     )
     .await
-    .expect("page developer events");
+    .expect("ignore debug page key");
 
     assert!(app.developer_facts_expanded);
-    assert!(app.developer_scroll.offset_from_bottom > 0);
     assert_eq!(app.transcript_scroll.offset_from_bottom, 0);
+    assert_eq!(app.history_replay_generation, generation + 1);
     assert!(app.status_message.starts_with("developer facts"));
 }
 
