@@ -1972,6 +1972,7 @@ async fn processing_command_journal_entry_is_reconciled_after_owner_exit() {
 #[tokio::test]
 async fn processing_thread_delete_retry_reuses_the_semantic_event_and_rebuilds_rollout() {
     let workspace = tempdir().expect("workspace");
+    let _home = IsolatedGlobalMockProvider::empty().await;
     let host = RuntimeHost::for_cwd(workspace.path()).await.expect("host");
     let transport = EmbeddedTransport::new(host.clone());
     let attached_session_id = transport.default_session_id();
