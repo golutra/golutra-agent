@@ -148,6 +148,7 @@ pub fn event_timeline_lines(events: &[Value]) -> Vec<EventTimelineLine> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommand {
     Help,
+    WhatsNew,
     New,
     Auth(SlashAuthCommand),
     Resume {
@@ -162,6 +163,22 @@ pub enum SlashCommand {
         from_turn_id: Option<String>,
     },
     Status,
+    Plan,
+    Tasks,
+    Usage,
+    Terminal {
+        command: Option<String>,
+    },
+    Settings,
+    Model {
+        model: Option<String>,
+    },
+    Effort {
+        effort: Option<ReasoningEffortSelection>,
+    },
+    Permissions {
+        unrestricted: Option<bool>,
+    },
     Debug,
     Takeover,
     Abort,
@@ -170,8 +187,21 @@ pub enum SlashCommand {
     Approve,
     Deny,
     Compact,
+    Queue,
+    Attach {
+        path: String,
+    },
+    Detach,
+    Editor,
+    Stash,
     Clear,
     Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffortSelection {
+    Default,
+    Effort(ProviderReasoningEffort),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,6 +292,16 @@ pub struct SlashCommandCandidate {
 
 const TOP_LEVEL_SLASH_HINTS: &[SlashCommandHint] = &[
     SlashCommandHint {
+        command: "/help",
+        description: "open contextual keyboard reference",
+        selection: SlashCommandSelection::Execute,
+    },
+    SlashCommandHint {
+        command: "/whats-new",
+        description: "show release notes for this version",
+        selection: SlashCommandSelection::Execute,
+    },
+    SlashCommandHint {
         command: "/new",
         description: "start a new session",
         selection: SlashCommandSelection::Execute,
@@ -294,6 +334,46 @@ const TOP_LEVEL_SLASH_HINTS: &[SlashCommandHint] = &[
     SlashCommandHint {
         command: "/status",
         description: "show runtime status",
+        selection: SlashCommandSelection::Execute,
+    },
+    SlashCommandHint {
+        command: "/plan",
+        description: "show execution and verification plan",
+        selection: SlashCommandSelection::Execute,
+    },
+    SlashCommandHint {
+        command: "/tasks",
+        description: "show tasks and background activity",
+        selection: SlashCommandSelection::Execute,
+    },
+    SlashCommandHint {
+        command: "/usage",
+        description: "show token, context, cost and rate limits",
+        selection: SlashCommandSelection::Execute,
+    },
+    SlashCommandHint {
+        command: "/terminal",
+        description: "open a shell or run one interactive command",
+        selection: SlashCommandSelection::Execute,
+    },
+    SlashCommandHint {
+        command: "/settings",
+        description: "session model, effort and permissions",
+        selection: SlashCommandSelection::Execute,
+    },
+    SlashCommandHint {
+        command: "/model",
+        description: "select or override the session model",
+        selection: SlashCommandSelection::Execute,
+    },
+    SlashCommandHint {
+        command: "/effort",
+        description: "set session reasoning effort",
+        selection: SlashCommandSelection::Execute,
+    },
+    SlashCommandHint {
+        command: "/permissions",
+        description: "select guarded or unrestricted tools",
         selection: SlashCommandSelection::Execute,
     },
     SlashCommandHint {
@@ -334,6 +414,31 @@ const TOP_LEVEL_SLASH_HINTS: &[SlashCommandHint] = &[
     SlashCommandHint {
         command: "/compact",
         description: "compact conversation history",
+        selection: SlashCommandSelection::Execute,
+    },
+    SlashCommandHint {
+        command: "/queue",
+        description: "edit or cancel queued prompts",
+        selection: SlashCommandSelection::Execute,
+    },
+    SlashCommandHint {
+        command: "/attach",
+        description: "attach a workspace file",
+        selection: SlashCommandSelection::Fill,
+    },
+    SlashCommandHint {
+        command: "/detach",
+        description: "clear prompt attachments",
+        selection: SlashCommandSelection::Execute,
+    },
+    SlashCommandHint {
+        command: "/editor",
+        description: "edit prompt in $VISUAL or $EDITOR",
+        selection: SlashCommandSelection::Execute,
+    },
+    SlashCommandHint {
+        command: "/stash",
+        description: "stash or restore prompt",
         selection: SlashCommandSelection::Execute,
     },
     SlashCommandHint {
@@ -463,6 +568,7 @@ pub fn parse_slash_input(input: &str) -> SlashInput {
     };
     match command {
         "/help" | "/?" => SlashInput::Command(SlashCommand::Help),
+        "/whats-new" => SlashInput::Command(SlashCommand::WhatsNew),
         "/new" => SlashInput::Command(SlashCommand::New),
         "/resume" => SlashInput::Command(SlashCommand::Resume {
             thread_id: tokens.get(1).cloned(),
@@ -475,6 +581,23 @@ pub fn parse_slash_input(input: &str) -> SlashInput {
         "/fork" => parse_fork_command(&tokens),
         "/auth" => parse_auth_command(&tokens),
         "/status" => SlashInput::Command(SlashCommand::Status),
+        "/plan" => SlashInput::Command(SlashCommand::Plan),
+        "/tasks" => SlashInput::Command(SlashCommand::Tasks),
+        "/usage" => SlashInput::Command(SlashCommand::Usage),
+        "/terminal" => SlashInput::Command(SlashCommand::Terminal {
+            command: (tokens.len() > 1).then(|| tokens[1..].join(" ")),
+        }),
+        "/settings" if tokens.len() == 1 => SlashInput::Command(SlashCommand::Settings),
+        "/settings" => SlashInput::Error("/settings does not take arguments".to_owned()),
+        "/model" => match tokens.as_slice() {
+            [_] => SlashInput::Command(SlashCommand::Model { model: None }),
+            [_, model] => SlashInput::Command(SlashCommand::Model {
+                model: Some(model.clone()),
+            }),
+            _ => SlashInput::Error("/model syntax: /model [model-id]".to_owned()),
+        },
+        "/effort" => parse_effort_command(&tokens),
+        "/permissions" | "/permission" => parse_permissions_command(&tokens),
         "/debug" => SlashInput::Command(SlashCommand::Debug),
         "/takeover" => SlashInput::Command(SlashCommand::Takeover),
         "/abort" => SlashInput::Command(SlashCommand::Abort),
@@ -483,10 +606,58 @@ pub fn parse_slash_input(input: &str) -> SlashInput {
         "/approve" => SlashInput::Command(SlashCommand::Approve),
         "/deny" => SlashInput::Command(SlashCommand::Deny),
         "/compact" => SlashInput::Command(SlashCommand::Compact),
+        "/queue" => SlashInput::Command(SlashCommand::Queue),
+        "/attach" => match tokens.get(1..) {
+            Some(path) if !path.is_empty() => SlashInput::Command(SlashCommand::Attach {
+                path: path.join(" ").trim_matches(['\'', '"']).to_owned(),
+            }),
+            _ => SlashInput::Error("/attach requires a workspace file path".to_owned()),
+        },
+        "/paste-image" => SlashInput::Error(
+            "clipboard images require a multimodal provider transport, which is not available"
+                .to_owned(),
+        ),
+        "/detach" => SlashInput::Command(SlashCommand::Detach),
+        "/editor" => SlashInput::Command(SlashCommand::Editor),
+        "/stash" => SlashInput::Command(SlashCommand::Stash),
         "/clear" => SlashInput::Command(SlashCommand::Clear),
         "/quit" | "/exit" => SlashInput::Command(SlashCommand::Quit),
         other => SlashInput::Error(format!("unknown slash command `{other}`; try /help")),
     }
+}
+
+fn parse_effort_command(tokens: &[String]) -> SlashInput {
+    let effort = match tokens.get(1).map(String::as_str) {
+        None => None,
+        Some("default" | "inherit" | "off") => Some(ReasoningEffortSelection::Default),
+        Some(value) => match parse_reasoning_effort(value) {
+            Ok(effort) => Some(ReasoningEffortSelection::Effort(effort)),
+            Err(error) => return SlashInput::Error(error),
+        },
+    };
+    if tokens.len() > 2 {
+        return SlashInput::Error(
+            "/effort syntax: /effort [default|low|medium|high|xhigh]".to_owned(),
+        );
+    }
+    SlashInput::Command(SlashCommand::Effort { effort })
+}
+
+fn parse_permissions_command(tokens: &[String]) -> SlashInput {
+    let unrestricted = match tokens.get(1).map(String::as_str) {
+        None => None,
+        Some("guarded") => Some(false),
+        Some("unrestricted" | "yolo") => Some(true),
+        Some(_) => {
+            return SlashInput::Error("permissions must be `guarded` or `unrestricted`".to_owned());
+        }
+    };
+    if tokens.len() > 2 {
+        return SlashInput::Error(
+            "/permissions syntax: /permissions [guarded|unrestricted]".to_owned(),
+        );
+    }
+    SlashInput::Command(SlashCommand::Permissions { unrestricted })
 }
 
 fn parse_fork_command(tokens: &[String]) -> SlashInput {
@@ -1078,6 +1249,44 @@ mod tests {
     }
 
     #[test]
+    fn slash_parser_accepts_session_provider_and_permission_controls() {
+        assert_eq!(
+            parse_slash_input("/settings"),
+            SlashInput::Command(SlashCommand::Settings)
+        );
+        assert_eq!(
+            parse_slash_input("/model gpt-5.6-codex"),
+            SlashInput::Command(SlashCommand::Model {
+                model: Some("gpt-5.6-codex".to_owned())
+            })
+        );
+        assert_eq!(
+            parse_slash_input("/effort high"),
+            SlashInput::Command(SlashCommand::Effort {
+                effort: Some(ReasoningEffortSelection::Effort(
+                    ProviderReasoningEffort::High
+                ))
+            })
+        );
+        assert_eq!(
+            parse_slash_input("/effort default"),
+            SlashInput::Command(SlashCommand::Effort {
+                effort: Some(ReasoningEffortSelection::Default)
+            })
+        );
+        assert_eq!(
+            parse_slash_input("/permissions unrestricted"),
+            SlashInput::Command(SlashCommand::Permissions {
+                unrestricted: Some(true)
+            })
+        );
+        assert!(matches!(
+            parse_slash_input("/permissions maybe"),
+            SlashInput::Error(_)
+        ));
+    }
+
+    #[test]
     fn slash_parser_rejects_workspace_auth_scope() {
         assert!(matches!(
             parse_slash_input("/auth login --base-url api.golutra.cn --model qwen --scope workspace"),
@@ -1202,11 +1411,11 @@ mod tests {
         assert_eq!(
             slash_command_suggestions("/"),
             vec![
+                "/help - open contextual keyboard reference".to_owned(),
+                "/whats-new - show release notes for this version".to_owned(),
                 "/new - start a new session".to_owned(),
                 "/resume - open sessions".to_owned(),
                 "/export - export session history and runtime facts".to_owned(),
-                "/threads - list threads".to_owned(),
-                "/fork - fork a thread".to_owned(),
             ]
         );
         assert_eq!(
@@ -1217,6 +1426,10 @@ mod tests {
             slash_command_suggestions("/r"),
             vec!["/resume - open sessions".to_owned()]
         );
+        assert!(matches!(
+            parse_slash_input("/paste-image"),
+            SlashInput::Error(error) if error.contains("multimodal provider transport")
+        ));
     }
 
     #[test]

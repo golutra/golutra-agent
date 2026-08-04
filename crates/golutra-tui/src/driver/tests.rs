@@ -1,5 +1,8 @@
 use chrono::Utc;
-use golutra_core::{EventId, SessionId, ThreadId};
+use golutra_core::{
+    ApprovalId, ApprovalRequest, EventId, QuestionId, SessionId, TaskId, ThreadId, ToolCallId,
+    TurnId, UserQuestionMode, UserQuestionOption, UserQuestionPrompt, UserQuestionRequest,
+};
 use golutra_protocol::{
     RuntimeEvent, RuntimeEventSource, RuntimeEventType, UserProjection, VisibleStep,
 };
@@ -16,6 +19,112 @@ fn test_app(task_id: Option<TaskId>, auth_dialog: Option<AuthDialogState>) -> Tu
         "ready (mock)".to_owned(),
         auth_dialog,
     )
+}
+
+fn question_dialog(secret: &str) -> QuestionDialogState {
+    let mut dialog = QuestionDialogState::new(UserQuestionRequest {
+        question_id: QuestionId::new(),
+        task_id: TaskId::new(),
+        turn_id: TurnId::new(),
+        tool_call_id: ToolCallId::new(),
+        questions: vec![UserQuestionPrompt {
+            id: "output".to_owned(),
+            header: format!("token={secret}"),
+            question: format!("Authorization: Bearer {secret}"),
+            mode: UserQuestionMode::Single,
+            options: vec![UserQuestionOption {
+                id: "json".to_owned(),
+                label: format!("api_key={secret}"),
+                description: Some(format!("token={secret}")),
+            }],
+        }],
+    });
+    dialog.focus_free_text(0);
+    dialog
+        .current_free_text_mut()
+        .set_text(format!("Authorization: Bearer {secret}"));
+    dialog
+}
+
+fn populate_snapshot_secrets(app: &mut TuiApp, secret: &str) {
+    app.input
+        .set_text(format!("Authorization: Bearer {secret}"));
+    app.queue_picker = Some(QueuePickerState {
+        items: vec![QueuedPrompt {
+            turn_id: TurnId::new(),
+            prompt: format!("token={secret}"),
+            steer: false,
+        }],
+        selected: 0,
+    });
+    app.approval_dialog = Some(ApprovalDialogState::new(ApprovalRequest {
+        approval_id: ApprovalId::new(),
+        task_id: TaskId::new(),
+        turn_id: TurnId::new(),
+        tool_call_id: ToolCallId::new(),
+        tool_name: format!("token={secret}"),
+        resource: format!("Authorization: Bearer {secret}"),
+        reason: format!("api_key={secret}"),
+    }));
+    app.question_dialog = Some(question_dialog(secret));
+
+    let mut history_search = HistorySearchState::default();
+    history_search
+        .input
+        .set_text(format!("Authorization: Bearer {secret}"));
+    app.history_search = Some(history_search);
+    let mut transcript_search = TranscriptSearchState::default();
+    transcript_search.input.set_text(format!("token={secret}"));
+    app.transcript_search = Some(transcript_search);
+
+    app.runtime_controls.profile_name = Some(format!("token={secret}"));
+    app.runtime_controls.custom_model = Some(format!("Authorization: Bearer {secret}"));
+    let mut settings = SettingsDialogState::new(
+        &app.runtime_controls,
+        &app.provider_choices,
+        &app.preferences,
+        false,
+    );
+    settings.editing_model = true;
+    settings.model_input.set_text(format!("api_key={secret}"));
+    app.settings_dialog = Some(settings);
+    app.attachments.push(ComposerAttachment {
+        path: std::path::PathBuf::from("attachment.txt"),
+        display_path: format!("token={secret}.txt"),
+        kind: AttachmentKind::Text,
+        bytes: 1,
+    });
+    app.mention_completion = Some(MentionCompletion {
+        replacement: 0..1,
+        candidates: vec![MentionCandidate {
+            kind: MentionKind::File,
+            label: format!("token={secret}"),
+            insertion: format!("Authorization: Bearer {secret}"),
+            detail: format!("api_key={secret}"),
+            source_path: None,
+        }],
+        selected: 0,
+    });
+}
+
+fn transient_snapshot_state(app: &TuiApp) -> Vec<String> {
+    [
+        format!("{:?}", app.input),
+        format!("{:?}", app.auth_dialog),
+        format!("{:?}", app.resume_picker),
+        format!("{:?}", app.queue_picker),
+        format!("{:?}", app.approval_dialog),
+        format!("{:?}", app.question_dialog),
+        format!("{:?}", app.settings_dialog),
+        format!("{:?}", app.export_flow),
+        format!("{:?}", app.history_search),
+        format!("{:?}", app.transcript_search),
+        format!("{:?}", app.attachments),
+        format!("{:?}", app.mention_completion),
+        format!("{:?}", app.runtime_controls),
+    ]
+    .into_iter()
+    .collect()
 }
 
 fn terminal_event(sequence_no: u64, task_id: TaskId, turn_id: TurnId) -> RuntimeEvent {
@@ -268,7 +377,7 @@ fn explicit_task_binding_is_read_only_for_prompts() {
 
     let auth_app = test_app(task_id, Some(AuthDialogState::new()));
     for key in [DriverKey::Enter, DriverKey::Char("1".to_owned())] {
-        let error = ensure_task_binding_allows_key(task_id, &auth_app, &key)
+        let error = ensure_driver_binding_allows_key(task_id, &auth_app, &key)
             .expect_err("task-bound auth input must be rejected");
         assert_eq!(driver_error_code(&error), "task_binding_read_only");
     }
@@ -278,6 +387,158 @@ fn explicit_task_binding_is_read_only_for_prompts() {
     assert!(!driver_key_starts_approval_shortcut(&DriverKey::Char(
         "xy".to_owned()
     )));
+}
+
+#[test]
+fn driver_binding_preflight_follows_the_visible_surface() {
+    let task_id = TaskId::new();
+    let mut app = test_app(Some(task_id), None);
+    app.projection = Some(UserProjection {
+        session_id: app.session_id,
+        task_id: Some(task_id),
+        status: TaskStatus::WaitingApproval,
+        visible_steps: Vec::new(),
+        pending_approval: Some(ApprovalId::new().to_string()),
+        final_message: None,
+        residual_risks: Vec::new(),
+    });
+    app.approval_dialog = Some(ApprovalDialogState::new(ApprovalRequest {
+        approval_id: ApprovalId::new(),
+        task_id,
+        turn_id: TurnId::new(),
+        tool_call_id: ToolCallId::new(),
+        tool_name: "shell".to_owned(),
+        resource: "cargo test".to_owned(),
+        reason: "process execution requires approval".to_owned(),
+    }));
+
+    for key in [DriverKey::Enter, DriverKey::Char("x1".to_owned())] {
+        let error = ensure_driver_binding_allows_key(Some(task_id), &app, &key)
+            .expect_err("task-bound approval submission must be rejected");
+        assert_eq!(driver_error_code(&error), "task_binding_read_only");
+    }
+    assert!(ensure_driver_binding_allows_key(Some(task_id), &app, &DriverKey::Up).is_ok());
+
+    app.help_dialog = Some(HelpDialogState::new(HelpTopic::Overview, "approval"));
+    assert!(
+        ensure_driver_binding_allows_key(Some(task_id), &app, &DriverKey::Char("y".to_owned()))
+            .is_ok()
+    );
+    assert!(ensure_driver_binding_allows_key(Some(task_id), &app, &DriverKey::Escape).is_ok());
+
+    app.help_dialog = None;
+    app.approval_dialog = None;
+    app.question_dialog = Some(QuestionDialogState::new(UserQuestionRequest {
+        question_id: QuestionId::new(),
+        task_id,
+        turn_id: TurnId::new(),
+        tool_call_id: ToolCallId::new(),
+        questions: vec![UserQuestionPrompt {
+            id: "format".to_owned(),
+            header: "Output".to_owned(),
+            question: "Choose an output format".to_owned(),
+            mode: UserQuestionMode::Single,
+            options: vec![
+                UserQuestionOption {
+                    id: "json".to_owned(),
+                    label: "JSON".to_owned(),
+                    description: None,
+                },
+                UserQuestionOption {
+                    id: "yaml".to_owned(),
+                    label: "YAML".to_owned(),
+                    description: None,
+                },
+            ],
+        }],
+    }));
+    let error = ensure_driver_binding_allows_key(Some(task_id), &app, &DriverKey::Enter)
+        .expect_err("task-bound question submission must be rejected");
+    assert_eq!(driver_error_code(&error), "task_binding_read_only");
+    assert!(
+        ensure_driver_binding_allows_key(
+            Some(task_id),
+            &app,
+            &DriverKey::Char("answer draft".to_owned())
+        )
+        .is_ok()
+    );
+
+    app.question_dialog = None;
+    app.queue_picker = Some(QueuePickerState {
+        items: vec![QueuedPrompt {
+            turn_id: TurnId::new(),
+            prompt: "queued prompt".to_owned(),
+            steer: false,
+        }],
+        selected: 0,
+    });
+    for key in [
+        DriverKey::Delete,
+        DriverKey::Backspace,
+        DriverKey::Char("d".to_owned()),
+    ] {
+        let error = ensure_driver_binding_allows_key(Some(task_id), &app, &key)
+            .expect_err("task-bound queue cancellation must be rejected");
+        assert_eq!(driver_error_code(&error), "task_binding_read_only");
+    }
+    assert!(ensure_driver_binding_allows_key(Some(task_id), &app, &DriverKey::Enter).is_ok());
+}
+
+#[test]
+fn driver_binding_preflight_keeps_search_local_and_sessions_fixed() {
+    let task_id = TaskId::new();
+    let mut app = test_app(Some(task_id), None);
+    app.projection = Some(UserProjection {
+        session_id: app.session_id,
+        task_id: Some(task_id),
+        status: TaskStatus::Running,
+        visible_steps: Vec::new(),
+        pending_approval: None,
+        final_message: None,
+        residual_risks: Vec::new(),
+    });
+    app.input.set_text("/not-a-command");
+    app.transcript_search = Some(TranscriptSearchState::default());
+    assert!(!driver_enter_reaches_composer(&app));
+    assert!(ensure_driver_binding_allows_key(Some(task_id), &app, &DriverKey::Enter).is_ok());
+    assert!(ensure_driver_binding_allows_key(Some(task_id), &app, &DriverKey::Escape).is_ok());
+
+    app.transcript_search = None;
+    app.composer_mode = ComposerMode::VimInsert;
+    assert!(ensure_driver_binding_allows_key(Some(task_id), &app, &DriverKey::Escape).is_ok());
+    app.composer_mode = ComposerMode::Standard;
+    let error = ensure_driver_binding_allows_key(Some(task_id), &app, &DriverKey::Escape)
+        .expect_err("composer escape would abort the active task");
+    assert_eq!(driver_error_code(&error), "task_binding_read_only");
+
+    app.resume_picker = Some(ResumePickerState::new(vec![ResumeThreadItem {
+        thread_id: ThreadId::new(),
+        session_id: SessionId::new(),
+        title: "other session".to_owned(),
+        preview: String::new(),
+    }]));
+    let error = ensure_driver_binding_allows_key(None, &app, &DriverKey::Enter)
+        .expect_err("Driver session binding must remain immutable");
+    assert_eq!(driver_error_code(&error), "session_binding_immutable");
+}
+
+#[test]
+fn driver_binding_preflight_rejects_mutating_mouse_activations() {
+    let task_id = Some(TaskId::new());
+    for activation in [
+        UiMouseActivation::AuthContinue,
+        UiMouseActivation::Approval(ApprovalChoice::Once),
+        UiMouseActivation::QuestionSubmit,
+    ] {
+        let error = ensure_driver_binding_allows_mouse(task_id, activation)
+            .expect_err("task-bound mouse control must be rejected");
+        assert_eq!(driver_error_code(&error), "task_binding_read_only");
+    }
+
+    let error = ensure_driver_binding_allows_mouse(None, UiMouseActivation::ResumeSession)
+        .expect_err("mouse input cannot switch a Driver session");
+    assert_eq!(driver_error_code(&error), "session_binding_immutable");
 }
 
 #[test]
@@ -296,6 +557,16 @@ fn slash_validation_rejects_malformed_commands() {
 
     let modal_app = test_app(None, Some(AuthDialogState::new()));
     assert!(ensure_modal_allows_slash(&modal_app, &SlashCommand::Quit).is_ok());
+    for command in [
+        SlashCommand::Takeover,
+        SlashCommand::Abort,
+        SlashCommand::Pause,
+        SlashCommand::Continue,
+        SlashCommand::Approve,
+        SlashCommand::Deny,
+    ] {
+        assert!(ensure_modal_allows_slash(&modal_app, &command).is_ok());
+    }
     let error = ensure_modal_allows_slash(&modal_app, &SlashCommand::Auth(SlashAuthCommand::Setup))
         .expect_err("provider setup must remain modal");
     assert_eq!(driver_error_code(&error), "ui_modal_active");
@@ -304,11 +575,34 @@ fn slash_validation_rejects_malformed_commands() {
 #[test]
 fn accumulated_driver_input_is_bounded() {
     let mut app = test_app(None, None);
-    app.input
-        .set_text("x".repeat(MAX_DRIVER_INPUT_BYTES.saturating_sub(1)));
-    assert!(ensure_driver_input_capacity(&app, 1).is_ok());
-    let error =
-        ensure_driver_input_capacity(&app, 2).expect_err("accumulated input must remain bounded");
+    app.input.set_text("a");
+    let mut question = question_dialog("ordinary");
+    question.current_free_text_mut().set_text("bb");
+    app.question_dialog = Some(question);
+    let mut resume = ResumePickerState::new(Vec::new());
+    resume.search.set_text("ccc");
+    resume.action_input.set_text("dddd");
+    app.resume_picker = Some(resume);
+    let mut settings = SettingsDialogState::new(
+        &app.runtime_controls,
+        &app.provider_choices,
+        &app.preferences,
+        false,
+    );
+    settings.model_input.set_text("eeeee");
+    app.settings_dialog = Some(settings);
+    let mut history = HistorySearchState::default();
+    history.input.set_text("ffffff");
+    app.history_search = Some(history);
+    let mut transcript = TranscriptSearchState::default();
+    transcript.input.set_text("ggggggg");
+    app.transcript_search = Some(transcript);
+    app.prompt_stash = Some("hhhhhhhh".to_owned());
+
+    assert_eq!(driver_input_state_bytes(&app), 36);
+    assert!(ensure_driver_input_capacity(&app, MAX_DRIVER_INPUT_BYTES - 36).is_ok());
+    let error = ensure_driver_input_capacity(&app, MAX_DRIVER_INPUT_BYTES - 35)
+        .expect_err("accumulated input must remain bounded");
     assert_eq!(driver_error_code(&error), "input_too_large");
 }
 
@@ -372,24 +666,22 @@ fn snapshot_state_redacts_transient_secrets() {
     let dialog = app.auth_dialog.as_mut().expect("auth dialog");
     dialog.api_key = secret.to_owned();
     dialog.custom_headers = format!("Authorization=Bearer {secret}");
-    let picker = ResumePickerState {
-        items: vec![ResumeThreadItem {
-            thread_id: ThreadId::new(),
-            session_id: SessionId::new(),
-            title: format!("Authorization: Bearer {secret}"),
-            preview: format!("token={secret}"),
-        }],
-        selected: 0,
-    };
+    let picker = ResumePickerState::new(vec![ResumeThreadItem {
+        thread_id: ThreadId::new(),
+        session_id: SessionId::new(),
+        title: format!("Authorization: Bearer {secret}"),
+        preview: format!("token={secret}"),
+    }]);
     app.resume_picker = Some(picker.clone());
     app.export_flow = Some(ExportFlowState {
         picker,
         step: ExportFlowStep::Destination,
-        range_input: "1".to_owned(),
-        destination_input: format!("/tmp/token={secret}"),
+        range_input: ComposerInput::from_text("1"),
+        destination_input: ComposerInput::from_text(format!("/tmp/token={secret}")),
         error: Some(format!("Authorization: Bearer {secret}")),
         receipt: None,
     });
+    populate_snapshot_secrets(&mut app, secret);
 
     redact_snapshot_ui_state(&mut app);
 
@@ -397,6 +689,89 @@ fn snapshot_state_redacts_transient_secrets() {
     assert!(!rendered.contains(secret));
     assert!(rendered.contains("redacted-secret"));
     assert!(rendered.contains("redacted-provider-headers"));
+}
+
+#[tokio::test]
+async fn snapshot_render_restores_every_transient_input_surface() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let transport = RuntimeTransport::ephemeral_for_cwd(workspace.path())
+        .await
+        .expect("transport");
+    let mut driver = TuiDriver::launch(transport, None, None, true, false, 100, 24)
+        .await
+        .expect("driver");
+    populate_snapshot_secrets(&mut driver.app, "sk-snapshot-state-secret");
+    let expected = transient_snapshot_state(&driver.app);
+
+    driver
+        .render_frame(&SnapshotRequest {
+            scope: SnapshotScope::Screen,
+            panes: SnapshotPanes::FullScreen,
+            width: 100,
+            height: 24,
+            rows: None,
+            frame_id: None,
+            detail: SnapshotDetail::Text,
+        })
+        .expect("full-screen snapshot");
+
+    assert_eq!(transient_snapshot_state(&driver.app), expected);
+}
+
+#[tokio::test]
+async fn rejected_mouse_activation_does_not_change_local_selection() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let transport = RuntimeTransport::ephemeral_for_cwd(workspace.path())
+        .await
+        .expect("transport");
+    let mut driver = TuiDriver::launch(transport, None, None, false, false, 100, 24)
+        .await
+        .expect("driver");
+    driver.app.auth_dialog = None;
+    driver.app.resume_picker = Some(ResumePickerState::new(vec![
+        ResumeThreadItem {
+            thread_id: ThreadId::new(),
+            session_id: SessionId::new(),
+            title: "first".to_owned(),
+            preview: String::new(),
+        },
+        ResumeThreadItem {
+            thread_id: ThreadId::new(),
+            session_id: SessionId::new(),
+            title: "second".to_owned(),
+            preview: String::new(),
+        },
+    ]));
+    driver.refresh_active_layout().expect("resume layout");
+    let region = overlay_mouse_regions(driver.app.layout.transcript, &driver.app)
+        .into_iter()
+        .find(|region| region.press == UiMousePress::Resume(1))
+        .expect("second resume row");
+
+    let response = driver
+        .handle(DriverRequest::InputMouse {
+            event: golutra_protocol::DriverMouseEvent {
+                kind: golutra_protocol::DriverMouseKind::LeftClick,
+                column: region.area.x,
+                row: region.area.y,
+            },
+        })
+        .await;
+
+    assert!(matches!(
+        response,
+        DriverResponse::Error { ref code, .. } if code == "session_binding_immutable"
+    ));
+    assert_eq!(
+        driver
+            .app
+            .resume_picker
+            .as_ref()
+            .expect("resume picker")
+            .selected,
+        0
+    );
+    assert_eq!(driver.app.mouse_press, None);
 }
 
 #[test]
@@ -529,10 +904,12 @@ async fn snapshot_render_does_not_mutate_the_active_pane_layout() {
     });
     driver.app.developer_facts_expanded = true;
     driver.refresh_active_layout().expect("active layout");
+    driver.app.transcript_top_row_override = Some(3);
     driver.app.developer_top_row_override = Some(3);
 
     let expected_layout = driver.app.layout;
     let expected_event_layout = driver.app.developer_event_layout.clone();
+    let expected_transcript_top_row = driver.app.transcript_top_row_override;
     let expected_top_row = driver.app.developer_top_row_override;
     let expected_scroll = driver.app.developer_scroll;
 
@@ -550,6 +927,10 @@ async fn snapshot_render_does_not_mutate_the_active_pane_layout() {
 
     assert_eq!(driver.app.layout, expected_layout);
     assert_eq!(driver.app.developer_event_layout, expected_event_layout);
+    assert_eq!(
+        driver.app.transcript_top_row_override,
+        expected_transcript_top_row
+    );
     assert_eq!(driver.app.developer_top_row_override, expected_top_row);
     assert_eq!(driver.app.developer_scroll, expected_scroll);
 }

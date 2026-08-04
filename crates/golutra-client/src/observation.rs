@@ -5,7 +5,7 @@
 //! snapshot that exporters, benchmark harnesses and regression tooling can
 //! serialize in their own formats.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap};
 
 use chrono::{DateTime, Utc};
 use golutra_core::{SessionId, TaskId, TraceIntegrity, TraceView};
@@ -361,11 +361,27 @@ async fn load_all_events(
 }
 
 pub(crate) fn conversation_entries(events: &[RuntimeEvent]) -> Vec<ConversationEntry> {
-    let mut entries = Vec::new();
-    let mut user_turns = HashSet::new();
+    let mut entries = Vec::<ConversationEntry>::new();
+    let mut user_turns = HashMap::new();
     for event in events {
+        if event.event_type == RuntimeEventType::TurnCancelled {
+            if let Some(index) = event
+                .turn_id
+                .and_then(|turn_id| user_turns.remove(&turn_id))
+            {
+                entries.remove(index);
+                for position in user_turns.values_mut() {
+                    if *position > index {
+                        *position = position.saturating_sub(1);
+                    }
+                }
+            }
+            continue;
+        }
         let (role, content) = match event.event_type {
-            RuntimeEventType::TaskCreated | RuntimeEventType::TurnQueued => (
+            RuntimeEventType::TaskCreated
+            | RuntimeEventType::TurnQueued
+            | RuntimeEventType::TurnUpdated => (
                 ConversationRole::User,
                 event
                     .payload
@@ -387,9 +403,17 @@ pub(crate) fn conversation_entries(events: &[RuntimeEvent]) -> Vec<ConversationE
         };
         if role == ConversationRole::User
             && let Some(turn_id) = event.turn_id
-            && !user_turns.insert(turn_id)
         {
-            continue;
+            if event.event_type == RuntimeEventType::TurnUpdated
+                && let Some(index) = user_turns.get(&turn_id).copied()
+            {
+                entries[index].content = content.to_owned();
+                continue;
+            }
+            if user_turns.contains_key(&turn_id) {
+                continue;
+            }
+            user_turns.insert(turn_id, entries.len());
         }
         entries.push(ConversationEntry {
             sequence_no: event.sequence_no,

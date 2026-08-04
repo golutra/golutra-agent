@@ -168,10 +168,10 @@ impl ActivityProjection {
                     provider.exact_output_tokens = Some(output_tokens);
                 }
             }
-            RuntimeEventType::ApprovalRequested => {
+            RuntimeEventType::ApprovalRequested | RuntimeEventType::UserQuestionRequested => {
                 self.pause_at(event.timestamp);
             }
-            RuntimeEventType::ApprovalResolved => {
+            RuntimeEventType::ApprovalResolved | RuntimeEventType::UserQuestionResolved => {
                 self.resume_at(event.timestamp);
             }
             RuntimeEventType::ProviderAuthRequired => {

@@ -881,6 +881,7 @@ async fn stores_and_lists_thread_metadata() {
         updated_at: now,
         recency_at: now,
         archived: false,
+        removed: false,
     };
 
     store.upsert_thread(&thread).await.expect("thread stored");
@@ -895,8 +896,147 @@ async fn stores_and_lists_thread_metadata() {
         .expect("threads list");
 
     assert_eq!(loaded.thread_id, thread.thread_id);
+    assert!(!loaded.removed);
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].session_id, thread.session_id);
+}
+
+#[tokio::test]
+async fn removed_threads_retain_ownership_and_events_but_leave_normal_windows() {
+    let store = RuntimeStore::in_memory().await.expect("store opens");
+    let now = Utc::now();
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let thread = ThreadRecord {
+        thread_id: ThreadId::new(),
+        session_id,
+        parent_thread_id: None,
+        forked_from_turn_id: None,
+        forked_from_sequence_no: None,
+        workspace_root: Some("/workspace".to_owned()),
+        rebound_from_workspace_root: None,
+        rollout_path: None,
+        title: "Removed thread".to_owned(),
+        preview: "retained for audit".to_owned(),
+        created_at: now,
+        updated_at: now,
+        recency_at: now,
+        archived: false,
+        removed: false,
+    };
+    store.upsert_thread(&thread).await.expect("thread");
+    store
+        .append_event_assigning_sequence(RuntimeEvent {
+            schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+            causal_context: Default::default(),
+            causal_links: Vec::new(),
+            id: EventId::new(),
+            sequence_no: 0,
+            session_id,
+            turn_id: Some(TurnId::new()),
+            task_id: Some(task_id),
+            parent_event_id: None,
+            event_type: RuntimeEventType::TaskCompleted,
+            timestamp: now,
+            source: RuntimeEventSource::Runtime,
+            payload: json!({
+                "status": "completed",
+                "post_task_governance": {"status": "pending"}
+            }),
+            payload_ref: None,
+            durable: true,
+        })
+        .await
+        .expect("terminal event");
+    let deleted = store
+        .delete_thread_with_event(
+            thread.thread_id,
+            RuntimeEvent {
+                schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+                causal_context: Default::default(),
+                causal_links: Vec::new(),
+                id: EventId::new(),
+                sequence_no: 0,
+                session_id,
+                turn_id: None,
+                task_id: None,
+                parent_event_id: None,
+                event_type: RuntimeEventType::ThreadDeleted,
+                timestamp: now,
+                source: RuntimeEventSource::User,
+                payload: json!({"thread_id": thread.thread_id}),
+                payload_ref: None,
+                durable: true,
+            },
+        )
+        .await
+        .expect("remove thread")
+        .expect("delete event");
+
+    let retained = store
+        .thread_by_id(thread.thread_id)
+        .await
+        .expect("thread by id")
+        .expect("retained tombstone");
+    assert!(retained.removed);
+    assert!(retained.archived);
+    assert_eq!(
+        store
+            .thread_by_session(session_id)
+            .await
+            .expect("thread by session")
+            .expect("ownership tombstone")
+            .thread_id,
+        thread.thread_id
+    );
+    assert!(
+        store
+            .list_threads(Some("/workspace"), 10)
+            .await
+            .expect("thread list")
+            .is_empty()
+    );
+    assert!(
+        store
+            .list_threads_page(Some("/workspace"), None, 10)
+            .await
+            .expect("thread page")
+            .is_empty()
+    );
+    assert!(
+        store
+            .thread_window(
+                Some("/workspace"),
+                &retained,
+                SessionRangeDirection::Single,
+                1,
+            )
+            .await
+            .expect("thread window")
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .unscheduled_post_task_terminal_events(Some("/workspace"))
+            .await
+            .expect("post-task recovery"),
+        store
+            .load_events(session_id, Some(task_id), None)
+            .await
+            .expect("task events")
+            .into_iter()
+            .filter(|event| event.event_type == RuntimeEventType::TaskCompleted)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(deleted.event_type, RuntimeEventType::ThreadDeleted);
+    assert!(
+        store
+            .load_events(session_id, None, None)
+            .await
+            .expect("session events")
+            .iter()
+            .any(|event| event.event_type == RuntimeEventType::ThreadDeleted)
+    );
 }
 
 #[tokio::test]
@@ -986,6 +1126,7 @@ async fn fork_transaction_copies_boundary_history_and_remaps_runtime_ids() {
         updated_at: now,
         recency_at: now,
         archived: false,
+        removed: false,
     };
 
     let forked = store
@@ -1053,6 +1194,7 @@ async fn different_threads_cannot_bind_the_same_session() {
         updated_at: now,
         recency_at: now,
         archived: false,
+        removed: false,
     };
     store
         .upsert_thread(&thread(ThreadId::new()))
@@ -1073,6 +1215,86 @@ async fn different_threads_cannot_bind_the_same_session() {
             .map(|thread| thread.session_id),
         Some(session_id)
     );
+}
+
+#[tokio::test]
+async fn thread_metadata_and_event_commit_or_rollback_together() {
+    let store = RuntimeStore::in_memory().await.expect("store");
+    let now = Utc::now();
+    let session_id = SessionId::new();
+    let mut thread = ThreadRecord {
+        thread_id: ThreadId::new(),
+        session_id,
+        parent_thread_id: None,
+        forked_from_turn_id: None,
+        forked_from_sequence_no: None,
+        workspace_root: Some("/workspace".to_owned()),
+        rebound_from_workspace_root: None,
+        rollout_path: None,
+        title: "before".to_owned(),
+        preview: "preview".to_owned(),
+        created_at: now,
+        updated_at: now,
+        recency_at: now,
+        archived: false,
+        removed: false,
+    };
+    store.upsert_thread(&thread).await.expect("thread");
+    let thread_id = thread.thread_id;
+    let event_id = EventId::new();
+    let event = |event_type| RuntimeEvent {
+        schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+        causal_context: Default::default(),
+        causal_links: Vec::new(),
+        id: event_id,
+        sequence_no: 0,
+        session_id,
+        turn_id: None,
+        task_id: None,
+        parent_event_id: None,
+        event_type,
+        timestamp: Utc::now(),
+        source: RuntimeEventSource::User,
+        payload: json!({"thread_id": thread_id}),
+        payload_ref: None,
+        durable: true,
+    };
+    store
+        .append_event_assigning_sequence(event(RuntimeEventType::CommandReceived))
+        .await
+        .expect("conflicting event");
+
+    thread.title = "after".to_owned();
+    assert!(
+        store
+            .upsert_thread_with_event(&thread, event(RuntimeEventType::ThreadRenamed))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .thread_by_id(thread_id)
+            .await
+            .expect("thread lookup")
+            .expect("thread remains")
+            .title,
+        "before"
+    );
+
+    assert!(
+        store
+            .delete_thread_with_event(thread_id, event(RuntimeEventType::ThreadDeleted))
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .thread_by_id(thread_id)
+            .await
+            .expect("thread lookup")
+            .is_some()
+    );
+    assert_eq!(store.max_sequence_no().await.expect("sequence"), 1);
 }
 
 #[tokio::test]
@@ -1149,6 +1371,7 @@ async fn migration_deduplicates_legacy_threads_before_adding_session_uniqueness(
     assert!(thread.forked_from_sequence_no.is_none());
     assert!(thread.rebound_from_workspace_root.is_none());
     assert!(thread.rollout_path.is_none());
+    assert!(!thread.removed);
     assert_eq!(
         store
             .list_threads(Some("/workspace"), 10)
@@ -1380,6 +1603,7 @@ async fn unscheduled_post_task_scan_requires_pending_governance_without_terminal
             updated_at: now,
             recency_at: now,
             archived: false,
+            removed: false,
         })
         .await
         .expect("thread");

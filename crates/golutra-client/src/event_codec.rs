@@ -15,8 +15,8 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ClientError, EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY, HostedAgentTask, LegacyTaskAdapter,
-    RecoveredPendingTurn, compact_event_summary, prompt_from_payload, task_contract_from_payload,
-    title_from_payload,
+    RecoveredPendingTurn, compact_event_summary, model_prompt_from_payload,
+    task_contract_from_payload, title_from_payload,
 };
 
 pub(crate) fn thread_id_from_payload(payload: &Value) -> Option<ThreadId> {
@@ -80,7 +80,7 @@ pub(crate) fn recovered_pending_turn_from_event(
             event.id
         ))
     })?;
-    let content = prompt_from_payload(&payload);
+    let content = model_prompt_from_payload(&payload);
     if content.trim().is_empty() {
         return Err(ClientError::TaskExecution(format!(
             "durable queued turn event {} has an empty prompt",
@@ -601,6 +601,16 @@ pub(crate) fn observation_descriptor(observation: &RuntimeObservation) -> Observ
             RuntimeEventSource::User,
             ObservationIntegrityClass::Required,
         ),
+        RuntimeObservation::UserQuestionRequested(_) => (
+            RuntimeEventType::UserQuestionRequested,
+            RuntimeEventSource::Runtime,
+            ObservationIntegrityClass::Required,
+        ),
+        RuntimeObservation::UserQuestionResolved(_) => (
+            RuntimeEventType::UserQuestionResolved,
+            RuntimeEventSource::User,
+            ObservationIntegrityClass::Required,
+        ),
         RuntimeObservation::RetryScheduled { .. } => (
             RuntimeEventType::RetryScheduled,
             RuntimeEventSource::Runtime,
@@ -979,6 +989,24 @@ pub(crate) fn trace_event_payload(
             json!({
                 "summary": format!("approval resolved as {:?}", resolution.decision),
                 "approval_id": resolution.approval_id,
+                "resolution": resolution,
+            }),
+        )),
+        AgentLoopTraceEvent::UserQuestionRequested(request) => Some((
+            RuntimeEventType::UserQuestionRequested,
+            RuntimeEventSource::Runtime,
+            json!({
+                "summary": "agent requested structured user input",
+                "question_id": request.question_id,
+                "request": request,
+            }),
+        )),
+        AgentLoopTraceEvent::UserQuestionResolved(resolution) => Some((
+            RuntimeEventType::UserQuestionResolved,
+            RuntimeEventSource::User,
+            json!({
+                "summary": "structured user input received",
+                "question_id": resolution.question_id,
                 "resolution": resolution,
             }),
         )),

@@ -99,6 +99,8 @@ pub struct ToolProgress {
     pub output_bytes: u64,
     pub output_lines: u64,
     pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_excerpt: Option<String>,
 }
 
 /// Stable execution metrics attached to every terminal tool report.

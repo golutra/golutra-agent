@@ -33,7 +33,7 @@ use golutra_llm::{ConfiguredProvider, ProviderError, ProviderRole, protocol_capa
 use golutra_mcp::McpToolBackend;
 use golutra_memory::{MemoryError, MemoryFeedbackKind, MemoryScope, MemoryStore};
 use golutra_plugin::PluginStore;
-use golutra_policy::WorkspacePolicy;
+use golutra_policy::{WorkspacePolicy, approval_resource_matches};
 use golutra_protocol::{
     ArtifactChunk, ArtifactReadRequest, CommandAck, EventFilter, EventPage, EventPageDirection,
     EventPageRequest, ExternalVerificationSpec, ProtocolVersionRange, RUNTIME_PROTOCOL_VERSION,
@@ -173,8 +173,9 @@ pub use application::{
 pub(crate) use context::{
     compact_event_summary, compact_history_text, compact_history_with_summary,
     completion_criteria_from_payload, context_compaction_from_event, conversation_history_line,
-    environment_context_prompt, load_project_instructions, memory_context, preview_from_payload,
-    prompt_from_payload, system_prompt, task_contract_from_payload, title_from_payload,
+    effective_model_history_events, environment_context_prompt, load_project_instructions,
+    memory_context, model_prompt_from_payload, preview_from_payload, prompt_from_payload,
+    system_prompt, task_contract_from_payload, title_from_payload,
 };
 pub use debug_export::{
     DebugExportCoordinator, DebugExportManifest, DebugExportReceipt, DebugExportRequest,
@@ -208,7 +209,7 @@ pub use post_task::PostTaskCoordinator;
 #[cfg(test)]
 pub(crate) use provider_runtime::configured_provider_plan;
 pub(crate) use provider_runtime::{
-    MockProviderPlan, isolated_mock_provider_plan, mock_provider_plan,
+    MockProviderPlan, isolated_mock_provider_plan, mock_provider_plan, pin_provider_turn_settings,
 };
 pub use rollout::{RolloutEnvelope, RolloutExport, ThreadRebindResult, redact_runtime_value};
 pub(crate) use rollout::{
@@ -430,10 +431,49 @@ struct HostedTaskControl {
     task_id: TaskId,
     allow_network: bool,
     yolo: bool,
+    provider_settings: ProviderTurnSettings,
     execution: AgentExecutionHandle,
     abort_handle: AbortHandle,
     completion: watch::Receiver<bool>,
     _session_lease: Option<Arc<File>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ProviderTurnSettings {
+    profile: Option<Value>,
+    model: Option<Value>,
+    generation_config: Option<Value>,
+}
+
+impl ProviderTurnSettings {
+    fn from_payload(payload: &Value) -> Self {
+        Self {
+            profile: payload.get("provider_profile").cloned(),
+            model: payload.get("provider_model").cloned(),
+            generation_config: payload.get("provider_generation_config").cloned(),
+        }
+    }
+
+    fn normalize_queued_payload(&self, payload: &mut Value) -> Result<(), &'static str> {
+        let requested = Self::from_payload(payload);
+        if (requested.profile.is_some() && requested.profile != self.profile)
+            || (requested.model.is_some() && requested.model != self.model)
+            || (requested.generation_config.is_some()
+                && requested.generation_config != self.generation_config)
+        {
+            return Err("queued prompt cannot change provider settings while a task is active");
+        }
+        for (key, value) in [
+            ("provider_profile", &self.profile),
+            ("provider_model", &self.model),
+            ("provider_generation_config", &self.generation_config),
+        ] {
+            if let Some(value) = value {
+                payload[key] = value.clone();
+            }
+        }
+        Ok(())
+    }
 }
 
 enum SessionLeaseAttempt {
@@ -1110,7 +1150,16 @@ impl RuntimeHost {
                         pending.insert(recovered.pending.turn_id, recovered);
                     }
                 }
-                RuntimeEventType::TurnStarted => {
+                RuntimeEventType::TurnUpdated => {
+                    if let Some(mut updated) = recovered_pending_turn_from_event(&event)?
+                        && let Some(original) = pending.get(&updated.pending.turn_id)
+                    {
+                        updated.sequence_no = original.sequence_no;
+                        updated.actor = original.actor.clone();
+                        pending.insert(updated.pending.turn_id, updated);
+                    }
+                }
+                RuntimeEventType::TurnStarted | RuntimeEventType::TurnCancelled => {
                     if let Some(turn_id) = event.turn_id {
                         pending.remove(&turn_id);
                     }
@@ -1662,6 +1711,16 @@ impl RuntimeHost {
         }
         Err(ClientError::InvalidSession(format!(
             "thread `{}` does not belong to workspace `{workspace_root}`",
+            thread.thread_id
+        )))
+    }
+
+    fn ensure_thread_not_removed(&self, thread: &ThreadRecord) -> Result<(), ClientError> {
+        if !thread.removed {
+            return Ok(());
+        }
+        Err(ClientError::InvalidSession(format!(
+            "thread `{}` was removed",
             thread.thread_id
         )))
     }

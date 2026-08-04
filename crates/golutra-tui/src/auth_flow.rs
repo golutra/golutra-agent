@@ -7,6 +7,11 @@ pub(crate) async fn handle_auth_dialog_key(
     app: &mut TuiApp,
     transport: &RuntimeTransport,
 ) -> miette::Result<()> {
+    let page = usize::from(app.layout.transcript.height.saturating_sub(1)).max(1);
+    let max_scroll = app
+        .auth_dialog
+        .as_ref()
+        .map_or(0, |dialog| auth_scroll_max(dialog, app.layout.transcript));
     match key.code {
         KeyCode::Esc => {
             if let Some(dialog) = &mut app.auth_dialog {
@@ -43,6 +48,26 @@ pub(crate) async fn handle_auth_dialog_key(
         KeyCode::Enter => {
             if let Err(error) = advance_auth_dialog(app, transport).await {
                 report_auth_dialog_error(app, error);
+            }
+        }
+        KeyCode::PageUp => {
+            if let Some(dialog) = &mut app.auth_dialog {
+                dialog.scroll_by(-(page as isize), max_scroll);
+            }
+        }
+        KeyCode::PageDown => {
+            if let Some(dialog) = &mut app.auth_dialog {
+                dialog.scroll_by(page as isize, max_scroll);
+            }
+        }
+        KeyCode::Home => {
+            if let Some(dialog) = &mut app.auth_dialog {
+                dialog.scroll_to(0);
+            }
+        }
+        KeyCode::End => {
+            if let Some(dialog) = &mut app.auth_dialog {
+                dialog.scroll_to(max_scroll);
             }
         }
         KeyCode::Char(character) if character.is_ascii_digit() => {
@@ -161,6 +186,7 @@ pub(crate) async fn advance_auth_dialog(
     app: &mut TuiApp,
     transport: &RuntimeTransport,
 ) -> miette::Result<()> {
+    let previous_step = app.auth_dialog.as_ref().map(|dialog| dialog.step);
     let action = {
         let Some(dialog) = &mut app.auth_dialog else {
             return Ok(());
@@ -322,6 +348,12 @@ pub(crate) async fn advance_auth_dialog(
             },
         }
     };
+    if let Some(dialog) = &mut app.auth_dialog
+        && previous_step != Some(dialog.step)
+    {
+        dialog.scroll = 0;
+        dialog.manual_scroll = false;
+    }
     match action {
         AuthAdvanceAction::None => {}
         AuthAdvanceAction::SaveMock => {

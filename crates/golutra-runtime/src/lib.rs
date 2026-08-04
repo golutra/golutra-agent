@@ -12,16 +12,19 @@ use golutra_context::{
     compile_model_input, estimate_message_tokens, estimate_tokens, token_usage_record,
 };
 use golutra_core::{
-    ApprovalDecision, ApprovalId, ApprovalRequest, ApprovalResolution, BudgetState, CommandId,
-    CorrectionEnvelope, LoopAction, LoopDecision, PolicyBlockDisposition, PolicyDecision,
-    SessionId, SideEffectType, TaskContract, TaskId, ToolContract, ToolProgress, ToolProgressPhase,
-    ToolRecoveryPolicy, ToolResultStatus, TurnId, TurnState, VerificationCheck,
-    VerificationCheckKind, VerificationPlan, VerificationRecord, VerificationRequirement,
-    VerificationResult, WorkspaceChangeRequirement,
+    ApprovalDecision, ApprovalId, ApprovalRequest, ApprovalResolution, ApprovalScope, BudgetState,
+    CommandId, CorrectionEnvelope, LoopAction, LoopDecision, PolicyBlockDisposition,
+    PolicyDecision, PolicyEvaluation, PolicyId, SessionId, SideEffectType, TaskContract, TaskId,
+    ToolContract, ToolExecutionMetrics, ToolProgress, ToolProgressPhase, ToolRecoveryPolicy,
+    ToolResultEnvelope, ToolResultStatus, TurnId, TurnState, UserQuestionPrompt,
+    UserQuestionRequest, UserQuestionResolution, VerificationCheck, VerificationCheckKind,
+    VerificationPlan, VerificationRecord, VerificationRequirement, VerificationResult,
+    WorkspaceChangeRequirement,
 };
 #[cfg(test)]
 use golutra_core::{
-    RequiredFileContent, infer_direct_legacy_write_path, infer_legacy_write_objective,
+    RequiredFileContent, UserQuestionAnswer, infer_direct_legacy_write_path,
+    infer_legacy_write_objective,
 };
 use golutra_governor::{
     GoalLedger, GovernorAction, GovernorObservation, GovernorPhase, RuntimeGovernor,
@@ -29,7 +32,7 @@ use golutra_governor::{
 use golutra_llm::{
     LlmProvider, ProviderError, ProviderMessage, ProviderRequest, ProviderResponse, ProviderRole,
 };
-use golutra_policy::parse_shell_command_with_input;
+use golutra_policy::{approval_resource_matches, parse_shell_command_with_input};
 use golutra_protocol::ExternalVerificationSpec;
 use golutra_tools::{
     CONTRACT_FILE_CONTENT_VERIFIER_TOOL, CONTRACT_PATH_VERIFIER_TOOL, FileBeforeImage, ToolError,
@@ -37,7 +40,7 @@ use golutra_tools::{
     model_visible_tool_result, redact_sensitive_text, redact_tool_arguments,
 };
 use golutra_verify::VerificationInput;
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{Notify, mpsc, watch};
@@ -81,8 +84,14 @@ pub enum AgentLoopError {
     PendingTurnQueueClosed,
     #[error("agent pending turn queue is full")]
     PendingTurnQueueFull,
+    #[error("queued agent turn was not found")]
+    PendingTurnNotFound,
+    #[error("queued agent turn is already being changed")]
+    PendingTurnMutationInProgress,
     #[error("invalid task contract: {0}")]
     TaskContract(String),
+    #[error("invalid user question response: {0}")]
+    UserQuestion(String),
     #[error("agent harness worker failed: {0}")]
     Worker(String),
 }
@@ -168,6 +177,7 @@ pub struct AgentExecutionHandle {
     pause: watch::Sender<bool>,
     pending_turns: Arc<PendingTurnQueue>,
     approvals: mpsc::Sender<ApprovalResolution>,
+    questions: mpsc::Sender<UserQuestionResolution>,
 }
 
 impl AgentExecutionHandle {
@@ -195,11 +205,36 @@ impl AgentExecutionHandle {
         self.pending_turns.reserve(turn)
     }
 
+    pub fn reserve_turn_update(
+        &self,
+        turn_id: TurnId,
+        replacement: PendingAgentTurn,
+    ) -> Result<PendingTurnMutation, AgentLoopError> {
+        self.pending_turns.reserve_update(turn_id, replacement)
+    }
+
+    pub fn reserve_turn_cancellation(
+        &self,
+        turn_id: TurnId,
+    ) -> Result<PendingTurnMutation, AgentLoopError> {
+        self.pending_turns.reserve_cancellation(turn_id)
+    }
+
     pub async fn resolve_approval(
         &self,
         resolution: ApprovalResolution,
     ) -> Result<(), AgentLoopError> {
         self.approvals
+            .send(resolution)
+            .await
+            .map_err(|_| AgentLoopError::Cancelled)
+    }
+
+    pub async fn resolve_question(
+        &self,
+        resolution: UserQuestionResolution,
+    ) -> Result<(), AgentLoopError> {
+        self.questions
             .send(resolution)
             .await
             .map_err(|_| AgentLoopError::Cancelled)
@@ -217,6 +252,15 @@ pub struct AgentExecutionControl {
     pause: watch::Receiver<bool>,
     pending_turns: Arc<PendingTurnQueue>,
     approvals: mpsc::Receiver<ApprovalResolution>,
+    questions: mpsc::Receiver<UserQuestionResolution>,
+    approval_grants: Vec<ApprovalGrant>,
+}
+
+#[derive(Debug, Clone)]
+struct ApprovalGrant {
+    scope: ApprovalScope,
+    tool_name: String,
+    resource_prefix: Option<String>,
 }
 
 #[derive(Debug)]
@@ -244,6 +288,35 @@ pub struct PendingTurnReservation {
     queue: Arc<PendingTurnQueue>,
     turn_id: TurnId,
     committed: bool,
+}
+
+#[derive(Debug)]
+enum PendingTurnMutationKind {
+    Update { original: Box<PendingAgentTurn> },
+    Cancel,
+}
+
+#[derive(Debug)]
+#[must_use = "dropping an uncommitted mutation restores the pending turn"]
+pub struct PendingTurnMutation {
+    queue: Arc<PendingTurnQueue>,
+    turn_id: TurnId,
+    kind: Option<PendingTurnMutationKind>,
+}
+
+impl PendingTurnMutation {
+    pub fn commit(mut self) {
+        let kind = self.kind.take().expect("pending turn mutation kind");
+        self.queue.commit_mutation(self.turn_id, kind);
+    }
+}
+
+impl Drop for PendingTurnMutation {
+    fn drop(&mut self) {
+        if let Some(kind) = self.kind.take() {
+            self.queue.rollback_mutation(self.turn_id, kind);
+        }
+    }
 }
 
 impl PendingTurnReservation {
@@ -304,6 +377,61 @@ impl PendingTurnQueue {
         })
     }
 
+    fn reserve_update(
+        self: &Arc<Self>,
+        turn_id: TurnId,
+        replacement: PendingAgentTurn,
+    ) -> Result<PendingTurnMutation, AgentLoopError> {
+        if replacement.turn_id != turn_id {
+            return Err(AgentLoopError::PendingTurnNotFound);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = state
+            .turns
+            .iter_mut()
+            .find(|entry| entry.turn.turn_id == turn_id)
+            .ok_or(AgentLoopError::PendingTurnNotFound)?;
+        if !entry.durable {
+            return Err(AgentLoopError::PendingTurnMutationInProgress);
+        }
+        let original = std::mem::replace(&mut entry.turn, replacement);
+        entry.durable = false;
+        Ok(PendingTurnMutation {
+            queue: self.clone(),
+            turn_id,
+            kind: Some(PendingTurnMutationKind::Update {
+                original: Box::new(original),
+            }),
+        })
+    }
+
+    fn reserve_cancellation(
+        self: &Arc<Self>,
+        turn_id: TurnId,
+    ) -> Result<PendingTurnMutation, AgentLoopError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = state
+            .turns
+            .iter_mut()
+            .find(|entry| entry.turn.turn_id == turn_id)
+            .ok_or(AgentLoopError::PendingTurnNotFound)?;
+        if !entry.durable {
+            return Err(AgentLoopError::PendingTurnMutationInProgress);
+        }
+        entry.durable = false;
+        Ok(PendingTurnMutation {
+            queue: self.clone(),
+            turn_id,
+            kind: Some(PendingTurnMutationKind::Cancel),
+        })
+    }
+
     fn commit(&self, turn_id: TurnId) {
         if let Some(entry) = self
             .state
@@ -324,6 +452,48 @@ impl PendingTurnQueue {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .turns
             .retain(|entry| entry.turn.turn_id != turn_id);
+        self.changed.notify_waiters();
+    }
+
+    fn commit_mutation(&self, turn_id: TurnId, kind: PendingTurnMutationKind) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match kind {
+            PendingTurnMutationKind::Update { .. } => {
+                if let Some(entry) = state
+                    .turns
+                    .iter_mut()
+                    .find(|entry| entry.turn.turn_id == turn_id)
+                {
+                    entry.durable = true;
+                }
+            }
+            PendingTurnMutationKind::Cancel => {
+                state.turns.retain(|entry| entry.turn.turn_id != turn_id);
+            }
+        }
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    fn rollback_mutation(&self, turn_id: TurnId, kind: PendingTurnMutationKind) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = state
+            .turns
+            .iter_mut()
+            .find(|entry| entry.turn.turn_id == turn_id)
+        {
+            if let PendingTurnMutationKind::Update { original } = kind {
+                entry.turn = *original;
+            }
+            entry.durable = true;
+        }
+        drop(state);
         self.changed.notify_waiters();
     }
 
@@ -385,18 +555,22 @@ pub fn agent_execution_channel(capacity: usize) -> (AgentExecutionHandle, AgentE
     let (pause_tx, pause_rx) = watch::channel(false);
     let pending_turns = Arc::new(PendingTurnQueue::new(capacity));
     let (approval_tx, approval_rx) = mpsc::channel(capacity.max(1));
+    let (question_tx, question_rx) = mpsc::channel(capacity.max(1));
     (
         AgentExecutionHandle {
             cancellation: cancellation.clone(),
             pause: pause_tx,
             pending_turns: pending_turns.clone(),
             approvals: approval_tx,
+            questions: question_tx,
         },
         AgentExecutionControl {
             cancellation,
             pause: pause_rx,
             pending_turns,
             approvals: approval_rx,
+            questions: question_rx,
+            approval_grants: Vec::new(),
         },
     )
 }
@@ -1210,6 +1384,52 @@ where
                         display_arguments: redact_tool_arguments(&tool_request.arguments),
                         recovery_policy,
                     });
+                    let question_report = if tool_request.tool_name == "ask_user" {
+                        match tool_request
+                            .arguments
+                            .get("questions")
+                            .cloned()
+                            .map(serde_json::from_value::<Vec<UserQuestionPrompt>>)
+                            .transpose()
+                        {
+                            Ok(Some(questions)) => {
+                                let question = UserQuestionRequest {
+                                    question_id: golutra_core::QuestionId::new(),
+                                    task_id: request.task_id,
+                                    turn_id: current_turn_id,
+                                    tool_call_id: tool_request.tool_call_id,
+                                    questions,
+                                };
+                                match question.validate() {
+                                    Ok(()) => {
+                                        trace(AgentLoopTraceEvent::UserQuestionRequested(
+                                            question.clone(),
+                                        ));
+                                        let resolution =
+                                            control.wait_for_question(&question).await?;
+                                        trace(AgentLoopTraceEvent::UserQuestionResolved(
+                                            resolution.clone(),
+                                        ));
+                                        Some(user_question_report(tool_request.clone(), resolution))
+                                    }
+                                    Err(error) => Some(
+                                        self.tool_executor
+                                            .invalid_request_report(tool_request.clone(), error),
+                                    ),
+                                }
+                            }
+                            Ok(None) => Some(self.tool_executor.invalid_request_report(
+                                tool_request.clone(),
+                                "ask_user requires questions",
+                            )),
+                            Err(error) => Some(self.tool_executor.invalid_request_report(
+                                tool_request.clone(),
+                                format!("invalid ask_user questions: {error}"),
+                            )),
+                        }
+                    } else {
+                        None
+                    };
                     let contract_blocked_report = self
                         .tool_executor
                         .registry()
@@ -1235,7 +1455,22 @@ where
                         )
                     });
                     let strategy_was_blocked = strategy_blocked_report.is_some();
-                    let mut report = if let Some(report) = strategy_blocked_report {
+                    let mut report = if let Some(report) = question_report {
+                        trace(AgentLoopTraceEvent::PolicyEvaluated(
+                            report.policy_evaluation.clone(),
+                        ));
+                        trace(AgentLoopTraceEvent::ToolProgress(ToolProgress {
+                            tool_call_id: report.envelope.tool_call_id,
+                            tool_name: report.envelope.tool_name.clone(),
+                            phase: ToolProgressPhase::Completed,
+                            elapsed_ms: report.metrics.duration_ms,
+                            output_bytes: report.metrics.output_bytes,
+                            output_lines: report.metrics.output_lines,
+                            detail: Some("answered".to_owned()),
+                            output_excerpt: report.envelope.model_visible_excerpt.clone(),
+                        }));
+                        report
+                    } else if let Some(report) = strategy_blocked_report {
                         trace(AgentLoopTraceEvent::PolicyEvaluated(
                             report.policy_evaluation.clone(),
                         ));
@@ -1247,6 +1482,7 @@ where
                             output_bytes: report.metrics.output_bytes,
                             output_lines: report.metrics.output_lines,
                             detail: Some("strategy_blocked".to_owned()),
+                            output_excerpt: None,
                         }));
                         report
                     } else if let Some(report) = contract_blocked_report {
@@ -1261,6 +1497,7 @@ where
                             output_bytes: report.metrics.output_bytes,
                             output_lines: report.metrics.output_lines,
                             detail: Some("blocked".to_owned()),
+                            output_excerpt: None,
                         }));
                         report
                     } else {
@@ -1278,8 +1515,10 @@ where
                                         reason: policy.reason.clone(),
                                     };
                                     trace(AgentLoopTraceEvent::ApprovalRequested(approval.clone()));
-                                    let resolution =
-                                        control.wait_for_approval(approval.approval_id).await?;
+                                    let resolution = match control.scoped_approval(&approval) {
+                                        Some(resolution) => resolution,
+                                        None => control.wait_for_approval(&approval).await?,
+                                    };
                                     let approved =
                                         resolution.decision == ApprovalDecision::Approved;
                                     trace(AgentLoopTraceEvent::ApprovalResolved(resolution));
@@ -1315,6 +1554,7 @@ where
                                             output_bytes: report.metrics.output_bytes,
                                             output_lines: report.metrics.output_lines,
                                             detail: Some("error".to_owned()),
+                                            output_excerpt: None,
                                         }));
                                         report
                                     }
@@ -1405,6 +1645,7 @@ where
                                     output_bytes: report.metrics.output_bytes,
                                     output_lines: report.metrics.output_lines,
                                     detail: Some("error".to_owned()),
+                                    output_excerpt: None,
                                 }));
                                 report
                             }
@@ -2436,21 +2677,138 @@ impl AgentExecutionControl {
         }
     }
 
+    fn scoped_approval(&self, request: &ApprovalRequest) -> Option<ApprovalResolution> {
+        self.approval_grants.iter().find_map(|grant| {
+            let matches = match grant.scope {
+                ApprovalScope::Session => true,
+                ApprovalScope::ResourcePrefix => {
+                    grant.tool_name == request.tool_name
+                        && grant.resource_prefix.as_deref().is_some_and(|prefix| {
+                            approval_resource_matches(&request.tool_name, prefix, &request.resource)
+                        })
+                }
+                ApprovalScope::Once => false,
+            };
+            matches.then(|| ApprovalResolution {
+                approval_id: request.approval_id,
+                decision: ApprovalDecision::Approved,
+                scope: grant.scope,
+                resource_prefix: grant.resource_prefix.clone(),
+                reason: "matched an explicit scoped approval from this execution".to_owned(),
+            })
+        })
+    }
+
     async fn wait_for_approval(
         &mut self,
-        approval_id: ApprovalId,
+        request: &ApprovalRequest,
     ) -> Result<ApprovalResolution, AgentLoopError> {
         loop {
             tokio::select! {
                 _ = self.cancellation.cancelled() => return Err(AgentLoopError::Cancelled),
                 resolution = self.approvals.recv() => {
-                    let resolution = resolution.ok_or(AgentLoopError::Cancelled)?;
-                    if resolution.approval_id == approval_id {
+                    let mut resolution = resolution.ok_or(AgentLoopError::Cancelled)?;
+                    if resolution.approval_id == request.approval_id {
+                        if resolution.decision != ApprovalDecision::Approved {
+                            resolution.scope = ApprovalScope::Once;
+                            resolution.resource_prefix = None;
+                        } else if resolution.scope == ApprovalScope::ResourcePrefix {
+                            let valid_prefix = resolution
+                                .resource_prefix
+                                .as_deref()
+                                .filter(|prefix| !prefix.is_empty())
+                                .filter(|prefix| {
+                                    approval_resource_matches(
+                                        &request.tool_name,
+                                        prefix,
+                                        &request.resource,
+                                    )
+                                });
+                            if valid_prefix.is_none() {
+                                resolution.scope = ApprovalScope::Once;
+                                resolution.resource_prefix = None;
+                            }
+                        } else {
+                            resolution.resource_prefix = None;
+                        }
+                        if resolution.decision == ApprovalDecision::Approved
+                            && resolution.scope != ApprovalScope::Once
+                        {
+                            self.approval_grants.push(ApprovalGrant {
+                                scope: resolution.scope,
+                                tool_name: request.tool_name.clone(),
+                                resource_prefix: resolution.resource_prefix.clone(),
+                            });
+                        }
                         return Ok(resolution);
                     }
                 }
             }
         }
+    }
+
+    async fn wait_for_question(
+        &mut self,
+        request: &UserQuestionRequest,
+    ) -> Result<UserQuestionResolution, AgentLoopError> {
+        loop {
+            tokio::select! {
+                _ = self.cancellation.cancelled() => return Err(AgentLoopError::Cancelled),
+                resolution = self.questions.recv() => {
+                    let resolution = resolution.ok_or(AgentLoopError::Cancelled)?;
+                    if resolution.question_id == request.question_id {
+                        request
+                            .validate_resolution(&resolution)
+                            .map_err(AgentLoopError::UserQuestion)?;
+                        return Ok(resolution);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn user_question_report(
+    request: ToolRequest,
+    resolution: UserQuestionResolution,
+) -> ToolExecutionReport {
+    let content = serde_json::to_string(&resolution.answers).unwrap_or_else(|_| "[]".to_owned());
+    let output_bytes = u64::try_from(content.len()).unwrap_or(u64::MAX);
+    let output_lines = u64::try_from(resolution.answers.len()).unwrap_or(u64::MAX);
+    ToolExecutionReport {
+        envelope: ToolResultEnvelope {
+            tool_call_id: request.tool_call_id,
+            tool_name: request.tool_name.clone(),
+            status: ToolResultStatus::Ok,
+            summary: "user answered structured questions".to_owned(),
+            structured_facts: json!({"answers": resolution.answers}),
+            model_visible_excerpt: Some(content),
+            raw_artifact_ref: None,
+            evidence_refs: Vec::new(),
+            risk: "p0_user_input".to_owned(),
+            verification_hint: None,
+        },
+        artifacts: Vec::new(),
+        evidence: Vec::new(),
+        changed_files: Vec::new(),
+        policy_evaluation: PolicyEvaluation {
+            policy_ref: PolicyId::new(),
+            subject: "tool".to_owned(),
+            action: request.tool_name,
+            resource: "interactive_user_input".to_owned(),
+            decision: PolicyDecision::Allow,
+            block_disposition: None,
+            reason: "structured user input is mediated by the active controller".to_owned(),
+            evidence_refs: Vec::new(),
+        },
+        artifact_contents: Vec::new(),
+        before_images: Vec::new(),
+        after_images: Vec::new(),
+        metrics: ToolExecutionMetrics {
+            output_bytes,
+            output_lines,
+            ..ToolExecutionMetrics::default()
+        },
     }
 }
 

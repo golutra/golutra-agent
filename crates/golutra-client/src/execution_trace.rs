@@ -135,6 +135,7 @@ impl RuntimeHost {
             AgentLoopTraceEvent::PendingTurnStarted(turn) => Some(turn.turn_id),
             AgentLoopTraceEvent::AssistantMessage { turn_id, .. } => Some(*turn_id),
             AgentLoopTraceEvent::ApprovalRequested(approval) => Some(approval.turn_id),
+            AgentLoopTraceEvent::UserQuestionRequested(request) => Some(request.turn_id),
             AgentLoopTraceEvent::TokenUsageRecorded(record) => Some(record.turn_id),
             _ => Some(active_turn_id),
         };

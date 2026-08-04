@@ -153,12 +153,9 @@ impl RuntimeHost {
             .as_ref()
             .map(|(sequence_no, _)| format!("event-sequence:{sequence_no}"));
         let summary_line = context_compaction.map(|(_, content)| format!("Summary: {content}"));
-        let history_events = events
-            .iter()
-            .filter(|event| event.sequence_no > compacted_after)
-            .filter(|event| event.task_id != Some(current_task_id))
-            .filter(|event| event.event_type.is_model_history_fact())
-            .collect::<Vec<_>>();
+        let history_events = effective_model_history_events(events.iter().filter(|event| {
+            event.sequence_no > compacted_after && event.task_id != Some(current_task_id)
+        }));
         let lines = history_events
             .iter()
             .filter_map(|event| conversation_history_line(event))
@@ -226,6 +223,7 @@ impl RuntimeHost {
                     .get("yolo")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                provider_settings: ProviderTurnSettings::from_payload(&task.payload),
                 execution,
                 abort_handle,
                 completion,
@@ -294,7 +292,7 @@ impl RuntimeHost {
         control: AgentExecutionControl,
     ) -> Result<(), ClientError> {
         let started_at = Instant::now();
-        let objective = prompt_from_payload(&task.payload);
+        let objective = model_prompt_from_payload(&task.payload);
         let explicit_task_contract = task
             .payload
             .get("task_contract")

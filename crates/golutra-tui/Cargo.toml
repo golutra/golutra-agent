@@ -7,6 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
 crossterm.workspace = true
@@ -18,13 +19,17 @@ golutra-config = { path = "../golutra-config" }
 golutra-core.workspace = true
 golutra-llm = { path = "../golutra-llm" }
 golutra-protocol.workspace = true
+ignore.workspace = true
 miette.workspace = true
 nix = { workspace = true, features = ["user"] }
+pulldown-cmark.workspace = true
 ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 serde.workspace = true
 serde_json.workspace = true
 secrecy.workspace = true
 sha2.workspace = true
+shlex.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 unicode-segmentation.workspace = true
@@ -33,4 +38,3 @@ uuid.workspace = true
 
 [dev-dependencies]
 golutra-app-server = { path = "../golutra-app-server" }
-tempfile.workspace = true

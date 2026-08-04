@@ -7,9 +7,15 @@ use serde_json::Value;
 #[serde(rename_all = "snake_case")]
 pub enum SessionCommandKind {
     Create,
+    RenameThread,
+    ArchiveThread,
+    DeleteThread,
     Prompt,
+    UpdateQueuedTurn,
+    CancelQueuedTurn,
     Approve,
     Deny,
+    AnswerQuestion,
     Pause,
     Resume,
     Abort,

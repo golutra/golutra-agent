@@ -8,6 +8,7 @@ use ratatui::style::Style;
 use serde_json::json;
 
 use super::*;
+use crate::BodyLayoutMode;
 
 fn event(
     sequence_no: u64,
@@ -231,9 +232,11 @@ fn hit_regions_expose_visible_transcript_operation_toggles() {
     ));
     let layout = UiLayoutSnapshot {
         header: Rect::new(0, 0, 80, 1),
+        body: Rect::new(0, 1, 80, 12),
         transcript: Rect::new(0, 1, 80, 12),
         developer: None,
         bottom: Rect::new(0, 13, 80, 4),
+        body_mode: BodyLayoutMode::Transcript,
     };
 
     let regions = frame_hit_regions(layout, layout.transcript, &app);
@@ -247,6 +250,47 @@ fn hit_regions_expose_visible_transcript_operation_toggles() {
         (toggle.x, toggle.y, toggle.width, toggle.height),
         (0, 2, 4, 1)
     );
+}
+
+#[test]
+fn hit_regions_expose_overlay_tabs_and_actions() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.help_dialog = Some(crate::HelpDialogState::new(
+        crate::HelpTopic::Overview,
+        "composer",
+    ));
+    let layout = UiLayoutSnapshot {
+        header: Rect::new(0, 0, 100, 1),
+        body: Rect::new(0, 1, 100, 16),
+        transcript: Rect::new(0, 1, 100, 16),
+        developer: None,
+        bottom: Rect::new(0, 17, 100, 4),
+        body_mode: BodyLayoutMode::Transcript,
+    };
+
+    let regions = frame_hit_regions(layout, Rect::new(0, 0, 100, 21), &app);
+    let overlay = regions
+        .iter()
+        .find(|region| region.id == "overlay")
+        .expect("overlay hit region");
+    assert_eq!(overlay.pane, TuiHitPane::Overlay);
+    assert_eq!(
+        (overlay.x, overlay.y, overlay.width, overlay.height),
+        (0, 1, 100, 16)
+    );
+    let whats_new = regions
+        .iter()
+        .find(|region| region.id == "help_what_s_new")
+        .expect("what's new hit region");
+    assert_eq!(whats_new.pane, TuiHitPane::Overlay);
+    assert_eq!(whats_new.height, 1);
 }
 
 #[test]

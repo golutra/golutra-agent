@@ -97,6 +97,7 @@ impl RuntimeHost {
                 ))
             })?;
         self.ensure_thread_in_workspace(&anchor)?;
+        self.ensure_thread_not_removed(&anchor)?;
         if anchor.archived {
             return Err(ClientError::InvalidSession(format!(
                 "thread `{}` is archived",
@@ -129,6 +130,7 @@ impl RuntimeHost {
         let thread = self.repositories.threads.by_session(session_id).await?;
         if let Some(thread) = &thread {
             self.ensure_thread_in_workspace(thread)?;
+            self.ensure_thread_not_removed(thread)?;
         }
         Ok(thread)
     }
@@ -143,6 +145,7 @@ impl RuntimeHost {
                 ClientError::InvalidSession(format!("thread `{thread_id}` not found"))
             })?;
         self.ensure_thread_in_workspace(&thread)?;
+        self.ensure_thread_not_removed(&thread)?;
         Ok(thread)
     }
 
@@ -160,6 +163,7 @@ impl RuntimeHost {
                 ClientError::InvalidSession(format!("thread `{thread_id}` not found"))
             })?;
         self.ensure_thread_in_workspace(&parent)?;
+        self.ensure_thread_not_removed(&parent)?;
         let parent_state = self
             .repositories
             .projections
@@ -207,6 +211,7 @@ impl RuntimeHost {
             updated_at: now,
             recency_at: now,
             archived: false,
+            removed: false,
         };
         let _writer = self.event_writer.lock().await;
         let forked_events = self
@@ -331,6 +336,7 @@ impl RuntimeHost {
                 thread.workspace_root.as_deref().unwrap_or("<none>")
             )));
         }
+        self.ensure_thread_not_removed(&thread)?;
         let state = self
             .repositories
             .projections
@@ -427,6 +433,7 @@ impl RuntimeHost {
         let existing = self.repositories.threads.by_session(session_id).await?;
         if let Some(existing) = &existing {
             self.ensure_thread_in_workspace(existing)?;
+            self.ensure_thread_not_removed(existing)?;
         }
         let payload_thread_id = thread_id_from_payload(payload);
         if let (Some(existing), Some(payload_thread_id)) = (&existing, payload_thread_id)
@@ -443,6 +450,7 @@ impl RuntimeHost {
         };
         if let Some(payload_thread) = &payload_thread {
             self.ensure_thread_in_workspace(payload_thread)?;
+            self.ensure_thread_not_removed(payload_thread)?;
         }
         if let Some(payload_thread) = &payload_thread
             && payload_thread.session_id != session_id
@@ -486,6 +494,7 @@ impl RuntimeHost {
             updated_at: now,
             recency_at: now,
             archived: false,
+            removed: false,
         };
         self.repositories.threads.upsert(&thread).await?;
         Ok(())

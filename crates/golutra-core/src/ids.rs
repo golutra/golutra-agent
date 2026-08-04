@@ -63,6 +63,7 @@ define_id!(EventId);
 define_id!(LaneId);
 define_id!(DecisionId);
 define_id!(ApprovalId);
+define_id!(QuestionId);
 define_id!(MemoryId);
 define_id!(ToolCallId);
 define_id!(ArtifactId);

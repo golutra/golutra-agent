@@ -3,7 +3,8 @@
 use std::time::Duration;
 
 use golutra_config::{
-    ProviderConfigPaths, ProviderRuntimeEnv, load_provider_runtime_env_from_paths,
+    ProviderConfigPaths, ProviderRuntimeEnv, load_merged_provider_settings,
+    load_provider_runtime_env_for_profile_from_paths, load_provider_runtime_env_from_paths,
 };
 use golutra_context::{ContextBudgetPolicy, ContextBuilder};
 use golutra_llm::{
@@ -24,17 +25,54 @@ pub(crate) struct MockProviderPlan {
     pub(crate) provider_session_policy: ProviderSessionPolicy,
 }
 
+pub(crate) fn pin_provider_turn_settings(
+    provider_config_paths: Option<&ProviderConfigPaths>,
+    payload: &mut Value,
+) {
+    let Some(paths) = provider_config_paths else {
+        return;
+    };
+    // Invalid or incomplete provider configuration is handled by the runtime's
+    // authentication flow. Only pin a binding when it can be resolved now.
+    let Ok(settings) = load_merged_provider_settings(paths) else {
+        return;
+    };
+    let requested_profile = match payload.get("provider_profile") {
+        None => None,
+        Some(Value::String(profile)) if !profile.trim().is_empty() => Some(profile.trim()),
+        Some(_) => return,
+    };
+    let profile = match requested_profile {
+        Some(requested_profile) => settings
+            .profiles
+            .iter()
+            .find(|profile| profile.enabled && profile.name == requested_profile),
+        None => settings.active_profile(),
+    };
+    let Some(profile) = profile else {
+        return;
+    };
+
+    payload["provider_profile"] = Value::String(profile.name.clone());
+    if payload.get("provider_model").is_none()
+        && let Some(model_id) = &profile.model_id
+    {
+        payload["provider_model"] = Value::String(model_id.clone());
+    }
+    if payload.get("provider_generation_config").is_none() {
+        payload["provider_generation_config"] = profile
+            .generation_config
+            .as_ref()
+            .map_or_else(|| json!({}), |config| json!(config));
+    }
+}
+
 pub(crate) fn mock_provider_plan(
     provider_config_paths: Option<&ProviderConfigPaths>,
     payload: &Value,
     objective: &str,
 ) -> Result<MockProviderPlan, ProviderError> {
-    let provider_env = provider_config_paths
-        .map(load_provider_runtime_env_from_paths)
-        .transpose()
-        .map_err(|error| ProviderError::NotConfigured {
-            message: format!("provider configuration could not be loaded: {error}"),
-        })?;
+    let provider_env = provider_runtime_env_for_payload(provider_config_paths, payload)?;
     #[cfg(test)]
     if payload
         .get("mock_provider_failure")
@@ -107,6 +145,81 @@ pub(crate) fn mock_provider_plan(
         false,
         legacy.requests_workspace_tools(),
     )
+}
+
+fn provider_runtime_env_for_payload(
+    provider_config_paths: Option<&ProviderConfigPaths>,
+    payload: &Value,
+) -> Result<Option<ProviderRuntimeEnv>, ProviderError> {
+    let profile_name = optional_bounded_string(payload, "provider_profile", 128)?;
+    let model_id = optional_bounded_string(payload, "provider_model", 256)?;
+    let generation_config = payload
+        .get("provider_generation_config")
+        .map(|value| {
+            serde_json::from_value::<golutra_llm::ProviderGenerationConfig>(value.clone())
+                .map_err(|error| ProviderError::NotConfigured {
+                    message: format!("provider generation override is invalid: {error}"),
+                })
+                .and_then(|config| {
+                    config
+                        .validate()
+                        .map_err(|message| ProviderError::NotConfigured { message })?;
+                    serde_json::to_string(&config).map_err(|error| ProviderError::NotConfigured {
+                        message: format!(
+                            "provider generation override could not be encoded: {error}"
+                        ),
+                    })
+                })
+        })
+        .transpose()?;
+
+    let Some(paths) = provider_config_paths else {
+        if profile_name.is_some() || model_id.is_some() || generation_config.is_some() {
+            return Err(ProviderError::NotConfigured {
+                message: "provider overrides require configured provider paths".to_owned(),
+            });
+        }
+        return Ok(None);
+    };
+    let mut environment = match profile_name {
+        Some(profile_name) => {
+            load_provider_runtime_env_for_profile_from_paths(paths, &profile_name)
+        }
+        None => load_provider_runtime_env_from_paths(paths),
+    }
+    .map_err(|error| ProviderError::NotConfigured {
+        message: format!("provider configuration could not be loaded: {error}"),
+    })?;
+    if let Some(model_id) = model_id {
+        environment = environment.with_runtime_override("GOLUTRA_PROVIDER_MODEL", model_id);
+    }
+    if let Some(generation_config) = generation_config {
+        environment = environment
+            .with_runtime_override("GOLUTRA_PROVIDER_GENERATION_CONFIG", generation_config);
+    }
+    Ok(Some(environment))
+}
+
+fn optional_bounded_string(
+    payload: &Value,
+    key: &str,
+    max_chars: usize,
+) -> Result<Option<String>, ProviderError> {
+    let Some(value) = payload.get(key) else {
+        return Ok(None);
+    };
+    let value = value
+        .as_str()
+        .ok_or_else(|| ProviderError::NotConfigured {
+            message: format!("{key} must be a string"),
+        })?
+        .trim();
+    if value.is_empty() || value.chars().count() > max_chars {
+        return Err(ProviderError::NotConfigured {
+            message: format!("{key} must contain between 1 and {max_chars} characters"),
+        });
+    }
+    Ok(Some(value.to_owned()))
 }
 
 pub(crate) fn isolated_mock_provider_plan(
@@ -360,4 +473,120 @@ fn non_empty_string_payload(payload: &Value, key: &str) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .map(ToOwned::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use golutra_auth::{CredentialRef, SecretKind};
+    use golutra_config::{ProviderProfile, ProviderSettings};
+    use golutra_llm::ProviderReasoningEffort;
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn provider_turn_binding_pins_defaults_without_overwriting_explicit_overrides() {
+        let home = tempdir().expect("home");
+        let paths = ProviderConfigPaths::from_home(home.path()).expect("paths");
+        let mut profile = ProviderProfile::mock();
+        profile.name = "primary".to_owned();
+        profile.model_id = Some("configured-model".to_owned());
+        profile.generation_config = Some(
+            serde_json::from_value(json!({"reasoning_effort": "high"})).expect("generation config"),
+        );
+        let mut settings = ProviderSettings::default();
+        settings.upsert_profile(profile, true);
+        settings.save(&paths.user_config).expect("save settings");
+
+        let mut defaults = json!({"prompt": "hello"});
+        pin_provider_turn_settings(Some(&paths), &mut defaults);
+        assert_eq!(defaults["provider_profile"], "primary");
+        assert_eq!(defaults["provider_model"], "configured-model");
+        assert_eq!(
+            defaults["provider_generation_config"],
+            json!({"reasoning_effort": "high"})
+        );
+
+        let mut overridden = json!({
+            "provider_model": "turn-model",
+            "provider_generation_config": {"reasoning_effort": "low"},
+        });
+        pin_provider_turn_settings(Some(&paths), &mut overridden);
+        assert_eq!(overridden["provider_profile"], "primary");
+        assert_eq!(overridden["provider_model"], "turn-model");
+        assert_eq!(
+            overridden["provider_generation_config"],
+            json!({"reasoning_effort": "low"})
+        );
+
+        let mut malformed = json!({"provider_profile": 7});
+        pin_provider_turn_settings(Some(&paths), &mut malformed);
+        assert_eq!(malformed, json!({"provider_profile": 7}));
+
+        let mut without_paths = json!({"prompt": "hello"});
+        pin_provider_turn_settings(None, &mut without_paths);
+        assert_eq!(without_paths, json!({"prompt": "hello"}));
+    }
+
+    #[test]
+    fn task_provider_overrides_are_ephemeral_and_validated() {
+        let home = tempdir().expect("home");
+        let paths = ProviderConfigPaths::from_home(home.path()).expect("paths");
+        let profile = ProviderProfile::openai_compatible(
+            "primary",
+            "https://api.example.com/v1",
+            "configured-model",
+            CredentialRef::ephemeral(SecretKind::ApiKey),
+        )
+        .expect("profile");
+        let mut settings = ProviderSettings::default();
+        settings.upsert_profile(profile, true);
+        settings.save(&paths.user_config).expect("save settings");
+
+        let environment = provider_runtime_env_for_payload(
+            Some(&paths),
+            &json!({
+                "provider_profile": "primary",
+                "provider_model": "session-model",
+                "provider_generation_config": {
+                    "reasoning_effort": "high"
+                }
+            }),
+        )
+        .expect("provider environment")
+        .expect("configured environment");
+
+        assert_eq!(
+            environment.get("GOLUTRA_PROVIDER_MODEL").as_deref(),
+            Some("session-model")
+        );
+        let generation = environment
+            .get("GOLUTRA_PROVIDER_GENERATION_CONFIG")
+            .and_then(|value| {
+                serde_json::from_str::<golutra_llm::ProviderGenerationConfig>(&value).ok()
+            })
+            .expect("generation config");
+        assert_eq!(
+            generation.reasoning_effort,
+            Some(ProviderReasoningEffort::High)
+        );
+        assert_eq!(
+            ProviderSettings::load(&paths.user_config)
+                .expect("persisted settings")
+                .active_profile()
+                .and_then(|profile| profile.model_id.as_deref()),
+            Some("configured-model")
+        );
+
+        assert!(
+            provider_runtime_env_for_payload(Some(&paths), &json!({"provider_model": ""})).is_err()
+        );
+        assert!(
+            provider_runtime_env_for_payload(
+                Some(&paths),
+                &json!({"provider_generation_config": {"max_tokens": 0}})
+            )
+            .is_err()
+        );
+    }
 }

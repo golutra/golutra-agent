@@ -3,7 +3,7 @@
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
@@ -13,6 +13,8 @@ use super::*;
 const DEVELOPER_TITLE_PREFIX: &str = "Developer runtime  ";
 const DEVELOPER_FACTS_COLLAPSED: &str = "▸ facts";
 const DEVELOPER_FACTS_EXPANDED: &str = "▾ facts";
+const DEVELOPER_FACTS_COLLAPSED_ASCII: &str = "> facts";
+const DEVELOPER_FACTS_EXPANDED_ASCII: &str = "v facts";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct DeveloperEventLayout {
@@ -98,6 +100,7 @@ pub(crate) fn developer_event_layout(app: &TuiApp, area: Rect) -> DeveloperEvent
             &summary,
             usize::from(content_width),
             app.developer_facts_expanded,
+            app.palette(),
         );
         row_count = row_count.saturating_add(event_line_count(
             lines,
@@ -149,6 +152,7 @@ pub(crate) fn developer_facts_toggle_hit_rect(area: Rect) -> Rect {
 }
 
 pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let palette = app.palette();
     let content_width = area.width.saturating_sub(2);
     let visible_rows = area.height.saturating_sub(1) as usize;
     let rows = developer_rows(app);
@@ -162,7 +166,7 @@ pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiA
         .filter_map(|row| match row {
             DeveloperPanelRow::Summary(summary) => Some(Line::from(Span::styled(
                 truncate_end_to_width(summary, usize::from(content_width)),
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(palette.accent),
             ))),
             DeveloperPanelRow::Event { .. } => None,
         })
@@ -182,10 +186,15 @@ pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiA
                 &summary,
                 usize::from(content_width),
                 app.developer_facts_expanded,
+                palette,
             ),
         })
         .collect::<Vec<_>>();
-    let facts_toggle = if app.developer_facts_expanded {
+    let facts_toggle = if app.preferences.screen_reader && app.developer_facts_expanded {
+        DEVELOPER_FACTS_EXPANDED_ASCII
+    } else if app.preferences.screen_reader {
+        DEVELOPER_FACTS_COLLAPSED_ASCII
+    } else if app.developer_facts_expanded {
         DEVELOPER_FACTS_EXPANDED
     } else {
         DEVELOPER_FACTS_COLLAPSED
@@ -194,20 +203,39 @@ pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiA
         Span::styled(
             DEVELOPER_TITLE_PREFIX,
             Style::default()
-                .fg(Color::White)
+                .fg(palette.text)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             facts_toggle,
             Style::default()
-                .fg(Color::Cyan)
+                .fg(palette.accent)
                 .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            if app.active_scroll_pane == ScrollablePane::Developer {
+                if app.preferences.screen_reader {
+                    "  *"
+                } else {
+                    "  •"
+                }
+            } else {
+                ""
+            },
+            Style::default().fg(palette.accent),
         ),
     ]);
     frame.render_widget(
         Block::default()
             .title(title)
-            .borders(Borders::TOP | Borders::LEFT),
+            .borders(Borders::TOP | Borders::LEFT)
+            .border_style(Style::default().fg(
+                if app.active_scroll_pane == ScrollablePane::Developer {
+                    palette.accent
+                } else {
+                    palette.muted
+                },
+            )),
         area,
     );
 
@@ -290,6 +318,7 @@ fn event_lines(
     summary: &str,
     content_width: usize,
     expanded: bool,
+    palette: TuiPalette,
 ) -> Vec<Line<'static>> {
     let sequence = format!("#{sequence_no} ");
     let summary_width = content_width
@@ -313,8 +342,8 @@ fn event_lines(
         truncate_end_to_width(&summaries.remove(0), summary_width)
     };
     let mut lines = vec![Line::from(vec![
-        Span::styled(sequence, Style::default().fg(Color::DarkGray)),
-        Span::styled(label.to_owned(), Style::default().fg(Color::Yellow)),
+        Span::styled(sequence, Style::default().fg(palette.muted)),
+        Span::styled(label.to_owned(), Style::default().fg(palette.warning)),
         Span::raw("  "),
         Span::raw(first_summary),
     ])];

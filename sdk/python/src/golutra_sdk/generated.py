@@ -1409,7 +1409,7 @@ class RuntimeEvent(TypedDict, total=False):
 
 RuntimeEventSource: TypeAlias = Literal['runtime', 'provider', 'tool', 'policy', 'verifier', 'memory', 'evaluator', 'governor', 'evolution', 'user']
 
-RuntimeEventType: TypeAlias = Literal['command_received', 'command_completed', 'command_accepted', 'command_rejected', 'session_created', 'thread_forked', 'thread_rebound', 'task_created', 'turn_started', 'step_started', 'step_completed', 'step_checkpointed', 'turn_queued', 'busy_policy_decided', 'controller_changed', 'context_built', 'provider_started', 'provider_streamed', 'provider_completed', 'provider_failed', 'token_usage_recorded', 'assistant_message', 'tool_started', 'tool_progress', 'tool_completed', 'policy_evaluated', 'verification_completed', 'loop_decided', 'checkpoint_created', 'task_completed', 'task_abort_requested', 'task_aborted', 'task_interrupted', 'task_uncertain', 'task_reconciled', 'task_paused', 'task_resumed', 'approval_requested', 'approval_resolved', 'retry_scheduled', 'provider_fallback', 'provider_transport_fallback', 'provider_auth_required', 'provider_auth_submitted', 'provider_auth_cancelled', 'provider_configured', 'provider_probe_started', 'provider_probe_completed', 'provider_auth_failed', 'provider_rate_limited', 'provider_credential_refreshed', 'loop_guard_triggered', 'compaction_started', 'compaction_completed', 'compaction_failed', 'memory_retrieved', 'memory_promoted', 'memory_promotion_rejected', 'memory_rolled_back', 'memory_feedback_recorded', 'post_task_reviewed', 'evaluation_completed', 'improvement_candidate_created', 'automation_candidate_created', 'candidate_patch_frozen', 'regression_blocked', 'regression_completed', 'promotion_decided', 'candidate_applied', 'candidate_rolled_back', 'benchmark_recorded', 'counterfactual_compared', 'evolution_planned', 'evolution_task_started', 'evolution_task_completed', 'evolution_completed', 'skill_staged', 'skill_reviewed', 'skill_installed', 'skill_rolled_back', 'governor_decided', 'storage_maintenance_completed', 'context_snapshot_created', 'post_task_job_queued', 'post_task_job_started', 'post_task_job_completed', 'post_task_job_failed', 'post_task_stage_failed', 'verification_planned', 'verification_assertion_completed', 'continuation_decided', 'regression_campaign_started', 'regression_execution_completed', 'memory_candidate_quarantined', 'memory_activated', 'memory_invalidated', 'failure_diagnosed', 'failure_episode_recorded', 'diagnostic_slice_created', 'replay_capsule_created', 'replay_executed', 'external_evaluation_ingested', 'external_evaluation_compared', 'candidate_ready', 'verification_ready', 'external_verification_requested', 'external_verification_feedback']
+RuntimeEventType: TypeAlias = Literal['command_received', 'command_completed', 'command_accepted', 'command_rejected', 'session_created', 'thread_forked', 'thread_rebound', 'thread_renamed', 'thread_archived', 'thread_deleted', 'task_created', 'turn_started', 'step_started', 'step_completed', 'step_checkpointed', 'turn_queued', 'turn_updated', 'turn_cancelled', 'busy_policy_decided', 'controller_changed', 'context_built', 'provider_started', 'provider_streamed', 'provider_completed', 'provider_failed', 'token_usage_recorded', 'assistant_message', 'tool_started', 'tool_progress', 'tool_completed', 'policy_evaluated', 'verification_completed', 'loop_decided', 'checkpoint_created', 'task_completed', 'task_abort_requested', 'task_aborted', 'task_interrupted', 'task_uncertain', 'task_reconciled', 'task_paused', 'task_resumed', 'approval_requested', 'approval_resolved', 'user_question_requested', 'user_question_resolved', 'retry_scheduled', 'provider_fallback', 'provider_transport_fallback', 'provider_auth_required', 'provider_auth_submitted', 'provider_auth_cancelled', 'provider_configured', 'provider_probe_started', 'provider_probe_completed', 'provider_auth_failed', 'provider_rate_limited', 'provider_credential_refreshed', 'loop_guard_triggered', 'compaction_started', 'compaction_completed', 'compaction_failed', 'memory_retrieved', 'memory_promoted', 'memory_promotion_rejected', 'memory_rolled_back', 'memory_feedback_recorded', 'post_task_reviewed', 'evaluation_completed', 'improvement_candidate_created', 'automation_candidate_created', 'candidate_patch_frozen', 'regression_blocked', 'regression_completed', 'promotion_decided', 'candidate_applied', 'candidate_rolled_back', 'benchmark_recorded', 'counterfactual_compared', 'evolution_planned', 'evolution_task_started', 'evolution_task_completed', 'evolution_completed', 'skill_staged', 'skill_reviewed', 'skill_installed', 'skill_rolled_back', 'governor_decided', 'storage_maintenance_completed', 'context_snapshot_created', 'post_task_job_queued', 'post_task_job_started', 'post_task_job_completed', 'post_task_job_failed', 'post_task_stage_failed', 'verification_planned', 'verification_assertion_completed', 'continuation_decided', 'regression_campaign_started', 'regression_execution_completed', 'memory_candidate_quarantined', 'memory_activated', 'memory_invalidated', 'failure_diagnosed', 'failure_episode_recorded', 'diagnostic_slice_created', 'replay_capsule_created', 'replay_executed', 'external_evaluation_ingested', 'external_evaluation_compared', 'candidate_ready', 'verification_ready', 'external_verification_requested', 'external_verification_feedback']
 
 class RuntimeGovernorDecision(TypedDict, total=False):
     action: Required[GovernorAction]
@@ -1464,7 +1464,7 @@ class SessionCommand(TypedDict, total=False):
     session_id: NotRequired[str | None]
     timestamp: Required[str]
 
-SessionCommandKind: TypeAlias = Literal['create', 'prompt', 'approve', 'deny', 'pause', 'resume', 'abort', 'reconcile_task', 'takeover', 'compact', 'memory_rollback', 'memory_feedback', 'run_regression', 'review_candidate', 'apply_candidate', 'rollback_candidate', 'record_benchmark', 'ingest_external_evaluation', 'compare_counterfactual', 'plan_evolution', 'run_evolution', 'stage_skill', 'review_skill', 'install_skill', 'rollback_skill', 'provider_configured', 'provider_auth_submitted', 'provider_auth_cancelled', 'run_storage_maintenance', 'wait_post_task_job', 'retry_post_task_job', 'run_regression_campaign', 'review_memory_candidate', 'expire_memory', 'verify', 'replay', 'export']
+SessionCommandKind: TypeAlias = Literal['create', 'rename_thread', 'archive_thread', 'delete_thread', 'prompt', 'update_queued_turn', 'cancel_queued_turn', 'approve', 'deny', 'answer_question', 'pause', 'resume', 'abort', 'reconcile_task', 'takeover', 'compact', 'memory_rollback', 'memory_feedback', 'run_regression', 'review_candidate', 'apply_candidate', 'rollback_candidate', 'record_benchmark', 'ingest_external_evaluation', 'compare_counterfactual', 'plan_evolution', 'run_evolution', 'stage_skill', 'review_skill', 'install_skill', 'rollback_skill', 'provider_configured', 'provider_auth_submitted', 'provider_auth_cancelled', 'run_storage_maintenance', 'wait_post_task_job', 'retry_post_task_job', 'run_regression_campaign', 'review_memory_candidate', 'expire_memory', 'verify', 'replay', 'export']
 
 class SessionCursor(TypedDict, total=False):
     recency_at: Required[str]
@@ -1781,7 +1781,7 @@ class TuiFrameLine(TypedDict, total=False):
 
 TuiFramePane: TypeAlias = Literal['transcript', 'developer', 'response_and_developer', 'screen']
 
-TuiHitPane: TypeAlias = Literal['transcript', 'bottom', 'developer']
+TuiHitPane: TypeAlias = Literal['transcript', 'bottom', 'developer', 'overlay']
 
 class TuiHitRegion(TypedDict, total=False):
     height: Required[int]
@@ -1799,6 +1799,37 @@ class UserProjection(TypedDict, total=False):
     status: Required[TaskStatus]
     task_id: NotRequired[str | None]
     visible_steps: Required[list[VisibleStep]]
+
+class UserQuestionAnswer(TypedDict, total=False):
+    free_text: NotRequired[str | None]
+    question_id: Required[str]
+    selected_option_ids: Required[list[str]]
+
+UserQuestionMode: TypeAlias = Literal['single', 'multiple']
+
+class UserQuestionOption(TypedDict, total=False):
+    description: NotRequired[str | None]
+    id: Required[str]
+    label: Required[str]
+
+class UserQuestionPrompt(TypedDict, total=False):
+    header: Required[str]
+    id: Required[str]
+    mode: NotRequired[UserQuestionMode]
+    options: Required[list[UserQuestionOption]]
+    question: Required[str]
+
+class UserQuestionRequest(TypedDict, total=False):
+    question_id: Required[str]
+    questions: Required[list[UserQuestionPrompt]]
+    task_id: Required[str]
+    tool_call_id: Required[str]
+    turn_id: Required[str]
+
+class UserQuestionResolution(TypedDict, total=False):
+    answers: Required[list[UserQuestionAnswer]]
+    question_id: Required[str]
+    reason: Required[str]
 
 class VerificationAssertion(TypedDict, total=False):
     assertion_id: Required[str]
@@ -2150,6 +2181,12 @@ __all__ = [
     "TuiHitPane",
     "TuiHitRegion",
     "UserProjection",
+    "UserQuestionAnswer",
+    "UserQuestionMode",
+    "UserQuestionOption",
+    "UserQuestionPrompt",
+    "UserQuestionRequest",
+    "UserQuestionResolution",
     "VerificationAssertion",
     "VerificationAssertionKind",
     "VerificationAssertionStatus",

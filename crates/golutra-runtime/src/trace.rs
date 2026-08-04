@@ -7,8 +7,9 @@
 use golutra_context::ContextCompactionRecord;
 use golutra_core::{
     ApprovalRequest, ApprovalResolution, ContextSnapshot, CorrectionEnvelope, ProviderRequestId,
-    ToolCallId, ToolProgress, ToolRecoveryPolicy, TurnId, VerificationAssertion, VerificationPlan,
-    VerificationPlanId, VerificationRecord,
+    ToolCallId, ToolProgress, ToolRecoveryPolicy, TurnId, UserQuestionRequest,
+    UserQuestionResolution, VerificationAssertion, VerificationPlan, VerificationPlanId,
+    VerificationRecord,
 };
 use golutra_governor::RuntimeGovernorDecision;
 use golutra_llm::{ProviderRequest, ProviderResponse, ProviderStreamEvent};
@@ -97,6 +98,8 @@ pub enum AgentLoopTraceEvent {
     PolicyEvaluated(golutra_core::PolicyEvaluation),
     ApprovalRequested(ApprovalRequest),
     ApprovalResolved(ApprovalResolution),
+    UserQuestionRequested(UserQuestionRequest),
+    UserQuestionResolved(UserQuestionResolution),
     RetryScheduled {
         attempt: u32,
         reason: String,

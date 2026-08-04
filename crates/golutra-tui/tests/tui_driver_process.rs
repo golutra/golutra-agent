@@ -898,7 +898,7 @@ async fn inspect_accepts_yolo_and_marks_the_full_screen() {
     assert_command_success(&output, "yolo inspect");
     let inspect_json = String::from_utf8(output.stdout).expect("inspect UTF-8");
 
-    assert!(inspect_json.contains("[yolo]"));
+    assert!(inspect_json.contains("[unrestricted]"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

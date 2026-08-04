@@ -2,7 +2,8 @@ use chrono::Utc;
 use golutra_core::{
     Actor, ActorKind, BudgetState, EvidenceId, LoopAction, LoopDecision, LoopDecisionId,
     RegressionCampaign, RegressionExecution, SessionId, TaskId, TaskReconciliationDecision,
-    TaskReconciliationRecord, TaskRecoveryRecord, TaskStatus, TurnId, VerificationId,
+    TaskReconciliationRecord, TaskRecoveryRecord, TaskStatus, TurnId, UserQuestionRequest,
+    UserQuestionResolution, VerificationId,
 };
 use golutra_eval::{
     AppliedCandidate, AutomationCandidate, BenchmarkPromotion, BenchmarkRun, CausalComparison,
@@ -53,6 +54,8 @@ pub struct SdkProtocolBundle {
     pub json_rpc_notification: JsonRpcNotification,
     pub command: SessionCommand,
     pub command_ack: CommandAck,
+    pub user_question_request: UserQuestionRequest,
+    pub user_question_resolution: UserQuestionResolution,
     pub task_recovery_record: TaskRecoveryRecord,
     pub task_reconciliation_decision: TaskReconciliationDecision,
     pub task_reconciliation_record: TaskReconciliationRecord,
@@ -342,6 +345,11 @@ mod tests {
         assert!(command_json.is_object());
         assert!(event_json.is_object());
         assert!(sdk_json.pointer("/$defs/TaskRecoveryRecord").is_some());
+        assert!(
+            sdk_json
+                .pointer("/$defs/UserQuestionAnswer/properties/free_text")
+                .is_some()
+        );
         assert!(
             sdk_json
                 .pointer("/$defs/TaskReconciliationDecision")

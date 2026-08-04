@@ -24,7 +24,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::ToolError;
+use super::{ToolError, redact_sensitive_text};
 
 pub(crate) const MAX_PIPE_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const PIPE_MESSAGE_CAPACITY: usize = 64;
@@ -57,6 +57,7 @@ pub(crate) struct ProcessProgress {
     pub(crate) output_lines: u64,
     pub(crate) retained_bytes: usize,
     pub(crate) truncated: bool,
+    pub(crate) output_excerpt: Option<String>,
 }
 
 pub(crate) struct ProcessExecutionRequest<'a> {
@@ -230,6 +231,7 @@ pub(crate) async fn run_process_with_progress(
     let mut readers_done = 0_u8;
     let mut stdout = OutputBuffer::default();
     let mut stderr = OutputBuffer::default();
+    let mut live_output = LiveOutputBuffer::default();
     let mut last_progress = Instant::now();
 
     while status.is_none() || readers_done < 2 || !stdin_done {
@@ -259,6 +261,7 @@ pub(crate) async fn run_process_with_progress(
             message = progress_rx.recv(), if readers_done < 2 => {
                 match message {
                     Some(PipeMessage::Chunk(stream, bytes)) => {
+                        live_output.push(&bytes);
                         match stream {
                             ProcessStream::Stdout => stdout.push(&bytes),
                             ProcessStream::Stderr => stderr.push(&bytes),
@@ -275,6 +278,7 @@ pub(crate) async fn run_process_with_progress(
                                     output_lines: stdout.total_lines().saturating_add(stderr.total_lines()),
                                     retained_bytes: stdout.bytes.len().saturating_add(stderr.bytes.len()),
                                     truncated: stdout.truncated || stderr.truncated,
+                                    output_excerpt: live_output.excerpt(),
                                 },
                             );
                             last_progress = now;
@@ -297,6 +301,7 @@ pub(crate) async fn run_process_with_progress(
             output_lines: stdout.total_lines().saturating_add(stderr.total_lines()),
             retained_bytes: stdout.bytes.len().saturating_add(stderr.bytes.len()),
             truncated: stdout.truncated || stderr.truncated,
+            output_excerpt: live_output.excerpt(),
         },
     );
     let output_bytes = stdout.total_bytes.saturating_add(stderr.total_bytes);
@@ -372,6 +377,87 @@ struct OutputBuffer {
     newline_count: u64,
     partial_line: bool,
     truncated: bool,
+}
+
+const MAX_LIVE_OUTPUT_BYTES: usize = 8 * 1024;
+const MAX_LIVE_OUTPUT_LINES: usize = 8;
+const MAX_LIVE_OUTPUT_CHARS: usize = 2_000;
+
+#[derive(Debug, Default)]
+struct LiveOutputBuffer {
+    bytes: Vec<u8>,
+}
+
+impl LiveOutputBuffer {
+    fn push(&mut self, input: &[u8]) {
+        self.bytes.extend_from_slice(input);
+        if self.bytes.len() > MAX_LIVE_OUTPUT_BYTES {
+            let remove = self.bytes.len().saturating_sub(MAX_LIVE_OUTPUT_BYTES);
+            self.bytes.drain(..remove);
+        }
+    }
+
+    fn excerpt(&self) -> Option<String> {
+        let visible = strip_terminal_controls(&String::from_utf8_lossy(&self.bytes));
+        let (redacted, _) = redact_sensitive_text(&visible);
+        let mut lines = redacted
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .rev()
+            .take(MAX_LIVE_OUTPUT_LINES)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        lines.reverse();
+        let excerpt = lines.join("\n");
+        let excerpt = excerpt
+            .chars()
+            .take(MAX_LIVE_OUTPUT_CHARS)
+            .collect::<String>();
+        (!excerpt.is_empty()).then_some(excerpt)
+    }
+}
+
+fn strip_terminal_controls(value: &str) -> String {
+    #[derive(Clone, Copy)]
+    enum TerminalControlState {
+        None,
+        Start,
+        Csi,
+        Osc,
+        OscEscape,
+    }
+
+    let mut state = TerminalControlState::None;
+    let mut output = String::with_capacity(value.len());
+    for character in value.chars() {
+        state = match state {
+            TerminalControlState::None if character == '\u{1b}' => TerminalControlState::Start,
+            TerminalControlState::None if character == '\r' => {
+                output.push('\n');
+                TerminalControlState::None
+            }
+            TerminalControlState::None
+                if character == '\n' || character == '\t' || !character.is_control() =>
+            {
+                output.push(character);
+                TerminalControlState::None
+            }
+            TerminalControlState::None => TerminalControlState::None,
+            TerminalControlState::Start if character == '[' => TerminalControlState::Csi,
+            TerminalControlState::Start if character == ']' => TerminalControlState::Osc,
+            TerminalControlState::Start => TerminalControlState::None,
+            TerminalControlState::Csi if ('@'..='~').contains(&character) => {
+                TerminalControlState::None
+            }
+            TerminalControlState::Csi => TerminalControlState::Csi,
+            TerminalControlState::Osc if character == '\u{7}' => TerminalControlState::None,
+            TerminalControlState::Osc if character == '\u{1b}' => TerminalControlState::OscEscape,
+            TerminalControlState::Osc => TerminalControlState::Osc,
+            TerminalControlState::OscEscape if character == '\\' => TerminalControlState::None,
+            TerminalControlState::OscEscape => TerminalControlState::Osc,
+        };
+    }
+    output
 }
 
 impl OutputBuffer {
@@ -467,4 +553,22 @@ pub(crate) async fn join_pipe_reader(
         .await
         .map_err(|error| ToolError::Execution(error.to_string()))?
         .map_err(|error| ToolError::Execution(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_excerpt_removes_terminal_controls_and_redacts_keys() {
+        let mut output = LiveOutputBuffer::default();
+        output.push(b"\x1b[31mstarting\x1b[0m\napi_key='secret-value'\ndone\n");
+
+        let excerpt = output.excerpt().expect("excerpt");
+        assert!(excerpt.contains("starting"));
+        assert!(excerpt.contains("done"));
+        assert!(!excerpt.contains("\x1b"));
+        assert!(!excerpt.contains("secret-value"));
+        assert!(excerpt.contains("<redacted-secret>"));
+    }
 }

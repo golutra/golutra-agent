@@ -84,12 +84,17 @@ export type RuntimeEventType =
   | "session_created"
   | "thread_forked"
   | "thread_rebound"
+  | "thread_renamed"
+  | "thread_archived"
+  | "thread_deleted"
   | "task_created"
   | "turn_started"
   | "step_started"
   | "step_completed"
   | "step_checkpointed"
   | "turn_queued"
+  | "turn_updated"
+  | "turn_cancelled"
   | "busy_policy_decided"
   | "controller_changed"
   | "context_built"
@@ -116,6 +121,8 @@ export type RuntimeEventType =
   | "task_resumed"
   | "approval_requested"
   | "approval_resolved"
+  | "user_question_requested"
+  | "user_question_resolved"
   | "retry_scheduled"
   | "provider_fallback"
   | "provider_transport_fallback"
@@ -268,9 +275,15 @@ export type EvaluationPartitionKind =
 export type ActorKind = "user" | "api" | "tui" | "cli" | "sdk" | "web" | "ide" | "runtime";
 export type SessionCommandKind =
   | "create"
+  | "rename_thread"
+  | "archive_thread"
+  | "delete_thread"
   | "prompt"
+  | "update_queued_turn"
+  | "cancel_queued_turn"
   | "approve"
   | "deny"
+  | "answer_question"
   | "pause"
   | "resume"
   | "abort"
@@ -654,7 +667,7 @@ export type DriverTaskStatus =
   | "interrupted"
   | "uncertain";
 export type TuiFramePane = "transcript" | "developer" | "response_and_developer" | "screen";
-export type TuiHitPane = "transcript" | "bottom" | "developer";
+export type TuiHitPane = "transcript" | "bottom" | "developer" | "overlay";
 export type SnapshotPanes = "transcript" | "developer" | "response_and_developer" | "full_screen";
 export type SnapshotScope = "current_turn" | "task" | "session" | "screen";
 export type DriverNotificationKind =
@@ -729,6 +742,8 @@ export interface SdkProtocolBundle {
   task_trace_request: TaskTraceRequest;
   tui_driver: TuiDriverProtocolBundle;
   user_projection: UserProjection;
+  user_question_request: UserQuestionRequest;
+  user_question_resolution: UserQuestionResolution;
   [k: string]: unknown;
 }
 export interface AgentItem {
@@ -2448,5 +2463,39 @@ export interface UserProjection {
   status: TaskStatus;
   task_id?: string | null;
   visible_steps: VisibleStep[];
+  [k: string]: unknown;
+}
+export interface UserQuestionRequest {
+  question_id: string;
+  questions: UserQuestionPrompt[];
+  task_id: string;
+  tool_call_id: string;
+  turn_id: string;
+  [k: string]: unknown;
+}
+export interface UserQuestionPrompt {
+  header: string;
+  id: string;
+  mode?: "single" | "multiple";
+  options: UserQuestionOption[];
+  question: string;
+  [k: string]: unknown;
+}
+export interface UserQuestionOption {
+  description?: string | null;
+  id: string;
+  label: string;
+  [k: string]: unknown;
+}
+export interface UserQuestionResolution {
+  answers: UserQuestionAnswer[];
+  question_id: string;
+  reason: string;
+  [k: string]: unknown;
+}
+export interface UserQuestionAnswer {
+  free_text?: string | null;
+  question_id: string;
+  selected_option_ids: string[];
   [k: string]: unknown;
 }

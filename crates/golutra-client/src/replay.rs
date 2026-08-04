@@ -397,7 +397,7 @@ impl RuntimeHost {
             .find(|event| event.event_type == RuntimeEventType::TaskCreated)
             .and_then(|event| event.payload.get("payload").cloned())
             .unwrap_or(Value::Null);
-        let objective = prompt_from_payload(&task_payload);
+        let objective = model_prompt_from_payload(&task_payload);
         let task_contract = replay_task_contract(&task_payload, &objective)?;
         let max_elapsed_ms = task_payload
             .get("max_elapsed_ms")

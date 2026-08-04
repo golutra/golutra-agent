@@ -499,6 +499,18 @@ impl ProviderRuntimeEnv {
     pub fn credential_provider(&self) -> Option<Arc<dyn CredentialProvider>> {
         self.credential.clone()
     }
+
+    /// Applies a non-secret, per-run provider setting without mutating the
+    /// persisted provider profile or replacing its credential provider.
+    #[must_use]
+    pub fn with_runtime_override(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.values.insert(key.into(), value.into());
+        self
+    }
 }
 
 pub fn load_provider_runtime_env() -> Result<ProviderRuntimeEnv, ConfigError> {
@@ -511,6 +523,18 @@ pub fn load_provider_runtime_env_from_paths(
 ) -> Result<ProviderRuntimeEnv, ConfigError> {
     let store = default_secret_store(paths)?;
     load_provider_runtime_env_from_paths_with_store(paths, store)
+}
+
+pub fn load_provider_runtime_env_for_profile_from_paths(
+    paths: &ProviderConfigPaths,
+    profile_name: &str,
+) -> Result<ProviderRuntimeEnv, ConfigError> {
+    let store = default_secret_store(paths)?;
+    let mut settings = load_provider_settings_with_store(paths, Arc::clone(&store))?;
+    settings.set_active_profile(profile_name.to_owned())?;
+    let auth = AuthService::new(paths.home.clone(), store)
+        .map_err(|error| ConfigError::Validation(error.to_string()))?;
+    runtime_env_from_settings(&settings, &auth)
 }
 
 pub fn load_provider_runtime_env_from_paths_with_store(

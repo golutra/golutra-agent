@@ -1561,6 +1561,9 @@ pub(crate) fn provider_tool_description(tool_name: &str) -> &'static str {
         "edit_file" => "Replace the first exact text match in a workspace-relative file.",
         "list_dir" => "List entries in a workspace-relative directory.",
         "rg_search" => "Search workspace files with ripgrep.",
+        "ask_user" => {
+            "Ask up to three concise structured questions when a decision cannot be inferred safely. Provide two to eight clear options per question and use multiple mode only when multiple selections are valid."
+        }
         "shell" => {
             "Run a workspace command as argv. A complete quoted foreground Python heredoc such as python - <<'PY' is passed directly on stdin; for other pipes, redirection, or compound scripts, explicitly invoke an available shell with the complete script as one argument. With background=true, timeout_ms is the absolute process lifetime and yield_time_ms only controls the initial wait. Managed background processes are runtime-scoped and stop when the runtime ends. If another process or evaluator must connect after the final response, do not use background=true; use a platform-appropriate lifecycle mechanism outside runtime ownership, detach standard streams as required, and verify availability before returning."
         }

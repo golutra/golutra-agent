@@ -1,7 +1,7 @@
 //! Ratatui adapter for the live activity view model.
 
 use ratatui::{
-    style::{Color, Style},
+    style::Style,
     text::{Line, Span},
 };
 
@@ -24,9 +24,16 @@ pub(crate) fn live_status_text(app: &TuiApp, width: usize) -> Option<String> {
 
 pub(crate) fn live_status_line(app: &TuiApp, width: usize) -> Option<Line<'static>> {
     let text = live_status_text(app, width)?;
-    let rest = text.strip_prefix("• ").unwrap_or(&text).to_owned();
+    let mut rest = text.strip_prefix("• ").unwrap_or(&text).to_owned();
+    let palette = app.palette();
+    let marker = if app.preferences.screen_reader {
+        rest = rest.replace(" • ", " | ");
+        "* "
+    } else {
+        "• "
+    };
     Some(Line::from(vec![
-        Span::styled("• ", Style::default().fg(Color::Cyan)),
-        Span::styled(rest, Style::default().fg(Color::DarkGray)),
+        Span::styled(marker, Style::default().fg(palette.accent)),
+        Span::styled(rest, Style::default().fg(palette.muted)),
     ]))
 }

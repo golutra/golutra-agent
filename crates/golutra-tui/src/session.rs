@@ -7,12 +7,24 @@ use serde_json::Value;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use super::TUI_ACTOR_ID;
+use super::{ComposerInput, TUI_ACTOR_ID};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResumePickerState {
     pub(crate) items: Vec<ResumeThreadItem>,
+    all_items: Vec<ResumeThreadItem>,
     pub(crate) selected: usize,
+    pub(crate) search: ComposerInput,
+    pub(crate) show_details: bool,
+    pub(crate) action: Option<SessionPickerAction>,
+    pub(crate) action_input: ComposerInput,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionPickerAction {
+    Rename,
+    Archive,
+    Delete,
 }
 
 #[derive(Debug, Clone)]
@@ -38,8 +50,8 @@ pub(crate) enum ExportFlowStep {
 pub(crate) struct ExportFlowState {
     pub(crate) picker: ResumePickerState,
     pub(crate) step: ExportFlowStep,
-    pub(crate) range_input: String,
-    pub(crate) destination_input: String,
+    pub(crate) range_input: ComposerInput,
+    pub(crate) destination_input: ComposerInput,
     pub(crate) error: Option<String>,
     pub(crate) receipt: Option<DebugExportReceipt>,
 }
@@ -57,6 +69,13 @@ impl ExportFlowState {
     pub(crate) fn selected_item(&self) -> Option<&ResumeThreadItem> {
         self.picker.items.get(self.picker.selected)
     }
+
+    pub(crate) fn input_bytes(&self) -> usize {
+        self.picker
+            .input_bytes()
+            .saturating_add(self.range_input.text().len())
+            .saturating_add(self.destination_input.text().len())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -66,8 +85,36 @@ pub(crate) enum ResumeSelectionDirection {
 }
 
 impl ResumePickerState {
+    pub(crate) fn new(items: Vec<ResumeThreadItem>) -> Self {
+        Self {
+            all_items: items.clone(),
+            items,
+            selected: 0,
+            search: ComposerInput::default(),
+            show_details: false,
+            action: None,
+            action_input: ComposerInput::default(),
+        }
+    }
+
     pub(crate) fn selected_thread_id(&self) -> Option<ThreadId> {
         self.items.get(self.selected).map(|item| item.thread_id)
+    }
+
+    pub(crate) fn input_bytes(&self) -> usize {
+        self.search
+            .text()
+            .len()
+            .saturating_add(self.action_input.text().len())
+    }
+
+    pub(crate) fn redact_text_with(&mut self, redact: fn(&str) -> String) {
+        for item in self.items.iter_mut().chain(self.all_items.iter_mut()) {
+            item.title = redact(&item.title);
+            item.preview = redact(&item.preview);
+        }
+        self.search.set_text(redact(self.search.text()));
+        self.action_input.set_text(redact(self.action_input.text()));
     }
 
     pub(crate) fn move_selection(&mut self, direction: ResumeSelectionDirection) {
@@ -108,6 +155,68 @@ impl ResumePickerState {
 
     pub(crate) fn select_last(&mut self) {
         self.selected = self.items.len().saturating_sub(1);
+    }
+
+    pub(crate) fn refresh_search(&mut self) {
+        let selected_thread = self.selected_thread_id();
+        let query = self.search.text().trim().to_lowercase();
+        self.items = self
+            .all_items
+            .iter()
+            .filter(|item| {
+                query.is_empty()
+                    || item.title.to_lowercase().contains(&query)
+                    || item.preview.to_lowercase().contains(&query)
+                    || item.thread_id.to_string().contains(&query)
+                    || item.session_id.to_string().contains(&query)
+            })
+            .cloned()
+            .collect();
+        self.selected = selected_thread
+            .and_then(|thread_id| {
+                self.items
+                    .iter()
+                    .position(|item| item.thread_id == thread_id)
+            })
+            .unwrap_or_default()
+            .min(self.items.len().saturating_sub(1));
+    }
+
+    pub(crate) fn begin_action(&mut self, action: SessionPickerAction) -> bool {
+        let Some(item) = self.items.get(self.selected) else {
+            return false;
+        };
+        self.action = Some(action);
+        self.action_input.reset();
+        if action == SessionPickerAction::Rename {
+            self.action_input.set_text(item.title.clone());
+        }
+        true
+    }
+
+    pub(crate) fn finish_action(&mut self) {
+        self.action = None;
+        self.action_input.reset();
+    }
+
+    pub(crate) fn remove_selected(&mut self) {
+        let Some(thread_id) = self.selected_thread_id() else {
+            return;
+        };
+        self.all_items.retain(|item| item.thread_id != thread_id);
+        self.refresh_search();
+    }
+
+    pub(crate) fn rename_selected(&mut self, title: &str) {
+        let Some(thread_id) = self.selected_thread_id() else {
+            return;
+        };
+        for item in &mut self.all_items {
+            if item.thread_id == thread_id {
+                item.title = title.to_owned();
+            }
+        }
+        self.refresh_search();
     }
 }
 

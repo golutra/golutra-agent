@@ -446,6 +446,26 @@ impl ThreadRepository {
         self.store.upsert_thread(thread).await
     }
 
+    pub async fn upsert_with_event(
+        &self,
+        thread: &ThreadRecord,
+        event: RuntimeEvent,
+    ) -> StoreResult<RuntimeEvent> {
+        self.store.upsert_thread_with_event(thread, event).await
+    }
+
+    pub async fn delete(&self, thread_id: ThreadId) -> StoreResult<bool> {
+        self.store.delete_thread(thread_id).await
+    }
+
+    pub async fn delete_with_event(
+        &self,
+        thread_id: ThreadId,
+        event: RuntimeEvent,
+    ) -> StoreResult<Option<RuntimeEvent>> {
+        self.store.delete_thread_with_event(thread_id, event).await
+    }
+
     pub async fn fork(
         &self,
         child: &ThreadRecord,

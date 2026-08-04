@@ -34,6 +34,8 @@ pub(crate) struct AuthTaskOutcome {
 pub(crate) struct AuthDialogState {
     pub(crate) step: AuthDialogStep,
     pub(crate) selected: usize,
+    pub(crate) scroll: usize,
+    pub(crate) manual_scroll: bool,
     pub(crate) provider: Option<AuthProviderPreset>,
     pub(crate) protocol: ProviderProtocol,
     pub(crate) base_url: String,
@@ -138,6 +140,8 @@ impl AuthDialogState {
         Self {
             step: AuthDialogStep::GroupChoice,
             selected: 0,
+            scroll: 0,
+            manual_scroll: false,
             provider: None,
             protocol: ProviderProtocol::OpenAiCompatible,
             base_url: String::new(),
@@ -200,6 +204,8 @@ impl AuthDialogState {
             AuthDialogStep::BaseUrl
         };
         self.selected = 0;
+        self.scroll = 0;
+        self.manual_scroll = false;
     }
 
     pub(crate) fn protocol_options(&self) -> &'static [ProviderProtocol] {
@@ -269,21 +275,7 @@ impl AuthDialogState {
     }
 
     pub(crate) fn move_selection(&mut self, direction: ResumeSelectionDirection) {
-        let last_index = match self.step {
-            AuthDialogStep::GroupChoice => AUTH_GROUP_ITEMS.len().saturating_sub(1),
-            AuthDialogStep::ThirdPartyChoice => {
-                THIRD_PARTY_PROVIDER_PRESETS.len().saturating_sub(1)
-            }
-            AuthDialogStep::AuthMethod => self.auth_method_count().saturating_sub(1),
-            AuthDialogStep::Protocol => self.protocol_options().len().saturating_sub(1),
-            AuthDialogStep::CredentialStore => 1,
-            AuthDialogStep::Model => self.custom_model_index(),
-            AuthDialogStep::AdvancedConfig => AUTH_ADVANCED_ITEMS.saturating_sub(1),
-            AuthDialogStep::BaseUrl
-            | AuthDialogStep::ApiKey
-            | AuthDialogStep::EnvKey
-            | AuthDialogStep::Review => 0,
-        };
+        let last_index = self.last_selection_index();
         let current = if self.step == AuthDialogStep::AdvancedConfig {
             self.advanced_selected
         } else {
@@ -298,7 +290,64 @@ impl AuthDialogState {
         } else {
             self.selected = target;
         }
+        self.manual_scroll = false;
         self.error = None;
+    }
+
+    pub(crate) fn has_interactive_options(&self) -> bool {
+        matches!(
+            self.step,
+            AuthDialogStep::GroupChoice
+                | AuthDialogStep::ThirdPartyChoice
+                | AuthDialogStep::AuthMethod
+                | AuthDialogStep::Protocol
+                | AuthDialogStep::CredentialStore
+                | AuthDialogStep::Model
+                | AuthDialogStep::AdvancedConfig
+        )
+    }
+
+    pub(crate) fn set_interactive_selection(&mut self, index: usize) {
+        if self.step == AuthDialogStep::AdvancedConfig {
+            self.advanced_selected = index.min(AUTH_ADVANCED_ITEMS.saturating_sub(1));
+        } else {
+            self.selected = index.min(self.last_selection_index());
+        }
+        self.manual_scroll = false;
+        self.error = None;
+    }
+
+    pub(crate) fn scroll_by(&mut self, delta: isize, max_scroll: usize) {
+        self.manual_scroll = true;
+        let current = self.scroll.min(max_scroll);
+        self.scroll = if delta.is_negative() {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            current.saturating_add(delta as usize).min(max_scroll)
+        };
+    }
+
+    pub(crate) fn scroll_to(&mut self, position: usize) {
+        self.scroll = position;
+        self.manual_scroll = true;
+    }
+
+    fn last_selection_index(&self) -> usize {
+        match self.step {
+            AuthDialogStep::GroupChoice => AUTH_GROUP_ITEMS.len().saturating_sub(1),
+            AuthDialogStep::ThirdPartyChoice => {
+                THIRD_PARTY_PROVIDER_PRESETS.len().saturating_sub(1)
+            }
+            AuthDialogStep::AuthMethod => self.auth_method_count().saturating_sub(1),
+            AuthDialogStep::Protocol => self.protocol_options().len().saturating_sub(1),
+            AuthDialogStep::CredentialStore => 1,
+            AuthDialogStep::Model => self.custom_model_index(),
+            AuthDialogStep::AdvancedConfig => AUTH_ADVANCED_ITEMS.saturating_sub(1),
+            AuthDialogStep::BaseUrl
+            | AuthDialogStep::ApiKey
+            | AuthDialogStep::EnvKey
+            | AuthDialogStep::Review => 0,
+        }
     }
 
     pub(crate) fn current_input_mut(&mut self) -> Option<&mut String> {
@@ -344,6 +393,8 @@ impl AuthDialogState {
     pub(crate) fn go_back(&mut self) {
         self.error = None;
         self.review = None;
+        self.scroll = 0;
+        self.manual_scroll = false;
         self.step = match self.step {
             AuthDialogStep::GroupChoice => AuthDialogStep::GroupChoice,
             AuthDialogStep::ThirdPartyChoice => AuthDialogStep::GroupChoice,

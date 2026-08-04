@@ -206,6 +206,12 @@
     },
     "user_projection": {
       "$ref": "#/$defs/UserProjection"
+    },
+    "user_question_request": {
+      "$ref": "#/$defs/UserQuestionRequest"
+    },
+    "user_question_resolution": {
+      "$ref": "#/$defs/UserQuestionResolution"
     }
   },
   "required": [
@@ -221,6 +227,8 @@
     "json_rpc_notification",
     "command",
     "command_ack",
+    "user_question_request",
+    "user_question_resolution",
     "task_recovery_record",
     "task_reconciliation_decision",
     "task_reconciliation_record",
@@ -7477,12 +7485,17 @@
         "session_created",
         "thread_forked",
         "thread_rebound",
+        "thread_renamed",
+        "thread_archived",
+        "thread_deleted",
         "task_created",
         "turn_started",
         "step_started",
         "step_completed",
         "step_checkpointed",
         "turn_queued",
+        "turn_updated",
+        "turn_cancelled",
         "busy_policy_decided",
         "controller_changed",
         "context_built",
@@ -7509,6 +7522,8 @@
         "task_resumed",
         "approval_requested",
         "approval_resolved",
+        "user_question_requested",
+        "user_question_resolved",
         "retry_scheduled",
         "provider_fallback",
         "provider_transport_fallback",
@@ -7856,9 +7871,15 @@
       "type": "string",
       "enum": [
         "create",
+        "rename_thread",
+        "archive_thread",
+        "delete_thread",
         "prompt",
+        "update_queued_turn",
+        "cancel_queued_turn",
         "approve",
         "deny",
+        "answer_question",
         "pause",
         "resume",
         "abort",
@@ -9538,7 +9559,8 @@
       "enum": [
         "transcript",
         "bottom",
-        "developer"
+        "developer",
+        "overlay"
       ]
     },
     "TuiHitRegion": {
@@ -9631,6 +9653,145 @@
         "status",
         "visible_steps",
         "residual_risks"
+      ]
+    },
+    "UserQuestionAnswer": {
+      "type": "object",
+      "properties": {
+        "free_text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "question_id": {
+          "type": "string"
+        },
+        "selected_option_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "question_id",
+        "selected_option_ids"
+      ]
+    },
+    "UserQuestionMode": {
+      "type": "string",
+      "enum": [
+        "single",
+        "multiple"
+      ]
+    },
+    "UserQuestionOption": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "label"
+      ]
+    },
+    "UserQuestionPrompt": {
+      "type": "object",
+      "properties": {
+        "header": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/$defs/UserQuestionMode",
+          "default": "single"
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/UserQuestionOption"
+          }
+        },
+        "question": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "header",
+        "question",
+        "options"
+      ]
+    },
+    "UserQuestionRequest": {
+      "type": "object",
+      "properties": {
+        "question_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "questions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/UserQuestionPrompt"
+          }
+        },
+        "task_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "tool_call_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "turn_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "question_id",
+        "task_id",
+        "turn_id",
+        "tool_call_id",
+        "questions"
+      ]
+    },
+    "UserQuestionResolution": {
+      "type": "object",
+      "properties": {
+        "answers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/UserQuestionAnswer"
+          }
+        },
+        "question_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "question_id",
+        "answers",
+        "reason"
       ]
     },
     "VerificationAssertion": {

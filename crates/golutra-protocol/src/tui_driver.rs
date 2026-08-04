@@ -418,6 +418,7 @@ pub enum TuiHitPane {
     Transcript,
     Bottom,
     Developer,
+    Overlay,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

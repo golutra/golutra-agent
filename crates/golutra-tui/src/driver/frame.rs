@@ -12,8 +12,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::super::{
-    TuiApp, UiLayoutSnapshot, developer_facts_toggle_hit_rect, display_width,
-    transcript_toggle_regions,
+    TuiApp, UiLayoutSnapshot, UiMousePress, developer_facts_toggle_hit_rect, display_width,
+    overlay_mouse_regions, transcript_toggle_regions,
 };
 
 pub(super) fn scoped_runtime_events(
@@ -269,6 +269,26 @@ pub(super) fn frame_hit_regions(
         layout.bottom,
         area,
     );
+    if layout.hit_test(layout.transcript.x, layout.transcript.y, app)
+        == super::super::UiHitTarget::Overlay
+    {
+        push_hit_region(
+            &mut regions,
+            "overlay",
+            TuiHitPane::Overlay,
+            layout.transcript,
+            area,
+        );
+        for region in overlay_mouse_regions(layout.transcript, app) {
+            push_hit_region(
+                &mut regions,
+                &overlay_region_id(region.press),
+                TuiHitPane::Overlay,
+                region.area,
+                area,
+            );
+        }
+    }
     if let Some(developer) = layout.developer {
         push_hit_region(
             &mut regions,
@@ -286,6 +306,43 @@ pub(super) fn frame_hit_regions(
         );
     }
     regions
+}
+
+fn overlay_region_id(press: UiMousePress) -> String {
+    match press {
+        UiMousePress::Auth(index) => format!("auth_option_{index}"),
+        UiMousePress::Resume(index) => format!("resume_item_{index}"),
+        UiMousePress::Queue(index) => format!("queue_item_{index}"),
+        UiMousePress::Approval(choice) => format!("approval_{}", region_slug(choice.label())),
+        UiMousePress::QuestionOption { question, option } => {
+            format!("question_{question}_option_{option}")
+        }
+        UiMousePress::QuestionFreeText { question } => {
+            format!("question_{question}_free_text")
+        }
+        UiMousePress::QuestionSubmit => "question_submit".to_owned(),
+        UiMousePress::Dashboard(tab) => format!("dashboard_{}", region_slug(tab.label())),
+        UiMousePress::Settings(row) => format!("settings_{}", row.index()),
+        UiMousePress::Help(topic) => format!("help_{}", region_slug(topic.label())),
+    }
+}
+
+fn region_slug(label: &str) -> String {
+    let mut slug = String::with_capacity(label.len());
+    let mut separator = false;
+    for character in label.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character);
+            separator = false;
+        } else if !separator && !slug.is_empty() {
+            slug.push('_');
+            separator = true;
+        }
+    }
+    while slug.ends_with('_') {
+        slug.pop();
+    }
+    slug
 }
 
 fn push_hit_region(

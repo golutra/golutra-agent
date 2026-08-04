@@ -11,7 +11,17 @@ use unicode_width::UnicodeWidthStr;
 pub(crate) struct ComposerInput {
     text: String,
     cursor: usize,
+    undo: Vec<ComposerSnapshot>,
+    redo: Vec<ComposerSnapshot>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ComposerSnapshot {
+    text: String,
+    cursor: usize,
+}
+
+const MAX_UNDO_SNAPSHOTS: usize = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ComposerViewport {
@@ -27,6 +37,12 @@ struct VisualLayout {
 }
 
 impl ComposerInput {
+    pub(crate) fn from_text(text: impl Into<String>) -> Self {
+        let mut input = Self::default();
+        input.set_text(text);
+        input
+    }
+
     pub(crate) fn text(&self) -> &str {
         &self.text
     }
@@ -41,13 +57,26 @@ impl ComposerInput {
     }
 
     pub(crate) fn clear(&mut self) {
+        if self.text.is_empty() {
+            return;
+        }
+        self.record_edit();
         self.text.clear();
         self.cursor = 0;
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.text.clear();
+        self.cursor = 0;
+        self.undo.clear();
+        self.redo.clear();
     }
 
     pub(crate) fn set_text(&mut self, text: impl Into<String>) {
         self.text = text.into();
         self.cursor = self.text.len();
+        self.undo.clear();
+        self.redo.clear();
     }
 
     pub(crate) fn trimmed(&self) -> String {
@@ -55,6 +84,7 @@ impl ComposerInput {
     }
 
     pub(crate) fn insert_char(&mut self, character: char) {
+        self.record_edit();
         self.text.insert(self.cursor, character);
         self.cursor += character.len_utf8();
     }
@@ -63,6 +93,7 @@ impl ComposerInput {
         if text.is_empty() {
             return;
         }
+        self.record_edit();
         self.text.insert_str(self.cursor, text);
         self.cursor += text.len();
     }
@@ -71,6 +102,7 @@ impl ComposerInput {
         if self.cursor == 0 {
             return;
         }
+        self.record_edit();
         let start = previous_grapheme_boundary(&self.text, self.cursor);
         self.text.replace_range(start..self.cursor, "");
         self.cursor = start;
@@ -80,6 +112,7 @@ impl ComposerInput {
         if self.cursor >= self.text.len() {
             return;
         }
+        self.record_edit();
         let end = next_grapheme_boundary(&self.text, self.cursor);
         self.text.replace_range(self.cursor..end, "");
     }
@@ -98,6 +131,228 @@ impl ComposerInput {
 
     pub(crate) fn move_to_end(&mut self) {
         self.cursor = self.text.len();
+    }
+
+    pub(crate) fn move_to_line_start(&mut self) {
+        self.cursor = self.text[..self.cursor]
+            .rfind('\n')
+            .map_or(0, |index| index.saturating_add(1));
+    }
+
+    pub(crate) fn move_to_line_end(&mut self) {
+        self.cursor = self.text[self.cursor..]
+            .find('\n')
+            .map_or(self.text.len(), |offset| self.cursor.saturating_add(offset));
+    }
+
+    pub(crate) fn insert_newline(&mut self) {
+        self.insert_char('\n');
+    }
+
+    pub(crate) fn move_word_left(&mut self) {
+        let mut cursor = self.cursor;
+        while cursor > 0 {
+            let previous = previous_grapheme_boundary(&self.text, cursor);
+            if !self.text[previous..cursor].chars().all(char::is_whitespace) {
+                break;
+            }
+            cursor = previous;
+        }
+        while cursor > 0 {
+            let previous = previous_grapheme_boundary(&self.text, cursor);
+            if self.text[previous..cursor]
+                .chars()
+                .all(|character| !character.is_alphanumeric() && character != '_')
+            {
+                break;
+            }
+            cursor = previous;
+        }
+        self.cursor = cursor;
+    }
+
+    pub(crate) fn move_word_right(&mut self) {
+        let mut cursor = self.cursor;
+        while cursor < self.text.len() {
+            let next = next_grapheme_boundary(&self.text, cursor);
+            if !self.text[cursor..next].chars().all(char::is_whitespace) {
+                break;
+            }
+            cursor = next;
+        }
+        while cursor < self.text.len() {
+            let next = next_grapheme_boundary(&self.text, cursor);
+            if self.text[cursor..next]
+                .chars()
+                .all(|character| !character.is_alphanumeric() && character != '_')
+            {
+                break;
+            }
+            cursor = next;
+        }
+        self.cursor = cursor;
+    }
+
+    pub(crate) fn delete_word_backward(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let end = self.cursor;
+        self.move_word_left();
+        let start = self.cursor;
+        self.cursor = end;
+        if start < end {
+            self.record_edit();
+            self.text.replace_range(start..end, "");
+            self.cursor = start;
+        }
+    }
+
+    pub(crate) fn delete_word_forward(&mut self) {
+        if self.cursor >= self.text.len() {
+            return;
+        }
+        let start = self.cursor;
+        self.move_word_right();
+        let end = self.cursor;
+        self.cursor = start;
+        if start < end {
+            self.record_edit();
+            self.text.replace_range(start..end, "");
+        }
+    }
+
+    pub(crate) fn delete_to_line_end(&mut self) {
+        let end = self.text[self.cursor..]
+            .find('\n')
+            .map_or(self.text.len(), |offset| self.cursor + offset);
+        if end > self.cursor {
+            self.record_edit();
+            self.text.replace_range(self.cursor..end, "");
+        }
+    }
+
+    pub(crate) fn delete_current_line(&mut self) {
+        if self.text.is_empty() {
+            return;
+        }
+        let mut start = self.text[..self.cursor]
+            .rfind('\n')
+            .map_or(0, |index| index.saturating_add(1));
+        let end = self.text[self.cursor..]
+            .find('\n')
+            .map_or(self.text.len(), |offset| {
+                self.cursor.saturating_add(offset).saturating_add(1)
+            });
+        if end == self.text.len() && start > 0 {
+            start = start.saturating_sub(1);
+        }
+        if start == end {
+            return;
+        }
+        self.record_edit();
+        self.text.replace_range(start..end, "");
+        self.cursor = start.min(self.text.len());
+    }
+
+    pub(crate) fn insert_line_below(&mut self) {
+        self.move_to_line_end();
+        self.insert_newline();
+    }
+
+    pub(crate) fn insert_line_above(&mut self) {
+        self.move_to_line_start();
+        self.insert_newline();
+    }
+
+    pub(crate) fn move_line_up(&mut self) -> bool {
+        let line_start = self.text[..self.cursor]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        if line_start == 0 {
+            return false;
+        }
+        let previous_end = line_start - 1;
+        let previous_start = self.text[..previous_end]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let column = self.text[line_start..self.cursor].graphemes(true).count();
+        self.cursor = grapheme_offset(&self.text[previous_start..previous_end], column)
+            .saturating_add(previous_start);
+        true
+    }
+
+    pub(crate) fn move_line_down(&mut self) -> bool {
+        let line_start = self.text[..self.cursor]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let Some(next_start) = self.text[self.cursor..]
+            .find('\n')
+            .map(|offset| self.cursor + offset + 1)
+        else {
+            return false;
+        };
+        let next_end = self.text[next_start..]
+            .find('\n')
+            .map_or(self.text.len(), |offset| next_start + offset);
+        let column = self.text[line_start..self.cursor].graphemes(true).count();
+        self.cursor =
+            grapheme_offset(&self.text[next_start..next_end], column).saturating_add(next_start);
+        true
+    }
+
+    pub(crate) fn replace_range(&mut self, range: Range<usize>, value: &str) {
+        if range.start > range.end
+            || range.end > self.text.len()
+            || !self.text.is_char_boundary(range.start)
+            || !self.text.is_char_boundary(range.end)
+        {
+            return;
+        }
+        self.record_edit();
+        self.text.replace_range(range.clone(), value);
+        self.cursor = range.start.saturating_add(value.len());
+    }
+
+    pub(crate) fn undo(&mut self) -> bool {
+        let Some(snapshot) = self.undo.pop() else {
+            return false;
+        };
+        self.redo.push(self.snapshot());
+        self.restore(snapshot);
+        true
+    }
+
+    pub(crate) fn redo(&mut self) -> bool {
+        let Some(snapshot) = self.redo.pop() else {
+            return false;
+        };
+        self.undo.push(self.snapshot());
+        self.restore(snapshot);
+        true
+    }
+
+    fn record_edit(&mut self) {
+        let snapshot = self.snapshot();
+        if self.undo.last() != Some(&snapshot) {
+            self.undo.push(snapshot);
+            if self.undo.len() > MAX_UNDO_SNAPSHOTS {
+                self.undo.remove(0);
+            }
+        }
+        self.redo.clear();
+    }
+
+    fn snapshot(&self) -> ComposerSnapshot {
+        ComposerSnapshot {
+            text: self.text.clone(),
+            cursor: self.cursor,
+        }
+    }
+
+    fn restore(&mut self, snapshot: ComposerSnapshot) {
+        self.text = snapshot.text;
+        self.cursor = snapshot.cursor.min(self.text.len());
     }
 
     /// 根据终端可用列数计算可见行和真实光标位置。
@@ -226,6 +481,12 @@ fn next_grapheme_boundary(text: &str, cursor: usize) -> usize {
         .map_or(text.len(), |grapheme| cursor + grapheme.len())
 }
 
+fn grapheme_offset(text: &str, count: usize) -> usize {
+    text.grapheme_indices(true)
+        .nth(count)
+        .map_or(text.len(), |(offset, _)| offset)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,5 +540,33 @@ mod tests {
         assert_eq!(input.viewport(20, 3).cursor, (2, 1));
         input.delete_backward();
         assert_eq!(input.text(), "第一行\n二行");
+    }
+
+    #[test]
+    fn undo_redo_and_word_edits_preserve_unicode_boundaries() {
+        let mut input = ComposerInput::default();
+        input.insert_str("hello 世界");
+        input.delete_word_backward();
+        assert_eq!(input.text(), "hello ");
+        assert!(input.undo());
+        assert_eq!(input.text(), "hello 世界");
+        assert!(input.redo());
+        assert_eq!(input.text(), "hello ");
+    }
+
+    #[test]
+    fn multiline_vertical_motion_uses_grapheme_columns() {
+        let mut input = ComposerInput::default();
+        input.set_text("abcd\n你👍x\nlast");
+        input.move_to_start();
+        for _ in 0..3 {
+            input.move_right();
+        }
+        assert!(input.move_line_down());
+        assert_eq!(&input.text()[..input.cursor()], "abcd\n你👍x");
+        assert!(input.move_line_down());
+        assert_eq!(&input.text()[..input.cursor()], "abcd\n你👍x\nlas");
+        assert!(input.move_line_up());
+        assert_eq!(&input.text()[..input.cursor()], "abcd\n你👍x");
     }
 }

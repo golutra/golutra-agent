@@ -665,6 +665,36 @@ pub struct ParsedShellCommand {
     pub stdin: Option<String>,
 }
 
+/// Matches an explicit scoped approval against a later policy resource.
+///
+/// Shell approvals use parsed argv boundaries so an approved command cannot be
+/// widened by concatenating text or shell syntax onto the displayed string.
+/// Other tools remain exact-resource grants until they expose their own typed
+/// resource matcher.
+#[must_use]
+pub fn approval_resource_matches(
+    tool_name: &str,
+    approved_prefix: &str,
+    requested_resource: &str,
+) -> bool {
+    if approved_prefix.is_empty() {
+        return false;
+    }
+    if tool_name != "shell" {
+        return approved_prefix == requested_resource;
+    }
+    let Some(approved) = parse_shell_command_with_input(approved_prefix) else {
+        return false;
+    };
+    let Some(requested) = parse_shell_command_with_input(requested_resource) else {
+        return false;
+    };
+    if approved.stdin.is_some() || requested.stdin.is_some() {
+        return approved == requested;
+    }
+    !approved.parts.is_empty() && requested.parts.starts_with(&approved.parts)
+}
+
 /// Parse the shell tool's command field as argv without invoking a shell.
 ///
 /// Most commands use ordinary `shlex` parsing.  Explicit interpreter wrappers

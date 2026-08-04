@@ -1,6 +1,6 @@
 use golutra_core::{
     ArtifactId, CausalContext, CausalLink, EventId, RUNTIME_EVENT_SCHEMA_VERSION, SessionId,
-    TaskId, TaskStatus, Timestamp, TurnId,
+    TaskId, TaskStatus, Timestamp, TurnId, UserQuestionRequest,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -46,12 +46,17 @@ pub enum RuntimeEventType {
     SessionCreated,
     ThreadForked,
     ThreadRebound,
+    ThreadRenamed,
+    ThreadArchived,
+    ThreadDeleted,
     TaskCreated,
     TurnStarted,
     StepStarted,
     StepCompleted,
     StepCheckpointed,
     TurnQueued,
+    TurnUpdated,
+    TurnCancelled,
     BusyPolicyDecided,
     ControllerChanged,
     ContextBuilt,
@@ -78,6 +83,8 @@ pub enum RuntimeEventType {
     TaskResumed,
     ApprovalRequested,
     ApprovalResolved,
+    UserQuestionRequested,
+    UserQuestionResolved,
     RetryScheduled,
     ProviderFallback,
     ProviderTransportFallback,
@@ -159,9 +166,14 @@ impl RuntimeEventType {
             | Self::SessionCreated
             | Self::ThreadForked
             | Self::ThreadRebound
+            | Self::ThreadRenamed
+            | Self::ThreadArchived
+            | Self::ThreadDeleted
             | Self::TaskCreated
             | Self::TurnStarted
             | Self::TurnQueued
+            | Self::TurnUpdated
+            | Self::TurnCancelled
             | Self::BusyPolicyDecided
             | Self::ControllerChanged
             | Self::CheckpointCreated
@@ -175,6 +187,8 @@ impl RuntimeEventType {
             | Self::TaskResumed
             | Self::ApprovalRequested
             | Self::ApprovalResolved
+            | Self::UserQuestionRequested
+            | Self::UserQuestionResolved
             | Self::ProviderAuthRequired
             | Self::ProviderAuthSubmitted
             | Self::ProviderAuthCancelled
@@ -270,6 +284,7 @@ impl RuntimeEventType {
             self,
             Self::TaskCreated
                 | Self::TurnQueued
+                | Self::TurnUpdated
                 | Self::AssistantMessage
                 | Self::ToolCompleted
                 | Self::TaskCompleted
@@ -290,6 +305,8 @@ impl RuntimeEventType {
             Self::TaskCreated
                 | Self::TurnStarted
                 | Self::TurnQueued
+                | Self::TurnUpdated
+                | Self::TurnCancelled
                 | Self::TaskCompleted
                 | Self::TaskAbortRequested
                 | Self::TaskAborted
@@ -300,6 +317,8 @@ impl RuntimeEventType {
                 | Self::TaskResumed
                 | Self::ApprovalRequested
                 | Self::ApprovalResolved
+                | Self::UserQuestionRequested
+                | Self::UserQuestionResolved
                 | Self::ProviderStarted
                 | Self::ProviderCompleted
                 | Self::ProviderFailed
@@ -374,6 +393,39 @@ impl RuntimeEvent {
     }
 }
 
+/// Returns the latest structured question that is still owned by an active task.
+///
+/// Question events are durable, so merely finding the latest request is not
+/// enough: a later terminal task event also closes the in-memory response
+/// channel even when no explicit resolution event was written.
+#[must_use]
+pub fn pending_user_question(
+    events: &[RuntimeEvent],
+    active_task_id: Option<TaskId>,
+) -> Option<UserQuestionRequest> {
+    let request_event = events.iter().rev().find(|event| {
+        event.event_type == RuntimeEventType::UserQuestionRequested
+            && active_task_id.is_none_or(|task_id| event.task_id == Some(task_id))
+    })?;
+    let request = request_event
+        .payload
+        .get("request")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<UserQuestionRequest>(value).ok())?;
+    if request_event.task_id != Some(request.task_id) {
+        return None;
+    }
+    let question_id = request.question_id.to_string();
+    let closed = events.iter().any(|event| {
+        event.sequence_no > request_event.sequence_no
+            && ((event.task_id == Some(request.task_id) && event.event_type.is_task_terminal())
+                || (event.event_type == RuntimeEventType::UserQuestionResolved
+                    && event.payload.get("question_id").and_then(Value::as_str)
+                        == Some(question_id.as_str())))
+    });
+    (!closed).then_some(request)
+}
+
 #[must_use]
 pub const fn new_runtime_event_schema_version() -> u32 {
     RUNTIME_EVENT_SCHEMA_VERSION
@@ -417,6 +469,11 @@ pub struct EventPage {
 
 #[cfg(test)]
 mod tests {
+    use golutra_core::{
+        QuestionId, ToolCallId, UserQuestionMode, UserQuestionOption, UserQuestionPrompt,
+    };
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -436,5 +493,107 @@ mod tests {
         assert!(RuntimeEventType::AssistantMessage.is_model_history_fact());
         assert!(!RuntimeEventType::EvaluationCompleted.is_model_history_fact());
         assert!(!RuntimeEventType::PromotionDecided.is_user_projection_fact());
+    }
+
+    #[test]
+    fn pending_question_is_closed_by_resolution_or_a_terminal_task_event() {
+        let session_id = SessionId::new();
+        let task_id = TaskId::new();
+        let request = UserQuestionRequest {
+            question_id: QuestionId::new(),
+            task_id,
+            turn_id: TurnId::new(),
+            tool_call_id: ToolCallId::new(),
+            questions: vec![UserQuestionPrompt {
+                id: "format".to_owned(),
+                header: "Output".to_owned(),
+                question: "Choose the output format".to_owned(),
+                mode: UserQuestionMode::Single,
+                options: vec![
+                    UserQuestionOption {
+                        id: "json".to_owned(),
+                        label: "JSON".to_owned(),
+                        description: None,
+                    },
+                    UserQuestionOption {
+                        id: "text".to_owned(),
+                        label: "Text".to_owned(),
+                        description: None,
+                    },
+                ],
+            }],
+        };
+        let requested = test_event(
+            1,
+            session_id,
+            task_id,
+            RuntimeEventType::UserQuestionRequested,
+            json!({"request": request}),
+        );
+
+        assert_eq!(
+            pending_user_question(std::slice::from_ref(&requested), Some(task_id))
+                .map(|pending| pending.question_id),
+            Some(request.question_id)
+        );
+        assert!(
+            pending_user_question(std::slice::from_ref(&requested), Some(TaskId::new())).is_none()
+        );
+
+        let unrelated_terminal = test_event(
+            2,
+            session_id,
+            TaskId::new(),
+            RuntimeEventType::TaskCompleted,
+            json!({}),
+        );
+        assert!(
+            pending_user_question(&[requested.clone(), unrelated_terminal], Some(task_id))
+                .is_some()
+        );
+
+        let terminal = test_event(
+            3,
+            session_id,
+            task_id,
+            RuntimeEventType::TaskCompleted,
+            json!({}),
+        );
+        assert!(pending_user_question(&[requested.clone(), terminal], Some(task_id)).is_none());
+
+        let resolved = test_event(
+            2,
+            session_id,
+            task_id,
+            RuntimeEventType::UserQuestionResolved,
+            json!({"question_id": request.question_id}),
+        );
+        assert!(pending_user_question(&[requested, resolved], Some(task_id)).is_none());
+    }
+
+    fn test_event(
+        sequence_no: u64,
+        session_id: SessionId,
+        task_id: TaskId,
+        event_type: RuntimeEventType,
+        payload: Value,
+    ) -> RuntimeEvent {
+        RuntimeEvent {
+            schema_version: RUNTIME_EVENT_SCHEMA_VERSION,
+            id: EventId::new(),
+            sequence_no,
+            session_id,
+            turn_id: None,
+            task_id: Some(task_id),
+            parent_event_id: None,
+            causal_context: CausalContext::default(),
+            causal_links: Vec::new(),
+            event_type,
+            timestamp: chrono::Utc::now(),
+            source: RuntimeEventSource::Runtime,
+            payload,
+            payload_ref: None,
+            durable: true,
+        }
     }
 }

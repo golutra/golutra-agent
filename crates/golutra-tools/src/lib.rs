@@ -198,6 +198,7 @@ impl ToolRegistry {
             contract("rg_search", SideEffectType::None),
             contract("symbol_search", SideEffectType::None),
             contract("find_references", SideEffectType::None),
+            contract("ask_user", SideEffectType::None),
             contract("shell", SideEffectType::Process),
             contract("process_poll", SideEffectType::None),
             contract("process_write", SideEffectType::Process),
@@ -1017,6 +1018,7 @@ impl ToolRuntime {
                 output_bytes: 0,
                 output_lines: 0,
                 detail: None,
+                output_excerpt: None,
             },
         );
         let result = async {
@@ -1127,6 +1129,7 @@ impl ToolRuntime {
                         output_bytes: report.metrics.output_bytes,
                         output_lines: report.metrics.output_lines,
                         detail: Some(format!("{:?}", report.envelope.status).to_ascii_lowercase()),
+                        output_excerpt: report.envelope.model_visible_excerpt.clone(),
                     },
                 );
                 Ok(report)
@@ -1142,6 +1145,7 @@ impl ToolRuntime {
                         output_bytes: 0,
                         output_lines: 0,
                         detail: Some("error".to_owned()),
+                        output_excerpt: None,
                     },
                 );
                 Err(error)
@@ -2293,6 +2297,44 @@ fn contract(tool_name: &str, side_effect_type: SideEffectType) -> ToolContract {
         ),
         "symbol_search" => query_schema("query"),
         "find_references" => query_schema("symbol"),
+        "ask_user" => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 3,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+                            "header": {"type": "string", "minLength": 1, "maxLength": 128},
+                            "question": {"type": "string", "minLength": 1, "maxLength": 2048},
+                            "mode": {"type": "string", "enum": ["single", "multiple"]},
+                            "options": {
+                                "type": "array",
+                                "minItems": 2,
+                                "maxItems": 8,
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "properties": {
+                                        "id": {"type": "string", "minLength": 1, "maxLength": 128},
+                                        "label": {"type": "string", "minLength": 1, "maxLength": 256},
+                                        "description": {"type": "string", "minLength": 1, "maxLength": 2048}
+                                    },
+                                    "required": ["id", "label"]
+                                }
+                            }
+                        },
+                        "required": ["id", "header", "question", "options"]
+                    }
+                }
+            },
+            "required": ["questions"]
+        }),
         "shell" => json!({
             "type": "object",
             "additionalProperties": false,
@@ -2919,6 +2961,7 @@ fn emit_process_progress(
             } else {
                 stream.to_owned()
             }),
+            output_excerpt: process.output_excerpt,
         },
     );
 }

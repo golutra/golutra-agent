@@ -79,6 +79,8 @@ pub struct ThreadRecord {
     pub updated_at: Timestamp,
     pub recency_at: Timestamp,
     pub archived: bool,
+    #[serde(default)]
+    pub removed: bool,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -285,6 +287,7 @@ impl RuntimeStore {
             ("forked_from_sequence_no", "INTEGER"),
             ("rebound_from_workspace_root", "TEXT"),
             ("rollout_path", "TEXT"),
+            ("removed", "INTEGER NOT NULL DEFAULT 0"),
         ] {
             if !existing.contains(name) {
                 sqlx::query(&format!(
@@ -434,20 +437,10 @@ impl RuntimeStore {
 
     pub async fn append_event_assigning_sequence(
         &self,
-        mut event: RuntimeEvent,
+        event: RuntimeEvent,
     ) -> StoreResult<RuntimeEvent> {
         let mut transaction = self.pool.begin().await?;
-        let row = sqlx::query(
-            "UPDATE runtime_sequence
-             SET last_sequence_no = last_sequence_no + 1
-             WHERE singleton = 1
-             RETURNING last_sequence_no",
-        )
-        .fetch_one(&mut *transaction)
-        .await?;
-        let sequence_no: i64 = row.try_get("last_sequence_no")?;
-        event.sequence_no = u64::try_from(sequence_no).unwrap_or(u64::MAX);
-        append_event_in_transaction(&mut transaction, &event).await?;
+        let event = append_event_assigning_sequence_in_transaction(&mut transaction, event).await?;
         transaction.commit().await?;
         Ok(event)
     }
@@ -1811,6 +1804,59 @@ impl RuntimeStore {
         Ok(())
     }
 
+    pub async fn upsert_thread_with_event(
+        &self,
+        thread: &ThreadRecord,
+        event: RuntimeEvent,
+    ) -> StoreResult<RuntimeEvent> {
+        let mut transaction = self.pool.begin().await?;
+        upsert_thread_in_transaction(&mut transaction, thread).await?;
+        let event = append_event_assigning_sequence_in_transaction(&mut transaction, event).await?;
+        transaction.commit().await?;
+        Ok(event)
+    }
+
+    pub async fn delete_thread(&self, thread_id: ThreadId) -> StoreResult<bool> {
+        let now = chrono::Utc::now();
+        let result = sqlx::query(
+            "UPDATE threads
+             SET removed = 1, archived = 1, updated_at = ?, recency_at = ?
+             WHERE thread_id = ? AND removed = 0",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(thread_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn delete_thread_with_event(
+        &self,
+        thread_id: ThreadId,
+        event: RuntimeEvent,
+    ) -> StoreResult<Option<RuntimeEvent>> {
+        let mut transaction = self.pool.begin().await?;
+        let now = chrono::Utc::now();
+        let result = sqlx::query(
+            "UPDATE threads
+             SET removed = 1, archived = 1, updated_at = ?, recency_at = ?
+             WHERE thread_id = ? AND removed = 0",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(thread_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        if result.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Ok(None);
+        }
+        let event = append_event_assigning_sequence_in_transaction(&mut transaction, event).await?;
+        transaction.commit().await?;
+        Ok(Some(event))
+    }
+
     pub async fn create_forked_thread(
         &self,
         child: &ThreadRecord,
@@ -1884,7 +1930,8 @@ impl RuntimeStore {
             r#"
             SELECT thread_id, session_id, parent_thread_id, forked_from_turn_id,
                    forked_from_sequence_no, workspace_root, rebound_from_workspace_root,
-                   rollout_path, title, preview, created_at, updated_at, recency_at, archived
+                   rollout_path, title, preview, created_at, updated_at, recency_at, archived,
+                   removed
             FROM threads
             WHERE thread_id = ?
             "#,
@@ -1904,7 +1951,8 @@ impl RuntimeStore {
             r#"
             SELECT thread_id, session_id, parent_thread_id, forked_from_turn_id,
                    forked_from_sequence_no, workspace_root, rebound_from_workspace_root,
-                   rollout_path, title, preview, created_at, updated_at, recency_at, archived
+                   rollout_path, title, preview, created_at, updated_at, recency_at, archived,
+                   removed
             FROM threads
             WHERE session_id = ?
             ORDER BY recency_at DESC
@@ -1927,9 +1975,10 @@ impl RuntimeStore {
             r#"
             SELECT thread_id, session_id, parent_thread_id, forked_from_turn_id,
                    forked_from_sequence_no, workspace_root, rebound_from_workspace_root,
-                   rollout_path, title, preview, created_at, updated_at, recency_at, archived
+                   rollout_path, title, preview, created_at, updated_at, recency_at, archived,
+                   removed
             FROM threads
-            WHERE archived = 0
+            WHERE archived = 0 AND removed = 0
               AND (? IS NULL OR workspace_root = ?)
             ORDER BY recency_at DESC
             LIMIT ?
@@ -1956,9 +2005,10 @@ impl RuntimeStore {
             r#"
             SELECT thread_id, session_id, parent_thread_id, forked_from_turn_id,
                    forked_from_sequence_no, workspace_root, rebound_from_workspace_root,
-                   rollout_path, title, preview, created_at, updated_at, recency_at, archived
+                   rollout_path, title, preview, created_at, updated_at, recency_at, archived,
+                   removed
             FROM threads
-            WHERE archived = 0
+            WHERE archived = 0 AND removed = 0
               AND (? IS NULL OR workspace_root = ?)
               AND (
                     ? IS NULL
@@ -1989,6 +2039,9 @@ impl RuntimeStore {
         direction: SessionRangeDirection,
         count: u32,
     ) -> StoreResult<Vec<ThreadRecord>> {
+        if anchor.removed {
+            return Ok(Vec::new());
+        }
         if count <= 1 || direction == SessionRangeDirection::Single {
             return Ok(vec![anchor.clone()]);
         }
@@ -2004,9 +2057,10 @@ impl RuntimeStore {
             r#"
             SELECT thread_id, session_id, parent_thread_id, forked_from_turn_id,
                    forked_from_sequence_no, workspace_root, rebound_from_workspace_root,
-                   rollout_path, title, preview, created_at, updated_at, recency_at, archived
+                   rollout_path, title, preview, created_at, updated_at, recency_at, archived,
+                   removed
             FROM threads
-            WHERE archived = 0
+            WHERE archived = 0 AND removed = 0
               AND (? IS NULL OR workspace_root = ?)
               AND (
                     recency_at {comparison} ?
@@ -2149,9 +2203,9 @@ async fn upsert_thread_in_transaction(
         INSERT INTO threads (
             thread_id, session_id, parent_thread_id, forked_from_turn_id,
             forked_from_sequence_no, workspace_root, rebound_from_workspace_root,
-            rollout_path, title, preview, created_at, updated_at, recency_at, archived
+            rollout_path, title, preview, created_at, updated_at, recency_at, archived, removed
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(thread_id) DO UPDATE SET
             session_id = excluded.session_id,
             parent_thread_id = excluded.parent_thread_id,
@@ -2164,7 +2218,8 @@ async fn upsert_thread_in_transaction(
             preview = excluded.preview,
             updated_at = excluded.updated_at,
             recency_at = excluded.recency_at,
-            archived = excluded.archived
+            archived = excluded.archived,
+            removed = excluded.removed
         "#,
     )
     .bind(thread.thread_id.to_string())
@@ -2185,6 +2240,7 @@ async fn upsert_thread_in_transaction(
     .bind(thread.updated_at)
     .bind(thread.recency_at)
     .bind(thread.archived)
+    .bind(thread.removed)
     .execute(&mut **transaction)
     .await?;
     Ok(())
@@ -2203,6 +2259,15 @@ async fn next_sequence_in_transaction(
     .await?;
     let sequence_no: i64 = row.try_get("last_sequence_no")?;
     Ok(u64::try_from(sequence_no).unwrap_or(u64::MAX))
+}
+
+async fn append_event_assigning_sequence_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    mut event: RuntimeEvent,
+) -> StoreResult<RuntimeEvent> {
+    event.sequence_no = next_sequence_in_transaction(transaction).await?;
+    append_event_in_transaction(transaction, &event).await?;
+    Ok(event)
 }
 
 fn fork_id_replacements(
@@ -2516,7 +2581,8 @@ const MIGRATIONS: &[&str] = &[
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         recency_at TEXT NOT NULL,
-        archived INTEGER NOT NULL DEFAULT 0
+        archived INTEGER NOT NULL DEFAULT 0,
+        removed INTEGER NOT NULL DEFAULT 0
     )
     "#,
     r#"
@@ -2838,6 +2904,7 @@ fn thread_from_row(row: sqlx::sqlite::SqliteRow) -> StoreResult<ThreadRecord> {
         updated_at: row.try_get("updated_at")?,
         recency_at: row.try_get("recency_at")?,
         archived: row.try_get("archived")?,
+        removed: row.try_get("removed")?,
     })
 }
 

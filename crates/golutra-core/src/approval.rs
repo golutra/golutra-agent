@@ -21,9 +21,22 @@ pub enum ApprovalDecision {
     Denied,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalScope {
+    #[default]
+    Once,
+    ResourcePrefix,
+    Session,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ApprovalResolution {
     pub approval_id: ApprovalId,
     pub decision: ApprovalDecision,
+    #[serde(default)]
+    pub scope: ApprovalScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_prefix: Option<String>,
     pub reason: String,
 }

@@ -139,6 +139,15 @@ pub(crate) fn accepts_text_response_without_evidence(
     tool_reports: &[ToolExecutionReport],
 ) -> bool {
     !requires_workspace_evidence
-        && tool_reports.is_empty()
+        && tool_reports.iter().all(interaction_only_report)
         && assistant_message.is_some_and(|message| !message.trim().is_empty())
+}
+
+fn interaction_only_report(report: &ToolExecutionReport) -> bool {
+    report.envelope.status == ToolResultStatus::Ok
+        && report.envelope.risk == "p0_user_input"
+        && report.envelope.raw_artifact_ref.is_none()
+        && report.envelope.evidence_refs.is_empty()
+        && report.evidence.is_empty()
+        && report.changed_files.is_empty()
 }

@@ -589,6 +589,13 @@ struct ToolResultProjectionProvider {
 }
 
 #[derive(Debug, Clone)]
+struct StructuredQuestionProvider {
+    calls: Arc<AtomicUsize>,
+    saw_answer: Arc<AtomicBool>,
+    contract: golutra_core::ProviderContract,
+}
+
+#[derive(Debug, Clone)]
 struct ProgressAdvisoryProvider {
     calls: Arc<AtomicUsize>,
     saw_advisory: Arc<AtomicBool>,
@@ -1062,6 +1069,79 @@ impl LlmProvider for ToolResultProjectionProvider {
 }
 
 #[async_trait]
+impl LlmProvider for StructuredQuestionProvider {
+    async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let (message, tool_calls, finish_reason) = if call == 0 {
+            (
+                None,
+                vec![ProviderToolCall {
+                    tool_call_id: "question-1".to_owned(),
+                    tool_name: "ask_user".to_owned(),
+                    arguments: json!({
+                        "questions": [{
+                            "id": "format",
+                            "header": "Output",
+                            "question": "Which format?",
+                            "mode": "single",
+                            "options": [
+                                {"id": "json", "label": "JSON"},
+                                {"id": "text", "label": "Text"}
+                            ]
+                        }]
+                    }),
+                }],
+                ProviderFinishReason::ToolCalls,
+            )
+        } else {
+            self.saw_answer.store(
+                request.messages.iter().rev().any(|message| {
+                    message.role == ProviderRole::Tool
+                        && message.tool_name.as_deref() == Some("ask_user")
+                        && message.content.contains("json")
+                        && message
+                            .content
+                            .contains("Pretty-print with two-space indentation")
+                }),
+                Ordering::SeqCst,
+            );
+            (
+                Some(ProviderMessage {
+                    role: ProviderRole::Assistant,
+                    content: "JSON selected".to_owned(),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: Vec::new(),
+                    metadata: Default::default(),
+                }),
+                Vec::new(),
+                ProviderFinishReason::Stop,
+            )
+        };
+        Ok(ProviderResponse {
+            response_id: golutra_core::ProviderResponseId::new(),
+            message,
+            tool_calls,
+            usage: ProviderUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                reasoning_tokens: None,
+                cached_input_tokens: None,
+                total_tokens: Some(15),
+                usage_source: UsageSource::Estimated,
+                raw: json!({"round": call}),
+            },
+            finish_reason,
+            raw_metadata: json!({"round": call}),
+        })
+    }
+
+    fn contract(&self) -> golutra_core::ProviderContract {
+        self.contract.clone()
+    }
+}
+
+#[async_trait]
 impl LlmProvider for ValidationGateProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
@@ -1469,6 +1549,105 @@ async fn reserved_pending_turn_is_not_visible_until_its_event_is_durable() {
     reservation.commit();
 
     assert_eq!(waiting.await.expect("waiter"), Some(turn));
+}
+
+#[tokio::test]
+async fn pending_turn_update_is_atomic_with_its_durable_event() {
+    let (handle, control) = agent_execution_channel(1);
+    let original = PendingAgentTurn {
+        command_id: CommandId::new(),
+        turn_id: TurnId::new(),
+        content: "original prompt".to_owned(),
+        task_contract: None,
+        output_schema: None,
+        external_verifiers: Vec::new(),
+        max_elapsed_ms: None,
+        defer_external_verification: false,
+        external_verifiers_require_os_sandbox: false,
+        allow_network: false,
+        yolo: false,
+        steer: false,
+    };
+    handle
+        .append_turn(original.clone())
+        .await
+        .expect("turn queues");
+
+    let mut replacement = original.clone();
+    replacement.content = "edited prompt".to_owned();
+    let mutation = handle
+        .reserve_turn_update(original.turn_id, replacement.clone())
+        .expect("turn update reserves");
+    let waiting = tokio::spawn(async move { control.pending_turns.take_or_close().await });
+    tokio::task::yield_now().await;
+    assert!(!waiting.is_finished());
+
+    mutation.commit();
+    assert_eq!(waiting.await.expect("waiter"), Some(replacement));
+}
+
+#[tokio::test]
+async fn dropped_pending_turn_mutations_restore_the_original_queue_entry() {
+    let (handle, control) = agent_execution_channel(1);
+    let original = PendingAgentTurn {
+        command_id: CommandId::new(),
+        turn_id: TurnId::new(),
+        content: "keep this prompt".to_owned(),
+        task_contract: None,
+        output_schema: None,
+        external_verifiers: Vec::new(),
+        max_elapsed_ms: None,
+        defer_external_verification: false,
+        external_verifiers_require_os_sandbox: false,
+        allow_network: false,
+        yolo: false,
+        steer: false,
+    };
+    handle
+        .append_turn(original.clone())
+        .await
+        .expect("turn queues");
+
+    let mut replacement = original.clone();
+    replacement.content = "discard this edit".to_owned();
+    drop(
+        handle
+            .reserve_turn_update(original.turn_id, replacement)
+            .expect("turn update reserves"),
+    );
+    drop(
+        handle
+            .reserve_turn_cancellation(original.turn_id)
+            .expect("turn cancellation reserves"),
+    );
+
+    assert_eq!(control.pending_turns.take_or_close().await, Some(original));
+}
+
+#[tokio::test]
+async fn committed_pending_turn_cancellation_removes_the_turn() {
+    let (handle, control) = agent_execution_channel(1);
+    let turn = PendingAgentTurn {
+        command_id: CommandId::new(),
+        turn_id: TurnId::new(),
+        content: "cancel this prompt".to_owned(),
+        task_contract: None,
+        output_schema: None,
+        external_verifiers: Vec::new(),
+        max_elapsed_ms: None,
+        defer_external_verification: false,
+        external_verifiers_require_os_sandbox: false,
+        allow_network: false,
+        yolo: false,
+        steer: false,
+    };
+    handle.append_turn(turn.clone()).await.expect("turn queues");
+    handle
+        .reserve_turn_cancellation(turn.turn_id)
+        .expect("turn cancellation reserves")
+        .commit();
+
+    assert_eq!(control.pending_turns.take_or_close().await, None);
 }
 
 #[test]
@@ -2222,6 +2401,8 @@ async fn workspace_change_is_returned_to_the_model_until_fresh_validation_passes
         .resolve_approval(ApprovalResolution {
             approval_id: approval.approval_id,
             decision: ApprovalDecision::Approved,
+            scope: ApprovalScope::Once,
+            resource_prefix: None,
             reason: "approved by test".to_owned(),
         })
         .await
@@ -2465,6 +2646,8 @@ async fn checkpoint_failure_emits_a_balanced_failed_tool_observation() {
         .resolve_approval(ApprovalResolution {
             approval_id: approval.approval_id,
             decision: ApprovalDecision::Approved,
+            scope: ApprovalScope::Once,
+            resource_prefix: None,
             reason: "approved by test".to_owned(),
         })
         .await
@@ -4457,6 +4640,8 @@ async fn agent_loop_waits_for_approval_before_process_execution() {
         .resolve_approval(ApprovalResolution {
             approval_id: approval.approval_id,
             decision: ApprovalDecision::Approved,
+            scope: ApprovalScope::Once,
+            resource_prefix: None,
             reason: "approved by test".to_owned(),
         })
         .await
@@ -4470,6 +4655,217 @@ async fn agent_loop_waits_for_approval_before_process_execution() {
         "{:?}",
         outcome.tool_reports[0]
     );
+}
+
+fn approval_request(tool_name: &str, resource: &str) -> ApprovalRequest {
+    ApprovalRequest {
+        approval_id: ApprovalId::new(),
+        task_id: TaskId::new(),
+        turn_id: TurnId::new(),
+        tool_call_id: ToolCallId::new(),
+        tool_name: tool_name.to_owned(),
+        resource: resource.to_owned(),
+        reason: "test approval".to_owned(),
+    }
+}
+
+#[tokio::test]
+async fn approval_scope_once_never_creates_a_grant() {
+    let (handle, mut control) = agent_execution_channel(4);
+    let request = approval_request("shell", "cargo test");
+    handle
+        .resolve_approval(ApprovalResolution {
+            approval_id: request.approval_id,
+            decision: ApprovalDecision::Approved,
+            scope: ApprovalScope::Once,
+            resource_prefix: None,
+            reason: "once".to_owned(),
+        })
+        .await
+        .expect("resolution queued");
+
+    let resolution = control
+        .wait_for_approval(&request)
+        .await
+        .expect("resolution accepted");
+    assert_eq!(resolution.scope, ApprovalScope::Once);
+    assert!(control.approval_grants.is_empty());
+    assert!(
+        control
+            .scoped_approval(&approval_request("shell", "cargo test"))
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn resource_approval_only_matches_the_same_tool_and_prefix() {
+    let (handle, mut control) = agent_execution_channel(4);
+    let request = approval_request("shell", "cargo test -p golutra-runtime");
+    handle
+        .resolve_approval(ApprovalResolution {
+            approval_id: request.approval_id,
+            decision: ApprovalDecision::Approved,
+            scope: ApprovalScope::ResourcePrefix,
+            resource_prefix: Some("cargo test".to_owned()),
+            reason: "cargo tests".to_owned(),
+        })
+        .await
+        .expect("resolution queued");
+    control
+        .wait_for_approval(&request)
+        .await
+        .expect("resolution accepted");
+
+    assert!(
+        control
+            .scoped_approval(&approval_request("shell", "cargo test -p golutra-client"))
+            .is_some()
+    );
+    assert!(
+        control
+            .scoped_approval(&approval_request(
+                "write_file",
+                "cargo test -p golutra-client"
+            ))
+            .is_none()
+    );
+    assert!(
+        control
+            .scoped_approval(&approval_request("shell", "cargo check"))
+            .is_none()
+    );
+    assert!(
+        control
+            .scoped_approval(&approval_request("shell", "cargo test; rm -rf /"))
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn session_approval_matches_later_requests_in_the_same_execution() {
+    let (handle, mut control) = agent_execution_channel(4);
+    let request = approval_request("shell", "cargo test");
+    handle
+        .resolve_approval(ApprovalResolution {
+            approval_id: request.approval_id,
+            decision: ApprovalDecision::Approved,
+            scope: ApprovalScope::Session,
+            resource_prefix: None,
+            reason: "task scope".to_owned(),
+        })
+        .await
+        .expect("resolution queued");
+    control
+        .wait_for_approval(&request)
+        .await
+        .expect("resolution accepted");
+
+    assert!(
+        control
+            .scoped_approval(&approval_request("write_file", "outside.txt"))
+            .is_some()
+    );
+    let (_, fresh_control) = agent_execution_channel(4);
+    assert!(
+        fresh_control
+            .scoped_approval(&approval_request("shell", "cargo test"))
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn invalid_prefixes_and_denials_never_create_grants() {
+    for (decision, prefix) in [
+        (ApprovalDecision::Approved, Some("outside/".to_owned())),
+        (ApprovalDecision::Denied, Some("src/".to_owned())),
+    ] {
+        let (handle, mut control) = agent_execution_channel(4);
+        let request = approval_request("read_file", "src/runtime.rs");
+        handle
+            .resolve_approval(ApprovalResolution {
+                approval_id: request.approval_id,
+                decision,
+                scope: ApprovalScope::ResourcePrefix,
+                resource_prefix: prefix,
+                reason: "invalid grant".to_owned(),
+            })
+            .await
+            .expect("resolution queued");
+        let resolution = control
+            .wait_for_approval(&request)
+            .await
+            .expect("resolution accepted");
+
+        assert_eq!(resolution.scope, ApprovalScope::Once);
+        assert_eq!(resolution.resource_prefix, None);
+        assert!(control.approval_grants.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn structured_question_round_trip_is_validated_and_model_visible() {
+    let workspace = tempdir().expect("workspace");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let saw_answer = Arc::new(AtomicBool::new(false));
+    let provider = StructuredQuestionProvider {
+        calls,
+        saw_answer: saw_answer.clone(),
+        contract: MockProvider::text_response("unused").contract(),
+    };
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor);
+    let (handle, control) = agent_execution_channel(4);
+    let (trace_tx, mut trace_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        agent_loop
+            .run_with_control_and_trace(
+                AgentTaskRequest {
+                    session_id: SessionId::new(),
+                    task_id: TaskId::new(),
+                    turn_id: TurnId::new(),
+                    objective: "ask for an output format".to_owned(),
+                    completion_criteria: Vec::new(),
+                    output_schema: None,
+                    touched_code: false,
+                    contributors: Vec::new(),
+                    tools: vec!["ask_user".to_owned()],
+                },
+                control,
+                move |event| {
+                    let _ = trace_tx.send(event);
+                },
+            )
+            .await
+    });
+    let question = loop {
+        let event = trace_rx.recv().await.expect("question trace");
+        if let AgentLoopTraceEvent::UserQuestionRequested(question) = event {
+            break question;
+        }
+    };
+    assert!(!task.is_finished());
+    handle
+        .resolve_question(UserQuestionResolution {
+            question_id: question.question_id,
+            answers: vec![UserQuestionAnswer {
+                question_id: "format".to_owned(),
+                selected_option_ids: vec!["json".to_owned()],
+                free_text: Some("Pretty-print with two-space indentation".to_owned()),
+            }],
+            reason: "test answer".to_owned(),
+        })
+        .await
+        .expect("answer queued");
+
+    let outcome = task.await.expect("task joins").expect("loop completes");
+    assert!(saw_answer.load(Ordering::SeqCst));
+    assert_eq!(outcome.final_message.as_deref(), Some("JSON selected"));
+    assert!(outcome.tool_reports.iter().any(|report| {
+        report.envelope.tool_name == "ask_user"
+            && report.envelope.structured_facts["answers"][0]["selected_option_ids"][0] == "json"
+            && report.envelope.structured_facts["answers"][0]["free_text"]
+                == "Pretty-print with two-space indentation"
+    }));
 }
 
 #[cfg(unix)]
@@ -4515,6 +4911,8 @@ async fn paused_approval_does_not_execute_tool_until_resume() {
         .resolve_approval(ApprovalResolution {
             approval_id: approval.approval_id,
             decision: ApprovalDecision::Approved,
+            scope: ApprovalScope::Once,
+            resource_prefix: None,
             reason: "approved while paused".to_owned(),
         })
         .await

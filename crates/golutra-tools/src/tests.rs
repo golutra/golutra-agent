@@ -82,6 +82,7 @@ async fn registry_contains_p0_tools() {
         names,
         vec![
             "apply_patch",
+            "ask_user",
             "edit_file",
             "find_references",
             "list_dir",
@@ -1328,6 +1329,12 @@ async fn shell_progress_and_terminal_metrics_share_one_tool_call() {
     let final_sample = output_samples.last().expect("terminal output sample");
     assert_eq!(final_sample.output_bytes, report.metrics.output_bytes);
     assert_eq!(final_sample.output_lines, report.metrics.output_lines);
+    assert!(
+        final_sample
+            .output_excerpt
+            .as_deref()
+            .is_some_and(|excerpt| excerpt.contains("three"))
+    );
 }
 
 #[tokio::test]

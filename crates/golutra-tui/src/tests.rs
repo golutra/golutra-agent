@@ -163,7 +163,9 @@ async fn remote_transport_attaches_to_the_real_app_server_and_resolves_a_session
         false,
         provider_status.message,
         None,
-    );
+    )
+    .with_transport_runtime_controls(&transport);
+    assert!(app.runtime_controls.profile_name.is_none());
     app.execute_slash_command(&transport, SlashCommand::Auth(SlashAuthCommand::Setup))
         .await
         .expect("remote auth setup guard");
@@ -586,6 +588,82 @@ async fn composer_keys_edit_unicode_at_the_grapheme_boundary() {
     assert_eq!(app.input.text(), "你好👍");
 }
 
+#[tokio::test]
+async fn vim_mode_edits_unicode_and_preserves_insert_normal_boundaries() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.preferences.keymap = KeymapMode::Vim;
+    app.composer_mode = ComposerMode::VimInsert;
+    handle_paste("你👍 alpha\n第二 line", &mut app);
+
+    handle_key(
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("enter normal mode");
+    assert_eq!(app.composer_mode, ComposerMode::VimNormal);
+
+    handle_paste("blocked", &mut app);
+    assert_eq!(app.input.text(), "你👍 alpha\n第二 line");
+    assert_eq!(app.status_message, "enter Vim insert mode before pasting");
+
+    for key in [KeyCode::Char('0'), KeyCode::Char('x')] {
+        handle_key(KeyEvent::new(key, KeyModifiers::NONE), &mut app, &transport)
+            .await
+            .expect("normal-mode edit");
+    }
+    assert_eq!(app.input.text(), "你👍 alpha\n二 line");
+
+    handle_key(
+        KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("undo character deletion");
+    assert_eq!(app.input.text(), "你👍 alpha\n第二 line");
+
+    for key in [KeyCode::Char('d'), KeyCode::Char('d')] {
+        handle_key(KeyEvent::new(key, KeyModifiers::NONE), &mut app, &transport)
+            .await
+            .expect("delete current line");
+    }
+    assert_eq!(app.input.text(), "你👍 alpha");
+
+    handle_key(
+        KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("undo line deletion");
+    handle_key(
+        KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("append at line end");
+    assert_eq!(app.composer_mode, ComposerMode::VimInsert);
+    handle_key(
+        KeyEvent::new(KeyCode::Char('界'), KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("insert unicode in Vim mode");
+    assert_eq!(app.input.text(), "你👍 alpha\n第二 line界");
+}
+
 #[test]
 fn bracketed_paste_preserves_chinese_and_newlines() {
     let mut app = TuiApp::new(
@@ -601,6 +679,88 @@ fn bracketed_paste_preserves_chinese_and_newlines() {
 
     assert_eq!(app.input.text(), "你好\n世界");
     assert_eq!(app.input.cursor(), "你好\n世界".len());
+}
+
+#[tokio::test]
+async fn structured_question_free_text_uses_unicode_composer_editing() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.question_dialog = Some(QuestionDialogState::new(UserQuestionRequest {
+        question_id: golutra_core::QuestionId::new(),
+        task_id: TaskId::new(),
+        turn_id: TurnId::new(),
+        tool_call_id: golutra_core::ToolCallId::new(),
+        questions: vec![golutra_core::UserQuestionPrompt {
+            id: "format".to_owned(),
+            header: "Output".to_owned(),
+            question: "Choose an output format".to_owned(),
+            mode: golutra_core::UserQuestionMode::Single,
+            options: vec![
+                golutra_core::UserQuestionOption {
+                    id: "json".to_owned(),
+                    label: "JSON".to_owned(),
+                    description: None,
+                },
+                golutra_core::UserQuestionOption {
+                    id: "text".to_owned(),
+                    label: "Text".to_owned(),
+                    description: None,
+                },
+            ],
+        }],
+    }));
+
+    handle_key(
+        KeyEvent::new(KeyCode::Char('自'), KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("type free text");
+    handle_paste("定义👍🏽", &mut app);
+    handle_key(
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("delete emoji grapheme");
+    handle_paste("\r\n说明", &mut app);
+
+    let dialog = app.question_dialog.as_ref().expect("question dialog");
+    assert!(dialog.is_free_text_focused());
+    assert_eq!(dialog.current_free_text().text(), "自定义\n说明");
+    let resolution = dialog.resolution("test").expect("free text answer");
+    assert!(resolution.answers[0].selected_option_ids.is_empty());
+    assert_eq!(
+        resolution.answers[0].free_text.as_deref(),
+        Some("自定义\n说明")
+    );
+}
+
+#[test]
+fn terminal_resume_generation_invalidates_the_crossterm_input_stream() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    let generation = app.terminal_resume_generation;
+    assert!(!app.terminal_input_stream_is_stale(generation));
+
+    app.mark_terminal_resumed();
+
+    assert!(app.terminal_input_stream_is_stale(generation));
 }
 
 #[test]
@@ -638,6 +798,232 @@ fn composer_hides_cursor_when_the_terminal_is_too_narrow_for_input() {
     );
 
     assert_eq!(composer_cursor_position(Rect::new(0, 0, 2, 3), &app), None);
+}
+
+#[test]
+fn structured_question_free_text_owns_focus_and_renders_a_unicode_cursor() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    let mut dialog = QuestionDialogState::new(UserQuestionRequest {
+        question_id: golutra_core::QuestionId::new(),
+        task_id: TaskId::new(),
+        turn_id: TurnId::new(),
+        tool_call_id: golutra_core::ToolCallId::new(),
+        questions: vec![golutra_core::UserQuestionPrompt {
+            id: "format".to_owned(),
+            header: "Output".to_owned(),
+            question: "Choose a format".to_owned(),
+            mode: golutra_core::UserQuestionMode::Single,
+            options: vec![
+                golutra_core::UserQuestionOption {
+                    id: "json".to_owned(),
+                    label: "JSON".to_owned(),
+                    description: None,
+                },
+                golutra_core::UserQuestionOption {
+                    id: "text".to_owned(),
+                    label: "Text".to_owned(),
+                    description: None,
+                },
+            ],
+        }],
+    });
+    dialog.focus_free_text(0);
+    dialog.current_free_text_mut().insert_str("你");
+    app.question_dialog = Some(dialog);
+    let mut terminal = Terminal::new(TestBackend::new(40, 14)).expect("terminal");
+
+    terminal
+        .draw(|frame| {
+            draw_question_dialog(
+                frame,
+                frame.area(),
+                app.question_dialog.as_ref().expect("dialog"),
+                &app,
+            );
+        })
+        .expect("draw question");
+
+    terminal
+        .backend_mut()
+        .assert_cursor_position(Position::new(6, 9));
+    let rows = (0..14)
+        .map(|row| {
+            (0..40)
+                .filter_map(|column| terminal.backend().buffer().cell((column, row)))
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        rows.iter().any(|row| row.starts_with("  ( ) JSON")),
+        "option must not retain focus while free text is focused: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("› Other answer / notes")),
+        "free-text editor must display the focus marker: {rows:?}"
+    );
+}
+
+#[test]
+fn settings_model_editor_renders_the_real_unicode_cursor() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    let mut dialog = SettingsDialogState::new(
+        &app.runtime_controls,
+        &app.provider_choices,
+        &app.preferences,
+        false,
+    );
+    dialog.selected_row = SettingsRow::Model;
+    dialog.editing_model = true;
+    dialog.model_input.set_text("你ab");
+    dialog.model_input.move_left();
+    app.settings_dialog = Some(dialog);
+    let mut terminal = Terminal::new(TestBackend::new(50, 20)).expect("terminal");
+
+    terminal
+        .draw(|frame| {
+            draw_settings_dialog(
+                frame,
+                frame.area(),
+                app.settings_dialog.as_ref().expect("settings"),
+                &app,
+            );
+        })
+        .expect("draw settings");
+
+    terminal
+        .backend_mut()
+        .assert_cursor_position(Position::new(12, 5));
+    assert!(!terminal_buffer_text(&terminal).contains("你ab|"));
+}
+
+#[test]
+fn session_picker_filter_and_rename_render_real_unicode_cursors() {
+    let app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    let mut picker = ResumePickerState::new(vec![resume_item("session")]);
+    picker.search.set_text("你ab");
+    picker.search.move_left();
+    let mut filter = Terminal::new(TestBackend::new(50, 8)).expect("filter terminal");
+
+    filter
+        .draw(|frame| draw_resume_picker(frame, frame.area(), &picker, app.thread_id, &app))
+        .expect("draw filter");
+    filter
+        .backend_mut()
+        .assert_cursor_position(Position::new(28, 0));
+
+    picker.begin_action(SessionPickerAction::Rename);
+    picker.action_input.set_text("你ab");
+    picker.action_input.move_left();
+    let mut rename = Terminal::new(TestBackend::new(50, 8)).expect("rename terminal");
+    rename
+        .draw(|frame| draw_resume_picker(frame, frame.area(), &picker, app.thread_id, &app))
+        .expect("draw rename");
+    rename
+        .backend_mut()
+        .assert_cursor_position(Position::new(10, 1));
+    assert!(!terminal_buffer_text(&rename).contains("你ab|"));
+}
+
+#[tokio::test]
+async fn export_destination_supports_in_place_unicode_editing_and_a_real_cursor() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.export_flow = Some(ExportFlowState {
+        picker: ResumePickerState::new(Vec::new()),
+        step: ExportFlowStep::Destination,
+        range_input: ComposerInput::from_text("1"),
+        destination_input: ComposerInput::from_text("你b"),
+        error: None,
+        receipt: None,
+    });
+
+    for key in [KeyCode::Left, KeyCode::Char('a')] {
+        handle_key(KeyEvent::new(key, KeyModifiers::NONE), &mut app, &transport)
+            .await
+            .expect("edit export destination");
+    }
+    assert_eq!(
+        app.export_flow
+            .as_ref()
+            .expect("export")
+            .destination_input
+            .text(),
+        "你ab"
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(50, 12)).expect("terminal");
+    terminal
+        .draw(|frame| {
+            draw_export_flow(
+                frame,
+                frame.area(),
+                app.export_flow.as_ref().expect("export"),
+                app.thread_id,
+                &app,
+            );
+        })
+        .expect("draw export");
+
+    assert_eq!(
+        terminal
+            .backend()
+            .buffer()
+            .cell((6, 3))
+            .expect("CJK cell")
+            .symbol(),
+        "你"
+    );
+    assert_eq!(
+        terminal
+            .backend()
+            .buffer()
+            .cell((8, 3))
+            .expect("a cell")
+            .symbol(),
+        "a"
+    );
+    assert_eq!(
+        terminal
+            .backend()
+            .buffer()
+            .cell((9, 3))
+            .expect("b cell")
+            .symbol(),
+        "b"
+    );
+    terminal
+        .backend_mut()
+        .assert_cursor_position(Position::new(9, 3));
 }
 
 #[test]
@@ -866,8 +1252,11 @@ fn slash_candidates_render_below_composer_with_selection() {
         None,
     );
     app.input.set_text("/");
-    app.slash_selected = 3;
     let candidates = app.slash_candidates();
+    app.slash_selected = candidates
+        .iter()
+        .position(|candidate| candidate.command == "/resume")
+        .expect("resume candidate");
     let lines = slash_candidate_lines(&app, &candidates)
         .into_iter()
         .map(|line| line.to_string())
@@ -876,7 +1265,7 @@ fn slash_candidates_render_below_composer_with_selection() {
 
     assert!(lines.contains("/new"));
     assert!(lines.contains("/resume"));
-    assert!(lines.contains("› /threads"));
+    assert!(lines.contains("› /resume"));
     assert_eq!(bottom_pane_height(&app), 8);
 }
 
@@ -911,8 +1300,34 @@ fn footer_context_marks_yolo_mode() {
 
     assert_eq!(
         footer_context_text(&app, 80),
-        "[yolo] gpt-5.6-sol · /workspace"
+        "[unrestricted] gpt-5.6-sol · /workspace"
     );
+}
+
+#[test]
+fn session_settings_are_embedded_in_the_next_prompt_without_global_mutation() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (configured-model)".to_owned(),
+        None,
+    );
+    app.set_session_model("session-model".to_owned());
+    app.set_session_effort(ReasoningEffortSelection::Effort(
+        ProviderReasoningEffort::High,
+    ));
+    app.set_permission_mode(true);
+
+    let payload = app.runtime_prompt_payload("inspect".to_owned());
+    assert_eq!(payload["provider_model"], "session-model");
+    assert_eq!(
+        payload["provider_generation_config"]["reasoning_effort"],
+        "high"
+    );
+    assert_eq!(payload["yolo"], true);
+    assert_eq!(payload["allow_network"], true);
 }
 
 #[test]
@@ -948,6 +1363,237 @@ fn bottom_pane_renders_context_instead_of_task_status() {
 }
 
 #[test]
+fn runtime_modal_temporarily_replaces_search_surface_without_losing_query() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.open_transcript_search();
+    app.transcript_search
+        .as_mut()
+        .expect("transcript search")
+        .input
+        .insert_str("needle");
+    app.approval_dialog = Some(ApprovalDialogState::new(ApprovalRequest {
+        approval_id: golutra_core::ApprovalId::new(),
+        task_id: TaskId::new(),
+        turn_id: TurnId::new(),
+        tool_call_id: golutra_core::ToolCallId::new(),
+        tool_name: "shell".to_owned(),
+        resource: "cargo test".to_owned(),
+        reason: "process execution requires approval".to_owned(),
+    }));
+
+    let mut modal = Terminal::new(TestBackend::new(80, 5)).expect("modal terminal");
+    modal
+        .draw(|frame| draw_bottom_pane(frame, frame.area(), &app))
+        .expect("draw modal surface");
+    let modal_text = terminal_buffer_text(&modal);
+    assert!(modal_text.contains("Resolve the pending tool request"));
+    assert!(!modal_text.contains("Find: needle"));
+
+    app.approval_dialog = None;
+    let mut restored = Terminal::new(TestBackend::new(80, 4)).expect("search terminal");
+    restored
+        .draw(|frame| draw_bottom_pane(frame, frame.area(), &app))
+        .expect("draw restored search");
+    assert!(terminal_buffer_text(&restored).contains("Find: needle"));
+}
+
+#[test]
+fn search_temporarily_hides_composer_accessories_and_restores_them() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("context.txt"), "context").expect("attachment");
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.workspace_path = workspace.path().to_path_buf();
+    app.input.set_text("/");
+    app.add_attachment("context.txt");
+    app.open_history_search();
+
+    let mut search = Terminal::new(TestBackend::new(80, 10)).expect("search terminal");
+    search
+        .draw(|frame| draw_bottom_pane(frame, frame.area(), &app))
+        .expect("draw search");
+    let search_text = terminal_buffer_text(&search);
+    assert!(search_text.contains("History:"));
+    assert!(!search_text.contains("/resume"));
+    assert!(!search_text.contains("context.txt"));
+
+    app.history_search = None;
+    let mut composer = Terminal::new(TestBackend::new(80, 10)).expect("composer terminal");
+    composer
+        .draw(|frame| draw_bottom_pane(frame, frame.area(), &app))
+        .expect("draw composer");
+    let composer_text = terminal_buffer_text(&composer);
+    assert!(composer_text.contains("/resume"));
+    assert!(composer_text.contains("context.txt"));
+}
+
+#[tokio::test]
+async fn runtime_prompt_stacks_above_user_workflows_and_restores_them() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.queue_picker = Some(QueuePickerState::default());
+    app.approval_dialog = Some(ApprovalDialogState::new(ApprovalRequest {
+        approval_id: golutra_core::ApprovalId::new(),
+        task_id: TaskId::new(),
+        turn_id: TurnId::new(),
+        tool_call_id: golutra_core::ToolCallId::new(),
+        tool_name: "shell".to_owned(),
+        resource: "cargo test".to_owned(),
+        reason: "process execution requires approval".to_owned(),
+    }));
+
+    assert_eq!(header_mode(&app), "  approval");
+    let regions = overlay_mouse_regions(Rect::new(0, 0, 80, 20), &app);
+    assert!(
+        regions
+            .iter()
+            .any(|region| matches!(region.press, UiMousePress::Approval(_)))
+    );
+    assert!(
+        regions
+            .iter()
+            .all(|region| !matches!(region.press, UiMousePress::Queue(_)))
+    );
+    handle_key(
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("route escape to approval");
+    assert!(app.queue_picker.is_some());
+    assert_eq!(
+        app.approval_dialog
+            .as_ref()
+            .expect("approval")
+            .selected_choice(),
+        ApprovalChoice::Deny
+    );
+
+    app.approval_dialog = None;
+    assert_eq!(header_mode(&app), "  queue");
+
+    app.queue_picker = None;
+    app.export_flow = Some(ExportFlowState {
+        picker: ResumePickerState::new(Vec::new()),
+        step: ExportFlowStep::SelectSession,
+        range_input: ComposerInput::from_text("1"),
+        destination_input: ComposerInput::default(),
+        error: None,
+        receipt: None,
+    });
+    app.question_dialog = Some(QuestionDialogState::new(UserQuestionRequest {
+        question_id: golutra_core::QuestionId::new(),
+        task_id: TaskId::new(),
+        turn_id: TurnId::new(),
+        tool_call_id: golutra_core::ToolCallId::new(),
+        questions: vec![golutra_core::UserQuestionPrompt {
+            id: "format".to_owned(),
+            header: "Output".to_owned(),
+            question: "Choose an output format".to_owned(),
+            mode: golutra_core::UserQuestionMode::Single,
+            options: vec![
+                golutra_core::UserQuestionOption {
+                    id: "json".to_owned(),
+                    label: "JSON".to_owned(),
+                    description: None,
+                },
+                golutra_core::UserQuestionOption {
+                    id: "text".to_owned(),
+                    label: "Text".to_owned(),
+                    description: None,
+                },
+            ],
+        }],
+    }));
+
+    assert_eq!(header_mode(&app), "  question");
+    handle_key(
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("route escape to question");
+    assert!(app.export_flow.is_some());
+    assert!(app.question_dialog.is_some());
+
+    app.question_dialog = None;
+    assert_eq!(header_mode(&app), "  export");
+
+    let task_id = TaskId::new();
+    app.apply_runtime_refresh_snapshot(RuntimeRefreshSnapshot {
+        binding: app.runtime_refresh_binding(),
+        projection: UserProjection {
+            session_id: app.session_id,
+            task_id: Some(task_id),
+            status: golutra_core::TaskStatus::WaitingAuthentication,
+            visible_steps: Vec::new(),
+            pending_approval: None,
+            final_message: None,
+            residual_risks: Vec::new(),
+        },
+        provider_status: None,
+        developer_projection: None,
+        remote: false,
+    });
+    assert!(app.auth_dialog.is_some());
+    assert!(app.export_flow.is_some());
+    assert_eq!(header_mode(&app), "  auth");
+
+    app.open_help(HelpTopic::Overview);
+    assert_eq!(header_mode(&app), "  help");
+    assert_eq!(status_chip(&app), "help");
+}
+
+#[test]
+fn contextual_help_reports_the_surface_beneath_it() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        Some(AuthDialogState::new()),
+    );
+
+    app.open_help(HelpTopic::Overview);
+    assert_eq!(
+        app.help_dialog.as_ref().expect("auth help").context,
+        "provider setup"
+    );
+
+    app.help_dialog = None;
+    app.auth_dialog = None;
+    app.open_transcript_search();
+    app.open_help(HelpTopic::Overview);
+    assert_eq!(
+        app.help_dialog.as_ref().expect("search help").context,
+        "transcript search"
+    );
+}
+
+#[test]
 fn provider_footer_adds_configured_reasoning_effort() {
     let mut profile = ProviderProfile::openai_compatible(
         "custom",
@@ -968,10 +1614,18 @@ fn provider_footer_adds_configured_reasoning_effort() {
 
 #[test]
 fn transcript_role_markers_follow_codex_symbols() {
-    assert_eq!(role_marker(&TranscriptRole::User), "› ");
-    assert_eq!(role_marker(&TranscriptRole::Assistant), "• ");
-    assert_eq!(role_marker(&TranscriptRole::Status), "• ");
-    assert_eq!(role_marker(&TranscriptRole::System), "• ");
+    let app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    assert_eq!(role_marker(&app, &TranscriptRole::User), "› ");
+    assert_eq!(role_marker(&app, &TranscriptRole::Assistant), "• ");
+    assert_eq!(role_marker(&app, &TranscriptRole::Status), "• ");
+    assert_eq!(role_marker(&app, &TranscriptRole::System), "• ");
 }
 
 #[tokio::test]
@@ -1609,6 +2263,126 @@ async fn auth_text_inputs_do_not_swallow_vim_key_characters() {
     assert_eq!(dialog.model, "jkl-model");
 }
 
+#[tokio::test]
+async fn question_mark_is_typed_into_modal_inputs_instead_of_opening_help() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        provider_status_message(),
+        Some(AuthDialogState::new()),
+    );
+    {
+        let dialog = app.auth_dialog.as_mut().expect("dialog");
+        dialog.select_provider(OFFICIAL_PROVIDER_PRESET);
+        dialog.step = AuthDialogStep::ApiKey;
+    }
+
+    handle_key(
+        KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("type question mark");
+
+    assert_eq!(app.auth_dialog.as_ref().expect("dialog").api_key, "?");
+    assert!(app.help_dialog.is_none());
+}
+
+#[test]
+fn bracketed_paste_routes_to_the_active_text_surface() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        provider_status_message(),
+        Some(AuthDialogState::new()),
+    );
+    {
+        let dialog = app.auth_dialog.as_mut().expect("dialog");
+        dialog.select_provider(OFFICIAL_PROVIDER_PRESET);
+        dialog.step = AuthDialogStep::ApiKey;
+    }
+    app.composer_mode = ComposerMode::VimNormal;
+    handle_paste("sk-?key\n", &mut app);
+    assert_eq!(app.auth_dialog.as_ref().expect("dialog").api_key, "sk-?key");
+
+    app.auth_dialog = None;
+    app.prompt_history.record("find this prompt");
+    app.open_history_search();
+    handle_paste("find\nthis", &mut app);
+    let search = app.history_search.as_ref().expect("history search");
+    assert_eq!(search.input.text(), "find this");
+    assert_eq!(search.matches, vec!["find this prompt"]);
+
+    app.history_search = None;
+    app.resume_picker = Some(ResumePickerState::new(vec![resume_item("search target")]));
+    handle_paste("target", &mut app);
+    let picker = app.resume_picker.as_ref().expect("resume picker");
+    assert_eq!(picker.search.text(), "target");
+    assert_eq!(picker.items.len(), 1);
+}
+
+#[test]
+fn help_dialog_captures_paste_before_hidden_input_surfaces() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.resume_picker = Some(ResumePickerState::new(vec![resume_item("search target")]));
+    app.help_dialog = Some(HelpDialogState::new(HelpTopic::Overview, "resume picker"));
+
+    handle_paste("hidden resume search", &mut app);
+
+    assert!(
+        app.resume_picker
+            .as_ref()
+            .expect("resume picker")
+            .search
+            .is_empty()
+    );
+
+    app.resume_picker = None;
+    app.question_dialog = Some(QuestionDialogState::new(UserQuestionRequest {
+        question_id: golutra_core::QuestionId::new(),
+        task_id: TaskId::new(),
+        turn_id: TurnId::new(),
+        tool_call_id: golutra_core::ToolCallId::new(),
+        questions: vec![golutra_core::UserQuestionPrompt {
+            id: "format".to_owned(),
+            header: "Output".to_owned(),
+            question: "Choose an output format".to_owned(),
+            mode: golutra_core::UserQuestionMode::Single,
+            options: vec![
+                golutra_core::UserQuestionOption {
+                    id: "json".to_owned(),
+                    label: "JSON".to_owned(),
+                    description: None,
+                },
+                golutra_core::UserQuestionOption {
+                    id: "text".to_owned(),
+                    label: "Text".to_owned(),
+                    description: None,
+                },
+            ],
+        }],
+    }));
+
+    handle_paste("hidden question answer", &mut app);
+
+    let question = app.question_dialog.as_ref().expect("question dialog");
+    assert!(!question.is_free_text_focused());
+    assert!(question.current_free_text().is_empty());
+}
+
 #[test]
 fn new_idle_session_has_empty_transcript() {
     let mut app = TuiApp::new(
@@ -1641,7 +2415,139 @@ fn new_idle_session_has_empty_transcript() {
         .filter_map(|x| terminal.backend().buffer().cell((x, 1)))
         .map(|cell| cell.symbol())
         .collect::<String>();
-    assert_eq!(separator, "─".repeat(80));
+    assert!(separator.starts_with(" Transcript • "));
+    assert!(separator.ends_with('─'));
+}
+
+#[test]
+fn debug_layout_is_split_only_when_both_panes_remain_readable() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        true,
+        "ready (mock)".to_owned(),
+        None,
+    );
+
+    let wide = ui_layout(Rect::new(0, 0, 120, 30), &app);
+    assert_eq!(wide.body_mode, BodyLayoutMode::Split);
+    assert_eq!(wide.transcript.width, 60);
+    assert_eq!(wide.developer.expect("developer pane").width, 60);
+
+    let narrow = ui_layout(Rect::new(0, 0, 80, 30), &app);
+    assert_eq!(narrow.body_mode, BodyLayoutMode::Transcript);
+    assert_eq!(narrow.transcript, narrow.body);
+    assert!(narrow.developer.is_none());
+
+    app.active_scroll_pane = ScrollablePane::Developer;
+    let developer = ui_layout(Rect::new(0, 0, 80, 30), &app);
+    assert_eq!(developer.body_mode, BodyLayoutMode::Developer);
+    assert_eq!(developer.developer, Some(developer.body));
+    assert_eq!(developer.transcript, Rect::default());
+}
+
+#[test]
+fn pane_focus_and_fullscreen_preserve_transcript_scroll_position() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        true,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.command_messages = (0..20)
+        .map(|index| TranscriptItem {
+            role: TranscriptRole::System,
+            title: format!("message {index}"),
+            body: vec!["body".to_owned()],
+        })
+        .collect();
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw split panes");
+    app.scroll_transcript(TranscriptScrollAction::PageUp, 10);
+    let offset = app.transcript_scroll.offset_from_bottom;
+    assert!(offset > 0);
+
+    app.toggle_transcript_fullscreen();
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw full transcript");
+    assert_eq!(app.layout.body_mode, BodyLayoutMode::Transcript);
+    assert_eq!(app.transcript_scroll.offset_from_bottom, offset);
+    assert!(terminal_buffer_text(&terminal).contains("Transcript •"));
+
+    app.toggle_transcript_fullscreen();
+    assert_eq!(app.body_view_mode, BodyViewMode::Auto);
+    assert_eq!(app.transcript_scroll.offset_from_bottom, offset);
+}
+
+#[test]
+fn transcript_search_finds_logical_rows_and_moves_the_viewport() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.command_messages = (0..30)
+        .map(|index| TranscriptItem {
+            role: TranscriptRole::System,
+            title: format!("message {index}"),
+            body: vec![if index == 3 || index == 27 {
+                format!("needle {index}")
+            } else {
+                "body".to_owned()
+            }],
+        })
+        .collect();
+    let mut terminal = Terminal::new(TestBackend::new(80, 16)).expect("terminal");
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw transcript");
+
+    app.open_transcript_search();
+    app.transcript_search
+        .as_mut()
+        .expect("search")
+        .input
+        .set_text("needle");
+    app.rebuild_transcript_search();
+    let search = app.transcript_search.as_ref().expect("search");
+    assert_eq!(search.matches.len(), 2);
+    assert_eq!(search.current_line(), Some(10));
+    assert!(app.transcript_scroll.offset_from_bottom > 0);
+    let first_offset = app.transcript_scroll.offset_from_bottom;
+
+    app.transcript_search
+        .as_mut()
+        .expect("search")
+        .select_next();
+    app.focus_current_search_match();
+    assert!(app.transcript_scroll.offset_from_bottom < first_offset);
+    let layout = transcript_layout(&app, app.layout.body);
+    let target = layout
+        .visual_start_for_line(
+            app.transcript_search
+                .as_ref()
+                .and_then(TranscriptSearchState::current_line)
+                .expect("selected result"),
+        )
+        .expect("result row");
+    assert!(
+        layout
+            .visible_window(
+                app.layout.body.height.saturating_sub(1) as usize,
+                app.transcript_scroll.offset_from_bottom,
+                app.transcript_top_row_override,
+            )
+            .contains(&target)
+    );
 }
 
 #[test]
@@ -2117,6 +3023,7 @@ fn developer_detail_reflow_keeps_the_first_visible_event_as_anchor() {
     assert_eq!(expanded_anchor, collapsed_anchor);
 
     let mut narrow_terminal = Terminal::new(TestBackend::new(90, 24)).expect("narrow terminal");
+    app.active_scroll_pane = ScrollablePane::Developer;
     narrow_terminal
         .draw(|frame| draw_ui(frame, &mut app))
         .expect("reflow expanded developer events");
@@ -2300,15 +3207,13 @@ async fn developer_projection_is_only_loaded_in_explicit_debug_mode() {
     app.refresh(&transport).await.expect("normal refresh");
     assert!(app.developer_projection.is_none());
 
-    app.set_debug_mode(&transport, true)
-        .await
-        .expect("enable developer mode");
+    app.set_debug_mode(true);
+    assert!(app.developer_projection.is_none());
+    app.refresh(&transport).await.expect("debug refresh");
     assert!(app.developer_projection.is_some());
     assert!(app.developer_error.is_none());
 
-    app.set_debug_mode(&transport, false)
-        .await
-        .expect("disable developer mode");
+    app.set_debug_mode(false);
     assert!(app.developer_projection.is_none());
     assert!(app.developer_error.is_none());
 }
@@ -2363,9 +3268,8 @@ async fn developer_mode_observes_runtime_verification_and_evaluation_events() {
         "ready (mock)".to_owned(),
         None,
     );
-    app.set_debug_mode(&transport, true)
-        .await
-        .expect("enable developer mode");
+    app.set_debug_mode(true);
+    app.refresh(&transport).await.expect("debug refresh");
     let projection = app
         .developer_projection
         .as_ref()
@@ -2718,6 +3622,323 @@ async fn transcript_operation_details_toggle_with_ctrl_o_and_mouse() {
             .body
             .iter()
             .any(|line| line == "+new value")
+    );
+}
+
+#[test]
+fn transcript_detail_reflow_keeps_the_first_visible_projection() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.events = (1..=24)
+        .map(|sequence_no| {
+            transcript_event(
+                sequence_no,
+                session_id,
+                task_id,
+                RuntimeEventType::ToolCompleted,
+                json!({
+                    "envelope": {
+                        "tool_call_id": golutra_core::ToolCallId::new(),
+                        "tool_name": "edit_file",
+                        "status": "ok",
+                        "summary": format!("file {sequence_no} edited"),
+                        "structured_facts": {}
+                    },
+                    "diff_previews": [{
+                        "path": format!("src/file_{sequence_no}.rs"),
+                        "lines": [
+                            format!("-old line {sequence_no}"),
+                            format!("+new line {sequence_no}"),
+                            "additional detail that remains associated with this operation"
+                        ],
+                        "truncated": false
+                    }]
+                }),
+            )
+        })
+        .collect();
+    let mut terminal = Terminal::new(TestBackend::new(72, 18)).expect("terminal");
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw collapsed transcript");
+    let visible_rows = app.layout.transcript.height.saturating_sub(1) as usize;
+    app.scroll_transcript(TranscriptScrollAction::PageUp, visible_rows);
+    let anchor = app
+        .first_visible_transcript_projection()
+        .expect("collapsed anchor");
+
+    app.toggle_transcript_details();
+    assert_eq!(app.first_visible_transcript_projection(), Some(anchor));
+
+    app.toggle_transcript_details();
+    assert_eq!(app.first_visible_transcript_projection(), Some(anchor));
+
+    app.toggle_transcript_details();
+    let expanded = transcript_layout(&app, app.layout.transcript);
+    let tail_projection = 22;
+    let tail_row = expanded
+        .visual_start_for_projection(tail_projection)
+        .expect("tail projection row");
+    app.transcript_scroll.row_count = expanded.row_count;
+    app.set_transcript_top_row(&expanded, tail_row, visible_rows);
+    assert_eq!(
+        app.first_visible_transcript_projection(),
+        Some(tail_projection)
+    );
+
+    app.toggle_transcript_details();
+    assert_eq!(
+        app.first_visible_transcript_projection(),
+        Some(tail_projection)
+    );
+}
+
+#[test]
+fn transcript_width_reflow_keeps_the_first_visible_projection() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.events = (1..=30)
+        .map(|sequence_no| {
+            transcript_event(
+                sequence_no,
+                session_id,
+                task_id,
+                RuntimeEventType::StepCompleted,
+                json!({
+                    "summary": format!(
+                        "event {sequence_no} {}",
+                        "has enough content to wrap when the transcript narrows ".repeat(3)
+                    )
+                }),
+            )
+        })
+        .collect();
+    let mut wide = Terminal::new(TestBackend::new(100, 20)).expect("wide terminal");
+    wide.draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw wide transcript");
+    let visible_rows = app.layout.transcript.height.saturating_sub(1) as usize;
+    app.scroll_transcript(TranscriptScrollAction::PageUp, visible_rows);
+    let anchor = app
+        .first_visible_transcript_projection()
+        .expect("wide anchor");
+
+    let mut narrow = Terminal::new(TestBackend::new(54, 20)).expect("narrow terminal");
+    narrow
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw narrow transcript");
+
+    assert_eq!(app.first_visible_transcript_projection(), Some(anchor));
+}
+
+#[test]
+fn transcript_height_reflow_keeps_the_first_visible_logical_row() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.events = (1..=36)
+        .map(|sequence_no| {
+            transcript_event(
+                sequence_no,
+                session_id,
+                task_id,
+                RuntimeEventType::StepCompleted,
+                json!({"summary": format!("stable logical row {sequence_no}")}),
+            )
+        })
+        .collect();
+    let mut tall = Terminal::new(TestBackend::new(80, 28)).expect("tall terminal");
+    tall.draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw tall transcript");
+    let visible_rows = app.layout.transcript.height.saturating_sub(1) as usize;
+    app.scroll_transcript(TranscriptScrollAction::PageUp, visible_rows);
+    let anchor = app
+        .first_visible_transcript_anchor()
+        .expect("tall transcript anchor");
+
+    let mut short = Terminal::new(TestBackend::new(80, 14)).expect("short terminal");
+    short
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw short transcript");
+
+    let resized = app
+        .first_visible_transcript_anchor()
+        .expect("short transcript anchor");
+    assert_eq!(resized.projection, anchor.projection);
+    assert_eq!(resized.visual_offset, anchor.visual_offset);
+}
+
+#[test]
+fn cancelling_an_earlier_turn_keeps_the_visible_projection_anchored() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let cancelled_turn = TurnId::new();
+    let mut cancelled = transcript_event(
+        1,
+        session_id,
+        task_id,
+        RuntimeEventType::TurnQueued,
+        json!({"payload": {"prompt": "cancel this queued turn"}}),
+    );
+    cancelled.turn_id = Some(cancelled_turn);
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.events = std::iter::once(cancelled)
+        .chain((2..=18).map(|sequence_no| {
+            transcript_event(
+                sequence_no,
+                session_id,
+                task_id,
+                RuntimeEventType::ToolCompleted,
+                json!({
+                    "envelope": {
+                        "tool_call_id": golutra_core::ToolCallId::new(),
+                        "tool_name": "read_file",
+                        "status": "ok",
+                        "summary": format!("unchanged operation {sequence_no}"),
+                        "structured_facts": {}
+                    }
+                }),
+            )
+        }))
+        .collect();
+    let mut terminal = Terminal::new(TestBackend::new(72, 18)).expect("terminal");
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw transcript");
+    let layout = transcript_layout(&app, app.layout.transcript);
+    let top_row = layout
+        .visual_start_for_projection(8)
+        .expect("anchor projection row");
+    let visible_rows = app.layout.transcript.height.saturating_sub(1) as usize;
+    app.transcript_scroll.row_count = layout.row_count;
+    app.set_transcript_top_row(&layout, top_row, visible_rows);
+    let anchor = app
+        .first_visible_transcript_anchor()
+        .expect("pre-cancellation anchor");
+
+    let mut cancellation = transcript_event(
+        19,
+        session_id,
+        task_id,
+        RuntimeEventType::TurnCancelled,
+        json!({"summary": "queued turn cancelled"}),
+    );
+    cancellation.turn_id = Some(cancelled_turn);
+    app.apply_runtime_event(cancellation);
+
+    let after = app
+        .first_visible_transcript_anchor()
+        .expect("post-cancellation anchor");
+    assert_eq!(after.projection, anchor.projection);
+    assert_eq!(after.visual_offset, anchor.visual_offset);
+    assert_eq!(after.original_index + 1, anchor.original_index);
+}
+
+#[test]
+fn override_paging_stops_at_the_last_full_viewport() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        true,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.events = (1..=30)
+        .map(|sequence_no| {
+            transcript_event(
+                sequence_no,
+                session_id,
+                task_id,
+                RuntimeEventType::StepCompleted,
+                json!({"summary": format!("transcript row {sequence_no}")}),
+            )
+        })
+        .collect();
+    app.developer_projection = Some(debug_projection_with_events(
+        session_id,
+        Some(task_id),
+        (1..=30)
+            .map(|sequence_no| {
+                transcript_event(
+                    sequence_no,
+                    session_id,
+                    task_id,
+                    RuntimeEventType::StepCompleted,
+                    json!({"summary": format!("developer row {sequence_no}")}),
+                )
+            })
+            .collect(),
+    ));
+    let mut terminal = Terminal::new(TestBackend::new(120, 22)).expect("terminal");
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw");
+
+    let transcript_layout = transcript_layout(&app, app.layout.transcript);
+    let transcript_rows = app.layout.transcript.height.saturating_sub(1) as usize;
+    app.transcript_scroll.row_count = transcript_layout.row_count;
+    app.set_transcript_top_row(
+        &transcript_layout,
+        transcript_layout.row_count.saturating_sub(1),
+        transcript_rows,
+    );
+    app.scroll_transcript(TranscriptScrollAction::PageDown, transcript_rows);
+    let transcript_window = transcript_layout.visible_window(
+        transcript_rows,
+        app.transcript_scroll.offset_from_bottom,
+        app.transcript_top_row_override,
+    );
+    assert_eq!(
+        transcript_window.start,
+        transcript_layout.row_count.saturating_sub(transcript_rows)
+    );
+
+    let developer_layout = app.developer_event_layout.clone();
+    let developer_rows = developer_layout.page_rows.max(1);
+    app.set_developer_top_row(
+        &developer_layout,
+        developer_layout.row_count.saturating_sub(1),
+    );
+    app.scroll_developer(TranscriptScrollAction::PageDown, developer_rows);
+    let developer_window = developer_layout.visible_window(
+        app.developer_scroll.offset_from_bottom,
+        app.developer_top_row_override,
+    );
+    assert_eq!(
+        developer_window.start,
+        developer_layout.row_count.saturating_sub(developer_rows)
     );
 }
 
@@ -3129,6 +4350,623 @@ fn mouse_wheel_routes_to_the_pane_under_the_pointer() {
     );
 }
 
+#[test]
+fn overlay_mouse_clicks_select_every_interactive_surface() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.layout.transcript = Rect::new(0, 1, 120, 24);
+
+    app.approval_dialog = Some(ApprovalDialogState::new(ApprovalRequest {
+        approval_id: golutra_core::ApprovalId::new(),
+        task_id: TaskId::new(),
+        turn_id: TurnId::new(),
+        tool_call_id: golutra_core::ToolCallId::new(),
+        tool_name: "shell".to_owned(),
+        resource: "cargo test".to_owned(),
+        reason: "process execution requires approval".to_owned(),
+    }));
+    let deny = overlay_mouse_regions(app.layout.transcript, &app)
+        .into_iter()
+        .find(|region| region.press == UiMousePress::Approval(ApprovalChoice::Deny))
+        .expect("deny region");
+    assert_eq!(
+        click_overlay(&mut app, deny.area.x, deny.area.y),
+        Some(UiMouseActivation::Approval(ApprovalChoice::Deny))
+    );
+    assert_eq!(
+        app.approval_dialog
+            .as_ref()
+            .expect("approval dialog")
+            .selected_choice(),
+        ApprovalChoice::Deny
+    );
+    app.approval_dialog = None;
+
+    app.question_dialog = Some(QuestionDialogState::new(UserQuestionRequest {
+        question_id: golutra_core::QuestionId::new(),
+        task_id: TaskId::new(),
+        turn_id: TurnId::new(),
+        tool_call_id: golutra_core::ToolCallId::new(),
+        questions: vec![golutra_core::UserQuestionPrompt {
+            id: "format".to_owned(),
+            header: "Output".to_owned(),
+            question: "Choose an output format".to_owned(),
+            mode: golutra_core::UserQuestionMode::Single,
+            options: vec![
+                golutra_core::UserQuestionOption {
+                    id: "json".to_owned(),
+                    label: "JSON".to_owned(),
+                    description: Some("structured output".to_owned()),
+                },
+                golutra_core::UserQuestionOption {
+                    id: "text".to_owned(),
+                    label: "Text".to_owned(),
+                    description: None,
+                },
+            ],
+        }],
+    }));
+    let option = overlay_mouse_regions(app.layout.transcript, &app)
+        .into_iter()
+        .find(|region| {
+            region.press
+                == UiMousePress::QuestionOption {
+                    question: 0,
+                    option: 1,
+                }
+        })
+        .expect("question option region");
+    assert_eq!(click_overlay(&mut app, option.area.x, option.area.y), None);
+    assert!(
+        app.question_dialog
+            .as_ref()
+            .expect("question dialog")
+            .is_selected(1)
+    );
+    let free_text = overlay_mouse_regions(app.layout.transcript, &app)
+        .into_iter()
+        .find(|region| region.press == UiMousePress::QuestionFreeText { question: 0 })
+        .expect("question free text region");
+    assert_eq!(
+        click_overlay(&mut app, free_text.area.x, free_text.area.y),
+        None
+    );
+    assert!(
+        app.question_dialog
+            .as_ref()
+            .expect("question dialog")
+            .is_free_text_focused()
+    );
+    let submit = overlay_mouse_regions(app.layout.transcript, &app)
+        .into_iter()
+        .find(|region| region.press == UiMousePress::QuestionSubmit)
+        .expect("question submit region");
+    assert_eq!(
+        click_overlay(&mut app, submit.area.x, submit.area.y),
+        Some(UiMouseActivation::QuestionSubmit)
+    );
+    app.question_dialog = None;
+
+    app.auth_dialog = Some(AuthDialogState::new());
+    let custom = overlay_mouse_regions(app.layout.transcript, &app)
+        .into_iter()
+        .find(|region| region.press == UiMousePress::Auth(2))
+        .expect("custom provider region");
+    assert_eq!(
+        click_overlay(&mut app, custom.area.x, custom.area.y),
+        Some(UiMouseActivation::AuthContinue)
+    );
+    assert_eq!(app.auth_dialog.as_ref().expect("auth dialog").selected, 2);
+    app.auth_dialog = None;
+
+    app.resume_picker = Some(ResumePickerState::new(vec![
+        resume_item("first"),
+        resume_item("second"),
+    ]));
+    let second = overlay_mouse_regions(app.layout.transcript, &app)
+        .into_iter()
+        .find(|region| region.press == UiMousePress::Resume(1))
+        .expect("second session region");
+    assert_eq!(
+        click_overlay(&mut app, second.area.x, second.area.y),
+        Some(UiMouseActivation::ResumeSession)
+    );
+    assert_eq!(
+        app.resume_picker.as_ref().expect("resume picker").selected,
+        1
+    );
+    app.resume_picker = None;
+
+    app.export_flow = Some(ExportFlowState {
+        picker: ResumePickerState::new(vec![resume_item("first"), resume_item("second")]),
+        step: ExportFlowStep::SelectSession,
+        range_input: ComposerInput::from_text("1"),
+        destination_input: ComposerInput::default(),
+        error: None,
+        receipt: None,
+    });
+    let second = overlay_mouse_regions(app.layout.transcript, &app)
+        .into_iter()
+        .find(|region| region.press == UiMousePress::Resume(1))
+        .expect("second export session region");
+    assert_eq!(click_overlay(&mut app, second.area.x, second.area.y), None);
+    assert_eq!(
+        app.export_flow
+            .as_ref()
+            .expect("export flow")
+            .picker
+            .selected,
+        1
+    );
+    app.export_flow = None;
+
+    app.dashboard = Some(DashboardState::new(DashboardTab::Plan));
+    let usage = overlay_mouse_regions(app.layout.transcript, &app)
+        .into_iter()
+        .find(|region| region.press == UiMousePress::Dashboard(DashboardTab::Usage))
+        .expect("usage tab region");
+    assert_eq!(click_overlay(&mut app, usage.area.x, usage.area.y), None);
+    assert_eq!(
+        app.dashboard.as_ref().expect("dashboard").tab,
+        DashboardTab::Usage
+    );
+    app.dashboard = None;
+
+    app.help_dialog = Some(HelpDialogState::new(HelpTopic::Overview, "composer"));
+    let whats_new = overlay_mouse_regions(app.layout.transcript, &app)
+        .into_iter()
+        .find(|region| region.press == UiMousePress::Help(HelpTopic::WhatsNew))
+        .expect("what's new tab region");
+    assert_eq!(
+        click_overlay(&mut app, whats_new.area.x, whats_new.area.y),
+        None
+    );
+    assert_eq!(
+        app.help_dialog.as_ref().expect("help dialog").topic,
+        HelpTopic::WhatsNew
+    );
+    assert!(!app.release_badge_visible);
+    app.help_dialog = None;
+
+    app.settings_dialog = Some(SettingsDialogState::new(
+        &app.runtime_controls,
+        &app.provider_choices,
+        &app.preferences,
+        false,
+    ));
+    let high_contrast = overlay_mouse_regions(app.layout.transcript, &app)
+        .into_iter()
+        .find(|region| region.press == UiMousePress::Settings(SettingsRow::HighContrast))
+        .expect("high contrast row region");
+    assert_eq!(
+        click_overlay(&mut app, high_contrast.area.x, high_contrast.area.y),
+        None
+    );
+    let settings = app.settings_dialog.as_ref().expect("settings dialog");
+    assert_eq!(settings.selected_row, SettingsRow::HighContrast);
+    assert!(settings.draft_preferences.high_contrast);
+}
+
+#[test]
+fn narrow_wrapped_overlays_keep_mouse_targets_aligned_with_visible_rows() {
+    let area = Rect::new(0, 0, 40, 8);
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.layout.transcript = area;
+
+    let mut approval = ApprovalDialogState::new(ApprovalRequest {
+        approval_id: golutra_core::ApprovalId::new(),
+        task_id: TaskId::new(),
+        turn_id: TurnId::new(),
+        tool_call_id: golutra_core::ToolCallId::new(),
+        tool_name: "shell".to_owned(),
+        resource: "cargo test --workspace --all-targets -- --test-threads=1".to_owned(),
+        reason: "a long approval reason that wraps over several narrow terminal rows".to_owned(),
+    });
+    approval.select(ApprovalChoice::Deny);
+    app.approval_dialog = Some(approval);
+    let deny = overlay_mouse_regions(area, &app)
+        .into_iter()
+        .find(|region| region.press == UiMousePress::Approval(ApprovalChoice::Deny))
+        .expect("visible deny region");
+    assert!(area.intersects(deny.area));
+    assert_eq!(
+        click_overlay(&mut app, deny.area.x, deny.area.y),
+        Some(UiMouseActivation::Approval(ApprovalChoice::Deny))
+    );
+    app.approval_dialog = None;
+
+    let mut question = QuestionDialogState::new(UserQuestionRequest {
+        question_id: golutra_core::QuestionId::new(),
+        task_id: TaskId::new(),
+        turn_id: TurnId::new(),
+        tool_call_id: golutra_core::ToolCallId::new(),
+        questions: vec![golutra_core::UserQuestionPrompt {
+            id: "strategy".to_owned(),
+            header: "Implementation strategy".to_owned(),
+            question: "Choose the implementation strategy that should be used for this change"
+                .to_owned(),
+            mode: golutra_core::UserQuestionMode::Single,
+            options: vec![
+                golutra_core::UserQuestionOption {
+                    id: "first".to_owned(),
+                    label: "Use the first deliberately long implementation option".to_owned(),
+                    description: Some(
+                        "This description also wraps on a narrow terminal".to_owned(),
+                    ),
+                },
+                golutra_core::UserQuestionOption {
+                    id: "second".to_owned(),
+                    label: "Use the second deliberately long implementation option".to_owned(),
+                    description: Some(
+                        "Another wrapped option description that is intentionally taller than the visible dialog viewport "
+                            .repeat(6),
+                    ),
+                },
+            ],
+        }],
+    });
+    question.focus(0, 1);
+    app.question_dialog = Some(question);
+    let second = overlay_mouse_regions(area, &app)
+        .into_iter()
+        .find(|region| {
+            region.press
+                == UiMousePress::QuestionOption {
+                    question: 0,
+                    option: 1,
+                }
+        })
+        .expect("visible wrapped question option");
+    assert_eq!(click_overlay(&mut app, second.area.x, second.area.y), None);
+    assert!(
+        app.question_dialog
+            .as_ref()
+            .expect("question dialog")
+            .is_selected(1)
+    );
+    let submit = overlay_mouse_regions(area, &app)
+        .into_iter()
+        .find(|region| region.press == UiMousePress::QuestionSubmit)
+        .expect("submit remains reachable below a tall final option");
+    assert!(area.intersects(submit.area));
+    app.question_dialog = None;
+
+    let mut auth = AuthDialogState::new();
+    auth.selected = AUTH_GROUP_ITEMS.len() - 1;
+    app.auth_dialog = Some(auth);
+    let quit = overlay_mouse_regions(area, &app)
+        .into_iter()
+        .find(|region| region.press == UiMousePress::Auth(AUTH_GROUP_ITEMS.len() - 1))
+        .expect("visible wrapped auth option");
+    assert_eq!(
+        click_overlay(&mut app, quit.area.x, quit.area.y),
+        Some(UiMouseActivation::AuthContinue)
+    );
+}
+
+#[tokio::test]
+async fn auth_manual_scrolling_overrides_selection_follow_until_selection_moves() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let area = Rect::new(0, 0, 32, 4);
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        Some(AuthDialogState::new()),
+    );
+    app.layout.transcript = area;
+    app.auth_dialog.as_mut().expect("dialog").selected = AUTH_GROUP_ITEMS.len() - 1;
+
+    handle_auth_dialog_key(
+        KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("home");
+    assert_eq!(
+        auth_scroll_offset(app.auth_dialog.as_ref().expect("dialog"), area),
+        0
+    );
+
+    handle_auth_dialog_key(
+        KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("page down");
+    let page_down = auth_scroll_offset(app.auth_dialog.as_ref().expect("dialog"), area);
+    assert!(page_down > 0);
+
+    handle_auth_dialog_key(
+        KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("end");
+    let end = auth_scroll_offset(app.auth_dialog.as_ref().expect("dialog"), area);
+    assert!(end >= page_down);
+
+    handle_auth_dialog_key(
+        KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("page up");
+    assert!(auth_scroll_offset(app.auth_dialog.as_ref().expect("dialog"), area) < end);
+
+    handle_auth_dialog_key(
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("selection move");
+    let dialog = app.auth_dialog.as_ref().expect("dialog");
+    assert!(!dialog.manual_scroll);
+    assert!(auth_scroll_offset(dialog, area) > 0);
+}
+
+#[test]
+fn help_scrolling_clamps_to_the_wrapped_content_height() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.layout.transcript = Rect::new(0, 0, 40, 8);
+    app.help_dialog = Some(HelpDialogState::new(HelpTopic::Composer, "composer"));
+    let max_scroll = help_scroll_max(
+        app.help_dialog.as_ref().expect("help"),
+        &app,
+        app.layout.transcript,
+    );
+    assert!(max_scroll > 0);
+
+    for _ in 0..50 {
+        handle_help_dialog_key(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            &mut app,
+        );
+    }
+    assert_eq!(app.help_dialog.as_ref().expect("help").scroll, max_scroll);
+
+    let mut terminal = Terminal::new(TestBackend::new(40, 8)).expect("terminal");
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw final help page");
+    assert!(terminal_buffer_text(&terminal).contains('@'));
+
+    handle_help_dialog_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE), &mut app);
+    assert_eq!(app.help_dialog.as_ref().expect("help").scroll, 0);
+    handle_help_dialog_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), &mut app);
+    assert_eq!(app.help_dialog.as_ref().expect("help").scroll, max_scroll);
+}
+
+#[test]
+fn terminal_restore_failure_keeps_the_primary_runtime_error() {
+    let error = combine_run_and_restore(
+        Err(miette::miette!("runtime event loop failed")),
+        Err(miette::miette!("stdout is closed")),
+    )
+    .expect_err("combined failure");
+    let message = error.to_string();
+
+    assert!(
+        message.starts_with("runtime event loop failed"),
+        "{message}"
+    );
+    assert!(
+        message.contains("terminal restore failed: stdout is closed"),
+        "{message}"
+    );
+}
+
+#[test]
+fn terminal_restore_guard_runs_during_unwind_and_can_be_disarmed() {
+    let restore_count = std::cell::Cell::new(0_u8);
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = TerminalRestoreGuard::new(|| restore_count.set(restore_count.get() + 1));
+        panic!("simulated event-loop panic");
+    }));
+
+    assert!(unwind.is_err());
+    assert_eq!(restore_count.get(), 1);
+
+    let mut guard = TerminalRestoreGuard::new(|| restore_count.set(restore_count.get() + 1));
+    guard.disarm();
+    drop(guard);
+    assert_eq!(restore_count.get(), 1);
+}
+
+#[test]
+fn panic_report_is_emitted_after_terminal_restoration() {
+    let operations = std::cell::RefCell::new(Vec::new());
+
+    restore_before_panic_report(
+        || operations.borrow_mut().push("restore"),
+        || operations.borrow_mut().push("report"),
+    );
+
+    assert_eq!(*operations.borrow(), ["restore", "report"]);
+}
+
+#[test]
+fn help_and_settings_keep_selected_content_visible_at_narrow_and_wide_widths() {
+    for width in [40, 120] {
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            SessionId::new(),
+            None,
+            false,
+            "ready (mock)".to_owned(),
+            None,
+        );
+        app.help_dialog = Some(HelpDialogState::new(HelpTopic::Composer, "composer"));
+        let mut terminal = Terminal::new(TestBackend::new(width, 18)).expect("help terminal");
+        terminal
+            .draw(|frame| draw_ui(frame, &mut app))
+            .expect("draw help");
+        let rendered = terminal_buffer_text(&terminal);
+        assert!(rendered.contains("Help"));
+        assert!(rendered.contains("Enter"));
+        assert!(
+            overlay_mouse_regions(app.layout.transcript, &app)
+                .iter()
+                .any(|region| region.press == UiMousePress::Help(HelpTopic::WhatsNew))
+        );
+
+        app.help_dialog = None;
+        let mut settings = SettingsDialogState::new(
+            &app.runtime_controls,
+            &app.provider_choices,
+            &app.preferences,
+            false,
+        );
+        settings.selected_row = SettingsRow::ScreenReader;
+        app.settings_dialog = Some(settings);
+        terminal
+            .draw(|frame| draw_ui(frame, &mut app))
+            .expect("draw settings");
+        let rendered = terminal_buffer_text(&terminal);
+        assert!(rendered.contains("Settings"));
+        assert!(rendered.contains("Screen reader symbols"));
+    }
+}
+
+#[test]
+fn semantic_theme_and_screen_reader_preferences_reach_the_composer() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.preferences.theme = ColorTheme::Amber;
+    app.preferences.screen_reader = true;
+    let mut terminal = Terminal::new(TestBackend::new(60, 4)).expect("terminal");
+
+    terminal
+        .draw(|frame| draw_bottom_pane(frame, frame.area(), &app))
+        .expect("draw amber composer");
+
+    let prefix = terminal
+        .backend()
+        .buffer()
+        .cell((0, 1))
+        .expect("composer prefix");
+    assert_eq!(prefix.symbol(), ">");
+    assert_eq!(prefix.fg, ratatui::style::Color::Yellow);
+
+    app.preferences.high_contrast = true;
+    terminal
+        .draw(|frame| draw_bottom_pane(frame, frame.area(), &app))
+        .expect("draw high contrast composer");
+    assert_eq!(
+        terminal
+            .backend()
+            .buffer()
+            .cell((0, 1))
+            .expect("high contrast prefix")
+            .fg,
+        ratatui::style::Color::LightCyan
+    );
+}
+
+#[tokio::test]
+async fn malformed_preferences_can_be_repaired_from_the_settings_surface() {
+    let home = tempfile::tempdir().expect("home");
+    let _guard = env_lock_guard().await;
+    let previous_home = std::env::var("GOLUTRA_HOME").ok();
+    unsafe {
+        std::env::set_var("GOLUTRA_HOME", home.path());
+    }
+    let path = home.path().join("tui.json");
+    std::fs::write(&path, "{not-json").expect("malformed preferences");
+
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_loaded_preferences();
+    assert_eq!(app.preferences_path.as_deref(), Some(path.as_path()));
+    assert!(app.status_message.contains("were not loaded"));
+
+    app.preferences.theme = ColorTheme::Monochrome;
+    app.persist_preferences();
+    assert_eq!(
+        TuiPreferences::load_from(&path)
+            .expect("repaired preferences")
+            .theme,
+        ColorTheme::Monochrome
+    );
+
+    unsafe {
+        match previous_home {
+            Some(previous_home) => std::env::set_var("GOLUTRA_HOME", previous_home),
+            None => std::env::remove_var("GOLUTRA_HOME"),
+        }
+    }
+}
+
+fn click_overlay(app: &mut TuiApp, column: u16, row: u16) -> Option<UiMouseActivation> {
+    let down = handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        app,
+    );
+    let up = handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        app,
+    );
+    up.or(down)
+}
+
+fn resume_item(title: &str) -> ResumeThreadItem {
+    ResumeThreadItem {
+        thread_id: ThreadId::new(),
+        session_id: SessionId::new(),
+        title: title.to_owned(),
+        preview: format!("{title} preview"),
+    }
+}
+
 #[tokio::test]
 async fn clicking_developer_pane_routes_page_keys_to_developer() {
     let transport = RuntimeTransport::in_memory().await.expect("transport");
@@ -3219,10 +5057,7 @@ async fn session_pickers_support_page_boundary_and_wheel_navigation() {
             preview: format!("preview-{index}"),
         })
         .collect::<Vec<_>>();
-    app.resume_picker = Some(ResumePickerState {
-        items: items.clone(),
-        selected: 0,
-    });
+    app.resume_picker = Some(ResumePickerState::new(items.clone()));
     let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("terminal");
     terminal
         .draw(|frame| draw_ui(frame, &mut app))
@@ -3281,10 +5116,10 @@ async fn session_pickers_support_page_boundary_and_wheel_navigation() {
 
     app.resume_picker = None;
     app.export_flow = Some(ExportFlowState {
-        picker: ResumePickerState { items, selected: 0 },
+        picker: ResumePickerState::new(items),
         step: ExportFlowStep::SelectSession,
-        range_input: "1".to_owned(),
-        destination_input: String::new(),
+        range_input: ComposerInput::from_text("1"),
+        destination_input: ComposerInput::default(),
         error: None,
         receipt: None,
     });
@@ -3302,6 +5137,111 @@ async fn session_pickers_support_page_boundary_and_wheel_navigation() {
         app.export_flow.as_ref().expect("export").picker.selected,
         resume_picker_page_size(app.layout.transcript)
     );
+}
+
+#[tokio::test]
+async fn session_picker_actions_update_runtime_and_visible_items() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let current_session_id = transport.default_session_id();
+    let current_thread_id = ThreadId::new();
+    let archive_session_id = SessionId::new();
+    let archive_thread_id = ThreadId::new();
+    let delete_session_id = SessionId::new();
+    let delete_thread_id = ThreadId::new();
+    for (session_id, thread_id, prompt) in [
+        (current_session_id, current_thread_id, "current"),
+        (archive_session_id, archive_thread_id, "archive target"),
+        (delete_session_id, delete_thread_id, "delete target"),
+    ] {
+        let ack = transport
+            .send_command(session_command(
+                session_id,
+                SessionCommandKind::Create,
+                json!({"_thread_id": thread_id, "prompt": prompt}),
+            ))
+            .await
+            .expect("create session");
+        assert!(ack.accepted);
+    }
+    let mut app = TuiApp::new(
+        current_thread_id,
+        current_session_id,
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.open_resume_picker(&transport)
+        .await
+        .expect("open session picker");
+
+    {
+        let picker = app.resume_picker.as_mut().expect("resume picker");
+        picker.selected = picker
+            .items
+            .iter()
+            .position(|item| item.thread_id == archive_thread_id)
+            .expect("archive target");
+        assert!(picker.begin_action(SessionPickerAction::Rename));
+        picker.action_input.set_text("renamed target");
+    }
+    app.apply_session_picker_action(&transport)
+        .await
+        .expect("rename target");
+    assert!(
+        app.last_control_ack
+            .as_ref()
+            .is_some_and(|ack| ack.accepted)
+    );
+    assert!(
+        app.resume_picker
+            .as_ref()
+            .expect("resume picker")
+            .items
+            .iter()
+            .any(|item| item.thread_id == archive_thread_id && item.title == "renamed target")
+    );
+
+    {
+        let picker = app.resume_picker.as_mut().expect("resume picker");
+        assert!(picker.begin_action(SessionPickerAction::Archive));
+    }
+    app.apply_session_picker_action(&transport)
+        .await
+        .expect("archive target");
+    assert!(
+        app.resume_picker
+            .as_ref()
+            .expect("resume picker")
+            .items
+            .iter()
+            .all(|item| item.thread_id != archive_thread_id)
+    );
+
+    {
+        let picker = app.resume_picker.as_mut().expect("resume picker");
+        picker.selected = picker
+            .items
+            .iter()
+            .position(|item| item.thread_id == delete_thread_id)
+            .expect("delete target");
+        assert!(picker.begin_action(SessionPickerAction::Delete));
+    }
+    app.apply_session_picker_action(&transport)
+        .await
+        .expect("delete target");
+    assert!(
+        app.resume_picker
+            .as_ref()
+            .expect("resume picker")
+            .items
+            .iter()
+            .all(|item| item.thread_id != delete_thread_id)
+    );
+    let threads = transport.list_threads(50).await.expect("runtime threads");
+    assert!(threads.iter().all(|thread| {
+        thread.thread_id != archive_thread_id && thread.thread_id != delete_thread_id
+    }));
 }
 
 #[tokio::test]
@@ -3433,18 +5373,15 @@ async fn export_enters_running_before_poll_and_finishes_asynchronously() {
         None,
     );
     app.export_flow = Some(ExportFlowState {
-        picker: ResumePickerState {
-            items: vec![ResumeThreadItem {
-                thread_id,
-                session_id,
-                title: "export fixture".to_owned(),
-                preview: "export this session".to_owned(),
-            }],
-            selected: 0,
-        },
+        picker: ResumePickerState::new(vec![ResumeThreadItem {
+            thread_id,
+            session_id,
+            title: "export fixture".to_owned(),
+            preview: "export this session".to_owned(),
+        }]),
         step: ExportFlowStep::Review,
-        range_input: "1".to_owned(),
-        destination_input: destination.display().to_string(),
+        range_input: ComposerInput::from_text("1"),
+        destination_input: ComposerInput::from_text(destination.display().to_string()),
         error: None,
         receipt: None,
     });
@@ -3517,10 +5454,7 @@ fn start_new_session_resets_visible_tui_state() {
     app.input.set_text("/new");
     app.slash_selected = 2;
     app.cursor = Some(9);
-    app.resume_picker = Some(ResumePickerState {
-        items: Vec::new(),
-        selected: 0,
-    });
+    app.resume_picker = Some(ResumePickerState::new(Vec::new()));
     app.transcript_scroll.offset_from_bottom = 7;
     app.transcript_scroll.row_count = 20;
     app.transcript_scroll.follow_tail = false;

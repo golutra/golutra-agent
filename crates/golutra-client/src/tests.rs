@@ -12,9 +12,10 @@ use golutra_context::{
 use golutra_core::{
     Actor, ActorKind, ArtifactId, ArtifactRecord, CausalRelation, CommandId, EvidenceId,
     FileChangeKind, FileChangeSummary, PolicyId, PostTaskJob, PostTaskJobId, PostTaskJobKind,
-    PostTaskJobStatus, QueryId, RedactionStatus, TaskContract, TaskId, TaskStatus, ToolCallId,
-    TraceView, TurnChangeSummary, TurnId, VerificationId, VerificationRecord, VerificationResult,
-    WorkspaceChangeRequirement, WorkspaceId,
+    PostTaskJobStatus, QueryId, QuestionId, RedactionStatus, TaskContract, TaskId, TaskStatus,
+    ToolCallId, TraceView, TurnChangeSummary, TurnId, UserQuestionMode, UserQuestionOption,
+    UserQuestionPrompt, UserQuestionRequest, VerificationId, VerificationRecord,
+    VerificationResult, WorkspaceChangeRequirement, WorkspaceId,
 };
 use golutra_llm::{ConfiguredProvider, MockProvider, ProviderError, ProviderMessage, ProviderRole};
 use golutra_protocol::{
@@ -1029,6 +1030,7 @@ async fn startup_recreates_a_post_task_job_missing_after_terminal_commit() {
             updated_at: now,
             recency_at: now,
             archived: false,
+            removed: false,
         })
         .await
         .expect("thread");
@@ -1624,6 +1626,125 @@ async fn queued_prompt_records_each_user_and_assistant_turn() {
 }
 
 #[tokio::test]
+async fn queued_prompts_can_be_updated_and_cancelled_durably() {
+    let transport = EmbeddedTransport::in_memory().await.expect("transport");
+    let session_id = SessionId::new();
+    transport
+        .send_command(command(session_id, "sleep"))
+        .await
+        .expect("blocking prompt");
+    wait_for_status(&transport, session_id, TaskStatus::WaitingApproval).await;
+
+    for prompt in ["original queued prompt", "cancelled queued prompt"] {
+        let ack = transport
+            .send_command(command_with_payload(
+                session_id,
+                json!({
+                    "prompt": prompt,
+                    "defer_external_verification": true,
+                }),
+            ))
+            .await
+            .expect("queued prompt");
+        assert!(ack.accepted, "{ack:?}");
+    }
+    let queued_events = transport
+        .host
+        .repositories
+        .events
+        .load(session_id, None, None)
+        .await
+        .expect("events")
+        .into_iter()
+        .filter(|event| event.event_type == RuntimeEventType::TurnQueued)
+        .collect::<Vec<_>>();
+    let active_task_id = queued_events[0].task_id.expect("active task");
+    let updated_turn_id = queued_events
+        .iter()
+        .find(|event| {
+            event
+                .payload
+                .pointer("/payload/prompt")
+                .and_then(Value::as_str)
+                == Some("original queued prompt")
+        })
+        .and_then(|event| event.turn_id)
+        .expect("updated turn id");
+    let cancelled_turn_id = queued_events
+        .iter()
+        .find(|event| {
+            event
+                .payload
+                .pointer("/payload/prompt")
+                .and_then(Value::as_str)
+                == Some("cancelled queued prompt")
+        })
+        .and_then(|event| event.turn_id)
+        .expect("cancelled turn id");
+
+    let updated = transport
+        .send_command(runtime_command(
+            session_id,
+            SessionCommandKind::UpdateQueuedTurn,
+            json!({
+                "turn_id": updated_turn_id,
+                "prompt": "edited queued prompt",
+            }),
+        ))
+        .await
+        .expect("update queued prompt");
+    assert!(updated.accepted, "{updated:?}");
+    let cancelled = transport
+        .send_command(runtime_command(
+            session_id,
+            SessionCommandKind::CancelQueuedTurn,
+            json!({"turn_id": cancelled_turn_id}),
+        ))
+        .await
+        .expect("cancel queued prompt");
+    assert!(cancelled.accepted, "{cancelled:?}");
+
+    let recovered = transport
+        .host
+        .recoverable_pending_turns(session_id, Some(active_task_id))
+        .await
+        .expect("recoverable turns");
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].pending.turn_id, updated_turn_id);
+    assert_eq!(recovered[0].pending.content, "edited queued prompt");
+
+    let events = transport
+        .host
+        .repositories
+        .events
+        .load(session_id, Some(active_task_id), None)
+        .await
+        .expect("events");
+    assert!(events.iter().any(|event| {
+        event.event_type == RuntimeEventType::TurnUpdated
+            && event.turn_id == Some(updated_turn_id)
+            && event
+                .payload
+                .pointer("/payload/prompt")
+                .and_then(Value::as_str)
+                == Some("edited queued prompt")
+    }));
+    assert!(events.iter().any(|event| {
+        event.event_type == RuntimeEventType::TurnCancelled
+            && event.turn_id == Some(cancelled_turn_id)
+    }));
+
+    transport
+        .send_command(runtime_command(
+            session_id,
+            SessionCommandKind::Abort,
+            json!({}),
+        ))
+        .await
+        .expect("abort active task");
+}
+
+#[tokio::test]
 async fn control_command_after_completion_does_not_reactivate_the_lane() {
     let transport = EmbeddedTransport::in_memory().await.expect("transport");
     let session_id = SessionId::new();
@@ -1846,6 +1967,127 @@ async fn processing_command_journal_entry_is_reconciled_after_owner_exit() {
 
     assert!(ack.accepted);
     assert_ne!(ack.reason.as_deref(), Some(PROVISIONAL_COMMAND_ACK_REASON));
+}
+
+#[tokio::test]
+async fn processing_thread_delete_retry_reuses_the_semantic_event_and_rebuilds_rollout() {
+    let workspace = tempdir().expect("workspace");
+    let host = RuntimeHost::for_cwd(workspace.path()).await.expect("host");
+    let transport = EmbeddedTransport::new(host.clone());
+    let attached_session_id = transport.default_session_id();
+    let target_session_id = SessionId::new();
+    let target_thread_id = ThreadId::new();
+    let now = chrono::Utc::now();
+    let rollout_path = host
+        .runtime_paths
+        .as_ref()
+        .expect("runtime paths")
+        .rollout_path(target_thread_id);
+    host.repositories
+        .threads
+        .upsert(&ThreadRecord {
+            thread_id: target_thread_id,
+            session_id: target_session_id,
+            parent_thread_id: None,
+            forked_from_turn_id: None,
+            forked_from_sequence_no: None,
+            workspace_root: host.workspace_root_string(),
+            rebound_from_workspace_root: None,
+            rollout_path: Some(rollout_path.display().to_string()),
+            title: "retry target".to_owned(),
+            preview: "retry target".to_owned(),
+            created_at: now,
+            updated_at: now,
+            recency_at: now,
+            archived: false,
+            removed: false,
+        })
+        .await
+        .expect("target thread");
+    let command = runtime_command(
+        attached_session_id,
+        SessionCommandKind::DeleteThread,
+        json!({"thread_id": target_thread_id}),
+    );
+    let scoped_key = host.scoped_idempotency_key(&command.idempotency_key);
+    host.store
+        .claim_command(
+            &scoped_key,
+            command.command_id,
+            &CommandAck {
+                command_id: command.command_id,
+                accepted: true,
+                reason: Some(PROVISIONAL_COMMAND_ACK_REASON.to_owned()),
+            },
+            host_event(
+                0,
+                attached_session_id,
+                None,
+                RuntimeEventType::CommandReceived,
+                RuntimeEventSource::Runtime,
+                json!({"command_id": command.command_id}),
+            ),
+        )
+        .await
+        .expect("processing command claim");
+    host.store
+        .delete_thread_with_event(
+            target_thread_id,
+            host_event(
+                0,
+                target_session_id,
+                None,
+                RuntimeEventType::ThreadDeleted,
+                RuntimeEventSource::User,
+                json!({
+                    "summary": "thread removed from history",
+                    "thread_id": target_thread_id,
+                    "actor": &command.actor,
+                    "command_id": command.command_id.to_string(),
+                }),
+            ),
+        )
+        .await
+        .expect("delete transaction")
+        .expect("delete event");
+
+    let ack = transport
+        .send_command(command.clone())
+        .await
+        .expect("processing retry");
+
+    assert!(ack.accepted);
+    assert_eq!(ack.reason.as_deref(), Some("thread removed from history"));
+    let events = host
+        .store
+        .load_events(target_session_id, None, None)
+        .await
+        .expect("target events");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == RuntimeEventType::ThreadDeleted)
+            .count(),
+        1
+    );
+    assert!(
+        host.store
+            .thread_by_id(target_thread_id)
+            .await
+            .expect("thread lookup")
+            .expect("tombstone")
+            .removed
+    );
+    let rollout = fs::read_to_string(&rollout_path).expect("rebuilt rollout");
+    assert_eq!(rollout.matches("thread_deleted").count(), 1);
+    assert_eq!(
+        host.store
+            .command_ack(&scoped_key)
+            .await
+            .expect("command journal")
+            .expect("completed ack"),
+        ack
+    );
 }
 
 #[tokio::test]
@@ -2858,6 +3100,7 @@ async fn session_window_selects_adjacent_newer_and_older_threads_from_an_anchor(
             updated_at: at,
             recency_at: at,
             archived: false,
+            removed: false,
         };
         transport
             .host
@@ -2998,6 +3241,7 @@ async fn session_window_validates_ranges_workspace_and_archived_anchors() {
         updated_at: at,
         recency_at: at,
         archived: false,
+        removed: false,
     };
     transport_a
         .host
@@ -3107,6 +3351,7 @@ async fn session_page_uses_thread_id_as_a_stable_cursor_tiebreaker() {
             updated_at: at,
             recency_at: at,
             archived: false,
+            removed: false,
         };
         transport
             .host
@@ -3149,6 +3394,314 @@ async fn session_page_uses_thread_id_as_a_stable_cursor_tiebreaker() {
 }
 
 #[tokio::test]
+async fn thread_metadata_commands_rename_archive_and_delete_an_idle_thread() {
+    let home = tempdir().expect("home");
+    let cwd = tempdir().expect("cwd");
+    let transport = EmbeddedTransport::from_home_and_cwd(home.path(), cwd.path())
+        .await
+        .expect("transport");
+    let attached_session_id = transport.default_session_id();
+    let at = chrono::Utc::now();
+    let target = ThreadRecord {
+        thread_id: ThreadId::new(),
+        session_id: SessionId::new(),
+        parent_thread_id: None,
+        forked_from_turn_id: None,
+        forked_from_sequence_no: None,
+        workspace_root: Some(
+            cwd.path()
+                .canonicalize()
+                .expect("canonical cwd")
+                .display()
+                .to_string(),
+        ),
+        rebound_from_workspace_root: None,
+        rollout_path: None,
+        title: "before".to_owned(),
+        preview: "idle target".to_owned(),
+        created_at: at,
+        updated_at: at,
+        recency_at: at,
+        archived: false,
+        removed: false,
+    };
+    transport
+        .host
+        .repositories
+        .threads
+        .upsert(&target)
+        .await
+        .expect("target thread");
+
+    for (kind, payload, reason) in [
+        (
+            SessionCommandKind::RenameThread,
+            json!({"thread_id": target.thread_id, "title": "after"}),
+            "thread renamed",
+        ),
+        (
+            SessionCommandKind::ArchiveThread,
+            json!({"thread_id": target.thread_id}),
+            "thread archived",
+        ),
+    ] {
+        let ack = transport
+            .send_command(runtime_command(attached_session_id, kind, payload))
+            .await
+            .expect("thread metadata command");
+        assert!(ack.accepted);
+        assert_eq!(ack.reason.as_deref(), Some(reason));
+    }
+    let archived = transport
+        .host
+        .repositories
+        .threads
+        .by_id(target.thread_id)
+        .await
+        .expect("archived lookup")
+        .expect("archived thread");
+    assert_eq!(archived.title, "after");
+    assert!(archived.archived);
+
+    let deleted = transport
+        .send_command(runtime_command(
+            attached_session_id,
+            SessionCommandKind::DeleteThread,
+            json!({"thread_id": target.thread_id}),
+        ))
+        .await
+        .expect("delete thread");
+    assert!(deleted.accepted);
+    assert_eq!(
+        deleted.reason.as_deref(),
+        Some("thread removed from history")
+    );
+    let removed = transport
+        .host
+        .repositories
+        .threads
+        .by_id(target.thread_id)
+        .await
+        .expect("deleted lookup")
+        .expect("retained tombstone");
+    assert!(removed.removed);
+    assert!(removed.archived);
+    let rollout = fs::read_to_string(removed.rollout_path.as_deref().expect("rollout path"))
+        .expect("retained rollout");
+    assert!(rollout.contains("thread_deleted"));
+    assert!(
+        transport
+            .list_threads(10)
+            .await
+            .expect("visible threads")
+            .is_empty()
+    );
+
+    let events = transport
+        .host
+        .repositories
+        .events
+        .load(target.session_id, None, None)
+        .await
+        .expect("metadata events");
+    assert!(events.iter().any(|event| {
+        event.event_type == RuntimeEventType::ThreadRenamed
+            && event.payload["thread_id"] == json!(target.thread_id)
+    }));
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == RuntimeEventType::ThreadArchived)
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == RuntimeEventType::ThreadDeleted)
+    );
+    assert!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event.event_type,
+                RuntimeEventType::ThreadRenamed
+                    | RuntimeEventType::ThreadArchived
+                    | RuntimeEventType::ThreadDeleted
+            ))
+            .all(|event| event
+                .payload
+                .get("command_id")
+                .and_then(Value::as_str)
+                .is_some())
+    );
+
+    for result in [
+        transport.resume_thread(target.thread_id).await.map(drop),
+        transport
+            .fork_thread(target.thread_id, None)
+            .await
+            .map(drop),
+        transport
+            .rebind_thread(target.thread_id, cwd.path())
+            .await
+            .map(drop),
+    ] {
+        assert!(
+            matches!(result, Err(ClientError::InvalidSession(reason)) if reason.contains("was removed"))
+        );
+    }
+    let prompt = transport
+        .send_command(command_with_payload(
+            target.session_id,
+            json!({
+                "prompt": "must not revive a removed session",
+                "_thread_id": target.thread_id,
+            }),
+        ))
+        .await;
+    assert!(
+        matches!(prompt, Err(ClientError::InvalidSession(reason)) if reason.contains("was removed"))
+    );
+
+    let foreign_workspace = tempdir().expect("foreign workspace");
+    let foreign = EmbeddedTransport::from_home_and_cwd(home.path(), foreign_workspace.path())
+        .await
+        .expect("foreign transport");
+    assert!(matches!(
+        foreign.resume_thread(target.thread_id).await,
+        Err(ClientError::InvalidSession(reason)) if reason.contains("does not belong to workspace")
+    ));
+}
+
+#[tokio::test]
+async fn another_runtime_session_lease_blocks_thread_metadata_mutation() {
+    let home = tempdir().expect("home");
+    let cwd = tempdir().expect("cwd");
+    let _provider = IsolatedGlobalMockProvider::install().await;
+    let owner = EmbeddedTransport::from_home_and_cwd(home.path(), cwd.path())
+        .await
+        .expect("owner transport");
+    let session_id = owner.default_session_id();
+    let thread_id = owner.default_thread_id();
+    owner
+        .send_command(command(session_id, "sleep"))
+        .await
+        .expect("blocking task");
+    wait_for_status(&owner, session_id, TaskStatus::WaitingApproval).await;
+
+    let contender = EmbeddedTransport::from_home_and_cwd(home.path(), cwd.path())
+        .await
+        .expect("contender transport");
+    let ack = contender
+        .send_command(runtime_command(
+            contender.default_session_id(),
+            SessionCommandKind::RenameThread,
+            json!({"thread_id": thread_id, "title": "must not change"}),
+        ))
+        .await
+        .expect("governed metadata command");
+
+    assert!(!ack.accepted);
+    assert!(
+        ack.reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("another Golutra runtime process"))
+    );
+    assert_ne!(
+        owner
+            .host
+            .repositories
+            .threads
+            .by_id(thread_id)
+            .await
+            .expect("thread lookup")
+            .expect("thread")
+            .title,
+        "must not change"
+    );
+
+    owner
+        .send_command(runtime_command(
+            session_id,
+            SessionCommandKind::Abort,
+            json!({}),
+        ))
+        .await
+        .expect("abort task");
+    if let Some(control) = owner.host.task_controls.lock().await.get(&session_id) {
+        control.abort_handle.abort();
+    }
+    sleep(Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn implicit_default_session_cannot_be_archived_or_removed() {
+    let home = tempdir().expect("home");
+    let cwd = tempdir().expect("cwd");
+    let transport = EmbeddedTransport::from_home_and_cwd(home.path(), cwd.path())
+        .await
+        .expect("transport");
+    let session_id = transport.default_session_id();
+    let now = chrono::Utc::now();
+    let thread = ThreadRecord {
+        thread_id: ThreadId::new(),
+        session_id,
+        parent_thread_id: None,
+        forked_from_turn_id: None,
+        forked_from_sequence_no: None,
+        workspace_root: Some(
+            cwd.path()
+                .canonicalize()
+                .expect("canonical cwd")
+                .display()
+                .to_string(),
+        ),
+        rebound_from_workspace_root: None,
+        rollout_path: None,
+        title: "attached".to_owned(),
+        preview: "attached session".to_owned(),
+        created_at: now,
+        updated_at: now,
+        recency_at: now,
+        archived: false,
+        removed: false,
+    };
+    transport
+        .host
+        .repositories
+        .threads
+        .upsert(&thread)
+        .await
+        .expect("thread");
+
+    for kind in [
+        SessionCommandKind::ArchiveThread,
+        SessionCommandKind::DeleteThread,
+    ] {
+        let mut command = runtime_command(session_id, kind, json!({"thread_id": thread.thread_id}));
+        command.session_id = None;
+        let ack = transport
+            .send_command(command)
+            .await
+            .expect("metadata command");
+        assert!(!ack.accepted);
+        assert_eq!(
+            ack.reason.as_deref(),
+            Some("the currently attached session cannot be archived or deleted")
+        );
+    }
+    assert!(
+        transport
+            .host
+            .repositories
+            .threads
+            .by_id(thread.thread_id)
+            .await
+            .expect("thread lookup")
+            .is_some()
+    );
+}
+
+#[tokio::test]
 async fn debug_export_writes_redacted_session_bundle_atomically() {
     let host = RuntimeHost::in_memory().await.expect("host");
     let session_id = SessionId::new();
@@ -3172,6 +3725,7 @@ async fn debug_export_writes_redacted_session_bundle_atomically() {
             updated_at: at,
             recency_at: at,
             archived: false,
+            removed: false,
         })
         .await
         .expect("thread");
@@ -3706,6 +4260,7 @@ async fn post_task_worker_does_not_claim_or_rewrite_a_foreign_workspace_job() {
             updated_at: now,
             recency_at: now,
             archived: false,
+            removed: false,
         })
         .await
         .expect("thread");
@@ -4489,6 +5044,26 @@ async fn approval_command_unblocks_waiting_tool_and_records_resolution() {
         .and_then(Value::as_str)
         .expect("pending approval")
         .to_owned();
+    let malformed = transport
+        .send_command(SessionCommand {
+            command_id: CommandId::new(),
+            session_id: Some(session_id),
+            kind: SessionCommandKind::Deny,
+            idempotency_key: "deny-malformed-tool-id".to_owned(),
+            actor: Actor {
+                kind: ActorKind::Cli,
+                id: "test".to_owned(),
+            },
+            payload: json!({"approval_id": "not-a-uuid"}),
+            timestamp: chrono::Utc::now(),
+        })
+        .await
+        .expect("malformed approval resolution");
+    assert!(!malformed.accepted);
+    assert_eq!(
+        malformed.reason.as_deref(),
+        Some("approval_id must be a valid UUID")
+    );
     let resolution = transport
         .send_command(SessionCommand {
             command_id: CommandId::new(),
@@ -4522,6 +5097,87 @@ async fn approval_command_unblocks_waiting_tool_and_records_resolution() {
         events
             .iter()
             .any(|event| event.event_type == RuntimeEventType::ApprovalResolved)
+    );
+}
+
+#[tokio::test]
+async fn terminal_task_rejects_a_stale_structured_question_answer() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let transport = EmbeddedTransport::new(host.clone());
+    let session_id = host.default_session_id();
+    let task_id = TaskId::new();
+    let request = UserQuestionRequest {
+        question_id: QuestionId::new(),
+        task_id,
+        turn_id: TurnId::new(),
+        tool_call_id: ToolCallId::new(),
+        questions: vec![UserQuestionPrompt {
+            id: "format".to_owned(),
+            header: "Output".to_owned(),
+            question: "Choose the output format".to_owned(),
+            mode: UserQuestionMode::Single,
+            options: vec![
+                UserQuestionOption {
+                    id: "json".to_owned(),
+                    label: "JSON".to_owned(),
+                    description: None,
+                },
+                UserQuestionOption {
+                    id: "text".to_owned(),
+                    label: "Text".to_owned(),
+                    description: None,
+                },
+            ],
+        }],
+    };
+    host.record_event(host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(task_id),
+        RuntimeEventType::UserQuestionRequested,
+        RuntimeEventSource::Runtime,
+        json!({"request": request}),
+    ))
+    .await
+    .expect("question event");
+    host.record_event(host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(task_id),
+        RuntimeEventType::TaskCompleted,
+        RuntimeEventSource::Runtime,
+        json!({"summary": "task completed"}),
+    ))
+    .await
+    .expect("terminal event");
+
+    let ack = transport
+        .send_command(runtime_command(
+            session_id,
+            SessionCommandKind::AnswerQuestion,
+            json!({
+                "question_id": request.question_id,
+                "answers": [{"question_id": "format", "selected_option_ids": ["json"]}],
+            }),
+        ))
+        .await
+        .expect("stale answer command");
+    let events = host
+        .store
+        .load_events(session_id, Some(task_id), None)
+        .await
+        .expect("events");
+
+    assert!(!ack.accepted);
+    assert!(
+        ack.reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("does not control an active task"))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| { event.event_type == RuntimeEventType::UserQuestionResolved })
     );
 }
 
@@ -6251,6 +6907,196 @@ async fn queued_turn_inherits_and_persists_the_active_yolo_capability() {
 }
 
 #[tokio::test]
+async fn queued_turn_inherits_and_persists_active_provider_settings() {
+    let workspace = tempdir().expect("workspace");
+    let _provider = IsolatedGlobalMockProvider::empty().await;
+    let active_settings = json!({
+        "provider_profile": "mock",
+        "provider_model": "active-model",
+        "provider_generation_config": {"reasoning_effort": "high"},
+    });
+    let mut profile = ProviderProfile::mock();
+    profile.model_id = Some("active-model".to_owned());
+    profile.generation_config = Some(
+        serde_json::from_value(active_settings["provider_generation_config"].clone())
+            .expect("generation config"),
+    );
+    ProviderInstallPlan {
+        scope: ProviderConfigScope::User,
+        profile,
+        activate: true,
+        pending_secret: None,
+    }
+    .apply(&ProviderConfigPaths::global().expect("provider paths"))
+    .expect("mock provider");
+    let transport = EmbeddedTransport::for_cwd(workspace.path())
+        .await
+        .expect("transport");
+    let session_id = transport.default_session_id();
+
+    transport
+        .send_command(command(session_id, "sleep"))
+        .await
+        .expect("blocking task");
+    wait_for_status(&transport, session_id, TaskStatus::WaitingApproval).await;
+
+    for payload in [
+        json!({"prompt": "queued without overrides"}),
+        json!({
+            "prompt": "queued naming the active default",
+            "provider_profile": active_settings["provider_profile"],
+        }),
+        json!({
+            "prompt": "queued with matching overrides",
+            "provider_profile": active_settings["provider_profile"],
+            "provider_model": active_settings["provider_model"],
+            "provider_generation_config": active_settings["provider_generation_config"],
+        }),
+    ] {
+        let queued = transport
+            .send_command(command_with_payload(session_id, payload))
+            .await
+            .expect("queued command");
+        assert!(queued.accepted, "{:?}", queued.reason);
+    }
+
+    let events = transport
+        .host
+        .repositories
+        .events
+        .load(session_id, None, None)
+        .await
+        .expect("events");
+    let started_payload = events
+        .iter()
+        .find(|event| event.event_type == RuntimeEventType::TaskCreated)
+        .and_then(|event| event.payload.get("payload"))
+        .expect("durable task payload");
+    assert_eq!(started_payload["provider_profile"], "mock");
+    assert_eq!(started_payload["provider_model"], "active-model");
+    assert_eq!(
+        started_payload["provider_generation_config"],
+        active_settings["provider_generation_config"]
+    );
+    let queued_payloads = events
+        .iter()
+        .filter(|event| event.event_type == RuntimeEventType::TurnQueued)
+        .filter_map(|event| event.payload.get("payload"))
+        .filter(|payload| {
+            payload
+                .get("prompt")
+                .and_then(Value::as_str)
+                .is_some_and(|prompt| prompt.starts_with("queued "))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(queued_payloads.len(), 3);
+    for payload in queued_payloads {
+        assert_eq!(
+            payload["provider_profile"],
+            active_settings["provider_profile"]
+        );
+        assert_eq!(payload["provider_model"], active_settings["provider_model"]);
+        assert_eq!(
+            payload["provider_generation_config"],
+            active_settings["provider_generation_config"]
+        );
+    }
+
+    transport
+        .send_command(runtime_command(
+            session_id,
+            SessionCommandKind::Abort,
+            json!({}),
+        ))
+        .await
+        .expect("release blocking task");
+    if let Some(control) = transport.host.task_controls.lock().await.get(&session_id) {
+        control.abort_handle.abort();
+    }
+    sleep(Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn queued_turn_cannot_change_active_provider_settings() {
+    let workspace = tempdir().expect("workspace");
+    let _provider = IsolatedGlobalMockProvider::install().await;
+    let transport = EmbeddedTransport::for_cwd(workspace.path())
+        .await
+        .expect("transport");
+    let session_id = transport.default_session_id();
+
+    transport
+        .send_command(command_with_payload(
+            session_id,
+            json!({
+                "prompt": "sleep",
+                "provider_profile": "mock",
+                "provider_model": "active-model",
+                "provider_generation_config": {"reasoning_effort": "high"},
+            }),
+        ))
+        .await
+        .expect("blocking task");
+    wait_for_status(&transport, session_id, TaskStatus::WaitingApproval).await;
+
+    for (name, override_payload) in [
+        ("profile", json!({"provider_profile": "other"})),
+        ("model", json!({"provider_model": "other-model"})),
+        (
+            "generation config",
+            json!({"provider_generation_config": {"reasoning_effort": "low"}}),
+        ),
+    ] {
+        let mut payload = json!({"prompt": format!("change {name}")});
+        payload.as_object_mut().expect("object").extend(
+            override_payload
+                .as_object()
+                .expect("override object")
+                .clone(),
+        );
+        let queued = transport
+            .send_command(command_with_payload(session_id, payload))
+            .await
+            .expect("queued command is governed");
+        assert!(!queued.accepted, "{name}");
+        assert_eq!(
+            queued.reason.as_deref(),
+            Some("queued prompt cannot change provider settings while a task is active"),
+            "{name}"
+        );
+    }
+
+    let events = transport
+        .host
+        .repositories
+        .events
+        .load(session_id, None, None)
+        .await
+        .expect("events");
+    assert!(!events.iter().any(|event| {
+        event.event_type == RuntimeEventType::TurnQueued
+            && event
+                .payload
+                .pointer("/payload/prompt")
+                .and_then(Value::as_str)
+                .is_some_and(|prompt| prompt.starts_with("change "))
+    }));
+
+    transport
+        .send_command(runtime_command(
+            session_id,
+            SessionCommandKind::Abort,
+            json!({}),
+        ))
+        .await
+        .expect("release blocking task");
+    if let Some(control) = transport.host.task_controls.lock().await.get(&session_id) {
+        control.abort_handle.abort();
+    }
+    sleep(Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
 async fn direct_protocol_rejects_non_boolean_yolo_capability() {
     let host = RuntimeHost::in_memory().await.expect("host");
     let session_id = host.default_session_id();
@@ -7369,6 +8215,123 @@ async fn runtime_recovery_restarts_durable_unstarted_pending_turns() {
 }
 
 #[tokio::test]
+async fn runtime_recovery_keeps_the_provider_binding_pinned_at_queue_time() {
+    let workspace = tempdir().expect("workspace");
+    let _provider = IsolatedGlobalMockProvider::empty().await;
+    let provider_paths = ProviderConfigPaths::global().expect("provider paths");
+    let mut profile_a = ProviderProfile::mock();
+    profile_a.name = "profile-a".to_owned();
+    profile_a.model_id = Some("model-a".to_owned());
+    profile_a.generation_config = Some(
+        serde_json::from_value(json!({"reasoning_effort": "high"}))
+            .expect("profile A generation config"),
+    );
+    let mut profile_b = ProviderProfile::mock();
+    profile_b.name = "profile-b".to_owned();
+    profile_b.model_id = Some("model-b".to_owned());
+    profile_b.generation_config = Some(
+        serde_json::from_value(json!({"reasoning_effort": "low"}))
+            .expect("profile B generation config"),
+    );
+    let mut settings = ProviderSettings::default();
+    settings.upsert_profile(profile_a, true);
+    settings.upsert_profile(profile_b, false);
+    settings
+        .save(&provider_paths.user_config)
+        .expect("provider settings A");
+
+    let host = RuntimeHost::for_cwd(workspace.path()).await.expect("host");
+    let session_id = host.default_session_id();
+    let task_id = TaskId::new();
+    let active_turn_id = TurnId::new();
+    let pending_turn_id = TurnId::new();
+    let actor = Actor {
+        kind: ActorKind::Cli,
+        id: "provider-recovery-owner".to_owned(),
+    };
+    host.upsert_current_thread(session_id, &json!({"prompt": "orphaned task"}))
+        .await
+        .expect("thread");
+    let started = host
+        .lane_manager
+        .lock()
+        .await
+        .start_task(
+            host.workspace_id,
+            session_id,
+            task_id,
+            active_turn_id,
+            actor,
+            host.next_sequence_no(),
+        )
+        .expect("orphan task starts");
+    host.record_event(started.event).await.expect("task event");
+    let queued = host
+        .lane_manager
+        .lock()
+        .await
+        .queue_turn(session_id, pending_turn_id, host.next_sequence_no())
+        .expect("turn queues");
+    let mut queued_payload = json!({"prompt": "sleep"});
+    pin_provider_turn_settings(host.provider_config_paths.as_ref(), &mut queued_payload);
+    assert_eq!(queued_payload["provider_profile"], "profile-a");
+    assert_eq!(queued_payload["provider_model"], "model-a");
+    assert_eq!(
+        queued_payload["provider_generation_config"],
+        json!({"reasoning_effort": "high"})
+    );
+    host.record_event(with_command_payload(
+        queued.event,
+        CommandId::new(),
+        queued_payload,
+    ))
+    .await
+    .expect("queued event");
+
+    settings
+        .set_active_profile("profile-b")
+        .expect("activate profile B");
+    settings
+        .save(&provider_paths.user_config)
+        .expect("provider settings B");
+    drop(host);
+
+    let reopened = RuntimeHost::for_cwd(workspace.path())
+        .await
+        .expect("reopened host");
+    let transport = EmbeddedTransport::new(reopened);
+    wait_for_status(&transport, session_id, TaskStatus::WaitingApproval).await;
+    let recovered_settings = transport
+        .host
+        .task_controls
+        .lock()
+        .await
+        .get(&session_id)
+        .expect("recovered task control")
+        .provider_settings
+        .clone();
+    assert_eq!(recovered_settings.profile, Some(json!("profile-a")));
+    assert_eq!(recovered_settings.model, Some(json!("model-a")));
+    assert_eq!(
+        recovered_settings.generation_config,
+        Some(json!({"reasoning_effort": "high"}))
+    );
+
+    transport
+        .send_command(runtime_command(
+            session_id,
+            SessionCommandKind::Abort,
+            json!({}),
+        ))
+        .await
+        .expect("release recovered task");
+    if let Some(control) = transport.host.task_controls.lock().await.get(&session_id) {
+        control.abort_handle.abort();
+    }
+    sleep(Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
 async fn runtime_recovery_rejects_a_pending_batch_that_changes_yolo_capability() {
     let host = RuntimeHost::in_memory().await.expect("host");
     let session_id = host.default_session_id();
@@ -7660,6 +8623,7 @@ async fn task_supervisor_converts_worker_panic_to_terminal_failure_and_cleans_co
             task_id: task.task_id,
             allow_network: false,
             yolo: false,
+            provider_settings: ProviderTurnSettings::default(),
             execution,
             abort_handle,
             completion,

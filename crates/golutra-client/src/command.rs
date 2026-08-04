@@ -1,6 +1,23 @@
 //! SessionCommand 校验、幂等日志与用例分派。
 
 use super::*;
+use golutra_core::{
+    ApprovalRequest, ApprovalScope, QuestionId, UserQuestionAnswer, UserQuestionResolution,
+};
+use golutra_protocol::pending_user_question;
+
+fn queued_turn_id_from_payload(payload: &Value) -> Option<TurnId> {
+    payload
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse().ok())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThreadMetadataMutation {
+    Upsert,
+    Delete,
+}
 
 impl RuntimeHost {
     pub async fn handle_command(
@@ -134,8 +151,20 @@ impl RuntimeHost {
                         reason: Some(format!("session {session_id} is ready")),
                     }
                 }
+                SessionCommandKind::RenameThread
+                | SessionCommandKind::ArchiveThread
+                | SessionCommandKind::DeleteThread => {
+                    self.handle_thread_metadata_command(session_id, command)
+                        .await?
+                }
                 SessionCommandKind::Prompt => {
                     self.clone().handle_prompt(session_id, command).await?
+                }
+                SessionCommandKind::UpdateQueuedTurn => {
+                    self.handle_update_queued_turn(session_id, command).await?
+                }
+                SessionCommandKind::CancelQueuedTurn => {
+                    self.handle_cancel_queued_turn(session_id, command).await?
                 }
                 SessionCommandKind::Abort => {
                     self.handle_lane_command(session_id, &command, "abort")
@@ -162,6 +191,10 @@ impl RuntimeHost {
                 }
                 SessionCommandKind::Deny => {
                     self.handle_approval_command(session_id, command, ApprovalDecision::Denied)
+                        .await?
+                }
+                SessionCommandKind::AnswerQuestion => {
+                    self.handle_answer_question_command(session_id, command)
                         .await?
                 }
                 SessionCommandKind::Compact => {
@@ -505,6 +538,12 @@ impl RuntimeHost {
                             reason =
                                 "queued prompt cannot change network capability while a task is active"
                                     .to_owned();
+                        } else if let Err(error) = control
+                            .provider_settings
+                            .normalize_queued_payload(&mut payload)
+                        {
+                            accepted = false;
+                            reason = error.to_owned();
                         } else {
                             let allow_network = requested_network.unwrap_or(control.allow_network);
                             let yolo = requested_yolo.unwrap_or(control.yolo);
@@ -523,7 +562,7 @@ impl RuntimeHost {
                                 .reserve_turn(PendingAgentTurn {
                                     command_id: command.command_id,
                                     turn_id,
-                                    content: prompt.clone(),
+                                    content: model_prompt_from_payload(&payload),
                                     task_contract: Some(task_contract.clone()),
                                     output_schema: payload.get("output_schema").cloned(),
                                     external_verifiers,
@@ -674,6 +713,7 @@ impl RuntimeHost {
             }
         }
 
+        pin_provider_turn_settings(self.provider_config_paths.as_ref(), &mut payload);
         self.upsert_current_thread(session_id, &payload).await?;
         let mut lane_manager = self.lane_manager.lock().await;
         let transition = lane_manager.start_task(
@@ -717,6 +757,236 @@ impl RuntimeHost {
             accepted: true,
             reason: Some(format!("started task {task_id} in session {session_id}")),
         })
+    }
+
+    async fn handle_update_queued_turn(
+        &self,
+        session_id: SessionId,
+        command: SessionCommand,
+    ) -> Result<CommandAck, ClientError> {
+        let Some(turn_id) = queued_turn_id_from_payload(&command.payload) else {
+            return Ok(CommandAck {
+                command_id: command.command_id,
+                accepted: false,
+                reason: Some("queued turn update requires a valid turn_id".to_owned()),
+            });
+        };
+        let prompt = prompt_from_payload(&command.payload);
+        if prompt.trim().is_empty() {
+            return Ok(CommandAck {
+                command_id: command.command_id,
+                accepted: false,
+                reason: Some("queued turn update requires a non-empty prompt".to_owned()),
+            });
+        }
+        let Some((task_id, lane)) = self.owned_active_lane(session_id, &command.actor).await else {
+            return Ok(CommandAck {
+                command_id: command.command_id,
+                accepted: false,
+                reason: Some("queued turn update requires control of an active task".to_owned()),
+            });
+        };
+        let Some(mut payload) = self
+            .latest_queued_turn_payload(session_id, task_id, turn_id)
+            .await?
+        else {
+            return Ok(CommandAck {
+                command_id: command.command_id,
+                accepted: false,
+                reason: Some("queued turn is no longer pending".to_owned()),
+            });
+        };
+        payload["prompt"] = Value::String(prompt);
+        if let Some(attachments) = command.payload.get("attachments") {
+            payload["attachments"] = attachments.clone();
+        }
+        if payload.get("_task_contract_origin").and_then(Value::as_str) == Some("legacy_adapter") {
+            if let Some(object) = payload.as_object_mut() {
+                object.remove("task_contract");
+            }
+            let updated_prompt = prompt_from_payload(&payload);
+            let mut task_contract = task_contract_from_payload(&payload)?;
+            LegacyTaskAdapter::new(&payload, &updated_prompt).apply_to(&mut task_contract);
+            if payload
+                .get("defer_external_verification")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                task_contract.require_objective_validation = false;
+            }
+            task_contract
+                .validate()
+                .map_err(ClientError::TaskExecution)?;
+            payload["task_contract"] = serde_json::to_value(task_contract)?;
+        }
+
+        let mut event = host_event(
+            self.next_sequence_no(),
+            session_id,
+            Some(task_id),
+            RuntimeEventType::TurnUpdated,
+            RuntimeEventSource::User,
+            json!({
+                "summary": "queued user turn updated",
+                "command_id": command.command_id,
+                "payload": payload,
+                "runtime_lane": lane,
+            }),
+        );
+        event.turn_id = Some(turn_id);
+        let replacement = recovered_pending_turn_from_event(&event)?
+            .ok_or_else(|| ClientError::TaskExecution("queued turn update is invalid".to_owned()))?
+            .pending;
+        let control = self.task_controls.lock().await.get(&session_id).cloned();
+        let Some(control) = control.filter(|control| control.task_id == task_id) else {
+            return Ok(CommandAck {
+                command_id: command.command_id,
+                accepted: false,
+                reason: Some("active task finished before the queued turn was updated".to_owned()),
+            });
+        };
+        let mutation = match control.execution.reserve_turn_update(turn_id, replacement) {
+            Ok(mutation) => mutation,
+            Err(AgentLoopError::PendingTurnNotFound) => {
+                return Ok(CommandAck {
+                    command_id: command.command_id,
+                    accepted: false,
+                    reason: Some("queued turn is no longer pending".to_owned()),
+                });
+            }
+            Err(AgentLoopError::PendingTurnMutationInProgress) => {
+                return Ok(CommandAck {
+                    command_id: command.command_id,
+                    accepted: false,
+                    reason: Some("queued turn is already being changed".to_owned()),
+                });
+            }
+            Err(error) => return Err(ClientError::TaskExecution(error.to_string())),
+        };
+        self.record_event(event).await?;
+        mutation.commit();
+        Ok(CommandAck {
+            command_id: command.command_id,
+            accepted: true,
+            reason: Some("queued turn updated".to_owned()),
+        })
+    }
+
+    async fn handle_cancel_queued_turn(
+        &self,
+        session_id: SessionId,
+        command: SessionCommand,
+    ) -> Result<CommandAck, ClientError> {
+        let Some(turn_id) = queued_turn_id_from_payload(&command.payload) else {
+            return Ok(CommandAck {
+                command_id: command.command_id,
+                accepted: false,
+                reason: Some("queued turn cancellation requires a valid turn_id".to_owned()),
+            });
+        };
+        let Some((task_id, mut lane)) = self.owned_active_lane(session_id, &command.actor).await
+        else {
+            return Ok(CommandAck {
+                command_id: command.command_id,
+                accepted: false,
+                reason: Some(
+                    "queued turn cancellation requires control of an active task".to_owned(),
+                ),
+            });
+        };
+        let control = self.task_controls.lock().await.get(&session_id).cloned();
+        let Some(control) = control.filter(|control| control.task_id == task_id) else {
+            return Ok(CommandAck {
+                command_id: command.command_id,
+                accepted: false,
+                reason: Some(
+                    "active task finished before the queued turn was cancelled".to_owned(),
+                ),
+            });
+        };
+        let mutation = match control.execution.reserve_turn_cancellation(turn_id) {
+            Ok(mutation) => mutation,
+            Err(AgentLoopError::PendingTurnNotFound) => {
+                return Ok(CommandAck {
+                    command_id: command.command_id,
+                    accepted: false,
+                    reason: Some("queued turn is no longer pending".to_owned()),
+                });
+            }
+            Err(AgentLoopError::PendingTurnMutationInProgress) => {
+                return Ok(CommandAck {
+                    command_id: command.command_id,
+                    accepted: false,
+                    reason: Some("queued turn is already being changed".to_owned()),
+                });
+            }
+            Err(error) => return Err(ClientError::TaskExecution(error.to_string())),
+        };
+        lane.pending_turns.retain(|pending| *pending != turn_id);
+        let mut event = host_event(
+            self.next_sequence_no(),
+            session_id,
+            Some(task_id),
+            RuntimeEventType::TurnCancelled,
+            RuntimeEventSource::User,
+            json!({
+                "summary": "queued user turn cancelled",
+                "command_id": command.command_id,
+                "turn_id": turn_id,
+                "runtime_lane": lane,
+            }),
+        );
+        event.turn_id = Some(turn_id);
+        self.record_event(event).await?;
+        mutation.commit();
+        self.lane_manager
+            .lock()
+            .await
+            .discard_queued_turn(session_id, turn_id)?;
+        Ok(CommandAck {
+            command_id: command.command_id,
+            accepted: true,
+            reason: Some("queued turn cancelled".to_owned()),
+        })
+    }
+
+    async fn owned_active_lane(
+        &self,
+        session_id: SessionId,
+        actor: &Actor,
+    ) -> Option<(TaskId, golutra_core::RuntimeLane)> {
+        self.lane_manager
+            .lock()
+            .await
+            .lane(session_id)
+            .filter(|lane| is_active_status(lane.status) && lane.active_controller == *actor)
+            .map(|lane| (lane.task_id, lane.clone()))
+    }
+
+    async fn latest_queued_turn_payload(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+        turn_id: TurnId,
+    ) -> Result<Option<Value>, ClientError> {
+        let events = self
+            .repositories
+            .events
+            .load(session_id, Some(task_id), None)
+            .await?;
+        let mut payload = None;
+        for event in events.iter().filter(|event| event.turn_id == Some(turn_id)) {
+            match event.event_type {
+                RuntimeEventType::TurnQueued | RuntimeEventType::TurnUpdated => {
+                    payload = event.payload.get("payload").cloned();
+                }
+                RuntimeEventType::TurnStarted | RuntimeEventType::TurnCancelled => {
+                    payload = None;
+                }
+                _ => {}
+            }
+        }
+        Ok(payload)
     }
 
     async fn handle_reconcile_task_command(
@@ -1252,6 +1522,223 @@ impl RuntimeHost {
         }
     }
 
+    async fn handle_thread_metadata_command(
+        &self,
+        attached_session_id: SessionId,
+        command: SessionCommand,
+    ) -> Result<CommandAck, ClientError> {
+        let Some(thread_id) = command
+            .payload
+            .get("thread_id")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<ThreadId>().ok())
+        else {
+            return Ok(CommandAck {
+                command_id: command.command_id,
+                accepted: false,
+                reason: Some("thread_id is required".to_owned()),
+            });
+        };
+        let Some(mut thread) = self.repositories.threads.by_id(thread_id).await? else {
+            return Ok(CommandAck {
+                command_id: command.command_id,
+                accepted: false,
+                reason: Some(format!("thread {thread_id} was not found")),
+            });
+        };
+        self.ensure_thread_in_workspace(&thread)?;
+        let (event_type, summary) = match command.kind {
+            SessionCommandKind::RenameThread => (RuntimeEventType::ThreadRenamed, "thread renamed"),
+            SessionCommandKind::ArchiveThread => {
+                (RuntimeEventType::ThreadArchived, "thread archived")
+            }
+            SessionCommandKind::DeleteThread => (
+                RuntimeEventType::ThreadDeleted,
+                "thread removed from history",
+            ),
+            _ => unreachable!("thread metadata handler only receives thread commands"),
+        };
+        if let Some(event) = self
+            .existing_thread_metadata_event(&thread, event_type, command.command_id)
+            .await?
+        {
+            self.rebuild_thread_rollout(&thread).await?;
+            let _ = self.event_bus.send(event);
+            return Ok(CommandAck {
+                command_id: command.command_id,
+                accepted: true,
+                reason: Some(summary.to_owned()),
+            });
+        }
+        self.ensure_thread_not_removed(&thread)?;
+        if matches!(
+            command.kind,
+            SessionCommandKind::ArchiveThread | SessionCommandKind::DeleteThread
+        ) && attached_session_id == thread.session_id
+        {
+            return Ok(CommandAck {
+                command_id: command.command_id,
+                accepted: false,
+                reason: Some(
+                    "the currently attached session cannot be archived or deleted".to_owned(),
+                ),
+            });
+        }
+        if self
+            .lane_manager
+            .lock()
+            .await
+            .lane(thread.session_id)
+            .is_some()
+        {
+            return Ok(CommandAck {
+                command_id: command.command_id,
+                accepted: false,
+                reason: Some("active sessions cannot be renamed, archived, or deleted".to_owned()),
+            });
+        }
+        let _session_lease = match self.try_acquire_session_lease(thread.session_id)? {
+            SessionLeaseAttempt::Acquired(lease) => lease,
+            SessionLeaseAttempt::Busy => {
+                return Ok(CommandAck {
+                    command_id: command.command_id,
+                    accepted: false,
+                    reason: Some(
+                        "thread metadata cannot change while the session is active in another Golutra runtime process"
+                            .to_owned(),
+                    ),
+                });
+            }
+        };
+        let mutation = match command.kind {
+            SessionCommandKind::RenameThread => {
+                let Some(title) = command
+                    .payload
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|title| !title.is_empty() && title.chars().count() <= 256)
+                else {
+                    return Ok(CommandAck {
+                        command_id: command.command_id,
+                        accepted: false,
+                        reason: Some("title must contain between 1 and 256 characters".to_owned()),
+                    });
+                };
+                thread.title = title.to_owned();
+                thread.updated_at = chrono::Utc::now();
+                ThreadMetadataMutation::Upsert
+            }
+            SessionCommandKind::ArchiveThread => {
+                thread.archived = true;
+                thread.updated_at = chrono::Utc::now();
+                ThreadMetadataMutation::Upsert
+            }
+            SessionCommandKind::DeleteThread => {
+                thread.archived = true;
+                thread.removed = true;
+                thread.updated_at = chrono::Utc::now();
+                ThreadMetadataMutation::Delete
+            }
+            _ => unreachable!("thread metadata handler only receives thread commands"),
+        };
+        let event = host_event(
+            self.next_sequence_no(),
+            thread.session_id,
+            None,
+            event_type,
+            RuntimeEventSource::User,
+            json!({
+                "summary": summary,
+                "thread_id": thread.thread_id,
+                "actor": command.actor,
+                "command_id": command.command_id.to_string(),
+            }),
+        );
+        if !self
+            .record_thread_metadata_event(&thread, mutation, event)
+            .await?
+        {
+            return Ok(CommandAck {
+                command_id: command.command_id,
+                accepted: false,
+                reason: Some(format!("thread {thread_id} was not found")),
+            });
+        }
+        Ok(CommandAck {
+            command_id: command.command_id,
+            accepted: true,
+            reason: Some(summary.to_owned()),
+        })
+    }
+
+    async fn existing_thread_metadata_event(
+        &self,
+        thread: &golutra_store::ThreadRecord,
+        event_type: RuntimeEventType,
+        command_id: CommandId,
+    ) -> Result<Option<RuntimeEvent>, ClientError> {
+        let command_id = command_id.to_string();
+        let thread_id = thread.thread_id.to_string();
+        Ok(self
+            .repositories
+            .events
+            .load(thread.session_id, None, None)
+            .await?
+            .into_iter()
+            .rev()
+            .find(|event| {
+                event.event_type == event_type
+                    && event.payload.get("command_id").and_then(Value::as_str)
+                        == Some(command_id.as_str())
+                    && event.payload.get("thread_id").and_then(Value::as_str)
+                        == Some(thread_id.as_str())
+            }))
+    }
+
+    async fn record_thread_metadata_event(
+        &self,
+        thread: &golutra_store::ThreadRecord,
+        mutation: ThreadMetadataMutation,
+        event: RuntimeEvent,
+    ) -> Result<bool, ClientError> {
+        let _writer = self.event_writer.lock().await;
+        let causal_before = self.causal_ledger.lock().await.clone();
+        let event = match self.prepare_canonical_event(event).await {
+            Ok(event) => event,
+            Err(error) => {
+                *self.causal_ledger.lock().await = causal_before;
+                return Err(error);
+            }
+        };
+        let committed = match mutation {
+            ThreadMetadataMutation::Upsert => self
+                .repositories
+                .threads
+                .upsert_with_event(thread, event)
+                .await
+                .map(Some),
+            ThreadMetadataMutation::Delete => {
+                self.repositories
+                    .threads
+                    .delete_with_event(thread.thread_id, event)
+                    .await
+            }
+        };
+        let Some(event) = (match committed {
+            Ok(event) => event,
+            Err(error) => {
+                *self.causal_ledger.lock().await = causal_before;
+                return Err(error.into());
+            }
+        }) else {
+            *self.causal_ledger.lock().await = causal_before;
+            return Ok(false);
+        };
+        self.publish_committed_event(event).await?;
+        Ok(true)
+    }
+
     async fn handle_approval_command(
         &self,
         session_id: SessionId,
@@ -1282,12 +1769,26 @@ impl RuntimeHost {
             .pending_approval
             .as_deref()
             .and_then(|value| value.parse::<ApprovalId>().ok());
-        let requested_approval = command
-            .payload
-            .get("approval_id")
-            .and_then(Value::as_str)
-            .and_then(|value| value.parse::<ApprovalId>().ok())
-            .or(pending_approval);
+        let requested_approval = match command.payload.get("approval_id") {
+            None | Some(Value::Null) => pending_approval,
+            Some(Value::String(value)) => match value.parse::<ApprovalId>() {
+                Ok(approval_id) => Some(approval_id),
+                Err(_) => {
+                    return Ok(CommandAck {
+                        command_id: command.command_id,
+                        accepted: false,
+                        reason: Some("approval_id must be a valid UUID".to_owned()),
+                    });
+                }
+            },
+            Some(_) => {
+                return Ok(CommandAck {
+                    command_id: command.command_id,
+                    accepted: false,
+                    reason: Some("approval_id must be a valid UUID".to_owned()),
+                });
+            }
+        };
         let Some(approval_id) = requested_approval else {
             return Ok(CommandAck {
                 command_id: command.command_id,
@@ -1304,6 +1805,77 @@ impl RuntimeHost {
                 )),
             });
         }
+        let scope = command
+            .payload
+            .get("scope")
+            .cloned()
+            .map(serde_json::from_value::<ApprovalScope>)
+            .transpose()
+            .map_err(|_| {
+                ClientError::TaskExecution(
+                    "approval scope must be once, resource_prefix, or session".to_owned(),
+                )
+            })?
+            .unwrap_or_default();
+        let resource_prefix = match command.payload.get("resource_prefix") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(prefix))
+                if !prefix.is_empty() && prefix.chars().count() <= 2_048 =>
+            {
+                Some(prefix.clone())
+            }
+            Some(_) => {
+                return Ok(CommandAck {
+                    command_id: command.command_id,
+                    accepted: false,
+                    reason: Some(
+                        "approval resource_prefix must contain between 1 and 2048 characters"
+                            .to_owned(),
+                    ),
+                });
+            }
+        };
+        if scope == ApprovalScope::ResourcePrefix {
+            let events = self
+                .repositories
+                .events
+                .load(session_id, state.active_task_id, None)
+                .await?;
+            let request = events.iter().rev().find_map(|event| {
+                (event.event_type == RuntimeEventType::ApprovalRequested
+                    && event
+                        .payload
+                        .get("approval_id")
+                        .and_then(Value::as_str)
+                        .and_then(|value| value.parse::<ApprovalId>().ok())
+                        == Some(approval_id))
+                .then(|| event.payload.get("request").cloned())
+                .flatten()
+                .and_then(|value| serde_json::from_value::<ApprovalRequest>(value).ok())
+            });
+            let valid = request.as_ref().is_some_and(|request| {
+                resource_prefix.as_deref().is_some_and(|prefix| {
+                    approval_resource_matches(&request.tool_name, prefix, &request.resource)
+                })
+            });
+            if !valid {
+                return Ok(CommandAck {
+                    command_id: command.command_id,
+                    accepted: false,
+                    reason: Some(
+                        "approval resource_prefix must prefix the pending resource".to_owned(),
+                    ),
+                });
+            }
+        } else if resource_prefix.is_some() {
+            return Ok(CommandAck {
+                command_id: command.command_id,
+                accepted: false,
+                reason: Some(
+                    "approval resource_prefix is only valid for resource_prefix scope".to_owned(),
+                ),
+            });
+        }
         let control = self.task_controls.lock().await.get(&session_id).cloned();
         let Some(control) = control else {
             return Ok(CommandAck {
@@ -1317,6 +1889,14 @@ impl RuntimeHost {
             .resolve_approval(ApprovalResolution {
                 approval_id,
                 decision,
+                scope: if decision == ApprovalDecision::Approved {
+                    scope
+                } else {
+                    ApprovalScope::Once
+                },
+                resource_prefix: (decision == ApprovalDecision::Approved)
+                    .then_some(resource_prefix)
+                    .flatten(),
                 reason: format!("resolved by {}", command.actor.id),
             })
             .await
@@ -1326,6 +1906,110 @@ impl RuntimeHost {
             command_id: command.command_id,
             accepted: true,
             reason: Some(format!("approval {approval_id} resolved as {decision:?}")),
+        })
+    }
+
+    async fn handle_answer_question_command(
+        &self,
+        session_id: SessionId,
+        command: SessionCommand,
+    ) -> Result<CommandAck, ClientError> {
+        let Some((task_id, _)) = self.owned_active_lane(session_id, &command.actor).await else {
+            return Ok(CommandAck {
+                command_id: command.command_id,
+                accepted: false,
+                reason: Some(
+                    "answer rejected because the actor does not control an active task".to_owned(),
+                ),
+            });
+        };
+        let events = self
+            .repositories
+            .events
+            .load(session_id, Some(task_id), None)
+            .await?;
+        let pending = pending_user_question(&events, Some(task_id));
+        let Some(request) = pending else {
+            return Ok(CommandAck {
+                command_id: command.command_id,
+                accepted: false,
+                reason: Some("session has no pending structured question".to_owned()),
+            });
+        };
+        let requested_id = match command.payload.get("question_id") {
+            None | Some(Value::Null) => request.question_id,
+            Some(Value::String(value)) => match value.parse::<QuestionId>() {
+                Ok(question_id) => question_id,
+                Err(_) => {
+                    return Ok(CommandAck {
+                        command_id: command.command_id,
+                        accepted: false,
+                        reason: Some("question_id must be a valid UUID".to_owned()),
+                    });
+                }
+            },
+            Some(_) => {
+                return Ok(CommandAck {
+                    command_id: command.command_id,
+                    accepted: false,
+                    reason: Some("question_id must be a valid UUID".to_owned()),
+                });
+            }
+        };
+        if requested_id != request.question_id {
+            return Ok(CommandAck {
+                command_id: command.command_id,
+                accepted: false,
+                reason: Some(format!(
+                    "question {requested_id} is not pending in this session"
+                )),
+            });
+        }
+        let answers = command
+            .payload
+            .get("answers")
+            .cloned()
+            .map(serde_json::from_value::<Vec<UserQuestionAnswer>>)
+            .transpose()
+            .map_err(|error| {
+                ClientError::TaskExecution(format!("invalid structured answers: {error}"))
+            })?
+            .unwrap_or_default();
+        let resolution = UserQuestionResolution {
+            question_id: request.question_id,
+            answers,
+            reason: format!("answered by {}", command.actor.id),
+        };
+        if let Err(error) = request.validate_resolution(&resolution) {
+            return Ok(CommandAck {
+                command_id: command.command_id,
+                accepted: false,
+                reason: Some(error),
+            });
+        }
+        let control = self
+            .task_controls
+            .lock()
+            .await
+            .get(&session_id)
+            .filter(|control| control.task_id == task_id)
+            .cloned();
+        let Some(control) = control else {
+            return Ok(CommandAck {
+                command_id: command.command_id,
+                accepted: false,
+                reason: Some("active task control is unavailable".to_owned()),
+            });
+        };
+        control
+            .execution
+            .resolve_question(resolution)
+            .await
+            .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
+        Ok(CommandAck {
+            command_id: command.command_id,
+            accepted: true,
+            reason: Some(format!("question {} answered", request.question_id)),
         })
     }
 
@@ -1365,12 +2049,14 @@ impl RuntimeHost {
             .as_ref()
             .map(|(sequence_no, _)| *sequence_no)
             .unwrap_or_default();
-        let lines = events
-            .iter()
-            .filter(|event| event.sequence_no > compacted_after)
-            .filter(|event| event.event_type.is_model_history_fact())
-            .filter_map(conversation_history_line)
-            .collect::<Vec<_>>();
+        let lines = effective_model_history_events(
+            events
+                .iter()
+                .filter(|event| event.sequence_no > compacted_after),
+        )
+        .into_iter()
+        .filter_map(conversation_history_line)
+        .collect::<Vec<_>>();
         if explicit_compaction.is_none() && lines.is_empty() {
             return Ok(CommandAck {
                 command_id: command.command_id,

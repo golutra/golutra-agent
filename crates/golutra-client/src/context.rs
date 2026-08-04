@@ -1,8 +1,8 @@
 //! 对话上下文、工作区指令与 prompt 归一化。
 
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
-use golutra_core::{TaskContract, VerificationRequirement};
+use golutra_core::{TaskContract, TurnId, VerificationRequirement};
 use golutra_memory::RetrievedMemory;
 use golutra_protocol::{RuntimeEvent, RuntimeEventType};
 use serde_json::Value;
@@ -15,7 +15,9 @@ pub(crate) fn conversation_history_line(event: &RuntimeEvent) -> Option<String> 
         return None;
     }
     match event.event_type {
-        RuntimeEventType::TaskCreated | RuntimeEventType::TurnQueued => event
+        RuntimeEventType::TaskCreated
+        | RuntimeEventType::TurnQueued
+        | RuntimeEventType::TurnUpdated => event
             .payload
             .get("payload")
             .and_then(|payload| payload.get("prompt"))
@@ -41,6 +43,45 @@ pub(crate) fn conversation_history_line(event: &RuntimeEvent) -> Option<String> 
             .map(|status| format!("Task: {status}")),
         _ => None,
     }
+}
+
+pub(crate) fn effective_model_history_events<'a>(
+    events: impl IntoIterator<Item = &'a RuntimeEvent>,
+) -> Vec<&'a RuntimeEvent> {
+    let mut effective = Vec::<Option<&RuntimeEvent>>::new();
+    let mut user_turn_positions = HashMap::<TurnId, usize>::new();
+    for event in events {
+        match event.event_type {
+            RuntimeEventType::TaskCreated | RuntimeEventType::TurnQueued => {
+                if let Some(turn_id) = event.turn_id {
+                    user_turn_positions.insert(turn_id, effective.len());
+                }
+                effective.push(Some(event));
+            }
+            RuntimeEventType::TurnUpdated => {
+                let Some(turn_id) = event.turn_id else {
+                    continue;
+                };
+                if let Some(index) = user_turn_positions.get(&turn_id).copied() {
+                    effective[index] = Some(event);
+                } else {
+                    user_turn_positions.insert(turn_id, effective.len());
+                    effective.push(Some(event));
+                }
+            }
+            RuntimeEventType::TurnCancelled => {
+                if let Some(index) = event
+                    .turn_id
+                    .and_then(|turn_id| user_turn_positions.remove(&turn_id))
+                {
+                    effective[index] = None;
+                }
+            }
+            _ if event.event_type.is_model_history_fact() => effective.push(Some(event)),
+            _ => {}
+        }
+    }
+    effective.into_iter().flatten().collect()
 }
 
 pub(crate) fn context_compaction_from_event(event: &RuntimeEvent) -> Option<(u64, String)> {
@@ -107,6 +148,7 @@ pub(crate) fn system_prompt() -> String {
         "For write tasks, call write_file or edit_file with complete arguments instead of only explaining the change.",
         "The shell tool has one command field: include the program and every argument in that string, for example `git status --short`. Commands are parsed as inert argv, not by a shell. A quoted foreground Python heredoc such as `python - <<'PY'` is passed directly to Python on stdin. For other pipes, redirection, command substitution, or chained commands, explicitly invoke `bash -lc` and pass the complete script as its single quoted argument; for reusable scripts, create a workspace file with write_file and run it with a simple command.",
         "When a required local dependency is missing, inspect the available package manager and call the needed install command with the shell tool instead of asking in prose or abandoning the task. The runtime will request any required approval before execution; validate the delivered artifact afterward.",
+        "When a consequential choice genuinely cannot be inferred from the request or workspace, use ask_user with concise structured options instead of embedding a question in ordinary assistant prose. Do not ask about decisions that can be discovered safely from available context.",
         "Before claiming completion after changing the workspace or environment, run an objective validation that exits non-zero when any explicit acceptance criterion is wrong. Validate semantic behavior and content, not only existence or metadata, and keep every requested deliverable intact.",
         "For multi-step validation, ensure any failed step makes the overall validation fail.",
         "Validate through the user-facing interface from an independent consumer or clean context when the request depends on interoperability, installation, deployment, or availability; an internal shortcut is not equivalent evidence.",
@@ -190,6 +232,35 @@ pub(crate) fn prompt_from_payload(payload: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned()
+}
+
+pub(crate) fn model_prompt_from_payload(payload: &Value) -> String {
+    let mut prompt = prompt_from_payload(payload);
+    let references = payload
+        .get("attachments")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(16)
+        .filter_map(|attachment| {
+            let path = attachment.get("path")?.as_str()?.trim();
+            if path.is_empty() || path.chars().count() > 512 || path.chars().any(char::is_control) {
+                return None;
+            }
+            let kind = attachment
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("file");
+            Some(format!("- {kind}: {path}"))
+        })
+        .collect::<Vec<_>>();
+    if !references.is_empty() {
+        prompt.push_str(
+            "\n\nUser-attached workspace references (inspect only as needed for the request):\n",
+        );
+        prompt.push_str(&references.join("\n"));
+    }
+    prompt
 }
 
 pub(crate) fn completion_criteria_from_payload(payload: &Value) -> Vec<String> {
@@ -300,5 +371,22 @@ mod tests {
         };
 
         assert_eq!(conversation_history_line(&event), None);
+    }
+
+    #[test]
+    fn model_prompt_adds_bounded_attachment_references_without_changing_display_prompt() {
+        let payload = serde_json::json!({
+            "prompt": "inspect the screenshot",
+            "attachments": [
+                {"path": "artifacts/screen.png", "kind": "image", "bytes": 42},
+                {"path": "notes.txt", "kind": "text", "bytes": 10}
+            ]
+        });
+
+        assert_eq!(prompt_from_payload(&payload), "inspect the screenshot");
+        let model = model_prompt_from_payload(&payload);
+        assert!(model.starts_with("inspect the screenshot\n\n"));
+        assert!(model.contains("- image: artifacts/screen.png"));
+        assert!(model.contains("- text: notes.txt"));
     }
 }

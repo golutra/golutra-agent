@@ -1088,6 +1088,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "getopts"
+version = "0.2.24"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfe4fbac503b8d1f88e6676011885f34b7174f46e59956bba534ba83abded4df"
+dependencies = [
+ "unicode-width 0.2.2",
+]
+
+[[package]]
 name = "getrandom"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1659,6 +1668,7 @@ dependencies = [
 name = "golutra-tui"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "chrono",
  "clap",
  "crossterm",
@@ -1671,13 +1681,16 @@ dependencies = [
  "golutra-core",
  "golutra-llm",
  "golutra-protocol",
+ "ignore",
  "miette",
  "nix 0.30.1",
+ "pulldown-cmark",
  "ratatui",
  "secrecy",
  "serde",
  "serde_json",
  "sha2",
+ "shlex 1.3.0",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -2816,6 +2829,25 @@ dependencies = [
  "tracing",
  "windows",
 ]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9f068eba8e7071c5f9511831b44f32c740d5adf574e990f946ddb53db2f314e"
+dependencies = [
+ "bitflags",
+ "getopts",
+ "memchr",
+ "pulldown-cmark-escape",
+ "unicase",
+]
+
+[[package]]
+name = "pulldown-cmark-escape"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "007d8adb5ddab6f8e3f491ac63566a7d5002cc7ed73901f72057943fa71ae1ae"
 
 [[package]]
 name = "quinn"

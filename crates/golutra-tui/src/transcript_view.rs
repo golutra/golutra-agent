@@ -1,6 +1,6 @@
 //! Pure mapping from runtime/user projections to transcript view models.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use golutra_core::{FileChangeKind, FileChangeSummary, ToolResultStatus, TurnId};
 use golutra_protocol::{RuntimeEvent, RuntimeEventType, UserProjection, VisibleStep};
@@ -157,7 +157,7 @@ pub(crate) fn event_operation_projections(events: &[RuntimeEvent]) -> Vec<Operat
     typed_events.sort_by_key(|event| event.sequence_no);
 
     let mut items: Vec<OperationProjection> = Vec::new();
-    let mut visible_user_turns = HashSet::new();
+    let mut visible_user_turns = HashMap::<TurnId, usize>::new();
     let mut streamed_assistant_items: HashMap<TurnId, usize> = HashMap::new();
     let mut active_tools = HashMap::<OperationId, usize>::new();
     for event in typed_events {
@@ -165,9 +165,45 @@ pub(crate) fn event_operation_projections(events: &[RuntimeEvent]) -> Vec<Operat
             RuntimeEventType::TaskCreated | RuntimeEventType::TurnQueued => {
                 let is_new_turn = event
                     .turn_id
-                    .is_none_or(|turn_id| visible_user_turns.insert(turn_id));
+                    .is_none_or(|turn_id| !visible_user_turns.contains_key(&turn_id));
                 if is_new_turn && let Some(item) = user_event_transcript_item(event) {
+                    if let Some(turn_id) = event.turn_id {
+                        visible_user_turns.insert(turn_id, items.len());
+                    }
                     items.push(message_projection(item));
+                }
+            }
+            RuntimeEventType::TurnUpdated => {
+                if let Some(index) = event
+                    .turn_id
+                    .and_then(|turn_id| visible_user_turns.get(&turn_id).copied())
+                    && let Some(item) = user_event_transcript_item(event)
+                {
+                    items[index] = message_projection(item);
+                }
+            }
+            RuntimeEventType::TurnCancelled => {
+                let Some(index) = event
+                    .turn_id
+                    .and_then(|turn_id| visible_user_turns.remove(&turn_id))
+                else {
+                    continue;
+                };
+                items.remove(index);
+                for position in visible_user_turns.values_mut() {
+                    if *position > index {
+                        *position = position.saturating_sub(1);
+                    }
+                }
+                for position in streamed_assistant_items.values_mut() {
+                    if *position > index {
+                        *position = position.saturating_sub(1);
+                    }
+                }
+                for position in active_tools.values_mut() {
+                    if *position > index {
+                        *position = position.saturating_sub(1);
+                    }
                 }
             }
             RuntimeEventType::ProviderStreamed => {
@@ -310,14 +346,28 @@ fn update_tool_progress(projection: &mut OperationProjection, event: &RuntimeEve
         .get("output_lines")
         .and_then(Value::as_u64)
         .unwrap_or_default();
+    let stream = progress
+        .get("detail")
+        .and_then(Value::as_str)
+        .unwrap_or("output");
     let item = projection.item_mut();
     item.body.truncate(1);
     item.body.push(format!(
-        "{} · {} · {}",
+        "{stream} · {} · {} · {}",
         plural_count(output_lines, "line", "lines"),
         format_bytes(output_bytes),
         format_millis(elapsed_ms)
     ));
+    if let Some(excerpt) = progress.get("output_excerpt").and_then(Value::as_str) {
+        let lines = excerpt.lines().filter(|line| !line.trim().is_empty());
+        let mut lines = lines.rev().take(6).collect::<Vec<_>>();
+        lines.reverse();
+        item.body.extend(
+            lines
+                .into_iter()
+                .map(|line| format!("│ {}", bounded_text(line, 320))),
+        );
+    }
 }
 
 fn tool_operation_projection(event: &RuntimeEvent) -> Option<OperationProjection> {
@@ -1063,7 +1113,9 @@ mod tests {
                         "phase": "output",
                         "elapsed_ms": 120,
                         "output_bytes": 42,
-                        "output_lines": 3
+                        "output_lines": 3,
+                        "detail": "stdout",
+                        "output_excerpt": "running test one\nrunning test two"
                     }
                 }),
             ),
@@ -1089,6 +1141,17 @@ mod tests {
                 }),
             ),
         ];
+
+        let running = event_operation_projections(&events[..2]);
+        let OperationProjection::ToolActivity { item, .. } = &running[0] else {
+            panic!("running tool projection");
+        };
+        assert!(
+            item.body
+                .iter()
+                .any(|line| line.contains("stdout · 3 lines"))
+        );
+        assert!(item.body.iter().any(|line| line == "│ running test two"));
 
         let projections = event_operation_projections(&events);
 

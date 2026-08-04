@@ -2,7 +2,10 @@ use std::{
     collections::HashSet,
     io::{self, Stdout},
     path::{Path, PathBuf},
-    sync::LazyLock,
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -32,23 +35,27 @@ use golutra_config::{
     provider_onboarding_state, provider_protocol_has_runtime_adapter,
     update_provider_settings_verified,
 };
-use golutra_core::{ActorKind, QueryId, SessionId, TaskId, ThreadId};
+use golutra_core::{
+    ActorKind, ApprovalRequest, ApprovalScope, QueryId, SessionId, TaskId, ThreadId, TurnId,
+    UserQuestionRequest, UserQuestionResolution,
+};
 use golutra_llm::{
     ProviderGenerationConfig, ProviderHeaderConfig, ProviderHeaderValue, ProviderProtocol,
     provider_protocol_catalog,
 };
 use golutra_protocol::{
-    CommandAck, EventPageDirection, EventPageRequest, RuntimeEvent, RuntimeQuery, RuntimeQueryKind,
-    SessionCommandKind, UserProjection,
+    CommandAck, EventPageDirection, EventPageRequest, RuntimeEvent, RuntimeEventType, RuntimeQuery,
+    RuntimeQueryKind, SessionCommandKind, UserProjection, pending_user_question,
 };
 use golutra_tui::{
     AuthConfigScope, AuthCredentialStore, OAuthLoginCommand, OpenAiCompatibleLogin,
-    PaneScrollState, SlashAuthCommand, SlashCommand, SlashCommandCandidate, SlashInput,
-    TranscriptScrollAction, parse_slash_input, slash_command_candidates,
+    PaneScrollState, ReasoningEffortSelection, SlashAuthCommand, SlashCommand,
+    SlashCommandCandidate, SlashInput, TranscriptScrollAction, parse_slash_input,
+    slash_command_candidates,
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use secrecy::SecretString;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -59,39 +66,59 @@ const TUI_HISTORY_PAGE_SIZE: u32 = 256;
 
 mod activity_view;
 mod activity_widget;
+mod approval_dialog;
 mod auth_flow;
 mod auth_state;
 mod change_projection;
 mod composer_input;
+mod composer_support;
+mod dashboard;
 mod developer_projection;
 mod developer_query;
 mod developer_view;
 mod developer_widget;
 mod driver;
 mod frame_scheduler;
+mod help;
+mod interaction;
 mod live_status;
+mod preferences;
 mod provider_status;
+mod question_dialog;
 mod render;
+mod rich_text;
 mod runtime_controller;
 mod session;
+mod settings;
+mod terminal_integration;
 mod transcript_view;
 mod transcript_widget;
 pub(crate) use activity_view::*;
 pub(crate) use activity_widget::*;
+pub(crate) use approval_dialog::*;
 pub(crate) use auth_flow::*;
 pub(crate) use auth_state::*;
 pub(crate) use change_projection::*;
 pub(crate) use composer_input::*;
+pub(crate) use composer_support::*;
+pub(crate) use dashboard::*;
 pub(crate) use developer_projection::*;
 pub(crate) use developer_query::*;
 pub(crate) use developer_view::*;
 pub(crate) use developer_widget::*;
 pub(crate) use frame_scheduler::*;
+pub(crate) use help::*;
+pub(crate) use interaction::*;
 pub(crate) use live_status::*;
+pub(crate) use preferences::*;
 pub(crate) use provider_status::*;
+pub(crate) use question_dialog::*;
 pub(crate) use render::*;
+pub(crate) use rich_text::*;
 pub(crate) use runtime_controller::*;
 pub(crate) use session::*;
+pub(crate) use settings::*;
+pub(crate) use terminal_integration::*;
 pub(crate) use transcript_view::*;
 pub(crate) use transcript_widget::*;
 
@@ -111,6 +138,9 @@ struct Args {
     task_id: Option<String>,
     #[arg(long, global = true)]
     debug: bool,
+    /// Render in the current screen buffer instead of an alternate screen.
+    #[arg(long, global = true)]
+    inline: bool,
     /// Disable workspace, sensitive-path, shell and OS sandbox restrictions
     /// for prompts submitted by this TUI.
     #[arg(long, global = true)]
@@ -189,6 +219,42 @@ enum ScrollablePane {
     Developer,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OverlaySurface {
+    Help,
+    Auth,
+    Approval,
+    Question,
+    Resume,
+    Queue,
+    Dashboard,
+    Settings,
+    Export,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RuntimeRefreshBinding {
+    session_id: SessionId,
+    task_id: Option<TaskId>,
+    debug_mode: bool,
+}
+
+#[derive(Debug)]
+struct RuntimeRefreshSnapshot {
+    binding: RuntimeRefreshBinding,
+    projection: UserProjection,
+    provider_status: Option<ProviderUiStatus>,
+    developer_projection: Option<Result<golutra_protocol::DebugProjection, String>>,
+    remote: bool,
+}
+
+#[derive(Debug, Clone)]
+struct TranscriptProjectionAnchor {
+    projection: OperationProjection,
+    original_index: usize,
+    visual_offset: usize,
+}
+
 #[derive(Debug)]
 struct TuiApp {
     thread_id: ThreadId,
@@ -200,15 +266,40 @@ struct TuiApp {
     events: Vec<RuntimeEvent>,
     command_messages: Vec<TranscriptItem>,
     resume_picker: Option<ResumePickerState>,
+    queue_picker: Option<QueuePickerState>,
+    approval_dialog: Option<ApprovalDialogState>,
+    question_dialog: Option<QuestionDialogState>,
+    help_dialog: Option<HelpDialogState>,
+    dashboard: Option<DashboardState>,
+    settings_dialog: Option<SettingsDialogState>,
+    editing_queued_turn: Option<TurnId>,
     export_flow: Option<ExportFlowState>,
     export_operation: Option<PendingExportOperation>,
     auth_dialog: Option<AuthDialogState>,
     auth_operation: Option<PendingAuthOperation>,
     input: ComposerInput,
+    prompt_history: PromptHistory,
+    history_search: Option<HistorySearchState>,
+    mention_catalog: MentionCatalog,
+    mention_catalog_loaded: bool,
+    mention_completion: Option<MentionCompletion>,
+    attachments: Vec<ComposerAttachment>,
+    selected_attachment: Option<usize>,
+    prompt_stash: Option<String>,
     slash_selected: usize,
     status_message: String,
     provider_message: String,
     provider_model: String,
+    runtime_controls: RuntimeControls,
+    provider_choices: Vec<ProviderChoice>,
+    preferences: TuiPreferences,
+    preferences_path: Option<PathBuf>,
+    release_badge_visible: bool,
+    composer_mode: ComposerMode,
+    vim_pending_operator: Option<char>,
+    terminal_resume_generation: u64,
+    mouse_press: Option<UiMousePress>,
+    last_activity_refresh_at: Instant,
     workspace_path: PathBuf,
     debug_mode: bool,
     yolo: bool,
@@ -220,8 +311,15 @@ struct TuiApp {
     transcript_details_expanded: bool,
     developer_facts_expanded: bool,
     transcript_scroll: PaneScrollState,
+    transcript_top_row_override: Option<usize>,
+    transcript_revision: u64,
+    transcript_layout_cache: Option<TranscriptLayoutCache>,
     developer_scroll: PaneScrollState,
     active_scroll_pane: ScrollablePane,
+    body_view_mode: BodyViewMode,
+    transcript_presentation: TranscriptPresentation,
+    transcript_search: Option<TranscriptSearchState>,
+    search_restore_body_view: Option<BodyViewMode>,
     developer_event_layout: DeveloperEventLayout,
     developer_top_row_override: Option<usize>,
     developer_load_requested: bool,
@@ -236,7 +334,84 @@ struct TuiApp {
     last_control_ack: Option<CommandAck>,
 }
 
+async fn load_runtime_refresh_snapshot(
+    transport: &RuntimeTransport,
+    binding: RuntimeRefreshBinding,
+) -> Result<RuntimeRefreshSnapshot, String> {
+    let projection = async {
+        let value = transport
+            .query(RuntimeQuery {
+                query_id: QueryId::new(),
+                session_id: binding.session_id,
+                task_id: binding.task_id,
+                kind: RuntimeQueryKind::UserProjection,
+                requester: ActorKind::Tui,
+                cursor: None,
+                timestamp: chrono::Utc::now(),
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        serde_json::from_value(value)
+            .map_err(|error| format!("user projection is invalid: {error}"))
+    };
+    let provider_status = async {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            provider_ui_status_from_runtime(transport, binding.session_id),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+    };
+    let developer_projection = async {
+        if binding.debug_mode {
+            Some(load_debug_projection(transport, binding.session_id, binding.task_id).await)
+        } else {
+            None
+        }
+    };
+    let (projection, provider_status, developer_projection) =
+        tokio::join!(projection, provider_status, developer_projection);
+
+    Ok(RuntimeRefreshSnapshot {
+        binding,
+        projection: projection?,
+        provider_status,
+        developer_projection,
+        remote: transport.is_remote(),
+    })
+}
+
 impl TuiApp {
+    fn overlay_surface_without_help(&self) -> Option<OverlaySurface> {
+        if self.auth_dialog.is_some() {
+            Some(OverlaySurface::Auth)
+        } else if self.approval_dialog.is_some() {
+            Some(OverlaySurface::Approval)
+        } else if self.question_dialog.is_some() {
+            Some(OverlaySurface::Question)
+        } else if self.resume_picker.is_some() {
+            Some(OverlaySurface::Resume)
+        } else if self.queue_picker.is_some() {
+            Some(OverlaySurface::Queue)
+        } else if self.dashboard.is_some() {
+            Some(OverlaySurface::Dashboard)
+        } else if self.settings_dialog.is_some() {
+            Some(OverlaySurface::Settings)
+        } else if self.export_flow.is_some() {
+            Some(OverlaySurface::Export)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn overlay_surface(&self) -> Option<OverlaySurface> {
+        self.help_dialog
+            .as_ref()
+            .map(|_| OverlaySurface::Help)
+            .or_else(|| self.overlay_surface_without_help())
+    }
+
     fn new(
         thread_id: ThreadId,
         session_id: SessionId,
@@ -246,6 +421,8 @@ impl TuiApp {
         auth_dialog: Option<AuthDialogState>,
     ) -> Self {
         let provider_model = provider_model_from_status(&provider_message);
+        let (runtime_controls, provider_choices) =
+            RuntimeControls::from_settings(None, &provider_model, false);
         let workspace_path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self {
             thread_id,
@@ -257,15 +434,40 @@ impl TuiApp {
             events: Vec::new(),
             command_messages: Vec::new(),
             resume_picker: None,
+            queue_picker: None,
+            approval_dialog: None,
+            question_dialog: None,
+            help_dialog: None,
+            dashboard: None,
+            settings_dialog: None,
+            editing_queued_turn: None,
             export_flow: None,
             export_operation: None,
             auth_dialog,
             auth_operation: None,
             input: ComposerInput::default(),
+            prompt_history: PromptHistory::default(),
+            history_search: None,
+            mention_catalog: MentionCatalog::default(),
+            mention_catalog_loaded: false,
+            mention_completion: None,
+            attachments: Vec::new(),
+            selected_attachment: None,
+            prompt_stash: None,
             slash_selected: 0,
             status_message: String::new(),
             provider_message,
             provider_model,
+            runtime_controls,
+            provider_choices,
+            preferences: TuiPreferences::default(),
+            preferences_path: None,
+            release_badge_visible: false,
+            composer_mode: ComposerMode::Standard,
+            vim_pending_operator: None,
+            terminal_resume_generation: 0,
+            mouse_press: None,
+            last_activity_refresh_at: Instant::now(),
             workspace_path,
             debug_mode,
             yolo: false,
@@ -280,11 +482,18 @@ impl TuiApp {
                 follow_tail: true,
                 ..PaneScrollState::default()
             },
+            transcript_top_row_override: None,
+            transcript_revision: 0,
+            transcript_layout_cache: None,
             developer_scroll: PaneScrollState {
                 follow_tail: true,
                 ..PaneScrollState::default()
             },
             active_scroll_pane: ScrollablePane::Transcript,
+            body_view_mode: BodyViewMode::Auto,
+            transcript_presentation: TranscriptPresentation::Rich,
+            transcript_search: None,
+            search_restore_body_view: None,
             developer_event_layout: DeveloperEventLayout::default(),
             developer_top_row_override: None,
             developer_load_requested: false,
@@ -306,13 +515,111 @@ impl TuiApp {
         provider_model: impl Into<String>,
     ) -> Self {
         self.workspace_path = workspace_path.into();
+        self.mention_catalog = MentionCatalog::default();
+        self.mention_catalog_loaded = false;
+        self.mention_completion = None;
         self.provider_model = provider_model.into();
+        let (mut controls, choices) =
+            RuntimeControls::from_settings(None, &self.provider_model, self.yolo);
+        controls.permission_mode = self.runtime_controls.permission_mode;
+        self.runtime_controls = controls;
+        self.provider_choices = choices;
         self
     }
 
     fn with_yolo(mut self, enabled: bool) -> Self {
         self.yolo = enabled;
+        self.runtime_controls.permission_mode = if enabled {
+            PermissionMode::Unrestricted
+        } else {
+            PermissionMode::Guarded
+        };
         self
+    }
+
+    fn with_discovered_runtime_controls(mut self) -> Self {
+        let (controls, choices) = RuntimeControls::discover(&self.provider_model, self.yolo);
+        self.runtime_controls = controls;
+        self.provider_choices = choices;
+        self
+    }
+
+    fn with_transport_runtime_controls(self, transport: &RuntimeTransport) -> Self {
+        if transport.is_remote() {
+            self
+        } else {
+            self.with_discovered_runtime_controls()
+        }
+    }
+
+    fn with_loaded_preferences(mut self) -> Self {
+        match TuiPreferences::global_path() {
+            Ok(path) => {
+                self.preferences_path = Some(path.clone());
+                let preferences = match TuiPreferences::load_from(&path) {
+                    Ok(preferences) => preferences,
+                    Err(error) => {
+                        self.status_message = format!("TUI preferences were not loaded: {error}");
+                        return self;
+                    }
+                };
+                self.release_badge_visible = preferences.has_unseen_release();
+                self.composer_mode = ComposerMode::for_keymap(preferences.keymap);
+                self.preferences = preferences;
+                if self.release_badge_visible && self.auth_dialog.is_none() {
+                    self.status_message = format!(
+                        "Golutra {} is ready; open /whats-new for release notes",
+                        env!("CARGO_PKG_VERSION")
+                    );
+                }
+            }
+            Err(error) => {
+                self.status_message = format!("TUI preferences were not loaded: {error}");
+            }
+        }
+        self
+    }
+
+    fn palette(&self) -> TuiPalette {
+        self.preferences.palette()
+    }
+
+    fn persist_preferences(&mut self) {
+        let Some(path) = self.preferences_path.as_deref() else {
+            return;
+        };
+        if let Err(error) = self.preferences.save_to(path) {
+            self.status_message = format!("TUI preferences were not saved: {error}");
+        }
+    }
+
+    fn help_context(&self) -> &'static str {
+        match self.overlay_surface_without_help() {
+            Some(OverlaySurface::Auth) => "provider setup",
+            Some(OverlaySurface::Approval) => "approval",
+            Some(OverlaySurface::Question) => "question",
+            Some(OverlaySurface::Resume) => "sessions",
+            Some(OverlaySurface::Queue) => "queued prompts",
+            Some(OverlaySurface::Dashboard) => "runtime dashboard",
+            Some(OverlaySurface::Settings) => "settings",
+            Some(OverlaySurface::Export) => "session export",
+            Some(OverlaySurface::Help) => "help",
+            None if self.transcript_search.is_some() => "transcript search",
+            None if self.history_search.is_some() => "prompt history search",
+            None if self.debug_mode => "developer runtime",
+            None => "composer",
+        }
+    }
+
+    fn open_help(&mut self, topic: HelpTopic) {
+        let context = self.help_context();
+        self.help_dialog = Some(HelpDialogState::new(topic, context));
+        if topic == HelpTopic::WhatsNew {
+            self.preferences.mark_current_release_seen();
+            self.release_badge_visible = false;
+            self.persist_preferences();
+        }
+        self.status_message = "keyboard reference".to_owned();
     }
 
     fn refresh_provider_status(&mut self) {
@@ -334,48 +641,54 @@ impl TuiApp {
         }
     }
 
-    async fn refresh(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
+    fn runtime_refresh_binding(&self) -> RuntimeRefreshBinding {
+        RuntimeRefreshBinding {
+            session_id: self.session_id,
+            task_id: self.task_id,
+            debug_mode: self.debug_mode,
+        }
+    }
+
+    fn apply_runtime_refresh_snapshot(&mut self, snapshot: RuntimeRefreshSnapshot) -> bool {
+        if snapshot.binding != self.runtime_refresh_binding() {
+            return false;
+        }
+
         let previous_row_count = self.transcript_scroll.row_count;
-        let projection = transport
-            .query(RuntimeQuery {
-                query_id: QueryId::new(),
-                session_id: self.session_id,
-                task_id: self.task_id,
-                kind: RuntimeQueryKind::UserProjection,
-                requester: ActorKind::Tui,
-                cursor: None,
-                timestamp: chrono::Utc::now(),
-            })
-            .await
-            .map_err(|error| miette::miette!("{error}"))?;
-        self.projection = serde_json::from_value(projection)
-            .map(Some)
-            .map_err(|error| miette::miette!("{error}"))?;
-        self.refresh_provider_status_from_runtime(transport).await;
+        let projection = Some(snapshot.projection);
+        if self.projection != projection {
+            self.projection = projection;
+            self.invalidate_transcript_layout();
+        }
+        self.sync_approval_dialog_from_events();
+        self.sync_question_dialog_from_events();
+        if let Some(status) = snapshot.provider_status {
+            self.provider_message = status.message;
+            self.provider_model = status.model;
+        }
         if self.projection.as_ref().is_some_and(|projection| {
             projection.status == golutra_core::TaskStatus::WaitingAuthentication
-        }) && !transport.is_remote()
+        }) && !snapshot.remote
             && self.auth_dialog.is_none()
             && self.auth_operation.is_none()
-            && self.resume_picker.is_none()
-            && self.export_flow.is_none()
         {
             self.auth_dialog = Some(AuthDialogState::new());
             self.status_message = "provider authentication required".to_owned();
         }
         if self.debug_mode {
-            match load_debug_projection(transport, self.session_id, self.task_id).await {
-                Ok(projection) => {
+            match snapshot.developer_projection {
+                Some(Ok(projection)) => {
                     self.developer_projection = Some(match self.developer_projection.take() {
                         Some(previous) => merge_debug_projection(previous, projection),
                         None => projection,
                     });
                     self.developer_error = None;
                 }
-                Err(error) => {
+                Some(Err(error)) => {
                     self.developer_projection = None;
                     self.developer_error = Some(error);
                 }
+                None => {}
             }
         } else {
             self.developer_projection = None;
@@ -388,6 +701,14 @@ impl TuiApp {
         self.refresh_activity_snapshot();
         self.sync_transcript_row_count(previous_row_count);
         self.sync_developer_row_count();
+        true
+    }
+
+    async fn refresh(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
+        let snapshot = load_runtime_refresh_snapshot(transport, self.runtime_refresh_binding())
+            .await
+            .map_err(|error| miette::miette!("{error}"))?;
+        self.apply_runtime_refresh_snapshot(snapshot);
         Ok(())
     }
 
@@ -403,6 +724,7 @@ impl TuiApp {
             .await
             .map_err(|error| miette::miette!("{error}"))?;
         self.events = page.events;
+        self.invalidate_transcript_layout();
         self.rebuild_event_projections();
         self.history_start_cursor = page.start_cursor;
         self.cursor = page.end_cursor;
@@ -436,24 +758,28 @@ impl TuiApp {
         }
         older.append(&mut self.events);
         self.events = older;
+        self.invalidate_transcript_layout();
         self.rebuild_event_projections();
         self.history_start_cursor = page.start_cursor;
         self.history_has_more_before = page.has_more;
         let current_rows = self.current_transcript_row_count();
-        self.transcript_scroll
-            .set_row_count_after_prepend(current_rows);
+        if let Some(top_row) = self.transcript_top_row_override {
+            let prepended_rows = current_rows.saturating_sub(self.transcript_scroll.row_count);
+            self.transcript_top_row_override = Some(top_row.saturating_add(prepended_rows));
+            self.transcript_scroll.row_count = current_rows;
+            self.transcript_scroll.follow_tail = false;
+        } else {
+            self.transcript_scroll
+                .set_row_count_after_prepend(current_rows);
+        }
         self.clamp_transcript_scroll();
         Ok(())
     }
 
-    async fn set_debug_mode(
-        &mut self,
-        transport: &RuntimeTransport,
-        enabled: bool,
-    ) -> miette::Result<()> {
+    fn set_debug_mode(&mut self, enabled: bool) {
         self.debug_mode = enabled;
         if enabled {
-            self.refresh(transport).await?;
+            self.developer_error = None;
             self.status_message = "developer runtime view visible".to_owned();
         } else {
             self.developer_projection = None;
@@ -462,9 +788,12 @@ impl TuiApp {
             self.developer_event_layout = DeveloperEventLayout::default();
             self.developer_top_row_override = None;
             self.developer_load_requested = false;
+            if self.body_view_mode == BodyViewMode::Developer {
+                self.body_view_mode = BodyViewMode::Auto;
+            }
+            self.active_scroll_pane = ScrollablePane::Transcript;
             self.status_message = "developer runtime view hidden".to_owned();
         }
-        Ok(())
     }
 
     fn apply_runtime_event(&mut self, event: RuntimeEvent) {
@@ -476,19 +805,148 @@ impl TuiApp {
         }
         self.history_start_cursor = self.history_start_cursor.or(Some(event.sequence_no));
         self.cursor = Some(event.sequence_no);
+        let event_type = event.event_type;
+        let preserve_transcript_anchor = event_type != RuntimeEventType::ProviderStreamed
+            && (!self.transcript_scroll.follow_tail || self.transcript_top_row_override.is_some());
+        let transcript_anchor = preserve_transcript_anchor
+            .then(|| self.first_visible_transcript_anchor())
+            .flatten();
+        let previous_row_count = self.transcript_scroll.row_count;
+        let event_turn_id = event.turn_id;
+        match event_type {
+            RuntimeEventType::ApprovalRequested => {
+                if let Some(request) = event
+                    .payload
+                    .get("request")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<ApprovalRequest>(value).ok())
+                {
+                    self.approval_dialog = Some(ApprovalDialogState::new(request));
+                    self.status_message = "tool approval required".to_owned();
+                }
+            }
+            RuntimeEventType::ApprovalResolved => {
+                self.approval_dialog = None;
+            }
+            RuntimeEventType::UserQuestionRequested => {
+                if let Some(request) = event
+                    .payload
+                    .get("request")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<UserQuestionRequest>(value).ok())
+                {
+                    self.question_dialog = Some(QuestionDialogState::new(request));
+                    self.status_message = "agent needs a decision".to_owned();
+                }
+            }
+            RuntimeEventType::UserQuestionResolved => {
+                self.question_dialog = None;
+            }
+            event_type if event_type.is_task_terminal() => {
+                self.question_dialog = None;
+            }
+            _ => {}
+        }
         self.activity_projection.apply(&event);
         self.change_projection.apply(&event);
         self.events.push(event);
+        if matches!(
+            event_type,
+            RuntimeEventType::TurnStarted | RuntimeEventType::TurnCancelled
+        ) && self.editing_queued_turn == event_turn_id
+        {
+            self.editing_queued_turn = None;
+            self.input.reset();
+            self.status_message = "queued prompt is no longer pending".to_owned();
+        }
+        if self.queue_picker.is_some()
+            && matches!(
+                event_type,
+                RuntimeEventType::TurnQueued
+                    | RuntimeEventType::TurnUpdated
+                    | RuntimeEventType::TurnStarted
+                    | RuntimeEventType::TurnCancelled
+            )
+        {
+            let items = queued_prompts(&self.events);
+            if items.is_empty() {
+                self.queue_picker = None;
+            } else if let Some(picker) = &mut self.queue_picker {
+                picker.items = items;
+                picker.selected = picker.selected.min(picker.items.len().saturating_sub(1));
+            }
+        }
+        self.invalidate_transcript_layout();
+        if transcript_anchor.is_some() {
+            self.reflow_transcript_with_anchor(transcript_anchor, previous_row_count);
+        }
     }
 
     fn rebuild_event_projections(&mut self) {
         self.activity_projection.rebuild(&self.events);
         self.invalidate_activity_snapshot();
         self.change_projection.rebuild(&self.events);
+        self.sync_approval_dialog_from_events();
+        self.sync_question_dialog_from_events();
+    }
+
+    fn sync_approval_dialog_from_events(&mut self) {
+        let pending_id = self
+            .projection
+            .as_ref()
+            .and_then(|projection| projection.pending_approval.as_deref());
+        let request = pending_id.and_then(|pending_id| {
+            self.events.iter().rev().find_map(|event| {
+                (event.event_type == RuntimeEventType::ApprovalRequested
+                    && event.payload.get("approval_id").and_then(Value::as_str) == Some(pending_id))
+                .then(|| event.payload.get("request").cloned())
+                .flatten()
+                .and_then(|value| serde_json::from_value::<ApprovalRequest>(value).ok())
+            })
+        });
+        match (request, self.approval_dialog.as_ref()) {
+            (Some(request), Some(dialog)) if dialog.request.approval_id == request.approval_id => {}
+            (Some(request), _) => {
+                self.approval_dialog = Some(ApprovalDialogState::new(request));
+            }
+            (None, _) => self.approval_dialog = None,
+        }
+    }
+
+    fn sync_question_dialog_from_events(&mut self) {
+        let active_task_id = self.projection.as_ref().and_then(|projection| {
+            projection
+                .status
+                .is_active()
+                .then_some(projection.task_id)
+                .flatten()
+        });
+        let request =
+            active_task_id.and_then(|task_id| pending_user_question(&self.events, Some(task_id)));
+        match (request, self.question_dialog.as_ref()) {
+            (Some(request), Some(dialog)) if dialog.request.question_id == request.question_id => {}
+            (Some(request), _) => {
+                self.question_dialog = Some(QuestionDialogState::new(request));
+            }
+            (None, _) => self.question_dialog = None,
+        }
     }
 
     fn refresh_activity_snapshot(&mut self) {
         self.refresh_activity_snapshot_at(chrono::Utc::now());
+    }
+
+    fn activity_refresh_due(&mut self, now: Instant) -> bool {
+        let cadence = if self.preferences.reduced_motion {
+            Duration::from_secs(1)
+        } else {
+            ACTIVITY_STATUS_INTERVAL
+        };
+        if now.duration_since(self.last_activity_refresh_at) < cadence {
+            return false;
+        }
+        self.last_activity_refresh_at = now;
+        true
     }
 
     fn refresh_activity_snapshot_at(&mut self, now: chrono::DateTime<chrono::Utc>) {
@@ -515,13 +973,29 @@ impl TuiApp {
             self.input.clear();
             return Ok(());
         }
-        if self.resume_picker.is_some() || self.export_flow.is_some() {
-            self.status_message = "select a session with arrow keys or Esc".to_owned();
+        if self.overlay_surface().is_some() {
+            self.status_message = "finish the active dialog before submitting".to_owned();
             self.input.clear();
             return Ok(());
         }
 
         let input = self.input.trimmed();
+        if let Some(turn_id) = self.editing_queued_turn {
+            return match parse_slash_input(&input) {
+                SlashInput::Prompt(prompt) => {
+                    self.update_queued_prompt(transport, turn_id, prompt).await
+                }
+                SlashInput::Empty => {
+                    self.status_message = "queued prompt is empty".to_owned();
+                    Ok(())
+                }
+                SlashInput::Command(_) | SlashInput::Error(_) => {
+                    self.status_message =
+                        "queued prompt editing accepts prompt text only".to_owned();
+                    Ok(())
+                }
+            };
+        }
         match parse_slash_input(&input) {
             SlashInput::Prompt(prompt) => self.send_runtime_prompt(transport, prompt).await,
             SlashInput::Command(command) => {
@@ -568,9 +1042,9 @@ impl TuiApp {
 
     fn slash_candidates(&self) -> Vec<SlashCommandCandidate> {
         if self.auth_operation.is_some()
-            || self.auth_dialog.is_some()
-            || self.resume_picker.is_some()
-            || self.export_flow.is_some()
+            || self.overlay_surface().is_some()
+            || self.transcript_search.is_some()
+            || self.history_search.is_some()
         {
             return Vec::new();
         }
@@ -597,23 +1071,394 @@ impl TuiApp {
         self.slash_selected = 0;
     }
 
+    fn refresh_mention_completion(&mut self) {
+        if !mention_is_active(&self.input) {
+            self.mention_completion = None;
+            return;
+        }
+        if !self.mention_catalog_loaded {
+            self.mention_catalog = MentionCatalog::discover(&self.workspace_path);
+            self.mention_catalog_loaded = true;
+        }
+        self.mention_completion = self.mention_catalog.complete(&self.input);
+    }
+
+    fn move_mention_selection(&mut self, forward: bool) -> bool {
+        let Some(completion) = &mut self.mention_completion else {
+            return false;
+        };
+        completion.move_selection(forward);
+        true
+    }
+
+    fn accept_mention_completion(&mut self) -> bool {
+        let Some(completion) = self.mention_completion.take() else {
+            return false;
+        };
+        let Some(candidate) = completion.selected().cloned() else {
+            return false;
+        };
+        self.input
+            .replace_range(completion.replacement, &format!("{} ", candidate.insertion));
+        self.prompt_history.reset_navigation();
+        self.status_message = format!("{} reference added", candidate.detail);
+        true
+    }
+
+    fn previous_prompt(&mut self) -> bool {
+        let Some(prompt) = self.prompt_history.previous(self.input.text()) else {
+            return false;
+        };
+        self.input.set_text(prompt);
+        self.refresh_mention_completion();
+        true
+    }
+
+    fn next_prompt(&mut self) -> bool {
+        let Some(prompt) = self.prompt_history.next() else {
+            return false;
+        };
+        self.input.set_text(prompt);
+        self.refresh_mention_completion();
+        true
+    }
+
+    fn open_history_search(&mut self) {
+        let mut search = HistorySearchState::default();
+        search.rebuild(&self.prompt_history);
+        self.history_search = Some(search);
+        self.mention_completion = None;
+        self.status_message = "prompt history search".to_owned();
+    }
+
+    fn toggle_prompt_stash(&mut self) {
+        if self.input.is_empty() {
+            if let Some(stash) = self.prompt_stash.take() {
+                self.input.set_text(stash);
+                self.status_message = "prompt restored".to_owned();
+                self.refresh_mention_completion();
+            } else {
+                self.status_message = "prompt stash is empty".to_owned();
+            }
+            return;
+        }
+        self.prompt_stash = Some(self.input.text().to_owned());
+        self.input.reset();
+        self.mention_completion = None;
+        self.status_message = "prompt stashed".to_owned();
+    }
+
+    fn edit_prompt_in_external_editor(&mut self) {
+        match edit_prompt_externally(self.input.text()) {
+            Ok(prompt) => {
+                self.input.set_text(prompt.trim_end_matches(['\r', '\n']));
+                self.refresh_mention_completion();
+                self.status_message = "prompt updated from external editor".to_owned();
+            }
+            Err(error) => self.status_message = format!("external editor failed: {error}"),
+        }
+        self.mark_terminal_resumed();
+    }
+
+    fn mark_terminal_resumed(&mut self) {
+        self.terminal_resume_generation = self.terminal_resume_generation.saturating_add(1);
+    }
+
+    fn terminal_input_stream_is_stale(&self, previous_generation: u64) -> bool {
+        self.terminal_resume_generation != previous_generation
+    }
+
+    fn add_attachment(&mut self, path: &str) {
+        match attachment_from_path(&self.workspace_path, path) {
+            Ok(attachment)
+                if self
+                    .attachments
+                    .iter()
+                    .any(|existing| existing.path == attachment.path) =>
+            {
+                self.status_message = "attachment already added".to_owned();
+            }
+            Ok(attachment) => {
+                let display_path = attachment.display_path.clone();
+                self.attachments.push(attachment);
+                self.selected_attachment = Some(self.attachments.len().saturating_sub(1));
+                self.status_message = format!("attached {display_path}");
+            }
+            Err(error) => self.status_message = error,
+        }
+    }
+
+    fn clear_attachments(&mut self) {
+        self.attachments.clear();
+        self.selected_attachment = None;
+        self.status_message = "attachments cleared".to_owned();
+    }
+
+    fn select_next_attachment(&mut self) {
+        if self.attachments.is_empty() {
+            self.selected_attachment = None;
+            self.status_message = "no prompt attachments".to_owned();
+            return;
+        }
+        self.selected_attachment = Some(
+            self.selected_attachment
+                .map_or(0, |index| (index + 1) % self.attachments.len()),
+        );
+        self.status_message = "attachment selected; Delete removes it".to_owned();
+    }
+
+    fn remove_selected_attachment(&mut self) -> bool {
+        let Some(index) = self
+            .selected_attachment
+            .filter(|index| *index < self.attachments.len())
+        else {
+            return false;
+        };
+        let removed = self.attachments.remove(index);
+        self.selected_attachment = if self.attachments.is_empty() {
+            None
+        } else {
+            Some(index.min(self.attachments.len().saturating_sub(1)))
+        };
+        self.status_message = format!("detached {}", removed.display_path);
+        true
+    }
+
+    fn open_queue_picker(&mut self) {
+        let items = queued_prompts(&self.events);
+        if items.is_empty() {
+            self.status_message = "queued prompt list is empty".to_owned();
+            return;
+        }
+        self.queue_picker = Some(QueuePickerState { items, selected: 0 });
+        self.mention_completion = None;
+        self.status_message = "queued prompt manager".to_owned();
+    }
+
+    fn open_settings_dialog(&mut self) {
+        let runtime_locked = has_active_task(self);
+        self.settings_dialog = Some(SettingsDialogState::new(
+            &self.runtime_controls,
+            &self.provider_choices,
+            &self.preferences,
+            runtime_locked,
+        ));
+        self.mention_completion = None;
+        self.status_message = if runtime_locked {
+            "display settings; runtime controls are locked while the task is active".to_owned()
+        } else {
+            "session and display settings".to_owned()
+        };
+    }
+
+    fn apply_settings_dialog(&mut self) -> bool {
+        let Some(dialog) = &mut self.settings_dialog else {
+            return false;
+        };
+        if !dialog.can_apply() {
+            self.status_message =
+                "unrestricted mode disables workspace and approval guards; apply again to confirm"
+                    .to_owned();
+            return false;
+        }
+        let previous_keymap = self.preferences.keymap;
+        self.runtime_controls = dialog.draft.clone();
+        self.preferences = dialog.draft_preferences.clone();
+        self.yolo = self.runtime_controls.permission_mode == PermissionMode::Unrestricted;
+        self.settings_dialog = None;
+        if previous_keymap != self.preferences.keymap {
+            self.composer_mode = ComposerMode::for_keymap(self.preferences.keymap);
+            self.vim_pending_operator = None;
+        }
+        self.invalidate_transcript_layout();
+        self.persist_preferences();
+        self.status_message = format!(
+            "settings applied: {} · {} · {} · {} keymap · {} theme",
+            self.runtime_controls.effective_model(),
+            effort_label(self.runtime_controls.reasoning_effort),
+            self.runtime_controls.permission_mode.label(),
+            self.preferences.keymap.label(),
+            self.preferences.theme.label()
+        );
+        true
+    }
+
+    fn set_session_model(&mut self, model: String) {
+        if has_active_task(self) {
+            self.status_message = "model is locked while a task is active".to_owned();
+            return;
+        }
+        match self.runtime_controls.set_custom_model(model) {
+            Ok(()) => {
+                self.status_message = format!(
+                    "session model set to {}",
+                    self.runtime_controls.effective_model()
+                );
+            }
+            Err(error) => self.status_message = error,
+        }
+    }
+
+    fn set_session_effort(&mut self, selection: ReasoningEffortSelection) {
+        if has_active_task(self) {
+            self.status_message = "reasoning effort is locked while a task is active".to_owned();
+            return;
+        }
+        self.runtime_controls.reasoning_effort = match selection {
+            ReasoningEffortSelection::Default => None,
+            ReasoningEffortSelection::Effort(effort) => Some(effort),
+        };
+        self.runtime_controls.reasoning_overridden = true;
+        self.status_message = format!(
+            "session reasoning effort set to {}",
+            effort_label(self.runtime_controls.reasoning_effort)
+        );
+    }
+
+    fn set_permission_mode(&mut self, unrestricted: bool) {
+        if has_active_task(self) {
+            self.status_message = "permissions are locked while a task is active".to_owned();
+            return;
+        }
+        self.runtime_controls.permission_mode = if unrestricted {
+            PermissionMode::Unrestricted
+        } else {
+            PermissionMode::Guarded
+        };
+        self.yolo = unrestricted;
+        self.status_message = format!(
+            "session permissions set to {}",
+            self.runtime_controls.permission_mode.label()
+        );
+    }
+
+    fn edit_selected_queued_prompt(&mut self) {
+        let Some(queued) = self
+            .queue_picker
+            .as_ref()
+            .and_then(QueuePickerState::selected)
+            .cloned()
+        else {
+            return;
+        };
+        self.queue_picker = None;
+        self.editing_queued_turn = Some(queued.turn_id);
+        self.input.set_text(queued.prompt);
+        self.prompt_history.reset_navigation();
+        self.refresh_mention_completion();
+        self.status_message = "editing queued prompt; Enter updates, Esc cancels edit".to_owned();
+    }
+
+    async fn cancel_selected_queued_prompt(
+        &mut self,
+        transport: &RuntimeTransport,
+    ) -> miette::Result<()> {
+        let Some(turn_id) = self
+            .queue_picker
+            .as_ref()
+            .and_then(QueuePickerState::selected)
+            .map(|queued| queued.turn_id)
+        else {
+            return Ok(());
+        };
+        let ack = transport
+            .send_command(session_command(
+                self.session_id,
+                SessionCommandKind::CancelQueuedTurn,
+                json!({"turn_id": turn_id}),
+            ))
+            .await
+            .map_err(|error| miette::miette!("{error}"))?;
+        self.status_message = compact_ack_reason(&ack.reason);
+        self.last_control_ack = Some(ack.clone());
+        if ack.accepted {
+            self.refresh(transport).await?;
+            let items = queued_prompts(&self.events);
+            if items.is_empty() {
+                self.queue_picker = None;
+            } else if let Some(picker) = &mut self.queue_picker {
+                picker.items = items;
+                picker.selected = picker.selected.min(picker.items.len().saturating_sub(1));
+            }
+        }
+        Ok(())
+    }
+
+    async fn update_queued_prompt(
+        &mut self,
+        transport: &RuntimeTransport,
+        turn_id: TurnId,
+        prompt: String,
+    ) -> miette::Result<()> {
+        let mut payload = json!({
+            "turn_id": turn_id,
+            "prompt": prompt,
+        });
+        if !self.attachments.is_empty() {
+            payload["attachments"] = Value::Array(
+                self.attachments
+                    .iter()
+                    .map(|attachment| {
+                        json!({
+                            "path": attachment.display_path,
+                            "kind": match attachment.kind {
+                                AttachmentKind::Image => "image",
+                                AttachmentKind::Text => "text",
+                                AttachmentKind::Binary => "binary",
+                            },
+                            "bytes": attachment.bytes,
+                        })
+                    })
+                    .collect(),
+            );
+        }
+        let ack = transport
+            .send_command(session_command(
+                self.session_id,
+                SessionCommandKind::UpdateQueuedTurn,
+                payload,
+            ))
+            .await
+            .map_err(|error| miette::miette!("{error}"))?;
+        self.status_message = compact_ack_reason(&ack.reason);
+        self.last_prompt_ack = Some(ack.clone());
+        if ack.accepted {
+            self.prompt_history.record(&prompt);
+            self.editing_queued_turn = None;
+            self.input.reset();
+            self.attachments.clear();
+            self.selected_attachment = None;
+            self.mention_completion = None;
+            self.refresh(transport).await?;
+        }
+        Ok(())
+    }
+
     fn reset_transcript_view(&mut self) {
         self.expanded_operations.clear();
         self.transcript_details_expanded = false;
+        self.transcript_top_row_override = None;
+        self.invalidate_transcript_layout();
         self.transcript_scroll
             .reset(self.current_transcript_row_count());
     }
 
     fn toggle_operation(&mut self, id: OperationId) {
+        let anchor = self.first_visible_transcript_anchor();
+        let previous_row_count = self.transcript_scroll.row_count;
         if !self.expanded_operations.insert(id.clone()) {
             self.expanded_operations.remove(&id);
         }
-        self.sync_transcript_row_count(self.transcript_scroll.row_count);
+        self.invalidate_transcript_layout();
+        self.reflow_transcript_with_anchor(anchor, previous_row_count);
     }
 
     fn toggle_transcript_details(&mut self) {
+        let anchor = self.first_visible_transcript_anchor();
+        let previous_row_count = self.transcript_scroll.row_count;
         self.transcript_details_expanded = !self.transcript_details_expanded;
-        self.sync_transcript_row_count(self.transcript_scroll.row_count);
+        self.invalidate_transcript_layout();
+        self.reflow_transcript_with_anchor(anchor, previous_row_count);
         self.status_message = if self.transcript_details_expanded {
             "transcript details expanded"
         } else {
@@ -638,11 +1483,181 @@ impl TuiApp {
         transcript_layout(self, self.layout.transcript).row_count
     }
 
+    #[cfg(test)]
+    fn first_visible_transcript_projection(&self) -> Option<usize> {
+        self.first_visible_transcript_anchor()
+            .map(|anchor| anchor.original_index)
+    }
+
+    fn first_visible_transcript_anchor(&self) -> Option<TranscriptProjectionAnchor> {
+        let area = self.layout.transcript;
+        if area.width == 0 || area.height < 2 {
+            return None;
+        }
+        let layout = transcript_layout(self, area);
+        let window = layout.visible_window(
+            area.height.saturating_sub(1) as usize,
+            self.transcript_scroll.offset_from_bottom,
+            self.transcript_top_row_override,
+        );
+        let projection_index = layout.first_visible_projection(window.clone())?;
+        let visual_start = layout.visual_start_for_projection(projection_index)?;
+        let projections = transcript_operation_projections(self);
+        Some(TranscriptProjectionAnchor {
+            projection: projections.get(projection_index)?.clone(),
+            original_index: projection_index,
+            visual_offset: window.start.saturating_sub(visual_start),
+        })
+    }
+
+    fn reflow_transcript_with_anchor(
+        &mut self,
+        anchor: Option<TranscriptProjectionAnchor>,
+        previous_row_count: usize,
+    ) {
+        let area = self.layout.transcript;
+        let layout = transcript_layout(self, area);
+        let projections = transcript_operation_projections(self);
+        if let Some(top_row) = anchor.and_then(|anchor| {
+            let projection_index = projections
+                .iter()
+                .enumerate()
+                .filter(|(_, projection)| **projection == anchor.projection)
+                .min_by_key(|(index, _)| index.abs_diff(anchor.original_index))
+                .map(|(index, _)| index)
+                .or_else(|| {
+                    let id = anchor.projection.id()?;
+                    projections
+                        .iter()
+                        .position(|projection| projection.id() == Some(id))
+                })
+                .or_else(|| {
+                    (!projections.is_empty()).then(|| {
+                        anchor
+                            .original_index
+                            .min(projections.len().saturating_sub(1))
+                    })
+                })?;
+            let range = layout.visual_range_for_projection(projection_index)?;
+            Some(
+                range.start.saturating_add(
+                    anchor
+                        .visual_offset
+                        .min(range.end.saturating_sub(range.start).saturating_sub(1)),
+                ),
+            )
+        }) {
+            self.transcript_scroll.row_count = layout.row_count;
+            self.set_transcript_top_row(&layout, top_row, area.height.saturating_sub(1) as usize);
+        } else {
+            self.sync_transcript_row_count_to(previous_row_count, layout.row_count);
+        }
+        self.transcript_layout_cache = Some(TranscriptLayoutCache {
+            revision: self.transcript_revision,
+            width: area.width,
+            height: area.height,
+            layout,
+        });
+    }
+
+    fn set_transcript_top_row(
+        &mut self,
+        layout: &TranscriptLayout,
+        top_row: usize,
+        visible_rows: usize,
+    ) {
+        if layout.row_count == 0 {
+            self.transcript_scroll.reset(0);
+            self.transcript_top_row_override = None;
+            return;
+        }
+        let top_row = top_row.min(layout.row_count.saturating_sub(1));
+        let visible_rows = visible_rows.max(1);
+        let normal_max_start = layout.row_count.saturating_sub(visible_rows);
+        if top_row > normal_max_start {
+            self.transcript_scroll.offset_from_bottom = 0;
+            self.transcript_scroll.follow_tail = false;
+            self.transcript_top_row_override = Some(top_row);
+        } else {
+            let offset_from_bottom = normal_max_start.saturating_sub(top_row);
+            self.transcript_scroll.offset_from_bottom = offset_from_bottom;
+            self.transcript_scroll.follow_tail = offset_from_bottom == 0;
+            self.transcript_top_row_override = None;
+            self.transcript_scroll.clamp(visible_rows);
+        }
+    }
+
+    fn invalidate_transcript_layout(&mut self) {
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        self.transcript_layout_cache = None;
+    }
+
+    fn ensure_transcript_layout(&mut self, area: ratatui::layout::Rect) {
+        let stale = self.transcript_layout_cache.as_ref().is_none_or(|cache| {
+            cache.revision != self.transcript_revision
+                || cache.width != area.width
+                || cache.height != area.height
+        });
+        if stale {
+            let resize_anchor = self.transcript_layout_cache.as_ref().and_then(|cache| {
+                (cache.revision == self.transcript_revision
+                    && (cache.width != area.width || cache.height != area.height)
+                    && cache.height >= 2
+                    && (!self.transcript_scroll.follow_tail
+                        || self.transcript_top_row_override.is_some()))
+                .then(|| {
+                    let window = cache.layout.visible_window(
+                        cache.height.saturating_sub(1) as usize,
+                        self.transcript_scroll.offset_from_bottom,
+                        self.transcript_top_row_override,
+                    );
+                    cache.layout.first_visible_row_anchor(window)
+                })
+                .flatten()
+            });
+            let previous_row_count = self.transcript_scroll.row_count;
+            let layout = transcript_layout(self, area);
+            if let Some(top_row) = resize_anchor
+                .and_then(|(row_index, offset)| layout.visual_row_for_row_anchor(row_index, offset))
+            {
+                self.transcript_scroll.row_count = layout.row_count;
+                self.set_transcript_top_row(
+                    &layout,
+                    top_row,
+                    area.height.saturating_sub(1) as usize,
+                );
+            } else {
+                self.sync_transcript_row_count_to(previous_row_count, layout.row_count);
+            }
+            self.transcript_layout_cache = Some(TranscriptLayoutCache {
+                revision: self.transcript_revision,
+                width: area.width,
+                height: area.height,
+                layout,
+            });
+        }
+    }
+
     fn sync_transcript_row_count_to(
         &mut self,
         previous_row_count: usize,
         current_row_count: usize,
     ) {
+        if self
+            .transcript_top_row_override
+            .is_some_and(|top_row| top_row < current_row_count)
+        {
+            if current_row_count > previous_row_count {
+                self.transcript_scroll.unseen_rows = self
+                    .transcript_scroll
+                    .unseen_rows
+                    .saturating_add(current_row_count - previous_row_count);
+            }
+            self.transcript_scroll.row_count = current_row_count;
+            self.transcript_scroll.follow_tail = false;
+            return;
+        }
+        self.transcript_top_row_override = None;
         if !self.transcript_scroll.follow_tail && current_row_count > previous_row_count {
             let added = current_row_count - previous_row_count;
             self.transcript_scroll.offset_from_bottom = self
@@ -657,10 +1672,42 @@ impl TuiApp {
     }
 
     fn scroll_transcript(&mut self, action: TranscriptScrollAction, visible_rows: usize) {
-        if self.auth_dialog.is_some() || self.resume_picker.is_some() {
+        if self.overlay_surface().is_some() {
             return;
         }
-        self.transcript_scroll.scroll(action, visible_rows);
+        if let Some(top_row) = self.transcript_top_row_override {
+            match action {
+                TranscriptScrollAction::Top | TranscriptScrollAction::Bottom => {
+                    self.transcript_top_row_override = None;
+                    self.transcript_scroll.scroll(action, visible_rows);
+                }
+                TranscriptScrollAction::LineUp
+                | TranscriptScrollAction::LineDown
+                | TranscriptScrollAction::PageUp
+                | TranscriptScrollAction::PageDown => {
+                    let page = visible_rows.max(1);
+                    let max_top = self
+                        .transcript_scroll
+                        .row_count
+                        .saturating_sub(visible_rows.max(1));
+                    let next_top = match action {
+                        TranscriptScrollAction::LineUp => top_row.saturating_sub(1),
+                        TranscriptScrollAction::LineDown => top_row.saturating_add(1).min(max_top),
+                        TranscriptScrollAction::PageUp => top_row.saturating_sub(page),
+                        TranscriptScrollAction::PageDown => {
+                            top_row.saturating_add(page).min(max_top)
+                        }
+                        TranscriptScrollAction::Top | TranscriptScrollAction::Bottom => {
+                            unreachable!()
+                        }
+                    };
+                    let layout = transcript_layout(self, self.layout.transcript);
+                    self.set_transcript_top_row(&layout, next_top, visible_rows);
+                }
+            }
+        } else {
+            self.transcript_scroll.scroll(action, visible_rows);
+        }
         if matches!(
             action,
             TranscriptScrollAction::LineDown
@@ -675,8 +1722,13 @@ impl TuiApp {
                     | TranscriptScrollAction::PageUp
                     | TranscriptScrollAction::Top
             )
-            && self.transcript_scroll.offset_from_bottom
-                == self.max_transcript_scroll_offset(visible_rows)
+            && self.transcript_top_row_override.map_or_else(
+                || {
+                    self.transcript_scroll.offset_from_bottom
+                        == self.max_transcript_scroll_offset(visible_rows)
+                },
+                |top_row| top_row == 0,
+            )
         {
             self.history_load_requested = true;
         }
@@ -700,6 +1752,133 @@ impl TuiApp {
             UiHitTarget::Developer => self.active_scroll_pane = ScrollablePane::Developer,
             UiHitTarget::Bottom | UiHitTarget::Overlay | UiHitTarget::None => {}
         }
+    }
+
+    fn cycle_scroll_pane(&mut self) {
+        if !self.debug_mode {
+            self.active_scroll_pane = ScrollablePane::Transcript;
+            self.status_message = "transcript focused".to_owned();
+            return;
+        }
+        self.active_scroll_pane = match self.active_scroll_pane {
+            ScrollablePane::Transcript => ScrollablePane::Developer,
+            ScrollablePane::Developer => ScrollablePane::Transcript,
+        };
+        self.status_message = match self.active_scroll_pane {
+            ScrollablePane::Transcript => "transcript focused",
+            ScrollablePane::Developer => "developer runtime focused",
+        }
+        .to_owned();
+    }
+
+    fn toggle_transcript_fullscreen(&mut self) {
+        self.body_view_mode = if self.body_view_mode == BodyViewMode::Transcript {
+            BodyViewMode::Auto
+        } else {
+            BodyViewMode::Transcript
+        };
+        self.active_scroll_pane = ScrollablePane::Transcript;
+        self.status_message = if self.body_view_mode == BodyViewMode::Transcript {
+            "transcript full screen"
+        } else {
+            "responsive pane layout"
+        }
+        .to_owned();
+    }
+
+    fn toggle_raw_transcript(&mut self) {
+        self.transcript_presentation = match self.transcript_presentation {
+            TranscriptPresentation::Rich => TranscriptPresentation::Raw,
+            TranscriptPresentation::Raw => TranscriptPresentation::Rich,
+        };
+        self.body_view_mode = BodyViewMode::Transcript;
+        self.active_scroll_pane = ScrollablePane::Transcript;
+        self.status_message = match self.transcript_presentation {
+            TranscriptPresentation::Rich => "rich transcript view",
+            TranscriptPresentation::Raw => "raw transcript view",
+        }
+        .to_owned();
+    }
+
+    fn open_transcript_search(&mut self) {
+        if self.transcript_search.is_none() {
+            self.search_restore_body_view = Some(self.body_view_mode);
+            self.transcript_search = Some(TranscriptSearchState::default());
+        }
+        self.body_view_mode = BodyViewMode::Transcript;
+        self.active_scroll_pane = ScrollablePane::Transcript;
+        self.rebuild_transcript_search();
+        self.status_message = "transcript search".to_owned();
+    }
+
+    fn close_transcript_search(&mut self) {
+        self.transcript_search = None;
+        self.body_view_mode = self.search_restore_body_view.take().unwrap_or_default();
+        self.status_message = "transcript search closed".to_owned();
+    }
+
+    fn rebuild_transcript_search(&mut self) {
+        let area = if self.layout.body.width > 0 {
+            self.layout.body
+        } else {
+            self.layout.transcript
+        };
+        let layout = transcript_layout(self, area);
+        let lines = layout.plain_lines();
+        if let Some(search) = &mut self.transcript_search {
+            search.rebuild(&lines);
+        }
+        self.focus_current_search_match_in(&layout, area.height.saturating_sub(1) as usize);
+    }
+
+    fn focus_current_search_match(&mut self) {
+        let area = if self.layout.body.width > 0 {
+            self.layout.body
+        } else {
+            self.layout.transcript
+        };
+        let layout = transcript_layout(self, area);
+        self.focus_current_search_match_in(&layout, area.height.saturating_sub(1) as usize);
+    }
+
+    fn focus_current_search_match_in(&mut self, layout: &TranscriptLayout, visible_rows: usize) {
+        let Some(line) = self
+            .transcript_search
+            .as_ref()
+            .and_then(TranscriptSearchState::current_line)
+        else {
+            return;
+        };
+        let Some(target) = layout.visual_start_for_line(line) else {
+            return;
+        };
+        let visible_rows = visible_rows.max(1);
+        let top = target.saturating_sub(visible_rows / 3);
+        let end = top.saturating_add(visible_rows).min(layout.row_count);
+        self.transcript_scroll.offset_from_bottom = layout.row_count.saturating_sub(end);
+        self.transcript_scroll.follow_tail = self.transcript_scroll.offset_from_bottom == 0;
+        self.transcript_scroll.row_count = layout.row_count;
+    }
+
+    fn copy_transcript(&mut self) {
+        let area = if self.layout.body.width > 0 {
+            self.layout.body
+        } else {
+            self.layout.transcript
+        };
+        let layout = transcript_layout(self, area);
+        let lines = layout.plain_lines();
+        let text = self
+            .transcript_search
+            .as_ref()
+            .and_then(TranscriptSearchState::current_line)
+            .and_then(|line| lines.get(line).cloned())
+            .unwrap_or_else(|| layout.plain_text());
+        self.status_message = match copy_to_terminal_clipboard(&text) {
+            Ok((bytes, true)) => format!("copied {bytes} bytes (clipboard limit reached)"),
+            Ok((bytes, false)) => format!("copied {bytes} bytes"),
+            Err(error) => format!("copy failed: {error}"),
+        };
     }
 
     fn scroll_active_pane(&mut self, action: TranscriptScrollAction) {
@@ -772,7 +1951,7 @@ impl TuiApp {
     }
 
     fn scroll_developer(&mut self, action: TranscriptScrollAction, visible_rows: usize) {
-        if self.auth_dialog.is_some() || self.resume_picker.is_some() {
+        if self.overlay_surface().is_some() {
             return;
         }
         if let Some(top_row) = self.developer_top_row_override {
@@ -786,7 +1965,10 @@ impl TuiApp {
                 | TranscriptScrollAction::PageUp
                 | TranscriptScrollAction::PageDown => {
                     let page = visible_rows.max(1);
-                    let max_top = self.developer_event_layout.row_count.saturating_sub(1);
+                    let max_top = self
+                        .developer_event_layout
+                        .row_count
+                        .saturating_sub(visible_rows.max(1));
                     let next_top = match action {
                         TranscriptScrollAction::LineUp => top_row.saturating_sub(1),
                         TranscriptScrollAction::LineDown => top_row.saturating_add(1).min(max_top),
@@ -875,7 +2057,17 @@ impl TuiApp {
         transport: &RuntimeTransport,
         prompt: String,
     ) -> miette::Result<()> {
-        self.submit_runtime_prompt(transport, prompt)
+        self.submit_runtime_prompt_with_mode(transport, prompt, false)
+            .await
+            .map(drop)
+    }
+
+    async fn send_steering_prompt(
+        &mut self,
+        transport: &RuntimeTransport,
+        prompt: String,
+    ) -> miette::Result<()> {
+        self.submit_runtime_prompt_with_mode(transport, prompt, true)
             .await
             .map(drop)
     }
@@ -885,17 +2077,32 @@ impl TuiApp {
         transport: &RuntimeTransport,
         prompt: String,
     ) -> miette::Result<Option<CommandAck>> {
+        self.submit_runtime_prompt_with_mode(transport, prompt, false)
+            .await
+    }
+
+    async fn submit_runtime_prompt_with_mode(
+        &mut self,
+        transport: &RuntimeTransport,
+        prompt: String,
+        steer: bool,
+    ) -> miette::Result<Option<CommandAck>> {
         self.last_prompt_ack = None;
         if prompt.trim().is_empty() {
             self.status_message = "prompt is empty".to_owned();
             return Ok(None);
         }
 
+        let payload = if steer {
+            self.runtime_prompt_payload_with_mode(prompt.clone(), true)
+        } else {
+            self.runtime_prompt_payload(prompt.clone())
+        };
         let ack = transport
             .send_command(session_command(
                 self.session_id,
                 SessionCommandKind::Prompt,
-                self.runtime_prompt_payload(prompt),
+                payload,
             ))
             .await
             .map_err(|error| miette::miette!("{error}"))?;
@@ -904,7 +2111,11 @@ impl TuiApp {
             self.last_prompt_ack = Some(ack.clone());
             return Ok(Some(ack));
         }
-        self.input.clear();
+        self.prompt_history.record(&prompt);
+        self.input.reset();
+        self.mention_completion = None;
+        self.attachments.clear();
+        self.selected_attachment = None;
         self.status_message = compact_ack_reason(&ack.reason);
         self.reset_transcript_view();
         self.refresh(transport).await?;
@@ -913,13 +2124,47 @@ impl TuiApp {
     }
 
     fn runtime_prompt_payload(&self, prompt: String) -> serde_json::Value {
+        self.runtime_prompt_payload_with_mode(prompt, false)
+    }
+
+    fn runtime_prompt_payload_with_mode(&self, prompt: String, steer: bool) -> serde_json::Value {
         let mut payload = json!({
             "prompt": prompt,
             "_thread_id": self.thread_id.to_string(),
         });
+        if steer {
+            payload["steer"] = json!(true);
+        }
+        if !self.attachments.is_empty() {
+            payload["attachments"] = Value::Array(
+                self.attachments
+                    .iter()
+                    .map(|attachment| {
+                        json!({
+                            "path": attachment.display_path,
+                            "kind": match attachment.kind {
+                                AttachmentKind::Image => "image",
+                                AttachmentKind::Text => "text",
+                                AttachmentKind::Binary => "binary",
+                            },
+                            "bytes": attachment.bytes,
+                        })
+                    })
+                    .collect(),
+            );
+        }
         if self.yolo {
             payload["yolo"] = json!(true);
             payload["allow_network"] = json!(true);
+        }
+        if let Some(profile_name) = &self.runtime_controls.profile_name {
+            payload["provider_profile"] = json!(profile_name);
+        }
+        if let Some(model_id) = &self.runtime_controls.custom_model {
+            payload["provider_model"] = json!(model_id);
+        }
+        if let Some(generation_config) = self.runtime_controls.generation_override() {
+            payload["provider_generation_config"] = json!(generation_config);
         }
         payload
     }
@@ -961,9 +2206,8 @@ impl TuiApp {
                     self.open_auth_dialog();
                 }
             }
-            SlashCommand::Help => {
-                self.push_system_message("Slash commands", slash_help_lines());
-            }
+            SlashCommand::Help => self.open_help(HelpTopic::Overview),
+            SlashCommand::WhatsNew => self.open_help(HelpTopic::WhatsNew),
             SlashCommand::New => {
                 self.start_new_session();
             }
@@ -1028,7 +2272,10 @@ impl TuiApp {
                 self.invalidate_activity_snapshot();
                 self.change_projection = ChangeProjection::default();
                 self.command_messages.clear();
-                self.input.clear();
+                self.input.reset();
+                self.mention_completion = None;
+                self.attachments.clear();
+                self.selected_attachment = None;
                 self.export_flow = None;
                 self.reset_slash_selection();
                 self.reset_history_window();
@@ -1071,11 +2318,59 @@ impl TuiApp {
                         ),
                         format!("status {status}"),
                         format!("events {}", self.events.len()),
+                        format!(
+                            "provider {} · effort {} · permissions {}",
+                            self.runtime_controls.effective_model(),
+                            effort_label(self.runtime_controls.reasoning_effort),
+                            self.runtime_controls.permission_mode.label()
+                        ),
                     ],
                 );
             }
+            SlashCommand::Plan => {
+                self.dashboard = Some(DashboardState::new(DashboardTab::Plan));
+                self.status_message = "execution plan".to_owned();
+            }
+            SlashCommand::Tasks => {
+                self.dashboard = Some(DashboardState::new(DashboardTab::Tasks));
+                self.status_message = "task activity".to_owned();
+            }
+            SlashCommand::Usage => {
+                self.dashboard = Some(DashboardState::new(DashboardTab::Usage));
+                self.status_message = "runtime usage".to_owned();
+            }
+            SlashCommand::Terminal { command } => {
+                if transport.is_remote() {
+                    self.status_message =
+                        "the interactive shell is unavailable for remote runtimes".to_owned();
+                } else if has_active_task(self) {
+                    self.status_message =
+                        "the interactive shell is unavailable while a task is active".to_owned();
+                } else {
+                    match run_terminal_session(command.as_deref()) {
+                        Ok(()) => self.status_message = "terminal session closed".to_owned(),
+                        Err(error) => {
+                            self.status_message = format!("terminal session failed: {error}");
+                        }
+                    }
+                    self.mark_terminal_resumed();
+                }
+            }
+            SlashCommand::Settings => self.open_settings_dialog(),
+            SlashCommand::Model { model } => match model {
+                Some(model) => self.set_session_model(model),
+                None => self.open_settings_dialog(),
+            },
+            SlashCommand::Effort { effort } => match effort {
+                Some(effort) => self.set_session_effort(effort),
+                None => self.open_settings_dialog(),
+            },
+            SlashCommand::Permissions { unrestricted } => match unrestricted {
+                Some(unrestricted) => self.set_permission_mode(unrestricted),
+                None => self.open_settings_dialog(),
+            },
             SlashCommand::Debug => {
-                self.set_debug_mode(transport, !self.debug_mode).await?;
+                self.set_debug_mode(!self.debug_mode);
             }
             SlashCommand::Takeover => {
                 let ack = self
@@ -1117,6 +2412,11 @@ impl TuiApp {
                     .await?;
                 self.last_control_ack = Some(ack);
             }
+            SlashCommand::Queue => self.open_queue_picker(),
+            SlashCommand::Attach { path } => self.add_attachment(&path),
+            SlashCommand::Detach => self.clear_attachments(),
+            SlashCommand::Editor => self.edit_prompt_in_external_editor(),
+            SlashCommand::Stash => self.toggle_prompt_stash(),
             SlashCommand::Clear => {
                 self.command_messages.clear();
                 self.reset_transcript_view();
@@ -1150,7 +2450,9 @@ impl TuiApp {
         }
 
         self.input.clear();
-        self.resume_picker = Some(ResumePickerState { items, selected: 0 });
+        self.queue_picker = None;
+        self.editing_queued_turn = None;
+        self.resume_picker = Some(ResumePickerState::new(items));
         self.status_message = "select a session to resume".to_owned();
         Ok(())
     }
@@ -1175,11 +2477,17 @@ impl TuiApp {
         }
         self.input.clear();
         self.resume_picker = None;
+        self.queue_picker = None;
+        self.approval_dialog = None;
+        self.question_dialog = None;
+        self.help_dialog = None;
+        self.dashboard = None;
+        self.editing_queued_turn = None;
         self.export_flow = Some(ExportFlowState {
-            picker: ResumePickerState { items, selected: 0 },
+            picker: ResumePickerState::new(items),
             step: ExportFlowStep::SelectSession,
-            range_input: "1".to_owned(),
-            destination_input: String::new(),
+            range_input: ComposerInput::from_text("1"),
+            destination_input: ComposerInput::default(),
             error: None,
             receipt: None,
         });
@@ -1192,7 +2500,7 @@ impl TuiApp {
         self.status_message = "export cancelled".to_owned();
     }
 
-    fn export_input_mut(&mut self) -> Option<&mut String> {
+    fn export_input_mut(&mut self) -> Option<&mut ComposerInput> {
         let flow = self.export_flow.as_mut()?;
         match flow.step {
             ExportFlowStep::Range => Some(&mut flow.range_input),
@@ -1211,7 +2519,7 @@ impl TuiApp {
                 self.status_message = "enter 1, +N, or -N for the session window".to_owned();
             }
             ExportFlowStep::Range => {
-                if let Err(error) = parse_session_range(&flow.range_input) {
+                if let Err(error) = parse_session_range(flow.range_input.text()) {
                     flow.error = Some(error.to_string());
                     self.status_message = "invalid export range".to_owned();
                 } else {
@@ -1220,10 +2528,10 @@ impl TuiApp {
                 }
             }
             ExportFlowStep::Destination => {
-                if !Path::new(&flow.destination_input).is_absolute() {
+                if !Path::new(flow.destination_input.text()).is_absolute() {
                     flow.error = Some("destination must be an absolute path".to_owned());
                     self.status_message = "absolute path required".to_owned();
-                } else if flow.destination_input.trim().is_empty() {
+                } else if flow.destination_input.trimmed().is_empty() {
                     flow.error = Some("destination must not be empty".to_owned());
                 } else {
                     flow.step = ExportFlowStep::Review;
@@ -1236,7 +2544,7 @@ impl TuiApp {
                     flow.step = ExportFlowStep::Error;
                     return Ok(());
                 };
-                let range = match parse_session_range(&flow.range_input) {
+                let range = match parse_session_range(flow.range_input.text()) {
                     Ok(range) => range,
                     Err(error) => {
                         flow.error = Some(error.to_string());
@@ -1244,7 +2552,7 @@ impl TuiApp {
                         return Ok(());
                     }
                 };
-                let destination = PathBuf::from(&flow.destination_input);
+                let destination = PathBuf::from(flow.destination_input.text());
                 flow.step = ExportFlowStep::Running;
                 flow.error = None;
                 let transport = transport.clone();
@@ -1322,11 +2630,20 @@ impl TuiApp {
         self.invalidate_activity_snapshot();
         self.change_projection = ChangeProjection::default();
         self.command_messages.clear();
-        self.input.clear();
+        self.input.reset();
+        self.mention_completion = None;
+        self.attachments.clear();
+        self.selected_attachment = None;
         self.export_flow = None;
         self.reset_slash_selection();
         self.reset_history_window();
         self.resume_picker = None;
+        self.queue_picker = None;
+        self.approval_dialog = None;
+        self.question_dialog = None;
+        self.help_dialog = None;
+        self.dashboard = None;
+        self.editing_queued_turn = None;
         self.status_message = "new session".to_owned();
         self.reset_transcript_view();
     }
@@ -1355,11 +2672,19 @@ impl TuiApp {
         self.invalidate_activity_snapshot();
         self.change_projection = ChangeProjection::default();
         self.command_messages.clear();
-        self.input.clear();
+        self.input.reset();
+        self.mention_completion = None;
+        self.attachments.clear();
+        self.selected_attachment = None;
         self.export_flow = None;
         self.reset_slash_selection();
         self.reset_history_window();
         self.resume_picker = None;
+        self.queue_picker = None;
+        self.approval_dialog = None;
+        self.question_dialog = None;
+        self.dashboard = None;
+        self.editing_queued_turn = None;
         self.status_message = format!("resumed {}", short_id(&thread.thread_id.to_string()));
         self.reset_transcript_view();
         self.refresh(transport).await
@@ -1376,6 +2701,60 @@ impl TuiApp {
         self.resume_thread(transport, thread_id).await
     }
 
+    async fn apply_session_picker_action(
+        &mut self,
+        transport: &RuntimeTransport,
+    ) -> miette::Result<()> {
+        let Some(picker) = self.resume_picker.as_ref() else {
+            return Ok(());
+        };
+        let Some(item) = picker.items.get(picker.selected) else {
+            self.status_message = "no session selected".to_owned();
+            return Ok(());
+        };
+        let Some(action) = picker.action else {
+            return Ok(());
+        };
+        let thread_id = item.thread_id;
+        let title = picker.action_input.trimmed();
+        let (kind, payload) = match action {
+            SessionPickerAction::Rename => (
+                SessionCommandKind::RenameThread,
+                json!({"thread_id": thread_id, "title": title}),
+            ),
+            SessionPickerAction::Archive => (
+                SessionCommandKind::ArchiveThread,
+                json!({"thread_id": thread_id}),
+            ),
+            SessionPickerAction::Delete => (
+                SessionCommandKind::DeleteThread,
+                json!({"thread_id": thread_id}),
+            ),
+        };
+        let ack = transport
+            .send_command(session_command(self.session_id, kind, payload))
+            .await
+            .map_err(|error| miette::miette!("{error}"))?;
+        self.status_message = compact_ack_reason(&ack.reason);
+        if !ack.accepted {
+            return Ok(());
+        }
+        if let Some(picker) = &mut self.resume_picker {
+            match action {
+                SessionPickerAction::Rename => picker.rename_selected(&title),
+                SessionPickerAction::Archive | SessionPickerAction::Delete => {
+                    picker.remove_selected();
+                }
+            }
+            picker.finish_action();
+            if picker.items.is_empty() {
+                self.resume_picker = None;
+            }
+        }
+        self.last_control_ack = Some(ack);
+        Ok(())
+    }
+
     fn move_resume_selection(&mut self, direction: ResumeSelectionDirection) {
         if let Some(picker) = &mut self.resume_picker {
             picker.move_selection(direction);
@@ -1383,14 +2762,70 @@ impl TuiApp {
     }
 
     fn move_overlay_selection(&mut self, direction: ResumeSelectionDirection) {
-        if let Some(picker) = &mut self.resume_picker {
-            picker.move_selection(direction);
-        } else if let Some(flow) = &mut self.export_flow
-            && flow.step == ExportFlowStep::SelectSession
-        {
-            flow.picker.move_selection(direction);
-        } else if let Some(dialog) = &mut self.auth_dialog {
-            dialog.move_selection(direction);
+        let surface = self.overlay_surface();
+        let help_max_scroll = self.help_dialog.as_ref().map_or(0, |dialog| {
+            help_scroll_max(dialog, self, self.layout.transcript)
+        });
+        let auth_max_scroll = self
+            .auth_dialog
+            .as_ref()
+            .map_or(0, |dialog| auth_scroll_max(dialog, self.layout.transcript));
+        let next = matches!(direction, ResumeSelectionDirection::Next);
+        match surface {
+            Some(OverlaySurface::Help) => {
+                self.help_dialog
+                    .as_mut()
+                    .expect("help surface")
+                    .scroll_by(if next { 1 } else { -1 }, help_max_scroll);
+            }
+            Some(OverlaySurface::Auth) => {
+                let dialog = self.auth_dialog.as_mut().expect("auth surface");
+                if dialog.has_interactive_options() {
+                    dialog.move_selection(direction);
+                } else {
+                    dialog.scroll_by(if next { 1 } else { -1 }, auth_max_scroll);
+                }
+            }
+            Some(OverlaySurface::Approval) => self
+                .approval_dialog
+                .as_mut()
+                .expect("approval surface")
+                .move_selection(next),
+            Some(OverlaySurface::Question) => self
+                .question_dialog
+                .as_mut()
+                .expect("question surface")
+                .move_option(next),
+            Some(OverlaySurface::Resume) => self
+                .resume_picker
+                .as_mut()
+                .expect("resume surface")
+                .move_selection(direction),
+            Some(OverlaySurface::Queue) => self
+                .queue_picker
+                .as_mut()
+                .expect("queue surface")
+                .move_selection(next),
+            Some(OverlaySurface::Dashboard) => {
+                self.dashboard
+                    .as_mut()
+                    .expect("dashboard surface")
+                    .scroll_by(
+                        if next { 1 } else { -1 },
+                        self.layout.transcript.height as usize,
+                    );
+            }
+            Some(OverlaySurface::Settings) => {
+                let dialog = self.settings_dialog.as_mut().expect("settings surface");
+                dialog.selected_row = dialog.selected_row.move_by(next);
+            }
+            Some(OverlaySurface::Export) => {
+                let flow = self.export_flow.as_mut().expect("export surface");
+                if flow.step == ExportFlowStep::SelectSession {
+                    flow.picker.move_selection(direction);
+                }
+            }
+            None => {}
         }
     }
 
@@ -1401,6 +2836,8 @@ impl TuiApp {
 
     fn open_auth_dialog(&mut self) {
         self.resume_picker = None;
+        self.queue_picker = None;
+        self.editing_queued_turn = None;
         self.input.clear();
         self.auth_dialog = Some(AuthDialogState::new());
         self.status_message = "connect a provider".to_owned();
@@ -1721,13 +3158,76 @@ impl TuiApp {
             .and_then(|projection| projection.pending_approval.clone());
         let payload = approval_id.map_or_else(
             || json!({}),
-            |approval_id| json!({"approval_id": approval_id}),
+            |approval_id| {
+                json!({
+                    "approval_id": approval_id,
+                    "scope": ApprovalScope::Once,
+                })
+            },
         );
         let ack = transport
             .send_command(session_command(self.session_id, kind, payload))
             .await
             .map_err(|error| miette::miette!("{error}"))?;
         self.status_message = compact_ack_reason(&ack.reason);
+        self.refresh(transport).await?;
+        Ok(ack)
+    }
+
+    async fn resolve_approval_choice(
+        &mut self,
+        transport: &RuntimeTransport,
+        choice: ApprovalChoice,
+    ) -> miette::Result<CommandAck> {
+        let Some(dialog) = self.approval_dialog.as_ref() else {
+            return self
+                .resolve_pending_approval(transport, SessionCommandKind::Approve)
+                .await;
+        };
+        let kind = if choice == ApprovalChoice::Deny {
+            SessionCommandKind::Deny
+        } else {
+            SessionCommandKind::Approve
+        };
+        let mut payload = json!({
+            "approval_id": dialog.request.approval_id,
+            "scope": choice.scope(),
+        });
+        if choice == ApprovalChoice::ResourcePrefix {
+            payload["resource_prefix"] = json!(dialog.resource_prefix);
+        }
+        let ack = transport
+            .send_command(session_command(self.session_id, kind, payload))
+            .await
+            .map_err(|error| miette::miette!("{error}"))?;
+        self.status_message = compact_ack_reason(&ack.reason);
+        if ack.accepted {
+            self.approval_dialog = None;
+        }
+        self.refresh(transport).await?;
+        Ok(ack)
+    }
+
+    async fn resolve_question(
+        &mut self,
+        transport: &RuntimeTransport,
+        resolution: UserQuestionResolution,
+    ) -> miette::Result<CommandAck> {
+        let ack = transport
+            .send_command(session_command(
+                self.session_id,
+                SessionCommandKind::AnswerQuestion,
+                json!({
+                    "question_id": resolution.question_id,
+                    "answers": resolution.answers,
+                }),
+            ))
+            .await
+            .map_err(|error| miette::miette!("{error}"))?;
+        self.status_message = compact_ack_reason(&ack.reason);
+        if ack.accepted {
+            self.question_dialog = None;
+        }
         self.refresh(transport).await?;
         Ok(ack)
     }
@@ -1779,6 +3279,7 @@ impl TuiApp {
             self.command_messages
                 .drain(0..self.command_messages.len().saturating_sub(12));
         }
+        self.invalidate_transcript_layout();
         self.sync_transcript_row_count(self.transcript_scroll.row_count);
         self.clamp_transcript_scroll();
     }
@@ -1863,10 +3364,89 @@ async fn run_interactive(
     )
     .with_yolo(args.yolo)
     .with_footer_context(runtime_cwd, provider_status.model);
-    let mut terminal = setup_terminal()?;
+    // The connected runtime stays authoritative for remote provider settings.
+    let app = app
+        .with_transport_runtime_controls(&transport)
+        .with_loaded_preferences();
+    let use_alternate_screen = !args.inline;
+    let mut terminal = setup_terminal(use_alternate_screen)?;
+    let terminal_restore = TerminalRestoreCoordinator::new(use_alternate_screen);
+    let panic_restore = terminal_restore.clone();
+    install_terminal_panic_hook(move || {
+        let _ = panic_restore.restore(&mut io::stdout());
+    });
+    let unwind_restore = terminal_restore.clone();
+    let mut terminal_restore_guard = TerminalRestoreGuard::new(move || {
+        let _ = unwind_restore.restore(&mut io::stdout());
+    });
     let result = run_app(&mut terminal, app, transport).await;
-    restore_terminal(&mut terminal)?;
-    result
+    let restore = terminal_restore.restore(terminal.backend_mut());
+    if restore.is_ok() {
+        terminal_restore_guard.disarm();
+    }
+    combine_run_and_restore(result, restore)
+}
+
+#[derive(Clone)]
+struct TerminalRestoreCoordinator {
+    restored: Arc<AtomicBool>,
+    use_alternate_screen: bool,
+}
+
+impl TerminalRestoreCoordinator {
+    fn new(use_alternate_screen: bool) -> Self {
+        Self {
+            restored: Arc::new(AtomicBool::new(false)),
+            use_alternate_screen,
+        }
+    }
+
+    fn restore(&self, output: &mut impl io::Write) -> miette::Result<()> {
+        if self.restored.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let result = restore_terminal(output, self.use_alternate_screen);
+        if result.is_err() {
+            self.restored.store(false, Ordering::Release);
+        }
+        result
+    }
+}
+
+fn install_terminal_panic_hook(restore: impl Fn() + Send + Sync + 'static) {
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        restore_before_panic_report(&restore, || previous_hook(panic_info));
+    }));
+}
+
+fn restore_before_panic_report(restore: impl FnOnce(), report: impl FnOnce()) {
+    restore();
+    report();
+}
+
+struct TerminalRestoreGuard<F: FnOnce()> {
+    restore: Option<F>,
+}
+
+impl<F: FnOnce()> TerminalRestoreGuard<F> {
+    fn new(restore: F) -> Self {
+        Self {
+            restore: Some(restore),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.restore = None;
+    }
+}
+
+impl<F: FnOnce()> Drop for TerminalRestoreGuard<F> {
+    fn drop(&mut self) {
+        if let Some(restore) = self.restore.take() {
+            restore();
+        }
+    }
 }
 
 async fn run_app(
@@ -1910,14 +3490,24 @@ async fn run_app(
                     .map_err(|error| miette::miette!("{error}"))?;
                 match event {
                 CrosstermEvent::Key(key) => {
+                    let resume_generation = app.terminal_resume_generation;
                     handle_key(key, &mut app, controller.transport()).await?;
+                    if app.terminal_input_stream_is_stale(resume_generation) {
+                        // Crossterm's stdin reader may remain parked after an external full-screen
+                        // process. Recreate it after restoring raw mode so keyboard and mouse input
+                        // cannot silently stop while the composer still appears usable.
+                        terminal_events = EventStream::new();
+                        terminal.clear().map_err(|error| miette::miette!("{error}"))?;
+                    }
                     if app.last_prompt_ack.as_ref().is_some_and(|ack| ack.accepted) {
                         controller.replay_from_cursor(&app).await?;
                         app.take_last_prompt_ack();
                     }
                 }
                 CrosstermEvent::Mouse(mouse) => {
-                    handle_mouse(mouse, &mut app);
+                    if let Some(activation) = handle_mouse(mouse, &mut app) {
+                        execute_mouse_activation(activation, &mut app, controller.transport()).await?;
+                    }
                 }
                 CrosstermEvent::Paste(pasted) => {
                     handle_paste(&pasted, &mut app);
@@ -1927,7 +3517,7 @@ async fn run_app(
                 frames.request_at(Instant::now());
             }
             _ = maintenance.tick() => {
-                let changed = controller.sync(&mut app).await?;
+                let changed = controller.sync_interactive(&mut app).await?;
                 if changed
                     || app.auth_operation.is_some()
                     || app.export_operation.is_some()
@@ -1936,8 +3526,11 @@ async fn run_app(
                 }
             }
             _ = activity_status.tick(), if has_active_task(&app) => {
-                app.refresh_activity_snapshot();
-                frames.request_at(Instant::now());
+                let now = Instant::now();
+                if app.activity_refresh_due(now) {
+                    app.refresh_activity_snapshot();
+                    frames.request_at(now);
+                }
             }
         }
     }
@@ -1959,14 +3552,102 @@ async fn handle_key(
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return app.interrupt_or_quit(transport).await;
     }
-    if app.export_flow.is_some() {
-        return handle_export_key(key, app, transport).await;
+    if key.code == KeyCode::F(1)
+        || (key.code == KeyCode::Char('?')
+            && key.modifiers.is_empty()
+            && plain_question_mark_opens_help(app))
+    {
+        if app.help_dialog.take().is_some() {
+            app.status_message = "help closed".to_owned();
+        } else {
+            app.open_help(HelpTopic::Overview);
+        }
+        return Ok(());
     }
-    if app.resume_picker.is_some() {
-        return handle_resume_picker_key(key, app, transport).await;
+    match app.overlay_surface() {
+        Some(OverlaySurface::Help) => {
+            handle_help_dialog_key(key, app);
+            return Ok(());
+        }
+        Some(OverlaySurface::Auth) => return handle_auth_dialog_key(key, app, transport).await,
+        Some(OverlaySurface::Approval) => {
+            return handle_approval_dialog_key(key, app, transport).await;
+        }
+        Some(OverlaySurface::Question) => {
+            return handle_question_dialog_key(key, app, transport).await;
+        }
+        Some(OverlaySurface::Resume) => {
+            return handle_resume_picker_key(key, app, transport).await;
+        }
+        Some(OverlaySurface::Queue) => {
+            return handle_queue_picker_key(key, app, transport).await;
+        }
+        Some(OverlaySurface::Dashboard) => {
+            handle_dashboard_key(key, app);
+            return Ok(());
+        }
+        Some(OverlaySurface::Settings) => {
+            handle_settings_dialog_key(key, app);
+            return Ok(());
+        }
+        Some(OverlaySurface::Export) => return handle_export_key(key, app, transport).await,
+        None => {}
     }
-    if app.auth_dialog.is_some() {
-        return handle_auth_dialog_key(key, app, transport).await;
+    if app.history_search.is_some() {
+        handle_history_search_key(key, app);
+        return Ok(());
+    }
+    if app.transcript_search.is_some() {
+        handle_transcript_search_key(key, app);
+        return Ok(());
+    }
+    if app.input.is_empty()
+        && key.code == KeyCode::Char('f')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        app.open_transcript_search();
+        return Ok(());
+    }
+    if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.toggle_transcript_fullscreen();
+        return Ok(());
+    }
+    if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.open_history_search();
+        return Ok(());
+    }
+    if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::ALT) {
+        app.dashboard = Some(DashboardState::new(DashboardTab::Plan));
+        app.status_message = "execution dashboard".to_owned();
+        return Ok(());
+    }
+    if key.code == KeyCode::Char('e') && key.modifiers.contains(KeyModifiers::ALT) {
+        app.edit_prompt_in_external_editor();
+        return Ok(());
+    }
+    if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::ALT) {
+        app.open_queue_picker();
+        return Ok(());
+    }
+    if key.code == KeyCode::Char('a') && key.modifiers.contains(KeyModifiers::ALT) {
+        app.select_next_attachment();
+        return Ok(());
+    }
+    if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::ALT) {
+        app.toggle_prompt_stash();
+        return Ok(());
+    }
+    if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::ALT) {
+        app.toggle_raw_transcript();
+        return Ok(());
+    }
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::ALT) {
+        app.copy_transcript();
+        return Ok(());
+    }
+    if key.code == KeyCode::F(6) {
+        app.cycle_scroll_pane();
+        return Ok(());
     }
     if key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL) {
         app.toggle_transcript_details();
@@ -1998,23 +3679,22 @@ async fn handle_key(
         }
     }
 
+    if app.composer_mode == ComposerMode::VimInsert
+        && key.code == KeyCode::Esc
+        && key.modifiers.is_empty()
+    {
+        app.composer_mode = ComposerMode::VimNormal;
+        app.vim_pending_operator = None;
+        app.status_message = "Vim normal mode".to_owned();
+        return Ok(());
+    }
+    if app.composer_mode == ComposerMode::VimNormal {
+        return handle_vim_normal_key(key, app, transport).await;
+    }
+
     match key.code {
         KeyCode::Esc => {
-            if has_active_task(app) {
-                let ack = app.abort(transport).await?;
-                app.last_control_ack = Some(ack.clone());
-                app.status_message = if ack.accepted {
-                    "interrupt requested".to_owned()
-                } else {
-                    compact_ack_reason(&ack.reason)
-                };
-            } else if !app.input.is_empty() {
-                app.input.clear();
-                app.reset_slash_selection();
-                app.status_message = "input cleared".to_owned();
-            } else {
-                app.status_message = "press Ctrl+C twice to quit".to_owned();
-            }
+            handle_composer_escape(app, transport).await?;
         }
         KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.input.move_to_start();
@@ -2035,17 +3715,61 @@ async fn handle_key(
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.input.clear();
             app.reset_slash_selection();
+            app.refresh_mention_completion();
+            app.prompt_history.reset_navigation();
+        }
+        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.input.delete_to_line_end();
+            app.reset_slash_selection();
+            app.refresh_mention_completion();
+            app.prompt_history.reset_navigation();
+        }
+        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.input.delete_word_backward();
+            app.reset_slash_selection();
+            app.refresh_mention_completion();
+            app.prompt_history.reset_navigation();
+        }
+        KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.input.undo();
+            app.refresh_mention_completion();
+        }
+        KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.input.redo();
+            app.refresh_mention_completion();
+        }
+        KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => {
+            app.input.move_word_left();
+        }
+        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
+            app.input.move_word_right();
         }
         KeyCode::Tab => {
-            if app.move_slash_selection(ResumeSelectionDirection::Next) {
+            if app.accept_mention_completion() {
+                app.status_message = "reference completed".to_owned();
+            } else if app.move_slash_selection(ResumeSelectionDirection::Next) {
                 app.status_message = "slash command selected".to_owned();
+            } else if app.input.is_empty() {
+                app.cycle_scroll_pane();
             }
         }
         KeyCode::Up => {
-            app.move_slash_selection(ResumeSelectionDirection::Previous);
+            if app.move_mention_selection(false) {
+                app.status_message = "reference selected".to_owned();
+            } else if app.move_slash_selection(ResumeSelectionDirection::Previous) {
+                app.status_message = "slash command selected".to_owned();
+            } else if !app.input.move_line_up() {
+                app.previous_prompt();
+            }
         }
         KeyCode::Down => {
-            app.move_slash_selection(ResumeSelectionDirection::Next);
+            if app.move_mention_selection(true) {
+                app.status_message = "reference selected".to_owned();
+            } else if app.move_slash_selection(ResumeSelectionDirection::Next) {
+                app.status_message = "slash command selected".to_owned();
+            } else if !app.input.move_line_down() {
+                app.next_prompt();
+            }
         }
         KeyCode::PageUp => {
             app.scroll_active_pane(TranscriptScrollAction::PageUp);
@@ -2073,18 +3797,51 @@ async fn handle_key(
         KeyCode::Right => {
             app.input.move_right();
         }
+        KeyCode::Enter
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+        {
+            app.input.insert_newline();
+            app.reset_slash_selection();
+            app.refresh_mention_completion();
+            app.prompt_history.reset_navigation();
+        }
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if app.editing_queued_turn.is_some() {
+                app.status_message = "finish or cancel the queued prompt edit first".to_owned();
+                return Ok(());
+            }
+            let input = app.input.trimmed();
+            match parse_slash_input(&input) {
+                SlashInput::Prompt(prompt) => app.send_steering_prompt(transport, prompt).await?,
+                SlashInput::Empty => app.status_message = "prompt is empty".to_owned(),
+                SlashInput::Command(_) | SlashInput::Error(_) => {
+                    app.status_message =
+                        "steering accepts a prompt, not a slash command".to_owned();
+                }
+            }
+        }
         KeyCode::Enter => {
-            if !app.accept_slash_candidate(transport).await? {
+            if app.accept_mention_completion() {
+                app.status_message = "reference completed".to_owned();
+            } else if !app.accept_slash_candidate(transport).await? {
                 app.send_prompt(transport).await?;
             }
         }
         KeyCode::Backspace => {
             app.input.delete_backward();
             app.reset_slash_selection();
+            app.refresh_mention_completion();
+            app.prompt_history.reset_navigation();
         }
         KeyCode::Delete => {
-            app.input.delete_forward();
-            app.reset_slash_selection();
+            if !app.input.is_empty() || !app.remove_selected_attachment() {
+                app.input.delete_forward();
+                app.reset_slash_selection();
+                app.refresh_mention_completion();
+                app.prompt_history.reset_navigation();
+            }
         }
         KeyCode::Char(character)
             if !key.modifiers.intersects(
@@ -2097,10 +3854,304 @@ async fn handle_key(
         {
             app.input.insert_char(character);
             app.reset_slash_selection();
+            app.refresh_mention_completion();
+            app.prompt_history.reset_navigation();
         }
         _ => {}
     }
     Ok(())
+}
+
+async fn handle_composer_escape(
+    app: &mut TuiApp,
+    transport: &RuntimeTransport,
+) -> miette::Result<()> {
+    if app.editing_queued_turn.take().is_some() {
+        app.input.reset();
+        app.attachments.clear();
+        app.selected_attachment = None;
+        app.mention_completion = None;
+        app.status_message = "queued prompt edit cancelled".to_owned();
+    } else if has_active_task(app) {
+        let ack = app.abort(transport).await?;
+        app.last_control_ack = Some(ack.clone());
+        app.status_message = if ack.accepted {
+            "interrupt requested".to_owned()
+        } else {
+            compact_ack_reason(&ack.reason)
+        };
+    } else if !app.input.is_empty() {
+        app.input.clear();
+        app.reset_slash_selection();
+        app.refresh_mention_completion();
+        app.prompt_history.reset_navigation();
+        app.status_message = "input cleared".to_owned();
+    } else {
+        app.status_message = "press Ctrl+C twice to quit".to_owned();
+    }
+    Ok(())
+}
+
+async fn handle_vim_normal_key(
+    key: KeyEvent,
+    app: &mut TuiApp,
+    transport: &RuntimeTransport,
+) -> miette::Result<()> {
+    if let Some(operator) = app.vim_pending_operator.take() {
+        match (operator, key.code) {
+            ('d', KeyCode::Char('d')) => app.input.delete_current_line(),
+            ('d', KeyCode::Char('w')) => app.input.delete_word_forward(),
+            ('d', KeyCode::Char('b')) => app.input.delete_word_backward(),
+            ('d', KeyCode::Char('$')) => app.input.delete_to_line_end(),
+            ('g', KeyCode::Char('g')) => app.input.move_to_start(),
+            ('r', KeyCode::Char(character)) if key.modifiers.is_empty() => {
+                app.input.delete_forward();
+                app.input.insert_char(character);
+                app.input.move_left();
+            }
+            _ => {
+                app.status_message = "Vim operator cancelled".to_owned();
+                return Ok(());
+            }
+        }
+        after_composer_edit(app);
+        return Ok(());
+    }
+
+    match key.code {
+        KeyCode::Esc => handle_composer_escape(app, transport).await?,
+        KeyCode::Enter => {
+            if app.accept_mention_completion() {
+                app.status_message = "reference completed".to_owned();
+            } else if !app.accept_slash_candidate(transport).await? {
+                app.send_prompt(transport).await?;
+            }
+        }
+        KeyCode::Char('i') if key.modifiers.is_empty() => {
+            app.composer_mode = ComposerMode::VimInsert;
+            app.status_message = "Vim insert mode".to_owned();
+        }
+        KeyCode::Char('a') if key.modifiers.is_empty() => {
+            app.input.move_right();
+            app.composer_mode = ComposerMode::VimInsert;
+            app.status_message = "Vim insert mode".to_owned();
+        }
+        KeyCode::Char('I') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            app.input.move_to_line_start();
+            app.composer_mode = ComposerMode::VimInsert;
+        }
+        KeyCode::Char('A') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            app.input.move_to_line_end();
+            app.composer_mode = ComposerMode::VimInsert;
+        }
+        KeyCode::Char('o') if key.modifiers.is_empty() => {
+            app.input.insert_line_below();
+            app.composer_mode = ComposerMode::VimInsert;
+            after_composer_edit(app);
+        }
+        KeyCode::Char('O') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            app.input.insert_line_above();
+            app.composer_mode = ComposerMode::VimInsert;
+            after_composer_edit(app);
+        }
+        KeyCode::Left | KeyCode::Char('h') => app.input.move_left(),
+        KeyCode::Right | KeyCode::Char('l') => app.input.move_right(),
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.input.move_line_up();
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.input.move_line_down();
+        }
+        KeyCode::Char('w') => app.input.move_word_right(),
+        KeyCode::Char('b') => app.input.move_word_left(),
+        KeyCode::Char('0') | KeyCode::Home => app.input.move_to_line_start(),
+        KeyCode::Char('$') => app.input.move_to_line_end(),
+        KeyCode::Char('G') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            app.input.move_to_end();
+        }
+        KeyCode::Char('x') | KeyCode::Delete => {
+            app.input.delete_forward();
+            after_composer_edit(app);
+        }
+        KeyCode::Char('D') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            app.input.delete_to_line_end();
+            after_composer_edit(app);
+        }
+        KeyCode::Char('C') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            app.input.delete_to_line_end();
+            app.composer_mode = ComposerMode::VimInsert;
+            after_composer_edit(app);
+        }
+        KeyCode::Char('s') if key.modifiers.is_empty() => {
+            app.input.delete_forward();
+            app.composer_mode = ComposerMode::VimInsert;
+            after_composer_edit(app);
+        }
+        KeyCode::Char('d') | KeyCode::Char('g') | KeyCode::Char('r')
+            if key.modifiers.is_empty() =>
+        {
+            app.vim_pending_operator = match key.code {
+                KeyCode::Char(operator) => Some(operator),
+                _ => None,
+            };
+            app.status_message = "Vim operator pending".to_owned();
+        }
+        KeyCode::Char('u') if key.modifiers.is_empty() => {
+            app.input.undo();
+            after_composer_edit(app);
+        }
+        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.input.redo();
+            after_composer_edit(app);
+        }
+        KeyCode::PageUp => app.scroll_active_pane(TranscriptScrollAction::PageUp),
+        KeyCode::PageDown => app.scroll_active_pane(TranscriptScrollAction::PageDown),
+        KeyCode::End => app.scroll_active_pane(TranscriptScrollAction::Bottom),
+        _ => {}
+    }
+    Ok(())
+}
+
+fn after_composer_edit(app: &mut TuiApp) {
+    app.reset_slash_selection();
+    app.refresh_mention_completion();
+    app.prompt_history.reset_navigation();
+}
+
+fn handle_history_search_key(key: KeyEvent, app: &mut TuiApp) {
+    match key.code {
+        KeyCode::Esc => {
+            app.history_search = None;
+            app.status_message = "prompt history search closed".to_owned();
+            return;
+        }
+        KeyCode::Enter => {
+            if let Some(prompt) = app
+                .history_search
+                .as_ref()
+                .and_then(HistorySearchState::selected)
+                .map(str::to_owned)
+            {
+                app.input.set_text(prompt);
+            }
+            app.history_search = None;
+            app.refresh_mention_completion();
+            app.status_message = "history prompt restored".to_owned();
+            return;
+        }
+        KeyCode::Up => {
+            if let Some(search) = &mut app.history_search {
+                search.move_selection(false);
+            }
+            return;
+        }
+        KeyCode::Down => {
+            if let Some(search) = &mut app.history_search {
+                search.move_selection(true);
+            }
+            return;
+        }
+        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(search) = &mut app.history_search {
+                search.move_selection(true);
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    let Some(search) = &mut app.history_search else {
+        return;
+    };
+    match key.code {
+        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            search.input.move_to_start();
+        }
+        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            search.input.move_to_end();
+        }
+        KeyCode::Left => search.input.move_left(),
+        KeyCode::Right => search.input.move_right(),
+        KeyCode::Backspace => search.input.delete_backward(),
+        KeyCode::Delete => search.input.delete_forward(),
+        KeyCode::Char(character)
+            if !key.modifiers.intersects(
+                KeyModifiers::CONTROL
+                    | KeyModifiers::ALT
+                    | KeyModifiers::SUPER
+                    | KeyModifiers::HYPER
+                    | KeyModifiers::META,
+            ) =>
+        {
+            search.input.insert_char(character);
+        }
+        _ => return,
+    }
+    search.rebuild(&app.prompt_history);
+}
+
+fn handle_transcript_search_key(key: KeyEvent, app: &mut TuiApp) {
+    match key.code {
+        KeyCode::Esc => {
+            app.close_transcript_search();
+            return;
+        }
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            if let Some(search) = &mut app.transcript_search {
+                search.select_previous();
+            }
+            app.focus_current_search_match();
+            return;
+        }
+        KeyCode::Enter | KeyCode::Down => {
+            if let Some(search) = &mut app.transcript_search {
+                search.select_next();
+            }
+            app.focus_current_search_match();
+            return;
+        }
+        KeyCode::Up => {
+            if let Some(search) = &mut app.transcript_search {
+                search.select_previous();
+            }
+            app.focus_current_search_match();
+            return;
+        }
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::ALT) => {
+            app.copy_transcript();
+            return;
+        }
+        _ => {}
+    }
+
+    let Some(search) = &mut app.transcript_search else {
+        return;
+    };
+    match key.code {
+        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            search.input.move_to_start();
+        }
+        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            search.input.move_to_end();
+        }
+        KeyCode::Left => search.input.move_left(),
+        KeyCode::Right => search.input.move_right(),
+        KeyCode::Backspace => search.input.delete_backward(),
+        KeyCode::Delete => search.input.delete_forward(),
+        KeyCode::Char(character)
+            if !key.modifiers.intersects(
+                KeyModifiers::CONTROL
+                    | KeyModifiers::ALT
+                    | KeyModifiers::SUPER
+                    | KeyModifiers::HYPER
+                    | KeyModifiers::META,
+            ) =>
+        {
+            search.input.insert_char(character);
+        }
+        _ => return,
+    }
+    app.rebuild_transcript_search();
 }
 
 async fn handle_export_key(
@@ -2173,9 +4224,94 @@ async fn handle_export_key(
                 }
             }
             KeyCode::Enter => app.handle_export_enter(transport).await?,
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(input) = app.export_input_mut() {
+                    input.move_to_start();
+                }
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(input) = app.export_input_mut() {
+                    input.move_to_end();
+                }
+            }
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(input) = app.export_input_mut() {
+                    input.move_left();
+                }
+            }
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(input) = app.export_input_mut() {
+                    input.move_right();
+                }
+            }
+            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(input) = app.export_input_mut() {
+                    input.delete_backward();
+                }
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(input) = app.export_input_mut() {
+                    input.clear();
+                }
+            }
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(input) = app.export_input_mut() {
+                    input.delete_to_line_end();
+                }
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(input) = app.export_input_mut() {
+                    input.delete_word_backward();
+                }
+            }
+            KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(input) = app.export_input_mut() {
+                    input.undo();
+                }
+            }
+            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(input) = app.export_input_mut() {
+                    input.redo();
+                }
+            }
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => {
+                if let Some(input) = app.export_input_mut() {
+                    input.move_word_left();
+                }
+            }
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
+                if let Some(input) = app.export_input_mut() {
+                    input.move_word_right();
+                }
+            }
+            KeyCode::Left => {
+                if let Some(input) = app.export_input_mut() {
+                    input.move_left();
+                }
+            }
+            KeyCode::Right => {
+                if let Some(input) = app.export_input_mut() {
+                    input.move_right();
+                }
+            }
+            KeyCode::Home => {
+                if let Some(input) = app.export_input_mut() {
+                    input.move_to_start();
+                }
+            }
+            KeyCode::End => {
+                if let Some(input) = app.export_input_mut() {
+                    input.move_to_end();
+                }
+            }
             KeyCode::Backspace => {
                 if let Some(input) = app.export_input_mut() {
-                    input.pop();
+                    input.delete_backward();
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(input) = app.export_input_mut() {
+                    input.delete_forward();
                 }
             }
             KeyCode::Char(character)
@@ -2188,7 +4324,7 @@ async fn handle_export_key(
                 ) =>
             {
                 if let Some(input) = app.export_input_mut() {
-                    input.push(character);
+                    input.insert_char(character);
                 }
             }
             _ => {}
@@ -2210,43 +4346,513 @@ async fn handle_export_key(
 }
 
 fn handle_paste(pasted: &str, app: &mut TuiApp) {
-    if app.resume_picker.is_some() {
-        return;
-    }
-
-    if app.export_flow.is_some() {
-        if let Some(input) = app.export_input_mut() {
-            input.push_str(&pasted.replace("\r\n", "\n").replace('\r', "\n"));
-        }
-        return;
-    }
-
     let normalized = pasted.replace("\r\n", "\n").replace('\r', "\n");
-    if let Some(dialog) = &mut app.auth_dialog {
-        if let Some(input) = dialog.current_input_mut() {
-            input.push_str(&normalized.replace('\n', ""));
-            dialog.error = None;
+    let single_line = normalized.lines().collect::<Vec<_>>().join(" ");
+
+    match app.overlay_surface() {
+        Some(OverlaySurface::Help)
+        | Some(OverlaySurface::Approval)
+        | Some(OverlaySurface::Queue)
+        | Some(OverlaySurface::Dashboard) => return,
+        Some(OverlaySurface::Auth) => {
+            let dialog = app.auth_dialog.as_mut().expect("auth surface");
+            if let Some(input) = dialog.current_input_mut() {
+                input.push_str(&normalized.replace('\n', ""));
+                dialog.error = None;
+            }
+            return;
         }
+        Some(OverlaySurface::Question) => {
+            let dialog = app.question_dialog.as_mut().expect("question surface");
+            dialog.focus_free_text(dialog.question_index);
+            dialog.current_free_text_mut().insert_str(&normalized);
+            return;
+        }
+        Some(OverlaySurface::Resume) => {
+            let picker = app.resume_picker.as_mut().expect("resume surface");
+            if picker.action == Some(SessionPickerAction::Rename) {
+                picker.action_input.insert_str(&single_line);
+            } else if picker.action.is_none() {
+                picker.search.insert_str(&single_line);
+                picker.refresh_search();
+            }
+            return;
+        }
+        Some(OverlaySurface::Settings) => {
+            let dialog = app.settings_dialog.as_mut().expect("settings surface");
+            if dialog.editing_model {
+                dialog.model_input.insert_str(&single_line);
+            }
+            return;
+        }
+        Some(OverlaySurface::Export) => {
+            if let Some(input) = app.export_input_mut() {
+                input.insert_str(&single_line);
+            }
+            return;
+        }
+        None => {}
+    }
+
+    if let Some(search) = &mut app.history_search {
+        search.input.insert_str(&single_line);
+        search.rebuild(&app.prompt_history);
+        return;
+    }
+
+    if app.transcript_search.is_some() {
+        if let Some(search) = &mut app.transcript_search {
+            search.input.insert_str(&single_line);
+        }
+        app.rebuild_transcript_search();
+        return;
+    }
+
+    if app.composer_mode == ComposerMode::VimNormal {
+        app.status_message = "enter Vim insert mode before pasting".to_owned();
         return;
     }
 
     app.input.insert_str(&normalized);
     app.reset_slash_selection();
+    app.refresh_mention_completion();
+    app.prompt_history.reset_navigation();
 }
 
-fn handle_mouse(mouse: MouseEvent, app: &mut TuiApp) {
+fn plain_question_mark_opens_help(app: &TuiApp) -> bool {
+    app.help_dialog.is_some()
+        || (app.input.is_empty()
+            && app.overlay_surface().is_none()
+            && app.history_search.is_none()
+            && app.transcript_search.is_none())
+}
+
+fn handle_help_dialog_key(key: KeyEvent, app: &mut TuiApp) {
+    let area = app.layout.transcript;
+    let max_scroll = app
+        .help_dialog
+        .as_ref()
+        .map_or(0, |dialog| help_scroll_max(dialog, app, area));
+    let Some(dialog) = &mut app.help_dialog else {
+        return;
+    };
+    let page = usize::from(area.height.saturating_sub(1)).max(1);
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.help_dialog = None;
+            app.status_message = "help closed".to_owned();
+        }
+        KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => dialog.cycle(true),
+        KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => dialog.cycle(false),
+        KeyCode::Char('1') => dialog.set_topic(HelpTopic::Overview),
+        KeyCode::Char('2') => dialog.set_topic(HelpTopic::Composer),
+        KeyCode::Char('3') => dialog.set_topic(HelpTopic::Navigation),
+        KeyCode::Char('4') => dialog.set_topic(HelpTopic::Runtime),
+        KeyCode::Char('5') => {
+            dialog.set_topic(HelpTopic::WhatsNew);
+            app.preferences.mark_current_release_seen();
+            app.release_badge_visible = false;
+            app.persist_preferences();
+        }
+        KeyCode::Up | KeyCode::Char('k') => dialog.scroll_by(-1, max_scroll),
+        KeyCode::Down | KeyCode::Char('j') => dialog.scroll_by(1, max_scroll),
+        KeyCode::PageUp => dialog.scroll_by(-(page as isize), max_scroll),
+        KeyCode::PageDown => dialog.scroll_by(page as isize, max_scroll),
+        KeyCode::Home => dialog.scroll = 0,
+        KeyCode::End => dialog.scroll = max_scroll,
+        _ => {}
+    }
+}
+
+fn handle_settings_dialog_key(key: KeyEvent, app: &mut TuiApp) {
+    let Some(dialog) = &mut app.settings_dialog else {
+        return;
+    };
+    if dialog.editing_model {
+        match key.code {
+            KeyCode::Esc => {
+                dialog.editing_model = false;
+                dialog.model_input.set_text(dialog.draft.effective_model());
+                app.status_message = "model edit cancelled".to_owned();
+            }
+            KeyCode::Enter => match dialog.apply_model_input() {
+                Ok(()) => app.status_message = "model override staged".to_owned(),
+                Err(error) => app.status_message = error,
+            },
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                dialog.model_input.move_to_start();
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                dialog.model_input.move_to_end();
+            }
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                dialog.model_input.move_left();
+            }
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                dialog.model_input.move_right();
+            }
+            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                dialog.model_input.delete_backward();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                dialog.model_input.clear();
+            }
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                dialog.model_input.delete_to_line_end();
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                dialog.model_input.delete_word_backward();
+            }
+            KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                dialog.model_input.undo();
+            }
+            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                dialog.model_input.redo();
+            }
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => {
+                dialog.model_input.move_word_left();
+            }
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
+                dialog.model_input.move_word_right();
+            }
+            KeyCode::Left => dialog.model_input.move_left(),
+            KeyCode::Right => dialog.model_input.move_right(),
+            KeyCode::Home => dialog.model_input.move_to_start(),
+            KeyCode::End => dialog.model_input.move_to_end(),
+            KeyCode::Backspace => dialog.model_input.delete_backward(),
+            KeyCode::Delete => dialog.model_input.delete_forward(),
+            KeyCode::Char(character)
+                if !key.modifiers.intersects(
+                    KeyModifiers::CONTROL
+                        | KeyModifiers::ALT
+                        | KeyModifiers::SUPER
+                        | KeyModifiers::HYPER
+                        | KeyModifiers::META,
+                ) =>
+            {
+                dialog.model_input.insert_char(character);
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            app.settings_dialog = None;
+            app.status_message = "session settings discarded".to_owned();
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            dialog.selected_row = dialog.selected_row.move_by(false);
+            dialog.unrestricted_confirmation = false;
+        }
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+            dialog.selected_row = dialog.selected_row.move_by(true);
+            dialog.unrestricted_confirmation = false;
+        }
+        KeyCode::Left | KeyCode::Char('h') => {
+            if !dialog.cycle_selected(false) {
+                app.status_message =
+                    "runtime controls are locked while the task is active".to_owned();
+            }
+        }
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
+            if !dialog.cycle_selected(true) {
+                app.status_message =
+                    "runtime controls are locked while the task is active".to_owned();
+            }
+        }
+        KeyCode::Char('e')
+            if dialog.selected_row == SettingsRow::Model && !dialog.runtime_locked =>
+        {
+            dialog.editing_model = true;
+        }
+        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.apply_settings_dialog();
+        }
+        _ => {}
+    }
+}
+
+async fn handle_approval_dialog_key(
+    key: KeyEvent,
+    app: &mut TuiApp,
+    transport: &RuntimeTransport,
+) -> miette::Result<()> {
+    let mut submit = None;
+    if let Some(dialog) = &mut app.approval_dialog {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => dialog.move_selection(false),
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => dialog.move_selection(true),
+            KeyCode::Char('1') | KeyCode::Char('y') => submit = Some(ApprovalChoice::Once),
+            KeyCode::Char('2') | KeyCode::Char('p') => {
+                submit = Some(ApprovalChoice::ResourcePrefix);
+            }
+            KeyCode::Char('3') | KeyCode::Char('a') => submit = Some(ApprovalChoice::Session),
+            KeyCode::Char('4') | KeyCode::Char('n') => submit = Some(ApprovalChoice::Deny),
+            KeyCode::Enter => submit = Some(dialog.selected_choice()),
+            KeyCode::Esc => {
+                dialog.select(ApprovalChoice::Deny);
+                app.status_message =
+                    "approval remains pending; select Deny to reject it".to_owned();
+            }
+            _ => {}
+        }
+    }
+    if let Some(choice) = submit {
+        let ack = app.resolve_approval_choice(transport, choice).await?;
+        app.last_control_ack = Some(ack);
+    }
+    Ok(())
+}
+
+async fn handle_question_dialog_key(
+    key: KeyEvent,
+    app: &mut TuiApp,
+    transport: &RuntimeTransport,
+) -> miette::Result<()> {
+    let mut submit = false;
+    let mut advance = false;
+    if let Some(dialog) = &mut app.question_dialog {
+        if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            submit = dialog.all_answered();
+            if !submit {
+                app.status_message = "answer every question before submitting".to_owned();
+            }
+        } else if dialog.is_free_text_focused() {
+            match key.code {
+                KeyCode::Tab | KeyCode::BackTab | KeyCode::Esc => dialog.toggle_focus(),
+                KeyCode::Enter
+                    if key
+                        .modifiers
+                        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                {
+                    dialog.current_free_text_mut().insert_newline();
+                }
+                KeyCode::Enter => advance = true,
+                KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    dialog.current_free_text_mut().move_to_start();
+                }
+                KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    dialog.current_free_text_mut().move_to_end();
+                }
+                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    dialog.current_free_text_mut().move_left();
+                }
+                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    dialog.current_free_text_mut().move_right();
+                }
+                KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    dialog.current_free_text_mut().delete_backward();
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    dialog.current_free_text_mut().clear();
+                }
+                KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    dialog.current_free_text_mut().delete_to_line_end();
+                }
+                KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    dialog.current_free_text_mut().delete_word_backward();
+                }
+                KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    dialog.current_free_text_mut().undo();
+                }
+                KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    dialog.current_free_text_mut().redo();
+                }
+                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    dialog.current_free_text_mut().move_word_left();
+                }
+                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    dialog.current_free_text_mut().move_word_right();
+                }
+                KeyCode::Up => {
+                    dialog.current_free_text_mut().move_line_up();
+                }
+                KeyCode::Down => {
+                    dialog.current_free_text_mut().move_line_down();
+                }
+                KeyCode::Left => dialog.current_free_text_mut().move_left(),
+                KeyCode::Right => dialog.current_free_text_mut().move_right(),
+                KeyCode::Home => dialog.current_free_text_mut().move_to_line_start(),
+                KeyCode::End => dialog.current_free_text_mut().move_to_line_end(),
+                KeyCode::Backspace => dialog.current_free_text_mut().delete_backward(),
+                KeyCode::Delete => dialog.current_free_text_mut().delete_forward(),
+                KeyCode::Char(character)
+                    if !key.modifiers.intersects(
+                        KeyModifiers::CONTROL
+                            | KeyModifiers::ALT
+                            | KeyModifiers::SUPER
+                            | KeyModifiers::HYPER
+                            | KeyModifiers::META,
+                    ) =>
+                {
+                    dialog.current_free_text_mut().insert_char(character);
+                }
+                _ => {}
+            }
+        } else {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => dialog.move_option(false),
+                KeyCode::Down | KeyCode::Char('j') => dialog.move_option(true),
+                KeyCode::Left => dialog.move_question(false),
+                KeyCode::Right => dialog.move_question(true),
+                KeyCode::Tab | KeyCode::BackTab => dialog.toggle_focus(),
+                KeyCode::Char(' ') => dialog.toggle_current(),
+                KeyCode::Enter => {
+                    if dialog.current_question().mode == golutra_core::UserQuestionMode::Single {
+                        dialog.toggle_current();
+                    }
+                    advance = true;
+                }
+                KeyCode::Esc => {
+                    app.status_message =
+                        "the task is waiting for these answers; make a selection to continue"
+                            .to_owned();
+                }
+                KeyCode::Backspace => {
+                    dialog.toggle_focus();
+                    dialog.current_free_text_mut().delete_backward();
+                }
+                KeyCode::Delete => {
+                    dialog.toggle_focus();
+                    dialog.current_free_text_mut().delete_forward();
+                }
+                KeyCode::Char(character)
+                    if !key.modifiers.intersects(
+                        KeyModifiers::CONTROL
+                            | KeyModifiers::ALT
+                            | KeyModifiers::SUPER
+                            | KeyModifiers::HYPER
+                            | KeyModifiers::META,
+                    ) =>
+                {
+                    dialog.toggle_focus();
+                    dialog.current_free_text_mut().insert_char(character);
+                }
+                _ => {}
+            }
+        }
+        if advance {
+            if !dialog.current_answered() {
+                app.status_message = "select an option or enter an answer".to_owned();
+            } else if dialog.question_index + 1 < dialog.request.questions.len() {
+                dialog.move_question(true);
+            } else {
+                submit = dialog.all_answered();
+                if !submit {
+                    app.status_message = "answer every question before submitting".to_owned();
+                }
+            }
+        }
+    }
+    if submit
+        && let Some(resolution) = app
+            .question_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.resolution("answered in TUI"))
+    {
+        let ack = app.resolve_question(transport, resolution).await?;
+        app.last_control_ack = Some(ack);
+    }
+    Ok(())
+}
+
+fn handle_dashboard_key(key: KeyEvent, app: &mut TuiApp) {
+    let Some(dashboard) = &mut app.dashboard else {
+        return;
+    };
+    let page = usize::from(app.layout.transcript.height.saturating_sub(2)).max(1);
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.dashboard = None;
+            app.status_message = "dashboard closed".to_owned();
+        }
+        KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => dashboard.cycle(true),
+        KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => dashboard.cycle(false),
+        KeyCode::Char('1') => dashboard.set_tab(DashboardTab::Plan),
+        KeyCode::Char('2') => dashboard.set_tab(DashboardTab::Tasks),
+        KeyCode::Char('3') => dashboard.set_tab(DashboardTab::Usage),
+        KeyCode::Up | KeyCode::Char('k') => dashboard.scroll_by(-1, page),
+        KeyCode::Down | KeyCode::Char('j') => dashboard.scroll_by(1, page),
+        KeyCode::PageUp => dashboard.scroll_by(-(page as isize), page),
+        KeyCode::PageDown => dashboard.scroll_by(page as isize, page),
+        KeyCode::Home => dashboard.scroll = 0,
+        _ => {}
+    }
+}
+
+fn handle_mouse(mouse: MouseEvent, app: &mut TuiApp) -> Option<UiMouseActivation> {
     let target = app.layout.hit_test(mouse.column, mouse.row, app);
     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        if let Some(press) = mouse_press_at(app, mouse.column, mouse.row) {
+            apply_mouse_press(app, press);
+            app.mouse_press = Some(press);
+            return None;
+        }
+        app.mouse_press = None;
         app.activate_scroll_pane(target);
         if target == UiHitTarget::Transcript
             && let Some(operation_id) =
                 transcript_toggle_at(app, app.layout.transcript, mouse.column, mouse.row)
         {
             app.toggle_operation(operation_id);
-            return;
+            return None;
         }
     }
     match mouse.kind {
+        MouseEventKind::Up(MouseButton::Left) => {
+            let pressed = app.mouse_press.take();
+            let released = mouse_press_at(app, mouse.column, mouse.row);
+            if let Some(pressed) = pressed.filter(|press| Some(*press) == released) {
+                match pressed {
+                    UiMousePress::Approval(choice) => {
+                        return Some(UiMouseActivation::Approval(choice));
+                    }
+                    UiMousePress::Auth(_) => {
+                        return Some(UiMouseActivation::AuthContinue);
+                    }
+                    UiMousePress::Resume(_) => {
+                        if app.resume_picker.is_some() {
+                            return Some(UiMouseActivation::ResumeSession);
+                        }
+                    }
+                    UiMousePress::QuestionOption { question, option } => {
+                        if let Some(dialog) = &mut app.question_dialog
+                            && dialog.focus(question, option)
+                        {
+                            dialog.toggle_current();
+                        }
+                    }
+                    UiMousePress::QuestionFreeText { question } => {
+                        if let Some(dialog) = &mut app.question_dialog {
+                            dialog.focus_free_text(question);
+                        }
+                    }
+                    UiMousePress::QuestionSubmit => {
+                        if app
+                            .question_dialog
+                            .as_ref()
+                            .is_some_and(QuestionDialogState::all_answered)
+                        {
+                            return Some(UiMouseActivation::QuestionSubmit);
+                        }
+                    }
+                    UiMousePress::Settings(row) => {
+                        if let Some(dialog) = &mut app.settings_dialog {
+                            dialog.selected_row = row;
+                            if !dialog.cycle_selected(true) {
+                                app.status_message =
+                                    "runtime controls are locked while the task is active"
+                                        .to_owned();
+                            }
+                        }
+                    }
+                    UiMousePress::Queue(_) | UiMousePress::Dashboard(_) | UiMousePress::Help(_) => {
+                    }
+                }
+            }
+        }
         MouseEventKind::Down(MouseButton::Left)
             if app
                 .layout
@@ -2256,6 +4862,7 @@ fn handle_mouse(mouse: MouseEvent, app: &mut TuiApp) {
             app.toggle_developer_facts();
         }
         MouseEventKind::ScrollUp => {
+            app.mouse_press = None;
             app.activate_scroll_pane(target);
             match target {
                 UiHitTarget::Developer | UiHitTarget::Transcript => {
@@ -2268,6 +4875,7 @@ fn handle_mouse(mouse: MouseEvent, app: &mut TuiApp) {
             }
         }
         MouseEventKind::ScrollDown => {
+            app.mouse_press = None;
             app.activate_scroll_pane(target);
             match target {
                 UiHitTarget::Developer | UiHitTarget::Transcript => {
@@ -2281,6 +4889,102 @@ fn handle_mouse(mouse: MouseEvent, app: &mut TuiApp) {
         }
         _ => {}
     }
+    None
+}
+
+fn mouse_press_at(app: &TuiApp, x: u16, y: u16) -> Option<UiMousePress> {
+    overlay_mouse_press_at(app.layout.transcript, app, x, y)
+}
+
+fn apply_mouse_press(app: &mut TuiApp, press: UiMousePress) {
+    match press {
+        UiMousePress::Auth(index) => {
+            if let Some(dialog) = &mut app.auth_dialog {
+                dialog.set_interactive_selection(index);
+            }
+        }
+        UiMousePress::Resume(index) => {
+            if let Some(picker) = &mut app.resume_picker {
+                picker.selected = index.min(picker.items.len().saturating_sub(1));
+            } else if let Some(flow) = &mut app.export_flow {
+                flow.picker.selected = index.min(flow.picker.items.len().saturating_sub(1));
+            }
+        }
+        UiMousePress::Queue(index) => {
+            if let Some(picker) = &mut app.queue_picker {
+                picker.selected = index.min(picker.items.len().saturating_sub(1));
+            }
+        }
+        UiMousePress::Approval(choice) => {
+            if let Some(dialog) = &mut app.approval_dialog {
+                dialog.select(choice);
+            }
+        }
+        UiMousePress::QuestionOption { question, option } => {
+            if let Some(dialog) = &mut app.question_dialog {
+                dialog.focus(question, option);
+            }
+        }
+        UiMousePress::QuestionFreeText { question } => {
+            if let Some(dialog) = &mut app.question_dialog {
+                dialog.focus_free_text(question);
+            }
+        }
+        UiMousePress::QuestionSubmit => {}
+        UiMousePress::Dashboard(tab) => {
+            if let Some(dashboard) = &mut app.dashboard {
+                dashboard.set_tab(tab);
+            }
+        }
+        UiMousePress::Settings(row) => {
+            if let Some(dialog) = &mut app.settings_dialog {
+                dialog.selected_row = row;
+            }
+        }
+        UiMousePress::Help(topic) => {
+            if let Some(dialog) = &mut app.help_dialog {
+                dialog.set_topic(topic);
+            }
+            if topic == HelpTopic::WhatsNew {
+                app.preferences.mark_current_release_seen();
+                app.release_badge_visible = false;
+                app.persist_preferences();
+            }
+        }
+    }
+}
+
+async fn execute_mouse_activation(
+    activation: UiMouseActivation,
+    app: &mut TuiApp,
+    transport: &RuntimeTransport,
+) -> miette::Result<()> {
+    let ack = match activation {
+        UiMouseActivation::AuthContinue => {
+            advance_auth_dialog(app, transport).await?;
+            return Ok(());
+        }
+        UiMouseActivation::ResumeSession => {
+            app.resume_selected_thread(transport).await?;
+            return Ok(());
+        }
+        UiMouseActivation::Approval(choice) => {
+            app.resolve_approval_choice(transport, choice).await?
+        }
+        UiMouseActivation::QuestionSubmit => {
+            let Some(resolution) = app
+                .question_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.resolution("answered in TUI"))
+            else {
+                app.status_message = "answer every question before submitting".to_owned();
+                return Ok(());
+            };
+            app.resolve_question(transport, resolution).await?
+        }
+    };
+    app.last_control_ack = Some(ack);
+    Ok(())
 }
 
 async fn handle_resume_picker_key(
@@ -2288,12 +4992,142 @@ async fn handle_resume_picker_key(
     app: &mut TuiApp,
     transport: &RuntimeTransport,
 ) -> miette::Result<()> {
+    if let Some(action) = app.resume_picker.as_ref().and_then(|picker| picker.action) {
+        match action {
+            SessionPickerAction::Rename => match key.code {
+                KeyCode::Esc => {
+                    if let Some(picker) = &mut app.resume_picker {
+                        picker.finish_action();
+                    }
+                }
+                KeyCode::Enter => app.apply_session_picker_action(transport).await?,
+                KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(picker) = &mut app.resume_picker {
+                        picker.action_input.move_to_start();
+                    }
+                }
+                KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(picker) = &mut app.resume_picker {
+                        picker.action_input.move_to_end();
+                    }
+                }
+                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(picker) = &mut app.resume_picker {
+                        picker.action_input.move_left();
+                    }
+                }
+                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(picker) = &mut app.resume_picker {
+                        picker.action_input.move_right();
+                    }
+                }
+                KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(picker) = &mut app.resume_picker {
+                        picker.action_input.delete_backward();
+                    }
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(picker) = &mut app.resume_picker {
+                        picker.action_input.clear();
+                    }
+                }
+                KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(picker) = &mut app.resume_picker {
+                        picker.action_input.delete_to_line_end();
+                    }
+                }
+                KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(picker) = &mut app.resume_picker {
+                        picker.action_input.delete_word_backward();
+                    }
+                }
+                KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(picker) = &mut app.resume_picker {
+                        picker.action_input.undo();
+                    }
+                }
+                KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(picker) = &mut app.resume_picker {
+                        picker.action_input.redo();
+                    }
+                }
+                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    if let Some(picker) = &mut app.resume_picker {
+                        picker.action_input.move_word_left();
+                    }
+                }
+                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    if let Some(picker) = &mut app.resume_picker {
+                        picker.action_input.move_word_right();
+                    }
+                }
+                KeyCode::Left => {
+                    if let Some(picker) = &mut app.resume_picker {
+                        picker.action_input.move_left();
+                    }
+                }
+                KeyCode::Right => {
+                    if let Some(picker) = &mut app.resume_picker {
+                        picker.action_input.move_right();
+                    }
+                }
+                KeyCode::Home => {
+                    if let Some(picker) = &mut app.resume_picker {
+                        picker.action_input.move_to_start();
+                    }
+                }
+                KeyCode::End => {
+                    if let Some(picker) = &mut app.resume_picker {
+                        picker.action_input.move_to_end();
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(picker) = &mut app.resume_picker {
+                        picker.action_input.delete_backward();
+                    }
+                }
+                KeyCode::Delete => {
+                    if let Some(picker) = &mut app.resume_picker {
+                        picker.action_input.delete_forward();
+                    }
+                }
+                KeyCode::Char(character)
+                    if !key.modifiers.intersects(
+                        KeyModifiers::CONTROL
+                            | KeyModifiers::ALT
+                            | KeyModifiers::SUPER
+                            | KeyModifiers::HYPER
+                            | KeyModifiers::META,
+                    ) =>
+                {
+                    if let Some(picker) = &mut app.resume_picker {
+                        picker.action_input.insert_char(character);
+                    }
+                }
+                _ => {}
+            },
+            SessionPickerAction::Archive | SessionPickerAction::Delete => match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    app.apply_session_picker_action(transport).await?;
+                }
+                KeyCode::Char('n') | KeyCode::Esc => {
+                    if let Some(picker) = &mut app.resume_picker {
+                        picker.finish_action();
+                    }
+                }
+                _ => {}
+            },
+        }
+        return Ok(());
+    }
     match key.code {
         KeyCode::Esc => app.close_resume_picker(),
-        KeyCode::Up | KeyCode::Char('k') => {
+        KeyCode::Up | KeyCode::Char('k') if key.code == KeyCode::Up || key.modifiers.is_empty() => {
             app.move_resume_selection(ResumeSelectionDirection::Previous);
         }
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Down | KeyCode::Char('j')
+            if key.code == KeyCode::Down || key.modifiers.is_empty() =>
+        {
             app.move_resume_selection(ResumeSelectionDirection::Next);
         }
         KeyCode::PageUp => {
@@ -2321,15 +5155,126 @@ async fn handle_resume_picker_key(
         KeyCode::Enter => {
             app.resume_selected_thread(transport).await?;
         }
-        KeyCode::Char(character) if character.is_ascii_digit() => {
-            if let Some(index) = character
-                .to_digit(10)
-                .and_then(|digit| digit.checked_sub(1))
-                && let Some(picker) = &mut app.resume_picker
-                && (index as usize) < picker.items.len()
-            {
-                picker.selected = index as usize;
-                app.resume_selected_thread(transport).await?;
+        KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::ALT) => {
+            if let Some(picker) = &mut app.resume_picker {
+                picker.show_details = !picker.show_details;
+            }
+        }
+        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::ALT) => {
+            if let Some(picker) = &mut app.resume_picker {
+                picker.begin_action(SessionPickerAction::Rename);
+            }
+        }
+        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::ALT) => {
+            if let Some(picker) = &mut app.resume_picker {
+                picker.begin_action(SessionPickerAction::Archive);
+            }
+        }
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) => {
+            if let Some(picker) = &mut app.resume_picker {
+                picker.begin_action(SessionPickerAction::Delete);
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(picker) = &mut app.resume_picker {
+                picker.search.delete_backward();
+                picker.refresh_search();
+            }
+        }
+        KeyCode::Delete => {
+            if let Some(picker) = &mut app.resume_picker {
+                picker.search.delete_forward();
+                picker.refresh_search();
+            }
+        }
+        KeyCode::Left => {
+            if let Some(picker) = &mut app.resume_picker {
+                picker.search.move_left();
+            }
+        }
+        KeyCode::Right => {
+            if let Some(picker) = &mut app.resume_picker {
+                picker.search.move_right();
+            }
+        }
+        KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(picker) = &mut app.resume_picker {
+                picker.search.move_left();
+            }
+        }
+        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(picker) = &mut app.resume_picker {
+                picker.search.move_right();
+            }
+        }
+        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(picker) = &mut app.resume_picker {
+                picker.search.move_to_start();
+            }
+        }
+        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(picker) = &mut app.resume_picker {
+                picker.search.move_to_end();
+            }
+        }
+        KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(picker) = &mut app.resume_picker {
+                picker.search.delete_backward();
+                picker.refresh_search();
+            }
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(picker) = &mut app.resume_picker {
+                picker.search.clear();
+                picker.refresh_search();
+            }
+        }
+        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(picker) = &mut app.resume_picker {
+                picker.search.delete_to_line_end();
+                picker.refresh_search();
+            }
+        }
+        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(picker) = &mut app.resume_picker {
+                picker.search.delete_word_backward();
+                picker.refresh_search();
+            }
+        }
+        KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(picker) = &mut app.resume_picker {
+                picker.search.undo();
+                picker.refresh_search();
+            }
+        }
+        KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(picker) = &mut app.resume_picker {
+                picker.search.redo();
+                picker.refresh_search();
+            }
+        }
+        KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => {
+            if let Some(picker) = &mut app.resume_picker {
+                picker.search.move_word_left();
+            }
+        }
+        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
+            if let Some(picker) = &mut app.resume_picker {
+                picker.search.move_word_right();
+            }
+        }
+        KeyCode::Char(character)
+            if !key.modifiers.intersects(
+                KeyModifiers::CONTROL
+                    | KeyModifiers::ALT
+                    | KeyModifiers::SUPER
+                    | KeyModifiers::HYPER
+                    | KeyModifiers::META,
+            ) =>
+        {
+            if let Some(picker) = &mut app.resume_picker {
+                picker.search.insert_char(character);
+                picker.refresh_search();
             }
         }
         _ => {}
@@ -2337,55 +5282,162 @@ async fn handle_resume_picker_key(
     Ok(())
 }
 
-fn setup_terminal() -> miette::Result<Terminal<CrosstermBackend<Stdout>>> {
+async fn handle_queue_picker_key(
+    key: KeyEvent,
+    app: &mut TuiApp,
+    transport: &RuntimeTransport,
+) -> miette::Result<()> {
+    match key.code {
+        KeyCode::Esc => {
+            app.queue_picker = None;
+            app.status_message = "queued prompt manager closed".to_owned();
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(picker) = &mut app.queue_picker {
+                picker.move_selection(false);
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(picker) = &mut app.queue_picker {
+                picker.move_selection(true);
+            }
+        }
+        KeyCode::Home => {
+            if let Some(picker) = &mut app.queue_picker {
+                picker.select_first();
+            }
+        }
+        KeyCode::End => {
+            if let Some(picker) = &mut app.queue_picker {
+                picker.select_last();
+            }
+        }
+        KeyCode::Enter | KeyCode::Char('e') => app.edit_selected_queued_prompt(),
+        KeyCode::Delete | KeyCode::Backspace | KeyCode::Char('d') => {
+            app.cancel_selected_queued_prompt(transport).await?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn setup_terminal(
+    use_alternate_screen: bool,
+) -> miette::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode().map_err(|error| miette::miette!("{error}"))?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, event::EnableMouseCapture)
-        .map_err(|error| miette::miette!("{error}"))?;
-    let _ = execute!(stdout, EnableBracketedPaste, SetCursorStyle::SteadyBar);
-    Terminal::new(CrosstermBackend::new(stdout)).map_err(|error| miette::miette!("{error}"))
+    if use_alternate_screen && let Err(error) = execute!(stdout, EnterAlternateScreen) {
+        return Err(rollback_terminal_setup(error, false));
+    }
+    if let Err(error) = execute!(stdout, event::EnableMouseCapture) {
+        return Err(rollback_terminal_setup(error, use_alternate_screen));
+    }
+    if let Err(error) = execute!(stdout, EnableBracketedPaste, SetCursorStyle::SteadyBar) {
+        return Err(rollback_terminal_setup(error, use_alternate_screen));
+    }
+    match Terminal::new(CrosstermBackend::new(stdout)) {
+        Ok(terminal) => {
+            set_alternate_screen_active(use_alternate_screen);
+            Ok(terminal)
+        }
+        Err(error) => Err(rollback_terminal_setup(error, use_alternate_screen)),
+    }
 }
 
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> miette::Result<()> {
-    disable_raw_mode().map_err(|error| miette::miette!("{error}"))?;
-    execute!(
-        terminal.backend_mut(),
-        DisableBracketedPaste,
-        event::DisableMouseCapture,
-        SetCursorStyle::DefaultUserShape,
-        LeaveAlternateScreen
-    )
-    .map_err(|error| miette::miette!("{error}"))?;
-    terminal
-        .show_cursor()
-        .map_err(|error| miette::miette!("{error}"))
+fn restore_terminal(output: &mut impl io::Write, use_alternate_screen: bool) -> miette::Result<()> {
+    let mut failures = Vec::new();
+    record_terminal_failure(&mut failures, "disable raw mode", disable_raw_mode());
+    record_terminal_failure(
+        &mut failures,
+        "disable bracketed paste",
+        execute!(output, DisableBracketedPaste),
+    );
+    record_terminal_failure(
+        &mut failures,
+        "disable mouse capture",
+        execute!(output, event::DisableMouseCapture),
+    );
+    record_terminal_failure(
+        &mut failures,
+        "restore cursor style",
+        execute!(output, SetCursorStyle::DefaultUserShape),
+    );
+    if use_alternate_screen {
+        record_terminal_failure(
+            &mut failures,
+            "leave alternate screen",
+            execute!(output, LeaveAlternateScreen),
+        );
+    }
+    record_terminal_failure(
+        &mut failures,
+        "show cursor",
+        execute!(output, crossterm::cursor::Show),
+    );
+    set_alternate_screen_active(false);
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(miette::miette!(failures.join("; ")))
+    }
 }
 
-fn slash_help_lines() -> Vec<String> {
-    vec![
-        "/new  start a new session".to_owned(),
-        "/resume  open current cwd session list".to_owned(),
-        "/resume <thread-id>  resume a specific current-cwd thread".to_owned(),
-        "/export  export selected sessions and governed runtime facts".to_owned(),
-        "/threads [limit]  list recent threads for this cwd".to_owned(),
-        "/fork <thread-id> [--from-turn <turn-id>]  fork history and switch to it".to_owned(),
-        "/auth status  show provider onboarding state".to_owned(),
-        "/auth setup  open provider setup".to_owned(),
-        "/auth protocols  list registered provider protocols".to_owned(),
-        "/auth mock  switch global provider to mock".to_owned(),
-        "/auth login --base-url <url> --model <model> [--api-key <key>|--api-key-env <env>] [--scope user]".to_owned(),
-        "/auth use <profile> [user]  activate saved global provider profile".to_owned(),
-        "/status  show current session/task status".to_owned(),
-        "/debug  toggle developer runtime facts and event view".to_owned(),
-        "/abort  abort active task".to_owned(),
-        "/pause  pause active task".to_owned(),
-        "/continue  resume paused task".to_owned(),
-        "/approve  approve pending tool execution".to_owned(),
-        "/deny  deny pending tool execution".to_owned(),
-        "/compact  compact durable conversation history".to_owned(),
-        "/clear  clear local command messages".to_owned(),
-        "/quit  leave TUI".to_owned(),
-    ]
+fn combine_run_and_restore(
+    run: miette::Result<()>,
+    restore: miette::Result<()>,
+) -> miette::Result<()> {
+    match (run, restore) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(run_error), Err(restore_error)) => Err(miette::miette!(
+            "{run_error}; terminal restore failed: {restore_error}"
+        )),
+    }
+}
+
+fn rollback_terminal_setup(error: io::Error, alternate_screen_entered: bool) -> miette::Report {
+    let mut failures = vec![format!("terminal setup failed: {error}")];
+    let mut stdout = io::stdout();
+    record_terminal_failure(
+        &mut failures,
+        "disable bracketed paste after setup failure",
+        execute!(stdout, DisableBracketedPaste),
+    );
+    record_terminal_failure(
+        &mut failures,
+        "disable mouse capture after setup failure",
+        execute!(stdout, event::DisableMouseCapture),
+    );
+    record_terminal_failure(
+        &mut failures,
+        "restore cursor after setup failure",
+        execute!(stdout, SetCursorStyle::DefaultUserShape),
+    );
+    if alternate_screen_entered {
+        record_terminal_failure(
+            &mut failures,
+            "leave alternate screen after setup failure",
+            execute!(stdout, LeaveAlternateScreen),
+        );
+    }
+    record_terminal_failure(
+        &mut failures,
+        "disable raw mode after setup failure",
+        disable_raw_mode(),
+    );
+    set_alternate_screen_active(false);
+    miette::miette!(failures.join("; "))
+}
+
+fn record_terminal_failure(
+    failures: &mut Vec<String>,
+    label: &'static str,
+    result: io::Result<()>,
+) {
+    if let Err(error) = result {
+        failures.push(format!("{label}: {error}"));
+    }
 }
 
 #[cfg(test)]

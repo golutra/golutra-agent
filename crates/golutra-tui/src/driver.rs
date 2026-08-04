@@ -48,6 +48,74 @@ struct CachedFrame {
     frame: TuiFrame,
 }
 
+#[derive(Clone)]
+struct SnapshotUiState {
+    projection: Option<UserProjection>,
+    command_messages: Vec<TranscriptItem>,
+    resume_picker: Option<ResumePickerState>,
+    queue_picker: Option<QueuePickerState>,
+    approval_dialog: Option<ApprovalDialogState>,
+    question_dialog: Option<QuestionDialogState>,
+    settings_dialog: Option<SettingsDialogState>,
+    export_flow: Option<ExportFlowState>,
+    auth_dialog: Option<AuthDialogState>,
+    input: ComposerInput,
+    history_search: Option<HistorySearchState>,
+    transcript_search: Option<TranscriptSearchState>,
+    attachments: Vec<ComposerAttachment>,
+    mention_completion: Option<MentionCompletion>,
+    status_message: String,
+    provider_message: String,
+    developer_error: Option<String>,
+    runtime_controls: RuntimeControls,
+}
+
+impl SnapshotUiState {
+    fn capture(app: &TuiApp) -> Self {
+        Self {
+            projection: app.projection.clone(),
+            command_messages: app.command_messages.clone(),
+            resume_picker: app.resume_picker.clone(),
+            queue_picker: app.queue_picker.clone(),
+            approval_dialog: app.approval_dialog.clone(),
+            question_dialog: app.question_dialog.clone(),
+            settings_dialog: app.settings_dialog.clone(),
+            export_flow: app.export_flow.clone(),
+            auth_dialog: app.auth_dialog.clone(),
+            input: app.input.clone(),
+            history_search: app.history_search.clone(),
+            transcript_search: app.transcript_search.clone(),
+            attachments: app.attachments.clone(),
+            mention_completion: app.mention_completion.clone(),
+            status_message: app.status_message.clone(),
+            provider_message: app.provider_message.clone(),
+            developer_error: app.developer_error.clone(),
+            runtime_controls: app.runtime_controls.clone(),
+        }
+    }
+
+    fn restore(self, app: &mut TuiApp) {
+        app.projection = self.projection;
+        app.command_messages = self.command_messages;
+        app.resume_picker = self.resume_picker;
+        app.queue_picker = self.queue_picker;
+        app.approval_dialog = self.approval_dialog;
+        app.question_dialog = self.question_dialog;
+        app.settings_dialog = self.settings_dialog;
+        app.export_flow = self.export_flow;
+        app.auth_dialog = self.auth_dialog;
+        app.input = self.input;
+        app.history_search = self.history_search;
+        app.transcript_search = self.transcript_search;
+        app.attachments = self.attachments;
+        app.mention_completion = self.mention_completion;
+        app.status_message = self.status_message;
+        app.provider_message = self.provider_message;
+        app.developer_error = self.developer_error;
+        app.runtime_controls = self.runtime_controls;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WaitFactsCacheKey {
     event_count: usize,
@@ -398,12 +466,8 @@ impl TuiDriver {
                     validate_input(text)?;
                     ensure_driver_input_capacity(&self.app, text.len())?;
                 }
-                ensure_task_binding_allows_key(self.app.task_id, &self.app, &key)?;
-                if matches!(key, DriverKey::Enter)
-                    && self.app.auth_dialog.is_none()
-                    && self.app.resume_picker.is_none()
-                    && self.app.export_flow.is_none()
-                {
+                ensure_driver_binding_allows_key(self.app.task_id, &self.app, &key)?;
+                if matches!(key, DriverKey::Enter) && driver_enter_reaches_composer(&self.app) {
                     let candidate = pending_slash_completion(&self.app);
                     if candidate
                         .as_ref()
@@ -457,7 +521,9 @@ impl TuiDriver {
             }
             DriverRequest::InputPaste { text } => {
                 validate_input(&text)?;
-                if self.app.task_id.is_some() && self.app.auth_dialog.is_some() {
+                if self.app.task_id.is_some()
+                    && self.app.overlay_surface() == Some(OverlaySurface::Auth)
+                {
                     ensure_task_binding_accepts_no_control(
                         self.app.task_id,
                         "provider authentication input",
@@ -480,7 +546,27 @@ impl TuiDriver {
                         ),
                     });
                 }
-                handle_mouse(driver_mouse_event(event), &mut self.app);
+                let mut mouse = driver_mouse_event(event);
+                let is_click = matches!(mouse.kind, crossterm::event::MouseEventKind::Down(_));
+                ensure_driver_binding_allows_mouse_event(self.app.task_id, &self.app, &mouse)?;
+                let mut activation = handle_mouse(mouse, &mut self.app);
+                if is_click {
+                    mouse.kind =
+                        crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left);
+                    activation = handle_mouse(mouse, &mut self.app).or(activation);
+                }
+                if let Some(activation) = activation {
+                    ensure_driver_binding_allows_mouse(self.app.task_id, activation)?;
+                    execute_mouse_activation(
+                        activation,
+                        &mut self.app,
+                        self.controller.transport(),
+                    )
+                    .await?;
+                    if let Some(ack) = self.app.take_last_control_ack() {
+                        ensure_command_accepted(&ack, "runtime rejected mouse command")?;
+                    }
+                }
                 self.refresh_active_layout()?;
                 Ok(DriverResponse::Accepted {
                     message: "mouse event handled".to_owned(),
@@ -771,22 +857,19 @@ impl TuiDriver {
 
     fn render_frame(&mut self, request: &SnapshotRequest) -> miette::Result<TuiFrame> {
         let saved_events = self.app.events.clone();
-        let saved_projection = self.app.projection.clone();
+        let saved_ui = SnapshotUiState::capture(&self.app);
         let saved_developer = self.app.developer_projection.clone();
-        let saved_commands = self.app.command_messages.clone();
-        let saved_auth_dialog = self.app.auth_dialog.clone();
-        let saved_resume_picker = self.app.resume_picker.clone();
-        let saved_export_flow = self.app.export_flow.clone();
-        let saved_status_message = self.app.status_message.clone();
-        let saved_provider_message = self.app.provider_message.clone();
-        let saved_developer_error = self.app.developer_error.clone();
+        let saved_commands = saved_ui.command_messages.clone();
         let saved_debug = self.app.debug_mode;
+        let saved_body_view_mode = self.app.body_view_mode;
         let saved_transcript_scroll = self.app.transcript_scroll;
+        let saved_transcript_top_row_override = self.app.transcript_top_row_override;
+        let saved_transcript_revision = self.app.transcript_revision;
+        let saved_transcript_layout_cache = self.app.transcript_layout_cache.clone();
         let saved_developer_scroll = self.app.developer_scroll;
         let saved_developer_event_layout = self.app.developer_event_layout.clone();
         let saved_developer_top_row_override = self.app.developer_top_row_override;
         let saved_layout = self.app.layout;
-        let saved_input = self.app.input.clone();
         let saved_activity_projection = self.app.activity_projection.clone();
         let saved_change_projection = self.app.change_projection.clone();
 
@@ -813,12 +896,14 @@ impl TuiDriver {
             SnapshotPanes::Developer | SnapshotPanes::ResponseAndDeveloper => true,
             SnapshotPanes::FullScreen => saved_debug,
         };
-        if matches!(request.panes, SnapshotPanes::FullScreen) && !saved_input.is_empty() {
-            self.app
-                .input
-                .set_text(redacted_ui_text(saved_input.text()));
-        }
+        self.app.body_view_mode = match request.panes {
+            SnapshotPanes::Transcript => BodyViewMode::Transcript,
+            SnapshotPanes::Developer => BodyViewMode::Developer,
+            SnapshotPanes::ResponseAndDeveloper => BodyViewMode::Split,
+            SnapshotPanes::FullScreen => saved_body_view_mode,
+        };
         redact_snapshot_ui_state(&mut self.app);
+        self.app.invalidate_transcript_layout();
         if !matches!(request.scope, SnapshotScope::Screen) {
             self.app.transcript_scroll.reset(0);
             self.app.developer_scroll.reset(0);
@@ -843,22 +928,18 @@ impl TuiDriver {
         })();
 
         self.app.events = saved_events;
-        self.app.projection = saved_projection;
         self.app.developer_projection = saved_developer;
-        self.app.command_messages = saved_commands;
-        self.app.auth_dialog = saved_auth_dialog;
-        self.app.resume_picker = saved_resume_picker;
-        self.app.export_flow = saved_export_flow;
-        self.app.status_message = saved_status_message;
-        self.app.provider_message = saved_provider_message;
-        self.app.developer_error = saved_developer_error;
+        saved_ui.restore(&mut self.app);
         self.app.transcript_scroll = saved_transcript_scroll;
+        self.app.transcript_top_row_override = saved_transcript_top_row_override;
+        self.app.transcript_revision = saved_transcript_revision;
+        self.app.transcript_layout_cache = saved_transcript_layout_cache;
         self.app.developer_scroll = saved_developer_scroll;
         self.app.developer_event_layout = saved_developer_event_layout;
         self.app.developer_top_row_override = saved_developer_top_row_override;
         self.app.debug_mode = saved_debug;
+        self.app.body_view_mode = saved_body_view_mode;
         self.app.layout = saved_layout;
-        self.app.input = saved_input;
         self.app.activity_projection = saved_activity_projection;
         self.app.change_projection = saved_change_projection;
 
@@ -1026,11 +1107,17 @@ fn ensure_slash_input_is_valid(text: &str) -> miette::Result<()> {
 }
 
 fn ensure_modal_allows_slash(app: &TuiApp, command: &SlashCommand) -> miette::Result<()> {
-    let modal_active = app.auth_operation.is_some()
-        || app.auth_dialog.is_some()
-        || app.resume_picker.is_some()
-        || app.export_flow.is_some();
-    if modal_active && !matches!(command, SlashCommand::Quit) {
+    let modal_active = app.auth_operation.is_some() || app.overlay_surface().is_some();
+    let can_resolve_runtime_wait = matches!(
+        command,
+        SlashCommand::Takeover
+            | SlashCommand::Abort
+            | SlashCommand::Pause
+            | SlashCommand::Continue
+            | SlashCommand::Approve
+            | SlashCommand::Deny
+    );
+    if modal_active && !can_resolve_runtime_wait && !matches!(command, SlashCommand::Quit) {
         return Err(miette::miette!(
             "ui_modal_active: close the active TUI flow before executing another slash command"
         ));
@@ -1069,9 +1156,13 @@ fn ensure_task_binding_allows_slash(task_id: Option<TaskId>, text: &str) -> miet
     let read_only = matches!(
         command,
         SlashCommand::Help
+            | SlashCommand::WhatsNew
             | SlashCommand::Export
             | SlashCommand::Threads { .. }
             | SlashCommand::Status
+            | SlashCommand::Plan
+            | SlashCommand::Tasks
+            | SlashCommand::Usage
             | SlashCommand::Debug
             | SlashCommand::Clear
             | SlashCommand::Quit
@@ -1085,29 +1176,131 @@ fn ensure_task_binding_allows_slash(task_id: Option<TaskId>, text: &str) -> miet
     ))
 }
 
-fn ensure_task_binding_allows_key(
+fn ensure_driver_binding_allows_key(
     task_id: Option<TaskId>,
     app: &TuiApp,
     key: &DriverKey,
 ) -> miette::Result<()> {
-    if task_id.is_none() {
+    let surface = app.overlay_surface();
+    if surface == Some(OverlaySurface::Resume) && matches!(key, DriverKey::Enter) {
+        return Err(miette::miette!(
+            "session_binding_immutable: a TUI Driver cannot switch sessions; start another Driver bound to the target session"
+        ));
+    }
+
+    let Some(task_id) = task_id else {
         return Ok(());
+    };
+    if matches!(key, DriverKey::CtrlC) {
+        return ensure_task_binding_accepts_no_control(Some(task_id), "key control");
     }
-    if app.auth_dialog.is_some() && matches!(key, DriverKey::Enter | DriverKey::Char(_)) {
-        return ensure_task_binding_accepts_no_control(task_id, "provider authentication input");
-    }
-    let approval_shortcut = app.input.is_empty()
-        && app
-            .projection
-            .as_ref()
-            .and_then(|projection| projection.pending_approval.as_ref())
-            .is_some()
-        && driver_key_starts_approval_shortcut(key);
-    let escape_interrupt = matches!(key, DriverKey::Escape) && has_active_task(app);
-    if matches!(key, DriverKey::CtrlC) || escape_interrupt || approval_shortcut {
-        return ensure_task_binding_accepts_no_control(task_id, "key control");
+
+    let runtime_control = match surface {
+        Some(OverlaySurface::Auth) => matches!(key, DriverKey::Enter | DriverKey::Char(_)),
+        Some(OverlaySurface::Approval) => driver_key_submits_approval_dialog(key),
+        Some(OverlaySurface::Question) => matches!(key, DriverKey::Enter),
+        Some(OverlaySurface::Queue) => driver_key_cancels_queued_turn(key),
+        Some(
+            OverlaySurface::Help
+            | OverlaySurface::Resume
+            | OverlaySurface::Dashboard
+            | OverlaySurface::Settings
+            | OverlaySurface::Export,
+        ) => false,
+        None if app.history_search.is_some() || app.transcript_search.is_some() => false,
+        None => {
+            let approval_shortcut = app.input.is_empty()
+                && app
+                    .projection
+                    .as_ref()
+                    .and_then(|projection| projection.pending_approval.as_ref())
+                    .is_some()
+                && driver_key_starts_approval_shortcut(key);
+            let escape_interrupt = matches!(key, DriverKey::Escape)
+                && has_active_task(app)
+                && app.editing_queued_turn.is_none()
+                && app.composer_mode != ComposerMode::VimInsert;
+            approval_shortcut || escape_interrupt
+        }
+    };
+    if runtime_control {
+        return ensure_task_binding_accepts_no_control(Some(task_id), "key control");
     }
     Ok(())
+}
+
+fn ensure_driver_binding_allows_mouse(
+    task_id: Option<TaskId>,
+    activation: UiMouseActivation,
+) -> miette::Result<()> {
+    if activation == UiMouseActivation::ResumeSession {
+        return Err(miette::miette!(
+            "session_binding_immutable: a TUI Driver cannot switch sessions; start another Driver bound to the target session"
+        ));
+    }
+    if task_id.is_some()
+        && matches!(
+            activation,
+            UiMouseActivation::AuthContinue
+                | UiMouseActivation::Approval(_)
+                | UiMouseActivation::QuestionSubmit
+        )
+    {
+        return ensure_task_binding_accepts_no_control(task_id, "mouse control");
+    }
+    Ok(())
+}
+
+fn ensure_driver_binding_allows_mouse_event(
+    task_id: Option<TaskId>,
+    app: &TuiApp,
+    mouse: &crossterm::event::MouseEvent,
+) -> miette::Result<()> {
+    if !matches!(
+        mouse.kind,
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+    ) {
+        return Ok(());
+    }
+    let activation = match mouse_press_at(app, mouse.column, mouse.row) {
+        Some(UiMousePress::Auth(_)) => Some(UiMouseActivation::AuthContinue),
+        Some(UiMousePress::Resume(_)) if app.resume_picker.is_some() => {
+            Some(UiMouseActivation::ResumeSession)
+        }
+        Some(UiMousePress::Approval(choice)) => Some(UiMouseActivation::Approval(choice)),
+        Some(UiMousePress::QuestionSubmit)
+            if app
+                .question_dialog
+                .as_ref()
+                .is_some_and(QuestionDialogState::all_answered) =>
+        {
+            Some(UiMouseActivation::QuestionSubmit)
+        }
+        _ => None,
+    };
+    activation.map_or(Ok(()), |activation| {
+        ensure_driver_binding_allows_mouse(task_id, activation)
+    })
+}
+
+fn driver_enter_reaches_composer(app: &TuiApp) -> bool {
+    app.overlay_surface().is_none()
+        && app.history_search.is_none()
+        && app.transcript_search.is_none()
+}
+
+fn driver_key_submits_approval_dialog(key: &DriverKey) -> bool {
+    matches!(key, DriverKey::Enter)
+        || matches!(
+            key,
+            DriverKey::Char(value)
+                if value.chars().any(|character| matches!(character, '1' | '2' | '3' | '4' | 'y' | 'p' | 'a' | 'n'))
+        )
+}
+
+fn driver_key_cancels_queued_turn(key: &DriverKey) -> bool {
+    matches!(key, DriverKey::Delete | DriverKey::Backspace)
+        || matches!(key, DriverKey::Char(value) if value.contains('d'))
 }
 
 fn driver_key_starts_approval_shortcut(key: &DriverKey) -> bool {
@@ -1141,15 +1334,32 @@ fn driver_input_state_bytes(app: &TuiApp) -> usize {
             bytes = bytes.saturating_add(value.len());
         }
     }
+    if let Some(dialog) = &app.question_dialog {
+        bytes = bytes.saturating_add(dialog.input_bytes());
+    }
+    if let Some(picker) = &app.resume_picker {
+        bytes = bytes.saturating_add(picker.input_bytes());
+    }
+    if let Some(dialog) = &app.settings_dialog {
+        bytes = bytes.saturating_add(dialog.model_input.text().len());
+    }
     if let Some(flow) = &app.export_flow {
-        bytes = bytes
-            .saturating_add(flow.range_input.len())
-            .saturating_add(flow.destination_input.len());
+        bytes = bytes.saturating_add(flow.input_bytes());
+    }
+    if let Some(search) = &app.history_search {
+        bytes = bytes.saturating_add(search.input.text().len());
+    }
+    if let Some(search) = &app.transcript_search {
+        bytes = bytes.saturating_add(search.input.text().len());
+    }
+    if let Some(stash) = &app.prompt_stash {
+        bytes = bytes.saturating_add(stash.len());
     }
     bytes
 }
 
 fn redact_snapshot_ui_state(app: &mut TuiApp) {
+    app.input.set_text(redacted_ui_text(app.input.text()));
     if let Some(projection) = &mut app.projection {
         redact_user_projection(projection);
     }
@@ -1165,17 +1375,25 @@ fn redact_snapshot_ui_state(app: &mut TuiApp) {
 
     if let Some(dialog) = &mut app.auth_dialog {
         dialog.base_url = redacted_ui_text(&dialog.base_url);
+        dialog.model = redacted_ui_text(&dialog.model);
         if !dialog.api_key.is_empty() {
             dialog.api_key = "<redacted-secret>".to_owned();
         }
+        dialog.api_key_env = redacted_ui_text(&dialog.api_key_env);
+        dialog.context_window_size = redacted_ui_text(&dialog.context_window_size);
+        dialog.max_tokens = redacted_ui_text(&dialog.max_tokens);
         if !dialog.custom_headers.is_empty() {
             dialog.custom_headers = "<redacted-provider-headers>".to_owned();
         }
         dialog.error = dialog.error.as_deref().map(redacted_ui_text);
         if let Some(review) = &mut dialog.review {
+            review.profile = redacted_ui_text(&review.profile);
+            review.protocol = redacted_ui_text(&review.protocol);
             review.base_url = redacted_ui_text(&review.base_url);
+            review.model = redacted_ui_text(&review.model);
             review.credential = "<redacted-secret-reference>".to_owned();
             review.advanced = redacted_ui_text(&review.advanced);
+            review.config_path = redacted_ui_text(&review.config_path.display().to_string()).into();
             review.preview_json = "<redacted-provider-config>".to_owned();
         }
     }
@@ -1183,16 +1401,52 @@ fn redact_snapshot_ui_state(app: &mut TuiApp) {
     if let Some(picker) = &mut app.resume_picker {
         redact_session_picker(picker);
     }
+    if let Some(picker) = &mut app.queue_picker {
+        for item in &mut picker.items {
+            item.prompt = redacted_ui_text(&item.prompt);
+        }
+    }
+    if let Some(dialog) = &mut app.approval_dialog {
+        dialog.request.tool_name = redacted_ui_text(&dialog.request.tool_name);
+        dialog.request.resource = redacted_ui_text(&dialog.request.resource);
+        dialog.request.reason = redacted_ui_text(&dialog.request.reason);
+        dialog.resource_prefix = redacted_ui_text(&dialog.resource_prefix);
+    }
+    if let Some(dialog) = &mut app.question_dialog {
+        dialog.redact_text_with(redacted_ui_text);
+    }
+    if let Some(dialog) = &mut app.settings_dialog {
+        dialog.redact_text_with(redacted_ui_text);
+    }
     if let Some(flow) = &mut app.export_flow {
         redact_session_picker(&mut flow.picker);
-        flow.range_input = redacted_ui_text(&flow.range_input);
-        flow.destination_input = redacted_ui_text(&flow.destination_input);
+        let range_input = redacted_ui_text(flow.range_input.text());
+        let destination_input = redacted_ui_text(flow.destination_input.text());
+        flow.range_input.set_text(range_input);
+        flow.destination_input.set_text(destination_input);
         flow.error = flow.error.as_deref().map(redacted_ui_text);
         if let Some(receipt) = &mut flow.receipt {
             receipt.destination =
                 redacted_ui_text(&receipt.destination.display().to_string()).into();
         }
     }
+    if let Some(search) = &mut app.history_search {
+        search.input.set_text(redacted_ui_text(search.input.text()));
+    }
+    if let Some(search) = &mut app.transcript_search {
+        search.input.set_text(redacted_ui_text(search.input.text()));
+    }
+    for attachment in &mut app.attachments {
+        attachment.display_path = redacted_ui_text(&attachment.display_path);
+    }
+    if let Some(completion) = &mut app.mention_completion {
+        for candidate in &mut completion.candidates {
+            candidate.label = redacted_ui_text(&candidate.label);
+            candidate.insertion = redacted_ui_text(&candidate.insertion);
+            candidate.detail = redacted_ui_text(&candidate.detail);
+        }
+    }
+    app.runtime_controls.redact_text_with(redacted_ui_text);
 }
 
 fn redact_user_projection(projection: &mut UserProjection) {
@@ -1209,10 +1463,7 @@ fn redact_user_projection(projection: &mut UserProjection) {
 }
 
 fn redact_session_picker(picker: &mut ResumePickerState) {
-    for item in &mut picker.items {
-        item.title = redacted_ui_text(&item.title);
-        item.preview = redacted_ui_text(&item.preview);
-    }
+    picker.redact_text_with(redacted_ui_text);
 }
 
 fn ensure_command_accepted(ack: &CommandAck, fallback: &str) -> miette::Result<()> {
