@@ -17,7 +17,7 @@ use crossterm::{
         KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures_util::StreamExt;
 use golutra_auth::{
@@ -53,7 +53,7 @@ use golutra_tui::{
     SlashCommandCandidate, SlashInput, TranscriptScrollAction, parse_slash_input,
     slash_command_candidates,
 };
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend};
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -80,6 +80,7 @@ mod developer_widget;
 mod driver;
 mod frame_scheduler;
 mod help;
+mod inline_history;
 mod interaction;
 mod live_status;
 mod preferences;
@@ -108,6 +109,7 @@ pub(crate) use developer_view::*;
 pub(crate) use developer_widget::*;
 pub(crate) use frame_scheduler::*;
 pub(crate) use help::*;
+pub(crate) use inline_history::*;
 pub(crate) use interaction::*;
 pub(crate) use live_status::*;
 pub(crate) use preferences::*;
@@ -138,7 +140,7 @@ struct Args {
     task_id: Option<String>,
     #[arg(long, global = true)]
     debug: bool,
-    /// Render in the current screen buffer instead of an alternate screen.
+    /// Compatibility flag; inline rendering is now the default.
     #[arg(long, global = true)]
     inline: bool,
     /// Disable workspace, sensitive-path, shell and OS sandbox restrictions
@@ -314,6 +316,8 @@ struct TuiApp {
     transcript_top_row_override: Option<usize>,
     transcript_revision: u64,
     transcript_layout_cache: Option<TranscriptLayoutCache>,
+    inline_history_enabled: bool,
+    inline_history_committed_event_projections: usize,
     developer_scroll: PaneScrollState,
     active_scroll_pane: ScrollablePane,
     body_view_mode: BodyViewMode,
@@ -485,6 +489,8 @@ impl TuiApp {
             transcript_top_row_override: None,
             transcript_revision: 0,
             transcript_layout_cache: None,
+            inline_history_enabled: false,
+            inline_history_committed_event_projections: 0,
             developer_scroll: PaneScrollState {
                 follow_tail: true,
                 ..PaneScrollState::default()
@@ -1491,18 +1497,18 @@ impl TuiApp {
 
     fn first_visible_transcript_anchor(&self) -> Option<TranscriptProjectionAnchor> {
         let area = self.layout.transcript;
-        if area.width == 0 || area.height < 2 {
+        if area.width == 0 || area.height == 0 {
             return None;
         }
         let layout = transcript_layout(self, area);
         let window = layout.visible_window(
-            area.height.saturating_sub(1) as usize,
+            area.height as usize,
             self.transcript_scroll.offset_from_bottom,
             self.transcript_top_row_override,
         );
         let projection_index = layout.first_visible_projection(window.clone())?;
         let visual_start = layout.visual_start_for_projection(projection_index)?;
-        let projections = transcript_operation_projections(self);
+        let projections = rendered_transcript_operation_projections(self);
         Some(TranscriptProjectionAnchor {
             projection: projections.get(projection_index)?.clone(),
             original_index: projection_index,
@@ -1517,7 +1523,7 @@ impl TuiApp {
     ) {
         let area = self.layout.transcript;
         let layout = transcript_layout(self, area);
-        let projections = transcript_operation_projections(self);
+        let projections = rendered_transcript_operation_projections(self);
         if let Some(top_row) = anchor.and_then(|anchor| {
             let projection_index = projections
                 .iter()
@@ -1548,7 +1554,7 @@ impl TuiApp {
             )
         }) {
             self.transcript_scroll.row_count = layout.row_count;
-            self.set_transcript_top_row(&layout, top_row, area.height.saturating_sub(1) as usize);
+            self.set_transcript_top_row(&layout, top_row, area.height as usize);
         } else {
             self.sync_transcript_row_count_to(previous_row_count, layout.row_count);
         }
@@ -1592,6 +1598,20 @@ impl TuiApp {
         self.transcript_layout_cache = None;
     }
 
+    fn enable_inline_history(&mut self) {
+        if !self.inline_history_enabled {
+            self.inline_history_enabled = true;
+            self.invalidate_transcript_layout();
+        }
+    }
+
+    fn set_inline_history_committed_event_projections(&mut self, count: usize) {
+        if self.inline_history_committed_event_projections != count {
+            self.inline_history_committed_event_projections = count;
+            self.invalidate_transcript_layout();
+        }
+    }
+
     fn ensure_transcript_layout(&mut self, area: ratatui::layout::Rect) {
         let stale = self.transcript_layout_cache.as_ref().is_none_or(|cache| {
             cache.revision != self.transcript_revision
@@ -1602,12 +1622,12 @@ impl TuiApp {
             let resize_anchor = self.transcript_layout_cache.as_ref().and_then(|cache| {
                 (cache.revision == self.transcript_revision
                     && (cache.width != area.width || cache.height != area.height)
-                    && cache.height >= 2
+                    && cache.height > 0
                     && (!self.transcript_scroll.follow_tail
                         || self.transcript_top_row_override.is_some()))
                 .then(|| {
                     let window = cache.layout.visible_window(
-                        cache.height.saturating_sub(1) as usize,
+                        cache.height as usize,
                         self.transcript_scroll.offset_from_bottom,
                         self.transcript_top_row_override,
                     );
@@ -1621,11 +1641,7 @@ impl TuiApp {
                 .and_then(|(row_index, offset)| layout.visual_row_for_row_anchor(row_index, offset))
             {
                 self.transcript_scroll.row_count = layout.row_count;
-                self.set_transcript_top_row(
-                    &layout,
-                    top_row,
-                    area.height.saturating_sub(1) as usize,
-                );
+                self.set_transcript_top_row(&layout, top_row, area.height as usize);
             } else {
                 self.sync_transcript_row_count_to(previous_row_count, layout.row_count);
             }
@@ -1715,7 +1731,8 @@ impl TuiApp {
                 | TranscriptScrollAction::Bottom
         ) {
             self.history_load_requested = false;
-        } else if self.history_has_more_before
+        } else if !self.inline_history_enabled
+            && self.history_has_more_before
             && matches!(
                 action,
                 TranscriptScrollAction::LineUp
@@ -1828,7 +1845,7 @@ impl TuiApp {
         if let Some(search) = &mut self.transcript_search {
             search.rebuild(&lines);
         }
-        self.focus_current_search_match_in(&layout, area.height.saturating_sub(1) as usize);
+        self.focus_current_search_match_in(&layout, area.height as usize);
     }
 
     fn focus_current_search_match(&mut self) {
@@ -1838,7 +1855,7 @@ impl TuiApp {
             self.layout.transcript
         };
         let layout = transcript_layout(self, area);
-        self.focus_current_search_match_in(&layout, area.height.saturating_sub(1) as usize);
+        self.focus_current_search_match_in(&layout, area.height as usize);
     }
 
     fn focus_current_search_match_in(&mut self, layout: &TranscriptLayout, visible_rows: usize) {
@@ -1866,7 +1883,7 @@ impl TuiApp {
         } else {
             self.layout.transcript
         };
-        let layout = transcript_layout(self, area);
+        let layout = full_transcript_layout(self, area);
         let lines = layout.plain_lines();
         let text = self
             .transcript_search
@@ -1888,7 +1905,7 @@ impl TuiApp {
             let rows = developer_event_page_rows(self, area);
             self.scroll_developer(action, rows);
         } else {
-            let rows = self.layout.transcript.height.saturating_sub(1).max(1) as usize;
+            let rows = self.layout.transcript.height.max(1) as usize;
             self.scroll_transcript(action, rows);
         }
     }
@@ -3365,12 +3382,15 @@ async fn run_interactive(
     .with_yolo(args.yolo)
     .with_footer_context(runtime_cwd, provider_status.model);
     // The connected runtime stays authoritative for remote provider settings.
-    let app = app
+    let mut app = app
         .with_transport_runtime_controls(&transport)
         .with_loaded_preferences();
-    let use_alternate_screen = !args.inline;
-    let mut terminal = setup_terminal(use_alternate_screen)?;
-    let terminal_restore = TerminalRestoreCoordinator::new(use_alternate_screen);
+    app.enable_inline_history();
+    let (terminal_width, terminal_height) = crossterm::terminal::size()
+        .map_err(|error| miette::miette!("read terminal size: {error}"))?;
+    let viewport_height = inline_viewport_height(&app, terminal_width, terminal_height);
+    let mut terminal = setup_terminal(viewport_height)?;
+    let terminal_restore = TerminalRestoreCoordinator::new(false);
     let panic_restore = terminal_restore.clone();
     install_terminal_panic_hook(move || {
         let _ = panic_restore.restore(&mut io::stdout());
@@ -3450,7 +3470,7 @@ impl<F: FnOnce()> Drop for TerminalRestoreGuard<F> {
 }
 
 async fn run_app(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    terminal: &mut InteractiveTerminal,
     mut app: TuiApp,
     transport: RuntimeTransport,
 ) -> miette::Result<()> {
@@ -3463,10 +3483,9 @@ async fn run_app(
     activity_status.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     activity_status.tick().await;
     let mut frames = FrameScheduler::default();
+    let mut inline_history = InlineHistoryState::new(app.session_id);
 
-    terminal
-        .draw(|frame| draw_ui(frame, &mut app))
-        .map_err(|error| miette::miette!("{error}"))?;
+    draw_interactive_frame(terminal, &mut app, &mut inline_history)?;
     frames.mark_drawn_at(Instant::now());
 
     while !app.should_quit {
@@ -3475,9 +3494,7 @@ async fn run_app(
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
         tokio::select! {
             _ = tokio::time::sleep_until(frame_deadline.into()), if frames.deadline().is_some() => {
-                terminal
-                    .draw(|frame| draw_ui(frame, &mut app))
-                    .map_err(|error| miette::miette!("{error}"))?;
+                draw_interactive_frame(terminal, &mut app, &mut inline_history)?;
                 frames.mark_drawn_at(Instant::now());
             }
             runtime_event = controller.recv() => {
@@ -3535,6 +3552,20 @@ async fn run_app(
         }
     }
 
+    Ok(())
+}
+
+fn draw_interactive_frame(
+    terminal: &mut InteractiveTerminal,
+    app: &mut TuiApp,
+    inline_history: &mut InlineHistoryState,
+) -> miette::Result<()> {
+    inline_history
+        .flush(terminal, app)
+        .map_err(|error| miette::miette!("write terminal history: {error}"))?;
+    terminal
+        .draw(|frame| draw_ui(frame, app))
+        .map_err(|error| miette::miette!("{error}"))?;
     Ok(())
 }
 
@@ -5321,26 +5352,25 @@ async fn handle_queue_picker_key(
     Ok(())
 }
 
-fn setup_terminal(
-    use_alternate_screen: bool,
-) -> miette::Result<Terminal<CrosstermBackend<Stdout>>> {
+type InteractiveTerminal = Terminal<CursorFallbackBackend<CrosstermBackend<Stdout>>>;
+
+fn setup_terminal(viewport_height: u16) -> miette::Result<InteractiveTerminal> {
     enable_raw_mode().map_err(|error| miette::miette!("{error}"))?;
     let mut stdout = io::stdout();
-    if use_alternate_screen && let Err(error) = execute!(stdout, EnterAlternateScreen) {
+    if let Err(error) = execute!(stdout, EnableBracketedPaste, SetCursorStyle::SteadyBar) {
         return Err(rollback_terminal_setup(error, false));
     }
-    if let Err(error) = execute!(stdout, event::EnableMouseCapture) {
-        return Err(rollback_terminal_setup(error, use_alternate_screen));
-    }
-    if let Err(error) = execute!(stdout, EnableBracketedPaste, SetCursorStyle::SteadyBar) {
-        return Err(rollback_terminal_setup(error, use_alternate_screen));
-    }
-    match Terminal::new(CrosstermBackend::new(stdout)) {
+    match Terminal::with_options(
+        CursorFallbackBackend::new(CrosstermBackend::new(stdout)),
+        TerminalOptions {
+            viewport: Viewport::Inline(viewport_height.max(1)),
+        },
+    ) {
         Ok(terminal) => {
-            set_alternate_screen_active(use_alternate_screen);
+            set_alternate_screen_active(false);
             Ok(terminal)
         }
-        Err(error) => Err(rollback_terminal_setup(error, use_alternate_screen)),
+        Err(error) => Err(rollback_terminal_setup(error, false)),
     }
 }
 

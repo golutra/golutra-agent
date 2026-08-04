@@ -3,7 +3,7 @@
 use crossterm::terminal::size;
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
@@ -30,7 +30,6 @@ pub(crate) enum BodyLayoutMode {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct UiLayoutSnapshot {
-    pub(crate) header: Rect,
     pub(crate) body: Rect,
     pub(crate) transcript: Rect,
     pub(crate) developer: Option<Rect>,
@@ -84,11 +83,7 @@ pub(crate) fn ui_layout(area: Rect, app: &TuiApp) -> UiLayoutSnapshot {
     let bottom_height = bottom_pane_height_for_width(app, area.width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(8),
-            Constraint::Length(bottom_height),
-        ])
+        .constraints([Constraint::Min(8), Constraint::Length(bottom_height)])
         .split(area);
     let overlay_visible = app.overlay_surface().is_some();
     let body_mode = if overlay_visible || !app.debug_mode {
@@ -110,18 +105,17 @@ pub(crate) fn ui_layout(area: Rect, app: &TuiApp) -> UiLayoutSnapshot {
             let body = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(chunks[1]);
+                .split(chunks[0]);
             (body[0], Some(body[1]))
         }
-        BodyLayoutMode::Developer => (Rect::default(), Some(chunks[1])),
-        BodyLayoutMode::Transcript => (chunks[1], None),
+        BodyLayoutMode::Developer => (Rect::default(), Some(chunks[0])),
+        BodyLayoutMode::Transcript => (chunks[0], None),
     };
     UiLayoutSnapshot {
-        header: chunks[0],
-        body: chunks[1],
+        body: chunks[0],
         transcript,
         developer,
-        bottom: chunks[2],
+        bottom: chunks[1],
         body_mode,
     }
 }
@@ -147,7 +141,6 @@ pub(crate) fn draw_ui(frame: &mut Frame<'_>, app: &mut TuiApp) {
     }
     app.layout = next_layout;
     let layout = app.layout;
-    draw_header(frame, layout.header, app);
     if transcript_visible {
         draw_transcript(frame, layout.transcript, app);
     }
@@ -212,69 +205,6 @@ pub(crate) fn bottom_pane_height_for_width(app: &TuiApp, width: u16) -> u16 {
         + overlay_rows
         + provider_rows
         + activity_rows
-}
-
-pub(crate) fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let palette = app.palette();
-    let mode = header_mode(app);
-    let right = if app.release_badge_visible {
-        format!(
-            "new in {}  ·  F1 help  ·  /settings",
-            env!("CARGO_PKG_VERSION")
-        )
-    } else {
-        "F1 help  ·  /settings".to_owned()
-    };
-    let left_width = display_width("Golutra").saturating_add(display_width(&mode));
-    let right_width = display_width(&right);
-    let padding = usize::from(area.width)
-        .saturating_sub(left_width)
-        .saturating_sub(right_width);
-    let mut spans = vec![
-        Span::styled(
-            "Golutra",
-            Style::default()
-                .fg(palette.text)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(mode, Style::default().fg(palette.muted)),
-    ];
-    if padding > 1 {
-        spans.push(Span::raw(" ".repeat(padding)));
-        spans.push(Span::styled(right, Style::default().fg(palette.muted)));
-    }
-    let lines = vec![Line::from(spans)];
-    let paragraph = Paragraph::new(lines).alignment(Alignment::Left);
-    frame.render_widget(paragraph, area);
-}
-
-pub(crate) fn header_mode(app: &TuiApp) -> String {
-    if let Some(surface) = app.overlay_surface() {
-        return match surface {
-            OverlaySurface::Help => "  help",
-            OverlaySurface::Auth => "  auth",
-            OverlaySurface::Approval => "  approval",
-            OverlaySurface::Question => "  question",
-            OverlaySurface::Resume => "  resume",
-            OverlaySurface::Queue => "  queue",
-            OverlaySurface::Dashboard => "  dashboard",
-            OverlaySurface::Settings => "  settings",
-            OverlaySurface::Export => "  export",
-        }
-        .to_owned();
-    }
-    if app.debug_mode {
-        return "  developer".to_owned();
-    }
-    match app.projection.as_ref().map(|projection| projection.status) {
-        Some(golutra_core::TaskStatus::Running) => "  running".to_owned(),
-        Some(golutra_core::TaskStatus::WaitingApproval) => "  waiting".to_owned(),
-        Some(golutra_core::TaskStatus::WaitingAuthentication) => "  auth required".to_owned(),
-        Some(golutra_core::TaskStatus::Failed) => "  failed".to_owned(),
-        Some(golutra_core::TaskStatus::Blocked) => "  blocked".to_owned(),
-        Some(golutra_core::TaskStatus::Completed) => "  complete".to_owned(),
-        _ => String::new(),
-    }
 }
 
 pub(crate) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
@@ -346,39 +276,13 @@ pub(crate) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .as_ref()
         .expect("transcript layout is prepared before drawing")
         .layout;
-    let visible_rows = area.height.saturating_sub(1) as usize;
+    let visible_rows = area.height as usize;
     let window = layout.visible_window(
         visible_rows,
         app.transcript_scroll.offset_from_bottom,
         app.transcript_top_row_override,
     );
-    let focused = app.active_scroll_pane == ScrollablePane::Transcript;
     let palette = app.palette();
-    frame.render_widget(
-        Block::default()
-            .title(if focused {
-                if app.preferences.screen_reader {
-                    " Transcript * "
-                } else {
-                    " Transcript • "
-                }
-            } else {
-                " Transcript "
-            })
-            .borders(Borders::TOP)
-            .border_style(Style::default().fg(if focused {
-                palette.accent
-            } else {
-                palette.muted
-            })),
-        area,
-    );
-    let content = Rect::new(
-        area.x,
-        area.y.saturating_add(1),
-        area.width,
-        area.height.saturating_sub(1),
-    );
     let (logical_window, local_scroll) = layout.logical_window(window);
     let logical_start = logical_window.start;
     let mut lines = if app.transcript_presentation == TranscriptPresentation::Raw {
@@ -419,7 +323,7 @@ pub(crate) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let paragraph = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((u16::try_from(local_scroll).unwrap_or(u16::MAX), 0));
-    frame.render_widget(paragraph, content);
+    frame.render_widget(paragraph, area);
 }
 
 pub(crate) fn draw_auth_dialog(

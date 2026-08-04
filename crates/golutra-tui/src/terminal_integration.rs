@@ -13,9 +13,105 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use ratatui::{
+    backend::{Backend, ClearType, WindowSize},
+    buffer::Cell,
+    layout::{Position, Size},
+};
 
 const MAX_OSC52_BYTES: usize = 100 * 1024;
 static ALTERNATE_SCREEN_ACTIVE: AtomicBool = AtomicBool::new(true);
+
+/// Keeps ratatui's inline viewport usable when a terminal does not answer a cursor-position query.
+pub(crate) struct CursorFallbackBackend<B> {
+    inner: B,
+    last_known_cursor_position: Position,
+    cursor_queries_supported: bool,
+}
+
+impl<B> CursorFallbackBackend<B> {
+    pub(crate) fn new(inner: B) -> Self {
+        Self {
+            inner,
+            last_known_cursor_position: Position::ORIGIN,
+            cursor_queries_supported: true,
+        }
+    }
+
+    fn resolve_cursor_position(&mut self, result: io::Result<Position>) -> Position {
+        match result {
+            Ok(position) => self.last_known_cursor_position = position,
+            Err(_) => self.cursor_queries_supported = false,
+        }
+        self.last_known_cursor_position
+    }
+}
+
+impl<B: Write> Write for CursorFallbackBackend<B> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.inner.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<B: Backend> Backend for CursorFallbackBackend<B> {
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a Cell)>,
+    {
+        self.inner.draw(content)
+    }
+
+    fn append_lines(&mut self, count: u16) -> io::Result<()> {
+        self.inner.append_lines(count)
+    }
+
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        self.inner.hide_cursor()
+    }
+
+    fn show_cursor(&mut self) -> io::Result<()> {
+        self.inner.show_cursor()
+    }
+
+    fn get_cursor_position(&mut self) -> io::Result<Position> {
+        if !self.cursor_queries_supported {
+            return Ok(self.last_known_cursor_position);
+        }
+        let result = self.inner.get_cursor_position();
+        Ok(self.resolve_cursor_position(result))
+    }
+
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+        let position = position.into();
+        self.inner.set_cursor_position(position)?;
+        self.last_known_cursor_position = position;
+        Ok(())
+    }
+
+    fn clear(&mut self) -> io::Result<()> {
+        self.inner.clear()
+    }
+
+    fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+        self.inner.clear_region(clear_type)
+    }
+
+    fn size(&self) -> io::Result<Size> {
+        self.inner.size()
+    }
+
+    fn window_size(&mut self) -> io::Result<WindowSize> {
+        self.inner.window_size()
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
 
 pub(crate) fn set_alternate_screen_active(active: bool) {
     ALTERNATE_SCREEN_ACTIVE.store(active, Ordering::Relaxed);
@@ -177,13 +273,13 @@ fn suspend_terminal_output(writer: &mut impl Write, alternate_screen: bool) -> i
 
 fn resume_terminal_output(writer: &mut impl Write, alternate_screen: bool) -> io::Result<()> {
     if alternate_screen {
-        execute!(writer, EnterAlternateScreen)?;
+        execute!(
+            writer,
+            EnterAlternateScreen,
+            crossterm::event::EnableMouseCapture
+        )?;
     }
-    execute!(
-        writer,
-        crossterm::event::EnableMouseCapture,
-        EnableBracketedPaste
-    )
+    execute!(writer, EnableBracketedPaste)
 }
 
 fn osc52_sequence(value: &str) -> String {
@@ -204,6 +300,7 @@ fn bounded_utf8_prefix(value: &str, max_bytes: usize) -> (&str, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
 
     #[test]
     fn osc52_payload_is_base64_encoded() {
@@ -236,9 +333,8 @@ mod tests {
         for output in [alternate_suspend, inline_suspend] {
             assert!(contains_bytes(&output, b"\x1b[?1000l"));
         }
-        for output in [alternate_resume, inline_resume] {
-            assert!(contains_bytes(&output, b"\x1b[?1000h"));
-        }
+        assert!(contains_bytes(&alternate_resume, b"\x1b[?1000h"));
+        assert!(!contains_bytes(&inline_resume, b"\x1b[?1000h"));
     }
 
     #[test]
@@ -251,6 +347,23 @@ mod tests {
 
         assert!(error.to_string().contains("output: closed"));
         assert!(error.to_string().contains("raw: unsupported"));
+    }
+
+    #[test]
+    fn cursor_backend_uses_the_last_known_position_when_queries_fail() {
+        let mut backend = CursorFallbackBackend::new(TestBackend::new(80, 24));
+        backend
+            .set_cursor_position(Position::new(7, 9))
+            .expect("set cursor");
+
+        let position = backend.resolve_cursor_position(Err(io::Error::other("no DSR reply")));
+
+        assert_eq!(position, Position::new(7, 9));
+        assert!(!backend.cursor_queries_supported);
+        assert_eq!(
+            backend.get_cursor_position().expect("cached cursor"),
+            Position::new(7, 9)
+        );
     }
 
     fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {

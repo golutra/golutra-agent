@@ -231,11 +231,10 @@ fn hit_regions_expose_visible_transcript_operation_toggles() {
         }),
     ));
     let layout = UiLayoutSnapshot {
-        header: Rect::new(0, 0, 80, 1),
-        body: Rect::new(0, 1, 80, 12),
-        transcript: Rect::new(0, 1, 80, 12),
+        body: Rect::new(0, 0, 80, 12),
+        transcript: Rect::new(0, 0, 80, 12),
         developer: None,
-        bottom: Rect::new(0, 13, 80, 4),
+        bottom: Rect::new(0, 12, 80, 4),
         body_mode: BodyLayoutMode::Transcript,
     };
 
@@ -248,7 +247,7 @@ fn hit_regions_expose_visible_transcript_operation_toggles() {
     assert_eq!(toggle.pane, TuiHitPane::Transcript);
     assert_eq!(
         (toggle.x, toggle.y, toggle.width, toggle.height),
-        (0, 2, 4, 1)
+        (0, 0, 4, 1)
     );
 }
 
@@ -267,11 +266,10 @@ fn hit_regions_expose_overlay_tabs_and_actions() {
         "composer",
     ));
     let layout = UiLayoutSnapshot {
-        header: Rect::new(0, 0, 100, 1),
-        body: Rect::new(0, 1, 100, 16),
-        transcript: Rect::new(0, 1, 100, 16),
+        body: Rect::new(0, 0, 100, 16),
+        transcript: Rect::new(0, 0, 100, 16),
         developer: None,
-        bottom: Rect::new(0, 17, 100, 4),
+        bottom: Rect::new(0, 16, 100, 4),
         body_mode: BodyLayoutMode::Transcript,
     };
 
@@ -283,7 +281,7 @@ fn hit_regions_expose_overlay_tabs_and_actions() {
     assert_eq!(overlay.pane, TuiHitPane::Overlay);
     assert_eq!(
         (overlay.x, overlay.y, overlay.width, overlay.height),
-        (0, 1, 100, 16)
+        (0, 0, 100, 16)
     );
     let whats_new = regions
         .iter()

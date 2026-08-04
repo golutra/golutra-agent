@@ -764,6 +764,90 @@ fn terminal_resume_generation_invalidates_the_crossterm_input_stream() {
 }
 
 #[test]
+fn session_history_card_replaces_persistent_header_hints() {
+    let app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_footer_context("/workspace", "gpt-test");
+
+    let text = session_history_lines(&app, 80)
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .into_iter()
+                .map(|span| span.content.into_owned())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(text.contains("Golutra (v0.1.0)"));
+    assert!(text.contains("model:     gpt-test"));
+    assert!(text.contains("directory: /workspace"));
+    assert!(!text.contains("new in"));
+    assert!(!text.contains("F1 help"));
+    assert!(!text.contains("/settings"));
+}
+
+#[test]
+fn inline_session_history_is_inserted_only_once() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_footer_context("/workspace", "gpt-test");
+    app.enable_inline_history();
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(12),
+        },
+    )
+    .expect("inline terminal");
+    let mut history = InlineHistoryState::new(app.session_id);
+
+    assert!(history.flush(&mut terminal, &mut app).expect("first flush"));
+    assert!(
+        !history
+            .flush(&mut terminal, &mut app)
+            .expect("second flush")
+    );
+
+    assert_eq!(
+        terminal_buffer_text(&terminal).matches("Golutra").count(),
+        1
+    );
+}
+
+#[test]
+fn session_history_card_fits_narrow_unicode_paths() {
+    let app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_footer_context("/工作区/非常长的目录名称/project", "模型-very-long-name");
+
+    let lines = session_history_lines(&app, 24);
+
+    assert!(lines.iter().all(|line| line.width() <= 24));
+    assert!(lines.iter().any(|line| line.to_string().contains('…')));
+}
+
+#[test]
 fn composer_renders_terminal_cursor_at_unicode_display_column() {
     let mut app = TuiApp::new(
         ThreadId::new(),
@@ -1462,7 +1546,7 @@ async fn runtime_prompt_stacks_above_user_workflows_and_restores_them() {
         reason: "process execution requires approval".to_owned(),
     }));
 
-    assert_eq!(header_mode(&app), "  approval");
+    assert_eq!(app.overlay_surface(), Some(OverlaySurface::Approval));
     let regions = overlay_mouse_regions(Rect::new(0, 0, 80, 20), &app);
     assert!(
         regions
@@ -1491,7 +1575,7 @@ async fn runtime_prompt_stacks_above_user_workflows_and_restores_them() {
     );
 
     app.approval_dialog = None;
-    assert_eq!(header_mode(&app), "  queue");
+    assert_eq!(app.overlay_surface(), Some(OverlaySurface::Queue));
 
     app.queue_picker = None;
     app.export_flow = Some(ExportFlowState {
@@ -1527,7 +1611,7 @@ async fn runtime_prompt_stacks_above_user_workflows_and_restores_them() {
         }],
     }));
 
-    assert_eq!(header_mode(&app), "  question");
+    assert_eq!(app.overlay_surface(), Some(OverlaySurface::Question));
     handle_key(
         KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
         &mut app,
@@ -1539,7 +1623,7 @@ async fn runtime_prompt_stacks_above_user_workflows_and_restores_them() {
     assert!(app.question_dialog.is_some());
 
     app.question_dialog = None;
-    assert_eq!(header_mode(&app), "  export");
+    assert_eq!(app.overlay_surface(), Some(OverlaySurface::Export));
 
     let task_id = TaskId::new();
     app.apply_runtime_refresh_snapshot(RuntimeRefreshSnapshot {
@@ -1559,10 +1643,10 @@ async fn runtime_prompt_stacks_above_user_workflows_and_restores_them() {
     });
     assert!(app.auth_dialog.is_some());
     assert!(app.export_flow.is_some());
-    assert_eq!(header_mode(&app), "  auth");
+    assert_eq!(app.overlay_surface(), Some(OverlaySurface::Auth));
 
     app.open_help(HelpTopic::Overview);
-    assert_eq!(header_mode(&app), "  help");
+    assert_eq!(app.overlay_surface(), Some(OverlaySurface::Help));
     assert_eq!(status_chip(&app), "help");
 }
 
@@ -2411,12 +2495,10 @@ fn new_idle_session_has_empty_transcript() {
     terminal
         .draw(|frame| draw_ui(frame, &mut app))
         .expect("draw empty session");
-    let separator = (0..80)
-        .filter_map(|x| terminal.backend().buffer().cell((x, 1)))
-        .map(|cell| cell.symbol())
-        .collect::<String>();
-    assert!(separator.starts_with(" Transcript • "));
-    assert!(separator.ends_with('─'));
+    let rendered = terminal_buffer_text(&terminal);
+    assert!(!rendered.contains("Transcript •"));
+    assert!(!rendered.contains("F1 help"));
+    assert_eq!(app.layout.body.y, 0);
 }
 
 #[test]
@@ -2478,7 +2560,7 @@ fn pane_focus_and_fullscreen_preserve_transcript_scroll_position() {
         .expect("draw full transcript");
     assert_eq!(app.layout.body_mode, BodyLayoutMode::Transcript);
     assert_eq!(app.transcript_scroll.offset_from_bottom, offset);
-    assert!(terminal_buffer_text(&terminal).contains("Transcript •"));
+    assert!(!terminal_buffer_text(&terminal).contains("Transcript •"));
 
     app.toggle_transcript_fullscreen();
     assert_eq!(app.body_view_mode, BodyViewMode::Auto);
@@ -4178,6 +4260,112 @@ fn transcript_coalesces_provider_deltas_and_replaces_them_with_final_message() {
 
     assert_eq!(final_items.len(), 1);
     assert_eq!(final_items[0].body, vec!["Hello world."]);
+}
+
+#[test]
+fn inline_history_commits_only_the_stable_projection_prefix() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let turn_id = TurnId::new();
+    let mut created = transcript_event(
+        1,
+        session_id,
+        task_id,
+        RuntimeEventType::TaskCreated,
+        json!({"payload": {"prompt": "inspect the workspace"}}),
+    );
+    created.turn_id = Some(turn_id);
+    let mut streamed = transcript_event(
+        2,
+        session_id,
+        task_id,
+        RuntimeEventType::ProviderStreamed,
+        json!({"delta": {"kind": "text_delta", "text": "Working"}}),
+    );
+    streamed.turn_id = Some(turn_id);
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.events = vec![created, streamed];
+    app.projection = Some(UserProjection {
+        session_id,
+        task_id: Some(task_id),
+        status: golutra_core::TaskStatus::Running,
+        visible_steps: Vec::new(),
+        pending_approval: None,
+        final_message: None,
+        residual_risks: Vec::new(),
+    });
+
+    assert_eq!(stable_event_operation_projection_count(&app.events), 1);
+    app.enable_inline_history();
+    app.set_inline_history_committed_event_projections(1);
+    let live = transcript_render_rows(&app)
+        .into_iter()
+        .map(|row| row.line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!live.contains("inspect the workspace"));
+    assert!(live.contains("Working"));
+
+    let full = full_transcript_layout(&app, Rect::new(0, 0, 80, 12)).plain_text();
+    assert!(full.contains("inspect the workspace"));
+    assert!(full.contains("Working"));
+
+    let mut completed = transcript_event(
+        3,
+        session_id,
+        task_id,
+        RuntimeEventType::AssistantMessage,
+        json!({"content": "Working complete."}),
+    );
+    completed.turn_id = Some(turn_id);
+    app.events.push(completed);
+    assert_eq!(stable_event_operation_projection_count(&app.events), 2);
+}
+
+#[test]
+fn terminal_task_event_stabilizes_incomplete_activity_for_scrollback() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let tool_call_id = golutra_core::ToolCallId::new();
+    let events = vec![
+        transcript_event(
+            1,
+            session_id,
+            task_id,
+            RuntimeEventType::TaskCreated,
+            json!({"payload": {"prompt": "run diagnostics"}}),
+        ),
+        transcript_event(
+            2,
+            session_id,
+            task_id,
+            RuntimeEventType::ToolStarted,
+            json!({
+                "tool_call_id": tool_call_id,
+                "tool_name": "shell",
+                "arguments": {"command": "cargo test"}
+            }),
+        ),
+        transcript_event(
+            3,
+            session_id,
+            task_id,
+            RuntimeEventType::TaskInterrupted,
+            json!({"summary": "task interrupted"}),
+        ),
+    ];
+
+    assert_eq!(
+        stable_event_operation_projection_count(&events),
+        event_operation_projections(&events).len()
+    );
 }
 
 #[test]

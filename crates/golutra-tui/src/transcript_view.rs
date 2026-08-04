@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use golutra_core::{FileChangeKind, FileChangeSummary, ToolResultStatus, TurnId};
+use golutra_core::{FileChangeKind, FileChangeSummary, TaskId, ToolResultStatus, TurnId};
 use golutra_protocol::{RuntimeEvent, RuntimeEventType, UserProjection, VisibleStep};
 use serde_json::Value;
 
@@ -112,13 +112,29 @@ pub(crate) fn transcript_items(app: &TuiApp) -> Vec<TranscriptItem> {
 }
 
 pub(crate) fn transcript_operation_projections(app: &TuiApp) -> Vec<OperationProjection> {
+    transcript_operation_projections_after(app, 0)
+}
+
+pub(crate) fn rendered_transcript_operation_projections(app: &TuiApp) -> Vec<OperationProjection> {
+    let committed = if app.inline_history_enabled && app.transcript_search.is_none() {
+        app.inline_history_committed_event_projections
+    } else {
+        0
+    };
+    transcript_operation_projections_after(app, committed)
+}
+
+fn transcript_operation_projections_after(
+    app: &TuiApp,
+    committed_event_projections: usize,
+) -> Vec<OperationProjection> {
     if app.auth_dialog.is_some() {
         return Vec::new();
     }
     let mut items: Vec<OperationProjection> = Vec::new();
     let event_items = event_operation_projections(&app.events);
     let has_event_items = !event_items.is_empty();
-    items.extend(event_items);
+    items.extend(event_items.into_iter().skip(committed_event_projections));
     items.extend(app.command_messages.iter().cloned().map(notice_projection));
     if let Some(projection) = &app.projection {
         if has_event_items {
@@ -153,16 +169,60 @@ pub(crate) fn event_transcript_items(events: &[RuntimeEvent]) -> Vec<TranscriptI
 }
 
 pub(crate) fn event_operation_projections(events: &[RuntimeEvent]) -> Vec<OperationProjection> {
+    event_operation_records(events)
+        .into_iter()
+        .map(|record| record.projection)
+        .collect()
+}
+
+pub(crate) fn stable_event_operation_projection_count(events: &[RuntimeEvent]) -> usize {
+    event_operation_records(events)
+        .into_iter()
+        .take_while(|record| record.stable)
+        .count()
+}
+
+#[derive(Debug, Clone)]
+struct EventOperationRecord {
+    projection: OperationProjection,
+    task_id: Option<TaskId>,
+    turn_id: Option<TurnId>,
+    stable: bool,
+}
+
+impl EventOperationRecord {
+    fn new(event: &RuntimeEvent, projection: OperationProjection, stable: bool) -> Self {
+        Self {
+            projection,
+            task_id: event.task_id,
+            turn_id: event.turn_id,
+            stable,
+        }
+    }
+}
+
+fn event_operation_records(events: &[RuntimeEvent]) -> Vec<EventOperationRecord> {
     let mut typed_events = events.iter().collect::<Vec<_>>();
     typed_events.sort_by_key(|event| event.sequence_no);
 
-    let mut items: Vec<OperationProjection> = Vec::new();
+    let mut items: Vec<EventOperationRecord> = Vec::new();
     let mut visible_user_turns = HashMap::<TurnId, usize>::new();
     let mut streamed_assistant_items: HashMap<TurnId, usize> = HashMap::new();
     let mut active_tools = HashMap::<OperationId, usize>::new();
     for event in typed_events {
+        if event.event_type.is_task_terminal() {
+            for record in &mut items {
+                if event.task_id.is_some() && record.task_id == event.task_id
+                    || event.task_id.is_none()
+                        && event.turn_id.is_some()
+                        && record.turn_id == event.turn_id
+                {
+                    record.stable = true;
+                }
+            }
+        }
         match event.event_type {
-            RuntimeEventType::TaskCreated | RuntimeEventType::TurnQueued => {
+            RuntimeEventType::TaskCreated => {
                 let is_new_turn = event
                     .turn_id
                     .is_none_or(|turn_id| !visible_user_turns.contains_key(&turn_id));
@@ -170,7 +230,36 @@ pub(crate) fn event_operation_projections(events: &[RuntimeEvent]) -> Vec<Operat
                     if let Some(turn_id) = event.turn_id {
                         visible_user_turns.insert(turn_id, items.len());
                     }
-                    items.push(message_projection(item));
+                    items.push(EventOperationRecord::new(
+                        event,
+                        message_projection(item),
+                        true,
+                    ));
+                }
+            }
+            RuntimeEventType::TurnQueued => {
+                let is_new_turn = event
+                    .turn_id
+                    .is_none_or(|turn_id| !visible_user_turns.contains_key(&turn_id));
+                if is_new_turn && let Some(item) = user_event_transcript_item(event) {
+                    if let Some(turn_id) = event.turn_id {
+                        visible_user_turns.insert(turn_id, items.len());
+                    }
+                    items.push(EventOperationRecord::new(
+                        event,
+                        message_projection(item),
+                        false,
+                    ));
+                }
+            }
+            RuntimeEventType::TurnStarted => {
+                if let Some(index) = event
+                    .turn_id
+                    .and_then(|turn_id| visible_user_turns.get(&turn_id).copied())
+                    && let Some(record) = items.get_mut(index)
+                {
+                    record.task_id = event.task_id.or(record.task_id);
+                    record.stable = true;
                 }
             }
             RuntimeEventType::TurnUpdated => {
@@ -179,7 +268,7 @@ pub(crate) fn event_operation_projections(events: &[RuntimeEvent]) -> Vec<Operat
                     .and_then(|turn_id| visible_user_turns.get(&turn_id).copied())
                     && let Some(item) = user_event_transcript_item(event)
                 {
-                    items[index] = message_projection(item);
+                    items[index].projection = message_projection(item);
                 }
             }
             RuntimeEventType::TurnCancelled => {
@@ -214,31 +303,42 @@ pub(crate) fn event_operation_projections(events: &[RuntimeEvent]) -> Vec<Operat
                     continue;
                 };
                 if let Some(index) = streamed_assistant_items.get(&turn_id).copied() {
-                    if let Some(projection) = items.get_mut(index)
-                        && let Some(body) = projection.item_mut().body.first_mut()
+                    if let Some(record) = items.get_mut(index)
+                        && let Some(body) = record.projection.item_mut().body.first_mut()
                     {
                         body.push_str(delta);
                     }
                 } else {
                     let index = items.len();
-                    items.push(message_projection(TranscriptItem {
-                        role: TranscriptRole::Assistant,
-                        title: "Golutra".to_owned(),
-                        body: vec![delta.to_owned()],
-                    }));
+                    items.push(EventOperationRecord::new(
+                        event,
+                        message_projection(TranscriptItem {
+                            role: TranscriptRole::Assistant,
+                            title: "Golutra".to_owned(),
+                            body: vec![delta.to_owned()],
+                        }),
+                        false,
+                    ));
                     streamed_assistant_items.insert(turn_id, index);
                 }
             }
             RuntimeEventType::AssistantMessage => {
-                if let Some(item) = assistant_event_transcript_item(event) {
-                    if let Some(index) = event
-                        .turn_id
-                        .and_then(|turn_id| streamed_assistant_items.remove(&turn_id))
-                    {
-                        items[index] = message_projection(item);
-                    } else {
-                        items.push(message_projection(item));
+                let streamed = event
+                    .turn_id
+                    .and_then(|turn_id| streamed_assistant_items.remove(&turn_id));
+                if let Some(index) = streamed {
+                    if let Some(record) = items.get_mut(index) {
+                        if let Some(item) = assistant_event_transcript_item(event) {
+                            record.projection = message_projection(item);
+                        }
+                        record.stable = true;
                     }
+                } else if let Some(item) = assistant_event_transcript_item(event) {
+                    items.push(EventOperationRecord::new(
+                        event,
+                        message_projection(item),
+                        true,
+                    ));
                 }
             }
             RuntimeEventType::ToolStarted => {
@@ -247,15 +347,15 @@ pub(crate) fn event_operation_projections(events: &[RuntimeEvent]) -> Vec<Operat
                     if let Some(id) = projection.id().cloned() {
                         active_tools.insert(id, index);
                     }
-                    items.push(projection);
+                    items.push(EventOperationRecord::new(event, projection, false));
                 }
             }
             RuntimeEventType::ToolProgress => {
                 if let Some(id) = operation_id_from_event(event)
                     && let Some(index) = active_tools.get(&id).copied()
-                    && let Some(projection) = items.get_mut(index)
+                    && let Some(record) = items.get_mut(index)
                 {
-                    update_tool_progress(projection, event);
+                    update_tool_progress(&mut record.projection, event);
                 }
             }
             RuntimeEventType::ToolCompleted => {
@@ -263,15 +363,20 @@ pub(crate) fn event_operation_projections(events: &[RuntimeEvent]) -> Vec<Operat
                     if let Some(id) = projection.id().cloned()
                         && let Some(index) = active_tools.remove(&id)
                     {
-                        items[index] = projection;
+                        items[index].projection = projection;
+                        items[index].stable = true;
                     } else {
-                        items.push(projection);
+                        items.push(EventOperationRecord::new(event, projection, true));
                     }
                 }
             }
             _ => {
                 if let Some(item) = status_event_transcript_item(event) {
-                    items.push(notice_projection(item));
+                    items.push(EventOperationRecord::new(
+                        event,
+                        notice_projection(item),
+                        true,
+                    ));
                 }
             }
         }

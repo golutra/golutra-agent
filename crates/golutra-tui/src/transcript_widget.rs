@@ -9,7 +9,8 @@ use ratatui::{
 
 use super::{
     OperationId, TranscriptItem, TranscriptRole, TuiApp, detail_line, markdown_lines,
-    transcript_operation_projections, transcript_visible_window,
+    rendered_transcript_operation_projections, transcript_operation_projections,
+    transcript_visible_window,
 };
 
 #[derive(Debug, Clone)]
@@ -158,7 +159,17 @@ impl TranscriptLayout {
 }
 
 pub(crate) fn transcript_layout(app: &TuiApp, area: Rect) -> TranscriptLayout {
-    let rendered = transcript_render_rows(app);
+    transcript_layout_from_rows(transcript_render_rows(app), area)
+}
+
+pub(crate) fn full_transcript_layout(app: &TuiApp, area: Rect) -> TranscriptLayout {
+    transcript_layout_from_rows(
+        render_operation_projections(app, transcript_operation_projections(app)),
+        area,
+    )
+}
+
+fn transcript_layout_from_rows(rendered: Vec<TranscriptRenderRow>, area: Rect) -> TranscriptLayout {
     let mut lines = Vec::with_capacity(rendered.len());
     let mut rows = Vec::with_capacity(rendered.len());
     let mut row_count = 0_usize;
@@ -185,7 +196,37 @@ pub(crate) fn transcript_layout(app: &TuiApp, area: Rect) -> TranscriptLayout {
 }
 
 pub(crate) fn transcript_render_rows(app: &TuiApp) -> Vec<TranscriptRenderRow> {
-    transcript_operation_projections(app)
+    render_operation_projections(app, rendered_transcript_operation_projections(app))
+}
+
+pub(crate) fn render_operation_projection_lines(
+    app: &TuiApp,
+    projections: Vec<super::OperationProjection>,
+) -> Vec<Line<'static>> {
+    projections
+        .into_iter()
+        .enumerate()
+        .flat_map(|(projection_index, projection)| {
+            let operation_id = projection.id().cloned();
+            let toggle = projection.is_expandable();
+            render_item_rows(
+                app,
+                projection.item(false),
+                operation_id,
+                toggle,
+                false,
+                projection_index,
+            )
+        })
+        .map(|row| row.line)
+        .collect()
+}
+
+fn render_operation_projections(
+    app: &TuiApp,
+    projections: Vec<super::OperationProjection>,
+) -> Vec<TranscriptRenderRow> {
+    projections
         .into_iter()
         .enumerate()
         .flat_map(|(projection_index, projection)| {
@@ -207,17 +248,18 @@ pub(crate) fn transcript_toggle_at(
     column: u16,
     row: u16,
 ) -> Option<OperationId> {
-    if column < area.x || column >= area.x.saturating_add(4) || row <= area.y {
+    if column < area.x || column >= area.x.saturating_add(4) || row < area.y || row >= area.bottom()
+    {
         return None;
     }
     let layout = transcript_layout(app, area);
-    let visible_rows = area.height.saturating_sub(1) as usize;
+    let visible_rows = area.height as usize;
     let window = layout.visible_window(
         visible_rows,
         app.transcript_scroll.offset_from_bottom,
         app.transcript_top_row_override,
     );
-    let offset = usize::from(row.saturating_sub(area.y + 1));
+    let offset = usize::from(row.saturating_sub(area.y));
     let visual_row = window.start.saturating_add(offset);
     layout
         .rows
@@ -229,11 +271,11 @@ pub(crate) fn transcript_toggle_at(
 }
 
 pub(crate) fn transcript_toggle_regions(app: &TuiApp, area: Rect) -> Vec<(String, Rect)> {
-    if area.width == 0 || area.height < 2 {
+    if area.width == 0 || area.height == 0 {
         return Vec::new();
     }
     let layout = transcript_layout(app, area);
-    let visible_rows = area.height.saturating_sub(1) as usize;
+    let visible_rows = area.height as usize;
     let window = layout.visible_window(
         visible_rows,
         app.transcript_scroll.offset_from_bottom,
@@ -252,7 +294,6 @@ pub(crate) fn transcript_toggle_regions(app: &TuiApp, area: Rect) -> Vec<(String
             let row_offset = start.saturating_sub(window.start);
             let y = area
                 .y
-                .saturating_add(1)
                 .saturating_add(u16::try_from(row_offset).unwrap_or(u16::MAX));
             Some((
                 format!("transcript_operation_toggle:{}", operation_id.as_str()),
