@@ -111,22 +111,41 @@ pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiA
     let event_rows = events.line_count(event_area.width.max(1));
     let scroll = event_rows.saturating_sub(usize::from(event_area.height));
     events = events.scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0));
+    let top_padding = if app.inline_history_enabled {
+        event_area.height.saturating_sub(
+            u16::try_from(event_rows)
+                .unwrap_or(u16::MAX)
+                .min(event_area.height),
+        )
+    } else {
+        0
+    };
+    let event_area = Rect::new(
+        event_area.x,
+        event_area.y.saturating_add(top_padding),
+        event_area.width,
+        event_area.height.saturating_sub(top_padding),
+    );
     frame.render_widget(events, event_area);
 }
 
 fn developer_live_rows(app: &TuiApp) -> Vec<DeveloperPanelRow> {
-    if let Some(error) = &app.developer_error {
-        return vec![DeveloperPanelRow::Summary(format!("error {error}"))];
-    }
-    app.events
-        .iter()
-        .filter(|event| !app.inline_history_committed_event_ids.contains(&event.id))
-        .map(|event| DeveloperPanelRow::Event {
-            sequence_no: event.sequence_no,
-            label: format!("{:?}/{:?}", event.event_type, event.source),
-            summary: developer_event_summary(event),
-        })
-        .collect()
+    let mut rows = app
+        .developer_error
+        .as_ref()
+        .map(|error| vec![DeveloperPanelRow::Summary(format!("error {error}"))])
+        .unwrap_or_default();
+    rows.extend(
+        app.events
+            .iter()
+            .filter(|event| !app.inline_history_committed_event_ids.contains(&event.id))
+            .map(|event| DeveloperPanelRow::Event {
+                sequence_no: event.sequence_no,
+                label: format!("{:?}/{:?}", event.event_type, event.source),
+                summary: developer_event_summary(event),
+            }),
+    );
+    rows
 }
 
 pub(crate) fn developer_fact_history_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {

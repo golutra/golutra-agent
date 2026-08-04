@@ -837,6 +837,139 @@ fn inline_session_history_is_inserted_only_once() {
 }
 
 #[test]
+fn completed_history_keeps_latest_response_next_to_composer() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_footer_context("/workspace", "gpt-test");
+    app.events = vec![
+        transcript_event(
+            1,
+            session_id,
+            task_id,
+            RuntimeEventType::TaskCreated,
+            json!({"payload": {"prompt": "compare completed layout"}}),
+        ),
+        transcript_event(
+            2,
+            session_id,
+            task_id,
+            RuntimeEventType::AssistantMessage,
+            json!({"content": "latest completed response"}),
+        ),
+    ];
+    app.projection = Some(UserProjection {
+        session_id,
+        task_id: Some(task_id),
+        status: golutra_core::TaskStatus::Completed,
+        visible_steps: Vec::new(),
+        pending_approval: None,
+        final_message: None,
+        residual_risks: Vec::new(),
+    });
+    app.enable_inline_history();
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(80, 24),
+        TerminalOptions {
+            viewport: Viewport::Inline(12),
+        },
+    )
+    .expect("inline terminal");
+    let mut history = InlineHistoryState::new(session_id);
+
+    history
+        .flush(&mut terminal, &mut app)
+        .expect("completed history");
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw completed frame");
+
+    let rows = (0..24)
+        .map(|row| {
+            (0..80)
+                .filter_map(|column| terminal.backend().buffer().cell((column, row)))
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    let response_row = rows
+        .iter()
+        .position(|row| row.contains("latest completed response"))
+        .expect("latest response row");
+    let composer_row = rows
+        .iter()
+        .position(|row| row.contains("Ask Golutra to change code or inspect the workspace"))
+        .expect("composer row");
+
+    assert!(
+        composer_row.saturating_sub(response_row) <= 3,
+        "latest response must stay immediately above the composer: {rows:#?}"
+    );
+}
+
+#[test]
+fn large_debug_history_does_not_exceed_ratatui_buffer_area() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let events = (1..=1_000)
+        .map(|sequence_no| {
+            transcript_event(
+                sequence_no,
+                session_id,
+                task_id,
+                RuntimeEventType::AssistantMessage,
+                json!({"content": format!("debug event {sequence_no}")}),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        true,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_footer_context("/workspace", "gpt-test");
+    app.events = events.clone();
+    app.developer_projection = Some(debug_projection_with_events(
+        session_id,
+        Some(task_id),
+        events,
+    ));
+    app.enable_inline_history();
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(80, 40),
+        TerminalOptions {
+            viewport: Viewport::Inline(12),
+        },
+    )
+    .expect("inline terminal");
+    let mut history = InlineHistoryState::new(session_id);
+
+    assert!(
+        history
+            .flush(&mut terminal, &mut app)
+            .expect("large debug history")
+    );
+    draw_inline_test_frame(&mut terminal, &mut app);
+    let rendered = terminal_buffer_text(&terminal);
+    let committed = rendered.find("#999 ").expect("last committed debug event");
+    let live = rendered.find("#1000 ").expect("live debug tail");
+    assert!(
+        committed < live,
+        "debug history batches must preserve order"
+    );
+}
+
+#[test]
 fn session_switch_clears_previous_history_while_replay_is_loading() {
     let first_session = SessionId::new();
     let first_task = TaskId::new();
@@ -869,6 +1002,7 @@ fn session_switch_clears_previous_history_while_replay_is_loading() {
     history
         .flush(&mut terminal, &mut app)
         .expect("initial history");
+    draw_inline_test_frame(&mut terminal, &mut app);
     assert!(terminal_buffer_text(&terminal).contains("old-session-only"));
 
     let next_session = SessionId::new();
@@ -897,12 +1031,14 @@ fn session_switch_clears_previous_history_while_replay_is_loading() {
         RuntimeEventType::AssistantMessage,
         json!({"content": "new-session-only"}),
     )];
+    app.invalidate_transcript_layout();
     app.history_replay_ready = true;
     assert!(
         history
             .flush(&mut terminal, &mut app)
             .expect("replayed history")
     );
+    draw_inline_test_frame(&mut terminal, &mut app);
     let replayed = terminal_buffer_text(&terminal);
     assert!(replayed.contains("new-session-only"));
     assert!(!replayed.contains("old-session-only"));
@@ -963,6 +1099,7 @@ fn debug_switch_clears_transcript_before_projection_finishes() {
             .flush(&mut terminal, &mut app)
             .expect("failed debug projection")
     );
+    draw_inline_test_frame(&mut terminal, &mut app);
     let failed = terminal_buffer_text(&terminal);
     assert_eq!(failed.matches("#1 AssistantMessage/Runtime").count(), 1);
     assert!(!failed.contains("transcript-projection-only"));
@@ -1014,6 +1151,7 @@ fn repeated_debug_facts_and_transcript_switches_do_not_duplicate_history() {
     let mut history = InlineHistoryState::new(session_id);
 
     history.flush(&mut terminal, &mut app).expect("transcript");
+    draw_inline_test_frame(&mut terminal, &mut app);
     assert_eq!(
         terminal_buffer_text(&terminal)
             .matches("unique-replay-prompt")
@@ -1023,6 +1161,7 @@ fn repeated_debug_facts_and_transcript_switches_do_not_duplicate_history() {
 
     app.set_debug_mode(true);
     history.flush(&mut terminal, &mut app).expect("debug");
+    draw_inline_test_frame(&mut terminal, &mut app);
     let debug = terminal_buffer_text(&terminal);
     assert_eq!(debug.matches("#1 TaskCreated/Runtime").count(), 1);
     assert_eq!(debug.matches("#2 AssistantMessage/Runtime").count(), 1);
@@ -1031,6 +1170,7 @@ fn repeated_debug_facts_and_transcript_switches_do_not_duplicate_history() {
     history
         .flush(&mut terminal, &mut app)
         .expect("expanded facts");
+    draw_inline_test_frame(&mut terminal, &mut app);
     let expanded = terminal_buffer_text(&terminal);
     assert_eq!(expanded.matches("#1 TaskCreated/Runtime").count(), 1);
     assert_eq!(expanded.matches("#2 AssistantMessage/Runtime").count(), 1);
@@ -1039,6 +1179,7 @@ fn repeated_debug_facts_and_transcript_switches_do_not_duplicate_history() {
     history
         .flush(&mut terminal, &mut app)
         .expect("transcript switch");
+    draw_inline_test_frame(&mut terminal, &mut app);
     let transcript = terminal_buffer_text(&terminal);
     assert_eq!(transcript.matches("unique-replay-prompt").count(), 1);
     assert!(!transcript.contains("#1 TaskCreated/Runtime"));
@@ -1047,9 +1188,10 @@ fn repeated_debug_facts_and_transcript_switches_do_not_duplicate_history() {
     history
         .flush(&mut terminal, &mut app)
         .expect("debug switch");
+    draw_inline_test_frame(&mut terminal, &mut app);
     let debug_again = terminal_buffer_text(&terminal);
     assert_eq!(debug_again.matches("#1 TaskCreated/Runtime").count(), 1);
-    assert_eq!(debug_again.matches("Golutra").count(), 1);
+    assert_eq!(debug_again.matches("Golutra (v").count(), 1);
 }
 
 #[test]
@@ -3777,6 +3919,12 @@ fn terminal_buffer_text(terminal: &Terminal<TestBackend>) -> String {
         .collect()
 }
 
+fn draw_inline_test_frame(terminal: &mut Terminal<TestBackend>, app: &mut TuiApp) {
+    terminal
+        .draw(|frame| draw_ui(frame, app))
+        .expect("draw inline frame");
+}
+
 #[tokio::test]
 async fn transcript_operation_details_toggle_with_ctrl_o_and_mouse() {
     let transport = RuntimeTransport::in_memory().await.expect("transport");
@@ -3854,6 +4002,7 @@ async fn transcript_operation_details_toggle_with_ctrl_o_and_mouse() {
     .await
     .expect("collapse all transcript operations");
 
+    app.enable_inline_history();
     let mut terminal = Terminal::new(TestBackend::new(100, 20)).expect("terminal");
     terminal
         .draw(|frame| draw_ui(frame, &mut app))

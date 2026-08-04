@@ -147,12 +147,7 @@ impl InlineHistoryState {
             return Ok(false);
         }
 
-        let height = history_height(&lines, width);
-        terminal.insert_before(height, |buffer| {
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .render(buffer.area, buffer);
-        })?;
+        insert_history_lines(terminal, lines, width)?;
 
         self.header_emitted = true;
         self.committed_event_ids
@@ -168,17 +163,29 @@ fn rendered_history_entries(
     mode: InlineHistoryMode,
 ) -> Vec<RenderedHistoryEntry> {
     match mode {
-        InlineHistoryMode::Transcript => event_operation_entries(&app.events)
-            .into_iter()
-            .take_while(|entry| entry.stable)
-            .map(|entry| RenderedHistoryEntry {
-                id: entry.id,
-                lines: render_operation_projection_lines(app, vec![entry.projection]),
-            })
-            .collect(),
+        InlineHistoryMode::Transcript => {
+            let entries = event_operation_entries(&app.events);
+            let stable_count = entries.iter().take_while(|entry| entry.stable).count();
+            // Keep the newest finalized item in the live viewport until another item replaces it.
+            let committed_count = if stable_count == entries.len() {
+                stable_count.saturating_sub(1)
+            } else {
+                stable_count
+            };
+            entries
+                .into_iter()
+                .take(committed_count)
+                .map(|entry| RenderedHistoryEntry {
+                    id: entry.id,
+                    lines: render_operation_projection_lines(app, vec![entry.projection]),
+                })
+                .collect()
+        }
         InlineHistoryMode::Developer { facts_expanded } => {
             let mut events = app.events.iter().collect::<Vec<_>>();
             events.sort_by_key(|event| event.sequence_no);
+            // The live developer pane owns the latest event so it stays next to the composer.
+            events.pop();
             events
                 .into_iter()
                 .map(|event| RenderedHistoryEntry {
@@ -283,9 +290,84 @@ pub(crate) fn session_history_lines(app: &TuiApp, width: u16) -> Vec<Line<'stati
     lines
 }
 
-fn history_height(lines: &[Line<'static>], width: u16) -> u16 {
-    let rows = Paragraph::new(lines.to_vec())
+fn insert_history_lines<B: Backend>(
+    terminal: &mut Terminal<B>,
+    lines: Vec<Line<'static>>,
+    width: u16,
+) -> io::Result<()> {
+    let width = width.max(1);
+    // Ratatui 0.28 clamps Buffer area to u16::MAX while indexing the full rectangle.
+    let max_rows = usize::from(u16::MAX / width).max(1);
+    let mut batch = Vec::new();
+    let mut batch_rows = 0_usize;
+
+    for line in lines {
+        let line_rows = history_line_height(&line, width);
+        if line_rows > max_rows {
+            insert_history_batch(terminal, std::mem::take(&mut batch), batch_rows)?;
+            batch_rows = 0;
+            insert_tall_history_line(terminal, line, line_rows, max_rows)?;
+            continue;
+        }
+        if batch_rows.saturating_add(line_rows) > max_rows {
+            insert_history_batch(terminal, std::mem::take(&mut batch), batch_rows)?;
+            batch_rows = 0;
+        }
+        batch_rows = batch_rows.saturating_add(line_rows);
+        batch.push(line);
+    }
+    insert_history_batch(terminal, batch, batch_rows)
+}
+
+fn insert_history_batch<B: Backend>(
+    terminal: &mut Terminal<B>,
+    lines: Vec<Line<'static>>,
+    rows: usize,
+) -> io::Result<()> {
+    if lines.is_empty() || rows == 0 {
+        return Ok(());
+    }
+    let height = u16::try_from(rows)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "history batch is too tall"))?;
+    terminal.insert_before(height, move |buffer| {
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .render(buffer.area, buffer);
+    })
+}
+
+fn insert_tall_history_line<B: Backend>(
+    terminal: &mut Terminal<B>,
+    line: Line<'static>,
+    rows: usize,
+    max_rows: usize,
+) -> io::Result<()> {
+    if rows > usize::from(u16::MAX) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "one history line exceeds the terminal scroll limit",
+        ));
+    }
+    let mut offset = 0_usize;
+    while offset < rows {
+        let chunk_rows = (rows - offset).min(max_rows);
+        let height = u16::try_from(chunk_rows).expect("history chunk is bounded by u16::MAX");
+        let scroll = u16::try_from(offset).expect("history line height was bounded by u16::MAX");
+        let line = line.clone();
+        terminal.insert_before(height, move |buffer| {
+            Paragraph::new(line)
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0))
+                .render(buffer.area, buffer);
+        })?;
+        offset = offset.saturating_add(chunk_rows);
+    }
+    Ok(())
+}
+
+fn history_line_height(line: &Line<'static>, width: u16) -> usize {
+    Paragraph::new(line.clone())
         .wrap(Wrap { trim: false })
-        .line_count(width.max(1));
-    u16::try_from(rows).unwrap_or(u16::MAX).max(1)
+        .line_count(width.max(1))
+        .max(1)
 }

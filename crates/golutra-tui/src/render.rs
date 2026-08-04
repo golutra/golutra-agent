@@ -262,6 +262,7 @@ pub(crate) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .expect("transcript layout is prepared before drawing")
         .layout;
     let visible_rows = area.height as usize;
+    let top_padding = transcript_top_padding(app, layout, area);
     let window = layout.visible_window(
         visible_rows,
         app.transcript_scroll.offset_from_bottom,
@@ -308,7 +309,13 @@ pub(crate) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let paragraph = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((u16::try_from(local_scroll).unwrap_or(u16::MAX), 0));
-    frame.render_widget(paragraph, area);
+    let content_area = Rect::new(
+        area.x,
+        area.y.saturating_add(top_padding),
+        area.width,
+        area.height.saturating_sub(top_padding),
+    );
+    frame.render_widget(paragraph, content_area);
 }
 
 pub(crate) fn draw_auth_dialog(

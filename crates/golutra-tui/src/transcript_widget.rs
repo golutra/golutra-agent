@@ -199,6 +199,21 @@ pub(crate) fn transcript_render_rows(app: &TuiApp) -> Vec<TranscriptRenderRow> {
     render_operation_projections(app, rendered_transcript_operation_projections(app))
 }
 
+pub(crate) fn transcript_top_padding(app: &TuiApp, layout: &TranscriptLayout, area: Rect) -> u16 {
+    if !app.inline_history_enabled
+        || !app.transcript_scroll.follow_tail
+        || app.transcript_top_row_override.is_some()
+        || app.transcript_search.is_some()
+    {
+        return 0;
+    }
+    area.height.saturating_sub(
+        u16::try_from(layout.row_count)
+            .unwrap_or(u16::MAX)
+            .min(area.height),
+    )
+}
+
 pub(crate) fn render_operation_projection_lines(
     app: &TuiApp,
     projections: Vec<super::OperationProjection>,
@@ -253,13 +268,18 @@ pub(crate) fn transcript_toggle_at(
         return None;
     }
     let layout = transcript_layout(app, area);
+    let top_padding = transcript_top_padding(app, &layout, area);
+    let content_top = area.y.saturating_add(top_padding);
+    if row < content_top {
+        return None;
+    }
     let visible_rows = area.height as usize;
     let window = layout.visible_window(
         visible_rows,
         app.transcript_scroll.offset_from_bottom,
         app.transcript_top_row_override,
     );
-    let offset = usize::from(row.saturating_sub(area.y));
+    let offset = usize::from(row.saturating_sub(content_top));
     let visual_row = window.start.saturating_add(offset);
     layout
         .rows
@@ -275,6 +295,7 @@ pub(crate) fn transcript_toggle_regions(app: &TuiApp, area: Rect) -> Vec<(String
         return Vec::new();
     }
     let layout = transcript_layout(app, area);
+    let top_padding = transcript_top_padding(app, &layout, area);
     let visible_rows = area.height as usize;
     let window = layout.visible_window(
         visible_rows,
@@ -294,6 +315,7 @@ pub(crate) fn transcript_toggle_regions(app: &TuiApp, area: Rect) -> Vec<(String
             let row_offset = start.saturating_sub(window.start);
             let y = area
                 .y
+                .saturating_add(top_padding)
                 .saturating_add(u16::try_from(row_offset).unwrap_or(u16::MAX));
             Some((
                 format!("transcript_operation_toggle:{}", operation_id.as_str()),
