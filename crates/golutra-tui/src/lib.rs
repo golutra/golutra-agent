@@ -147,10 +147,8 @@ pub fn event_timeline_lines(events: &[Value]) -> Vec<EventTimelineLine> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashDebugCommand {
-    Toggle,
-    Expand,
-    Compact,
-    Off,
+    ToggleView,
+    ToggleObservationDetail,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -386,7 +384,7 @@ const TOP_LEVEL_SLASH_HINTS: &[SlashCommandHint] = &[
     },
     SlashCommandHint {
         command: "/debug",
-        description: "reload and toggle runtime observation detail",
+        description: "toggle debug view; use /debug switch for detail",
         selection: SlashCommandSelection::Execute,
     },
     SlashCommandHint {
@@ -607,17 +605,11 @@ pub fn parse_slash_input(input: &str) -> SlashInput {
         "/effort" => parse_effort_command(&tokens),
         "/permissions" | "/permission" => parse_permissions_command(&tokens),
         "/debug" => match tokens.as_slice() {
-            [_] => SlashInput::Command(SlashCommand::Debug(SlashDebugCommand::Toggle)),
-            [_, action] if action == "expand" => {
-                SlashInput::Command(SlashCommand::Debug(SlashDebugCommand::Expand))
-            }
-            [_, action] if action == "compact" => {
-                SlashInput::Command(SlashCommand::Debug(SlashDebugCommand::Compact))
-            }
-            [_, action] if action == "off" => {
-                SlashInput::Command(SlashCommand::Debug(SlashDebugCommand::Off))
-            }
-            _ => SlashInput::Error("/debug syntax: /debug [expand|compact|off]".to_owned()),
+            [_] => SlashInput::Command(SlashCommand::Debug(SlashDebugCommand::ToggleView)),
+            [_, action] if action == "switch" => SlashInput::Command(SlashCommand::Debug(
+                SlashDebugCommand::ToggleObservationDetail,
+            )),
+            _ => SlashInput::Error("/debug syntax: /debug [switch]".to_owned()),
         },
         "/takeover" => SlashInput::Command(SlashCommand::Takeover),
         "/abort" => SlashInput::Command(SlashCommand::Abort),
@@ -1307,26 +1299,20 @@ mod tests {
     }
 
     #[test]
-    fn slash_parser_accepts_debug_reload_modes() {
+    fn slash_parser_accepts_debug_mode_and_detail_switches() {
         assert_eq!(
             parse_slash_input("/debug"),
-            SlashInput::Command(SlashCommand::Debug(SlashDebugCommand::Toggle))
+            SlashInput::Command(SlashCommand::Debug(SlashDebugCommand::ToggleView))
         );
         assert_eq!(
-            parse_slash_input("/debug expand"),
-            SlashInput::Command(SlashCommand::Debug(SlashDebugCommand::Expand))
-        );
-        assert_eq!(
-            parse_slash_input("/debug compact"),
-            SlashInput::Command(SlashCommand::Debug(SlashDebugCommand::Compact))
-        );
-        assert_eq!(
-            parse_slash_input("/debug off"),
-            SlashInput::Command(SlashCommand::Debug(SlashDebugCommand::Off))
+            parse_slash_input("/debug switch"),
+            SlashInput::Command(SlashCommand::Debug(
+                SlashDebugCommand::ToggleObservationDetail
+            ))
         );
         assert!(matches!(
-            parse_slash_input("/debug verbose"),
-            SlashInput::Error(error) if error.contains("/debug [expand|compact|off]")
+            parse_slash_input("/debug expand"),
+            SlashInput::Error(error) if error.contains("/debug [switch]")
         ));
     }
 

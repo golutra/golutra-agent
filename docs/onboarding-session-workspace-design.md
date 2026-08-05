@@ -305,7 +305,7 @@ TUI 输入框现在先经过 slash command parser：
 | `/auth logout [profile]` | revoke（provider 支持时）并删除本地 credential，禁用 profile；省略 profile 时退出 active profile |
 | `/auth use <profile> [user]` | 激活已保存的全局 provider profile |
 | `/export` | 按 `/resume` 风格选择当前 cwd 的 anchor session，输入 `1`、`+N` 或 `-N`，再输入绝对目录，导出对话和治理事实 |
-| `/status`、`/debug [expand\|compact\|off]`、`/abort`、`/clear`、`/quit` | 本地状态、debug 重载/显示、abort 和退出控制 |
+| `/status`、`/debug [switch]`、`/abort`、`/clear`、`/quit` | 本地状态、debug 模式/详情切换、abort 和退出控制 |
 
 输入体验对齐 Codex：
 
@@ -313,7 +313,7 @@ TUI 输入框现在先经过 slash command parser：
 - Up/Down 或 Tab 可移动候选，Enter 会启动可直接执行的命令；需要参数的命令会先补全命令文本并等待用户继续输入。
 - `/resume` 选择 session 后会清空当前 TUI 的本地 command messages、event cursor、输入框和 transcript scroll 状态，再 replay 目标 session 的历史；这样不会把旧 session 的提示或历史混到新 session。
 - 普通 transcript 默认跟随最新内容；PageUp/PageDown 按页翻历史，输入框有草稿时 Home/End 移动编辑光标，草稿为空时 Home/End 才跳到最旧/最新。TUI 捕获鼠标滚轮并按命中区域路由：对话区和 developer 区独立滚动；文本复制使用终端的修饰键选择模式（通常为 Shift+拖动）。
-- `--debug` 或 `/debug` 将主体区按左右 1:1 分为 transcript 和 runtime observations。`/debug` 首次进入 expanded，再次执行会在 expanded/compact 间切换；`/debug expand`、`/debug compact` 和 `/debug off` 提供显式状态。除 `off` 外每次命令都重新读取当前 session/task 的完整 canonical event history 和 `DebugProjection`，按事件序号把左侧正文与右侧观测作为同一行组写入终端原生 scrollback；facts 快照只在 expanded 重载时写入右半历史，不保留可点击标题或固定 dashboard。最新尾部贴近 composer，旧记录由终端原生翻页查看；`Ctrl+T` 只切换全正文与双列视图。
+- `--debug` 或 `/debug` 将主体区分为互不越界的左右等分区域，分别展示 transcript 和 runtime observations。`/debug` 在普通模式与 debug 模式间切换，进入时按照保留的 expanded/compact 偏好显示，并重新读取当前 session/task 的完整 canonical event history；进入 debug 时同时读取 `DebugProjection`。`/debug switch` 翻转 expanded/compact 偏好：普通模式下只更新偏好，不重放屏幕；debug 模式下重新读取历史与投影并重绘。事件按序把左侧正文与右侧观测作为同一行组写入终端原生 scrollback；facts 快照只在 expanded 重载时写入右半历史，不保留可点击标题或固定 dashboard。最新尾部贴近 composer，旧记录由终端原生翻页查看；`Ctrl+T` 只切换全正文与双列视图。
 - 普通 transcript 从同一 `RuntimeEvent` 流投影简洁运行记录：文件工具显示 `Edited N files (+A -D)`，shell 显示 `Ran`，读取和搜索显示 `Explored`；工具失败、超时、取消和阻断保留对应状态颜色和标题。命令、耗时/输出指标仍可在 operation 展开层查看，完整 structured facts、verification、loop、evaluation 和 trace completeness 只在 Developer runtime 展开，不能混入普通对话。
 - 工具开始、采样进度和完成事件按稳定 `tool_call_id` 合并为一条 operation；普通视图默认折叠输出/diff，成功、失败、超时、取消和阻断使用明确状态。`Ctrl+O` 或标题箭头展开；Driver 快照同时返回 `transcript_operation_toggle:<tool_call_id>` hit region，供无头 agent 精确操作。
 - `/export` 不切换当前 session：先选择 anchor，再输入范围（空/`1` 只导出 anchor，`+N` 包含 anchor 及其前 N-1 个更新 session，`-N` 包含 anchor 及其后 N-1 个更旧 session），最后 review 绝对目的地。导出目录使用同文件系统临时目录、owner-only 权限、校验后原子 rename；默认 `full-redacted`，Raw checkpoint blob 只在 manifest 标记为省略。

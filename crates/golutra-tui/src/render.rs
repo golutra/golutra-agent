@@ -18,13 +18,10 @@ const QUESTION_FREE_TEXT_PREFIX: &str = "    ";
 const QUESTION_FREE_TEXT_PREFIX_WIDTH: u16 = 4;
 const MAX_QUESTION_FREE_TEXT_ROWS: u16 = 4;
 const SETTINGS_MODEL_PREFIX_WIDTH: u16 = 9;
-const DEBUG_PANE_GAP: u16 = 1;
-
-pub(crate) fn debug_pane_widths(width: u16) -> (u16, u16, u16) {
-    let gap = DEBUG_PANE_GAP.min(width.saturating_sub(2));
-    let transcript = width.saturating_sub(gap) / 2;
-    let developer = width.saturating_sub(gap).saturating_sub(transcript);
-    (transcript, gap, developer)
+pub(crate) fn debug_pane_widths(width: u16) -> (u16, u16) {
+    let transcript = width / 2;
+    let developer = width.saturating_sub(transcript);
+    (transcript, developer)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -98,11 +95,11 @@ pub(crate) fn ui_layout(area: Rect, app: &TuiApp) -> UiLayoutSnapshot {
     };
     let (transcript, developer) = match body_mode {
         BodyLayoutMode::ResponseAndDeveloper => {
-            let (transcript_width, gap, developer_width) = debug_pane_widths(chunks[0].width);
+            let (transcript_width, developer_width) = debug_pane_widths(chunks[0].width);
             let transcript =
                 Rect::new(chunks[0].x, chunks[0].y, transcript_width, chunks[0].height);
             let developer = Rect::new(
-                transcript.right().saturating_add(gap),
+                transcript.right(),
                 chunks[0].y,
                 developer_width,
                 chunks[0].height,

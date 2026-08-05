@@ -117,7 +117,7 @@ pub(crate) fn help_lines(topic: HelpTopic, keymap: KeymapMode, context: &str) ->
             "/pause           pause an active task".to_owned(),
             "/continue        resume a paused task".to_owned(),
             "/abort           stop an active task".to_owned(),
-            "/debug [expand|compact|off]  reload runtime observations".to_owned(),
+            "/debug [switch]  toggle debug view or observation detail".to_owned(),
             String::new(),
             "Approval and question dialogs keep the task paused until resolved.".to_owned(),
         ],

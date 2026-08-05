@@ -173,7 +173,7 @@ impl InlineHistoryState {
                     developer_fact_history_lines(app, width)
                 }
                 InlineHistoryMode::DebugSplit { expanded: true } => {
-                    let (_, _, developer_width) = debug_pane_widths(width);
+                    let (_, developer_width) = debug_pane_widths(width);
                     debug_split_history_lines(
                         Vec::new(),
                         developer_fact_history_lines(app, developer_width),
@@ -280,7 +280,7 @@ fn debug_split_history_entries(
             .position(|event| event.id == id)
             .unwrap_or_default()
     });
-    let (_, _, developer_width) = debug_pane_widths(width);
+    let (_, developer_width) = debug_pane_widths(width);
     let rendered = events
         .into_iter()
         .map(|event| {
@@ -305,12 +305,12 @@ fn debug_split_history_entries(
     rendered.into_iter().take(committed_count).collect()
 }
 
-fn debug_split_history_lines(
+pub(crate) fn debug_split_history_lines(
     transcript: Vec<Line<'static>>,
     developer: Vec<Line<'static>>,
     width: u16,
 ) -> Vec<Line<'static>> {
-    let (transcript_width, gap_width, developer_width) = debug_pane_widths(width);
+    let (transcript_width, developer_width) = debug_pane_widths(width);
     let transcript_rows = wrapped_history_rows(transcript, transcript_width);
     let developer_rows = wrapped_history_rows(developer, developer_width);
     let row_count = transcript_rows.len().max(developer_rows.len());
@@ -321,9 +321,6 @@ fn debug_split_history_lines(
                 .get(row)
                 .cloned()
                 .unwrap_or_else(|| vec![Span::raw(" ".repeat(usize::from(transcript_width)))]);
-            if gap_width > 0 {
-                spans.push(Span::raw(" ".repeat(usize::from(gap_width))));
-            }
             spans.extend(
                 developer_rows
                     .get(row)

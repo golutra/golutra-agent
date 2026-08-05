@@ -4,6 +4,7 @@ use golutra_llm::ProviderReasoningEffort;
 use golutra_protocol::{RuntimeEventType, VisibleStep};
 use ratatui::backend::TestBackend;
 use ratatui::layout::{Position, Rect};
+use ratatui::text::Line;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -1129,10 +1130,10 @@ fn debug_history_pairs_transcript_and_observations_in_terminal_scrollback() {
             .expect("oldest observation in terminal scrollback");
         assert!(first.contains("paired 正文 1"), "{width}: {first:?}");
         let observation_column = first.find("#1 ").expect("observation column");
-        let (transcript_width, gap_width, _) = debug_pane_widths(width);
+        let (transcript_width, _) = debug_pane_widths(width);
         assert_eq!(
             display_width(&first[..observation_column]),
-            usize::from(transcript_width.saturating_add(gap_width)),
+            usize::from(transcript_width),
             "{width}: {first:?}"
         );
         assert_eq!(
@@ -1150,8 +1151,57 @@ fn debug_history_pairs_transcript_and_observations_in_terminal_scrollback() {
         let facts_column = facts.find("facts events=36").expect("facts column");
         assert_eq!(
             display_width(&facts[..facts_column]),
-            usize::from(transcript_width.saturating_add(gap_width)),
+            usize::from(transcript_width),
             "{width}: {facts:?}"
+        );
+    }
+}
+
+#[test]
+fn debug_split_history_keeps_both_columns_inside_equal_halves() {
+    for width in [80, 81, 120, 121] {
+        let (transcript_width, developer_width) = debug_pane_widths(width);
+        assert_eq!(transcript_width, width / 2);
+        assert_eq!(developer_width, width - transcript_width);
+        assert!(transcript_width.abs_diff(developer_width) <= 1);
+
+        let rows = debug_split_history_lines(
+            vec![Line::from("L".repeat(usize::from(width) * 2))],
+            vec![Line::from("R".repeat(usize::from(width) * 2))],
+            width,
+        );
+        assert!(!rows.is_empty());
+        for row in rows {
+            let text = row.to_string();
+            assert_eq!(
+                display_width(&text),
+                usize::from(width),
+                "{width}: {text:?}"
+            );
+            let boundary = usize::from(transcript_width);
+            assert!(
+                text[..boundary]
+                    .chars()
+                    .all(|character| matches!(character, 'L' | ' ')),
+                "left transcript crossed its half at width {width}: {text:?}"
+            );
+            assert!(
+                text[boundary..]
+                    .chars()
+                    .all(|character| matches!(character, 'R' | ' ')),
+                "right observation crossed its half at width {width}: {text:?}"
+            );
+        }
+
+        let unicode_rows = debug_split_history_lines(
+            vec![Line::from("旅途正文".repeat(usize::from(width)))],
+            vec![Line::from("运行观测".repeat(usize::from(width)))],
+            width,
+        );
+        assert!(
+            unicode_rows
+                .iter()
+                .all(|row| row.width() == usize::from(width))
         );
     }
 }
@@ -3214,7 +3264,12 @@ fn debug_layout_keeps_transcript_left_and_observations_right_at_every_width() {
     assert_eq!(wide.body_mode, BodyLayoutMode::ResponseAndDeveloper);
     let wide_developer = wide.developer.expect("wide observation pane");
     assert_eq!(wide.transcript.x, wide.body.x);
-    assert_eq!(wide_developer.x, wide.transcript.right() + 1);
+    assert_eq!(wide.transcript.width, wide.body.width / 2);
+    assert_eq!(wide_developer.x, wide.transcript.right());
+    assert_eq!(
+        wide_developer.width,
+        wide.body.width - wide.transcript.width
+    );
     assert_eq!(wide_developer.right(), wide.body.right());
     assert_eq!(wide.transcript.height, wide.body.height);
     assert_eq!(wide_developer.height, wide.body.height);
@@ -3223,7 +3278,12 @@ fn debug_layout_keeps_transcript_left_and_observations_right_at_every_width() {
     assert_eq!(narrow.body_mode, BodyLayoutMode::ResponseAndDeveloper);
     let narrow_developer = narrow.developer.expect("narrow observation pane");
     assert_eq!(narrow.transcript.x, narrow.body.x);
-    assert_eq!(narrow_developer.x, narrow.transcript.right() + 1);
+    assert_eq!(narrow.transcript.width, narrow.body.width / 2);
+    assert_eq!(narrow_developer.x, narrow.transcript.right());
+    assert_eq!(
+        narrow_developer.width,
+        narrow.body.width - narrow.transcript.width
+    );
     assert_eq!(narrow_developer.right(), narrow.body.right());
     assert_eq!(narrow.transcript.height, narrow.body.height);
     assert_eq!(narrow_developer.height, narrow.body.height);
@@ -3619,7 +3679,12 @@ fn developer_panel_exposes_governance_without_leaking_into_normal_view() {
     let layout = app.layout;
     let developer_area = layout.developer.expect("developer area");
     assert_eq!(layout.body_mode, BodyLayoutMode::ResponseAndDeveloper);
-    assert_eq!(developer_area.x, layout.transcript.right() + 1);
+    assert_eq!(developer_area.x, layout.transcript.right());
+    assert_eq!(layout.transcript.width, layout.body.width / 2);
+    assert_eq!(
+        developer_area.width,
+        layout.body.width - layout.transcript.width
+    );
     assert!(layout.transcript.width > 0);
 }
 
@@ -3741,7 +3806,7 @@ fn transcript_wraps_long_body_lines_to_the_available_width() {
 }
 
 #[tokio::test]
-async fn debug_command_reloads_history_and_toggles_observation_detail() {
+async fn debug_commands_keep_mode_and_observation_detail_independent() {
     let transport = RuntimeTransport::in_memory().await.expect("transport");
     let mut app = TuiApp::new(
         ThreadId::new(),
@@ -3754,14 +3819,39 @@ async fn debug_command_reloads_history_and_toggles_observation_detail() {
 
     app.refresh(&transport).await.expect("normal refresh");
     assert!(app.developer_projection.is_none());
-
-    app.execute_slash_command(&transport, SlashCommand::Debug(SlashDebugCommand::Toggle))
-        .await
-        .expect("enable debug");
-    assert!(app.debug_mode);
     assert!(app.developer_observations_expanded);
+
+    app.events.push(transcript_event(
+        1,
+        app.session_id,
+        TaskId::new(),
+        RuntimeEventType::AssistantMessage,
+        json!({"content": "ordinary history must not reload"}),
+    ));
+    let ordinary_generation = app.history_replay_generation;
+    app.execute_slash_command(
+        &transport,
+        SlashCommand::Debug(SlashDebugCommand::ToggleObservationDetail),
+    )
+    .await
+    .expect("change future debug detail");
+    assert!(!app.debug_mode);
+    assert!(!app.developer_observations_expanded);
+    assert!(app.developer_projection.is_none());
+    assert_eq!(app.events.len(), 1);
+    assert_eq!(app.history_replay_generation, ordinary_generation);
+
+    app.execute_slash_command(
+        &transport,
+        SlashCommand::Debug(SlashDebugCommand::ToggleView),
+    )
+    .await
+    .expect("enable debug");
+    assert!(app.debug_mode);
+    assert!(!app.developer_observations_expanded);
     assert!(app.developer_projection.is_some());
     assert!(app.developer_error.is_none());
+    assert!(app.events.is_empty());
 
     app.events.push(transcript_event(
         1,
@@ -3771,26 +3861,49 @@ async fn debug_command_reloads_history_and_toggles_observation_detail() {
         json!({"content": "local history must be replaced"}),
     ));
     let generation = app.history_replay_generation;
-    app.execute_slash_command(&transport, SlashCommand::Debug(SlashDebugCommand::Toggle))
-        .await
-        .expect("compact and reload debug");
+    app.execute_slash_command(
+        &transport,
+        SlashCommand::Debug(SlashDebugCommand::ToggleObservationDetail),
+    )
+    .await
+    .expect("expand and reload debug");
     assert!(app.debug_mode);
-    assert!(!app.developer_observations_expanded);
+    assert!(app.developer_observations_expanded);
     assert!(app.events.is_empty());
     assert_eq!(app.history_replay_generation, generation + 1);
 
-    app.execute_slash_command(&transport, SlashCommand::Debug(SlashDebugCommand::Expand))
-        .await
-        .expect("expand and reload debug");
+    app.events.push(transcript_event(
+        2,
+        app.session_id,
+        TaskId::new(),
+        RuntimeEventType::AssistantMessage,
+        json!({"content": "debug history must be replaced when leaving"}),
+    ));
+    let generation = app.history_replay_generation;
+    app.execute_slash_command(
+        &transport,
+        SlashCommand::Debug(SlashDebugCommand::ToggleView),
+    )
+    .await
+    .expect("disable debug");
+    assert!(!app.debug_mode);
     assert!(app.developer_observations_expanded);
+    assert!(app.developer_projection.is_none());
+    assert!(app.developer_error.is_none());
+    assert!(app.events.is_empty());
+    assert_eq!(app.history_replay_generation, generation + 1);
 
-    app.execute_slash_command(&transport, SlashCommand::Debug(SlashDebugCommand::Off))
-        .await
-        .expect("disable debug");
+    let generation = app.history_replay_generation;
+    app.execute_slash_command(
+        &transport,
+        SlashCommand::Debug(SlashDebugCommand::ToggleObservationDetail),
+    )
+    .await
+    .expect("change future debug detail again");
     assert!(!app.debug_mode);
     assert!(!app.developer_observations_expanded);
     assert!(app.developer_projection.is_none());
-    assert!(app.developer_error.is_none());
+    assert_eq!(app.history_replay_generation, generation);
 }
 
 #[tokio::test]

@@ -474,7 +474,7 @@ impl TuiApp {
             change_projection: ChangeProjection::default(),
             expanded_operations: HashSet::new(),
             transcript_details_expanded: false,
-            developer_observations_expanded: debug_mode,
+            developer_observations_expanded: true,
             transcript_scroll: PaneScrollState {
                 follow_tail: true,
                 ..PaneScrollState::default()
@@ -762,6 +762,19 @@ impl TuiApp {
         Ok(())
     }
 
+    async fn reload_transcript_history(
+        &mut self,
+        transport: &RuntimeTransport,
+    ) -> miette::Result<()> {
+        let history = load_complete_event_history(transport, self.session_id, self.task_id)
+            .await
+            .map_err(|error| miette::miette!("{error}"))?;
+        self.begin_history_replay();
+        self.apply_loaded_history(history);
+        self.status_message = "transcript history reloaded".to_owned();
+        Ok(())
+    }
+
     async fn load_older_history(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
         if !self.history_has_more_before {
             self.history_load_requested = false;
@@ -809,13 +822,10 @@ impl TuiApp {
         }
         self.debug_mode = enabled;
         self.body_view_mode = BodyViewMode::Auto;
-        self.request_history_rebuild();
         if enabled {
-            self.developer_observations_expanded = true;
             self.developer_error = None;
             self.status_message = "developer runtime view visible".to_owned();
         } else {
-            self.developer_observations_expanded = false;
             self.developer_projection = None;
             self.developer_error = None;
             self.status_message = "developer runtime view hidden".to_owned();
@@ -2235,24 +2245,24 @@ impl TuiApp {
                 Some(unrestricted) => self.set_permission_mode(unrestricted),
                 None => self.open_settings_dialog(),
             },
-            SlashCommand::Debug(action) => {
-                if action == SlashDebugCommand::Off {
-                    self.set_debug_mode(false);
-                } else {
-                    let expanded = match action {
-                        SlashDebugCommand::Toggle => {
-                            !self.debug_mode || !self.developer_observations_expanded
-                        }
-                        SlashDebugCommand::Expand => true,
-                        SlashDebugCommand::Compact => false,
-                        SlashDebugCommand::Off => unreachable!("handled above"),
-                    };
-                    self.set_debug_mode(true);
-                    self.body_view_mode = BodyViewMode::Auto;
-                    self.developer_observations_expanded = expanded;
-                    self.reload_debug_history(transport).await?;
+            SlashCommand::Debug(action) => match action {
+                SlashDebugCommand::ToggleView => {
+                    let enabled = !self.debug_mode;
+                    self.set_debug_mode(enabled);
+                    if enabled {
+                        self.reload_debug_history(transport).await?;
+                    } else {
+                        self.reload_transcript_history(transport).await?;
+                    }
                 }
-            }
+                SlashDebugCommand::ToggleObservationDetail => {
+                    self.developer_observations_expanded = !self.developer_observations_expanded;
+                    if self.debug_mode {
+                        self.body_view_mode = BodyViewMode::Auto;
+                        self.reload_debug_history(transport).await?;
+                    }
+                }
+            },
             SlashCommand::Takeover => {
                 let ack = self
                     .send_control_command(transport, SessionCommandKind::Takeover)
