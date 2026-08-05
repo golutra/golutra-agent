@@ -902,7 +902,6 @@ async fn snapshot_render_does_not_mutate_the_active_pane_layout() {
         missing_sections: Vec::new(),
         retention_losses: Vec::new(),
     });
-    driver.app.developer_facts_expanded = true;
     driver.refresh_active_layout().expect("active layout");
     driver.app.transcript_top_row_override = Some(3);
 

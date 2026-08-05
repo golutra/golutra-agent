@@ -378,7 +378,7 @@ const TOP_LEVEL_SLASH_HINTS: &[SlashCommandHint] = &[
     },
     SlashCommandHint {
         command: "/debug",
-        description: "toggle developer runtime view",
+        description: "refresh and toggle runtime observations",
         selection: SlashCommandSelection::Execute,
     },
     SlashCommandHint {

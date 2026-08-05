@@ -18,6 +18,7 @@ const QUESTION_FREE_TEXT_PREFIX: &str = "    ";
 const QUESTION_FREE_TEXT_PREFIX_WIDTH: u16 = 4;
 const MAX_QUESTION_FREE_TEXT_ROWS: u16 = 4;
 const SETTINGS_MODEL_PREFIX_WIDTH: u16 = 9;
+const DEBUG_PANE_GAP: u16 = 1;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum BodyLayoutMode {
@@ -63,11 +64,6 @@ impl UiLayoutSnapshot {
             UiHitTarget::None
         }
     }
-
-    pub(crate) fn developer_facts_toggle_hit(self, x: u16, y: u16, app: &TuiApp) -> bool {
-        developer_facts_indicator(app).is_some()
-            && rect_contains(developer_facts_toggle_hit_rect(self.bottom), x, y)
-    }
 }
 
 fn rect_contains(area: Rect, x: u16, y: u16) -> bool {
@@ -89,17 +85,27 @@ pub(crate) fn ui_layout(area: Rect, app: &TuiApp) -> UiLayoutSnapshot {
     } else {
         match app.body_view_mode {
             BodyViewMode::Transcript => BodyLayoutMode::Transcript,
-            BodyViewMode::Auto | BodyViewMode::Developer => BodyLayoutMode::Developer,
-            BodyViewMode::Split => BodyLayoutMode::ResponseAndDeveloper,
+            BodyViewMode::Developer => BodyLayoutMode::Developer,
+            BodyViewMode::Auto | BodyViewMode::Split => BodyLayoutMode::ResponseAndDeveloper,
         }
     };
     let (transcript, developer) = match body_mode {
         BodyLayoutMode::ResponseAndDeveloper => {
-            let body = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(chunks[0]);
-            (body[0], Some(body[1]))
+            let gap = DEBUG_PANE_GAP.min(chunks[0].width.saturating_sub(2));
+            let transcript_width = chunks[0].width.saturating_sub(gap) / 2;
+            let developer_width = chunks[0]
+                .width
+                .saturating_sub(gap)
+                .saturating_sub(transcript_width);
+            let transcript =
+                Rect::new(chunks[0].x, chunks[0].y, transcript_width, chunks[0].height);
+            let developer = Rect::new(
+                transcript.right().saturating_add(gap),
+                chunks[0].y,
+                developer_width,
+                chunks[0].height,
+            );
+            (transcript, Some(developer))
         }
         BodyLayoutMode::Developer => (Rect::default(), Some(chunks[0])),
         BodyLayoutMode::Transcript => (chunks[0], None),
@@ -3052,100 +3058,25 @@ pub(crate) fn footer_context_line(app: &TuiApp, max_width: usize) -> Line<'stati
     const INDENT_WIDTH: usize = 2;
     let indent_width = INDENT_WIDTH.min(max_width);
     let indent = " ".repeat(indent_width);
-    let right = developer_facts_indicator(app);
-    let right_width = right.as_ref().map_or(0, |value| display_width(value));
-    let right_padding = usize::from(right.is_some()) * 2;
-    let gap = usize::from(right.is_some()) * 2;
-    let content_width = max_width
-        .saturating_sub(indent_width)
-        .saturating_sub(right_width)
-        .saturating_sub(right_padding)
-        .saturating_sub(gap);
-    let (left, style) = if app.quit_shortcut_is_active() && !app.status_message.trim().is_empty() {
+    let content_width = max_width.saturating_sub(indent_width);
+    let (text, style) = if app.quit_shortcut_is_active() && !app.status_message.trim().is_empty() {
         (
-            &app.status_message,
+            app.status_message.clone(),
             Style::default().fg(app.palette().warning),
         )
     } else {
-        return footer_context_line_with_right(app, max_width, right);
+        (
+            footer_context_text(app, content_width),
+            Style::default().fg(app.palette().muted),
+        )
     };
-    let left = truncate_end_to_width(left, content_width);
-    let padding = " ".repeat(
-        max_width
-            .saturating_sub(indent_width)
-            .saturating_sub(display_width(&left))
-            .saturating_sub(right_width)
-            .saturating_sub(right_padding),
-    );
-    let mut spans = vec![
+    let text = truncate_end_to_width(&text, content_width);
+    let padding = " ".repeat(content_width.saturating_sub(display_width(&text)));
+    Line::from(vec![
         Span::raw(indent),
-        Span::styled(left, style),
+        Span::styled(text, style),
         Span::raw(padding),
-    ];
-    if let Some(right) = right {
-        spans.push(Span::styled(
-            right,
-            Style::default().fg(app.palette().accent),
-        ));
-        spans.push(Span::raw(" ".repeat(right_padding)));
-    }
-    Line::from(spans)
-}
-
-fn footer_context_line_with_right(
-    app: &TuiApp,
-    max_width: usize,
-    right: Option<&'static str>,
-) -> Line<'static> {
-    const INDENT_WIDTH: usize = 2;
-    let indent_width = INDENT_WIDTH.min(max_width);
-    let indent = " ".repeat(indent_width);
-    let right_width = right.map_or(0, display_width);
-    let right_padding = usize::from(right.is_some()) * 2;
-    let gap = usize::from(right.is_some()) * 2;
-    let content_width = max_width
-        .saturating_sub(indent_width)
-        .saturating_sub(right_width)
-        .saturating_sub(right_padding)
-        .saturating_sub(gap);
-    let left = footer_context_text(app, content_width);
-    let padding = " ".repeat(
-        max_width
-            .saturating_sub(indent_width)
-            .saturating_sub(display_width(&left))
-            .saturating_sub(right_width)
-            .saturating_sub(right_padding),
-    );
-    let mut spans = vec![
-        Span::raw(indent),
-        Span::styled(left, Style::default().fg(app.palette().muted)),
-        Span::raw(padding),
-    ];
-    if let Some(right) = right {
-        spans.push(Span::styled(
-            right,
-            Style::default().fg(app.palette().accent),
-        ));
-        spans.push(Span::raw(" ".repeat(right_padding)));
-    }
-    Line::from(spans)
-}
-
-pub(crate) fn developer_facts_indicator(app: &TuiApp) -> Option<&'static str> {
-    if !app.debug_mode || app.overlay_surface().is_some() {
-        return None;
-    }
-    Some(if app.preferences.screen_reader {
-        if app.developer_facts_expanded {
-            "v facts"
-        } else {
-            "> facts"
-        }
-    } else if app.developer_facts_expanded {
-        "▾ facts"
-    } else {
-        "▸ facts"
-    })
+    ])
 }
 
 pub(crate) fn footer_context_text(app: &TuiApp, max_width: usize) -> String {

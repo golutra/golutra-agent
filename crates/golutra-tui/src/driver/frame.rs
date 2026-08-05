@@ -12,8 +12,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::super::{
-    TuiApp, UiLayoutSnapshot, UiMousePress, developer_facts_indicator,
-    developer_facts_toggle_hit_rect, display_width, overlay_mouse_regions,
+    TuiApp, UiLayoutSnapshot, UiMousePress, display_width, overlay_mouse_regions,
     transcript_toggle_regions,
 };
 
@@ -289,15 +288,6 @@ pub(super) fn frame_hit_regions(
                 area,
             );
         }
-    }
-    if developer_facts_indicator(app).is_some() {
-        push_hit_region(
-            &mut regions,
-            "developer_facts_toggle",
-            TuiHitPane::Bottom,
-            developer_facts_toggle_hit_rect(layout.bottom),
-            area,
-        );
     }
     regions
 }

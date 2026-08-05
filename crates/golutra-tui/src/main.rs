@@ -306,7 +306,6 @@ struct TuiApp {
     change_projection: ChangeProjection,
     expanded_operations: HashSet<OperationId>,
     transcript_details_expanded: bool,
-    developer_facts_expanded: bool,
     transcript_scroll: PaneScrollState,
     transcript_top_row_override: Option<usize>,
     transcript_revision: u64,
@@ -473,7 +472,6 @@ impl TuiApp {
             change_projection: ChangeProjection::default(),
             expanded_operations: HashSet::new(),
             transcript_details_expanded: false,
-            developer_facts_expanded: false,
             transcript_scroll: PaneScrollState {
                 follow_tail: true,
                 ..PaneScrollState::default()
@@ -701,6 +699,24 @@ impl TuiApp {
             .map_err(|error| miette::miette!("{error}"))?;
         self.apply_runtime_refresh_snapshot(snapshot);
         Ok(())
+    }
+
+    async fn refresh_developer_projection(&mut self, transport: &RuntimeTransport) {
+        match load_debug_projection(transport, self.session_id, self.task_id).await {
+            Ok(mut projection) => {
+                if !self.events.is_empty() {
+                    replace_debug_event_history(&mut projection, self.events.clone());
+                }
+                self.developer_projection = Some(projection);
+                self.developer_error = None;
+                self.status_message = "runtime observations refreshed".to_owned();
+            }
+            Err(error) => {
+                self.developer_projection = None;
+                self.developer_error = Some(error.clone());
+                self.status_message = format!("runtime observations unavailable: {error}");
+            }
+        }
     }
 
     async fn load_recent_history(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
@@ -1750,14 +1766,6 @@ impl TuiApp {
         self.transcript_scroll.max_offset(visible_rows)
     }
 
-    fn cycle_scroll_pane(&mut self) {
-        if self.debug_mode {
-            self.toggle_developer_facts();
-        } else {
-            self.status_message = "history active".to_owned();
-        }
-    }
-
     fn toggle_transcript_fullscreen(&mut self) {
         self.body_view_mode = if self.body_view_mode == BodyViewMode::Transcript {
             BodyViewMode::Auto
@@ -1883,18 +1891,6 @@ impl TuiApp {
         }
         let rows = self.layout.transcript.height.max(1) as usize;
         self.scroll_transcript(action, rows);
-    }
-
-    fn toggle_developer_facts(&mut self) {
-        self.body_view_mode = BodyViewMode::Auto;
-        self.developer_facts_expanded = !self.developer_facts_expanded;
-        self.request_history_rebuild();
-        self.status_message = if self.developer_facts_expanded {
-            "developer facts expanded"
-        } else {
-            "developer facts collapsed"
-        }
-        .to_owned();
     }
 
     async fn send_runtime_prompt(
@@ -2212,7 +2208,11 @@ impl TuiApp {
                 None => self.open_settings_dialog(),
             },
             SlashCommand::Debug => {
-                self.set_debug_mode(!self.debug_mode);
+                let enabled = !self.debug_mode;
+                self.set_debug_mode(enabled);
+                if enabled {
+                    self.refresh_developer_projection(transport).await;
+                }
             }
             SlashCommand::Takeover => {
                 let ack = self
@@ -3495,10 +3495,6 @@ async fn handle_key(
         app.copy_transcript();
         return Ok(());
     }
-    if key.code == KeyCode::F(6) {
-        app.cycle_scroll_pane();
-        return Ok(());
-    }
     if key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL) {
         app.toggle_transcript_details();
         return Ok(());
@@ -3599,8 +3595,6 @@ async fn handle_key(
                 app.status_message = "reference completed".to_owned();
             } else if app.move_slash_selection(ResumeSelectionDirection::Next) {
                 app.status_message = "slash command selected".to_owned();
-            } else if app.input.is_empty() {
-                app.cycle_scroll_pane();
             }
         }
         KeyCode::Up => {
@@ -4701,13 +4695,6 @@ fn handle_mouse(mouse: MouseEvent, app: &mut TuiApp) -> Option<UiMouseActivation
                     }
                 }
             }
-        }
-        MouseEventKind::Down(MouseButton::Left)
-            if app
-                .layout
-                .developer_facts_toggle_hit(mouse.column, mouse.row, app) =>
-        {
-            app.toggle_developer_facts();
         }
         MouseEventKind::ScrollUp => {
             app.mouse_press = None;

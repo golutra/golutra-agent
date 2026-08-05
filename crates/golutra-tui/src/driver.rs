@@ -261,7 +261,8 @@ impl TuiDriver {
             status,
             width: self.width,
             height: self.height,
-            facts_expanded: self.app.developer_facts_expanded,
+            facts_expanded: self.app.debug_mode
+                && self.app.body_view_mode != BodyViewMode::Transcript,
             controller_mode: self.last_controller_mode,
             closed: self.closed,
         }

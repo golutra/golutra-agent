@@ -1208,7 +1208,7 @@ fn session_switch_clears_previous_history_while_replay_is_loading() {
 }
 
 #[test]
-fn debug_switch_clears_transcript_before_projection_finishes() {
+fn debug_switch_keeps_transcript_visible_before_projection_finishes() {
     let session_id = SessionId::new();
     let task_id = TaskId::new();
     let events = vec![transcript_event(
@@ -1247,9 +1247,10 @@ fn debug_switch_clears_transcript_before_projection_finishes() {
     assert!(
         history
             .flush(&mut terminal, &mut app)
-            .expect("clear transcript")
+            .expect("rebuild transcript")
     );
-    assert!(!terminal_buffer_text(&terminal).contains("transcript-projection-only"));
+    draw_inline_test_frame(&mut terminal, &mut app);
+    assert!(terminal_buffer_text(&terminal).contains("transcript-projection-only"));
     assert!(
         !history
             .flush(&mut terminal, &mut app)
@@ -1258,18 +1259,18 @@ fn debug_switch_clears_transcript_before_projection_finishes() {
 
     app.developer_error = Some("debug projection unavailable".to_owned());
     assert!(
-        history
+        !history
             .flush(&mut terminal, &mut app)
             .expect("failed debug projection")
     );
     draw_inline_test_frame(&mut terminal, &mut app);
     let failed = terminal_buffer_text(&terminal);
-    assert_eq!(failed.matches("#1 AssistantMessage/Runtime").count(), 1);
-    assert!(!failed.contains("transcript-projection-only"));
+    assert_eq!(failed.matches("transcript-projection-only").count(), 1);
+    assert!(failed.contains("debug projection unavailable"));
 }
 
 #[test]
-fn repeated_debug_facts_and_transcript_switches_do_not_duplicate_history() {
+fn repeated_debug_and_transcript_switches_do_not_duplicate_history() {
     let session_id = SessionId::new();
     let task_id = TaskId::new();
     let events = vec![
@@ -1328,15 +1329,6 @@ fn repeated_debug_facts_and_transcript_switches_do_not_duplicate_history() {
     let debug = terminal_buffer_text(&terminal);
     assert_eq!(debug.matches("#1 TaskCreated/Runtime").count(), 1);
     assert_eq!(debug.matches("#2 AssistantMessage/Runtime").count(), 1);
-
-    app.toggle_developer_facts();
-    history
-        .flush(&mut terminal, &mut app)
-        .expect("expanded facts");
-    draw_inline_test_frame(&mut terminal, &mut app);
-    let expanded = terminal_buffer_text(&terminal);
-    assert_eq!(expanded.matches("#1 TaskCreated/Runtime").count(), 1);
-    assert_eq!(expanded.matches("#2 AssistantMessage/Runtime").count(), 1);
 
     app.toggle_transcript_fullscreen();
     history
@@ -1975,7 +1967,7 @@ fn bottom_pane_renders_context_instead_of_task_status() {
 }
 
 #[test]
-fn debug_facts_is_right_aligned_without_overlapping_footer_context() {
+fn debug_footer_does_not_render_a_facts_control() {
     for width in [40_u16, 80, 120] {
         let app = TuiApp::new(
             ThreadId::new(),
@@ -1999,46 +1991,13 @@ fn debug_facts_is_right_aligned_without_overlapping_footer_context() {
             .filter_map(|x| terminal.backend().buffer().cell((x, 2)))
             .map(|cell| cell.symbol())
             .collect::<String>();
-        let facts = footer.find("▸ facts").expect("facts indicator");
-        assert_eq!(display_width(&footer[..facts]), usize::from(width - 9));
         assert_eq!(display_width(&footer), usize::from(width));
-        assert!(footer[..facts].ends_with("  "), "{width}: {footer:?}");
+        assert!(!footer.contains("facts"), "{width}: {footer:?}");
     }
 }
 
 #[test]
-fn normal_mode_does_not_expose_the_footer_facts_hit_target() {
-    let mut app = TuiApp::new(
-        ThreadId::new(),
-        SessionId::new(),
-        None,
-        false,
-        "ready (mock)".to_owned(),
-        None,
-    );
-    let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("terminal");
-    terminal
-        .draw(|frame| draw_ui(frame, &mut app))
-        .expect("draw normal footer");
-    let toggle = developer_facts_toggle_rect(app.layout.bottom);
-    let generation = app.history_replay_generation;
-
-    handle_mouse(
-        MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: toggle.x,
-            row: toggle.y,
-            modifiers: KeyModifiers::NONE,
-        },
-        &mut app,
-    );
-
-    assert!(!app.developer_facts_expanded);
-    assert_eq!(app.history_replay_generation, generation);
-}
-
-#[test]
-fn modal_does_not_expose_the_hidden_footer_facts_hit_target() {
+fn footer_click_does_not_change_the_debug_view() {
     let mut app = TuiApp::new(
         ThreadId::new(),
         SessionId::new(),
@@ -2047,30 +2006,25 @@ fn modal_does_not_expose_the_hidden_footer_facts_hit_target() {
         "ready (mock)".to_owned(),
         None,
     );
-    app.help_dialog = Some(HelpDialogState::new(
-        HelpTopic::Overview,
-        "developer runtime",
-    ));
     let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("terminal");
     terminal
         .draw(|frame| draw_ui(frame, &mut app))
-        .expect("draw help modal");
-    let toggle = developer_facts_toggle_rect(app.layout.bottom);
+        .expect("draw debug footer");
     let generation = app.history_replay_generation;
+    let body_mode = app.layout.body_mode;
 
     handle_mouse(
         MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: toggle.x,
-            row: toggle.y,
+            column: app.layout.bottom.right().saturating_sub(3),
+            row: app.layout.bottom.bottom().saturating_sub(1),
             modifiers: KeyModifiers::NONE,
         },
         &mut app,
     );
 
-    assert!(developer_facts_indicator(&app).is_none());
-    assert!(!app.developer_facts_expanded);
     assert_eq!(app.history_replay_generation, generation);
+    assert_eq!(app.layout.body_mode, body_mode);
 }
 
 #[test]
@@ -3167,7 +3121,7 @@ fn new_idle_session_has_empty_transcript() {
 }
 
 #[test]
-fn debug_layout_uses_one_unframed_body_at_every_width() {
+fn debug_layout_keeps_transcript_left_and_observations_right_at_every_width() {
     let app = TuiApp::new(
         ThreadId::new(),
         SessionId::new(),
@@ -3178,14 +3132,22 @@ fn debug_layout_uses_one_unframed_body_at_every_width() {
     );
 
     let wide = ui_layout(Rect::new(0, 0, 120, 30), &app);
-    assert_eq!(wide.body_mode, BodyLayoutMode::Developer);
-    assert_eq!(wide.developer, Some(wide.body));
-    assert_eq!(wide.transcript, Rect::default());
+    assert_eq!(wide.body_mode, BodyLayoutMode::ResponseAndDeveloper);
+    let wide_developer = wide.developer.expect("wide observation pane");
+    assert_eq!(wide.transcript.x, wide.body.x);
+    assert_eq!(wide_developer.x, wide.transcript.right() + 1);
+    assert_eq!(wide_developer.right(), wide.body.right());
+    assert_eq!(wide.transcript.height, wide.body.height);
+    assert_eq!(wide_developer.height, wide.body.height);
 
     let narrow = ui_layout(Rect::new(0, 0, 80, 30), &app);
-    assert_eq!(narrow.body_mode, BodyLayoutMode::Developer);
-    assert_eq!(narrow.developer, Some(narrow.body));
-    assert_eq!(narrow.transcript, Rect::default());
+    assert_eq!(narrow.body_mode, BodyLayoutMode::ResponseAndDeveloper);
+    let narrow_developer = narrow.developer.expect("narrow observation pane");
+    assert_eq!(narrow.transcript.x, narrow.body.x);
+    assert_eq!(narrow_developer.x, narrow.transcript.right() + 1);
+    assert_eq!(narrow_developer.right(), narrow.body.right());
+    assert_eq!(narrow.transcript.height, narrow.body.height);
+    assert_eq!(narrow_developer.height, narrow.body.height);
 }
 
 #[test]
@@ -3202,7 +3164,7 @@ fn debug_transcript_switch_requests_a_source_backed_rebuild() {
     terminal
         .draw(|frame| draw_ui(frame, &mut app))
         .expect("draw debug events");
-    assert_eq!(app.layout.body_mode, BodyLayoutMode::Developer);
+    assert_eq!(app.layout.body_mode, BodyLayoutMode::ResponseAndDeveloper);
     let initial_generation = app.history_replay_generation;
 
     app.toggle_transcript_fullscreen();
@@ -3557,7 +3519,7 @@ fn developer_panel_exposes_governance_without_leaking_into_normal_view() {
         .collect::<String>();
     assert!(!normal_text.contains("Developer runtime"));
 
-    app.debug_mode = true;
+    app.set_debug_mode(true);
     let mut developer_terminal = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
     developer_terminal
         .draw(|frame| draw_ui(frame, &mut app))
@@ -3570,82 +3532,20 @@ fn developer_panel_exposes_governance_without_leaking_into_normal_view() {
         .map(|cell| cell.symbol())
         .collect::<String>();
     assert!(!developer_text.contains("Developer runtime"));
-    assert!(developer_text.contains("▸ facts"));
-    assert!(!developer_text.contains("verify Pass"));
+    assert!(!developer_text.contains("▸ facts"));
+    assert!(!developer_text.contains("▾ facts"));
+    assert!(developer_text.contains("verify Pass"));
+    assert!(developer_text.contains("diagnosis Tool/tool_failed"));
 
     let layout = app.layout;
     let developer_area = layout.developer.expect("developer area");
-    assert_eq!(developer_area, layout.body);
-    assert_eq!(layout.transcript, Rect::default());
-
-    let toggle = developer_facts_toggle_rect(layout.bottom);
-    assert_eq!(
-        developer_terminal
-            .backend()
-            .buffer()
-            .cell((toggle.x, toggle.y))
-            .map(|cell| cell.symbol()),
-        Some("▸")
-    );
-    handle_mouse(
-        MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: toggle.x,
-            row: toggle.y,
-            modifiers: KeyModifiers::NONE,
-        },
-        &mut app,
-    );
-    assert!(app.developer_facts_expanded);
-    developer_terminal
-        .draw(|frame| draw_ui(frame, &mut app))
-        .expect("draw expanded developer facts");
-    let expanded_text = developer_terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(|cell| cell.symbol())
-        .collect::<String>();
-    assert!(expanded_text.contains("▾ facts"));
-    assert!(expanded_text.contains("verify Pass"));
-    assert!(expanded_text.contains("diagnosis Tool/tool_failed"));
-    assert_eq!(
-        developer_terminal
-            .backend()
-            .buffer()
-            .cell((toggle.x, toggle.y))
-            .map(|cell| cell.symbol()),
-        Some("▾")
-    );
-
-    handle_mouse(
-        MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: toggle.x,
-            row: toggle.y,
-            modifiers: KeyModifiers::NONE,
-        },
-        &mut app,
-    );
-    assert!(!app.developer_facts_expanded);
-
-    let padded_toggle = developer_facts_toggle_hit_rect(layout.bottom);
-    assert!(padded_toggle.x < toggle.x);
-    handle_mouse(
-        MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: padded_toggle.x,
-            row: padded_toggle.y,
-            modifiers: KeyModifiers::NONE,
-        },
-        &mut app,
-    );
-    assert!(app.developer_facts_expanded);
+    assert_eq!(layout.body_mode, BodyLayoutMode::ResponseAndDeveloper);
+    assert_eq!(developer_area.x, layout.transcript.right() + 1);
+    assert!(layout.transcript.width > 0);
 }
 
 #[test]
-fn developer_event_details_toggle_between_ellipsis_and_complete_wrapped_text() {
+fn developer_event_details_stay_compact_in_the_observation_pane() {
     let session_id = SessionId::new();
     let task_id = TaskId::new();
     let tail = "developer-event-tail-marker";
@@ -3673,30 +3573,12 @@ fn developer_event_details_toggle_between_ellipsis_and_complete_wrapped_text() {
 
     terminal
         .draw(|frame| draw_ui(frame, &mut app))
-        .expect("draw collapsed developer event");
-    let collapsed = terminal_buffer_text(&terminal);
-    assert!(collapsed.contains("▸ facts"));
-    assert!(collapsed.contains('…'));
-    assert!(!collapsed.contains(tail));
-
-    let generation = app.history_replay_generation;
-    app.toggle_developer_facts();
-    terminal
-        .draw(|frame| draw_ui(frame, &mut app))
-        .expect("draw expanded developer event");
-    let expanded = terminal_buffer_text(&terminal);
-    assert!(expanded.contains("▾ facts"));
-    assert!(expanded.contains(tail));
-    assert_eq!(app.history_replay_generation, generation + 1);
-
-    app.toggle_developer_facts();
-    terminal
-        .draw(|frame| draw_ui(frame, &mut app))
-        .expect("redraw collapsed developer event");
-    let collapsed_again = terminal_buffer_text(&terminal);
-    assert!(collapsed_again.contains("▸ facts"));
-    assert!(collapsed_again.contains('…'));
-    assert!(!collapsed_again.contains(tail));
+        .expect("draw compact developer event");
+    let rendered = terminal_buffer_text(&terminal);
+    assert!(!rendered.contains("▸ facts"));
+    assert!(!rendered.contains("▾ facts"));
+    assert!(rendered.contains('…'));
+    assert!(!rendered.contains(tail));
 }
 
 #[test]
@@ -3735,22 +3617,10 @@ fn developer_live_surface_follows_the_latest_event() {
     terminal
         .draw(|frame| draw_ui(frame, &mut app))
         .expect("draw latest developer events");
-    let collapsed = terminal_buffer_text(&terminal);
-    assert!(
-        collapsed.contains("#30 StepCompleted/Runtime"),
-        "{collapsed}"
-    );
-    assert!(
-        !collapsed.contains("#1 StepCompleted/Runtime"),
-        "{collapsed}"
-    );
-
-    app.toggle_developer_facts();
-    terminal
-        .draw(|frame| draw_ui(frame, &mut app))
-        .expect("draw expanded latest developer event");
-    let expanded = terminal_buffer_text(&terminal);
-    assert!(expanded.contains("event-30"), "{expanded}");
+    let rendered = terminal_buffer_text(&terminal);
+    assert!(rendered.contains("#30 StepCompleted/Runtime"), "{rendered}");
+    assert!(!rendered.contains("#1 StepCompleted/Runtime"), "{rendered}");
+    assert!(rendered.contains("event-30"), "{rendered}");
 }
 
 #[test]
@@ -3791,7 +3661,7 @@ fn transcript_wraps_long_body_lines_to_the_available_width() {
 }
 
 #[tokio::test]
-async fn developer_projection_is_only_loaded_in_explicit_debug_mode() {
+async fn debug_command_refreshes_the_developer_projection_before_returning() {
     let transport = RuntimeTransport::in_memory().await.expect("transport");
     let mut app = TuiApp::new(
         ThreadId::new(),
@@ -3805,13 +3675,17 @@ async fn developer_projection_is_only_loaded_in_explicit_debug_mode() {
     app.refresh(&transport).await.expect("normal refresh");
     assert!(app.developer_projection.is_none());
 
-    app.set_debug_mode(true);
-    assert!(app.developer_projection.is_none());
-    app.refresh(&transport).await.expect("debug refresh");
+    app.execute_slash_command(&transport, SlashCommand::Debug)
+        .await
+        .expect("enable debug");
+    assert!(app.debug_mode);
     assert!(app.developer_projection.is_some());
     assert!(app.developer_error.is_none());
 
-    app.set_debug_mode(false);
+    app.execute_slash_command(&transport, SlashCommand::Debug)
+        .await
+        .expect("disable debug");
+    assert!(!app.debug_mode);
     assert!(app.developer_projection.is_none());
     assert!(app.developer_error.is_none());
 }
@@ -4007,8 +3881,7 @@ fn file_changes_are_compact_in_normal_mode_and_detailed_in_developer_mode() {
     assert!(normal_text.contains("src/lib.rs  +2 -1"));
     assert!(!normal_text.contains("changes files="));
 
-    app.debug_mode = true;
-    app.developer_facts_expanded = true;
+    app.set_debug_mode(true);
     app.developer_projection = Some(golutra_protocol::DebugProjection {
         session_id,
         task_id: Some(task_id),
@@ -5583,7 +5456,7 @@ fn resume_item(title: &str) -> ResumeThreadItem {
 }
 
 #[tokio::test]
-async fn clicking_footer_facts_rebuilds_debug_history_and_page_keys_are_ignored() {
+async fn debug_page_keys_leave_the_observation_tail_fixed() {
     let transport = RuntimeTransport::in_memory().await.expect("transport");
     let session_id = SessionId::new();
     let mut app = TuiApp::new(
@@ -5621,18 +5494,9 @@ async fn clicking_footer_facts_rebuilds_debug_history_and_page_keys_are_ignored(
     terminal
         .draw(|frame| draw_ui(frame, &mut app))
         .expect("draw");
-    let toggle = developer_facts_toggle_rect(app.layout.bottom);
+    let before = terminal_buffer_text(&terminal);
     let generation = app.history_replay_generation;
 
-    handle_mouse(
-        MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: toggle.x,
-            row: toggle.y,
-            modifiers: KeyModifiers::NONE,
-        },
-        &mut app,
-    );
     handle_key(
         KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
         &mut app,
@@ -5641,10 +5505,15 @@ async fn clicking_footer_facts_rebuilds_debug_history_and_page_keys_are_ignored(
     .await
     .expect("ignore debug page key");
 
-    assert!(app.developer_facts_expanded);
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("redraw");
+    let after = terminal_buffer_text(&terminal);
+    assert!(!after.contains("▸ facts"));
+    assert!(!after.contains("▾ facts"));
+    assert_eq!(after, before);
     assert_eq!(app.transcript_scroll.offset_from_bottom, 0);
-    assert_eq!(app.history_replay_generation, generation + 1);
-    assert!(app.status_message.starts_with("developer facts"));
+    assert_eq!(app.history_replay_generation, generation);
 }
 
 #[tokio::test]

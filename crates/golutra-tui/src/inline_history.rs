@@ -19,15 +19,13 @@ const MIN_INLINE_BOTTOM_ROWS: u16 = 3;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InlineHistoryMode {
     Transcript,
-    Developer { facts_expanded: bool },
+    Developer,
 }
 
 impl InlineHistoryMode {
     fn from_app(app: &TuiApp) -> Self {
-        if app.debug_mode && app.body_view_mode != BodyViewMode::Transcript {
-            Self::Developer {
-                facts_expanded: app.developer_facts_expanded,
-            }
+        if app.debug_mode && app.body_view_mode == BodyViewMode::Developer {
+            Self::Developer
         } else {
             Self::Transcript
         }
@@ -119,7 +117,7 @@ impl InlineHistoryState {
         }
 
         let source_ready = app.history_replay_ready
-            && (!matches!(mode, InlineHistoryMode::Developer { .. })
+            && (!matches!(mode, InlineHistoryMode::Developer)
                 || app.developer_projection.is_some()
                 || app.developer_error.is_some());
         if !source_ready {
@@ -155,12 +153,7 @@ impl InlineHistoryState {
         let emit_header = !self.header_emitted;
         if emit_header {
             lines.extend(session_history_lines(app, width));
-            if matches!(
-                mode,
-                InlineHistoryMode::Developer {
-                    facts_expanded: true
-                }
-            ) {
+            if matches!(mode, InlineHistoryMode::Developer) {
                 lines.extend(developer_fact_history_lines(app, width));
                 lines.push(Line::default());
             }
@@ -209,19 +202,14 @@ fn rendered_history_entries(
             );
             rendered.into_iter().take(committed_count).collect()
         }
-        InlineHistoryMode::Developer { facts_expanded } => {
+        InlineHistoryMode::Developer => {
             let mut events = app.events.iter().collect::<Vec<_>>();
             events.sort_by_key(|event| event.sequence_no);
             let rendered = events
                 .into_iter()
                 .map(|event| RenderedHistoryEntry {
                     id: event.id,
-                    lines: developer_event_history_lines(
-                        event,
-                        width,
-                        facts_expanded,
-                        app.palette(),
-                    ),
+                    lines: developer_event_history_lines(event, width, false, app.palette()),
                 })
                 .collect::<Vec<_>>();
             let committed_count = committed_prefix_len(

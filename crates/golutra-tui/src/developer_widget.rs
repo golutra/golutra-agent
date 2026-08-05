@@ -5,44 +5,16 @@ use ratatui::{
     layout::Rect,
     style::Style,
     text::{Line, Span},
-    widgets::{Paragraph, Wrap},
+    widgets::Paragraph,
 };
 
 use super::*;
-
-pub(crate) fn developer_facts_toggle_rect(area: Rect) -> Rect {
-    let width = 7.min(area.width);
-    let right_padding = 2.min(area.width.saturating_sub(width));
-    Rect::new(
-        area.right()
-            .saturating_sub(width)
-            .saturating_sub(right_padding),
-        area.bottom().saturating_sub(1),
-        width,
-        u16::from(area.height > 0),
-    )
-}
-
-pub(crate) fn developer_facts_toggle_hit_rect(area: Rect) -> Rect {
-    let toggle = developer_facts_toggle_rect(area);
-    if toggle.width == 0 {
-        return toggle;
-    }
-    let left = toggle.x.saturating_sub(1).max(area.x);
-    let area_right = area.x.saturating_add(area.width);
-    let right = toggle
-        .x
-        .saturating_add(toggle.width)
-        .saturating_add(1)
-        .min(area_right);
-    Rect::new(left, toggle.y, right.saturating_sub(left), toggle.height)
-}
 
 pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let palette = app.palette();
     let content_width = area.width;
     let visible_rows = area.height as usize;
-    let rows = if app.inline_history_enabled {
+    let rows = if app.inline_history_enabled && app.layout.body_mode == BodyLayoutMode::Developer {
         developer_live_rows(app)
     } else {
         developer_rows(app)
@@ -51,7 +23,7 @@ pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiA
         .iter()
         .filter(|row| matches!(row, DeveloperPanelRow::Event { .. }))
         .count();
-    let summary_count = visible_summary_count(app, &rows, visible_rows, event_count);
+    let summary_count = visible_summary_count(&rows, visible_rows, event_count);
     let summary_lines = rows
         .iter()
         .filter_map(|row| match row {
@@ -76,7 +48,7 @@ pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiA
                 &label,
                 &summary,
                 usize::from(content_width),
-                app.developer_facts_expanded,
+                false,
                 palette,
             ),
         })
@@ -105,9 +77,6 @@ pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiA
             .saturating_sub(u16::try_from(summary_count).unwrap_or(u16::MAX)),
     );
     let mut events = Paragraph::new(event_lines);
-    if app.developer_facts_expanded {
-        events = events.wrap(Wrap { trim: false });
-    }
     let event_rows = events.line_count(event_area.width.max(1));
     let scroll = event_rows.saturating_sub(usize::from(event_area.height));
     events = events.scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0));
@@ -207,14 +176,10 @@ fn developer_rows(app: &TuiApp) -> Vec<DeveloperPanelRow> {
 }
 
 fn visible_summary_count(
-    app: &TuiApp,
     rows: &[DeveloperPanelRow],
     visible_rows: usize,
     event_count: usize,
 ) -> usize {
-    if !app.developer_facts_expanded && event_count > 0 {
-        return 0;
-    }
     let available = if event_count > 0 {
         visible_rows.saturating_sub(1)
     } else {

@@ -615,49 +615,20 @@ async fn inspect_and_stdio_driver_execute_real_offscreen_tui() {
         "removed developer title returned: {screen}"
     );
     assert!(
-        screen_json.contains("▸ facts"),
-        "collapsed facts control missing from footer: {screen}"
+        !screen_json.contains("▸ facts") && !screen_json.contains("▾ facts"),
+        "removed facts control returned: {screen}"
     );
-    let facts_toggle = screen["hit_regions"]
-        .as_array()
-        .and_then(|regions| {
+    assert!(
+        screen["hit_regions"].as_array().is_some_and(|regions| {
             regions
                 .iter()
-                .find(|region| region["id"] == "developer_facts_toggle")
-        })
-        .expect("developer facts hit region");
-    assert!(
-        facts_toggle["x"].as_u64().is_some_and(|x| x >= 90),
-        "facts control is not right-aligned: {facts_toggle}"
-    );
-    let facts_x = facts_toggle["x"].as_u64().expect("facts x")
-        + facts_toggle["width"].as_u64().expect("facts width") / 2;
-    let facts_y = facts_toggle["y"].as_u64().expect("facts y");
-    driver
-        .send(json!({
-            "request_id": "expand-developer-facts",
-            "type": "input_mouse",
-            "event": {"kind": "left_click", "column": facts_x, "row": facts_y}
-        }))
-        .await;
-    assert_eq!(
-        driver.receive("expand-developer-facts").await["type"],
-        "accepted"
+                .all(|region| region["id"] != "developer_facts_toggle")
+        }),
+        "removed facts hit region returned: {screen}"
     );
     driver
         .send(json!({
-            "request_id": "developer-facts-end",
-            "type": "input_key",
-            "key": "end"
-        }))
-        .await;
-    assert_eq!(
-        driver.receive("developer-facts-end").await["type"],
-        "accepted"
-    );
-    driver
-        .send(json!({
-            "request_id": "expanded-developer-before-page",
+            "request_id": "developer-before-page",
             "type": "snapshot",
             "scope": "screen",
             "panes": "full_screen",
@@ -665,18 +636,19 @@ async fn inspect_and_stdio_driver_execute_real_offscreen_tui() {
             "height": 24
         }))
         .await;
-    let before_page = driver.receive("expanded-developer-before-page").await;
-    let before_page_json = serde_json::to_string(&before_page).expect("expanded developer JSON");
-    assert!(before_page_json.contains("▾ facts"));
+    let before_page = driver.receive("developer-before-page").await;
+    let before_page_json = serde_json::to_string(&before_page).expect("developer JSON");
+    assert!(!before_page_json.contains("▸ facts"));
+    assert!(!before_page_json.contains("▾ facts"));
     driver
         .send(json!({
-            "request_id": "page-developer-facts",
+            "request_id": "page-developer-observations",
             "type": "input_key",
             "key": "page_up"
         }))
         .await;
     assert_eq!(
-        driver.receive("page-developer-facts").await["type"],
+        driver.receive("page-developer-observations").await["type"],
         "accepted"
     );
     driver
@@ -700,12 +672,9 @@ async fn inspect_and_stdio_driver_execute_real_offscreen_tui() {
         after_watermark >= before_watermark,
         "PageUp moved the debug view behind the runtime event tail"
     );
-    assert!(
-        serde_json::to_string(&after_page)
-            .expect("after PageUp JSON")
-            .contains("▾ facts"),
-        "PageUp collapsed developer facts: {after_page}"
-    );
+    let after_page_json = serde_json::to_string(&after_page).expect("after PageUp JSON");
+    assert!(!after_page_json.contains("▸ facts"));
+    assert!(!after_page_json.contains("▾ facts"));
     if after_watermark == before_watermark {
         assert_eq!(
             after_page["lines"], before_page["lines"],
