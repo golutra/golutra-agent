@@ -20,7 +20,7 @@
 - `EvaluationStore::compare_counterfactual` 能比较调用方提供的 baseline/variant durable run facts，但不会自行生成受控 paired execution；没有 execution refs 的结果不能作为未来代码晋升证据。
 - deep evaluation 在 TaskCompleted 后写入 SQLite `PostTaskJob`，worker 提供 lease/retry/recovery；若终态提交后尚未入队就退出，新 Host/daemon 会按 workspace 从 pending terminal fact 幂等补建 job，再继续执行。
 - event writer 可在导出边界生成不可变 rollout snapshot；TaskTrace 通过 cursor 分页和 integrity/disclosure 读取 canonical facts，迟到 evaluation event 不会改写已导出的边界。
-- `golutra-vis` 可从 RuntimeEvent/DebugProjection 导出 Audit、Events 和 OpenTelemetry JSON span；TUI 只有显式 `--debug` 或 `/debug` 才查询有界开发者摘要，普通启动不渲染治理噪声。
+- `golutra-vis` 可从 RuntimeEvent/DebugProjection 导出 Audit、Events 和 OpenTelemetry JSON span；TUI 只有显式 `--debug` 或 `/debug` 才查询脱敏 `DebugProjection`，并在 `/debug` 重载时读取当前绑定的完整 event history，普通启动不渲染治理噪声。
 - `golutra-supervisor` 只接收 complete TaskTrace，使用 paired execution、sealed/fresh/security/migration、holdout disclosure budget 和 OS-enforced TrustedBuilder 决定 runtime code release；普通 Runtime 无 stable pointer 写权限。
 
 隔离 GeneratedTask 已能由 `golutra-evolution` 通过独立 fixture RuntimeHost 执行；任意冻结候选的 baseline/candidate regression 也已由 `golutra-client` 接入。完整 `TaskTrace`、SQLite durable job、语义 verification 和 execution-backed regression 属于已完成的 P2.5 当前范围。

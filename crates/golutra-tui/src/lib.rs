@@ -146,6 +146,14 @@ pub fn event_timeline_lines(events: &[Value]) -> Vec<EventTimelineLine> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlashDebugCommand {
+    Toggle,
+    Expand,
+    Compact,
+    Off,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommand {
     Help,
     WhatsNew,
@@ -179,7 +187,7 @@ pub enum SlashCommand {
     Permissions {
         unrestricted: Option<bool>,
     },
-    Debug,
+    Debug(SlashDebugCommand),
     Takeover,
     Abort,
     Pause,
@@ -378,7 +386,7 @@ const TOP_LEVEL_SLASH_HINTS: &[SlashCommandHint] = &[
     },
     SlashCommandHint {
         command: "/debug",
-        description: "refresh and toggle runtime observations",
+        description: "reload and toggle runtime observation detail",
         selection: SlashCommandSelection::Execute,
     },
     SlashCommandHint {
@@ -598,7 +606,19 @@ pub fn parse_slash_input(input: &str) -> SlashInput {
         },
         "/effort" => parse_effort_command(&tokens),
         "/permissions" | "/permission" => parse_permissions_command(&tokens),
-        "/debug" => SlashInput::Command(SlashCommand::Debug),
+        "/debug" => match tokens.as_slice() {
+            [_] => SlashInput::Command(SlashCommand::Debug(SlashDebugCommand::Toggle)),
+            [_, action] if action == "expand" => {
+                SlashInput::Command(SlashCommand::Debug(SlashDebugCommand::Expand))
+            }
+            [_, action] if action == "compact" => {
+                SlashInput::Command(SlashCommand::Debug(SlashDebugCommand::Compact))
+            }
+            [_, action] if action == "off" => {
+                SlashInput::Command(SlashCommand::Debug(SlashDebugCommand::Off))
+            }
+            _ => SlashInput::Error("/debug syntax: /debug [expand|compact|off]".to_owned()),
+        },
         "/takeover" => SlashInput::Command(SlashCommand::Takeover),
         "/abort" => SlashInput::Command(SlashCommand::Abort),
         "/pause" => SlashInput::Command(SlashCommand::Pause),
@@ -1283,6 +1303,30 @@ mod tests {
         assert!(matches!(
             parse_slash_input("/permissions maybe"),
             SlashInput::Error(_)
+        ));
+    }
+
+    #[test]
+    fn slash_parser_accepts_debug_reload_modes() {
+        assert_eq!(
+            parse_slash_input("/debug"),
+            SlashInput::Command(SlashCommand::Debug(SlashDebugCommand::Toggle))
+        );
+        assert_eq!(
+            parse_slash_input("/debug expand"),
+            SlashInput::Command(SlashCommand::Debug(SlashDebugCommand::Expand))
+        );
+        assert_eq!(
+            parse_slash_input("/debug compact"),
+            SlashInput::Command(SlashCommand::Debug(SlashDebugCommand::Compact))
+        );
+        assert_eq!(
+            parse_slash_input("/debug off"),
+            SlashInput::Command(SlashCommand::Debug(SlashDebugCommand::Off))
+        );
+        assert!(matches!(
+            parse_slash_input("/debug verbose"),
+            SlashInput::Error(error) if error.contains("/debug [expand|compact|off]")
         ));
     }
 

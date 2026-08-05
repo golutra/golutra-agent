@@ -1,11 +1,16 @@
 //! Native terminal scrollback for finalized transcript content.
 
-use std::{collections::HashSet, io};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+};
 
 use golutra_core::{EventId, SessionId};
 use ratatui::{
     Terminal,
     backend::Backend,
+    buffer::Buffer,
+    layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Paragraph, Widget, Wrap},
@@ -19,15 +24,23 @@ const MIN_INLINE_BOTTOM_ROWS: u16 = 3;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InlineHistoryMode {
     Transcript,
-    Developer,
+    Developer { expanded: bool },
+    DebugSplit { expanded: bool },
 }
 
 impl InlineHistoryMode {
     fn from_app(app: &TuiApp) -> Self {
-        if app.debug_mode && app.body_view_mode == BodyViewMode::Developer {
-            Self::Developer
-        } else {
-            Self::Transcript
+        if !app.debug_mode {
+            return Self::Transcript;
+        }
+        match app.body_view_mode {
+            BodyViewMode::Transcript => Self::Transcript,
+            BodyViewMode::Developer => Self::Developer {
+                expanded: app.developer_observations_expanded,
+            },
+            BodyViewMode::Auto | BodyViewMode::Split => Self::DebugSplit {
+                expanded: app.developer_observations_expanded,
+            },
         }
     }
 }
@@ -117,8 +130,10 @@ impl InlineHistoryState {
         }
 
         let source_ready = app.history_replay_ready
-            && (!matches!(mode, InlineHistoryMode::Developer)
-                || app.developer_projection.is_some()
+            && (!matches!(
+                mode,
+                InlineHistoryMode::Developer { .. } | InlineHistoryMode::DebugSplit { .. }
+            ) || app.developer_projection.is_some()
                 || app.developer_error.is_some());
         if !source_ready {
             return Ok(history_cleared);
@@ -153,8 +168,22 @@ impl InlineHistoryState {
         let emit_header = !self.header_emitted;
         if emit_header {
             lines.extend(session_history_lines(app, width));
-            if matches!(mode, InlineHistoryMode::Developer) {
-                lines.extend(developer_fact_history_lines(app, width));
+            let fact_lines = match mode {
+                InlineHistoryMode::Developer { expanded: true } => {
+                    developer_fact_history_lines(app, width)
+                }
+                InlineHistoryMode::DebugSplit { expanded: true } => {
+                    let (_, _, developer_width) = debug_pane_widths(width);
+                    debug_split_history_lines(
+                        Vec::new(),
+                        developer_fact_history_lines(app, developer_width),
+                        width,
+                    )
+                }
+                _ => Vec::new(),
+            };
+            if !fact_lines.is_empty() {
+                lines.extend(fact_lines);
                 lines.push(Line::default());
             }
         }
@@ -202,14 +231,14 @@ fn rendered_history_entries(
             );
             rendered.into_iter().take(committed_count).collect()
         }
-        InlineHistoryMode::Developer => {
+        InlineHistoryMode::Developer { expanded } => {
             let mut events = app.events.iter().collect::<Vec<_>>();
             events.sort_by_key(|event| event.sequence_no);
             let rendered = events
                 .into_iter()
                 .map(|event| RenderedHistoryEntry {
                     id: event.id,
-                    lines: developer_event_history_lines(event, width, false, app.palette()),
+                    lines: developer_event_history_lines(event, width, expanded, app.palette()),
                 })
                 .collect::<Vec<_>>();
             let committed_count = committed_prefix_len(
@@ -220,7 +249,160 @@ fn rendered_history_entries(
             );
             rendered.into_iter().take(committed_count).collect()
         }
+        InlineHistoryMode::DebugSplit { expanded } => {
+            debug_split_history_entries(app, width, live_row_capacity, expanded)
+        }
     }
+}
+
+fn debug_split_history_entries(
+    app: &TuiApp,
+    width: u16,
+    live_row_capacity: u16,
+    expanded: bool,
+) -> Vec<RenderedHistoryEntry> {
+    let operation_entries = event_operation_entries(&app.events);
+    // A streaming message or running tool can still rewrite its earlier transcript row. Keep
+    // that event and every later observation live until the operation reaches a stable state.
+    let first_unstable_id = operation_entries
+        .iter()
+        .find(|entry| !entry.stable)
+        .map(|entry| entry.id);
+    let mut operations = operation_entries
+        .into_iter()
+        .map(|entry| (entry.id, entry.projection))
+        .collect::<HashMap<_, _>>();
+    let mut events = app.events.iter().collect::<Vec<_>>();
+    events.sort_by_key(|event| event.sequence_no);
+    let stable_count = first_unstable_id.map_or(events.len(), |id| {
+        events
+            .iter()
+            .position(|event| event.id == id)
+            .unwrap_or_default()
+    });
+    let (_, _, developer_width) = debug_pane_widths(width);
+    let rendered = events
+        .into_iter()
+        .map(|event| {
+            let transcript = operations
+                .remove(&event.id)
+                .map(|projection| render_operation_projection_lines(app, vec![projection]))
+                .unwrap_or_default();
+            let developer =
+                developer_event_history_lines(event, developer_width, expanded, app.palette());
+            RenderedHistoryEntry {
+                id: event.id,
+                lines: debug_split_history_lines(transcript, developer, width),
+            }
+        })
+        .collect::<Vec<_>>();
+    let committed_count = committed_prefix_len(
+        &rendered,
+        stable_count,
+        width,
+        usize::from(live_row_capacity),
+    );
+    rendered.into_iter().take(committed_count).collect()
+}
+
+fn debug_split_history_lines(
+    transcript: Vec<Line<'static>>,
+    developer: Vec<Line<'static>>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let (transcript_width, gap_width, developer_width) = debug_pane_widths(width);
+    let transcript_rows = wrapped_history_rows(transcript, transcript_width);
+    let developer_rows = wrapped_history_rows(developer, developer_width);
+    let row_count = transcript_rows.len().max(developer_rows.len());
+
+    (0..row_count)
+        .map(|row| {
+            let mut spans = transcript_rows
+                .get(row)
+                .cloned()
+                .unwrap_or_else(|| vec![Span::raw(" ".repeat(usize::from(transcript_width)))]);
+            if gap_width > 0 {
+                spans.push(Span::raw(" ".repeat(usize::from(gap_width))));
+            }
+            spans.extend(
+                developer_rows
+                    .get(row)
+                    .cloned()
+                    .unwrap_or_else(|| vec![Span::raw(" ".repeat(usize::from(developer_width)))]),
+            );
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn wrapped_history_rows(lines: Vec<Line<'static>>, width: u16) -> Vec<Vec<Span<'static>>> {
+    if lines.is_empty() || width == 0 {
+        return Vec::new();
+    }
+    let row_count = Paragraph::new(lines.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(width)
+        .max(1)
+        .min(usize::from(u16::MAX));
+    // Ratatui 0.28 indexes Buffer rectangles with u16 arithmetic. Render pane rows in bounded
+    // chunks so width * height never crosses the representable buffer area.
+    let max_chunk_rows = usize::from(u16::MAX / width).max(1);
+    let mut rows = Vec::with_capacity(row_count);
+    let mut offset = 0_usize;
+
+    while offset < row_count {
+        let chunk_rows = (row_count - offset).min(max_chunk_rows);
+        let height = u16::try_from(chunk_rows).expect("debug history chunk is u16-bounded");
+        let area = Rect::new(0, 0, width, height);
+        let mut buffer = Buffer::empty(area);
+        Paragraph::new(lines.clone())
+            .wrap(Wrap { trim: false })
+            .scroll((
+                u16::try_from(offset).expect("debug history height is u16-bounded"),
+                0,
+            ))
+            .render(area, &mut buffer);
+        rows.extend((0..height).map(|row| styled_buffer_row(&buffer, row, width)));
+        offset = offset.saturating_add(chunk_rows);
+    }
+
+    rows
+}
+
+fn styled_buffer_row(buffer: &Buffer, row: u16, width: u16) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut current_style = None;
+    let mut current_text = String::new();
+    let mut column = 0_u16;
+
+    while column < width {
+        let Some(cell) = buffer.cell((column, row)) else {
+            break;
+        };
+        let style = cell.style();
+        if current_style.is_some_and(|current| current != style) {
+            spans.push(Span::styled(
+                std::mem::take(&mut current_text),
+                current_style.expect("debug history row has an active style"),
+            ));
+        }
+        current_style = Some(style);
+        let symbol_width = display_width(cell.symbol());
+        if symbol_width == 0 {
+            current_text.push(' ');
+            column = column.saturating_add(1);
+        } else {
+            current_text.push_str(cell.symbol());
+            column = column.saturating_add(u16::try_from(symbol_width).unwrap_or(u16::MAX).max(1));
+        }
+    }
+    if !current_text.is_empty() {
+        spans.push(Span::styled(
+            current_text,
+            current_style.expect("debug history row has an active style"),
+        ));
+    }
+    spans
 }
 
 fn committed_prefix_len(

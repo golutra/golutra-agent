@@ -262,7 +262,8 @@ impl TuiDriver {
             width: self.width,
             height: self.height,
             facts_expanded: self.app.debug_mode
-                && self.app.body_view_mode != BodyViewMode::Transcript,
+                && self.app.body_view_mode != BodyViewMode::Transcript
+                && self.app.developer_observations_expanded,
             controller_mode: self.last_controller_mode,
             closed: self.closed,
         }
@@ -1157,7 +1158,7 @@ fn ensure_task_binding_allows_slash(task_id: Option<TaskId>, text: &str) -> miet
             | SlashCommand::Plan
             | SlashCommand::Tasks
             | SlashCommand::Usage
-            | SlashCommand::Debug
+            | SlashCommand::Debug(_)
             | SlashCommand::Clear
             | SlashCommand::Quit
             | SlashCommand::Auth(SlashAuthCommand::Status | SlashAuthCommand::Protocols)

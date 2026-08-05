@@ -5,7 +5,7 @@ use ratatui::{
     layout::Rect,
     style::Style,
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Paragraph, Wrap},
 };
 
 use super::*;
@@ -14,7 +14,7 @@ pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiA
     let palette = app.palette();
     let content_width = area.width;
     let visible_rows = area.height as usize;
-    let rows = if app.inline_history_enabled && app.layout.body_mode == BodyLayoutMode::Developer {
+    let rows = if app.inline_history_enabled {
         developer_live_rows(app)
     } else {
         developer_rows(app)
@@ -23,7 +23,7 @@ pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiA
         .iter()
         .filter(|row| matches!(row, DeveloperPanelRow::Event { .. }))
         .count();
-    let summary_count = visible_summary_count(&rows, visible_rows, event_count);
+    let summary_count = visible_summary_count(app, &rows, visible_rows, event_count);
     let summary_lines = rows
         .iter()
         .filter_map(|row| match row {
@@ -48,7 +48,7 @@ pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiA
                 &label,
                 &summary,
                 usize::from(content_width),
-                false,
+                app.developer_observations_expanded,
                 palette,
             ),
         })
@@ -77,6 +77,9 @@ pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiA
             .saturating_sub(u16::try_from(summary_count).unwrap_or(u16::MAX)),
     );
     let mut events = Paragraph::new(event_lines);
+    if app.developer_observations_expanded {
+        events = events.wrap(Wrap { trim: false });
+    }
     let event_rows = events.line_count(event_area.width.max(1));
     let scroll = event_rows.saturating_sub(usize::from(event_area.height));
     events = events.scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0));
@@ -165,7 +168,13 @@ pub(crate) fn developer_event_history_lines(
 
 fn developer_rows(app: &TuiApp) -> Vec<DeveloperPanelRow> {
     if let Some(error) = &app.developer_error {
-        vec![DeveloperPanelRow::Summary(format!("error {error}"))]
+        let mut rows = vec![DeveloperPanelRow::Summary(format!("error {error}"))];
+        rows.extend(app.events.iter().map(|event| DeveloperPanelRow::Event {
+            sequence_no: event.sequence_no,
+            label: format!("{:?}/{:?}", event.event_type, event.source),
+            summary: developer_event_summary(event),
+        }));
+        rows
     } else if let Some(projection) = &app.developer_projection {
         developer_panel_rows_with_changes(projection, app.change_projection.summary(), usize::MAX)
     } else {
@@ -176,10 +185,14 @@ fn developer_rows(app: &TuiApp) -> Vec<DeveloperPanelRow> {
 }
 
 fn visible_summary_count(
+    app: &TuiApp,
     rows: &[DeveloperPanelRow],
     visible_rows: usize,
     event_count: usize,
 ) -> usize {
+    if !app.developer_observations_expanded && event_count > 0 {
+        return 0;
+    }
     let available = if event_count > 0 {
         visible_rows.saturating_sub(1)
     } else {

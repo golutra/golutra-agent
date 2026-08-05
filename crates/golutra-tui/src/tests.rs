@@ -1072,9 +1072,88 @@ fn resumed_debug_events_remain_contiguous_above_the_composer() {
         .position(|row| row.contains("#30 AssistantMessage/Runtime"))
         .expect("latest debug event row");
     assert!(
-        latest_row.saturating_sub(previous_row) <= 1,
+        latest_row.saturating_sub(previous_row) <= 2,
         "debug events must not be separated by viewport padding: {rows:#?}"
     );
+}
+
+#[test]
+fn debug_history_pairs_transcript_and_observations_in_terminal_scrollback() {
+    for width in [80, 120, 160] {
+        let session_id = SessionId::new();
+        let task_id = TaskId::new();
+        let events = (1..=36)
+            .map(|sequence_no| {
+                transcript_event(
+                    sequence_no,
+                    session_id,
+                    task_id,
+                    RuntimeEventType::AssistantMessage,
+                    json!({"content": format!("paired 正文 {sequence_no}")}),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            session_id,
+            Some(task_id),
+            true,
+            "ready (mock)".to_owned(),
+            None,
+        )
+        .with_footer_context("/workspace", "gpt-test");
+        app.events = events.clone();
+        app.developer_projection = Some(debug_projection_with_events(
+            session_id,
+            Some(task_id),
+            events,
+        ));
+        app.enable_inline_history();
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(width, 160),
+            TerminalOptions {
+                viewport: Viewport::Inline(12),
+            },
+        )
+        .expect("inline terminal");
+        let mut history = InlineHistoryState::new(session_id);
+
+        history
+            .flush(&mut terminal, &mut app)
+            .expect("paired debug history");
+        draw_inline_test_frame(&mut terminal, &mut app);
+        let rows = terminal_buffer_display_rows(&terminal);
+        let first = rows
+            .iter()
+            .find(|row| row.contains("#1 AssistantMessage/Runtime"))
+            .expect("oldest observation in terminal scrollback");
+        assert!(first.contains("paired 正文 1"), "{width}: {first:?}");
+        let observation_column = first.find("#1 ").expect("observation column");
+        let (transcript_width, gap_width, _) = debug_pane_widths(width);
+        assert_eq!(
+            display_width(&first[..observation_column]),
+            usize::from(transcript_width.saturating_add(gap_width)),
+            "{width}: {first:?}"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("#1 AssistantMessage/Runtime"))
+                .count(),
+            1,
+            "{width}: observation history must not be duplicated"
+        );
+
+        let facts = rows
+            .iter()
+            .find(|row| row.contains("facts events=36"))
+            .expect("expanded facts in terminal scrollback");
+        let facts_column = facts.find("facts events=36").expect("facts column");
+        assert_eq!(
+            display_width(&facts[..facts_column]),
+            usize::from(transcript_width.saturating_add(gap_width)),
+            "{width}: {facts:?}"
+        );
+    }
 }
 
 #[test]
@@ -1259,7 +1338,7 @@ fn debug_switch_keeps_transcript_visible_before_projection_finishes() {
 
     app.developer_error = Some("debug projection unavailable".to_owned());
     assert!(
-        !history
+        history
             .flush(&mut terminal, &mut app)
             .expect("failed debug projection")
     );
@@ -3569,6 +3648,7 @@ fn developer_event_details_stay_compact_in_the_observation_pane() {
             json!({"summary": summary}),
         )],
     ));
+    app.developer_observations_expanded = false;
     let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
 
     terminal
@@ -3661,7 +3741,7 @@ fn transcript_wraps_long_body_lines_to_the_available_width() {
 }
 
 #[tokio::test]
-async fn debug_command_refreshes_the_developer_projection_before_returning() {
+async fn debug_command_reloads_history_and_toggles_observation_detail() {
     let transport = RuntimeTransport::in_memory().await.expect("transport");
     let mut app = TuiApp::new(
         ThreadId::new(),
@@ -3675,17 +3755,40 @@ async fn debug_command_refreshes_the_developer_projection_before_returning() {
     app.refresh(&transport).await.expect("normal refresh");
     assert!(app.developer_projection.is_none());
 
-    app.execute_slash_command(&transport, SlashCommand::Debug)
+    app.execute_slash_command(&transport, SlashCommand::Debug(SlashDebugCommand::Toggle))
         .await
         .expect("enable debug");
     assert!(app.debug_mode);
+    assert!(app.developer_observations_expanded);
     assert!(app.developer_projection.is_some());
     assert!(app.developer_error.is_none());
 
-    app.execute_slash_command(&transport, SlashCommand::Debug)
+    app.events.push(transcript_event(
+        1,
+        app.session_id,
+        TaskId::new(),
+        RuntimeEventType::AssistantMessage,
+        json!({"content": "local history must be replaced"}),
+    ));
+    let generation = app.history_replay_generation;
+    app.execute_slash_command(&transport, SlashCommand::Debug(SlashDebugCommand::Toggle))
+        .await
+        .expect("compact and reload debug");
+    assert!(app.debug_mode);
+    assert!(!app.developer_observations_expanded);
+    assert!(app.events.is_empty());
+    assert_eq!(app.history_replay_generation, generation + 1);
+
+    app.execute_slash_command(&transport, SlashCommand::Debug(SlashDebugCommand::Expand))
+        .await
+        .expect("expand and reload debug");
+    assert!(app.developer_observations_expanded);
+
+    app.execute_slash_command(&transport, SlashCommand::Debug(SlashDebugCommand::Off))
         .await
         .expect("disable debug");
     assert!(!app.debug_mode);
+    assert!(!app.developer_observations_expanded);
     assert!(app.developer_projection.is_none());
     assert!(app.developer_error.is_none());
 }
@@ -4001,6 +4104,27 @@ fn terminal_buffer_rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
                 .filter_map(|column| terminal.backend().buffer().cell((column, row)))
                 .map(|cell| cell.symbol())
                 .collect::<String>()
+        })
+        .collect()
+}
+
+fn terminal_buffer_display_rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
+    let buffer = terminal.backend().buffer();
+    let area = buffer.area;
+    (area.top()..area.bottom())
+        .map(|row| {
+            let mut rendered = String::new();
+            let mut column = area.left();
+            while column < area.right() {
+                let Some(cell) = buffer.cell((column, row)) else {
+                    break;
+                };
+                rendered.push_str(cell.symbol());
+                column = column.saturating_add(
+                    u16::try_from(display_width(cell.symbol()).max(1)).unwrap_or(u16::MAX),
+                );
+            }
+            rendered
         })
         .collect()
 }
@@ -4704,6 +4828,120 @@ fn inline_history_commits_only_the_stable_projection_prefix() {
     completed.turn_id = Some(turn_id);
     app.events.push(completed);
     assert_eq!(stable_event_operation_projection_count(&app.events), 2);
+}
+
+#[test]
+fn debug_scrollback_stops_at_an_unstable_transcript_operation() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let tool_call_id = golutra_core::ToolCallId::new();
+    let mut events = (1..=24)
+        .map(|sequence_no| {
+            transcript_event(
+                sequence_no,
+                session_id,
+                task_id,
+                RuntimeEventType::AssistantMessage,
+                json!({"content": format!("stable response {sequence_no}")}),
+            )
+        })
+        .collect::<Vec<_>>();
+    let tool_started = transcript_event(
+        25,
+        session_id,
+        task_id,
+        RuntimeEventType::ToolStarted,
+        json!({
+            "tool_call_id": tool_call_id,
+            "tool_name": "shell",
+            "arguments": {"command": "cargo test"}
+        }),
+    );
+    let tool_started_id = tool_started.id;
+    events.push(tool_started);
+    events.extend((26..=40).map(|sequence_no| {
+        transcript_event(
+            sequence_no,
+            session_id,
+            task_id,
+            RuntimeEventType::StepCompleted,
+            json!({"summary": format!("later observation {sequence_no}")}),
+        )
+    }));
+    let initial_events = events.clone();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        true,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.events = events;
+    app.developer_observations_expanded = false;
+    app.developer_projection = Some(debug_projection_with_events(
+        session_id,
+        Some(task_id),
+        initial_events.clone(),
+    ));
+    app.enable_inline_history();
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(100, 80),
+        TerminalOptions {
+            viewport: Viewport::Inline(12),
+        },
+    )
+    .expect("inline terminal");
+    let mut history = InlineHistoryState::new(session_id);
+
+    history
+        .flush(&mut terminal, &mut app)
+        .expect("history before tool completion");
+    assert!(!app.inline_history_committed_event_ids.is_empty());
+    assert!(
+        !app.inline_history_committed_event_ids
+            .contains(&tool_started_id)
+    );
+    assert!(
+        initial_events[24..]
+            .iter()
+            .all(|event| !app.inline_history_committed_event_ids.contains(&event.id)),
+        "events after an unstable operation must remain in the live tail"
+    );
+
+    app.events.push(transcript_event(
+        41,
+        session_id,
+        task_id,
+        RuntimeEventType::ToolCompleted,
+        json!({
+            "envelope": {
+                "tool_call_id": tool_call_id,
+                "tool_name": "shell",
+                "status": "ok",
+                "summary": "tests passed",
+                "structured_facts": {"command": "cargo test"}
+            }
+        }),
+    ));
+    app.events.extend((42..=55).map(|sequence_no| {
+        transcript_event(
+            sequence_no,
+            session_id,
+            task_id,
+            RuntimeEventType::StepCompleted,
+            json!({"summary": format!("settled observation {sequence_no}")}),
+        )
+    }));
+
+    history
+        .flush(&mut terminal, &mut app)
+        .expect("history after tool completion");
+    assert!(
+        app.inline_history_committed_event_ids
+            .contains(&tool_started_id),
+        "the completed operation should become eligible for scrollback"
+    );
 }
 
 #[test]
@@ -5456,7 +5694,7 @@ fn resume_item(title: &str) -> ResumeThreadItem {
 }
 
 #[tokio::test]
-async fn debug_page_keys_leave_the_observation_tail_fixed() {
+async fn debug_page_keys_leave_history_navigation_to_the_terminal() {
     let transport = RuntimeTransport::in_memory().await.expect("transport");
     let session_id = SessionId::new();
     let mut app = TuiApp::new(

@@ -44,14 +44,15 @@ use golutra_llm::{
     provider_protocol_catalog,
 };
 use golutra_protocol::{
-    CommandAck, EventPageDirection, EventPageRequest, RuntimeEvent, RuntimeEventType, RuntimeQuery,
-    RuntimeQueryKind, SessionCommandKind, UserProjection, pending_user_question,
+    CommandAck, DebugProjection, EventPageDirection, EventPageRequest, RuntimeEvent,
+    RuntimeEventType, RuntimeQuery, RuntimeQueryKind, SessionCommandKind, UserProjection,
+    pending_user_question,
 };
 use golutra_tui::{
     AuthConfigScope, AuthCredentialStore, OAuthLoginCommand, OpenAiCompatibleLogin,
     PaneScrollState, ReasoningEffortSelection, SlashAuthCommand, SlashCommand,
-    SlashCommandCandidate, SlashInput, TranscriptScrollAction, parse_slash_input,
-    slash_command_candidates,
+    SlashCommandCandidate, SlashDebugCommand, SlashInput, TranscriptScrollAction,
+    parse_slash_input, slash_command_candidates,
 };
 use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend};
 use secrecy::SecretString;
@@ -306,6 +307,7 @@ struct TuiApp {
     change_projection: ChangeProjection,
     expanded_operations: HashSet<OperationId>,
     transcript_details_expanded: bool,
+    developer_observations_expanded: bool,
     transcript_scroll: PaneScrollState,
     transcript_top_row_override: Option<usize>,
     transcript_revision: u64,
@@ -472,6 +474,7 @@ impl TuiApp {
             change_projection: ChangeProjection::default(),
             expanded_operations: HashSet::new(),
             transcript_details_expanded: false,
+            developer_observations_expanded: debug_mode,
             transcript_scroll: PaneScrollState {
                 follow_tail: true,
                 ..PaneScrollState::default()
@@ -701,28 +704,7 @@ impl TuiApp {
         Ok(())
     }
 
-    async fn refresh_developer_projection(&mut self, transport: &RuntimeTransport) {
-        match load_debug_projection(transport, self.session_id, self.task_id).await {
-            Ok(mut projection) => {
-                if !self.events.is_empty() {
-                    replace_debug_event_history(&mut projection, self.events.clone());
-                }
-                self.developer_projection = Some(projection);
-                self.developer_error = None;
-                self.status_message = "runtime observations refreshed".to_owned();
-            }
-            Err(error) => {
-                self.developer_projection = None;
-                self.developer_error = Some(error.clone());
-                self.status_message = format!("runtime observations unavailable: {error}");
-            }
-        }
-    }
-
-    async fn load_recent_history(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
-        let history = load_complete_event_history(transport, self.session_id, self.task_id)
-            .await
-            .map_err(|error| miette::miette!("{error}"))?;
+    fn apply_loaded_history(&mut self, history: LoadedEventHistory) {
         self.events = history.events;
         self.invalidate_transcript_layout();
         self.rebuild_event_projections();
@@ -733,6 +715,50 @@ impl TuiApp {
         self.sync_transcript_row_count(0);
         self.clamp_transcript_scroll();
         self.history_replay_ready = true;
+    }
+
+    fn apply_developer_projection_result(&mut self, result: Result<DebugProjection, String>) {
+        match result {
+            Ok(mut projection) => {
+                if !self.events.is_empty() {
+                    replace_debug_event_history(&mut projection, self.events.clone());
+                }
+                self.developer_projection = Some(projection);
+                self.developer_error = None;
+            }
+            Err(error) => {
+                self.developer_projection = None;
+                self.developer_error = Some(error.clone());
+                self.status_message = format!("runtime observations unavailable: {error}");
+            }
+        }
+    }
+
+    async fn reload_debug_history(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
+        let (history, projection) = tokio::join!(
+            load_complete_event_history(transport, self.session_id, self.task_id),
+            load_debug_projection(transport, self.session_id, self.task_id),
+        );
+        let history = history.map_err(|error| miette::miette!("{error}"))?;
+        self.begin_history_replay();
+        self.apply_loaded_history(history);
+        self.apply_developer_projection_result(projection);
+        if self.developer_error.is_none() {
+            self.status_message = if self.developer_observations_expanded {
+                "runtime observations reloaded and expanded"
+            } else {
+                "runtime observations reloaded in compact form"
+            }
+            .to_owned();
+        }
+        Ok(())
+    }
+
+    async fn load_recent_history(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
+        let history = load_complete_event_history(transport, self.session_id, self.task_id)
+            .await
+            .map_err(|error| miette::miette!("{error}"))?;
+        self.apply_loaded_history(history);
         Ok(())
     }
 
@@ -785,9 +811,11 @@ impl TuiApp {
         self.body_view_mode = BodyViewMode::Auto;
         self.request_history_rebuild();
         if enabled {
+            self.developer_observations_expanded = true;
             self.developer_error = None;
             self.status_message = "developer runtime view visible".to_owned();
         } else {
+            self.developer_observations_expanded = false;
             self.developer_projection = None;
             self.developer_error = None;
             self.status_message = "developer runtime view hidden".to_owned();
@@ -2207,11 +2235,22 @@ impl TuiApp {
                 Some(unrestricted) => self.set_permission_mode(unrestricted),
                 None => self.open_settings_dialog(),
             },
-            SlashCommand::Debug => {
-                let enabled = !self.debug_mode;
-                self.set_debug_mode(enabled);
-                if enabled {
-                    self.refresh_developer_projection(transport).await;
+            SlashCommand::Debug(action) => {
+                if action == SlashDebugCommand::Off {
+                    self.set_debug_mode(false);
+                } else {
+                    let expanded = match action {
+                        SlashDebugCommand::Toggle => {
+                            !self.debug_mode || !self.developer_observations_expanded
+                        }
+                        SlashDebugCommand::Expand => true,
+                        SlashDebugCommand::Compact => false,
+                        SlashDebugCommand::Off => unreachable!("handled above"),
+                    };
+                    self.set_debug_mode(true);
+                    self.body_view_mode = BodyViewMode::Auto;
+                    self.developer_observations_expanded = expanded;
+                    self.reload_debug_history(transport).await?;
                 }
             }
             SlashCommand::Takeover => {
