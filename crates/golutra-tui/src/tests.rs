@@ -807,6 +807,13 @@ fn session_history_card_uses_golutra_brand_and_operational_fields() {
     assert!(text.contains("██║  ███╗"));
     assert!(text.contains("╚══════╝"));
     assert!(logo_colors.len() >= 12);
+    assert!(logo_colors.contains(&Color::Rgb(0x0E, 0xA5, 0xE9)));
+    assert!(
+        lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .any(|span| span.style.fg == Some(Color::Rgb(0xF5, 0x9E, 0x0B)))
+    );
     assert!(
         logo_colors
             .iter()
