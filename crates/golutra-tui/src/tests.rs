@@ -765,8 +765,54 @@ fn terminal_resume_generation_invalidates_the_crossterm_input_stream() {
 }
 
 #[test]
-fn session_history_card_replaces_persistent_header_hints() {
+fn session_history_card_uses_golutra_brand_and_operational_fields() {
     let app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_yolo(true)
+    .with_footer_context("/workspace", "gpt-test");
+
+    let lines = session_history_lines(&app, 120);
+    let text = lines
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut logo_colors = Vec::new();
+    for color in lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .filter(|span| span.content.contains('█'))
+        .filter_map(|span| span.style.fg)
+    {
+        if !logo_colors.contains(&color) {
+            logo_colors.push(color);
+        }
+    }
+
+    assert!(text.contains("GOLUTRA"));
+    assert!(text.contains("plan > act > verify"));
+    assert!(text.contains("engine"));
+    assert!(text.contains("gpt-test"));
+    assert!(text.contains("scope"));
+    assert!(text.contains("/workspace"));
+    assert!(text.contains("guard"));
+    assert!(text.contains("unrestricted"));
+    assert!(text.contains("█████"));
+    assert!(logo_colors.len() >= 3);
+    assert!(!text.contains("new in"));
+    assert!(!text.contains("F1 help"));
+    assert!(!text.contains("/settings"));
+}
+
+#[test]
+fn session_history_logo_is_responsive_and_screen_reader_safe() {
+    let mut app = TuiApp::new(
         ThreadId::new(),
         SessionId::new(),
         None,
@@ -776,23 +822,32 @@ fn session_history_card_replaces_persistent_header_hints() {
     )
     .with_footer_context("/workspace", "gpt-test");
 
-    let text = session_history_lines(&app, 80)
-        .into_iter()
-        .map(|line| {
-            line.spans
-                .into_iter()
-                .map(|span| span.content.into_owned())
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    for width in [7, 8, 15, 24, 60, 87, 88, 120, 121] {
+        assert!(
+            session_history_lines(&app, width)
+                .iter()
+                .all(|line| line.width() <= usize::from(width)),
+            "width {width}"
+        );
+    }
+    assert!(
+        !session_history_lines(&app, 87)
+            .iter()
+            .any(|line| line.to_string().contains('█'))
+    );
+    assert!(
+        session_history_lines(&app, 88)
+            .iter()
+            .any(|line| line.to_string().contains('█'))
+    );
 
-    assert!(text.contains("Golutra (v0.1.0)"));
-    assert!(text.contains("model:     gpt-test"));
-    assert!(text.contains("directory: /workspace"));
-    assert!(!text.contains("new in"));
-    assert!(!text.contains("F1 help"));
-    assert!(!text.contains("/settings"));
+    app.preferences.screen_reader = true;
+    let accessible = session_history_lines(&app, 120)
+        .iter()
+        .map(ToString::to_string)
+        .collect::<String>();
+    assert!(accessible.contains("GOLUTRA"));
+    assert!(!accessible.contains('█'));
 }
 
 #[test]
@@ -825,14 +880,14 @@ fn inline_session_history_is_inserted_only_once() {
     );
 
     assert_eq!(
-        terminal_buffer_text(&terminal).matches("Golutra").count(),
+        terminal_buffer_text(&terminal).matches("GOLUTRA").count(),
         1
     );
 
     app.request_history_rebuild();
     assert!(history.flush(&mut terminal, &mut app).expect("rebuild"));
     assert_eq!(
-        terminal_buffer_text(&terminal).matches("Golutra").count(),
+        terminal_buffer_text(&terminal).matches("GOLUTRA").count(),
         1
     );
 }
@@ -1565,7 +1620,7 @@ fn repeated_debug_and_transcript_switches_do_not_duplicate_history() {
     draw_inline_test_frame(&mut terminal, &mut app);
     let debug_again = terminal_buffer_text(&terminal);
     assert_eq!(debug_again.matches("#1 TaskCreated/Runtime").count(), 1);
-    assert_eq!(debug_again.matches("Golutra (v").count(), 1);
+    assert_eq!(debug_again.matches("GOLUTRA").count(), 1);
 }
 
 #[test]
@@ -1581,9 +1636,12 @@ fn session_history_card_fits_narrow_unicode_paths() {
     .with_footer_context("/工作区/非常长的目录名称/project", "模型-very-long-name");
 
     let lines = session_history_lines(&app, 24);
+    let text = lines.iter().map(ToString::to_string).collect::<String>();
 
     assert!(lines.iter().all(|line| line.width() <= 24));
     assert!(lines.iter().any(|line| line.to_string().contains('…')));
+    assert!(text.contains("GOLUTRA"));
+    assert!(!text.contains('█'));
 }
 
 #[test]
