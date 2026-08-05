@@ -120,8 +120,7 @@ pub(crate) fn ui_layout(area: Rect, app: &TuiApp) -> UiLayoutSnapshot {
 
 pub(crate) fn draw_ui(frame: &mut Frame<'_>, app: &mut TuiApp) {
     let next_layout = ui_layout(frame.area(), app);
-    let transcript_visible = next_layout.body_mode != BodyLayoutMode::Developer;
-    if transcript_visible {
+    if next_layout.body_mode == BodyLayoutMode::Transcript {
         app.ensure_transcript_layout(next_layout.transcript);
         let row_count = app
             .transcript_layout_cache
@@ -131,11 +130,14 @@ pub(crate) fn draw_ui(frame: &mut Frame<'_>, app: &mut TuiApp) {
     }
     app.layout = next_layout;
     let layout = app.layout;
-    if transcript_visible {
-        draw_transcript(frame, layout.transcript, app);
-    }
-    if let Some(developer) = layout.developer {
-        draw_developer_panel(frame, developer, app);
+    match layout.body_mode {
+        BodyLayoutMode::Transcript => draw_transcript(frame, layout.transcript, app),
+        BodyLayoutMode::Developer => {
+            draw_developer_panel(frame, layout.developer.expect("developer layout"), app);
+        }
+        BodyLayoutMode::ResponseAndDeveloper => {
+            draw_debug_timeline(frame, layout.body, app);
+        }
     }
     draw_bottom_pane(frame, layout.bottom, app);
 }

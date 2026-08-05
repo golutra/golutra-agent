@@ -268,10 +268,6 @@ fn debug_split_history_entries(
         .iter()
         .find(|entry| !entry.stable)
         .map(|entry| entry.id);
-    let mut operations = operation_entries
-        .into_iter()
-        .map(|entry| (entry.id, entry.projection))
-        .collect::<HashMap<_, _>>();
     let mut events = app.events.iter().collect::<Vec<_>>();
     events.sort_by_key(|event| event.sequence_no);
     let stable_count = first_unstable_id.map_or(events.len(), |id| {
@@ -280,8 +276,41 @@ fn debug_split_history_entries(
             .position(|event| event.id == id)
             .unwrap_or_default()
     });
+    let rendered = debug_split_event_entries(app, events, width, expanded);
+    let committed_count = committed_prefix_len(
+        &rendered,
+        stable_count,
+        width,
+        usize::from(live_row_capacity),
+    );
+    rendered.into_iter().take(committed_count).collect()
+}
+
+fn debug_source_events(app: &TuiApp) -> Vec<&golutra_protocol::RuntimeEvent> {
+    let mut events = if app.events.is_empty() {
+        app.developer_projection
+            .as_ref()
+            .map(|projection| projection.events.iter().collect::<Vec<_>>())
+            .unwrap_or_default()
+    } else {
+        app.events.iter().collect::<Vec<_>>()
+    };
+    events.sort_by_key(|event| event.sequence_no);
+    events
+}
+
+fn debug_split_event_entries(
+    app: &TuiApp,
+    events: Vec<&golutra_protocol::RuntimeEvent>,
+    width: u16,
+    expanded: bool,
+) -> Vec<RenderedHistoryEntry> {
+    let mut operations = event_operation_entries(&app.events)
+        .into_iter()
+        .map(|entry| (entry.id, entry.projection))
+        .collect::<HashMap<_, _>>();
     let (_, developer_width) = debug_pane_widths(width);
-    let rendered = events
+    events
         .into_iter()
         .map(|event| {
             let transcript = operations
@@ -295,14 +324,159 @@ fn debug_split_history_entries(
                 lines: debug_split_history_lines(transcript, developer, width),
             }
         })
-        .collect::<Vec<_>>();
-    let committed_count = committed_prefix_len(
-        &rendered,
-        stable_count,
+        .collect()
+}
+
+pub(crate) fn debug_split_live_lines(
+    app: &TuiApp,
+    width: u16,
+    visible_rows: u16,
+) -> Vec<Line<'static>> {
+    let (_, developer_width) = debug_pane_widths(width);
+    let facts = if !app.inline_history_enabled || app.developer_error.is_some() {
+        let mut facts = developer_fact_history_lines(app, developer_width);
+        if facts.is_empty() && app.developer_projection.is_none() {
+            facts.push(Line::from("loading developer projection"));
+        }
+        debug_split_history_lines(Vec::new(), facts, width)
+    } else {
+        Vec::new()
+    };
+
+    let mut timeline = debug_split_event_entries(
+        app,
+        debug_source_events(app),
         width,
-        usize::from(live_row_capacity),
-    );
-    rendered.into_iter().take(committed_count).collect()
+        app.developer_observations_expanded,
+    )
+    .into_iter()
+    .filter(|entry| !app.inline_history_committed_event_ids.contains(&entry.id))
+    .flat_map(|entry| entry.lines)
+    .collect::<Vec<_>>();
+
+    let live_event_operation_count = event_operation_entries(&app.events)
+        .into_iter()
+        .filter(|entry| !app.inline_history_committed_event_ids.contains(&entry.id))
+        .count();
+    let transcript_only = rendered_transcript_operation_projections(app)
+        .into_iter()
+        .skip(live_event_operation_count)
+        .collect::<Vec<_>>();
+    timeline.extend(debug_split_history_lines(
+        render_operation_projection_lines(app, transcript_only),
+        Vec::new(),
+        width,
+    ));
+
+    let capacity = usize::from(visible_rows);
+    // Interactive history can rely on native scrollback. Offscreen snapshots cannot, so reserve
+    // space for governance facts and prioritize user-visible transcript plus event headers.
+    let fact_budget = if timeline.is_empty() {
+        capacity
+    } else {
+        (capacity / 3).max(1)
+    };
+    let fact_count = facts.len().min(fact_budget);
+    let timeline_count = timeline.len().min(capacity.saturating_sub(fact_count));
+    let visible_timeline = if !app.inline_history_enabled && timeline.len() > timeline_count {
+        prioritized_debug_snapshot_lines(timeline, timeline_count, debug_pane_widths(width).0)
+    } else {
+        timeline
+            .drain(timeline.len().saturating_sub(timeline_count)..)
+            .collect::<Vec<_>>()
+    };
+    let gap = capacity.saturating_sub(fact_count + timeline_count);
+    let mut lines = facts.into_iter().take(fact_count).collect::<Vec<_>>();
+    lines.extend(std::iter::repeat_with(|| Line::from(" ".repeat(usize::from(width)))).take(gap));
+    lines.extend(visible_timeline);
+    lines
+}
+
+fn prioritized_debug_snapshot_lines(
+    timeline: Vec<Line<'static>>,
+    capacity: usize,
+    transcript_width: u16,
+) -> Vec<Line<'static>> {
+    if timeline.len() <= capacity {
+        return timeline;
+    }
+
+    let transcript_rows = timeline
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            debug_line_has_content_in_range(line, 0, transcript_width).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let observation_rows = timeline
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            debug_line_has_content_in_range(line, transcript_width, u16::MAX).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let observation_headers = observation_rows
+        .iter()
+        .copied()
+        .filter(|index| {
+            timeline[*index]
+                .spans
+                .iter()
+                .any(|span| span.content.trim_start().starts_with('#'))
+        })
+        .collect::<Vec<_>>();
+    let transcript_budget = capacity.saturating_sub(usize::from(!observation_rows.is_empty()));
+    let mut selected = HashSet::with_capacity(capacity);
+    if transcript_rows.len() <= transcript_budget {
+        selected.extend(transcript_rows);
+    } else {
+        let head_count = transcript_budget / 2;
+        let tail_count = transcript_budget.saturating_sub(head_count);
+        selected.extend(transcript_rows.iter().take(head_count).copied());
+        selected.extend(transcript_rows.iter().rev().take(tail_count).copied());
+    }
+    for index in observation_headers
+        .into_iter()
+        .rev()
+        .chain(observation_rows.into_iter().rev())
+    {
+        if selected.len() >= capacity {
+            break;
+        }
+        selected.insert(index);
+    }
+    for index in (0..timeline.len()).rev() {
+        if selected.len() >= capacity {
+            break;
+        }
+        selected.insert(index);
+    }
+
+    timeline
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, line)| selected.contains(&index).then_some(line))
+        .collect()
+}
+
+fn debug_line_has_content_in_range(line: &Line<'_>, start: u16, end: u16) -> bool {
+    let mut column = 0_u16;
+    for span in &line.spans {
+        for character in span.content.chars() {
+            let character_width = u16::try_from(display_width(&character.to_string()))
+                .unwrap_or(u16::MAX)
+                .max(1);
+            let character_end = column.saturating_add(character_width);
+            if column < end && character_end > start && !character.is_whitespace() {
+                return true;
+            }
+            column = character_end;
+            if column >= end {
+                return false;
+            }
+        }
+    }
+    false
 }
 
 pub(crate) fn debug_split_history_lines(
@@ -313,23 +487,18 @@ pub(crate) fn debug_split_history_lines(
     let (transcript_width, developer_width) = debug_pane_widths(width);
     let transcript_rows = wrapped_history_rows(transcript, transcript_width);
     let developer_rows = wrapped_history_rows(developer, developer_width);
-    let row_count = transcript_rows.len().max(developer_rows.len());
+    let mut rows = Vec::with_capacity(transcript_rows.len() + developer_rows.len());
 
-    (0..row_count)
-        .map(|row| {
-            let mut spans = transcript_rows
-                .get(row)
-                .cloned()
-                .unwrap_or_else(|| vec![Span::raw(" ".repeat(usize::from(transcript_width)))]);
-            spans.extend(
-                developer_rows
-                    .get(row)
-                    .cloned()
-                    .unwrap_or_else(|| vec![Span::raw(" ".repeat(usize::from(developer_width)))]),
-            );
-            Line::from(spans)
-        })
-        .collect()
+    rows.extend(transcript_rows.into_iter().map(|mut transcript| {
+        transcript.push(Span::raw(" ".repeat(usize::from(developer_width))));
+        Line::from(transcript)
+    }));
+    rows.extend(developer_rows.into_iter().map(|developer| {
+        let mut spans = vec![Span::raw(" ".repeat(usize::from(transcript_width)))];
+        spans.extend(developer);
+        Line::from(spans)
+    }));
+    rows
 }
 
 fn wrapped_history_rows(lines: Vec<Line<'static>>, width: u16) -> Vec<Vec<Span<'static>>> {

@@ -502,6 +502,12 @@ const AUTH_SLASH_HINTS: &[SlashCommandHint] = &[
     },
 ];
 
+const DEBUG_SLASH_HINTS: &[SlashCommandHint] = &[SlashCommandHint {
+    command: "/debug switch",
+    description: "toggle expanded or compact observations",
+    selection: SlashCommandSelection::Execute,
+}];
+
 #[must_use]
 pub fn slash_command_suggestions(input: &str) -> Vec<String> {
     slash_command_candidates(input)
@@ -519,17 +525,26 @@ pub fn slash_command_candidates(input: &str) -> Vec<SlashCommandCandidate> {
 
     let tokens = input.split_whitespace().collect::<Vec<_>>();
     let first_token = tokens.first().copied().unwrap_or("/");
-    let suggestions =
-        if first_token == "/auth" && (input.ends_with(char::is_whitespace) || tokens.len() > 1) {
-            let action_prefix = if input.ends_with(char::is_whitespace) && tokens.len() == 1 {
-                ""
-            } else {
-                tokens.get(1).copied().unwrap_or("")
-            };
-            matching_hints(AUTH_SLASH_HINTS, action_prefix, "/auth ")
+    let suggestions = if first_token == "/auth"
+        && (input.ends_with(char::is_whitespace) || tokens.len() > 1)
+    {
+        let action_prefix = if input.ends_with(char::is_whitespace) && tokens.len() == 1 {
+            ""
         } else {
-            matching_hints(TOP_LEVEL_SLASH_HINTS, first_token, "")
+            tokens.get(1).copied().unwrap_or("")
         };
+        matching_hints(AUTH_SLASH_HINTS, action_prefix, "/auth ")
+    } else if first_token == "/debug" && (input.ends_with(char::is_whitespace) || tokens.len() > 1)
+    {
+        let action_prefix = if input.ends_with(char::is_whitespace) && tokens.len() == 1 {
+            ""
+        } else {
+            tokens.get(1).copied().unwrap_or("")
+        };
+        matching_hints(DEBUG_SLASH_HINTS, action_prefix, "/debug ")
+    } else {
+        matching_hints(TOP_LEVEL_SLASH_HINTS, first_token, "")
+    };
 
     suggestions.into_iter().take(5).collect()
 }

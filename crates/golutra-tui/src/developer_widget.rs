@@ -10,6 +10,17 @@ use ratatui::{
 
 use super::*;
 
+pub(crate) fn draw_debug_timeline(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let lines = debug_split_live_lines(app, area.width, area.height);
+    if lines.is_empty() {
+        return;
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let palette = app.palette();
     let content_width = area.width;

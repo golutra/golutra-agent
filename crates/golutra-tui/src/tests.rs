@@ -1072,14 +1072,19 @@ fn resumed_debug_events_remain_contiguous_above_the_composer() {
         .iter()
         .position(|row| row.contains("#30 AssistantMessage/Runtime"))
         .expect("latest debug event row");
+    let rows_between = &rows[previous_row.saturating_add(1)..latest_row];
     assert!(
-        latest_row.saturating_sub(previous_row) <= 2,
+        rows_between
+            .iter()
+            .filter(|row| row.trim().is_empty())
+            .count()
+            <= 1,
         "debug events must not be separated by viewport padding: {rows:#?}"
     );
 }
 
 #[test]
-fn debug_history_pairs_transcript_and_observations_in_terminal_scrollback() {
+fn debug_history_sequences_transcript_before_observations_in_terminal_scrollback() {
     for width in [80, 120, 160] {
         let session_id = SessionId::new();
         let task_id = TaskId::new();
@@ -1111,7 +1116,7 @@ fn debug_history_pairs_transcript_and_observations_in_terminal_scrollback() {
         ));
         app.enable_inline_history();
         let mut terminal = Terminal::with_options(
-            TestBackend::new(width, 160),
+            TestBackend::new(width, 320),
             TerminalOptions {
                 viewport: Viewport::Inline(12),
             },
@@ -1124,11 +1129,29 @@ fn debug_history_pairs_transcript_and_observations_in_terminal_scrollback() {
             .expect("paired debug history");
         draw_inline_test_frame(&mut terminal, &mut app);
         let rows = terminal_buffer_display_rows(&terminal);
-        let first = rows
+        let transcript_row = rows
             .iter()
-            .find(|row| row.contains("#1 AssistantMessage/Runtime"))
+            .position(|row| row.contains("paired 正文 1"))
+            .expect("oldest transcript in terminal scrollback");
+        let observation_row = rows
+            .iter()
+            .position(|row| row.contains("#1 AssistantMessage/Runtime"))
             .expect("oldest observation in terminal scrollback");
-        assert!(first.contains("paired 正文 1"), "{width}: {first:?}");
+        assert!(
+            transcript_row < observation_row,
+            "{width}: transcript must precede its observation: {rows:#?}"
+        );
+        assert!(
+            !rows[transcript_row].contains("#1 AssistantMessage/Runtime"),
+            "{width}: {:?}",
+            rows[transcript_row]
+        );
+        assert!(
+            !rows[observation_row].contains("paired 正文 1"),
+            "{width}: {:?}",
+            rows[observation_row]
+        );
+        let first = &rows[observation_row];
         let observation_column = first.find("#1 ").expect("observation column");
         let (transcript_width, _) = debug_pane_widths(width);
         assert_eq!(
@@ -1171,6 +1194,8 @@ fn debug_split_history_keeps_both_columns_inside_equal_halves() {
             width,
         );
         assert!(!rows.is_empty());
+        let mut saw_transcript = false;
+        let mut saw_observation = false;
         for row in rows {
             let text = row.to_string();
             assert_eq!(
@@ -1179,6 +1204,14 @@ fn debug_split_history_keeps_both_columns_inside_equal_halves() {
                 "{width}: {text:?}"
             );
             let boundary = usize::from(transcript_width);
+            let transcript_has_content = text[..boundary].contains('L');
+            let observation_has_content = text[boundary..].contains('R');
+            assert_ne!(
+                transcript_has_content, observation_has_content,
+                "each physical debug row must belong to exactly one side at width {width}: {text:?}"
+            );
+            saw_transcript |= transcript_has_content;
+            saw_observation |= observation_has_content;
             assert!(
                 text[..boundary]
                     .chars()
@@ -1192,6 +1225,7 @@ fn debug_split_history_keeps_both_columns_inside_equal_halves() {
                 "right observation crossed its half at width {width}: {text:?}"
             );
         }
+        assert!(saw_transcript && saw_observation);
 
         let unicode_rows = debug_split_history_lines(
             vec![Line::from("旅途正文".repeat(usize::from(width)))],
@@ -1396,6 +1430,62 @@ fn debug_switch_keeps_transcript_visible_before_projection_finishes() {
     let failed = terminal_buffer_text(&terminal);
     assert_eq!(failed.matches("transcript-projection-only").count(), 1);
     assert!(failed.contains("debug projection unavailable"));
+}
+
+#[test]
+fn debug_scrollback_waits_for_canonical_history_before_committing_projection_events() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let events = (1..=36)
+        .map(|sequence_no| {
+            transcript_event(
+                sequence_no,
+                session_id,
+                task_id,
+                RuntimeEventType::AssistantMessage,
+                json!({"content": format!("canonical transcript {sequence_no}")}),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        true,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_footer_context("/workspace", "gpt-test");
+    app.developer_projection = Some(debug_projection_with_events(
+        session_id,
+        Some(task_id),
+        events.clone(),
+    ));
+    app.enable_inline_history();
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(80, 240),
+        TerminalOptions {
+            viewport: Viewport::Inline(12),
+        },
+    )
+    .expect("inline terminal");
+    let mut history = InlineHistoryState::new(session_id);
+
+    history
+        .flush(&mut terminal, &mut app)
+        .expect("projection-only debug frame");
+    assert!(app.inline_history_committed_event_ids.is_empty());
+    draw_inline_test_frame(&mut terminal, &mut app);
+    assert!(terminal_buffer_text(&terminal).contains("#36 AssistantMessage/Runtime"));
+
+    app.events = events;
+    app.invalidate_transcript_layout();
+    history
+        .flush(&mut terminal, &mut app)
+        .expect("canonical debug history");
+    assert!(!app.inline_history_committed_event_ids.is_empty());
+    draw_inline_test_frame(&mut terminal, &mut app);
+    assert!(terminal_buffer_text(&terminal).contains("canonical transcript 36"));
 }
 
 #[test]
@@ -1947,6 +2037,40 @@ async fn tab_without_slash_candidates_does_not_enable_developer_mode() {
 
     assert!(!app.debug_mode);
     assert!(app.developer_projection.is_none());
+}
+
+#[tokio::test]
+async fn debug_switch_candidate_executes_through_the_composer_enter_path() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.input.set_text("/debug switch");
+
+    let candidates = app.slash_candidates();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].command, "/debug switch");
+
+    handle_key(
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("execute debug switch");
+
+    assert!(!app.developer_observations_expanded);
+    assert!(app.input.is_empty());
+    assert!(
+        app.command_messages
+            .iter()
+            .all(|message| message.title != "Command error")
+    );
 }
 
 #[tokio::test]
@@ -3287,6 +3411,78 @@ fn debug_layout_keeps_transcript_left_and_observations_right_at_every_width() {
     assert_eq!(narrow_developer.right(), narrow.body.right());
     assert_eq!(narrow.transcript.height, narrow.body.height);
     assert_eq!(narrow_developer.height, narrow.body.height);
+}
+
+#[test]
+fn debug_live_timeline_never_renders_transcript_and_observation_on_the_same_row() {
+    for width in [80, 81, 120, 121] {
+        let session_id = SessionId::new();
+        let task_id = TaskId::new();
+        let turn_id = TurnId::new();
+        let mut created = transcript_event(
+            1,
+            session_id,
+            task_id,
+            RuntimeEventType::TaskCreated,
+            json!({"payload": {"prompt": "恢复后的长中文正文".repeat(24)}}),
+        );
+        created.turn_id = Some(turn_id);
+        let mut streamed = transcript_event(
+            2,
+            session_id,
+            task_id,
+            RuntimeEventType::ProviderStreamed,
+            json!({"delta": {"kind": "text_delta", "text": "模型流式输出内容".repeat(36)}}),
+        );
+        streamed.turn_id = Some(turn_id);
+        let events = vec![created, streamed];
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            session_id,
+            Some(task_id),
+            true,
+            "ready (mock)".to_owned(),
+            None,
+        );
+        app.events = events.clone();
+        app.developer_projection = Some(debug_projection_with_events(
+            session_id,
+            Some(task_id),
+            events,
+        ));
+        app.enable_inline_history();
+        let mut terminal = Terminal::new(TestBackend::new(width, 44)).expect("terminal");
+
+        terminal
+            .draw(|frame| draw_ui(frame, &mut app))
+            .expect("draw debug timeline");
+
+        let buffer = terminal.backend().buffer();
+        let transcript = app.layout.transcript;
+        let developer = app.layout.developer.expect("developer half");
+        let mut transcript_rows = 0_usize;
+        let mut observation_rows = 0_usize;
+        for row in app.layout.body.top()..app.layout.body.bottom() {
+            let left_has_content = (transcript.left()..transcript.right()).any(|column| {
+                buffer
+                    .cell((column, row))
+                    .is_some_and(|cell| !cell.symbol().trim().is_empty())
+            });
+            let right_has_content = (developer.left()..developer.right()).any(|column| {
+                buffer
+                    .cell((column, row))
+                    .is_some_and(|cell| !cell.symbol().trim().is_empty())
+            });
+            assert!(
+                !(left_has_content && right_has_content),
+                "width {width} rendered both panes on terminal row {row}"
+            );
+            transcript_rows += usize::from(left_has_content);
+            observation_rows += usize::from(right_has_content);
+        }
+        assert!(transcript_rows > 0, "width {width} lost transcript rows");
+        assert!(observation_rows > 0, "width {width} lost observation rows");
+    }
 }
 
 #[test]
