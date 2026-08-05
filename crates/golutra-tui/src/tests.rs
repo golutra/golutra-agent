@@ -915,6 +915,169 @@ fn completed_history_keeps_latest_response_next_to_composer() {
 }
 
 #[test]
+fn resumed_turns_remain_contiguous_above_the_composer() {
+    let session_id = SessionId::new();
+    let first_task = TaskId::new();
+    let second_task = TaskId::new();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(second_task),
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_footer_context("/workspace", "gpt-test");
+    let mut events = vec![
+        transcript_event(
+            1,
+            session_id,
+            first_task,
+            RuntimeEventType::TaskCreated,
+            json!({"payload": {"prompt": "first restored prompt"}}),
+        ),
+        transcript_event(
+            2,
+            session_id,
+            first_task,
+            RuntimeEventType::AssistantMessage,
+            json!({"content": "first restored answer"}),
+        ),
+    ];
+    events.extend((3..=14).map(|sequence_no| {
+        transcript_event(
+            sequence_no,
+            session_id,
+            first_task,
+            RuntimeEventType::AssistantMessage,
+            json!({"content": format!("archived answer {sequence_no}")}),
+        )
+    }));
+    events.extend([
+        transcript_event(
+            15,
+            session_id,
+            second_task,
+            RuntimeEventType::TaskCreated,
+            json!({"payload": {"prompt": "second restored prompt"}}),
+        ),
+        transcript_event(
+            16,
+            session_id,
+            second_task,
+            RuntimeEventType::AssistantMessage,
+            json!({"content": "second restored answer"}),
+        ),
+    ]);
+    app.events = events;
+    app.projection = Some(UserProjection {
+        session_id,
+        task_id: Some(second_task),
+        status: golutra_core::TaskStatus::Completed,
+        visible_steps: Vec::new(),
+        pending_approval: None,
+        final_message: None,
+        residual_risks: Vec::new(),
+    });
+    app.enable_inline_history();
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(80, 40),
+        TerminalOptions {
+            viewport: Viewport::Inline(24),
+        },
+    )
+    .expect("inline terminal");
+    let mut history = InlineHistoryState::new(session_id);
+
+    history
+        .flush(&mut terminal, &mut app)
+        .expect("restored history");
+    assert!(
+        !app.inline_history_committed_event_ids.is_empty(),
+        "fixture must cross the scrollback/live boundary"
+    );
+    draw_inline_test_frame(&mut terminal, &mut app);
+
+    let rows = terminal_buffer_rows(&terminal);
+    let prompt_row = rows
+        .iter()
+        .position(|row| row.contains("second restored prompt"))
+        .expect("second prompt row");
+    let answer_row = rows
+        .iter()
+        .position(|row| row.contains("second restored answer"))
+        .expect("second answer row");
+    assert!(
+        answer_row.saturating_sub(prompt_row) <= 2,
+        "restored messages must not be separated by viewport padding: {rows:#?}"
+    );
+}
+
+#[test]
+fn resumed_debug_events_remain_contiguous_above_the_composer() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let events = (1..=30)
+        .map(|sequence_no| {
+            transcript_event(
+                sequence_no,
+                session_id,
+                task_id,
+                RuntimeEventType::AssistantMessage,
+                json!({"content": format!("debug event {sequence_no}")}),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        true,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_footer_context("/workspace", "gpt-test");
+    app.events = events.clone();
+    app.developer_projection = Some(debug_projection_with_events(
+        session_id,
+        Some(task_id),
+        events,
+    ));
+    app.enable_inline_history();
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(80, 40),
+        TerminalOptions {
+            viewport: Viewport::Inline(24),
+        },
+    )
+    .expect("inline terminal");
+    let mut history = InlineHistoryState::new(session_id);
+
+    history
+        .flush(&mut terminal, &mut app)
+        .expect("restored debug history");
+    assert!(
+        !app.inline_history_committed_event_ids.is_empty(),
+        "fixture must cross the scrollback/live boundary"
+    );
+    draw_inline_test_frame(&mut terminal, &mut app);
+
+    let rows = terminal_buffer_rows(&terminal);
+    let previous_row = rows
+        .iter()
+        .position(|row| row.contains("#29 AssistantMessage/Runtime"))
+        .expect("previous debug event row");
+    let latest_row = rows
+        .iter()
+        .position(|row| row.contains("#30 AssistantMessage/Runtime"))
+        .expect("latest debug event row");
+    assert!(
+        latest_row.saturating_sub(previous_row) <= 1,
+        "debug events must not be separated by viewport padding: {rows:#?}"
+    );
+}
+
+#[test]
 fn large_debug_history_does_not_exceed_ratatui_buffer_area() {
     let session_id = SessionId::new();
     let task_id = TaskId::new();
@@ -2174,6 +2337,44 @@ fn transcript_role_markers_follow_codex_symbols() {
     assert_eq!(role_marker(&app, &TranscriptRole::Assistant), "• ");
     assert_eq!(role_marker(&app, &TranscriptRole::Status), "• ");
     assert_eq!(role_marker(&app, &TranscriptRole::System), "• ");
+}
+
+#[test]
+fn user_and_assistant_messages_start_on_the_marker_line() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.events = vec![
+        transcript_event(
+            1,
+            session_id,
+            task_id,
+            RuntimeEventType::TaskCreated,
+            json!({"payload": {"prompt": "第一行\n第二行"}}),
+        ),
+        transcript_event(
+            2,
+            session_id,
+            task_id,
+            RuntimeEventType::AssistantMessage,
+            json!({"content": "直接回答"}),
+        ),
+    ];
+
+    let lines = full_transcript_layout(&app, Rect::new(0, 0, 80, 12)).plain_lines();
+
+    assert!(lines.iter().any(|line| line == "› 第一行"));
+    assert!(lines.iter().any(|line| line == "  第二行"));
+    assert!(lines.iter().any(|line| line == "• 直接回答"));
+    assert!(!lines.iter().any(|line| line.contains("You")));
+    assert!(!lines.iter().any(|line| line.contains("Golutra")));
 }
 
 #[tokio::test]
@@ -3916,6 +4117,18 @@ fn terminal_buffer_text(terminal: &Terminal<TestBackend>) -> String {
         .content()
         .iter()
         .map(|cell| cell.symbol())
+        .collect()
+}
+
+fn terminal_buffer_rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
+    let area = terminal.backend().buffer().area;
+    (area.top()..area.bottom())
+        .map(|row| {
+            (area.left()..area.right())
+                .filter_map(|column| terminal.backend().buffer().cell((column, row)))
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        })
         .collect()
 }
 

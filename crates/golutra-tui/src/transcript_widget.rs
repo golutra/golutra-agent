@@ -350,19 +350,8 @@ fn render_item_rows(
     } else {
         role_marker(app, &item.role)
     };
-    let mut rows = vec![TranscriptRenderRow {
-        line: Line::from(vec![
-            Span::styled(marker, Style::default().fg(color)),
-            Span::styled(
-                item.title.clone(),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        operation_id: operation_id.clone(),
-        toggle,
-        projection_index,
-    }];
-    let body_lines = match item.role {
+    let inline_body = matches!(item.role, TranscriptRole::User | TranscriptRole::Assistant);
+    let mut body_lines = match item.role {
         TranscriptRole::Assistant => markdown_lines(&item.body.join("\n")),
         TranscriptRole::User => item
             .body
@@ -385,20 +374,68 @@ fn render_item_rows(
             .flat_map(|value| value.split('\n').map(detail_line).collect::<Vec<_>>())
             .collect(),
     };
-    rows.extend(body_lines.into_iter().map(|mut line| {
+    for line in &mut body_lines {
         for span in &mut line.spans {
             if let Some(color) = span.style.fg {
                 span.style.fg = Some(palette.map_color(color));
             }
         }
-        line.spans.insert(0, Span::raw("  "));
-        TranscriptRenderRow {
-            line,
-            operation_id: None,
-            toggle: false,
-            projection_index,
+    }
+
+    let mut rows = Vec::new();
+    if inline_body {
+        if body_lines.is_empty() {
+            rows.push(TranscriptRenderRow {
+                line: Line::from(Span::styled(marker, Style::default().fg(color))),
+                operation_id: operation_id.clone(),
+                toggle,
+                projection_index,
+            });
+        } else {
+            for (index, mut line) in body_lines.into_iter().enumerate() {
+                line.spans.insert(
+                    0,
+                    if index == 0 {
+                        Span::styled(marker, Style::default().fg(color))
+                    } else {
+                        Span::raw("  ")
+                    },
+                );
+                rows.push(TranscriptRenderRow {
+                    line,
+                    operation_id: if index == 0 {
+                        operation_id.clone()
+                    } else {
+                        None
+                    },
+                    toggle: index == 0 && toggle,
+                    projection_index,
+                });
+            }
         }
-    }));
+    } else {
+        rows.push(TranscriptRenderRow {
+            line: Line::from(vec![
+                Span::styled(marker, Style::default().fg(color)),
+                Span::styled(
+                    item.title,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            operation_id: operation_id.clone(),
+            toggle,
+            projection_index,
+        });
+        rows.extend(body_lines.into_iter().map(|mut line| {
+            line.spans.insert(0, Span::raw("  "));
+            TranscriptRenderRow {
+                line,
+                operation_id: None,
+                toggle: false,
+                projection_index,
+            }
+        }));
+    }
     rows.push(TranscriptRenderRow {
         line: Line::from(""),
         operation_id: None,

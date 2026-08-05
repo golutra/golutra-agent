@@ -14,6 +14,7 @@ use ratatui::{
 use super::*;
 
 const SESSION_CARD_MAX_WIDTH: usize = 60;
+const MIN_INLINE_BOTTOM_ROWS: u16 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InlineHistoryMode {
@@ -45,6 +46,7 @@ pub(crate) struct InlineHistoryState {
     generation: u64,
     mode: InlineHistoryMode,
     rendered_width: u16,
+    rendered_height: u16,
     initialized: bool,
     header_emitted: bool,
     committed_event_ids: HashSet<EventId>,
@@ -57,6 +59,7 @@ impl InlineHistoryState {
             generation: 0,
             mode: InlineHistoryMode::Transcript,
             rendered_width: 0,
+            rendered_height: 0,
             initialized: false,
             header_emitted: false,
             committed_event_ids: HashSet::new(),
@@ -84,26 +87,31 @@ impl InlineHistoryState {
         &mut self,
         terminal: &mut Terminal<B>,
         app: &mut TuiApp,
-        rebuild_terminal: impl FnOnce(&mut Terminal<B>) -> io::Result<()>,
+        mut rebuild_terminal: impl FnMut(&mut Terminal<B>) -> io::Result<()>,
     ) -> io::Result<bool> {
         let mode = InlineHistoryMode::from_app(app);
         let width = terminal.size()?.width.max(1);
+        let viewport_height = terminal.current_buffer_mut().area.height.max(1);
         let target_changed = self.initialized
             && (self.session_id != app.session_id
                 || self.generation != app.history_replay_generation
                 || self.mode != mode
-                || self.rendered_width != width);
+                || self.rendered_width != width
+                || self.rendered_height != viewport_height);
         let clear_previous_history =
             target_changed && (self.header_emitted || !self.committed_event_ids.is_empty());
 
+        let mut history_cleared = false;
         if clear_previous_history {
             rebuild_terminal(terminal)?;
+            history_cleared = true;
         }
         if !self.initialized || target_changed {
             self.session_id = app.session_id;
             self.generation = app.history_replay_generation;
             self.mode = mode;
             self.rendered_width = width;
+            self.rendered_height = viewport_height;
             self.initialized = true;
             self.header_emitted = false;
             self.committed_event_ids.clear();
@@ -115,11 +123,30 @@ impl InlineHistoryState {
                 || app.developer_projection.is_some()
                 || app.developer_error.is_some());
         if !source_ready {
-            return Ok(clear_previous_history);
+            return Ok(history_cleared);
         }
 
-        let all_stable_entries = rendered_history_entries(app, width, mode);
-        let stable_entries = all_stable_entries
+        // Retain enough event rows to fill the largest possible live body. A larger bottom pane
+        // may clip the oldest retained row, but it cannot expose padding between scrollback and
+        // the live tail when the composer shrinks again.
+        let live_row_capacity = viewport_height
+            .saturating_sub(MIN_INLINE_BOTTOM_ROWS)
+            .max(1);
+        let committable_entries = rendered_history_entries(app, width, live_row_capacity, mode);
+        let committable_ids = committable_entries
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<HashSet<_>>();
+        if !self.committed_event_ids.is_subset(&committable_ids) {
+            if !history_cleared {
+                rebuild_terminal(terminal)?;
+                history_cleared = true;
+            }
+            self.header_emitted = false;
+            self.committed_event_ids.clear();
+            app.set_inline_history_committed_event_ids(HashSet::new());
+        }
+        let stable_entries = committable_entries
             .iter()
             .filter(|entry| !self.committed_event_ids.contains(&entry.id))
             .cloned()
@@ -144,7 +171,7 @@ impl InlineHistoryState {
         }
 
         if lines.is_empty() {
-            return Ok(false);
+            return Ok(history_cleared);
         }
 
         insert_history_lines(terminal, lines, width)?;
@@ -160,33 +187,32 @@ impl InlineHistoryState {
 fn rendered_history_entries(
     app: &TuiApp,
     width: u16,
+    live_row_capacity: u16,
     mode: InlineHistoryMode,
 ) -> Vec<RenderedHistoryEntry> {
     match mode {
         InlineHistoryMode::Transcript => {
             let entries = event_operation_entries(&app.events);
             let stable_count = entries.iter().take_while(|entry| entry.stable).count();
-            // Keep the newest finalized item in the live viewport until another item replaces it.
-            let committed_count = if stable_count == entries.len() {
-                stable_count.saturating_sub(1)
-            } else {
-                stable_count
-            };
-            entries
+            let rendered = entries
                 .into_iter()
-                .take(committed_count)
                 .map(|entry| RenderedHistoryEntry {
                     id: entry.id,
                     lines: render_operation_projection_lines(app, vec![entry.projection]),
                 })
-                .collect()
+                .collect::<Vec<_>>();
+            let committed_count = committed_prefix_len(
+                &rendered,
+                stable_count,
+                width,
+                usize::from(live_row_capacity),
+            );
+            rendered.into_iter().take(committed_count).collect()
         }
         InlineHistoryMode::Developer { facts_expanded } => {
             let mut events = app.events.iter().collect::<Vec<_>>();
             events.sort_by_key(|event| event.sequence_no);
-            // The live developer pane owns the latest event so it stays next to the composer.
-            events.pop();
-            events
+            let rendered = events
                 .into_iter()
                 .map(|event| RenderedHistoryEntry {
                     id: event.id,
@@ -197,9 +223,38 @@ fn rendered_history_entries(
                         app.palette(),
                     ),
                 })
-                .collect()
+                .collect::<Vec<_>>();
+            let committed_count = committed_prefix_len(
+                &rendered,
+                rendered.len(),
+                width,
+                usize::from(live_row_capacity),
+            );
+            rendered.into_iter().take(committed_count).collect()
         }
     }
+}
+
+fn committed_prefix_len(
+    entries: &[RenderedHistoryEntry],
+    stable_count: usize,
+    width: u16,
+    live_row_capacity: usize,
+) -> usize {
+    let stable_count = stable_count.min(entries.len());
+    let mut committed_count = stable_count;
+    let mut live_rows = entries[stable_count..]
+        .iter()
+        .map(|entry| history_lines_height(&entry.lines, width))
+        .sum::<usize>();
+
+    while committed_count > 0 && live_rows < live_row_capacity {
+        committed_count = committed_count.saturating_sub(1);
+        live_rows =
+            live_rows.saturating_add(history_lines_height(&entries[committed_count].lines, width));
+    }
+
+    committed_count
 }
 
 #[cfg(test)]
@@ -370,4 +425,11 @@ fn history_line_height(line: &Line<'static>, width: u16) -> usize {
         .wrap(Wrap { trim: false })
         .line_count(width.max(1))
         .max(1)
+}
+
+fn history_lines_height(lines: &[Line<'static>], width: u16) -> usize {
+    lines
+        .iter()
+        .map(|line| history_line_height(line, width))
+        .sum()
 }
