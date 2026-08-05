@@ -4,6 +4,7 @@ use golutra_llm::ProviderReasoningEffort;
 use golutra_protocol::{RuntimeEventType, VisibleStep};
 use ratatui::backend::TestBackend;
 use ratatui::layout::{Position, Rect};
+use ratatui::style::Color;
 use ratatui::text::Line;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -796,15 +797,21 @@ fn session_history_card_uses_golutra_brand_and_operational_fields() {
     }
 
     assert!(text.contains("GOLUTRA"));
-    assert!(text.contains("plan > act > verify"));
+    assert!(!text.contains("plan > act > verify"));
     assert!(text.contains("engine"));
     assert!(text.contains("gpt-test"));
     assert!(text.contains("scope"));
     assert!(text.contains("/workspace"));
     assert!(text.contains("guard"));
     assert!(text.contains("unrestricted"));
-    assert!(text.contains("█████"));
-    assert!(logo_colors.len() >= 3);
+    assert!(text.contains("██║  ███╗"));
+    assert!(text.contains("╚══════╝"));
+    assert!(logo_colors.len() >= 12);
+    assert!(
+        logo_colors
+            .iter()
+            .all(|color| matches!(color, Color::Rgb(_, _, _)))
+    );
     assert!(!text.contains("new in"));
     assert!(!text.contains("F1 help"));
     assert!(!text.contains("/settings"));
@@ -822,7 +829,7 @@ fn session_history_logo_is_responsive_and_screen_reader_safe() {
     )
     .with_footer_context("/workspace", "gpt-test");
 
-    for width in [7, 8, 15, 24, 60, 87, 88, 120, 121] {
+    for width in [7, 8, 15, 24, 60, 112, 113, 120, 160] {
         assert!(
             session_history_lines(&app, width)
                 .iter()
@@ -831,14 +838,35 @@ fn session_history_logo_is_responsive_and_screen_reader_safe() {
         );
     }
     assert!(
-        !session_history_lines(&app, 87)
+        !session_history_lines(&app, 112)
             .iter()
             .any(|line| line.to_string().contains('█'))
     );
     assert!(
-        session_history_lines(&app, 88)
+        session_history_lines(&app, 113)
             .iter()
             .any(|line| line.to_string().contains('█'))
+    );
+
+    app.preferences.theme = ColorTheme::Monochrome;
+    let monochrome = session_history_lines(&app, 160);
+    assert!(
+        monochrome
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| span.content.contains('█'))
+            .all(|span| span.style.fg == Some(Color::White))
+    );
+
+    app.preferences.theme = ColorTheme::Classic;
+    app.preferences.high_contrast = true;
+    let high_contrast = session_history_lines(&app, 160);
+    assert!(
+        high_contrast
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| span.content.contains('█'))
+            .all(|span| span.style.fg == Some(Color::LightCyan))
     );
 
     app.preferences.screen_reader = true;

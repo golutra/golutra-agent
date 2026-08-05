@@ -11,7 +11,7 @@ use ratatui::{
     backend::Backend,
     buffer::Buffer,
     layout::Rect,
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Paragraph, Widget, Wrap},
 };
@@ -23,15 +23,59 @@ const SESSION_PANEL_MIN_WIDTH: usize = 40;
 const SESSION_OUTER_MARGIN: usize = 2;
 const SESSION_LOGO_GAP: usize = 3;
 const SESSION_FIELD_LABEL_WIDTH: usize = 7;
-const GOLUTRA_LOGO_GLYPHS: [[&str; 5]; 7] = [
-    ["█████", "█    ", "█ ███", "█   █", "█████"],
-    [" ███ ", "█   █", "█   █", "█   █", " ███ "],
-    ["█    ", "█    ", "█    ", "█    ", "█████"],
-    ["█   █", "█   █", "█   █", "█   █", " ███ "],
-    ["█████", "  █  ", "  █  ", "  █  ", "  █  "],
-    ["████ ", "█   █", "████ ", "█  █ ", "█   █"],
-    [" ███ ", "█   █", "█████", "█   █", "█   █"],
+const GOLUTRA_LOGO_GLYPHS: [[&str; 6]; 7] = [
+    [
+        " ██████╗",
+        "██╔════╝",
+        "██║  ███╗",
+        "██║   ██║",
+        "╚██████╔╝",
+        " ╚═════╝",
+    ],
+    [
+        " ██████╗",
+        "██╔═══██╗",
+        "██║   ██║",
+        "██║   ██║",
+        "╚██████╔╝",
+        " ╚═════╝",
+    ],
+    ["██╗", "██║", "██║", "██║", "███████╗", "╚══════╝"],
+    [
+        "██╗   ██╗",
+        "██║   ██║",
+        "██║   ██║",
+        "██║   ██║",
+        "╚██████╔╝",
+        " ╚═════╝",
+    ],
+    [
+        "████████╗",
+        "╚══██╔══╝",
+        "   ██║",
+        "   ██║",
+        "   ██║",
+        "   ╚═╝",
+    ],
+    [
+        "██████╗",
+        "██╔══██╗",
+        "██████╔╝",
+        "██╔══██╗",
+        "██║  ██║",
+        "╚═╝  ╚═╝",
+    ],
+    [
+        " █████╗",
+        "██╔══██╗",
+        "███████║",
+        "██╔══██║",
+        "██║  ██║",
+        "╚═╝  ╚═╝",
+    ],
 ];
+const SESSION_LOGO_GRADIENT: [[u8; 3]; 3] =
+    [[0x47, 0x96, 0xE4], [0x84, 0x7A, 0xCE], [0xC3, 0x67, 0x7F]];
 const MIN_INLINE_BOTTOM_ROWS: u16 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -667,7 +711,14 @@ pub(crate) fn session_history_lines(app: &TuiApp, width: u16) -> Vec<Line<'stati
     let directory = workspace_path_label(&app.workspace_path);
     let panel = session_panel_lines(app, panel_width, model, &directory);
     let mut lines = if show_logo {
-        combine_session_logo_and_panel(session_logo_lines(palette), panel, margin_width, logo_width)
+        let gradient =
+            app.preferences.theme != ColorTheme::Monochrome && !app.preferences.high_contrast;
+        combine_session_logo_and_panel(
+            session_logo_lines(palette, gradient),
+            panel,
+            margin_width,
+            logo_width,
+        )
     } else {
         panel
             .into_iter()
@@ -693,38 +744,96 @@ pub(crate) fn session_history_lines(app: &TuiApp, width: u16) -> Vec<Line<'stati
 fn session_logo_width() -> usize {
     GOLUTRA_LOGO_GLYPHS
         .iter()
-        .map(|glyph| display_width(glyph[0]))
+        .map(|glyph| {
+            glyph
+                .iter()
+                .map(|row| display_width(row))
+                .max()
+                .unwrap_or(0)
+        })
         .sum::<usize>()
         .saturating_add(GOLUTRA_LOGO_GLYPHS.len().saturating_sub(1))
 }
 
-fn session_logo_lines(palette: TuiPalette) -> Vec<Line<'static>> {
-    let colors = [
-        palette.accent,
-        palette.accent,
-        palette.secondary,
-        palette.secondary,
-        palette.success,
-        palette.success,
-        palette.warning,
-    ];
+fn session_logo_lines(palette: TuiPalette, gradient: bool) -> Vec<Line<'static>> {
+    let logo_width = session_logo_width();
     (0..GOLUTRA_LOGO_GLYPHS[0].len())
         .map(|row| {
-            let mut spans = Vec::new();
+            let mut text = String::with_capacity(logo_width);
             for (index, glyph) in GOLUTRA_LOGO_GLYPHS.iter().enumerate() {
                 if index > 0 {
-                    spans.push(Span::raw(" "));
+                    text.push(' ');
                 }
-                spans.push(Span::styled(
-                    glyph[row].to_owned(),
-                    Style::default()
-                        .fg(colors[index])
-                        .add_modifier(Modifier::BOLD),
-                ));
+                let glyph_width = glyph
+                    .iter()
+                    .map(|line| display_width(line))
+                    .max()
+                    .unwrap_or(0);
+                text.push_str(glyph[row]);
+                text.push_str(&" ".repeat(glyph_width.saturating_sub(display_width(glyph[row]))));
             }
-            Line::from(spans)
+            session_logo_line(text, palette, gradient, logo_width)
         })
         .collect()
+}
+
+fn session_logo_line(
+    text: String,
+    palette: TuiPalette,
+    gradient: bool,
+    logo_width: usize,
+) -> Line<'static> {
+    let style = Style::default().add_modifier(Modifier::BOLD);
+    if !gradient {
+        return Line::from(Span::styled(text, style.fg(palette.accent)));
+    }
+
+    Line::from(
+        text.chars()
+            .enumerate()
+            .map(|(column, character)| {
+                if character == ' ' {
+                    Span::raw(" ")
+                } else {
+                    Span::styled(
+                        character.to_string(),
+                        style.fg(session_logo_gradient_color(column, logo_width)),
+                    )
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn session_logo_gradient_color(column: usize, width: usize) -> Color {
+    let last = SESSION_LOGO_GRADIENT.len().saturating_sub(1);
+    let denominator = width.saturating_sub(1);
+    if denominator == 0 || column >= denominator {
+        let [red, green, blue] = SESSION_LOGO_GRADIENT[last];
+        return Color::Rgb(red, green, blue);
+    }
+
+    let scaled = column.saturating_mul(last);
+    let segment = scaled / denominator;
+    let numerator = scaled % denominator;
+    let start = SESSION_LOGO_GRADIENT[segment];
+    let end = SESSION_LOGO_GRADIENT[segment.saturating_add(1)];
+    Color::Rgb(
+        interpolate_logo_channel(start[0], end[0], numerator, denominator),
+        interpolate_logo_channel(start[1], end[1], numerator, denominator),
+        interpolate_logo_channel(start[2], end[2], numerator, denominator),
+    )
+}
+
+fn interpolate_logo_channel(start: u8, end: u8, numerator: usize, denominator: usize) -> u8 {
+    let start = usize::from(start);
+    let end = usize::from(end);
+    let value = start
+        .saturating_mul(denominator.saturating_sub(numerator))
+        .saturating_add(end.saturating_mul(numerator))
+        .saturating_add(denominator / 2)
+        / denominator;
+    u8::try_from(value).unwrap_or(u8::MAX)
 }
 
 fn session_panel_lines(
@@ -788,14 +897,6 @@ fn session_panel_lines(
                     Style::default().fg(palette.muted),
                 ),
             ],
-            content_width,
-            border_style,
-        ),
-        session_panel_row(
-            vec![Span::styled(
-                "plan > act > verify",
-                Style::default().fg(palette.secondary),
-            )],
             content_width,
             border_style,
         ),
@@ -868,12 +969,13 @@ fn combine_session_logo_and_panel(
     margin_width: usize,
     logo_width: usize,
 ) -> Vec<Line<'static>> {
+    let logo_offset = panel.len().saturating_sub(logo.len()) / 2;
     panel
         .into_iter()
         .enumerate()
         .map(|(row, panel_line)| {
             let mut spans = vec![Span::raw(" ".repeat(margin_width))];
-            if let Some(logo_line) = row.checked_sub(1).and_then(|row| logo.get(row)) {
+            if let Some(logo_line) = row.checked_sub(logo_offset).and_then(|row| logo.get(row)) {
                 spans.extend(logo_line.spans.iter().cloned());
             } else {
                 spans.push(Span::raw(" ".repeat(logo_width)));
