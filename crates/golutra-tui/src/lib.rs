@@ -296,7 +296,13 @@ pub struct SlashCommandCandidate {
     pub execute_on_select: bool,
 }
 
-const TOP_LEVEL_SLASH_HINTS: &[SlashCommandHint] = &[
+const DEBUG_SWITCH_SLASH_HINT: SlashCommandHint = SlashCommandHint {
+    command: "/debug switch",
+    description: "toggle expanded or compact observations",
+    selection: SlashCommandSelection::Execute,
+};
+
+const SEARCHABLE_SLASH_HINTS: &[SlashCommandHint] = &[
     SlashCommandHint {
         command: "/help",
         description: "open contextual keyboard reference",
@@ -387,6 +393,7 @@ const TOP_LEVEL_SLASH_HINTS: &[SlashCommandHint] = &[
         description: "toggle debug view; use /debug switch for detail",
         selection: SlashCommandSelection::Execute,
     },
+    DEBUG_SWITCH_SLASH_HINT,
     SlashCommandHint {
         command: "/takeover",
         description: "take control of active task",
@@ -502,11 +509,7 @@ const AUTH_SLASH_HINTS: &[SlashCommandHint] = &[
     },
 ];
 
-const DEBUG_SLASH_HINTS: &[SlashCommandHint] = &[SlashCommandHint {
-    command: "/debug switch",
-    description: "toggle expanded or compact observations",
-    selection: SlashCommandSelection::Execute,
-}];
+const DEBUG_SLASH_HINTS: &[SlashCommandHint] = &[DEBUG_SWITCH_SLASH_HINT];
 
 #[must_use]
 pub fn slash_command_suggestions(input: &str) -> Vec<String> {
@@ -525,7 +528,7 @@ pub fn slash_command_candidates(input: &str) -> Vec<SlashCommandCandidate> {
 
     let tokens = input.split_whitespace().collect::<Vec<_>>();
     let first_token = tokens.first().copied().unwrap_or("/");
-    let mut suggestions = if first_token == "/auth"
+    let suggestions = if first_token == "/auth"
         && (input.ends_with(char::is_whitespace) || tokens.len() > 1)
     {
         let action_prefix = if input.ends_with(char::is_whitespace) && tokens.len() == 1 {
@@ -543,12 +546,8 @@ pub fn slash_command_candidates(input: &str) -> Vec<SlashCommandCandidate> {
         };
         matching_hints(DEBUG_SLASH_HINTS, action_prefix, "/debug ")
     } else {
-        matching_hints(TOP_LEVEL_SLASH_HINTS, first_token, "")
+        matching_hints(SEARCHABLE_SLASH_HINTS, first_token, "")
     };
-
-    if input == "/debug" {
-        suggestions.extend(matching_hints(DEBUG_SLASH_HINTS, "", "/debug "));
-    }
 
     suggestions.into_iter().take(5).collect()
 }
@@ -1507,7 +1506,16 @@ mod tests {
     }
 
     #[test]
-    fn slash_suggestions_show_debug_switch_before_trailing_space() {
+    fn slash_suggestions_treat_debug_switch_as_a_first_class_search_result() {
+        assert_eq!(
+            slash_command_suggestions("/d"),
+            vec![
+                "/debug - toggle debug view; use /debug switch for detail".to_owned(),
+                "/debug switch - toggle expanded or compact observations".to_owned(),
+                "/deny - deny pending tool".to_owned(),
+                "/detach - clear prompt attachments".to_owned(),
+            ]
+        );
         assert_eq!(
             slash_command_suggestions("/debug"),
             vec![

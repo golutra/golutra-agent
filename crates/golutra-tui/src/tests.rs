@@ -2127,7 +2127,7 @@ fn slash_candidates_render_below_composer_with_selection() {
 }
 
 #[test]
-fn debug_candidates_render_parent_and_switch_without_trailing_space() {
+fn debug_candidates_render_parent_and_switch_from_a_short_prefix() {
     let mut app = TuiApp::new(
         ThreadId::new(),
         SessionId::new(),
@@ -2136,7 +2136,7 @@ fn debug_candidates_render_parent_and_switch_without_trailing_space() {
         "ready (mock)".to_owned(),
         None,
     );
-    app.input.set_text("/debug");
+    app.input.set_text("/d");
 
     let candidates = app.slash_candidates();
     let lines = slash_candidate_lines(&app, &candidates)
@@ -2144,7 +2144,7 @@ fn debug_candidates_render_parent_and_switch_without_trailing_space() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>();
 
-    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates.len(), 4);
     assert!(lines[0].contains("/debug  toggle debug view"));
     assert!(lines[1].contains("/debug switch  toggle expanded or compact observations"));
 }
