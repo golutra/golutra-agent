@@ -525,7 +525,7 @@ pub fn slash_command_candidates(input: &str) -> Vec<SlashCommandCandidate> {
 
     let tokens = input.split_whitespace().collect::<Vec<_>>();
     let first_token = tokens.first().copied().unwrap_or("/");
-    let suggestions = if first_token == "/auth"
+    let mut suggestions = if first_token == "/auth"
         && (input.ends_with(char::is_whitespace) || tokens.len() > 1)
     {
         let action_prefix = if input.ends_with(char::is_whitespace) && tokens.len() == 1 {
@@ -545,6 +545,10 @@ pub fn slash_command_candidates(input: &str) -> Vec<SlashCommandCandidate> {
     } else {
         matching_hints(TOP_LEVEL_SLASH_HINTS, first_token, "")
     };
+
+    if input == "/debug" {
+        suggestions.extend(matching_hints(DEBUG_SLASH_HINTS, "", "/debug "));
+    }
 
     suggestions.into_iter().take(5).collect()
 }
@@ -1499,6 +1503,21 @@ mod tests {
         assert_eq!(
             slash_command_suggestions("/auth o"),
             vec!["/auth oauth-login - authorize with OAuth descriptor".to_owned()]
+        );
+    }
+
+    #[test]
+    fn slash_suggestions_show_debug_switch_before_trailing_space() {
+        assert_eq!(
+            slash_command_suggestions("/debug"),
+            vec![
+                "/debug - toggle debug view; use /debug switch for detail".to_owned(),
+                "/debug switch - toggle expanded or compact observations".to_owned(),
+            ]
+        );
+        assert_eq!(
+            slash_command_suggestions("/debug "),
+            vec!["/debug switch - toggle expanded or compact observations".to_owned()]
         );
     }
 

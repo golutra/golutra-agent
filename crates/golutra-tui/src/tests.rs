@@ -2127,6 +2127,29 @@ fn slash_candidates_render_below_composer_with_selection() {
 }
 
 #[test]
+fn debug_candidates_render_parent_and_switch_without_trailing_space() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.input.set_text("/debug");
+
+    let candidates = app.slash_candidates();
+    let lines = slash_candidate_lines(&app, &candidates)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+
+    assert_eq!(candidates.len(), 2);
+    assert!(lines[0].contains("/debug  toggle debug view"));
+    assert!(lines[1].contains("/debug switch  toggle expanded or compact observations"));
+}
+
+#[test]
 fn footer_context_shows_model_and_home_relative_workspace_without_wrapping() {
     let workspace = Path::new("/Users/skyseek/Desktop/project/open/golutra-agent/golutra-agent");
     let label = workspace_path_label_with_home(workspace, Some(Path::new("/Users/skyseek")));
