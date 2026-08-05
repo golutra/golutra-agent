@@ -2274,6 +2274,55 @@ async fn deferred_external_verification_survives_abort() {
 }
 
 #[tokio::test]
+async fn post_task_wait_started_before_terminal_observes_the_durable_job() {
+    let _provider = IsolatedGlobalMockProvider::install().await;
+    let application = RuntimeApplication::in_memory().await.expect("application");
+    let session_id = application.session_service().default_session_id();
+    let transport = EmbeddedTransport::from_application(application.clone());
+
+    application
+        .send_command(command(session_id, "sleep"))
+        .await
+        .expect("running task");
+    let state = wait_for_status(&transport, session_id, TaskStatus::WaitingApproval).await;
+    let task_id = state
+        .get("active_task_id")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<TaskId>().ok())
+        .expect("running task id");
+
+    let waiter_application = application.clone();
+    let waiter = tokio::spawn(async move {
+        waiter_application
+            .post_task_service()
+            .wait_for_terminal(task_id)
+            .await
+    });
+    tokio::task::yield_now().await;
+
+    application
+        .send_command(runtime_command(
+            session_id,
+            SessionCommandKind::Abort,
+            json!({}),
+        ))
+        .await
+        .expect("abort");
+    wait_for_status(&transport, session_id, TaskStatus::Cancelled).await;
+
+    let job = tokio::time::timeout(Duration::from_secs(15), waiter)
+        .await
+        .expect("post-task wait deadline")
+        .expect("post-task waiter")
+        .expect("post-task wait")
+        .expect("post-task job");
+    assert!(matches!(
+        job.status,
+        PostTaskJobStatus::Succeeded | PostTaskJobStatus::Failed | PostTaskJobStatus::Cancelled
+    ));
+}
+
+#[tokio::test]
 async fn failed_task_blocks_unfrozen_regression_without_polluting_memory() {
     let _provider = IsolatedGlobalMockProvider::install().await;
     let application = RuntimeApplication::in_memory().await.expect("application");

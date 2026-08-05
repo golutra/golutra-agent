@@ -198,6 +198,7 @@ struct ManagedProcess {
     state: Mutex<ProcessStateRecord>,
     control: CancellationToken,
     notify: Notify,
+    terminal_notify: Notify,
     last_touched: Mutex<Instant>,
     sandbox_backend: golutra_sandbox::SandboxBackendKind,
     sandbox_os_enforced: bool,
@@ -375,6 +376,7 @@ impl ProcessSupervisor {
             }),
             control: CancellationToken::new(),
             notify: Notify::new(),
+            terminal_notify: Notify::new(),
             last_touched: Mutex::new(Instant::now()),
             sandbox_backend: launch.backend,
             sandbox_os_enforced: launch.os_enforced,
@@ -540,13 +542,16 @@ impl ProcessSupervisor {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
         loop {
             self.touch(entry).await;
-            let notification = entry.notify.notified();
-            let current_snapshot = snapshot(entry, cursor).await;
-            if current_snapshot.state.is_terminal() || tokio::time::Instant::now() >= deadline {
-                return current_snapshot;
+            let notification = entry.terminal_notify.notified();
+            tokio::pin!(notification);
+            notification.as_mut().enable();
+            if entry.state.lock().await.state.is_terminal()
+                || tokio::time::Instant::now() >= deadline
+            {
+                return snapshot(entry, cursor).await;
             }
             tokio::select! {
-                _ = notification => {}
+                _ = &mut notification => {}
                 _ = tokio::time::sleep_until(deadline) => return snapshot(entry, cursor).await,
             }
         }
@@ -609,6 +614,9 @@ where
             };
             entry.output.lock().await.append(stream, &buffer[..read]);
             entry.notify.notify_waiters();
+            // A continuously readable pipe can otherwise monopolize a current-thread
+            // runtime and delay process cancellation, timeout, and terminal bookkeeping.
+            tokio::task::yield_now().await;
         }
         if let Some(entry) = entry.upgrade() {
             entry.notify.notify_waiters();
@@ -674,6 +682,7 @@ async fn supervise_process(
         record.completed_at = Some(Instant::now());
     }
     entry.notify.notify_waiters();
+    entry.terminal_notify.notify_waiters();
 }
 
 async fn snapshot(entry: &ManagedProcess, cursor: u64) -> ProcessSnapshot {

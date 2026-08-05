@@ -53,9 +53,6 @@ impl PostTaskCoordinator {
         };
         let current = host.repositories.jobs.get_for_task(task_id).await?;
         ensure_job_in_workspace(&host, current.as_ref(), task_id)?;
-        if current.is_none() {
-            return Ok(None);
-        }
         host.wait_for_deep_task_evaluation(task_id).await;
         let job = host.repositories.jobs.get_for_task(task_id).await?;
         ensure_job_in_workspace(&host, job.as_ref(), task_id)?;

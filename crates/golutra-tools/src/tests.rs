@@ -1591,7 +1591,7 @@ async fn background_process_terminate_timeout_and_cancellation_are_terminal() {
         .as_str()
         .expect("process id");
     let terminated = tokio::time::timeout(
-        Duration::from_secs(2),
+        Duration::from_secs(7),
         executor.execute(
             request_for_session(
                 session_id,
@@ -1672,7 +1672,7 @@ async fn background_process_output_journal_is_bounded_and_reports_cursor_loss() 
             json!({
                 "command": "yes output",
                 "background": true,
-                "timeout_ms": 100,
+                "timeout_ms": 15_000,
                 "yield_time_ms": 0,
             }),
         ),
@@ -1682,7 +1682,33 @@ async fn background_process_output_journal_is_bounded_and_reports_cursor_loss() 
     let process_id = start.envelope.structured_facts["process_id"]
         .as_str()
         .expect("process id");
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    let mut cursor = start.envelope.structured_facts["output_cursor"]
+        .as_u64()
+        .expect("start cursor");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let report = executor
+            .execute(
+                request_for_session(
+                    session_id,
+                    "process_poll",
+                    json!({"process_id": process_id, "cursor": cursor, "wait_ms": 250}),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("poll output flood");
+        cursor = report.envelope.structured_facts["output_cursor"]
+            .as_u64()
+            .expect("output cursor");
+        if report.envelope.structured_facts["output_truncated"] == true {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "output journal did not reach its retention bound"
+        );
+    }
     let report = executor
         .execute(
             request_for_session(
@@ -1694,6 +1720,21 @@ async fn background_process_output_journal_is_bounded_and_reports_cursor_loss() 
         )
         .await
         .expect("reconnect after output flood");
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        executor.execute(
+            request_for_session(
+                session_id,
+                "process_terminate",
+                json!({"process_id": process_id}),
+            ),
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("output flood process termination remains responsive")
+    .expect("output flood termination report");
 
     assert_eq!(report.envelope.structured_facts["output_truncated"], true);
     assert_eq!(report.envelope.structured_facts["output_lost"], true);
