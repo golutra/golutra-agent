@@ -262,6 +262,18 @@ fn sanitized_environment(scratch_dir: &Path, allow_network: bool) -> BTreeMap<Os
     let mut values = env::vars_os()
         .filter(|(key, _)| environment_key_allowed_for_network(key, allow_network))
         .collect::<BTreeMap<_, _>>();
+    for (key, value) in [
+        ("NO_COLOR", "1"),
+        ("TERM", "dumb"),
+        ("COLORTERM", ""),
+        ("PAGER", "cat"),
+        ("GIT_PAGER", "cat"),
+        ("GH_PAGER", "cat"),
+        ("GIT_EDITOR", "true"),
+        ("GIT_SEQUENCE_EDITOR", "true"),
+    ] {
+        values.insert(OsString::from(key), OsString::from(value));
+    }
     values.insert(OsString::from("TMPDIR"), scratch_dir.as_os_str().to_owned());
     values.insert(OsString::from("TMP"), scratch_dir.as_os_str().to_owned());
     values.insert(OsString::from("TEMP"), scratch_dir.as_os_str().to_owned());
@@ -495,6 +507,22 @@ mod tests {
                     .into_os_string()
             )
         );
+        for (key, expected) in [
+            ("NO_COLOR", "1"),
+            ("TERM", "dumb"),
+            ("COLORTERM", ""),
+            ("PAGER", "cat"),
+            ("GIT_PAGER", "cat"),
+            ("GH_PAGER", "cat"),
+            ("GIT_EDITOR", "true"),
+            ("GIT_SEQUENCE_EDITOR", "true"),
+        ] {
+            assert_eq!(
+                plan.environment.get(OsStr::new(key)),
+                Some(&OsString::from(expected)),
+                "{key}"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]

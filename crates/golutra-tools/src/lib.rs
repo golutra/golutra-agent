@@ -65,7 +65,7 @@ pub(crate) use process::{
 pub(crate) use process::{MAX_PIPE_OUTPUT_BYTES, join_pipe_reader, run_process, spawn_pipe_reader};
 pub use process_supervisor::ProcessSupervisor;
 pub(crate) use process_supervisor::{
-    ProcessSnapshot, ProcessStartRequest, ProcessState, default_poll_wait_ms,
+    ProcessSnapshot, ProcessStartRequest, ProcessState, ProcessSummary, default_poll_wait_ms,
     default_start_wait_ms, max_poll_wait_ms,
 };
 pub use project_verifier::{DiscoveredProjectVerifier, discover_project_verifiers};
@@ -200,6 +200,7 @@ impl ToolRegistry {
             contract("find_references", SideEffectType::None),
             contract("ask_user", SideEffectType::None),
             contract("shell", SideEffectType::Process),
+            contract("process_list", SideEffectType::None),
             contract("process_poll", SideEffectType::None),
             contract("process_write", SideEffectType::Process),
             contract("process_terminate", SideEffectType::Process),
@@ -821,9 +822,16 @@ impl ToolRuntime {
             "symbol_search" | "find_references" => {
                 self.policy.evaluate_path(&request.tool_name, ".", true)
             }
-            "shell" => self
-                .policy
-                .evaluate_shell(&string_arg(&request.arguments, "command")?),
+            "shell" => {
+                let shell_policy = self
+                    .policy
+                    .evaluate_shell(&string_arg(&request.arguments, "command")?);
+                optional_string_arg(&request.arguments, "workdir")
+                    .map(|workdir| self.policy.evaluate_path("shell", workdir, true))
+                    .filter(|workdir_policy| workdir_policy.decision != PolicyDecision::Allow)
+                    .unwrap_or(shell_policy)
+            }
+            "process_list" => process_list_policy(request),
             "process_poll" | "process_write" | "process_terminate" | "process_reconnect" => {
                 process_control_policy(request)
             }
@@ -1108,6 +1116,7 @@ impl ToolRuntime {
                     )
                     .await
                 }
+                "process_list" => self.process_list(request, policy).await,
                 "process_poll" => self.process_poll(request, policy).await,
                 "process_write" => self.process_write(request, policy).await,
                 "process_terminate" => self.process_terminate(request, policy).await,
@@ -1847,6 +1856,16 @@ impl ToolRuntime {
             });
         let effective_timeout_ms = effective_shell_timeout(timeout_ms);
         let command_line = CommandLine::parse(&command)?;
+        let cwd = match optional_string_arg(&request.arguments, "workdir") {
+            Some(workdir) => self.resolve_tool_path("shell", workdir, true)?,
+            None => self.policy.workspace_root().to_path_buf(),
+        };
+        if !cwd.is_dir() {
+            return Err(ToolError::InvalidArguments(format!(
+                "shell workdir is not a directory: {}",
+                cwd.display()
+            )));
+        }
         if background && command_line.stdin.is_some() {
             return Err(ToolError::InvalidArguments(
                 "quoted Python heredocs are supported only for foreground commands".to_owned(),
@@ -1872,7 +1891,8 @@ impl ToolRuntime {
                     program: &command_line.program,
                     args: &command_line.args,
                     command_display: redact_sensitive_text(&command).0,
-                    cwd: self.policy.workspace_root(),
+                    cwd: &cwd,
+                    workspace_root: self.policy.workspace_root(),
                     timeout_ms: effective_timeout_ms,
                     wait_ms,
                     cancellation,
@@ -1894,7 +1914,7 @@ impl ToolRuntime {
                 ProcessExecutionRequest {
                     program: &command_line.program,
                     args: &command_line.args,
-                    cwd: self.policy.workspace_root(),
+                    cwd: &cwd,
                     workspace_root: self.policy.workspace_root(),
                     timeout_ms: effective_timeout_ms,
                     cancellation,
@@ -1951,6 +1971,40 @@ impl ToolRuntime {
         report.before_images = workspace_changes.before_images;
         report.after_images = workspace_changes.after_images;
         Ok(report)
+    }
+
+    async fn process_list(
+        &self,
+        request: ToolRequest,
+        policy: PolicyEvaluation,
+    ) -> Result<ToolExecutionReport, ToolError> {
+        let summaries = self.process_supervisor.list(request.session_id).await;
+        let running_count = summaries
+            .iter()
+            .filter(|summary| summary.state == ProcessState::Running)
+            .count();
+        let processes = summaries
+            .into_iter()
+            .map(process_summary_value)
+            .collect::<Vec<_>>();
+        let process_count = processes.len();
+        let output = serde_json::to_string_pretty(&processes)
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        Ok(with_item_count(
+            success_report(
+                request,
+                "managed processes listed",
+                json!({
+                    "process_count": process_count,
+                    "running_count": running_count,
+                    "processes": processes,
+                }),
+                output,
+                Vec::new(),
+                policy,
+            ),
+            u64::try_from(process_count).unwrap_or(u64::MAX),
+        ))
     }
 
     async fn process_poll(
@@ -2345,6 +2399,12 @@ fn contract(tool_name: &str, side_effect_type: SideEffectType) -> ToolContract {
                     "maxLength": MAX_SHELL_COMMAND_CHARS,
                     "description": "A single argv command parsed without a shell. A complete quoted foreground Python heredoc such as python - <<'PY' is passed directly on stdin. Unquoted operators such as |, >, &&, and ; are otherwise rejected; for a pipeline, redirection, or compound script, invoke bash -lc and pass the entire script as one quoted argument."
                 },
+                "workdir": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_PATH_ARGUMENT_CHARS,
+                    "description": "Optional working directory resolved from the workspace root. It changes only the command cwd; sandbox permissions and workspace change tracking remain rooted at the workspace root."
+                },
                 "timeout_ms": {
                     "type": "integer",
                     "minimum": 1,
@@ -2364,6 +2424,7 @@ fn contract(tool_name: &str, side_effect_type: SideEffectType) -> ToolContract {
             },
             "required": ["command"]
         }),
+        "process_list" => object_schema(&[], &[], &[]),
         "process_poll" => process_session_schema(false, true),
         "process_write" => process_session_schema(true, true),
         "process_terminate" => process_session_schema(false, false),
@@ -2810,6 +2871,16 @@ fn process_metrics(output: &process::ShellOutput) -> ToolExecutionMetrics {
     }
 }
 
+fn process_list_policy(request: &ToolRequest) -> PolicyEvaluation {
+    let mut policy = execution_policy(
+        request,
+        PolicyDecision::Allow,
+        "managed process discovery is scoped to the current session",
+    );
+    policy.resource = format!("process-session:{}", request.session_id);
+    policy
+}
+
 fn process_control_policy(request: &ToolRequest) -> PolicyEvaluation {
     let process_id = request
         .arguments
@@ -2837,6 +2908,22 @@ fn process_wait_ms(arguments: &Value, default: u64) -> u64 {
         .and_then(Value::as_u64)
         .unwrap_or(default)
         .min(max_poll_wait_ms())
+}
+
+fn process_summary_value(summary: ProcessSummary) -> Value {
+    json!({
+        "process_id": summary.process_id,
+        "command": bounded_text(
+            &summary.command_display,
+            MAX_TOOL_ARGUMENT_DISPLAY_STRING_BYTES,
+        ),
+        "process_state": process_state_name(summary.state),
+        "exit_code": summary.exit_code,
+        "output_cursor": summary.output_cursor,
+        "output_bytes": summary.output_bytes,
+        "output_lines": summary.output_lines,
+        "output_truncated": summary.output_truncated,
+    })
 }
 
 fn supervised_process_report(
@@ -3182,6 +3269,7 @@ fn omitted_model_tool_value(value: &Value) -> Value {
 const PREFERRED_TOOL_ARGUMENT_KEYS: &[&str] = &[
     "path",
     "command",
+    "workdir",
     "pattern",
     "query",
     "symbol",

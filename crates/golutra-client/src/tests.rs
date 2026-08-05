@@ -60,26 +60,23 @@ async fn task_control_cleanup_wait_has_a_deadline() {
 }
 
 #[test]
-fn system_prompt_exposes_general_tool_and_validation_contracts() {
+fn system_prompt_preserves_general_autonomy_and_verification_principles() {
     let prompt = system_prompt();
-    assert!(prompt.contains("parsed as inert argv"));
-    assert!(prompt.contains("include the program and every argument"));
-    assert!(prompt.contains("git status --short"));
-    assert!(prompt.contains("explicitly invoke `bash -lc`"));
-    assert!(prompt.contains("create a workspace file with write_file"));
-    assert!(prompt.contains("required local dependency"));
-    assert!(prompt.contains("instead of asking in prose"));
-    assert!(prompt.contains("runtime will request any required approval"));
-    assert!(prompt.contains("exits non-zero"));
-    assert!(prompt.contains("any explicit acceptance criterion"));
-    assert!(prompt.contains("semantic behavior and content"));
-    assert!(prompt.contains("keep every requested deliverable intact"));
-    assert!(prompt.contains("user-facing interface"));
-    assert!(prompt.contains("independent consumer or clean context"));
-    assert!(prompt.contains("internal shortcut is not equivalent evidence"));
-    assert!(prompt.contains("lifecycle mechanism"));
-    assert!(prompt.contains("outlives runtime ownership"));
-    assert!(prompt.contains("verify the handoff independently"));
+    for principle in [
+        "understand the user's intent",
+        "choose the most effective approach",
+        "never invent observable facts",
+        "Follow existing project conventions",
+        "carry the task through implementation and verification",
+        "consequential ambiguity",
+        "user-facing path when relevant",
+        "remaining blockers concisely",
+    ] {
+        assert!(prompt.contains(principle), "{principle}");
+    }
+    assert!(!prompt.contains("bash -lc"));
+    assert!(!prompt.contains("write_file"));
+    assert!(!prompt.contains("ask_user"));
 }
 
 #[test]

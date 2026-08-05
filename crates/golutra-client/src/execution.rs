@@ -27,7 +27,7 @@ impl RuntimeHost {
             name: "system".to_owned(),
             role: ProviderRole::System,
             content: system_prompt(),
-            token_budget_hint: 64,
+            token_budget_hint: 192,
             source_refs: vec!["builtin:system_prompt".to_owned()],
         }];
         contributors.push(ContextContributor {

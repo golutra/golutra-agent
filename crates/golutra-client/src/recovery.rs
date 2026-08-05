@@ -184,6 +184,7 @@ fn legacy_recovery_policy(tool_name: &str) -> ToolRecoveryPolicy {
             | "rg_search"
             | "symbol_search"
             | "find_references"
+            | "process_list"
             | "process_poll"
             | "process_reconnect"
     ) {

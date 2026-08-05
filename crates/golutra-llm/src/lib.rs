@@ -1557,15 +1557,39 @@ fn is_sensitive_header(name: &str) -> bool {
 pub(crate) fn provider_tool_description(tool_name: &str) -> &'static str {
     match tool_name {
         "read_file" => "Read a UTF-8 text file from the current workspace.",
-        "write_file" => "Write UTF-8 text content to a workspace-relative file.",
-        "edit_file" => "Replace the first exact text match in a workspace-relative file.",
+        "write_file" => {
+            "Create or replace a workspace-relative UTF-8 file with the complete supplied content. Honor an explicit working or output directory; when the requested deliverable has only a basename and no directory context, place it in the workspace root."
+        }
+        "edit_file" => {
+            "Edit a workspace-relative UTF-8 file by replacing the first exact search match with the complete supplied replacement."
+        }
+        "apply_patch" => {
+            "Atomically apply a unified diff to one or more workspace-relative files. Use this for focused multi-file or multi-hunk edits."
+        }
         "list_dir" => "List entries in a workspace-relative directory.",
         "rg_search" => "Search workspace files with ripgrep.",
+        "symbol_search" => "Search the workspace code graph for matching symbol definitions.",
+        "find_references" => "Find workspace code-graph references to a named symbol.",
         "ask_user" => {
-            "Ask up to three concise structured questions when a decision cannot be inferred safely. Provide two to eight clear options per question and use multiple mode only when multiple selections are valid."
+            "Ask up to three concise structured questions only when a consequential decision cannot be resolved safely from the request or workspace. Provide two to eight clear options per question and use multiple mode only when multiple selections are valid."
         }
         "shell" => {
-            "Run a workspace command as argv. A complete quoted foreground Python heredoc such as python - <<'PY' is passed directly on stdin; for other pipes, redirection, or compound scripts, explicitly invoke an available shell with the complete script as one argument. With background=true, timeout_ms is the absolute process lifetime and yield_time_ms only controls the initial wait. Managed background processes are runtime-scoped and stop when the runtime ends. If another process or evaluator must connect after the final response, do not use background=true; use a platform-appropriate lifecycle mechanism outside runtime ownership, detach standard streams as required, and verify availability before returning."
+            "Run a workspace command as inert argv; include the program and every argument in command. Use workdir to run from a workspace subdirectory without changing the workspace boundary. A complete quoted foreground Python heredoc such as python - <<'PY' is passed directly on stdin; for other pipes, redirection, or compound scripts, explicitly invoke an available shell with the complete script as one argument. When a required local dependency is missing, inspect the project's package-manager conventions, prefer a project-scoped installation when practical, and validate after installing. With background=true, timeout_ms is the absolute process lifetime and yield_time_ms only controls the initial wait. Managed background processes are runtime-scoped and stop when the runtime ends. If another process or evaluator must connect after the final response, do not use background=true; use a platform-appropriate lifecycle mechanism outside runtime ownership, detach standard streams as required, and verify availability before returning."
+        }
+        "process_list" => {
+            "List managed background processes owned by the current session, including redacted commands, states, exit codes, and output statistics. This does not consume process output or advance a cursor."
+        }
+        "process_poll" => {
+            "Read new output and status from a managed background process. Reuse the returned cursor to avoid replaying output; wait_ms optionally performs a bounded wait."
+        }
+        "process_write" => {
+            "Send input verbatim to a managed background process and read output after the supplied cursor. Include a newline when the process expects Enter."
+        }
+        "process_terminate" => {
+            "Terminate a managed background process and return its final status."
+        }
+        "process_reconnect" => {
+            "Recover current output and status for a managed background process after an interrupted tool interaction, starting at the supplied cursor."
         }
         _ => "Golutra workspace tool.",
     }

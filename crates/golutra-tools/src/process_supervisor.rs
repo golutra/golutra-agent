@@ -70,6 +70,18 @@ pub(crate) struct ProcessSnapshot {
     pub(crate) workspace_changes_known: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProcessSummary {
+    pub(crate) process_id: String,
+    pub(crate) command_display: String,
+    pub(crate) state: ProcessState,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) output_cursor: u64,
+    pub(crate) output_bytes: u64,
+    pub(crate) output_lines: u64,
+    pub(crate) output_truncated: bool,
+}
+
 pub(crate) struct ProcessStartRequest<'a> {
     pub(crate) process_id: String,
     pub(crate) session_id: SessionId,
@@ -77,6 +89,7 @@ pub(crate) struct ProcessStartRequest<'a> {
     pub(crate) args: &'a [String],
     pub(crate) command_display: String,
     pub(crate) cwd: &'a Path,
+    pub(crate) workspace_root: &'a Path,
     pub(crate) timeout_ms: u64,
     pub(crate) wait_ms: u64,
     pub(crate) cancellation: CancellationToken,
@@ -326,7 +339,7 @@ impl ProcessSupervisor {
                 program: request.program.into(),
                 args: request.args.iter().map(Into::into).collect(),
                 cwd: request.cwd.to_path_buf(),
-                workspace_root: request.cwd.to_path_buf(),
+                workspace_root: request.workspace_root.to_path_buf(),
                 scratch_dir: scratch.path().to_path_buf(),
                 read_only_roots: Vec::new(),
                 workspace_access: request.workspace_access,
@@ -396,7 +409,7 @@ impl ProcessSupervisor {
         let shutdown = self.inner.shutdown.clone();
         let process_control = entry.control.clone();
         let task_cancellation = request.cancellation;
-        let workspace_root = request.cwd.to_path_buf();
+        let workspace_root = request.workspace_root.to_path_buf();
         let workspace_before = request.workspace_before;
         let timeout = Duration::from_millis(request.timeout_ms.max(1));
         tokio::spawn(supervise_process(
@@ -434,6 +447,42 @@ impl ProcessSupervisor {
         cursor: u64,
     ) -> Result<ProcessSnapshot, ToolError> {
         self.poll(session_id, process_id, cursor, 0).await
+    }
+
+    pub(crate) async fn list(&self, session_id: SessionId) -> Vec<ProcessSummary> {
+        self.prune().await;
+        let mut entries = self
+            .inner
+            .processes
+            .lock()
+            .await
+            .values()
+            .filter(|entry| entry.session_id == session_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.id.cmp(&right.id));
+
+        let mut summaries = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let output = entry.output.lock().await;
+            let output_cursor = output.next_cursor;
+            let output_bytes = output.total_bytes;
+            let output_lines = output.lines();
+            let output_truncated = output.truncated;
+            drop(output);
+            let state = entry.state.lock().await;
+            summaries.push(ProcessSummary {
+                process_id: entry.id.clone(),
+                command_display: entry.command_display.clone(),
+                state: state.state,
+                exit_code: state.exit_code,
+                output_cursor,
+                output_bytes,
+                output_lines,
+                output_truncated,
+            });
+        }
+        summaries
     }
 
     pub(crate) async fn write(

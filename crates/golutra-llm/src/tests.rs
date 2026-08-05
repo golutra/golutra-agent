@@ -188,7 +188,11 @@ fn openai_tool_parameters_come_from_the_runtime_tool_contract() {
 fn shell_provider_description_distinguishes_lifetime_from_initial_wait() {
     let description = provider_tool_description("shell");
 
+    assert!(description.contains("inert argv"));
+    assert!(description.contains("program and every argument"));
     assert!(description.contains("Python heredoc"));
+    assert!(description.contains("package-manager conventions"));
+    assert!(description.contains("project-scoped installation"));
     assert!(description.contains("timeout_ms is the absolute process lifetime"));
     assert!(description.contains("yield"));
     assert!(description.contains("only controls the initial wait"));
@@ -197,6 +201,43 @@ fn shell_provider_description_distinguishes_lifetime_from_initial_wait() {
     assert!(description.contains("platform-appropriate lifecycle mechanism"));
     assert!(description.contains("verify availability before returning"));
     assert!(!description.contains("nohup"));
+}
+
+#[test]
+fn provider_tool_descriptions_own_file_and_question_usage_details() {
+    let write_file = provider_tool_description("write_file");
+    assert!(write_file.contains("complete supplied content"));
+    assert!(write_file.contains("explicit working or output directory"));
+    assert!(write_file.contains("workspace root"));
+
+    let ask_user = provider_tool_description("ask_user");
+    assert!(ask_user.contains("consequential decision"));
+    assert!(ask_user.contains("cannot be resolved safely"));
+
+    assert_ne!(
+        provider_tool_description("apply_patch"),
+        "Golutra workspace tool."
+    );
+    assert_ne!(
+        provider_tool_description("process_list"),
+        "Golutra workspace tool."
+    );
+    assert_ne!(
+        provider_tool_description("process_poll"),
+        "Golutra workspace tool."
+    );
+    assert_ne!(
+        provider_tool_description("process_write"),
+        "Golutra workspace tool."
+    );
+    assert_ne!(
+        provider_tool_description("process_terminate"),
+        "Golutra workspace tool."
+    );
+    assert_ne!(
+        provider_tool_description("process_reconnect"),
+        "Golutra workspace tool."
+    );
 }
 
 #[test]

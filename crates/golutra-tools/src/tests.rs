@@ -86,6 +86,7 @@ async fn registry_contains_p0_tools() {
             "edit_file",
             "find_references",
             "list_dir",
+            "process_list",
             "process_poll",
             "process_reconnect",
             "process_terminate",
@@ -124,6 +125,9 @@ fn shell_contract_explains_how_to_submit_compound_commands() {
     let yield_time = contract.input_schema["properties"]["yield_time_ms"]["description"]
         .as_str()
         .expect("yield time description");
+    let workdir = contract.input_schema["properties"]["workdir"]["description"]
+        .as_str()
+        .expect("workdir description");
     assert!(timeout.contains("absolute process lifetime"));
     assert!(background.contains("runtime-scoped"));
     assert!(background.contains("do not use background=true"));
@@ -131,6 +135,8 @@ fn shell_contract_explains_how_to_submit_compound_commands() {
     assert!(background.contains("verify availability before returning"));
     assert!(yield_time.contains("initial wait"));
     assert!(yield_time.contains("does not extend"));
+    assert!(workdir.contains("working directory"));
+    assert!(workdir.contains("workspace root"));
 }
 
 #[tokio::test]
@@ -1555,6 +1561,200 @@ async fn background_process_supports_cursor_reconnect_stdin_and_terminal_diff() 
             .iter()
             .any(|path| path.ends_with("background.txt"))
     );
+}
+
+#[tokio::test]
+async fn shell_workdir_changes_cwd_without_changing_workspace_tracking_root() {
+    let workspace = tempdir().expect("workspace");
+    let nested = workspace.path().join("nested");
+    fs::create_dir(&nested).expect("nested directory");
+    fs::write(
+        nested.join("foreground.sh"),
+        "pwd\nprintf foreground > ../foreground.txt\n",
+    )
+    .expect("foreground script");
+    let executor = executor(workspace.path());
+
+    let report = execute_approved(
+        &executor,
+        request(
+            "shell",
+            json!({"command": "sh foreground.sh", "workdir": "nested"}),
+        ),
+        CancellationToken::new(),
+    )
+    .await;
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+    assert!(
+        artifact_text(&report).contains(
+            &nested
+                .canonicalize()
+                .expect("canonical nested")
+                .display()
+                .to_string()
+        )
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("foreground.txt")).expect("foreground output"),
+        "foreground"
+    );
+    assert!(
+        report
+            .changed_files
+            .iter()
+            .any(|path| path.ends_with("foreground.txt"))
+    );
+
+    let outside = tempdir().expect("outside");
+    let blocked = request(
+        "shell",
+        json!({
+            "command": "sh foreground.sh",
+            "workdir": outside.path().display().to_string(),
+        }),
+    );
+    let policy = executor.evaluate(&blocked).expect("workdir policy");
+    assert_eq!(policy.decision, PolicyDecision::Block);
+    assert!(policy.reason.contains("outside workspace"));
+}
+
+#[tokio::test]
+async fn process_list_is_session_scoped_and_reports_background_status() {
+    let workspace = tempdir().expect("workspace");
+    let nested = workspace.path().join("nested");
+    fs::create_dir(&nested).expect("nested directory");
+    fs::write(
+        nested.join("background.sh"),
+        concat!(
+            "printf 'ready\\n'\n",
+            "printf background > ../background.txt\n",
+            "read value\n",
+            "printf 'done:%s\\n' \"$value\"\n",
+        ),
+    )
+    .expect("background script");
+    let executor = executor(workspace.path());
+    let session_id = SessionId::new();
+    let start = execute_approved(
+        &executor,
+        request_for_session(
+            session_id,
+            "shell",
+            json!({
+                "command": "sh background.sh API_KEY=plain-secret-value",
+                "workdir": "nested",
+                "background": true,
+                "yield_time_ms": 1_000,
+            }),
+        ),
+        CancellationToken::new(),
+    )
+    .await;
+    let process_id = start.envelope.structured_facts["process_id"]
+        .as_str()
+        .expect("process id")
+        .to_owned();
+    let cursor = start.envelope.structured_facts["output_cursor"]
+        .as_u64()
+        .expect("output cursor");
+
+    let listed = executor
+        .execute(
+            request_for_session(session_id, "process_list", json!({})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("list current session");
+    assert_eq!(listed.envelope.status, ToolResultStatus::Ok);
+    assert_eq!(listed.envelope.structured_facts["process_count"], 1);
+    assert_eq!(listed.envelope.structured_facts["running_count"], 1);
+    assert_eq!(listed.metrics.item_count, Some(1));
+    let process = &listed.envelope.structured_facts["processes"][0];
+    assert_eq!(process["process_id"], process_id);
+    assert_eq!(
+        process["command"],
+        "sh background.sh API_KEY=<redacted-secret>"
+    );
+    assert!(!artifact_text(&listed).contains("plain-secret-value"));
+    assert_eq!(process["process_state"], "running");
+    assert_eq!(process["output_cursor"], cursor);
+    assert!(
+        process["output_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
+    );
+    assert!(!artifact_text(&listed).contains("ready"));
+
+    let isolated = executor
+        .execute(
+            request_for_session(SessionId::new(), "process_list", json!({})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("list other session");
+    assert_eq!(isolated.envelope.structured_facts["process_count"], 0);
+
+    let mut terminal = executor
+        .execute(
+            request_for_session(
+                session_id,
+                "process_write",
+                json!({
+                    "process_id": process_id,
+                    "input": "continue\n",
+                    "cursor": cursor,
+                    "wait_ms": 1_000,
+                }),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("finish background process");
+    let mut terminal_cursor = terminal.envelope.structured_facts["output_cursor"]
+        .as_u64()
+        .expect("terminal cursor");
+    while terminal.envelope.structured_facts["process_state"] == "running" {
+        terminal = executor
+            .execute(
+                request_for_session(
+                    session_id,
+                    "process_poll",
+                    json!({
+                        "process_id": process_id,
+                        "cursor": terminal_cursor,
+                        "wait_ms": 1_000,
+                    }),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("poll background process to terminal state");
+        terminal_cursor = terminal.envelope.structured_facts["output_cursor"]
+            .as_u64()
+            .expect("terminal cursor");
+    }
+    assert_eq!(
+        terminal.envelope.structured_facts["process_state"],
+        "exited"
+    );
+    assert!(
+        terminal
+            .changed_files
+            .iter()
+            .any(|path| path.ends_with("background.txt"))
+    );
+
+    let completed = executor
+        .execute(
+            request_for_session(session_id, "process_list", json!({})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("list completed process");
+    let process = &completed.envelope.structured_facts["processes"][0];
+    assert_eq!(process["process_state"], "exited");
+    assert_eq!(process["exit_code"], 0);
 }
 
 #[cfg(unix)]
