@@ -609,6 +609,244 @@ async fn runtime_network_capability_requires_both_host_and_turn_grants() {
 }
 
 #[tokio::test]
+async fn delegated_task_inherits_overrides_and_archives_an_isolated_child() {
+    let workspace = tempdir().expect("workspace");
+    let _provider = IsolatedGlobalMockProvider::install().await;
+    let host = RuntimeHost::ephemeral_for_cwd(workspace.path())
+        .await
+        .expect("host");
+    let parent_session_id = host.default_session_id();
+    let parent_turn_id = TurnId::new();
+    host.upsert_current_thread(
+        parent_session_id,
+        &json!({"prompt": "parent delegation fixture"}),
+    )
+    .await
+    .expect("parent thread");
+    let parent_thread_id = host
+        .repositories
+        .threads
+        .by_session(parent_session_id)
+        .await
+        .expect("parent lookup")
+        .expect("parent thread")
+        .thread_id;
+    let (execution, _control) = agent_execution_channel(1);
+    let parent_worker = tokio::spawn(std::future::pending::<()>());
+    let (completion_sender, completion) = watch::channel(false);
+    host.task_controls.lock().await.insert(
+        parent_session_id,
+        HostedTaskControl {
+            task_id: TaskId::new(),
+            allow_network: false,
+            yolo: false,
+            provider_settings: ProviderTurnSettings {
+                profile: Some(json!("mock")),
+                model: Some(json!("parent-model")),
+                generation_config: Some(json!({
+                    "reasoning_effort": "medium",
+                    "context_window_size": 32_000,
+                    "max_tokens": 2_000,
+                })),
+            },
+            execution,
+            abort_handle: parent_worker.abort_handle(),
+            completion,
+            _session_lease: None,
+        },
+    );
+    let backend = crate::delegation::RuntimeTaskDelegationBackend::new(Arc::downgrade(&host));
+    let inherited_request = ToolRequest {
+        tool_call_id: ToolCallId::new(),
+        provider_tool_call_id: Some("delegate-inherited".to_owned()),
+        session_id: parent_session_id,
+        turn_id: Some(parent_turn_id),
+        tool_name: "delegate_task".to_owned(),
+        arguments: json!({"task": "Summarize the number seven."}),
+    };
+
+    let inherited = golutra_tools::TaskDelegationBackend::delegate(
+        &backend,
+        &inherited_request,
+        CancellationToken::new(),
+    )
+    .await
+    .expect("inherited delegation");
+    assert_eq!(inherited.status, golutra_core::ToolResultStatus::Ok);
+    assert_eq!(
+        inherited.structured_facts["requested_model"],
+        "parent-model"
+    );
+    assert_eq!(inherited.structured_facts["effective_model"], "mock-model");
+    assert_eq!(
+        inherited.structured_facts["effective_reasoning_effort"],
+        "medium"
+    );
+    let inherited_session_id = inherited.structured_facts["child_session_id"]
+        .as_str()
+        .expect("child session id")
+        .parse::<SessionId>()
+        .expect("valid child session id");
+    let inherited_thread = host
+        .repositories
+        .threads
+        .by_session(inherited_session_id)
+        .await
+        .expect("child lookup")
+        .expect("child thread");
+    assert_eq!(inherited_thread.parent_thread_id, Some(parent_thread_id));
+    assert!(inherited_thread.archived);
+    let inherited_events = host
+        .repositories
+        .events
+        .load(inherited_session_id, None, None)
+        .await
+        .expect("child events");
+    let inherited_payload = inherited_events
+        .iter()
+        .find(|event| event.event_type == RuntimeEventType::TaskCreated)
+        .and_then(|event| event.payload.get("payload"))
+        .expect("child task payload");
+    assert_eq!(inherited_payload["provider_profile"], "mock");
+    assert_eq!(inherited_payload["provider_model"], "parent-model");
+    assert_eq!(
+        inherited_payload["provider_generation_config"],
+        json!({
+            "reasoning_effort": "medium",
+            "context_window_size": 32_000,
+            "max_tokens": 2_000,
+        })
+    );
+
+    let retried = golutra_tools::TaskDelegationBackend::delegate(
+        &backend,
+        &inherited_request,
+        CancellationToken::new(),
+    )
+    .await
+    .expect("idempotent delegation retry");
+    assert_eq!(
+        retried.structured_facts["child_session_id"],
+        inherited.structured_facts["child_session_id"]
+    );
+
+    let changed_arguments = golutra_tools::TaskDelegationBackend::delegate(
+        &backend,
+        &ToolRequest {
+            arguments: json!({"task": "Summarize the number eight."}),
+            ..inherited_request.clone()
+        },
+        CancellationToken::new(),
+    )
+    .await
+    .expect("changed delegation arguments");
+    assert_ne!(
+        changed_arguments.structured_facts["child_session_id"],
+        inherited.structured_facts["child_session_id"]
+    );
+
+    let overridden = golutra_tools::TaskDelegationBackend::delegate(
+        &backend,
+        &ToolRequest {
+            tool_call_id: ToolCallId::new(),
+            provider_tool_call_id: Some("delegate-overridden".to_owned()),
+            session_id: parent_session_id,
+            turn_id: Some(parent_turn_id),
+            tool_name: "delegate_task".to_owned(),
+            arguments: json!({
+                "task": "Summarize the number eight.",
+                "model": "child-model",
+                "reasoning_effort": "xhigh",
+            }),
+        },
+        CancellationToken::new(),
+    )
+    .await
+    .expect("overridden delegation");
+    assert_eq!(
+        overridden.structured_facts["requested_model"],
+        "child-model"
+    );
+    assert_eq!(overridden.structured_facts["effective_model"], "mock-model");
+    assert_eq!(
+        overridden.structured_facts["effective_reasoning_effort"],
+        "xhigh"
+    );
+    let overridden_session_id = overridden.structured_facts["child_session_id"]
+        .as_str()
+        .expect("overridden child session id")
+        .parse::<SessionId>()
+        .expect("valid overridden child session id");
+    let overridden_thread = host
+        .repositories
+        .threads
+        .by_session(overridden_session_id)
+        .await
+        .expect("overridden child lookup")
+        .expect("overridden child thread");
+    assert_eq!(overridden_thread.parent_thread_id, Some(parent_thread_id));
+    assert!(overridden_thread.archived);
+    let overridden_events = host
+        .repositories
+        .events
+        .load(overridden_session_id, None, None)
+        .await
+        .expect("overridden child events");
+    let overridden_payload = overridden_events
+        .iter()
+        .find(|event| event.event_type == RuntimeEventType::TaskCreated)
+        .and_then(|event| event.payload.get("payload"))
+        .expect("overridden child task payload");
+    assert_eq!(overridden_payload["provider_model"], "child-model");
+    assert_eq!(
+        overridden_payload["provider_generation_config"],
+        json!({
+            "reasoning_effort": "xhigh",
+            "context_window_size": 32_000,
+            "max_tokens": 2_000,
+        })
+    );
+
+    host.task_controls.lock().await.remove(&parent_session_id);
+    drop(completion_sender);
+    parent_worker.abort();
+}
+
+#[tokio::test]
+async fn cancelled_delegation_does_not_create_a_child_session() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let backend = crate::delegation::RuntimeTaskDelegationBackend::new(Arc::downgrade(&host));
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    let output = golutra_tools::TaskDelegationBackend::delegate(
+        &backend,
+        &ToolRequest {
+            tool_call_id: ToolCallId::new(),
+            provider_tool_call_id: Some("cancelled-delegation".to_owned()),
+            session_id: host.default_session_id(),
+            turn_id: Some(TurnId::new()),
+            tool_name: "delegate_task".to_owned(),
+            arguments: json!({"task": "this child must never start"}),
+        },
+        cancellation,
+    )
+    .await
+    .expect("cancelled delegation returns a tool result");
+
+    assert_eq!(output.status, golutra_core::ToolResultStatus::Cancelled);
+    assert_eq!(output.structured_facts["cancelled"], true);
+    assert!(
+        host.repositories
+            .threads
+            .list(None, 100)
+            .await
+            .expect("threads")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn dropping_runtime_host_terminates_its_background_processes() {
     let workspace = tempdir().expect("workspace");
     fs::write(

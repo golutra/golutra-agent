@@ -26,6 +26,13 @@ pub(crate) fn thread_id_from_payload(payload: &Value) -> Option<ThreadId> {
         .and_then(|value| value.parse().ok())
 }
 
+pub(crate) fn parent_thread_id_from_payload(payload: &Value) -> Option<ThreadId> {
+    payload
+        .get("_parent_thread_id")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse().ok())
+}
+
 pub(crate) fn thread_title_for_prompt(
     source_thread: Option<&ThreadRecord>,
     payload: &Value,

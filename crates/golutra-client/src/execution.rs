@@ -339,9 +339,25 @@ impl RuntimeHost {
         let workspace_root = self.execution_workspace_root()?;
         let policy = WorkspacePolicy::new(workspace_root.clone())
             .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
-        let tool_executor = self
+        let mut tool_executor = self
             .build_tool_executor(policy, workspace_root.clone(), requested_network, yolo)
             .await?;
+        if task
+            .payload
+            .get(crate::delegation::DELEGATED_TASK_MARKER)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            tool_executor = tool_executor
+                .without_tool("delegate_task")
+                .without_tool("ask_user");
+        } else {
+            tool_executor = tool_executor
+                .with_task_delegation_backend(Arc::new(
+                    crate::delegation::RuntimeTaskDelegationBackend::new(Arc::downgrade(&self)),
+                ))
+                .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
+        }
         let workspace_tool_names = tool_executor
             .registry()
             .contracts()

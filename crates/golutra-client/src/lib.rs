@@ -138,6 +138,7 @@ mod change_tracker;
 mod command;
 mod context;
 mod debug_export;
+mod delegation;
 mod diagnosis;
 mod event_codec;
 mod evolution;
@@ -186,9 +187,9 @@ pub(crate) use event_codec::redact_provider_json;
 pub(crate) use event_codec::{
     agent_event, agent_event_for_turn, candidate_id_from_payload, context_compaction_artifact,
     context_replay_request_artifact, context_request_artifact, event_matches_filter, host_event,
-    provider_raw_artifact, provider_response_replay_artifact, recovered_pending_turn_from_event,
-    task_status_from_loop_action, thread_id_from_payload, thread_title_for_prompt,
-    trace_event_payload, with_command_payload,
+    parent_thread_id_from_payload, provider_raw_artifact, provider_response_replay_artifact,
+    recovered_pending_turn_from_event, task_status_from_loop_action, thread_id_from_payload,
+    thread_title_for_prompt, trace_event_payload, with_command_payload,
 };
 pub use event_codec::{event_sequence_no, projection_status};
 pub(crate) use execution_trace::CanonicalFactRecorder;

@@ -535,6 +535,55 @@ impl ProcessSupervisor {
         }
     }
 
+    /// Terminate all running processes owned by one session and wait for their
+    /// supervisors to record a terminal state.
+    ///
+    /// A delegated child is archived as soon as it returns, so leaving one of
+    /// its managed processes alive would make that process unreachable through
+    /// the normal session-scoped process tools. The shared deadline keeps one
+    /// misbehaving process from serially extending cleanup for every sibling.
+    pub async fn terminate_session(&self, session_id: SessionId) -> Result<usize, ToolError> {
+        self.prune().await;
+        let entries = self
+            .inner
+            .processes
+            .lock()
+            .await
+            .values()
+            .filter(|entry| entry.session_id == session_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut running = Vec::new();
+        for entry in entries {
+            if !entry.state.lock().await.state.is_terminal() {
+                entry.control.cancel();
+                running.push(entry);
+            }
+        }
+        if running.is_empty() {
+            return Ok(0);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut unfinished = Vec::new();
+        for entry in &running {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let wait_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
+            let snapshot = self.wait_for_terminal(entry, 0, wait_ms).await;
+            if !snapshot.state.is_terminal() {
+                unfinished.push(entry.id.clone());
+            }
+        }
+        if unfinished.is_empty() {
+            Ok(running.len())
+        } else {
+            Err(ToolError::Execution(format!(
+                "processes did not terminate within 5000 ms: {}",
+                unfinished.join(", ")
+            )))
+        }
+    }
+
     async fn entry(
         &self,
         session_id: SessionId,

@@ -1560,8 +1560,10 @@ where
                                     }
                                     Ok(preparation) => {
                                         let checkpoint_error = if may_execute
-                                            && (tool_request.tool_name == "shell"
-                                                || !preparation.before_images.is_empty())
+                                            && (matches!(
+                                                tool_request.tool_name.as_str(),
+                                                "shell" | "delegate_task"
+                                            ) || !preparation.before_images.is_empty())
                                             && let Some(recorder) =
                                                 &self.before_side_effect_recorder
                                         {
@@ -1603,15 +1605,19 @@ where
                                             };
                                             let error_request = tool_request.clone();
                                             let error_policy = policy.clone();
+                                            let invocation =
+                                                ToolInvocation::new(tool_request, policy, approved)
+                                                    .with_preparation(preparation);
+                                            let invocation =
+                                                if let Some(deadline) = runtime_deadline {
+                                                    invocation.with_deadline(deadline)
+                                                } else {
+                                                    invocation
+                                                };
                                             match self
                                                 .tool_executor
                                                 .invoke(
-                                                    ToolInvocation::new(
-                                                        tool_request,
-                                                        policy,
-                                                        approved,
-                                                    )
-                                                    .with_preparation(preparation),
+                                                    invocation,
                                                     control.cancellation.clone(),
                                                     Some(&mut progress),
                                                 )

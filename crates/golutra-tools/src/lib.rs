@@ -31,6 +31,7 @@ const MAX_PATTERN_ARGUMENT_CHARS: usize = 64 * 1024;
 const MAX_SHELL_COMMAND_CHARS: usize = 64 * 1024;
 const MAX_PROCESS_INPUT_CHARS: usize = 64 * 1024;
 const MAX_PATCH_BYTES: usize = 16 * 1024 * 1024;
+const MAX_DELEGATED_TASK_CHARS: usize = 64 * 1024;
 const MAX_BACKGROUND_PROCESS_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
 const MAX_TOOL_ERROR_CHARS: usize = 4 * 1024;
 const MAX_AUDIT_RESOURCE_CHARS: usize = 64 * 1024;
@@ -132,6 +133,7 @@ pub struct ToolInvocation {
     pub policy: PolicyEvaluation,
     pub approved: bool,
     preparation: Option<SideEffectPreparation>,
+    deadline: Option<tokio::time::Instant>,
 }
 
 impl ToolInvocation {
@@ -142,12 +144,19 @@ impl ToolInvocation {
             policy,
             approved,
             preparation: None,
+            deadline: None,
         }
     }
 
     #[must_use]
     pub fn with_preparation(mut self, preparation: SideEffectPreparation) -> Self {
         self.preparation = Some(preparation);
+        self
+    }
+
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: tokio::time::Instant) -> Self {
+        self.deadline = Some(deadline);
         self
     }
 }
@@ -158,6 +167,28 @@ pub struct ExternalToolOutput {
     pub content: String,
     pub structured_facts: Value,
     pub is_error: bool,
+}
+
+/// Result returned by the host-owned delegated-agent backend.
+///
+/// Delegation is kept separate from [`ExternalToolBackend`]: it may outlive a
+/// normal tool-call timeout and must retain the enclosing runtime's lifecycle,
+/// cancellation and workspace accounting.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskDelegationOutput {
+    pub status: ToolResultStatus,
+    pub summary: String,
+    pub content: String,
+    pub structured_facts: Value,
+}
+
+#[async_trait]
+pub trait TaskDelegationBackend: std::fmt::Debug + Send + Sync {
+    async fn delegate(
+        &self,
+        request: &ToolRequest,
+        cancellation: CancellationToken,
+    ) -> Result<TaskDelegationOutput, ToolError>;
 }
 
 #[async_trait]
@@ -259,6 +290,7 @@ pub struct ToolRuntime {
     sandbox: SystemSandbox,
     allow_network: bool,
     external_backend: Option<Arc<dyn ExternalToolBackend>>,
+    delegation_backend: Option<Arc<dyn TaskDelegationBackend>>,
     replay_backend: Option<Arc<dyn ToolReplayBackend>>,
     process_supervisor: ProcessSupervisor,
 }
@@ -272,6 +304,7 @@ impl ToolRuntime {
             sandbox: SystemSandbox::detect(),
             allow_network: false,
             external_backend: None,
+            delegation_backend: None,
             replay_backend: None,
             process_supervisor: ProcessSupervisor::new(),
         }
@@ -504,6 +537,27 @@ impl ToolRuntime {
         Ok(self)
     }
 
+    pub fn with_task_delegation_backend(
+        mut self,
+        backend: Arc<dyn TaskDelegationBackend>,
+    ) -> Result<Self, ToolError> {
+        self.registry
+            .register_external([contract("delegate_task", SideEffectType::Process)])?;
+        self.delegation_backend = Some(backend);
+        Ok(self)
+    }
+
+    /// Remove a tool from this runtime's model-visible and executable registry.
+    /// Delegated child agents use this to prevent recursive delegation.
+    #[must_use]
+    pub fn without_tool(mut self, tool_name: &str) -> Self {
+        self.registry.contracts.remove(tool_name);
+        if tool_name == "delegate_task" {
+            self.delegation_backend = None;
+        }
+        self
+    }
+
     /// Replace real tool execution with deterministic, artifact-backed
     /// results. This is only intended for explicit replay entrypoints.
     #[must_use]
@@ -530,36 +584,27 @@ impl ToolRuntime {
 
     pub async fn invoke(
         &self,
-        invocation: ToolInvocation,
+        mut invocation: ToolInvocation,
         cancellation: CancellationToken,
         progress: Option<&mut (dyn FnMut(ToolProgress) + Send)>,
     ) -> Result<ToolExecutionReport, ToolError> {
-        let ToolInvocation {
-            request,
-            policy,
-            approved,
-            preparation,
-        } = invocation;
         let may_execute = !cancellation.is_cancelled()
-            && match policy.decision {
+            && match invocation.policy.decision {
                 PolicyDecision::Allow => true,
-                PolicyDecision::Ask => approved,
+                PolicyDecision::Ask => invocation.approved,
                 PolicyDecision::Deny | PolicyDecision::Block => false,
             };
-        let preparation = match preparation {
+        let preparation = match invocation.preparation.take() {
             Some(preparation) => preparation,
-            None if may_execute => self.prepare_side_effect_snapshot(&request).await?,
+            None if may_execute => {
+                self.prepare_side_effect_snapshot(&invocation.request)
+                    .await?
+            }
             None => SideEffectPreparation::default(),
         };
-        self.invoke_prepared(
-            request,
-            policy,
-            approved,
-            cancellation,
-            preparation,
-            progress,
-        )
-        .await
+        invocation.preparation = Some(preparation);
+        self.invoke_prepared(invocation, cancellation, progress)
+            .await
     }
 
     /// Execute a caller-declared verification command without shell parsing.
@@ -835,6 +880,7 @@ impl ToolRuntime {
             "process_poll" | "process_write" | "process_terminate" | "process_reconnect" => {
                 process_control_policy(request)
             }
+            "delegate_task" if self.delegation_backend.is_some() => delegation_policy(request),
             _ if self.external_backend.is_some() => {
                 let mut policy = execution_policy(
                     request,
@@ -927,6 +973,14 @@ impl ToolRuntime {
                     workspace_snapshot: Some(snapshot),
                 })
             }
+            "delegate_task" => {
+                let snapshot = workspace_scan::capture(self.policy.workspace_root()).await;
+                Ok(SideEffectPreparation {
+                    before_images: snapshot.before_images(),
+                    complete: snapshot.is_complete(),
+                    workspace_snapshot: Some(snapshot),
+                })
+            }
             _ if matches!(
                 contract.side_effect_type,
                 SideEffectType::ExternalSystem | SideEffectType::Network
@@ -1001,13 +1055,22 @@ impl ToolRuntime {
 
     async fn invoke_prepared(
         &self,
-        request: ToolRequest,
-        policy: PolicyEvaluation,
-        approved: bool,
+        invocation: ToolInvocation,
         cancellation: CancellationToken,
-        preparation: SideEffectPreparation,
         mut progress: Option<&mut (dyn FnMut(ToolProgress) + Send)>,
     ) -> Result<ToolExecutionReport, ToolError> {
+        let ToolInvocation {
+            request,
+            policy,
+            approved,
+            preparation,
+            deadline,
+        } = invocation;
+        let Some(preparation) = preparation else {
+            return Err(ToolError::Execution(
+                "tool invocation was not prepared".to_owned(),
+            ));
+        };
         let started_at = Instant::now();
         let tool_call_id = request.tool_call_id;
         let tool_name = request.tool_name.clone();
@@ -1115,6 +1178,10 @@ impl ToolRuntime {
                         &mut progress,
                     )
                     .await
+                }
+                "delegate_task" => {
+                    self.delegate_task(request, policy, cancellation, workspace_snapshot, deadline)
+                        .await
                 }
                 "process_list" => self.process_list(request, policy).await,
                 "process_poll" => self.process_poll(request, policy).await,
@@ -1973,6 +2040,81 @@ impl ToolRuntime {
         Ok(report)
     }
 
+    async fn delegate_task(
+        &self,
+        request: ToolRequest,
+        policy: PolicyEvaluation,
+        cancellation: CancellationToken,
+        workspace_before: Option<workspace_scan::WorkspaceSnapshot>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<ToolExecutionReport, ToolError> {
+        let backend = self
+            .delegation_backend
+            .as_ref()
+            .ok_or_else(|| ToolError::UnknownTool("delegate_task".to_owned()))?;
+        let delegation_cancellation = cancellation.child_token();
+        let output = {
+            let backend_call = backend.delegate(&request, delegation_cancellation.clone());
+            tokio::pin!(backend_call);
+            if let Some(deadline) = deadline {
+                tokio::select! {
+                    output = &mut backend_call => output?,
+                    _ = tokio::time::sleep_until(deadline) => {
+                        delegation_cancellation.cancel();
+                        backend_call.await?
+                    }
+                }
+            } else {
+                backend_call.await?
+            }
+        };
+        let workspace_changes = match workspace_before {
+            Some(snapshot) => workspace_scan::compare(self.policy.workspace_root(), snapshot).await,
+            None => {
+                workspace_scan::compare(
+                    self.policy.workspace_root(),
+                    workspace_scan::capture(self.policy.workspace_root()).await,
+                )
+                .await
+            }
+        };
+        let mut structured_facts = match output.structured_facts {
+            Value::Object(facts) => Value::Object(facts),
+            value => json!({"child_result": value}),
+        };
+        if let Some(facts) = structured_facts.as_object_mut() {
+            facts.insert(
+                "workspace_changes_known".to_owned(),
+                Value::Bool(workspace_changes.complete),
+            );
+            facts.insert(
+                "workspace_change_count".to_owned(),
+                json!(workspace_changes.changed_files.len()),
+            );
+        }
+        let mut report = report(
+            request,
+            output.status,
+            &output.summary,
+            structured_facts,
+            output.content,
+            if workspace_changes.complete {
+                workspace_changes.changed_files.clone()
+            } else {
+                Vec::new()
+            },
+            policy,
+        );
+        report.envelope.risk = "delegated_agent".to_owned();
+        report.envelope.verification_hint =
+            Some("delegated child result and enclosing workspace diff".to_owned());
+        if workspace_changes.complete {
+            report.before_images = workspace_changes.before_images;
+            report.after_images = workspace_changes.after_images;
+        }
+        Ok(report)
+    }
+
     async fn process_list(
         &self,
         request: ToolRequest,
@@ -2388,6 +2530,30 @@ fn contract(tool_name: &str, side_effect_type: SideEffectType) -> ToolContract {
                 }
             },
             "required": ["questions"]
+        }),
+        "delegate_task" => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_DELEGATED_TASK_CHARS,
+                    "description": "A complete, self-contained task for one child agent. Include the relevant goal, constraints, and expected result; the child does not receive the parent conversation history."
+                },
+                "model": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "description": "Optional model override. Omit it to inherit the parent agent's effective model."
+                },
+                "reasoning_effort": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high", "xhigh"],
+                    "description": "Optional reasoning effort override. Omit it to inherit the parent agent's effective setting."
+                }
+            },
+            "required": ["task"]
         }),
         "shell" => json!({
             "type": "object",
@@ -2895,6 +3061,16 @@ fn process_control_policy(request: &ToolRequest) -> PolicyEvaluation {
     // A write request may contain arbitrary stdin. Keep it out of durable
     // policy/audit resources while retaining the handle needed for review.
     policy.resource = format!("process:{process_id}");
+    policy
+}
+
+fn delegation_policy(request: &ToolRequest) -> PolicyEvaluation {
+    let mut policy = execution_policy(
+        request,
+        PolicyDecision::Allow,
+        "delegated child inherits the enclosing agent capabilities",
+    );
+    policy.resource = format!("delegated-task:{}", request.session_id);
     policy
 }
 

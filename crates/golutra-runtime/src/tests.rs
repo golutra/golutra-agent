@@ -2602,6 +2602,80 @@ impl BeforeSideEffectRecorder for FailingCheckpointRecorder {
     }
 }
 
+#[derive(Debug)]
+struct RecordingDelegationBackend {
+    called: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl golutra_tools::TaskDelegationBackend for RecordingDelegationBackend {
+    async fn delegate(
+        &self,
+        _request: &golutra_tools::ToolRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<golutra_tools::TaskDelegationOutput, golutra_tools::ToolError> {
+        self.called.store(true, Ordering::SeqCst);
+        Ok(golutra_tools::TaskDelegationOutput {
+            status: ToolResultStatus::Ok,
+            summary: "delegated task completed".to_owned(),
+            content: "child result".to_owned(),
+            structured_facts: json!({"child_status": "completed"}),
+        })
+    }
+}
+
+#[tokio::test]
+async fn delegation_requires_a_checkpoint_even_when_the_workspace_is_empty() {
+    let workspace = tempdir().expect("workspace");
+    let called = Arc::new(AtomicBool::new(false));
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"))
+        .with_task_delegation_backend(Arc::new(RecordingDelegationBackend {
+            called: called.clone(),
+        }))
+        .expect("delegation backend");
+    let provider = MockProvider::tool_call(
+        "delegate_task",
+        json!({"task": "return a concise independent result"}),
+    );
+    let mut agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor);
+    agent_loop.before_side_effect_recorder = Some(Arc::new(FailingCheckpointRecorder));
+    let mut trace = Vec::new();
+
+    let outcome = agent_loop
+        .run_with_trace(
+            AgentTaskRequest {
+                session_id: SessionId::new(),
+                task_id: TaskId::new(),
+                turn_id: TurnId::new(),
+                objective: "delegate an independent task".to_owned(),
+                completion_criteria: Vec::new(),
+                output_schema: None,
+                touched_code: false,
+                contributors: Vec::new(),
+                tools: vec!["delegate_task".to_owned()],
+            },
+            |event| trace.push(event),
+        )
+        .await
+        .expect("loop completes");
+
+    assert!(!called.load(Ordering::SeqCst));
+    let report = outcome
+        .tool_reports
+        .iter()
+        .find(|report| report.envelope.tool_name == "delegate_task")
+        .expect("delegation report");
+    assert_eq!(report.envelope.status, ToolResultStatus::Error);
+    assert!(report.artifact_contents.iter().any(|content| {
+        String::from_utf8_lossy(&content.bytes).contains("checkpoint persistence failure")
+    }));
+    assert!(trace.iter().any(|event| matches!(
+        event,
+        AgentLoopTraceEvent::ToolCompleted(report)
+            if report.envelope.tool_name == "delegate_task"
+    )));
+}
+
 #[tokio::test]
 async fn checkpoint_failure_emits_a_balanced_failed_tool_observation() {
     let workspace = tempdir().expect("workspace");

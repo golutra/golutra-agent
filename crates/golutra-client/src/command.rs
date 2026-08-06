@@ -1589,7 +1589,7 @@ impl RuntimeHost {
             .lock()
             .await
             .lane(thread.session_id)
-            .is_some()
+            .is_some_and(|lane| is_active_status(lane.status))
         {
             return Ok(CommandAck {
                 command_id: command.command_id,

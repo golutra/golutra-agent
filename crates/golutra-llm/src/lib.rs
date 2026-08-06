@@ -1573,6 +1573,9 @@ pub(crate) fn provider_tool_description(tool_name: &str) -> &'static str {
         "ask_user" => {
             "Ask up to three concise structured questions only when a consequential decision cannot be resolved safely from the request or workspace. Provide two to eight clear options per question and use multiple mode only when multiple selections are valid."
         }
+        "delegate_task" => {
+            "Delegate one complete, self-contained task to an isolated child agent and wait for its result. The child does not receive this conversation. Omit model and reasoning_effort to inherit the current agent settings; specify either field only when the task benefits from an explicit override."
+        }
         "shell" => {
             "Run a workspace command as inert argv; include the program and every argument in command. Use workdir to run from a workspace subdirectory without changing the workspace boundary. A complete quoted foreground Python heredoc such as python - <<'PY' is passed directly on stdin; for other pipes, redirection, or compound scripts, explicitly invoke an available shell with the complete script as one argument. When a required local dependency is missing, inspect the project's package-manager conventions, prefer a project-scoped installation when practical, and validate after installing. With background=true, timeout_ms is the absolute process lifetime and yield_time_ms only controls the initial wait. Managed background processes are runtime-scoped and stop when the runtime ends. If another process or evaluator must connect after the final response, do not use background=true; use a platform-appropriate lifecycle mechanism outside runtime ownership, detach standard streams as required, and verify availability before returning."
         }

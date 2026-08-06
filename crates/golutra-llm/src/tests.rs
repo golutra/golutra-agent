@@ -218,6 +218,10 @@ fn provider_tool_descriptions_own_file_and_question_usage_details() {
         provider_tool_description("apply_patch"),
         "Golutra workspace tool."
     );
+    let delegate = provider_tool_description("delegate_task");
+    assert!(delegate.contains("self-contained task"));
+    assert!(delegate.contains("does not receive this conversation"));
+    assert!(delegate.contains("reasoning_effort"));
     assert_ne!(
         provider_tool_description("process_list"),
         "Golutra workspace tool."

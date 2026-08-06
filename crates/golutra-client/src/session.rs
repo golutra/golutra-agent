@@ -460,6 +460,15 @@ impl RuntimeHost {
                 payload_thread.thread_id
             )));
         }
+        let payload_parent_thread_id = if payload.get("_parent_thread_id").is_some() {
+            Some(parent_thread_id_from_payload(payload).ok_or_else(|| {
+                ClientError::InvalidSession(
+                    "_parent_thread_id must be a valid thread id".to_owned(),
+                )
+            })?)
+        } else {
+            None
+        };
         let source_thread = existing.as_ref().or(payload_thread.as_ref());
         let thread_id = source_thread
             .map(|thread| thread.thread_id)
@@ -471,10 +480,46 @@ impl RuntimeHost {
                     ThreadId::new()
                 }
             });
+        if let Some(parent_thread_id) = payload_parent_thread_id
+            && parent_thread_id == thread_id
+        {
+            return Err(ClientError::InvalidSession(
+                "a thread cannot be its own parent".to_owned(),
+            ));
+        }
+        let parent_thread = match payload_parent_thread_id {
+            Some(parent_thread_id) => Some(
+                self.repositories
+                    .threads
+                    .by_id(parent_thread_id)
+                    .await?
+                    .ok_or_else(|| {
+                        ClientError::InvalidSession(format!(
+                            "parent thread `{parent_thread_id}` was not found"
+                        ))
+                    })?,
+            ),
+            None => None,
+        };
+        if let Some(parent_thread) = &parent_thread {
+            self.ensure_thread_in_workspace(parent_thread)?;
+            self.ensure_thread_not_removed(parent_thread)?;
+        }
+        if let Some(existing_parent_thread_id) =
+            source_thread.and_then(|thread| thread.parent_thread_id)
+            && payload_parent_thread_id.is_some_and(|parent| parent != existing_parent_thread_id)
+        {
+            return Err(ClientError::InvalidSession(format!(
+                "thread `{thread_id}` cannot change its parent thread"
+            )));
+        }
+        let parent_thread_id = source_thread
+            .and_then(|thread| thread.parent_thread_id)
+            .or(payload_parent_thread_id);
         let thread = ThreadRecord {
             thread_id,
             session_id,
-            parent_thread_id: source_thread.and_then(|thread| thread.parent_thread_id),
+            parent_thread_id,
             forked_from_turn_id: source_thread.and_then(|thread| thread.forked_from_turn_id),
             forked_from_sequence_no: source_thread
                 .and_then(|thread| thread.forked_from_sequence_no),

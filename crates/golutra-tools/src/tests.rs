@@ -1,7 +1,8 @@
 use std::{
     fs,
+    path::PathBuf,
     process::Stdio,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::Duration,
 };
 
@@ -69,6 +70,70 @@ impl ExternalToolBackend for FakeExternalBackend {
     }
 }
 
+#[derive(Debug)]
+struct FakeTaskDelegationBackend {
+    calls: AtomicUsize,
+    mutation: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct CancellationAwareDelegationBackend {
+    cancelled: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl TaskDelegationBackend for CancellationAwareDelegationBackend {
+    async fn delegate(
+        &self,
+        _request: &ToolRequest,
+        cancellation: CancellationToken,
+    ) -> Result<TaskDelegationOutput, ToolError> {
+        cancellation.cancelled().await;
+        self.cancelled.store(true, Ordering::SeqCst);
+        Ok(TaskDelegationOutput {
+            status: ToolResultStatus::Cancelled,
+            summary: "delegated task cancelled".to_owned(),
+            content: String::new(),
+            structured_facts: json!({"cancelled": true}),
+        })
+    }
+}
+
+#[async_trait]
+impl TaskDelegationBackend for FakeTaskDelegationBackend {
+    async fn delegate(
+        &self,
+        request: &ToolRequest,
+        cancellation: CancellationToken,
+    ) -> Result<TaskDelegationOutput, ToolError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if cancellation.is_cancelled() {
+            return Ok(TaskDelegationOutput {
+                status: ToolResultStatus::Cancelled,
+                summary: "delegated task cancelled".to_owned(),
+                content: String::new(),
+                structured_facts: json!({"child_status": "cancelled"}),
+            });
+        }
+        if let Some(path) = &self.mutation {
+            tokio::fs::write(path, "child change")
+                .await
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+        }
+        Ok(TaskDelegationOutput {
+            status: ToolResultStatus::Ok,
+            summary: "delegated task completed".to_owned(),
+            content: "child response".to_owned(),
+            structured_facts: json!({
+                "task": request.arguments["task"],
+                "effective_model": request.arguments.get("model"),
+                "effective_reasoning_effort": request.arguments.get("reasoning_effort"),
+                "child_status": "completed",
+            }),
+        })
+    }
+}
+
 #[tokio::test]
 async fn registry_contains_p0_tools() {
     let registry = ToolRegistry::p0_default();
@@ -101,6 +166,131 @@ async fn registry_contains_p0_tools() {
     let search = registry.contract("rg_search").expect("rg contract");
     assert_eq!(search.side_effect_type, SideEffectType::None);
     assert_eq!(search.retry_policy, "retry_allowed");
+}
+
+#[tokio::test]
+async fn delegated_task_is_registered_only_with_a_backend_and_tracks_workspace_changes() {
+    let workspace = tempdir().expect("workspace");
+    let changed = workspace.path().join("delegated.txt");
+    let backend = Arc::new(FakeTaskDelegationBackend {
+        calls: AtomicUsize::new(0),
+        mutation: Some(changed.clone()),
+    });
+    let executor = executor(workspace.path())
+        .with_task_delegation_backend(backend.clone())
+        .expect("delegation backend registers");
+    let request = request(
+        "delegate_task",
+        json!({
+            "task": "inspect and update the delegated fixture",
+            "model": "test-model",
+            "reasoning_effort": "high",
+        }),
+    );
+    let contract = executor
+        .registry()
+        .contract("delegate_task")
+        .expect("delegation contract");
+    assert_eq!(contract.side_effect_type, SideEffectType::Process);
+    assert_eq!(
+        contract.input_schema["properties"]["reasoning_effort"]["enum"],
+        json!(["low", "medium", "high", "xhigh"])
+    );
+    let policy = executor.evaluate(&request).expect("delegation policy");
+    assert_eq!(policy.decision, PolicyDecision::Allow);
+    assert!(!policy.resource.contains("inspect and update"));
+    let preparation = executor
+        .prepare_side_effect_snapshot(&request)
+        .await
+        .expect("delegation preparation");
+    let report = executor
+        .invoke(
+            ToolInvocation::new(request, policy, false).with_preparation(preparation),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("delegated task executes");
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+    assert_eq!(report.envelope.risk, "delegated_agent");
+    assert_eq!(
+        report.envelope.structured_facts["child_status"],
+        "completed"
+    );
+    assert_eq!(
+        report.envelope.structured_facts["workspace_changes_known"],
+        true
+    );
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fs::read_to_string(changed).expect("delegated output"),
+        "child change"
+    );
+    assert!(
+        report
+            .changed_files
+            .iter()
+            .any(|path| path.ends_with("delegated.txt"))
+    );
+    assert!(artifact_text(&report).contains("child response"));
+}
+
+#[tokio::test]
+async fn delegated_task_rejects_invalid_effort_and_can_be_removed_for_children() {
+    let workspace = tempdir().expect("workspace");
+    let backend = Arc::new(FakeTaskDelegationBackend {
+        calls: AtomicUsize::new(0),
+        mutation: None,
+    });
+    let executor = executor(workspace.path())
+        .with_task_delegation_backend(backend.clone())
+        .expect("delegation backend registers");
+    let invalid = request(
+        "delegate_task",
+        json!({"task": "inspect", "reasoning_effort": "extreme"}),
+    );
+    assert!(matches!(
+        executor.evaluate(&invalid),
+        Err(ToolError::InvalidArguments(_))
+    ));
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+
+    let child = executor.without_tool("delegate_task");
+    assert!(child.registry().contract("delegate_task").is_none());
+    assert!(matches!(
+        child.evaluate(&request("delegate_task", json!({"task": "inspect"}))),
+        Err(ToolError::UnknownTool(_))
+    ));
+}
+
+#[tokio::test]
+async fn delegated_task_receives_the_enclosing_runtime_deadline() {
+    let workspace = tempdir().expect("workspace");
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let executor = executor(workspace.path())
+        .with_task_delegation_backend(Arc::new(CancellationAwareDelegationBackend {
+            cancelled: cancelled.clone(),
+        }))
+        .expect("delegation backend registers");
+    let request = request("delegate_task", json!({"task": "wait for cancellation"}));
+    let policy = executor.evaluate(&request).expect("delegation policy");
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(25);
+    let report = tokio::time::timeout(
+        Duration::from_secs(1),
+        executor.invoke(
+            ToolInvocation::new(request, policy, false).with_deadline(deadline),
+            CancellationToken::new(),
+            None,
+        ),
+    )
+    .await
+    .expect("deadline cancellation should settle")
+    .expect("delegation report");
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Cancelled);
+    assert_eq!(report.envelope.structured_facts["cancelled"], true);
+    assert!(cancelled.load(Ordering::SeqCst));
 }
 
 #[test]
@@ -1755,6 +1945,52 @@ async fn process_list_is_session_scoped_and_reports_background_status() {
     let process = &completed.envelope.structured_facts["processes"][0];
     assert_eq!(process["process_state"], "exited");
     assert_eq!(process["exit_code"], 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_supervisor_can_terminate_all_running_session_processes() {
+    let workspace = tempdir().expect("workspace");
+    let supervisor = ProcessSupervisor::new();
+    let executor = executor(workspace.path()).with_process_supervisor(supervisor.clone());
+    let session_id = SessionId::new();
+    let started = execute_approved(
+        &executor,
+        request_for_session(
+            session_id,
+            "shell",
+            json!({
+                "command": "sleep 30",
+                "background": true,
+                "yield_time_ms": 1,
+            }),
+        ),
+        CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(
+        started.envelope.structured_facts["process_state"],
+        "running"
+    );
+
+    let terminated = supervisor
+        .terminate_session(session_id)
+        .await
+        .expect("terminate session processes");
+    assert_eq!(terminated, 1);
+
+    let listed = executor
+        .execute(
+            request_for_session(session_id, "process_list", json!({})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("list terminated process");
+    assert_eq!(listed.envelope.structured_facts["process_count"], 1);
+    assert_eq!(
+        listed.envelope.structured_facts["processes"][0]["process_state"],
+        "terminated"
+    );
 }
 
 #[cfg(unix)]
