@@ -6,6 +6,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
 };
+use unicode_width::UnicodeWidthStr;
 
 use super::{
     OperationId, TranscriptItem, TranscriptRole, TuiApp, detail_line, markdown_lines,
@@ -159,12 +160,12 @@ impl TranscriptLayout {
 }
 
 pub(crate) fn transcript_layout(app: &TuiApp, area: Rect) -> TranscriptLayout {
-    transcript_layout_from_rows(transcript_render_rows(app), area)
+    transcript_layout_from_rows(transcript_render_rows_at_width(app, area.width), area)
 }
 
 pub(crate) fn full_transcript_layout(app: &TuiApp, area: Rect) -> TranscriptLayout {
     transcript_layout_from_rows(
-        render_operation_projections(app, transcript_operation_projections(app)),
+        render_operation_projections(app, transcript_operation_projections(app), area.width),
         area,
     )
 }
@@ -195,8 +196,13 @@ fn transcript_layout_from_rows(rendered: Vec<TranscriptRenderRow>, area: Rect) -
     }
 }
 
+#[cfg(test)]
 pub(crate) fn transcript_render_rows(app: &TuiApp) -> Vec<TranscriptRenderRow> {
-    render_operation_projections(app, rendered_transcript_operation_projections(app))
+    transcript_render_rows_at_width(app, u16::MAX)
+}
+
+fn transcript_render_rows_at_width(app: &TuiApp, width: u16) -> Vec<TranscriptRenderRow> {
+    render_operation_projections(app, rendered_transcript_operation_projections(app), width)
 }
 
 pub(crate) fn transcript_top_padding(app: &TuiApp, layout: &TranscriptLayout, area: Rect) -> u16 {
@@ -217,6 +223,7 @@ pub(crate) fn transcript_top_padding(app: &TuiApp, layout: &TranscriptLayout, ar
 pub(crate) fn render_operation_projection_lines(
     app: &TuiApp,
     projections: Vec<super::OperationProjection>,
+    width: u16,
 ) -> Vec<Line<'static>> {
     projections
         .into_iter()
@@ -231,6 +238,7 @@ pub(crate) fn render_operation_projection_lines(
                 toggle,
                 false,
                 projection_index,
+                width,
             )
         })
         .map(|row| row.line)
@@ -240,6 +248,7 @@ pub(crate) fn render_operation_projection_lines(
 fn render_operation_projections(
     app: &TuiApp,
     projections: Vec<super::OperationProjection>,
+    width: u16,
 ) -> Vec<TranscriptRenderRow> {
     projections
         .into_iter()
@@ -252,7 +261,15 @@ fn render_operation_projections(
             let operation_id = projection.id().cloned();
             let toggle = projection.is_expandable();
             let item = projection.item(expanded);
-            render_item_rows(app, item, operation_id, toggle, expanded, projection_index)
+            render_item_rows(
+                app,
+                item,
+                operation_id,
+                toggle,
+                expanded,
+                projection_index,
+                width,
+            )
         })
         .collect()
 }
@@ -337,6 +354,7 @@ fn render_item_rows(
     toggle: bool,
     expanded: bool,
     projection_index: usize,
+    width: u16,
 ) -> Vec<TranscriptRenderRow> {
     let palette = app.palette();
     let color = role_color(app, &item.role);
@@ -350,9 +368,20 @@ fn render_item_rows(
     } else {
         role_marker(app, &item.role)
     };
+    let marker_width = UnicodeWidthStr::width(marker);
+    let (marker, marker_width) = if marker_width >= usize::from(width.max(1)) {
+        ("", 0)
+    } else {
+        (marker, marker_width)
+    };
     let inline_body = matches!(item.role, TranscriptRole::User | TranscriptRole::Assistant);
     let mut body_lines = match item.role {
-        TranscriptRole::Assistant => markdown_lines(&item.body.join("\n")),
+        TranscriptRole::Assistant => markdown_lines(
+            &item.body.join("\n"),
+            width
+                .saturating_sub(u16::try_from(marker_width).unwrap_or(u16::MAX))
+                .max(1),
+        ),
         TranscriptRole::User => item
             .body
             .into_iter()
@@ -393,14 +422,12 @@ fn render_item_rows(
             });
         } else {
             for (index, mut line) in body_lines.into_iter().enumerate() {
-                line.spans.insert(
-                    0,
-                    if index == 0 {
-                        Span::styled(marker, Style::default().fg(color))
-                    } else {
-                        Span::raw("  ")
-                    },
-                );
+                if index == 0 {
+                    line.spans
+                        .insert(0, Span::styled(marker, Style::default().fg(color)));
+                } else if !line.spans.is_empty() {
+                    line.spans.insert(0, Span::raw(" ".repeat(marker_width)));
+                }
                 rows.push(TranscriptRenderRow {
                     line,
                     operation_id: if index == 0 {

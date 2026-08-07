@@ -277,7 +277,7 @@ fn rendered_history_entries(
                 .into_iter()
                 .map(|entry| RenderedHistoryEntry {
                     id: entry.id,
-                    lines: render_operation_projection_lines(app, vec![entry.projection]),
+                    lines: render_operation_projection_lines(app, vec![entry.projection], width),
                 })
                 .collect::<Vec<_>>();
             let committed_count = committed_prefix_len(
@@ -366,13 +366,15 @@ fn debug_split_event_entries(
         .into_iter()
         .map(|entry| (entry.id, entry.projection))
         .collect::<HashMap<_, _>>();
-    let (_, developer_width) = debug_pane_widths(width);
+    let (transcript_width, developer_width) = debug_pane_widths(width);
     events
         .into_iter()
         .map(|event| {
             let transcript = operations
                 .remove(&event.id)
-                .map(|projection| render_operation_projection_lines(app, vec![projection]))
+                .map(|projection| {
+                    render_operation_projection_lines(app, vec![projection], transcript_width)
+                })
                 .unwrap_or_default();
             let developer =
                 developer_event_history_lines(event, developer_width, expanded, app.palette());
@@ -389,7 +391,7 @@ pub(crate) fn debug_split_live_lines(
     width: u16,
     visible_rows: u16,
 ) -> Vec<Line<'static>> {
-    let (_, developer_width) = debug_pane_widths(width);
+    let (transcript_width, developer_width) = debug_pane_widths(width);
     let facts = if !app.inline_history_enabled || app.developer_error.is_some() {
         let mut facts = developer_fact_history_lines(app, developer_width);
         if facts.is_empty() && app.developer_projection.is_none() {
@@ -420,7 +422,7 @@ pub(crate) fn debug_split_live_lines(
         .skip(live_event_operation_count)
         .collect::<Vec<_>>();
     timeline.extend(debug_split_history_lines(
-        render_operation_projection_lines(app, transcript_only),
+        render_operation_projection_lines(app, transcript_only, transcript_width),
         Vec::new(),
         width,
     ));
@@ -642,9 +644,17 @@ fn committed_prefix_len(
         .sum::<usize>();
 
     while committed_count > 0 && live_rows < live_row_capacity {
-        committed_count = committed_count.saturating_sub(1);
-        live_rows =
-            live_rows.saturating_add(history_lines_height(&entries[committed_count].lines, width));
+        let candidate = committed_count.saturating_sub(1);
+        let candidate_rows = history_lines_height(&entries[candidate].lines, width);
+        // A whole operation is the smallest stable scrollback unit. Keeping an operation that is
+        // taller than the live body would permanently clip its leading rows, because its event id
+        // could never be marked as committed. Commit that operation in full once it stabilizes;
+        // shorter operations still form the live tail immediately above the composer.
+        if candidate_rows > live_row_capacity {
+            break;
+        }
+        committed_count = candidate;
+        live_rows = live_rows.saturating_add(candidate_rows);
     }
 
     committed_count

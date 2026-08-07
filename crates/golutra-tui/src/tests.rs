@@ -1006,6 +1006,86 @@ fn completed_history_keeps_latest_response_next_to_composer() {
 }
 
 #[test]
+fn completed_response_taller_than_the_live_viewport_moves_to_scrollback() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let turn_id = TurnId::new();
+    let content = (1..=40)
+        .map(|row| format!("long response row {row}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_footer_context("/workspace", "gpt-test");
+    let mut created = transcript_event(
+        1,
+        session_id,
+        task_id,
+        RuntimeEventType::TaskCreated,
+        json!({"payload": {"prompt": "produce a long response"}}),
+    );
+    created.turn_id = Some(turn_id);
+    let mut streamed = transcript_event(
+        2,
+        session_id,
+        task_id,
+        RuntimeEventType::ProviderStreamed,
+        json!({"delta": {"kind": "text_delta", "text": content}}),
+    );
+    streamed.turn_id = Some(turn_id);
+    let mut completed = transcript_event(
+        3,
+        session_id,
+        task_id,
+        RuntimeEventType::AssistantMessage,
+        json!({"content": content}),
+    );
+    completed.turn_id = Some(turn_id);
+    app.events = vec![created, streamed, completed];
+    let assistant_event_id = app.events[1].id;
+    app.projection = Some(UserProjection {
+        session_id,
+        task_id: Some(task_id),
+        status: golutra_core::TaskStatus::Completed,
+        visible_steps: Vec::new(),
+        pending_approval: None,
+        final_message: None,
+        residual_risks: Vec::new(),
+    });
+    app.enable_inline_history();
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(80, 24),
+        TerminalOptions {
+            viewport: Viewport::Inline(12),
+        },
+    )
+    .expect("inline terminal");
+    let mut history = InlineHistoryState::new(session_id);
+
+    history
+        .flush(&mut terminal, &mut app)
+        .expect("commit tall completed response");
+
+    assert!(
+        app.inline_history_committed_event_ids
+            .contains(&assistant_event_id),
+        "a finalized response that cannot fit in the live body must be committed in full"
+    );
+    let live = transcript_render_rows(&app)
+        .into_iter()
+        .map(|row| row.line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!live.contains("long response row"));
+}
+
+#[test]
 fn resumed_turns_remain_contiguous_above_the_composer() {
     let session_id = SessionId::new();
     let first_task = TaskId::new();
@@ -2698,6 +2778,142 @@ fn user_and_assistant_messages_start_on_the_marker_line() {
     assert!(lines.iter().any(|line| line == "• 直接回答"));
     assert!(!lines.iter().any(|line| line.contains("You")));
     assert!(!lines.iter().any(|line| line.contains("Golutra")));
+}
+
+#[test]
+fn markdown_blocks_use_one_spacer_row_in_transcript_layout() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.events = vec![transcript_event(
+        1,
+        session_id,
+        task_id,
+        RuntimeEventType::AssistantMessage,
+        json!({"content": "# Heading\n\nBody paragraph.\n\n- List item\n\n> Quote"}),
+    )];
+
+    let lines = full_transcript_layout(&app, Rect::new(0, 0, 80, 20)).plain_lines();
+    let heading = lines
+        .iter()
+        .position(|line| line == "• Heading")
+        .expect("heading row");
+    let body = lines
+        .iter()
+        .position(|line| line == "  Body paragraph.")
+        .expect("body row");
+    let list = lines
+        .iter()
+        .position(|line| line == "  - List item")
+        .expect("list row");
+    let quote = lines
+        .iter()
+        .position(|line| line == "  │ Quote")
+        .expect("quote row");
+
+    assert_eq!(body, heading + 2, "heading/body spacing: {lines:?}");
+    assert_eq!(list, body + 2, "body/list spacing: {lines:?}");
+    assert_eq!(quote, list + 2, "list/quote spacing: {lines:?}");
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 20)).expect("terminal");
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw markdown transcript");
+    let rows = terminal_buffer_rows(&terminal)
+        .into_iter()
+        .map(|row| row.trim_end().to_owned())
+        .collect::<Vec<_>>();
+    let heading = rows
+        .iter()
+        .position(|row| row == "• Heading")
+        .expect("rendered heading row");
+    let body = rows
+        .iter()
+        .position(|row| row == "  Body paragraph.")
+        .expect("rendered body row");
+    assert_eq!(body, heading + 2, "rendered spacing: {rows:?}");
+}
+
+#[test]
+fn streamed_and_final_markdown_share_the_same_width_aware_layout() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let turn_id = TurnId::new();
+    let source = "## 结果\n\n- 第一项包含需要换行的中文正文\n- second item with wrapped English prose\n\n| Name | Status |\n| --- | --- |\n| parser | ready |";
+    let mut created = transcript_event(
+        1,
+        session_id,
+        task_id,
+        RuntimeEventType::TaskCreated,
+        json!({"payload": {"prompt": "render this response"}}),
+    );
+    created.turn_id = Some(turn_id);
+
+    let mut first_delta = transcript_event(
+        2,
+        session_id,
+        task_id,
+        RuntimeEventType::ProviderStreamed,
+        json!({"delta": {"kind": "text_delta", "text": "## 结果\n\n- 第一项包含需要换行的中文正文\n"}}),
+    );
+    first_delta.turn_id = Some(turn_id);
+    let mut second_delta = transcript_event(
+        3,
+        session_id,
+        task_id,
+        RuntimeEventType::ProviderStreamed,
+        json!({"delta": {"kind": "text_delta", "text": "- second item with wrapped English prose\n\n| Name | Status |\n| --- | --- |\n| parser | ready |"}}),
+    );
+    second_delta.turn_id = Some(turn_id);
+    let mut final_message = transcript_event(
+        2,
+        session_id,
+        task_id,
+        RuntimeEventType::AssistantMessage,
+        json!({"content": source}),
+    );
+    final_message.turn_id = Some(turn_id);
+
+    let mut streamed = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    streamed.events = vec![created.clone(), first_delta, second_delta];
+    let mut finalized = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    finalized.events = vec![created, final_message];
+    let area = Rect::new(0, 0, 36, 24);
+
+    let streamed_layout = full_transcript_layout(&streamed, area);
+    let finalized_layout = full_transcript_layout(&finalized, area);
+
+    assert_eq!(
+        streamed_layout.plain_lines(),
+        finalized_layout.plain_lines()
+    );
+    assert!(
+        finalized_layout
+            .lines
+            .iter()
+            .all(|line| line.width() <= usize::from(area.width))
+    );
 }
 
 #[tokio::test]
