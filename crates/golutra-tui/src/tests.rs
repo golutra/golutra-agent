@@ -1244,6 +1244,137 @@ fn resumed_turns_remain_contiguous_above_the_composer() {
 }
 
 #[test]
+fn replay_rebuild_clears_provisional_frame_before_committing_history() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_footer_context("/workspace", "gpt-test");
+    app.events = (1..=30)
+        .map(|sequence_no| {
+            transcript_event(
+                sequence_no,
+                session_id,
+                task_id,
+                RuntimeEventType::AssistantMessage,
+                json!({"content": format!("old replay response {sequence_no}")}),
+            )
+        })
+        .collect();
+    app.projection = Some(UserProjection {
+        session_id,
+        task_id: Some(task_id),
+        status: golutra_core::TaskStatus::Completed,
+        visible_steps: Vec::new(),
+        pending_approval: None,
+        final_message: None,
+        residual_risks: Vec::new(),
+    });
+    app.enable_inline_history();
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(80, 40),
+        TerminalOptions {
+            viewport: Viewport::Inline(24),
+        },
+    )
+    .expect("inline terminal");
+    let mut history = InlineHistoryState::new(session_id);
+    let mut rebuilds = 0_usize;
+    let mut rebuild = |terminal: &mut Terminal<TestBackend>| {
+        rebuilds = rebuilds.saturating_add(1);
+        terminal.clear()?;
+        terminal.current_buffer_mut().reset();
+        Ok(())
+    };
+    history
+        .flush_with_rebuild_for_test(&mut terminal, &mut app, &mut rebuild)
+        .expect("initial history");
+    draw_inline_test_frame(&mut terminal, &mut app);
+
+    app.begin_history_replay();
+    app.events.clear();
+    app.projection = Some(UserProjection {
+        session_id,
+        task_id: Some(task_id),
+        status: golutra_core::TaskStatus::Completed,
+        visible_steps: Vec::new(),
+        pending_approval: None,
+        final_message: Some("provisional resume projection".to_owned()),
+        residual_risks: Vec::new(),
+    });
+    app.invalidate_transcript_layout();
+    history
+        .flush_with_rebuild_for_test(&mut terminal, &mut app, &mut rebuild)
+        .expect("clear old history");
+    draw_inline_test_frame(&mut terminal, &mut app);
+    assert!(
+        terminal_buffer_text(&terminal).contains("provisional resume projection"),
+        "fixture must render the projection while canonical history is loading"
+    );
+    app.provider_message = "provider status".to_owned();
+    app.events = (1..=30)
+        .map(|sequence_no| {
+            transcript_event(
+                sequence_no,
+                session_id,
+                task_id,
+                RuntimeEventType::AssistantMessage,
+                json!({"content": format!("resumed response {sequence_no}")}),
+            )
+        })
+        .collect();
+    app.invalidate_transcript_layout();
+    app.transcript.history.replay_ready = true;
+    history
+        .flush_with_rebuild_for_test(&mut terminal, &mut app, &mut rebuild)
+        .expect("replayed history");
+    draw_inline_test_frame(&mut terminal, &mut app);
+
+    let scrollback = terminal
+        .backend()
+        .scrollback()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    let rows = terminal_buffer_rows(&terminal);
+    assert_eq!(
+        rebuilds, 2,
+        "replay must clear both the old history and its provisional loading frame"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("old replay response")),
+        "old replay content survived the loading frame: {rows:#?}"
+    );
+    assert!(
+        !scrollback.contains("provisional resume projection"),
+        "the provisional loading frame leaked into terminal scrollback: {scrollback:?}"
+    );
+    let latest_row = rows
+        .iter()
+        .position(|row| row.contains("resumed response 30"))
+        .expect("latest resumed response row");
+    let composer_row = rows
+        .iter()
+        .position(|row| row.contains("Ask Golutra to change code or inspect the workspace"))
+        .expect("composer row");
+    let blank_rows = rows[latest_row.saturating_add(1)..composer_row]
+        .iter()
+        .filter(|row| row.trim().is_empty())
+        .count();
+    assert!(
+        blank_rows <= 1,
+        "replay left a gap before the composer: {rows:#?}"
+    );
+}
+
+#[test]
 fn resumed_debug_events_remain_contiguous_above_the_composer() {
     let session_id = SessionId::new();
     let task_id = TaskId::new();

@@ -328,7 +328,14 @@ pub(crate) fn clear_inline_scrollback(terminal: &mut InteractiveTerminal) -> io:
     let backend = terminal.backend_mut();
     Write::write_all(backend, b"\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[H")?;
     Write::flush(backend)?;
-    terminal.resize(ratatui::layout::Rect::new(0, 0, size.width, size.height))
+    let result = terminal.resize(ratatui::layout::Rect::new(0, 0, size.width, size.height));
+    if result.is_ok() {
+        // `Terminal::resize` resets the inactive buffer, while the inline rebuild begins with
+        // the previously rendered buffer still current. Clear it too so the replay-loading
+        // frame cannot carry old transcript rows into the next scrollback insertion.
+        terminal.current_buffer_mut().reset();
+    }
+    result
 }
 
 pub(crate) fn copy_to_terminal_clipboard(value: &str) -> io::Result<(usize, bool)> {

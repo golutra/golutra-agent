@@ -129,6 +129,7 @@ pub(crate) struct InlineHistoryState {
     rendered_height: u16,
     initialized: bool,
     header_emitted: bool,
+    rebuild_after_replay: bool,
     committed_event_ids: HashSet<EventId>,
 }
 
@@ -142,6 +143,7 @@ impl InlineHistoryState {
             rendered_height: 0,
             initialized: false,
             header_emitted: false,
+            rebuild_after_replay: false,
             committed_event_ids: HashSet::new(),
         }
     }
@@ -153,6 +155,16 @@ impl InlineHistoryState {
         app: &mut TuiApp,
     ) -> io::Result<bool> {
         self.flush_with_rebuild(terminal, app, clear_history_terminal)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn flush_with_rebuild_for_test<B: Backend>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+        app: &mut TuiApp,
+        rebuild_terminal: impl FnMut(&mut Terminal<B>) -> io::Result<()>,
+    ) -> io::Result<bool> {
+        self.flush_with_rebuild(terminal, app, rebuild_terminal)
     }
 
     pub(crate) fn flush_interactive(
@@ -210,7 +222,18 @@ impl InlineHistoryState {
             ) || app.developer_projection.is_some()
                 || app.developer_error.is_some());
         if !source_ready {
+            // A resume/debug reload can render a provisional projection while canonical events
+            // are still loading. Rebuild once the source is ready so that frame is not folded
+            // into the next terminal scrollback insertion.
+            self.rebuild_after_replay = true;
             return Ok(history_cleared);
+        }
+        if self.rebuild_after_replay {
+            if !history_cleared {
+                rebuild_terminal(terminal)?;
+                history_cleared = true;
+            }
+            self.rebuild_after_replay = false;
         }
 
         // Retain enough event rows to fill the largest possible live body. A larger bottom pane
@@ -834,7 +857,9 @@ fn clear_history_terminal<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<
     terminal
         .backend_mut()
         .clear_region(ratatui::backend::ClearType::All)?;
-    terminal.resize(ratatui::layout::Rect::new(0, 0, size.width, size.height))
+    terminal.resize(ratatui::layout::Rect::new(0, 0, size.width, size.height))?;
+    terminal.current_buffer_mut().reset();
+    Ok(())
 }
 
 pub(crate) fn inline_viewport_height(app: &TuiApp, width: u16, screen_height: u16) -> u16 {
