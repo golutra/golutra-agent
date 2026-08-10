@@ -72,6 +72,17 @@ fn objective_test_report(tool_name: &str, command: Option<&str>) -> ToolExecutio
     }
 }
 
+fn objective_test_report_with_output(command: &str, output: &str) -> ToolExecutionReport {
+    let mut report = objective_test_report("shell", Some(command));
+    report
+        .artifact_contents
+        .push(golutra_tools::ArtifactContent {
+            artifact_id: golutra_core::ArtifactId::new(),
+            bytes: output.as_bytes().to_vec(),
+        });
+    report
+}
+
 #[test]
 fn agent_run_preserves_legacy_touched_code_contract() {
     let run = AgentRun::new(AgentTaskRequest {
@@ -293,116 +304,6 @@ fn python_validation_requires_observed_runtime_state() {
     ] {
         assert!(is_objective_validation_command(command), "{command}");
     }
-}
-
-#[test]
-fn turn_local_python_verifier_is_source_bound_and_observes_runtime_state() {
-    let workspace = tempdir().expect("workspace");
-    let verifier_path = workspace.path().join("verify.py");
-    let source = concat!(
-        "from pathlib import Path\n",
-        "score = float(Path('score.txt').read_text())\n",
-        "assert score >= 0.62\n",
-    );
-    fs::write(&verifier_path, source).expect("verifier source");
-    let verifier_path = fs::canonicalize(verifier_path).expect("canonical verifier");
-
-    let mut write_report = objective_test_report("write_file", None);
-    write_report.changed_files.push(verifier_path.clone());
-    write_report.after_images.push(FileBeforeImage {
-        path: verifier_path.clone(),
-        content: Some(source.as_bytes().to_vec()),
-        unix_mode: None,
-        metadata: None,
-    });
-    let validation_report = objective_test_report("shell", Some("python verify.py"));
-    let reports = vec![write_report.clone(), validation_report.clone()];
-
-    assert!(objective_validation_report(&validation_report).is_none());
-    let outcome = objective_validation_report_in_turn(&reports[1], &reports, 1, workspace.path())
-        .expect("turn-local verifier");
-    assert!(outcome.passed);
-    assert!(outcome.identity.contains("python-file:verify.py:sha256:"));
-
-    assert!(
-        objective_validation_report_in_turn(
-            &validation_report,
-            std::slice::from_ref(&validation_report),
-            0,
-            workspace.path(),
-        )
-        .is_none()
-    );
-
-    let mut later_write = objective_test_report("write_file", None);
-    later_write.changed_files.push(verifier_path.clone());
-    later_write.after_images.push(FileBeforeImage {
-        path: verifier_path.clone(),
-        content: Some(source.as_bytes().to_vec()),
-        unix_mode: None,
-        metadata: None,
-    });
-    let reports_with_later_change = vec![write_report, validation_report, later_write];
-    assert!(
-        objective_validation_report_in_turn(
-            &reports_with_later_change[1],
-            &reports_with_later_change,
-            1,
-            workspace.path(),
-        )
-        .is_none()
-    );
-}
-
-#[test]
-fn turn_local_python_verifier_rejects_constant_self_reports() {
-    let workspace = tempdir().expect("workspace");
-    let verifier_path = workspace.path().join("verify.py");
-    let source = "accuracy = 0.7\nassert accuracy >= 0.62\n";
-    fs::write(&verifier_path, source).expect("verifier source");
-    let verifier_path = fs::canonicalize(verifier_path).expect("canonical verifier");
-
-    let mut write_report = objective_test_report("write_file", None);
-    write_report.changed_files.push(verifier_path.clone());
-    write_report.after_images.push(FileBeforeImage {
-        path: verifier_path,
-        content: Some(source.as_bytes().to_vec()),
-        unix_mode: None,
-        metadata: None,
-    });
-    let validation_report = objective_test_report("shell", Some("python verify.py"));
-    let reports = vec![write_report, validation_report];
-
-    assert!(
-        objective_validation_report_in_turn(&reports[1], &reports, 1, workspace.path()).is_none()
-    );
-}
-
-#[test]
-fn turn_local_python_verifier_identity_changes_with_source() {
-    let workspace = tempdir().expect("workspace");
-    let verifier_path = workspace.path().join("verify.py");
-    let validation_report = objective_test_report("shell", Some("python3 verify.py"));
-    let identity_for = |source: &str| {
-        fs::write(&verifier_path, source).expect("verifier source");
-        let canonical_path = fs::canonicalize(&verifier_path).expect("canonical verifier");
-        let mut write_report = objective_test_report("apply_patch", None);
-        write_report.changed_files.push(canonical_path.clone());
-        write_report.after_images.push(FileBeforeImage {
-            path: canonical_path,
-            content: Some(source.as_bytes().to_vec()),
-            unix_mode: None,
-            metadata: None,
-        });
-        let reports = vec![write_report, validation_report.clone()];
-        objective_validation_report_in_turn(&reports[1], &reports, 1, workspace.path())
-            .expect("turn-local verifier")
-            .identity
-    };
-
-    let first = identity_for("from pathlib import Path\nassert Path('one').exists()\n");
-    let second = identity_for("from pathlib import Path\nassert Path('two').exists()\n");
-    assert_ne!(first, second);
 }
 
 #[test]
@@ -3380,6 +3281,53 @@ PY'"#;
 }
 
 #[test]
+fn validation_command_classifier_uses_subcommands_goals_and_targets() {
+    for command in [
+        "cargo +nightly --locked test --workspace",
+        "npm --workspace app run test:unit",
+        "make custom-test",
+        "mvn integration-test",
+        "gradle :app:integrationTest",
+        "swift --package-path project test",
+    ] {
+        assert_eq!(
+            objective_validation_command_kind(command),
+            Some(ObjectiveValidationKind::Test),
+            "{command}"
+        );
+    }
+
+    for command in [
+        "cargo --config net.retry=2 check",
+        "npm --prefix app run build",
+        "pnpm run typecheck",
+        "make -f test build",
+        "mvn -f test verify",
+        "gradle -p test build",
+        "swift --package-path project build",
+    ] {
+        assert_eq!(
+            objective_validation_command_kind(command),
+            Some(ObjectiveValidationKind::Diagnostic),
+            "{command}"
+        );
+    }
+
+    for command in [
+        "cargo run -- test",
+        "cargo metadata --filter-platform test",
+        "npm run contest",
+        "pnpm exec app test",
+        "make latest contest",
+        "mvn -DskipTests package",
+        "gradle latest contest",
+        "swift run tool test",
+    ] {
+        assert!(!is_objective_validation_command(command), "{command}");
+    }
+}
+
+#[test]
 fn code_file_classifier_includes_scripts_and_build_files() {
     assert!(is_code_file(Path::new("process_data.sh")));
     assert!(is_code_file(Path::new("Makefile")));
@@ -3397,6 +3345,159 @@ fn test_output_classifier_requires_an_executed_test() {
         "test result: ok. 0 passed; 0 failed; 0 ignored"
     ));
     assert!(!line_reports_executed_tests("running 0 tests"));
+    assert!(line_reports_executed_tests("2 passed in 0.10s"));
+    assert!(!line_reports_executed_tests("7 successful uploads"));
+    assert!(!line_reports_executed_tests("7 checks completed"));
+    assert!(!line_reports_executed_tests("2 passed uploads"));
+}
+
+#[test]
+fn objective_test_evidence_supports_common_runner_formats() {
+    for (command, output) in [
+        (
+            "cargo test",
+            "test result: ok. 3 passed; 0 failed; 0 ignored",
+        ),
+        ("python -m pytest", "2 passed in 0.10s"),
+        ("npm test", "Tests: 4 passed, 4 total"),
+        ("pnpm test", "Tests  3 passed (3)"),
+        ("go test ./...", "ok  example.test/pkg  0.01s"),
+        (
+            "mvn test",
+            "Tests run: 5, Failures: 0, Errors: 0, Skipped: 0",
+        ),
+        ("swift test", "Executed 6 tests, with 0 failures"),
+        ("make custom-test", "7 tests completed"),
+        (
+            "cargo test --workspace",
+            "running 2 tests\ntest result: ok. 2 passed; 0 failed\nrunning 0 tests",
+        ),
+    ] {
+        let outcome =
+            objective_validation_report(&objective_test_report_with_output(command, output))
+                .expect("recognized objective test command");
+        assert!(outcome.passed, "{command}: {output}");
+    }
+}
+
+#[test]
+fn objective_test_evidence_accepts_explicit_structured_execution_facts() {
+    let facts = json!({
+        "golutra_test_execution": {
+            "schema_version": 1,
+            "status": "passed",
+            "executed": 2,
+            "passed": 2,
+            "failed": 0,
+            "skipped": 0
+        }
+    });
+    let mut report = objective_test_report("shell", Some("make test"));
+    report.envelope.structured_facts["golutra_test_execution"] =
+        facts["golutra_test_execution"].clone();
+    let outcome = objective_validation_report(&report).expect("objective test outcome");
+    assert!(outcome.passed, "{:?}", report.envelope.structured_facts);
+}
+
+#[test]
+fn objective_test_evidence_rejects_untrusted_structured_shapes() {
+    for facts in [
+        json!({"test_results": {"executed": 2}}),
+        json!({"tests_run": 3}),
+        json!({"test_execution_observed": true}),
+        json!({"tests": [{"name": "planned"}]}),
+    ] {
+        let mut report = objective_test_report_with_output("make test", "");
+        report.envelope.structured_facts["test_evidence"] = facts;
+        let outcome = objective_validation_report(&report).expect("objective test outcome");
+        assert!(!outcome.passed, "untrusted facts must not prove execution");
+    }
+}
+
+#[test]
+fn objective_test_evidence_rejects_trusted_facts_with_contradictory_output() {
+    let mut report = objective_test_report_with_output("make test", "no tests found");
+    report.envelope.structured_facts["golutra_test_execution"] = json!({
+        "schema_version": 1,
+        "status": "passed",
+        "executed": 2,
+        "passed": 2,
+        "failed": 0,
+        "skipped": 0
+    });
+    let outcome = objective_validation_report(&report).expect("objective test outcome");
+    assert!(!outcome.passed);
+}
+
+#[test]
+fn objective_test_evidence_rejects_zero_test_and_unsuccessful_runs() {
+    for output in [
+        "running 0 tests",
+        "Tests: 0 total",
+        "? example.test/pkg [no test files]",
+        "testing: warning: no tests to run\nPASS\nok example.test/pkg 0.01s",
+        "Executed 0 checks",
+        "7 successful uploads",
+        "7 checks completed",
+        "2 passed uploads",
+        "loaded 4 test fixtures",
+        "planning 3 test scenarios",
+        "Tests: 4 skipped, 4 total",
+        "2 passed in 0.10s\nno tests found",
+    ] {
+        let outcome = objective_validation_report(&objective_test_report_with_output(
+            "go test ./...",
+            output,
+        ))
+        .expect("objective test outcome");
+        assert!(!outcome.passed, "{output}");
+    }
+
+    let mut split_output = objective_test_report_with_output(
+        "go test ./...",
+        "ok example.test/pkg 0.01s\n? example.test/empty [no test files]",
+    );
+    split_output
+        .artifact_contents
+        .push(golutra_tools::ArtifactContent {
+            artifact_id: golutra_core::ArtifactId::new(),
+            bytes: b"? example.test/other [no test files]".to_vec(),
+        });
+    assert!(
+        objective_validation_report(&split_output)
+            .expect("split objective test outcome")
+            .passed,
+        "a package with no tests must not invalidate a package that ran tests"
+    );
+
+    let failed_package = objective_test_report_with_output(
+        "go test ./...",
+        "ok example.test/pkg 0.01s\nFAIL example.test/broken",
+    );
+    assert!(
+        !objective_validation_report(&failed_package)
+            .expect("failed package objective test outcome")
+            .passed,
+        "a failed package must invalidate an otherwise successful package result"
+    );
+
+    let mut failed = objective_test_report_with_output("cargo test", "running 3 tests");
+    failed.envelope.status = ToolResultStatus::Error;
+    failed.envelope.structured_facts["exit_code"] = json!(1);
+    assert!(
+        !objective_validation_report(&failed)
+            .expect("failed objective test outcome")
+            .passed
+    );
+
+    let mut timed_out = objective_test_report_with_output("cargo test", "running 3 tests");
+    timed_out.envelope.status = ToolResultStatus::Timeout;
+    timed_out.envelope.structured_facts["timed_out"] = json!(true);
+    assert!(
+        !objective_validation_report(&timed_out)
+            .expect("timed-out objective test outcome")
+            .passed
+    );
 }
 
 #[tokio::test]

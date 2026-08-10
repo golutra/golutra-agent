@@ -25,7 +25,7 @@ pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiA
     let palette = app.palette();
     let content_width = area.width;
     let visible_rows = area.height as usize;
-    let rows = if app.inline_history_enabled {
+    let rows = if app.transcript.history.enabled {
         developer_live_rows(app)
     } else {
         developer_rows(app)
@@ -52,10 +52,12 @@ pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiA
             DeveloperPanelRow::Summary(_) => Vec::new(),
             DeveloperPanelRow::Event {
                 sequence_no,
+                end_sequence_no,
                 label,
                 summary,
             } => event_lines(
                 sequence_no,
+                end_sequence_no,
                 &label,
                 &summary,
                 usize::from(content_width),
@@ -93,8 +95,8 @@ pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiA
     }
     let event_rows = events.line_count(event_area.width.max(1));
     let scroll = event_rows.saturating_sub(usize::from(event_area.height));
-    events = events.scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0));
-    let top_padding = if app.inline_history_enabled {
+    events = events.scroll((ratatui_vertical_scroll(scroll, event_area.height), 0));
+    let top_padding = if app.transcript.history.enabled {
         event_area.height.saturating_sub(
             u16::try_from(event_rows)
                 .unwrap_or(u16::MAX)
@@ -119,14 +121,22 @@ fn developer_live_rows(app: &TuiApp) -> Vec<DeveloperPanelRow> {
         .map(|error| vec![DeveloperPanelRow::Summary(format!("error {error}"))])
         .unwrap_or_default();
     rows.extend(
-        app.events
-            .iter()
-            .filter(|event| !app.inline_history_committed_event_ids.contains(&event.id))
-            .map(|event| DeveloperPanelRow::Event {
+        developer_event_projections(app.events.iter().filter(|event| {
+            !app.transcript
+                .history
+                .committed_event_ids
+                .contains(&event.id)
+        }))
+        .into_iter()
+        .map(|event| {
+            let summary = event.summary();
+            DeveloperPanelRow::Event {
                 sequence_no: event.sequence_no,
-                label: format!("{:?}/{:?}", event.event_type, event.source),
-                summary: developer_event_summary(event),
-            }),
+                end_sequence_no: event.end_sequence_no,
+                label: event.label,
+                summary,
+            }
+        }),
     );
     rows
 }
@@ -162,15 +172,16 @@ pub(crate) fn developer_fact_history_lines(app: &TuiApp, width: u16) -> Vec<Line
 }
 
 pub(crate) fn developer_event_history_lines(
-    event: &golutra_protocol::RuntimeEvent,
+    event: &DeveloperEventProjection,
     width: u16,
     expanded: bool,
     palette: TuiPalette,
 ) -> Vec<Line<'static>> {
     event_lines(
         event.sequence_no,
-        &format!("{:?}/{:?}", event.event_type, event.source),
-        &developer_event_summary(event),
+        event.end_sequence_no,
+        &event.label,
+        &event.summary(),
         usize::from(width),
         expanded,
         palette,
@@ -180,11 +191,19 @@ pub(crate) fn developer_event_history_lines(
 fn developer_rows(app: &TuiApp) -> Vec<DeveloperPanelRow> {
     if let Some(error) = &app.developer_error {
         let mut rows = vec![DeveloperPanelRow::Summary(format!("error {error}"))];
-        rows.extend(app.events.iter().map(|event| DeveloperPanelRow::Event {
-            sequence_no: event.sequence_no,
-            label: format!("{:?}/{:?}", event.event_type, event.source),
-            summary: developer_event_summary(event),
-        }));
+        rows.extend(
+            developer_event_projections(&app.events)
+                .into_iter()
+                .map(|event| {
+                    let summary = event.summary();
+                    DeveloperPanelRow::Event {
+                        sequence_no: event.sequence_no,
+                        end_sequence_no: event.end_sequence_no,
+                        label: event.label,
+                        summary,
+                    }
+                }),
+        );
         rows
     } else if let Some(projection) = &app.developer_projection {
         developer_panel_rows_with_changes(projection, app.change_projection.summary(), usize::MAX)
@@ -217,13 +236,18 @@ fn visible_summary_count(
 
 fn event_lines(
     sequence_no: u64,
+    end_sequence_no: u64,
     label: &str,
     summary: &str,
     content_width: usize,
     expanded: bool,
     palette: TuiPalette,
 ) -> Vec<Line<'static>> {
-    let sequence = format!("#{sequence_no} ");
+    let sequence = if sequence_no == end_sequence_no {
+        format!("#{sequence_no} ")
+    } else {
+        format!("#{sequence_no}-#{end_sequence_no} ")
+    };
     let summary_width = content_width
         .saturating_sub(display_width(&sequence))
         .saturating_sub(display_width(label))

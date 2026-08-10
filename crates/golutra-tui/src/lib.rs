@@ -17,6 +17,27 @@ pub enum TranscriptScrollAction {
     Bottom,
 }
 
+/// Ratatui 0.28 stores paragraph scroll coordinates as `u16` and evaluates
+/// `area.height + scroll.y` with `u16` arithmetic. Keep the scroll value below
+/// that overflow boundary even when the logical transcript is much larger.
+pub fn ratatui_vertical_scroll(offset: usize, viewport_height: u16) -> u16 {
+    u16::try_from(offset)
+        .unwrap_or(u16::MAX)
+        .min(u16::MAX.saturating_sub(viewport_height))
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::ratatui_vertical_scroll;
+
+    #[test]
+    fn paragraph_scroll_stays_inside_ratatui_u16_boundary() {
+        assert_eq!(ratatui_vertical_scroll(12, 24), 12);
+        assert_eq!(ratatui_vertical_scroll(usize::MAX, 24), u16::MAX - 24);
+        assert_eq!(ratatui_vertical_scroll(usize::MAX, u16::MAX), 0);
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PaneScrollState {
     pub offset_from_bottom: usize,

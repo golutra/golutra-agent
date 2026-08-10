@@ -37,7 +37,7 @@ impl PostTaskCoordinator {
                 "runtime host is no longer available".to_owned(),
             ));
         };
-        let job = host.repositories.jobs.get_for_task(task_id).await?;
+        let job = host.storage.repositories.jobs.get_for_task(task_id).await?;
         ensure_job_in_workspace(&host, job.as_ref(), task_id)?;
         Ok(job)
     }
@@ -51,10 +51,10 @@ impl PostTaskCoordinator {
                 "runtime host is no longer available".to_owned(),
             ));
         };
-        let current = host.repositories.jobs.get_for_task(task_id).await?;
+        let current = host.storage.repositories.jobs.get_for_task(task_id).await?;
         ensure_job_in_workspace(&host, current.as_ref(), task_id)?;
         host.wait_for_deep_task_evaluation(task_id).await;
-        let job = host.repositories.jobs.get_for_task(task_id).await?;
+        let job = host.storage.repositories.jobs.get_for_task(task_id).await?;
         ensure_job_in_workspace(&host, job.as_ref(), task_id)?;
         Ok(job)
     }
@@ -65,6 +65,7 @@ impl PostTaskCoordinator {
                 return;
             };
             if host
+                .storage
                 .repositories
                 .jobs
                 .recover_expired(&host.workspace_id.to_string(), chrono::Utc::now())
@@ -77,6 +78,7 @@ impl PostTaskCoordinator {
             }
             let workspace_id = host.workspace_id.to_string();
             let claimed = host
+                .storage
                 .repositories
                 .jobs
                 .claim(
@@ -102,6 +104,7 @@ impl PostTaskCoordinator {
         };
         if job.workspace_id != host.workspace_id.to_string() {
             let _ = host
+                .storage
                 .repositories
                 .jobs
                 .requeue(
@@ -113,20 +116,29 @@ impl PostTaskCoordinator {
             return;
         }
         let started_ok = host
+            .storage
             .repositories
             .jobs
             .start(job.job_id, worker_id, chrono::Utc::now())
             .await
             .unwrap_or(false);
         if !started_ok {
-            host.deep_evaluation_inputs.lock().await.remove(&job.job_id);
+            host.storage
+                .deep_evaluation_inputs
+                .lock()
+                .await
+                .remove(&job.job_id);
             return;
         }
         let context = host.reconstruct_post_task_context(&job).await;
         let (task, input) = match context {
             Ok(context) => context,
             Err(error) => {
-                host.deep_evaluation_inputs.lock().await.remove(&job.job_id);
+                host.storage
+                    .deep_evaluation_inputs
+                    .lock()
+                    .await
+                    .remove(&job.job_id);
                 self.finish_or_retry(&host, &job, worker_id, error.to_string())
                     .await;
                 return;
@@ -145,12 +157,13 @@ impl PostTaskCoordinator {
                 }),
             ))
             .await;
-        let bundle = host.governance.evaluate_deep(input);
+        let bundle = host.storage.governance.evaluate_deep(input);
         let result = host.record_task_evaluation(&task, bundle).await;
         match result {
             Ok(true) => {
                 let result_refs = vec![format!("evaluation:{}", task.task_id)];
                 let finished = host
+                    .storage
                     .repositories
                     .jobs
                     .finish(
@@ -193,7 +206,11 @@ impl PostTaskCoordinator {
                     .await
             }
         }
-        host.deep_evaluation_inputs.lock().await.remove(&job.job_id);
+        host.storage
+            .deep_evaluation_inputs
+            .lock()
+            .await
+            .remove(&job.job_id);
     }
 
     async fn finish_or_retry(
@@ -205,6 +222,7 @@ impl PostTaskCoordinator {
     ) {
         let error = compact_event_summary(&error);
         let requeued = host
+            .storage
             .repositories
             .jobs
             .requeue(job.job_id, worker_id, &error)
@@ -229,6 +247,7 @@ impl PostTaskCoordinator {
             return;
         }
         let finished = host
+            .storage
             .repositories
             .jobs
             .finish(

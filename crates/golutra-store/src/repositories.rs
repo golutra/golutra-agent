@@ -315,6 +315,12 @@ impl DurableJobRepository {
         self.store.list_post_task_jobs(task_id).await
     }
 
+    pub async fn has_nonterminal_for_workspace(&self, workspace_id: &str) -> StoreResult<bool> {
+        self.store
+            .has_nonterminal_post_task_jobs(workspace_id)
+            .await
+    }
+
     pub async fn enqueue_with_event(
         &self,
         job: &PostTaskJob,

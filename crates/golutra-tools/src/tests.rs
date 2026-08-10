@@ -12,6 +12,7 @@ use tempfile::tempdir;
 use tokio::process::Command;
 
 use super::*;
+use crate::builtin::contract;
 
 #[test]
 fn shell_timeout_contract_honors_long_foreground_requests() {
@@ -1990,6 +1991,422 @@ async fn process_supervisor_can_terminate_all_running_session_processes() {
     assert_eq!(
         listed.envelope.structured_facts["processes"][0]["process_state"],
         "terminated"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_supervisor_shutdown_waits_for_terminal_bookkeeping_and_descendants() {
+    let workspace = tempdir().expect("workspace");
+    let supervisor = ProcessSupervisor::new();
+    let sandbox = SystemSandbox::process_only();
+    let session_id = SessionId::new();
+    let args = vec![
+        "-c".to_owned(),
+        "sleep 30 & child=$!; printf 'child=%s\\n' \"$child\"; wait".to_owned(),
+    ];
+    let workspace_before = workspace_scan::capture(workspace.path()).await;
+    let started = tokio::time::timeout(
+        Duration::from_secs(2),
+        supervisor.start(ProcessStartRequest {
+            process_id: "shutdown-descendant".to_owned(),
+            session_id,
+            program: "/bin/sh",
+            args: &args,
+            command_display: "shutdown descendant fixture".to_owned(),
+            cwd: workspace.path(),
+            workspace_root: workspace.path(),
+            timeout_ms: 30_000,
+            wait_ms: 1_000,
+            cancellation: CancellationToken::new(),
+            sandbox: &sandbox,
+            workspace_access: WorkspaceAccess::ReadWrite,
+            allow_network: false,
+            workspace_before,
+        }),
+    )
+    .await
+    .expect("process start remains bounded")
+    .expect("process starts");
+    assert_eq!(started.state, ProcessState::Running);
+    let child_pid = started
+        .output
+        .lines()
+        .find_map(|line| line.strip_prefix("child=")?.trim().parse::<i32>().ok())
+        .expect("descendant pid is reported");
+
+    tokio::time::timeout(Duration::from_secs(2), supervisor.shutdown_and_wait())
+        .await
+        .expect("shutdown remains bounded")
+        .expect("managed process shutdown");
+
+    let terminal = supervisor
+        .reconnect(session_id, "shutdown-descendant", 0)
+        .await
+        .expect("terminal process remains queryable");
+    assert!(terminal.state.is_terminal());
+    let descendant_status = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &child_pid.to_string()])
+        .output()
+        .expect("inspect descendant status");
+    let descendant_is_running = descendant_status.status.success()
+        && String::from_utf8_lossy(&descendant_status.stdout)
+            .lines()
+            .any(|line| !line.trim().is_empty() && !line.trim_start().starts_with('Z'));
+    assert!(
+        !descendant_is_running,
+        "managed descendant survived shutdown"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn process_supervisor_starts_each_process_id_at_most_once() {
+    const STARTERS: usize = 8;
+
+    let workspace = tempdir().expect("workspace");
+    let workspace_path = workspace.path().to_path_buf();
+    let supervisor = ProcessSupervisor::new();
+    let session_id = SessionId::new();
+    let barrier = Arc::new(tokio::sync::Barrier::new(STARTERS));
+    let mut starts = Vec::with_capacity(STARTERS);
+
+    for _ in 0..STARTERS {
+        let barrier = Arc::clone(&barrier);
+        let supervisor = supervisor.clone();
+        let workspace_path = workspace_path.clone();
+        starts.push(tokio::spawn(async move {
+            let sandbox = SystemSandbox::process_only();
+            let args = vec![
+                "-c".to_owned(),
+                "printf x >> launch-count; sleep 30".to_owned(),
+            ];
+            let workspace_before = workspace_scan::capture(&workspace_path).await;
+            barrier.wait().await;
+            supervisor
+                .start(ProcessStartRequest {
+                    process_id: "shared-process-id".to_owned(),
+                    session_id,
+                    program: "/bin/sh",
+                    args: &args,
+                    command_display: "shared process fixture".to_owned(),
+                    cwd: &workspace_path,
+                    workspace_root: &workspace_path,
+                    timeout_ms: 30_000,
+                    wait_ms: 0,
+                    cancellation: CancellationToken::new(),
+                    sandbox: &sandbox,
+                    workspace_access: WorkspaceAccess::ReadWrite,
+                    allow_network: false,
+                    workspace_before,
+                })
+                .await
+        }));
+    }
+
+    for start in starts {
+        let snapshot = start.await.expect("start task").expect("start process");
+        assert_eq!(snapshot.process_id, "shared-process-id");
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if tokio::fs::read_to_string(workspace_path.join("launch-count"))
+                .await
+                .is_ok_and(|value| !value.is_empty())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("process writes launch marker");
+
+    assert_eq!(
+        tokio::fs::read_to_string(workspace_path.join("launch-count"))
+            .await
+            .expect("launch marker"),
+        "x"
+    );
+    assert_eq!(supervisor.list(session_id).await.len(), 1);
+    assert_eq!(
+        supervisor
+            .terminate_session(session_id)
+            .await
+            .expect("terminate process"),
+        1
+    );
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+async fn start_process_identity_fixture(
+    supervisor: &ProcessSupervisor,
+    process_id: &str,
+    session_id: SessionId,
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    workspace_root: &Path,
+    timeout_ms: u64,
+    sandbox: &SystemSandbox,
+    workspace_access: WorkspaceAccess,
+    allow_network: bool,
+) -> Result<ProcessSnapshot, ToolError> {
+    let workspace_before = workspace_scan::capture(workspace_root).await;
+    supervisor
+        .start(ProcessStartRequest {
+            process_id: process_id.to_owned(),
+            session_id,
+            program,
+            args,
+            command_display: "process identity fixture".to_owned(),
+            cwd,
+            workspace_root,
+            timeout_ms,
+            wait_ms: 0,
+            cancellation: CancellationToken::new(),
+            sandbox,
+            workspace_access,
+            allow_network,
+            workspace_before,
+        })
+        .await
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_supervisor_reuses_only_equivalent_start_requests() {
+    let root = tempdir().expect("root");
+    let workspace = root.path().join("workspace");
+    let cwd = workspace.join("cwd");
+    let alternate_cwd = workspace.join("alternate-cwd");
+    fs::create_dir_all(&cwd).expect("cwd");
+    fs::create_dir_all(&alternate_cwd).expect("alternate cwd");
+    let workspace_alias = root.path().join("workspace-alias");
+    std::os::unix::fs::symlink(&workspace, &workspace_alias).expect("workspace alias");
+
+    let supervisor = ProcessSupervisor::new();
+    let sandbox = SystemSandbox::process_only();
+    let session_id = SessionId::new();
+    let process_id = "request-identity";
+    let args = vec!["-c".to_owned(), "sleep 30".to_owned()];
+    let alternate_args = vec!["-c".to_owned(), "sleep 29".to_owned()];
+
+    let started = start_process_identity_fixture(
+        &supervisor,
+        process_id,
+        session_id,
+        "/bin/sh",
+        &args,
+        &cwd,
+        &workspace,
+        30_000,
+        &sandbox,
+        WorkspaceAccess::ReadWrite,
+        false,
+    )
+    .await
+    .expect("start process");
+    assert_eq!(started.process_id, process_id);
+
+    let reused = start_process_identity_fixture(
+        &supervisor,
+        process_id,
+        session_id,
+        "/bin/sh",
+        &args,
+        &workspace_alias.join("cwd"),
+        &workspace_alias,
+        30_000,
+        &sandbox,
+        WorkspaceAccess::ReadWrite,
+        false,
+    )
+    .await
+    .expect("reuse canonical-equivalent process request");
+    assert_eq!(reused.process_id, process_id);
+
+    struct ConflictCase<'a> {
+        label: &'static str,
+        program: &'a str,
+        args: &'a [String],
+        cwd: &'a Path,
+        workspace_root: &'a Path,
+        timeout_ms: u64,
+        workspace_access: WorkspaceAccess,
+        allow_network: bool,
+    }
+
+    let cases = [
+        ConflictCase {
+            label: "program",
+            program: "/bin/echo",
+            args: &args,
+            cwd: &cwd,
+            workspace_root: &workspace,
+            timeout_ms: 30_000,
+            workspace_access: WorkspaceAccess::ReadWrite,
+            allow_network: false,
+        },
+        ConflictCase {
+            label: "arguments",
+            program: "/bin/sh",
+            args: &alternate_args,
+            cwd: &cwd,
+            workspace_root: &workspace,
+            timeout_ms: 30_000,
+            workspace_access: WorkspaceAccess::ReadWrite,
+            allow_network: false,
+        },
+        ConflictCase {
+            label: "working directory",
+            program: "/bin/sh",
+            args: &args,
+            cwd: &alternate_cwd,
+            workspace_root: &workspace,
+            timeout_ms: 30_000,
+            workspace_access: WorkspaceAccess::ReadWrite,
+            allow_network: false,
+        },
+        ConflictCase {
+            label: "workspace root",
+            program: "/bin/sh",
+            args: &args,
+            cwd: &cwd,
+            workspace_root: root.path(),
+            timeout_ms: 30_000,
+            workspace_access: WorkspaceAccess::ReadWrite,
+            allow_network: false,
+        },
+        ConflictCase {
+            label: "timeout",
+            program: "/bin/sh",
+            args: &args,
+            cwd: &cwd,
+            workspace_root: &workspace,
+            timeout_ms: 29_000,
+            workspace_access: WorkspaceAccess::ReadWrite,
+            allow_network: false,
+        },
+        ConflictCase {
+            label: "workspace access",
+            program: "/bin/sh",
+            args: &args,
+            cwd: &cwd,
+            workspace_root: &workspace,
+            timeout_ms: 30_000,
+            workspace_access: WorkspaceAccess::ReadOnly,
+            allow_network: false,
+        },
+        ConflictCase {
+            label: "network access",
+            program: "/bin/sh",
+            args: &args,
+            cwd: &cwd,
+            workspace_root: &workspace,
+            timeout_ms: 30_000,
+            workspace_access: WorkspaceAccess::ReadWrite,
+            allow_network: true,
+        },
+    ];
+
+    for case in cases {
+        let error = start_process_identity_fixture(
+            &supervisor,
+            process_id,
+            session_id,
+            case.program,
+            case.args,
+            case.cwd,
+            case.workspace_root,
+            case.timeout_ms,
+            &sandbox,
+            case.workspace_access,
+            case.allow_network,
+        )
+        .await
+        .expect_err(case.label);
+        let ToolError::Execution(message) = error else {
+            panic!("{} returned the wrong error: {error}", case.label);
+        };
+        assert_eq!(
+            message,
+            format!(
+                "process `{process_id}` idempotency conflict: start request does not match the existing process"
+            ),
+            "{}",
+            case.label
+        );
+    }
+
+    assert_eq!(supervisor.list(session_id).await.len(), 1);
+    assert_eq!(
+        supervisor
+            .terminate_session(session_id)
+            .await
+            .expect("terminate process"),
+        1
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_supervisor_bounds_reader_drain_when_a_descendant_keeps_pipes_open() {
+    let workspace = tempdir().expect("workspace");
+    let supervisor = ProcessSupervisor::new();
+    let sandbox = SystemSandbox::process_only();
+    let session_id = SessionId::new();
+    let args = vec![
+        "-c".to_owned(),
+        "sleep 30 & child=$!; printf 'child=%s\\n' \"$child\"".to_owned(),
+    ];
+    let workspace_before = workspace_scan::capture(workspace.path()).await;
+
+    let snapshot = tokio::time::timeout(
+        Duration::from_secs(2),
+        supervisor.start(ProcessStartRequest {
+            process_id: "inherited-pipes".to_owned(),
+            session_id,
+            program: "/bin/sh",
+            args: &args,
+            command_display: "inherited pipe fixture".to_owned(),
+            cwd: workspace.path(),
+            workspace_root: workspace.path(),
+            timeout_ms: 30_000,
+            wait_ms: 1_500,
+            cancellation: CancellationToken::new(),
+            sandbox: &sandbox,
+            workspace_access: WorkspaceAccess::ReadWrite,
+            allow_network: false,
+            workspace_before,
+        }),
+    )
+    .await
+    .expect("reader drain remains bounded")
+    .expect("process starts");
+
+    let terminal = supervisor
+        .poll(session_id, "inherited-pipes", snapshot.output_cursor, 1_500)
+        .await
+        .expect("wait for natural process exit");
+    assert_eq!(terminal.state, ProcessState::Exited);
+    assert_eq!(terminal.exit_code, Some(0));
+    let child_pid = format!("{}{}", snapshot.output, terminal.output)
+        .lines()
+        .find_map(|line| line.strip_prefix("child=")?.trim().parse::<i32>().ok())
+        .expect("descendant pid is reported");
+    let descendant_status = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &child_pid.to_string()])
+        .output()
+        .expect("inspect descendant status");
+    let descendant_is_running = descendant_status.status.success()
+        && String::from_utf8_lossy(&descendant_status.stdout)
+            .lines()
+            .any(|line| !line.trim().is_empty() && !line.trim_start().starts_with('Z'));
+    assert!(
+        !descendant_is_running,
+        "descendant holding inherited pipes survived natural process exit"
     );
 }
 

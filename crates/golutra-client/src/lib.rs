@@ -3,7 +3,7 @@ use std::{
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -45,7 +45,7 @@ use golutra_runtime::{
     AgentExecutionControl, AgentExecutionHandle, AgentHarness, AgentLoopError, AgentLoopTraceEvent,
     AgentRun, AgentTaskRequest, BeforeSideEffectRecorder, PendingAgentTurn, RuntimeLaneError,
     RuntimeLaneManager, RuntimeObservation, RuntimeObservationSink, RuntimeVerificationService,
-    WorkspaceCheckpointManager, agent_execution_channel, is_active_status,
+    WorkspaceCheckpointManager, agent_execution_channel_with_cancellation, is_active_status,
 };
 use golutra_store::{CommandClaim, RuntimeRepositories, RuntimeStore, StoreError, ThreadRecord};
 use golutra_tools::{
@@ -75,6 +75,7 @@ const MAX_HISTORY_SOURCE_EVENTS: u32 = 512;
 const MAX_HTTP_JSON_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RUN_BUNDLE_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
+const MAX_LIVE_SUBSCRIPTIONS: usize = 1_024;
 const MAX_COMMAND_PAYLOAD_JSON_BYTES: usize = 256 * 1024;
 const MAX_IDEMPOTENCY_KEY_CHARS: usize = 512;
 const MAX_ACTOR_ID_CHARS: usize = 256;
@@ -139,6 +140,7 @@ mod command;
 mod context;
 mod debug_export;
 mod delegation;
+mod delegation_policy;
 mod diagnosis;
 mod event_codec;
 mod evolution;
@@ -149,6 +151,7 @@ mod governance;
 mod governance_commands;
 mod legacy_task;
 mod observation;
+mod observation_recorder;
 mod paths;
 mod post_task;
 mod provenance;
@@ -214,8 +217,8 @@ pub(crate) use provider_runtime::{
 };
 pub use rollout::{RolloutEnvelope, RolloutExport, ThreadRebindResult, redact_runtime_value};
 pub(crate) use rollout::{
-    append_rollout_line, normalize_rebind_source, rebuild_rollout_file, rollout_line,
-    rollout_path_for_workspace,
+    append_rollout_line, normalize_rebind_source, rebuild_rollout_file, remove_rollout_projection,
+    rollout_line, rollout_path_for_workspace, rollout_projection_files,
 };
 #[cfg(test)]
 pub(crate) use rollout::{redact_rollout_value, rollout_lock_path};
@@ -231,7 +234,8 @@ pub use transport::UnixIpcTransport;
 pub(crate) use transport::run_blocking;
 pub use transport::{
     AppServerInfo, EmbeddedTransport, HttpSseTransport, RuntimeAttachment, RuntimeClient,
-    RuntimeEventStream, RuntimeHostInfo, RuntimeTransport, TaskTraceClient,
+    RuntimeEventStream, RuntimeHostInfo, RuntimeOperation, RuntimeOperationClient,
+    RuntimeOperationResult, RuntimeTransport, TaskTraceClient,
 };
 #[cfg(test)]
 pub(crate) use transport::{
@@ -259,6 +263,8 @@ pub enum ClientError {
     Http(String),
     #[error("runtime daemon failed: {0}")]
     Daemon(String),
+    #[error("runtime transport protocol failed: {0}")]
+    Protocol(String),
     #[error("runtime memory failed")]
     Memory(#[from] MemoryError),
     #[error("runtime evaluation failed")]
@@ -364,18 +370,46 @@ struct RuntimeHostBootstrap {
 }
 
 #[derive(Debug)]
-pub struct RuntimeHost {
+struct RuntimeHostStorageState {
     store: RuntimeStore,
     repositories: RuntimeRepositories,
     memory_store: MemoryStore,
     evaluation_store: EvaluationStore,
     evolution_store: EvolutionStore,
     governance: governance::GovernanceService,
+    deep_evaluation_inputs: Mutex<HashMap<PostTaskJobId, TaskEvaluationInput>>,
+    checkpoint_evaluation_tasks: HashSet<TaskId>,
+    _temporary_root: Option<Arc<tempfile::TempDir>>,
+}
+
+#[derive(Debug)]
+struct RuntimeHostExecutionState {
+    shutdown: CancellationToken,
     lane_manager: Mutex<RuntimeLaneManager>,
     event_bus: broadcast::Sender<RuntimeEvent>,
+    live_subscriptions: StdMutex<Vec<LiveSubscription>>,
     next_sequence_no: AtomicU64,
     event_writer: Mutex<()>,
     causal_ledger: Mutex<causal_recorder::CausalLedger>,
+    command_mutex: Mutex<()>,
+    task_controls: Mutex<HashMap<SessionId, HostedTaskControl>>,
+    delegation_admissions: Mutex<HashMap<SessionId, delegation::DelegationAdmission>>,
+    delegation_operations: Mutex<HashMap<String, Arc<delegation::DelegationOperation>>>,
+    provider_auth_waiters: Mutex<HashMap<SessionId, PendingProviderAuth>>,
+    process_supervisor: ProcessSupervisor,
+    workspace_change_tracker: Mutex<change_tracker::WorkspaceChangeTracker>,
+}
+
+#[derive(Debug)]
+struct LiveSubscription {
+    filter: EventFilter,
+    sender: broadcast::Sender<RuntimeEvent>,
+}
+
+#[derive(Debug)]
+pub struct RuntimeHost {
+    storage: RuntimeHostStorageState,
+    execution: RuntimeHostExecutionState,
     workspace_id: WorkspaceId,
     workspace_root: Option<PathBuf>,
     runtime_paths: Option<RuntimePaths>,
@@ -384,21 +418,16 @@ pub struct RuntimeHost {
     default_thread_id: ThreadId,
     instance_id: String,
     started_at: chrono::DateTime<chrono::Utc>,
-    command_mutex: Mutex<()>,
-    task_controls: Mutex<HashMap<SessionId, HostedTaskControl>>,
-    provider_auth_waiters: Mutex<HashMap<SessionId, PendingProviderAuth>>,
-    process_supervisor: ProcessSupervisor,
-    workspace_change_tracker: Mutex<change_tracker::WorkspaceChangeTracker>,
-    deep_evaluation_inputs: Mutex<HashMap<PostTaskJobId, TaskEvaluationInput>>,
     force_mock_provider: bool,
     execution_options: RuntimeExecutionOptions,
-    checkpoint_evaluation_tasks: HashSet<TaskId>,
-    _temporary_root: Option<Arc<tempfile::TempDir>>,
 }
 
 impl Drop for RuntimeHost {
     fn drop(&mut self) {
-        self.process_supervisor.shutdown();
+        // Drop cannot await. Explicit owners should call `close()` while the
+        // Tokio runtime is alive so process supervisors can finish bookkeeping.
+        self.execution.shutdown.cancel();
+        self.execution.process_supervisor.shutdown();
     }
 }
 
@@ -436,6 +465,7 @@ struct HostedTaskControl {
     execution: AgentExecutionHandle,
     abort_handle: AbortHandle,
     completion: watch::Receiver<bool>,
+    delegation: Option<delegation_policy::DelegationContext>,
     _session_lease: Option<Arc<File>>,
 }
 
@@ -482,11 +512,6 @@ enum SessionLeaseAttempt {
     Busy,
 }
 
-enum HostedTraceCommand {
-    Event(Box<RuntimeObservation>),
-    Flush(oneshot::Sender<Result<(), ClientError>>),
-}
-
 #[derive(Debug)]
 struct PendingProviderAuth {
     request_id: ProviderAuthRequestId,
@@ -503,7 +528,7 @@ enum ProviderAuthResolution {
 struct HostedCheckpointRecorder {
     host: Arc<RuntimeHost>,
     task: HostedAgentTask,
-    trace_sender: mpsc::UnboundedSender<HostedTraceCommand>,
+    trace_sender: observation_recorder::ObservationSender,
 }
 
 #[async_trait]
@@ -514,14 +539,9 @@ impl BeforeSideEffectRecorder for HostedCheckpointRecorder {
         before_images: &[FileBeforeImage],
         complete: bool,
     ) -> Result<(), AgentLoopError> {
-        let (flush_sender, flush_receiver) = oneshot::channel();
-        self.trace_sender
-            .send(HostedTraceCommand::Flush(flush_sender))
-            .map_err(|_| AgentLoopError::Checkpoint("trace recorder is unavailable".to_owned()))?;
-        flush_receiver
-            .await
-            .map_err(|_| AgentLoopError::Checkpoint("trace recorder stopped".to_owned()))?
-            .map_err(|error| AgentLoopError::Checkpoint(error.to_string()))?;
+        self.trace_sender.flush().await.map_err(|error| {
+            AgentLoopError::Checkpoint(format!("trace recorder is unavailable: {error}"))
+        })?;
         self.host
             .persist_checkpoint_before_side_effect(&self.task, request, before_images, complete)
             .await
@@ -530,6 +550,26 @@ impl BeforeSideEffectRecorder for HostedCheckpointRecorder {
 }
 
 impl RuntimeHost {
+    /// Shut down runtime-owned managed processes and wait for each supervisor
+    /// to persist its terminal state before the host is torn down.
+    pub async fn close(&self) -> Result<(), ClientError> {
+        self.execution.shutdown.cancel();
+        let work_result = self.shutdown_active_work().await;
+        let process_result = self
+            .execution
+            .process_supervisor
+            .shutdown_and_wait()
+            .await
+            .map_err(|error| ClientError::TaskExecution(error.to_string()));
+        match (work_result, process_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(work), Ok(())) | (Ok(()), Err(work)) => Err(work),
+            (Err(work), Err(process)) => Err(ClientError::TaskExecution(format!(
+                "{work}; additionally, {process}"
+            ))),
+        }
+    }
+
     pub async fn in_memory() -> Result<Arc<Self>, ClientError> {
         Self::in_memory_with_options(RuntimeExecutionOptions::isolated()).await
     }
@@ -837,17 +877,35 @@ impl RuntimeHost {
             memory_store.clone(),
         );
         let host = Arc::new(Self {
-            store,
-            repositories,
-            memory_store,
-            evaluation_store,
-            evolution_store,
-            governance,
-            lane_manager: Mutex::new(RuntimeLaneManager::new()),
-            event_bus,
-            next_sequence_no: AtomicU64::new(next_sequence_no),
-            event_writer: Mutex::new(()),
-            causal_ledger: Mutex::new(causal_recorder::CausalLedger::default()),
+            storage: RuntimeHostStorageState {
+                store,
+                repositories,
+                memory_store,
+                evaluation_store,
+                evolution_store,
+                governance,
+                deep_evaluation_inputs: Mutex::new(HashMap::new()),
+                checkpoint_evaluation_tasks,
+                _temporary_root: temporary_root,
+            },
+            execution: RuntimeHostExecutionState {
+                shutdown: CancellationToken::new(),
+                lane_manager: Mutex::new(RuntimeLaneManager::new()),
+                event_bus,
+                live_subscriptions: StdMutex::new(Vec::new()),
+                next_sequence_no: AtomicU64::new(next_sequence_no),
+                event_writer: Mutex::new(()),
+                causal_ledger: Mutex::new(causal_recorder::CausalLedger::default()),
+                command_mutex: Mutex::new(()),
+                task_controls: Mutex::new(HashMap::new()),
+                delegation_admissions: Mutex::new(HashMap::new()),
+                delegation_operations: Mutex::new(HashMap::new()),
+                provider_auth_waiters: Mutex::new(HashMap::new()),
+                process_supervisor: ProcessSupervisor::new(),
+                workspace_change_tracker: Mutex::new(
+                    change_tracker::WorkspaceChangeTracker::default(),
+                ),
+            },
             workspace_id,
             workspace_root,
             runtime_paths,
@@ -856,18 +914,11 @@ impl RuntimeHost {
             default_thread_id,
             instance_id: Uuid::now_v7().to_string(),
             started_at: chrono::Utc::now(),
-            command_mutex: Mutex::new(()),
-            task_controls: Mutex::new(HashMap::new()),
-            provider_auth_waiters: Mutex::new(HashMap::new()),
-            process_supervisor: ProcessSupervisor::new(),
-            workspace_change_tracker: Mutex::new(change_tracker::WorkspaceChangeTracker::default()),
-            deep_evaluation_inputs: Mutex::new(HashMap::new()),
             force_mock_provider,
             execution_options,
-            checkpoint_evaluation_tasks,
-            _temporary_root: temporary_root,
         });
-        host.repositories
+        host.storage
+            .repositories
             .jobs
             .recover_expired(&host.workspace_id.to_string(), chrono::Utc::now())
             .await?;
@@ -944,6 +995,7 @@ impl RuntimeHost {
     ) -> Result<RuntimeHostInfo, ClientError> {
         let workspace_root = self.workspace_root_string();
         let latest_thread = self
+            .storage
             .repositories
             .threads
             .list(workspace_root.as_deref(), 1)
@@ -970,8 +1022,22 @@ impl RuntimeHost {
     }
 
     #[must_use]
-    pub fn subscribe_live(&self, _filter: EventFilter) -> broadcast::Receiver<RuntimeEvent> {
-        self.event_bus.subscribe()
+    pub fn subscribe_live(&self, filter: EventFilter) -> broadcast::Receiver<RuntimeEvent> {
+        let (sender, receiver) = broadcast::channel(512);
+        let mut subscriptions = self
+            .execution
+            .live_subscriptions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A raw broadcast receiver cannot notify this registry from Drop. Prune
+        // abandoned receivers whenever a new one is registered and keep the
+        // registry bounded even when the runtime is otherwise idle.
+        subscriptions.retain(|subscription| subscription.sender.receiver_count() > 0);
+        if subscriptions.len() >= MAX_LIVE_SUBSCRIPTIONS {
+            subscriptions.remove(0);
+        }
+        subscriptions.push(LiveSubscription { filter, sender });
+        receiver
     }
 
     async fn event_stream(
@@ -979,7 +1045,7 @@ impl RuntimeHost {
         filter: EventFilter,
     ) -> Result<RuntimeEventStream, ClientError> {
         self.ensure_session_in_workspace(filter.session_id).await?;
-        let mut live = self.event_bus.subscribe();
+        let mut live = self.execution.event_bus.subscribe();
         let (sender, receiver) = mpsc::channel(256);
         tokio::spawn(async move {
             let mut cursor = filter.after_sequence_no;
@@ -1025,6 +1091,7 @@ impl RuntimeHost {
     ) -> Result<bool, ClientError> {
         loop {
             let events = self
+                .storage
                 .repositories
                 .events
                 .load_page(
@@ -1052,6 +1119,7 @@ impl RuntimeHost {
             return Ok(0);
         };
         let threads = self
+            .storage
             .repositories
             .threads
             .list(Some(&workspace_root), u32::MAX)
@@ -1059,6 +1127,7 @@ impl RuntimeHost {
         let mut recovered = 0;
         for thread in threads {
             let state = self
+                .storage
                 .repositories
                 .projections
                 .state(thread.session_id, None)
@@ -1114,6 +1183,7 @@ impl RuntimeHost {
             return Ok(Vec::new());
         };
         let events = self
+            .storage
             .repositories
             .events
             .load(session_id, Some(task_id), None)
@@ -1135,6 +1205,7 @@ impl RuntimeHost {
                         && event.payload.get("payload").is_none();
                     for sequence_no in referenced_sequences {
                         if let Some(referenced_event) = self
+                            .storage
                             .repositories
                             .events
                             .load_by_sequence(session_id, sequence_no)
@@ -1218,7 +1289,7 @@ impl RuntimeHost {
             }),
         ))
         .await?;
-        let mut lane_manager = self.lane_manager.lock().await;
+        let mut lane_manager = self.execution.lane_manager.lock().await;
         let mut transition = lane_manager.start_task(
             self.workspace_id,
             session_id,
@@ -1241,7 +1312,7 @@ impl RuntimeHost {
         transition.event.payload["command_id"] = json!(first.pending.command_id);
         transition.event.payload["runtime_identity"] = json!(runtime_identity());
         self.record_event(transition.event).await?;
-        self.spawn_agent_task(
+        let spawn = Box::pin(self.spawn_agent_task(
             HostedAgentTask {
                 session_id,
                 task_id,
@@ -1250,8 +1321,9 @@ impl RuntimeHost {
             },
             session_lease,
             pending_turns.into_iter().map(|turn| turn.pending).collect(),
-        )
-        .await
+            None,
+        ));
+        spawn.await
     }
 
     async fn record_orphaned_task_cancelled(
@@ -1284,6 +1356,7 @@ impl RuntimeHost {
         recovery: &str,
     ) -> Result<TaskRecoveryRecord, ClientError> {
         let events = self
+            .storage
             .repositories
             .events
             .load(session_id, Some(task_id), None)
@@ -1335,16 +1408,17 @@ impl RuntimeHost {
     }
 
     async fn record_event(&self, event: RuntimeEvent) -> Result<(), ClientError> {
-        let _writer = self.event_writer.lock().await;
-        let causal_before = self.causal_ledger.lock().await.clone();
+        let _writer = self.execution.event_writer.lock().await;
+        let causal_before = self.execution.causal_ledger.lock().await.clone();
         let event = match self.prepare_canonical_event(event).await {
             Ok(event) => event,
             Err(error) => {
-                *self.causal_ledger.lock().await = causal_before;
+                *self.execution.causal_ledger.lock().await = causal_before;
                 return Err(error);
             }
         };
         let event = match self
+            .storage
             .repositories
             .events
             .append_assigning_sequence(event)
@@ -1352,7 +1426,7 @@ impl RuntimeHost {
         {
             Ok(event) => event,
             Err(error) => {
-                *self.causal_ledger.lock().await = causal_before;
+                *self.execution.causal_ledger.lock().await = causal_before;
                 return Err(error.into());
             }
         };
@@ -1366,16 +1440,17 @@ impl RuntimeHost {
         provisional_ack: &CommandAck,
         receipt_event: RuntimeEvent,
     ) -> Result<CommandClaim, ClientError> {
-        let _writer = self.event_writer.lock().await;
-        let causal_before = self.causal_ledger.lock().await.clone();
+        let _writer = self.execution.event_writer.lock().await;
+        let causal_before = self.execution.causal_ledger.lock().await.clone();
         let receipt_event = match self.prepare_canonical_event(receipt_event).await {
             Ok(event) => event,
             Err(error) => {
-                *self.causal_ledger.lock().await = causal_before;
+                *self.execution.causal_ledger.lock().await = causal_before;
                 return Err(error);
             }
         };
         let claim = match self
+            .storage
             .repositories
             .events
             .claim_command(idempotency_key, command_id, provisional_ack, receipt_event)
@@ -1383,7 +1458,7 @@ impl RuntimeHost {
         {
             Ok(claim) => claim,
             Err(error) => {
-                *self.causal_ledger.lock().await = causal_before;
+                *self.execution.causal_ledger.lock().await = causal_before;
                 return Err(error.into());
             }
         };
@@ -1393,7 +1468,7 @@ impl RuntimeHost {
         {
             self.publish_committed_event(event.clone()).await?;
         } else {
-            *self.causal_ledger.lock().await = causal_before;
+            *self.execution.causal_ledger.lock().await = causal_before;
         }
         Ok(claim)
     }
@@ -1405,16 +1480,17 @@ impl RuntimeHost {
         ack: &CommandAck,
         completion_event: RuntimeEvent,
     ) -> Result<(), ClientError> {
-        let _writer = self.event_writer.lock().await;
-        let causal_before = self.causal_ledger.lock().await.clone();
+        let _writer = self.execution.event_writer.lock().await;
+        let causal_before = self.execution.causal_ledger.lock().await.clone();
         let completion_event = match self.prepare_canonical_event(completion_event).await {
             Ok(event) => event,
             Err(error) => {
-                *self.causal_ledger.lock().await = causal_before;
+                *self.execution.causal_ledger.lock().await = causal_before;
                 return Err(error);
             }
         };
         let event = match self
+            .storage
             .repositories
             .events
             .complete_command(idempotency_key, command_id, ack, completion_event)
@@ -1422,7 +1498,7 @@ impl RuntimeHost {
         {
             Ok(event) => event,
             Err(error) => {
-                *self.causal_ledger.lock().await = causal_before;
+                *self.execution.causal_ledger.lock().await = causal_before;
                 return Err(error.into());
             }
         };
@@ -1431,13 +1507,35 @@ impl RuntimeHost {
 
     async fn publish_committed_event(&self, event: RuntimeEvent) -> Result<(), ClientError> {
         self.append_rollout_event(&event).await?;
-        let _ = self.event_bus.send(event);
+        self.publish_live_event(event);
         Ok(())
+    }
+
+    fn publish_live_event(&self, event: RuntimeEvent) {
+        let _ = self.execution.event_bus.send(event.clone());
+        let mut subscriptions = self
+            .execution
+            .live_subscriptions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        subscriptions.retain(|subscription| {
+            if subscription.sender.receiver_count() == 0 {
+                return false;
+            }
+            if !event_matches_filter(
+                &event,
+                &subscription.filter,
+                subscription.filter.after_sequence_no,
+            ) {
+                return true;
+            }
+            subscription.sender.send(event.clone()).is_ok()
+        });
     }
 
     async fn run_storage_maintenance(&self) -> Result<StorageMaintenanceReport, ClientError> {
         let now = chrono::Utc::now();
-        let artifact_report = self.store.run_artifact_maintenance(now).await?;
+        let artifact_report = self.storage.store.run_artifact_maintenance(now).await?;
         let checkpoint_directories_removed = if let (Some(workspace_root), Some(paths)) =
             (self.workspace_root.clone(), self.runtime_paths.clone())
         {
@@ -1461,7 +1559,7 @@ impl RuntimeHost {
     }
 
     async fn storage_stats(&self) -> Result<StorageStats, ClientError> {
-        let mut stats = self.store.storage_stats().await?;
+        let mut stats = self.storage.store.storage_stats().await?;
         if let (Some(workspace_root), Some(paths)) =
             (self.workspace_root.clone(), self.runtime_paths.clone())
         {
@@ -1484,7 +1582,26 @@ impl RuntimeHost {
         let Some(workspace_root) = self.workspace_root_string() else {
             return Ok(());
         };
+        let Some(paths) = self.runtime_paths.clone() else {
+            return Ok(());
+        };
+        let rollout_directory = paths.rollouts_dir;
+        let projections =
+            run_blocking(move || rollout_projection_files(&rollout_directory)).await??;
+        for (thread_id, path) in projections {
+            if self
+                .storage
+                .repositories
+                .threads
+                .by_id(thread_id)
+                .await?
+                .is_none()
+            {
+                run_blocking(move || remove_rollout_projection(&path)).await??;
+            }
+        }
         let threads = self
+            .storage
             .repositories
             .threads
             .list(Some(&workspace_root), u32::MAX)
@@ -1508,13 +1625,14 @@ impl RuntimeHost {
         if thread.rollout_path.as_deref() != Some(expected.as_str()) {
             thread.rollout_path = Some(expected);
             thread.updated_at = chrono::Utc::now();
-            self.repositories.threads.upsert(thread).await?;
+            self.storage.repositories.threads.upsert(thread).await?;
         }
         Ok(())
     }
 
     async fn append_rollout_event(&self, event: &RuntimeEvent) -> Result<(), ClientError> {
         let Some(mut thread) = self
+            .storage
             .repositories
             .threads
             .by_session(event.session_id)
@@ -1549,6 +1667,7 @@ impl RuntimeHost {
             });
         };
         let events = self
+            .storage
             .repositories
             .events
             .load(thread.session_id, None, None)
@@ -1575,6 +1694,7 @@ impl RuntimeHost {
         session_id: SessionId,
     ) -> Result<Option<TaskId>, ClientError> {
         let state = self
+            .storage
             .repositories
             .projections
             .state(session_id, None)
@@ -1591,6 +1711,7 @@ impl RuntimeHost {
         session_id: SessionId,
     ) -> Result<(), ClientError> {
         let mut completion = self
+            .execution
             .task_controls
             .lock()
             .await
@@ -1656,7 +1777,13 @@ impl RuntimeHost {
     }
 
     async fn ensure_session_in_workspace(&self, session_id: SessionId) -> Result<(), ClientError> {
-        if let Some(thread) = self.repositories.threads.by_session(session_id).await? {
+        if let Some(thread) = self
+            .storage
+            .repositories
+            .threads
+            .by_session(session_id)
+            .await?
+        {
             self.ensure_thread_in_workspace(&thread)?;
         }
         Ok(())
@@ -1669,7 +1796,13 @@ impl RuntimeHost {
         if session_id == self.default_session_id {
             return Ok(());
         }
-        if let Some(thread) = self.repositories.threads.by_session(session_id).await? {
+        if let Some(thread) = self
+            .storage
+            .repositories
+            .threads
+            .by_session(session_id)
+            .await?
+        {
             return self.ensure_thread_in_workspace(&thread);
         }
         Err(ClientError::InvalidSession(format!(
@@ -1684,6 +1817,7 @@ impl RuntimeHost {
     ) -> Result<(), ClientError> {
         self.ensure_session_in_workspace(session_id).await?;
         if self
+            .storage
             .repositories
             .events
             .load_page(session_id, Some(task_id), None, 1)

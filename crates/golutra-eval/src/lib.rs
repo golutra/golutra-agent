@@ -1,6 +1,9 @@
-mod model;
 mod runner;
 mod store;
+
+mod model {
+    pub use golutra_eval_model::*;
+}
 
 pub use golutra_core::EvaluationPartitionKind;
 pub use model::*;

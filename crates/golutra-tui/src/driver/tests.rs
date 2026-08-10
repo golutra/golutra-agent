@@ -75,7 +75,7 @@ fn populate_snapshot_secrets(app: &mut TuiApp, secret: &str) {
     app.history_search = Some(history_search);
     let mut transcript_search = TranscriptSearchState::default();
     transcript_search.input.set_text(format!("token={secret}"));
-    app.transcript_search = Some(transcript_search);
+    app.transcript.search = Some(transcript_search);
 
     app.runtime_controls.profile_name = Some(format!("token={secret}"));
     app.runtime_controls.custom_model = Some(format!("Authorization: Bearer {secret}"));
@@ -118,7 +118,7 @@ fn transient_snapshot_state(app: &TuiApp) -> Vec<String> {
         format!("{:?}", app.settings_dialog),
         format!("{:?}", app.export_flow),
         format!("{:?}", app.history_search),
-        format!("{:?}", app.transcript_search),
+        format!("{:?}", app.transcript.search),
         format!("{:?}", app.attachments),
         format!("{:?}", app.mention_completion),
         format!("{:?}", app.runtime_controls),
@@ -499,12 +499,12 @@ fn driver_binding_preflight_keeps_search_local_and_sessions_fixed() {
         residual_risks: Vec::new(),
     });
     app.input.set_text("/not-a-command");
-    app.transcript_search = Some(TranscriptSearchState::default());
+    app.transcript.search = Some(TranscriptSearchState::default());
     assert!(!driver_enter_reaches_composer(&app));
     assert!(ensure_driver_binding_allows_key(Some(task_id), &app, &DriverKey::Enter).is_ok());
     assert!(ensure_driver_binding_allows_key(Some(task_id), &app, &DriverKey::Escape).is_ok());
 
-    app.transcript_search = None;
+    app.transcript.search = None;
     app.composer_mode = ComposerMode::VimInsert;
     assert!(ensure_driver_binding_allows_key(Some(task_id), &app, &DriverKey::Escape).is_ok());
     app.composer_mode = ComposerMode::Standard;
@@ -596,7 +596,7 @@ fn accumulated_driver_input_is_bounded() {
     app.history_search = Some(history);
     let mut transcript = TranscriptSearchState::default();
     transcript.input.set_text("ggggggg");
-    app.transcript_search = Some(transcript);
+    app.transcript.search = Some(transcript);
     app.prompt_stash = Some("hhhhhhhh".to_owned());
 
     assert_eq!(driver_input_state_bytes(&app), 36);
@@ -903,10 +903,10 @@ async fn snapshot_render_does_not_mutate_the_active_pane_layout() {
         retention_losses: Vec::new(),
     });
     driver.refresh_active_layout().expect("active layout");
-    driver.app.transcript_top_row_override = Some(3);
+    driver.app.transcript.top_row_override = Some(3);
 
     let expected_layout = driver.app.layout;
-    let expected_transcript_top_row = driver.app.transcript_top_row_override;
+    let expected_transcript_top_row = driver.app.transcript.top_row_override;
 
     driver
         .render_frame(&SnapshotRequest {
@@ -922,7 +922,7 @@ async fn snapshot_render_does_not_mutate_the_active_pane_layout() {
 
     assert_eq!(driver.app.layout, expected_layout);
     assert_eq!(
-        driver.app.transcript_top_row_override,
+        driver.app.transcript.top_row_override,
         expected_transcript_top_row
     );
 }

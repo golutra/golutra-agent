@@ -217,6 +217,51 @@ pub(crate) fn rollout_path_for_workspace(
         .join(format!("{thread_id}.jsonl"))
 }
 
+pub(crate) fn rollout_projection_files(
+    directory: &Path,
+) -> Result<Vec<(ThreadId, PathBuf)>, ClientError> {
+    let mut projections = Vec::new();
+    for entry in fs::read_dir(directory)
+        .map_err(|error| ClientError::Io(format!("{}: {error}", directory.display())))?
+    {
+        let entry =
+            entry.map_err(|error| ClientError::Io(format!("{}: {error}", directory.display())))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| ClientError::Io(format!("{}: {error}", entry.path().display())))?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(thread_id) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.parse::<ThreadId>().ok())
+        else {
+            continue;
+        };
+        projections.push((thread_id, path));
+    }
+    Ok(projections)
+}
+
+pub(crate) fn remove_rollout_projection(path: &Path) -> Result<(), ClientError> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(ClientError::Io(format!("{}: {error}", path.display())));
+        }
+    }
+    if let Some(parent) = path.parent() {
+        sync_runtime_directory(parent)?;
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 pub(crate) fn sync_runtime_directory(path: &Path) -> Result<(), ClientError> {
     File::open(path)

@@ -20,6 +20,82 @@ enum ThreadMetadataMutation {
 }
 
 impl RuntimeHost {
+    pub(super) async fn reconcile_replayed_delegated_prompt(
+        &self,
+        session_id: SessionId,
+    ) -> Result<(), ClientError> {
+        if !self.session_is_delegated_child(session_id).await? {
+            return Ok(());
+        }
+        let state = self
+            .storage
+            .repositories
+            .projections
+            .state(session_id, None)
+            .await?;
+        if !state.task_status.is_active() {
+            return Ok(());
+        }
+
+        let has_task_control = self
+            .execution
+            .task_controls
+            .lock()
+            .await
+            .contains_key(&session_id);
+        if has_task_control {
+            return Ok(());
+        }
+
+        // A missing local control is only an orphan if this runtime owns the durable session.
+        // Another runtime may still be supervising the child, in which case waiting remains
+        // the correct behavior and avoids publishing a competing terminal event.
+        let session_lease = match self.try_acquire_session_lease(session_id)? {
+            SessionLeaseAttempt::Acquired(lease) => lease,
+            SessionLeaseAttempt::Busy => return Ok(()),
+        };
+        let state = self
+            .storage
+            .repositories
+            .projections
+            .state(session_id, None)
+            .await?;
+        let has_task_control = self
+            .execution
+            .task_controls
+            .lock()
+            .await
+            .contains_key(&session_id);
+        if !state.task_status.is_active() || has_task_control {
+            drop(session_lease);
+            return Ok(());
+        }
+        let task_id = state.active_task_id.ok_or_else(|| {
+            ClientError::TaskExecution(
+                "active delegated child has no durable task id for orphan recovery".to_owned(),
+            )
+        })?;
+        self.record_orphaned_task_recovery(session_id, task_id, "delegated_prompt_replay")
+            .await?;
+        drop(session_lease);
+        Ok(())
+    }
+
+    async fn delegated_command_is_authorized(
+        &self,
+        session_id: SessionId,
+        command: &SessionCommand,
+    ) -> Result<bool, ClientError> {
+        let contains_metadata = crate::delegation::contains_delegation_metadata(&command.payload);
+        let delegated_child = self.session_is_delegated_child(session_id).await?;
+        let admissions = self.execution.delegation_admissions.lock().await;
+        let admission = admissions.get(&session_id);
+        if !contains_metadata && !delegated_child && admission.is_none() {
+            return Ok(true);
+        }
+        Ok(admission.is_some_and(|admission| admission.authorizes(command)))
+    }
+
     pub async fn handle_command(
         self: Arc<Self>,
         command: SessionCommand,
@@ -65,7 +141,19 @@ impl RuntimeHost {
         let scoped_idempotency_key = self.scoped_idempotency_key(&idempotency_key);
         let session_id = command.session_id.unwrap_or(self.default_session_id);
         self.ensure_session_in_workspace(session_id).await?;
-        let _command_guard = self.command_mutex.lock().await;
+        let _command_guard = self.execution.command_mutex.lock().await;
+        if self.execution.shutdown.is_cancelled()
+            && matches!(
+                &command.kind,
+                SessionCommandKind::Create | SessionCommandKind::Prompt
+            )
+        {
+            return Ok(CommandAck {
+                command_id: command.command_id,
+                accepted: false,
+                reason: Some("runtime host is shutting down".to_owned()),
+            });
+        }
         let _command_lease = self.acquire_command_lease(&scoped_idempotency_key).await?;
         let command_id = command.command_id;
         let provisional_ack = CommandAck {
@@ -99,7 +187,23 @@ impl RuntimeHost {
             )
             .await?
         {
-            CommandClaim::Existing(ack) => return Ok(ack),
+            CommandClaim::Existing(ack) => {
+                // A completed delegated prompt can be replayed after the runtime process that
+                // accepted it has exited. The journal must remain idempotent, but its old ack
+                // does not imply that this host still has a child supervisor. Reconcile that
+                // durable child before the delegation waiter starts polling it.
+                if ack.accepted
+                    && command.kind == SessionCommandKind::Prompt
+                    && command
+                        .payload
+                        .get(crate::delegation::DELEGATED_TASK_MARKER)
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                {
+                    self.reconcile_replayed_delegated_prompt(session_id).await?;
+                }
+                return Ok(ack);
+            }
             CommandClaim::Conflict {
                 existing_command_id,
             } => {
@@ -116,6 +220,19 @@ impl RuntimeHost {
         let result: Result<CommandAck, ClientError> = async {
             let ack = match command.kind {
                 SessionCommandKind::Create => {
+                    if !self
+                        .delegated_command_is_authorized(session_id, &command)
+                        .await?
+                    {
+                        return Ok(CommandAck {
+                            command_id,
+                            accepted: false,
+                            reason: Some(
+                                "delegated session metadata is only valid for a host-created child admission"
+                                    .to_owned(),
+                            ),
+                        });
+                    }
                     let session_lease = match self.try_acquire_session_lease(session_id)? {
                         SessionLeaseAttempt::Acquired(lease) => lease,
                         SessionLeaseAttempt::Busy => {
@@ -290,24 +407,28 @@ impl RuntimeHost {
                     self.handle_retry_post_task_job_command(session_id, command)
                         .await?
                 }
-                _ => {
+                SessionCommandKind::Verify | SessionCommandKind::Export => {
+                    let reason = format!(
+                        "runtime command {:?} is not supported; use the typed verification or thread export entrypoint",
+                        command.kind
+                    );
                     self.record_event(host_event(
                         self.next_sequence_no(),
                         session_id,
                         None,
-                        RuntimeEventType::CommandAccepted,
+                        RuntimeEventType::CommandRejected,
                         RuntimeEventSource::Runtime,
                         json!({
-                            "summary": format!("accepted {:?}", command.kind),
+                            "summary": reason.clone(),
                             "command_id": command_id.to_string(),
-                            "payload": command.payload,
+                            "kind": command.kind,
                         }),
                     ))
                     .await?;
                     CommandAck {
                         command_id,
-                        accepted: true,
-                        reason: Some(format!("accepted in session {session_id}")),
+                        accepted: false,
+                        reason: Some(reason),
                     }
                 }
             };
@@ -387,6 +508,23 @@ impl RuntimeHost {
                 reason: Some("prompt cannot be empty".to_owned()),
             });
         }
+        let delegated_payload = payload
+            .get(crate::delegation::DELEGATED_TASK_MARKER)
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !self
+            .delegated_command_is_authorized(session_id, &command)
+            .await?
+        {
+            return Ok(CommandAck {
+                command_id: command.command_id,
+                accepted: false,
+                reason: Some(
+                    "delegated task metadata is only valid for a host-created child task or host admission"
+                        .to_owned(),
+                ),
+            });
+        }
         let explicit_task_contract = payload
             .get("task_contract")
             .is_some_and(|value| !value.is_null());
@@ -417,6 +555,8 @@ impl RuntimeHost {
                 ));
             }
         };
+        delegation_policy::cost_budget_from_payload(&payload)
+            .map_err(|error| ClientError::TaskExecution(error.to_owned()))?;
         let defer_external_verification = match payload.get("defer_external_verification") {
             None => false,
             Some(Value::Bool(deferred)) => *deferred,
@@ -501,7 +641,7 @@ impl RuntimeHost {
         payload["task_contract"] = serde_json::to_value(&task_contract)?;
         payload["_task_contract_origin"] = Value::String(contract_origin.to_owned());
         let busy_decision = {
-            let lane_manager = self.lane_manager.lock().await;
+            let lane_manager = self.execution.lane_manager.lock().await;
             lane_manager
                 .lane(session_id)
                 .filter(|lane| is_active_status(lane.status))
@@ -523,7 +663,13 @@ impl RuntimeHost {
             let mut reason = decision.reason.clone();
             let mut retry_as_new_task = false;
             if accepted {
-                let control = self.task_controls.lock().await.get(&session_id).cloned();
+                let control = self
+                    .execution
+                    .task_controls
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .cloned();
                 match control {
                     Some(control) if control.task_id == active_task_id => {
                         if requested_yolo.is_some_and(|requested| control.yolo != requested) {
@@ -582,11 +728,12 @@ impl RuntimeHost {
                                 .await
                             {
                                 Ok(reservation) => {
-                                    let transition = self.lane_manager.lock().await.queue_turn(
-                                        session_id,
-                                        turn_id,
-                                        self.next_sequence_no(),
-                                    )?;
+                                    let transition = self
+                                        .execution
+                                        .lane_manager
+                                        .lock()
+                                        .await
+                                        .queue_turn(session_id, turn_id, self.next_sequence_no())?;
                                     if let Err(error) = self
                                         .record_event(with_command_payload(
                                             transition.event,
@@ -596,6 +743,7 @@ impl RuntimeHost {
                                         .await
                                     {
                                         let _ = self
+                                            .execution
                                             .lane_manager
                                             .lock()
                                             .await
@@ -677,6 +825,7 @@ impl RuntimeHost {
             }
         };
         let persisted_state = self
+            .storage
             .repositories
             .projections
             .state(session_id, None)
@@ -713,9 +862,32 @@ impl RuntimeHost {
             }
         }
 
+        let delegation_context = if delegated_payload {
+            let admission = self
+                .execution
+                .delegation_admissions
+                .lock()
+                .await
+                .remove(&session_id)
+                .ok_or_else(|| {
+                    ClientError::TaskExecution(
+                        "delegated child admission context disappeared before task start"
+                            .to_owned(),
+                    )
+                })?;
+            payload[crate::delegation::DELEGATED_TASK_MARKER] = Value::Bool(true);
+            if let Some(payload) = payload.as_object_mut() {
+                payload.remove(crate::delegation::DELEGATED_ADMISSION_TOKEN_KEY);
+            }
+            let context = admission.into_context();
+            payload["_delegation"] = context.metadata();
+            Some(context)
+        } else {
+            None
+        };
         pin_provider_turn_settings(self.provider_config_paths.as_ref(), &mut payload);
         self.upsert_current_thread(session_id, &payload).await?;
-        let mut lane_manager = self.lane_manager.lock().await;
+        let mut lane_manager = self.execution.lane_manager.lock().await;
         let transition = lane_manager.start_task(
             self.workspace_id,
             session_id,
@@ -732,25 +904,25 @@ impl RuntimeHost {
         task_created.payload["run_provenance"] =
             serde_json::to_value(self.capture_run_provenance(task_id))?;
         if let Err(error) = self.record_event(task_created).await {
-            let _ = self.lane_manager.lock().await.finish_task(
+            let _ = self.execution.lane_manager.lock().await.finish_task(
                 session_id,
                 TaskStatus::Failed,
                 self.next_sequence_no(),
             );
             return Err(error);
         }
-        self.clone()
-            .spawn_agent_task(
-                HostedAgentTask {
-                    session_id,
-                    task_id,
-                    turn_id,
-                    payload,
-                },
-                session_lease,
-                Vec::new(),
-            )
-            .await?;
+        let spawn = Box::pin(self.clone().spawn_agent_task(
+            HostedAgentTask {
+                session_id,
+                task_id,
+                turn_id,
+                payload,
+            },
+            session_lease,
+            Vec::new(),
+            delegation_context,
+        ));
+        spawn.await?;
 
         Ok(CommandAck {
             command_id: command.command_id,
@@ -837,7 +1009,13 @@ impl RuntimeHost {
         let replacement = recovered_pending_turn_from_event(&event)?
             .ok_or_else(|| ClientError::TaskExecution("queued turn update is invalid".to_owned()))?
             .pending;
-        let control = self.task_controls.lock().await.get(&session_id).cloned();
+        let control = self
+            .execution
+            .task_controls
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned();
         let Some(control) = control.filter(|control| control.task_id == task_id) else {
             return Ok(CommandAck {
                 command_id: command.command_id,
@@ -894,7 +1072,13 @@ impl RuntimeHost {
                 ),
             });
         };
-        let control = self.task_controls.lock().await.get(&session_id).cloned();
+        let control = self
+            .execution
+            .task_controls
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned();
         let Some(control) = control.filter(|control| control.task_id == task_id) else {
             return Ok(CommandAck {
                 command_id: command.command_id,
@@ -939,7 +1123,8 @@ impl RuntimeHost {
         event.turn_id = Some(turn_id);
         self.record_event(event).await?;
         mutation.commit();
-        self.lane_manager
+        self.execution
+            .lane_manager
             .lock()
             .await
             .discard_queued_turn(session_id, turn_id)?;
@@ -955,7 +1140,8 @@ impl RuntimeHost {
         session_id: SessionId,
         actor: &Actor,
     ) -> Option<(TaskId, golutra_core::RuntimeLane)> {
-        self.lane_manager
+        self.execution
+            .lane_manager
             .lock()
             .await
             .lane(session_id)
@@ -970,6 +1156,7 @@ impl RuntimeHost {
         turn_id: TurnId,
     ) -> Result<Option<Value>, ClientError> {
         let events = self
+            .storage
             .repositories
             .events
             .load(session_id, Some(task_id), None)
@@ -998,6 +1185,7 @@ impl RuntimeHost {
 
         let command_id = command.command_id;
         let state = self
+            .storage
             .repositories
             .projections
             .state(session_id, None)
@@ -1094,6 +1282,7 @@ impl RuntimeHost {
             }
         };
         let events = self
+            .storage
             .repositories
             .events
             .load(session_id, Some(task_id), None)
@@ -1176,7 +1365,13 @@ impl RuntimeHost {
         action: &str,
     ) -> Result<CommandAck, ClientError> {
         let command_id = command.command_id;
-        let task_control = self.task_controls.lock().await.get(&session_id).cloned();
+        let task_control = self
+            .execution
+            .task_controls
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned();
         let Some(task_control) = task_control else {
             let active_task_id = self.persisted_active_task(session_id).await?;
             if action == "abort"
@@ -1231,7 +1426,7 @@ impl RuntimeHost {
                 )),
             });
         }
-        let mut lane_manager = self.lane_manager.lock().await;
+        let mut lane_manager = self.execution.lane_manager.lock().await;
         if lane_manager
             .lane(session_id)
             .is_some_and(|lane| lane.active_controller != command.actor)
@@ -1396,7 +1591,7 @@ impl RuntimeHost {
 
         let requested_id = provider_auth_request_id_from_payload(&command.payload)?;
         let pending = {
-            let mut waiters = self.provider_auth_waiters.lock().await;
+            let mut waiters = self.execution.provider_auth_waiters.lock().await;
             if let Some(pending) = waiters.get(&session_id)
                 && requested_id.is_some_and(|request_id| request_id != pending.request_id)
             {
@@ -1412,6 +1607,7 @@ impl RuntimeHost {
         };
         if let Some(pending) = pending {
             let mut transition = self
+                .execution
                 .lane_manager
                 .lock()
                 .await
@@ -1438,7 +1634,7 @@ impl RuntimeHost {
     ) -> Result<CommandAck, ClientError> {
         let requested_id = provider_auth_request_id_from_payload(&command.payload)?;
         let pending = {
-            let mut waiters = self.provider_auth_waiters.lock().await;
+            let mut waiters = self.execution.provider_auth_waiters.lock().await;
             let Some(active) = waiters.get(&session_id) else {
                 return Ok(CommandAck {
                     command_id: command.command_id,
@@ -1457,7 +1653,13 @@ impl RuntimeHost {
             }
             waiters.remove(&session_id).expect("checked pending auth")
         };
-        let lane = self.lane_manager.lock().await.lane(session_id).cloned();
+        let lane = self
+            .execution
+            .lane_manager
+            .lock()
+            .await
+            .lane(session_id)
+            .cloned();
         let mut event = host_event(
             self.next_sequence_no(),
             session_id,
@@ -1485,7 +1687,13 @@ impl RuntimeHost {
         session_id: SessionId,
         command: &SessionCommand,
     ) -> Result<CommandAck, ClientError> {
-        if !self.task_controls.lock().await.contains_key(&session_id) {
+        if !self
+            .execution
+            .task_controls
+            .lock()
+            .await
+            .contains_key(&session_id)
+        {
             return Ok(CommandAck {
                 command_id: command.command_id,
                 accepted: false,
@@ -1494,7 +1702,7 @@ impl RuntimeHost {
                 ),
             });
         }
-        let transition = self.lane_manager.lock().await.takeover(
+        let transition = self.execution.lane_manager.lock().await.takeover(
             session_id,
             command.actor.clone(),
             self.next_sequence_no(),
@@ -1539,7 +1747,7 @@ impl RuntimeHost {
                 reason: Some("thread_id is required".to_owned()),
             });
         };
-        let Some(mut thread) = self.repositories.threads.by_id(thread_id).await? else {
+        let Some(mut thread) = self.storage.repositories.threads.by_id(thread_id).await? else {
             return Ok(CommandAck {
                 command_id: command.command_id,
                 accepted: false,
@@ -1563,7 +1771,7 @@ impl RuntimeHost {
             .await?
         {
             self.rebuild_thread_rollout(&thread).await?;
-            let _ = self.event_bus.send(event);
+            self.publish_live_event(event);
             return Ok(CommandAck {
                 command_id: command.command_id,
                 accepted: true,
@@ -1585,6 +1793,7 @@ impl RuntimeHost {
             });
         }
         if self
+            .execution
             .lane_manager
             .lock()
             .await
@@ -1672,6 +1881,70 @@ impl RuntimeHost {
         })
     }
 
+    pub(super) async fn archive_thread_after_delegated_parent_cancel(
+        &self,
+        attached_session_id: SessionId,
+        thread_id: ThreadId,
+        actor: &Actor,
+    ) -> Result<(), ClientError> {
+        let Some(mut thread) = self.storage.repositories.threads.by_id(thread_id).await? else {
+            return Ok(());
+        };
+        self.ensure_thread_in_workspace(&thread)?;
+        if thread.archived {
+            return Ok(());
+        }
+        if attached_session_id == thread.session_id {
+            return Err(ClientError::TaskExecution(
+                "a delegated child cannot archive its attached session".to_owned(),
+            ));
+        }
+        if self
+            .execution
+            .lane_manager
+            .lock()
+            .await
+            .lane(thread.session_id)
+            .is_some_and(|lane| is_active_status(lane.status))
+        {
+            return Err(ClientError::TaskExecution(
+                "a delegated child must reach a terminal lane before archival".to_owned(),
+            ));
+        }
+        let _session_lease = match self.try_acquire_session_lease(thread.session_id)? {
+            SessionLeaseAttempt::Acquired(lease) => lease,
+            SessionLeaseAttempt::Busy => {
+                return Err(ClientError::TaskExecution(
+                    "delegated child archival is owned by another runtime process".to_owned(),
+                ));
+            }
+        };
+        thread.archived = true;
+        thread.updated_at = chrono::Utc::now();
+        let event = host_event(
+            self.next_sequence_no(),
+            thread.session_id,
+            None,
+            RuntimeEventType::ThreadArchived,
+            RuntimeEventSource::Runtime,
+            json!({
+                "summary": "delegated child thread archived after parent cancellation",
+                "thread_id": thread.thread_id,
+                "actor": actor,
+                "recovery": "delegated_parent_cancelled",
+            }),
+        );
+        if !self
+            .record_thread_metadata_event(&thread, ThreadMetadataMutation::Upsert, event)
+            .await?
+        {
+            return Err(ClientError::TaskExecution(format!(
+                "delegated child thread {thread_id} disappeared during archival"
+            )));
+        }
+        Ok(())
+    }
+
     async fn existing_thread_metadata_event(
         &self,
         thread: &golutra_store::ThreadRecord,
@@ -1681,6 +1954,7 @@ impl RuntimeHost {
         let command_id = command_id.to_string();
         let thread_id = thread.thread_id.to_string();
         Ok(self
+            .storage
             .repositories
             .events
             .load(thread.session_id, None, None)
@@ -1702,24 +1976,26 @@ impl RuntimeHost {
         mutation: ThreadMetadataMutation,
         event: RuntimeEvent,
     ) -> Result<bool, ClientError> {
-        let _writer = self.event_writer.lock().await;
-        let causal_before = self.causal_ledger.lock().await.clone();
+        let _writer = self.execution.event_writer.lock().await;
+        let causal_before = self.execution.causal_ledger.lock().await.clone();
         let event = match self.prepare_canonical_event(event).await {
             Ok(event) => event,
             Err(error) => {
-                *self.causal_ledger.lock().await = causal_before;
+                *self.execution.causal_ledger.lock().await = causal_before;
                 return Err(error);
             }
         };
         let committed = match mutation {
             ThreadMetadataMutation::Upsert => self
+                .storage
                 .repositories
                 .threads
                 .upsert_with_event(thread, event)
                 .await
                 .map(Some),
             ThreadMetadataMutation::Delete => {
-                self.repositories
+                self.storage
+                    .repositories
                     .threads
                     .delete_with_event(thread.thread_id, event)
                     .await
@@ -1728,11 +2004,11 @@ impl RuntimeHost {
         let Some(event) = (match committed {
             Ok(event) => event,
             Err(error) => {
-                *self.causal_ledger.lock().await = causal_before;
+                *self.execution.causal_ledger.lock().await = causal_before;
                 return Err(error.into());
             }
         }) else {
-            *self.causal_ledger.lock().await = causal_before;
+            *self.execution.causal_ledger.lock().await = causal_before;
             return Ok(false);
         };
         self.publish_committed_event(event).await?;
@@ -1746,6 +2022,7 @@ impl RuntimeHost {
         decision: ApprovalDecision,
     ) -> Result<CommandAck, ClientError> {
         if self
+            .execution
             .lane_manager
             .lock()
             .await
@@ -1761,6 +2038,7 @@ impl RuntimeHost {
             });
         }
         let state = self
+            .storage
             .repositories
             .projections
             .state(session_id, None)
@@ -1837,6 +2115,7 @@ impl RuntimeHost {
         };
         if scope == ApprovalScope::ResourcePrefix {
             let events = self
+                .storage
                 .repositories
                 .events
                 .load(session_id, state.active_task_id, None)
@@ -1876,7 +2155,13 @@ impl RuntimeHost {
                 ),
             });
         }
-        let control = self.task_controls.lock().await.get(&session_id).cloned();
+        let control = self
+            .execution
+            .task_controls
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned();
         let Some(control) = control else {
             return Ok(CommandAck {
                 command_id: command.command_id,
@@ -1924,6 +2209,7 @@ impl RuntimeHost {
             });
         };
         let events = self
+            .storage
             .repositories
             .events
             .load(session_id, Some(task_id), None)
@@ -1988,6 +2274,7 @@ impl RuntimeHost {
             });
         }
         let control = self
+            .execution
             .task_controls
             .lock()
             .await
@@ -2019,6 +2306,7 @@ impl RuntimeHost {
         command: SessionCommand,
     ) -> Result<CommandAck, ClientError> {
         if self
+            .execution
             .lane_manager
             .lock()
             .await
@@ -2034,11 +2322,13 @@ impl RuntimeHost {
             });
         }
         let events = self
+            .storage
             .repositories
             .events
             .load_recent(session_id, None, None, MAX_HISTORY_SOURCE_EVENTS)
             .await?;
         let explicit_compaction = self
+            .storage
             .repositories
             .events
             .latest_explicit_compaction(session_id)
@@ -2069,6 +2359,7 @@ impl RuntimeHost {
             lines,
         );
         let active_task_id = self
+            .storage
             .repositories
             .projections
             .state(session_id, None)

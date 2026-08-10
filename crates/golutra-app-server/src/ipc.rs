@@ -1,5 +1,5 @@
 #[cfg(unix)]
-use std::{collections::BTreeMap, io, sync::Arc};
+use std::{collections::BTreeMap, io, sync::Arc, time::Duration};
 
 #[cfg(unix)]
 use axum::{
@@ -12,10 +12,10 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 #[cfg(unix)]
 use futures_util::StreamExt;
 #[cfg(unix)]
-use golutra_protocol::{IpcHttpRequest, IpcHttpResponseFrame};
+use golutra_protocol::{IpcHttpRequest, IpcHttpResponseFrame, MAX_WIRE_MESSAGE_BYTES};
 #[cfg(unix)]
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
     sync::Semaphore,
 };
@@ -30,7 +30,7 @@ use tower::ServiceExt;
 pub(crate) struct LocalIpcRequest;
 
 #[cfg(unix)]
-const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(unix)]
 const RESPONSE_CHUNK_BYTES: usize = 48 * 1024;
 #[cfg(unix)]
@@ -59,11 +59,17 @@ async fn handle_connection(stream: UnixStream, app: Router) -> io::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = Vec::new();
-    let read = reader.read_until(b'\n', &mut line).await?;
+    let read = read_initial_request_line(
+        &mut reader,
+        &mut line,
+        MAX_WIRE_MESSAGE_BYTES,
+        INITIAL_REQUEST_TIMEOUT,
+    )
+    .await?;
     if read == 0 {
         return Ok(());
     }
-    if line.len() > MAX_REQUEST_BYTES || !line.ends_with(b"\n") {
+    if !line.ends_with(b"\n") || line.len().saturating_sub(1) > MAX_WIRE_MESSAGE_BYTES {
         write_frame(
             &mut writer,
             &IpcHttpResponseFrame::Error {
@@ -136,6 +142,34 @@ async fn handle_connection(stream: UnixStream, app: Router) -> io::Result<()> {
 }
 
 #[cfg(unix)]
+async fn read_bounded_line<R>(reader: &mut R, line: &mut Vec<u8>, limit: usize) -> io::Result<usize>
+where
+    R: AsyncBufRead + Unpin,
+{
+    line.clear();
+    let mut read = 0_usize;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(read);
+        }
+        let remaining = limit.saturating_add(1).saturating_sub(line.len());
+        if remaining == 0 {
+            return Ok(read);
+        }
+        let available = &available[..available.len().min(remaining)];
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |index| index.saturating_add(1));
+        line.extend_from_slice(&available[..consumed]);
+        reader.consume(consumed);
+        read = read.saturating_add(consumed);
+        if newline.is_some() || line.len() > limit {
+            return Ok(read);
+        }
+    }
+}
+
+#[cfg(unix)]
 fn axum_request(request: IpcHttpRequest) -> Result<Request<Body>, String> {
     if request.path.len() > 16 * 1024 {
         return Err("IPC request path is too long".to_owned());
@@ -144,7 +178,7 @@ fn axum_request(request: IpcHttpRequest) -> Result<Request<Body>, String> {
         .method
         .parse::<Method>()
         .map_err(|_| "IPC request method is invalid".to_owned())?;
-    if !matches!(method, Method::GET | Method::POST) {
+    if !matches!(method, Method::GET | Method::POST | Method::DELETE) {
         return Err("IPC request method is not allowed".to_owned());
     }
     let uri = request
@@ -186,7 +220,7 @@ fn axum_request(request: IpcHttpRequest) -> Result<Request<Body>, String> {
         .transpose()
         .map_err(|error| format!("IPC request body is invalid: {error}"))?
         .unwrap_or_default();
-    if body.len() > MAX_REQUEST_BYTES {
+    if body.len() > MAX_WIRE_MESSAGE_BYTES {
         return Err("IPC request body exceeds its size limit".to_owned());
     }
     if !body.is_empty() {
@@ -200,6 +234,21 @@ fn axum_request(request: IpcHttpRequest) -> Result<Request<Body>, String> {
 }
 
 #[cfg(unix)]
+async fn read_initial_request_line<R>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    limit: usize,
+    deadline: Duration,
+) -> io::Result<usize>
+where
+    R: AsyncBufRead + Unpin,
+{
+    tokio::time::timeout(deadline, read_bounded_line(reader, line, limit))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "IPC request first frame timed out"))?
+}
+
+#[cfg(unix)]
 async fn write_frame(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     frame: &IpcHttpResponseFrame,
@@ -208,4 +257,76 @@ async fn write_frame(
     bytes.push(b'\n');
     writer.write_all(&bytes).await?;
     writer.flush().await
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn bounded_line_reader_accepts_a_newline_after_the_limit_bytes() {
+        let mut input = vec![b'x'; 16];
+        input.extend_from_slice(b"\nremaining");
+        let mut reader = BufReader::new(Cursor::new(input));
+        let mut line = Vec::new();
+
+        let read = read_bounded_line(&mut reader, &mut line, 16)
+            .await
+            .expect("bounded line");
+
+        assert_eq!(read, 17);
+        assert_eq!(line, [vec![b'x'; 16], vec![b'\n']].concat());
+        assert_eq!(reader.fill_buf().await.expect("remaining"), b"remaining");
+    }
+
+    #[tokio::test]
+    async fn bounded_line_reader_stops_at_limit_plus_one_without_a_newline() {
+        let mut reader = BufReader::new(Cursor::new(vec![b'x'; 64]));
+        let mut line = Vec::new();
+
+        let read = read_bounded_line(&mut reader, &mut line, 16)
+            .await
+            .expect("bounded line");
+
+        assert_eq!(read, 17);
+        assert_eq!(line.len(), 17);
+        assert_eq!(reader.fill_buf().await.expect("remaining").len(), 47);
+    }
+
+    #[tokio::test]
+    async fn initial_request_reader_times_out_without_a_first_frame() {
+        let (_writer, reader) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(reader);
+        let mut line = Vec::new();
+
+        let error = read_initial_request_line(
+            &mut reader,
+            &mut line,
+            MAX_WIRE_MESSAGE_BYTES,
+            Duration::from_millis(20),
+        )
+        .await
+        .expect_err("initial frame deadline");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn ipc_request_body_uses_the_protocol_wire_limit() {
+        let request = IpcHttpRequest {
+            method: "POST".to_owned(),
+            path: "/rpc".to_owned(),
+            headers: BTreeMap::new(),
+            body: Some(serde_json::Value::String(
+                "x".repeat(MAX_WIRE_MESSAGE_BYTES),
+            )),
+        };
+
+        assert!(matches!(
+            axum_request(request),
+            Err(message) if message == "IPC request body exceeds its size limit"
+        ));
+    }
 }

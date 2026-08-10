@@ -252,19 +252,24 @@ MemoryGovernance
 | --- | --- |
 | `golutra-core` | 核心协议与状态类型 |
 | `golutra-runtime` | RuntimeLane、turn 状态机、loop 执行、LoopGuard、resume、compact、fallback |
-| `golutra-event` | Durable / live-only 事件协议 |
+| `golutra-protocol` | Session command/query、RuntimeEvent 与 durable/live-only 事件协议 |
+| `golutra-event` | `golutra-protocol` 的兼容 re-export；新代码直接依赖 `golutra-protocol` |
+| `golutra-protocol-fixtures` | JSON Schema、跨语言协议 fixture 与兼容性测试输入 |
 | `golutra-context` | ContextBuilder、TokenBudgetTracker、TokenBudgetSnapshot、ContextSnapshot、WorkingSummary、context projection |
 | `golutra-memory` | MemoryRetriever、MemoryGovernance、memory quarantine/promotion/rollback |
 | `golutra-store` | SQLite、event log、artifact store、state snapshot、durable post-task job、workspace checkpoint refs |
 | `golutra-sandbox` | macOS Seatbelt、Linux bubblewrap 与 process-only launch plan；统一 workspace/network/env 边界 |
+| `golutra-file-search` | ignore-aware 文件枚举、ripgrep/fallback 文本搜索与文件元数据索引 |
 | `golutra-code-intelligence` | tree-sitter symbol/reference/import graph、ignore-aware 索引和 owner-only snapshot |
 | `golutra-auth` | CredentialRef、owner-only disk/env SecretStore、OAuth PKCE/device/refresh/revoke 和非敏感 credential metadata |
 | `golutra-config` | 全局 provider v2、受审计 provider auth catalog、v1 到 disk SecretRef 原子迁移、verified install/probe/rollback |
 | `golutra-llm` | OpenAI-compatible/Responses/native Provider adapter、CapabilityMatrix、routing、usage normalization、TokenUsageRecord |
 | `golutra-tools` | ToolContract、tool registry、tool execution、ToolResultEnvelope |
+| `golutra-project-service` | 由 tmux、Docker Compose 或 systemd-user 持有的项目级持久服务生命周期；不复用 Runtime managed-process 所有权 |
 | `golutra-governor` | GoalLedger、RuntimeGovernor、GoalAlignment、budget/security/policy GovernanceDecision |
 | `golutra-policy` | PermissionPolicy、PolicyEvaluation、workspace isolation |
 | `golutra-verify` | VerificationPlan/Assertion、VerifierRegistry、PASS/FAIL/PARTIAL、证据记录 |
+| `golutra-eval-model` | 无执行逻辑的稳定 Evaluation DTO，供 protocol 与 evaluator 共享 |
 | `golutra-eval` | EvaluationCase、EvaluationRun、Scorer、TrajectoryReplay、CounterfactualReplay、CausalComparison、benchmark、regression |
 | `golutra-eval-worker` | sealed 版本评测入口；使用被测版本的 RuntimeApplication 运行单个 case 并输出完整 TaskTrace，不接收 assertion/holdout 答案 |
 | `golutra-evolution` | GeneratedTask、novelty/curriculum/frontier、隔离执行和 Skill stage/review/install/rollback |
@@ -276,6 +281,7 @@ MemoryGovernance
 | `golutra-cli` | 薄 CLI 入口 |
 | `golutra-app-server` | 同一 Axum Router 上的 Unix IPC 与 HTTP command/query + SSE 入口 |
 | `golutra-vis` | replay、audit、event 和 OpenTelemetry JSON 投影视图 |
+| `golutra-test-client` | 跨进程 transport smoke 与安装/协议交付验收客户端 |
 
 应用层不直接把这些 crate 暴露给前端。`golutra-client::RuntimeApplication`
 （别名 `GovernedRuntime`）是 command/query/session/trace/governance 的唯一
@@ -289,13 +295,15 @@ artifact、durable job、thread 五类事实访问边界。`EmbeddedTransport`�
 
 | Crate | 内部模块 | 约束 |
 | --- | --- | --- |
-| `golutra-client` | `application`、`command`、`query`、`session`、`execution`、`execution_trace`、`change_tracker`、`task_governance`、`post_task`、`governance`、`governance_commands`、`regression`、`trace`、`transport`、`transport::ipc` | `RuntimeApplication` 是前端用例 facade；`RuntimeHost` 只拥有 lane/worker/EventBus/sequence 与生命周期；文件副作用由 `change_tracker` 从工具执行时冻结的 before/after-image 生成 operation 与 turn net change facts，不重新读取可能已变化的 live workspace；command、查询、执行、trace、后台治理和回归共享同一事实与 owner |
-| `golutra-runtime` | `lane`、`checkpoint`、`completion`、`context_guard`、`provider_retry`、`trace`、`verification` | lane 状态机、checkpoint、终态策略、context guard、retry、trace adapter 和 verification service 独立于 loop orchestration；loop 不直接实现 session controller 转换或快照 IO |
+| `golutra-client` | `application`、`command`、`query`、`session`、`execution`、`execution_trace`、`change_tracker`、`observation_recorder`、`delegation`、`delegation_policy`、`task_governance`、`post_task`、`governance_commands`、`regression`、`trace`、`transport`、`transport::ipc`、`transport_operation` | `RuntimeApplication` 是前端用例 facade；`RuntimeHostStorageState` 拥有 repositories/artifacts，`RuntimeHostExecutionState` 拥有 lane/worker/live publication/sequence 与生命周期；文件副作用由 `change_tracker` 从工具执行时冻结的 before/after-image 生成 operation 与 turn net change facts；所有 transport 适配器共享 typed operation dispatcher |
+| `golutra-runtime` | `lane`、`harness`、`checkpoint`、`completion`、`context_guard`、`objective_evidence`、`provider_retry`、`provider_session`、`step_machine`、`trace`、`verification` | harness 是 provider/tool loop 边界；lane、checkpoint、终态策略、客观证据、provider session/retry、step machine、trace 和 verification service 独立于 loop orchestration；loop 不直接实现 session controller 转换或快照 IO |
 | `golutra-tui` | `live_status`、`change_projection`、`developer_projection`、`developer_query`、`activity_view`、`transcript_view`、`developer_view`、`activity_widget`、`transcript_widget`、`developer_widget`、`auth_state`、`auth_flow`、`session`、`render`、`runtime_controller`、`driver::{frame,io,session,wait}` | Runtime facts、replayable projection、terminal-neutral view model、Ratatui widget 和 controller 五层分离；developer transport 查询与纯 projection reducer 分离；交互 TUI 与离屏 Driver 共用同一投影和 widget；渲染不查询 SQLite、不写 provider 配置，认证 flow 不编排 runtime task |
 | `golutra-config` | `provider_auth`、`provider_storage` | provider catalog 与凭据/配置事务分离；磁盘写入、锁、迁移、probe 和 rollback 统一由 storage 层负责 |
 | `golutra-llm` | `provider_config`、`openai_responses`、`genai_adapter` | 环境解析与 URL/错误处理不进入 adapter 执行循环；各协议 adapter 只处理自己的 wire contract |
-| `golutra-store` | `projection`、`repositories` | event reducer 保持纯函数；`RuntimeRepositories` 对 event/projection/artifact/job/thread 提供逻辑 seam；SQLite 只负责事实读写和持久化派生索引 |
-| `golutra-tools` | `process`、`workspace_scan` | shell argv、进程组取消、timeout、有界管道读取和有界 workspace before/after scan 分层维护 |
+| `golutra-store` | `migrations`、`projection`、`repositories` | migration 顺序、event reducer 和 repository facade 分离；`RuntimeRepositories` 对 event/projection/artifact/job/thread 提供逻辑边界；SQLite 只负责事实读写和持久化派生索引 |
+| `golutra-tools` | `builtin`、`process`、`process_supervisor`、`project_verifier`、`text_search`、`workspace_scan` | typed builtin contract、shell 执行、受控后台进程、项目 verifier 发现、文本搜索和 workspace before/after scan 分层维护 |
+| `golutra-protocol` | `codec`、`command`、`event`、`query`、`rpc`、`projection`、`trace`、`version` | versioned codec 集中校验 envelope、payload kind、discriminant 与大小限制；DTO 模块不依赖 transport 或 evaluator 执行逻辑 |
+| `golutra-app-server` | `attachment_registry`、`rpc`、`ipc`、`transport_security` | attachment capability 的容量、TTL、撤销和连接生命周期由单一 registry 管理；REST、SSE、WebSocket、stdio RPC 只适配 typed runtime operation |
 
 每个大型入口的单元测试位于同目录 `tests.rs`；生产模块通过 `#[cfg(test)] mod tests;` 接入。测试可以验证 crate 内实现，但生产模块不能通过 test-only 重导出形成运行时依赖。
 

@@ -9,20 +9,223 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crossterm::{
+    cursor::MoveTo,
     event::{DisableBracketedPaste, EnableBracketedPaste},
-    execute,
+    execute, queue,
+    style::{
+        Attribute as CrosstermAttribute, Color as CrosstermColor, Colors, Print, SetAttribute,
+        SetBackgroundColor, SetColors, SetForegroundColor, SetUnderlineColor,
+    },
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
-    backend::{Backend, ClearType, WindowSize},
+    backend::{Backend, ClearType, CrosstermBackend, WindowSize},
     buffer::Cell,
     layout::{Position, Size},
+    style::{Color, Modifier},
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::InteractiveTerminal;
 
 const MAX_OSC52_BYTES: usize = 100 * 1024;
 static ALTERNATE_SCREEN_ACTIVE: AtomicBool = AtomicBool::new(true);
+
+/// Crossterm backend that keeps adjacent wide glyphs contiguous in the output stream.
+///
+/// Ratatui 0.28 compares the next cell with `previous_x + 1`, even when the previous glyph
+/// occupies two columns. The resulting absolute cursor move is visually correct, but terminal
+/// scrollback and copied text can materialize the covered column as a space between every CJK
+/// glyph. Tracking the displayed end column preserves both the screen and its textual history.
+pub(crate) struct ContiguousCrosstermBackend<W: Write> {
+    writer: W,
+}
+
+impl<W: Write> ContiguousCrosstermBackend<W> {
+    pub(crate) const fn new(writer: W) -> Self {
+        Self { writer }
+    }
+
+    #[cfg(test)]
+    fn into_inner(self) -> W {
+        self.writer
+    }
+}
+
+impl<W: Write> Write for ContiguousCrosstermBackend<W> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.writer.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+impl<W: Write> Backend for ContiguousCrosstermBackend<W> {
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a Cell)>,
+    {
+        let mut foreground = Color::Reset;
+        let mut background = Color::Reset;
+        let mut underline = Color::Reset;
+        let mut modifier = Modifier::empty();
+        let mut previous_end = None;
+
+        for (x, y, cell) in content {
+            // `insert_before` draws the complete temporary buffer, including the reset cell
+            // covered by a preceding wide grapheme. That cell is not a terminal character and
+            // writing it would erase the grapheme's second column in scrollback.
+            if previous_end.is_some_and(|(end, row)| row == y && x < end) {
+                continue;
+            }
+            if !matches!(previous_end, Some((end, row)) if x == end && y == row) {
+                queue!(self.writer, MoveTo(x, y))?;
+            }
+            let width = u16::try_from(UnicodeWidthStr::width(cell.symbol()))
+                .unwrap_or(u16::MAX)
+                .max(1);
+            previous_end = Some((x.saturating_add(width), y));
+
+            if cell.modifier != modifier {
+                ModifierDiff {
+                    from: modifier,
+                    to: cell.modifier,
+                }
+                .queue(&mut self.writer)?;
+                modifier = cell.modifier;
+            }
+            if cell.fg != foreground || cell.bg != background {
+                queue!(
+                    self.writer,
+                    SetColors(Colors::new(cell.fg.into(), cell.bg.into()))
+                )?;
+                foreground = cell.fg;
+                background = cell.bg;
+            }
+            if cell.underline_color != underline {
+                queue!(
+                    self.writer,
+                    SetUnderlineColor(CrosstermColor::from(cell.underline_color))
+                )?;
+                underline = cell.underline_color;
+            }
+            queue!(self.writer, Print(cell.symbol()))?;
+        }
+
+        queue!(
+            self.writer,
+            SetForegroundColor(CrosstermColor::Reset),
+            SetBackgroundColor(CrosstermColor::Reset),
+            SetUnderlineColor(CrosstermColor::Reset),
+            SetAttribute(CrosstermAttribute::Reset),
+        )
+    }
+
+    fn append_lines(&mut self, count: u16) -> io::Result<()> {
+        CrosstermBackend::new(&mut self.writer).append_lines(count)
+    }
+
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        CrosstermBackend::new(&mut self.writer).hide_cursor()
+    }
+
+    fn show_cursor(&mut self) -> io::Result<()> {
+        CrosstermBackend::new(&mut self.writer).show_cursor()
+    }
+
+    fn get_cursor_position(&mut self) -> io::Result<Position> {
+        CrosstermBackend::new(&mut self.writer).get_cursor_position()
+    }
+
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+        CrosstermBackend::new(&mut self.writer).set_cursor_position(position)
+    }
+
+    fn clear(&mut self) -> io::Result<()> {
+        CrosstermBackend::new(&mut self.writer).clear()
+    }
+
+    fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+        CrosstermBackend::new(&mut self.writer).clear_region(clear_type)
+    }
+
+    fn size(&self) -> io::Result<Size> {
+        let (width, height) = crossterm::terminal::size()?;
+        Ok(Size { width, height })
+    }
+
+    fn window_size(&mut self) -> io::Result<WindowSize> {
+        let window = crossterm::terminal::window_size()?;
+        Ok(WindowSize {
+            columns_rows: Size {
+                width: window.columns,
+                height: window.rows,
+            },
+            pixels: Size {
+                width: window.width,
+                height: window.height,
+            },
+        })
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+struct ModifierDiff {
+    from: Modifier,
+    to: Modifier,
+}
+
+impl ModifierDiff {
+    fn queue(self, writer: &mut impl Write) -> io::Result<()> {
+        let removed = self.from - self.to;
+        if removed.contains(Modifier::REVERSED) {
+            queue!(writer, SetAttribute(CrosstermAttribute::NoReverse))?;
+        }
+        if removed.contains(Modifier::BOLD) {
+            queue!(writer, SetAttribute(CrosstermAttribute::NormalIntensity))?;
+            if self.to.contains(Modifier::DIM) {
+                queue!(writer, SetAttribute(CrosstermAttribute::Dim))?;
+            }
+        }
+        if removed.contains(Modifier::ITALIC) {
+            queue!(writer, SetAttribute(CrosstermAttribute::NoItalic))?;
+        }
+        if removed.contains(Modifier::UNDERLINED) {
+            queue!(writer, SetAttribute(CrosstermAttribute::NoUnderline))?;
+        }
+        if removed.contains(Modifier::DIM) {
+            queue!(writer, SetAttribute(CrosstermAttribute::NormalIntensity))?;
+        }
+        if removed.contains(Modifier::CROSSED_OUT) {
+            queue!(writer, SetAttribute(CrosstermAttribute::NotCrossedOut))?;
+        }
+        if removed.intersects(Modifier::SLOW_BLINK | Modifier::RAPID_BLINK) {
+            queue!(writer, SetAttribute(CrosstermAttribute::NoBlink))?;
+        }
+
+        let added = self.to - self.from;
+        for (modifier, attribute) in [
+            (Modifier::REVERSED, CrosstermAttribute::Reverse),
+            (Modifier::BOLD, CrosstermAttribute::Bold),
+            (Modifier::ITALIC, CrosstermAttribute::Italic),
+            (Modifier::UNDERLINED, CrosstermAttribute::Underlined),
+            (Modifier::DIM, CrosstermAttribute::Dim),
+            (Modifier::CROSSED_OUT, CrosstermAttribute::CrossedOut),
+            (Modifier::SLOW_BLINK, CrosstermAttribute::SlowBlink),
+            (Modifier::RAPID_BLINK, CrosstermAttribute::RapidBlink),
+        ] {
+            if added.contains(modifier) {
+                queue!(writer, SetAttribute(attribute))?;
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Keeps ratatui's inline viewport usable when a terminal does not answer a cursor-position query.
 pub(crate) struct CursorFallbackBackend<B> {
@@ -311,6 +514,41 @@ fn bounded_utf8_prefix(value: &str, max_bytes: usize) -> (&str, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adjacent_cjk_cells_are_written_as_contiguous_text() {
+        let mut first = Cell::default();
+        first.set_symbol("你");
+        let continuation = Cell::default();
+        let mut second = Cell::default();
+        second.set_symbol("好");
+        let second_continuation = Cell::default();
+        let mut backend = ContiguousCrosstermBackend::new(Vec::new());
+
+        backend
+            .draw(
+                [
+                    (0, 0, &first),
+                    (1, 0, &continuation),
+                    (2, 0, &second),
+                    (3, 0, &second_continuation),
+                ]
+                .into_iter(),
+            )
+            .expect("draw adjacent CJK cells");
+
+        let bytes = backend.into_inner();
+        let output = String::from_utf8_lossy(&bytes);
+        assert!(output.contains("你好"), "terminal output was {output:?}");
+        assert!(
+            !output.contains("\x1b[1;2H"),
+            "continuation cell was addressed: {output:?}"
+        );
+        assert!(
+            !output.contains("\x1b[1;4H"),
+            "continuation cell was addressed: {output:?}"
+        );
+    }
     use ratatui::backend::TestBackend;
 
     #[test]

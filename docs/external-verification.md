@@ -29,12 +29,15 @@ Delivery-path checks apply to turns that changed files; a resume turn may verify
 an unchanged existing delivery without manufacturing another write.
 
 When a code/workspace task omits the `external_verifiers` field, the command
-adapter conservatively discovers project checks from regular, bounded manifest
-files: Cargo workspace tests, one meaningful Node script, pytest for an
-identifiable Python project, and Go package tests. Manifest symlinks and
-oversized files are ignored. An explicitly supplied list remains authoritative;
-an explicit empty list disables discovery. Each queued turn owns its own list,
-so a conversational follow-up never inherits a previous verifier.
+adapter conservatively examines regular, bounded manifest files at the
+workspace root. It discovers one verifier only when exactly one supported
+project family is unambiguous: Cargo workspace tests, one meaningful Node
+script, pytest for an identifiable Python project, or Go package tests.
+Manifest symlinks and oversized files are ignored; mixed or ambiguous roots
+produce no implicit verifier and require an explicit list. An explicitly
+supplied list remains authoritative; an explicit empty list disables discovery.
+Each queued turn owns its own list, so a conversational follow-up never
+inherits a previous verifier.
 
 ## Entry Points
 

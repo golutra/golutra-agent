@@ -21,6 +21,19 @@ pub struct DiscoveredProjectVerifier {
 
 #[must_use]
 pub fn discover_project_verifiers(workspace_root: &Path) -> Vec<DiscoveredProjectVerifier> {
+    let candidates = discover_project_verifier_candidates(workspace_root);
+    // A workspace can legitimately contain several independent applications. Running every
+    // ecosystem's default check would make an unrelated coding task depend on sibling projects.
+    // Automatic verification is therefore limited to an unambiguous root project; callers with a
+    // polyglot workspace can provide the intended verifier explicitly.
+    if candidates.len() == 1 {
+        candidates
+    } else {
+        Vec::new()
+    }
+}
+
+fn discover_project_verifier_candidates(workspace_root: &Path) -> Vec<DiscoveredProjectVerifier> {
     let mut verifiers = Vec::new();
     if is_regular_project_file(&workspace_root.join("Cargo.toml")) {
         verifiers.push(verifier(
@@ -201,7 +214,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn discovers_supported_project_verifiers_without_shell_commands() {
+    fn discovers_supported_project_verifier_candidates_without_shell_commands() {
         let workspace = tempdir().expect("workspace");
         fs::write(workspace.path().join("Cargo.toml"), "[workspace]\n").expect("cargo manifest");
         fs::write(
@@ -231,7 +244,7 @@ mod tests {
         )
         .expect("go manifest");
 
-        let discovered = discover_project_verifiers(workspace.path());
+        let discovered = discover_project_verifier_candidates(workspace.path());
 
         assert_eq!(
             discovered
@@ -252,6 +265,26 @@ mod tests {
         assert_eq!(
             python.args,
             ["-B", "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+        );
+        assert!(
+            discover_project_verifiers(workspace.path()).is_empty(),
+            "ambiguous project roots require an explicit verifier"
+        );
+    }
+
+    #[test]
+    fn discovers_one_verifier_for_an_unambiguous_project_root() {
+        let workspace = tempdir().expect("workspace");
+        fs::write(workspace.path().join("Cargo.toml"), "[workspace]\n").expect("cargo manifest");
+
+        let discovered = discover_project_verifiers(workspace.path());
+
+        assert_eq!(
+            discovered
+                .iter()
+                .map(|verifier| verifier.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cargo_test"]
         );
     }
 

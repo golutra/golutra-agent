@@ -228,6 +228,7 @@ pub(crate) async fn run_process_with_progress(
     let mut termination_requested = false;
     let mut stdin_done = input.is_none();
     let mut stdin_error = None;
+    let mut pipe_error = None;
     let mut readers_done = 0_u8;
     let mut stdout = OutputBuffer::default();
     let mut stderr = OutputBuffer::default();
@@ -249,6 +250,13 @@ pub(crate) async fn run_process_with_progress(
             }
             result = &mut child_wait, if status.is_none() => {
                 status = Some(result.map_err(|error| ToolError::Execution(error.to_string()))?);
+                // A shell can exit while a descendant still owns inherited pipes. The
+                // process group remains the execution boundary, so settle it before
+                // waiting for the pipe readers.
+                if !termination_requested {
+                    terminate_process_group_only(child_id);
+                    termination_requested = true;
+                }
             }
             result = &mut stdin_write, if !stdin_done => {
                 stdin_done = true;
@@ -285,7 +293,16 @@ pub(crate) async fn run_process_with_progress(
                         }
                     }
                     Some(PipeMessage::Done(_stream)) => readers_done = readers_done.saturating_add(1),
-                    Some(PipeMessage::Error(error)) => return Err(ToolError::Execution(error)),
+                    Some(PipeMessage::Error(error)) => {
+                        if pipe_error.is_none() {
+                            pipe_error = Some(error);
+                        }
+                        readers_done = readers_done.saturating_add(1);
+                        if status.is_none() && !termination_requested {
+                            terminate_process_group(child_id);
+                            termination_requested = true;
+                        }
+                    }
                     None => readers_done = 2,
                 }
             }
@@ -293,6 +310,9 @@ pub(crate) async fn run_process_with_progress(
     }
     let status =
         status.ok_or_else(|| ToolError::Execution("process exited without a status".to_owned()))?;
+    if let Some(error) = pipe_error {
+        return Err(ToolError::Execution(error));
+    }
     emit_progress(
         &mut progress,
         ProcessProgress {
@@ -355,6 +375,28 @@ pub(crate) fn terminate_process_group(process_id: Option<u32>) {
 
     #[cfg(windows)]
     if let Some(process_id) = process_id {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &process_id.to_string(), "/T", "/F"])
+            .status();
+    }
+}
+
+/// Kill the managed process group without falling back to the direct PID.
+///
+/// This is used after the direct child has already exited, when a descendant may
+/// still hold an inherited pipe. At that point a failed group lookup means the
+/// managed group is gone; signaling the old leader PID could hit an unrelated
+/// process after PID reuse.
+pub(crate) fn terminate_process_group_only(process_id: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(process_id) = process_id.and_then(|id| i32::try_from(id).ok()) {
+        let _ = killpg(Pid::from_raw(process_id), Signal::SIGKILL);
+    }
+
+    #[cfg(windows)]
+    if let Some(process_id) = process_id {
+        // Windows has no portable process-group-only signal primitive. `taskkill`
+        // remains the available tree cleanup operation for inherited pipe handles.
         let _ = std::process::Command::new("taskkill")
             .args(["/PID", &process_id.to_string(), "/T", "/F"])
             .status();

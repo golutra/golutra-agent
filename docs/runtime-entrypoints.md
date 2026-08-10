@@ -190,11 +190,15 @@ When no explicit verifier field is supplied and the task contract requires
 objective validation or workspace evidence, Golutra conservatively discovers
 one project check from trusted, workspace-local manifests. Supported project
 families are Cargo, Node, Python and Go; discovery never scans arbitrary shell
-scripts, follows manifest symlinks or reads oversized manifests. An explicit
-verifier always wins. An explicit empty verifier list disables discovery, as
-does `exec --no-project-verifier-discovery`. This omission-versus-empty rule is
-the same through App Server and both SDKs. MCP sends an explicit empty list so
-an agent invoking Golutra cannot cause project code to run implicitly.
+scripts, follows manifest symlinks or reads oversized manifests. Automatic
+discovery only runs when exactly one supported project family is present at the
+workspace root. A mixed or ambiguous root returns no implicit verifier and
+requires the caller to choose the intended check explicitly, so an unrelated
+sibling project cannot affect the task. An explicit verifier always wins. An
+explicit empty verifier list disables discovery, as does `exec
+--no-project-verifier-discovery`. This omission-versus-empty rule is the same
+through App Server and both SDKs. MCP sends an explicit empty list so an agent
+invoking Golutra cannot cause project code to run implicitly.
 Discovery happens before the turn is queued: the command boundary serializes
 the selected verifier list and the normalized `TaskContract` into the durable
 task/queued-turn payload. The execution worker therefore consumes an

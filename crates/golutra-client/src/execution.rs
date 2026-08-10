@@ -1,16 +1,263 @@
-//! Context 构建、task supervision、AgentLoop 与 provider auth 生命周期。
+//! Context construction, task supervision, AgentLoop, and provider auth lifecycles.
 
 use super::*;
+use golutra_llm::ProviderGenerationConfig;
+use tokio::{runtime::Handle, task::JoinHandle};
+
+const ABNORMAL_RECORDER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const HOST_SHUTDOWN_GRACE_TIMEOUT: Duration = Duration::from_millis(250);
+
+struct AbortOnDropJoinHandle<T> {
+    handle: Option<JoinHandle<T>>,
+}
+
+impl<T> AbortOnDropJoinHandle<T> {
+    fn new(handle: JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    fn abort(&self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+
+    async fn wait(&mut self) -> Result<T, tokio::task::JoinError> {
+        self.handle
+            .as_mut()
+            .expect("guarded join handle must be present")
+            .await
+    }
+
+    fn disarm(&mut self) {
+        self.handle = None;
+    }
+}
+
+impl<T> Drop for AbortOnDropJoinHandle<T> {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
 
 struct ChannelObservationSink {
-    sender: mpsc::UnboundedSender<HostedTraceCommand>,
+    sender: observation_recorder::ObservationSender,
+    send_error: Arc<StdMutex<Option<observation_recorder::ObservationSendError>>>,
+    cancellation: CancellationToken,
+}
+
+fn provider_max_tokens(settings: &ProviderTurnSettings) -> Option<u64> {
+    settings
+        .generation_config
+        .as_ref()
+        .and_then(|value| serde_json::from_value::<ProviderGenerationConfig>(value.clone()).ok())
+        .and_then(|config| config.max_tokens)
 }
 
 impl RuntimeObservationSink for ChannelObservationSink {
     fn emit(&mut self, observation: RuntimeObservation) {
-        let _ = self
+        let already_failed = self
+            .send_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+        if already_failed {
+            return;
+        }
+        if let Err(error) = self.sender.send(observation) {
+            let mut send_error = self
+                .send_error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            send_error.get_or_insert(error);
+            self.cancellation.cancel();
+        }
+    }
+}
+
+impl RuntimeHost {
+    /// Cancel every host-owned task and delegation operation, then wait until
+    /// their supervisors have released the in-process ownership maps. The
+    /// process supervisor is shut down by `RuntimeHost::close` after this
+    /// coordination step; keeping the two responsibilities separate prevents
+    /// task bookkeeping from being coupled to a particular process backend.
+    pub(super) async fn shutdown_active_work(&self) -> Result<(), ClientError> {
+        let mut failures = Vec::new();
+
+        // Commands acquire this mutex before they can create a task. A short
+        // barrier closes the race where shutdown snapshots controls while a
+        // Prompt/Create command is still about to insert one.
+        let command_guard = tokio::time::timeout(
+            TASK_CONTROL_CLEANUP_TIMEOUT,
+            self.execution.command_mutex.lock(),
+        )
+        .await;
+        if command_guard.is_err() {
+            failures.push("command dispatcher did not quiesce during shutdown".to_owned());
+        }
+        let deadline = Instant::now() + TASK_CONTROL_CLEANUP_TIMEOUT;
+        // Snapshot and signal active work while the dispatcher barrier is held. This prevents a
+        // command that was waiting on the barrier from inserting a new task after the snapshot.
+        // The guard is released before waiting for supervisors because delegated cleanup can
+        // issue an internal archive command.
+        self.cancel_active_work().await;
+        drop(command_guard);
+        if !self.wait_for_active_work_until(deadline).await {
+            // A stuck worker must not keep a host-owned delegation task alive
+            // indefinitely. Abort its worker, force-complete its waiter, and
+            // let the global process shutdown below clean any child tools.
+            let controls = self
+                .execution
+                .task_controls
+                .lock()
+                .await
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            for control in controls {
+                control.abort_handle.abort();
+            }
+            let operations = self
+                .execution
+                .delegation_operations
+                .lock()
+                .await
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            for operation in operations {
+                operation.force_stop();
+            }
+            self.execution.delegation_admissions.lock().await.clear();
+            self.execution.delegation_operations.lock().await.clear();
+
+            if !self
+                .wait_for_active_work_until(Instant::now() + HOST_SHUTDOWN_GRACE_TIMEOUT)
+                .await
+            {
+                failures.push("runtime task supervisors did not finish shutdown".to_owned());
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(ClientError::TaskExecution(failures.join("; ")))
+        }
+    }
+
+    async fn cancel_active_work(&self) {
+        let controls = self
+            .execution
+            .task_controls
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for control in controls {
+            control.execution.cancel();
+        }
+        let operations = self
+            .execution
+            .delegation_operations
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for operation in operations {
+            operation.cancel();
+        }
+    }
+
+    async fn wait_for_active_work_until(&self, deadline: Instant) -> bool {
+        loop {
+            let tasks_active = !self.execution.task_controls.lock().await.is_empty();
+            let operations_active = {
+                let mut operations = self.execution.delegation_operations.lock().await;
+                operations.retain(|_, operation| !operation.is_complete());
+                !operations.is_empty()
+            };
+            if !tasks_active && !operations_active {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
+pub(crate) struct HostedObservationRecorder {
+    sender: observation_recorder::ObservationSender,
+    worker: Option<tokio::task::JoinHandle<Result<(), ClientError>>>,
+}
+
+impl HostedObservationRecorder {
+    pub(crate) fn spawn(host: Arc<RuntimeHost>, task: HostedAgentTask) -> Self {
+        let (sender, receiver) = observation_recorder::channel();
+        let fact_recorder = CanonicalFactRecorder::new(host, task);
+        let worker = tokio::spawn(fact_recorder.drain(receiver));
+        Self {
+            sender,
+            worker: Some(worker),
+        }
+    }
+
+    pub(crate) fn sender(&self) -> observation_recorder::ObservationSender {
+        self.sender.clone()
+    }
+
+    pub(crate) async fn close(self) -> Result<(), ClientError> {
+        let mut this = self;
+        let close_result = this
             .sender
-            .send(HostedTraceCommand::Event(Box::new(observation)));
+            .close()
+            .map_err(|error| ClientError::TaskExecution(error.to_string()));
+        // Move the worker into an abort-on-drop guard before awaiting it. If this close future is
+        // cancelled, the guard is dropped with the future and cannot silently detach the worker.
+        let worker = this
+            .worker
+            .take()
+            .expect("hosted observation recorder worker must be present");
+        let mut worker = AbortOnDropJoinHandle::new(worker);
+        let recorder_result = worker
+            .wait()
+            .await
+            .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
+        worker.disarm();
+        close_result?;
+        recorder_result
+    }
+}
+
+impl Drop for HostedObservationRecorder {
+    fn drop(&mut self) {
+        // Close ingress first so the drain worker can persist the queued lossless facts. The
+        // cleanup task owns an abort-on-drop guard: runtime shutdown or task cancellation cannot
+        // silently detach the worker and retain the host forever.
+        let _ = self.sender.close();
+        if let Some(worker) = self.worker.take() {
+            let Ok(handle) = Handle::try_current() else {
+                worker.abort();
+                return;
+            };
+            handle.spawn(async move {
+                let mut worker = AbortOnDropJoinHandle::new(worker);
+                match tokio::time::timeout(ABNORMAL_RECORDER_DRAIN_TIMEOUT, worker.wait()).await {
+                    Ok(_) => {}
+                    Err(_) => {
+                        worker.abort();
+                        let _ = worker.wait().await;
+                    }
+                }
+                worker.disarm();
+            });
+        }
     }
 }
 
@@ -59,7 +306,7 @@ impl RuntimeHost {
             });
         }
 
-        let memory_store = self.memory_store.clone();
+        let memory_store = self.storage.memory_store.clone();
         let memory_query = objective.clone();
         let memories =
             run_blocking(move || memory_store.retrieve(&memory_query, MemoryScope::Project, 5))
@@ -134,11 +381,13 @@ impl RuntimeHost {
         current_task_id: TaskId,
     ) -> Result<Option<(String, Vec<String>)>, ClientError> {
         let events = self
+            .storage
             .repositories
             .events
             .load_recent(session_id, None, None, MAX_HISTORY_SOURCE_EVENTS)
             .await?;
         let context_compaction = self
+            .storage
             .repositories
             .events
             .latest_context_compaction(session_id)
@@ -180,7 +429,9 @@ impl RuntimeHost {
     }
 
     pub(super) fn next_sequence_no(&self) -> u64 {
-        self.next_sequence_no.fetch_add(1, Ordering::SeqCst)
+        self.execution
+            .next_sequence_no
+            .fetch_add(1, Ordering::SeqCst)
     }
 
     pub(super) fn scoped_idempotency_key(&self, idempotency_key: &str) -> String {
@@ -192,13 +443,56 @@ impl RuntimeHost {
         task: HostedAgentTask,
         session_lease: Option<Arc<File>>,
         pending_turns: Vec<PendingAgentTurn>,
+        delegation: Option<delegation_policy::DelegationContext>,
     ) -> Result<(), ClientError> {
-        let (execution, control) = agent_execution_channel(32);
+        if self.execution.shutdown.is_cancelled() {
+            return self
+                .fail_task_start(
+                    &task,
+                    ClientError::TaskExecution("runtime host is shutting down".to_owned()),
+                )
+                .await;
+        }
+        let provider_settings = ProviderTurnSettings::from_payload(&task.payload);
+        let (execution, control, delegation) = match delegation {
+            Some(context) => {
+                let cancellation = context.cancellation().child_token();
+                let (execution, control) =
+                    agent_execution_channel_with_cancellation(32, cancellation);
+                (execution, control, context)
+            }
+            None => {
+                let cancellation = self.execution.shutdown.child_token();
+                let (execution, control) =
+                    agent_execution_channel_with_cancellation(32, cancellation);
+                let max_cost_microusd =
+                    match delegation_policy::cost_budget_from_payload(&task.payload) {
+                        Ok(cost) => cost,
+                        Err(error) => {
+                            return self
+                                .fail_task_start(
+                                    &task,
+                                    ClientError::TaskExecution(error.to_owned()),
+                                )
+                                .await;
+                        }
+                    };
+                let context = delegation_policy::DelegationContext::root(
+                    task.session_id,
+                    task.payload.get("max_elapsed_ms").and_then(Value::as_u64),
+                    provider_max_tokens(&provider_settings),
+                    max_cost_microusd,
+                    execution.cancellation_token(),
+                );
+                (execution, control, context)
+            }
+        };
         for pending_turn in pending_turns {
-            execution
-                .append_turn(pending_turn)
-                .await
-                .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
+            if let Err(error) = execution.append_turn(pending_turn).await {
+                return self
+                    .fail_task_start(&task, ClientError::TaskExecution(error.to_string()))
+                    .await;
+            }
         }
         let (start_tx, start_rx) = oneshot::channel();
         let worker_host = self.clone();
@@ -209,7 +503,18 @@ impl RuntimeHost {
         });
         let abort_handle = worker.abort_handle();
         let (completion_sender, completion) = watch::channel(false);
-        self.task_controls.lock().await.insert(
+        let mut task_controls = self.execution.task_controls.lock().await;
+        if self.execution.shutdown.is_cancelled() {
+            worker.abort();
+            drop(task_controls);
+            return self
+                .fail_task_start(
+                    &task,
+                    ClientError::TaskExecution("runtime host is shutting down".to_owned()),
+                )
+                .await;
+        }
+        task_controls.insert(
             task.session_id,
             HostedTaskControl {
                 task_id: task.task_id,
@@ -223,13 +528,15 @@ impl RuntimeHost {
                     .get("yolo")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
-                provider_settings: ProviderTurnSettings::from_payload(&task.payload),
+                provider_settings,
                 execution,
                 abort_handle,
                 completion,
+                delegation: Some(delegation),
                 _session_lease: session_lease,
             },
         );
+        drop(task_controls);
         let supervisor = self.clone();
         let supervised_task = task.clone();
         tokio::spawn(async move {
@@ -239,6 +546,42 @@ impl RuntimeHost {
         });
         start_tx.send(()).map_err(|_| ClientError::TaskCancelled)?;
         Ok(())
+    }
+
+    /// Convert a failure before the supervisor owns the task into the same durable terminal
+    /// facts used for ordinary worker failures. The task-created event is already persisted by
+    /// the caller at this point, so returning directly would leave an active lane with no worker.
+    async fn fail_task_start(
+        self: &Arc<Self>,
+        task: &HostedAgentTask,
+        error: ClientError,
+    ) -> Result<(), ClientError> {
+        let existing_control = self
+            .execution
+            .task_controls
+            .lock()
+            .await
+            .get(&task.session_id)
+            .filter(|control| control.task_id == task.task_id)
+            .cloned();
+        if let Some(control) = existing_control {
+            control.execution.cancel();
+            control.abort_handle.abort();
+            let mut completion = control.completion.clone();
+            let _ =
+                wait_for_task_control_cleanup(&mut completion, TASK_CONTROL_CLEANUP_TIMEOUT).await;
+            return Err(error);
+        }
+
+        let failure = ClientError::TaskExecution(error.to_string());
+        if self
+            .record_task_execution_failure(task, failure)
+            .await
+            .is_err()
+        {
+            let _ = self.finish_lane(task, TaskStatus::Failed).await;
+        }
+        Err(error)
     }
 
     pub(super) async fn supervise_agent_task(
@@ -257,6 +600,33 @@ impl RuntimeHost {
                 "agent task worker stopped unexpectedly: {error}"
             ))),
         };
+        let control = self
+            .execution
+            .task_controls
+            .lock()
+            .await
+            .get(&task.session_id)
+            .cloned();
+        // A delegated context observes its parent's token, while a root context observes this
+        // task's token. Freeze the parent state before cancelling local task resources so ordinary
+        // root completion cannot be mistaken for delegated-parent cancellation.
+        let delegated_parent_cancelled = task
+            .payload
+            .get(crate::delegation::DELEGATED_TASK_MARKER)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            && control
+                .as_ref()
+                .and_then(|control| control.delegation.as_ref())
+                .is_some_and(|context| context.cancellation().is_cancelled());
+        // Normal task completion must not cancel runtime-scoped background processes. Explicit
+        // aborts already cancel the execution token before the worker exits; an error or raw
+        // worker abort still needs the fallback cleanup so foreground resources cannot leak.
+        if result.is_err()
+            && let Some(control) = control.as_ref()
+        {
+            control.execution.cancel();
+        }
         if let Err(error) = result {
             let terminal_status = if matches!(&error, ClientError::TaskCancelled) {
                 TaskStatus::Cancelled
@@ -272,18 +642,62 @@ impl RuntimeHost {
             }
         }
         self.clear_task_control(task.session_id, task.task_id).await;
+        if delegated_parent_cancelled {
+            let _ = delegation::cleanup_cancelled_delegated_task(&self, &task).await;
+        }
         completion.send_replace(true);
     }
 
     pub(super) async fn clear_task_control(&self, session_id: SessionId, task_id: TaskId) {
-        let mut controls = self.task_controls.lock().await;
+        let mut controls = self.execution.task_controls.lock().await;
         if controls
             .get(&session_id)
             .is_some_and(|control| control.task_id == task_id)
         {
             controls.remove(&session_id);
         }
-        self.provider_auth_waiters.lock().await.remove(&session_id);
+        drop(controls);
+        self.execution
+            .provider_auth_waiters
+            .lock()
+            .await
+            .remove(&session_id);
+        self.execution
+            .delegation_admissions
+            .lock()
+            .await
+            .remove(&session_id);
+        self.execution
+            .delegation_operations
+            .lock()
+            .await
+            .retain(|_, operation| !operation.belongs_to(session_id) || !operation.is_complete());
+    }
+
+    pub(super) async fn cleanup_delegation_operation(
+        &self,
+        parent_session_id: SessionId,
+        identity: &str,
+        operation: &Arc<delegation::DelegationOperation>,
+    ) {
+        if self
+            .execution
+            .task_controls
+            .lock()
+            .await
+            .contains_key(&parent_session_id)
+        {
+            // Completed operations remain available for idempotent retries while the parent
+            // task is still alive. The parent cleanup path removes them once its control ends.
+            return;
+        }
+        let mut operations = self.execution.delegation_operations.lock().await;
+        if operations
+            .get(identity)
+            .is_some_and(|current| Arc::ptr_eq(current, operation))
+        {
+            operations.remove(identity);
+        }
     }
 
     pub(super) async fn run_agent_task(
@@ -342,21 +756,18 @@ impl RuntimeHost {
         let mut tool_executor = self
             .build_tool_executor(policy, workspace_root.clone(), requested_network, yolo)
             .await?;
-        if task
+        let delegated_task = task
             .payload
             .get(crate::delegation::DELEGATED_TASK_MARKER)
             .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            tool_executor = tool_executor
-                .without_tool("delegate_task")
-                .without_tool("ask_user");
-        } else {
-            tool_executor = tool_executor
-                .with_task_delegation_backend(Arc::new(
-                    crate::delegation::RuntimeTaskDelegationBackend::new(Arc::downgrade(&self)),
-                ))
-                .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
+            .unwrap_or(false);
+        tool_executor = tool_executor
+            .with_task_delegation_backend(Arc::new(
+                crate::delegation::RuntimeTaskDelegationBackend::new(Arc::downgrade(&self)),
+            ))
+            .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
+        if delegated_task {
+            tool_executor = tool_executor.without_tool("ask_user");
         }
         let workspace_tool_names = tool_executor
             .registry()
@@ -407,21 +818,9 @@ impl RuntimeHost {
                 task.payload.get("output_schema"),
             )
             .await?;
-        let (trace_tx, mut trace_rx) = mpsc::unbounded_channel::<HostedTraceCommand>();
-        let fact_recorder = CanonicalFactRecorder::new(self.clone(), task.clone());
-        let trace_recorder = tokio::spawn(async move {
-            while let Some(command) = trace_rx.recv().await {
-                match command {
-                    HostedTraceCommand::Event(event) => {
-                        fact_recorder.commit(*event).await?;
-                    }
-                    HostedTraceCommand::Flush(sender) => {
-                        let _ = sender.send(Ok(()));
-                    }
-                }
-            }
-            Ok::<(), ClientError>(())
-        });
+        let trace_recorder = HostedObservationRecorder::spawn(self.clone(), task.clone());
+        let trace_tx = trace_recorder.sender();
+        let observation_send_error = Arc::new(StdMutex::new(None));
         let harness = if self.workspace_root.is_some() {
             harness.with_before_side_effect_recorder(Arc::new(HostedCheckpointRecorder {
                 host: self.clone(),
@@ -452,12 +851,15 @@ impl RuntimeHost {
             Some(max_elapsed_ms) => run.with_max_elapsed_ms(max_elapsed_ms),
             None => run,
         };
+        let control_cancellation = control.cancellation_token();
         let outcome = harness
             .execute(
                 run,
                 control,
                 ChannelObservationSink {
                     sender: trace_tx.clone(),
+                    send_error: observation_send_error.clone(),
+                    cancellation: control_cancellation.clone(),
                 },
             )
             .await
@@ -466,10 +868,16 @@ impl RuntimeHost {
                 error => ClientError::TaskExecution(error.to_string()),
             });
         drop(harness);
-        drop(trace_tx);
-        trace_recorder
-            .await
-            .map_err(|error| ClientError::TaskExecution(error.to_string()))??;
+        trace_recorder.close().await?;
+        if let Some(error) = observation_send_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            return Err(ClientError::TaskExecution(format!(
+                "trace observation delivery failed: {error}"
+            )));
+        }
         let outcome = outcome?;
         let terminal_status = if outcome.candidate_ready_for_external_verification {
             TaskStatus::Partial
@@ -553,7 +961,8 @@ impl RuntimeHost {
             match plan {
                 Ok(plan) => {
                     if let Some((request_id, _)) = pending.take() {
-                        self.provider_auth_waiters
+                        self.execution
+                            .provider_auth_waiters
                             .lock()
                             .await
                             .remove(&task.session_id);
@@ -579,7 +988,7 @@ impl RuntimeHost {
             };
             tokio::select! {
                 _ = cancellation.cancelled() => {
-                    self.provider_auth_waiters.lock().await.remove(&task.session_id);
+                    self.execution.provider_auth_waiters.lock().await.remove(&task.session_id);
                     return Err(ClientError::TaskCancelled);
                 }
                 resolution = receiver => {
@@ -610,7 +1019,7 @@ impl RuntimeHost {
     > {
         let request_id = ProviderAuthRequestId::new();
         let (sender, receiver) = oneshot::channel();
-        self.provider_auth_waiters.lock().await.insert(
+        self.execution.provider_auth_waiters.lock().await.insert(
             task.session_id,
             PendingProviderAuth {
                 request_id,
@@ -618,6 +1027,7 @@ impl RuntimeHost {
             },
         );
         let mut transition = self
+            .execution
             .lane_manager
             .lock()
             .await
@@ -640,6 +1050,7 @@ impl RuntimeHost {
         summary: &str,
     ) -> Result<(), ClientError> {
         let mut transition = self
+            .execution
             .lane_manager
             .lock()
             .await
@@ -650,5 +1061,64 @@ impl RuntimeHost {
         transition.event.payload["request_id"] = json!(request_id);
         transition.event.payload["runtime_lane"] = json!(transition.lane);
         self.record_event(transition.event).await
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use super::*;
+
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_normal_close_aborts_the_owned_recorder_worker() {
+        let (sender, receiver) = observation_recorder::channel();
+        let worker_started = tokio::sync::oneshot::channel();
+        let worker_started_sender = worker_started.0;
+        let worker_started_receiver = worker_started.1;
+        let worker_dropped = Arc::new(AtomicBool::new(false));
+        let worker_probe = DropProbe(worker_dropped.clone());
+        let worker = tokio::spawn(async move {
+            let _probe = worker_probe;
+            let _receiver = receiver;
+            worker_started_sender
+                .send(())
+                .expect("worker start notification");
+            std::future::pending::<Result<(), ClientError>>().await
+        });
+        worker_started_receiver.await.expect("worker must start");
+
+        let recorder = HostedObservationRecorder {
+            sender,
+            worker: Some(worker),
+        };
+        let close_task = tokio::spawn(recorder.close());
+        tokio::task::yield_now().await;
+        close_task.abort();
+        assert!(
+            close_task
+                .await
+                .expect_err("cancelled close must be aborted")
+                .is_cancelled()
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !worker_dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled close must abort the recorder worker");
     }
 }

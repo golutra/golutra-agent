@@ -19,12 +19,30 @@ fn session_summary(thread: ThreadRecord) -> SessionSummary {
 }
 
 impl RuntimeHost {
+    pub(super) async fn session_is_delegated_child(
+        &self,
+        session_id: SessionId,
+    ) -> Result<bool, ClientError> {
+        let thread = self
+            .storage
+            .repositories
+            .threads
+            .by_session(session_id)
+            .await?;
+        Ok(thread.is_some_and(|thread| {
+            // Forked threads always persist their source sequence. A parent without a fork
+            // boundary is the durable lineage marker for a host-created delegated child.
+            thread.parent_thread_id.is_some() && thread.forked_from_sequence_no.is_none()
+        }))
+    }
+
     pub async fn list_threads(&self, limit: u32) -> Result<Vec<ThreadRecord>, ClientError> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         let workspace_root = self.workspace_root_string();
         let threads = self
+            .storage
             .repositories
             .threads
             .list(workspace_root.as_deref(), limit)
@@ -46,6 +64,7 @@ impl RuntimeHost {
         }
         let workspace_root = self.workspace_root_string();
         let mut records = self
+            .storage
             .repositories
             .threads
             .page(
@@ -86,6 +105,7 @@ impl RuntimeHost {
             ));
         }
         let anchor = self
+            .storage
             .repositories
             .threads
             .by_id(request.anchor_thread_id)
@@ -106,6 +126,7 @@ impl RuntimeHost {
         }
         let workspace_root = self.workspace_root_string();
         let records = self
+            .storage
             .repositories
             .threads
             .window(
@@ -127,7 +148,12 @@ impl RuntimeHost {
         &self,
         session_id: SessionId,
     ) -> Result<Option<ThreadRecord>, ClientError> {
-        let thread = self.repositories.threads.by_session(session_id).await?;
+        let thread = self
+            .storage
+            .repositories
+            .threads
+            .by_session(session_id)
+            .await?;
         if let Some(thread) = &thread {
             self.ensure_thread_in_workspace(thread)?;
             self.ensure_thread_not_removed(thread)?;
@@ -137,6 +163,7 @@ impl RuntimeHost {
 
     pub async fn resume_thread(&self, thread_id: ThreadId) -> Result<ThreadRecord, ClientError> {
         let thread = self
+            .storage
             .repositories
             .threads
             .by_id(thread_id)
@@ -155,6 +182,7 @@ impl RuntimeHost {
         from_turn_id: Option<TurnId>,
     ) -> Result<ThreadRecord, ClientError> {
         let parent = self
+            .storage
             .repositories
             .threads
             .by_id(thread_id)
@@ -165,6 +193,7 @@ impl RuntimeHost {
         self.ensure_thread_in_workspace(&parent)?;
         self.ensure_thread_not_removed(&parent)?;
         let parent_state = self
+            .storage
             .repositories
             .projections
             .state(parent.session_id, None)
@@ -175,6 +204,7 @@ impl RuntimeHost {
             )));
         }
         let parent_events = self
+            .storage
             .repositories
             .events
             .load(parent.session_id, None, None)
@@ -213,17 +243,19 @@ impl RuntimeHost {
             archived: false,
             removed: false,
         };
-        let _writer = self.event_writer.lock().await;
+        let _writer = self.execution.event_writer.lock().await;
         let forked_events = self
+            .storage
             .repositories
             .threads
             .fork(&child, parent.session_id, through_sequence_no)
             .await?;
         for event in &forked_events {
-            let _ = self.event_bus.send(event.clone());
+            self.publish_live_event(event.clone());
         }
         drop(_writer);
         let child_state = self
+            .storage
             .repositories
             .projections
             .state(child.session_id, None)
@@ -266,6 +298,7 @@ impl RuntimeHost {
         thread_id: ThreadId,
     ) -> Result<RolloutExport, ClientError> {
         let mut thread = self
+            .storage
             .repositories
             .threads
             .by_id(thread_id)
@@ -275,8 +308,9 @@ impl RuntimeHost {
             })?;
         self.ensure_thread_in_workspace(&thread)?;
         self.ensure_thread_rollout_path(&mut thread).await?;
-        let _writer = self.event_writer.lock().await;
+        let _writer = self.execution.event_writer.lock().await;
         let events = self
+            .storage
             .repositories
             .events
             .load(thread.session_id, None, None)
@@ -323,6 +357,7 @@ impl RuntimeHost {
         let source_workspace_root = normalize_rebind_source(from_workspace_root.as_ref())?;
         let from_workspace_root = source_workspace_root.display().to_string();
         let mut thread = self
+            .storage
             .repositories
             .threads
             .by_id(thread_id)
@@ -338,6 +373,7 @@ impl RuntimeHost {
         }
         self.ensure_thread_not_removed(&thread)?;
         let state = self
+            .storage
             .repositories
             .projections
             .state(thread.session_id, None)
@@ -392,7 +428,7 @@ impl RuntimeHost {
             .map(|paths| paths.rollout_path(thread.thread_id).display().to_string());
         thread.updated_at = chrono::Utc::now();
         thread.recency_at = thread.updated_at;
-        self.repositories.threads.upsert(&thread).await?;
+        self.storage.repositories.threads.upsert(&thread).await?;
         let rollout = self.rebuild_thread_rollout(&thread).await?;
         self.record_event(host_event(
             self.next_sequence_no(),
@@ -430,7 +466,12 @@ impl RuntimeHost {
         payload: &Value,
     ) -> Result<(), ClientError> {
         let now = chrono::Utc::now();
-        let existing = self.repositories.threads.by_session(session_id).await?;
+        let existing = self
+            .storage
+            .repositories
+            .threads
+            .by_session(session_id)
+            .await?;
         if let Some(existing) = &existing {
             self.ensure_thread_in_workspace(existing)?;
             self.ensure_thread_not_removed(existing)?;
@@ -445,7 +486,7 @@ impl RuntimeHost {
             )));
         }
         let payload_thread = match payload_thread_id {
-            Some(thread_id) => self.repositories.threads.by_id(thread_id).await?,
+            Some(thread_id) => self.storage.repositories.threads.by_id(thread_id).await?,
             None => None,
         };
         if let Some(payload_thread) = &payload_thread {
@@ -489,7 +530,8 @@ impl RuntimeHost {
         }
         let parent_thread = match payload_parent_thread_id {
             Some(parent_thread_id) => Some(
-                self.repositories
+                self.storage
+                    .repositories
                     .threads
                     .by_id(parent_thread_id)
                     .await?
@@ -541,7 +583,7 @@ impl RuntimeHost {
             archived: false,
             removed: false,
         };
-        self.repositories.threads.upsert(&thread).await?;
+        self.storage.repositories.threads.upsert(&thread).await?;
         Ok(())
     }
 }

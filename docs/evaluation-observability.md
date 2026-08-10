@@ -94,7 +94,7 @@ case_ref × partition × provider_variant × seed
 
 ## 可操作的失败观测闭包
 
-单个 error event 不再直接等同于最终根因。runtime protocol v7 把失败投影成
+单个 error event 不再直接等同于最终根因。runtime protocol v8（兼容 v7）把失败投影成
 一等 `FailureEpisode`：producer failure、runtime self-check 和 external
 assertion 可以归并为同一 episode，并显式记录 `active/recovered/superseded`、
 `recovered_by` 与 `superseded_by`。后续等价工具成功或 verification/evaluator

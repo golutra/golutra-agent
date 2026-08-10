@@ -18,6 +18,7 @@ golutra-core.workspace = true
 golutra-eval = { path = "../golutra-eval" }
 golutra-llm = { path = "../golutra-llm" }
 golutra-plugin = { path = "../golutra-plugin" }
+golutra-project-service.workspace = true
 golutra-protocol.workspace = true
 miette.workspace = true
 rmcp.workspace = true

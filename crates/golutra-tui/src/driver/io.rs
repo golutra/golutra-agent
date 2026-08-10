@@ -41,55 +41,60 @@ pub(crate) async fn run_inspect_command(args: &Args, command: InspectArgs) -> mi
     )
     .await?;
 
-    let wait = command
-        .wait
-        .as_deref()
-        .unwrap_or(if command.prompt.is_some() {
-            "auto"
-        } else {
-            "none"
-        });
-    if let Some(prompt) = command.prompt {
-        match driver
-            .try_handle(DriverRequest::InputPrompt { text: prompt })
-            .await?
-        {
-            DriverResponse::Accepted { .. } => {}
-            response => return Err(unexpected_response("submit prompt", response)),
-        }
-    }
-    if wait != "none" {
-        let condition = inspect_wait_condition(wait, panes)?;
-        match driver
-            .try_handle(DriverRequest::Wait {
-                until: condition,
-                timeout_ms: Some(command.timeout_ms),
-            })
-            .await?
-        {
-            DriverResponse::WaitResult { .. } => {}
-            DriverResponse::WaitTimeout { .. } => {
-                return Err(miette::miette!(
-                    "wait_timeout: condition {wait} was not reached within {}ms",
-                    command.timeout_ms
-                ));
+    let result: miette::Result<()> = async {
+        let wait = command
+            .wait
+            .as_deref()
+            .unwrap_or(if command.prompt.is_some() {
+                "auto"
+            } else {
+                "none"
+            });
+        if let Some(prompt) = command.prompt {
+            match driver
+                .try_handle(DriverRequest::InputPrompt { text: prompt })
+                .await?
+            {
+                DriverResponse::Accepted { .. } => {}
+                response => return Err(unexpected_response("submit prompt", response)),
             }
-            response => return Err(unexpected_response("wait", response)),
         }
-    }
+        if wait != "none" {
+            let condition = inspect_wait_condition(wait, panes)?;
+            match driver
+                .try_handle(DriverRequest::Wait {
+                    until: condition,
+                    timeout_ms: Some(command.timeout_ms),
+                })
+                .await?
+            {
+                DriverResponse::WaitResult { .. } => {}
+                DriverResponse::WaitTimeout { .. } => {
+                    return Err(miette::miette!(
+                        "wait_timeout: condition {wait} was not reached within {}ms",
+                        command.timeout_ms
+                    ));
+                }
+                response => return Err(unexpected_response("wait", response)),
+            }
+        }
 
-    let frame = driver
-        .snapshot(SnapshotRequest {
-            scope,
-            panes,
-            width: command.width,
-            height: command.height,
-            rows: command.rows.as_deref().map(parse_row_range).transpose()?,
-            frame_id: None,
-            detail,
-        })
-        .await?;
-    write_inspect_output(&command.format, frame).await
+        let frame = driver
+            .snapshot(SnapshotRequest {
+                scope,
+                panes,
+                width: command.width,
+                height: command.height,
+                rows: command.rows.as_deref().map(parse_row_range).transpose()?,
+                frame_id: None,
+                detail,
+            })
+            .await?;
+        write_inspect_output(&command.format, frame).await
+    }
+    .await;
+    let shutdown = driver.shutdown().await;
+    result.and(shutdown)
 }
 
 fn inspect_wait_condition(value: &str, panes: SnapshotPanes) -> miette::Result<WaitCondition> {
@@ -125,23 +130,29 @@ pub(crate) async fn run_driver_command(args: &Args, command: DriverArgs) -> miet
 
     #[cfg(unix)]
     if let Some(socket) = command.socket.as_deref() {
-        return run_socket_driver(&mut driver, socket, &command).await;
+        let result = run_socket_driver(&mut driver, socket, &command).await;
+        let shutdown = driver.shutdown().await;
+        return result.and(shutdown);
     }
     #[cfg(not(unix))]
     if command.socket.is_some() {
-        return Err(miette::miette!(
+        let error = Err(miette::miette!(
             "unsupported_transport: Unix socket mode is unavailable on this platform"
         ));
+        let shutdown = driver.shutdown().await;
+        return error.and(shutdown);
     }
 
-    serve_protocol(
+    let result = serve_protocol(
         &mut driver,
         tokio::io::stdin(),
         tokio::io::stdout(),
         heartbeat_duration(command.heartbeat_secs),
         (command.idle_timeout_secs > 0).then(|| Duration::from_secs(command.idle_timeout_secs)),
     )
-    .await
+    .await;
+    let shutdown = driver.shutdown().await;
+    result.and(shutdown)
 }
 
 async fn driver_transport(
@@ -484,6 +495,8 @@ where
         driver.cancel_wait_metrics(pending.started_at);
     }
     reader_task.abort();
+    // A socket connection is short-lived, while the driver and its runtime attachment are
+    // owned by the surrounding socket server. Keep the transport alive for the next client.
     protocol_result
 }
 

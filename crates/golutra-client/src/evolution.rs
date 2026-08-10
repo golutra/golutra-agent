@@ -48,12 +48,12 @@ impl RuntimeHost {
             .unwrap_or_default();
         validate_budget(&budget)?;
 
-        let evaluation_store = self.evaluation_store.clone();
+        let evaluation_store = self.storage.evaluation_store.clone();
         let evaluation = run_blocking(move || evaluation_store.snapshot()).await??;
         let plan = EvolutionPlanner.plan(&evaluation, &objective, budget);
         let run_id = plan.run.run_id.clone();
         let selected = plan.run.selected_task_ids.len();
-        let evolution_store = self.evolution_store.clone();
+        let evolution_store = self.storage.evolution_store.clone();
         let state = run_blocking(move || evolution_store.record_plan(plan)).await??;
         let run = state
             .runs
@@ -89,7 +89,7 @@ impl RuntimeHost {
         session_id: SessionId,
         command: SessionCommand,
     ) -> Result<CommandAck, ClientError> {
-        let snapshot_store = self.evolution_store.clone();
+        let snapshot_store = self.storage.evolution_store.clone();
         let snapshot = run_blocking(move || snapshot_store.snapshot()).await??;
         let requested_run_id = command
             .payload
@@ -123,7 +123,7 @@ impl RuntimeHost {
         }
 
         let run_id = run.run_id.clone();
-        let start_store = self.evolution_store.clone();
+        let start_store = self.storage.evolution_store.clone();
         run_blocking({
             let run_id = run_id.clone();
             move || start_store.start_run(&run_id)
@@ -178,7 +178,7 @@ impl RuntimeHost {
                 run.selected_task_ids.len()
             )
         });
-        let finish_store = self.evolution_store.clone();
+        let finish_store = self.storage.evolution_store.clone();
         let finished = run_blocking({
             let run_id = run_id.clone();
             let blocked_reason = blocked_reason.clone();
@@ -211,7 +211,7 @@ impl RuntimeHost {
         command: SessionCommand,
     ) -> Result<CommandAck, ClientError> {
         let candidate_id = required_string(&command.payload, "candidate_id")?;
-        let evaluation_store = self.evaluation_store.clone();
+        let evaluation_store = self.storage.evaluation_store.clone();
         let candidate = run_blocking(move || evaluation_store.snapshot())
             .await??
             .skill_candidates
@@ -220,7 +220,7 @@ impl RuntimeHost {
             .ok_or_else(|| {
                 ClientError::TaskExecution(format!("skill candidate {candidate_id} was not found"))
             })?;
-        let evolution_store = self.evolution_store.clone();
+        let evolution_store = self.storage.evolution_store.clone();
         let record = run_blocking(move || evolution_store.stage_skill(&candidate)).await??;
         self.record_skill_event(
             session_id,
@@ -265,7 +265,7 @@ impl RuntimeHost {
             .map(ToOwned::to_owned)
             .collect::<Vec<_>>();
         let reviewer = command.actor.id.clone();
-        let evolution_store = self.evolution_store.clone();
+        let evolution_store = self.storage.evolution_store.clone();
         let record = run_blocking({
             let skill_id = skill_id.clone();
             move || {
@@ -297,7 +297,7 @@ impl RuntimeHost {
         command: SessionCommand,
     ) -> Result<CommandAck, ClientError> {
         let skill_id = required_string(&command.payload, "skill_id")?;
-        let evolution_store = self.evolution_store.clone();
+        let evolution_store = self.storage.evolution_store.clone();
         let record = run_blocking({
             let skill_id = skill_id.clone();
             move || evolution_store.install_skill(&skill_id)
@@ -321,7 +321,7 @@ impl RuntimeHost {
     ) -> Result<CommandAck, ClientError> {
         let skill_id = required_string(&command.payload, "skill_id")?;
         let reason = required_string(&command.payload, "reason")?;
-        let evolution_store = self.evolution_store.clone();
+        let evolution_store = self.storage.evolution_store.clone();
         let record = run_blocking({
             let skill_id = skill_id.clone();
             move || evolution_store.rollback_skill(&skill_id, &reason)
@@ -342,7 +342,7 @@ impl RuntimeHost {
         &self,
         objective: &str,
     ) -> Result<Option<String>, ClientError> {
-        let evolution_store = self.evolution_store.clone();
+        let evolution_store = self.storage.evolution_store.clone();
         let objective = objective.to_owned();
         let manifests = run_blocking(move || {
             evolution_store.active_skill_context(&objective, SKILL_CONTEXT_LIMIT)
@@ -403,7 +403,7 @@ impl RuntimeHost {
             started_at: chrono::Utc::now(),
             completed_at: None,
         };
-        let evolution_store = self.evolution_store.clone();
+        let evolution_store = self.storage.evolution_store.clone();
         let started_execution = execution.clone();
         run_blocking(move || evolution_store.record_execution(started_execution)).await??;
         self.record_event(host_event(
@@ -448,6 +448,7 @@ impl RuntimeHost {
             .is_err()
             {
                 if let Some(control) = child
+                    .execution
                     .task_controls
                     .lock()
                     .await
@@ -465,6 +466,7 @@ impl RuntimeHost {
             }
         }
         let state = child
+            .storage
             .repositories
             .projections
             .state(child_session_id, None)
@@ -478,7 +480,7 @@ impl RuntimeHost {
             execution.status = task_status_name(state.task_status).to_owned();
         }
         execution.completed_at = Some(chrono::Utc::now());
-        let evolution_store = self.evolution_store.clone();
+        let evolution_store = self.storage.evolution_store.clone();
         let completed_execution = execution.clone();
         run_blocking(move || evolution_store.record_execution(completed_execution)).await??;
         self.record_event(host_event(

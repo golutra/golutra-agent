@@ -123,10 +123,11 @@ pub(crate) fn draw_ui(frame: &mut Frame<'_>, app: &mut TuiApp) {
     if next_layout.body_mode == BodyLayoutMode::Transcript {
         app.ensure_transcript_layout(next_layout.transcript);
         let row_count = app
-            .transcript_layout_cache
+            .transcript
+            .layout_cache
             .as_ref()
             .map_or(0, |cache| cache.layout.row_count);
-        app.sync_transcript_row_count_to(app.transcript_scroll.row_count, row_count);
+        app.sync_transcript_row_count_to(app.transcript.scroll.row_count, row_count);
     }
     app.layout = next_layout;
     let layout = app.layout;
@@ -150,7 +151,7 @@ pub(crate) fn bottom_pane_height(app: &TuiApp) -> u16 {
 
 pub(crate) fn bottom_pane_height_for_width(app: &TuiApp, width: u16) -> u16 {
     let composer_suppressed = app.overlay_surface().is_some()
-        || app.transcript_search.is_some()
+        || app.transcript.search.is_some()
         || app.history_search.is_some();
     let mention_rows = if composer_suppressed {
         0
@@ -173,7 +174,7 @@ pub(crate) fn bottom_pane_height_for_width(app: &TuiApp, width: u16) -> u16 {
     let overlay_rows = u16::from(app.overlay_surface().is_some());
     let provider_rows = u16::from(provider_footer_line(app).is_some());
     let activity_rows = u16::from(live_status_text(app, usize::from(width)).is_some());
-    let composer_rows = if app.transcript_search.is_some()
+    let composer_rows = if app.transcript.search.is_some()
         || app.history_search.is_some()
         || app.overlay_surface().is_some()
     {
@@ -264,7 +265,8 @@ pub(crate) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     }
 
     let layout = &app
-        .transcript_layout_cache
+        .transcript
+        .layout_cache
         .as_ref()
         .expect("transcript layout is prepared before drawing")
         .layout;
@@ -272,13 +274,13 @@ pub(crate) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let top_padding = transcript_top_padding(app, layout, area);
     let window = layout.visible_window(
         visible_rows,
-        app.transcript_scroll.offset_from_bottom,
-        app.transcript_top_row_override,
+        app.transcript.scroll.offset_from_bottom,
+        app.transcript.top_row_override,
     );
     let palette = app.palette();
     let (logical_window, local_scroll) = layout.logical_window(window);
     let logical_start = logical_window.start;
-    let mut lines = if app.transcript_presentation == TranscriptPresentation::Raw {
+    let mut lines = if app.transcript.presentation == TranscriptPresentation::Raw {
         layout.lines[logical_window.clone()]
             .iter()
             .map(|line| {
@@ -293,7 +295,7 @@ pub(crate) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     } else {
         layout.lines[logical_window].to_vec()
     };
-    if let Some(search) = &app.transcript_search {
+    if let Some(search) = &app.transcript.search {
         for (match_index, line_index) in search.matches.iter().copied().enumerate() {
             if let Some(line) = line_index
                 .checked_sub(logical_start)
@@ -313,15 +315,16 @@ pub(crate) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             }
         }
     }
-    let paragraph = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((u16::try_from(local_scroll).unwrap_or(u16::MAX), 0));
     let content_area = Rect::new(
         area.x,
         area.y.saturating_add(top_padding),
         area.width,
         area.height.saturating_sub(top_padding),
     );
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((
+        ratatui_vertical_scroll(local_scroll, content_area.height),
+        0,
+    ));
     frame.render_widget(paragraph, content_area);
 }
 
@@ -340,7 +343,10 @@ pub(crate) fn draw_auth_dialog(
                 .borders(Borders::TOP),
         )
         .wrap(Wrap { trim: false })
-        .scroll((auth_scroll_offset(dialog, area), 0));
+        .scroll((
+            ratatui_vertical_scroll(usize::from(auth_scroll_offset(dialog, area)), area.height),
+            0,
+        ));
     frame.render_widget(paragraph, area);
 }
 
@@ -1263,7 +1269,13 @@ pub(crate) fn draw_approval_dialog(
                     .borders(Borders::TOP),
             )
             .wrap(Wrap { trim: false })
-            .scroll((approval_scroll_offset(dialog, area), 0)),
+            .scroll((
+                ratatui_vertical_scroll(
+                    usize::from(approval_scroll_offset(dialog, area)),
+                    area.height,
+                ),
+                0,
+            )),
         area,
     );
 }
@@ -1448,7 +1460,7 @@ pub(crate) fn draw_question_dialog(
                     .borders(Borders::TOP),
             )
             .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
+            .scroll((ratatui_vertical_scroll(usize::from(scroll), area.height), 0)),
         area,
     );
     if free_text_focused && area.width > QUESTION_FREE_TEXT_PREFIX_WIDTH && area.height > 1 {
@@ -1660,7 +1672,7 @@ pub(crate) fn draw_help_dialog(
         Paragraph::new(lines)
             .block(Block::default().title("Help").borders(Borders::TOP))
             .wrap(Wrap { trim: false })
-            .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
+            .scroll((ratatui_vertical_scroll(scroll, area.height), 0)),
         area,
     );
 }
@@ -1770,7 +1782,7 @@ pub(crate) fn draw_dashboard(
         Paragraph::new(lines)
             .block(Block::default().title("Runtime").borders(Borders::TOP))
             .wrap(Wrap { trim: false })
-            .scroll((u16::try_from(dashboard.scroll).unwrap_or(u16::MAX), 0)),
+            .scroll((ratatui_vertical_scroll(dashboard.scroll, area.height), 0)),
         area,
     );
 }
@@ -1893,7 +1905,7 @@ pub(crate) fn draw_settings_dialog(
         Paragraph::new(lines)
             .block(Block::default().title("Settings").borders(Borders::TOP))
             .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
+            .scroll((ratatui_vertical_scroll(usize::from(scroll), area.height), 0)),
         area,
     );
     if dialog.editing_model && area.width > SETTINGS_MODEL_PREFIX_WIDTH && area.height > 1 {
@@ -2247,7 +2259,7 @@ fn draw_export_input_step(
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::default().title(title).borders(Borders::TOP))
-            .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
+            .scroll((ratatui_vertical_scroll(scroll, area.height), 0)),
         area,
     );
     if area.width > prefix_width && area.height > 1 {
@@ -2685,7 +2697,7 @@ pub(crate) fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
             Span::styled(composer_prefix, Style::default().fg(palette.accent)),
             Span::styled("Export session history", composer_style(app)),
         ])]
-    } else if let Some(search) = &app.transcript_search {
+    } else if let Some(search) = &app.transcript.search {
         vec![Line::from(vec![
             Span::styled("Find: ", Style::default().fg(palette.warning)),
             Span::styled(
@@ -2727,7 +2739,7 @@ pub(crate) fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
             .collect()
     };
     let composer_visible =
-        surface.is_none() && app.transcript_search.is_none() && app.history_search.is_none();
+        surface.is_none() && app.transcript.search.is_none() && app.history_search.is_none();
     if composer_visible {
         if let Some(completion) = &app.mention_completion {
             lines.extend(mention_candidate_lines(app, completion));
@@ -2796,8 +2808,8 @@ pub(crate) fn composer_cursor_position(area: Rect, app: &TuiApp) -> Option<(u16,
     let cursor = match app.overlay_surface() {
         Some(OverlaySurface::Auth) => auth_cursor_column(app.auth_dialog.as_ref()?)?,
         Some(_) => return None,
-        None if app.transcript_search.is_some() => {
-            let search = app.transcript_search.as_ref()?;
+        None if app.transcript.search.is_some() => {
+            let search = app.transcript.search.as_ref()?;
             let prefix_width = 6_u16;
             let viewport = search
                 .input

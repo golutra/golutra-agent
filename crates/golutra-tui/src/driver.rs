@@ -48,6 +48,41 @@ struct CachedFrame {
     frame: TuiFrame,
 }
 
+struct TransportCleanupGuard {
+    transport: Option<RuntimeTransport>,
+}
+
+impl TransportCleanupGuard {
+    fn new(transport: RuntimeTransport) -> Self {
+        Self {
+            transport: Some(transport),
+        }
+    }
+
+    async fn close(&mut self) {
+        if let Some(transport) = self.transport.take() {
+            let _ = transport.close().await;
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.transport = None;
+    }
+}
+
+impl Drop for TransportCleanupGuard {
+    fn drop(&mut self) {
+        let Some(transport) = self.transport.take() else {
+            return;
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = transport.close().await;
+            });
+        }
+    }
+}
+
 #[derive(Clone)]
 struct SnapshotUiState {
     projection: Option<UserProjection>,
@@ -84,7 +119,7 @@ impl SnapshotUiState {
             auth_dialog: app.auth_dialog.clone(),
             input: app.input.clone(),
             history_search: app.history_search.clone(),
-            transcript_search: app.transcript_search.clone(),
+            transcript_search: app.transcript.search.clone(),
             attachments: app.attachments.clone(),
             mention_completion: app.mention_completion.clone(),
             status_message: app.status_message.clone(),
@@ -106,7 +141,7 @@ impl SnapshotUiState {
         app.auth_dialog = self.auth_dialog;
         app.input = self.input;
         app.history_search = self.history_search;
-        app.transcript_search = self.transcript_search;
+        app.transcript.search = self.transcript_search;
         app.attachments = self.attachments;
         app.mention_completion = self.mention_completion;
         app.status_message = self.status_message;
@@ -164,6 +199,9 @@ impl TuiDriver {
         width: u16,
         height: u16,
     ) -> miette::Result<Self> {
+        // The transport may already own a remote attachment. Establish its
+        // cleanup owner before any validation or lookup can return early.
+        let mut cleanup = TransportCleanupGuard::new(transport.clone());
         validate_dimensions(width, height)?;
         let (thread_id, session_id) = resolve_driver_session(session, &transport).await?;
         let task_id = parse_task_id(task_id)?;
@@ -188,7 +226,13 @@ impl TuiDriver {
         )
         .with_yolo(yolo)
         .with_footer_context(runtime_cwd, provider_status.model);
-        let controller = TuiRuntimeController::attach(&mut app, transport).await?;
+        let controller = match TuiRuntimeController::attach(&mut app, transport).await {
+            Ok(controller) => controller,
+            Err(error) => {
+                cleanup.close().await;
+                return Err(error);
+            }
+        };
         let last_notified_cursor = app.cursor;
         let last_notified_status = app.projection.as_ref().map(|projection| projection.status);
         let mut driver = Self {
@@ -206,8 +250,17 @@ impl TuiDriver {
             wait_facts_cache: None,
             metrics: DriverMetricsAccumulator::default(),
         };
-        driver.last_controller_mode = driver.controller_mode().await?;
-        driver.refresh_active_layout()?;
+        if let Err(error) = driver.controller_mode().await {
+            let _ = driver.controller.shutdown().await;
+            cleanup.close().await;
+            return Err(error);
+        }
+        if let Err(error) = driver.refresh_active_layout() {
+            let _ = driver.controller.shutdown().await;
+            cleanup.close().await;
+            return Err(error);
+        }
+        cleanup.disarm();
         Ok(driver)
     }
 
@@ -227,6 +280,10 @@ impl TuiDriver {
             session_id: self.app.session_id.to_string(),
             controller_mode: self.last_controller_mode,
         })
+    }
+
+    pub(crate) async fn shutdown(&mut self) -> miette::Result<()> {
+        self.controller.shutdown().await
     }
 
     async fn state(&mut self) -> miette::Result<DriverState> {
@@ -864,10 +921,10 @@ impl TuiDriver {
         let saved_commands = saved_ui.command_messages.clone();
         let saved_debug = self.app.debug_mode;
         let saved_body_view_mode = self.app.body_view_mode;
-        let saved_transcript_scroll = self.app.transcript_scroll;
-        let saved_transcript_top_row_override = self.app.transcript_top_row_override;
-        let saved_transcript_revision = self.app.transcript_revision;
-        let saved_transcript_layout_cache = self.app.transcript_layout_cache.clone();
+        let saved_transcript_scroll = self.app.transcript.scroll;
+        let saved_transcript_top_row_override = self.app.transcript.top_row_override;
+        let saved_transcript_revision = self.app.transcript.revision;
+        let saved_transcript_layout_cache = self.app.transcript.layout_cache.clone();
         let saved_layout = self.app.layout;
         let saved_activity_projection = self.app.activity_projection.clone();
         let saved_change_projection = self.app.change_projection.clone();
@@ -904,7 +961,7 @@ impl TuiDriver {
         redact_snapshot_ui_state(&mut self.app);
         self.app.invalidate_transcript_layout();
         if !matches!(request.scope, SnapshotScope::Screen) {
-            self.app.transcript_scroll.reset(0);
+            self.app.transcript.scroll.reset(0);
         }
 
         let rendered = (|| -> miette::Result<_> {
@@ -928,10 +985,10 @@ impl TuiDriver {
         self.app.events = saved_events;
         self.app.developer_projection = saved_developer;
         saved_ui.restore(&mut self.app);
-        self.app.transcript_scroll = saved_transcript_scroll;
-        self.app.transcript_top_row_override = saved_transcript_top_row_override;
-        self.app.transcript_revision = saved_transcript_revision;
-        self.app.transcript_layout_cache = saved_transcript_layout_cache;
+        self.app.transcript.scroll = saved_transcript_scroll;
+        self.app.transcript.top_row_override = saved_transcript_top_row_override;
+        self.app.transcript.revision = saved_transcript_revision;
+        self.app.transcript.layout_cache = saved_transcript_layout_cache;
         self.app.debug_mode = saved_debug;
         self.app.body_view_mode = saved_body_view_mode;
         self.app.layout = saved_layout;
@@ -1202,7 +1259,7 @@ fn ensure_driver_binding_allows_key(
             | OverlaySurface::Settings
             | OverlaySurface::Export,
         ) => false,
-        None if app.history_search.is_some() || app.transcript_search.is_some() => false,
+        None if app.history_search.is_some() || app.transcript.search.is_some() => false,
         None => {
             let approval_shortcut = app.input.is_empty()
                 && app
@@ -1281,7 +1338,7 @@ fn ensure_driver_binding_allows_mouse_event(
 fn driver_enter_reaches_composer(app: &TuiApp) -> bool {
     app.overlay_surface().is_none()
         && app.history_search.is_none()
-        && app.transcript_search.is_none()
+        && app.transcript.search.is_none()
 }
 
 fn driver_key_submits_approval_dialog(key: &DriverKey) -> bool {
@@ -1344,7 +1401,7 @@ fn driver_input_state_bytes(app: &TuiApp) -> usize {
     if let Some(search) = &app.history_search {
         bytes = bytes.saturating_add(search.input.text().len());
     }
-    if let Some(search) = &app.transcript_search {
+    if let Some(search) = &app.transcript.search {
         bytes = bytes.saturating_add(search.input.text().len());
     }
     if let Some(stash) = &app.prompt_stash {
@@ -1428,7 +1485,7 @@ fn redact_snapshot_ui_state(app: &mut TuiApp) {
     if let Some(search) = &mut app.history_search {
         search.input.set_text(redacted_ui_text(search.input.text()));
     }
-    if let Some(search) = &mut app.transcript_search {
+    if let Some(search) = &mut app.transcript.search {
         search.input.set_text(redacted_ui_text(search.input.text()));
     }
     for attachment in &mut app.attachments {

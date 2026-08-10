@@ -695,7 +695,7 @@ MemoryInvalidated
 | Crate | P2.5 已实施内容 |
 | --- | --- |
 | `golutra-core` | VerificationPlan/Assertion、ContextSnapshot、PostTaskJob、MemoryClaim 基础类型 |
-| `golutra-protocol` | typed Context/Evaluation projection、TaskTrace、artifact chunk、job、regression、memory query/command/event schema（runtime protocol v7） |
+| `golutra-protocol` | typed Context/Evaluation projection、TaskTrace、artifact chunk、job、regression、memory query/command/event schema（runtime protocol v8，兼容 v7） |
 | `golutra-store` | context snapshot、job lease、trace ref closure、artifact range read、migration；`RuntimeRepositories` 五类事实访问 seam |
 | `golutra-context` | canonical request snapshot、contributor manifest、tool output budget |
 | `golutra-runtime` | task 前 verification plan、criterion/assertion 终态判定；completion/context guard/retry/trace/verification 模块边界 |

@@ -6,7 +6,10 @@ use golutra_core::{EventId, FileChangeKind, FileChangeSummary, TaskId, ToolResul
 use golutra_protocol::{RuntimeEvent, RuntimeEventType, UserProjection, VisibleStep};
 use serde_json::Value;
 
-use super::{TuiApp, operation_file_changes};
+use super::{
+    BodyViewMode, PaneScrollState, TranscriptLayoutCache, TranscriptPresentation,
+    TranscriptSearchState, TuiApp, operation_file_changes,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TranscriptRole {
@@ -33,6 +36,111 @@ pub(crate) struct OperationId(String);
 impl OperationId {
     pub(crate) fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TranscriptHistoryState {
+    pub(crate) enabled: bool,
+    pub(crate) committed_event_ids: HashSet<EventId>,
+    pub(crate) replay_generation: u64,
+    pub(crate) replay_ready: bool,
+}
+
+impl Default for TranscriptHistoryState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            committed_event_ids: HashSet::new(),
+            replay_generation: 0,
+            replay_ready: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TranscriptState {
+    pub(crate) expanded_operations: HashSet<OperationId>,
+    pub(crate) details_expanded: bool,
+    pub(crate) scroll: PaneScrollState,
+    pub(crate) top_row_override: Option<usize>,
+    pub(crate) revision: u64,
+    pub(crate) layout_cache: Option<TranscriptLayoutCache>,
+    pub(crate) history: TranscriptHistoryState,
+    pub(crate) presentation: TranscriptPresentation,
+    pub(crate) search: Option<TranscriptSearchState>,
+    pub(crate) search_restore_body_view: Option<BodyViewMode>,
+}
+
+impl Default for TranscriptState {
+    fn default() -> Self {
+        Self {
+            expanded_operations: HashSet::new(),
+            details_expanded: false,
+            scroll: PaneScrollState {
+                follow_tail: true,
+                ..PaneScrollState::default()
+            },
+            top_row_override: None,
+            revision: 0,
+            layout_cache: None,
+            history: TranscriptHistoryState::default(),
+            presentation: TranscriptPresentation::Rich,
+            search: None,
+            search_restore_body_view: None,
+        }
+    }
+}
+
+impl TranscriptState {
+    pub(crate) fn invalidate_layout(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+        self.layout_cache = None;
+    }
+
+    pub(crate) fn reset_view(&mut self) {
+        self.expanded_operations.clear();
+        self.details_expanded = false;
+        self.top_row_override = None;
+        self.invalidate_layout();
+    }
+
+    pub(crate) fn toggle_operation(&mut self, id: OperationId) {
+        if !self.expanded_operations.insert(id.clone()) {
+            self.expanded_operations.remove(&id);
+        }
+        self.invalidate_layout();
+    }
+
+    pub(crate) fn toggle_details(&mut self) -> bool {
+        self.details_expanded = !self.details_expanded;
+        self.invalidate_layout();
+        self.details_expanded
+    }
+
+    pub(crate) fn enable_inline_history(&mut self) {
+        if !self.history.enabled {
+            self.history.enabled = true;
+            self.invalidate_layout();
+        }
+    }
+
+    pub(crate) fn begin_history_replay(&mut self) {
+        self.history.replay_generation = self.history.replay_generation.wrapping_add(1);
+        self.history.replay_ready = false;
+        self.set_committed_event_ids(HashSet::new());
+    }
+
+    pub(crate) fn request_history_rebuild(&mut self) {
+        self.history.replay_generation = self.history.replay_generation.wrapping_add(1);
+        self.set_committed_event_ids(HashSet::new());
+    }
+
+    pub(crate) fn set_committed_event_ids(&mut self, ids: HashSet<EventId>) {
+        if self.history.committed_event_ids != ids {
+            self.history.committed_event_ids = ids;
+            self.invalidate_layout();
+        }
     }
 }
 
@@ -102,10 +210,10 @@ pub(crate) fn transcript_items(app: &TuiApp) -> Vec<TranscriptItem> {
     transcript_operation_projections(app)
         .into_iter()
         .map(|projection| {
-            let expanded = app.transcript_details_expanded
+            let expanded = app.transcript.details_expanded
                 || projection
                     .id()
-                    .is_some_and(|id| app.expanded_operations.contains(id));
+                    .is_some_and(|id| app.transcript.expanded_operations.contains(id));
             projection.item(expanded)
         })
         .collect()
@@ -116,8 +224,8 @@ pub(crate) fn transcript_operation_projections(app: &TuiApp) -> Vec<OperationPro
 }
 
 pub(crate) fn rendered_transcript_operation_projections(app: &TuiApp) -> Vec<OperationProjection> {
-    let committed = (app.inline_history_enabled && app.transcript_search.is_none())
-        .then_some(&app.inline_history_committed_event_ids);
+    let committed = (app.transcript.history.enabled && app.transcript.search.is_none())
+        .then_some(&app.transcript.history.committed_event_ids);
     transcript_operation_projections_after(app, committed)
 }
 

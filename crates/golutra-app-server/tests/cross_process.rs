@@ -2,7 +2,9 @@ use std::{collections::BTreeSet, env, fs, path::Path, process::Stdio, time::Dura
 
 #[cfg(unix)]
 use golutra_client::UnixIpcTransport;
-use golutra_client::{AppServerInfo, HttpSseTransport, RuntimeClient, TaskTraceClient};
+use golutra_client::{
+    AppServerInfo, ClientError, HttpSseTransport, RuntimeClient, TaskTraceClient,
+};
 use golutra_core::{
     Actor, ActorKind, CommandId, SessionId, TaskId, TaskReconciliationDecision, ThreadId, TraceView,
 };
@@ -140,6 +142,31 @@ async fn unix_ipc_and_http_share_commands_history_and_event_streams() {
             .iter()
             .map(|artifact| artifact.artifact_id)
             .collect::<std::collections::HashSet<_>>()
+    );
+
+    http.close().await.expect("close HTTP attachment");
+    ipc.close().await.expect("close IPC attachment");
+    let http_error = http
+        .subscribe(EventFilter {
+            session_id,
+            task_id: None,
+            after_sequence_no: None,
+        })
+        .await
+        .expect_err("closed HTTP transport must reject subscriptions");
+    assert!(
+        matches!(http_error, ClientError::Http(message) if message == "runtime transport is closed")
+    );
+    let ipc_error = ipc
+        .subscribe(EventFilter {
+            session_id,
+            task_id: None,
+            after_sequence_no: None,
+        })
+        .await
+        .expect_err("closed IPC transport must reject subscriptions");
+    assert!(
+        matches!(ipc_error, ClientError::Daemon(message) if message == "runtime transport is closed")
     );
 }
 

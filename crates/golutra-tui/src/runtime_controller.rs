@@ -58,6 +58,14 @@ impl TuiRuntimeController {
         &self.transport
     }
 
+    pub(crate) async fn shutdown(&mut self) -> miette::Result<()> {
+        self.abort_interactive_refresh();
+        self.transport
+            .close()
+            .await
+            .map_err(|error| miette::miette!("close runtime attachment: {error}"))
+    }
+
     pub(crate) async fn recv(&mut self) -> Option<Result<RuntimeEvent, ClientError>> {
         self.subscription.recv().await
     }

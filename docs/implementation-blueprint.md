@@ -881,21 +881,20 @@ Debug Projection 只在 debug/audit/replay 模式启用，并且只承担治理�
 
 1. `golutra-core`：核心 schema。
 2. `golutra-store`：SQLite、event log、artifact store。
-3. `golutra-event`：durable/live-only event。
-4. `golutra-runtime`：RuntimeLane、turn loop、LoopGuard、LoopDecision、verification 调度。
-5. `golutra-context`：ContextBuilder、TokenBudgetTracker、WorkingSummary。
-6. `golutra-llm`：provider contract、capability matrix、routing、usage normalization。
-7. `golutra-tools`：tool schema、permission、ToolResultEnvelope。
-8. `golutra-store` checkpoint 子模块：workspace checkpoint。
-9. `golutra-verify`：任务类型基础验证策略。
-10. `golutra-client` host 子模块：`RuntimeHost`、cwd thread resolver、`EventBus`、全局 `RuntimePaths`。
-11. `golutra-client`：统一 `RuntimeClient`、`RuntimeQuery`、event replay 和 live subscription 接口。
-12. `golutra-cli` / `golutra-tui`：默认通过 `EmbeddedTransport`，可显式选择 daemon/remote，只消费 command/query/event。
-13. `golutra-app-server`：用户级单实例管理多 cwd attachment，暴露 Unix IPC 与 HTTP command/query/SSE stream。
-14. `golutra-vis`：DebugProjection、event replay、audit 和 OTel JSON。
-15. `golutra-eval` / `golutra-evolution`：ImprovementCandidate、RegressionResult、PromotionDecision、GeneratedTask 与 Skill 生命周期。
-16. `golutra-plugin` / `golutra-mcp`：reviewed package、OS sandbox、approval 和统一 ToolContract bridge。
-17. TypeScript/Python SDK 与安装/三平台 CI 交付。
+3. `golutra-runtime`：RuntimeLane、turn loop、LoopGuard、LoopDecision、verification 调度。
+4. `golutra-context`：ContextBuilder、TokenBudgetTracker、WorkingSummary。
+5. `golutra-llm`：provider contract、capability matrix、routing、usage normalization。
+6. `golutra-tools`：tool schema、permission、ToolResultEnvelope。
+7. `golutra-store` checkpoint 子模块：workspace checkpoint。
+8. `golutra-verify`：任务类型基础验证策略。
+9. `golutra-client` host 子模块：`RuntimeHost`、cwd thread resolver、`EventBus`、全局 `RuntimePaths`。
+10. `golutra-client`：统一 `RuntimeClient`、`RuntimeQuery`、event replay 和 live subscription 接口。
+11. `golutra-cli` / `golutra-tui`：默认通过 `EmbeddedTransport`，可显式选择 daemon/remote，只消费 command/query/event。
+12. `golutra-app-server`：用户级单实例管理多 cwd attachment，暴露 Unix IPC 与 HTTP command/query/SSE stream。
+13. `golutra-vis`：DebugProjection、event replay、audit 和 OTel JSON。
+14. `golutra-eval` / `golutra-evolution`：ImprovementCandidate、RegressionResult、PromotionDecision、GeneratedTask 与 Skill 生命周期。
+15. `golutra-plugin` / `golutra-mcp`：reviewed package、OS sandbox、approval 和统一 ToolContract bridge。
+16. TypeScript/Python SDK 与安装/三平台 CI 交付。
 
 入口优先级默认值：
 

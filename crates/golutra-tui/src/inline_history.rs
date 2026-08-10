@@ -15,6 +15,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Paragraph, Widget, Wrap},
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::*;
 
@@ -77,6 +78,7 @@ const GOLUTRA_LOGO_GLYPHS: [[&str; 6]; 7] = [
 const SESSION_LOGO_GRADIENT: [[u8; 3]; 3] =
     [[0x0E, 0xA5, 0xE9], [0x10, 0xB9, 0x81], [0xF5, 0x9E, 0x0B]];
 const MIN_INLINE_BOTTOM_ROWS: u16 = 3;
+const HISTORY_OMISSION_MARKER: &str = "…";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InlineHistoryMode {
@@ -104,8 +106,18 @@ impl InlineHistoryMode {
 
 #[derive(Debug, Clone)]
 struct RenderedHistoryEntry {
-    id: EventId,
+    event_ids: Vec<EventId>,
     lines: Vec<Line<'static>>,
+}
+
+impl RenderedHistoryEntry {
+    fn is_committed(&self, committed: &HashSet<EventId>) -> bool {
+        self.event_ids.iter().all(|id| committed.contains(id))
+    }
+
+    fn is_partially_committed(&self, committed: &HashSet<EventId>) -> bool {
+        self.event_ids.iter().any(|id| committed.contains(id)) && !self.is_committed(committed)
+    }
 }
 
 #[derive(Debug)]
@@ -157,12 +169,17 @@ impl InlineHistoryState {
         app: &mut TuiApp,
         mut rebuild_terminal: impl FnMut(&mut Terminal<B>) -> io::Result<()>,
     ) -> io::Result<bool> {
+        // History is inserted before the normal frame draw, while ratatui normally performs its
+        // autoresize at the start of that draw. Synchronize the internal inline buffer first so
+        // wrapping and insert_before use the same physical dimensions after a resize.
+        terminal.autoresize()?;
         let mode = InlineHistoryMode::from_app(app);
-        let width = terminal.size()?.width.max(1);
-        let viewport_height = terminal.current_buffer_mut().area.height.max(1);
+        let buffer_area = terminal.current_buffer_mut().area;
+        let width = buffer_area.width.max(1);
+        let viewport_height = buffer_area.height.max(1);
         let target_changed = self.initialized
             && (self.session_id != app.session_id
-                || self.generation != app.history_replay_generation
+                || self.generation != app.transcript.history.replay_generation
                 || self.mode != mode
                 || self.rendered_width != width
                 || self.rendered_height != viewport_height);
@@ -176,7 +193,7 @@ impl InlineHistoryState {
         }
         if !self.initialized || target_changed {
             self.session_id = app.session_id;
-            self.generation = app.history_replay_generation;
+            self.generation = app.transcript.history.replay_generation;
             self.mode = mode;
             self.rendered_width = width;
             self.rendered_height = viewport_height;
@@ -186,7 +203,7 @@ impl InlineHistoryState {
             app.set_inline_history_committed_event_ids(HashSet::new());
         }
 
-        let source_ready = app.history_replay_ready
+        let source_ready = app.transcript.history.replay_ready
             && (!matches!(
                 mode,
                 InlineHistoryMode::Developer { .. } | InlineHistoryMode::DebugSplit { .. }
@@ -205,9 +222,12 @@ impl InlineHistoryState {
         let committable_entries = rendered_history_entries(app, width, live_row_capacity, mode);
         let committable_ids = committable_entries
             .iter()
-            .map(|entry| entry.id)
+            .flat_map(|entry| entry.event_ids.iter().copied())
             .collect::<HashSet<_>>();
-        if !self.committed_event_ids.is_subset(&committable_ids) {
+        let grouping_changed = committable_entries
+            .iter()
+            .any(|entry| entry.is_partially_committed(&self.committed_event_ids));
+        if !self.committed_event_ids.is_subset(&committable_ids) || grouping_changed {
             if !history_cleared {
                 rebuild_terminal(terminal)?;
                 history_cleared = true;
@@ -218,7 +238,7 @@ impl InlineHistoryState {
         }
         let stable_entries = committable_entries
             .iter()
-            .filter(|entry| !self.committed_event_ids.contains(&entry.id))
+            .filter(|entry| !entry.is_committed(&self.committed_event_ids))
             .cloned()
             .collect::<Vec<_>>();
         let mut lines = Vec::new();
@@ -257,7 +277,7 @@ impl InlineHistoryState {
 
         self.header_emitted = true;
         self.committed_event_ids
-            .extend(stable_entries.into_iter().map(|entry| entry.id));
+            .extend(stable_entries.into_iter().flat_map(|entry| entry.event_ids));
         app.set_inline_history_committed_event_ids(self.committed_event_ids.clone());
         Ok(true)
     }
@@ -276,7 +296,7 @@ fn rendered_history_entries(
             let rendered = entries
                 .into_iter()
                 .map(|entry| RenderedHistoryEntry {
-                    id: entry.id,
+                    event_ids: vec![entry.id],
                     lines: render_operation_projection_lines(app, vec![entry.projection], width),
                 })
                 .collect::<Vec<_>>();
@@ -291,16 +311,22 @@ fn rendered_history_entries(
         InlineHistoryMode::Developer { expanded } => {
             let mut events = app.events.iter().collect::<Vec<_>>();
             events.sort_by_key(|event| event.sequence_no);
-            let rendered = events
+            let projected = developer_event_projections(events);
+            let stable_count = projected.len().saturating_sub(usize::from(
+                projected
+                    .last()
+                    .is_some_and(DeveloperEventProjection::is_open_provider_stream),
+            ));
+            let rendered = projected
                 .into_iter()
                 .map(|event| RenderedHistoryEntry {
-                    id: event.id,
-                    lines: developer_event_history_lines(event, width, expanded, app.palette()),
+                    event_ids: event.event_ids.clone(),
+                    lines: developer_event_history_lines(&event, width, expanded, app.palette()),
                 })
                 .collect::<Vec<_>>();
             let committed_count = committed_prefix_len(
                 &rendered,
-                rendered.len(),
+                stable_count,
                 width,
                 usize::from(live_row_capacity),
             );
@@ -327,13 +353,13 @@ fn debug_split_history_entries(
         .map(|entry| entry.id);
     let mut events = app.events.iter().collect::<Vec<_>>();
     events.sort_by_key(|event| event.sequence_no);
-    let stable_count = first_unstable_id.map_or(events.len(), |id| {
-        events
+    let rendered = debug_split_event_entries(app, events, width, expanded);
+    let stable_count = first_unstable_id.map_or(rendered.len(), |id| {
+        rendered
             .iter()
-            .position(|event| event.id == id)
+            .position(|entry| entry.event_ids.contains(&id))
             .unwrap_or_default()
     });
-    let rendered = debug_split_event_entries(app, events, width, expanded);
     let committed_count = committed_prefix_len(
         &rendered,
         stable_count,
@@ -367,19 +393,21 @@ fn debug_split_event_entries(
         .map(|entry| (entry.id, entry.projection))
         .collect::<HashMap<_, _>>();
     let (transcript_width, developer_width) = debug_pane_widths(width);
-    events
+    developer_event_projections(events)
         .into_iter()
         .map(|event| {
-            let transcript = operations
-                .remove(&event.id)
+            let transcript = event
+                .event_ids
+                .iter()
+                .find_map(|event_id| operations.remove(event_id))
                 .map(|projection| {
                     render_operation_projection_lines(app, vec![projection], transcript_width)
                 })
                 .unwrap_or_default();
             let developer =
-                developer_event_history_lines(event, developer_width, expanded, app.palette());
+                developer_event_history_lines(&event, developer_width, expanded, app.palette());
             RenderedHistoryEntry {
-                id: event.id,
+                event_ids: event.event_ids,
                 lines: debug_split_history_lines(transcript, developer, width),
             }
         })
@@ -392,7 +420,7 @@ pub(crate) fn debug_split_live_lines(
     visible_rows: u16,
 ) -> Vec<Line<'static>> {
     let (transcript_width, developer_width) = debug_pane_widths(width);
-    let facts = if !app.inline_history_enabled || app.developer_error.is_some() {
+    let facts = if !app.transcript.history.enabled || app.developer_error.is_some() {
         let mut facts = developer_fact_history_lines(app, developer_width);
         if facts.is_empty() && app.developer_projection.is_none() {
             facts.push(Line::from("loading developer projection"));
@@ -409,13 +437,18 @@ pub(crate) fn debug_split_live_lines(
         app.developer_observations_expanded,
     )
     .into_iter()
-    .filter(|entry| !app.inline_history_committed_event_ids.contains(&entry.id))
+    .filter(|entry| !entry.is_committed(&app.transcript.history.committed_event_ids))
     .flat_map(|entry| entry.lines)
     .collect::<Vec<_>>();
 
     let live_event_operation_count = event_operation_entries(&app.events)
         .into_iter()
-        .filter(|entry| !app.inline_history_committed_event_ids.contains(&entry.id))
+        .filter(|entry| {
+            !app.transcript
+                .history
+                .committed_event_ids
+                .contains(&entry.id)
+        })
         .count();
     let transcript_only = rendered_transcript_operation_projections(app)
         .into_iter()
@@ -437,7 +470,7 @@ pub(crate) fn debug_split_live_lines(
     };
     let fact_count = facts.len().min(fact_budget);
     let timeline_count = timeline.len().min(capacity.saturating_sub(fact_count));
-    let visible_timeline = if !app.inline_history_enabled && timeline.len() > timeline_count {
+    let visible_timeline = if !app.transcript.history.enabled && timeline.len() > timeline_count {
         prioritized_debug_snapshot_lines(timeline, timeline_count, debug_pane_widths(width).0)
     } else {
         timeline
@@ -521,15 +554,13 @@ fn prioritized_debug_snapshot_lines(
 fn debug_line_has_content_in_range(line: &Line<'_>, start: u16, end: u16) -> bool {
     let mut column = 0_u16;
     for span in &line.spans {
-        for character in span.content.chars() {
-            let character_width = u16::try_from(display_width(&character.to_string()))
-                .unwrap_or(u16::MAX)
-                .max(1);
-            let character_end = column.saturating_add(character_width);
-            if column < end && character_end > start && !character.is_whitespace() {
+        for grapheme in span.content.graphemes(true) {
+            let grapheme_width = u16::try_from(display_width(grapheme)).unwrap_or(u16::MAX);
+            let grapheme_end = column.saturating_add(grapheme_width);
+            if column < end && grapheme_end > start && !grapheme.chars().all(char::is_whitespace) {
                 return true;
             }
-            column = character_end;
+            column = grapheme_end;
             if column >= end {
                 return false;
             }
@@ -543,55 +574,191 @@ pub(crate) fn debug_split_history_lines(
     developer: Vec<Line<'static>>,
     width: u16,
 ) -> Vec<Line<'static>> {
+    if width == 0 || (transcript.is_empty() && developer.is_empty()) {
+        return Vec::new();
+    }
+    // A one-column terminal cannot represent either half of a strict split. Keep the degraded
+    // state explicit instead of silently dropping both projections.
+    if width == 1 {
+        return vec![Line::from(HISTORY_OMISSION_MARKER)];
+    }
     let (transcript_width, developer_width) = debug_pane_widths(width);
     let transcript_rows = wrapped_history_rows(transcript, transcript_width);
     let developer_rows = wrapped_history_rows(developer, developer_width);
-    let mut rows = Vec::with_capacity(transcript_rows.len() + developer_rows.len());
+    let row_count = transcript_rows.len().max(developer_rows.len());
+    let mut rows = Vec::with_capacity(row_count);
 
-    rows.extend(transcript_rows.into_iter().map(|mut transcript| {
-        transcript.push(Span::raw(" ".repeat(usize::from(developer_width))));
-        Line::from(transcript)
-    }));
-    rows.extend(developer_rows.into_iter().map(|developer| {
-        let mut spans = vec![Span::raw(" ".repeat(usize::from(transcript_width)))];
-        spans.extend(developer);
-        Line::from(spans)
-    }));
+    // Keep the two projections on the same physical rows. This makes an observation legible as
+    // the counterpart of the transcript event that produced it, while still allowing either
+    // side to continue with blank rows after the other side has finished wrapping.
+    for index in 0..row_count {
+        let mut spans = Vec::new();
+        append_debug_pane_row(&mut spans, transcript_rows.get(index), transcript_width);
+        append_debug_pane_row(&mut spans, developer_rows.get(index), developer_width);
+        rows.push(Line::from(spans));
+    }
     rows
+}
+
+fn append_debug_pane_row(
+    destination: &mut Vec<Span<'static>>,
+    row: Option<&Vec<Span<'static>>>,
+    width: u16,
+) {
+    let used = row
+        .map(|spans| spans.iter().map(Span::width).sum::<usize>())
+        .unwrap_or_default();
+    if let Some(spans) = row {
+        destination.extend(spans.iter().cloned());
+    }
+    let padding = usize::from(width).saturating_sub(used);
+    if padding > 0 {
+        destination.push(Span::raw(" ".repeat(padding)));
+    }
+}
+
+const RATATUI_MAX_BUFFER_CELLS: usize = u16::MAX as usize;
+const RATATUI_MAX_SCROLL_ROWS: usize = u16::MAX as usize - 1;
+
+fn max_history_chunk_rows(width: u16) -> usize {
+    let width = usize::from(width.max(1));
+    (RATATUI_MAX_BUFFER_CELLS / width).clamp(1, RATATUI_MAX_SCROLL_ROWS)
 }
 
 fn wrapped_history_rows(lines: Vec<Line<'static>>, width: u16) -> Vec<Vec<Span<'static>>> {
     if lines.is_empty() || width == 0 {
         return Vec::new();
     }
-    let row_count = Paragraph::new(lines.clone())
-        .wrap(Wrap { trim: false })
-        .line_count(width)
-        .max(1)
-        .min(usize::from(u16::MAX));
     // Ratatui 0.28 indexes Buffer rectangles with u16 arithmetic. Render pane rows in bounded
-    // chunks so width * height never crosses the representable buffer area.
-    let max_chunk_rows = usize::from(u16::MAX / width).max(1);
-    let mut rows = Vec::with_capacity(row_count);
-    let mut offset = 0_usize;
+    // chunks, and segment extreme logical lines so neither area nor scroll offset can overflow.
+    let max_chunk_rows = max_history_chunk_rows(width);
+    let mut rows = Vec::new();
 
-    while offset < row_count {
-        let chunk_rows = (row_count - offset).min(max_chunk_rows);
-        let height = u16::try_from(chunk_rows).expect("debug history chunk is u16-bounded");
-        let area = Rect::new(0, 0, width, height);
-        let mut buffer = Buffer::empty(area);
-        Paragraph::new(lines.clone())
+    for line in lines
+        .into_iter()
+        .flat_map(|line| bounded_history_line_segments(line, width))
+    {
+        let row_count = Paragraph::new(line.clone())
             .wrap(Wrap { trim: false })
-            .scroll((
-                u16::try_from(offset).expect("debug history height is u16-bounded"),
-                0,
-            ))
-            .render(area, &mut buffer);
-        rows.extend((0..height).map(|row| styled_buffer_row(&buffer, row, width)));
-        offset = offset.saturating_add(chunk_rows);
+            .line_count(width)
+            .max(1);
+        let mut offset = 0_usize;
+        while offset < row_count {
+            let chunk_rows = (row_count - offset).min(max_chunk_rows);
+            let height = u16::try_from(chunk_rows).expect("debug history chunk is u16-bounded");
+            let area = Rect::new(0, 0, width, height);
+            let mut buffer = Buffer::empty(area);
+            Paragraph::new(line.clone())
+                .wrap(Wrap { trim: false })
+                .scroll((ratatui_vertical_scroll(offset, height), 0))
+                .render(area, &mut buffer);
+            rows.extend((0..height).map(|row| styled_buffer_row(&buffer, row, width)));
+            offset = offset.saturating_add(chunk_rows);
+        }
     }
 
     rows
+}
+
+fn bounded_history_line_segments(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
+    let line_style = line.style;
+    let line_alignment = line.alignment;
+    let mut logical_lines = vec![Line {
+        spans: Vec::new(),
+        style: line_style,
+        alignment: line_alignment,
+    }];
+
+    // A provider can put literal newlines inside one styled span. Ratatui treats those as
+    // physical rows, so split them before applying the cell/grapheme bound below.
+    for span in line.spans {
+        let mut parts = span.content.split('\n').peekable();
+        while let Some(part) = parts.next() {
+            if !part.is_empty() {
+                append_history_span(
+                    &mut logical_lines
+                        .last_mut()
+                        .expect("history line accumulator is non-empty")
+                        .spans,
+                    part,
+                    span.style,
+                );
+            }
+            if parts.peek().is_some() {
+                logical_lines.push(Line {
+                    spans: Vec::new(),
+                    style: line_style,
+                    alignment: line_alignment,
+                });
+            }
+        }
+    }
+
+    logical_lines
+        .into_iter()
+        .flat_map(|line| bounded_history_cell_segments(line, width))
+        .collect()
+}
+
+fn append_history_span(spans: &mut Vec<Span<'static>>, content: &str, style: Style) {
+    if let Some(previous) = spans.last_mut()
+        && previous.style == style
+    {
+        previous.content.to_mut().push_str(content);
+    } else {
+        spans.push(Span::styled(content.to_owned(), style));
+    }
+}
+
+fn bounded_history_cell_segments(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let width_cells = usize::from(width);
+    // Emit physical rows instead of one giant logical line. Ratatui's word wrapper can turn a
+    // cell-bounded logical line into many rows when words do not fit together; truncating that
+    // line afterward loses its prefix. Hard-splitting here keeps every grapheme and lets the
+    // normal paragraph renderer consume one already-bounded row at a time.
+    let max_graphemes = max_history_chunk_rows(width)
+        .saturating_mul(width_cells)
+        .clamp(1, RATATUI_MAX_SCROLL_ROWS);
+    let mut segments = Vec::new();
+    let mut spans = Vec::<Span<'static>>::new();
+    let mut grapheme_count = 0_usize;
+    let mut cell_count = 0_usize;
+    for span in line.spans {
+        for grapheme in span.content.graphemes(true) {
+            let raw_width = display_width(grapheme);
+            // Ratatui intentionally ignores a grapheme wider than the target pane. Replace it
+            // with a visible marker so narrow debug panes have an explicit degradation.
+            let (grapheme, grapheme_width) = if raw_width > usize::from(width.max(1)) {
+                (HISTORY_OMISSION_MARKER, 1)
+            } else {
+                (grapheme, raw_width)
+            };
+            if !spans.is_empty()
+                && (cell_count.saturating_add(grapheme_width) > width_cells
+                    || grapheme_count >= max_graphemes)
+            {
+                segments.push(Line {
+                    spans: std::mem::take(&mut spans),
+                    style: line.style,
+                    alignment: line.alignment,
+                });
+                grapheme_count = 0;
+                cell_count = 0;
+            }
+            append_history_span(&mut spans, grapheme, span.style);
+            grapheme_count = grapheme_count.saturating_add(1);
+            cell_count = cell_count.saturating_add(grapheme_width);
+        }
+    }
+    if !spans.is_empty() || segments.is_empty() {
+        segments.push(Line {
+            spans,
+            style: line.style,
+            alignment: line.alignment,
+        });
+    }
+    segments
 }
 
 fn styled_buffer_row(buffer: &Buffer, row: u16, width: u16) -> Vec<Span<'static>> {
@@ -1010,11 +1177,14 @@ fn insert_history_lines<B: Backend>(
 ) -> io::Result<()> {
     let width = width.max(1);
     // Ratatui 0.28 clamps Buffer area to u16::MAX while indexing the full rectangle.
-    let max_rows = usize::from(u16::MAX / width).max(1);
+    let max_rows = max_history_chunk_rows(width);
     let mut batch = Vec::new();
     let mut batch_rows = 0_usize;
 
-    for line in lines {
+    for line in lines
+        .into_iter()
+        .flat_map(|line| bounded_history_line_segments(line, width))
+    {
         let line_rows = history_line_height(&line, width);
         if line_rows > max_rows {
             insert_history_batch(terminal, std::mem::take(&mut batch), batch_rows)?;
@@ -1055,7 +1225,7 @@ fn insert_tall_history_line<B: Backend>(
     rows: usize,
     max_rows: usize,
 ) -> io::Result<()> {
-    if rows > usize::from(u16::MAX) {
+    if rows > RATATUI_MAX_SCROLL_ROWS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "one history line exceeds the terminal scroll limit",
@@ -1064,13 +1234,13 @@ fn insert_tall_history_line<B: Backend>(
     let mut offset = 0_usize;
     while offset < rows {
         let chunk_rows = (rows - offset).min(max_rows);
-        let height = u16::try_from(chunk_rows).expect("history chunk is bounded by u16::MAX");
-        let scroll = u16::try_from(offset).expect("history line height was bounded by u16::MAX");
+        let height = u16::try_from(chunk_rows)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "history chunk is too tall"))?;
         let line = line.clone();
         terminal.insert_before(height, move |buffer| {
             Paragraph::new(line)
                 .wrap(Wrap { trim: false })
-                .scroll((scroll, 0))
+                .scroll((ratatui_vertical_scroll(offset, height), 0))
                 .render(buffer.area, buffer);
         })?;
         offset = offset.saturating_add(chunk_rows);
@@ -1090,4 +1260,80 @@ fn history_lines_height(lines: &[Line<'static>], width: u16) -> usize {
         .iter()
         .map(|line| history_line_height(line, width))
         .sum()
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+
+    #[test]
+    fn debug_history_does_not_truncate_beyond_the_ratatui_buffer_boundary() {
+        let pane_width = 1_u16;
+        let expected_rows = usize::from(u16::MAX) + 1;
+        let content = "x".repeat(expected_rows * usize::from(pane_width));
+        let rows = wrapped_history_rows(vec![Line::from(content)], pane_width);
+
+        assert_eq!(rows.len(), expected_rows);
+        assert_eq!(
+            rows.iter()
+                .flat_map(|row| row.iter())
+                .map(|span| span.content.matches('x').count())
+                .sum::<usize>(),
+            expected_rows * usize::from(pane_width)
+        );
+        assert!(rows.iter().all(|row| {
+            row.iter().map(|span| span.width()).sum::<usize>() == usize::from(pane_width)
+        }));
+    }
+
+    #[test]
+    fn word_spaced_history_preserves_content_when_word_wrapping_would_exceed_the_row_cap() {
+        let width = 80_u16;
+        let unit = format!("{} ", "x".repeat(41));
+        let content = format!("{}TAIL", unit.repeat(1_558));
+        assert_eq!(content.len(), 65_440);
+        let expected_x_count = content.matches('x').count();
+
+        let rows = wrapped_history_rows(vec![Line::from(content)], width);
+        assert!(rows.len() <= max_history_chunk_rows(width));
+        let rendered = rows
+            .iter()
+            .flat_map(|row| row.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(!rendered.contains(HISTORY_OMISSION_MARKER));
+        assert_eq!(rendered.matches('x').count(), expected_x_count);
+        assert!(rendered.contains("TAIL"));
+    }
+
+    #[test]
+    fn debug_history_splits_embedded_newlines_before_rendering() {
+        let pane_width = 8_u16;
+        let newline_count = 70_000;
+        let content = "x\n".repeat(newline_count);
+        let rows = wrapped_history_rows(vec![Line::from(vec![Span::raw(content)])], pane_width);
+
+        assert_eq!(
+            rows.iter()
+                .flat_map(|row| row.iter())
+                .map(|span| span.content.matches('x').count())
+                .sum::<usize>(),
+            newline_count
+        );
+        assert!(rows.len() >= newline_count);
+        assert!(rows.iter().all(|row| {
+            row.iter().map(|span| span.width()).sum::<usize>() == usize::from(pane_width)
+        }));
+    }
+
+    #[test]
+    fn debug_split_content_measurement_ignores_zero_width_joiners() {
+        let line = Line::from("x\u{200d}");
+        assert!(!debug_line_has_content_in_range(&line, 1, 2));
+        assert!(debug_line_has_content_in_range(&line, 0, 1));
+
+        let emoji = Line::from("👩\u{200d}💻");
+        assert!(debug_line_has_content_in_range(&emoji, 0, 1));
+        assert!(debug_line_has_content_in_range(&emoji, 1, 2));
+    }
 }

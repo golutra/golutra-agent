@@ -24,6 +24,7 @@ use std::{
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
+mod migrations;
 mod projection;
 mod repositories;
 
@@ -38,6 +39,8 @@ const CHECKPOINT_ARTIFACT_RETENTION_DAYS: i64 = 30;
 const EPHEMERAL_ARTIFACT_RETENTION_DAYS: i64 = 1;
 const TEMPORARY_ARTIFACT_RETENTION_HOURS: u64 = 1;
 pub const MAX_ARTIFACT_READ_BYTES: u64 = 1024 * 1024;
+const SQLITE_OPEN_RETRIES: usize = 120;
+const SQLITE_OPEN_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 pub(crate) use projection::{
     apply_event_to_state, initial_projection, loop_decision_from_event, verification_from_event,
@@ -55,6 +58,8 @@ pub enum StoreError {
     ArtifactIo(String),
     #[error("artifact checksum mismatch for {0}")]
     ArtifactChecksum(String),
+    #[error("sqlite migration failed: {0}")]
+    Migration(String),
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -161,10 +166,7 @@ impl RuntimeStore {
             .create_if_missing(true)
             .journal_mode(journal_mode)
             .busy_timeout(Duration::from_secs(5));
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await?;
+        let pool = connect_sqlite_pool_with_retry(options).await?;
         let store = Self {
             pool,
             artifact_root: artifact_root.into(),
@@ -193,111 +195,9 @@ impl RuntimeStore {
     }
 
     pub async fn initialize(&self) -> StoreResult<()> {
-        for statement in MIGRATIONS {
-            sqlx::query(statement).execute(&self.pool).await?;
-        }
-        self.ensure_thread_columns().await?;
-        self.ensure_command_columns().await?;
-        self.ensure_artifact_columns().await?;
-        Ok(())
-    }
-
-    async fn ensure_artifact_columns(&self) -> StoreResult<()> {
-        let rows = sqlx::query("PRAGMA table_info(artifact_records)")
-            .fetch_all(&self.pool)
-            .await?;
-        let existing = rows
-            .into_iter()
-            .map(|row| row.try_get::<String, _>("name"))
-            .collect::<Result<HashSet<_>, _>>()?;
-        for (name, declaration) in [
-            ("created_at", "TEXT"),
-            ("retention_policy", "TEXT"),
-            ("size_bytes", "INTEGER"),
-            ("expires_at", "TEXT"),
-            ("blob_deleted_at", "TEXT"),
-        ] {
-            if !existing.contains(name) {
-                sqlx::query(&format!(
-                    "ALTER TABLE artifact_records ADD COLUMN {name} {declaration}"
-                ))
-                .execute(&self.pool)
-                .await?;
-            }
-        }
-        let rows = sqlx::query(
-            "SELECT artifact_id, artifact_json FROM artifact_records
-             WHERE created_at IS NULL OR retention_policy IS NULL OR size_bytes IS NULL",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        for row in rows {
-            let artifact_id: String = row.try_get("artifact_id")?;
-            let artifact_json: String = row.try_get("artifact_json")?;
-            let artifact: ArtifactRecord = serde_json::from_str(&artifact_json)?;
-            sqlx::query(
-                "UPDATE artifact_records
-                 SET created_at = ?, retention_policy = ?, size_bytes = ?, expires_at = ?
-                 WHERE artifact_id = ?",
-            )
-            .bind(artifact.created_at.to_rfc3339())
-            .bind(&artifact.retention_policy)
-            .bind(i64::try_from(artifact.size_bytes).unwrap_or(i64::MAX))
-            .bind(artifact_expiration(&artifact).map(|value| value.to_rfc3339()))
-            .bind(artifact_id)
-            .execute(&self.pool)
-            .await?;
-        }
-        Ok(())
-    }
-
-    async fn ensure_command_columns(&self) -> StoreResult<()> {
-        let rows = sqlx::query("PRAGMA table_info(command_acks)")
-            .fetch_all(&self.pool)
-            .await?;
-        let existing = rows
-            .into_iter()
-            .map(|row| row.try_get::<String, _>("name"))
-            .collect::<Result<HashSet<_>, _>>()?;
-        for (name, declaration) in [
-            ("status", "TEXT NOT NULL DEFAULT 'completed'"),
-            ("updated_at", "TEXT"),
-        ] {
-            if !existing.contains(name) {
-                sqlx::query(&format!(
-                    "ALTER TABLE command_acks ADD COLUMN {name} {declaration}"
-                ))
-                .execute(&self.pool)
-                .await?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn ensure_thread_columns(&self) -> StoreResult<()> {
-        let rows = sqlx::query("PRAGMA table_info(threads)")
-            .fetch_all(&self.pool)
-            .await?;
-        let existing = rows
-            .into_iter()
-            .map(|row| row.try_get::<String, _>("name"))
-            .collect::<Result<HashSet<_>, _>>()?;
-        for (name, declaration) in [
-            ("forked_from_turn_id", "TEXT"),
-            ("forked_from_sequence_no", "INTEGER"),
-            ("rebound_from_workspace_root", "TEXT"),
-            ("rollout_path", "TEXT"),
-            ("removed", "INTEGER NOT NULL DEFAULT 0"),
-        ] {
-            if !existing.contains(name) {
-                sqlx::query(&format!(
-                    "ALTER TABLE threads ADD COLUMN {name} {declaration}"
-                ))
-                .execute(&self.pool)
-                .await?;
-            }
-        }
-        Ok(())
+        migrations::run(&self.pool)
+            .await
+            .map_err(StoreError::Migration)
     }
 
     pub async fn command_ack(&self, idempotency_key: &str) -> StoreResult<Option<CommandAck>> {
@@ -1378,6 +1278,20 @@ impl RuntimeStore {
         rows.into_iter().map(post_task_job_from_row).collect()
     }
 
+    pub async fn has_nonterminal_post_task_jobs(&self, workspace_id: &str) -> StoreResult<bool> {
+        let row = sqlx::query(
+            "SELECT EXISTS(
+                 SELECT 1 FROM post_task_jobs
+                 WHERE workspace_id = ? AND status IN ('queued', 'leased', 'running')
+             ) AS has_active",
+        )
+        .bind(workspace_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let has_active: i64 = row.try_get("has_active")?;
+        Ok(has_active != 0)
+    }
+
     /// Return terminal tasks whose durable event declares pending governance,
     /// but which have neither a deep-evaluation job nor a terminal scheduling
     /// failure. This closes the crash window between terminal event commit and
@@ -2155,6 +2069,35 @@ impl RuntimeStore {
     }
 }
 
+async fn connect_sqlite_pool_with_retry(
+    options: SqliteConnectOptions,
+) -> Result<SqlitePool, sqlx::Error> {
+    for attempt in 0..=SQLITE_OPEN_RETRIES {
+        match SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.clone())
+            .await
+        {
+            Ok(pool) => return Ok(pool),
+            Err(error) if is_sqlite_busy_error(&error) && attempt < SQLITE_OPEN_RETRIES => {
+                tokio::time::sleep(SQLITE_OPEN_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("SQLite connection retry loop always returns")
+}
+
+fn is_sqlite_busy_error(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::Database(database_error)
+            if database_error
+                .code()
+                .is_some_and(|code| code == "5" || code == "6")
+    )
+}
+
 async fn prune_temporary_artifact_entry(entry: tokio::fs::DirEntry) -> StoreResult<bool> {
     let name = entry.file_name();
     let Some(name) = name.to_str() else {
@@ -2446,229 +2389,6 @@ async fn persist_runtime_indexes(
     }
     Ok(())
 }
-
-const MIGRATIONS: &[&str] = &[
-    r#"
-    CREATE TABLE IF NOT EXISTS runtime_events (
-        event_id TEXT PRIMARY KEY,
-        sequence_no INTEGER NOT NULL,
-        session_id TEXT NOT NULL,
-        task_id TEXT,
-        turn_id TEXT,
-        event_type TEXT NOT NULL,
-        source TEXT NOT NULL,
-        durable INTEGER NOT NULL,
-        payload_json TEXT NOT NULL,
-        event_json TEXT NOT NULL
-    )
-    "#,
-    r#"
-    CREATE INDEX IF NOT EXISTS idx_runtime_events_session_sequence
-    ON runtime_events (session_id, sequence_no)
-    "#,
-    r#"
-    CREATE INDEX IF NOT EXISTS idx_runtime_events_task_sequence
-    ON runtime_events (task_id, sequence_no)
-    "#,
-    r#"
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_events_sequence_no
-    ON runtime_events (sequence_no)
-    "#,
-    r#"
-    CREATE TABLE IF NOT EXISTS runtime_sequence (
-        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-        last_sequence_no INTEGER NOT NULL
-    )
-    "#,
-    r#"
-    INSERT OR IGNORE INTO runtime_sequence (singleton, last_sequence_no)
-    SELECT 1, COALESCE(MAX(sequence_no), 0) FROM runtime_events
-    "#,
-    r#"
-    CREATE TABLE IF NOT EXISTS command_acks (
-        idempotency_key TEXT PRIMARY KEY,
-        command_id TEXT NOT NULL,
-        ack_json TEXT NOT NULL,
-        status TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-    )
-    "#,
-    r#"
-    CREATE TABLE IF NOT EXISTS sessions (
-        session_id TEXT PRIMARY KEY,
-        status TEXT NOT NULL,
-        active_task_id TEXT,
-        last_sequence_no INTEGER NOT NULL,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-    )
-    "#,
-    r#"
-    CREATE TABLE IF NOT EXISTS tasks (
-        task_id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        status TEXT NOT NULL,
-        last_sequence_no INTEGER NOT NULL,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-    )
-    "#,
-    r#"
-    CREATE INDEX IF NOT EXISTS idx_tasks_session_updated
-    ON tasks (session_id, updated_at DESC)
-    "#,
-    r#"
-    CREATE TABLE IF NOT EXISTS turns (
-        turn_id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        task_id TEXT,
-        status TEXT NOT NULL,
-        last_sequence_no INTEGER NOT NULL,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-    )
-    "#,
-    r#"
-    CREATE INDEX IF NOT EXISTS idx_turns_session_updated
-    ON turns (session_id, updated_at DESC)
-    "#,
-    r#"
-    CREATE TABLE IF NOT EXISTS state_projections (
-        session_id TEXT PRIMARY KEY,
-        last_sequence_no INTEGER NOT NULL,
-        projection_json TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-    )
-    "#,
-    r#"
-    CREATE TABLE IF NOT EXISTS artifact_records (
-        artifact_id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        uri TEXT NOT NULL,
-        checksum TEXT NOT NULL,
-        artifact_json TEXT NOT NULL,
-        created_at TEXT,
-        retention_policy TEXT,
-        size_bytes INTEGER,
-        expires_at TEXT,
-        blob_deleted_at TEXT
-    )
-    "#,
-    r#"
-    CREATE INDEX IF NOT EXISTS idx_artifact_records_content
-    ON artifact_records (checksum, size_bytes, blob_deleted_at)
-    "#,
-    r#"
-    CREATE TABLE IF NOT EXISTS evidence_records (
-        evidence_id TEXT PRIMARY KEY,
-        claim TEXT NOT NULL,
-        evidence_json TEXT NOT NULL
-    )
-    "#,
-    r#"
-    CREATE TABLE IF NOT EXISTS threads (
-        thread_id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        parent_thread_id TEXT,
-        forked_from_turn_id TEXT,
-        forked_from_sequence_no INTEGER,
-        workspace_root TEXT,
-        rebound_from_workspace_root TEXT,
-        rollout_path TEXT,
-        title TEXT NOT NULL,
-        preview TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        recency_at TEXT NOT NULL,
-        archived INTEGER NOT NULL DEFAULT 0,
-        removed INTEGER NOT NULL DEFAULT 0
-    )
-    "#,
-    r#"
-    CREATE INDEX IF NOT EXISTS idx_threads_workspace_recency
-    ON threads (workspace_root, recency_at DESC)
-    "#,
-    r#"
-    DELETE FROM threads
-    WHERE EXISTS (
-        SELECT 1
-        FROM threads AS newer
-        WHERE newer.session_id = threads.session_id
-          AND (
-              newer.recency_at > threads.recency_at
-              OR (newer.recency_at = threads.recency_at AND newer.updated_at > threads.updated_at)
-              OR (
-                  newer.recency_at = threads.recency_at
-                  AND newer.updated_at = threads.updated_at
-                  AND newer.thread_id > threads.thread_id
-              )
-          )
-    )
-    "#,
-    r#"
-    DROP INDEX IF EXISTS idx_threads_session
-    "#,
-    r#"
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_threads_session_unique
-    ON threads (session_id)
-    "#,
-    r#"
-    CREATE TABLE IF NOT EXISTS context_snapshots (
-        snapshot_id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        task_id TEXT NOT NULL,
-        turn_id TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        snapshot_json TEXT NOT NULL
-    )
-    "#,
-    r#"
-    CREATE INDEX IF NOT EXISTS idx_context_snapshots_task_created
-    ON context_snapshots (task_id, created_at ASC)
-    "#,
-    r#"
-    CREATE TABLE IF NOT EXISTS verification_plans (
-        plan_id TEXT PRIMARY KEY,
-        task_id TEXT NOT NULL,
-        revision INTEGER NOT NULL,
-        created_at TEXT NOT NULL,
-        plan_json TEXT NOT NULL
-    )
-    "#,
-    r#"
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_verification_plans_task_revision
-    ON verification_plans (task_id, revision)
-    "#,
-    r#"
-    CREATE TABLE IF NOT EXISTS post_task_jobs (
-        job_id TEXT PRIMARY KEY,
-        kind TEXT NOT NULL,
-        workspace_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        task_id TEXT NOT NULL,
-        input_refs_json TEXT NOT NULL,
-        status TEXT NOT NULL,
-        attempt INTEGER NOT NULL,
-        max_attempts INTEGER NOT NULL,
-        lease_owner TEXT,
-        lease_expires_at TEXT,
-        result_refs_json TEXT NOT NULL,
-        last_error TEXT,
-        created_at TEXT NOT NULL,
-        started_at TEXT,
-        completed_at TEXT
-    )
-    "#,
-    r#"
-    CREATE INDEX IF NOT EXISTS idx_post_task_jobs_status_created
-    ON post_task_jobs (status, created_at ASC)
-    "#,
-    r#"
-    CREATE INDEX IF NOT EXISTS idx_post_task_jobs_task_created
-    ON post_task_jobs (task_id, created_at ASC)
-    "#,
-];
 
 fn artifact_root_for_database_url(database_url: &str) -> PathBuf {
     database_url

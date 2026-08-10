@@ -115,7 +115,7 @@ Projection Plane                 Improvement Plane
 - 持有 `RuntimeLaneManager`、任务 handle、`CancellationToken`、pending turn queue、approval waiter 和 EventBus。
 - `AgentHarness` 是 provider/tool loop 的唯一公开执行 seam：`AgentRun` 同时携带 request、`TaskContract` 和可选 replay context；`execute` 复用 Host 已持有的 control channel，`start` 返回可 steer/pause/interrupt/wait 的 `RunningTurn`。`AgentLoop` 保持 crate-private，Host、replay 和独立调用方不再各自组合内部入口。
 - 在执行前校验显式 `TaskContract`，包括 workspace change、delivery path、verification independence 和 correction 上限；兼容旧客户端的 prompt 推断只存在于 application adapter，不能进入核心终态判断。
-- 每个 queued turn 独立携带 `TaskContract` 和 external verifier 列表；普通 follow-up 不继承上一 turn 的写入或验证要求。没有显式 verifier 字段的代码任务会在 command 边界保守发现 Cargo、Node、Python、Go 项目检查；显式空列表关闭发现。
+- 每个 queued turn 独立携带 `TaskContract` 和 external verifier 列表；普通 follow-up 不继承上一 turn 的写入或验证要求。没有显式 verifier 字段的代码任务会在 command 边界检查 workspace 根目录的受信 manifest；只有恰好一种 Cargo、Node、Python 或 Go 项目生态明确时才自动选择一个 verifier，混合或歧义根目录不隐式执行检查，要求调用方显式指定；显式空列表关闭发现。
 - 将每个 provider/tool/context/verification 阶段转成 `AgentLoopTraceEvent`，由 host adapter 写入 `RuntimeEvent` 和 artifact。
 - `ToolRuntime::invoke(ToolInvocation)` 统一 policy、approval、before-image、sandbox、progress 和 terminal report。`apply_patch` 通过隔离配置的 `git apply` 原子修改多文件；`/app`、`/workspace` 只映射到当前 workspace，其他绝对路径仍被拒绝。
 - `RuntimeVerificationService` 只接受结构化 `VerificationInput`，由 `golutra-verify` 产生 assertion status；模型不能直接写 Pass。

@@ -94,7 +94,6 @@ Python 和 TypeScript 的优势主要在生态和开发速度，但它们更适�
 ```text
 golutra-core
 golutra-runtime
-golutra-event
 golutra-protocol
 golutra-protocol-fixtures
 golutra-context
@@ -126,7 +125,6 @@ sdk/python
 | --- | --- |
 | `golutra-core` | Message、SessionState、GoalState、RuntimeLane、BusyPolicyDecision、LoopGuard、LoopDecision、ToolResultEnvelope、TaskRecord、Policy 等核心类型 |
 | `golutra-runtime` | query loop、RuntimeLane、turn 状态机、LoopGuard、LoopDecision 生成、tool/model 回流、resume/compact 调度 |
-| `golutra-event` | ProviderRawEvent、RuntimeEvent、UiSdkEvent、durable/live-only 事件协议 |
 | `golutra-protocol` | `SessionCommand`、`RuntimeQuery`、`RuntimeEvent`、app-server transport contract、SDK 共享类型 |
 | `golutra-protocol-fixtures` | schema 产物、协议 fixture、跨语言契约测试输入 |
 | `golutra-context` | ContextBuilder、TokenBudgetTracker、WorkingSummary、CompactManager、history 分层、context projection |
@@ -173,6 +171,7 @@ Governance
 - `golutra-eval` 和 `golutra-verify` 基于 durable event/replay 做验证，不另建一套不可回放的评估输入。
 - `golutra-client` 只暴露统一 runtime 语义，不携带前端私有状态机。
 - `golutra-protocol` 负责跨 crate、跨 transport、跨语言的契约定义；协议升级必须先过 fixture 和 SDK 契约测试。
+- `golutra-event` 仅作为旧 workspace 依赖的兼容 re-export 保留；新实现不得把事件类型放回独立协议副本。
 - `golutra-test-client` 不承载业务逻辑，只用于 app-server、SDK、transport 和 schema 对拍。
 
 判断一个新能力是否进入主架构时，必须回答：它产生什么 runtime fact、改变什么 state projection、是否影响 context projection、是否参与 LoopDecision 或 PromotionGate。如果回答不清楚，就先作为插件或实验能力，不进入核心。
@@ -631,7 +630,7 @@ Extension
 
 1. 建 `golutra-core`：定义 Message、SessionState、GoalState、LoopGuard、LoopDecision、TaskRecord、ArtifactRef、DecisionRecord、EvidenceRecord。
 2. 建 `golutra-store`：SQLite metadata、event log、artifact store、migration。
-3. 建 `golutra-event`：ProviderRawEvent、RuntimeEvent、UiSdkEvent，明确 durable 与 live-only。
+3. 在 `golutra-protocol` 中定义 ProviderRawEvent、RuntimeEvent、UiSdkEvent，明确 durable 与 live-only。
 4. 建 `golutra-llm`：ProviderConfig、ModelCatalog、CapabilityMatrix、GenaiProviderAdapter、ModelRouteDecision、FallbackPolicy。
 5. 建 `golutra-tools`：ToolSchema、ToolAccesses、ToolResultEnvelope、tool registry。
 6. 建 `golutra-policy`：PermissionPolicy、permission `allow/ask/deny`、workspace isolation、sandbox policy。
@@ -668,9 +667,8 @@ Extension
 ### 第二优先级
 
 1. `golutra-store`
-2. `golutra-event`
-3. `golutra-file-search`
-4. `golutra-policy`
+2. `golutra-file-search`
+3. `golutra-policy`
 
 原因：
 

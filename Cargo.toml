@@ -9,6 +9,7 @@ members = [
   "crates/golutra-context",
   "crates/golutra-core",
   "crates/golutra-eval",
+  "crates/golutra-eval-model",
   "crates/golutra-eval-worker",
   "crates/golutra-evolution",
   "crates/golutra-event",
@@ -21,6 +22,7 @@ members = [
   "crates/golutra-plugin",
   "crates/golutra-protocol",
   "crates/golutra-protocol-fixtures",
+  "crates/golutra-project-service",
   "crates/golutra-runtime",
   "crates/golutra-release",
   "crates/golutra-sandbox",
@@ -99,4 +101,5 @@ golutra-supervisor = { path = "crates/golutra-supervisor" }
 golutra-core = { path = "crates/golutra-core" }
 golutra-protocol = { path = "crates/golutra-protocol" }
 golutra-protocol-fixtures = { path = "crates/golutra-protocol-fixtures" }
+golutra-project-service = { path = "crates/golutra-project-service" }
 golutra-sandbox = { path = "crates/golutra-sandbox" }

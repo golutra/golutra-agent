@@ -21,10 +21,11 @@ use golutra_llm::{ConfiguredProvider, MockProvider, ProviderError, ProviderMessa
 use golutra_protocol::{
     ArtifactReadRequest, EventFilter, RuntimeEventType, RuntimeQueryKind, TaskTraceRequest,
 };
+use golutra_runtime::agent_execution_channel;
 use tempfile::{TempDir, tempdir};
 use tokio::{
     sync::{Mutex, MutexGuard},
-    time::{Duration, sleep},
+    time::{Duration, sleep, timeout},
 };
 
 use crate::event_codec::{ObservationIntegrityClass, observation_descriptor};
@@ -57,6 +58,87 @@ async fn task_control_cleanup_wait_has_a_deadline() {
         ClientError::TaskExecution(message)
             if message.contains("did not release the session within 1 milliseconds")
     ));
+}
+
+#[tokio::test]
+async fn live_subscription_applies_session_and_task_filters() {
+    let transport = EmbeddedTransport::in_memory().await.expect("transport");
+    let host = transport.host.clone();
+    let session_id = transport.default_session_id();
+    let selected_task_id = TaskId::new();
+    let other_task_id = TaskId::new();
+    let mut events = transport.subscribe_live(EventFilter {
+        session_id,
+        task_id: Some(selected_task_id),
+        after_sequence_no: None,
+    });
+
+    host.record_event(host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(other_task_id),
+        RuntimeEventType::ToolCompleted,
+        RuntimeEventSource::Tool,
+        json!({"summary": "unselected task"}),
+    ))
+    .await
+    .expect("other task event");
+    host.record_event(host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(selected_task_id),
+        RuntimeEventType::ToolCompleted,
+        RuntimeEventSource::Tool,
+        json!({"summary": "selected task"}),
+    ))
+    .await
+    .expect("selected task event");
+
+    let event = timeout(Duration::from_secs(1), events.recv())
+        .await
+        .expect("filtered event timeout")
+        .expect("filtered event channel closed");
+    assert_eq!(event.task_id, Some(selected_task_id));
+    assert_eq!(event.payload["summary"], "selected task");
+    assert!(
+        timeout(Duration::from_millis(20), events.recv())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn live_subscription_registry_prunes_dropped_receivers_and_stays_bounded() {
+    let transport = EmbeddedTransport::in_memory().await.expect("transport");
+    let host = transport.host.clone();
+    let filter = EventFilter {
+        session_id: transport.default_session_id(),
+        task_id: None,
+        after_sequence_no: None,
+    };
+    let mut receivers = Vec::new();
+    for _ in 0..(MAX_LIVE_SUBSCRIPTIONS + 8) {
+        receivers.push(transport.subscribe_live(filter.clone()));
+    }
+    assert_eq!(
+        host.execution
+            .live_subscriptions
+            .lock()
+            .expect("live subscription lock")
+            .len(),
+        MAX_LIVE_SUBSCRIPTIONS
+    );
+
+    drop(receivers);
+    let retained_receiver = transport.subscribe_live(filter);
+    let subscriptions = host
+        .execution
+        .live_subscriptions
+        .lock()
+        .expect("live subscription lock");
+    assert_eq!(subscriptions.len(), 1);
+    assert_eq!(subscriptions[0].sender.receiver_count(), 1);
+    drop(retained_receiver);
 }
 
 #[test]
@@ -326,6 +408,7 @@ fn http_transport_uses_the_connected_url_instead_of_advertised_runtime_url() {
             protocol_versions: ProtocolVersionRange::runtime(),
             started_at: chrono::Utc::now(),
         },
+        protocol_version: RUNTIME_PROTOCOL_VERSION,
         info: RuntimeHostInfo {
             instance_id: "runtime".to_owned(),
             pid: 1,
@@ -338,6 +421,8 @@ fn http_transport_uses_the_connected_url_instead_of_advertised_runtime_url() {
         },
         cwd: PathBuf::from("/workspace"),
         attachment_id: Arc::new(RwLock::new("attachment".to_owned())),
+        refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+        lifecycle: crate::transport::TransportLifecycle::default(),
         transport_token: Arc::new(secrecy::SecretString::from("a".repeat(64))),
     };
 
@@ -392,6 +477,48 @@ async fn event_writer_assigns_sequence_numbers_in_record_order() {
 }
 
 #[tokio::test]
+async fn unimplemented_protocol_commands_fail_closed() {
+    let transport = EmbeddedTransport::in_memory().await.expect("transport");
+    let session_id = transport.default_session_id();
+
+    for kind in [SessionCommandKind::Verify, SessionCommandKind::Export] {
+        let ack = transport
+            .send_command(runtime_command(session_id, kind, json!({})))
+            .await
+            .expect("unsupported command ack");
+        assert!(!ack.accepted, "{kind:?}");
+        assert!(
+            ack.reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("is not supported")),
+            "{kind:?}: {:?}",
+            ack.reason
+        );
+    }
+
+    let events = transport
+        .replay_events(EventFilter {
+            session_id,
+            task_id: None,
+            after_sequence_no: None,
+        })
+        .await
+        .expect("events");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event_type"] == json!(RuntimeEventType::CommandRejected))
+            .count(),
+        2
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event["event_type"] != json!(RuntimeEventType::CommandAccepted))
+    );
+}
+
+#[tokio::test]
 async fn failed_event_append_does_not_pollute_causal_lifecycle_indexes() {
     let host = RuntimeHost::in_memory().await.expect("host");
     let session_id = host.default_session_id();
@@ -432,6 +559,7 @@ async fn failed_event_append_does_not_pollute_causal_lifecycle_indexes() {
         .await
         .expect("provider event");
     let events = host
+        .storage
         .store
         .load_events(session_id, Some(task_id), None)
         .await
@@ -459,6 +587,8 @@ async fn runtime_host_reuses_one_process_supervisor_across_tool_executors() {
     let host = RuntimeHost::in_memory().await.expect("host");
     let session_id = host.default_session_id();
     let root = workspace.path().to_path_buf();
+    let (execution, _control) = agent_execution_channel(1);
+    let process_cancellation = execution.cancellation_token();
     let first = host
         .build_tool_executor(
             WorkspacePolicy::new(&root).expect("first policy"),
@@ -482,13 +612,51 @@ async fn runtime_host_reuses_one_process_supervisor_across_tool_executors() {
     };
     let policy = first.evaluate(&start_request).expect("shell policy");
     let started = first
-        .execute_with_policy(start_request, policy, true, CancellationToken::new())
+        .execute_with_policy(start_request, policy, true, process_cancellation)
         .await
         .expect("start process");
     let process_id = started.envelope.structured_facts["process_id"]
         .as_str()
         .expect("process id")
         .to_owned();
+
+    let task_id = TaskId::new();
+    let root_context = crate::delegation_policy::DelegationContext::root(
+        session_id,
+        Some(10_000),
+        Some(1_024),
+        None,
+        execution.cancellation_token(),
+    );
+    let worker = tokio::spawn(async { Ok::<(), ClientError>(()) });
+    let abort_handle = worker.abort_handle();
+    let (completion_sender, completion) = watch::channel(false);
+    host.execution.task_controls.lock().await.insert(
+        session_id,
+        HostedTaskControl {
+            task_id,
+            allow_network: false,
+            yolo: false,
+            provider_settings: ProviderTurnSettings::default(),
+            execution,
+            abort_handle,
+            completion,
+            delegation: Some(root_context),
+            _session_lease: None,
+        },
+    );
+    host.clone()
+        .supervise_agent_task(
+            HostedAgentTask {
+                session_id,
+                task_id,
+                turn_id: TurnId::new(),
+                payload: json!({"prompt": "ordinary root task"}),
+            },
+            worker,
+            completion_sender,
+        )
+        .await;
 
     let second = host
         .build_tool_executor(
@@ -523,6 +691,109 @@ async fn runtime_host_reuses_one_process_supervisor_across_tool_executors() {
         String::from_utf8_lossy(&reconnected.artifact_contents[0].bytes)
             .contains("host-survived-turn")
     );
+}
+
+#[tokio::test]
+async fn embedded_transport_close_awaits_managed_process_shutdown() {
+    let workspace = tempdir().expect("workspace");
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let transport = EmbeddedTransport::new(host.clone());
+    let session_id = host.default_session_id();
+    let executor = host
+        .build_tool_executor(
+            WorkspacePolicy::new(workspace.path()).expect("policy"),
+            workspace.path().to_path_buf(),
+            false,
+            false,
+        )
+        .await
+        .expect("executor");
+    let request = ToolRequest {
+        tool_call_id: ToolCallId::new(),
+        provider_tool_call_id: None,
+        session_id,
+        turn_id: Some(TurnId::new()),
+        tool_name: "shell".to_owned(),
+        arguments: json!({
+            "command": "sleep 30",
+            "background": true,
+            "yield_time_ms": 1,
+        }),
+    };
+    let policy = executor.evaluate(&request).expect("shell policy");
+    let started = executor
+        .execute_with_policy(request, policy, true, CancellationToken::new())
+        .await
+        .expect("start managed process");
+    assert_eq!(
+        started.envelope.structured_facts["process_state"],
+        "running"
+    );
+
+    RuntimeTransport::Embedded(transport)
+        .close()
+        .await
+        .expect("embedded close waits for process shutdown");
+    assert!(
+        !host
+            .execution
+            .process_supervisor
+            .has_running_processes()
+            .await
+    );
+}
+
+#[tokio::test]
+async fn runtime_close_waits_for_an_inflight_command_dispatch() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let command_guard = host.execution.command_mutex.lock().await;
+    let closing_host = host.clone();
+    let close_task = tokio::spawn(async move { closing_host.close().await });
+
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(
+        !close_task.is_finished(),
+        "close must wait for a command already inside the dispatcher"
+    );
+
+    drop(command_guard);
+    timeout(Duration::from_secs(1), close_task)
+        .await
+        .expect("close should not remain blocked after the command exits")
+        .expect("close task")
+        .expect("runtime close");
+}
+
+#[tokio::test]
+async fn runtime_close_rejects_a_prompt_waiting_on_the_dispatch_barrier() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let session_id = host.default_session_id();
+    let command_guard = host.execution.command_mutex.lock().await;
+    let closing_host = host.clone();
+    let close_task = tokio::spawn(async move { closing_host.close().await });
+
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let command_host = host.clone();
+    let prompt_task = tokio::spawn(async move {
+        command_host
+            .handle_command(command(session_id, "must not start during close"))
+            .await
+            .expect("prompt acknowledgement")
+    });
+    tokio::task::yield_now().await;
+    drop(command_guard);
+
+    timeout(Duration::from_secs(1), close_task)
+        .await
+        .expect("close should finish")
+        .expect("close task")
+        .expect("runtime close");
+    let ack = timeout(Duration::from_secs(1), prompt_task)
+        .await
+        .expect("prompt should finish")
+        .expect("prompt task");
+    assert!(!ack.accepted);
+    assert_eq!(ack.reason.as_deref(), Some("runtime host is shutting down"));
 }
 
 #[tokio::test]
@@ -624,6 +895,7 @@ async fn delegated_task_inherits_overrides_and_archives_an_isolated_child() {
     .await
     .expect("parent thread");
     let parent_thread_id = host
+        .storage
         .repositories
         .threads
         .by_session(parent_session_id)
@@ -631,13 +903,15 @@ async fn delegated_task_inherits_overrides_and_archives_an_isolated_child() {
         .expect("parent lookup")
         .expect("parent thread")
         .thread_id;
+    let parent_task_id = TaskId::new();
     let (execution, _control) = agent_execution_channel(1);
+    let execution_cancellation = execution.cancellation_token();
     let parent_worker = tokio::spawn(std::future::pending::<()>());
     let (completion_sender, completion) = watch::channel(false);
-    host.task_controls.lock().await.insert(
+    host.execution.task_controls.lock().await.insert(
         parent_session_id,
         HostedTaskControl {
-            task_id: TaskId::new(),
+            task_id: parent_task_id,
             allow_network: false,
             yolo: false,
             provider_settings: ProviderTurnSettings {
@@ -652,6 +926,13 @@ async fn delegated_task_inherits_overrides_and_archives_an_isolated_child() {
             execution,
             abort_handle: parent_worker.abort_handle(),
             completion,
+            delegation: Some(crate::delegation_policy::DelegationContext::root(
+                parent_session_id,
+                Some(10_000),
+                Some(2_000),
+                None,
+                execution_cancellation,
+            )),
             _session_lease: None,
         },
     );
@@ -665,14 +946,22 @@ async fn delegated_task_inherits_overrides_and_archives_an_isolated_child() {
         arguments: json!({"task": "Summarize the number seven."}),
     };
 
-    let inherited = golutra_tools::TaskDelegationBackend::delegate(
-        &backend,
-        &inherited_request,
-        CancellationToken::new(),
-    )
-    .await
-    .expect("inherited delegation");
+    let (inherited, concurrent_retry) = tokio::join!(
+        golutra_tools::TaskDelegationBackend::delegate(
+            &backend,
+            &inherited_request,
+            CancellationToken::new(),
+        ),
+        golutra_tools::TaskDelegationBackend::delegate(
+            &backend,
+            &inherited_request,
+            CancellationToken::new(),
+        ),
+    );
+    let inherited = inherited.expect("inherited delegation");
+    let concurrent_retry = concurrent_retry.expect("concurrent idempotent retry");
     assert_eq!(inherited.status, golutra_core::ToolResultStatus::Ok);
+    assert_eq!(concurrent_retry, inherited);
     assert_eq!(
         inherited.structured_facts["requested_model"],
         "parent-model"
@@ -688,6 +977,7 @@ async fn delegated_task_inherits_overrides_and_archives_an_isolated_child() {
         .parse::<SessionId>()
         .expect("valid child session id");
     let inherited_thread = host
+        .storage
         .repositories
         .threads
         .by_session(inherited_session_id)
@@ -697,6 +987,7 @@ async fn delegated_task_inherits_overrides_and_archives_an_isolated_child() {
     assert_eq!(inherited_thread.parent_thread_id, Some(parent_thread_id));
     assert!(inherited_thread.archived);
     let inherited_events = host
+        .storage
         .repositories
         .events
         .load(inherited_session_id, None, None)
@@ -717,6 +1008,35 @@ async fn delegated_task_inherits_overrides_and_archives_an_isolated_child() {
             "max_tokens": 2_000,
         })
     );
+    assert_eq!(inherited_payload["_delegation"]["depth"], 1);
+    assert_eq!(
+        inherited_payload["_delegation"]["root_session_id"],
+        json!(parent_session_id)
+    );
+    assert_eq!(
+        inherited_payload["_delegation"]["parent_session_id"],
+        json!(parent_session_id)
+    );
+    assert_eq!(
+        inherited_payload["_delegation"]["parent_task_id"],
+        json!(parent_task_id)
+    );
+    assert_eq!(
+        inherited_payload["_delegation"]["parent_thread_id"],
+        json!(parent_thread_id)
+    );
+    let parent_delegation = host
+        .execution
+        .task_controls
+        .lock()
+        .await
+        .get(&parent_session_id)
+        .and_then(|control| control.delegation.clone())
+        .expect("parent delegation budget");
+    assert_eq!(
+        parent_delegation.metadata()["budget"]["started_children"],
+        1
+    );
 
     let retried = golutra_tools::TaskDelegationBackend::delegate(
         &backend,
@@ -728,6 +1048,10 @@ async fn delegated_task_inherits_overrides_and_archives_an_isolated_child() {
     assert_eq!(
         retried.structured_facts["child_session_id"],
         inherited.structured_facts["child_session_id"]
+    );
+    assert_eq!(
+        parent_delegation.metadata()["budget"]["started_children"],
+        1
     );
 
     let changed_arguments = golutra_tools::TaskDelegationBackend::delegate(
@@ -778,6 +1102,7 @@ async fn delegated_task_inherits_overrides_and_archives_an_isolated_child() {
         .parse::<SessionId>()
         .expect("valid overridden child session id");
     let overridden_thread = host
+        .storage
         .repositories
         .threads
         .by_session(overridden_session_id)
@@ -787,6 +1112,7 @@ async fn delegated_task_inherits_overrides_and_archives_an_isolated_child() {
     assert_eq!(overridden_thread.parent_thread_id, Some(parent_thread_id));
     assert!(overridden_thread.archived);
     let overridden_events = host
+        .storage
         .repositories
         .events
         .load(overridden_session_id, None, None)
@@ -807,7 +1133,11 @@ async fn delegated_task_inherits_overrides_and_archives_an_isolated_child() {
         })
     );
 
-    host.task_controls.lock().await.remove(&parent_session_id);
+    host.execution
+        .task_controls
+        .lock()
+        .await
+        .remove(&parent_session_id);
     drop(completion_sender);
     parent_worker.abort();
 }
@@ -837,12 +1167,320 @@ async fn cancelled_delegation_does_not_create_a_child_session() {
     assert_eq!(output.status, golutra_core::ToolResultStatus::Cancelled);
     assert_eq!(output.structured_facts["cancelled"], true);
     assert!(
-        host.repositories
+        host.storage
+            .repositories
             .threads
             .list(None, 100)
             .await
             .expect("threads")
             .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn cancelling_a_parent_execution_stops_and_archives_a_running_child() {
+    let _provider = IsolatedGlobalMockProvider::install().await;
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let parent_session_id = host.default_session_id();
+    host.upsert_current_thread(
+        parent_session_id,
+        &json!({"prompt": "parent cancellation fixture"}),
+    )
+    .await
+    .expect("parent thread");
+    let parent_task_id = TaskId::new();
+    let (parent_execution, _parent_control) = agent_execution_channel(1);
+    let root_context = crate::delegation_policy::DelegationContext::root(
+        parent_session_id,
+        Some(10_000),
+        Some(1_024),
+        None,
+        parent_execution.cancellation_token(),
+    );
+    let parent_worker = tokio::spawn(std::future::pending::<()>());
+    let (completion_sender, completion) = watch::channel(false);
+    host.execution.task_controls.lock().await.insert(
+        parent_session_id,
+        HostedTaskControl {
+            task_id: parent_task_id,
+            allow_network: false,
+            yolo: false,
+            provider_settings: ProviderTurnSettings::default(),
+            execution: parent_execution.clone(),
+            abort_handle: parent_worker.abort_handle(),
+            completion,
+            delegation: Some(root_context),
+            _session_lease: None,
+        },
+    );
+
+    let backend = crate::delegation::RuntimeTaskDelegationBackend::new(Arc::downgrade(&host));
+    let request = ToolRequest {
+        tool_call_id: ToolCallId::new(),
+        provider_tool_call_id: Some("parent-abort-child".to_owned()),
+        session_id: parent_session_id,
+        turn_id: Some(TurnId::new()),
+        tool_name: "delegate_task".to_owned(),
+        arguments: json!({"task": "sleep while the parent is cancelled"}),
+    };
+    let delegation = tokio::spawn(async move {
+        golutra_tools::TaskDelegationBackend::delegate(&backend, &request, CancellationToken::new())
+            .await
+    });
+    let child_session_id = timeout(Duration::from_secs(20), async {
+        loop {
+            if let Some(session_id) = host
+                .storage
+                .repositories
+                .threads
+                .list(None, 100)
+                .await
+                .expect("threads")
+                .into_iter()
+                .find(|thread| thread.session_id != parent_session_id)
+                .map(|thread| thread.session_id)
+            {
+                return session_id;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("child thread starts");
+
+    delegation.abort();
+    parent_execution.cancel();
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let child_control_present = host
+                .execution
+                .task_controls
+                .lock()
+                .await
+                .contains_key(&child_session_id);
+            let archived = host
+                .storage
+                .repositories
+                .threads
+                .by_session(child_session_id)
+                .await
+                .expect("child lookup")
+                .is_some_and(|thread| thread.archived);
+            if !child_control_present && archived {
+                return;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("parent cancellation cleans child");
+
+    host.clear_task_control(parent_session_id, parent_task_id)
+        .await;
+    drop(completion_sender);
+    parent_worker.abort();
+}
+
+#[tokio::test]
+async fn delegated_payload_rejects_a_forged_runtime_actor() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let parent_session_id = host.default_session_id();
+    let parent_task_id = TaskId::new();
+    let parent_thread_id = host.default_thread_id();
+    let parent_tool_call_id = ToolCallId::new();
+    let child_session_id = SessionId::new();
+    let child_thread_id = ThreadId::new();
+    let cancellation = CancellationToken::new();
+    host.upsert_current_thread(
+        parent_session_id,
+        &json!({"_thread_id": parent_thread_id, "prompt": "parent"}),
+    )
+    .await
+    .expect("parent thread");
+    let root = crate::delegation_policy::DelegationContext::root(
+        parent_session_id,
+        Some(10_000),
+        Some(1_024),
+        None,
+        cancellation.clone(),
+    );
+    let child = root
+        .child(
+            parent_session_id,
+            parent_task_id,
+            parent_thread_id,
+            1_024,
+            Some(0),
+            &cancellation,
+        )
+        .expect("child context");
+    let expected_actor_id = format!("delegate:parent:{parent_session_id}");
+    let admission = crate::delegation::DelegationAdmission::new(
+        child,
+        parent_session_id,
+        parent_tool_call_id,
+        child_thread_id,
+        expected_actor_id,
+        "authorized child task",
+    );
+    let token = admission.token().to_owned();
+    host.execution
+        .delegation_admissions
+        .lock()
+        .await
+        .insert(child_session_id, admission);
+
+    let ack = host
+        .clone()
+        .handle_command(SessionCommand {
+            command_id: CommandId::new(),
+            session_id: Some(child_session_id),
+            kind: SessionCommandKind::Prompt,
+            idempotency_key: CommandId::new().to_string(),
+            actor: Actor {
+                kind: ActorKind::Runtime,
+                id: "delegate:parent:forged".to_owned(),
+            },
+            payload: json!({
+                "prompt": "authorized child task",
+                "_delegated_task": true,
+                "_delegation_admission_token": token,
+                "_delegation_parent_session_id": parent_session_id,
+                "_delegation_parent_tool_call_id": parent_tool_call_id,
+            }),
+            timestamp: chrono::Utc::now(),
+        })
+        .await
+        .expect("forged prompt is handled");
+
+    assert!(!ack.accepted);
+    assert!(
+        ack.reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("host-created child task"))
+    );
+    assert!(
+        host.execution
+            .delegation_admissions
+            .lock()
+            .await
+            .contains_key(&child_session_id)
+    );
+    host.execution
+        .delegation_admissions
+        .lock()
+        .await
+        .remove(&child_session_id);
+}
+
+#[tokio::test]
+async fn delegated_child_session_rejects_plain_prompt_between_create_and_start() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let parent_session_id = host.default_session_id();
+    let parent_task_id = TaskId::new();
+    let parent_thread_id = host.default_thread_id();
+    let parent_tool_call_id = ToolCallId::new();
+    let child_session_id = SessionId::new();
+    let child_thread_id = ThreadId::new();
+    let cancellation = CancellationToken::new();
+    host.upsert_current_thread(
+        parent_session_id,
+        &json!({"_thread_id": parent_thread_id, "prompt": "parent"}),
+    )
+    .await
+    .expect("parent thread");
+    let root = crate::delegation_policy::DelegationContext::root(
+        parent_session_id,
+        Some(10_000),
+        Some(1_024),
+        None,
+        cancellation.clone(),
+    );
+    let child = root
+        .child(
+            parent_session_id,
+            parent_task_id,
+            parent_thread_id,
+            1_024,
+            Some(0),
+            &cancellation,
+        )
+        .expect("child context");
+    let actor = Actor {
+        kind: ActorKind::Runtime,
+        id: format!("delegate:parent:{parent_session_id}"),
+    };
+    let admission = crate::delegation::DelegationAdmission::new(
+        child.clone(),
+        parent_session_id,
+        parent_tool_call_id,
+        child_thread_id,
+        actor.id.clone(),
+        "authorized child task",
+    );
+    let token = admission.token().to_owned();
+    host.execution
+        .delegation_admissions
+        .lock()
+        .await
+        .insert(child_session_id, admission);
+
+    let create = host
+        .clone()
+        .handle_command(SessionCommand {
+            command_id: CommandId::new(),
+            session_id: Some(child_session_id),
+            kind: SessionCommandKind::Create,
+            idempotency_key: CommandId::new().to_string(),
+            actor: actor.clone(),
+            payload: json!({
+                "_thread_id": child_thread_id,
+                "_parent_thread_id": parent_thread_id,
+                "title": "Delegated task",
+                "prompt": "authorized child task",
+                "_delegated_task": true,
+                "_delegation_admission_token": token,
+                "_delegation_parent_session_id": parent_session_id,
+                "_delegation_parent_tool_call_id": parent_tool_call_id,
+                "_delegation": child.metadata(),
+            }),
+            timestamp: chrono::Utc::now(),
+        })
+        .await
+        .expect("delegated child create is handled");
+    assert!(create.accepted);
+
+    let plain_prompt = host
+        .clone()
+        .handle_command(SessionCommand {
+            command_id: CommandId::new(),
+            session_id: Some(child_session_id),
+            kind: SessionCommandKind::Prompt,
+            idempotency_key: CommandId::new().to_string(),
+            actor: Actor {
+                kind: ActorKind::User,
+                id: "competing-client".to_owned(),
+            },
+            payload: json!({"prompt": "take over the delegated session"}),
+            timestamp: chrono::Utc::now(),
+        })
+        .await
+        .expect("plain prompt is handled");
+
+    assert!(!plain_prompt.accepted);
+    assert!(
+        plain_prompt
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("host admission"))
+    );
+    assert!(
+        host.execution
+            .delegation_admissions
+            .lock()
+            .await
+            .contains_key(&child_session_id)
     );
 }
 
@@ -1120,6 +1758,7 @@ async fn artifact_reads_reject_a_different_workspace_before_loading_blob_bytes()
     let bytes = b"workspace-a-only";
     let artifact_id = ArtifactId::new();
     host_a
+        .storage
         .repositories
         .artifacts
         .store(
@@ -1153,6 +1792,52 @@ async fn artifact_reads_reject_a_different_workspace_before_loading_blob_bytes()
         .expect_err("foreign workspace artifact must be rejected");
 
     assert!(matches!(error, ClientError::InvalidSession(_)));
+}
+
+#[tokio::test]
+async fn active_work_includes_a_nonterminal_post_task_job() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let transport = EmbeddedTransport::new(host.clone());
+    let job = PostTaskJob {
+        job_id: PostTaskJobId::new(),
+        kind: PostTaskJobKind::DeepEvaluation,
+        workspace_id: host.workspace_id().to_string(),
+        session_id: host.default_session_id().to_string(),
+        task_id: TaskId::new(),
+        input_refs: Vec::new(),
+        status: PostTaskJobStatus::Running,
+        attempt: 1,
+        max_attempts: 2,
+        lease_owner: Some("test-worker".to_owned()),
+        lease_expires_at: None,
+        result_refs: Vec::new(),
+        last_error: None,
+        created_at: chrono::Utc::now(),
+        started_at: Some(chrono::Utc::now()),
+        completed_at: None,
+    };
+    host.storage
+        .store
+        .enqueue_post_task_job(&job)
+        .await
+        .expect("enqueue post-task job");
+
+    assert!(transport.has_active_work().await);
+
+    host.storage
+        .repositories
+        .jobs
+        .finish(
+            job.job_id,
+            "test-worker",
+            PostTaskJobStatus::Succeeded,
+            &[],
+            None,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("finish post-task job");
+    assert!(!transport.has_active_work().await);
 }
 
 #[tokio::test]
@@ -1220,6 +1905,7 @@ async fn durable_post_task_worker_recovers_a_queued_job_after_host_restart() {
         .expect("restarted host");
     host.wait_for_deep_task_evaluation(task_id).await;
     let recovered = host
+        .storage
         .store
         .post_task_job(task_id)
         .await
@@ -1227,7 +1913,8 @@ async fn durable_post_task_worker_recovers_a_queued_job_after_host_restart() {
         .expect("job");
     assert_eq!(recovered.status, PostTaskJobStatus::Succeeded);
     assert!(
-        host.store
+        host.storage
+            .store
             .load_events(session_id, Some(task_id), None)
             .await
             .expect("evaluation events")
@@ -1312,6 +1999,7 @@ async fn startup_recreates_a_post_task_job_missing_after_terminal_commit() {
         .expect("restarted host");
     host.wait_for_deep_task_evaluation(task_id).await;
     let jobs = host
+        .storage
         .repositories
         .jobs
         .list_for_task(task_id)
@@ -1320,6 +2008,7 @@ async fn startup_recreates_a_post_task_job_missing_after_terminal_commit() {
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].status, PostTaskJobStatus::Succeeded);
     let events = host
+        .storage
         .repositories
         .events
         .load(session_id, Some(task_id), None)
@@ -1465,6 +2154,7 @@ async fn queued_turn_options_drive_failure_outcome() {
     };
     let queued_turn_id = TurnId::new();
     let started = host
+        .execution
         .lane_manager
         .lock()
         .await
@@ -1482,6 +2172,7 @@ async fn queued_turn_options_drive_failure_outcome() {
         .expect("task starts");
     host.record_event(started.event).await.expect("task event");
     let queued = host
+        .execution
         .lane_manager
         .lock()
         .await
@@ -1498,7 +2189,8 @@ async fn queued_turn_options_drive_failure_outcome() {
     ))
     .await
     .expect("queued event");
-    host.lane_manager
+    host.execution
+        .lane_manager
         .lock()
         .await
         .start_queued_turn(session_id, queued_turn_id)
@@ -1508,6 +2200,7 @@ async fn queued_turn_options_drive_failure_outcome() {
         .await
         .expect("failure outcome");
     let events = host
+        .storage
         .repositories
         .events
         .load(session_id, Some(task.task_id), None)
@@ -1821,6 +2514,7 @@ async fn queued_prompt_records_each_user_and_assistant_turn() {
     transport.host.wait_for_deep_task_evaluation(task_id).await;
     let settled_events = transport
         .host
+        .storage
         .repositories
         .events
         .load(session_id, Some(task_id), None)
@@ -1885,6 +2579,7 @@ async fn queued_prompts_can_be_updated_and_cancelled_durably() {
     }
     let queued_events = transport
         .host
+        .storage
         .repositories
         .events
         .load(session_id, None, None)
@@ -1950,6 +2645,7 @@ async fn queued_prompts_can_be_updated_and_cancelled_durably() {
 
     let events = transport
         .host
+        .storage
         .repositories
         .events
         .load(session_id, Some(active_task_id), None)
@@ -2114,6 +2810,7 @@ async fn duplicate_command_is_serialized_across_embedded_hosts() {
     wait_for_status(&first, session_id, TaskStatus::Completed).await;
     let events = first
         .host
+        .storage
         .store
         .load_events(session_id, None, None)
         .await
@@ -2167,6 +2864,7 @@ async fn processing_command_journal_entry_is_reconciled_after_owner_exit() {
     let session_id = transport.default_session_id();
     let command = command(session_id, "recover claimed command");
     let claim = host
+        .storage
         .store
         .claim_command(
             &host.scoped_idempotency_key(&command.idempotency_key),
@@ -2219,7 +2917,8 @@ async fn processing_thread_delete_retry_reuses_the_semantic_event_and_rebuilds_r
         .as_ref()
         .expect("runtime paths")
         .rollout_path(target_thread_id);
-    host.repositories
+    host.storage
+        .repositories
         .threads
         .upsert(&ThreadRecord {
             thread_id: target_thread_id,
@@ -2246,7 +2945,8 @@ async fn processing_thread_delete_retry_reuses_the_semantic_event_and_rebuilds_r
         json!({"thread_id": target_thread_id}),
     );
     let scoped_key = host.scoped_idempotency_key(&command.idempotency_key);
-    host.store
+    host.storage
+        .store
         .claim_command(
             &scoped_key,
             command.command_id,
@@ -2266,7 +2966,8 @@ async fn processing_thread_delete_retry_reuses_the_semantic_event_and_rebuilds_r
         )
         .await
         .expect("processing command claim");
-    host.store
+    host.storage
+        .store
         .delete_thread_with_event(
             target_thread_id,
             host_event(
@@ -2295,6 +2996,7 @@ async fn processing_thread_delete_retry_reuses_the_semantic_event_and_rebuilds_r
     assert!(ack.accepted);
     assert_eq!(ack.reason.as_deref(), Some("thread removed from history"));
     let events = host
+        .storage
         .store
         .load_events(target_session_id, None, None)
         .await
@@ -2307,7 +3009,8 @@ async fn processing_thread_delete_retry_reuses_the_semantic_event_and_rebuilds_r
         1
     );
     assert!(
-        host.store
+        host.storage
+            .store
             .thread_by_id(target_thread_id)
             .await
             .expect("thread lookup")
@@ -2317,7 +3020,8 @@ async fn processing_thread_delete_retry_reuses_the_semantic_event_and_rebuilds_r
     let rollout = fs::read_to_string(&rollout_path).expect("rebuilt rollout");
     assert_eq!(rollout.matches("thread_deleted").count(), 1);
     assert_eq!(
-        host.store
+        host.storage
+            .store
             .command_ack(&scoped_key)
             .await
             .expect("command journal")
@@ -2434,6 +3138,7 @@ async fn deferred_external_verification_survives_provider_failure() {
     wait_for_status(&transport, session_id, TaskStatus::Failed).await;
     let events = transport
         .host
+        .storage
         .repositories
         .events
         .load(session_id, None, None)
@@ -2487,6 +3192,7 @@ async fn deferred_external_verification_survives_abort() {
     wait_for_status(&transport, session_id, TaskStatus::Cancelled).await;
     let events = transport
         .host
+        .storage
         .repositories
         .events
         .load(session_id, None, None)
@@ -2620,7 +3326,7 @@ async fn failed_task_blocks_unfrozen_regression_without_polluting_memory() {
             json!({"candidate_id": &candidate_id}),
         ))
         .await;
-    let evaluation_store = application.host().evaluation_store.clone();
+    let evaluation_store = application.host().storage.evaluation_store.clone();
     let second_task_id = TaskId::new();
     let second_bundle = EvaluationRunner.evaluate_task(TaskEvaluationInput {
         task_id: second_task_id,
@@ -2683,6 +3389,7 @@ async fn failed_task_blocks_unfrozen_regression_without_polluting_memory() {
     assert_eq!(frozen_patch.file_count, 1);
     let candidate_artifact = application
         .host()
+        .storage
         .repositories
         .artifacts
         .get(candidate_artifact_ref)
@@ -2692,6 +3399,7 @@ async fn failed_task_blocks_unfrozen_regression_without_polluting_memory() {
     assert_eq!(candidate_artifact.artifact_type, "candidate_patch_set");
     let candidate_bytes = application
         .host()
+        .storage
         .repositories
         .artifacts
         .bytes(candidate_artifact_ref)
@@ -2740,6 +3448,7 @@ async fn failed_task_blocks_unfrozen_regression_without_polluting_memory() {
             .expect("durable regression trace artifact ref");
         let bytes = application
             .host()
+            .storage
             .repositories
             .artifacts
             .bytes(artifact_id)
@@ -3015,6 +3724,7 @@ async fn evaluation_persistence_failure_is_reported_to_the_durable_worker() {
     );
     let events = transport
         .host
+        .storage
         .repositories
         .events
         .load(task.session_id, Some(task.task_id), None)
@@ -3046,6 +3756,7 @@ async fn post_task_governance_failure_does_not_rewrite_verified_terminal_status(
         .expect("task id");
     let turn_id = transport
         .host
+        .storage
         .repositories
         .events
         .load(session_id, Some(task_id), None)
@@ -3072,6 +3783,7 @@ async fn post_task_governance_failure_does_not_rewrite_verified_terminal_status(
         .await;
     let events = transport
         .host
+        .storage
         .repositories
         .events
         .load(session_id, Some(task_id), None)
@@ -3090,6 +3802,7 @@ async fn post_task_governance_failure_does_not_rewrite_verified_terminal_status(
     assert_eq!(
         transport
             .host
+            .storage
             .repositories
             .projections
             .state(session_id, None)
@@ -3389,6 +4102,7 @@ async fn session_window_selects_adjacent_newer_and_older_threads_from_an_anchor(
         };
         transport
             .host
+            .storage
             .repositories
             .threads
             .upsert(&thread)
@@ -3530,6 +4244,7 @@ async fn session_window_validates_ranges_workspace_and_archived_anchors() {
     };
     transport_a
         .host
+        .storage
         .repositories
         .threads
         .upsert(&thread)
@@ -3587,6 +4302,7 @@ async fn session_window_validates_ranges_workspace_and_archived_anchors() {
     archived.archived = true;
     transport_a
         .host
+        .storage
         .repositories
         .threads
         .upsert(&archived)
@@ -3640,6 +4356,7 @@ async fn session_page_uses_thread_id_as_a_stable_cursor_tiebreaker() {
         };
         transport
             .host
+            .storage
             .repositories
             .threads
             .upsert(&thread)
@@ -3712,6 +4429,7 @@ async fn thread_metadata_commands_rename_archive_and_delete_an_idle_thread() {
     };
     transport
         .host
+        .storage
         .repositories
         .threads
         .upsert(&target)
@@ -3739,6 +4457,7 @@ async fn thread_metadata_commands_rename_archive_and_delete_an_idle_thread() {
     }
     let archived = transport
         .host
+        .storage
         .repositories
         .threads
         .by_id(target.thread_id)
@@ -3763,6 +4482,7 @@ async fn thread_metadata_commands_rename_archive_and_delete_an_idle_thread() {
     );
     let removed = transport
         .host
+        .storage
         .repositories
         .threads
         .by_id(target.thread_id)
@@ -3784,6 +4504,7 @@ async fn thread_metadata_commands_rename_archive_and_delete_an_idle_thread() {
 
     let events = transport
         .host
+        .storage
         .repositories
         .events
         .load(target.session_id, None, None)
@@ -3894,6 +4615,7 @@ async fn another_runtime_session_lease_blocks_thread_metadata_mutation() {
     assert_ne!(
         owner
             .host
+            .storage
             .repositories
             .threads
             .by_id(thread_id)
@@ -3912,7 +4634,14 @@ async fn another_runtime_session_lease_blocks_thread_metadata_mutation() {
         ))
         .await
         .expect("abort task");
-    if let Some(control) = owner.host.task_controls.lock().await.get(&session_id) {
+    if let Some(control) = owner
+        .host
+        .execution
+        .task_controls
+        .lock()
+        .await
+        .get(&session_id)
+    {
         control.abort_handle.abort();
     }
     sleep(Duration::from_millis(100)).await;
@@ -3952,6 +4681,7 @@ async fn implicit_default_session_cannot_be_archived_or_removed() {
     };
     transport
         .host
+        .storage
         .repositories
         .threads
         .upsert(&thread)
@@ -3977,6 +4707,7 @@ async fn implicit_default_session_cannot_be_archived_or_removed() {
     assert!(
         transport
             .host
+            .storage
             .repositories
             .threads
             .by_id(thread.thread_id)
@@ -3993,7 +4724,8 @@ async fn debug_export_writes_redacted_session_bundle_atomically() {
     let thread_id = ThreadId::new();
     let task_id = TaskId::new();
     let at = chrono::Utc::now();
-    host.repositories
+    host.storage
+        .repositories
         .threads
         .upsert(&ThreadRecord {
             thread_id,
@@ -4272,6 +5004,77 @@ async fn rollout_jsonl_is_complete_checksummed_redacted_and_owner_only() {
 }
 
 #[tokio::test]
+async fn rollout_sync_removes_only_projections_without_thread_records() {
+    let home = tempdir().expect("home");
+    let workspace = tempdir().expect("workspace");
+    let host = RuntimeHost::from_home_and_cwd(home.path(), workspace.path())
+        .await
+        .expect("host");
+    let paths = host.runtime_paths.as_ref().expect("runtime paths");
+    let workspace_root = workspace
+        .path()
+        .canonicalize()
+        .expect("canonical workspace")
+        .display()
+        .to_string();
+    let at = chrono::Utc::now();
+    let archived_id = ThreadId::new();
+    let removed_id = ThreadId::new();
+    for (thread_id, archived, removed) in [(archived_id, true, false), (removed_id, true, true)] {
+        let path = paths.rollout_path(thread_id);
+        host.storage
+            .repositories
+            .threads
+            .upsert(&ThreadRecord {
+                thread_id,
+                session_id: SessionId::new(),
+                parent_thread_id: None,
+                forked_from_turn_id: None,
+                forked_from_sequence_no: None,
+                workspace_root: Some(workspace_root.clone()),
+                rebound_from_workspace_root: None,
+                rollout_path: Some(path.display().to_string()),
+                title: "retained history".to_owned(),
+                preview: String::new(),
+                created_at: at,
+                updated_at: at,
+                recency_at: at,
+                archived,
+                removed,
+            })
+            .await
+            .expect("retained thread");
+        fs::write(path, "retained\n").expect("retained projection");
+    }
+
+    let orphan = paths.rollout_path(ThreadId::new());
+    let non_thread_file = paths.rollouts_dir.join("notes.jsonl");
+    let uuid_directory = paths.rollout_path(ThreadId::new());
+    fs::write(&orphan, "orphaned\n").expect("orphan projection");
+    fs::write(&non_thread_file, "user data\n").expect("non-thread file");
+    fs::create_dir(&uuid_directory).expect("uuid directory");
+
+    host.synchronize_workspace_rollouts()
+        .await
+        .expect("rollout synchronization");
+
+    assert!(!orphan.exists());
+    assert_eq!(
+        fs::read_to_string(paths.rollout_path(archived_id)).expect("archived projection"),
+        "retained\n"
+    );
+    assert_eq!(
+        fs::read_to_string(paths.rollout_path(removed_id)).expect("removed projection"),
+        "retained\n"
+    );
+    assert_eq!(
+        fs::read_to_string(non_thread_file).expect("non-thread file retained"),
+        "user data\n"
+    );
+    assert!(uuid_directory.is_dir());
+}
+
+#[tokio::test]
 async fn fork_from_turn_copies_complete_history_with_fresh_runtime_ids() {
     let workspace = tempdir().expect("workspace");
     fs::write(
@@ -4302,6 +5105,7 @@ async fn fork_from_turn_copies_complete_history_with_fresh_runtime_ids() {
     wait_for_status(&transport, parent_session_id, TaskStatus::Completed).await;
     let after_first = transport
         .host
+        .storage
         .store
         .load_events(parent_session_id, None, None)
         .await
@@ -4322,6 +5126,7 @@ async fn fork_from_turn_copies_complete_history_with_fresh_runtime_ids() {
         .expect("fork at first turn");
     let child_events = transport
         .host
+        .storage
         .store
         .load_events(child.session_id, None, None)
         .await
@@ -4354,6 +5159,7 @@ async fn fork_from_turn_copies_complete_history_with_fresh_runtime_ids() {
     assert!(!is_active_status(
         transport
             .host
+            .storage
             .store
             .query_state(child.session_id, None)
             .await
@@ -4383,6 +5189,7 @@ async fn fork_from_turn_copies_complete_history_with_fresh_runtime_ids() {
     assert!(!history.content.contains("second fork turn"));
     let debug = transport
         .host
+        .storage
         .store
         .debug_projection(child.session_id, None)
         .await
@@ -4395,6 +5202,7 @@ async fn fork_from_turn_copies_complete_history_with_fresh_runtime_ids() {
     assert!(
         transport
             .host
+            .storage
             .store
             .load_artifact_bytes(inherited_artifact.artifact_id)
             .await
@@ -4499,6 +5307,7 @@ async fn rebind_moves_thread_to_current_cwd_and_rebuilds_rollout() {
     );
     let events = new_transport
         .host
+        .storage
         .store
         .load_events(old_thread.session_id, None, None)
         .await
@@ -4650,6 +5459,7 @@ async fn rebind_rejects_a_rollout_path_outside_the_source_workspace_partition() 
     .await;
     let task_id = old_transport
         .host
+        .storage
         .store
         .query_state(old_transport.default_session_id(), None)
         .await
@@ -4668,6 +5478,7 @@ async fn rebind_rejects_a_rollout_path_outside_the_source_workspace_partition() 
     thread.rollout_path = Some(victim.display().to_string());
     old_transport
         .host
+        .storage
         .store
         .upsert_thread(&thread)
         .await
@@ -4690,6 +5501,7 @@ async fn rebind_rejects_a_rollout_path_outside_the_source_workspace_partition() 
     assert_eq!(
         new_transport
             .host
+            .storage
             .store
             .thread_by_id(thread_id)
             .await
@@ -5011,6 +5823,7 @@ async fn prompt_runs_mock_agent_loop_and_writes_file() {
     );
     let request_bytes = transport
         .host
+        .storage
         .store
         .load_artifact_bytes(ArtifactId(request_artifact_id))
         .await
@@ -5118,6 +5931,7 @@ async fn prompt_runs_mock_agent_loop_and_writes_file() {
     }));
     let change_manifest_bytes = transport
         .host
+        .storage
         .store
         .load_artifact_bytes(
             change_manifest_ref
@@ -5308,6 +6122,11 @@ async fn prompt_plain_conversation_completes_without_tool_evidence() {
         .position(|event| event.event_type == RuntimeEventType::AssistantMessage)
         .expect("assistant message");
     assert!(streamed < completed);
+    assert_eq!(events[streamed].payload["coalescing"]["applied"], false);
+    assert_eq!(
+        events[streamed].payload["coalescing"]["omitted_event_count"],
+        0
+    );
 }
 
 #[tokio::test]
@@ -5367,6 +6186,7 @@ async fn approval_command_unblocks_waiting_tool_and_records_resolution() {
     wait_for_status(&transport, session_id, TaskStatus::Failed).await;
     let events = transport
         .host
+        .storage
         .store
         .load_events(session_id, None, None)
         .await
@@ -5448,6 +6268,7 @@ async fn terminal_task_rejects_a_stale_structured_question_answer() {
         .await
         .expect("stale answer command");
     let events = host
+        .storage
         .store
         .load_events(session_id, Some(task_id), None)
         .await
@@ -5767,6 +6588,7 @@ async fn persisted_ephemeral_runtime_retains_isolated_state_and_full_run_bundle(
         "persisted ephemeral writes must keep checkpoints"
     );
     let runtime_events = host
+        .storage
         .store
         .load_events(result.session_id, Some(task_id), None)
         .await
@@ -6739,6 +7561,7 @@ async fn task_contract_is_normalized_into_task_and_queued_turn_events() {
 
     let events = transport
         .host
+        .storage
         .repositories
         .events
         .load(session_id, None, None)
@@ -6784,7 +7607,14 @@ async fn task_contract_is_normalized_into_task_and_queued_turn_events() {
         ))
         .await
         .expect("release blocking task");
-    if let Some(control) = transport.host.task_controls.lock().await.get(&session_id) {
+    if let Some(control) = transport
+        .host
+        .execution
+        .task_controls
+        .lock()
+        .await
+        .get(&session_id)
+    {
         control.abort_handle.abort();
     }
     sleep(Duration::from_millis(100)).await;
@@ -6821,6 +7651,7 @@ async fn discovered_project_verifier_is_normalized_as_independent_on_a_queued_tu
 
     let events = transport
         .host
+        .storage
         .repositories
         .events
         .load(session_id, None, None)
@@ -6854,7 +7685,14 @@ async fn discovered_project_verifier_is_normalized_as_independent_on_a_queued_tu
         ))
         .await
         .expect("release blocking task");
-    if let Some(control) = transport.host.task_controls.lock().await.get(&session_id) {
+    if let Some(control) = transport
+        .host
+        .execution
+        .task_controls
+        .lock()
+        .await
+        .get(&session_id)
+    {
         control.abort_handle.abort();
     }
     sleep(Duration::from_millis(100)).await;
@@ -6894,6 +7732,7 @@ async fn direct_protocol_can_disable_project_verifier_discovery() {
 
     let events = transport
         .host
+        .storage
         .repositories
         .events
         .load(session_id, None, None)
@@ -6919,7 +7758,14 @@ async fn direct_protocol_can_disable_project_verifier_discovery() {
         ))
         .await
         .expect("release blocking task");
-    if let Some(control) = transport.host.task_controls.lock().await.get(&session_id) {
+    if let Some(control) = transport
+        .host
+        .execution
+        .task_controls
+        .lock()
+        .await
+        .get(&session_id)
+    {
         control.abort_handle.abort();
     }
     sleep(Duration::from_millis(100)).await;
@@ -6981,6 +7827,7 @@ async fn queued_turn_cannot_change_the_active_network_capability() {
     );
     let events = transport
         .host
+        .storage
         .repositories
         .events
         .load(session_id, None, None)
@@ -7003,7 +7850,14 @@ async fn queued_turn_cannot_change_the_active_network_capability() {
         ))
         .await
         .expect("release blocking task");
-    if let Some(control) = transport.host.task_controls.lock().await.get(&session_id) {
+    if let Some(control) = transport
+        .host
+        .execution
+        .task_controls
+        .lock()
+        .await
+        .get(&session_id)
+    {
         control.abort_handle.abort();
     }
     sleep(Duration::from_millis(100)).await;
@@ -7035,6 +7889,7 @@ async fn queued_turn_inherits_and_persists_the_active_network_capability() {
 
     let events = transport
         .host
+        .storage
         .repositories
         .events
         .load(session_id, None, None)
@@ -7062,7 +7917,14 @@ async fn queued_turn_inherits_and_persists_the_active_network_capability() {
         ))
         .await
         .expect("release blocking task");
-    if let Some(control) = transport.host.task_controls.lock().await.get(&session_id) {
+    if let Some(control) = transport
+        .host
+        .execution
+        .task_controls
+        .lock()
+        .await
+        .get(&session_id)
+    {
         control.abort_handle.abort();
     }
     sleep(Duration::from_millis(100)).await;
@@ -7126,7 +7988,14 @@ async fn queued_turn_cannot_change_the_active_yolo_capability() {
         ))
         .await
         .expect("release blocking task");
-    if let Some(control) = transport.host.task_controls.lock().await.get(&session_id) {
+    if let Some(control) = transport
+        .host
+        .execution
+        .task_controls
+        .lock()
+        .await
+        .get(&session_id)
+    {
         control.abort_handle.abort();
     }
     sleep(Duration::from_millis(100)).await;
@@ -7158,6 +8027,7 @@ async fn queued_turn_inherits_and_persists_the_active_yolo_capability() {
 
     let events = transport
         .host
+        .storage
         .repositories
         .events
         .load(session_id, None, None)
@@ -7185,7 +8055,14 @@ async fn queued_turn_inherits_and_persists_the_active_yolo_capability() {
         ))
         .await
         .expect("release blocking task");
-    if let Some(control) = transport.host.task_controls.lock().await.get(&session_id) {
+    if let Some(control) = transport
+        .host
+        .execution
+        .task_controls
+        .lock()
+        .await
+        .get(&session_id)
+    {
         control.abort_handle.abort();
     }
     sleep(Duration::from_millis(100)).await;
@@ -7247,6 +8124,7 @@ async fn queued_turn_inherits_and_persists_active_provider_settings() {
 
     let events = transport
         .host
+        .storage
         .repositories
         .events
         .load(session_id, None, None)
@@ -7295,7 +8173,14 @@ async fn queued_turn_inherits_and_persists_active_provider_settings() {
         ))
         .await
         .expect("release blocking task");
-    if let Some(control) = transport.host.task_controls.lock().await.get(&session_id) {
+    if let Some(control) = transport
+        .host
+        .execution
+        .task_controls
+        .lock()
+        .await
+        .get(&session_id)
+    {
         control.abort_handle.abort();
     }
     sleep(Duration::from_millis(100)).await;
@@ -7353,6 +8238,7 @@ async fn queued_turn_cannot_change_active_provider_settings() {
 
     let events = transport
         .host
+        .storage
         .repositories
         .events
         .load(session_id, None, None)
@@ -7375,7 +8261,14 @@ async fn queued_turn_cannot_change_active_provider_settings() {
         ))
         .await
         .expect("release blocking task");
-    if let Some(control) = transport.host.task_controls.lock().await.get(&session_id) {
+    if let Some(control) = transport
+        .host
+        .execution
+        .task_controls
+        .lock()
+        .await
+        .get(&session_id)
+    {
         control.abort_handle.abort();
     }
     sleep(Duration::from_millis(100)).await;
@@ -7424,6 +8317,32 @@ async fn direct_protocol_rejects_invalid_elapsed_budgets() {
 }
 
 #[tokio::test]
+async fn direct_protocol_rejects_malformed_delegation_cost_budgets() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let session_id = host.default_session_id();
+
+    for value in [json!("100"), json!(-1), json!(1.5), json!(true)] {
+        let error = host
+            .clone()
+            .handle_command(command_with_payload(
+                session_id,
+                json!({
+                    "prompt": "do not start",
+                    "_delegation_cost_budget_microusd": value,
+                }),
+            ))
+            .await
+            .expect_err("malformed delegation cost budget must be rejected");
+
+        assert!(matches!(
+            error,
+            ClientError::TaskExecution(message)
+                if message == "_delegation_cost_budget_microusd must be a non-negative integer"
+        ));
+    }
+}
+
+#[tokio::test]
 async fn queued_turn_persists_its_runtime_and_evaluator_options() {
     let workspace = tempdir().expect("workspace");
     let _provider = IsolatedGlobalMockProvider::install().await;
@@ -7453,6 +8372,7 @@ async fn queued_turn_persists_its_runtime_and_evaluator_options() {
 
     let events = transport
         .host
+        .storage
         .repositories
         .events
         .load(session_id, None, None)
@@ -7481,7 +8401,14 @@ async fn queued_turn_persists_its_runtime_and_evaluator_options() {
         ))
         .await
         .expect("release blocking task");
-    if let Some(control) = transport.host.task_controls.lock().await.get(&session_id) {
+    if let Some(control) = transport
+        .host
+        .execution
+        .task_controls
+        .lock()
+        .await
+        .get(&session_id)
+    {
         control.abort_handle.abort();
     }
     sleep(Duration::from_millis(100)).await;
@@ -7517,6 +8444,7 @@ async fn per_turn_elapsed_budget_clamps_shell_execution() {
         .expect("task id format");
     let events = transport
         .host
+        .storage
         .repositories
         .events
         .load(session_id, Some(task_id), None)
@@ -7574,6 +8502,7 @@ async fn yolo_turn_writes_outside_the_workspace_without_approval() {
     );
     let events = transport
         .host
+        .storage
         .repositories
         .events
         .load(session_id, None, None)
@@ -7653,6 +8582,7 @@ async fn forbidden_workspace_contract_blocks_provider_side_effects() {
         .expect("task id format");
     let events = transport
         .host
+        .storage
         .repositories
         .events
         .load(session_id, Some(task_id), None)
@@ -8155,7 +9085,7 @@ async fn aborting_lane_rejects_a_new_prompt_until_cancellation_finishes() {
         id: "test".to_owned(),
     };
     {
-        let mut lanes = host.lane_manager.lock().await;
+        let mut lanes = host.execution.lane_manager.lock().await;
         lanes
             .start_task(
                 host.workspace_id,
@@ -8174,7 +9104,7 @@ async fn aborting_lane_rejects_a_new_prompt_until_cancellation_finishes() {
         .handle_command(command(session_id, "start another task"))
         .await
         .expect("command ack");
-    let lanes = host.lane_manager.lock().await;
+    let lanes = host.execution.lane_manager.lock().await;
     let lane = lanes.lane(session_id).expect("lane remains active");
 
     assert!(!ack.accepted);
@@ -8205,6 +9135,7 @@ async fn runtime_recovery_interrupts_unlocked_orphaned_active_tasks() {
 
     let recovered = host.recover_orphaned_tasks().await.expect("recovery");
     let state = host
+        .storage
         .store
         .query_state(session_id, None)
         .await
@@ -8213,6 +9144,7 @@ async fn runtime_recovery_interrupts_unlocked_orphaned_active_tasks() {
     assert_eq!(recovered, 1);
     assert_eq!(state.task_status, TaskStatus::Interrupted);
     let events = host
+        .storage
         .store
         .load_events(session_id, Some(task_id), None)
         .await
@@ -8276,11 +9208,13 @@ async fn runtime_recovery_marks_unclosed_side_effects_uncertain_without_replay()
 
     assert_eq!(host.recover_orphaned_tasks().await.expect("recovery"), 1);
     let state = host
+        .storage
         .store
         .query_state(session_id, None)
         .await
         .expect("state");
     let events = host
+        .storage
         .store
         .load_events(session_id, Some(task_id), None)
         .await
@@ -8368,12 +9302,14 @@ async fn uncertain_recovery_requires_explicit_reconciliation_before_new_work() {
     assert!(reconciled.accepted);
 
     let state = host
+        .storage
         .store
         .query_state(session_id, None)
         .await
         .expect("state");
     assert_eq!(state.task_status, TaskStatus::Interrupted);
     let events = host
+        .storage
         .store
         .load_events(session_id, Some(task_id), None)
         .await
@@ -8411,6 +9347,7 @@ async fn runtime_recovery_restarts_durable_unstarted_pending_turns() {
         .await
         .expect("thread");
     let started = host
+        .execution
         .lane_manager
         .lock()
         .await
@@ -8425,6 +9362,7 @@ async fn runtime_recovery_restarts_durable_unstarted_pending_turns() {
         .expect("orphan task starts");
     host.record_event(started.event).await.expect("task event");
     let queued = host
+        .execution
         .lane_manager
         .lock()
         .await
@@ -8438,6 +9376,7 @@ async fn runtime_recovery_restarts_durable_unstarted_pending_turns() {
     .await
     .expect("queued event");
     let second_queued = host
+        .execution
         .lane_manager
         .lock()
         .await
@@ -8538,6 +9477,7 @@ async fn runtime_recovery_keeps_the_provider_binding_pinned_at_queue_time() {
         .await
         .expect("thread");
     let started = host
+        .execution
         .lane_manager
         .lock()
         .await
@@ -8552,6 +9492,7 @@ async fn runtime_recovery_keeps_the_provider_binding_pinned_at_queue_time() {
         .expect("orphan task starts");
     host.record_event(started.event).await.expect("task event");
     let queued = host
+        .execution
         .lane_manager
         .lock()
         .await
@@ -8588,6 +9529,7 @@ async fn runtime_recovery_keeps_the_provider_binding_pinned_at_queue_time() {
     wait_for_status(&transport, session_id, TaskStatus::WaitingApproval).await;
     let recovered_settings = transport
         .host
+        .execution
         .task_controls
         .lock()
         .await
@@ -8610,7 +9552,14 @@ async fn runtime_recovery_keeps_the_provider_binding_pinned_at_queue_time() {
         ))
         .await
         .expect("release recovered task");
-    if let Some(control) = transport.host.task_controls.lock().await.get(&session_id) {
+    if let Some(control) = transport
+        .host
+        .execution
+        .task_controls
+        .lock()
+        .await
+        .get(&session_id)
+    {
         control.abort_handle.abort();
     }
     sleep(Duration::from_millis(100)).await;
@@ -8679,6 +9628,7 @@ async fn uncertain_recovery_holds_pending_turns_until_reconciled() {
         .await
         .expect("thread");
     let started = host
+        .execution
         .lane_manager
         .lock()
         .await
@@ -8709,6 +9659,7 @@ async fn uncertain_recovery_holds_pending_turns_until_reconciled() {
     .await
     .expect("side effect start");
     let queued = host
+        .execution
         .lane_manager
         .lock()
         .await
@@ -8728,6 +9679,7 @@ async fn uncertain_recovery_holds_pending_turns_until_reconciled() {
         .expect("reopened host");
     let transport = EmbeddedTransport::new(reopened.clone());
     let held_events = reopened
+        .storage
         .store
         .load_events(session_id, None, None)
         .await
@@ -8782,6 +9734,7 @@ async fn runtime_recovery_survives_a_crash_after_pending_turn_transfer() {
         .await
         .expect("thread");
     let started = host
+        .execution
         .lane_manager
         .lock()
         .await
@@ -8799,6 +9752,7 @@ async fn runtime_recovery_survives_a_crash_after_pending_turn_transfer() {
         .expect("orphan starts");
     host.record_event(started.event).await.expect("start event");
     let queued = host
+        .execution
         .lane_manager
         .lock()
         .await
@@ -8812,6 +9766,7 @@ async fn runtime_recovery_survives_a_crash_after_pending_turn_transfer() {
     .await
     .expect("queue event");
     let queued_sequence_no = host
+        .storage
         .store
         .load_events(session_id, Some(orphaned_task_id), None)
         .await
@@ -8876,6 +9831,7 @@ async fn task_supervisor_converts_worker_panic_to_terminal_failure_and_cleans_co
         payload: json!({"prompt": "panic fixture"}),
     };
     let transition = host
+        .execution
         .lane_manager
         .lock()
         .await
@@ -8895,6 +9851,7 @@ async fn task_supervisor_converts_worker_panic_to_terminal_failure_and_cleans_co
         .await
         .expect("task event");
     let (execution, _control) = agent_execution_channel(1);
+    let execution_cancellation = execution.cancellation_token();
     let worker = tokio::spawn(async {
         panic!("intentional worker panic");
         #[allow(unreachable_code)]
@@ -8902,7 +9859,7 @@ async fn task_supervisor_converts_worker_panic_to_terminal_failure_and_cleans_co
     });
     let abort_handle = worker.abort_handle();
     let (completion_sender, completion) = watch::channel(false);
-    host.task_controls.lock().await.insert(
+    host.execution.task_controls.lock().await.insert(
         task.session_id,
         HostedTaskControl {
             task_id: task.task_id,
@@ -8912,6 +9869,7 @@ async fn task_supervisor_converts_worker_panic_to_terminal_failure_and_cleans_co
             execution,
             abort_handle,
             completion,
+            delegation: None,
             _session_lease: None,
         },
     );
@@ -8920,19 +9878,90 @@ async fn task_supervisor_converts_worker_panic_to_terminal_failure_and_cleans_co
         .supervise_agent_task(task.clone(), worker, completion_sender)
         .await;
     let state = host
+        .storage
         .store
         .query_state(task.session_id, None)
         .await
         .expect("state");
 
     assert_eq!(state.task_status, TaskStatus::Failed);
+    assert!(execution_cancellation.is_cancelled());
     assert!(
         !host
+            .execution
             .task_controls
             .lock()
             .await
             .contains_key(&task.session_id)
     );
+}
+
+#[tokio::test]
+async fn aborting_a_hosted_observation_owner_releases_the_recorder_and_runtime_host() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let weak_host = Arc::downgrade(&host);
+    let task = HostedAgentTask {
+        session_id: host.default_session_id(),
+        task_id: TaskId::new(),
+        turn_id: TurnId::new(),
+        payload: json!({"prompt": "abort recorder fixture"}),
+    };
+    let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+    let worker_host = host.clone();
+    let worker = tokio::spawn(async move {
+        let _recorder = crate::execution::HostedObservationRecorder::spawn(worker_host, task);
+        let _ = started_sender.send(());
+        std::future::pending::<()>().await;
+    });
+
+    started_receiver.await.expect("recorder started");
+    drop(host);
+    worker.abort();
+    assert!(
+        worker
+            .await
+            .expect_err("worker must be aborted")
+            .is_cancelled()
+    );
+
+    timeout(Duration::from_secs(2), async {
+        while weak_host.strong_count() != 0 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("observation recorder must release the runtime host");
+}
+
+#[tokio::test]
+async fn panicking_a_hosted_observation_owner_releases_the_recorder_and_runtime_host() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let weak_host = Arc::downgrade(&host);
+    let task = HostedAgentTask {
+        session_id: host.default_session_id(),
+        task_id: TaskId::new(),
+        turn_id: TurnId::new(),
+        payload: json!({"prompt": "panic recorder fixture"}),
+    };
+    let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+    let worker_host = host.clone();
+    let worker = tokio::spawn(async move {
+        let _recorder = crate::execution::HostedObservationRecorder::spawn(worker_host, task);
+        let _ = started_sender.send(());
+        panic!("intentional observation owner panic");
+    });
+
+    started_receiver.await.expect("recorder started");
+    drop(host);
+    assert!(worker.await.expect_err("worker must panic").is_panic());
+
+    timeout(Duration::from_secs(2), async {
+        while weak_host.strong_count() != 0 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("observation recorder must release the runtime host");
 }
 
 #[tokio::test]
@@ -9001,6 +10030,7 @@ async fn abort_cancels_an_unlocked_orphan_without_an_in_memory_task_handle() {
 
     let ack = transport.send_command(abort).await.expect("abort");
     let state = host
+        .storage
         .store
         .query_state(session_id, None)
         .await

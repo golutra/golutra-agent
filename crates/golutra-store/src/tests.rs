@@ -1334,6 +1334,8 @@ async fn migration_deduplicates_legacy_threads_before_adding_session_uniqueness(
     let session_id = SessionId::new();
     let older_thread_id = ThreadId::new();
     let newer_thread_id = ThreadId::new();
+    let child_session_id = SessionId::new();
+    let child_thread_id = ThreadId::new();
     for (thread_id, timestamp) in [
         (older_thread_id, "2026-07-10T00:00:00Z"),
         (newer_thread_id, "2026-07-11T00:00:00Z"),
@@ -1355,6 +1357,23 @@ async fn migration_deduplicates_legacy_threads_before_adding_session_uniqueness(
         .await
         .expect("legacy thread");
     }
+    sqlx::query(
+        r#"
+            INSERT INTO threads (
+                thread_id, session_id, parent_thread_id, workspace_root, title, preview,
+                created_at, updated_at, recency_at, archived
+            ) VALUES (?, ?, ?, '/workspace', 'Child', 'Child preview', ?, ?, ?, 0)
+            "#,
+    )
+    .bind(child_thread_id.to_string())
+    .bind(child_session_id.to_string())
+    .bind(older_thread_id.to_string())
+    .bind("2026-07-12T00:00:00Z")
+    .bind("2026-07-12T00:00:00Z")
+    .bind("2026-07-12T00:00:00Z")
+    .execute(&pool)
+    .await
+    .expect("legacy child thread");
     drop(pool);
 
     let store = RuntimeStore::connect(&database_url)
@@ -1372,13 +1391,58 @@ async fn migration_deduplicates_legacy_threads_before_adding_session_uniqueness(
     assert!(thread.rebound_from_workspace_root.is_none());
     assert!(thread.rollout_path.is_none());
     assert!(!thread.removed);
+    let child = store
+        .thread_by_id(child_thread_id)
+        .await
+        .expect("child thread query")
+        .expect("child thread");
+    assert_eq!(child.parent_thread_id, Some(newer_thread_id));
+    let now = Utc::now();
+    let forked = ThreadRecord {
+        thread_id: ThreadId::new(),
+        session_id: SessionId::new(),
+        parent_thread_id: Some(child.thread_id),
+        forked_from_turn_id: None,
+        forked_from_sequence_no: Some(0),
+        workspace_root: child.workspace_root.clone(),
+        rebound_from_workspace_root: None,
+        rollout_path: None,
+        title: "Fork after migration".to_owned(),
+        preview: child.preview.clone(),
+        created_at: now,
+        updated_at: now,
+        recency_at: now,
+        archived: false,
+        removed: false,
+    };
+    let forked_events = store
+        .create_forked_thread(&forked, child.session_id, 0)
+        .await
+        .expect("fork after migration");
+    assert!(forked_events.is_empty());
+    assert_eq!(
+        store
+            .thread_by_id(forked.thread_id)
+            .await
+            .expect("forked thread query")
+            .expect("forked thread")
+            .parent_thread_id,
+        Some(child.thread_id)
+    );
+    assert!(
+        store
+            .thread_by_id(older_thread_id)
+            .await
+            .expect("duplicate thread query")
+            .is_none()
+    );
     assert_eq!(
         store
             .list_threads(Some("/workspace"), 10)
             .await
             .expect("thread list")
             .len(),
-        1
+        3
     );
 }
 
@@ -1828,6 +1892,71 @@ async fn post_task_claim_is_scoped_to_the_worker_workspace() {
     assert!(unrelated.is_none());
     assert_eq!(claimed_a.job_id, job_a.job_id);
     assert_eq!(claimed_a.workspace_id, workspace_a);
+}
+
+#[tokio::test]
+async fn nonterminal_post_task_query_is_scoped_and_status_aware() {
+    let store = RuntimeStore::in_memory().await.expect("store");
+    let now = Utc::now();
+    let make_job = |workspace_id: &str, status: PostTaskJobStatus| PostTaskJob {
+        job_id: PostTaskJobId::new(),
+        kind: PostTaskJobKind::DeepEvaluation,
+        workspace_id: workspace_id.to_owned(),
+        session_id: SessionId::new().to_string(),
+        task_id: TaskId::new(),
+        input_refs: Vec::new(),
+        status,
+        attempt: 0,
+        max_attempts: 2,
+        lease_owner: None,
+        lease_expires_at: None,
+        result_refs: Vec::new(),
+        last_error: None,
+        created_at: now,
+        started_at: None,
+        completed_at: None,
+    };
+
+    for status in [
+        PostTaskJobStatus::Queued,
+        PostTaskJobStatus::Leased,
+        PostTaskJobStatus::Running,
+    ] {
+        let workspace_id = WorkspaceId::new().to_string();
+        let job = make_job(&workspace_id, status);
+        store.enqueue_post_task_job(&job).await.expect("active job");
+        assert!(
+            store
+                .has_nonterminal_post_task_jobs(&workspace_id)
+                .await
+                .expect("active status query")
+        );
+    }
+
+    let terminal_workspace = WorkspaceId::new().to_string();
+    for status in [
+        PostTaskJobStatus::Succeeded,
+        PostTaskJobStatus::Failed,
+        PostTaskJobStatus::Cancelled,
+    ] {
+        let job = make_job(&terminal_workspace, status);
+        store
+            .enqueue_post_task_job(&job)
+            .await
+            .expect("terminal job");
+    }
+    assert!(
+        !store
+            .has_nonterminal_post_task_jobs(&terminal_workspace)
+            .await
+            .expect("terminal status query")
+    );
+    assert!(
+        !store
+            .has_nonterminal_post_task_jobs("workspace-with-no-jobs")
+            .await
+            .expect("empty status query")
+    );
 }
 
 #[tokio::test]

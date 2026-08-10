@@ -53,6 +53,7 @@ const MAX_VERIFIER_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 pub const CONTRACT_FILE_CONTENT_VERIFIER_TOOL: &str = "contract_file_content_verifier";
 pub const CONTRACT_PATH_VERIFIER_TOOL: &str = "contract_path_verifier";
 
+mod builtin;
 mod process;
 mod process_supervisor;
 mod project_verifier;
@@ -70,6 +71,8 @@ pub(crate) use process_supervisor::{
     default_start_wait_ms, max_poll_wait_ms,
 };
 pub use project_verifier::{DiscoveredProjectVerifier, discover_project_verifiers};
+
+use builtin::BuiltinTool;
 
 #[derive(Debug, Error)]
 pub enum ToolError {
@@ -220,26 +223,11 @@ pub struct ToolRegistry {
 impl ToolRegistry {
     #[must_use]
     pub fn p0_default() -> Self {
-        let contracts = [
-            contract("read_file", SideEffectType::None),
-            contract("write_file", SideEffectType::File),
-            contract("edit_file", SideEffectType::File),
-            contract("apply_patch", SideEffectType::File),
-            contract("list_dir", SideEffectType::None),
-            contract("rg_search", SideEffectType::None),
-            contract("symbol_search", SideEffectType::None),
-            contract("find_references", SideEffectType::None),
-            contract("ask_user", SideEffectType::None),
-            contract("shell", SideEffectType::Process),
-            contract("process_list", SideEffectType::None),
-            contract("process_poll", SideEffectType::None),
-            contract("process_write", SideEffectType::Process),
-            contract("process_terminate", SideEffectType::Process),
-            contract("process_reconnect", SideEffectType::None),
-        ]
-        .into_iter()
-        .map(|contract| (contract.tool_name.clone(), contract))
-        .collect();
+        let contracts = BuiltinTool::P0_DEFAULT
+            .into_iter()
+            .map(BuiltinTool::contract)
+            .map(|contract| (contract.tool_name.clone(), contract))
+            .collect();
         Self { contracts }
     }
 
@@ -542,17 +530,17 @@ impl ToolRuntime {
         backend: Arc<dyn TaskDelegationBackend>,
     ) -> Result<Self, ToolError> {
         self.registry
-            .register_external([contract("delegate_task", SideEffectType::Process)])?;
+            .register_external([BuiltinTool::DelegateTask.contract()])?;
         self.delegation_backend = Some(backend);
         Ok(self)
     }
 
     /// Remove a tool from this runtime's model-visible and executable registry.
-    /// Delegated child agents use this to prevent recursive delegation.
+    /// This keeps capability reduction explicit for restricted runtimes and child tasks.
     #[must_use]
     pub fn without_tool(mut self, tool_name: &str) -> Self {
         self.registry.contracts.remove(tool_name);
-        if tool_name == "delegate_task" {
+        if BuiltinTool::from_name(tool_name) == Some(BuiltinTool::DelegateTask) {
             self.delegation_backend = None;
         }
         self
@@ -837,51 +825,63 @@ impl ToolRuntime {
             .ok_or_else(|| ToolError::UnknownTool(request.tool_name.clone()))?;
         validate_tool_arguments(contract, &request.arguments)?;
 
-        let mut policy = match request.tool_name.as_str() {
-            "read_file" => self.policy.evaluate_path(
-                "read_file",
+        let builtin = BuiltinTool::from_name(&request.tool_name);
+        let mut policy = match builtin {
+            Some(BuiltinTool::ReadFile) => self.policy.evaluate_path(
+                BuiltinTool::ReadFile.name(),
                 string_arg(&request.arguments, "path")?,
                 true,
             ),
-            "write_file" => self.policy.evaluate_path(
-                "write_file",
+            Some(BuiltinTool::WriteFile) => self.policy.evaluate_path(
+                BuiltinTool::WriteFile.name(),
                 string_arg(&request.arguments, "path")?,
                 false,
             ),
-            "edit_file" => self.policy.evaluate_path(
-                "edit_file",
+            Some(BuiltinTool::EditFile) => self.policy.evaluate_path(
+                BuiltinTool::EditFile.name(),
                 string_arg(&request.arguments, "path")?,
                 true,
             ),
-            "apply_patch" => self.policy.evaluate_path("apply_patch", ".", true),
-            "list_dir" => self.policy.evaluate_path(
-                "list_dir",
+            Some(BuiltinTool::ApplyPatch) => {
+                self.policy
+                    .evaluate_path(BuiltinTool::ApplyPatch.name(), ".", true)
+            }
+            Some(BuiltinTool::ListDir) => self.policy.evaluate_path(
+                BuiltinTool::ListDir.name(),
                 optional_string_arg(&request.arguments, "path").unwrap_or_else(|| ".".to_owned()),
                 true,
             ),
-            "rg_search" => self.policy.evaluate_path(
-                "rg_search",
+            Some(BuiltinTool::RgSearch) => self.policy.evaluate_path(
+                BuiltinTool::RgSearch.name(),
                 optional_string_arg(&request.arguments, "path").unwrap_or_else(|| ".".to_owned()),
                 true,
             ),
-            "symbol_search" | "find_references" => {
+            Some(BuiltinTool::SymbolSearch | BuiltinTool::FindReferences) => {
                 self.policy.evaluate_path(&request.tool_name, ".", true)
             }
-            "shell" => {
+            Some(BuiltinTool::Shell) => {
                 let shell_policy = self
                     .policy
                     .evaluate_shell(&string_arg(&request.arguments, "command")?);
                 optional_string_arg(&request.arguments, "workdir")
-                    .map(|workdir| self.policy.evaluate_path("shell", workdir, true))
+                    .map(|workdir| {
+                        self.policy
+                            .evaluate_path(BuiltinTool::Shell.name(), workdir, true)
+                    })
                     .filter(|workdir_policy| workdir_policy.decision != PolicyDecision::Allow)
                     .unwrap_or(shell_policy)
             }
-            "process_list" => process_list_policy(request),
-            "process_poll" | "process_write" | "process_terminate" | "process_reconnect" => {
-                process_control_policy(request)
+            Some(BuiltinTool::ProcessList) => process_list_policy(request),
+            Some(
+                BuiltinTool::ProcessPoll
+                | BuiltinTool::ProcessWrite
+                | BuiltinTool::ProcessTerminate
+                | BuiltinTool::ProcessReconnect,
+            ) => process_control_policy(request),
+            Some(BuiltinTool::DelegateTask) if self.delegation_backend.is_some() => {
+                delegation_policy(request)
             }
-            "delegate_task" if self.delegation_backend.is_some() => delegation_policy(request),
-            _ if self.external_backend.is_some() => {
+            None if self.external_backend.is_some() => {
                 let mut policy = execution_policy(
                     request,
                     PolicyDecision::Ask,
@@ -890,7 +890,9 @@ impl ToolRuntime {
                 policy.resource = format!("external-tool:{}", request.tool_name);
                 policy
             }
-            _ => return Err(ToolError::UnknownTool(request.tool_name.clone())),
+            Some(BuiltinTool::AskUser | BuiltinTool::DelegateTask) | None => {
+                return Err(ToolError::UnknownTool(request.tool_name.clone()));
+            }
         };
         if self.policy.mode() == golutra_policy::WorkspacePolicyMode::Unrestricted {
             policy.decision = PolicyDecision::Allow;
@@ -927,8 +929,8 @@ impl ToolRuntime {
             .ok_or_else(|| ToolError::UnknownTool(request.tool_name.clone()))?;
         validate_tool_arguments(contract, &request.arguments)?;
 
-        match request.tool_name.as_str() {
-            "write_file" => {
+        match BuiltinTool::from_name(&request.tool_name) {
+            Some(BuiltinTool::WriteFile) => {
                 let path = string_arg(&request.arguments, "path")?;
                 let resolved_path = self.resolve_tool_path("write_file", &path, false)?;
                 Ok(SideEffectPreparation {
@@ -937,7 +939,7 @@ impl ToolRuntime {
                     workspace_snapshot: None,
                 })
             }
-            "edit_file" => {
+            Some(BuiltinTool::EditFile) => {
                 let path = string_arg(&request.arguments, "path")?;
                 let resolved_path = self.resolve_tool_path("edit_file", &path, true)?;
                 let before_image = read_optional_file(&resolved_path).await?;
@@ -952,7 +954,7 @@ impl ToolRuntime {
                     workspace_snapshot: None,
                 })
             }
-            "apply_patch" => {
+            Some(BuiltinTool::ApplyPatch) => {
                 let patch = string_arg(&request.arguments, "patch")?;
                 let paths = self.resolved_patch_paths(&patch).await?;
                 let mut before_images = Vec::with_capacity(paths.len());
@@ -965,7 +967,7 @@ impl ToolRuntime {
                     workspace_snapshot: None,
                 })
             }
-            "shell" => {
+            Some(BuiltinTool::Shell) => {
                 let snapshot = workspace_scan::capture(self.policy.workspace_root()).await;
                 Ok(SideEffectPreparation {
                     before_images: snapshot.before_images(),
@@ -973,7 +975,7 @@ impl ToolRuntime {
                     workspace_snapshot: Some(snapshot),
                 })
             }
-            "delegate_task" => {
+            Some(BuiltinTool::DelegateTask) => {
                 let snapshot = workspace_scan::capture(self.policy.workspace_root()).await;
                 Ok(SideEffectPreparation {
                     before_images: snapshot.before_images(),
@@ -981,7 +983,7 @@ impl ToolRuntime {
                     workspace_snapshot: Some(snapshot),
                 })
             }
-            _ if matches!(
+            None if matches!(
                 contract.side_effect_type,
                 SideEffectType::ExternalSystem | SideEffectType::Network
             ) =>
@@ -1153,22 +1155,28 @@ impl ToolRuntime {
                 }
             }
 
-            match request.tool_name.as_str() {
-                "read_file" => self.read_file(request, policy).await,
-                "write_file" => self.write_file(request, policy, before_images).await,
-                "edit_file" => self.edit_file(request, policy, before_images).await,
-                "apply_patch" => {
+            match BuiltinTool::from_name(&request.tool_name) {
+                Some(BuiltinTool::ReadFile) => self.read_file(request, policy).await,
+                Some(BuiltinTool::WriteFile) => {
+                    self.write_file(request, policy, before_images).await
+                }
+                Some(BuiltinTool::EditFile) => self.edit_file(request, policy, before_images).await,
+                Some(BuiltinTool::ApplyPatch) => {
                     self.apply_patch(request, policy, before_images, cancellation)
                         .await
                 }
-                "list_dir" => self.list_dir(request, policy).await,
-                "rg_search" => {
+                Some(BuiltinTool::ListDir) => self.list_dir(request, policy).await,
+                Some(BuiltinTool::RgSearch) => {
                     self.rg_search(request, policy, cancellation, started_at, &mut progress)
                         .await
                 }
-                "symbol_search" => self.symbol_search(request, policy, cancellation).await,
-                "find_references" => self.find_references(request, policy, cancellation).await,
-                "shell" => {
+                Some(BuiltinTool::SymbolSearch) => {
+                    self.symbol_search(request, policy, cancellation).await
+                }
+                Some(BuiltinTool::FindReferences) => {
+                    self.find_references(request, policy, cancellation).await
+                }
+                Some(BuiltinTool::Shell) => {
                     self.shell(
                         request,
                         policy,
@@ -1179,16 +1187,23 @@ impl ToolRuntime {
                     )
                     .await
                 }
-                "delegate_task" => {
+                Some(BuiltinTool::DelegateTask) => {
                     self.delegate_task(request, policy, cancellation, workspace_snapshot, deadline)
                         .await
                 }
-                "process_list" => self.process_list(request, policy).await,
-                "process_poll" => self.process_poll(request, policy).await,
-                "process_write" => self.process_write(request, policy).await,
-                "process_terminate" => self.process_terminate(request, policy).await,
-                "process_reconnect" => self.process_reconnect(request, policy).await,
-                _ => self.execute_external(request, policy, cancellation).await,
+                Some(BuiltinTool::ProcessList) => self.process_list(request, policy).await,
+                Some(BuiltinTool::ProcessPoll) => self.process_poll(request, policy).await,
+                Some(BuiltinTool::ProcessWrite) => self.process_write(request, policy).await,
+                Some(BuiltinTool::ProcessTerminate) => {
+                    self.process_terminate(request, policy).await
+                }
+                Some(BuiltinTool::ProcessReconnect) => {
+                    self.process_reconnect(request, policy).await
+                }
+                Some(BuiltinTool::AskUser) => Err(ToolError::UnknownTool(
+                    BuiltinTool::AskUser.name().to_owned(),
+                )),
+                None => self.execute_external(request, policy, cancellation).await,
             }
         }
         .await;
@@ -2461,232 +2476,6 @@ async fn directory_entries(path: &Path) -> Result<Vec<String>, ToolError> {
     Ok(entries)
 }
 
-fn contract(tool_name: &str, side_effect_type: SideEffectType) -> ToolContract {
-    let input_schema = match tool_name {
-        "read_file" => object_schema(&[("path", MAX_PATH_ARGUMENT_CHARS)], &["path"], &["path"]),
-        "write_file" => object_schema(
-            &[
-                ("path", MAX_PATH_ARGUMENT_CHARS),
-                ("content", MAX_FILE_CONTENT_BYTES as usize),
-            ],
-            &["path", "content"],
-            &["path"],
-        ),
-        "edit_file" => object_schema(
-            &[
-                ("path", MAX_PATH_ARGUMENT_CHARS),
-                ("search", MAX_FILE_CONTENT_BYTES as usize),
-                ("replace", MAX_FILE_CONTENT_BYTES as usize),
-            ],
-            &["path", "search", "replace"],
-            &["path", "search"],
-        ),
-        "apply_patch" => object_schema(&[("patch", MAX_PATCH_BYTES)], &["patch"], &["patch"]),
-        "list_dir" => object_schema(&[("path", MAX_PATH_ARGUMENT_CHARS)], &[], &[]),
-        "rg_search" => object_schema(
-            &[
-                ("pattern", MAX_PATTERN_ARGUMENT_CHARS),
-                ("path", MAX_PATH_ARGUMENT_CHARS),
-            ],
-            &["pattern"],
-            &["pattern"],
-        ),
-        "symbol_search" => query_schema("query"),
-        "find_references" => query_schema("symbol"),
-        "ask_user" => json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "questions": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": 3,
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "properties": {
-                            "id": {"type": "string", "minLength": 1, "maxLength": 128},
-                            "header": {"type": "string", "minLength": 1, "maxLength": 128},
-                            "question": {"type": "string", "minLength": 1, "maxLength": 2048},
-                            "mode": {"type": "string", "enum": ["single", "multiple"]},
-                            "options": {
-                                "type": "array",
-                                "minItems": 2,
-                                "maxItems": 8,
-                                "items": {
-                                    "type": "object",
-                                    "additionalProperties": false,
-                                    "properties": {
-                                        "id": {"type": "string", "minLength": 1, "maxLength": 128},
-                                        "label": {"type": "string", "minLength": 1, "maxLength": 256},
-                                        "description": {"type": "string", "minLength": 1, "maxLength": 2048}
-                                    },
-                                    "required": ["id", "label"]
-                                }
-                            }
-                        },
-                        "required": ["id", "header", "question", "options"]
-                    }
-                }
-            },
-            "required": ["questions"]
-        }),
-        "delegate_task" => json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "task": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": MAX_DELEGATED_TASK_CHARS,
-                    "description": "A complete, self-contained task for one child agent. Include the relevant goal, constraints, and expected result; the child does not receive the parent conversation history."
-                },
-                "model": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 256,
-                    "description": "Optional model override. Omit it to inherit the parent agent's effective model."
-                },
-                "reasoning_effort": {
-                    "type": "string",
-                    "enum": ["low", "medium", "high", "xhigh"],
-                    "description": "Optional reasoning effort override. Omit it to inherit the parent agent's effective setting."
-                }
-            },
-            "required": ["task"]
-        }),
-        "shell" => json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": MAX_SHELL_COMMAND_CHARS,
-                    "description": "A single argv command parsed without a shell. A complete quoted foreground Python heredoc such as python - <<'PY' is passed directly on stdin. Unquoted operators such as |, >, &&, and ; are otherwise rejected; for a pipeline, redirection, or compound script, invoke bash -lc and pass the entire script as one quoted argument."
-                },
-                "workdir": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": MAX_PATH_ARGUMENT_CHARS,
-                    "description": "Optional working directory resolved from the workspace root. It changes only the command cwd; sandbox permissions and workspace change tracking remain rooted at the workspace root."
-                },
-                "timeout_ms": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": MAX_BACKGROUND_PROCESS_TIMEOUT_MS,
-                    "description": "The absolute process lifetime from launch in milliseconds, not an initial wait. Expiry terminates the process with a timed_out state. Defaults to 5000 for foreground commands and 3600000 for background commands."
-                },
-                "background": {
-                    "type": "boolean",
-                    "description": "When true, start a runtime-scoped managed process and return its process_id after yield_time_ms. The process stops when the runtime ends. If another process or evaluator must connect after the final response, do not use background=true; use a platform-appropriate lifecycle mechanism outside runtime ownership, detach standard streams as required, and verify availability before returning."
-                },
-                "yield_time_ms": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": max_poll_wait_ms(),
-                    "description": "For a background command, wait at most this long for initial output or termination before returning. This only controls the initial wait and does not extend timeout_ms or the process lifetime."
-                }
-            },
-            "required": ["command"]
-        }),
-        "process_list" => object_schema(&[], &[], &[]),
-        "process_poll" => process_session_schema(false, true),
-        "process_write" => process_session_schema(true, true),
-        "process_terminate" => process_session_schema(false, false),
-        "process_reconnect" => process_session_schema(false, false),
-        _ => json!({"type": "object", "additionalProperties": false}),
-    };
-    ToolContract {
-        tool_name: tool_name.to_owned(),
-        input_schema,
-        output_schema: json!({
-            "type": "object",
-            "additionalProperties": true,
-            "required": ["status", "summary"]
-        }),
-        error_schema: json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "code": {"type": "string"},
-                "message": {"type": "string"}
-            },
-            "required": ["code", "message"]
-        }),
-        side_effect_type,
-        idempotency_key_policy: match side_effect_type {
-            SideEffectType::None => "not_required",
-            SideEffectType::File | SideEffectType::Process => "required_for_retry",
-            SideEffectType::Network | SideEffectType::ExternalSystem => "blocked_in_p0",
-        }
-        .to_owned(),
-        timeout_policy: "bounded_by_tool_or_default_timeout".to_owned(),
-        cancellation_policy: "returns_cancelled_envelope".to_owned(),
-        retry_policy: if side_effect_type == SideEffectType::None {
-            "retry_allowed"
-        } else {
-            "no_implicit_retry_for_side_effects"
-        }
-        .to_owned(),
-        artifact_policy: "raw_output_to_artifact_ref".to_owned(),
-        permission_policy_ref: None,
-    }
-}
-
-fn query_schema(field: &str) -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-            (field): {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 512
-            },
-            "limit": {"type": "integer", "minimum": 1, "maximum": 100}
-        },
-        "required": [field]
-    })
-}
-
-fn process_session_schema(include_input: bool, include_wait: bool) -> Value {
-    let mut properties = serde_json::Map::from_iter([
-        (
-            "process_id".to_owned(),
-            json!({"type": "string", "minLength": 1, "maxLength": 128}),
-        ),
-        (
-            "cursor".to_owned(),
-            json!({"type": "integer", "minimum": 0}),
-        ),
-    ]);
-    let mut required = vec!["process_id"];
-    if include_input {
-        properties.insert(
-            "input".to_owned(),
-            json!({
-                "type": "string",
-                "minLength": 1,
-                "maxLength": MAX_PROCESS_INPUT_CHARS
-            }),
-        );
-        required.push("input");
-    }
-    if include_wait {
-        properties.insert(
-            "wait_ms".to_owned(),
-            json!({"type": "integer", "minimum": 0, "maximum": max_poll_wait_ms()}),
-        );
-    }
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "properties": properties,
-        "required": required,
-    })
-}
-
 fn bounded_query_limit(arguments: &Value) -> usize {
     arguments
         .get("limit")
@@ -2694,25 +2483,6 @@ fn bounded_query_limit(arguments: &Value) -> usize {
         .and_then(|limit| usize::try_from(limit).ok())
         .unwrap_or(20)
         .clamp(1, 100)
-}
-
-fn object_schema(properties: &[(&str, usize)], required: &[&str], non_empty: &[&str]) -> Value {
-    let properties = properties
-        .iter()
-        .map(|(name, max_length)| {
-            let mut schema = json!({"type": "string", "maxLength": max_length});
-            if non_empty.contains(name) {
-                schema["minLength"] = json!(1);
-            }
-            ((*name).to_owned(), schema)
-        })
-        .collect::<serde_json::Map<_, _>>();
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "properties": properties,
-        "required": required,
-    })
 }
 
 fn validate_tool_arguments(contract: &ToolContract, arguments: &Value) -> Result<(), ToolError> {

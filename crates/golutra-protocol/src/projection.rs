@@ -2,7 +2,7 @@ use golutra_core::{
     ArtifactRecord, BusyPolicyDecision, ContextSnapshot, EvidenceRecord, LoopDecision, PostTaskJob,
     RuntimeLane, SessionId, TaskId, TaskStatus, ToolResultEnvelope, VerificationRecord,
 };
-use golutra_eval::{
+use golutra_eval_model::{
     AutomationCandidate, CausalComparison, DiagnosticSlice, EvaluationResult,
     ExternalEvaluationRecord, FailureDiagnosis, FailureEpisode, FrozenCandidatePatch,
     ImprovementCandidate, PostTaskReview, PromotionDecision, RegressionResult, ReplayCapsule,

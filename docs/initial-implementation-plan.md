@@ -121,7 +121,6 @@ crates/
   golutra-auth
   golutra-protocol
   golutra-protocol-fixtures
-  golutra-event
   golutra-file-search
   golutra-code-intelligence
   golutra-store
@@ -129,6 +128,7 @@ crates/
   golutra-sandbox
   golutra-context
   golutra-tools
+  golutra-project-service
   golutra-policy
   golutra-memory
   golutra-llm
@@ -138,7 +138,9 @@ crates/
   golutra-cli
   golutra-tui
   golutra-app-server
+  golutra-eval-model
   golutra-eval
+  golutra-eval-worker
   golutra-evolution
   golutra-supervisor
   golutra-release
@@ -154,7 +156,7 @@ docs/
 
 P0 可以先创建全部 crate 空壳，但只实现 P0 必需模块：
 
-- 必需：`core`、`protocol`、`event`、`store`、`runtime`、`context`、`tools`、`policy`、`llm`、`verify`、`client`、`cli`、`app-server`、`test-client`。
+- 必需：`core`、`protocol`、`store`、`runtime`、`context`、`tools`、`policy`、`llm`、`verify`、`client`、`cli`、`app-server`、`test-client`。
 - 可延后：`tui` 可先做最小 attach；`eval` 只放 schema；`sdk/typescript` 到 P1 再做类型消费。
 
 ## 技术基线

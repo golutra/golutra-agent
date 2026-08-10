@@ -247,7 +247,7 @@ pub(crate) async fn read_task_trace(
     if request.wait_for_evaluation {
         host.wait_for_deep_task_evaluation(request.task_id).await;
     }
-    let repositories = &host.repositories;
+    let repositories = &host.storage.repositories;
     let all_task_events = repositories
         .events
         .load(request.session_id, Some(request.task_id), None)
@@ -400,6 +400,7 @@ pub(crate) async fn read_task_trace(
     let verification_plan = repositories.artifacts.verification(request.task_id).await?;
     let post_task_jobs = repositories.jobs.list_for_task(request.task_id).await?;
     let evaluation = host
+        .storage
         .governance
         .evaluation_projection(request.session_id, request.task_id)
         .await?;
@@ -583,12 +584,18 @@ pub(crate) async fn read_artifact_chunk(
             "artifact read length must be between 1 and {MAX_ARTIFACT_READ_BYTES}"
         )));
     }
-    let Some(artifact) = host.repositories.artifacts.get(request.artifact_id).await? else {
+    let Some(artifact) = host
+        .storage
+        .repositories
+        .artifacts
+        .get(request.artifact_id)
+        .await?
+    else {
         return Ok(None);
     };
     host.ensure_owned_session_in_workspace(artifact.session_id)
         .await?;
-    let Some(range) = host.repositories.artifacts.range(&request).await? else {
+    let Some(range) = host.storage.repositories.artifacts.range(&request).await? else {
         return Ok(None);
     };
     let length = u64::try_from(range.bytes.len()).unwrap_or(u64::MAX);

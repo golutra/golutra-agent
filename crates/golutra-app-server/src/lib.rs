@@ -11,26 +11,27 @@ use std::{
 
 use axum::{
     Extension, Json, Router,
-    extract::{Path as AxumPath, Query, Request, State},
+    extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State},
     http::{HeaderMap, StatusCode, header, uri::Authority},
     middleware::{self, Next},
     response::{
         Html, IntoResponse, Response,
         sse::{Event, Sse},
     },
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use fs2::FileExt;
 use golutra_client::{
     APP_SERVER_ATTACHMENT_HEADER, APP_SERVER_PROTOCOL_HEADER, AgentEventProjector, AppServerInfo,
-    AppServerPaths, ClientError, EmbeddedTransport, RuntimeAttachment, RuntimeClient,
-    TaskTraceClient, app_server_attachment_actor_id,
+    AppServerPaths, ClientError, EmbeddedTransport, RuntimeAttachment, RuntimeOperation,
+    RuntimeOperationClient, app_server_attachment_actor_id,
 };
 use golutra_core::{Actor, ActorKind, CommandId, SessionId, TaskId, ThreadId, TraceView};
 use golutra_protocol::{
     AgentThreadRef, ArtifactChunk, ArtifactReadRequest, CommandAck, EventFilter, EventPage,
-    EventPageRequest, ProtocolVersionRange, RuntimeQuery, SessionCommand, SessionPage,
-    SessionPageRequest, SessionWindow, SessionWindowRequest, TaskTracePage, TaskTraceRequest,
+    EventPageRequest, MAX_WIRE_MESSAGE_BYTES, ProtocolVersionRange, RUNTIME_PROTOCOL_VERSION,
+    RuntimeQuery, SessionPage, SessionPageRequest, SessionWindow, SessionWindowRequest,
+    TaskTracePage, TaskTraceRequest, decode_command_value, encode_event_value_for_protocol,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -39,10 +40,15 @@ use uuid::Uuid;
 
 const MAX_ATTACHED_RUNTIMES: usize = 128;
 
+mod attachment_registry;
 mod ipc;
 mod rpc;
 mod transport_security;
 
+use attachment_registry::{
+    AttachedAttachment, AttachmentInsertError, AttachmentRegistry, DEFAULT_IDLE_TTL,
+    DEFAULT_MAX_ATTACHMENTS,
+};
 use transport_security::TransportAuth;
 
 #[derive(Debug, Clone)]
@@ -54,10 +60,12 @@ pub struct AppState {
 struct AppStateInner {
     info: AppServerInfo,
     max_runtimes: usize,
+    max_attachments: usize,
     runtime_home: Option<PathBuf>,
     transport_auth: TransportAuth,
     runtimes: Mutex<HashMap<PathBuf, Arc<OnceCell<AttachedRuntime>>>>,
-    attachments: Mutex<HashMap<String, AttachedAttachment>>,
+    attachments: Mutex<AttachmentRegistry>,
+    lifecycle: Mutex<()>,
 }
 
 #[derive(Debug, Clone)]
@@ -65,17 +73,18 @@ struct AttachedRuntime {
     transport: EmbeddedTransport,
 }
 
-#[derive(Debug, Clone)]
-struct AttachedAttachment {
-    transport: EmbeddedTransport,
-    actor: Actor,
-}
-
 impl AppState {
     pub fn new(info: AppServerInfo, transport_token: &str) -> miette::Result<Self> {
-        Self::with_runtime_limit(info, transport_token, MAX_ATTACHED_RUNTIMES)
+        Ok(Self::with_limits(
+            info,
+            TransportAuth::from_token(transport_token)?,
+            MAX_ATTACHED_RUNTIMES,
+            DEFAULT_MAX_ATTACHMENTS,
+            None,
+        ))
     }
 
+    #[cfg(test)]
     fn with_runtime_limit(
         info: AppServerInfo,
         transport_token: &str,
@@ -85,24 +94,44 @@ impl AppState {
             info,
             TransportAuth::from_token(transport_token)?,
             max_runtimes,
+            DEFAULT_MAX_ATTACHMENTS,
             None,
         ))
+    }
+
+    fn with_limits(
+        info: AppServerInfo,
+        transport_auth: TransportAuth,
+        max_runtimes: usize,
+        max_attachments: usize,
+        runtime_home: Option<PathBuf>,
+    ) -> Self {
+        Self::from_auth(
+            info,
+            transport_auth,
+            max_runtimes,
+            max_attachments,
+            runtime_home,
+        )
     }
 
     fn from_auth(
         info: AppServerInfo,
         transport_auth: TransportAuth,
         max_runtimes: usize,
+        max_attachments: usize,
         runtime_home: Option<PathBuf>,
     ) -> Self {
         Self {
             inner: Arc::new(AppStateInner {
                 info,
                 max_runtimes: max_runtimes.max(1),
+                max_attachments: max_attachments.max(1),
                 runtime_home,
                 transport_auth,
                 runtimes: Mutex::new(HashMap::new()),
-                attachments: Mutex::new(HashMap::new()),
+                attachments: Mutex::new(AttachmentRegistry::new(max_attachments, DEFAULT_IDLE_TTL)),
+                lifecycle: Mutex::new(()),
             }),
         }
     }
@@ -112,6 +141,7 @@ impl AppState {
     }
 
     async fn attach_cwd(&self, cwd: impl AsRef<Path>) -> Result<RuntimeAttachment, ClientError> {
+        let _lifecycle = self.inner.lifecycle.lock().await;
         if !cwd.as_ref().is_absolute() {
             return Err(ClientError::InvalidSession(format!(
                 "runtime cwd must be absolute: {}",
@@ -122,6 +152,7 @@ impl AppState {
             .as_ref()
             .canonicalize()
             .map_err(|error| ClientError::Io(format!("{}: {error}", cwd.as_ref().display())))?;
+        self.prune_unreferenced_runtimes_locked().await;
         let runtime = {
             let mut runtimes = self.inner.runtimes.lock().await;
             if let Some(runtime) = runtimes.get(&cwd) {
@@ -162,10 +193,17 @@ impl AppState {
                 return Err(error);
             }
         };
-        let runtime = attached
+        let runtime = match attached
             .transport
             .runtime_info(self.inner.info.base_url.clone())
-            .await?;
+            .await
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                self.prune_unreferenced_runtimes_locked().await;
+                return Err(error);
+            }
+        };
         // Every attach is a distinct controller capability. The durable
         // runtime is shared by cwd, but the attachment id is the server-bound
         // actor identity used for control commands.
@@ -174,68 +212,126 @@ impl AppState {
             kind: ActorKind::Api,
             id: app_server_attachment_actor_id(&attachment_id),
         };
-        self.inner.attachments.lock().await.insert(
+        let insert_result = self.inner.attachments.lock().await.insert(
             attachment_id.clone(),
-            AttachedAttachment {
-                transport: attached.transport,
-                actor,
-            },
+            attached.transport,
+            actor,
+            cwd.clone(),
+            std::time::Instant::now(),
         );
+        if let Err(error) = insert_result {
+            self.prune_unreferenced_runtimes_locked().await;
+            return Err(match error {
+                AttachmentInsertError::Capacity => ClientError::Daemon(format!(
+                    "app-server attachment limit {} reached",
+                    self.inner.max_attachments
+                )),
+                AttachmentInsertError::Duplicate => {
+                    ClientError::Daemon("app-server generated a duplicate attachment id".to_owned())
+                }
+            });
+        }
         Ok(RuntimeAttachment {
             attachment_id,
             runtime,
         })
     }
 
-    async fn attached_transport(&self, headers: &HeaderMap) -> Result<EmbeddedTransport, AppError> {
-        let attachment_id = headers
-            .get(APP_SERVER_ATTACHMENT_HEADER)
-            .ok_or_else(|| {
-                AppError::Attachment("runtime attachment header is required".to_owned())
-            })?
-            .to_str()
-            .map_err(|_| AppError::Attachment("runtime attachment header is invalid".to_owned()))?;
-        self.inner
-            .attachments
-            .lock()
+    async fn attached_transport(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<AttachedAttachment, AppError> {
+        let attachment_id = self.attachment_id_from_headers(headers)?;
+        self.attached_attachment(attachment_id)
             .await
-            .get(attachment_id)
-            .map(|attachment| attachment.transport.clone())
             .ok_or_else(|| AppError::Attachment("runtime attachment was not found".to_owned()))
     }
 
     async fn attached_transport_id(
         &self,
         attachment_id: &str,
-    ) -> Result<EmbeddedTransport, AppError> {
+    ) -> Result<AttachedAttachment, AppError> {
+        self.attached_attachment(attachment_id)
+            .await
+            .ok_or_else(|| AppError::Attachment("runtime attachment was not found".to_owned()))
+    }
+
+    async fn detach_attachment(&self, attachment_id: &str) -> bool {
+        let revocation = {
+            let _lifecycle = self.inner.lifecycle.lock().await;
+            self.inner
+                .attachments
+                .lock()
+                .await
+                .detach_attachment(attachment_id)
+        };
+        let Some(revocation) = revocation else {
+            return false;
+        };
+        revocation.wait_idle().await;
+        self.prune_unreferenced_runtimes().await;
+        true
+    }
+
+    async fn attached_attachment(
+        &self,
+        attachment_id: &str,
+    ) -> Option<attachment_registry::AttachedAttachment> {
+        let _lifecycle = self.inner.lifecycle.lock().await;
+        let attachment = self
+            .inner
+            .attachments
+            .lock()
+            .await
+            .attachment(attachment_id, std::time::Instant::now());
+        self.prune_unreferenced_runtimes_locked().await;
+        attachment
+    }
+
+    async fn prune_unreferenced_runtimes(&self) {
+        let _lifecycle = self.inner.lifecycle.lock().await;
+        self.prune_unreferenced_runtimes_locked().await;
+    }
+
+    async fn prune_unreferenced_runtimes_locked(&self) {
         self.inner
             .attachments
             .lock()
             .await
-            .get(attachment_id)
-            .map(|attachment| attachment.transport.clone())
-            .ok_or_else(|| AppError::Attachment("runtime attachment was not found".to_owned()))
-    }
-
-    async fn attached_actor(&self, attachment_id: &str) -> Result<Actor, AppError> {
-        self.inner
-            .attachments
+            .prune_expired_at(std::time::Instant::now());
+        let referenced = self.inner.attachments.lock().await.runtime_keys();
+        let entries = self
+            .inner
+            .runtimes
             .lock()
             .await
-            .get(attachment_id)
-            .map(|attachment| attachment.actor.clone())
-            .ok_or_else(|| AppError::Attachment("runtime attachment was not found".to_owned()))
+            .iter()
+            .map(|(runtime_key, runtime)| (runtime_key.clone(), runtime.clone()))
+            .collect::<Vec<_>>();
+        let mut keep_active = std::collections::HashSet::new();
+        for (runtime_key, runtime) in entries {
+            if referenced.contains(&runtime_key) {
+                continue;
+            }
+            if let Some(attached) = runtime.get()
+                && attached.transport.has_active_work().await
+            {
+                keep_active.insert(runtime_key);
+            }
+        }
+        self.inner.runtimes.lock().await.retain(|runtime_key, _| {
+            referenced.contains(runtime_key) || keep_active.contains(runtime_key)
+        });
     }
 
-    async fn actor_from_headers(&self, headers: &HeaderMap) -> Result<Actor, AppError> {
-        let attachment_id = headers
+    fn attachment_id_from_headers<'a>(&self, headers: &'a HeaderMap) -> Result<&'a str, AppError> {
+        headers
             .get(APP_SERVER_ATTACHMENT_HEADER)
             .ok_or_else(|| {
                 AppError::Attachment("runtime attachment header is required".to_owned())
             })?
             .to_str()
-            .map_err(|_| AppError::Attachment("runtime attachment header is invalid".to_owned()))?;
-        self.attached_actor(attachment_id).await
+            .map_err(|_| AppError::Attachment("runtime attachment header is invalid".to_owned()))
     }
 }
 
@@ -244,6 +340,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/runtime/info", get(runtime_info))
         .route("/runtime/attach", post(attach_runtime))
+        .route("/runtime/attach/{attachment_id}", delete(detach_runtime))
         .route("/rpc", post(rpc::http_rpc))
         .route("/rpc/ws", get(rpc::websocket_rpc))
         .route("/attach", get(attach_page))
@@ -268,6 +365,7 @@ pub fn router(state: AppState) -> Router {
         .route("/threads/{thread_id}/rebind", post(rebind_thread))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, enforce_http_boundary))
+        .layer(DefaultBodyLimit::max(MAX_WIRE_MESSAGE_BYTES))
 }
 
 pub async fn run(addr: SocketAddr) -> miette::Result<()> {
@@ -297,6 +395,7 @@ pub async fn run(addr: SocketAddr) -> miette::Result<()> {
         info,
         transport_auth,
         MAX_ATTACHED_RUNTIMES,
+        DEFAULT_MAX_ATTACHMENTS,
         Some(runtime_home),
     ));
     #[cfg(unix)]
@@ -338,6 +437,7 @@ pub async fn run_stdio() -> miette::Result<()> {
         info,
         transport_auth,
         MAX_ATTACHED_RUNTIMES,
+        DEFAULT_MAX_ATTACHMENTS,
         Some(runtime_home),
     );
     rpc::serve_stdio(state)
@@ -512,15 +612,42 @@ async fn attach_runtime(
     Ok(Json(state.attach_cwd(request.cwd).await?))
 }
 
+async fn detach_runtime(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(attachment_id): AxumPath<String>,
+) -> Result<StatusCode, AppError> {
+    let header_attachment_id = state.attachment_id_from_headers(&headers)?;
+    if header_attachment_id != attachment_id {
+        return Err(AppError::Attachment(
+            "attachment path does not match the capability header".to_owned(),
+        ));
+    }
+    if state.detach_attachment(&attachment_id).await {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::Attachment(
+            "runtime attachment was not found".to_owned(),
+        ))
+    }
+}
+
 async fn send_command(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(command): Json<SessionCommand>,
+    Json(value): Json<Value>,
 ) -> Result<Json<CommandAck>, AppError> {
     let transport = state.attached_transport(&headers).await?;
-    let mut command = command;
-    command.actor = state.actor_from_headers(&headers).await?;
-    Ok(Json(transport.send_command(command).await?))
+    let actor = transport.actor.clone();
+    let mut command = decode_command_value(value)
+        .map_err(|error| AppError::InvalidPayload(format!("invalid command payload: {error}")))?;
+    command.actor = actor;
+    Ok(Json(
+        transport
+            .execute_operation(RuntimeOperation::SendCommand(command))
+            .await?
+            .into_command_ack()?,
+    ))
 }
 
 async fn query_runtime(
@@ -529,7 +656,12 @@ async fn query_runtime(
     Json(query): Json<RuntimeQuery>,
 ) -> Result<Json<Value>, AppError> {
     let transport = state.attached_transport(&headers).await?;
-    Ok(Json(transport.query(query).await?))
+    Ok(Json(
+        transport
+            .execute_operation(RuntimeOperation::Query(query))
+            .await?
+            .into_query()?,
+    ))
 }
 
 async fn task_trace(
@@ -544,7 +676,12 @@ async fn task_trace(
         ));
     }
     let transport = state.attached_transport(&headers).await?;
-    Ok(Json(transport.task_trace(request).await?))
+    Ok(Json(
+        transport
+            .execute_operation(RuntimeOperation::TaskTrace(request))
+            .await?
+            .into_task_trace()?,
+    ))
 }
 
 async fn read_artifact_chunk(
@@ -554,7 +691,10 @@ async fn read_artifact_chunk(
     Json(request): Json<ArtifactReadRequest>,
 ) -> Result<Json<Option<ArtifactChunk>>, AppError> {
     let transport = state.attached_transport(&headers).await?;
-    let chunk = transport.read_artifact_chunk(request).await?;
+    let chunk = transport
+        .execute_operation(RuntimeOperation::ReadArtifactChunk(request))
+        .await?
+        .into_artifact_chunk()?;
     enforce_artifact_disclosure(local_ipc.is_some(), chunk.as_ref())?;
     Ok(Json(chunk))
 }
@@ -582,7 +722,10 @@ async fn events(
     headers: HeaderMap,
     Query(query): Query<EventQuery>,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, AppError> {
-    let transport = state.attached_transport(&headers).await?;
+    let attachment = state.attached_transport(&headers).await?;
+    let transport = &*attachment;
+    let cancellation = attachment.cancellation();
+    let protocol_version = requested_protocol_version(&headers);
     let session_id = parse_session_id(&query.session_id)?;
     let task_id = query.task_id.as_deref().map(parse_task_id).transpose()?;
     let header_cursor = headers
@@ -590,16 +733,23 @@ async fn events(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
     let mut events = transport
-        .subscribe(EventFilter {
+        .execute_operation(RuntimeOperation::Subscribe(EventFilter {
             session_id,
             task_id,
             after_sequence_no: query.cursor.or(header_cursor),
-        })
-        .await?;
+        }))
+        .await?
+        .into_subscription()?;
     let stream = async_stream::stream! {
-        while let Some(event) = events.recv().await {
+        let _attachment = attachment;
+        loop {
+            let event = tokio::select! {
+                _ = cancellation.cancelled() => break,
+                event = events.recv() => event,
+            };
+            let Some(event) = event else { break; };
             match event {
-                Ok(event) => match serde_json::to_value(event) {
+                Ok(event) => match encode_event_value_for_protocol(&event, protocol_version) {
                     Ok(value) => yield Ok::<Event, Infallible>(sse_event(value)),
                     Err(error) => {
                         yield Ok::<Event, Infallible>(sse_named_event(
@@ -629,7 +779,9 @@ async fn agent_events(
     headers: HeaderMap,
     Query(query): Query<AgentEventQuery>,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, AppError> {
-    let transport = state.attached_transport(&headers).await?;
+    let attachment = state.attached_transport(&headers).await?;
+    let transport = &*attachment;
+    let cancellation = attachment.cancellation();
     let session_id = parse_session_id(&query.session_id)?;
     let thread = if let Some(thread_id) = query.thread_id.as_deref() {
         let record = transport.resume_thread(parse_thread_id(thread_id)?).await?;
@@ -672,14 +824,16 @@ async fn agent_events(
         ));
     }
     let mut events = transport
-        .subscribe(EventFilter {
+        .execute_operation(RuntimeOperation::Subscribe(EventFilter {
             session_id,
             task_id: None,
             after_sequence_no: projection_cursor,
-        })
-        .await?;
+        }))
+        .await?
+        .into_subscription()?;
     let mut projector = AgentEventProjector::new(thread, command_id);
     let stream = async_stream::stream! {
+        let _attachment = attachment;
         // This transport lifecycle marker is emitted once per SSE connection,
         // including reconnects that carry a runtime cursor. Consumers must
         // therefore treat thread.started as idempotent.
@@ -687,7 +841,12 @@ async fn agent_events(
         if let Ok(value) = serde_json::to_value(initial) {
             yield Ok::<Event, Infallible>(agent_sse_event(value));
         }
-        while let Some(event) = events.recv().await {
+        loop {
+            let event = tokio::select! {
+                _ = cancellation.cancelled() => break,
+                event = events.recv() => event,
+            };
+            let Some(event) = event else { break; };
             match event {
                 Ok(event) => {
                     let sequence_no = event.sequence_no;
@@ -731,13 +890,25 @@ async fn agent_events(
 }
 
 fn sse_event(value: Value) -> Event {
-    let sequence_no = value.get("sequence_no").and_then(Value::as_u64);
+    let sequence_no = value
+        .get("event")
+        .and_then(|event| event.get("sequence_no"))
+        .and_then(Value::as_u64)
+        .or_else(|| value.get("sequence_no").and_then(Value::as_u64));
     let builder = sequence_no.map_or_else(Event::default, |sequence_no| {
         Event::default().id(sequence_no.to_string())
     });
     builder.json_data(value).unwrap_or_else(|_| {
         Event::default().data(json!({"error": "event serialization failed"}).to_string())
     })
+}
+
+fn requested_protocol_version(headers: &HeaderMap) -> u32 {
+    headers
+        .get(APP_SERVER_PROTOCOL_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(RUNTIME_PROTOCOL_VERSION)
 }
 
 fn sse_named_event(name: &'static str, value: Value) -> Event {
@@ -774,7 +945,12 @@ async fn replay_events(
     Query(query): Query<EventQuery>,
 ) -> Result<Json<Vec<Value>>, AppError> {
     let transport = state.attached_transport(&headers).await?;
-    Ok(Json(transport.replay_events(event_filter(query)?).await?))
+    Ok(Json(
+        transport
+            .execute_operation(RuntimeOperation::ReplayEvents(event_filter(query)?))
+            .await?
+            .into_replayed_events()?,
+    ))
 }
 
 async fn event_page(
@@ -783,7 +959,12 @@ async fn event_page(
     Query(request): Query<EventPageRequest>,
 ) -> Result<Json<EventPage>, AppError> {
     let transport = state.attached_transport(&headers).await?;
-    Ok(Json(transport.event_page(request).await?))
+    Ok(Json(
+        transport
+            .execute_operation(RuntimeOperation::EventPage(request))
+            .await?
+            .into_event_page()?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -925,6 +1106,7 @@ fn event_filter(query: EventQuery) -> Result<EventFilter, AppError> {
 enum AppError {
     Client(ClientError),
     InvalidId(String),
+    InvalidPayload(String),
     Attachment(String),
     Protocol(String),
     Disclosure(String),
@@ -942,6 +1124,7 @@ impl IntoResponse for AppError {
             Self::Client(ClientError::InvalidSession(error)) => (StatusCode::BAD_REQUEST, error),
             Self::Client(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
             Self::InvalidId(error) => (StatusCode::BAD_REQUEST, error),
+            Self::InvalidPayload(error) => (StatusCode::BAD_REQUEST, error),
             Self::Attachment(error) => (StatusCode::GONE, error),
             Self::Protocol(error) => (StatusCode::UPGRADE_REQUIRED, error),
             Self::Disclosure(error) => (StatusCode::FORBIDDEN, error),
@@ -1183,8 +1366,11 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
+    use futures_util::StreamExt;
     use golutra_core::{Actor, ActorKind, ArtifactId, CommandId, RedactionStatus};
-    use golutra_protocol::{RUNTIME_PROTOCOL_VERSION, SessionCommandKind};
+    use golutra_protocol::{
+        RUNTIME_PROTOCOL_VERSION, RuntimeQueryKind, SessionCommand, SessionCommandKind,
+    };
     use tower::ServiceExt;
 
     use super::*;
@@ -1212,21 +1398,33 @@ mod tests {
             .header(APP_SERVER_PROTOCOL_HEADER, RUNTIME_PROTOCOL_VERSION)
     }
 
-    async fn state_with_attachment() -> (AppState, String, SessionId) {
+    async fn state_with_attachment_and_transport()
+    -> (AppState, String, SessionId, EmbeddedTransport) {
         let state = AppState::new(server_info(), TEST_TRANSPORT_TOKEN).expect("app state");
         let transport = EmbeddedTransport::in_memory().await.expect("transport");
         let attachment_id = Uuid::now_v7().to_string();
         let session_id = transport.default_session_id();
-        state.inner.attachments.lock().await.insert(
-            attachment_id.clone(),
-            AttachedAttachment {
-                transport,
-                actor: Actor {
+        state
+            .inner
+            .attachments
+            .lock()
+            .await
+            .insert(
+                attachment_id.clone(),
+                transport.clone(),
+                Actor {
                     kind: ActorKind::Api,
                     id: format!("test-attachment-{attachment_id}"),
                 },
-            },
-        );
+                PathBuf::from("/test-workspace"),
+                std::time::Instant::now(),
+            )
+            .expect("attachment insert");
+        (state, attachment_id, session_id, transport)
+    }
+
+    async fn state_with_attachment() -> (AppState, String, SessionId) {
+        let (state, attachment_id, session_id, _) = state_with_attachment_and_transport().await;
         (state, attachment_id, session_id)
     }
 
@@ -1250,6 +1448,7 @@ mod tests {
             server_info(),
             TransportAuth::from_token(TEST_TRANSPORT_TOKEN).expect("transport auth"),
             MAX_ATTACHED_RUNTIMES,
+            DEFAULT_MAX_ATTACHMENTS,
             Some(home.path().to_path_buf()),
         );
 
@@ -1270,6 +1469,22 @@ mod tests {
         occupied
             .set(AttachedRuntime { transport })
             .expect("runtime cell");
+        state
+            .inner
+            .attachments
+            .lock()
+            .await
+            .insert(
+                "occupied-attachment".to_owned(),
+                occupied.get().expect("occupied runtime").transport.clone(),
+                Actor {
+                    kind: ActorKind::Api,
+                    id: "occupied-actor".to_owned(),
+                },
+                PathBuf::from("/already-attached"),
+                std::time::Instant::now(),
+            )
+            .expect("occupied attachment");
         state
             .inner
             .runtimes
@@ -1293,6 +1508,207 @@ mod tests {
             .await
             .expect_err("file cwd must fail initialization");
         assert!(state.inner.runtimes.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn detaching_the_last_attachment_releases_the_runtime_slot() {
+        let home = tempfile::tempdir().expect("runtime home");
+        let first_workspace = tempfile::tempdir().expect("first workspace");
+        let second_workspace = tempfile::tempdir().expect("second workspace");
+        let state = AppState::from_auth(
+            server_info(),
+            TransportAuth::from_token(TEST_TRANSPORT_TOKEN).expect("transport auth"),
+            1,
+            DEFAULT_MAX_ATTACHMENTS,
+            Some(home.path().to_path_buf()),
+        );
+
+        let first = state
+            .attach_cwd(first_workspace.path())
+            .await
+            .expect("first attachment");
+        let duplicate = state
+            .attach_cwd(first_workspace.path())
+            .await
+            .expect("second attachment to the same runtime");
+        assert_eq!(state.inner.runtimes.lock().await.len(), 1);
+
+        assert!(state.detach_attachment(&first.attachment_id).await);
+        assert_eq!(state.inner.runtimes.lock().await.len(), 1);
+        assert!(state.detach_attachment(&duplicate.attachment_id).await);
+        assert!(state.inner.runtimes.lock().await.is_empty());
+
+        state
+            .attach_cwd(second_workspace.path())
+            .await
+            .expect("released runtime slot can be reused");
+    }
+
+    #[tokio::test]
+    async fn expired_attachment_releases_its_idle_runtime_slot_on_next_attach() {
+        let home = tempfile::tempdir().expect("runtime home");
+        let first_workspace = tempfile::tempdir().expect("first workspace");
+        let second_workspace = tempfile::tempdir().expect("second workspace");
+        let state = AppState::from_auth(
+            server_info(),
+            TransportAuth::from_token(TEST_TRANSPORT_TOKEN).expect("transport auth"),
+            1,
+            DEFAULT_MAX_ATTACHMENTS,
+            Some(home.path().to_path_buf()),
+        );
+        let first_runtime_key = first_workspace.path().canonicalize().expect("first cwd");
+        let stale_runtime = Arc::new(OnceCell::new());
+        stale_runtime
+            .set(AttachedRuntime {
+                transport: EmbeddedTransport::in_memory().await.expect("transport"),
+            })
+            .expect("runtime cell");
+        state
+            .inner
+            .attachments
+            .lock()
+            .await
+            .insert(
+                "stale-attachment".to_owned(),
+                stale_runtime
+                    .get()
+                    .expect("stale runtime")
+                    .transport
+                    .clone(),
+                Actor {
+                    kind: ActorKind::Api,
+                    id: "stale-actor".to_owned(),
+                },
+                first_runtime_key.clone(),
+                std::time::Instant::now()
+                    .checked_sub(DEFAULT_IDLE_TTL + std::time::Duration::from_secs(1))
+                    .expect("stale timestamp"),
+            )
+            .expect("stale attachment");
+        state
+            .inner
+            .runtimes
+            .lock()
+            .await
+            .insert(first_runtime_key, stale_runtime);
+
+        state
+            .attach_cwd(second_workspace.path())
+            .await
+            .expect("expired runtime slot is reusable");
+
+        let runtimes = state.inner.runtimes.lock().await;
+        assert_eq!(runtimes.len(), 1);
+        assert!(
+            runtimes.contains_key(&second_workspace.path().canonicalize().expect("second cwd"))
+        );
+    }
+
+    #[tokio::test]
+    async fn detaching_an_active_task_keeps_the_runtime_available_for_reattach() {
+        let home = tempfile::tempdir().expect("runtime home");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let state = AppState::from_auth(
+            server_info(),
+            TransportAuth::from_token(TEST_TRANSPORT_TOKEN).expect("transport auth"),
+            1,
+            DEFAULT_MAX_ATTACHMENTS,
+            Some(home.path().to_path_buf()),
+        );
+        let first = state
+            .attach_cwd(workspace.path())
+            .await
+            .expect("first attachment");
+        let attachment = state
+            .attached_transport_id(&first.attachment_id)
+            .await
+            .expect("attached transport");
+        let transport = attachment.transport.clone();
+        drop(attachment);
+        let ack = transport
+            .execute_operation(RuntimeOperation::SendCommand(
+                golutra_protocol::SessionCommand {
+                    command_id: CommandId::new(),
+                    session_id: Some(first.runtime.default_session_id),
+                    kind: golutra_protocol::SessionCommandKind::Prompt,
+                    idempotency_key: CommandId::new().to_string(),
+                    actor: Actor {
+                        kind: ActorKind::Api,
+                        id: "active-task-owner".to_owned(),
+                    },
+                    payload: json!({"prompt": "sleep"}),
+                    timestamp: chrono::Utc::now(),
+                },
+            ))
+            .await
+            .expect("start task")
+            .into_command_ack()
+            .expect("command ack");
+        assert!(ack.accepted);
+        assert!(transport.has_active_work().await);
+
+        assert!(state.detach_attachment(&first.attachment_id).await);
+        assert_eq!(state.inner.runtimes.lock().await.len(), 1);
+        let second = state
+            .attach_cwd(workspace.path())
+            .await
+            .expect("reattach active runtime");
+        assert_eq!(second.runtime.instance_id, first.runtime.instance_id);
+        let abort = transport
+            .execute_operation(RuntimeOperation::SendCommand(
+                golutra_protocol::SessionCommand {
+                    command_id: CommandId::new(),
+                    session_id: Some(first.runtime.default_session_id),
+                    kind: golutra_protocol::SessionCommandKind::Abort,
+                    idempotency_key: CommandId::new().to_string(),
+                    actor: Actor {
+                        kind: ActorKind::Api,
+                        id: "active-task-owner".to_owned(),
+                    },
+                    payload: json!({}),
+                    timestamp: chrono::Utc::now(),
+                },
+            ))
+            .await
+            .expect("abort task")
+            .into_command_ack()
+            .expect("abort ack");
+        assert!(abort.accepted);
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while transport.has_active_work().await {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("task completion");
+        assert!(state.detach_attachment(&second.attachment_id).await);
+        assert!(state.inner.runtimes.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn attachment_capacity_failure_does_not_retain_an_unowned_runtime() {
+        let home = tempfile::tempdir().expect("runtime home");
+        let first_workspace = tempfile::tempdir().expect("first workspace");
+        let second_workspace = tempfile::tempdir().expect("second workspace");
+        let state = AppState::from_auth(
+            server_info(),
+            TransportAuth::from_token(TEST_TRANSPORT_TOKEN).expect("transport auth"),
+            2,
+            1,
+            Some(home.path().to_path_buf()),
+        );
+
+        state
+            .attach_cwd(first_workspace.path())
+            .await
+            .expect("first attachment");
+        let error = state
+            .attach_cwd(second_workspace.path())
+            .await
+            .expect_err("attachment capacity");
+        assert!(matches!(error, ClientError::Daemon(_)));
+        assert_eq!(state.inner.runtimes.lock().await.len(), 1);
     }
 
     #[test]
@@ -1407,6 +1823,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_routes_reject_bodies_larger_than_the_wire_protocol_limit() {
+        let app = router(AppState::new(server_info(), TEST_TRANSPORT_TOKEN).expect("app state"));
+        let response = app
+            .oneshot(
+                authorized_request(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/rpc")
+                        .header(header::CONTENT_TYPE, "application/json"),
+                )
+                .body(Body::from(vec![b' '; MAX_WIRE_MESSAGE_BYTES + 1]))
+                .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
     async fn remote_http_rejects_forensic_trace_disclosure() {
         let app = router(AppState::new(server_info(), TEST_TRANSPORT_TOKEN).expect("app state"));
         let request = TaskTraceRequest {
@@ -1503,6 +1939,307 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(accepted.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn event_sse_uses_the_negotiated_v7_and_v8_wire_shapes() {
+        let (state, attachment_id, session_id, transport) =
+            state_with_attachment_and_transport().await;
+        let app = router(state);
+        let subscribe = |protocol_version| {
+            app.clone().oneshot(
+                Request::builder()
+                    .uri(format!("/events?session_id={session_id}"))
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {TEST_TRANSPORT_TOKEN}"),
+                    )
+                    .header(APP_SERVER_PROTOCOL_HEADER, protocol_version)
+                    .header(APP_SERVER_ATTACHMENT_HEADER, &attachment_id)
+                    .body(Body::empty())
+                    .expect("event request"),
+            )
+        };
+        let legacy_response = subscribe(7).await.expect("legacy SSE response");
+        let current_response = subscribe(8).await.expect("current SSE response");
+        assert_eq!(legacy_response.status(), StatusCode::OK);
+        assert_eq!(current_response.status(), StatusCode::OK);
+
+        let command = SessionCommand {
+            command_id: CommandId::new(),
+            session_id: Some(session_id),
+            kind: SessionCommandKind::Create,
+            idempotency_key: CommandId::new().to_string(),
+            actor: Actor {
+                kind: ActorKind::Api,
+                id: "sse-version-test".to_owned(),
+            },
+            payload: json!({}),
+            timestamp: chrono::Utc::now(),
+        };
+        let ack = transport
+            .execute_operation(RuntimeOperation::SendCommand(command))
+            .await
+            .expect("emit runtime event")
+            .into_command_ack()
+            .expect("command ack");
+        assert!(ack.accepted);
+
+        let legacy = first_sse_data(legacy_response.into_body()).await;
+        assert!(legacy.get("codec_version").is_none());
+        assert!(legacy.get("event").is_none());
+        assert!(legacy.get("schema_version").is_some());
+
+        let current = first_sse_data(current_response.into_body()).await;
+        assert_eq!(current["codec_version"], 1);
+        assert_eq!(current["payload_kind"], "event");
+        assert!(current.pointer("/event/schema_version").is_some());
+    }
+
+    async fn first_sse_data(body: Body) -> Value {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+            let mut stream = body.into_data_stream();
+            let mut pending = String::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.expect("SSE body chunk");
+                pending.push_str(&String::from_utf8_lossy(&chunk));
+                while let Some(frame_end) = pending.find("\n\n") {
+                    let frame = pending[..frame_end].to_owned();
+                    pending.drain(..frame_end + 2);
+                    if let Some(data) = frame.lines().find_map(|line| line.strip_prefix("data: ")) {
+                        return serde_json::from_str(data).expect("SSE JSON data");
+                    }
+                }
+            }
+            panic!("SSE stream ended before an event arrived");
+        })
+        .await
+        .expect("SSE event timeout")
+    }
+
+    #[tokio::test]
+    async fn typed_operations_match_embedded_and_http_results() {
+        let (state, attachment_id, session_id, transport) =
+            state_with_attachment_and_transport().await;
+        let mut events = transport
+            .execute_operation(RuntimeOperation::Subscribe(EventFilter {
+                session_id,
+                task_id: None,
+                after_sequence_no: None,
+            }))
+            .await
+            .expect("embedded subscription")
+            .into_subscription()
+            .expect("subscription result");
+        let command = SessionCommand {
+            command_id: CommandId::new(),
+            session_id: Some(session_id),
+            kind: SessionCommandKind::Prompt,
+            idempotency_key: CommandId::new().to_string(),
+            actor: Actor {
+                kind: ActorKind::Sdk,
+                id: "parity-test".to_owned(),
+            },
+            payload: json!({"prompt": "typed operation parity"}),
+            timestamp: chrono::Utc::now(),
+        };
+        let app = router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                authorized_request(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/commands")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(APP_SERVER_ATTACHMENT_HEADER, &attachment_id),
+                )
+                .body(Body::from(serde_json::to_vec(&command).expect("json")))
+                .expect("command request"),
+            )
+            .await
+            .expect("command response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let ack = serde_json::from_slice::<CommandAck>(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("command body"),
+        )
+        .expect("command ack");
+        assert!(ack.accepted);
+
+        let task_id = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut task_id = None;
+            while let Some(event) = events.recv().await {
+                let event = event.expect("runtime event");
+                task_id = task_id.or(event.task_id);
+                if event.event_type.is_task_terminal() {
+                    return task_id.expect("terminal task id");
+                }
+            }
+            panic!("runtime event stream ended before task completion");
+        })
+        .await
+        .expect("task completion");
+
+        let trace_request = TaskTraceRequest {
+            session_id,
+            task_id,
+            view: TraceView::Full,
+            cursor: None,
+            limit: 512,
+            wait_for_evaluation: true,
+        };
+        let embedded_trace = transport
+            .execute_operation(RuntimeOperation::TaskTrace(trace_request.clone()))
+            .await
+            .expect("embedded trace")
+            .into_task_trace()
+            .expect("trace result");
+
+        let query = RuntimeQuery {
+            query_id: golutra_core::QueryId::new(),
+            session_id,
+            task_id: Some(task_id),
+            kind: RuntimeQueryKind::SessionState,
+            requester: ActorKind::Api,
+            cursor: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let embedded_query = transport
+            .execute_operation(RuntimeOperation::Query(query.clone()))
+            .await
+            .expect("embedded query")
+            .into_query()
+            .expect("query result");
+        let response = app
+            .clone()
+            .oneshot(
+                authorized_request(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/queries")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(APP_SERVER_ATTACHMENT_HEADER, &attachment_id),
+                )
+                .body(Body::from(serde_json::to_vec(&query).expect("query json")))
+                .expect("query request"),
+            )
+            .await
+            .expect("query response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let http_query = serde_json::from_slice::<Value>(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("query body"),
+        )
+        .expect("query value");
+        assert_eq!(http_query, embedded_query);
+
+        let response = app
+            .oneshot(
+                authorized_request(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/traces")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(APP_SERVER_ATTACHMENT_HEADER, &attachment_id),
+                )
+                .body(Body::from(
+                    serde_json::to_vec(&trace_request).expect("trace json"),
+                ))
+                .expect("trace request"),
+            )
+            .await
+            .expect("trace response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let http_trace = serde_json::from_slice::<TaskTracePage>(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("trace body"),
+        )
+        .expect("trace page");
+        assert_eq!(http_trace, embedded_trace);
+    }
+
+    #[tokio::test]
+    async fn detach_endpoint_revokes_the_attachment_capability() {
+        let (state, attachment_id, session_id) = state_with_attachment().await;
+        let app = router(state);
+        let missing_header = app
+            .clone()
+            .oneshot(
+                authorized_request(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(format!("/runtime/attach/{attachment_id}")),
+                )
+                .body(Body::empty())
+                .expect("missing-header detach request"),
+            )
+            .await
+            .expect("missing-header detach response");
+        assert_eq!(missing_header.status(), StatusCode::GONE);
+
+        let detached = app
+            .clone()
+            .oneshot(
+                authorized_request(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(format!("/runtime/attach/{attachment_id}"))
+                        .header(APP_SERVER_ATTACHMENT_HEADER, &attachment_id),
+                )
+                .body(Body::empty())
+                .expect("detach request"),
+            )
+            .await
+            .expect("detach response");
+        assert_eq!(detached.status(), StatusCode::NO_CONTENT);
+
+        let command = SessionCommand {
+            command_id: CommandId::new(),
+            session_id: Some(session_id),
+            kind: SessionCommandKind::Create,
+            idempotency_key: CommandId::new().to_string(),
+            actor: Actor {
+                kind: ActorKind::Sdk,
+                id: "test".to_owned(),
+            },
+            payload: json!({}),
+            timestamp: chrono::Utc::now(),
+        };
+        let revoked = app
+            .clone()
+            .oneshot(
+                authorized_request(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/commands")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(APP_SERVER_ATTACHMENT_HEADER, &attachment_id),
+                )
+                .body(Body::from(serde_json::to_vec(&command).expect("json")))
+                .expect("command request"),
+            )
+            .await
+            .expect("command response");
+        assert_eq!(revoked.status(), StatusCode::GONE);
+
+        let already_detached = app
+            .oneshot(
+                authorized_request(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(format!("/runtime/attach/{attachment_id}"))
+                        .header(APP_SERVER_ATTACHMENT_HEADER, &attachment_id),
+                )
+                .body(Body::empty())
+                .expect("second detach request"),
+            )
+            .await
+            .expect("second detach response");
+        assert_eq!(already_detached.status(), StatusCode::GONE);
     }
 
     #[tokio::test]

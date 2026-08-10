@@ -21,25 +21,28 @@ impl RuntimeHost {
         self.ensure_session_in_workspace(query.session_id).await?;
         let value = match query.kind {
             RuntimeQueryKind::SessionState | RuntimeQueryKind::TaskState => serde_json::to_value(
-                self.repositories
+                self.storage
+                    .repositories
                     .projections
                     .state(query.session_id, query.task_id)
                     .await?,
             )?,
             RuntimeQueryKind::UserProjection => serde_json::to_value(
-                self.repositories
+                self.storage
+                    .repositories
                     .projections
                     .user(query.session_id, query.task_id)
                     .await?,
             )?,
             RuntimeQueryKind::DebugProjection => {
                 let mut projection = self
+                    .storage
                     .repositories
                     .projections
                     .debug(query.session_id, query.task_id)
                     .await?;
                 if let Some(task_id) = query.task_id {
-                    let evaluation_store = self.evaluation_store.clone();
+                    let evaluation_store = self.storage.evaluation_store.clone();
                     let state = run_blocking(move || evaluation_store.snapshot()).await??;
                     projection.failure_diagnosis = state
                         .failure_diagnoses
@@ -101,7 +104,8 @@ impl RuntimeHost {
                 self.ensure_task_in_session(query.session_id, task_id)
                     .await?;
                 serde_json::to_value(
-                    self.governance
+                    self.storage
+                        .governance
                         .context_projection(query.session_id, task_id)
                         .await?,
                 )?
@@ -115,23 +119,25 @@ impl RuntimeHost {
                 self.ensure_task_in_session(query.session_id, task_id)
                     .await?;
                 serde_json::to_value(
-                    self.governance
+                    self.storage
+                        .governance
                         .evaluation_projection(query.session_id, task_id)
                         .await?,
                 )?
             }
             RuntimeQueryKind::ReplayCursor => serde_json::to_value(
-                self.repositories
+                self.storage
+                    .repositories
                     .events
                     .load(query.session_id, query.task_id, query.cursor)
                     .await?,
             )?,
             RuntimeQueryKind::MemoryList => {
-                let memory_store = self.memory_store.clone();
+                let memory_store = self.storage.memory_store.clone();
                 serde_json::to_value(run_blocking(move || memory_store.list()).await??)?
             }
             RuntimeQueryKind::EvaluationResults => {
-                let evaluation_store = self.evaluation_store.clone();
+                let evaluation_store = self.storage.evaluation_store.clone();
                 let state = run_blocking(move || evaluation_store.snapshot()).await??;
                 json!({
                     "cases": state.cases,
@@ -145,7 +151,7 @@ impl RuntimeHost {
                 })
             }
             RuntimeQueryKind::ImprovementCandidates => {
-                let evaluation_store = self.evaluation_store.clone();
+                let evaluation_store = self.storage.evaluation_store.clone();
                 serde_json::to_value(
                     run_blocking(move || evaluation_store.snapshot())
                         .await??
@@ -153,7 +159,7 @@ impl RuntimeHost {
                 )?
             }
             RuntimeQueryKind::AutomationCandidates => {
-                let evaluation_store = self.evaluation_store.clone();
+                let evaluation_store = self.storage.evaluation_store.clone();
                 let state = run_blocking(move || evaluation_store.snapshot()).await??;
                 json!({
                     "candidates": state.automation_candidates,
@@ -166,7 +172,7 @@ impl RuntimeHost {
                 })
             }
             RuntimeQueryKind::EvolutionState => {
-                let evolution_store = self.evolution_store.clone();
+                let evolution_store = self.storage.evolution_store.clone();
                 serde_json::to_value(run_blocking(move || evolution_store.snapshot()).await??)?
             }
             RuntimeQueryKind::ProviderState => {
@@ -183,6 +189,7 @@ impl RuntimeHost {
                     },
                 );
                 let latest_runtime_fact = self
+                    .storage
                     .repositories
                     .events
                     .load_recent(query.session_id, query.task_id, None, 128)
@@ -234,7 +241,13 @@ impl RuntimeHost {
                 })?;
                 self.ensure_task_in_session(query.session_id, task_id)
                     .await?;
-                serde_json::to_value(self.repositories.jobs.list_for_task(task_id).await?)?
+                serde_json::to_value(
+                    self.storage
+                        .repositories
+                        .jobs
+                        .list_for_task(task_id)
+                        .await?,
+                )?
             }
             RuntimeQueryKind::ArtifactChunk => {
                 return Err(ClientError::InvalidSession(
@@ -251,6 +264,7 @@ impl RuntimeHost {
     ) -> Result<Vec<Value>, ClientError> {
         self.ensure_session_in_workspace(filter.session_id).await?;
         let events = self
+            .storage
             .repositories
             .events
             .load(filter.session_id, filter.task_id, filter.after_sequence_no)
@@ -268,7 +282,8 @@ impl RuntimeHost {
         let fetch_limit = limit.saturating_add(1);
         let mut events = match request.direction {
             EventPageDirection::Forward => {
-                self.repositories
+                self.storage
+                    .repositories
                     .events
                     .load_page(
                         request.session_id,
@@ -279,7 +294,8 @@ impl RuntimeHost {
                     .await?
             }
             EventPageDirection::Backward => {
-                self.repositories
+                self.storage
+                    .repositories
                     .events
                     .load_before(
                         request.session_id,

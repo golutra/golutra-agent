@@ -52,9 +52,9 @@ use golutra_tui::{
     AuthConfigScope, AuthCredentialStore, OAuthLoginCommand, OpenAiCompatibleLogin,
     PaneScrollState, ReasoningEffortSelection, SlashAuthCommand, SlashCommand,
     SlashCommandCandidate, SlashDebugCommand, SlashInput, TranscriptScrollAction,
-    parse_slash_input, slash_command_candidates,
+    parse_slash_input, ratatui_vertical_scroll, slash_command_candidates,
 };
-use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend};
+use ratatui::{Terminal, TerminalOptions, Viewport};
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -305,21 +305,9 @@ struct TuiApp {
     activity_snapshot: Option<ActivitySnapshot>,
     activity_snapshot_captured: bool,
     change_projection: ChangeProjection,
-    expanded_operations: HashSet<OperationId>,
-    transcript_details_expanded: bool,
+    transcript: TranscriptState,
     developer_observations_expanded: bool,
-    transcript_scroll: PaneScrollState,
-    transcript_top_row_override: Option<usize>,
-    transcript_revision: u64,
-    transcript_layout_cache: Option<TranscriptLayoutCache>,
-    inline_history_enabled: bool,
-    inline_history_committed_event_ids: HashSet<EventId>,
-    history_replay_generation: u64,
-    history_replay_ready: bool,
     body_view_mode: BodyViewMode,
-    transcript_presentation: TranscriptPresentation,
-    transcript_search: Option<TranscriptSearchState>,
-    search_restore_body_view: Option<BodyViewMode>,
     layout: UiLayoutSnapshot,
     cursor: Option<u64>,
     history_start_cursor: Option<u64>,
@@ -472,24 +460,9 @@ impl TuiApp {
             activity_snapshot: None,
             activity_snapshot_captured: false,
             change_projection: ChangeProjection::default(),
-            expanded_operations: HashSet::new(),
-            transcript_details_expanded: false,
+            transcript: TranscriptState::default(),
             developer_observations_expanded: true,
-            transcript_scroll: PaneScrollState {
-                follow_tail: true,
-                ..PaneScrollState::default()
-            },
-            transcript_top_row_override: None,
-            transcript_revision: 0,
-            transcript_layout_cache: None,
-            inline_history_enabled: false,
-            inline_history_committed_event_ids: HashSet::new(),
-            history_replay_generation: 0,
-            history_replay_ready: true,
             body_view_mode: BodyViewMode::Auto,
-            transcript_presentation: TranscriptPresentation::Rich,
-            transcript_search: None,
-            search_restore_body_view: None,
             layout: UiLayoutSnapshot::default(),
             cursor: None,
             history_start_cursor: None,
@@ -597,7 +570,7 @@ impl TuiApp {
             Some(OverlaySurface::Settings) => "settings",
             Some(OverlaySurface::Export) => "session export",
             Some(OverlaySurface::Help) => "help",
-            None if self.transcript_search.is_some() => "transcript search",
+            None if self.transcript.search.is_some() => "transcript search",
             None if self.history_search.is_some() => "prompt history search",
             None if self.debug_mode => "developer runtime",
             None => "composer",
@@ -647,7 +620,7 @@ impl TuiApp {
             return false;
         }
 
-        let previous_row_count = self.transcript_scroll.row_count;
+        let previous_row_count = self.transcript.scroll.row_count;
         let projection = Some(snapshot.projection);
         if self.projection != projection {
             self.projection = projection;
@@ -714,7 +687,7 @@ impl TuiApp {
         self.history_load_requested = false;
         self.sync_transcript_row_count(0);
         self.clamp_transcript_scroll();
-        self.history_replay_ready = true;
+        self.transcript.history.replay_ready = true;
     }
 
     fn apply_developer_projection_result(&mut self, result: Result<DebugProjection, String>) {
@@ -803,13 +776,14 @@ impl TuiApp {
         self.history_start_cursor = page.start_cursor;
         self.history_has_more_before = page.has_more;
         let current_rows = self.current_transcript_row_count();
-        if let Some(top_row) = self.transcript_top_row_override {
-            let prepended_rows = current_rows.saturating_sub(self.transcript_scroll.row_count);
-            self.transcript_top_row_override = Some(top_row.saturating_add(prepended_rows));
-            self.transcript_scroll.row_count = current_rows;
-            self.transcript_scroll.follow_tail = false;
+        if let Some(top_row) = self.transcript.top_row_override {
+            let prepended_rows = current_rows.saturating_sub(self.transcript.scroll.row_count);
+            self.transcript.top_row_override = Some(top_row.saturating_add(prepended_rows));
+            self.transcript.scroll.row_count = current_rows;
+            self.transcript.scroll.follow_tail = false;
         } else {
-            self.transcript_scroll
+            self.transcript
+                .scroll
                 .set_row_count_after_prepend(current_rows);
         }
         self.clamp_transcript_scroll();
@@ -843,11 +817,11 @@ impl TuiApp {
         self.cursor = Some(event.sequence_no);
         let event_type = event.event_type;
         let preserve_transcript_anchor = event_type != RuntimeEventType::ProviderStreamed
-            && (!self.transcript_scroll.follow_tail || self.transcript_top_row_override.is_some());
+            && (!self.transcript.scroll.follow_tail || self.transcript.top_row_override.is_some());
         let transcript_anchor = preserve_transcript_anchor
             .then(|| self.first_visible_transcript_anchor())
             .flatten();
-        let previous_row_count = self.transcript_scroll.row_count;
+        let previous_row_count = self.transcript.scroll.row_count;
         let event_turn_id = event.turn_id;
         match event_type {
             RuntimeEventType::ApprovalRequested => {
@@ -1079,7 +1053,7 @@ impl TuiApp {
     fn slash_candidates(&self) -> Vec<SlashCommandCandidate> {
         if self.auth_operation.is_some()
             || self.overlay_surface().is_some()
-            || self.transcript_search.is_some()
+            || self.transcript.search.is_some()
             || self.history_search.is_some()
         {
             return Vec::new();
@@ -1471,31 +1445,25 @@ impl TuiApp {
     }
 
     fn reset_transcript_view(&mut self) {
-        self.expanded_operations.clear();
-        self.transcript_details_expanded = false;
-        self.transcript_top_row_override = None;
-        self.invalidate_transcript_layout();
-        self.transcript_scroll
+        self.transcript.reset_view();
+        self.transcript
+            .scroll
             .reset(self.current_transcript_row_count());
     }
 
     fn toggle_operation(&mut self, id: OperationId) {
         let anchor = self.first_visible_transcript_anchor();
-        let previous_row_count = self.transcript_scroll.row_count;
-        if !self.expanded_operations.insert(id.clone()) {
-            self.expanded_operations.remove(&id);
-        }
-        self.invalidate_transcript_layout();
+        let previous_row_count = self.transcript.scroll.row_count;
+        self.transcript.toggle_operation(id);
         self.reflow_transcript_with_anchor(anchor, previous_row_count);
     }
 
     fn toggle_transcript_details(&mut self) {
         let anchor = self.first_visible_transcript_anchor();
-        let previous_row_count = self.transcript_scroll.row_count;
-        self.transcript_details_expanded = !self.transcript_details_expanded;
-        self.invalidate_transcript_layout();
+        let previous_row_count = self.transcript.scroll.row_count;
+        let expanded = self.transcript.toggle_details();
         self.reflow_transcript_with_anchor(anchor, previous_row_count);
-        self.status_message = if self.transcript_details_expanded {
+        self.status_message = if expanded {
             "transcript details expanded"
         } else {
             "transcript details collapsed"
@@ -1533,8 +1501,8 @@ impl TuiApp {
         let layout = transcript_layout(self, area);
         let window = layout.visible_window(
             area.height as usize,
-            self.transcript_scroll.offset_from_bottom,
-            self.transcript_top_row_override,
+            self.transcript.scroll.offset_from_bottom,
+            self.transcript.top_row_override,
         );
         let projection_index = layout.first_visible_projection(window.clone())?;
         let visual_start = layout.visual_start_for_projection(projection_index)?;
@@ -1583,13 +1551,13 @@ impl TuiApp {
                 ),
             )
         }) {
-            self.transcript_scroll.row_count = layout.row_count;
+            self.transcript.scroll.row_count = layout.row_count;
             self.set_transcript_top_row(&layout, top_row, area.height as usize);
         } else {
             self.sync_transcript_row_count_to(previous_row_count, layout.row_count);
         }
-        self.transcript_layout_cache = Some(TranscriptLayoutCache {
-            revision: self.transcript_revision,
+        self.transcript.layout_cache = Some(TranscriptLayoutCache {
+            revision: self.transcript.revision,
             width: area.width,
             height: area.height,
             layout,
@@ -1603,91 +1571,81 @@ impl TuiApp {
         visible_rows: usize,
     ) {
         if layout.row_count == 0 {
-            self.transcript_scroll.reset(0);
-            self.transcript_top_row_override = None;
+            self.transcript.scroll.reset(0);
+            self.transcript.top_row_override = None;
             return;
         }
         let top_row = top_row.min(layout.row_count.saturating_sub(1));
         let visible_rows = visible_rows.max(1);
         let normal_max_start = layout.row_count.saturating_sub(visible_rows);
         if top_row > normal_max_start {
-            self.transcript_scroll.offset_from_bottom = 0;
-            self.transcript_scroll.follow_tail = false;
-            self.transcript_top_row_override = Some(top_row);
+            self.transcript.scroll.offset_from_bottom = 0;
+            self.transcript.scroll.follow_tail = false;
+            self.transcript.top_row_override = Some(top_row);
         } else {
             let offset_from_bottom = normal_max_start.saturating_sub(top_row);
-            self.transcript_scroll.offset_from_bottom = offset_from_bottom;
-            self.transcript_scroll.follow_tail = offset_from_bottom == 0;
-            self.transcript_top_row_override = None;
-            self.transcript_scroll.clamp(visible_rows);
+            self.transcript.scroll.offset_from_bottom = offset_from_bottom;
+            self.transcript.scroll.follow_tail = offset_from_bottom == 0;
+            self.transcript.top_row_override = None;
+            self.transcript.scroll.clamp(visible_rows);
         }
     }
 
     fn invalidate_transcript_layout(&mut self) {
-        self.transcript_revision = self.transcript_revision.wrapping_add(1);
-        self.transcript_layout_cache = None;
+        self.transcript.invalidate_layout();
     }
 
     fn enable_inline_history(&mut self) {
-        if !self.inline_history_enabled {
-            self.inline_history_enabled = true;
-            self.invalidate_transcript_layout();
-        }
+        self.transcript.enable_inline_history();
     }
 
     fn begin_history_replay(&mut self) {
-        self.history_replay_generation = self.history_replay_generation.wrapping_add(1);
-        self.history_replay_ready = false;
-        self.set_inline_history_committed_event_ids(HashSet::new());
+        self.transcript.begin_history_replay();
     }
 
     fn request_history_rebuild(&mut self) {
-        self.history_replay_generation = self.history_replay_generation.wrapping_add(1);
-        self.set_inline_history_committed_event_ids(HashSet::new());
+        self.transcript.request_history_rebuild();
     }
 
     fn set_inline_history_committed_event_ids(&mut self, ids: HashSet<EventId>) {
-        if self.inline_history_committed_event_ids != ids {
-            self.inline_history_committed_event_ids = ids;
-            self.invalidate_transcript_layout();
-        }
+        self.transcript.set_committed_event_ids(ids);
     }
 
     fn ensure_transcript_layout(&mut self, area: ratatui::layout::Rect) {
-        let stale = self.transcript_layout_cache.as_ref().is_none_or(|cache| {
-            cache.revision != self.transcript_revision
+        let stale = self.transcript.layout_cache.as_ref().is_none_or(|cache| {
+            cache.revision != self.transcript.revision
                 || cache.width != area.width
                 || cache.height != area.height
         });
         if stale {
-            let resize_anchor = self.transcript_layout_cache.as_ref().and_then(|cache| {
-                (cache.revision == self.transcript_revision
+            let resize_anchor = self.transcript.layout_cache.as_ref().and_then(|cache| {
+                (cache.revision == self.transcript.revision
                     && (cache.width != area.width || cache.height != area.height)
                     && cache.height > 0
-                    && (!self.transcript_scroll.follow_tail
-                        || self.transcript_top_row_override.is_some()))
+                    && (!self.transcript.scroll.follow_tail
+                        || self.transcript.top_row_override.is_some()))
                 .then(|| {
                     let window = cache.layout.visible_window(
                         cache.height as usize,
-                        self.transcript_scroll.offset_from_bottom,
-                        self.transcript_top_row_override,
+                        self.transcript.scroll.offset_from_bottom,
+                        self.transcript.top_row_override,
                     );
                     cache.layout.first_visible_row_anchor(window)
                 })
                 .flatten()
             });
-            let previous_row_count = self.transcript_scroll.row_count;
+            let previous_row_count = self.transcript.scroll.row_count;
             let layout = transcript_layout(self, area);
             if let Some(top_row) = resize_anchor
                 .and_then(|(row_index, offset)| layout.visual_row_for_row_anchor(row_index, offset))
             {
-                self.transcript_scroll.row_count = layout.row_count;
+                self.transcript.scroll.row_count = layout.row_count;
                 self.set_transcript_top_row(&layout, top_row, area.height as usize);
             } else {
                 self.sync_transcript_row_count_to(previous_row_count, layout.row_count);
             }
-            self.transcript_layout_cache = Some(TranscriptLayoutCache {
-                revision: self.transcript_revision,
+            self.transcript.layout_cache = Some(TranscriptLayoutCache {
+                revision: self.transcript.revision,
                 width: area.width,
                 height: area.height,
                 layout,
@@ -1701,30 +1659,33 @@ impl TuiApp {
         current_row_count: usize,
     ) {
         if self
-            .transcript_top_row_override
+            .transcript
+            .top_row_override
             .is_some_and(|top_row| top_row < current_row_count)
         {
             if current_row_count > previous_row_count {
-                self.transcript_scroll.unseen_rows = self
-                    .transcript_scroll
+                self.transcript.scroll.unseen_rows = self
+                    .transcript
+                    .scroll
                     .unseen_rows
                     .saturating_add(current_row_count - previous_row_count);
             }
-            self.transcript_scroll.row_count = current_row_count;
-            self.transcript_scroll.follow_tail = false;
+            self.transcript.scroll.row_count = current_row_count;
+            self.transcript.scroll.follow_tail = false;
             return;
         }
-        self.transcript_top_row_override = None;
-        if !self.transcript_scroll.follow_tail && current_row_count > previous_row_count {
+        self.transcript.top_row_override = None;
+        if !self.transcript.scroll.follow_tail && current_row_count > previous_row_count {
             let added = current_row_count - previous_row_count;
-            self.transcript_scroll.offset_from_bottom = self
-                .transcript_scroll
+            self.transcript.scroll.offset_from_bottom = self
+                .transcript
+                .scroll
                 .offset_from_bottom
                 .saturating_add(added);
-            self.transcript_scroll.unseen_rows =
-                self.transcript_scroll.unseen_rows.saturating_add(added);
+            self.transcript.scroll.unseen_rows =
+                self.transcript.scroll.unseen_rows.saturating_add(added);
         }
-        self.transcript_scroll.row_count = current_row_count;
+        self.transcript.scroll.row_count = current_row_count;
         self.clamp_transcript_scroll();
     }
 
@@ -1732,11 +1693,11 @@ impl TuiApp {
         if self.overlay_surface().is_some() {
             return;
         }
-        if let Some(top_row) = self.transcript_top_row_override {
+        if let Some(top_row) = self.transcript.top_row_override {
             match action {
                 TranscriptScrollAction::Top | TranscriptScrollAction::Bottom => {
-                    self.transcript_top_row_override = None;
-                    self.transcript_scroll.scroll(action, visible_rows);
+                    self.transcript.top_row_override = None;
+                    self.transcript.scroll.scroll(action, visible_rows);
                 }
                 TranscriptScrollAction::LineUp
                 | TranscriptScrollAction::LineDown
@@ -1744,7 +1705,8 @@ impl TuiApp {
                 | TranscriptScrollAction::PageDown => {
                     let page = visible_rows.max(1);
                     let max_top = self
-                        .transcript_scroll
+                        .transcript
+                        .scroll
                         .row_count
                         .saturating_sub(visible_rows.max(1));
                     let next_top = match action {
@@ -1763,7 +1725,7 @@ impl TuiApp {
                 }
             }
         } else {
-            self.transcript_scroll.scroll(action, visible_rows);
+            self.transcript.scroll.scroll(action, visible_rows);
         }
         if matches!(
             action,
@@ -1772,7 +1734,7 @@ impl TuiApp {
                 | TranscriptScrollAction::Bottom
         ) {
             self.history_load_requested = false;
-        } else if !self.inline_history_enabled
+        } else if !self.transcript.history.enabled
             && self.history_has_more_before
             && matches!(
                 action,
@@ -1780,9 +1742,9 @@ impl TuiApp {
                     | TranscriptScrollAction::PageUp
                     | TranscriptScrollAction::Top
             )
-            && self.transcript_top_row_override.map_or_else(
+            && self.transcript.top_row_override.map_or_else(
                 || {
-                    self.transcript_scroll.offset_from_bottom
+                    self.transcript.scroll.offset_from_bottom
                         == self.max_transcript_scroll_offset(visible_rows)
                 },
                 |top_row| top_row == 0,
@@ -1791,17 +1753,17 @@ impl TuiApp {
             self.history_load_requested = true;
         }
         self.status_message = transcript_scroll_status(
-            self.transcript_scroll.offset_from_bottom,
-            self.transcript_scroll.unseen_rows,
+            self.transcript.scroll.offset_from_bottom,
+            self.transcript.scroll.unseen_rows,
         );
     }
 
     fn clamp_transcript_scroll(&mut self) {
-        self.transcript_scroll.clamp(usize::MAX);
+        self.transcript.scroll.clamp(usize::MAX);
     }
 
     fn max_transcript_scroll_offset(&self, visible_rows: usize) -> usize {
-        self.transcript_scroll.max_offset(visible_rows)
+        self.transcript.scroll.max_offset(visible_rows)
     }
 
     fn toggle_transcript_fullscreen(&mut self) {
@@ -1822,7 +1784,7 @@ impl TuiApp {
     }
 
     fn toggle_raw_transcript(&mut self) {
-        self.transcript_presentation = match self.transcript_presentation {
+        self.transcript.presentation = match self.transcript.presentation {
             TranscriptPresentation::Rich => TranscriptPresentation::Raw,
             TranscriptPresentation::Raw => TranscriptPresentation::Rich,
         };
@@ -1830,7 +1792,7 @@ impl TuiApp {
         if self.debug_mode {
             self.request_history_rebuild();
         }
-        self.status_message = match self.transcript_presentation {
+        self.status_message = match self.transcript.presentation {
             TranscriptPresentation::Rich => "rich transcript view",
             TranscriptPresentation::Raw => "raw transcript view",
         }
@@ -1838,9 +1800,9 @@ impl TuiApp {
     }
 
     fn open_transcript_search(&mut self) {
-        if self.transcript_search.is_none() {
-            self.search_restore_body_view = Some(self.body_view_mode);
-            self.transcript_search = Some(TranscriptSearchState::default());
+        if self.transcript.search.is_none() {
+            self.transcript.search_restore_body_view = Some(self.body_view_mode);
+            self.transcript.search = Some(TranscriptSearchState::default());
         }
         self.body_view_mode = BodyViewMode::Transcript;
         if self.debug_mode {
@@ -1851,8 +1813,12 @@ impl TuiApp {
     }
 
     fn close_transcript_search(&mut self) {
-        self.transcript_search = None;
-        self.body_view_mode = self.search_restore_body_view.take().unwrap_or_default();
+        self.transcript.search = None;
+        self.body_view_mode = self
+            .transcript
+            .search_restore_body_view
+            .take()
+            .unwrap_or_default();
         if self.debug_mode {
             self.request_history_rebuild();
         }
@@ -1867,7 +1833,7 @@ impl TuiApp {
         };
         let layout = transcript_layout(self, area);
         let lines = layout.plain_lines();
-        if let Some(search) = &mut self.transcript_search {
+        if let Some(search) = &mut self.transcript.search {
             search.rebuild(&lines);
         }
         self.focus_current_search_match_in(&layout, area.height as usize);
@@ -1885,7 +1851,8 @@ impl TuiApp {
 
     fn focus_current_search_match_in(&mut self, layout: &TranscriptLayout, visible_rows: usize) {
         let Some(line) = self
-            .transcript_search
+            .transcript
+            .search
             .as_ref()
             .and_then(TranscriptSearchState::current_line)
         else {
@@ -1897,9 +1864,9 @@ impl TuiApp {
         let visible_rows = visible_rows.max(1);
         let top = target.saturating_sub(visible_rows / 3);
         let end = top.saturating_add(visible_rows).min(layout.row_count);
-        self.transcript_scroll.offset_from_bottom = layout.row_count.saturating_sub(end);
-        self.transcript_scroll.follow_tail = self.transcript_scroll.offset_from_bottom == 0;
-        self.transcript_scroll.row_count = layout.row_count;
+        self.transcript.scroll.offset_from_bottom = layout.row_count.saturating_sub(end);
+        self.transcript.scroll.follow_tail = self.transcript.scroll.offset_from_bottom == 0;
+        self.transcript.scroll.row_count = layout.row_count;
     }
 
     fn copy_transcript(&mut self) {
@@ -1911,7 +1878,8 @@ impl TuiApp {
         let layout = full_transcript_layout(self, area);
         let lines = layout.plain_lines();
         let text = self
-            .transcript_search
+            .transcript
+            .search
             .as_ref()
             .and_then(TranscriptSearchState::current_line)
             .and_then(|line| lines.get(line).cloned())
@@ -3165,7 +3133,7 @@ impl TuiApp {
                 .drain(0..self.command_messages.len().saturating_sub(12));
         }
         self.invalidate_transcript_layout();
-        self.sync_transcript_row_count(self.transcript_scroll.row_count);
+        self.sync_transcript_row_count(self.transcript.scroll.row_count);
         self.clamp_transcript_scroll();
     }
 }
@@ -3342,7 +3310,14 @@ async fn run_app(
     mut app: TuiApp,
     transport: RuntimeTransport,
 ) -> miette::Result<()> {
-    let mut controller = TuiRuntimeController::attach(&mut app, transport).await?;
+    let cleanup_transport = transport.clone();
+    let mut controller = match TuiRuntimeController::attach(&mut app, transport).await {
+        Ok(controller) => controller,
+        Err(error) => {
+            let _ = cleanup_transport.close().await;
+            return Err(error);
+        }
+    };
     let mut terminal_events = EventStream::new();
     let mut maintenance = tokio::time::interval(INTERACTIVE_MAINTENANCE_INTERVAL);
     maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -3353,10 +3328,11 @@ async fn run_app(
     let mut frames = FrameScheduler::default();
     let mut inline_history = InlineHistoryState::new(app.session_id);
 
-    draw_interactive_frame(terminal, &mut app, &mut inline_history)?;
-    frames.mark_drawn_at(Instant::now());
+    let result: miette::Result<()> = async {
+        draw_interactive_frame(terminal, &mut app, &mut inline_history)?;
+        frames.mark_drawn_at(Instant::now());
 
-    while !app.should_quit {
+        while !app.should_quit {
         let frame_deadline = frames
             .deadline()
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
@@ -3418,9 +3394,13 @@ async fn run_app(
                 }
             }
         }
-    }
+        }
 
-    Ok(())
+        Ok(())
+    }
+    .await;
+    let shutdown = controller.shutdown().await;
+    result.and(shutdown)
 }
 
 fn draw_interactive_frame(
@@ -3496,7 +3476,7 @@ async fn handle_key(
         handle_history_search_key(key, app);
         return Ok(());
     }
-    if app.transcript_search.is_some() {
+    if app.transcript.search.is_some() {
         handle_transcript_search_key(key, app);
         return Ok(());
     }
@@ -3990,21 +3970,21 @@ fn handle_transcript_search_key(key: KeyEvent, app: &mut TuiApp) {
             return;
         }
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-            if let Some(search) = &mut app.transcript_search {
+            if let Some(search) = &mut app.transcript.search {
                 search.select_previous();
             }
             app.focus_current_search_match();
             return;
         }
         KeyCode::Enter | KeyCode::Down => {
-            if let Some(search) = &mut app.transcript_search {
+            if let Some(search) = &mut app.transcript.search {
                 search.select_next();
             }
             app.focus_current_search_match();
             return;
         }
         KeyCode::Up => {
-            if let Some(search) = &mut app.transcript_search {
+            if let Some(search) = &mut app.transcript.search {
                 search.select_previous();
             }
             app.focus_current_search_match();
@@ -4017,7 +3997,7 @@ fn handle_transcript_search_key(key: KeyEvent, app: &mut TuiApp) {
         _ => {}
     }
 
-    let Some(search) = &mut app.transcript_search else {
+    let Some(search) = &mut app.transcript.search else {
         return;
     };
     match key.code {
@@ -4293,8 +4273,8 @@ fn handle_paste(pasted: &str, app: &mut TuiApp) {
         return;
     }
 
-    if app.transcript_search.is_some() {
-        if let Some(search) = &mut app.transcript_search {
+    if app.transcript.search.is_some() {
+        if let Some(search) = &mut app.transcript.search {
             search.input.insert_str(&single_line);
         }
         app.rebuild_transcript_search();
@@ -4317,7 +4297,7 @@ fn plain_question_mark_opens_help(app: &TuiApp) -> bool {
         || (app.input.is_empty()
             && app.overlay_surface().is_none()
             && app.history_search.is_none()
-            && app.transcript_search.is_none())
+            && app.transcript.search.is_none())
 }
 
 fn handle_help_dialog_key(key: KeyEvent, app: &mut TuiApp) {
@@ -5203,7 +5183,7 @@ async fn handle_queue_picker_key(
     Ok(())
 }
 
-type InteractiveTerminal = Terminal<CursorFallbackBackend<CrosstermBackend<Stdout>>>;
+type InteractiveTerminal = Terminal<CursorFallbackBackend<ContiguousCrosstermBackend<Stdout>>>;
 
 fn setup_terminal(viewport_height: u16) -> miette::Result<InteractiveTerminal> {
     enable_raw_mode().map_err(|error| miette::miette!("{error}"))?;
@@ -5212,7 +5192,7 @@ fn setup_terminal(viewport_height: u16) -> miette::Result<InteractiveTerminal> {
         return Err(rollback_terminal_setup(error, false));
     }
     match Terminal::with_options(
-        CursorFallbackBackend::new(CrosstermBackend::new(stdout)),
+        CursorFallbackBackend::new(ContiguousCrosstermBackend::new(stdout)),
         TerminalOptions {
             viewport: Viewport::Inline(viewport_height.max(1)),
         },

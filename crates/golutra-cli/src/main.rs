@@ -26,6 +26,9 @@ use golutra_llm::{
     ProviderProtocol, ProviderReasoningEffort, provider_protocol_catalog,
 };
 use golutra_plugin::PluginStore;
+use golutra_project_service::{
+    ProjectServiceManager, ProjectServiceSpec, ProjectServiceStartRequest,
+};
 use golutra_protocol::{
     AgentStreamEvent, AgentTurnOptions, EventFilter, ExternalVerificationSpec, RuntimeEvent,
     RuntimeEventType, RuntimeQuery, RuntimeQueryKind, SessionCommand, SessionCommandKind,
@@ -183,6 +186,11 @@ enum Command {
     Plugin {
         #[command(subcommand)]
         command: PluginCommand,
+    },
+    /// Manage project-owned services that survive runtime shutdown.
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
     },
 }
 
@@ -388,6 +396,48 @@ enum ThreadCommand {
 enum StorageCommand {
     Status,
     Clean,
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceCommand {
+    Start {
+        name: String,
+        #[command(subcommand)]
+        backend: ServiceStartBackend,
+    },
+    List,
+    Status {
+        name: String,
+    },
+    Logs {
+        name: String,
+        #[arg(long, default_value_t = 200)]
+        tail: u32,
+    },
+    Stop {
+        name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceStartBackend {
+    /// Run an argv command in a detached tmux session.
+    Tmux {
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// Start selected services from a Docker Compose project.
+    DockerCompose {
+        #[arg(long, value_name = "FILE", default_value = "compose.yaml")]
+        file: std::path::PathBuf,
+        #[arg(long = "service", value_name = "NAME")]
+        services: Vec<String>,
+    },
+    /// Run an argv command as a transient systemd user unit.
+    SystemdUser {
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -731,6 +781,23 @@ async fn main() -> miette::Result<()> {
     if let Command::Plugin { command } = &cli.command {
         return run_plugin_command(command);
     }
+    if let Command::Service { command } = &cli.command {
+        if cli.daemon
+            || cli.connect.is_some()
+            || cli.session_id.is_some()
+            || cli.run_bundle.is_some()
+        {
+            return Err(miette::miette!(
+                "project service commands cannot use runtime connection, session, or run-bundle options"
+            ));
+        }
+        let cwd = cli
+            .cwd
+            .clone()
+            .map_or_else(std::env::current_dir, Ok)
+            .map_err(|error| miette::miette!("{error}"))?;
+        return run_project_service_command(&cwd, command).await;
+    }
     if let Command::McpServer(args) = &cli.command {
         let cwd = cli
             .cwd
@@ -797,9 +864,11 @@ async fn main() -> miette::Result<()> {
     .map_err(|error| miette::miette!("{error}"))?;
     let session_id = resolve_session_id(cli.session_id.as_deref(), &transport)?;
 
-    match cli.command {
+    let command_result: miette::Result<()> = async {
+        match cli.command {
         Command::AppServer { .. } => unreachable!("app-server exits before runtime setup"),
         Command::Plugin { .. } => unreachable!("plugin exits before runtime setup"),
+        Command::Service { .. } => unreachable!("service exits before runtime setup"),
         Command::Chat { prompt } => {
             let ack = transport
                 .send_command(command(
@@ -866,7 +935,7 @@ async fn main() -> miette::Result<()> {
                         .unwrap_or_default()
                     );
                 }
-                Err(error) => return Err(miette::miette!("{error}")),
+                Err(error) => Err(miette::miette!("{error}"))?,
             }
         }
         Command::Fork {
@@ -1073,10 +1142,10 @@ async fn main() -> miette::Result<()> {
                 .await
                 .map_err(|error| miette::miette!("{error}"))?;
             if !ack.accepted {
-                return Err(miette::miette!(
+                Err(miette::miette!(
                     "replay was rejected: {}",
                     ack.reason.unwrap_or_else(|| "unknown reason".to_owned())
-                ));
+                ))?;
             }
             let projection = query_task_evaluation(&transport, session_id, task_id).await?;
             let execution = projection
@@ -1359,11 +1428,9 @@ async fn main() -> miette::Result<()> {
                             .map_err(|error| miette::miette!("{error}"))?,
                         None,
                     ),
-                    _ => {
-                        return Err(miette::miette!(
-                            "set-key requires exactly one of --api-key or --env-key"
-                        ));
-                    }
+                    _ => Err(miette::miette!(
+                        "set-key requires exactly one of --api-key or --env-key"
+                    ))?,
                 };
                 replace_provider_credential_verified(
                     &paths,
@@ -1416,11 +1483,11 @@ async fn main() -> miette::Result<()> {
                     model,
                 )?;
                 if !descriptor.flows.contains(&flow) {
-                    return Err(miette::miette!(
+                    Err(miette::miette!(
                         "OAuth descriptor `{}` does not support {:?}",
                         descriptor.provider_id,
                         flow
-                    ));
+                    ))?;
                 }
                 validate_provider_protocol_runtime_supported(protocol)
                     .map_err(|error| miette::miette!("{error}"))?;
@@ -2058,8 +2125,15 @@ async fn main() -> miette::Result<()> {
                 }
             }
         }
+        }
+        Ok(())
     }
-    Ok(())
+    .await;
+    let close_result = transport
+        .close()
+        .await
+        .map_err(|error| miette::miette!("close runtime attachment: {error}"));
+    command_result.and(close_result)
 }
 
 fn command_allows_persisted_run(command: &Command) -> bool {
@@ -3159,6 +3233,75 @@ fn run_plugin_command(command: &PluginCommand) -> miette::Result<()> {
         "{}",
         serde_json::to_string_pretty(&value)
             .map_err(|error| miette::miette!("failed to encode plugin result: {error}"))?
+    );
+    Ok(())
+}
+
+async fn run_project_service_command(
+    cwd: &std::path::Path,
+    command: &ServiceCommand,
+) -> miette::Result<()> {
+    let state_root = golutra_client::RuntimePaths::for_cwd(cwd)
+        .map_err(|error| miette::miette!("{error}"))?
+        .state_dir;
+    let manager =
+        ProjectServiceManager::new(cwd, state_root).map_err(|error| miette::miette!("{error}"))?;
+    let value = match command {
+        ServiceCommand::Start { name, backend } => {
+            let spec = match backend {
+                ServiceStartBackend::Tmux { command } => ProjectServiceSpec::Tmux {
+                    command: command.clone(),
+                },
+                ServiceStartBackend::DockerCompose { file, services } => {
+                    ProjectServiceSpec::DockerCompose {
+                        compose_file: file.clone(),
+                        services: services.clone(),
+                    }
+                }
+                ServiceStartBackend::SystemdUser { command } => ProjectServiceSpec::SystemdUser {
+                    command: command.clone(),
+                },
+            };
+            serde_json::to_value(
+                manager
+                    .start(ProjectServiceStartRequest {
+                        name: name.clone(),
+                        spec,
+                    })
+                    .await
+                    .map_err(|error| miette::miette!("{error}"))?,
+            )
+        }
+        ServiceCommand::List => serde_json::to_value(
+            manager
+                .list()
+                .await
+                .map_err(|error| miette::miette!("{error}"))?,
+        ),
+        ServiceCommand::Status { name } => serde_json::to_value(
+            manager
+                .status(name)
+                .await
+                .map_err(|error| miette::miette!("{error}"))?,
+        ),
+        ServiceCommand::Logs { name, tail } => serde_json::to_value(
+            manager
+                .logs(name, *tail)
+                .await
+                .map_err(|error| miette::miette!("{error}"))?,
+        ),
+        ServiceCommand::Stop { name } => serde_json::to_value(
+            manager
+                .stop(name)
+                .await
+                .map_err(|error| miette::miette!("{error}"))?,
+        ),
+    }
+    .map_err(|error| miette::miette!("failed to encode project service result: {error}"))?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&value)
+            .map_err(|error| miette::miette!("failed to encode project service result: {error}"))?
     );
     Ok(())
 }

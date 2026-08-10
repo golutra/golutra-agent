@@ -14,7 +14,7 @@ use std::{
 };
 
 use golutra_core::SessionId;
-use golutra_sandbox::{SandboxRequest, SystemSandbox, WorkspaceAccess};
+use golutra_sandbox::{SandboxBackendKind, SandboxRequest, SystemSandbox, WorkspaceAccess};
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -32,7 +32,15 @@ const MAX_POLL_WAIT_MS: u64 = 30_000;
 const DEFAULT_POLL_WAIT_MS: u64 = 5_000;
 const DEFAULT_START_WAIT_MS: u64 = 1_000;
 const MAX_RETENTION: Duration = Duration::from_secs(15 * 60);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_BUFFER_BYTES: usize = 16 * 1024;
+const READER_DRAIN_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(100)
+} else {
+    Duration::from_secs(2)
+};
+const READER_DRAIN_GRACE: Duration = Duration::from_millis(250);
+const READER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProcessState {
@@ -97,6 +105,45 @@ pub(crate) struct ProcessStartRequest<'a> {
     pub(crate) workspace_access: WorkspaceAccess,
     pub(crate) allow_network: bool,
     pub(crate) workspace_before: workspace_scan::WorkspaceSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcessRequestIdentity {
+    program: String,
+    args: Vec<String>,
+    cwd: PathBuf,
+    workspace_root: PathBuf,
+    timeout_ms: u64,
+    sandbox_backend: SandboxBackendKind,
+    workspace_access: WorkspaceAccess,
+    allow_network: bool,
+}
+
+impl ProcessRequestIdentity {
+    async fn from_request(request: &ProcessStartRequest<'_>) -> Result<Self, ToolError> {
+        let cwd = canonical_process_path("working directory", request.cwd).await?;
+        let workspace_root =
+            canonical_process_path("workspace root", request.workspace_root).await?;
+        Ok(Self {
+            program: request.program.to_owned(),
+            args: request.args.to_vec(),
+            cwd,
+            workspace_root,
+            timeout_ms: request.timeout_ms.max(1),
+            sandbox_backend: request.sandbox.backend(),
+            workspace_access: request.workspace_access,
+            allow_network: request.allow_network,
+        })
+    }
+}
+
+async fn canonical_process_path(label: &str, path: &Path) -> Result<PathBuf, ToolError> {
+    tokio::fs::canonicalize(path).await.map_err(|error| {
+        ToolError::Execution(format!(
+            "process {label} could not be canonicalized (`{}`): {error}",
+            path.display()
+        ))
+    })
 }
 
 #[derive(Debug)]
@@ -204,6 +251,7 @@ impl OutputJournal {
 struct ManagedProcess {
     id: String,
     session_id: SessionId,
+    request_identity: ProcessRequestIdentity,
     command_display: String,
     pid: Option<u32>,
     stdin: Mutex<Option<ChildStdin>>,
@@ -232,6 +280,7 @@ impl std::fmt::Debug for ManagedProcess {
 
 struct SupervisorInner {
     processes: Mutex<HashMap<String, Arc<ManagedProcess>>>,
+    start_gate: Mutex<()>,
     shutdown: CancellationToken,
 }
 
@@ -266,15 +315,76 @@ impl ProcessSupervisor {
         Self {
             inner: Arc::new(SupervisorInner {
                 processes: Mutex::new(HashMap::new()),
+                start_gate: Mutex::new(()),
                 shutdown: CancellationToken::new(),
             }),
         }
     }
 
     /// Stop every child owned by this supervisor. The method is synchronous
-    /// so a RuntimeHost can invoke it while being dropped.
+    /// so a RuntimeHost can invoke it while being dropped. Call
+    /// [`Self::shutdown_and_wait`] when the caller still owns an async runtime
+    /// and needs terminal bookkeeping to complete before teardown.
     pub fn shutdown(&self) {
         self.inner.shutdown.cancel();
+    }
+
+    /// Cancel all running processes and wait for their supervisors to record a
+    /// terminal state before returning.
+    ///
+    /// The start gate is acquired after cancellation so a start already in
+    /// flight is either registered and included in this shutdown, or observes
+    /// the cancelled supervisor and never launches. Process groups are killed
+    /// eagerly as well as through the supervisor cancellation branch; this
+    /// closes the window in which a descendant could outlive the direct child
+    /// while the Tokio runtime is being torn down.
+    pub async fn shutdown_and_wait(&self) -> Result<(), ToolError> {
+        self.inner.shutdown.cancel();
+        let start_guard = self.inner.start_gate.lock().await;
+        let entries = self
+            .inner
+            .processes
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        drop(start_guard);
+
+        let mut running = Vec::new();
+        for entry in entries {
+            if !entry.state.lock().await.state.is_terminal() {
+                entry.control.cancel();
+                // Do this synchronously before awaiting terminal bookkeeping so
+                // descendants are terminated even if cancellation scheduling is
+                // delayed on a nearly-tearing-down runtime.
+                process::terminate_process_group(entry.pid);
+                running.push(entry);
+            }
+        }
+        if running.is_empty() {
+            return Ok(());
+        }
+
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
+        let mut unfinished = Vec::new();
+        for entry in &running {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let wait_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
+            let snapshot = self.wait_for_terminal(entry, 0, wait_ms).await;
+            if !snapshot.state.is_terminal() {
+                unfinished.push(entry.id.clone());
+            }
+        }
+        if unfinished.is_empty() {
+            Ok(())
+        } else {
+            Err(ToolError::Execution(format!(
+                "processes did not finish shutdown bookkeeping within {} ms: {}",
+                SHUTDOWN_TIMEOUT.as_millis(),
+                unfinished.join(", ")
+            )))
+        }
     }
 
     pub(crate) async fn start(
@@ -286,7 +396,16 @@ impl ProcessSupervisor {
                 "process supervisor is shutting down".to_owned(),
             ));
         }
+        let request_identity = ProcessRequestIdentity::from_request(&request).await?;
         self.prune().await;
+        // Registration and launch are one operation: duplicate provider retries can reach this
+        // method concurrently with the same tool-call-derived process id.
+        let start_guard = self.inner.start_gate.lock().await;
+        if self.inner.shutdown.is_cancelled() {
+            return Err(ToolError::Execution(
+                "process supervisor is shutting down".to_owned(),
+            ));
+        }
         if let Some(existing) = self
             .inner
             .processes
@@ -300,6 +419,13 @@ impl ProcessSupervisor {
                     "process id belongs to a different session".to_owned(),
                 ));
             }
+            if existing.request_identity != request_identity {
+                return Err(ToolError::Execution(format!(
+                    "process `{}` idempotency conflict: start request does not match the existing process",
+                    request.process_id
+                )));
+            }
+            drop(start_guard);
             return self.poll_for(&existing, 0, request.wait_ms).await;
         }
         let entries = self
@@ -377,6 +503,7 @@ impl ProcessSupervisor {
         let entry = Arc::new(ManagedProcess {
             id: request.process_id,
             session_id: request.session_id,
+            request_identity,
             command_display: request.command_display,
             pid,
             stdin: Mutex::new(Some(stdin)),
@@ -425,6 +552,7 @@ impl ProcessSupervisor {
             workspace_before,
             timeout,
         ));
+        drop(start_guard);
 
         self.poll_for(&entry, 0, request.wait_ms).await
     }
@@ -544,6 +672,10 @@ impl ProcessSupervisor {
     /// misbehaving process from serially extending cleanup for every sibling.
     pub async fn terminate_session(&self, session_id: SessionId) -> Result<usize, ToolError> {
         self.prune().await;
+        // Keep the launch gate until every selected process has reached a terminal
+        // state. Otherwise a concurrent start can register a new process after the
+        // snapshot above and escape this session-wide termination request.
+        let _start_guard = self.inner.start_gate.lock().await;
         let entries = self
             .inner
             .processes
@@ -582,6 +714,28 @@ impl ProcessSupervisor {
                 unfinished.join(", ")
             )))
         }
+    }
+
+    /// Returns whether this runtime still owns a running child process.
+    ///
+    /// Terminal process journals may be retained for reconnects, but they do not
+    /// keep the runtime host alive once every attachment is gone.
+    pub async fn has_running_processes(&self) -> bool {
+        self.prune().await;
+        let entries = self
+            .inner
+            .processes
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for entry in entries {
+            if !entry.state.lock().await.state.is_terminal() {
+                return true;
+            }
+        }
+        false
     }
 
     async fn entry(
@@ -762,8 +916,7 @@ async fn supervise_process(
             (exit_code, Some(ProcessState::TimedOut))
         }
     };
-    let _ = stdout_reader.await;
-    let _ = stderr_reader.await;
+    drain_process_readers(child_id, stdout_reader, stderr_reader).await;
     let changes = workspace_scan::compare(&workspace_root, workspace_before).await;
     let state = override_state.unwrap_or_else(|| {
         if exit_code == Some(0) {
@@ -781,6 +934,46 @@ async fn supervise_process(
     }
     entry.notify.notify_waiters();
     entry.terminal_notify.notify_waiters();
+}
+
+async fn drain_process_readers(
+    child_id: Option<u32>,
+    stdout_reader: JoinHandle<()>,
+    stderr_reader: JoinHandle<()>,
+) {
+    if !readers_finished_within(&stdout_reader, &stderr_reader, READER_DRAIN_TIMEOUT).await {
+        // A descendant can outlive the direct child while retaining inherited pipe handles. It is
+        // still part of this managed process group, so terminate it before abandoning the readers.
+        process::terminate_process_group_only(child_id);
+        if !readers_finished_within(&stdout_reader, &stderr_reader, READER_DRAIN_GRACE).await {
+            if !stdout_reader.is_finished() {
+                stdout_reader.abort();
+            }
+            if !stderr_reader.is_finished() {
+                stderr_reader.abort();
+            }
+        }
+    }
+    let _ = stdout_reader.await;
+    let _ = stderr_reader.await;
+}
+
+async fn readers_finished_within(
+    stdout_reader: &JoinHandle<()>,
+    stderr_reader: &JoinHandle<()>,
+    timeout: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if stdout_reader.is_finished() && stderr_reader.is_finished() {
+            return true;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        tokio::time::sleep(READER_POLL_INTERVAL.min(deadline - now)).await;
+    }
 }
 
 async fn snapshot(entry: &ManagedProcess, cursor: u64) -> ProcessSnapshot {

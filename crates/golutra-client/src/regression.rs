@@ -64,7 +64,7 @@ impl RuntimeHost {
         command: &SessionCommand,
         candidate_id: &str,
     ) -> Result<RegressionResult, ClientError> {
-        let evaluation_store = self.evaluation_store.clone();
+        let evaluation_store = self.storage.evaluation_store.clone();
         let state = run_blocking(move || evaluation_store.snapshot()).await??;
         let candidate = state
             .automation_candidates
@@ -195,7 +195,7 @@ impl RuntimeHost {
             started_at: Some(chrono::Utc::now()),
             completed_at: None,
         };
-        let evaluation_store = self.evaluation_store.clone();
+        let evaluation_store = self.storage.evaluation_store.clone();
         let campaign_to_store = campaign.clone();
         run_blocking(move || evaluation_store.record_regression_campaign(campaign_to_store))
             .await??;
@@ -270,7 +270,7 @@ impl RuntimeHost {
                     )
                     .await?;
                 for execution in [baseline, candidate_execution] {
-                    let evaluation_store = self.evaluation_store.clone();
+                    let evaluation_store = self.storage.evaluation_store.clone();
                     let stored = execution.clone();
                     run_blocking(move || evaluation_store.record_regression_execution(stored))
                         .await??;
@@ -294,9 +294,9 @@ impl RuntimeHost {
             }
         }
         campaign.completed_at = Some(chrono::Utc::now());
-        let evaluation_store = self.evaluation_store.clone();
+        let evaluation_store = self.storage.evaluation_store.clone();
         run_blocking(move || evaluation_store.record_regression_campaign(campaign)).await??;
-        let evaluation_store = self.evaluation_store.clone();
+        let evaluation_store = self.storage.evaluation_store.clone();
         let candidate_id = candidate_id.to_owned();
         let regression =
             run_blocking(move || evaluation_store.run_regression(&candidate_id)).await??;
@@ -309,7 +309,7 @@ impl RuntimeHost {
         candidate_id: &'a str,
     ) -> BoxFuture<'a, Result<(), ClientError>> {
         async move {
-            let evaluation_store = self.evaluation_store.clone();
+            let evaluation_store = self.storage.evaluation_store.clone();
             let state = run_blocking(move || evaluation_store.snapshot()).await??;
             let Some(candidate) = state
                 .automation_candidates
@@ -350,7 +350,7 @@ impl RuntimeHost {
                     {
                         Ok(regression) => regression,
                         Err(error) => {
-                            let evaluation_store = self.evaluation_store.clone();
+                            let evaluation_store = self.storage.evaluation_store.clone();
                             let reason =
                                 format!("automatic isolated regression could not run: {error}");
                             let candidate_id = candidate_id.to_owned();
@@ -362,7 +362,7 @@ impl RuntimeHost {
                         }
                     }
                 } else {
-                    let evaluation_store = self.evaluation_store.clone();
+                    let evaluation_store = self.storage.evaluation_store.clone();
                     let candidate_id = candidate_id.to_owned();
                     run_blocking(move || {
                         evaluation_store.record_blocked_regression(
@@ -394,7 +394,7 @@ impl RuntimeHost {
                     )
                     .await;
             }
-            let evaluation_store = self.evaluation_store.clone();
+            let evaluation_store = self.storage.evaluation_store.clone();
             let state = run_blocking(move || evaluation_store.snapshot()).await??;
             let decision = if let Some(decision) = state
                 .promotion_decisions
@@ -405,7 +405,7 @@ impl RuntimeHost {
             {
                 decision
             } else {
-                let evaluation_store = self.evaluation_store.clone();
+                let evaluation_store = self.storage.evaluation_store.clone();
                 let candidate_id_owned = candidate_id.to_owned();
                 run_blocking(move || {
                     evaluation_store.decide_after_regression(&candidate_id_owned)
@@ -431,6 +431,7 @@ impl RuntimeHost {
         decision: Option<&golutra_eval::PromotionDecision>,
     ) -> Result<(), ClientError> {
         let events = self
+            .storage
             .repositories
             .events
             .load(session_id, Some(source_task_id), None)
@@ -506,7 +507,7 @@ impl RuntimeHost {
         payload: &Value,
     ) -> Result<(Vec<CandidateFile>, FrozenCandidatePatch), ClientError> {
         let supplied_files = candidate_files_from_payload(payload)?;
-        let evaluation_store = self.evaluation_store.clone();
+        let evaluation_store = self.storage.evaluation_store.clone();
         let candidate_id_owned = candidate_id.to_owned();
         let existing = run_blocking(move || {
             evaluation_store.snapshot().map(|state| {
@@ -583,7 +584,11 @@ impl RuntimeHost {
             retention_policy: "governance_evidence".to_owned(),
             provenance_refs: vec![event_id],
         };
-        self.repositories.artifacts.store(&artifact, &bytes).await?;
+        self.storage
+            .repositories
+            .artifacts
+            .store(&artifact, &bytes)
+            .await?;
         let patch = FrozenCandidatePatch {
             candidate_id: candidate_id.to_owned(),
             source_task_id,
@@ -594,7 +599,7 @@ impl RuntimeHost {
             total_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
             frozen_at: chrono::Utc::now(),
         };
-        let evaluation_store = self.evaluation_store.clone();
+        let evaluation_store = self.storage.evaluation_store.clone();
         let stored_patch = patch.clone();
         run_blocking(move || evaluation_store.record_frozen_candidate_patch(stored_patch))
             .await??;
@@ -609,6 +614,7 @@ impl RuntimeHost {
         patch: &FrozenCandidatePatch,
     ) -> Result<(), ClientError> {
         let events = self
+            .storage
             .repositories
             .events
             .load(session_id, Some(patch.source_task_id), None)
@@ -623,6 +629,7 @@ impl RuntimeHost {
             return Ok(());
         }
         let artifact = self
+            .storage
             .repositories
             .artifacts
             .get(patch.artifact_ref)
@@ -660,6 +667,7 @@ impl RuntimeHost {
         patch: &FrozenCandidatePatch,
     ) -> Result<Vec<CandidateFile>, ClientError> {
         let artifact = self
+            .storage
             .repositories
             .artifacts
             .get(patch.artifact_ref)
@@ -673,6 +681,7 @@ impl RuntimeHost {
             ));
         }
         let bytes = self
+            .storage
             .repositories
             .artifacts
             .bytes(patch.artifact_ref)
@@ -745,6 +754,7 @@ impl RuntimeHost {
             .await;
         }
         let state = child
+            .storage
             .repositories
             .projections
             .state(session_id, None)
@@ -823,6 +833,7 @@ impl RuntimeHost {
         let mut artifact_blobs = Vec::with_capacity(trace.artifacts.len());
         for artifact in &trace.artifacts {
             let Some(bytes) = child
+                .storage
                 .repositories
                 .artifacts
                 .bytes(artifact.artifact_id)
@@ -849,7 +860,8 @@ impl RuntimeHost {
         let artifact_id = ArtifactId::new();
         let checksum = format!("sha256:{:x}", Sha256::digest(&bytes));
         let uri = format!("artifact://regression-trace/{artifact_id}");
-        self.repositories
+        self.storage
+            .repositories
             .artifacts
             .store(
                 &ArtifactRecord {
@@ -1310,7 +1322,8 @@ mod tests {
             retention_policy: "governance_evidence".to_owned(),
             provenance_refs: vec![event_id],
         };
-        host.repositories
+        host.storage
+            .repositories
             .artifacts
             .store(&artifact, bytes)
             .await
@@ -1350,6 +1363,7 @@ mod tests {
             .expect("idempotent recovery");
 
         let matching = host
+            .storage
             .repositories
             .events
             .load(session_id, Some(source_task_id), None)

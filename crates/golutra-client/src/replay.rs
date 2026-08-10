@@ -222,6 +222,7 @@ impl RuntimeHost {
                 .parse::<TaskId>()
                 .map_err(|error| ClientError::InvalidSession(error.to_string()))?,
             None => self
+                .storage
                 .repositories
                 .projections
                 .state(session_id, None)
@@ -257,10 +258,11 @@ impl RuntimeHost {
         source_task_id: TaskId,
         capsule_id: Option<&str>,
     ) -> Result<ReplayExecution, ClientError> {
-        let store = self.evaluation_store.clone();
+        let store = self.storage.evaluation_store.clone();
         let evaluation = run_blocking(move || store.snapshot()).await??;
         let capsule = select_capsule(&evaluation.replay_capsules, source_task_id, capsule_id)?;
         let all_events = self
+            .storage
             .repositories
             .events
             .load(session_id, Some(source_task_id), None)
@@ -295,12 +297,14 @@ impl RuntimeHost {
             return self.persist_replay_execution(session_id, execution).await;
         }
         let prefix_integrity = if source_last_sequence_no == u64::MAX {
-            self.repositories
+            self.storage
+                .repositories
                 .events
                 .integrity(session_id, source_task_id)
                 .await?
         } else {
-            self.repositories
+            self.storage
+                .repositories
                 .events
                 .integrity_before(
                     session_id,
@@ -386,7 +390,8 @@ impl RuntimeHost {
         let tool_executor =
             ToolRuntime::new(policy).with_replay_backend(Arc::new(tool_backend.clone()));
         let context_builder = replay_context_builder(
-            self.repositories
+            self.storage
+                .repositories
                 .artifacts
                 .contexts(source_task_id)
                 .await?
@@ -526,7 +531,7 @@ impl RuntimeHost {
         session_id: SessionId,
         execution: ReplayExecution,
     ) -> Result<ReplayExecution, ClientError> {
-        let evaluation_store = self.evaluation_store.clone();
+        let evaluation_store = self.storage.evaluation_store.clone();
         let stored = execution.clone();
         run_blocking(move || evaluation_store.record_replay_execution(stored)).await??;
         self.record_event(host_event(
@@ -554,6 +559,7 @@ impl RuntimeHost {
         expected_type: &str,
     ) -> Result<T, ClientError> {
         let artifact = self
+            .storage
             .repositories
             .artifacts
             .get(artifact_id)
@@ -563,6 +569,7 @@ impl RuntimeHost {
             })?;
         validate_replay_artifact_metadata(&artifact, session_id, expected_type)?;
         let bytes = self
+            .storage
             .repositories
             .artifacts
             .bytes(artifact_id)

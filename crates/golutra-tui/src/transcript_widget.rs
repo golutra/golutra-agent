@@ -206,10 +206,10 @@ fn transcript_render_rows_at_width(app: &TuiApp, width: u16) -> Vec<TranscriptRe
 }
 
 pub(crate) fn transcript_top_padding(app: &TuiApp, layout: &TranscriptLayout, area: Rect) -> u16 {
-    if !app.inline_history_enabled
-        || !app.transcript_scroll.follow_tail
-        || app.transcript_top_row_override.is_some()
-        || app.transcript_search.is_some()
+    if !app.transcript.history.enabled
+        || !app.transcript.scroll.follow_tail
+        || app.transcript.top_row_override.is_some()
+        || app.transcript.search.is_some()
     {
         return 0;
     }
@@ -254,10 +254,10 @@ fn render_operation_projections(
         .into_iter()
         .enumerate()
         .flat_map(|(projection_index, projection)| {
-            let expanded = app.transcript_details_expanded
+            let expanded = app.transcript.details_expanded
                 || projection
                     .id()
-                    .is_some_and(|id| app.expanded_operations.contains(id));
+                    .is_some_and(|id| app.transcript.expanded_operations.contains(id));
             let operation_id = projection.id().cloned();
             let toggle = projection.is_expandable();
             let item = projection.item(expanded);
@@ -293,8 +293,8 @@ pub(crate) fn transcript_toggle_at(
     let visible_rows = area.height as usize;
     let window = layout.visible_window(
         visible_rows,
-        app.transcript_scroll.offset_from_bottom,
-        app.transcript_top_row_override,
+        app.transcript.scroll.offset_from_bottom,
+        app.transcript.top_row_override,
     );
     let offset = usize::from(row.saturating_sub(content_top));
     let visual_row = window.start.saturating_add(offset);
@@ -316,8 +316,8 @@ pub(crate) fn transcript_toggle_regions(app: &TuiApp, area: Rect) -> Vec<(String
     let visible_rows = area.height as usize;
     let window = layout.visible_window(
         visible_rows,
-        app.transcript_scroll.offset_from_bottom,
-        app.transcript_top_row_override,
+        app.transcript.scroll.offset_from_bottom,
+        app.transcript.top_row_override,
     );
     layout
         .rows

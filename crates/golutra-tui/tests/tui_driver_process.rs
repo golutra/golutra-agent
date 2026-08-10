@@ -1939,9 +1939,10 @@ async fn daemon_driver_enforces_binding_and_survives_disconnect_and_restart() {
             "text": "after daemon restart"
         }))
         .await;
+    let prompt_after = after_restart.receive("prompt-after").await;
     assert_eq!(
-        after_restart.receive("prompt-after").await["type"],
-        "accepted"
+        prompt_after["type"], "accepted",
+        "prompt after daemon restart: {prompt_after}"
     );
     after_restart
         .send(json!({

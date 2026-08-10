@@ -137,7 +137,7 @@ impl RuntimeHost {
         mut event: RuntimeEvent,
     ) -> Result<RuntimeEvent, ClientError> {
         let (has_session, has_task) = {
-            let ledger = self.causal_ledger.lock().await;
+            let ledger = self.execution.causal_ledger.lock().await;
             (
                 ledger.has_session(event.session_id),
                 event
@@ -148,25 +148,28 @@ impl RuntimeHost {
         if !has_task
             && let Some(task_id) = event.task_id
             && let Some(previous) = self
+                .storage
                 .repositories
                 .events
                 .load_recent(event.session_id, Some(task_id), None, 1)
                 .await?
                 .pop()
         {
-            self.causal_ledger.lock().await.seed(&previous);
+            self.execution.causal_ledger.lock().await.seed(&previous);
         }
         if !has_session
             && let Some(previous) = self
+                .storage
                 .repositories
                 .events
                 .load_recent(event.session_id, None, None, 1)
                 .await?
                 .pop()
         {
-            self.causal_ledger.lock().await.seed(&previous);
+            self.execution.causal_ledger.lock().await.seed(&previous);
         }
-        self.causal_ledger
+        self.execution
+            .causal_ledger
             .lock()
             .await
             .enrich(self.workspace_id, &mut event);

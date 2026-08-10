@@ -9,7 +9,8 @@ rust-version.workspace = true
 [dependencies]
 chrono.workspace = true
 golutra-core.workspace = true
-golutra-eval = { path = "../golutra-eval" }
+golutra-eval-model = { path = "../golutra-eval-model" }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true

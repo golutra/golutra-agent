@@ -56,7 +56,7 @@ impl RuntimeHost {
                 ClientError::InvalidSession("external evaluation record is required".to_owned())
             })?;
         let existing = {
-            let evaluation_store = self.evaluation_store.clone();
+            let evaluation_store = self.storage.evaluation_store.clone();
             let evaluation_id = record.evaluation_id.clone();
             run_blocking(move || {
                 evaluation_store.snapshot().map(|state| {
@@ -108,17 +108,25 @@ impl RuntimeHost {
             .collect();
         record.ingested_at = chrono::Utc::now();
         for (artifact, bytes) in &imported.artifacts {
-            self.repositories.artifacts.store(artifact, bytes).await?;
+            self.storage
+                .repositories
+                .artifacts
+                .store(artifact, bytes)
+                .await?;
         }
         for evidence in &imported.evidence {
-            self.repositories.artifacts.store_evidence(evidence).await?;
+            self.storage
+                .repositories
+                .artifacts
+                .store_evidence(evidence)
+                .await?;
         }
-        let evaluation_store = self.evaluation_store.clone();
+        let evaluation_store = self.storage.evaluation_store.clone();
         let stored = record.clone();
         let inserted =
             run_blocking(move || evaluation_store.record_external_evaluation(stored)).await??;
         let comparison = if inserted {
-            let evaluation_store = self.evaluation_store.clone();
+            let evaluation_store = self.storage.evaluation_store.clone();
             let evaluation_id = record.evaluation_id.clone();
             run_blocking(move || {
                 evaluation_store.snapshot().map(|state| {
@@ -213,6 +221,7 @@ impl RuntimeHost {
         imported_evidence_refs: Vec<EvidenceId>,
     ) -> Result<(), ClientError> {
         let events = self
+            .storage
             .repositories
             .events
             .load(session_id, Some(task_id), None)
@@ -471,6 +480,7 @@ impl RuntimeHost {
         task_id: TaskId,
     ) -> Result<(), ClientError> {
         let events = self
+            .storage
             .repositories
             .events
             .load(session_id, Some(task_id), None)
@@ -483,7 +493,7 @@ impl RuntimeHost {
             .and_then(|provenance| provenance.build.source_digest);
         let projected_episodes = diagnosis::task_failure_episodes(task_id, &events);
         let Some(analysis) = diagnosis::diagnose_task(task_id, &events, source_digest) else {
-            let evaluation_store = self.evaluation_store.clone();
+            let evaluation_store = self.storage.evaluation_store.clone();
             let changed =
                 run_blocking(move || evaluation_store.record_failure_episodes(projected_episodes))
                     .await??;
@@ -506,7 +516,7 @@ impl RuntimeHost {
             }
             return Ok(());
         };
-        let evaluation_store = self.evaluation_store.clone();
+        let evaluation_store = self.storage.evaluation_store.clone();
         let analysis_for_store = analysis.clone();
         let outcome_only =
             analysis_for_store.diagnosis.layer == golutra_eval::DiagnosisLayer::Outcome;
@@ -644,6 +654,7 @@ impl RuntimeHost {
             })
             .await?;
         let checkpoint_prefix = self
+            .storage
             .checkpoint_evaluation_tasks
             .contains(&record.source_task_id)
             && !matches!(record.trust, ExternalEvaluationTrust::UntrustedLocal)

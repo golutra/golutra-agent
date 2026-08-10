@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod codec;
 pub mod command;
 pub mod event;
 pub mod ipc;
@@ -12,6 +13,7 @@ pub mod tui_driver;
 pub mod version;
 
 pub use agent::*;
+pub use codec::*;
 pub use command::*;
 pub use event::*;
 pub use ipc::*;

@@ -535,3 +535,54 @@ fn evaluation_artifact_base_prefers_the_explicit_directory() {
             .expect("canonical artifact base")
     );
 }
+
+#[test]
+fn project_service_cli_keeps_persistent_backends_outside_runtime_flags() {
+    let tmux = Cli::try_parse_from([
+        "golutra",
+        "--cwd",
+        "/tmp/project",
+        "service",
+        "start",
+        "web",
+        "tmux",
+        "npm",
+        "run",
+        "dev",
+        "--",
+        "--host",
+        "0.0.0.0",
+    ])
+    .expect("tmux service args");
+    assert!(matches!(
+        tmux.command,
+        Command::Service {
+            command: ServiceCommand::Start {
+                name,
+                backend: ServiceStartBackend::Tmux { command },
+            }
+        } if name == "web" && command.first().is_some_and(|value| value == "npm")
+    ));
+
+    let compose = Cli::try_parse_from([
+        "golutra",
+        "service",
+        "start",
+        "stack",
+        "docker-compose",
+        "--file",
+        "deploy/compose.yaml",
+        "--service",
+        "api",
+    ])
+    .expect("compose service args");
+    assert!(matches!(
+        compose.command,
+        Command::Service {
+            command: ServiceCommand::Start {
+                backend: ServiceStartBackend::DockerCompose { services, .. },
+                ..
+            }
+        } if services == ["api"]
+    ));
+}

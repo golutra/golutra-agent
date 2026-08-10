@@ -202,7 +202,7 @@ impl RuntimeCommandService {
     }
 
     pub async fn execute(&self, command: SessionCommand) -> Result<CommandAck, ClientError> {
-        self.host.clone().handle_command(command).await
+        Box::pin(self.host.clone().handle_command(command)).await
     }
 }
 
@@ -388,6 +388,7 @@ impl RuntimeGovernanceService {
             .ensure_task_in_session(session_id, task_id)
             .await?;
         self.host
+            .storage
             .governance
             .context_projection(session_id, task_id)
             .await
@@ -402,6 +403,7 @@ impl RuntimeGovernanceService {
             .ensure_task_in_session(session_id, task_id)
             .await?;
         self.host
+            .storage
             .governance
             .evaluation_projection(session_id, task_id)
             .await

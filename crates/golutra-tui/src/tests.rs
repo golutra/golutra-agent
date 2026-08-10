@@ -928,6 +928,63 @@ fn inline_session_history_is_inserted_only_once() {
 }
 
 #[test]
+fn history_replay_resizes_before_committing_new_content() {
+    let session_id = SessionId::new();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(TaskId::new()),
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_footer_context("/workspace", "gpt-test");
+    app.enable_inline_history();
+    app.transcript.history.replay_ready = false;
+
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(40, 240),
+        TerminalOptions {
+            viewport: Viewport::Inline(3),
+        },
+    )
+    .expect("inline terminal");
+    let mut history = InlineHistoryState::new(session_id);
+    assert!(
+        !history
+            .flush(&mut terminal, &mut app)
+            .expect("replay loading")
+    );
+
+    terminal.backend_mut().resize(80, 240);
+    app.events.push(transcript_event(
+        1,
+        session_id,
+        app.task_id.expect("task id"),
+        RuntimeEventType::AssistantMessage,
+        json!({"content": format!("{} RESIZE_TAIL", "x".repeat(160))}),
+    ));
+    app.transcript.history.replay_ready = true;
+
+    history
+        .flush(&mut terminal, &mut app)
+        .expect("resized replay");
+    assert_eq!(terminal.current_buffer_mut().area.width, 80);
+    let scrollback = terminal
+        .backend()
+        .scrollback()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    let visible = terminal_buffer_text(&terminal);
+    assert!(
+        visible.contains("RESIZE_TAIL") || scrollback.contains("RESIZE_TAIL"),
+        "a row clipped using the stale width must not be committed: visible={visible}; scrollback={scrollback}"
+    );
+}
+
+#[test]
 fn completed_history_keeps_latest_response_next_to_composer() {
     let session_id = SessionId::new();
     let task_id = TaskId::new();
@@ -1073,7 +1130,9 @@ fn completed_response_taller_than_the_live_viewport_moves_to_scrollback() {
         .expect("commit tall completed response");
 
     assert!(
-        app.inline_history_committed_event_ids
+        app.transcript
+            .history
+            .committed_event_ids
             .contains(&assistant_event_id),
         "a finalized response that cannot fit in the live body must be committed in full"
     );
@@ -1164,7 +1223,7 @@ fn resumed_turns_remain_contiguous_above_the_composer() {
         .flush(&mut terminal, &mut app)
         .expect("restored history");
     assert!(
-        !app.inline_history_committed_event_ids.is_empty(),
+        !app.transcript.history.committed_event_ids.is_empty(),
         "fixture must cross the scrollback/live boundary"
     );
     draw_inline_test_frame(&mut terminal, &mut app);
@@ -1228,7 +1287,7 @@ fn resumed_debug_events_remain_contiguous_above_the_composer() {
         .flush(&mut terminal, &mut app)
         .expect("restored debug history");
     assert!(
-        !app.inline_history_committed_event_ids.is_empty(),
+        !app.transcript.history.committed_event_ids.is_empty(),
         "fixture must cross the scrollback/live boundary"
     );
     draw_inline_test_frame(&mut terminal, &mut app);
@@ -1254,7 +1313,7 @@ fn resumed_debug_events_remain_contiguous_above_the_composer() {
 }
 
 #[test]
-fn debug_history_sequences_transcript_before_observations_in_terminal_scrollback() {
+fn debug_history_pairs_transcript_with_its_observation_in_terminal_scrollback() {
     for width in [80, 120, 160] {
         let session_id = SessionId::new();
         let task_id = TaskId::new();
@@ -1308,18 +1367,8 @@ fn debug_history_sequences_transcript_before_observations_in_terminal_scrollback
             .position(|row| row.contains("#1 AssistantMessage/Runtime"))
             .expect("oldest observation in terminal scrollback");
         assert!(
-            transcript_row < observation_row,
-            "{width}: transcript must precede its observation: {rows:#?}"
-        );
-        assert!(
-            !rows[transcript_row].contains("#1 AssistantMessage/Runtime"),
-            "{width}: {:?}",
-            rows[transcript_row]
-        );
-        assert!(
-            !rows[observation_row].contains("paired 正文 1"),
-            "{width}: {:?}",
-            rows[observation_row]
+            transcript_row == observation_row,
+            "{width}: transcript and observation must share a physical row: {rows:#?}"
         );
         let first = &rows[observation_row];
         let observation_column = first.find("#1 ").expect("observation column");
@@ -1366,7 +1415,7 @@ fn debug_split_history_keeps_both_columns_inside_equal_halves() {
         assert!(!rows.is_empty());
         let mut saw_transcript = false;
         let mut saw_observation = false;
-        for row in rows {
+        for row in &rows {
             let text = row.to_string();
             assert_eq!(
                 display_width(&text),
@@ -1376,9 +1425,9 @@ fn debug_split_history_keeps_both_columns_inside_equal_halves() {
             let boundary = usize::from(transcript_width);
             let transcript_has_content = text[..boundary].contains('L');
             let observation_has_content = text[boundary..].contains('R');
-            assert_ne!(
-                transcript_has_content, observation_has_content,
-                "each physical debug row must belong to exactly one side at width {width}: {text:?}"
+            assert!(
+                transcript_has_content || observation_has_content,
+                "each physical debug row must contain one or both projections at width {width}: {text:?}"
             );
             saw_transcript |= transcript_has_content;
             saw_observation |= observation_has_content;
@@ -1397,6 +1446,19 @@ fn debug_split_history_keeps_both_columns_inside_equal_halves() {
         }
         assert!(saw_transcript && saw_observation);
 
+        let paired_rows = rows
+            .iter()
+            .filter(|row| {
+                let text = row.to_string();
+                let boundary = usize::from(transcript_width);
+                text[..boundary].contains('L') && text[boundary..].contains('R')
+            })
+            .count();
+        assert!(
+            paired_rows > 0,
+            "left and right projections should be paired when both have content at width {width}"
+        );
+
         let unicode_rows = debug_split_history_lines(
             vec![Line::from("旅途正文".repeat(usize::from(width)))],
             vec![Line::from("运行观测".repeat(usize::from(width)))],
@@ -1408,6 +1470,21 @@ fn debug_split_history_keeps_both_columns_inside_equal_halves() {
                 .all(|row| row.width() == usize::from(width))
         );
     }
+}
+
+#[test]
+fn narrow_debug_split_marks_wide_graphemes_instead_of_dropping_them() {
+    let rows = debug_split_history_lines(vec![Line::from("你")], vec![Line::from("🙂")], 2);
+    assert_eq!(rows.len(), 1);
+    let text = rows[0].to_string();
+    assert_eq!(display_width(&text), 2);
+    assert_eq!(
+        text.chars().filter(|character| *character == '…').count(),
+        2
+    );
+
+    let one_column = debug_split_history_lines(vec![Line::from("你")], Vec::new(), 1);
+    assert_eq!(one_column, vec![Line::from("…")]);
 }
 
 #[test]
@@ -1528,7 +1605,7 @@ fn session_switch_clears_previous_history_while_replay_is_loading() {
         json!({"content": "new-session-only"}),
     )];
     app.invalidate_transcript_layout();
-    app.history_replay_ready = true;
+    app.transcript.history.replay_ready = true;
     assert!(
         history
             .flush(&mut terminal, &mut app)
@@ -1644,7 +1721,7 @@ fn debug_scrollback_waits_for_canonical_history_before_committing_projection_eve
     history
         .flush(&mut terminal, &mut app)
         .expect("projection-only debug frame");
-    assert!(app.inline_history_committed_event_ids.is_empty());
+    assert!(app.transcript.history.committed_event_ids.is_empty());
     draw_inline_test_frame(&mut terminal, &mut app);
     assert!(terminal_buffer_text(&terminal).contains("#36 AssistantMessage/Runtime"));
 
@@ -1653,7 +1730,7 @@ fn debug_scrollback_waits_for_canonical_history_before_committing_projection_eve
     history
         .flush(&mut terminal, &mut app)
         .expect("canonical debug history");
-    assert!(!app.inline_history_committed_event_ids.is_empty());
+    assert!(!app.transcript.history.committed_event_ids.is_empty());
     draw_inline_test_frame(&mut terminal, &mut app);
     assert!(terminal_buffer_text(&terminal).contains("canonical transcript 36"));
 }
@@ -2459,7 +2536,7 @@ fn footer_click_does_not_change_the_debug_view() {
     terminal
         .draw(|frame| draw_ui(frame, &mut app))
         .expect("draw debug footer");
-    let generation = app.history_replay_generation;
+    let generation = app.transcript.history.replay_generation;
     let body_mode = app.layout.body_mode;
 
     handle_mouse(
@@ -2472,7 +2549,7 @@ fn footer_click_does_not_change_the_debug_view() {
         &mut app,
     );
 
-    assert_eq!(app.history_replay_generation, generation);
+    assert_eq!(app.transcript.history.replay_generation, generation);
     assert_eq!(app.layout.body_mode, body_mode);
 }
 
@@ -2487,7 +2564,8 @@ fn runtime_modal_temporarily_replaces_search_surface_without_losing_query() {
         None,
     );
     app.open_transcript_search();
-    app.transcript_search
+    app.transcript
+        .search
         .as_mut()
         .expect("transcript search")
         .input
@@ -3746,7 +3824,7 @@ fn debug_layout_keeps_transcript_left_and_observations_right_at_every_width() {
 }
 
 #[test]
-fn debug_live_timeline_never_renders_transcript_and_observation_on_the_same_row() {
+fn debug_live_timeline_pairs_transcript_and_observation_on_the_same_row() {
     for width in [80, 81, 120, 121] {
         let session_id = SessionId::new();
         let task_id = TaskId::new();
@@ -3794,6 +3872,7 @@ fn debug_live_timeline_never_renders_transcript_and_observation_on_the_same_row(
         let developer = app.layout.developer.expect("developer half");
         let mut transcript_rows = 0_usize;
         let mut observation_rows = 0_usize;
+        let mut paired_rows = 0_usize;
         for row in app.layout.body.top()..app.layout.body.bottom() {
             let left_has_content = (transcript.left()..transcript.right()).any(|column| {
                 buffer
@@ -3805,15 +3884,16 @@ fn debug_live_timeline_never_renders_transcript_and_observation_on_the_same_row(
                     .cell((column, row))
                     .is_some_and(|cell| !cell.symbol().trim().is_empty())
             });
-            assert!(
-                !(left_has_content && right_has_content),
-                "width {width} rendered both panes on terminal row {row}"
-            );
             transcript_rows += usize::from(left_has_content);
             observation_rows += usize::from(right_has_content);
+            paired_rows += usize::from(left_has_content && right_has_content);
         }
         assert!(transcript_rows > 0, "width {width} lost transcript rows");
         assert!(observation_rows > 0, "width {width} lost observation rows");
+        assert!(
+            paired_rows > 0,
+            "width {width} never paired transcript and observation rows"
+        );
     }
 }
 
@@ -3832,18 +3912,24 @@ fn debug_transcript_switch_requests_a_source_backed_rebuild() {
         .draw(|frame| draw_ui(frame, &mut app))
         .expect("draw debug events");
     assert_eq!(app.layout.body_mode, BodyLayoutMode::ResponseAndDeveloper);
-    let initial_generation = app.history_replay_generation;
+    let initial_generation = app.transcript.history.replay_generation;
 
     app.toggle_transcript_fullscreen();
     terminal
         .draw(|frame| draw_ui(frame, &mut app))
         .expect("draw full transcript");
     assert_eq!(app.layout.body_mode, BodyLayoutMode::Transcript);
-    assert_eq!(app.history_replay_generation, initial_generation + 1);
+    assert_eq!(
+        app.transcript.history.replay_generation,
+        initial_generation + 1
+    );
 
     app.toggle_transcript_fullscreen();
     assert_eq!(app.body_view_mode, BodyViewMode::Auto);
-    assert_eq!(app.history_replay_generation, initial_generation + 2);
+    assert_eq!(
+        app.transcript.history.replay_generation,
+        initial_generation + 2
+    );
 }
 
 #[test]
@@ -3873,28 +3959,31 @@ fn transcript_search_finds_logical_rows_and_moves_the_viewport() {
         .expect("draw transcript");
 
     app.open_transcript_search();
-    app.transcript_search
+    app.transcript
+        .search
         .as_mut()
         .expect("search")
         .input
         .set_text("needle");
     app.rebuild_transcript_search();
-    let search = app.transcript_search.as_ref().expect("search");
+    let search = app.transcript.search.as_ref().expect("search");
     assert_eq!(search.matches.len(), 2);
     assert_eq!(search.current_line(), Some(10));
-    assert!(app.transcript_scroll.offset_from_bottom > 0);
-    let first_offset = app.transcript_scroll.offset_from_bottom;
+    assert!(app.transcript.scroll.offset_from_bottom > 0);
+    let first_offset = app.transcript.scroll.offset_from_bottom;
 
-    app.transcript_search
+    app.transcript
+        .search
         .as_mut()
         .expect("search")
         .select_next();
     app.focus_current_search_match();
-    assert!(app.transcript_scroll.offset_from_bottom < first_offset);
+    assert!(app.transcript.scroll.offset_from_bottom < first_offset);
     let layout = transcript_layout(&app, app.layout.body);
     let target = layout
         .visual_start_for_line(
-            app.transcript_search
+            app.transcript
+                .search
                 .as_ref()
                 .and_then(TranscriptSearchState::current_line)
                 .expect("selected result"),
@@ -3904,8 +3993,8 @@ fn transcript_search_finds_logical_rows_and_moves_the_viewport() {
         layout
             .visible_window(
                 app.layout.body.height.saturating_sub(1) as usize,
-                app.transcript_scroll.offset_from_bottom,
-                app.transcript_top_row_override,
+                app.transcript.scroll.offset_from_bottom,
+                app.transcript.top_row_override,
             )
             .contains(&target)
     );
@@ -4323,7 +4412,7 @@ fn transcript_wraps_long_body_lines_to_the_available_width() {
         .expect("draw wrapped transcript");
 
     assert!(terminal_buffer_text(&terminal).contains(marker));
-    assert!(app.transcript_scroll.row_count > transcript_render_rows(&app).len());
+    assert!(app.transcript.scroll.row_count > transcript_render_rows(&app).len());
 
     let visible_rows = app.layout.transcript.height.saturating_sub(1) as usize;
     app.scroll_transcript(TranscriptScrollAction::Top, visible_rows);
@@ -4356,7 +4445,7 @@ async fn debug_commands_keep_mode_and_observation_detail_independent() {
         RuntimeEventType::AssistantMessage,
         json!({"content": "ordinary history must not reload"}),
     ));
-    let ordinary_generation = app.history_replay_generation;
+    let ordinary_generation = app.transcript.history.replay_generation;
     app.execute_slash_command(
         &transport,
         SlashCommand::Debug(SlashDebugCommand::ToggleObservationDetail),
@@ -4367,7 +4456,10 @@ async fn debug_commands_keep_mode_and_observation_detail_independent() {
     assert!(!app.developer_observations_expanded);
     assert!(app.developer_projection.is_none());
     assert_eq!(app.events.len(), 1);
-    assert_eq!(app.history_replay_generation, ordinary_generation);
+    assert_eq!(
+        app.transcript.history.replay_generation,
+        ordinary_generation
+    );
 
     app.execute_slash_command(
         &transport,
@@ -4388,7 +4480,7 @@ async fn debug_commands_keep_mode_and_observation_detail_independent() {
         RuntimeEventType::AssistantMessage,
         json!({"content": "local history must be replaced"}),
     ));
-    let generation = app.history_replay_generation;
+    let generation = app.transcript.history.replay_generation;
     app.execute_slash_command(
         &transport,
         SlashCommand::Debug(SlashDebugCommand::ToggleObservationDetail),
@@ -4398,7 +4490,7 @@ async fn debug_commands_keep_mode_and_observation_detail_independent() {
     assert!(app.debug_mode);
     assert!(app.developer_observations_expanded);
     assert!(app.events.is_empty());
-    assert_eq!(app.history_replay_generation, generation + 1);
+    assert_eq!(app.transcript.history.replay_generation, generation + 1);
 
     app.events.push(transcript_event(
         2,
@@ -4407,7 +4499,7 @@ async fn debug_commands_keep_mode_and_observation_detail_independent() {
         RuntimeEventType::AssistantMessage,
         json!({"content": "debug history must be replaced when leaving"}),
     ));
-    let generation = app.history_replay_generation;
+    let generation = app.transcript.history.replay_generation;
     app.execute_slash_command(
         &transport,
         SlashCommand::Debug(SlashDebugCommand::ToggleView),
@@ -4419,9 +4511,9 @@ async fn debug_commands_keep_mode_and_observation_detail_independent() {
     assert!(app.developer_projection.is_none());
     assert!(app.developer_error.is_none());
     assert!(app.events.is_empty());
-    assert_eq!(app.history_replay_generation, generation + 1);
+    assert_eq!(app.transcript.history.replay_generation, generation + 1);
 
-    let generation = app.history_replay_generation;
+    let generation = app.transcript.history.replay_generation;
     app.execute_slash_command(
         &transport,
         SlashCommand::Debug(SlashDebugCommand::ToggleObservationDetail),
@@ -4431,7 +4523,7 @@ async fn debug_commands_keep_mode_and_observation_detail_independent() {
     assert!(!app.debug_mode);
     assert!(!app.developer_observations_expanded);
     assert!(app.developer_projection.is_none());
-    assert_eq!(app.history_replay_generation, generation);
+    assert_eq!(app.transcript.history.replay_generation, generation);
 }
 
 #[tokio::test]
@@ -4942,7 +5034,7 @@ fn transcript_detail_reflow_keeps_the_first_visible_projection() {
     let tail_row = expanded
         .visual_start_for_projection(tail_projection)
         .expect("tail projection row");
-    app.transcript_scroll.row_count = expanded.row_count;
+    app.transcript.scroll.row_count = expanded.row_count;
     app.set_transcript_top_row(&expanded, tail_row, visible_rows);
     assert_eq!(
         app.first_visible_transcript_projection(),
@@ -5094,7 +5186,7 @@ fn cancelling_an_earlier_turn_keeps_the_visible_projection_anchored() {
         .visual_start_for_projection(8)
         .expect("anchor projection row");
     let visible_rows = app.layout.transcript.height.saturating_sub(1) as usize;
-    app.transcript_scroll.row_count = layout.row_count;
+    app.transcript.scroll.row_count = layout.row_count;
     app.set_transcript_top_row(&layout, top_row, visible_rows);
     let anchor = app
         .first_visible_transcript_anchor()
@@ -5148,7 +5240,7 @@ fn transcript_override_paging_stops_at_the_last_full_viewport() {
 
     let transcript_layout = transcript_layout(&app, app.layout.transcript);
     let transcript_rows = app.layout.transcript.height.saturating_sub(1) as usize;
-    app.transcript_scroll.row_count = transcript_layout.row_count;
+    app.transcript.scroll.row_count = transcript_layout.row_count;
     app.set_transcript_top_row(
         &transcript_layout,
         transcript_layout.row_count.saturating_sub(1),
@@ -5157,8 +5249,8 @@ fn transcript_override_paging_stops_at_the_last_full_viewport() {
     app.scroll_transcript(TranscriptScrollAction::PageDown, transcript_rows);
     let transcript_window = transcript_layout.visible_window(
         transcript_rows,
-        app.transcript_scroll.offset_from_bottom,
-        app.transcript_top_row_override,
+        app.transcript.scroll.offset_from_bottom,
+        app.transcript.top_row_override,
     );
     assert_eq!(
         transcript_window.start,
@@ -5538,15 +5630,19 @@ fn debug_scrollback_stops_at_an_unstable_transcript_operation() {
     history
         .flush(&mut terminal, &mut app)
         .expect("history before tool completion");
-    assert!(!app.inline_history_committed_event_ids.is_empty());
+    assert!(!app.transcript.history.committed_event_ids.is_empty());
     assert!(
-        !app.inline_history_committed_event_ids
+        !app.transcript
+            .history
+            .committed_event_ids
             .contains(&tool_started_id)
     );
     assert!(
-        initial_events[24..]
-            .iter()
-            .all(|event| !app.inline_history_committed_event_ids.contains(&event.id)),
+        initial_events[24..].iter().all(|event| !app
+            .transcript
+            .history
+            .committed_event_ids
+            .contains(&event.id)),
         "events after an unstable operation must remain in the live tail"
     );
 
@@ -5579,7 +5675,9 @@ fn debug_scrollback_stops_at_an_unstable_transcript_operation() {
         .flush(&mut terminal, &mut app)
         .expect("history after tool completion");
     assert!(
-        app.inline_history_committed_event_ids
+        app.transcript
+            .history
+            .committed_event_ids
             .contains(&tool_started_id),
         "the completed operation should become eligible for scrollback"
     );
@@ -5669,19 +5767,19 @@ fn transcript_visible_window_pages_from_bottom_and_round_trips() {
         "ready (mock)".to_owned(),
         None,
     );
-    app.transcript_scroll.row_count = 50;
-    app.transcript_scroll.follow_tail = true;
+    app.transcript.scroll.row_count = 50;
+    app.transcript.scroll.follow_tail = true;
 
     app.scroll_transcript(TranscriptScrollAction::PageUp, 10);
-    assert_eq!(app.transcript_scroll.offset_from_bottom, 10);
+    assert_eq!(app.transcript.scroll.offset_from_bottom, 10);
     app.scroll_transcript(TranscriptScrollAction::PageDown, 10);
-    assert_eq!(app.transcript_scroll.offset_from_bottom, 0);
+    assert_eq!(app.transcript.scroll.offset_from_bottom, 0);
     app.history_has_more_before = true;
     app.scroll_transcript(TranscriptScrollAction::Top, 10);
-    assert_eq!(app.transcript_scroll.offset_from_bottom, 40);
+    assert_eq!(app.transcript.scroll.offset_from_bottom, 40);
     assert!(app.history_load_requested);
     app.scroll_transcript(TranscriptScrollAction::Bottom, 10);
-    assert_eq!(app.transcript_scroll.offset_from_bottom, 0);
+    assert_eq!(app.transcript.scroll.offset_from_bottom, 0);
     assert!(!app.history_load_requested);
 }
 
@@ -5702,7 +5800,7 @@ fn debug_mouse_wheel_leaves_history_scrolling_to_the_terminal() {
         .draw(|frame| draw_ui(frame, &mut app))
         .expect("draw");
     let developer_area = app.layout.developer.expect("developer area");
-    let generation = app.history_replay_generation;
+    let generation = app.transcript.history.replay_generation;
 
     handle_mouse(
         MouseEvent {
@@ -5713,8 +5811,8 @@ fn debug_mouse_wheel_leaves_history_scrolling_to_the_terminal() {
         },
         &mut app,
     );
-    assert_eq!(app.transcript_scroll.offset_from_bottom, 0);
-    assert_eq!(app.history_replay_generation, generation);
+    assert_eq!(app.transcript.scroll.offset_from_bottom, 0);
+    assert_eq!(app.transcript.history.replay_generation, generation);
 }
 
 #[test]
@@ -6374,7 +6472,7 @@ async fn debug_page_keys_leave_history_navigation_to_the_terminal() {
         .draw(|frame| draw_ui(frame, &mut app))
         .expect("draw");
     let before = terminal_buffer_text(&terminal);
-    let generation = app.history_replay_generation;
+    let generation = app.transcript.history.replay_generation;
 
     handle_key(
         KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
@@ -6391,8 +6489,8 @@ async fn debug_page_keys_leave_history_navigation_to_the_terminal() {
     assert!(!after.contains("▸ facts"));
     assert!(!after.contains("▾ facts"));
     assert_eq!(after, before);
-    assert_eq!(app.transcript_scroll.offset_from_bottom, 0);
-    assert_eq!(app.history_replay_generation, generation);
+    assert_eq!(app.transcript.scroll.offset_from_bottom, 0);
+    assert_eq!(app.transcript.history.replay_generation, generation);
 }
 
 #[tokio::test]
@@ -6662,9 +6760,9 @@ async fn resume_thread_clears_previous_visible_transcript_state() {
     ));
     app.input.set_text("/resume");
     app.slash_selected = 2;
-    app.transcript_scroll.offset_from_bottom = 12;
-    app.transcript_scroll.row_count = 30;
-    app.transcript_scroll.follow_tail = false;
+    app.transcript.scroll.offset_from_bottom = 12;
+    app.transcript.scroll.row_count = 30;
+    app.transcript.scroll.follow_tail = false;
 
     app.resume_thread(&transport, target_thread_id)
         .await
@@ -6674,7 +6772,7 @@ async fn resume_thread_clears_previous_visible_transcript_state() {
     assert!(app.events.is_empty());
     assert!(app.input.is_empty());
     assert_eq!(app.slash_selected, 0);
-    assert_eq!(app.transcript_scroll.offset_from_bottom, 0);
+    assert_eq!(app.transcript.scroll.offset_from_bottom, 0);
 }
 
 #[tokio::test]
@@ -6812,9 +6910,9 @@ fn start_new_session_resets_visible_tui_state() {
     app.slash_selected = 2;
     app.cursor = Some(9);
     app.resume_picker = Some(ResumePickerState::new(Vec::new()));
-    app.transcript_scroll.offset_from_bottom = 7;
-    app.transcript_scroll.row_count = 20;
-    app.transcript_scroll.follow_tail = false;
+    app.transcript.scroll.offset_from_bottom = 7;
+    app.transcript.scroll.row_count = 20;
+    app.transcript.scroll.follow_tail = false;
 
     app.start_new_session();
 
@@ -6831,7 +6929,7 @@ fn start_new_session_resets_visible_tui_state() {
     assert!(app.cursor.is_none());
     assert!(app.resume_picker.is_none());
     assert!(app.debug_mode);
-    assert_eq!(app.transcript_scroll.offset_from_bottom, 0);
+    assert_eq!(app.transcript.scroll.offset_from_bottom, 0);
     assert_eq!(app.status_message, "new session");
 }
 

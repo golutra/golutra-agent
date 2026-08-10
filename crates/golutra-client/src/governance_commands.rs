@@ -24,7 +24,7 @@ impl RuntimeHost {
             .filter(|reason| !reason.trim().is_empty())
             .unwrap_or("rolled back by user")
             .to_owned();
-        let memory_store = self.memory_store.clone();
+        let memory_store = self.storage.memory_store.clone();
         let record = run_blocking(move || memory_store.rollback(memory_id, reason)).await??;
         self.record_event(host_event(
             self.next_sequence_no(),
@@ -78,7 +78,7 @@ impl RuntimeHost {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
-        let memory_store = self.memory_store.clone();
+        let memory_store = self.storage.memory_store.clone();
         let record =
             run_blocking(move || memory_store.record_feedback(memory_id, feedback, reason))
                 .await??;
@@ -120,7 +120,7 @@ impl RuntimeHost {
             .get("decision")
             .and_then(Value::as_str)
             .unwrap_or("approve");
-        let memory_store = self.memory_store.clone();
+        let memory_store = self.storage.memory_store.clone();
         if decision == "reject" {
             let record =
                 run_blocking(move || memory_store.rollback(memory_id, "human review rejected"))
@@ -180,7 +180,7 @@ impl RuntimeHost {
                 ActorKind::User | ActorKind::Cli | ActorKind::Tui
             );
         if !human_approved {
-            let records = self.memory_store.clone();
+            let records = self.storage.memory_store.clone();
             let record = run_blocking(move || records.list())
                 .await??
                 .into_iter()
@@ -200,6 +200,7 @@ impl RuntimeHost {
             }
             for task_id in &tasks {
                 let events = self
+                    .storage
                     .repositories
                     .events
                     .load(session_id, Some(*task_id), None)
@@ -267,7 +268,7 @@ impl RuntimeHost {
             .ok_or_else(|| ClientError::InvalidSession("memory_id is required".to_owned()))?
             .parse::<MemoryId>()
             .map_err(|error| ClientError::InvalidSession(error.to_string()))?;
-        let memory_store = self.memory_store.clone();
+        let memory_store = self.storage.memory_store.clone();
         let record = run_blocking(move || memory_store.expire(memory_id)).await??;
         self.record_event(host_event(
             self.next_sequence_no(),
@@ -296,6 +297,7 @@ impl RuntimeHost {
     ) -> Result<CommandAck, ClientError> {
         let candidate_id = candidate_id_from_payload(&command.payload)?.to_owned();
         let source_task_id = self
+            .storage
             .governance
             .candidate_source_task_id(&candidate_id)
             .await?;
@@ -305,7 +307,7 @@ impl RuntimeHost {
         let regression = self
             .run_regression_campaign(session_id, &command, &candidate_id)
             .await?;
-        let evaluation_store = self.evaluation_store.clone();
+        let evaluation_store = self.storage.evaluation_store.clone();
         let decision = run_blocking({
             let candidate_id = candidate_id.clone();
             move || evaluation_store.decide_after_regression(&candidate_id)
@@ -374,16 +376,22 @@ impl RuntimeHost {
                     })?
                     .parse::<PostTaskJobId>()
                     .map_err(|error| ClientError::InvalidSession(error.to_string()))?;
-                let job = self.repositories.jobs.by_id(job_id).await?.ok_or_else(|| {
-                    ClientError::InvalidSession(format!("post-task job `{job_id}` not found"))
-                })?;
+                let job = self
+                    .storage
+                    .repositories
+                    .jobs
+                    .by_id(job_id)
+                    .await?
+                    .ok_or_else(|| {
+                        ClientError::InvalidSession(format!("post-task job `{job_id}` not found"))
+                    })?;
                 post_task::ensure_job_in_workspace(self, Some(&job), job.task_id)?;
                 job.task_id
             }
         };
         self.ensure_task_in_session(session_id, task_id).await?;
         self.wait_for_deep_task_evaluation(task_id).await;
-        let job = self.repositories.jobs.get_for_task(task_id).await?;
+        let job = self.storage.repositories.jobs.get_for_task(task_id).await?;
         post_task::ensure_job_in_workspace(self, job.as_ref(), task_id)?;
         self.record_event(host_event(
             self.next_sequence_no(),
@@ -418,12 +426,18 @@ impl RuntimeHost {
             .ok_or_else(|| ClientError::InvalidSession("job_id is required".to_owned()))?
             .parse::<PostTaskJobId>()
             .map_err(|error| ClientError::InvalidSession(error.to_string()))?;
-        let job = self.repositories.jobs.by_id(job_id).await?.ok_or_else(|| {
-            ClientError::InvalidSession(format!("post-task job `{job_id}` not found"))
-        })?;
+        let job = self
+            .storage
+            .repositories
+            .jobs
+            .by_id(job_id)
+            .await?
+            .ok_or_else(|| {
+                ClientError::InvalidSession(format!("post-task job `{job_id}` not found"))
+            })?;
         post_task::ensure_job_in_workspace(self, Some(&job), job.task_id)?;
         self.ensure_task_in_session(session_id, job.task_id).await?;
-        let retried = self.repositories.jobs.retry(job_id).await?;
+        let retried = self.storage.repositories.jobs.retry(job_id).await?;
         if retried {
             self.record_event(host_event(
                 self.next_sequence_no(),
@@ -457,6 +471,7 @@ impl RuntimeHost {
     ) -> Result<CommandAck, ClientError> {
         let candidate_id = candidate_id_from_payload(&command.payload)?.to_owned();
         let source_task_id = self
+            .storage
             .governance
             .candidate_source_task_id(&candidate_id)
             .await?;
@@ -482,7 +497,7 @@ impl RuntimeHost {
             .unwrap_or("reviewed by runtime controller")
             .to_owned();
         let reviewer_id = command.actor.id.clone();
-        let evaluation_store = self.evaluation_store.clone();
+        let evaluation_store = self.storage.evaluation_store.clone();
         let review = run_blocking({
             let candidate_id = candidate_id.clone();
             move || {
@@ -520,7 +535,7 @@ impl RuntimeHost {
                 ClientError::InvalidSession("benchmark run is required".to_owned())
             })?)?;
         let benchmark_id = run.benchmark_id.clone();
-        let evaluation_store = self.evaluation_store.clone();
+        let evaluation_store = self.storage.evaluation_store.clone();
         run_blocking(move || evaluation_store.record_benchmark_run(run)).await??;
         self.record_event(host_event(
             self.next_sequence_no(),
@@ -556,7 +571,7 @@ impl RuntimeHost {
                 ClientError::InvalidSession("counterfactual group_id is required".to_owned())
             })?
             .to_owned();
-        let evaluation_store = self.evaluation_store.clone();
+        let evaluation_store = self.storage.evaluation_store.clone();
         let comparison = run_blocking({
             let group_id = group_id.clone();
             move || evaluation_store.compare_counterfactual(&group_id)
@@ -589,13 +604,14 @@ impl RuntimeHost {
     ) -> Result<CommandAck, ClientError> {
         let candidate_id = candidate_id_from_payload(&command.payload)?.to_owned();
         let source_task_id = self
+            .storage
             .governance
             .candidate_source_task_id(&candidate_id)
             .await?;
         self.ensure_task_in_session(session_id, source_task_id)
             .await?;
         self.wait_for_candidate_evaluation(&candidate_id).await;
-        let evaluation_store = self.evaluation_store.clone();
+        let evaluation_store = self.storage.evaluation_store.clone();
         let candidate_status = run_blocking({
             let candidate_id = candidate_id.clone();
             move || {
@@ -610,7 +626,7 @@ impl RuntimeHost {
         })
         .await??;
         if candidate_status == CandidateStatus::RegressionPassed {
-            let evaluation_store = self.evaluation_store.clone();
+            let evaluation_store = self.storage.evaluation_store.clone();
             let decision = run_blocking({
                 let candidate_id = candidate_id.clone();
                 move || evaluation_store.decide_promotion(&candidate_id)
@@ -648,7 +664,7 @@ impl RuntimeHost {
                 )),
             });
         }
-        let evaluation_store = self.evaluation_store.clone();
+        let evaluation_store = self.storage.evaluation_store.clone();
         let applied = run_blocking({
             let candidate_id = candidate_id.clone();
             move || evaluation_store.apply_candidate(&candidate_id)
@@ -681,6 +697,7 @@ impl RuntimeHost {
     ) -> Result<CommandAck, ClientError> {
         let candidate_id = candidate_id_from_payload(&command.payload)?.to_owned();
         let source_task_id = self
+            .storage
             .governance
             .candidate_source_task_id(&candidate_id)
             .await?;
@@ -693,7 +710,7 @@ impl RuntimeHost {
             .filter(|reason| !reason.trim().is_empty())
             .unwrap_or("rolled back by user")
             .to_owned();
-        let evaluation_store = self.evaluation_store.clone();
+        let evaluation_store = self.storage.evaluation_store.clone();
         let rolled_back = run_blocking({
             let candidate_id = candidate_id.clone();
             move || evaluation_store.rollback_candidate(&candidate_id, reason)

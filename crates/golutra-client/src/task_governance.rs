@@ -168,6 +168,7 @@ impl RuntimeHost {
         input: HostedTaskEvaluation<'_>,
     ) -> Result<TaskEvaluationInput, ClientError> {
         let events = self
+            .storage
             .repositories
             .events
             .load(task.session_id, Some(task.task_id), None)
@@ -204,7 +205,10 @@ impl RuntimeHost {
             policy_violation_count: u32::try_from(policy_violation_count).unwrap_or(u32::MAX),
             trajectory_summary: trajectory_summary(&events),
         };
-        let bundle = self.governance.evaluate_minimal(evaluation_input.clone());
+        let bundle = self
+            .storage
+            .governance
+            .evaluate_minimal(evaluation_input.clone());
         // Post-task governance is durable but does not rewrite the already-decided user task
         // status. The deep worker will retry a failed persistence attempt independently.
         let _ = self.record_task_evaluation(task, bundle).await?;
@@ -216,12 +220,19 @@ impl RuntimeHost {
         task: &HostedAgentTask,
         input: TaskEvaluationInput,
     ) -> Result<bool, ClientError> {
-        if let Some(existing) = self.repositories.jobs.get_for_task(task.task_id).await? {
+        if let Some(existing) = self
+            .storage
+            .repositories
+            .jobs
+            .get_for_task(task.task_id)
+            .await?
+        {
             match existing.status {
                 PostTaskJobStatus::Queued
                 | PostTaskJobStatus::Leased
                 | PostTaskJobStatus::Running => {
-                    self.deep_evaluation_inputs
+                    self.storage
+                        .deep_evaluation_inputs
                         .lock()
                         .await
                         .insert(existing.job_id, input);
@@ -229,9 +240,15 @@ impl RuntimeHost {
                 }
                 PostTaskJobStatus::Succeeded => return Ok(false),
                 PostTaskJobStatus::Failed | PostTaskJobStatus::Cancelled => {
-                    let retried = self.repositories.jobs.retry(existing.job_id).await?;
+                    let retried = self
+                        .storage
+                        .repositories
+                        .jobs
+                        .retry(existing.job_id)
+                        .await?;
                     if retried {
-                        self.deep_evaluation_inputs
+                        self.storage
+                            .deep_evaluation_inputs
                             .lock()
                             .await
                             .insert(existing.job_id, input);
@@ -275,29 +292,37 @@ impl RuntimeHost {
                 "mode": "deep",
             }),
         );
-        let _writer = self.event_writer.lock().await;
-        let causal_before = self.causal_ledger.lock().await.clone();
+        let _writer = self.execution.event_writer.lock().await;
+        let causal_before = self.execution.causal_ledger.lock().await.clone();
         let event = match self.prepare_canonical_event(event).await {
             Ok(event) => event,
             Err(error) => {
-                *self.causal_ledger.lock().await = causal_before;
+                *self.execution.causal_ledger.lock().await = causal_before;
                 return Err(error);
             }
         };
-        let event = match self.repositories.jobs.enqueue_with_event(&job, event).await {
+        let event = match self
+            .storage
+            .repositories
+            .jobs
+            .enqueue_with_event(&job, event)
+            .await
+        {
             Ok(Some(event)) => event,
             Ok(None) => {
-                *self.causal_ledger.lock().await = causal_before;
+                *self.execution.causal_ledger.lock().await = causal_before;
                 return Ok(false);
             }
             Err(error) => {
-                *self.causal_ledger.lock().await = causal_before;
+                *self.execution.causal_ledger.lock().await = causal_before;
                 return Err(error.into());
             }
         };
-        self.next_sequence_no
+        self.execution
+            .next_sequence_no
             .fetch_max(event.sequence_no.saturating_add(1), Ordering::SeqCst);
-        self.deep_evaluation_inputs
+        self.storage
+            .deep_evaluation_inputs
             .lock()
             .await
             .insert(job.job_id, input);
@@ -311,6 +336,7 @@ impl RuntimeHost {
     pub(super) async fn recover_unscheduled_post_task_jobs(&self) -> Result<usize, ClientError> {
         let workspace_root = self.workspace_root_string();
         let terminal_events = self
+            .storage
             .repositories
             .jobs
             .unscheduled_terminal_events(workspace_root.as_deref())
@@ -350,11 +376,17 @@ impl RuntimeHost {
         &self,
         job: &PostTaskJob,
     ) -> Result<(HostedAgentTask, TaskEvaluationInput), ClientError> {
-        let queued_input = self.deep_evaluation_inputs.lock().await.remove(&job.job_id);
+        let queued_input = self
+            .storage
+            .deep_evaluation_inputs
+            .lock()
+            .await
+            .remove(&job.job_id);
         let session_id = job.session_id.parse().map_err(|error: uuid::Error| {
             ClientError::InvalidSession(format!("post-task job session id is invalid: {error}"))
         })?;
         let events = self
+            .storage
             .repositories
             .events
             .load(session_id, Some(job.task_id), None)
@@ -475,6 +507,7 @@ impl RuntimeHost {
         // scheduling (or recording the scheduling failure) before treating an absent job as
         // terminal. The user-visible task result remains independent of this barrier.
         let mut task_completion = self
+            .execution
             .task_controls
             .lock()
             .await
@@ -495,6 +528,7 @@ impl RuntimeHost {
         }
 
         let mut session_id = self
+            .execution
             .task_controls
             .lock()
             .await
@@ -502,7 +536,7 @@ impl RuntimeHost {
             .find(|(_, control)| control.task_id == task_id)
             .map(|(session_id, _)| *session_id);
         loop {
-            let job = self.repositories.jobs.get_for_task(task_id).await;
+            let job = self.storage.repositories.jobs.get_for_task(task_id).await;
             if session_id.is_none() {
                 session_id = job
                     .as_ref()
@@ -512,6 +546,7 @@ impl RuntimeHost {
             }
             if session_id.is_none() {
                 session_id = self
+                    .storage
                     .repositories
                     .events
                     .session_for_task(task_id)
@@ -521,6 +556,7 @@ impl RuntimeHost {
             }
             let events = match session_id {
                 Some(session_id) => self
+                    .storage
                     .repositories
                     .events
                     .load(session_id, Some(task_id), None)
@@ -574,7 +610,7 @@ impl RuntimeHost {
         task: &HostedAgentTask,
         bundle: TaskEvaluationBundle,
     ) -> Result<bool, ClientError> {
-        let recorded = match self.governance.persist_evaluation(bundle).await {
+        let recorded = match self.storage.governance.persist_evaluation(bundle).await {
             Ok(recorded) => recorded,
             Err(error) => {
                 self.record_event(agent_event(
@@ -664,11 +700,13 @@ impl RuntimeHost {
 
     async fn record_observation_products(&self, task: &HostedAgentTask) -> Result<(), ClientError> {
         let events = self
+            .storage
             .repositories
             .events
             .load(task.session_id, Some(task.task_id), None)
             .await?;
         let integrity = self
+            .storage
             .repositories
             .events
             .integrity(task.session_id, task.task_id)
@@ -686,7 +724,7 @@ impl RuntimeHost {
                 .as_ref()
                 .and_then(|provenance| provenance.runtime_config_digest.clone()),
         );
-        let evaluation_store = self.evaluation_store.clone();
+        let evaluation_store = self.storage.evaluation_store.clone();
         let capsule_for_store = capsule.clone();
         let replay_inserted =
             run_blocking(move || evaluation_store.record_replay_capsule(capsule_for_store))
@@ -709,7 +747,7 @@ impl RuntimeHost {
         let projected_episodes = diagnosis::task_failure_episodes(task.task_id, &events);
         let Some(analysis) = diagnosis::diagnose_task(task.task_id, &events, source_digest) else {
             if !projected_episodes.is_empty() {
-                let evaluation_store = self.evaluation_store.clone();
+                let evaluation_store = self.storage.evaluation_store.clone();
                 let changed = run_blocking(move || {
                     evaluation_store.record_failure_episodes(projected_episodes)
                 })
@@ -733,7 +771,7 @@ impl RuntimeHost {
             }
             return Ok(());
         };
-        let evaluation_store = self.evaluation_store.clone();
+        let evaluation_store = self.storage.evaluation_store.clone();
         let analysis_for_store = analysis.clone();
         let update = run_blocking(move || {
             evaluation_store.record_failure_products(
@@ -843,6 +881,7 @@ impl RuntimeHost {
             .as_deref()
             .unwrap_or("verified completion");
         let promotion = self
+            .storage
             .governance
             .quarantine_verified_memory(
                 task.task_id,
