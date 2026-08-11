@@ -945,7 +945,7 @@ fn history_replay_resizes_before_committing_new_content() {
     let mut terminal = Terminal::with_options(
         TestBackend::new(40, 240),
         TerminalOptions {
-            viewport: Viewport::Inline(3),
+            viewport: Viewport::Inline(4),
         },
     )
     .expect("inline terminal");
@@ -957,18 +957,30 @@ fn history_replay_resizes_before_committing_new_content() {
     );
 
     terminal.backend_mut().resize(80, 240);
+    let task_id = app.task_id.expect("task id");
     app.events.push(transcript_event(
         1,
         session_id,
-        app.task_id.expect("task id"),
+        task_id,
         RuntimeEventType::AssistantMessage,
         json!({"content": format!("{} RESIZE_TAIL", "x".repeat(160))}),
     ));
+    app.projection = Some(UserProjection {
+        session_id,
+        task_id: Some(task_id),
+        status: golutra_core::TaskStatus::Completed,
+        visible_steps: Vec::new(),
+        pending_approval: None,
+        final_message: None,
+        residual_risks: Vec::new(),
+    });
+    app.invalidate_transcript_layout();
     app.transcript.history.replay_ready = true;
 
     history
         .flush(&mut terminal, &mut app)
         .expect("resized replay");
+    draw_inline_test_frame(&mut terminal, &mut app);
     assert_eq!(terminal.current_buffer_mut().area.width, 80);
     let scrollback = terminal
         .backend()
@@ -1063,7 +1075,7 @@ fn completed_history_keeps_latest_response_next_to_composer() {
 }
 
 #[test]
-fn completed_response_taller_than_the_live_viewport_moves_to_scrollback() {
+fn completed_response_taller_than_the_live_viewport_stays_live_for_tail_alignment() {
     let session_id = SessionId::new();
     let task_id = TaskId::new();
     let turn_id = TurnId::new();
@@ -1127,21 +1139,323 @@ fn completed_response_taller_than_the_live_viewport_moves_to_scrollback() {
 
     history
         .flush(&mut terminal, &mut app)
-        .expect("commit tall completed response");
+        .expect("render tall completed response");
 
     assert!(
-        app.transcript
+        !app.transcript
             .history
             .committed_event_ids
             .contains(&assistant_event_id),
-        "a finalized response that cannot fit in the live body must be committed in full"
+        "an oversized latest response must remain live for tail alignment"
     );
     let live = transcript_render_rows(&app)
         .into_iter()
         .map(|row| row.line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(!live.contains("long response row"));
+    assert!(live.contains("long response row"));
+}
+
+#[test]
+fn resume_keeps_an_oversized_latest_response_above_the_composer() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let turn_id = TurnId::new();
+    let content = (1..=40)
+        .map(|row| format!("resumed response row {row}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_footer_context("/workspace", "gpt-test");
+    app.projection = Some(UserProjection {
+        session_id,
+        task_id: Some(task_id),
+        status: golutra_core::TaskStatus::Completed,
+        visible_steps: Vec::new(),
+        pending_approval: None,
+        final_message: None,
+        residual_risks: Vec::new(),
+    });
+    app.enable_inline_history();
+    app.resume_picker = Some(ResumePickerState::new(vec![ResumeThreadItem {
+        thread_id: app.thread_id,
+        session_id,
+        title: "resume target".to_owned(),
+        preview: "long response".to_owned(),
+    }]));
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(80, 24),
+        TerminalOptions {
+            viewport: Viewport::Inline(12),
+        },
+    )
+    .expect("inline terminal");
+    let mut history = InlineHistoryState::new(session_id);
+
+    history
+        .flush(&mut terminal, &mut app)
+        .expect("picker history");
+    draw_inline_test_frame(&mut terminal, &mut app);
+    assert!(terminal_buffer_text(&terminal).contains("Resume session"));
+
+    app.begin_history_replay();
+    app.resume_picker = None;
+    app.events.clear();
+    app.projection = Some(UserProjection {
+        session_id,
+        task_id: Some(task_id),
+        status: golutra_core::TaskStatus::Completed,
+        visible_steps: Vec::new(),
+        pending_approval: None,
+        final_message: Some("loading resumed session".to_owned()),
+        residual_risks: Vec::new(),
+    });
+    app.reset_transcript_view();
+    history
+        .flush(&mut terminal, &mut app)
+        .expect("loading frame");
+    draw_inline_test_frame(&mut terminal, &mut app);
+
+    let mut created = transcript_event(
+        1,
+        session_id,
+        task_id,
+        RuntimeEventType::TaskCreated,
+        json!({"payload": {"prompt": "produce a long response"}}),
+    );
+    created.turn_id = Some(turn_id);
+    let mut streamed = transcript_event(
+        2,
+        session_id,
+        task_id,
+        RuntimeEventType::ProviderStreamed,
+        json!({"delta": {"kind": "text_delta", "text": content}}),
+    );
+    streamed.turn_id = Some(turn_id);
+    let mut completed = transcript_event(
+        3,
+        session_id,
+        task_id,
+        RuntimeEventType::AssistantMessage,
+        json!({"content": content}),
+    );
+    completed.turn_id = Some(turn_id);
+    app.events = vec![created, streamed, completed];
+    app.projection = Some(UserProjection {
+        session_id,
+        task_id: Some(task_id),
+        status: golutra_core::TaskStatus::Completed,
+        visible_steps: Vec::new(),
+        pending_approval: None,
+        final_message: None,
+        residual_risks: Vec::new(),
+    });
+    app.invalidate_transcript_layout();
+    app.transcript.history.replay_ready = true;
+    history
+        .flush(&mut terminal, &mut app)
+        .expect("replayed history");
+    draw_inline_test_frame(&mut terminal, &mut app);
+
+    let rows = terminal_buffer_rows(&terminal);
+    assert!(
+        !rows.iter().any(|row| row.contains("Resume session")),
+        "resume picker frame survived replay: {rows:#?}"
+    );
+    let response_row = rows
+        .iter()
+        .position(|row| row.contains("resumed response row 40"))
+        .expect("latest resumed response row must remain live");
+    let composer_row = rows
+        .iter()
+        .position(|row| row.contains("Ask Golutra to change code or inspect the workspace"))
+        .expect("composer row");
+    let blank_rows = rows[response_row.saturating_add(1)..composer_row]
+        .iter()
+        .filter(|row| row.trim().is_empty())
+        .count();
+    assert!(
+        blank_rows <= 1,
+        "resume left a gap before the composer: {rows:#?}"
+    );
+}
+
+#[test]
+fn oversized_non_tail_response_can_be_archived_atomically() {
+    let session_id = SessionId::new();
+    let first_task = TaskId::new();
+    let second_task = TaskId::new();
+    let first_turn = TurnId::new();
+    let second_turn = TurnId::new();
+    let archive_marker = "ARCHIVED-RESPONSE-ONCE";
+    let content = std::iter::once(archive_marker.to_owned())
+        .chain((2..=40).map(|row| format!("archived response row {row}")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut first_created = transcript_event(
+        1,
+        session_id,
+        first_task,
+        RuntimeEventType::TaskCreated,
+        json!({"payload": {"prompt": "first prompt"}}),
+    );
+    first_created.turn_id = Some(first_turn);
+    let mut first_streamed = transcript_event(
+        2,
+        session_id,
+        first_task,
+        RuntimeEventType::ProviderStreamed,
+        json!({"delta": {"kind": "text_delta", "text": content}}),
+    );
+    first_streamed.turn_id = Some(first_turn);
+    let first_streamed_id = first_streamed.id;
+    let mut first_completed = transcript_event(
+        3,
+        session_id,
+        first_task,
+        RuntimeEventType::AssistantMessage,
+        json!({"content": content}),
+    );
+    first_completed.turn_id = Some(first_turn);
+    let mut second_created = transcript_event(
+        4,
+        session_id,
+        second_task,
+        RuntimeEventType::TaskCreated,
+        json!({"payload": {"prompt": "second prompt"}}),
+    );
+    second_created.turn_id = Some(second_turn);
+    let mut second_completed = transcript_event(
+        5,
+        session_id,
+        second_task,
+        RuntimeEventType::AssistantMessage,
+        json!({"content": "latest response"}),
+    );
+    second_completed.turn_id = Some(second_turn);
+
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(first_task),
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_footer_context("/workspace", "gpt-test");
+    app.events = vec![first_created, first_streamed, first_completed];
+    app.projection = Some(UserProjection {
+        session_id,
+        task_id: Some(first_task),
+        status: golutra_core::TaskStatus::Completed,
+        visible_steps: Vec::new(),
+        pending_approval: None,
+        final_message: None,
+        residual_risks: Vec::new(),
+    });
+    app.enable_inline_history();
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(80, 24),
+        TerminalOptions {
+            viewport: Viewport::Inline(12),
+        },
+    )
+    .expect("inline terminal");
+    let mut history = InlineHistoryState::new(session_id);
+
+    history
+        .flush(&mut terminal, &mut app)
+        .expect("oversized live history");
+    draw_inline_test_frame(&mut terminal, &mut app);
+
+    assert!(
+        !app.transcript
+            .history
+            .committed_event_ids
+            .contains(&first_streamed_id),
+        "the oversized latest response should initially remain live"
+    );
+    let initial_scrollback = terminal
+        .backend()
+        .scrollback()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(!initial_scrollback.contains(archive_marker));
+
+    app.task_id = Some(second_task);
+    app.events.extend([second_created, second_completed]);
+    app.projection = Some(UserProjection {
+        session_id,
+        task_id: Some(second_task),
+        status: golutra_core::TaskStatus::Completed,
+        visible_steps: Vec::new(),
+        pending_approval: None,
+        final_message: None,
+        residual_risks: Vec::new(),
+    });
+    app.invalidate_transcript_layout();
+    history
+        .flush(&mut terminal, &mut app)
+        .expect("archive oversized history after the next operation");
+    draw_inline_test_frame(&mut terminal, &mut app);
+
+    assert!(
+        app.transcript
+            .history
+            .committed_event_ids
+            .contains(&first_streamed_id),
+        "an oversized response with a later turn should be archived"
+    );
+    let archived_once = terminal
+        .backend()
+        .scrollback()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert_eq!(archived_once.matches(archive_marker).count(), 1);
+
+    assert!(
+        !history
+            .flush(&mut terminal, &mut app)
+            .expect("unchanged history")
+    );
+    draw_inline_test_frame(&mut terminal, &mut app);
+    let archived_after_repeat = terminal
+        .backend()
+        .scrollback()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert_eq!(archived_after_repeat.matches(archive_marker).count(), 1);
+
+    let rows = terminal_buffer_rows(&terminal);
+    let latest_row = rows
+        .iter()
+        .position(|row| row.contains("latest response"))
+        .expect("latest turn remains live");
+    let composer_row = rows
+        .iter()
+        .position(|row| row.contains("Ask Golutra to change code or inspect the workspace"))
+        .expect("composer row");
+    let blank_rows = rows[latest_row.saturating_add(1)..composer_row]
+        .iter()
+        .filter(|row| row.trim().is_empty())
+        .count();
+    assert!(
+        blank_rows <= 1,
+        "latest live turn should stay next to composer: {rows:#?}"
+    );
 }
 
 #[test]

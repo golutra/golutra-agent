@@ -836,11 +836,16 @@ fn committed_prefix_len(
     while committed_count > 0 && live_rows < live_row_capacity {
         let candidate = committed_count.saturating_sub(1);
         let candidate_rows = history_lines_height(&entries[candidate].lines, width);
-        // A whole operation is the smallest stable scrollback unit. Keeping an operation that is
-        // taller than the live body would permanently clip its leading rows, because its event id
-        // could never be marked as committed. Commit that operation in full once it stabilizes;
-        // shorter operations still form the live tail immediately above the composer.
+        // A whole operation is the smallest stable scrollback unit. A stable operation taller than
+        // the live body cannot be committed without leaving an empty live transcript, so keep it
+        // in the live tail and let the transcript pane show its final rows. Shorter operations can
+        // still be moved to scrollback as a complete unit.
         if candidate_rows > live_row_capacity {
+            // Once a later operation exists, it supplies the live tail and the oversized
+            // operation can be archived atomically. Only the latest operation must stay live.
+            if candidate.saturating_add(1) == entries.len() {
+                committed_count = candidate;
+            }
             break;
         }
         committed_count = candidate;
