@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 import sys
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -212,6 +213,63 @@ class AdapterHelpersTest(unittest.TestCase):
                 ADAPTER._terminal_bench_agent_timeout_sec(logging_dir), 120.0
             )
 
+    def test_agent_timeout_reads_registered_dataset_cache(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "cache"
+            run_root = root / "runs/run"
+            logging_dir = run_root / "task/task.1-of-1.run/sessions"
+            task_root = cache / "terminal-bench-core/0.1.1/task"
+            logging_dir.mkdir(parents=True)
+            task_root.mkdir(parents=True)
+            (run_root / "run_metadata.json").write_text(
+                json.dumps(
+                    {
+                        "dataset_path": None,
+                        "dataset_name": "terminal-bench-core",
+                        "dataset_version": "0.1.1",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run_root / "tb.lock").write_text(
+                json.dumps(
+                    {
+                        "run_config": {
+                            "global_agent_timeout_sec": None,
+                            "global_timeout_multiplier": 2.0,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (task_root / "task.yaml").write_text(
+                "max_agent_timeout_sec: 900.0\n", encoding="utf-8"
+            )
+
+            registry_client = types.ModuleType("terminal_bench.registry.client")
+
+            class RegistryClient:
+                CACHE_DIR = cache
+
+            registry_client.RegistryClient = RegistryClient
+            yaml = types.ModuleType("yaml")
+            yaml.safe_load = lambda _content: {"max_agent_timeout_sec": 900.0}
+
+            with patch.dict(
+                sys.modules,
+                {
+                    "terminal_bench.registry": types.ModuleType(
+                        "terminal_bench.registry"
+                    ),
+                    "terminal_bench.registry.client": registry_client,
+                    "yaml": yaml,
+                },
+            ):
+                self.assertEqual(
+                    ADAPTER._terminal_bench_agent_timeout_sec(logging_dir), 1800.0
+                )
+
     def test_runtime_budget_reserves_setup_and_finalization_time(self):
         self.assertEqual(
             ADAPTER._runtime_elapsed_budget_ms(
@@ -304,6 +362,7 @@ class AdapterHelpersTest(unittest.TestCase):
             session = Session()
             with patch.dict(ADAPTER.os.environ, {"GOLUTRA_TBENCH_PROXY": ""}):
                 agent = ADAPTER.GolutraAgent(
+                    model_name="terminal-bench/model-specific-candidate",
                     arm64_binary=str(binary),
                     provider_path=str(provider),
                     credentials_path=str(credentials),
@@ -319,6 +378,9 @@ class AdapterHelpersTest(unittest.TestCase):
 
             self.assertIsNotNone(session.command)
             self.assertIn("--yolo", session.command.command)
+            default_argv = ADAPTER.shlex.split(session.command.command)
+            self.assertNotIn("--execution-mode", default_argv)
+            self.assertNotIn("--tool-profile", default_argv)
             self.assertIn("--defer-external-verification", session.command.command)
             budget_match = ADAPTER.re.search(
                 r"--max-elapsed-ms (\d+)", session.command.command
@@ -364,12 +426,31 @@ class AdapterHelpersTest(unittest.TestCase):
             self.assertIn("runtime_max_elapsed_ms", observation["facts"])
             self.assertEqual(observation["facts"]["finalization_reserve_sec"], 5.01)
 
+            explicit_agent = ADAPTER.GolutraAgent(
+                arm64_binary=str(binary),
+                provider_path=str(provider),
+                credentials_path=str(credentials),
+                collector_binary=str(root / "missing-collector"),
+                agent_command_timeout_sec=10.0,
+                graceful_drain_timeout_sec=0.01,
+                execution_mode="strict",
+                tool_profile="full",
+            )
             success_session = Session(times_out=False)
-            with patch.object(agent, "_start_result_collector"):
-                result = agent.perform_task("do work", success_session, logging_dir)
+            with patch.object(explicit_agent, "_start_result_collector"):
+                result = explicit_agent.perform_task(
+                    "task_id=model-specific-task", success_session, logging_dir
+                )
 
             self.assertEqual(result.total_input_tokens, 0)
             self.assertEqual(result.total_output_tokens, 0)
+            explicit_argv = ADAPTER.shlex.split(success_session.command.command)
+            self.assertEqual(
+                explicit_argv[explicit_argv.index("--execution-mode") + 1], "strict"
+            )
+            self.assertEqual(
+                explicit_argv[explicit_argv.index("--tool-profile") + 1], "full"
+            )
             self.assertEqual(
                 [call[1]["container_dir"] for call in success_session.copy_calls],
                 ["/installed-agent", "/installed-agent/auth", "/installed-agent/auth"],
@@ -389,6 +470,16 @@ class AdapterHelpersTest(unittest.TestCase):
             self.assertIn(
                 "runtime_max_elapsed_ms", completed_observation["facts"]
             )
+
+    def test_execution_profile_configuration_is_validated_and_normalized(self):
+        agent = ADAPTER.GolutraAgent(execution_mode=" OPEN ", tool_profile="Coding")
+
+        self.assertEqual(agent._execution_mode, "open")
+        self.assertEqual(agent._tool_profile, "coding")
+        with self.assertRaisesRegex(ValueError, "execution_mode"):
+            ADAPTER.GolutraAgent(execution_mode="benchmark")
+        with self.assertRaisesRegex(ValueError, "tool_profile"):
+            ADAPTER.GolutraAgent(tool_profile="terminal-bench")
 
     def test_runtime_readiness_uses_manifest_without_opening_live_sqlite(self):
         with TemporaryDirectory() as temporary:
@@ -712,7 +803,7 @@ class AdapterHelpersTest(unittest.TestCase):
                 return types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
 
             with patch.object(ADAPTER.subprocess, "run", side_effect=ingest):
-                agent._collect_result(trial_root)
+                agent._collect_result(trial_root, "task")
 
             self.assertEqual(len(collector_timeouts), 1)
             self.assertGreater(collector_timeouts[0], 0)
@@ -738,7 +829,7 @@ class AdapterHelpersTest(unittest.TestCase):
             with patch.object(
                 ADAPTER.subprocess, "run", side_effect=collector_timeout
             ):
-                agent._collect_result(trial_root)
+                agent._collect_result(trial_root, "task")
             timeout_pending = json.loads(
                 (run_dir / "terminal-bench-evaluation.pending.json").read_text()
             )
@@ -759,7 +850,7 @@ class AdapterHelpersTest(unittest.TestCase):
             trace_path.write_text(json.dumps(trace), encoding="utf-8")
             completed = types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
             with patch.object(ADAPTER.subprocess, "run", return_value=completed):
-                agent._collect_result(trial_root)
+                agent._collect_result(trial_root, "task")
 
             pending = json.loads(
                 (run_dir / "terminal-bench-evaluation.pending.json").read_text()
@@ -904,6 +995,32 @@ class AdapterHelpersTest(unittest.TestCase):
         self.assertEqual(parser_results, {"tests": "passed"})
         self.assertTrue(resolved)
         self.assertIsNone(failure_mode)
+
+    def test_trial_result_rejects_mismatched_single_and_aggregate_records(self):
+        with self.assertRaisesRegex(
+            ADAPTER.TrialResultBindingError, "does not match bound task_id"
+        ):
+            ADAPTER._extract_trial_result(
+                {
+                    "task_id": "other",
+                    "parser_results": {"wrong_test": "failed"},
+                    "is_resolved": False,
+                },
+                "target",
+            )
+
+        with self.assertRaisesRegex(
+            ADAPTER.TrialResultBindingError, "available task_ids"
+        ):
+            ADAPTER._extract_trial_result(
+                {
+                    "results": [
+                        {"task_id": "other", "is_resolved": False},
+                        {"task_id": "another", "is_resolved": True},
+                    ]
+                },
+                "target",
+            )
 
     def test_trial_result_preserves_harness_failure_mode(self):
         parser_results, resolved, failure_mode = ADAPTER._extract_trial_result(
@@ -1184,7 +1301,7 @@ class AdapterHelpersTest(unittest.TestCase):
             agent._graceful_drain_timeout_sec = 0.01
 
             with patch.object(ADAPTER.subprocess, "run") as collector:
-                agent._collect_result(trial_root)
+                agent._collect_result(trial_root, "csv-to-parquet")
             collector.assert_not_called()
 
             record = json.loads(
@@ -1214,6 +1331,195 @@ class AdapterHelpersTest(unittest.TestCase):
                 str(run_dir / "terminal-bench-evaluation.json"),
             )
             self.assertFalse(stale_pending.exists())
+
+    def test_result_lookup_is_bound_to_the_exact_trial_directory(self):
+        with TemporaryDirectory() as temporary:
+            task_root = Path(temporary) / "task"
+            trial_root = task_root / "task.1-of-1.run"
+            nested = trial_root / "unrelated"
+            nested.mkdir(parents=True)
+            (task_root / "results.json").write_text("{}", encoding="utf-8")
+            (nested / "results.json").write_text("{}", encoding="utf-8")
+
+            self.assertIsNone(ADAPTER._find_trial_results(trial_root))
+
+            exact = trial_root / "results.json"
+            exact.write_text("{}", encoding="utf-8")
+            self.assertEqual(ADAPTER._find_trial_results(trial_root), exact)
+
+    def test_collector_thread_captures_exact_trial_and_task_identity(self):
+        with TemporaryDirectory() as temporary:
+            logging_dir = (
+                Path(temporary)
+                / "case-name"
+                / "case-name.1-of-1.run"
+                / "sessions"
+            )
+            logging_dir.mkdir(parents=True)
+            captured = {}
+
+            class Thread:
+                def __init__(self, **kwargs):
+                    captured.update(kwargs)
+
+                def start(self):
+                    captured["started"] = True
+
+            agent = ADAPTER.GolutraAgent.__new__(ADAPTER.GolutraAgent)
+            with patch.object(ADAPTER.threading, "Thread", Thread):
+                agent._start_result_collector(logging_dir)
+
+            self.assertEqual(
+                captured["args"],
+                (logging_dir.parent.resolve(), "case-name"),
+            )
+            self.assertEqual(
+                captured["name"],
+                "golutra-evaluation-case-name.1-of-1.run",
+            )
+            self.assertFalse(captured["daemon"])
+            self.assertTrue(captured["started"])
+
+    def test_concurrent_collectors_never_bind_sibling_trial_results(self):
+        with TemporaryDirectory() as temporary:
+            run_root = Path(temporary)
+            cases = {
+                "alpha": ("runtime-alpha", "alpha_test"),
+                "beta": ("runtime-beta", "beta_test"),
+            }
+            trials = {}
+            for case_id, (runtime_task_id, assertion_name) in cases.items():
+                trial_root = run_root / case_id / f"{case_id}.1-of-1.run"
+                run_dir = trial_root / "sessions" / "golutra-runtime"
+                run_dir.mkdir(parents=True)
+                (run_dir / "manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "terminal_outcome": {
+                                "kind": "result",
+                                "result": {
+                                    "task_id": runtime_task_id,
+                                    "session_id": f"session-{case_id}",
+                                },
+                            },
+                            "observations": {"sessions": []},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (trial_root / "results.json").write_text(
+                    json.dumps(
+                        {
+                            "id": f"trial-{case_id}",
+                            "task_id": case_id,
+                            "is_resolved": False,
+                            "parser_results": {assertion_name: "failed"},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                trials[case_id] = (trial_root, run_dir)
+
+            (run_root / "results.json").write_text(
+                json.dumps(
+                    {
+                        "results": [
+                            {
+                                "task_id": "alpha",
+                                "parser_results": {"wrong_for_beta": "failed"},
+                            },
+                            {
+                                "task_id": "beta",
+                                "parser_results": {"wrong_for_alpha": "failed"},
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            agent = ADAPTER.GolutraAgent.__new__(ADAPTER.GolutraAgent)
+            agent._result_collection_timeout_sec = 1.0
+            agent._dataset_id = "terminal-bench"
+            agent._dataset_version = "local"
+            agent._model_name = "test/model"
+            agent._collector_binary = None
+            agent._graceful_drain_timeout_sec = 0.01
+            barrier = threading.Barrier(len(cases))
+
+            def collect(case_id):
+                barrier.wait()
+                agent._collect_result(trials[case_id][0], case_id)
+
+            threads = [
+                threading.Thread(target=collect, args=(case_id,))
+                for case_id in cases
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=2.0)
+                self.assertFalse(thread.is_alive())
+
+            for case_id, (runtime_task_id, assertion_name) in cases.items():
+                record = json.loads(
+                    (
+                        trials[case_id][1] / "terminal-bench-evaluation.json"
+                    ).read_text()
+                )
+                self.assertEqual(record["source_task_id"], runtime_task_id)
+                self.assertEqual(record["case_id"], case_id)
+                self.assertEqual(
+                    [assertion["name"] for assertion in record["assertions"]],
+                    [assertion_name],
+                )
+
+    def test_collector_rejects_a_result_with_another_trial_identity(self):
+        with TemporaryDirectory() as temporary:
+            trial_root = Path(temporary) / "target" / "target.1-of-1.run"
+            run_dir = trial_root / "sessions" / "golutra-runtime"
+            run_dir.mkdir(parents=True)
+            (run_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "terminal_outcome": {
+                            "kind": "result",
+                            "result": {
+                                "task_id": "runtime-task",
+                                "session_id": "runtime-session",
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (trial_root / "results.json").write_text(
+                json.dumps(
+                    {
+                        "id": "wrong-trial",
+                        "task_id": "other",
+                        "is_resolved": True,
+                        "parser_results": {"wrong_test": "passed"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            agent = ADAPTER.GolutraAgent.__new__(ADAPTER.GolutraAgent)
+            agent._result_collection_timeout_sec = 0.1
+            agent._graceful_drain_timeout_sec = 0.01
+
+            with patch.object(ADAPTER.subprocess, "run") as collector:
+                agent._collect_result(trial_root, "target")
+
+            collector.assert_not_called()
+            self.assertFalse(
+                (run_dir / "terminal-bench-evaluation.json").exists()
+            )
+            pending = json.loads(
+                (run_dir / "terminal-bench-evaluation.pending.json").read_text()
+            )
+            self.assertEqual(pending["status"], "result_identity_mismatch")
+            self.assertEqual(pending["expected_task_id"], "target")
 
 
 if __name__ == "__main__":

@@ -1,8 +1,19 @@
 // Generated from Golutra Rust protocol schemas. Do not edit manually.
 
+/**
+ * Selects how much deterministic completion policy is allowed to shape one
+ * turn.  The open path leaves planning, tool order, and stopping to the
+ * provider while retaining the runtime's safety, budget, and audit gates.
+ */
+export type AgentExecutionMode = "open" | "strict";
 export type AgentItemKind =
   "user_message" | "assistant_message" | "model" | "tool" | "approval" | "verification" | "runtime";
 export type AgentItemStatus = "in_progress" | "completed" | "failed" | "cancelled";
+/**
+ * Controls the model-visible tool surface without removing the underlying
+ * executor capability or its policy checks.
+ */
+export type AgentToolProfile = "coding" | "full";
 export type AgentStreamEvent =
   | {
       session_id: string;
@@ -674,9 +685,13 @@ export type DriverNotificationKind =
   "heartbeat" | "runtime_event_available" | "state_changed" | "task_terminal";
 
 export interface SdkProtocolBundle {
+  agent_execution_mode: AgentExecutionMode;
   agent_item: AgentItem;
+  agent_steer_options: AgentSteerOptions;
   agent_stream_event: AgentStreamEvent;
   agent_thread_ref: AgentThreadRef;
+  agent_tool_profile: AgentToolProfile;
+  agent_turn_execution_options: AgentTurnExecutionOptions;
   agent_turn_options: AgentTurnOptions;
   agent_turn_result: AgentTurnResult;
   agent_turn_start: AgentTurnStart;
@@ -755,6 +770,14 @@ export interface AgentItem {
   sequence_no?: number | null;
   status: AgentItemStatus;
   title: string;
+  [k: string]: unknown;
+}
+/**
+ * Optional execution-surface override for a steering continuation. Steering
+ * cannot replace the active task contract or execution mode.
+ */
+export interface AgentSteerOptions {
+  tool_profile?: AgentToolProfile | null;
   [k: string]: unknown;
 }
 export interface RuntimeEvent {
@@ -854,6 +877,26 @@ export interface AgentThreadRef {
   session_id: string;
   thread_id: string;
   workspace_root?: string | null;
+  [k: string]: unknown;
+}
+/**
+ * Selects the model-facing execution surface for a newly started turn.
+ *
+ * This is separate from [`AgentTurnOptions`] so adding execution profiles does
+ * not break existing Rust callers that construct that options type directly.
+ */
+export interface AgentTurnExecutionOptions {
+  /**
+   * Selects how much deterministic completion policy is allowed to shape one
+   * turn.  The open path leaves planning, tool order, and stopping to the
+   * provider while retaining the runtime's safety, budget, and audit gates.
+   */
+  execution_mode?: "open" | "strict";
+  /**
+   * Controls the model-visible tool surface without removing the underlying
+   * executor capability or its policy checks.
+   */
+  tool_profile?: "coding" | "full";
   [k: string]: unknown;
 }
 export interface AgentTurnOptions {

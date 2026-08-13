@@ -7,7 +7,9 @@ use golutra_core::{
 };
 use golutra_llm::{ProviderRequest, ProviderResponse, ProviderStreamEvent};
 use golutra_protocol::{EventFilter, RuntimeEvent, RuntimeEventSource, RuntimeEventType};
-use golutra_runtime::{AgentLoopTraceEvent, PendingAgentTurn, RuntimeObservation};
+use golutra_runtime::{
+    AgentLoopTraceEvent, PendingAgentTurn, PendingTurnExecutionOptions, RuntimeObservation,
+};
 use golutra_store::ThreadRecord;
 use golutra_tools::redact_sensitive_text;
 use serde_json::{Value, json};
@@ -15,8 +17,9 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ClientError, EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY, HostedAgentTask, LegacyTaskAdapter,
-    RecoveredPendingTurn, compact_event_summary, model_prompt_from_payload,
-    task_contract_from_payload, title_from_payload,
+    NormalizedExecutionMode, RecoveredPendingTurn, compact_event_summary,
+    execution_mode_from_payload, model_prompt_from_payload, should_apply_legacy_adapter,
+    task_contract_from_payload, title_from_payload, tool_profile_from_payload,
 };
 
 pub(crate) fn thread_id_from_payload(payload: &Value) -> Option<ThreadId> {
@@ -98,7 +101,31 @@ pub(crate) fn recovered_pending_turn_from_event(
         .get("steer")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let task_contract = if payload
+    let execution_mode = (!steer)
+        .then(|| execution_mode_from_payload(&payload))
+        .transpose()
+        .map_err(|error| {
+            ClientError::TaskExecution(format!(
+                "durable queued turn event {} has an invalid execution mode: {error}",
+                event.id
+            ))
+        })?;
+    let effective_execution_mode = execution_mode.unwrap_or(NormalizedExecutionMode::Legacy);
+    let tool_profile = if steer && payload.get("tool_profile").is_none_or(Value::is_null) {
+        None
+    } else {
+        Some(
+            tool_profile_from_payload(&payload, effective_execution_mode).map_err(|error| {
+                ClientError::TaskExecution(format!(
+                    "durable queued turn event {} has an invalid tool profile: {error}",
+                    event.id
+                ))
+            })?,
+        )
+    };
+    let task_contract = if steer {
+        None
+    } else if payload
         .get("task_contract")
         .is_some_and(|value| !value.is_null())
     {
@@ -110,10 +137,12 @@ pub(crate) fn recovered_pending_turn_from_event(
                 ))
             })?;
         Some(contract)
-    } else {
+    } else if should_apply_legacy_adapter(&payload, effective_execution_mode) {
         let mut contract = task_contract_from_payload(&payload)?;
         LegacyTaskAdapter::new(&payload, &content).apply_to(&mut contract);
         Some(contract)
+    } else {
+        Some(task_contract_from_payload(&payload)?)
     };
     if let Some(contract) = &task_contract {
         contract.validate().map_err(|error| {
@@ -218,6 +247,11 @@ pub(crate) fn recovered_pending_turn_from_event(
             yolo,
             steer,
         },
+        execution: PendingTurnExecutionOptions {
+            execution_mode: execution_mode.and_then(NormalizedExecutionMode::explicit),
+            tool_profile,
+        },
+        continuation: None,
     }))
 }
 
@@ -643,7 +677,8 @@ pub(crate) fn observation_descriptor(observation: &RuntimeObservation) -> Observ
             RuntimeEventSource::Governor,
             ObservationIntegrityClass::Required,
         ),
-        RuntimeObservation::PendingTurnStarted(_) => (
+        RuntimeObservation::PendingTurnStarted(_)
+        | RuntimeObservation::PendingTurnStartedWithExecution(_) => (
             RuntimeEventType::TurnStarted,
             RuntimeEventSource::User,
             ObservationIntegrityClass::Required,
@@ -1085,6 +1120,19 @@ pub(crate) fn trace_event_payload(
                 "steer": turn.steer,
             }),
         )),
+        AgentLoopTraceEvent::PendingTurnStartedWithExecution(configured) => Some((
+            RuntimeEventType::TurnStarted,
+            RuntimeEventSource::User,
+            json!({
+                "summary": "queued user turn started",
+                "command_id": configured.turn.command_id,
+                "turn_id": configured.turn.turn_id,
+                "prompt": configured.turn.content,
+                "steer": configured.turn.steer,
+                "execution_mode": configured.execution.execution_mode,
+                "tool_profile": configured.execution.tool_profile,
+            }),
+        )),
         AgentLoopTraceEvent::AssistantMessage { content, .. } => Some((
             RuntimeEventType::AssistantMessage,
             RuntimeEventSource::Runtime,
@@ -1235,6 +1283,49 @@ mod tests {
         assert!(recovered.pending.allow_network);
         assert!(recovered.pending.yolo);
         assert!(recovered.pending.external_verifiers_require_os_sandbox);
+        assert_eq!(
+            recovered.execution.tool_profile,
+            Some(golutra_protocol::AgentToolProfile::Full)
+        );
+    }
+
+    #[test]
+    fn steering_recovery_inherits_the_active_tool_profile_unless_explicit() {
+        for (payload, expected) in [
+            (
+                json!({
+                    "prompt": "focus on the public API",
+                    "execution_mode": "open",
+                    "steer": true
+                }),
+                None,
+            ),
+            (
+                json!({
+                    "prompt": "use the managed tools",
+                    "execution_mode": "open",
+                    "tool_profile": "full",
+                    "steer": true
+                }),
+                Some(golutra_protocol::AgentToolProfile::Full),
+            ),
+        ] {
+            let mut event = host_event(
+                7,
+                SessionId::new(),
+                Some(TaskId::new()),
+                RuntimeEventType::TurnQueued,
+                RuntimeEventSource::Runtime,
+                json!({"payload": payload}),
+            );
+            event.turn_id = Some(TurnId::new());
+
+            let recovered = recovered_pending_turn_from_event(&event)
+                .expect("valid steering event")
+                .expect("pending steering turn");
+            assert_eq!(recovered.execution.tool_profile, expected);
+            assert_eq!(recovered.pending.task_contract, None);
+        }
     }
 
     #[test]
@@ -1255,6 +1346,15 @@ mod tests {
             json!({
                 "prompt": "run a recovered turn",
                 "yolo": "true"
+            }),
+            json!({
+                "prompt": "run a recovered turn",
+                "execution_mode": "adaptive"
+            }),
+            json!({
+                "prompt": "run a recovered turn",
+                "execution_mode": "open",
+                "tool_profile": "everything"
             }),
         ] {
             let mut event = host_event(

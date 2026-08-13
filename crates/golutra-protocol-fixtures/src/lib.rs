@@ -18,7 +18,8 @@ use golutra_evolution::{
 use golutra_governor::RuntimeGovernorDecision;
 use golutra_memory::MemoryRecord;
 use golutra_protocol::{
-    AgentItem, AgentStreamEvent, AgentThreadRef, AgentTurnOptions, AgentTurnResult, AgentTurnStart,
+    AgentExecutionMode, AgentItem, AgentSteerOptions, AgentStreamEvent, AgentThreadRef,
+    AgentToolProfile, AgentTurnExecutionOptions, AgentTurnOptions, AgentTurnResult, AgentTurnStart,
     AgentTurnStartResponse, ArtifactChunk, ArtifactReadRequest, CommandAck, ContextProjection,
     DebugProjection, EvaluationProjection, EventFilter, EventPage, EventPageRequest,
     JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, ProtocolHandshake, RuntimeEvent,
@@ -45,6 +46,10 @@ pub struct SdkProtocolBundle {
     pub agent_thread_ref: AgentThreadRef,
     pub agent_turn_start: AgentTurnStart,
     pub agent_turn_start_response: AgentTurnStartResponse,
+    pub agent_execution_mode: AgentExecutionMode,
+    pub agent_tool_profile: AgentToolProfile,
+    pub agent_steer_options: AgentSteerOptions,
+    pub agent_turn_execution_options: AgentTurnExecutionOptions,
     pub agent_turn_options: AgentTurnOptions,
     pub agent_turn_result: AgentTurnResult,
     pub agent_item: AgentItem,
@@ -285,6 +290,10 @@ pub fn protocol_schema_names() -> Vec<&'static str> {
         "AgentThreadRef",
         "AgentTurnStart",
         "AgentTurnStartResponse",
+        "AgentExecutionMode",
+        "AgentToolProfile",
+        "AgentSteerOptions",
+        "AgentTurnExecutionOptions",
         "AgentTurnOptions",
         "AgentTurnResult",
         "AgentItem",
@@ -360,6 +369,7 @@ mod tests {
                 .pointer("/$defs/TaskReconciliationRecord")
                 .is_some()
         );
-        assert_eq!(protocol_schema_names().len(), 20);
+        assert!(sdk_json.pointer("/$defs/AgentSteerOptions").is_some());
+        assert_eq!(protocol_schema_names().len(), 24);
     }
 }

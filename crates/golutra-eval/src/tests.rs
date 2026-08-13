@@ -3,14 +3,55 @@ use std::{collections::BTreeMap, fs};
 use chrono::Utc;
 use golutra_core::{
     ArtifactId, EvidenceId, RegressionCampaign, RegressionCampaignId, RegressionExecution,
-    RegressionExecutionId, RegressionExecutionRole, RegressionExecutionStatus, TaskId, TaskStatus,
-    VerificationCheck, VerificationCheckKind, VerificationId, VerificationRecord,
+    RegressionExecutionId, RegressionExecutionRole, RegressionExecutionStatus, RunId, TaskId,
+    TaskStatus, VerificationCheck, VerificationCheckKind, VerificationId, VerificationRecord,
     VerificationResult,
 };
 use tempfile::tempdir;
 
 use super::*;
 use crate::{runner::sanitize_text, store::MAX_EVALUATION_STATE_BYTES};
+
+fn replay_projection_fixture(task_id: TaskId, suffix: &str) -> (ReplayCapsule, ReplayExecution) {
+    let now = Utc::now();
+    let capsule = ReplayCapsule {
+        capsule_id: format!("capsule-{suffix}"),
+        source_task_id: task_id,
+        source_run_id: RunId::from(task_id),
+        mode: ReplayMode::DeterministicControlFlow,
+        provider_exchanges: Vec::new(),
+        tool_results: Vec::new(),
+        clock_seed: "2026-08-13T00:00:00Z".to_owned(),
+        random_seed: 7,
+        runtime_config_digest: "sha256:test-runtime".to_owned(),
+        fixture_ref: None,
+        event_chain_digest: "sha256:test-events".to_owned(),
+        source_last_sequence_no: None,
+        complete: false,
+        missing_inputs: vec!["fixture input is unavailable".to_owned()],
+        limitations: Vec::new(),
+        created_at: now,
+    };
+    let execution = ReplayExecution {
+        execution_id: format!("execution-{suffix}"),
+        capsule_id: capsule.capsule_id.clone(),
+        source_task_id: task_id,
+        mode: capsule.mode,
+        status: ReplayExecutionStatus::Incomplete,
+        provider_exchanges_total: 0,
+        provider_exchanges_consumed: 0,
+        tool_results_total: 0,
+        tool_results_consumed: 0,
+        expected_loop_action: None,
+        observed_loop_action: None,
+        expected_verification: None,
+        observed_verification: None,
+        mismatches: Vec::new(),
+        started_at: now,
+        completed_at: now,
+    };
+    (capsule, execution)
+}
 
 fn failed_input(task_id: TaskId, evidence_id: EvidenceId) -> TaskEvaluationInput {
     TaskEvaluationInput {
@@ -399,6 +440,126 @@ fn repeated_task_evaluation_is_idempotent_for_candidates() {
     assert_eq!(state.results.len(), 1);
     assert_eq!(state.improvement_candidates.len(), 1);
     assert_eq!(state.automation_candidates.len(), 3);
+}
+
+#[test]
+fn replay_projection_replacement_is_task_scoped_and_removes_stale_records() {
+    let target_task_id = TaskId::new();
+    let other_task_id = TaskId::new();
+    let store = EvaluationStore::in_memory();
+    let (stale_capsule, stale_execution) =
+        replay_projection_fixture(target_task_id, "target-stale");
+    let (canonical_capsule, canonical_execution) =
+        replay_projection_fixture(target_task_id, "target-canonical");
+    let (other_capsule, other_execution) = replay_projection_fixture(other_task_id, "other");
+    for (capsule, execution) in [
+        (stale_capsule, stale_execution),
+        (other_capsule.clone(), other_execution.clone()),
+    ] {
+        store.record_replay_capsule(capsule).expect("seed capsule");
+        store
+            .record_replay_execution(execution)
+            .expect("seed execution");
+    }
+
+    store
+        .replace_replay_projection_for_task(
+            target_task_id,
+            vec![canonical_capsule.clone()],
+            vec![canonical_execution.clone()],
+        )
+        .expect("replace target projection");
+
+    let state = store.snapshot().expect("state");
+    assert_eq!(
+        state
+            .replay_capsules
+            .iter()
+            .filter(|capsule| capsule.source_task_id == target_task_id)
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![canonical_capsule]
+    );
+    assert_eq!(
+        state
+            .replay_executions
+            .iter()
+            .filter(|execution| execution.source_task_id == target_task_id)
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![canonical_execution]
+    );
+    assert!(state.replay_capsules.contains(&other_capsule));
+    assert!(state.replay_executions.contains(&other_execution));
+}
+
+#[test]
+fn empty_replay_projection_replacement_only_clears_the_target_task() {
+    let target_task_id = TaskId::new();
+    let other_task_id = TaskId::new();
+    let store = EvaluationStore::in_memory();
+    let (target_capsule, target_execution) = replay_projection_fixture(target_task_id, "target");
+    let (other_capsule, other_execution) = replay_projection_fixture(other_task_id, "other");
+    for (capsule, execution) in [
+        (target_capsule, target_execution),
+        (other_capsule.clone(), other_execution.clone()),
+    ] {
+        store.record_replay_capsule(capsule).expect("seed capsule");
+        store
+            .record_replay_execution(execution)
+            .expect("seed execution");
+    }
+
+    store
+        .replace_replay_projection_for_task(target_task_id, Vec::new(), Vec::new())
+        .expect("clear target projection");
+
+    let state = store.snapshot().expect("state");
+    assert_eq!(state.replay_capsules, vec![other_capsule]);
+    assert_eq!(state.replay_executions, vec![other_execution]);
+}
+
+#[test]
+fn invalid_replay_projection_replacement_is_atomic() {
+    let target_task_id = TaskId::new();
+    let other_task_id = TaskId::new();
+    let store = EvaluationStore::in_memory();
+    let (target_capsule, target_execution) = replay_projection_fixture(target_task_id, "target");
+    let (other_capsule, other_execution) = replay_projection_fixture(other_task_id, "shared");
+    for (capsule, execution) in [
+        (target_capsule, target_execution),
+        (other_capsule.clone(), other_execution),
+    ] {
+        store.record_replay_capsule(capsule).expect("seed capsule");
+        store
+            .record_replay_execution(execution)
+            .expect("seed execution");
+    }
+    let before = store.snapshot().expect("state before conflict");
+    let mut conflicting_capsule = other_capsule;
+    conflicting_capsule.source_task_id = target_task_id;
+    conflicting_capsule.source_run_id = RunId::from(target_task_id);
+
+    assert!(matches!(
+        store.replace_replay_projection_for_task(
+            target_task_id,
+            vec![conflicting_capsule],
+            Vec::new()
+        ),
+        Err(EvaluationError::Invariant(_))
+    ));
+    assert_eq!(store.snapshot().expect("state after conflict"), before);
+
+    let (wrong_task_capsule, _) = replay_projection_fixture(other_task_id, "wrong-task");
+    assert!(matches!(
+        store.replace_replay_projection_for_task(
+            target_task_id,
+            vec![wrong_task_capsule],
+            Vec::new()
+        ),
+        Err(EvaluationError::Invariant(_))
+    ));
+    assert_eq!(store.snapshot().expect("state after wrong task"), before);
 }
 
 #[test]

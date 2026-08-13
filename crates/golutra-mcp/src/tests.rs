@@ -12,6 +12,27 @@ use tempfile::tempdir;
 
 use super::*;
 
+#[test]
+fn reviewed_enabled_plugins_are_visible_in_the_coding_profile() {
+    let home = tempdir().expect("home");
+    let workspace = tempdir().expect("workspace");
+    let package = fixture_package();
+    let backend = McpToolBackend::from_store_unrestricted(
+        enabled_store(home.path(), package.path()),
+        workspace.path(),
+        home.path().join("scratch"),
+    )
+    .expect("backend")
+    .expect("enabled plugin");
+
+    let capabilities = backend.capabilities();
+    let echo = capabilities
+        .get("mcp__fixture__echo")
+        .expect("reviewed MCP capability");
+    assert!(echo.available_in_coding_profile);
+    assert!(!echo.parallel_read_safe);
+}
+
 #[tokio::test]
 async fn process_only_hosts_refuse_to_execute_plugins() {
     let home = tempdir().expect("home");

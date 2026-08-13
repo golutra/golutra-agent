@@ -62,6 +62,8 @@ test("Thread and TurnHandle preserve the shared agent lifecycle", async () => {
   const thread = new Thread(client, threadReference);
   await assert.rejects(thread.run("   "), /turn prompt cannot be empty/);
   const handle = await thread.run("inspect the workspace", {
+    executionMode: "strict",
+    toolProfile: "full",
     outputSchema: { type: "object" },
     taskContract: {
       workspace_change: "required",
@@ -94,6 +96,8 @@ test("Thread and TurnHandle preserve the shared agent lifecycle", async () => {
     {
       thread_id: "thread-1",
       prompt: "inspect the workspace",
+      execution_mode: "strict",
+      tool_profile: "full",
       allow_network: true,
       yolo: true,
       max_elapsed_ms: 345_000,
@@ -114,7 +118,11 @@ test("Thread and TurnHandle preserve the shared agent lifecycle", async () => {
   assert.equal(calls[1][1].start_cursor, 10);
   assert.equal(calls.filter(([name]) => name === "subscribeAgent").length, 1);
 
-  assert.equal((await thread.steer("continue")).accepted, true);
+  assert.equal((await thread.steer("continue", { toolProfile: "full" })).accepted, true);
+  assert.deepEqual(calls.find(([name]) => name === "turn/steer"), [
+    "turn/steer",
+    { thread_id: "thread-1", prompt: "continue", tool_profile: "full" },
+  ]);
   await assert.rejects(thread.steer("   "), /steering prompt cannot be empty/);
   assert.equal((await thread.interrupt()).accepted, true);
   assert.equal((await thread.takeover()).accepted, true);
@@ -179,8 +187,38 @@ test("project verifier discovery distinguishes omission from an explicit opt-out
   await thread.run("discover checks");
   await thread.run("disable discovery", { discoverProjectVerifiers: false });
 
+  assert.equal(calls[0][1].execution_mode, "open");
+  assert.equal(calls[0][1].tool_profile, "coding");
   assert.equal("external_verifiers" in calls[0][1], false);
   assert.deepEqual(calls[1][1].external_verifiers, []);
+});
+
+test("regular runs select new defaults while legacy runs preserve server defaults", async () => {
+  const calls = [];
+  const client = {
+    async rpc(method, params) {
+      calls.push([method, params]);
+      return {
+        accepted: true,
+        command_id: `command-${calls.length}`,
+        cursor: 0,
+        thread: threadReference,
+      };
+    },
+  };
+  const thread = new Thread(client, threadReference);
+
+  await thread.run("new defaults");
+  await thread.runLegacy("server defaults");
+  await thread.runLegacyStreamed("streamed server defaults");
+
+  assert.equal(calls[0][0], "turn/start");
+  assert.equal(calls[0][1].execution_mode, "open");
+  assert.equal(calls[0][1].tool_profile, "coding");
+  for (const [, params] of calls.slice(1)) {
+    assert.equal("execution_mode" in params, false);
+    assert.equal("tool_profile" in params, false);
+  }
 });
 
 test("TurnHandle ends or fails when the backing subscription settles", async () => {

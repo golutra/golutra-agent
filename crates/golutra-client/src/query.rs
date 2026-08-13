@@ -2,6 +2,24 @@
 
 use super::*;
 
+fn mark_debug_projection_failure(
+    projection: &mut golutra_protocol::DebugProjection,
+    section: &str,
+    detail: String,
+) {
+    projection.trace_complete = false;
+    if !projection
+        .missing_sections
+        .iter()
+        .any(|missing| missing == section)
+    {
+        projection.missing_sections.push(section.to_owned());
+    }
+    if !projection.retention_losses.contains(&detail) {
+        projection.retention_losses.push(detail);
+    }
+}
+
 impl RuntimeHost {
     pub async fn task_trace(
         &self,
@@ -35,63 +53,113 @@ impl RuntimeHost {
                     .await?,
             )?,
             RuntimeQueryKind::DebugProjection => {
+                if let Some(task_id) = query.task_id {
+                    self.ensure_task_in_session(query.session_id, task_id)
+                        .await?;
+                }
                 let mut projection = self
                     .storage
                     .repositories
                     .projections
                     .debug(query.session_id, query.task_id)
                     .await?;
+                if let Some(error) = self
+                    .execution
+                    .rollout_projection_failures
+                    .lock()
+                    .await
+                    .get(&query.session_id)
+                    .cloned()
+                {
+                    projection.trace_complete = false;
+                    projection
+                        .missing_sections
+                        .push("rollout_projection".to_owned());
+                    projection
+                        .retention_losses
+                        .push(format!("rollout_projection_rebuild_failed:{error}"));
+                }
                 if let Some(task_id) = query.task_id {
+                    projection.replay_execution = None;
+                    match self
+                        .load_canonical_replay_state(query.session_id, task_id)
+                        .await
+                    {
+                        Ok(canonical) => {
+                            projection.replay_execution = canonical.projection.latest_execution();
+                            if let Some(error) = canonical.reconciliation_error {
+                                mark_debug_projection_failure(
+                                    &mut projection,
+                                    "replay_projection",
+                                    format!("replay_projection_rebuild_failed:{error}"),
+                                );
+                            }
+                        }
+                        Err(error) => mark_debug_projection_failure(
+                            &mut projection,
+                            "canonical_replay",
+                            format!("canonical_replay_read_failed:{error}"),
+                        ),
+                    }
                     let evaluation_store = self.storage.evaluation_store.clone();
-                    let state = run_blocking(move || evaluation_store.snapshot()).await??;
-                    projection.failure_diagnosis = state
-                        .failure_diagnoses
-                        .into_iter()
-                        .rev()
-                        .find(|diagnosis| diagnosis.source_task_id == task_id);
-                    projection.failure_episodes = state
-                        .failure_episodes
-                        .into_iter()
-                        .filter(|episode| episode.source_task_id == task_id)
-                        .collect();
-                    projection.diagnostic_slice = state
-                        .diagnostic_slices
-                        .into_iter()
-                        .rev()
-                        .find(|slice| slice.source_task_id == task_id);
-                    projection.replay_execution = state
-                        .replay_executions
-                        .into_iter()
-                        .rev()
-                        .find(|execution| execution.source_task_id == task_id);
-                    projection.external_evaluations = state
-                        .external_evaluations
-                        .into_iter()
-                        .rev()
-                        .filter(|evaluation| evaluation.source_task_id == task_id)
-                        .take(16)
-                        .collect();
-                    let external_ids = projection
-                        .external_evaluations
-                        .iter()
-                        .map(|evaluation| evaluation.evaluation_id.as_str())
-                        .collect::<std::collections::HashSet<_>>();
-                    projection.causal_comparisons = state
-                        .causal_comparisons
-                        .into_iter()
-                        .rev()
-                        .filter(|comparison| {
-                            comparison
-                                .baseline_evaluation_ref
-                                .as_deref()
-                                .is_some_and(|reference| external_ids.contains(reference))
-                                || comparison
-                                    .candidate_evaluation_ref
-                                    .as_deref()
-                                    .is_some_and(|reference| external_ids.contains(reference))
-                        })
-                        .take(16)
-                        .collect();
+                    match run_blocking(move || evaluation_store.snapshot()).await {
+                        Ok(Ok(state)) => {
+                            projection.failure_diagnosis = state
+                                .failure_diagnoses
+                                .into_iter()
+                                .rev()
+                                .find(|diagnosis| diagnosis.source_task_id == task_id);
+                            projection.failure_episodes = state
+                                .failure_episodes
+                                .into_iter()
+                                .filter(|episode| episode.source_task_id == task_id)
+                                .collect();
+                            projection.diagnostic_slice = state
+                                .diagnostic_slices
+                                .into_iter()
+                                .rev()
+                                .find(|slice| slice.source_task_id == task_id);
+                            projection.external_evaluations = state
+                                .external_evaluations
+                                .into_iter()
+                                .rev()
+                                .filter(|evaluation| evaluation.source_task_id == task_id)
+                                .take(16)
+                                .collect();
+                            let external_ids = projection
+                                .external_evaluations
+                                .iter()
+                                .map(|evaluation| evaluation.evaluation_id.as_str())
+                                .collect::<std::collections::HashSet<_>>();
+                            projection.causal_comparisons =
+                                state
+                                    .causal_comparisons
+                                    .into_iter()
+                                    .rev()
+                                    .filter(|comparison| {
+                                        comparison.baseline_evaluation_ref.as_deref().is_some_and(
+                                            |reference| external_ids.contains(reference),
+                                        ) || comparison
+                                            .candidate_evaluation_ref
+                                            .as_deref()
+                                            .is_some_and(|reference| {
+                                                external_ids.contains(reference)
+                                            })
+                                    })
+                                    .take(16)
+                                    .collect();
+                        }
+                        Ok(Err(error)) => mark_debug_projection_failure(
+                            &mut projection,
+                            "evaluation_projection",
+                            format!("evaluation_projection_read_failed:{error}"),
+                        ),
+                        Err(error) => mark_debug_projection_failure(
+                            &mut projection,
+                            "evaluation_projection",
+                            format!("evaluation_projection_task_failed:{error}"),
+                        ),
+                    }
                 }
                 serde_json::to_value(projection)?
             }
@@ -176,18 +244,21 @@ impl RuntimeHost {
                 serde_json::to_value(run_blocking(move || evolution_store.snapshot()).await??)?
             }
             RuntimeQueryKind::ProviderState => {
-                let provider = self.provider_config_paths.as_ref().map_or_else(
-                    ConfiguredProvider::redacted_from_env,
-                    |paths| {
-                        let environment =
-                            load_provider_runtime_env_from_paths(paths).map_err(|error| {
-                                ProviderError::NotConfigured {
-                                    message: error.to_string(),
-                                }
-                            })?;
-                        ConfiguredProvider::redacted_from_reader(|key| environment.get(key))
-                    },
-                );
+                let provider_config_paths = self.provider_config_paths.clone();
+                let provider =
+                    run_blocking(move || {
+                        provider_config_paths.as_ref().map_or_else(
+                            ConfiguredProvider::redacted_from_env,
+                            |paths| {
+                                let environment = load_provider_runtime_env_from_paths(paths)
+                                    .map_err(|error| ProviderError::NotConfigured {
+                                        message: error.to_string(),
+                                    })?;
+                                ConfiguredProvider::redacted_from_reader(|key| environment.get(key))
+                            },
+                        )
+                    })
+                    .await?;
                 let latest_runtime_fact = self
                     .storage
                     .repositories

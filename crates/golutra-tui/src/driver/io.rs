@@ -18,8 +18,8 @@ use tokio::{
 use uuid::Uuid;
 
 use super::{
-    DEFAULT_WAIT_MILLIS, MAX_DRIVER_LINE_BYTES, MAX_PENDING_WAITS, MAX_WAIT_MILLIS, TuiDriver,
-    bounded_error, driver_error_code,
+    DEFAULT_WAIT_MILLIS, DriverLaunchOptions, MAX_DRIVER_LINE_BYTES, MAX_PENDING_WAITS,
+    MAX_WAIT_MILLIS, TuiDriver, bounded_error, driver_error_code,
 };
 use crate::{Args, DriverArgs, InspectArgs};
 
@@ -32,12 +32,16 @@ pub(crate) async fn run_inspect_command(args: &Args, command: InspectArgs) -> mi
     let transport = driver_transport(args, command.embedded, &cwd).await?;
     let mut driver = TuiDriver::launch(
         transport,
-        command.session.as_deref().or(args.session_id.as_deref()),
-        args.task_id.as_deref(),
-        args.debug,
-        args.yolo,
-        command.width,
-        command.height,
+        DriverLaunchOptions {
+            session: command.session.as_deref().or(args.session_id.as_deref()),
+            task_id: args.task_id.as_deref(),
+            debug: args.debug,
+            yolo: args.yolo,
+            execution_mode: args.execution_mode,
+            tool_profile: args.tool_profile,
+            width: command.width,
+            height: command.height,
+        },
     )
     .await?;
 
@@ -119,12 +123,16 @@ pub(crate) async fn run_driver_command(args: &Args, command: DriverArgs) -> miet
     let transport = driver_transport(args, command.embedded, &cwd).await?;
     let mut driver = TuiDriver::launch(
         transport,
-        command.session.as_deref().or(args.session_id.as_deref()),
-        args.task_id.as_deref(),
-        args.debug,
-        args.yolo,
-        command.width,
-        command.height,
+        DriverLaunchOptions {
+            session: command.session.as_deref().or(args.session_id.as_deref()),
+            task_id: args.task_id.as_deref(),
+            debug: args.debug,
+            yolo: args.yolo,
+            execution_mode: args.execution_mode,
+            tool_profile: args.tool_profile,
+            width: command.width,
+            height: command.height,
+        },
     )
     .await?;
 

@@ -279,6 +279,9 @@ pub(crate) fn completion_criteria_from_payload(payload: &Value) -> Vec<String> {
 }
 
 pub(crate) fn task_contract_from_payload(payload: &Value) -> Result<TaskContract, ClientError> {
+    let execution_mode = crate::task_mode::execution_mode_from_payload(payload)
+        .map_err(|error| ClientError::TaskExecution(error.to_owned()))?;
+    let explicit_contract = crate::task_mode::explicit_task_contract(payload);
     let mut contract: TaskContract = payload
         .get("task_contract")
         .filter(|value| !value.is_null())
@@ -298,6 +301,11 @@ pub(crate) fn task_contract_from_payload(payload: &Value) -> Result<TaskContract
         contract.verification = VerificationRequirement::Independent;
         contract.require_objective_validation = true;
     }
+    crate::task_mode::apply_execution_mode_contract(
+        execution_mode,
+        explicit_contract,
+        &mut contract,
+    );
     contract.validate().map_err(ClientError::TaskExecution)?;
     Ok(contract)
 }

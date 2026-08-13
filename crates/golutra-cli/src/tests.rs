@@ -15,6 +15,18 @@ fn separate_cli_commands_use_the_same_controller_identity() {
 }
 
 #[test]
+fn chat_uses_the_model_owned_coding_defaults() {
+    assert_eq!(
+        chat_prompt_payload("inspect the workspace".to_owned()),
+        serde_json::json!({
+            "prompt": "inspect the workspace",
+            "execution_mode": "open",
+            "tool_profile": "coding",
+        })
+    );
+}
+
+#[test]
 fn run_directory_implies_ephemeral_exec_and_keeps_legacy_alias() {
     let cli = Cli::try_parse_from([
         "golutra",

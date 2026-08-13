@@ -2,7 +2,7 @@ use chrono::Utc;
 use golutra_core::{
     Actor, ActorKind, ArtifactId, BusyPolicy, CommandId, EvidenceId, EvidenceStrength, LaneId,
     PostTaskJob, PostTaskJobId, PostTaskJobKind, PostTaskJobStatus, RedactionStatus, RuntimeLane,
-    TaskId, TaskStatus, ToolCallId, TurnId, WorkspaceId,
+    TaskId, TaskStatus, ToolCallId, ToolResultStatus, TurnId, WorkspaceId,
 };
 use golutra_protocol::{ArtifactReadRequest, RuntimeEventSource, RuntimeEventType};
 use serde_json::json;
@@ -2170,4 +2170,963 @@ async fn artifact_range_reads_are_bounded_and_full_reads_verify_checksums() {
         .await
         .expect_err("checksum mismatch");
     assert!(error.to_string().contains("checksum"));
+}
+
+fn tool_completion_artifact(
+    artifact_id: ArtifactId,
+    session_id: SessionId,
+    event_id: EventId,
+    bytes: &[u8],
+    label: &str,
+) -> ArtifactRecord {
+    ArtifactRecord {
+        artifact_id,
+        session_id,
+        turn_id: Some(TurnId::new()),
+        tool_call_id: Some(ToolCallId::new()),
+        artifact_type: "tool_result".to_owned(),
+        uri: format!("artifact://fixture/{label}"),
+        checksum: artifact_checksum(bytes),
+        size_bytes: u64::try_from(bytes.len()).expect("fixture size"),
+        created_at: Utc::now(),
+        producer: "test".to_owned(),
+        redaction_status: RedactionStatus::NotRequired,
+        retention_policy: "test".to_owned(),
+        provenance_refs: vec![event_id],
+    }
+}
+
+fn tool_completed_event(
+    event_id: EventId,
+    session_id: SessionId,
+    artifact_id: ArtifactId,
+    evidence_id: EvidenceId,
+) -> RuntimeEvent {
+    RuntimeEvent {
+        schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+        causal_context: Default::default(),
+        causal_links: Vec::new(),
+        id: event_id,
+        sequence_no: 0,
+        session_id,
+        turn_id: Some(TurnId::new()),
+        task_id: Some(TaskId::new()),
+        parent_event_id: None,
+        event_type: RuntimeEventType::ToolCompleted,
+        timestamp: Utc::now(),
+        source: RuntimeEventSource::Tool,
+        payload: json!({
+            "summary": "tool completed",
+            "envelope": ToolResultEnvelope {
+                tool_call_id: ToolCallId::new(),
+                tool_name: "shell".to_owned(),
+                status: ToolResultStatus::Ok,
+                summary: "tool completed".to_owned(),
+                structured_facts: json!({"exit_code": 0}),
+                model_visible_excerpt: Some("ok".to_owned()),
+                raw_artifact_ref: Some(artifact_id),
+                evidence_refs: vec![evidence_id],
+                risk: "low".to_owned(),
+                verification_hint: None,
+            },
+        }),
+        payload_ref: Some(artifact_id),
+        durable: true,
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn tool_completed_bundle_atomically_commits_facts_and_deduplicates_blobs() {
+    use std::os::unix::fs::MetadataExt;
+
+    let store = RuntimeStore::in_memory().await.expect("store");
+    let session_id = SessionId::new();
+    let event_id = EventId::new();
+    let evidence_id = EvidenceId::new();
+    let first_id = ArtifactId::new();
+    let second_id = ArtifactId::new();
+    let bytes = b"shared tool completion output";
+    let first = tool_completion_artifact(first_id, session_id, event_id, bytes, "first");
+    let second = tool_completion_artifact(second_id, session_id, event_id, bytes, "second");
+    let evidence = EvidenceRecord {
+        evidence_id,
+        claim: "tool output was captured".to_owned(),
+        artifact_refs: vec![first_id, second_id],
+        source_event_refs: vec![event_id],
+        evidence_strength: EvidenceStrength::Strong,
+        verifier: "test".to_owned(),
+        confidence: 1.0,
+        limitations: "fixture".to_owned(),
+    };
+
+    let committed = store
+        .repositories()
+        .events
+        .append_tool_completed_bundle(
+            tool_completed_event(event_id, session_id, first_id, evidence_id),
+            &[
+                (first.clone(), bytes.to_vec()),
+                (second.clone(), bytes.to_vec()),
+            ],
+            std::slice::from_ref(&evidence),
+        )
+        .await
+        .expect("atomic bundle");
+
+    assert_eq!(committed.sequence_no, 1);
+    assert_eq!(
+        store.load_artifact(first_id).await.expect("first"),
+        Some(first)
+    );
+    assert_eq!(
+        store.load_artifact(second_id).await.expect("second"),
+        Some(second)
+    );
+    assert_eq!(
+        store
+            .load_evidence_by_ids(&HashSet::from([evidence_id]))
+            .await
+            .expect("evidence"),
+        vec![evidence]
+    );
+    assert_eq!(
+        store
+            .load_events(session_id, None, None)
+            .await
+            .expect("events"),
+        vec![committed]
+    );
+    let projection = store
+        .query_state(session_id, None)
+        .await
+        .expect("projection");
+    assert_eq!(projection.last_sequence_no, 1);
+    let first_metadata = std::fs::metadata(store.artifact_blob_path(first_id)).expect("first blob");
+    let second_metadata =
+        std::fs::metadata(store.artifact_blob_path(second_id)).expect("second blob");
+    assert_eq!(first_metadata.ino(), second_metadata.ino());
+}
+
+#[tokio::test]
+async fn tool_completed_bundle_rolls_back_database_facts_and_unique_blob_on_event_conflict() {
+    let store = RuntimeStore::in_memory().await.expect("store");
+    let conflicting_event_id = EventId::new();
+    let existing_session_id = SessionId::new();
+    store
+        .append_event_assigning_sequence(RuntimeEvent {
+            schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+            causal_context: Default::default(),
+            causal_links: Vec::new(),
+            id: conflicting_event_id,
+            sequence_no: 0,
+            session_id: existing_session_id,
+            turn_id: None,
+            task_id: None,
+            parent_event_id: None,
+            event_type: RuntimeEventType::ToolStarted,
+            timestamp: Utc::now(),
+            source: RuntimeEventSource::Tool,
+            payload: json!({"summary": "existing event"}),
+            payload_ref: None,
+            durable: true,
+        })
+        .await
+        .expect("conflicting event");
+
+    let session_id = SessionId::new();
+    let artifact_id = ArtifactId::new();
+    let evidence_id = EvidenceId::new();
+    let bytes = b"unique rollback output";
+    let artifact = tool_completion_artifact(
+        artifact_id,
+        session_id,
+        conflicting_event_id,
+        bytes,
+        "rollback",
+    );
+    let evidence = EvidenceRecord {
+        evidence_id,
+        claim: "must roll back".to_owned(),
+        artifact_refs: vec![artifact_id],
+        source_event_refs: vec![conflicting_event_id],
+        evidence_strength: EvidenceStrength::Strong,
+        verifier: "test".to_owned(),
+        confidence: 1.0,
+        limitations: "fixture".to_owned(),
+    };
+
+    store
+        .append_tool_completed_bundle(
+            tool_completed_event(conflicting_event_id, session_id, artifact_id, evidence_id),
+            &[(artifact, bytes.to_vec())],
+            &[evidence],
+        )
+        .await
+        .expect_err("event primary key conflict must roll back bundle");
+
+    assert_eq!(
+        store.load_artifact(artifact_id).await.expect("metadata"),
+        None
+    );
+    assert!(
+        store
+            .load_evidence_by_ids(&HashSet::from([evidence_id]))
+            .await
+            .expect("evidence")
+            .is_empty()
+    );
+    assert!(
+        store
+            .load_events(session_id, None, None)
+            .await
+            .expect("target events")
+            .is_empty()
+    );
+    assert!(!store.artifact_blob_path(artifact_id).exists());
+    assert_eq!(store.max_sequence_no().await.expect("sequence"), 1);
+}
+
+#[tokio::test]
+async fn tool_completed_bundle_compensates_final_link_when_temporary_cleanup_fails() {
+    let store = RuntimeStore::in_memory().await.expect("store");
+    let session_id = SessionId::new();
+    let event_id = EventId::new();
+    let artifact_id = ArtifactId::new();
+    let evidence_id = EvidenceId::new();
+    let bytes = b"cleanup failure output";
+    let artifact =
+        tool_completion_artifact(artifact_id, session_id, event_id, bytes, "cleanup-failure");
+    let evidence = EvidenceRecord {
+        evidence_id,
+        claim: "must not survive prewrite failure".to_owned(),
+        artifact_refs: vec![artifact_id],
+        source_event_refs: vec![event_id],
+        evidence_strength: EvidenceStrength::Strong,
+        verifier: "test".to_owned(),
+        confidence: 1.0,
+        limitations: "fixture".to_owned(),
+    };
+    inject_temporary_cleanup_failure(artifact_id);
+
+    let error = store
+        .append_tool_completed_bundle(
+            tool_completed_event(event_id, session_id, artifact_id, evidence_id),
+            &[(artifact, bytes.to_vec())],
+            &[evidence],
+        )
+        .await
+        .expect_err("temporary cleanup failure must abort the bundle");
+
+    assert!(
+        error
+            .to_string()
+            .contains("injected temporary cleanup failure")
+    );
+    assert!(!store.artifact_blob_path(artifact_id).exists());
+    assert_eq!(
+        store.load_artifact(artifact_id).await.expect("metadata"),
+        None
+    );
+    assert!(
+        store
+            .load_evidence_by_ids(&HashSet::from([evidence_id]))
+            .await
+            .expect("evidence")
+            .is_empty()
+    );
+    assert!(
+        store
+            .load_events(session_id, None, None)
+            .await
+            .expect("events")
+            .is_empty()
+    );
+    assert_eq!(store.max_sequence_no().await.expect("sequence"), 0);
+    let temporary = std::fs::read_dir(&store.artifact_root)
+        .expect("artifact directory")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("artifact entries")
+        .into_iter()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(".tmp-"))
+        })
+        .expect("failed cleanup leaves its temporary file for maintenance");
+    let old = std::time::SystemTime::now()
+        .checked_sub(Duration::from_secs(
+            TEMPORARY_ARTIFACT_RETENTION_HOURS * 60 * 60 + 1,
+        ))
+        .expect("old timestamp");
+    std::fs::File::open(&temporary)
+        .expect("temporary file")
+        .set_times(std::fs::FileTimes::new().set_modified(old))
+        .expect("age temporary file");
+
+    let report = store
+        .run_artifact_maintenance(Utc::now())
+        .await
+        .expect("maintenance");
+    assert_eq!(report.temporary_artifacts_removed, 1);
+    assert!(!temporary.exists());
+}
+
+#[tokio::test]
+async fn concurrent_bundle_rollback_cannot_remove_a_committed_blob() {
+    let directory = tempdir().expect("directory");
+    let database_url = format!(
+        "sqlite://{}",
+        directory.path().join("runtime.sqlite").display()
+    );
+    let artifact_root = directory.path().join("artifacts");
+    let first = RuntimeStore::connect_with_artifact_root(&database_url, &artifact_root)
+        .await
+        .expect("first store");
+    let second = RuntimeStore::connect_with_artifact_root(&database_url, &artifact_root)
+        .await
+        .expect("second store");
+    let conflicting_event_id = EventId::new();
+    first
+        .append_event_assigning_sequence(RuntimeEvent {
+            schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+            causal_context: Default::default(),
+            causal_links: Vec::new(),
+            id: conflicting_event_id,
+            sequence_no: 0,
+            session_id: SessionId::new(),
+            turn_id: None,
+            task_id: None,
+            parent_event_id: None,
+            event_type: RuntimeEventType::ToolStarted,
+            timestamp: Utc::now(),
+            source: RuntimeEventSource::Tool,
+            payload: json!({"summary": "conflicting event"}),
+            payload_ref: None,
+            durable: true,
+        })
+        .await
+        .expect("conflicting event");
+
+    let session_id = SessionId::new();
+    let success_event_id = EventId::new();
+    let artifact_id = ArtifactId::new();
+    let bytes = b"concurrent immutable output";
+    let artifact = tool_completion_artifact(
+        artifact_id,
+        session_id,
+        success_event_id,
+        bytes,
+        "concurrent",
+    );
+    let success_evidence_id = EvidenceId::new();
+    let failed_evidence_id = EvidenceId::new();
+    let evidence = |evidence_id, event_id| EvidenceRecord {
+        evidence_id,
+        claim: "concurrent bundle output".to_owned(),
+        artifact_refs: vec![artifact_id],
+        source_event_refs: vec![event_id],
+        evidence_strength: EvidenceStrength::Strong,
+        verifier: "test".to_owned(),
+        confidence: 1.0,
+        limitations: "fixture".to_owned(),
+    };
+    let failed_artifacts = [(artifact.clone(), bytes.to_vec())];
+    let committed_artifacts = [(artifact.clone(), bytes.to_vec())];
+    let failed_evidence = [evidence(failed_evidence_id, conflicting_event_id)];
+    let committed_evidence = [evidence(success_evidence_id, success_event_id)];
+
+    let (failed, committed) = tokio::join!(
+        first.append_tool_completed_bundle(
+            tool_completed_event(
+                conflicting_event_id,
+                session_id,
+                artifact_id,
+                failed_evidence_id,
+            ),
+            &failed_artifacts,
+            &failed_evidence,
+        ),
+        second.append_tool_completed_bundle(
+            tool_completed_event(
+                success_event_id,
+                session_id,
+                artifact_id,
+                success_evidence_id,
+            ),
+            &committed_artifacts,
+            &committed_evidence,
+        ),
+    );
+
+    failed.expect_err("conflicting bundle must roll back");
+    committed.expect("other bundle commits");
+    assert_eq!(
+        first
+            .load_artifact_bytes(artifact_id)
+            .await
+            .expect("committed blob"),
+        Some(bytes.to_vec())
+    );
+    assert_eq!(
+        first.load_artifact(artifact_id).await.expect("metadata"),
+        Some(artifact)
+    );
+}
+
+#[tokio::test]
+async fn failed_tombstone_retry_removes_the_recreated_blob() {
+    let store = RuntimeStore::in_memory().await.expect("store");
+    let session_id = SessionId::new();
+    let artifact_id = ArtifactId::new();
+    let event_id = EventId::new();
+    let bytes = b"expired output retried";
+    let mut artifact =
+        tool_completion_artifact(artifact_id, session_id, event_id, bytes, "tombstone");
+    artifact.created_at = Utc::now() - chrono::Duration::days(31);
+    artifact.retention_policy = "debug_default".to_owned();
+    store
+        .store_artifact(&artifact, bytes)
+        .await
+        .expect("initial artifact");
+    store
+        .run_artifact_maintenance(Utc::now())
+        .await
+        .expect("expire artifact");
+    assert!(!store.artifact_blob_path(artifact_id).exists());
+
+    store
+        .append_event_assigning_sequence(RuntimeEvent {
+            schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+            causal_context: Default::default(),
+            causal_links: Vec::new(),
+            id: event_id,
+            sequence_no: 0,
+            session_id: SessionId::new(),
+            turn_id: None,
+            task_id: None,
+            parent_event_id: None,
+            event_type: RuntimeEventType::ToolStarted,
+            timestamp: Utc::now(),
+            source: RuntimeEventSource::Tool,
+            payload: json!({"summary": "event collision"}),
+            payload_ref: None,
+            durable: true,
+        })
+        .await
+        .expect("conflicting event");
+    let evidence_id = EvidenceId::new();
+    let evidence = EvidenceRecord {
+        evidence_id,
+        claim: "retry must roll back".to_owned(),
+        artifact_refs: vec![artifact_id],
+        source_event_refs: vec![event_id],
+        evidence_strength: EvidenceStrength::Strong,
+        verifier: "test".to_owned(),
+        confidence: 1.0,
+        limitations: "fixture".to_owned(),
+    };
+
+    store
+        .append_tool_completed_bundle(
+            tool_completed_event(event_id, session_id, artifact_id, evidence_id),
+            &[(artifact, bytes.to_vec())],
+            &[evidence],
+        )
+        .await
+        .expect_err("event collision rolls back retry");
+
+    assert!(!store.artifact_blob_path(artifact_id).exists());
+    let tombstoned: Option<String> =
+        sqlx::query_scalar("SELECT blob_deleted_at FROM artifact_records WHERE artifact_id = ?")
+            .bind(artifact_id.to_string())
+            .fetch_one(&store.pool)
+            .await
+            .expect("tombstone state");
+    assert!(tombstoned.is_some());
+}
+
+#[tokio::test]
+async fn maintenance_removes_final_blobs_without_live_metadata() {
+    let store = RuntimeStore::in_memory().await.expect("store");
+    tokio::fs::create_dir_all(&store.artifact_root)
+        .await
+        .expect("artifact root");
+    let orphan_id = ArtifactId::new();
+    let orphan_path = store.artifact_blob_path(orphan_id);
+    tokio::fs::write(&orphan_path, b"cancelled precommit")
+        .await
+        .expect("orphan blob");
+
+    let report = store
+        .run_artifact_maintenance(Utc::now())
+        .await
+        .expect("maintenance");
+
+    assert_eq!(report.artifact_blobs_removed, 1);
+    assert!(!orphan_path.exists());
+}
+
+#[tokio::test]
+async fn tool_completed_bundle_accepts_an_empty_tool_output_artifact() {
+    let store = RuntimeStore::in_memory().await.expect("store");
+    let session_id = SessionId::new();
+    let event_id = EventId::new();
+    let artifact_id = ArtifactId::new();
+    let evidence_id = EvidenceId::new();
+    let bytes = b"";
+    let artifact =
+        tool_completion_artifact(artifact_id, session_id, event_id, bytes, "empty-output");
+    let evidence = EvidenceRecord {
+        evidence_id,
+        claim: "empty output is still an observed result".to_owned(),
+        artifact_refs: vec![artifact_id],
+        source_event_refs: vec![event_id],
+        evidence_strength: EvidenceStrength::Medium,
+        verifier: "test".to_owned(),
+        confidence: 1.0,
+        limitations: "fixture".to_owned(),
+    };
+
+    let committed = store
+        .append_tool_completed_bundle(
+            tool_completed_event(event_id, session_id, artifact_id, evidence_id),
+            &[(artifact.clone(), bytes.to_vec())],
+            std::slice::from_ref(&evidence),
+        )
+        .await
+        .expect("empty artifact bundle");
+
+    assert_eq!(committed.sequence_no, 1);
+    assert_eq!(
+        store.load_artifact(artifact_id).await.expect("metadata"),
+        Some(artifact)
+    );
+    assert_eq!(
+        store
+            .load_artifact_bytes(artifact_id)
+            .await
+            .expect("artifact bytes"),
+        Some(Vec::new())
+    );
+    assert_eq!(
+        store
+            .load_evidence_by_ids(&HashSet::from([evidence_id]))
+            .await
+            .expect("evidence"),
+        vec![evidence]
+    );
+}
+
+#[tokio::test]
+async fn cancelled_bundle_callers_leave_commit_and_compensation_running() {
+    let store = RuntimeStore::in_memory().await.expect("store");
+
+    let committed_session_id = SessionId::new();
+    let committed_event_id = EventId::new();
+    let committed_artifact_id = ArtifactId::new();
+    let committed_evidence_id = EvidenceId::new();
+    let committed_bytes = b"commit survives caller cancellation";
+    let committed_artifact = tool_completion_artifact(
+        committed_artifact_id,
+        committed_session_id,
+        committed_event_id,
+        committed_bytes,
+        "cancelled-commit",
+    );
+    let committed_evidence = EvidenceRecord {
+        evidence_id: committed_evidence_id,
+        claim: "cancelled caller still commits".to_owned(),
+        artifact_refs: vec![committed_artifact_id],
+        source_event_refs: vec![committed_event_id],
+        evidence_strength: EvidenceStrength::Strong,
+        verifier: "test".to_owned(),
+        confidence: 1.0,
+        limitations: "fixture".to_owned(),
+    };
+    let pause = install_store_test_pause(
+        &store.database_identity,
+        StoreTestPausePoint::BundleAfterBlobPublication,
+    );
+    let operation = {
+        let store = store.clone();
+        let artifact = committed_artifact.clone();
+        let evidence = committed_evidence.clone();
+        tokio::spawn(async move {
+            store
+                .append_tool_completed_bundle(
+                    tool_completed_event(
+                        committed_event_id,
+                        committed_session_id,
+                        committed_artifact_id,
+                        committed_evidence_id,
+                    ),
+                    &[(artifact, committed_bytes.to_vec())],
+                    &[evidence],
+                )
+                .await
+        })
+    };
+    pause.reached.notified().await;
+    assert!(store.artifact_blob_path(committed_artifact_id).exists());
+    operation.abort();
+    assert!(
+        operation
+            .await
+            .expect_err("caller cancelled")
+            .is_cancelled()
+    );
+    pause.release.notify_one();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if store
+                .load_artifact(committed_artifact_id)
+                .await
+                .expect("committed metadata")
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached commit completes");
+    assert_eq!(
+        store
+            .load_artifact_bytes(committed_artifact_id)
+            .await
+            .expect("committed bytes"),
+        Some(committed_bytes.to_vec())
+    );
+
+    let conflicting_event_id = EventId::new();
+    store
+        .append_event_assigning_sequence(RuntimeEvent {
+            schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+            causal_context: Default::default(),
+            causal_links: Vec::new(),
+            id: conflicting_event_id,
+            sequence_no: 0,
+            session_id: SessionId::new(),
+            turn_id: None,
+            task_id: None,
+            parent_event_id: None,
+            event_type: RuntimeEventType::ToolStarted,
+            timestamp: Utc::now(),
+            source: RuntimeEventSource::Tool,
+            payload: json!({"summary": "conflicting event"}),
+            payload_ref: None,
+            durable: true,
+        })
+        .await
+        .expect("conflicting event");
+    let failed_session_id = SessionId::new();
+    let failed_artifact_id = ArtifactId::new();
+    let failed_evidence_id = EvidenceId::new();
+    let failed_bytes = b"compensation survives caller cancellation";
+    let failed_artifact = tool_completion_artifact(
+        failed_artifact_id,
+        failed_session_id,
+        conflicting_event_id,
+        failed_bytes,
+        "cancelled-compensation",
+    );
+    let failed_evidence = EvidenceRecord {
+        evidence_id: failed_evidence_id,
+        claim: "cancelled caller still compensates".to_owned(),
+        artifact_refs: vec![failed_artifact_id],
+        source_event_refs: vec![conflicting_event_id],
+        evidence_strength: EvidenceStrength::Strong,
+        verifier: "test".to_owned(),
+        confidence: 1.0,
+        limitations: "fixture".to_owned(),
+    };
+    let pause = install_store_test_pause(
+        &store.database_identity,
+        StoreTestPausePoint::BundleAfterBlobPublication,
+    );
+    let operation = {
+        let store = store.clone();
+        tokio::spawn(async move {
+            store
+                .append_tool_completed_bundle(
+                    tool_completed_event(
+                        conflicting_event_id,
+                        failed_session_id,
+                        failed_artifact_id,
+                        failed_evidence_id,
+                    ),
+                    &[(failed_artifact, failed_bytes.to_vec())],
+                    &[failed_evidence],
+                )
+                .await
+        })
+    };
+    pause.reached.notified().await;
+    assert!(store.artifact_blob_path(failed_artifact_id).exists());
+    operation.abort();
+    assert!(
+        operation
+            .await
+            .expect_err("caller cancelled")
+            .is_cancelled()
+    );
+    pause.release.notify_one();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while store.artifact_blob_path(failed_artifact_id).exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached compensation completes");
+    assert_eq!(
+        store
+            .load_artifact(failed_artifact_id)
+            .await
+            .expect("rolled back metadata"),
+        None
+    );
+    assert!(
+        store
+            .load_evidence_by_ids(&HashSet::from([failed_evidence_id]))
+            .await
+            .expect("rolled back evidence")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn cancelled_store_artifact_caller_leaves_the_commit_running() {
+    let store = RuntimeStore::in_memory().await.expect("store");
+    let bytes = b"standalone artifact commit survives cancellation";
+    let artifact = tool_completion_artifact(
+        ArtifactId::new(),
+        SessionId::new(),
+        EventId::new(),
+        bytes,
+        "cancelled-store-artifact",
+    );
+    let pause = install_store_test_pause(
+        &store.database_identity,
+        StoreTestPausePoint::ArtifactAfterBlobPublication,
+    );
+    let operation = {
+        let store = store.clone();
+        let artifact = artifact.clone();
+        tokio::spawn(async move { store.store_artifact(&artifact, bytes).await })
+    };
+    pause.reached.notified().await;
+    assert!(store.artifact_blob_path(artifact.artifact_id).exists());
+    operation.abort();
+    assert!(
+        operation
+            .await
+            .expect_err("caller cancelled")
+            .is_cancelled()
+    );
+    pause.release.notify_one();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if store
+                .load_artifact(artifact.artifact_id)
+                .await
+                .expect("metadata")
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached artifact commit completes");
+    assert_eq!(
+        store
+            .load_artifact_bytes(artifact.artifact_id)
+            .await
+            .expect("bytes"),
+        Some(bytes.to_vec())
+    );
+}
+
+#[tokio::test]
+async fn cancelled_maintenance_finishes_deleting_a_durable_tombstone() {
+    let store = RuntimeStore::in_memory().await.expect("store");
+    let bytes = b"expired cancellation fixture";
+    let mut artifact = tool_completion_artifact(
+        ArtifactId::new(),
+        SessionId::new(),
+        EventId::new(),
+        bytes,
+        "cancelled-maintenance",
+    );
+    artifact.created_at = Utc::now() - chrono::Duration::days(31);
+    artifact.retention_policy = "debug_default".to_owned();
+    store
+        .store_artifact(&artifact, bytes)
+        .await
+        .expect("artifact");
+
+    let pause = install_store_test_pause(
+        &store.database_identity,
+        StoreTestPausePoint::MaintenanceAfterTombstone,
+    );
+    let operation = {
+        let store = store.clone();
+        tokio::spawn(async move { store.run_artifact_maintenance(Utc::now()).await })
+    };
+    pause.reached.notified().await;
+    let tombstone: Option<String> =
+        sqlx::query_scalar("SELECT blob_deleted_at FROM artifact_records WHERE artifact_id = ?")
+            .bind(artifact.artifact_id.to_string())
+            .fetch_one(&store.pool)
+            .await
+            .expect("durable tombstone");
+    assert!(tombstone.is_some());
+    assert!(store.artifact_blob_path(artifact.artifact_id).exists());
+    operation.abort();
+    assert!(
+        operation
+            .await
+            .expect_err("caller cancelled")
+            .is_cancelled()
+    );
+    pause.release.notify_one();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while store.artifact_blob_path(artifact.artifact_id).exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached maintenance completes");
+}
+
+#[tokio::test]
+async fn evidence_and_maintenance_share_the_artifact_lock() {
+    let store = RuntimeStore::in_memory().await.expect("store");
+    let bytes = b"protected during maintenance race";
+    let mut artifact = tool_completion_artifact(
+        ArtifactId::new(),
+        SessionId::new(),
+        EventId::new(),
+        bytes,
+        "evidence-race",
+    );
+    artifact.created_at = Utc::now() - chrono::Duration::days(31);
+    artifact.retention_policy = "debug_default".to_owned();
+    store
+        .store_artifact(&artifact, bytes)
+        .await
+        .expect("artifact");
+    let evidence = EvidenceRecord {
+        evidence_id: EvidenceId::new(),
+        claim: "artifact becomes protected before maintenance snapshots evidence".to_owned(),
+        artifact_refs: vec![artifact.artifact_id],
+        source_event_refs: Vec::new(),
+        evidence_strength: EvidenceStrength::Strong,
+        verifier: "test".to_owned(),
+        confidence: 1.0,
+        limitations: "fixture".to_owned(),
+    };
+
+    let pause = install_store_test_pause(
+        &store.database_identity,
+        StoreTestPausePoint::EvidenceAfterLock,
+    );
+    let evidence_operation = {
+        let store = store.clone();
+        let evidence = evidence.clone();
+        tokio::spawn(async move { store.store_evidence(&evidence).await })
+    };
+    pause.reached.notified().await;
+    let maintenance_operation = {
+        let store = store.clone();
+        tokio::spawn(async move { store.run_artifact_maintenance(Utc::now()).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!maintenance_operation.is_finished());
+    pause.release.notify_one();
+    evidence_operation
+        .await
+        .expect("evidence caller")
+        .expect("evidence commit");
+    let report = maintenance_operation
+        .await
+        .expect("maintenance caller")
+        .expect("maintenance");
+
+    assert_eq!(report.artifact_blobs_removed, 0);
+    assert_eq!(report.protected_artifacts_skipped, 1);
+    assert_eq!(
+        store
+            .load_artifact_bytes(artifact.artifact_id)
+            .await
+            .expect("protected blob"),
+        Some(bytes.to_vec())
+    );
+}
+
+#[tokio::test]
+async fn artifact_root_is_bound_to_one_logical_database() {
+    let directory = tempdir().expect("directory");
+    let artifact_root = directory.path().join("shared-artifacts");
+    let first_database_url = format!(
+        "sqlite://{}",
+        directory.path().join("first.sqlite").display()
+    );
+    let second_database_url = format!(
+        "sqlite://{}",
+        directory.path().join("second.sqlite").display()
+    );
+
+    RuntimeStore::connect_with_artifact_root(&first_database_url, &artifact_root)
+        .await
+        .expect("first database claims root");
+    RuntimeStore::connect_with_artifact_root(&first_database_url, &artifact_root)
+        .await
+        .expect("same database may reopen root");
+    let error = RuntimeStore::connect_with_artifact_root(&second_database_url, &artifact_root)
+        .await
+        .expect_err("different database must not share root");
+
+    assert!(error.to_string().contains("different runtime database"));
+    assert!(artifact_root.join(ARTIFACT_STORE_IDENTITY_FILE).is_file());
+}
+
+#[tokio::test]
+async fn maintenance_reclaims_a_blob_left_behind_after_a_durable_tombstone() {
+    let store = RuntimeStore::in_memory().await.expect("store");
+    let bytes = b"tombstoned residual";
+    let artifact = tool_completion_artifact(
+        ArtifactId::new(),
+        SessionId::new(),
+        EventId::new(),
+        bytes,
+        "tombstone-residual",
+    );
+    store
+        .store_artifact(&artifact, bytes)
+        .await
+        .expect("artifact");
+    sqlx::query("UPDATE artifact_records SET blob_deleted_at = ? WHERE artifact_id = ?")
+        .bind(Utc::now().to_rfc3339())
+        .bind(artifact.artifact_id.to_string())
+        .execute(&store.pool)
+        .await
+        .expect("simulate committed tombstone before process exit");
+    assert!(store.artifact_blob_path(artifact.artifact_id).exists());
+
+    let report = store
+        .run_artifact_maintenance(Utc::now())
+        .await
+        .expect("maintenance");
+
+    assert_eq!(report.artifact_blobs_removed, 1);
+    assert!(!store.artifact_blob_path(artifact.artifact_id).exists());
 }

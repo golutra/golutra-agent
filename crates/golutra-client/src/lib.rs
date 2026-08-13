@@ -35,17 +35,19 @@ use golutra_memory::{MemoryError, MemoryFeedbackKind, MemoryScope, MemoryStore};
 use golutra_plugin::PluginStore;
 use golutra_policy::{WorkspacePolicy, approval_resource_matches};
 use golutra_protocol::{
-    ArtifactChunk, ArtifactReadRequest, CommandAck, EventFilter, EventPage, EventPageDirection,
-    EventPageRequest, ExternalVerificationSpec, ProtocolVersionRange, RUNTIME_PROTOCOL_VERSION,
-    RuntimeEvent, RuntimeEventSource, RuntimeEventType, RuntimeQuery, RuntimeQueryKind,
-    SessionCommand, SessionCommandKind, StorageMaintenanceReport, StorageStats, TaskTracePage,
-    TaskTraceRequest,
+    AgentToolProfile, ArtifactChunk, ArtifactReadRequest, CommandAck, EventFilter, EventPage,
+    EventPageDirection, EventPageRequest, ExternalVerificationSpec, ProtocolVersionRange,
+    RUNTIME_PROTOCOL_VERSION, RuntimeEvent, RuntimeEventSource, RuntimeEventType, RuntimeQuery,
+    RuntimeQueryKind, SessionCommand, SessionCommandKind, StorageMaintenanceReport, StorageStats,
+    TaskTracePage, TaskTraceRequest,
 };
 use golutra_runtime::{
-    AgentExecutionControl, AgentExecutionHandle, AgentHarness, AgentLoopError, AgentLoopTraceEvent,
-    AgentRun, AgentTaskRequest, BeforeSideEffectRecorder, PendingAgentTurn, RuntimeLaneError,
+    AgentExecutionControl, AgentExecutionHandle, AgentGovernorUsage, AgentHarness, AgentLoopError,
+    AgentLoopTraceEvent, AgentTaskRequest, BeforeSideEffectRecorder, ConfiguredAgentRun,
+    ConfiguredPendingAgentTurn, PendingAgentTurn, PendingTurnExecutionOptions, RuntimeLaneError,
     RuntimeLaneManager, RuntimeObservation, RuntimeObservationSink, RuntimeVerificationService,
-    WorkspaceCheckpointManager, agent_execution_channel_with_cancellation, is_active_status,
+    WorkspaceCheckpointManager, agent_execution_channel_with_cancellation,
+    default_agent_max_elapsed_ms, is_active_status,
 };
 use golutra_store::{CommandClaim, RuntimeRepositories, RuntimeStore, StoreError, ThreadRecord};
 use golutra_tools::{
@@ -164,6 +166,7 @@ mod rollout;
 mod run_bundle;
 mod session;
 mod task_governance;
+mod task_mode;
 mod trace;
 mod trace_integrity;
 mod transport;
@@ -227,6 +230,11 @@ pub use run_bundle::{
     ObservationSessionManifest, ObservationTaskManifest, RawStateManifest, RunBundleExportRequest,
     RunBundleExporter, RunBundleFile, RunBundleManifest, RunBundlePath, RunBundleReceipt,
     RunBundleTerminalOutcome,
+};
+pub(crate) use task_mode::{
+    NormalizedExecutionMode, TOOL_PROFILE_KEY, execution_mode_from_payload, explicit_task_contract,
+    should_apply_legacy_adapter, strict_execution_requested, tool_profile_from_payload,
+    write_normalized_execution_mode,
 };
 pub use trace::merge_task_trace_page;
 #[cfg(unix)]
@@ -398,6 +406,7 @@ struct RuntimeHostExecutionState {
     provider_auth_waiters: Mutex<HashMap<SessionId, PendingProviderAuth>>,
     process_supervisor: ProcessSupervisor,
     workspace_change_tracker: Mutex<change_tracker::WorkspaceChangeTracker>,
+    rollout_projection_failures: Mutex<HashMap<SessionId, String>>,
 }
 
 #[derive(Debug)]
@@ -445,6 +454,821 @@ pub(crate) struct RecoveredPendingTurn {
     pub(crate) actor: Actor,
     pub(crate) payload: Value,
     pub(crate) pending: PendingAgentTurn,
+    pub(crate) execution: PendingTurnExecutionOptions,
+    continuation: Option<RecoveredTaskContinuation>,
+}
+
+const RECOVERED_PENDING_TURNS_KEY: &str = "recovered_pending_turns";
+const RECOVERY_CONTINUATION_KEY: &str = "recovery_continuation";
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct RecoveredTaskContinuation {
+    governor_usage: AgentGovernorUsage,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    accounted_cost_response_ids: Vec<String>,
+    delegation: Option<delegation_policy::TimedDelegationRecoveryState>,
+}
+
+#[derive(Debug, Default)]
+struct RecoveredGovernorFacts {
+    baseline: AgentGovernorUsage,
+    max_governor_iterations: u32,
+    max_governor_tool_calls: u32,
+    max_governor_failed_tool_calls: u32,
+    max_step_iteration: u32,
+    completed_tool_calls: u32,
+    completed_failed_tool_calls: u32,
+    consecutive_failed_tool_calls: u32,
+    provider_tool_call_ids: HashSet<String>,
+    completed_tool_call_ids: HashSet<String>,
+    estimated_cost_microusd: Option<u64>,
+    accounted_cost_response_ids: Vec<String>,
+    accounted_cost_response_id_set: HashSet<String>,
+}
+
+impl RecoveredGovernorFacts {
+    fn usage(&self) -> AgentGovernorUsage {
+        AgentGovernorUsage {
+            iterations: self
+                .baseline
+                .iterations
+                .max(self.max_governor_iterations)
+                .max(self.max_step_iteration),
+            tool_calls: self
+                .baseline
+                .tool_calls
+                .saturating_add(self.completed_tool_calls)
+                .max(self.max_governor_tool_calls),
+            failed_tool_calls: self
+                .baseline
+                .failed_tool_calls
+                .saturating_add(self.completed_failed_tool_calls)
+                .max(self.max_governor_failed_tool_calls),
+            consecutive_failed_tool_calls: self.consecutive_failed_tool_calls,
+            estimated_cost_microusd: self.estimated_cost_microusd,
+        }
+    }
+
+    fn merge_transfer(&mut self, transferred: &RecoveredTaskContinuation) {
+        let current = self.usage();
+        let incoming = transferred.governor_usage;
+        let baseline = AgentGovernorUsage {
+            iterations: current.iterations.max(incoming.iterations),
+            tool_calls: current.tool_calls.max(incoming.tool_calls),
+            failed_tool_calls: current.failed_tool_calls.max(incoming.failed_tool_calls),
+            // Unlike cumulative counters, a successful tool call legitimately
+            // resets this value. The later transfer is therefore authoritative.
+            consecutive_failed_tool_calls: incoming.consecutive_failed_tool_calls,
+            estimated_cost_microusd: match (
+                current.estimated_cost_microusd,
+                incoming.estimated_cost_microusd,
+            ) {
+                (Some(current), Some(incoming)) => Some(current.max(incoming)),
+                (Some(value), None) | (None, Some(value)) => Some(value),
+                (None, None) => None,
+            },
+        };
+        for response_id in &transferred.accounted_cost_response_ids {
+            if self
+                .accounted_cost_response_id_set
+                .insert(response_id.clone())
+            {
+                self.accounted_cost_response_ids.push(response_id.clone());
+            }
+        }
+        self.baseline = baseline;
+        self.max_governor_iterations = baseline.iterations;
+        self.max_governor_tool_calls = baseline.tool_calls;
+        self.max_governor_failed_tool_calls = baseline.failed_tool_calls;
+        self.max_step_iteration = baseline.iterations;
+        self.completed_tool_calls = 0;
+        self.completed_failed_tool_calls = 0;
+        self.consecutive_failed_tool_calls = baseline.consecutive_failed_tool_calls;
+        self.provider_tool_call_ids.clear();
+        self.completed_tool_call_ids.clear();
+        self.estimated_cost_microusd = baseline.estimated_cost_microusd;
+    }
+
+    fn observe_governor(&mut self, record: &Value) {
+        if let Some(value) = value_u32(record.get("iteration")) {
+            self.max_governor_iterations = self.max_governor_iterations.max(value);
+        }
+        if let Some(value) = value_u32(record.get("tool_calls")) {
+            self.max_governor_tool_calls = self.max_governor_tool_calls.max(value);
+        }
+        if let Some(value) = value_u32(record.get("failed_tool_calls")) {
+            self.max_governor_failed_tool_calls = self.max_governor_failed_tool_calls.max(value);
+        }
+        if let Some(value) = value_u32(record.get("consecutive_failed_tool_calls")) {
+            self.consecutive_failed_tool_calls = value;
+        }
+    }
+
+    fn observe_step_started(&mut self, event: &RuntimeEvent) -> bool {
+        let Some(step_no) = value_u32(event.payload.pointer("/step/step_no")) else {
+            return false;
+        };
+        self.max_step_iteration = self.max_step_iteration.max(
+            self.baseline
+                .iterations
+                .saturating_add(step_no)
+                .saturating_add(1),
+        );
+        true
+    }
+
+    fn observe_tool_started(&mut self, event: &RuntimeEvent) {
+        if event
+            .payload
+            .get("provider_tool_call_id")
+            .is_some_and(|value| !value.is_null())
+            && let Some(tool_call_id) = event.payload.get("tool_call_id").and_then(Value::as_str)
+        {
+            self.provider_tool_call_ids.insert(tool_call_id.to_owned());
+        }
+    }
+
+    fn observe_tool_completed(&mut self, event: &RuntimeEvent) -> bool {
+        let Some(tool_call_id) = event
+            .payload
+            .pointer("/envelope/tool_call_id")
+            .and_then(Value::as_str)
+        else {
+            return false;
+        };
+        let Some(status) = event
+            .payload
+            .pointer("/envelope/status")
+            .and_then(Value::as_str)
+        else {
+            return false;
+        };
+        if !self.provider_tool_call_ids.contains(tool_call_id) {
+            return false;
+        }
+        if !self.completed_tool_call_ids.insert(tool_call_id.to_owned()) {
+            return false;
+        }
+
+        self.completed_tool_calls = self.completed_tool_calls.saturating_add(1);
+        if status == "ok" {
+            self.consecutive_failed_tool_calls = 0;
+        } else {
+            self.completed_failed_tool_calls = self.completed_failed_tool_calls.saturating_add(1);
+            self.consecutive_failed_tool_calls =
+                self.consecutive_failed_tool_calls.saturating_add(1);
+        }
+        true
+    }
+
+    fn observe_token_usage(&mut self, record: TokenUsageRecord) -> bool {
+        let Some(cost) = record.estimated_cost.and_then(cost_to_microusd) else {
+            return false;
+        };
+        let response_id = record.response_event_id.to_string();
+        if !self
+            .accounted_cost_response_id_set
+            .insert(response_id.clone())
+        {
+            return false;
+        }
+        self.accounted_cost_response_ids.push(response_id);
+        self.estimated_cost_microusd = Some(
+            self.estimated_cost_microusd
+                .unwrap_or_default()
+                .saturating_add(cost),
+        );
+        true
+    }
+}
+
+pub(crate) enum DelegationContextSeed {
+    Live(delegation_policy::DelegationContext),
+    Recovered(delegation_policy::TimedDelegationRecoveryState),
+}
+
+#[derive(Debug, Clone)]
+struct RecoveredActiveTurnSurface {
+    payload: Value,
+    budget_turn_id: Option<TurnId>,
+    budget_started_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+fn is_pending_transfer_event(event: &RuntimeEvent) -> bool {
+    event.event_type == RuntimeEventType::TurnQueued
+        && event.turn_id.is_none()
+        && (event
+            .payload
+            .get("recovered_pending_sequence_nos")
+            .is_some()
+            || event.payload.get(RECOVERED_PENDING_TURNS_KEY).is_some())
+}
+
+fn inline_recovered_pending_event(
+    source: &RuntimeEvent,
+    entry: &Value,
+) -> Result<RuntimeEvent, ClientError> {
+    let turn_id = entry
+        .get("turn_id")
+        .cloned()
+        .ok_or_else(|| {
+            ClientError::TaskExecution("recovery transfer entry is missing turn_id".to_owned())
+        })
+        .and_then(|value| {
+            serde_json::from_value(value).map_err(|error| {
+                ClientError::TaskExecution(format!(
+                    "recovery transfer entry has an invalid turn_id: {error}"
+                ))
+            })
+        })?;
+    let payload = entry.get("payload").cloned().ok_or_else(|| {
+        ClientError::TaskExecution(format!(
+            "recovery transfer entry for turn {turn_id} is missing payload"
+        ))
+    })?;
+    let command_id = entry
+        .get("command_id")
+        .cloned()
+        .unwrap_or_else(|| Value::String(CommandId::default().to_string()));
+    let actor = entry
+        .get("actor")
+        .cloned()
+        .or_else(|| {
+            source
+                .payload
+                .get("runtime_lane")
+                .and_then(|lane| lane.get("active_controller"))
+                .cloned()
+        })
+        .unwrap_or_else(|| {
+            json!({
+                "kind": "runtime",
+                "id": "runtime-pending-turn-recovery"
+            })
+        });
+    let sequence_no = entry
+        .get("sequence_no")
+        .and_then(Value::as_u64)
+        .unwrap_or(source.sequence_no);
+    let mut event = source.clone();
+    event.sequence_no = sequence_no;
+    event.turn_id = Some(turn_id);
+    event.payload = json!({
+        "command_id": command_id,
+        "payload": payload,
+        "runtime_lane": {
+            "active_controller": actor,
+        },
+    });
+    Ok(event)
+}
+
+async fn recoverable_transfer_turns(
+    host: &RuntimeHost,
+    session_id: SessionId,
+    events: &[RuntimeEvent],
+) -> Result<HashMap<TurnId, RecoveredPendingTurn>, ClientError> {
+    let mut transferred = HashMap::new();
+    for event in events
+        .iter()
+        .filter(|event| is_pending_transfer_event(event))
+    {
+        if let Some(entries) = event
+            .payload
+            .get(RECOVERED_PENDING_TURNS_KEY)
+            .and_then(Value::as_array)
+        {
+            for entry in entries {
+                let synthetic = inline_recovered_pending_event(event, entry)?;
+                if let Some(recovered) = recovered_pending_turn_from_event(&synthetic)? {
+                    transferred.insert(recovered.pending.turn_id, recovered);
+                }
+            }
+        }
+        let referenced_sequences = event
+            .payload
+            .get("recovered_pending_sequence_nos")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_u64);
+        for sequence_no in referenced_sequences {
+            if let Some(referenced_event) = host
+                .storage
+                .repositories
+                .events
+                .load_by_sequence(session_id, sequence_no)
+                .await?
+                && let Some(recovered) = recovered_pending_turn_from_event(&referenced_event)?
+            {
+                transferred
+                    .entry(recovered.pending.turn_id)
+                    .or_insert(recovered);
+            }
+        }
+    }
+    Ok(transferred)
+}
+
+fn recovery_continuation_from_value(
+    value: &Value,
+) -> Result<RecoveredTaskContinuation, ClientError> {
+    serde_json::from_value(value.clone()).map_err(|error| {
+        ClientError::TaskExecution(format!(
+            "durable recovery continuation is malformed: {error}"
+        ))
+    })
+}
+
+fn value_u32(value: Option<&Value>) -> Option<u32> {
+    value
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+fn cost_to_microusd(cost_usd: f64) -> Option<u64> {
+    if !cost_usd.is_finite() || cost_usd.is_sign_negative() {
+        return None;
+    }
+    let microusd = cost_usd * 1_000_000.0;
+    if microusd >= u64::MAX as f64 {
+        Some(u64::MAX)
+    } else {
+        Some(microusd.round() as u64)
+    }
+}
+
+fn delegation_recovery_from_metadata(
+    metadata: &Value,
+    captured_at: chrono::DateTime<chrono::Utc>,
+) -> Result<delegation_policy::TimedDelegationRecoveryState, ClientError> {
+    let budget = metadata.get("budget").unwrap_or(metadata);
+    let parse_budget = |key: &str| {
+        budget.get(key).and_then(Value::as_u64).ok_or_else(|| {
+            ClientError::TaskExecution(format!(
+                "delegation recovery metadata is missing numeric field `{key}`"
+            ))
+        })
+    };
+    let optional_id = |key: &str| -> Result<Option<Uuid>, ClientError> {
+        match metadata.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(value) => serde_json::from_value(value.clone())
+                .map(Some)
+                .map_err(|error| {
+                    ClientError::TaskExecution(format!(
+                        "delegation recovery metadata has an invalid `{key}`: {error}"
+                    ))
+                }),
+        }
+    };
+    let root_session_id = metadata
+        .get("root_session_id")
+        .cloned()
+        .ok_or_else(|| {
+            ClientError::TaskExecution(
+                "delegation recovery metadata is missing root_session_id".to_owned(),
+            )
+        })
+        .and_then(|value| {
+            serde_json::from_value(value).map_err(|error| {
+                ClientError::TaskExecution(format!(
+                    "delegation recovery metadata has an invalid root_session_id: {error}"
+                ))
+            })
+        })?;
+    let reserved_tokens = parse_budget("reserved_tokens")?;
+    let reserved_cost_microusd = parse_budget("reserved_cost_microusd")?;
+    let active_children = parse_budget("active_children")?;
+    let max_tokens = parse_budget("max_tokens")?;
+    let spent_tokens = parse_budget("spent_tokens")?;
+    let spent_cost_microusd = parse_budget("spent_cost_microusd")?;
+    let has_unsettled_reservation =
+        active_children > 0 || reserved_tokens > 0 || reserved_cost_microusd > 0;
+    let state = delegation_policy::DelegationRecoveryState {
+        root_session_id,
+        parent_session_id: optional_id("parent_session_id")?.map(SessionId),
+        parent_task_id: optional_id("parent_task_id")?.map(TaskId),
+        parent_thread_id: optional_id("parent_thread_id")?.map(ThreadId),
+        // Context metadata has always stored depth beside `budget`. Accept a
+        // budget-local value as well for compatibility with early recovery
+        // snapshots that flattened all numeric fields into one object.
+        depth: u8::try_from(
+            metadata
+                .get("depth")
+                .and_then(Value::as_u64)
+                .or_else(|| budget.get("depth").and_then(Value::as_u64))
+                .ok_or_else(|| {
+                    ClientError::TaskExecution(
+                        "delegation recovery metadata is missing numeric field `depth`".to_owned(),
+                    )
+                })?,
+        )
+        .map_err(|_| {
+            ClientError::TaskExecution(
+                "delegation recovery metadata depth is out of range".to_owned(),
+            )
+        })?,
+        remaining_elapsed_ms: parse_budget("remaining_elapsed_ms")?,
+        local_remaining_elapsed_ms: metadata
+            .get("local_remaining_elapsed_ms")
+            .and_then(Value::as_u64),
+        max_tokens,
+        max_cost_microusd: match budget.get("max_cost_microusd") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(value.as_u64().ok_or_else(|| {
+                ClientError::TaskExecution(
+                    "delegation recovery metadata has an invalid max_cost_microusd: expected u64"
+                        .to_owned(),
+                )
+            })?),
+        },
+        started_children: usize::try_from(parse_budget("started_children")?).unwrap_or(usize::MAX),
+        // 活动 reservation 代表旧进程可能已经执行但尚未完成结算。恢复时必须先耗尽
+        // 对应上限，只有新的 durable checkpoint 才能用实际 usage 替换这个保守状态。
+        spent_tokens: if has_unsettled_reservation {
+            spent_tokens.max(max_tokens)
+        } else {
+            spent_tokens.saturating_add(reserved_tokens)
+        },
+        spent_cost_microusd: if has_unsettled_reservation {
+            match budget.get("max_cost_microusd").and_then(Value::as_u64) {
+                Some(max_cost) => spent_cost_microusd.max(max_cost),
+                None => spent_cost_microusd,
+            }
+        } else {
+            spent_cost_microusd.saturating_add(reserved_cost_microusd)
+        },
+    };
+    Ok(delegation_policy::TimedDelegationRecoveryState { captured_at, state })
+}
+
+fn validate_canonical_delegation_checkpoint(
+    event: &RuntimeEvent,
+    candidate: &delegation_policy::TimedDelegationRecoveryState,
+    previous: Option<&delegation_policy::TimedDelegationRecoveryState>,
+) -> Result<(), ClientError> {
+    let state = &candidate.state;
+    if state.root_session_id != event.session_id {
+        return Err(ClientError::TaskExecution(format!(
+            "durable delegation recovery checkpoint root session {} does not match event session {}",
+            state.root_session_id, event.session_id
+        )));
+    }
+    if state.depth != 0
+        || state.parent_session_id.is_some()
+        || state.parent_task_id.is_some()
+        || state.parent_thread_id.is_some()
+    {
+        return Err(ClientError::TaskExecution(
+            "durable delegation recovery checkpoint is not a canonical root state".to_owned(),
+        ));
+    }
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+    let previous = &previous.state;
+    if previous.root_session_id != state.root_session_id
+        || previous.max_tokens != state.max_tokens
+        || previous.max_cost_microusd != state.max_cost_microusd
+    {
+        return Err(ClientError::TaskExecution(
+            "durable delegation recovery checkpoint changes immutable root budget identity"
+                .to_owned(),
+        ));
+    }
+    if state.started_children < previous.started_children {
+        return Err(ClientError::TaskExecution(
+            "durable delegation recovery checkpoint regresses started child count".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn recovered_task_continuation(
+    events: &[RuntimeEvent],
+    recovered_at: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<RecoveredTaskContinuation>, ClientError> {
+    let mut governor = RecoveredGovernorFacts::default();
+    let mut has_continuation = false;
+    let mut delegation = None;
+    let mut canonical_delegation = None;
+    let mut has_authoritative_delegation_state = false;
+
+    for event in events {
+        if is_pending_transfer_event(event)
+            && let Some(value) = event.payload.get(RECOVERY_CONTINUATION_KEY)
+        {
+            let transferred = recovery_continuation_from_value(value)?;
+            governor.merge_transfer(&transferred);
+            delegation = transferred.delegation;
+            if let Some(candidate) = delegation.as_ref() {
+                validate_canonical_delegation_checkpoint(event, candidate, None)?;
+                canonical_delegation = Some(candidate.clone());
+            }
+            has_authoritative_delegation_state = true;
+            has_continuation = true;
+        }
+
+        if event.event_type == RuntimeEventType::GovernorDecided
+            && let Some(record) = event.payload.get("record")
+        {
+            governor.observe_governor(record);
+            has_continuation = true;
+        }
+
+        if event.event_type == RuntimeEventType::StepStarted && governor.observe_step_started(event)
+        {
+            has_continuation = true;
+        }
+
+        if event.event_type == RuntimeEventType::ToolStarted {
+            governor.observe_tool_started(event);
+        }
+
+        if event.event_type == RuntimeEventType::ToolCompleted
+            && governor.observe_tool_completed(event)
+        {
+            has_continuation = true;
+        }
+
+        if matches!(
+            event.event_type,
+            RuntimeEventType::TaskCreated | RuntimeEventType::TurnStarted
+        ) && !has_authoritative_delegation_state
+            && let Some(metadata) = event
+                .payload
+                .get("payload")
+                .and_then(|payload| payload.get("_delegation"))
+        {
+            delegation = Some(delegation_recovery_from_metadata(
+                metadata,
+                event.timestamp,
+            )?);
+        }
+
+        if event.event_type == RuntimeEventType::TokenUsageRecorded
+            && let Some(record) = event.payload.get("record")
+            && let Ok(record) = serde_json::from_value::<TokenUsageRecord>(record.clone())
+            && governor.observe_token_usage(record)
+        {
+            has_continuation = true;
+        }
+
+        if event.event_type == RuntimeEventType::CheckpointCreated
+            && event.payload.get("recovery_kind").and_then(Value::as_str)
+                == Some("delegation_budget")
+            && let Some(value) = event.payload.get("delegation_recovery")
+        {
+            let candidate = serde_json::from_value(value.clone()).map_err(|error| {
+                ClientError::TaskExecution(format!(
+                    "durable delegation recovery checkpoint is malformed: {error}"
+                ))
+            })?;
+            validate_canonical_delegation_checkpoint(
+                event,
+                &candidate,
+                canonical_delegation.as_ref(),
+            )?;
+            canonical_delegation = Some(candidate.clone());
+            delegation = Some(candidate);
+            has_authoritative_delegation_state = true;
+        }
+    }
+
+    let continuation = RecoveredTaskContinuation {
+        governor_usage: governor.usage(),
+        accounted_cost_response_ids: governor.accounted_cost_response_ids,
+        delegation: delegation.map(|state| state.refreshed(recovered_at)),
+    };
+    if has_continuation || continuation.delegation.is_some() {
+        Ok(Some(continuation))
+    } else {
+        Ok(None)
+    }
+}
+
+fn inherit_steering_execution_surface(
+    active_task_payload: &Value,
+    steering_payload: &mut Value,
+) -> Result<(), ClientError> {
+    let execution_mode = execution_mode_from_payload(active_task_payload).map_err(|error| {
+        ClientError::TaskExecution(format!(
+            "cannot recover a leading steering turn from an invalid active execution mode: {error}"
+        ))
+    })?;
+    let inherited_tool_profile = tool_profile_from_payload(active_task_payload, execution_mode)
+        .map_err(|error| {
+            ClientError::TaskExecution(format!(
+                "cannot recover a leading steering turn from an invalid active tool profile: {error}"
+            ))
+        })?;
+    let mut task_contract = task_contract_from_payload(active_task_payload)?;
+    if !explicit_task_contract(active_task_payload)
+        && should_apply_legacy_adapter(active_task_payload, execution_mode)
+    {
+        LegacyTaskAdapter::new(
+            active_task_payload,
+            &model_prompt_from_payload(active_task_payload),
+        )
+        .apply_to(&mut task_contract);
+    }
+
+    let explicit_tool_profile = steering_payload
+        .get(TOOL_PROFILE_KEY)
+        .is_some_and(|value| !value.is_null());
+    let steering_object = steering_payload.as_object_mut().ok_or_else(|| {
+        ClientError::TaskExecution(
+            "cannot recover a leading steering turn from a non-object payload".to_owned(),
+        )
+    })?;
+    for key in [
+        "completion_criteria",
+        "output_schema",
+        "external_verifiers",
+        "max_elapsed_ms",
+        "allow_network",
+        "yolo",
+        "defer_external_verification",
+        "provider_profile",
+        "provider_model",
+        "provider_generation_config",
+        EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY,
+        crate::delegation::DELEGATED_TASK_MARKER,
+        "_delegation_parent_session_id",
+        "_delegation_parent_tool_call_id",
+        "_delegation",
+        delegation_policy::DELEGATION_COST_BUDGET_KEY,
+    ] {
+        match active_task_payload.get(key) {
+            Some(value) => {
+                steering_object.insert(key.to_owned(), value.clone());
+            }
+            None => {
+                steering_object.remove(key);
+            }
+        }
+    }
+    steering_object.insert(
+        "task_contract".to_owned(),
+        serde_json::to_value(task_contract)?,
+    );
+    steering_object.insert(
+        "_task_contract_origin".to_owned(),
+        Value::String("active_task".to_owned()),
+    );
+    write_normalized_execution_mode(steering_payload, execution_mode);
+    if !explicit_tool_profile {
+        steering_payload[TOOL_PROFILE_KEY] = serde_json::to_value(inherited_tool_profile)?;
+    }
+    Ok(())
+}
+
+fn materialize_recovered_leading_steer(
+    active_surface: &RecoveredActiveTurnSurface,
+    recovered_at: chrono::DateTime<chrono::Utc>,
+    steering_payload: &mut Value,
+) -> Result<(), ClientError> {
+    inherit_steering_execution_surface(&active_surface.payload, steering_payload)?;
+    match active_surface.payload.get("max_elapsed_ms") {
+        None | Some(Value::Null) => {
+            let budget_ms = default_agent_max_elapsed_ms();
+            let elapsed_ms = recovered_elapsed_ms(active_surface.budget_started_at, recovered_at);
+            steering_payload["max_elapsed_ms"] = json!(budget_ms.saturating_sub(elapsed_ms).max(1));
+        }
+        Some(value) if value.as_u64().is_some_and(|value| value > 0) => {
+            let budget_ms = value.as_u64().expect("positive elapsed budget");
+            let elapsed_ms = recovered_elapsed_ms(active_surface.budget_started_at, recovered_at);
+            steering_payload["max_elapsed_ms"] = json!(budget_ms.saturating_sub(elapsed_ms).max(1));
+        }
+        Some(_) => {
+            return Err(ClientError::TaskExecution(
+                "cannot recover a leading steering turn from an invalid active elapsed-time budget"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn recovered_steer_has_materialized_surface(payload: &Value) -> bool {
+    payload.get("steer").and_then(Value::as_bool) == Some(true)
+        && payload.get("_task_contract_origin").and_then(Value::as_str) == Some("active_task")
+        && payload
+            .get("task_contract")
+            .is_some_and(|value| value.is_object())
+        && matches!(
+            payload.get("_execution_mode").and_then(Value::as_str),
+            Some("legacy" | "open" | "strict")
+        )
+        && matches!(
+            payload.get(TOOL_PROFILE_KEY).and_then(Value::as_str),
+            Some("coding" | "full")
+        )
+        && payload
+            .get("max_elapsed_ms")
+            .and_then(Value::as_u64)
+            .is_some_and(|value| value > 0)
+}
+
+fn recovered_elapsed_ms(
+    budget_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    recovered_at: chrono::DateTime<chrono::Utc>,
+) -> u64 {
+    let Some(budget_started_at) = budget_started_at else {
+        return 0;
+    };
+    let elapsed_ms = recovered_at
+        .signed_duration_since(budget_started_at)
+        .num_milliseconds()
+        .max(0);
+    u64::try_from(elapsed_ms).unwrap_or(u64::MAX)
+}
+
+fn recovered_active_turn_surface(
+    events: &[RuntimeEvent],
+    transferred_payloads: &HashMap<TurnId, Value>,
+) -> Result<Option<RecoveredActiveTurnSurface>, ClientError> {
+    let mut active = None::<RecoveredActiveTurnSurface>;
+    let mut queued_payloads = HashMap::<TurnId, Value>::new();
+
+    for event in events {
+        match event.event_type {
+            RuntimeEventType::TaskCreated => {
+                if let Some(payload) = event.payload.get("payload").cloned() {
+                    active = Some(RecoveredActiveTurnSurface {
+                        payload,
+                        budget_turn_id: event.turn_id,
+                        budget_started_at: None,
+                    });
+                }
+            }
+            RuntimeEventType::TurnQueued | RuntimeEventType::TurnUpdated => {
+                if let (Some(turn_id), Some(payload)) =
+                    (event.turn_id, event.payload.get("payload").cloned())
+                {
+                    queued_payloads.insert(turn_id, payload);
+                }
+            }
+            RuntimeEventType::TurnCancelled => {
+                if let Some(turn_id) = event.turn_id {
+                    queued_payloads.remove(&turn_id);
+                }
+            }
+            RuntimeEventType::TurnStarted => {
+                let Some(turn_id) = event.turn_id else {
+                    continue;
+                };
+                let inline_payload = event.payload.get("payload").cloned();
+                let source_payload = inline_payload
+                    .clone()
+                    .or_else(|| queued_payloads.get(&turn_id).cloned())
+                    .or_else(|| transferred_payloads.get(&turn_id).cloned())
+                    .ok_or_else(|| {
+                        ClientError::TaskExecution(format!(
+                            "cannot recover active turn {turn_id}: its durable payload is missing"
+                        ))
+                    })?;
+                queued_payloads.remove(&turn_id);
+                let steer = source_payload
+                    .get("steer")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let restarted_after_recovery =
+                    event.payload.get("recovery").and_then(Value::as_str)
+                        == Some("durable_pending_turn");
+                if steer && !restarted_after_recovery {
+                    let current = active.as_mut().ok_or_else(|| {
+                        ClientError::TaskExecution(format!(
+                            "cannot recover steering turn {turn_id} without an active execution surface"
+                        ))
+                    })?;
+                    let mut merged = source_payload;
+                    inherit_steering_execution_surface(&current.payload, &mut merged)?;
+                    current.payload = merged;
+                } else {
+                    active = Some(RecoveredActiveTurnSurface {
+                        payload: source_payload,
+                        budget_turn_id: Some(turn_id),
+                        budget_started_at: None,
+                    });
+                }
+            }
+            RuntimeEventType::StepStarted => {
+                if let Some(current) = active.as_mut()
+                    && current.budget_started_at.is_none()
+                    && current
+                        .budget_turn_id
+                        .is_none_or(|turn_id| event.turn_id == Some(turn_id))
+                {
+                    current.budget_started_at = Some(event.timestamp);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(active)
 }
 
 struct HostedTaskEvaluation<'a> {
@@ -905,6 +1729,7 @@ impl RuntimeHost {
                 workspace_change_tracker: Mutex::new(
                     change_tracker::WorkspaceChangeTracker::default(),
                 ),
+                rollout_projection_failures: Mutex::new(HashMap::new()),
             },
             workspace_id,
             workspace_root,
@@ -1188,35 +2013,18 @@ impl RuntimeHost {
             .events
             .load(session_id, Some(task_id), None)
             .await?;
-        let mut pending = HashMap::<TurnId, RecoveredPendingTurn>::new();
+        let transferred = recoverable_transfer_turns(self, session_id, &events).await?;
+        let transferred_payloads = transferred
+            .iter()
+            .map(|(turn_id, turn)| (*turn_id, turn.payload.clone()))
+            .collect::<HashMap<_, _>>();
+        let active_surface = recovered_active_turn_surface(&events, &transferred_payloads)?;
+        let continuation = recovered_task_continuation(&events, chrono::Utc::now())?;
+        let mut pending = transferred;
         for event in events {
             match event.event_type {
                 RuntimeEventType::TurnQueued => {
-                    let referenced_sequences = event
-                        .payload
-                        .get("recovered_pending_sequence_nos")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_u64)
-                        .collect::<Vec<_>>();
-                    let is_pending_transfer_event = !referenced_sequences.is_empty()
-                        && event.turn_id.is_none()
-                        && event.payload.get("payload").is_none();
-                    for sequence_no in referenced_sequences {
-                        if let Some(referenced_event) = self
-                            .storage
-                            .repositories
-                            .events
-                            .load_by_sequence(session_id, sequence_no)
-                            .await?
-                            && let Some(referenced) =
-                                recovered_pending_turn_from_event(&referenced_event)?
-                        {
-                            pending.insert(referenced.pending.turn_id, referenced);
-                        }
-                    }
-                    if !is_pending_transfer_event
+                    if !is_pending_transfer_event(&event)
                         && let Some(recovered) = recovered_pending_turn_from_event(&event)?
                     {
                         pending.insert(recovered.pending.turn_id, recovered);
@@ -1241,6 +2049,24 @@ impl RuntimeHost {
         }
         let mut pending = pending.into_values().collect::<Vec<_>>();
         pending.sort_by_key(|turn| turn.sequence_no);
+        if let Some(first) = pending.first_mut() {
+            first.continuation = continuation;
+        }
+        if pending.first().is_some_and(|turn| turn.pending.steer)
+            && !recovered_steer_has_materialized_surface(&pending[0].payload)
+        {
+            let active_surface = active_surface.as_ref().ok_or_else(|| {
+                ClientError::TaskExecution(
+                    "cannot recover a leading steering turn without its active task payload"
+                        .to_owned(),
+                )
+            })?;
+            materialize_recovered_leading_steer(
+                active_surface,
+                chrono::Utc::now(),
+                &mut pending[0].payload,
+            )?;
+        }
         Ok(pending)
     }
 
@@ -1272,21 +2098,37 @@ impl RuntimeHost {
             ));
         }
         let first = pending_turns.remove(0);
+        let continuation = first.continuation.clone().unwrap_or_default();
         let task_id = TaskId::new();
+        let recovered_pending_payloads = std::iter::once(&first)
+            .chain(pending_turns.iter())
+            .map(|turn| {
+                json!({
+                    "sequence_no": turn.sequence_no,
+                    "turn_id": turn.pending.turn_id,
+                    "command_id": turn.pending.command_id,
+                    "actor": turn.actor,
+                    "payload": turn.payload,
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut transfer_payload = json!({
+            "summary": "durable pending turns transferred to a recovery task",
+            "recovery": "durable_pending_turn_batch",
+            "recovered_pending_sequence_nos": std::iter::once(&first)
+                .chain(pending_turns.iter())
+                .map(|turn| turn.sequence_no)
+                .collect::<Vec<_>>(),
+        });
+        transfer_payload[RECOVERED_PENDING_TURNS_KEY] = json!(recovered_pending_payloads);
+        transfer_payload[RECOVERY_CONTINUATION_KEY] = serde_json::to_value(&continuation)?;
         self.record_event(host_event(
             self.next_sequence_no(),
             session_id,
             Some(task_id),
             RuntimeEventType::TurnQueued,
             RuntimeEventSource::Runtime,
-            json!({
-                "summary": "durable pending turns transferred to a recovery task",
-                "recovery": "durable_pending_turn_batch",
-                "recovered_pending_sequence_nos": std::iter::once(&first)
-                    .chain(pending_turns.iter())
-                    .map(|turn| turn.sequence_no)
-                    .collect::<Vec<_>>(),
-            }),
+            transfer_payload,
         ))
         .await?;
         let mut lane_manager = self.execution.lane_manager.lock().await;
@@ -1311,18 +2153,32 @@ impl RuntimeHost {
         transition.event.payload["recovery"] = json!("durable_pending_turn");
         transition.event.payload["command_id"] = json!(first.pending.command_id);
         transition.event.payload["runtime_identity"] = json!(runtime_identity());
+        transition.event.payload["payload"] = first.payload.clone();
         self.record_event(transition.event).await?;
-        let spawn = Box::pin(self.spawn_agent_task(
-            HostedAgentTask {
-                session_id,
-                task_id,
-                turn_id: first.pending.turn_id,
-                payload: first.payload,
-            },
-            session_lease,
-            pending_turns.into_iter().map(|turn| turn.pending).collect(),
-            None,
-        ));
+        let delegation_seed = continuation
+            .delegation
+            .clone()
+            .map(DelegationContextSeed::Recovered);
+        let spawn = Box::pin(
+            self.spawn_agent_task(
+                HostedAgentTask {
+                    session_id,
+                    task_id,
+                    turn_id: first.pending.turn_id,
+                    payload: first.payload,
+                },
+                session_lease,
+                pending_turns
+                    .into_iter()
+                    .map(|turn| ConfiguredPendingAgentTurn {
+                        turn: turn.pending,
+                        execution: turn.execution,
+                    })
+                    .collect(),
+                delegation_seed,
+                continuation.governor_usage,
+            ),
+        );
         spawn.await
     }
 
@@ -1433,6 +2289,37 @@ impl RuntimeHost {
         self.publish_committed_event(event).await
     }
 
+    async fn record_tool_completed_bundle(
+        &self,
+        event: RuntimeEvent,
+        artifacts: &[(ArtifactRecord, Vec<u8>)],
+        evidence: &[golutra_core::EvidenceRecord],
+    ) -> Result<(), ClientError> {
+        let _writer = self.execution.event_writer.lock().await;
+        let causal_before = self.execution.causal_ledger.lock().await.clone();
+        let event = match self.prepare_canonical_event(event).await {
+            Ok(event) => event,
+            Err(error) => {
+                *self.execution.causal_ledger.lock().await = causal_before;
+                return Err(error);
+            }
+        };
+        let event = match self
+            .storage
+            .repositories
+            .events
+            .append_tool_completed_bundle(event, artifacts, evidence)
+            .await
+        {
+            Ok(event) => event,
+            Err(error) => {
+                *self.execution.causal_ledger.lock().await = causal_before;
+                return Err(error.into());
+            }
+        };
+        self.publish_committed_event(event).await
+    }
+
     async fn claim_command_journal(
         &self,
         idempotency_key: &str,
@@ -1506,8 +2393,40 @@ impl RuntimeHost {
     }
 
     async fn publish_committed_event(&self, event: RuntimeEvent) -> Result<(), ClientError> {
-        self.append_rollout_event(&event).await?;
-        self.publish_live_event(event);
+        self.publish_live_event(event.clone());
+        match self.append_rollout_event(&event).await {
+            Ok(()) => {
+                self.execution
+                    .rollout_projection_failures
+                    .lock()
+                    .await
+                    .remove(&event.session_id);
+            }
+            Err(append_error) => {
+                let repair_result = match self
+                    .storage
+                    .repositories
+                    .threads
+                    .by_session(event.session_id)
+                    .await
+                {
+                    Ok(Some(thread)) => self.rebuild_thread_rollout(&thread).await.map(|_| ()),
+                    Ok(None) => Ok(()),
+                    Err(error) => Err(error.into()),
+                };
+                let mut failures = self.execution.rollout_projection_failures.lock().await;
+                match repair_result {
+                    Ok(()) => {
+                        failures.remove(&event.session_id);
+                    }
+                    Err(repair_error) => {
+                        let detail =
+                            format!("{append_error}; rollout rebuild failed: {repair_error}");
+                        failures.insert(event.session_id, detail);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

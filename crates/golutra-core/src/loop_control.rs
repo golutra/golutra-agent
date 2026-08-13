@@ -147,6 +147,12 @@ impl TurnState {
         self.last_verification_id = Some(verification_id);
     }
 
+    pub fn continue_after_steer(&mut self, turn_id: TurnId) {
+        self.turn_id = turn_id;
+        self.phase = TurnPhase::Running;
+        self.continuation_reason = Some(ContinuationReason::UserSteer);
+    }
+
     pub fn issue_correction(&mut self, reason: ContinuationReason) {
         self.correction_attempt = self.correction_attempt.saturating_add(1);
         self.phase = TurnPhase::Correcting;
@@ -209,6 +215,17 @@ mod tests {
         assert_eq!(
             state.continuation_reason,
             Some(ContinuationReason::VerificationFailed)
+        );
+
+        let steered_turn_id = TurnId::new();
+        state.continue_after_steer(steered_turn_id);
+        assert_eq!(state.turn_id, steered_turn_id);
+        assert_eq!(state.phase, TurnPhase::Running);
+        assert_eq!(state.correction_attempt, 1);
+        assert_eq!(state.last_verification_id, Some(verification_id));
+        assert_eq!(
+            state.continuation_reason,
+            Some(ContinuationReason::UserSteer)
         );
     }
 

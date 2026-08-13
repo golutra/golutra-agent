@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use clap::{Args as ClapArgs, Parser, Subcommand};
+use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use crossterm::{
     cursor::SetCursorStyle,
     event::{
@@ -150,8 +150,46 @@ struct Args {
     /// for prompts submitted by this TUI.
     #[arg(long, global = true)]
     yolo: bool,
+    /// Let the model own task completion or require strict completion policy.
+    #[arg(long, global = true, value_enum, default_value_t = TuiExecutionModeArg::Open)]
+    execution_mode: TuiExecutionModeArg,
+    /// Expose coding-safe built-ins/extensions or every registered extension.
+    #[arg(long, global = true, value_enum, default_value_t = TuiToolProfileArg::Coding)]
+    tool_profile: TuiToolProfileArg,
     #[command(subcommand)]
     command: Option<TuiCommand>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+enum TuiExecutionModeArg {
+    #[default]
+    Open,
+    Strict,
+}
+
+impl TuiExecutionModeArg {
+    const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Strict => "strict",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+enum TuiToolProfileArg {
+    #[default]
+    Coding,
+    Full,
+}
+
+impl TuiToolProfileArg {
+    const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Coding => "coding",
+            Self::Full => "full",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -301,6 +339,8 @@ struct TuiApp {
     workspace_path: PathBuf,
     debug_mode: bool,
     yolo: bool,
+    execution_mode: TuiExecutionModeArg,
+    tool_profile: TuiToolProfileArg,
     activity_projection: ActivityProjection,
     activity_snapshot: Option<ActivitySnapshot>,
     activity_snapshot_captured: bool,
@@ -456,6 +496,8 @@ impl TuiApp {
             workspace_path,
             debug_mode,
             yolo: false,
+            execution_mode: TuiExecutionModeArg::Open,
+            tool_profile: TuiToolProfileArg::Coding,
             activity_projection: ActivityProjection::default(),
             activity_snapshot: None,
             activity_snapshot_captured: false,
@@ -500,6 +542,16 @@ impl TuiApp {
         } else {
             PermissionMode::Guarded
         };
+        self
+    }
+
+    fn with_tool_profile(mut self, profile: TuiToolProfileArg) -> Self {
+        self.tool_profile = profile;
+        self
+    }
+
+    fn with_execution_mode(mut self, mode: TuiExecutionModeArg) -> Self {
+        self.execution_mode = mode;
         self
     }
 
@@ -1981,6 +2033,9 @@ impl TuiApp {
         });
         if steer {
             payload["steer"] = json!(true);
+        } else {
+            payload["execution_mode"] = json!(self.execution_mode.wire_name());
+            payload["tool_profile"] = json!(self.tool_profile.wire_name());
         }
         if !self.attachments.is_empty() {
             payload["attachments"] = Value::Array(
@@ -3216,6 +3271,8 @@ async fn run_interactive(
         auth_dialog,
     )
     .with_yolo(args.yolo)
+    .with_execution_mode(args.execution_mode)
+    .with_tool_profile(args.tool_profile)
     .with_footer_context(runtime_cwd, provider_status.model);
     // The connected runtime stays authoritative for remote provider settings.
     let mut app = app

@@ -13,8 +13,9 @@ use golutra_core::{
     Actor, ActorKind, CommandId, SessionId, TaskId, TaskReconciliationDecision, ThreadId,
 };
 use golutra_protocol::{
-    AgentStreamEvent, AgentThreadRef, AgentTurnOptions, AgentTurnResult, AgentTurnStart,
-    EventFilter, RuntimeQuery, RuntimeQueryKind, SessionCommand, SessionCommandKind,
+    AgentSteerOptions, AgentStreamEvent, AgentThreadRef, AgentTurnExecutionOptions,
+    AgentTurnOptions, AgentTurnResult, AgentTurnStart, EventFilter, RuntimeQuery, RuntimeQueryKind,
+    SessionCommand, SessionCommandKind,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -155,6 +156,34 @@ impl AgentThread {
         prompt: impl Into<String>,
         options: AgentTurnOptions,
     ) -> Result<TurnHandle, ClientError> {
+        self.start_turn_inner(prompt, options, Some(AgentTurnExecutionOptions::default()))
+            .await
+    }
+
+    pub async fn start_turn_legacy(
+        &self,
+        prompt: impl Into<String>,
+        options: AgentTurnOptions,
+    ) -> Result<TurnHandle, ClientError> {
+        self.start_turn_inner(prompt, options, None).await
+    }
+
+    pub async fn start_turn_with_execution_options(
+        &self,
+        prompt: impl Into<String>,
+        options: AgentTurnOptions,
+        execution: AgentTurnExecutionOptions,
+    ) -> Result<TurnHandle, ClientError> {
+        self.start_turn_inner(prompt, options, Some(execution))
+            .await
+    }
+
+    async fn start_turn_inner(
+        &self,
+        prompt: impl Into<String>,
+        options: AgentTurnOptions,
+        execution: Option<AgentTurnExecutionOptions>,
+    ) -> Result<TurnHandle, ClientError> {
         let prompt = prompt.into();
         if prompt.trim().is_empty() {
             return Err(ClientError::TaskExecution(
@@ -185,23 +214,7 @@ impl AgentThread {
                 after_sequence_no: cursor,
             })
             .await?;
-        let mut payload = json!({
-            "prompt": prompt,
-            "_thread_id": self.thread.thread_id,
-            "task_contract": options.task_contract.clone(),
-            "completion_criteria": options.completion_criteria.clone(),
-            "output_schema": options.output_schema.clone(),
-            "allow_network": options.allow_network,
-            "yolo": options.yolo,
-            "defer_external_verification": options.defer_external_verification,
-        });
-        if let Some(max_elapsed_ms) = options.max_elapsed_ms {
-            payload["max_elapsed_ms"] = json!(max_elapsed_ms);
-        }
-        if !options.external_verifiers.is_empty() || !options.discover_project_verifiers {
-            payload["external_verifiers"] =
-                serde_json::to_value(options.external_verifiers.clone())?;
-        }
+        let payload = turn_payload(prompt, self.thread.thread_id, &options, execution)?;
         let ack = self
             .client
             .transport
@@ -239,22 +252,35 @@ impl AgentThread {
         &self,
         prompt: impl Into<String>,
     ) -> Result<golutra_protocol::CommandAck, ClientError> {
+        self.steer_with_options(prompt, AgentSteerOptions::default())
+            .await
+    }
+
+    pub async fn steer_with_options(
+        &self,
+        prompt: impl Into<String>,
+        options: AgentSteerOptions,
+    ) -> Result<golutra_protocol::CommandAck, ClientError> {
         let prompt = prompt.into();
         if prompt.trim().is_empty() {
             return Err(ClientError::TaskExecution(
                 "steering prompt cannot be empty".to_owned(),
             ));
         }
+        let mut payload = json!({
+            "prompt": prompt,
+            "_thread_id": self.thread.thread_id,
+            "steer": true,
+        });
+        if let Some(tool_profile) = options.tool_profile {
+            payload["tool_profile"] = serde_json::to_value(tool_profile)?;
+        }
         self.client
             .transport
             .send_command(command(
                 self.thread.session_id,
                 SessionCommandKind::Prompt,
-                json!({
-                    "prompt": prompt,
-                    "_thread_id": self.thread.thread_id,
-                    "steer": true,
-                }),
+                payload,
                 &self.client.actor,
             ))
             .await
@@ -316,6 +342,35 @@ impl AgentThread {
             ))
             .await
     }
+}
+
+fn turn_payload(
+    prompt: String,
+    thread_id: ThreadId,
+    options: &AgentTurnOptions,
+    execution: Option<AgentTurnExecutionOptions>,
+) -> Result<Value, ClientError> {
+    let mut payload = json!({
+        "prompt": prompt,
+        "_thread_id": thread_id,
+        "task_contract": options.task_contract,
+        "completion_criteria": options.completion_criteria,
+        "output_schema": options.output_schema,
+        "allow_network": options.allow_network,
+        "yolo": options.yolo,
+        "defer_external_verification": options.defer_external_verification,
+    });
+    if let Some(execution) = execution {
+        payload["execution_mode"] = serde_json::to_value(execution.execution_mode)?;
+        payload["tool_profile"] = serde_json::to_value(execution.tool_profile)?;
+    }
+    if let Some(max_elapsed_ms) = options.max_elapsed_ms {
+        payload["max_elapsed_ms"] = json!(max_elapsed_ms);
+    }
+    if !options.external_verifiers.is_empty() || !options.discover_project_verifiers {
+        payload["external_verifiers"] = serde_json::to_value(&options.external_verifiers)?;
+    }
+    Ok(payload)
 }
 
 #[derive(Debug)]
@@ -397,21 +452,34 @@ impl TurnHandle {
         &self,
         prompt: impl Into<String>,
     ) -> Result<golutra_protocol::CommandAck, ClientError> {
+        self.steer_with_options(prompt, AgentSteerOptions::default())
+            .await
+    }
+
+    pub async fn steer_with_options(
+        &self,
+        prompt: impl Into<String>,
+        options: AgentSteerOptions,
+    ) -> Result<golutra_protocol::CommandAck, ClientError> {
         let prompt = prompt.into();
         if prompt.trim().is_empty() {
             return Err(ClientError::TaskExecution(
                 "steering prompt cannot be empty".to_owned(),
             ));
         }
+        let mut payload = json!({
+            "prompt": prompt,
+            "_thread_id": self.thread.thread_id,
+            "steer": true,
+        });
+        if let Some(tool_profile) = options.tool_profile {
+            payload["tool_profile"] = serde_json::to_value(tool_profile)?;
+        }
         self.transport
             .send_command(command(
                 self.thread.session_id,
                 SessionCommandKind::Prompt,
-                json!({
-                    "prompt": prompt,
-                    "_thread_id": self.thread.thread_id,
-                    "steer": true,
-                }),
+                payload,
                 &self.actor,
             ))
             .await
@@ -472,10 +540,12 @@ fn command(
 #[cfg(test)]
 mod tests {
     use golutra_core::{Actor, ActorKind, CommandId, SessionId, ThreadId};
-    use golutra_protocol::{AgentThreadRef, AgentTurnStart};
+    use golutra_protocol::{
+        AgentThreadRef, AgentTurnExecutionOptions, AgentTurnOptions, AgentTurnStart,
+    };
     use tokio::sync::mpsc;
 
-    use super::{AgentClient, TurnHandle};
+    use super::{AgentClient, TurnHandle, turn_payload};
     use crate::{EmbeddedTransport, RuntimeEventStream, RuntimeTransport};
 
     #[tokio::test]
@@ -524,5 +594,26 @@ mod tests {
                 .to_string()
                 .contains("steering prompt cannot be empty")
         );
+    }
+
+    #[test]
+    fn turn_payload_distinguishes_new_defaults_from_legacy_server_defaults() {
+        let thread_id = ThreadId::new();
+        let options = AgentTurnOptions::default();
+
+        let current = turn_payload(
+            "current".to_owned(),
+            thread_id,
+            &options,
+            Some(AgentTurnExecutionOptions::default()),
+        )
+        .expect("current payload");
+        assert_eq!(current["execution_mode"], "open");
+        assert_eq!(current["tool_profile"], "coding");
+
+        let legacy =
+            turn_payload("legacy".to_owned(), thread_id, &options, None).expect("legacy payload");
+        assert!(legacy.get("execution_mode").is_none());
+        assert!(legacy.get("tool_profile").is_none());
     }
 }

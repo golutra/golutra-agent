@@ -716,6 +716,12 @@ fn turn_payload_from_params(params: &Value, thread_id: ThreadId, prompt: &str) -
         "output_schema": params.get("output_schema").cloned(),
         "completion_criteria": params.get("completion_criteria").cloned().unwrap_or_else(|| json!([])),
     });
+    if let Some(execution_mode) = params.get("execution_mode") {
+        payload["execution_mode"] = execution_mode.clone();
+    }
+    if let Some(tool_profile) = params.get("tool_profile") {
+        payload["tool_profile"] = tool_profile.clone();
+    }
     if let Some(allow_network) = params.get("allow_network") {
         payload["allow_network"] = allow_network.clone();
     }
@@ -743,6 +749,35 @@ fn turn_payload_from_params(params: &Value, thread_id: ThreadId, prompt: &str) -
     payload
 }
 
+fn turn_steer_payload_from_params(params: &Value) -> Result<Value, RpcDispatchError> {
+    for field in [
+        "execution_mode",
+        "task_contract",
+        "output_schema",
+        "completion_criteria",
+        "external_verifiers",
+        "max_elapsed_ms",
+        "defer_external_verification",
+    ] {
+        if params.get(field).is_some() {
+            return Err(RpcDispatchError::new(
+                -32602,
+                format!("turn/steer cannot change {field}"),
+            ));
+        }
+    }
+
+    let mut payload = json!({
+        "prompt": required_string(params, "prompt")?,
+        "steer": true,
+        "_thread_id": params.get("thread_id"),
+    });
+    if let Some(tool_profile) = params.get("tool_profile") {
+        payload["tool_profile"] = tool_profile.clone();
+    }
+    Ok(payload)
+}
+
 async fn turn_control(
     state: &AppState,
     params: &Value,
@@ -751,22 +786,18 @@ async fn turn_control(
     interrupt: bool,
     temporary_attachment: &mut Option<String>,
 ) -> RpcResult {
-    let (transport, attachment_id) =
-        resolve_transport(state, params, attachment_hint, temporary_attachment).await?;
-    let actor = transport.actor.clone();
-    let session_id = resolve_session(&transport, params).await?;
     let (kind, payload) = if interrupt {
         (SessionCommandKind::Abort, json!({}))
     } else {
         (
             SessionCommandKind::Prompt,
-            json!({
-                "prompt": required_string(params, "prompt")?,
-                "steer": true,
-                "_thread_id": params.get("thread_id"),
-            }),
+            turn_steer_payload_from_params(params)?,
         )
     };
+    let (transport, attachment_id) =
+        resolve_transport(state, params, attachment_hint, temporary_attachment).await?;
+    let actor = transport.actor.clone();
+    let session_id = resolve_session(&transport, params).await?;
     let ack = transport
         .execute_operation(RuntimeOperation::SendCommand(rpc_command(
             session_id, kind, payload, &actor,
@@ -1692,6 +1723,8 @@ mod tests {
 
         let payload = turn_payload_from_params(&params, ThreadId::new(), "fix the tests");
 
+        assert!(payload.get("execution_mode").is_none());
+        assert!(payload.get("tool_profile").is_none());
         assert_eq!(payload["discover_project_verifiers"], false);
         assert_eq!(payload["external_verifiers"], json!([]));
     }
@@ -1722,6 +1755,30 @@ mod tests {
 
         assert_eq!(payload["discover_project_verifiers"], "false");
         assert!(payload.get("external_verifiers").is_none());
+    }
+
+    #[test]
+    fn turn_payload_preserves_omitted_execution_options_for_legacy_clients() {
+        let default_payload =
+            turn_payload_from_params(&json!({}), ThreadId::new(), "fix the tests");
+
+        assert!(default_payload.get("execution_mode").is_none());
+        assert!(default_payload.get("tool_profile").is_none());
+    }
+
+    #[test]
+    fn turn_payload_forwards_explicit_execution_options() {
+        let payload = turn_payload_from_params(
+            &json!({
+                "execution_mode": "strict",
+                "tool_profile": "full",
+            }),
+            ThreadId::new(),
+            "run the checked task",
+        );
+
+        assert_eq!(payload["execution_mode"], "strict");
+        assert_eq!(payload["tool_profile"], "full");
     }
 
     #[test]
@@ -1766,6 +1823,74 @@ mod tests {
         );
         assert_eq!(bounded_payload["max_elapsed_ms"], 345_000);
         assert_eq!(bounded_payload["defer_external_verification"], true);
+    }
+
+    #[tokio::test]
+    async fn turn_steer_rpc_rejects_active_task_semantic_overrides() {
+        let state = test_state();
+        let forbidden_fields = [
+            ("execution_mode", json!("strict")),
+            (
+                "task_contract",
+                json!({"require_objective_validation": true}),
+            ),
+            ("output_schema", json!({"type": "object"})),
+            ("completion_criteria", json!(["tests pass"])),
+            ("external_verifiers", json!([])),
+            ("max_elapsed_ms", json!(30_000)),
+            ("defer_external_verification", json!(false)),
+        ];
+
+        for (index, (field, value)) in forbidden_fields.into_iter().enumerate() {
+            let mut params = json!({"prompt": "continue the active task"});
+            params[field] = value;
+            let request = serde_json::from_value(json!({
+                "jsonrpc": "2.0",
+                "id": index,
+                "method": "turn/steer",
+                "params": params,
+            }))
+            .expect("request");
+            let mut temporary_attachment = None;
+
+            let response = dispatch(
+                &state,
+                request,
+                None,
+                &connection_actor("test"),
+                &mut temporary_attachment,
+            )
+            .await
+            .expect("error response");
+
+            assert_eq!(
+                response.error.as_ref().map(|error| error.code),
+                Some(-32602),
+                "{field}"
+            );
+            assert!(
+                response
+                    .error
+                    .as_ref()
+                    .is_some_and(|error| error.message.contains(field)),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn turn_steer_payload_forwards_explicit_tool_profile() {
+        let payload = turn_steer_payload_from_params(&json!({
+            "thread_id": "thread-1",
+            "prompt": "continue the active task",
+            "tool_profile": "full",
+        }))
+        .expect("steer payload");
+
+        assert_eq!(payload["prompt"], "continue the active task");
+        assert_eq!(payload["steer"], true);
+        assert_eq!(payload["_thread_id"], "thread-1");
+        assert_eq!(payload["tool_profile"], "full");
     }
 
     #[tokio::test]

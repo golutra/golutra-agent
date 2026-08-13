@@ -158,6 +158,10 @@ export interface AgentSubscriptionRequest {
 }
 
 export interface ThreadRunOptions {
+  /** Let the provider own planning/stopping, or use an explicit contract adapter. */
+  executionMode?: "open" | "strict";
+  /** Expose coding-safe tools, or every registered extension. */
+  toolProfile?: "coding" | "full";
   outputSchema?: Record<string, unknown>;
   taskContract?: TaskContract;
   completionCriteria?: readonly string[];
@@ -167,6 +171,16 @@ export interface ThreadRunOptions {
   deferExternalVerification?: boolean;
   externalVerifiers?: readonly ExternalVerificationSpec[];
   discoverProjectVerifiers?: boolean;
+}
+
+export type LegacyThreadRunOptions = Omit<
+  ThreadRunOptions,
+  "executionMode" | "toolProfile"
+>;
+
+export interface SteerOptions {
+  /** Override only the model-visible tool surface for this continuation. */
+  toolProfile?: "coding" | "full";
 }
 
 export interface ReconcileTaskOptions {
@@ -202,6 +216,21 @@ export class Thread {
   }
 
   async run(prompt: string, options: ThreadRunOptions = {}): Promise<TurnHandle> {
+    return this.startTurn(prompt, options, true);
+  }
+
+  async runLegacy(
+    prompt: string,
+    options: LegacyThreadRunOptions = {},
+  ): Promise<TurnHandle> {
+    return this.startTurn(prompt, options, false);
+  }
+
+  private async startTurn(
+    prompt: string,
+    options: ThreadRunOptions,
+    useNewDefaults: boolean,
+  ): Promise<TurnHandle> {
     if (!prompt.trim()) {
       throw new Error("turn prompt cannot be empty");
     }
@@ -213,6 +242,10 @@ export class Thread {
       defer_external_verification: options.deferExternalVerification ?? false,
       completion_criteria: [...(options.completionCriteria ?? [])].filter((value) => value.trim()),
     };
+    if (useNewDefaults) {
+      params.execution_mode = options.executionMode ?? "open";
+      params.tool_profile = options.toolProfile ?? "coding";
+    }
     if (options.maxElapsedMs !== undefined) {
       params.max_elapsed_ms = options.maxElapsedMs;
     }
@@ -236,13 +269,21 @@ export class Thread {
     return this.run(prompt, options);
   }
 
-  async steer(prompt: string): Promise<CommandAck> {
+  runLegacyStreamed(
+    prompt: string,
+    options: LegacyThreadRunOptions = {},
+  ): Promise<TurnHandle> {
+    return this.runLegacy(prompt, options);
+  }
+
+  async steer(prompt: string, options: SteerOptions = {}): Promise<CommandAck> {
     if (!prompt.trim()) {
       throw new Error("steering prompt cannot be empty");
     }
     return this.client.rpcCommand("turn/steer", {
       thread_id: this.threadId,
       prompt,
+      ...(options.toolProfile !== undefined ? { tool_profile: options.toolProfile } : {}),
     });
   }
 
@@ -379,8 +420,8 @@ export class TurnHandle {
     return this.terminal;
   }
 
-  steer(prompt: string): Promise<CommandAck> {
-    return this.thread.steer(prompt);
+  steer(prompt: string, options: SteerOptions = {}): Promise<CommandAck> {
+    return this.thread.steer(prompt, options);
   }
 
   interrupt(): Promise<CommandAck> {

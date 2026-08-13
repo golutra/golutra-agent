@@ -16,6 +16,8 @@ pub enum RuntimeLaneError {
     ActiveTaskExists,
     #[error("session has no active runtime lane")]
     LaneNotFound,
+    #[error("queued turn is not pending on the runtime lane")]
+    QueuedTurnNotPending,
     #[error("actor is not the active controller")]
     NonActiveController,
 }
@@ -178,11 +180,48 @@ impl RuntimeLaneManager {
         session_id: SessionId,
         turn_id: TurnId,
     ) -> Result<(), RuntimeLaneError> {
+        let lane_id = self.prepare_queued_turn_start(session_id, turn_id)?;
+        self.commit_queued_turn_start(session_id, lane_id, turn_id)
+    }
+
+    /// Validates a queued-turn transition without changing the lane.
+    ///
+    /// The returned lane identity must be passed to [`Self::commit_queued_turn_start`]
+    /// after the corresponding `TurnStarted` event is durable.
+    pub fn prepare_queued_turn_start(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+    ) -> Result<LaneId, RuntimeLaneError> {
+        let lane = self
+            .lanes_by_session
+            .get(&session_id)
+            .ok_or(RuntimeLaneError::LaneNotFound)?;
+        if !lane.pending_turns.contains(&turn_id) {
+            return Err(RuntimeLaneError::QueuedTurnNotPending);
+        }
+        Ok(lane.lane_id)
+    }
+
+    pub fn commit_queued_turn_start(
+        &mut self,
+        session_id: SessionId,
+        lane_id: LaneId,
+        turn_id: TurnId,
+    ) -> Result<(), RuntimeLaneError> {
         let lane = self
             .lanes_by_session
             .get_mut(&session_id)
+            .filter(|lane| lane.lane_id == lane_id)
             .ok_or(RuntimeLaneError::LaneNotFound)?;
-        lane.pending_turns.retain(|pending| *pending != turn_id);
+        let Some(index) = lane
+            .pending_turns
+            .iter()
+            .position(|pending| *pending == turn_id)
+        else {
+            return Err(RuntimeLaneError::QueuedTurnNotPending);
+        };
+        lane.pending_turns.remove(index);
         lane.active_turn_id = Some(turn_id);
         Ok(())
     }
@@ -379,5 +418,139 @@ fn lane_event(
         }),
         payload_ref: None,
         durable: true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use golutra_core::ActorKind;
+
+    fn actor() -> Actor {
+        Actor {
+            kind: ActorKind::Runtime,
+            id: "lane-test".to_owned(),
+        }
+    }
+
+    fn manager_with_queued_turns(
+        queued_turns: &[TurnId],
+    ) -> (RuntimeLaneManager, SessionId, TurnId) {
+        let mut manager = RuntimeLaneManager::new();
+        let session_id = SessionId::new();
+        let active_turn_id = TurnId::new();
+        manager
+            .start_task(
+                WorkspaceId::new(),
+                session_id,
+                TaskId::new(),
+                active_turn_id,
+                actor(),
+                1,
+            )
+            .expect("task starts");
+        for (index, turn_id) in queued_turns.iter().copied().enumerate() {
+            manager
+                .queue_turn(
+                    session_id,
+                    turn_id,
+                    u64::try_from(index).expect("sequence") + 2,
+                )
+                .expect("turn queues");
+        }
+        (manager, session_id, active_turn_id)
+    }
+
+    #[test]
+    fn preparing_queued_turn_start_does_not_mutate_lane() {
+        let queued_turn_id = TurnId::new();
+        let (manager, session_id, active_turn_id) = manager_with_queued_turns(&[queued_turn_id]);
+        let before = manager.lane(session_id).expect("lane").clone();
+
+        let lane_id = manager
+            .prepare_queued_turn_start(session_id, queued_turn_id)
+            .expect("transition prepares");
+
+        assert_eq!(lane_id, before.lane_id);
+        assert_eq!(manager.lane(session_id), Some(&before));
+        assert_eq!(before.active_turn_id, Some(active_turn_id));
+        assert_eq!(before.pending_turns, vec![queued_turn_id]);
+    }
+
+    #[test]
+    fn committing_queued_turn_start_preserves_turns_queued_after_prepare() {
+        let queued_turn_id = TurnId::new();
+        let later_turn_id = TurnId::new();
+        let (mut manager, session_id, _) = manager_with_queued_turns(&[queued_turn_id]);
+        let lane_id = manager
+            .prepare_queued_turn_start(session_id, queued_turn_id)
+            .expect("transition prepares");
+        manager
+            .queue_turn(session_id, later_turn_id, 3)
+            .expect("later turn queues");
+
+        manager
+            .commit_queued_turn_start(session_id, lane_id, queued_turn_id)
+            .expect("transition commits");
+
+        let lane = manager.lane(session_id).expect("lane");
+        assert_eq!(lane.active_turn_id, Some(queued_turn_id));
+        assert_eq!(lane.pending_turns, vec![later_turn_id]);
+    }
+
+    #[test]
+    fn prepared_start_cannot_mutate_a_replacement_lane() {
+        let queued_turn_id = TurnId::new();
+        let (mut manager, session_id, _) = manager_with_queued_turns(&[queued_turn_id]);
+        let lane_id = manager
+            .prepare_queued_turn_start(session_id, queued_turn_id)
+            .expect("transition prepares");
+        manager
+            .finish_task(session_id, TaskStatus::Completed, 3)
+            .expect("task finishes");
+        let replacement_turn_id = TurnId::new();
+        manager
+            .start_task(
+                WorkspaceId::new(),
+                session_id,
+                TaskId::new(),
+                replacement_turn_id,
+                actor(),
+                4,
+            )
+            .expect("replacement task starts");
+        let before = manager.lane(session_id).expect("replacement lane").clone();
+
+        assert_eq!(
+            manager.commit_queued_turn_start(session_id, lane_id, queued_turn_id),
+            Err(RuntimeLaneError::LaneNotFound)
+        );
+        assert_eq!(manager.lane(session_id), Some(&before));
+    }
+
+    #[test]
+    fn queued_turn_start_rejects_an_unknown_turn_without_mutating_the_lane() {
+        let queued_turn_id = TurnId::new();
+        let unknown_turn_id = TurnId::new();
+        let (mut manager, session_id, active_turn_id) =
+            manager_with_queued_turns(&[queued_turn_id]);
+        let before = manager.lane(session_id).expect("lane").clone();
+
+        assert_eq!(
+            manager.prepare_queued_turn_start(session_id, unknown_turn_id),
+            Err(RuntimeLaneError::QueuedTurnNotPending)
+        );
+        assert_eq!(
+            manager.start_queued_turn(session_id, unknown_turn_id),
+            Err(RuntimeLaneError::QueuedTurnNotPending)
+        );
+        assert_eq!(manager.lane(session_id), Some(&before));
+        assert_eq!(
+            manager.commit_queued_turn_start(session_id, before.lane_id, unknown_turn_id),
+            Err(RuntimeLaneError::QueuedTurnNotPending)
+        );
+        let lane = manager.lane(session_id).expect("lane");
+        assert_eq!(lane.active_turn_id, Some(active_turn_id));
+        assert_eq!(lane.pending_turns, vec![queued_turn_id]);
     }
 }

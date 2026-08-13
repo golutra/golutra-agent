@@ -70,6 +70,17 @@ impl EventRepository {
         self.store.append_event_assigning_sequence(event).await
     }
 
+    pub async fn append_tool_completed_bundle(
+        &self,
+        event: RuntimeEvent,
+        artifacts: &[(ArtifactRecord, Vec<u8>)],
+        evidence: &[EvidenceRecord],
+    ) -> StoreResult<RuntimeEvent> {
+        self.store
+            .append_tool_completed_bundle(event, artifacts, evidence)
+            .await
+    }
+
     pub async fn max_sequence(&self) -> StoreResult<u64> {
         self.store.max_sequence_no().await
     }

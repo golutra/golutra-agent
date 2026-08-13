@@ -7,7 +7,12 @@ from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .client import GolutraClient
-    from .generated import TaskContract, TaskReconciliationDecision
+    from .generated import (
+        AgentExecutionMode,
+        AgentToolProfile,
+        TaskContract,
+        TaskReconciliationDecision,
+    )
 
 
 class Thread:
@@ -24,6 +29,8 @@ class Thread:
         self,
         prompt: str,
         *,
+        execution_mode: AgentExecutionMode = "open",
+        tool_profile: AgentToolProfile = "coding",
         output_schema: dict[str, Any] | None = None,
         task_contract: TaskContract | None = None,
         allow_network: bool = False,
@@ -33,6 +40,67 @@ class Thread:
         completion_criteria: Iterable[str] = (),
         external_verifiers: Iterable[dict[str, Any]] | None = None,
         discover_project_verifiers: bool = True,
+    ) -> TurnHandle:
+        return self._start_turn(
+            prompt,
+            execution_mode=execution_mode,
+            tool_profile=tool_profile,
+            output_schema=output_schema,
+            task_contract=task_contract,
+            allow_network=allow_network,
+            yolo=yolo,
+            max_elapsed_ms=max_elapsed_ms,
+            defer_external_verification=defer_external_verification,
+            completion_criteria=completion_criteria,
+            external_verifiers=external_verifiers,
+            discover_project_verifiers=discover_project_verifiers,
+        )
+
+    def run_legacy(
+        self,
+        prompt: str,
+        *,
+        output_schema: dict[str, Any] | None = None,
+        task_contract: TaskContract | None = None,
+        allow_network: bool = False,
+        yolo: bool = False,
+        max_elapsed_ms: int | None = None,
+        defer_external_verification: bool = False,
+        completion_criteria: Iterable[str] = (),
+        external_verifiers: Iterable[dict[str, Any]] | None = None,
+        discover_project_verifiers: bool = True,
+    ) -> TurnHandle:
+        """Start a turn without selecting the new execution or tool defaults."""
+        return self._start_turn(
+            prompt,
+            execution_mode=None,
+            tool_profile=None,
+            output_schema=output_schema,
+            task_contract=task_contract,
+            allow_network=allow_network,
+            yolo=yolo,
+            max_elapsed_ms=max_elapsed_ms,
+            defer_external_verification=defer_external_verification,
+            completion_criteria=completion_criteria,
+            external_verifiers=external_verifiers,
+            discover_project_verifiers=discover_project_verifiers,
+        )
+
+    def _start_turn(
+        self,
+        prompt: str,
+        *,
+        execution_mode: AgentExecutionMode | None,
+        tool_profile: AgentToolProfile | None,
+        output_schema: dict[str, Any] | None,
+        task_contract: TaskContract | None,
+        allow_network: bool,
+        yolo: bool,
+        max_elapsed_ms: int | None,
+        defer_external_verification: bool,
+        completion_criteria: Iterable[str],
+        external_verifiers: Iterable[dict[str, Any]] | None,
+        discover_project_verifiers: bool,
     ) -> TurnHandle:
         if not prompt.strip():
             raise ValueError("turn prompt cannot be empty")
@@ -44,6 +112,10 @@ class Thread:
             "defer_external_verification": defer_external_verification,
             "completion_criteria": [item for item in completion_criteria if item.strip()],
         }
+        if execution_mode is not None:
+            params["execution_mode"] = execution_mode
+        if tool_profile is not None:
+            params["tool_profile"] = tool_profile
         if max_elapsed_ms is not None:
             params["max_elapsed_ms"] = max_elapsed_ms
         if external_verifiers is not None or not discover_project_verifiers:
@@ -63,6 +135,8 @@ class Thread:
         self,
         prompt: str,
         *,
+        execution_mode: AgentExecutionMode = "open",
+        tool_profile: AgentToolProfile = "coding",
         output_schema: dict[str, Any] | None = None,
         task_contract: TaskContract | None = None,
         allow_network: bool = False,
@@ -75,6 +149,8 @@ class Thread:
     ) -> TurnHandle:
         return self.run(
             prompt,
+            execution_mode=execution_mode,
+            tool_profile=tool_profile,
             output_schema=output_schema,
             task_contract=task_contract,
             allow_network=allow_network,
@@ -86,14 +162,46 @@ class Thread:
             discover_project_verifiers=discover_project_verifiers,
         )
 
-    def steer(self, prompt: str) -> dict[str, Any]:
+    def run_legacy_streamed(
+        self,
+        prompt: str,
+        *,
+        output_schema: dict[str, Any] | None = None,
+        task_contract: TaskContract | None = None,
+        allow_network: bool = False,
+        yolo: bool = False,
+        max_elapsed_ms: int | None = None,
+        defer_external_verification: bool = False,
+        completion_criteria: Iterable[str] = (),
+        external_verifiers: Iterable[dict[str, Any]] | None = None,
+        discover_project_verifiers: bool = True,
+    ) -> TurnHandle:
+        return self.run_legacy(
+            prompt,
+            output_schema=output_schema,
+            task_contract=task_contract,
+            allow_network=allow_network,
+            yolo=yolo,
+            max_elapsed_ms=max_elapsed_ms,
+            defer_external_verification=defer_external_verification,
+            completion_criteria=completion_criteria,
+            external_verifiers=external_verifiers,
+            discover_project_verifiers=discover_project_verifiers,
+        )
+
+    def steer(
+        self,
+        prompt: str,
+        *,
+        tool_profile: AgentToolProfile | None = None,
+    ) -> dict[str, Any]:
         if not prompt.strip():
             raise ValueError("steering prompt cannot be empty")
+        params: dict[str, Any] = {"thread_id": self.thread_id, "prompt": prompt}
+        if tool_profile is not None:
+            params["tool_profile"] = tool_profile
         return _command_ack(
-            self._client.rpc(
-                "turn/steer",
-                {"thread_id": self.thread_id, "prompt": prompt},
-            ),
+            self._client.rpc("turn/steer", params),
             "turn/steer",
         )
 
@@ -233,8 +341,13 @@ class TurnHandle:
             "last_sequence_no": self._terminal.get("last_sequence_no"),
         }
 
-    def steer(self, prompt: str) -> dict[str, Any]:
-        return self.thread.steer(prompt)
+    def steer(
+        self,
+        prompt: str,
+        *,
+        tool_profile: AgentToolProfile | None = None,
+    ) -> dict[str, Any]:
+        return self.thread.steer(prompt, tool_profile=tool_profile)
 
     def interrupt(self) -> dict[str, Any]:
         return self.thread.interrupt()

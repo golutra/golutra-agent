@@ -724,24 +724,8 @@ impl RuntimeHost {
                 .as_ref()
                 .and_then(|provenance| provenance.runtime_config_digest.clone()),
         );
-        let evaluation_store = self.storage.evaluation_store.clone();
-        let capsule_for_store = capsule.clone();
-        let replay_inserted =
-            run_blocking(move || evaluation_store.record_replay_capsule(capsule_for_store))
-                .await??;
-        if replay_inserted {
-            self.record_event(agent_event(
-                self.next_sequence_no(),
-                task,
-                RuntimeEventType::ReplayCapsuleCreated,
-                RuntimeEventSource::Evaluator,
-                json!({
-                    "summary": format!("deterministic replay capsule {} created", capsule.capsule_id),
-                    "record": capsule,
-                }),
-            ))
+        self.persist_replay_capsule(task.session_id, Some(task.turn_id), capsule)
             .await?;
-        }
 
         let source_digest = run_provenance.and_then(|provenance| provenance.build.source_digest);
         let projected_episodes = diagnosis::task_failure_episodes(task.task_id, &events);

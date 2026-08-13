@@ -442,8 +442,9 @@ impl RuntimeHost {
         self: Arc<Self>,
         task: HostedAgentTask,
         session_lease: Option<Arc<File>>,
-        pending_turns: Vec<PendingAgentTurn>,
-        delegation: Option<delegation_policy::DelegationContext>,
+        pending_turns: Vec<ConfiguredPendingAgentTurn>,
+        delegation: Option<DelegationContextSeed>,
+        governor_usage: AgentGovernorUsage,
     ) -> Result<(), ClientError> {
         if self.execution.shutdown.is_cancelled() {
             return self
@@ -455,10 +456,28 @@ impl RuntimeHost {
         }
         let provider_settings = ProviderTurnSettings::from_payload(&task.payload);
         let (execution, control, delegation) = match delegation {
-            Some(context) => {
+            Some(DelegationContextSeed::Live(context)) => {
                 let cancellation = context.cancellation().child_token();
                 let (execution, control) =
                     agent_execution_channel_with_cancellation(32, cancellation);
+                (execution, control, context)
+            }
+            Some(DelegationContextSeed::Recovered(recovered)) => {
+                let cancellation = self.execution.shutdown.child_token();
+                let (execution, control) =
+                    agent_execution_channel_with_cancellation(32, cancellation);
+                let context = match delegation_policy::DelegationContext::recovered(
+                    recovered,
+                    chrono::Utc::now(),
+                    execution.cancellation_token(),
+                ) {
+                    Ok(context) => context,
+                    Err(error) => {
+                        return self
+                            .fail_task_start(&task, ClientError::TaskExecution(error.to_owned()))
+                            .await;
+                    }
+                };
                 (execution, control, context)
             }
             None => {
@@ -488,7 +507,7 @@ impl RuntimeHost {
             }
         };
         for pending_turn in pending_turns {
-            if let Err(error) = execution.append_turn(pending_turn).await {
+            if let Err(error) = execution.append_configured_turn(pending_turn).await {
                 return self
                     .fail_task_start(&task, ClientError::TaskExecution(error.to_string()))
                     .await;
@@ -499,7 +518,9 @@ impl RuntimeHost {
         let worker_task = task.clone();
         let worker = tokio::spawn(async move {
             start_rx.await.map_err(|_| ClientError::TaskCancelled)?;
-            worker_host.run_agent_task(worker_task, control).await
+            worker_host
+                .run_agent_task(worker_task, control, governor_usage)
+                .await
         });
         let abort_handle = worker.abort_handle();
         let (completion_sender, completion) = watch::channel(false);
@@ -704,13 +725,15 @@ impl RuntimeHost {
         self: Arc<Self>,
         task: HostedAgentTask,
         control: AgentExecutionControl,
+        governor_usage: AgentGovernorUsage,
     ) -> Result<(), ClientError> {
         let started_at = Instant::now();
         let objective = model_prompt_from_payload(&task.payload);
-        let explicit_task_contract = task
-            .payload
-            .get("task_contract")
-            .is_some_and(|value| !value.is_null());
+        let execution_mode = execution_mode_from_payload(&task.payload)
+            .map_err(|error| ClientError::TaskExecution(error.to_owned()))?;
+        let tool_profile = tool_profile_from_payload(&task.payload, execution_mode)
+            .map_err(|error| ClientError::TaskExecution(error.to_owned()))?;
+        let has_explicit_task_contract = explicit_task_contract(&task.payload);
         let mut task_contract = task_contract_from_payload(&task.payload)?;
         let requested_network = match task.payload.get("allow_network") {
             None => false,
@@ -787,10 +810,14 @@ impl RuntimeHost {
             provider_session_policy,
         } = provider_plan;
         let legacy_task = LegacyTaskAdapter::new(&task.payload, &objective);
-        if !explicit_task_contract && (touched_code || legacy_task.requests_workspace_change()) {
+        if !has_explicit_task_contract && should_apply_legacy_adapter(&task.payload, execution_mode)
+        {
             legacy_task.apply_to(&mut task_contract);
         }
-        if !explicit_task_contract && defer_external_verification {
+        if !has_explicit_task_contract
+            && should_apply_legacy_adapter(&task.payload, execution_mode)
+            && defer_external_verification
+        {
             task_contract.require_objective_validation = false;
         }
         task_contract
@@ -830,7 +857,7 @@ impl RuntimeHost {
         } else {
             harness
         };
-        let run = AgentRun::new(AgentTaskRequest {
+        let run = ConfiguredAgentRun::new(AgentTaskRequest {
             session_id: task.session_id,
             task_id: task.task_id,
             turn_id: task.turn_id,
@@ -846,14 +873,17 @@ impl RuntimeHost {
             },
         })
         .with_task_contract(task_contract)
-        .with_deferred_external_verification(defer_external_verification);
+        .with_execution_mode(execution_mode.explicit())
+        .with_tool_profile(tool_profile)
+        .with_deferred_external_verification(defer_external_verification)
+        .with_governor_usage(governor_usage);
         let run = match max_elapsed_ms {
             Some(max_elapsed_ms) => run.with_max_elapsed_ms(max_elapsed_ms),
             None => run,
         };
         let control_cancellation = control.cancellation_token();
         let outcome = harness
-            .execute(
+            .execute_configured(
                 run,
                 control,
                 ChannelObservationSink {
@@ -952,11 +982,13 @@ impl RuntimeHost {
             let plan = if self.force_mock_provider {
                 isolated_mock_provider_plan(&task.payload, objective)
             } else {
-                mock_provider_plan(
-                    self.provider_config_paths.as_ref(),
-                    &task.payload,
-                    objective,
-                )
+                let provider_config_paths = self.provider_config_paths.clone();
+                let payload = task.payload.clone();
+                let objective = objective.to_owned();
+                run_blocking(move || {
+                    mock_provider_plan(provider_config_paths.as_ref(), &payload, &objective)
+                })
+                .await?
             };
             match plan {
                 Ok(plan) => {

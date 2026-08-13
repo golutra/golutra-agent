@@ -15,7 +15,7 @@ use golutra_governor::RuntimeGovernorDecision;
 use golutra_llm::{ProviderRequest, ProviderResponse, ProviderStreamEvent};
 use golutra_tools::ToolExecutionReport;
 
-use super::PendingAgentTurn;
+use super::{ConfiguredPendingAgentTurn, PendingAgentTurn};
 use super::{StepCheckpoint, StepCompletion, StepSnapshot};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -121,6 +121,9 @@ pub enum AgentLoopTraceEvent {
     },
     GovernorDecided(RuntimeGovernorDecision),
     PendingTurnStarted(PendingAgentTurn),
+    /// Queued turn start with an explicit execution surface. The legacy
+    /// variant remains available for callers that use the original queue API.
+    PendingTurnStartedWithExecution(ConfiguredPendingAgentTurn),
     AssistantMessage {
         turn_id: TurnId,
         content: String,

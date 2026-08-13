@@ -42,7 +42,9 @@ combined agent/test horizon or a deliberately shorter local feedback loop.
 
 The blocking tmux command and the runtime itself are both bounded. The adapter reads the trial's
 `max_agent_timeout_sec`, global timeout override, and timeout multiplier from
-the active Terminal-Bench run. It subtracts setup and finalization reserves,
+the active Terminal-Bench run. Local datasets are resolved from `dataset_path`;
+registry datasets are resolved from Terminal-Bench's official cache using the
+recorded dataset name and version. It subtracts setup and finalization reserves,
 passes the remaining budget through `--max-elapsed-ms`, and gives tmux a short
 grace period to interrupt Golutra after the harness deadline. This lets Golutra
 write a governed terminal state before Terminal-Bench's outer asyncio timeout

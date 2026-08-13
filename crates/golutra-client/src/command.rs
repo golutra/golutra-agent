@@ -13,6 +13,97 @@ fn queued_turn_id_from_payload(payload: &Value) -> Option<TurnId> {
         .and_then(|value| value.parse().ok())
 }
 
+fn steering_override_reason(payload: &Value) -> Option<&'static str> {
+    if payload.get(crate::task_mode::EXECUTION_MODE_KEY).is_some() {
+        return Some("steering cannot change execution_mode; only tool_profile may be overridden");
+    }
+    if payload
+        .get("task_contract")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Some("steering cannot change the active task contract");
+    }
+    if payload
+        .get("output_schema")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Some("steering cannot change the active output schema");
+    }
+    if payload
+        .get("completion_criteria")
+        .is_some_and(|value| match value {
+            Value::Null => false,
+            Value::Array(values) => !values.is_empty(),
+            Value::String(value) => !value.trim().is_empty(),
+            _ => true,
+        })
+    {
+        return Some("steering cannot change the active completion criteria");
+    }
+    if payload
+        .get("external_verifiers")
+        .is_some_and(|value| match value {
+            Value::Null => false,
+            Value::Array(values) => !values.is_empty(),
+            _ => true,
+        })
+    {
+        return Some("steering cannot change the active verifier set");
+    }
+    if payload
+        .get("max_elapsed_ms")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Some("steering cannot change the active elapsed-time budget");
+    }
+    if payload
+        .get("defer_external_verification")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Some("steering cannot change active external-verification behavior");
+    }
+    if payload
+        .get(delegation_policy::DELEGATION_COST_BUDGET_KEY)
+        .is_some_and(|value| !value.is_null())
+    {
+        return Some("steering cannot change the active delegation cost budget");
+    }
+    None
+}
+
+fn normalize_inherited_steering_payload(
+    payload: &mut Value,
+    tool_profile: AgentToolProfile,
+    has_explicit_tool_profile: bool,
+) -> Result<(), ClientError> {
+    if let Some(object) = payload.as_object_mut() {
+        for key in [
+            crate::task_mode::EXECUTION_MODE_KEY,
+            crate::task_mode::NORMALIZED_EXECUTION_MODE_KEY,
+            "task_contract",
+            "completion_criteria",
+            "output_schema",
+            "external_verifiers",
+            "max_elapsed_ms",
+            "defer_external_verification",
+            "discover_project_verifiers",
+            EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY,
+            delegation_policy::DELEGATION_COST_BUDGET_KEY,
+        ] {
+            object.remove(key);
+        }
+        if !has_explicit_tool_profile {
+            object.remove(TOOL_PROFILE_KEY);
+        }
+    }
+    payload["_task_contract_origin"] = Value::String("active_task".to_owned());
+    if has_explicit_tool_profile {
+        payload[TOOL_PROFILE_KEY] = serde_json::to_value(tool_profile)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ThreadMetadataMutation {
     Upsert,
@@ -337,7 +428,7 @@ impl RuntimeHost {
                     self.handle_regression_command(session_id, command).await?
                 }
                 SessionCommandKind::Replay => {
-                    self.handle_replay_command(session_id, command).await?
+                    Box::pin(self.handle_replay_command(session_id, command)).await?
                 }
                 SessionCommandKind::ReviewCandidate => {
                     self.handle_review_candidate_command(session_id, command)
@@ -512,6 +603,14 @@ impl RuntimeHost {
             .get(crate::delegation::DELEGATED_TASK_MARKER)
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let steer = payload
+            .get("steer")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let steering_override_reason = steer.then(|| steering_override_reason(&payload)).flatten();
+        let has_explicit_tool_profile = payload
+            .get(TOOL_PROFILE_KEY)
+            .is_some_and(|value| !value.is_null());
         if !self
             .delegated_command_is_authorized(session_id, &command)
             .await?
@@ -525,9 +624,12 @@ impl RuntimeHost {
                 ),
             });
         }
-        let explicit_task_contract = payload
-            .get("task_contract")
-            .is_some_and(|value| !value.is_null());
+        let execution_mode = execution_mode_from_payload(&payload)
+            .map_err(|error| ClientError::TaskExecution(error.to_owned()))?;
+        let tool_profile = tool_profile_from_payload(&payload, execution_mode)
+            .map_err(|error| ClientError::TaskExecution(error.to_owned()))?;
+        let has_explicit_task_contract = explicit_task_contract(&payload);
+        let apply_legacy_adapter = !steer && should_apply_legacy_adapter(&payload, execution_mode);
         let requested_network = match payload.get("allow_network") {
             None => None,
             Some(Value::Bool(allow_network)) => Some(*allow_network),
@@ -573,11 +675,15 @@ impl RuntimeHost {
                 Some(requested || requested_yolo.unwrap_or(false))
             });
         let mut task_contract = task_contract_from_payload(&payload)?;
-        let contract_origin = if explicit_task_contract {
+        let contract_origin = if steer {
+            "active_task"
+        } else if has_explicit_task_contract {
             "explicit"
-        } else {
+        } else if apply_legacy_adapter {
             LegacyTaskAdapter::new(&payload, &prompt).apply_to(&mut task_contract);
             "legacy_adapter"
+        } else {
+            "open"
         };
         let mut discovered_project_verifiers = false;
         let discover_project_verifiers_enabled = match payload.get("discover_project_verifiers") {
@@ -589,9 +695,11 @@ impl RuntimeHost {
                 ));
             }
         };
-        if discover_project_verifiers_enabled
+        if !steer
+            && discover_project_verifiers_enabled
             && !defer_external_verification
             && payload.get("external_verifiers").is_none()
+            && strict_execution_requested(&payload, execution_mode)
             && (task_contract.require_objective_validation
                 || task_contract.requires_workspace_evidence())
         {
@@ -614,11 +722,11 @@ impl RuntimeHost {
         }
         if discovered_project_verifiers {
             task_contract = task_contract_from_payload(&payload)?;
-            if !explicit_task_contract {
+            if apply_legacy_adapter {
                 LegacyTaskAdapter::new(&payload, &prompt).apply_to(&mut task_contract);
             }
         }
-        if !explicit_task_contract && defer_external_verification {
+        if apply_legacy_adapter && defer_external_verification {
             task_contract.require_objective_validation = false;
         }
         payload[EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY] =
@@ -640,6 +748,10 @@ impl RuntimeHost {
             .unwrap_or_default();
         payload["task_contract"] = serde_json::to_value(&task_contract)?;
         payload["_task_contract_origin"] = Value::String(contract_origin.to_owned());
+        write_normalized_execution_mode(&mut payload, execution_mode);
+        if !steer || has_explicit_tool_profile {
+            payload[TOOL_PROFILE_KEY] = serde_json::to_value(tool_profile)?;
+        }
         let busy_decision = {
             let lane_manager = self.execution.lane_manager.lock().await;
             lane_manager
@@ -672,95 +784,131 @@ impl RuntimeHost {
                     .cloned();
                 match control {
                     Some(control) if control.task_id == active_task_id => {
-                        if requested_yolo.is_some_and(|requested| control.yolo != requested) {
+                        if steer {
+                            if let Some(error) = steering_override_reason {
+                                accepted = false;
+                                reason = error.to_owned();
+                            } else {
+                                normalize_inherited_steering_payload(
+                                    &mut payload,
+                                    tool_profile,
+                                    has_explicit_tool_profile,
+                                )?;
+                            }
+                        }
+                        if accepted
+                            && requested_yolo.is_some_and(|requested| control.yolo != requested)
+                        {
                             accepted = false;
                             reason =
                                 "queued prompt cannot change yolo capability while a task is active"
                                     .to_owned();
-                        } else if requested_network
-                            .is_some_and(|requested| control.allow_network != requested)
+                        } else if accepted
+                            && requested_network
+                                .is_some_and(|requested| control.allow_network != requested)
                         {
                             accepted = false;
                             reason =
                                 "queued prompt cannot change network capability while a task is active"
                                     .to_owned();
-                        } else if let Err(error) = control
-                            .provider_settings
-                            .normalize_queued_payload(&mut payload)
-                        {
-                            accepted = false;
-                            reason = error.to_owned();
-                        } else {
-                            let allow_network = requested_network.unwrap_or(control.allow_network);
-                            let yolo = requested_yolo.unwrap_or(control.yolo);
-                            payload["allow_network"] = Value::Bool(allow_network);
-                            payload["yolo"] = Value::Bool(yolo);
-                            payload[EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY] = Value::Bool(
-                                payload
-                                    .get(EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY)
-                                    .and_then(Value::as_bool)
-                                    .unwrap_or(false)
-                                    && !yolo,
-                            );
-                            self.upsert_current_thread(session_id, &payload).await?;
-                            match control
-                                .execution
-                                .reserve_turn(PendingAgentTurn {
-                                    command_id: command.command_id,
-                                    turn_id,
-                                    content: model_prompt_from_payload(&payload),
-                                    task_contract: Some(task_contract.clone()),
-                                    output_schema: payload.get("output_schema").cloned(),
-                                    external_verifiers,
-                                    max_elapsed_ms,
-                                    defer_external_verification,
-                                    external_verifiers_require_os_sandbox: payload
-                                        .get(EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY)
-                                        .and_then(Value::as_bool)
-                                        .unwrap_or(false),
-                                    allow_network,
-                                    yolo,
-                                    steer: payload
-                                        .get("steer")
-                                        .and_then(Value::as_bool)
-                                        .unwrap_or(false),
-                                })
-                                .await
+                        } else if accepted {
+                            if let Err(error) = control
+                                .provider_settings
+                                .normalize_queued_payload(&mut payload)
                             {
-                                Ok(reservation) => {
-                                    let transition = self
-                                        .execution
-                                        .lane_manager
-                                        .lock()
-                                        .await
-                                        .queue_turn(session_id, turn_id, self.next_sequence_no())?;
-                                    if let Err(error) = self
-                                        .record_event(with_command_payload(
-                                            transition.event,
-                                            command.command_id,
-                                            payload.clone(),
-                                        ))
-                                        .await
-                                    {
-                                        let _ = self
-                                            .execution
-                                            .lane_manager
-                                            .lock()
+                                accepted = false;
+                                reason = error.to_owned();
+                            } else {
+                                let allow_network =
+                                    requested_network.unwrap_or(control.allow_network);
+                                let yolo = requested_yolo.unwrap_or(control.yolo);
+                                payload["allow_network"] = Value::Bool(allow_network);
+                                payload["yolo"] = Value::Bool(yolo);
+                                if !steer {
+                                    payload[EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY] =
+                                        Value::Bool(
+                                            payload
+                                                .get(EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY)
+                                                .and_then(Value::as_bool)
+                                                .unwrap_or(false)
+                                                && !yolo,
+                                        );
+                                }
+                                self.upsert_current_thread(session_id, &payload).await?;
+                                let configured_turn =
+                                    ConfiguredPendingAgentTurn::new(PendingAgentTurn {
+                                        command_id: command.command_id,
+                                        turn_id,
+                                        content: model_prompt_from_payload(&payload),
+                                        task_contract: (!steer).then_some(task_contract.clone()),
+                                        output_schema: (!steer)
+                                            .then(|| payload.get("output_schema").cloned())
+                                            .flatten(),
+                                        external_verifiers: if steer {
+                                            Vec::new()
+                                        } else {
+                                            external_verifiers
+                                        },
+                                        max_elapsed_ms: (!steer)
+                                            .then_some(max_elapsed_ms)
+                                            .flatten(),
+                                        defer_external_verification: !steer
+                                            && defer_external_verification,
+                                        external_verifiers_require_os_sandbox: !steer
+                                            && payload
+                                                .get(EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY)
+                                                .and_then(Value::as_bool)
+                                                .unwrap_or(false),
+                                        allow_network,
+                                        yolo,
+                                        steer,
+                                    })
+                                    .with_execution_options(
+                                        PendingTurnExecutionOptions {
+                                            execution_mode: (!steer)
+                                                .then(|| execution_mode.explicit())
+                                                .flatten(),
+                                            tool_profile: (!steer || has_explicit_tool_profile)
+                                                .then_some(tool_profile),
+                                        },
+                                    );
+                                match control.execution.reserve_configured_turn(configured_turn) {
+                                    Ok(reservation) => {
+                                        let transition =
+                                            self.execution.lane_manager.lock().await.queue_turn(
+                                                session_id,
+                                                turn_id,
+                                                self.next_sequence_no(),
+                                            )?;
+                                        if let Err(error) = self
+                                            .record_event(with_command_payload(
+                                                transition.event,
+                                                command.command_id,
+                                                payload.clone(),
+                                            ))
                                             .await
-                                            .discard_queued_turn(session_id, turn_id);
-                                        return Err(error);
+                                        {
+                                            let _ = self
+                                                .execution
+                                                .lane_manager
+                                                .lock()
+                                                .await
+                                                .discard_queued_turn(session_id, turn_id);
+                                            return Err(error);
+                                        }
+                                        reservation.commit();
                                     }
-                                    reservation.commit();
-                                }
-                                Err(AgentLoopError::PendingTurnQueueClosed) => {
-                                    retry_as_new_task = true;
-                                }
-                                Err(AgentLoopError::PendingTurnQueueFull) => {
-                                    accepted = false;
-                                    reason = "active task pending turn queue is full".to_owned();
-                                }
-                                Err(error) => {
-                                    return Err(ClientError::TaskExecution(error.to_string()));
+                                    Err(AgentLoopError::PendingTurnQueueClosed) => {
+                                        retry_as_new_task = true;
+                                    }
+                                    Err(AgentLoopError::PendingTurnQueueFull) => {
+                                        accepted = false;
+                                        reason =
+                                            "active task pending turn queue is full".to_owned();
+                                    }
+                                    Err(error) => {
+                                        return Err(ClientError::TaskExecution(error.to_string()));
+                                    }
                                 }
                             }
                         }
@@ -801,6 +949,13 @@ impl RuntimeHost {
                     }),
                 });
             }
+        }
+        if steer {
+            return Ok(CommandAck {
+                command_id: command.command_id,
+                accepted: false,
+                reason: Some("steering requires an active runtime task".to_owned()),
+            });
         }
         let requested_network = requested_network.unwrap_or(false);
         let yolo = requested_yolo.unwrap_or(false);
@@ -885,7 +1040,12 @@ impl RuntimeHost {
         } else {
             None
         };
-        pin_provider_turn_settings(self.provider_config_paths.as_ref(), &mut payload);
+        let provider_config_paths = self.provider_config_paths.clone();
+        payload = run_blocking(move || {
+            pin_provider_turn_settings(provider_config_paths.as_ref(), &mut payload);
+            payload
+        })
+        .await?;
         self.upsert_current_thread(session_id, &payload).await?;
         let mut lane_manager = self.execution.lane_manager.lock().await;
         let transition = lane_manager.start_task(
@@ -920,7 +1080,8 @@ impl RuntimeHost {
             },
             session_lease,
             Vec::new(),
-            delegation_context,
+            delegation_context.map(DelegationContextSeed::Live),
+            AgentGovernorUsage::default(),
         ));
         spawn.await?;
 
@@ -1006,9 +1167,13 @@ impl RuntimeHost {
             }),
         );
         event.turn_id = Some(turn_id);
-        let replacement = recovered_pending_turn_from_event(&event)?
-            .ok_or_else(|| ClientError::TaskExecution("queued turn update is invalid".to_owned()))?
-            .pending;
+        let recovered = recovered_pending_turn_from_event(&event)?.ok_or_else(|| {
+            ClientError::TaskExecution("queued turn update is invalid".to_owned())
+        })?;
+        let replacement = ConfiguredPendingAgentTurn {
+            turn: recovered.pending,
+            execution: recovered.execution,
+        };
         let control = self
             .execution
             .task_controls
@@ -1023,7 +1188,10 @@ impl RuntimeHost {
                 reason: Some("active task finished before the queued turn was updated".to_owned()),
             });
         };
-        let mutation = match control.execution.reserve_turn_update(turn_id, replacement) {
+        let mutation = match control
+            .execution
+            .reserve_configured_turn_update(turn_id, replacement)
+        {
             Ok(mutation) => mutation,
             Err(AgentLoopError::PendingTurnNotFound) => {
                 return Ok(CommandAck {
@@ -1489,10 +1657,14 @@ impl RuntimeHost {
             .clone()
             .map_or_else(ProviderConfigPaths::global, Ok)
             .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
-        let environment = load_provider_runtime_env_from_paths(&paths)
-            .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
-        let redacted = ConfiguredProvider::redacted_from_reader(|key| environment.get(key))
-            .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
+        let (environment, redacted) = run_blocking(move || {
+            let environment = load_provider_runtime_env_from_paths(&paths)
+                .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
+            let redacted = ConfiguredProvider::redacted_from_reader(|key| environment.get(key))
+                .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
+            Ok::<_, ClientError>((environment, redacted))
+        })
+        .await??;
         let protocol = redacted.protocol;
         self.record_event(host_event(
             self.next_sequence_no(),

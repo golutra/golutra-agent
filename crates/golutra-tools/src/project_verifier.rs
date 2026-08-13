@@ -1,8 +1,15 @@
 //! Conservative project-level verifier discovery.
 
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
+
+use crate::workspace_scan;
 
 const MAX_PROJECT_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_TEST_DISCOVERY_ENTRIES: usize = 256;
@@ -135,11 +142,14 @@ fn is_regular_project_file(path: &Path) -> bool {
 }
 
 fn read_project_file(path: &Path) -> Option<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path).ok()?;
-    if !metadata.file_type().is_file() || metadata.len() > MAX_PROJECT_MANIFEST_BYTES {
-        return None;
-    }
-    fs::read(path).ok()
+    workspace_scan::read_regular_file_bounded(
+        path,
+        path.parent()?,
+        MAX_PROJECT_MANIFEST_BYTES,
+        &CancellationToken::new(),
+        Instant::now().checked_add(Duration::from_secs(1))?,
+    )
+    .ok()
 }
 
 fn read_project_text(path: &Path) -> Option<String> {

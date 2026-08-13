@@ -10,6 +10,8 @@ class Actor(TypedDict, total=False):
 
 ActorKind: TypeAlias = Literal['user', 'api', 'tui', 'cli', 'sdk', 'web', 'ide', 'runtime']
 
+AgentExecutionMode: TypeAlias = Literal['open', 'strict']
+
 class AgentItem(TypedDict, total=False):
     content: NotRequired[str | None]
     data: Required[Any]
@@ -23,6 +25,9 @@ class AgentItem(TypedDict, total=False):
 AgentItemKind: TypeAlias = Literal['user_message', 'assistant_message', 'model', 'tool', 'approval', 'verification', 'runtime']
 
 AgentItemStatus: TypeAlias = Literal['in_progress', 'completed', 'failed', 'cancelled']
+
+class AgentSteerOptions(TypedDict, total=False):
+    tool_profile: NotRequired[AgentToolProfile | None]
 
 class AgentStreamEventThreadStarted(TypedDict, total=False):
     session_id: Required[str]
@@ -86,6 +91,12 @@ class AgentThreadRef(TypedDict, total=False):
     session_id: Required[str]
     thread_id: Required[str]
     workspace_root: NotRequired[str | None]
+
+AgentToolProfile: TypeAlias = Literal['coding', 'full']
+
+class AgentTurnExecutionOptions(TypedDict, total=False):
+    execution_mode: NotRequired[AgentExecutionMode]
+    tool_profile: NotRequired[AgentToolProfile]
 
 class AgentTurnOptions(TypedDict, total=False):
     allow_network: NotRequired[bool]
@@ -1944,9 +1955,11 @@ WorkspaceChangeRequirement: TypeAlias = Literal['optional', 'required', 'forbidd
 __all__ = [
     "Actor",
     "ActorKind",
+    "AgentExecutionMode",
     "AgentItem",
     "AgentItemKind",
     "AgentItemStatus",
+    "AgentSteerOptions",
     "AgentStreamEvent",
     "AgentStreamEventItemCompleted",
     "AgentStreamEventItemStarted",
@@ -1957,6 +1970,8 @@ __all__ = [
     "AgentStreamEventTurnFailed",
     "AgentStreamEventTurnStarted",
     "AgentThreadRef",
+    "AgentToolProfile",
+    "AgentTurnExecutionOptions",
     "AgentTurnOptions",
     "AgentTurnResult",
     "AgentTurnStart",

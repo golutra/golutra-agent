@@ -19,11 +19,19 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_EXCERPT_LIMIT: usize = 2048;
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
-const MAX_FILE_CONTENT_BYTES: u64 = 16 * 1024 * 1024;
+/// Maximum raw content retained by a built-in tool artifact.
+pub const MAX_TOOL_ARTIFACT_CONTENT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_FILE_CONTENT_BYTES: u64 = MAX_TOOL_ARTIFACT_CONTENT_BYTES as u64;
+/// Maximum file-body bytes retained by one side of an opaque workspace scan.
+///
+/// Hosts that queue complete tool reports use this contract to reserve room
+/// for both the before and after snapshots without inspecting tool internals.
+pub const MAX_WORKSPACE_SNAPSHOT_CONTENT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 10_000;
 const MAX_DIRECTORY_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_PATH_ARGUMENT_CHARS: usize = 4 * 1024;
@@ -50,6 +58,10 @@ const MAX_MODEL_TOOL_RESULT_DEPTH: usize = 5;
 const EXTERNAL_TOOL_TIMEOUT_MS: u64 = if cfg!(test) { 100 } else { 30_000 };
 const MAX_VERIFIER_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
 const MAX_VERIFIER_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+const DEADLINE_CLEANUP_TIMEOUT: Duration = Duration::from_millis(250);
+const CODE_INDEX_BUILD_CONCURRENCY: usize = 1;
+static CODE_INDEX_BUILD_PERMITS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(CODE_INDEX_BUILD_CONCURRENCY)));
 pub const CONTRACT_FILE_CONTENT_VERIFIER_TOOL: &str = "contract_file_content_verifier";
 pub const CONTRACT_PATH_VERIFIER_TOOL: &str = "contract_path_verifier";
 
@@ -137,6 +149,19 @@ pub struct ToolInvocation {
     pub approved: bool,
     preparation: Option<SideEffectPreparation>,
     deadline: Option<tokio::time::Instant>,
+    pre_execution_stop: Option<ToolInvocationStop>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolInvocationStop {
+    Cancelled,
+    TimedOut,
+}
+
+enum ToolOperationOutcome<T> {
+    Completed(T),
+    Cancelled,
+    TimedOut(Option<T>),
 }
 
 impl ToolInvocation {
@@ -148,6 +173,7 @@ impl ToolInvocation {
             approved,
             preparation: None,
             deadline: None,
+            pre_execution_stop: None,
         }
     }
 
@@ -198,11 +224,28 @@ pub trait TaskDelegationBackend: std::fmt::Debug + Send + Sync {
 pub trait ExternalToolBackend: std::fmt::Debug + Send + Sync {
     fn contracts(&self) -> Vec<ToolContract>;
 
+    /// Optional host-reviewed execution capabilities keyed by tool name.
+    /// External tools default to the full profile and serial execution.
+    fn capabilities(&self) -> HashMap<String, ToolCapabilities> {
+        HashMap::new()
+    }
+
     async fn call(
         &self,
         request: &ToolRequest,
         cancellation: CancellationToken,
     ) -> Result<ExternalToolOutput, ToolError>;
+}
+
+/// Runtime-only capabilities kept adjacent to a tool contract.
+///
+/// These properties affect scheduling and model-visible profiles, not the
+/// provider protocol, so they intentionally remain outside [`ToolContract`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolCapabilities {
+    pub available_in_coding_profile: bool,
+    pub parallel_read_safe: bool,
+    pub coding_profile_hidden_arguments: Vec<String>,
 }
 
 /// Owner-provided source for deterministic tool replay.
@@ -218,17 +261,23 @@ pub trait ToolReplayBackend: std::fmt::Debug + Send + Sync {
 #[derive(Debug, Clone)]
 pub struct ToolRegistry {
     contracts: HashMap<String, ToolContract>,
+    capabilities: HashMap<String, ToolCapabilities>,
 }
 
 impl ToolRegistry {
     #[must_use]
     pub fn p0_default() -> Self {
-        let contracts = BuiltinTool::P0_DEFAULT
-            .into_iter()
-            .map(BuiltinTool::contract)
-            .map(|contract| (contract.tool_name.clone(), contract))
-            .collect();
-        Self { contracts }
+        let mut contracts = HashMap::new();
+        let mut capabilities = HashMap::new();
+        for tool in BuiltinTool::P0_DEFAULT {
+            let contract = tool.contract();
+            capabilities.insert(contract.tool_name.clone(), tool.capabilities());
+            contracts.insert(contract.tool_name.clone(), contract);
+        }
+        Self {
+            contracts,
+            capabilities,
+        }
     }
 
     #[must_use]
@@ -243,10 +292,27 @@ impl ToolRegistry {
         self.contracts.get(tool_name)
     }
 
+    #[must_use]
+    pub fn capabilities(&self, tool_name: &str) -> Option<&ToolCapabilities> {
+        self.capabilities.get(tool_name)
+    }
+
     fn register_external(
         &mut self,
         contracts: impl IntoIterator<Item = ToolContract>,
+        mut declared_capabilities: HashMap<String, ToolCapabilities>,
     ) -> Result<(), ToolError> {
+        let contracts = contracts.into_iter().collect::<Vec<_>>();
+        for tool_name in declared_capabilities.keys() {
+            if !contracts
+                .iter()
+                .any(|contract| contract.tool_name == *tool_name)
+            {
+                return Err(ToolError::ExternalRegistration(format!(
+                    "capabilities declared for unknown tool `{tool_name}`"
+                )));
+            }
+        }
         for contract in contracts {
             if contract.tool_name.trim().is_empty() {
                 return Err(ToolError::ExternalRegistration(
@@ -259,6 +325,26 @@ impl ToolRegistry {
                     contract.tool_name
                 )));
             }
+            let capabilities = declared_capabilities
+                .remove(&contract.tool_name)
+                .unwrap_or_default();
+            if capabilities.parallel_read_safe && contract.side_effect_type != SideEffectType::None
+            {
+                return Err(ToolError::ExternalRegistration(format!(
+                    "tool `{}` cannot be parallel-read-safe because its contract admits side effects",
+                    contract.tool_name
+                )));
+            }
+            if !capabilities.available_in_coding_profile
+                && !capabilities.coding_profile_hidden_arguments.is_empty()
+            {
+                return Err(ToolError::ExternalRegistration(format!(
+                    "tool `{}` hides coding arguments but is not available in the coding profile",
+                    contract.tool_name
+                )));
+            }
+            self.capabilities
+                .insert(contract.tool_name.clone(), capabilities);
             self.contracts.insert(contract.tool_name.clone(), contract);
         }
         Ok(())
@@ -520,8 +606,41 @@ impl ToolRuntime {
         mut self,
         backend: Arc<dyn ExternalToolBackend>,
     ) -> Result<Self, ToolError> {
-        self.registry.register_external(backend.contracts())?;
+        let contracts = backend.contracts();
+        let capabilities = backend.capabilities();
+        self.registry.register_external(contracts, capabilities)?;
         self.external_backend = Some(backend);
+        Ok(self)
+    }
+
+    /// Register provider-visible external contracts for deterministic replay.
+    ///
+    /// Replay injects recorded results before dispatch, so these contracts do
+    /// not grant access to a live external backend. Runtime-only capability
+    /// metadata is not part of the provider protocol; recorded host MCP tools
+    /// are owner-reviewed coding tools and remain serial during replay.
+    pub fn with_replay_contracts(
+        mut self,
+        contracts: impl IntoIterator<Item = ToolContract>,
+    ) -> Result<Self, ToolError> {
+        let contracts = contracts
+            .into_iter()
+            .filter(|contract| self.registry.contract(&contract.tool_name).is_none())
+            .collect::<Vec<_>>();
+        let capabilities = contracts
+            .iter()
+            .map(|contract| {
+                (
+                    contract.tool_name.clone(),
+                    ToolCapabilities {
+                        available_in_coding_profile: true,
+                        parallel_read_safe: false,
+                        coding_profile_hidden_arguments: Vec::new(),
+                    },
+                )
+            })
+            .collect();
+        self.registry.register_external(contracts, capabilities)?;
         Ok(self)
     }
 
@@ -529,8 +648,11 @@ impl ToolRuntime {
         mut self,
         backend: Arc<dyn TaskDelegationBackend>,
     ) -> Result<Self, ToolError> {
-        self.registry
-            .register_external([BuiltinTool::DelegateTask.contract()])?;
+        let tool = BuiltinTool::DelegateTask;
+        self.registry.register_external(
+            [tool.contract()],
+            HashMap::from([(tool.name().to_owned(), tool.capabilities())]),
+        )?;
         self.delegation_backend = Some(backend);
         Ok(self)
     }
@@ -540,6 +662,7 @@ impl ToolRuntime {
     #[must_use]
     pub fn without_tool(mut self, tool_name: &str) -> Self {
         self.registry.contracts.remove(tool_name);
+        self.registry.capabilities.remove(tool_name);
         if BuiltinTool::from_name(tool_name) == Some(BuiltinTool::DelegateTask) {
             self.delegation_backend = None;
         }
@@ -585,8 +708,19 @@ impl ToolRuntime {
         let preparation = match invocation.preparation.take() {
             Some(preparation) => preparation,
             None if may_execute => {
-                self.prepare_side_effect_snapshot(&invocation.request)
-                    .await?
+                match await_preparation_operation(
+                    self.prepare_side_effect_snapshot(&invocation.request),
+                    &cancellation,
+                    invocation.deadline,
+                )
+                .await
+                {
+                    Ok(preparation) => preparation?,
+                    Err(stop) => {
+                        invocation.pre_execution_stop = Some(stop);
+                        SideEffectPreparation::default()
+                    }
+                }
             }
             None => SideEffectPreparation::default(),
         };
@@ -958,8 +1092,17 @@ impl ToolRuntime {
                 let patch = string_arg(&request.arguments, "patch")?;
                 let paths = self.resolved_patch_paths(&patch).await?;
                 let mut before_images = Vec::with_capacity(paths.len());
+                let mut retained_bytes = 0_usize;
                 for path in paths {
-                    before_images.push(read_optional_file(&path).await?);
+                    let image = read_optional_file(&path).await?;
+                    retained_bytes =
+                        retained_bytes.saturating_add(file_image_content_bytes(&image));
+                    if retained_bytes > MAX_WORKSPACE_SNAPSHOT_CONTENT_BYTES {
+                        return Err(ToolError::InvalidArguments(format!(
+                            "patch checkpoint exceeds {MAX_WORKSPACE_SNAPSHOT_CONTENT_BYTES} retained bytes"
+                        )));
+                    }
+                    before_images.push(image);
                 }
                 Ok(SideEffectPreparation {
                     before_images,
@@ -1067,6 +1210,7 @@ impl ToolRuntime {
             approved,
             preparation,
             deadline,
+            pre_execution_stop,
         } = invocation;
         let Some(preparation) = preparation else {
             return Err(ToolError::Execution(
@@ -1081,6 +1225,7 @@ impl ToolRuntime {
             workspace_snapshot,
             ..
         } = preparation;
+        validate_checkpoint_content_limit(&before_images)?;
         emit_tool_progress(
             &mut progress,
             ToolProgress {
@@ -1094,119 +1239,192 @@ impl ToolRuntime {
                 output_excerpt: None,
             },
         );
-        let result = async {
-            if let Some(replay_backend) = &self.replay_backend {
-                if cancellation.is_cancelled() {
-                    return Ok(cancelled_report(
-                        request,
-                        "tool replay cancelled before result injection",
-                    ));
+        let deadline_request = request.clone();
+        let deadline_policy = policy.clone();
+        let execution_cancellation = cancellation.child_token();
+        let result = {
+            let operation = async {
+                if let Some(replay_backend) = &self.replay_backend {
+                    if execution_cancellation.is_cancelled() {
+                        return Ok(cancelled_report_with_policy(
+                            request,
+                            policy,
+                            "tool replay cancelled before result injection",
+                        ));
+                    }
+                    let mut envelope = replay_backend.replay(&request).await?;
+                    envelope.tool_call_id = request.tool_call_id;
+                    envelope.tool_name = request.tool_name.clone();
+                    let output_bytes = envelope
+                        .model_visible_excerpt
+                        .as_deref()
+                        .map_or(0, str::len);
+                    let output_lines = envelope
+                        .model_visible_excerpt
+                        .as_deref()
+                        .map_or(0, |output| output.lines().count());
+                    return Ok(ToolExecutionReport {
+                        envelope,
+                        artifacts: Vec::new(),
+                        evidence: Vec::new(),
+                        changed_files: Vec::new(),
+                        policy_evaluation: policy,
+                        artifact_contents: Vec::new(),
+                        before_images: Vec::new(),
+                        after_images: Vec::new(),
+                        metrics: ToolExecutionMetrics {
+                            output_bytes: u64::try_from(output_bytes).unwrap_or(u64::MAX),
+                            output_lines: u64::try_from(output_lines).unwrap_or(u64::MAX),
+                            ..ToolExecutionMetrics::default()
+                        },
+                    });
                 }
-                let mut envelope = replay_backend.replay(&request).await?;
-                envelope.tool_call_id = request.tool_call_id;
-                envelope.tool_name = request.tool_name.clone();
-                let output_bytes = envelope
-                    .model_visible_excerpt
-                    .as_deref()
-                    .map_or(0, str::len);
-                let output_lines = envelope
-                    .model_visible_excerpt
-                    .as_deref()
-                    .map_or(0, |output| output.lines().count());
-                return Ok(ToolExecutionReport {
-                    envelope,
-                    artifacts: Vec::new(),
-                    evidence: Vec::new(),
-                    changed_files: Vec::new(),
-                    policy_evaluation: policy,
-                    artifact_contents: Vec::new(),
-                    before_images: Vec::new(),
-                    after_images: Vec::new(),
-                    metrics: ToolExecutionMetrics {
-                        output_bytes: u64::try_from(output_bytes).unwrap_or(u64::MAX),
-                        output_lines: u64::try_from(output_lines).unwrap_or(u64::MAX),
-                        ..ToolExecutionMetrics::default()
-                    },
-                });
-            }
-            let contract = self
-                .registry
-                .contract(&request.tool_name)
-                .ok_or_else(|| ToolError::UnknownTool(request.tool_name.clone()))?;
-            validate_tool_arguments(contract, &request.arguments)?;
-            if cancellation.is_cancelled() {
-                return Ok(cancelled_report(
-                    request,
-                    "tool call cancelled before execution",
-                ));
-            }
-            match policy.decision {
-                PolicyDecision::Allow => {}
-                PolicyDecision::Ask if approved => {}
-                PolicyDecision::Ask => {
-                    return Ok(denied_report(
+                let contract = self
+                    .registry
+                    .contract(&request.tool_name)
+                    .ok_or_else(|| ToolError::UnknownTool(request.tool_name.clone()))?;
+                validate_tool_arguments(contract, &request.arguments)?;
+                if execution_cancellation.is_cancelled() {
+                    return Ok(cancelled_report_with_policy(
                         request,
                         policy,
-                        "tool execution requires approval",
+                        "tool call cancelled before execution",
                     ));
                 }
-                PolicyDecision::Deny | PolicyDecision::Block => {
-                    return Ok(blocked_report(request, policy));
+                match policy.decision {
+                    PolicyDecision::Allow => {}
+                    PolicyDecision::Ask if approved => {}
+                    PolicyDecision::Ask => {
+                        return Ok(denied_report(
+                            request,
+                            policy,
+                            "tool execution requires approval",
+                        ));
+                    }
+                    PolicyDecision::Deny | PolicyDecision::Block => {
+                        return Ok(blocked_report(request, policy));
+                    }
                 }
-            }
 
-            match BuiltinTool::from_name(&request.tool_name) {
-                Some(BuiltinTool::ReadFile) => self.read_file(request, policy).await,
-                Some(BuiltinTool::WriteFile) => {
-                    self.write_file(request, policy, before_images).await
-                }
-                Some(BuiltinTool::EditFile) => self.edit_file(request, policy, before_images).await,
-                Some(BuiltinTool::ApplyPatch) => {
-                    self.apply_patch(request, policy, before_images, cancellation)
+                match BuiltinTool::from_name(&request.tool_name) {
+                    Some(BuiltinTool::ReadFile) => self.read_file(request, policy).await,
+                    Some(BuiltinTool::WriteFile) => {
+                        self.write_file(request, policy, before_images).await
+                    }
+                    Some(BuiltinTool::EditFile) => {
+                        self.edit_file(request, policy, before_images).await
+                    }
+                    Some(BuiltinTool::ApplyPatch) => {
+                        self.apply_patch(
+                            request,
+                            policy,
+                            before_images,
+                            execution_cancellation.clone(),
+                        )
                         .await
-                }
-                Some(BuiltinTool::ListDir) => self.list_dir(request, policy).await,
-                Some(BuiltinTool::RgSearch) => {
-                    self.rg_search(request, policy, cancellation, started_at, &mut progress)
+                    }
+                    Some(BuiltinTool::ListDir) => self.list_dir(request, policy).await,
+                    Some(BuiltinTool::RgSearch) => {
+                        self.rg_search(
+                            request,
+                            policy,
+                            execution_cancellation.clone(),
+                            started_at,
+                            &mut progress,
+                        )
                         .await
+                    }
+                    Some(BuiltinTool::SymbolSearch) => {
+                        self.symbol_search(request, policy, execution_cancellation.clone())
+                            .await
+                    }
+                    Some(BuiltinTool::FindReferences) => {
+                        self.find_references(request, policy, execution_cancellation.clone())
+                            .await
+                    }
+                    Some(BuiltinTool::Shell) => {
+                        self.shell(
+                            request,
+                            policy,
+                            execution_cancellation.clone(),
+                            workspace_snapshot,
+                            started_at,
+                            &mut progress,
+                        )
+                        .await
+                    }
+                    Some(BuiltinTool::DelegateTask) => {
+                        self.delegate_task(
+                            request,
+                            policy,
+                            execution_cancellation.clone(),
+                            workspace_snapshot,
+                        )
+                        .await
+                    }
+                    Some(BuiltinTool::ProcessList) => self.process_list(request, policy).await,
+                    Some(BuiltinTool::ProcessPoll) => self.process_poll(request, policy).await,
+                    Some(BuiltinTool::ProcessWrite) => self.process_write(request, policy).await,
+                    Some(BuiltinTool::ProcessTerminate) => {
+                        self.process_terminate(request, policy).await
+                    }
+                    Some(BuiltinTool::ProcessReconnect) => {
+                        self.process_reconnect(request, policy).await
+                    }
+                    Some(BuiltinTool::AskUser) => Err(ToolError::UnknownTool(
+                        BuiltinTool::AskUser.name().to_owned(),
+                    )),
+                    None => {
+                        self.execute_external(request, policy, execution_cancellation.clone())
+                            .await
+                    }
                 }
-                Some(BuiltinTool::SymbolSearch) => {
-                    self.symbol_search(request, policy, cancellation).await
-                }
-                Some(BuiltinTool::FindReferences) => {
-                    self.find_references(request, policy, cancellation).await
-                }
-                Some(BuiltinTool::Shell) => {
-                    self.shell(
-                        request,
-                        policy,
-                        cancellation,
-                        workspace_snapshot,
-                        started_at,
-                        &mut progress,
+            };
+            match pre_execution_stop {
+                Some(ToolInvocationStop::Cancelled) => Ok(cancelled_report_with_policy(
+                    deadline_request,
+                    deadline_policy,
+                    "tool call cancelled during side-effect preparation",
+                )),
+                Some(ToolInvocationStop::TimedOut) => Ok(self.deadline_exceeded_report(
+                    deadline_request,
+                    deadline_policy,
+                    "side-effect preparation",
+                )),
+                None => {
+                    match await_tool_operation(
+                        operation,
+                        &cancellation,
+                        &execution_cancellation,
+                        deadline,
                     )
                     .await
+                    {
+                        ToolOperationOutcome::Completed(result) => result,
+                        ToolOperationOutcome::Cancelled => {
+                            execution_cancellation.cancel();
+                            Ok(cancelled_report_with_policy(
+                                deadline_request,
+                                deadline_policy,
+                                "tool call cancelled during execution",
+                            ))
+                        }
+                        ToolOperationOutcome::TimedOut(completed) => {
+                            execution_cancellation.cancel();
+                            match completed {
+                                Some(Ok(report)) => Ok(mark_report_deadline_exceeded(report)),
+                                Some(Err(error)) => Err(error),
+                                None => Ok(self.deadline_exceeded_report(
+                                    deadline_request,
+                                    deadline_policy,
+                                    "execution",
+                                )),
+                            }
+                        }
+                    }
                 }
-                Some(BuiltinTool::DelegateTask) => {
-                    self.delegate_task(request, policy, cancellation, workspace_snapshot, deadline)
-                        .await
-                }
-                Some(BuiltinTool::ProcessList) => self.process_list(request, policy).await,
-                Some(BuiltinTool::ProcessPoll) => self.process_poll(request, policy).await,
-                Some(BuiltinTool::ProcessWrite) => self.process_write(request, policy).await,
-                Some(BuiltinTool::ProcessTerminate) => {
-                    self.process_terminate(request, policy).await
-                }
-                Some(BuiltinTool::ProcessReconnect) => {
-                    self.process_reconnect(request, policy).await
-                }
-                Some(BuiltinTool::AskUser) => Err(ToolError::UnknownTool(
-                    BuiltinTool::AskUser.name().to_owned(),
-                )),
-                None => self.execute_external(request, policy, cancellation).await,
             }
-        }
-        .await;
+        };
         match result {
             Ok(mut report) => {
                 report.metrics.duration_ms = elapsed_millis(started_at);
@@ -1277,6 +1495,53 @@ impl ToolRuntime {
             reason,
             policy,
         )
+    }
+
+    /// Build the terminal report used when an enclosing runtime deadline wins.
+    /// The report is data rather than an error so hosts can persist a balanced
+    /// tool completion even when no tool implementation reached its own timeout.
+    #[must_use]
+    pub fn deadline_exceeded_report(
+        &self,
+        request: ToolRequest,
+        policy: PolicyEvaluation,
+        stage: &str,
+    ) -> ToolExecutionReport {
+        let workspace_changes_known = self
+            .registry
+            .contract(&request.tool_name)
+            .is_some_and(|contract| contract.side_effect_type == SideEffectType::None);
+        let mut result = report(
+            request,
+            ToolResultStatus::Timeout,
+            "tool call exceeded its enclosing runtime deadline",
+            json!({
+                "timed_out": true,
+                "deadline_stage": stage,
+                "workspace_changes_known": workspace_changes_known,
+            }),
+            String::new(),
+            Vec::new(),
+            policy,
+        );
+        match BuiltinTool::from_name(&result.envelope.tool_name) {
+            Some(BuiltinTool::DelegateTask) => result.envelope.risk = "delegated_agent".to_owned(),
+            None => result.envelope.risk = "external_mcp_tool".to_owned(),
+            _ => {}
+        }
+        result
+    }
+
+    /// Build a terminal cancellation report while retaining the evaluated
+    /// policy that authorized or rejected the original request.
+    #[must_use]
+    pub fn cancelled_execution_report(
+        &self,
+        request: ToolRequest,
+        policy: PolicyEvaluation,
+        reason: &str,
+    ) -> ToolExecutionReport {
+        cancelled_report_with_policy(request, policy, reason)
     }
 
     #[must_use]
@@ -1897,8 +2162,23 @@ impl ToolRuntime {
                 "code intelligence query was cancelled".to_owned(),
             ));
         }
+        let permit = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                return Err(ToolError::Execution(
+                    "code intelligence query was cancelled".to_owned(),
+                ));
+            }
+            permit = CODE_INDEX_BUILD_PERMITS.clone().acquire_owned() => {
+                permit.map_err(|error| ToolError::Execution(error.to_string()))?
+            }
+        };
         let workspace_root = self.policy.workspace_root().to_path_buf();
         let graph = tokio::task::spawn_blocking(move || {
+            // The permit lives inside the blocking task. Cancelling the async
+            // waiter cannot admit another expensive index build before this
+            // worker has actually stopped.
+            let _permit = permit;
             golutra_code_intelligence::CodeIntelligence::new(workspace_root)?.build()
         })
         .await
@@ -2061,28 +2341,14 @@ impl ToolRuntime {
         policy: PolicyEvaluation,
         cancellation: CancellationToken,
         workspace_before: Option<workspace_scan::WorkspaceSnapshot>,
-        deadline: Option<tokio::time::Instant>,
     ) -> Result<ToolExecutionReport, ToolError> {
         let backend = self
             .delegation_backend
             .as_ref()
             .ok_or_else(|| ToolError::UnknownTool("delegate_task".to_owned()))?;
-        let delegation_cancellation = cancellation.child_token();
-        let output = {
-            let backend_call = backend.delegate(&request, delegation_cancellation.clone());
-            tokio::pin!(backend_call);
-            if let Some(deadline) = deadline {
-                tokio::select! {
-                    output = &mut backend_call => output?,
-                    _ = tokio::time::sleep_until(deadline) => {
-                        delegation_cancellation.cancel();
-                        backend_call.await?
-                    }
-                }
-            } else {
-                backend_call.await?
-            }
-        };
+        let output = backend
+            .delegate(&request, cancellation.child_token())
+            .await?;
         let workspace_changes = match workspace_before {
             Some(snapshot) => workspace_scan::compare(self.policy.workspace_root(), snapshot).await,
             None => {
@@ -2581,8 +2847,11 @@ fn denied_report(
     )
 }
 
-fn cancelled_report(request: ToolRequest, reason: &str) -> ToolExecutionReport {
-    let policy_evaluation = execution_policy(&request, PolicyDecision::Allow, reason);
+fn cancelled_report_with_policy(
+    request: ToolRequest,
+    policy_evaluation: PolicyEvaluation,
+    reason: &str,
+) -> ToolExecutionReport {
     report(
         request,
         ToolResultStatus::Cancelled,
@@ -2592,6 +2861,132 @@ fn cancelled_report(request: ToolRequest, reason: &str) -> ToolExecutionReport {
         Vec::new(),
         policy_evaluation,
     )
+}
+
+fn mark_report_deadline_exceeded(mut report: ToolExecutionReport) -> ToolExecutionReport {
+    report.envelope.status = ToolResultStatus::Timeout;
+    report.envelope.summary = "tool call completed after its enclosing runtime deadline".to_owned();
+    let workspace_changes_known = report
+        .envelope
+        .structured_facts
+        .get("workspace_changes_known")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let facts = match report.envelope.structured_facts {
+        Value::Object(mut facts) => {
+            facts.insert("timed_out".to_owned(), Value::Bool(true));
+            facts.insert(
+                "deadline_stage".to_owned(),
+                Value::String("execution".to_owned()),
+            );
+            facts.insert(
+                "completed_during_deadline_cleanup".to_owned(),
+                Value::Bool(true),
+            );
+            facts.insert(
+                "workspace_changes_known".to_owned(),
+                Value::Bool(workspace_changes_known),
+            );
+            Value::Object(facts)
+        }
+        value => json!({
+            "result": value,
+            "timed_out": true,
+            "deadline_stage": "execution",
+            "completed_during_deadline_cleanup": true,
+            "workspace_changes_known": workspace_changes_known,
+        }),
+    };
+    report.envelope.structured_facts = facts;
+    report
+}
+
+async fn await_tool_operation<F>(
+    operation: F,
+    cancellation: &CancellationToken,
+    operation_cancellation: &CancellationToken,
+    deadline: Option<tokio::time::Instant>,
+) -> ToolOperationOutcome<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::pin!(operation);
+    match deadline {
+        Some(deadline) => {
+            tokio::select! {
+                biased;
+                output = &mut operation => ToolOperationOutcome::Completed(output),
+                _ = tokio::time::sleep_until(deadline) => {
+                    operation_cancellation.cancel();
+                    let completed = tokio::time::timeout(
+                        DEADLINE_CLEANUP_TIMEOUT,
+                        &mut operation,
+                    )
+                    .await
+                    .ok();
+                    ToolOperationOutcome::TimedOut(completed)
+                }
+                _ = cancellation.cancelled() => {
+                    operation_cancellation.cancel();
+                    match tokio::time::timeout(
+                        DEADLINE_CLEANUP_TIMEOUT,
+                        &mut operation,
+                    )
+                    .await
+                    {
+                        Ok(output) => ToolOperationOutcome::Completed(output),
+                        Err(_) => ToolOperationOutcome::Cancelled,
+                    }
+                }
+            }
+        }
+        None => {
+            tokio::select! {
+                biased;
+                output = &mut operation => ToolOperationOutcome::Completed(output),
+                _ = cancellation.cancelled() => {
+                    operation_cancellation.cancel();
+                    match tokio::time::timeout(
+                        DEADLINE_CLEANUP_TIMEOUT,
+                        &mut operation,
+                    )
+                    .await
+                    {
+                        Ok(output) => ToolOperationOutcome::Completed(output),
+                        Err(_) => ToolOperationOutcome::Cancelled,
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn await_preparation_operation<F>(
+    operation: F,
+    cancellation: &CancellationToken,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<F::Output, ToolInvocationStop>
+where
+    F: std::future::Future,
+{
+    tokio::pin!(operation);
+    match deadline {
+        Some(deadline) => {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => Err(ToolInvocationStop::Cancelled),
+                _ = tokio::time::sleep_until(deadline) => Err(ToolInvocationStop::TimedOut),
+                output = &mut operation => Ok(output),
+            }
+        }
+        None => {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => Err(ToolInvocationStop::Cancelled),
+                output = &mut operation => Ok(output),
+            }
+        }
+    }
 }
 
 fn external_report(
@@ -3435,10 +3830,17 @@ async fn read_optional_file(path: &Path) -> Result<FileBeforeImage, ToolError> {
         });
     }
 
+    if !path_metadata.file_type().is_file() {
+        return Err(ToolError::Execution(format!(
+            "path {} is not a regular file",
+            path.display()
+        )));
+    }
+
     let mut options = tokio::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
-    options.custom_flags(nix::libc::O_NOFOLLOW);
+    options.custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
     #[cfg(windows)]
     options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
     let mut file = options
@@ -3449,6 +3851,14 @@ async fn read_optional_file(path: &Path) -> Result<FileBeforeImage, ToolError> {
         .metadata()
         .await
         .map_err(|error| ToolError::Execution(error.to_string()))?;
+    if !metadata.file_type().is_file()
+        || !workspace_scan::same_file_identity(&path_metadata, &metadata)
+    {
+        return Err(ToolError::Execution(format!(
+            "path {} changed type or identity while opening",
+            path.display()
+        )));
+    }
     if metadata.len() > MAX_FILE_CONTENT_BYTES {
         return Err(ToolError::Execution(format!(
             "file {} exceeds {MAX_FILE_CONTENT_BYTES} byte limit",
@@ -3456,7 +3866,10 @@ async fn read_optional_file(path: &Path) -> Result<FileBeforeImage, ToolError> {
         )));
     }
     let mut content = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-    file.read_to_end(&mut content)
+    let read_limit = MAX_FILE_CONTENT_BYTES.saturating_add(1);
+    (&mut file)
+        .take(read_limit)
+        .read_to_end(&mut content)
         .await
         .map_err(|error| ToolError::Execution(error.to_string()))?;
     if content.len() as u64 > MAX_FILE_CONTENT_BYTES {
@@ -3465,7 +3878,24 @@ async fn read_optional_file(path: &Path) -> Result<FileBeforeImage, ToolError> {
             path.display()
         )));
     }
-    let unix_mode = unix_mode(&metadata);
+    let final_metadata = file
+        .metadata()
+        .await
+        .map_err(|error| ToolError::Execution(error.to_string()))?;
+    let current_metadata = tokio::fs::symlink_metadata(path)
+        .await
+        .map_err(|error| ToolError::Execution(error.to_string()))?;
+    if !current_metadata.file_type().is_file()
+        || !workspace_scan::same_file_state(&metadata, &final_metadata)
+        || !workspace_scan::same_file_state(&final_metadata, &current_metadata)
+        || final_metadata.len() != content.len() as u64
+    {
+        return Err(ToolError::Execution(format!(
+            "file {} changed while reading",
+            path.display()
+        )));
+    }
+    let unix_mode = unix_mode(&final_metadata);
     let file_metadata = file_state_metadata(&content, unix_mode, true);
     Ok(FileBeforeImage {
         path: path.to_path_buf(),
@@ -3473,6 +3903,23 @@ async fn read_optional_file(path: &Path) -> Result<FileBeforeImage, ToolError> {
         unix_mode,
         metadata: Some(file_metadata),
     })
+}
+
+fn validate_checkpoint_content_limit(images: &[FileBeforeImage]) -> Result<(), ToolError> {
+    let retained_bytes = images
+        .iter()
+        .map(file_image_content_bytes)
+        .fold(0_usize, usize::saturating_add);
+    if retained_bytes > MAX_WORKSPACE_SNAPSHOT_CONTENT_BYTES {
+        return Err(ToolError::InvalidArguments(format!(
+            "side-effect checkpoint exceeds {MAX_WORKSPACE_SNAPSHOT_CONTENT_BYTES} retained bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn file_image_content_bytes(image: &FileBeforeImage) -> usize {
+    image.content.as_ref().map_or(0, Vec::len)
 }
 
 fn file_state_metadata(

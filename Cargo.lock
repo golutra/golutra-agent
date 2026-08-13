@@ -1583,6 +1583,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "futures-util",
  "golutra-context",
  "golutra-core",
  "golutra-governor",
@@ -1623,6 +1624,7 @@ name = "golutra-store"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "fs2",
  "golutra-core",
  "golutra-protocol",
  "serde",

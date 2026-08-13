@@ -12,7 +12,10 @@ use std::{
 
 use golutra_client::{AgentClient, AgentThread, RuntimeTransport};
 use golutra_core::{TaskContract, TaskStatus};
-use golutra_protocol::{AgentItemKind, AgentStreamEvent, AgentTurnOptions};
+use golutra_protocol::{
+    AgentExecutionMode, AgentItemKind, AgentStreamEvent, AgentToolProfile,
+    AgentTurnExecutionOptions, AgentTurnOptions,
+};
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -124,6 +127,12 @@ struct RunParameters {
     /// Additional objective checks for the runtime verification layer.
     #[serde(default)]
     completion_criteria: Vec<String>,
+    /// Optional completion policy profile. Defaults to the open model-facing loop.
+    #[serde(default)]
+    execution_mode: AgentExecutionMode,
+    /// Model-visible tool profile. Defaults to coding-safe tools.
+    #[serde(default)]
+    tool_profile: AgentToolProfile,
     /// Include a bounded normalized event sample in the tool result.
     #[serde(default)]
     include_events: bool,
@@ -147,6 +156,12 @@ struct ReplyParameters {
     /// Additional objective checks for the runtime verification layer.
     #[serde(default)]
     completion_criteria: Vec<String>,
+    /// Optional completion policy profile. Defaults to the open model-facing loop.
+    #[serde(default)]
+    execution_mode: AgentExecutionMode,
+    /// Model-visible tool profile. Defaults to coding-safe tools.
+    #[serde(default)]
+    tool_profile: AgentToolProfile,
     /// Include a bounded normalized event sample in the tool result.
     #[serde(default)]
     include_events: bool,
@@ -206,6 +221,10 @@ impl GolutraMcpServer {
                 external_verifiers: Vec::new(),
                 discover_project_verifiers: false,
             },
+            AgentTurnExecutionOptions {
+                execution_mode: parameters.execution_mode,
+                tool_profile: parameters.tool_profile,
+            },
             parameters.include_events,
         )
         .await
@@ -237,6 +256,8 @@ impl GolutraMcpServer {
                 output_schema: parameters.output_schema,
                 task_contract: parameters.task_contract,
                 completion_criteria: parameters.completion_criteria,
+                execution_mode: parameters.execution_mode,
+                tool_profile: parameters.tool_profile,
                 include_events: parameters.include_events,
             },
             Some(parameters.thread_id),
@@ -259,10 +280,14 @@ async fn execute_turn(
     thread: AgentThread,
     prompt: String,
     options: AgentTurnOptions,
+    execution: AgentTurnExecutionOptions,
     include_events: bool,
 ) -> CallToolResult {
     let thread_ref = thread.reference().clone();
-    let mut handle = match thread.start_turn(prompt, options).await {
+    let mut handle = match thread
+        .start_turn_with_execution_options(prompt, options, execution)
+        .await
+    {
         Ok(handle) => handle,
         Err(error) => return error_result(format!("start turn failed: {error}")),
     };

@@ -189,22 +189,29 @@ pub(crate) struct TuiDriver {
     metrics: DriverMetricsAccumulator,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DriverLaunchOptions<'a> {
+    session: Option<&'a str>,
+    task_id: Option<&'a str>,
+    debug: bool,
+    yolo: bool,
+    execution_mode: TuiExecutionModeArg,
+    tool_profile: TuiToolProfileArg,
+    width: u16,
+    height: u16,
+}
+
 impl TuiDriver {
     async fn launch(
         transport: RuntimeTransport,
-        session: Option<&str>,
-        task_id: Option<&str>,
-        debug: bool,
-        yolo: bool,
-        width: u16,
-        height: u16,
+        options: DriverLaunchOptions<'_>,
     ) -> miette::Result<Self> {
         // The transport may already own a remote attachment. Establish its
         // cleanup owner before any validation or lookup can return early.
         let mut cleanup = TransportCleanupGuard::new(transport.clone());
-        validate_dimensions(width, height)?;
-        let (thread_id, session_id) = resolve_driver_session(session, &transport).await?;
-        let task_id = parse_task_id(task_id)?;
+        validate_dimensions(options.width, options.height)?;
+        let (thread_id, session_id) = resolve_driver_session(options.session, &transport).await?;
+        let task_id = parse_task_id(options.task_id)?;
         validate_task_id(task_id, session_id, &transport).await?;
         let provider_status = initial_provider_ui_status(&transport, session_id).await;
         let runtime_cwd = transport
@@ -220,11 +227,13 @@ impl TuiDriver {
             thread_id,
             session_id,
             task_id,
-            debug,
+            options.debug,
             provider_status.message,
             auth_dialog,
         )
-        .with_yolo(yolo)
+        .with_yolo(options.yolo)
+        .with_execution_mode(options.execution_mode)
+        .with_tool_profile(options.tool_profile)
         .with_footer_context(runtime_cwd, provider_status.model);
         let controller = match TuiRuntimeController::attach(&mut app, transport).await {
             Ok(controller) => controller,
@@ -239,8 +248,8 @@ impl TuiDriver {
             instance_id: Uuid::now_v7().to_string(),
             app,
             controller,
-            width,
-            height,
+            width: options.width,
+            height: options.height,
             frame_cache: VecDeque::new(),
             closed: false,
             last_notified_cursor,

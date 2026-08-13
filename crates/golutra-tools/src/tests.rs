@@ -30,6 +30,8 @@ struct FakeExternalBackend {
     calls: AtomicUsize,
     delay: Duration,
     output: ExternalToolOutput,
+    contract_side_effect: SideEffectType,
+    capabilities: Option<ToolCapabilities>,
 }
 
 impl FakeExternalBackend {
@@ -43,17 +45,33 @@ impl FakeExternalBackend {
                 structured_facts: json!({"provider": "fixture", "api_key": "secret"}),
                 is_error: false,
             },
+            contract_side_effect: SideEffectType::ExternalSystem,
+            capabilities: None,
         }
+    }
+
+    fn with_contract_capabilities(
+        mut self,
+        side_effect_type: SideEffectType,
+        capabilities: ToolCapabilities,
+    ) -> Self {
+        self.contract_side_effect = side_effect_type;
+        self.capabilities = Some(capabilities);
+        self
     }
 }
 
 #[async_trait]
 impl ExternalToolBackend for FakeExternalBackend {
     fn contracts(&self) -> Vec<ToolContract> {
-        vec![contract(
-            "mcp__fixture__echo",
-            SideEffectType::ExternalSystem,
-        )]
+        vec![contract("mcp__fixture__echo", self.contract_side_effect)]
+    }
+
+    fn capabilities(&self) -> HashMap<String, ToolCapabilities> {
+        self.capabilities
+            .clone()
+            .map(|capabilities| HashMap::from([("mcp__fixture__echo".to_owned(), capabilities)]))
+            .unwrap_or_default()
     }
 
     async fn call(
@@ -69,6 +87,87 @@ impl ExternalToolBackend for FakeExternalBackend {
             () = tokio::time::sleep(self.delay) => Ok(self.output.clone()),
         }
     }
+}
+
+#[test]
+fn external_tool_capabilities_are_explicit_and_validated() {
+    let workspace = tempdir().expect("workspace");
+    let default_runtime = executor(workspace.path())
+        .with_external_backend(Arc::new(FakeExternalBackend::successful(Duration::ZERO)))
+        .expect("external backend registers");
+    assert_eq!(
+        default_runtime
+            .registry()
+            .capabilities("mcp__fixture__echo"),
+        Some(&ToolCapabilities::default())
+    );
+
+    let opted_in = executor(workspace.path())
+        .with_external_backend(Arc::new(
+            FakeExternalBackend::successful(Duration::ZERO).with_contract_capabilities(
+                SideEffectType::None,
+                ToolCapabilities {
+                    available_in_coding_profile: true,
+                    parallel_read_safe: true,
+                    coding_profile_hidden_arguments: Vec::new(),
+                },
+            ),
+        ))
+        .expect("pure external read registers");
+    assert!(
+        opted_in
+            .registry()
+            .capabilities("mcp__fixture__echo")
+            .is_some_and(|capabilities| capabilities.parallel_read_safe)
+    );
+
+    let unsafe_backend = Arc::new(
+        FakeExternalBackend::successful(Duration::ZERO).with_contract_capabilities(
+            SideEffectType::ExternalSystem,
+            ToolCapabilities {
+                available_in_coding_profile: true,
+                parallel_read_safe: true,
+                coding_profile_hidden_arguments: Vec::new(),
+            },
+        ),
+    );
+    let error = executor(workspace.path())
+        .with_external_backend(unsafe_backend)
+        .expect_err("side-effecting tools cannot opt into parallel reads");
+    assert!(error.to_string().contains("admits side effects"));
+
+    let removed = opted_in.without_tool("mcp__fixture__echo");
+    assert!(removed.registry().contract("mcp__fixture__echo").is_none());
+    assert!(
+        removed
+            .registry()
+            .capabilities("mcp__fixture__echo")
+            .is_none()
+    );
+}
+
+#[test]
+fn replay_contracts_register_without_a_live_external_backend() {
+    let workspace = tempdir().expect("workspace");
+    let mut external = contract("mcp__fixture__recorded", SideEffectType::None);
+    external.input_schema["properties"]["query"] = json!({"type": "string"});
+    external.input_schema["required"] = json!(["query"]);
+    let runtime = executor(workspace.path())
+        .with_replay_contracts([external.clone()])
+        .expect("recorded contract registers");
+
+    assert_eq!(
+        runtime.registry().contract(&external.tool_name),
+        Some(&external)
+    );
+    assert_eq!(
+        runtime.registry().capabilities(&external.tool_name),
+        Some(&ToolCapabilities {
+            available_in_coding_profile: true,
+            parallel_read_safe: false,
+            coding_profile_hidden_arguments: Vec::new(),
+        })
+    );
 }
 
 #[derive(Debug)]
@@ -192,6 +291,12 @@ async fn delegated_task_is_registered_only_with_a_backend_and_tracks_workspace_c
         .registry()
         .contract("delegate_task")
         .expect("delegation contract");
+    assert!(
+        executor
+            .registry()
+            .capabilities("delegate_task")
+            .is_some_and(|capabilities| capabilities.available_in_coding_profile)
+    );
     assert_eq!(contract.side_effect_type, SideEffectType::Process);
     assert_eq!(
         contract.input_schema["properties"]["reasoning_effort"]["enum"],
@@ -289,8 +394,12 @@ async fn delegated_task_receives_the_enclosing_runtime_deadline() {
     .expect("deadline cancellation should settle")
     .expect("delegation report");
 
-    assert_eq!(report.envelope.status, ToolResultStatus::Cancelled);
-    assert_eq!(report.envelope.structured_facts["cancelled"], true);
+    assert_eq!(report.envelope.status, ToolResultStatus::Timeout);
+    assert_eq!(report.envelope.structured_facts["timed_out"], true);
+    assert_eq!(
+        report.envelope.structured_facts["deadline_stage"],
+        "execution"
+    );
     assert!(cancelled.load(Ordering::SeqCst));
 }
 
@@ -390,6 +499,152 @@ async fn external_tool_timeout_returns_a_terminal_envelope() {
 
     assert_eq!(report.envelope.status, ToolResultStatus::Timeout);
     assert_eq!(report.envelope.risk, "external_mcp_tool");
+}
+
+#[tokio::test]
+async fn enclosing_deadline_bounds_external_tools_and_reports_timeout() {
+    let workspace = tempdir().expect("workspace");
+    let backend = Arc::new(FakeExternalBackend::successful(Duration::from_secs(1)));
+    let executor = executor(workspace.path())
+        .with_external_backend(backend)
+        .expect("external backend registers");
+    let request = request("mcp__fixture__echo", json!({}));
+    let policy = executor.evaluate(&request).expect("policy");
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(20);
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(1),
+        executor.invoke(
+            ToolInvocation::new(request, policy, true).with_deadline(deadline),
+            CancellationToken::new(),
+            None,
+        ),
+    )
+    .await
+    .expect("enclosing deadline settles the invocation")
+    .expect("deadline returns a report");
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Timeout);
+    assert_eq!(report.envelope.structured_facts["timed_out"], true);
+    assert_eq!(
+        report.envelope.structured_facts["deadline_stage"],
+        "execution"
+    );
+    assert_eq!(report.envelope.risk, "external_mcp_tool");
+}
+
+#[tokio::test]
+async fn expired_deadline_prevents_file_side_effects() {
+    let workspace = tempdir().expect("workspace");
+    let target = workspace.path().join("deadline.txt");
+    let executor = executor(workspace.path());
+    let request = request(
+        "write_file",
+        json!({"path": "deadline.txt", "content": "must not be written"}),
+    );
+    let policy = executor.evaluate(&request).expect("policy");
+    let expired = tokio::time::Instant::now() - Duration::from_millis(1);
+    let mut progress = Vec::new();
+    let mut collect_progress = |event| progress.push(event);
+
+    let report = executor
+        .invoke(
+            ToolInvocation::new(request, policy, false).with_deadline(expired),
+            CancellationToken::new(),
+            Some(&mut collect_progress),
+        )
+        .await
+        .expect("expired deadline returns a report");
+    assert_eq!(report.envelope.status, ToolResultStatus::Timeout);
+    assert_eq!(
+        report.envelope.structured_facts["deadline_stage"],
+        "side-effect preparation"
+    );
+    assert!(!target.exists(), "expired invocations cannot mutate files");
+    assert_eq!(
+        progress
+            .iter()
+            .filter(|event| event.phase == ToolProgressPhase::Completed)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn deadline_cleanup_preserves_a_completed_tool_report() {
+    let workspace = tempdir().expect("workspace");
+    let executor = executor(workspace.path());
+    let request = request(
+        "write_file",
+        json!({"path": "deadline.txt", "content": "written"}),
+    );
+    let policy = executor.evaluate(&request).expect("policy");
+    let mut operation = Box::pin(async {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        executor
+            .invoke(
+                ToolInvocation::new(request, policy, false),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+    });
+    let cancellation = CancellationToken::new();
+    let operation_cancellation = CancellationToken::new();
+
+    let outcome = await_tool_operation(
+        &mut operation,
+        &cancellation,
+        &operation_cancellation,
+        Some(tokio::time::Instant::now() + Duration::from_millis(1)),
+    )
+    .await;
+    let ToolOperationOutcome::TimedOut(Some(Ok(report))) = outcome else {
+        panic!("the completed report must survive deadline cleanup");
+    };
+    let report = mark_report_deadline_exceeded(report);
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Timeout);
+    assert_eq!(
+        report.envelope.structured_facts["completed_during_deadline_cleanup"],
+        true
+    );
+    assert_eq!(
+        report.envelope.structured_facts["workspace_changes_known"],
+        true
+    );
+    assert_eq!(report.changed_files.len(), 1);
+    assert!(report.changed_files[0].ends_with("deadline.txt"));
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("deadline.txt")).expect("written file"),
+        "written"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn file_tools_reject_special_files_without_blocking() {
+    let workspace = tempdir().expect("workspace");
+    let fifo = workspace.path().join("input.pipe");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("launch mkfifo");
+    assert!(status.success());
+    let executor = executor(workspace.path());
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        executor.execute(
+            request("read_file", json!({"path": "input.pipe"})),
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("special-file rejection is bounded")
+    .expect_err("FIFO is not a regular file");
+
+    assert!(error.to_string().contains("not a regular file"));
 }
 
 #[tokio::test]
@@ -745,6 +1000,51 @@ async fn apply_patch_changes_multiple_files_through_one_atomic_tool_call() {
     assert_eq!(report.changed_files.len(), 2);
     assert_eq!(report.before_images.len(), 2);
     assert_eq!(report.after_images.len(), 2);
+}
+
+#[tokio::test]
+async fn apply_patch_rejects_checkpoints_over_the_total_retention_limit() {
+    let workspace = tempdir().expect("workspace");
+    let file_bytes = MAX_WORKSPACE_SNAPSHOT_CONTENT_BYTES / 3 + 1;
+    for name in ["one.bin", "two.bin", "three.bin"] {
+        fs::write(workspace.path().join(name), vec![b'x'; file_bytes]).expect("large fixture");
+    }
+    let executor = executor(workspace.path());
+    let patch = concat!(
+        "diff --git a/one.bin b/one.bin\n",
+        "--- a/one.bin\n",
+        "+++ b/one.bin\n",
+        "@@ -1 +1 @@\n",
+        "-x\n",
+        "+y\n",
+        "diff --git a/three.bin b/three.bin\n",
+        "--- a/three.bin\n",
+        "+++ b/three.bin\n",
+        "@@ -1 +1 @@\n",
+        "-x\n",
+        "+y\n",
+        "diff --git a/two.bin b/two.bin\n",
+        "--- a/two.bin\n",
+        "+++ b/two.bin\n",
+        "@@ -1 +1 @@\n",
+        "-x\n",
+        "+y\n",
+    );
+
+    let result = executor
+        .prepare_side_effect_snapshot(&request("apply_patch", json!({"patch": patch})))
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(ToolError::InvalidArguments(message))
+            if message.contains("patch checkpoint exceeds")
+    ));
+    for name in ["one.bin", "two.bin", "three.bin"] {
+        let bytes = fs::read(workspace.path().join(name)).expect("unchanged fixture");
+        assert_eq!(bytes.len(), file_bytes);
+        assert!(bytes.iter().all(|byte| *byte == b'x'));
+    }
 }
 
 #[cfg(unix)]

@@ -3,14 +3,26 @@
   "title": "SdkProtocolBundle",
   "type": "object",
   "properties": {
+    "agent_execution_mode": {
+      "$ref": "#/$defs/AgentExecutionMode"
+    },
     "agent_item": {
       "$ref": "#/$defs/AgentItem"
+    },
+    "agent_steer_options": {
+      "$ref": "#/$defs/AgentSteerOptions"
     },
     "agent_stream_event": {
       "$ref": "#/$defs/AgentStreamEvent"
     },
     "agent_thread_ref": {
       "$ref": "#/$defs/AgentThreadRef"
+    },
+    "agent_tool_profile": {
+      "$ref": "#/$defs/AgentToolProfile"
+    },
+    "agent_turn_execution_options": {
+      "$ref": "#/$defs/AgentTurnExecutionOptions"
     },
     "agent_turn_options": {
       "$ref": "#/$defs/AgentTurnOptions"
@@ -218,6 +230,10 @@
     "agent_thread_ref",
     "agent_turn_start",
     "agent_turn_start_response",
+    "agent_execution_mode",
+    "agent_tool_profile",
+    "agent_steer_options",
+    "agent_turn_execution_options",
     "agent_turn_options",
     "agent_turn_result",
     "agent_item",
@@ -315,6 +331,14 @@
         "runtime"
       ]
     },
+    "AgentExecutionMode": {
+      "description": "Selects how much deterministic completion policy is allowed to shape one\nturn.  The open path leaves planning, tool order, and stopping to the\nprovider while retaining the runtime's safety, budget, and audit gates.",
+      "type": "string",
+      "enum": [
+        "open",
+        "strict"
+      ]
+    },
     "AgentItem": {
       "type": "object",
       "properties": {
@@ -380,6 +404,23 @@
         "failed",
         "cancelled"
       ]
+    },
+    "AgentSteerOptions": {
+      "description": "Optional execution-surface override for a steering continuation. Steering\ncannot replace the active task contract or execution mode.",
+      "type": "object",
+      "properties": {
+        "tool_profile": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentToolProfile"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      }
     },
     "AgentStreamEvent": {
       "oneOf": [
@@ -687,6 +728,30 @@
         "thread_id",
         "session_id"
       ]
+    },
+    "AgentToolProfile": {
+      "description": "Controls the model-visible tool surface without removing the underlying\nexecutor capability or its policy checks.",
+      "type": "string",
+      "enum": [
+        "coding",
+        "full"
+      ]
+    },
+    "AgentTurnExecutionOptions": {
+      "description": "Selects the model-facing execution surface for a newly started turn.\n\nThis is separate from [`AgentTurnOptions`] so adding execution profiles does\nnot break existing Rust callers that construct that options type directly.",
+      "type": "object",
+      "properties": {
+        "execution_mode": {
+          "description": "Open is the default for new clients. Strict is intended for explicit\ncompletion policy or externally verified turns.",
+          "$ref": "#/$defs/AgentExecutionMode",
+          "default": "open"
+        },
+        "tool_profile": {
+          "description": "Coding exposes built-in coding, managed process, delegation, and\nhost-reviewed coding extensions. Full also exposes other extensions.",
+          "$ref": "#/$defs/AgentToolProfile",
+          "default": "coding"
+        }
+      }
     },
     "AgentTurnOptions": {
       "type": "object",

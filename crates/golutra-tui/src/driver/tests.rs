@@ -697,9 +697,21 @@ async fn snapshot_render_restores_every_transient_input_surface() {
     let transport = RuntimeTransport::ephemeral_for_cwd(workspace.path())
         .await
         .expect("transport");
-    let mut driver = TuiDriver::launch(transport, None, None, true, false, 100, 24)
-        .await
-        .expect("driver");
+    let mut driver = TuiDriver::launch(
+        transport,
+        DriverLaunchOptions {
+            session: None,
+            task_id: None,
+            debug: true,
+            yolo: false,
+            execution_mode: TuiExecutionModeArg::Open,
+            tool_profile: TuiToolProfileArg::Coding,
+            width: 100,
+            height: 24,
+        },
+    )
+    .await
+    .expect("driver");
     populate_snapshot_secrets(&mut driver.app, "sk-snapshot-state-secret");
     let expected = transient_snapshot_state(&driver.app);
 
@@ -724,9 +736,21 @@ async fn rejected_mouse_activation_does_not_change_local_selection() {
     let transport = RuntimeTransport::ephemeral_for_cwd(workspace.path())
         .await
         .expect("transport");
-    let mut driver = TuiDriver::launch(transport, None, None, false, false, 100, 24)
-        .await
-        .expect("driver");
+    let mut driver = TuiDriver::launch(
+        transport,
+        DriverLaunchOptions {
+            session: None,
+            task_id: None,
+            debug: false,
+            yolo: false,
+            execution_mode: TuiExecutionModeArg::Open,
+            tool_profile: TuiToolProfileArg::Coding,
+            width: 100,
+            height: 24,
+        },
+    )
+    .await
+    .expect("driver");
     driver.app.auth_dialog = None;
     driver.app.resume_picker = Some(ResumePickerState::new(vec![
         ResumeThreadItem {
@@ -852,9 +876,21 @@ async fn snapshot_render_does_not_mutate_the_active_pane_layout() {
     let transport = RuntimeTransport::ephemeral_for_cwd(workspace.path())
         .await
         .expect("transport");
-    let mut driver = TuiDriver::launch(transport, None, None, true, false, 100, 24)
-        .await
-        .expect("driver");
+    let mut driver = TuiDriver::launch(
+        transport,
+        DriverLaunchOptions {
+            session: None,
+            task_id: None,
+            debug: true,
+            yolo: false,
+            execution_mode: TuiExecutionModeArg::Open,
+            tool_profile: TuiToolProfileArg::Coding,
+            width: 100,
+            height: 24,
+        },
+    )
+    .await
+    .expect("driver");
     driver.app.auth_dialog = None;
     let session_id = driver.app.session_id;
     driver.app.developer_projection = Some(golutra_protocol::DebugProjection {

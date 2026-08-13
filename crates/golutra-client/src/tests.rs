@@ -45,6 +45,46 @@ fn hosted_tasks_use_only_explicit_completion_criteria() {
     );
 }
 
+#[test]
+fn strict_wire_mode_builds_completion_contract_without_prompt_heuristics() {
+    let contract = task_contract_from_payload(&json!({
+        "execution_mode": "strict",
+        "prompt": "inspect and summarize the workspace",
+    }))
+    .expect("strict contract");
+
+    assert!(contract.require_objective_validation);
+    assert_eq!(
+        contract.verification,
+        golutra_core::VerificationRequirement::Required
+    );
+    assert_eq!(contract.max_correction_rounds, 1);
+}
+
+#[test]
+fn nullable_steering_profile_is_inheritance_not_an_explicit_override() {
+    let mut event = host_event(
+        1,
+        SessionId::new(),
+        Some(TaskId::new()),
+        RuntimeEventType::TurnQueued,
+        RuntimeEventSource::User,
+        json!({
+            "payload": {
+                "prompt": "continue",
+                "steer": true,
+                "tool_profile": null,
+            }
+        }),
+    );
+    event.turn_id = Some(TurnId::new());
+
+    let pending = recovered_pending_turn_from_event(&event)
+        .expect("pending turn")
+        .expect("valid pending turn");
+    assert_eq!(pending.execution.tool_profile, None);
+}
+
 #[tokio::test]
 async fn task_control_cleanup_wait_has_a_deadline() {
     let (_completion_sender, mut completion) = watch::channel(false);
@@ -694,6 +734,22 @@ async fn runtime_host_reuses_one_process_supervisor_across_tool_executors() {
 }
 
 #[tokio::test]
+async fn hosted_execution_channel_exposes_one_active_surface() {
+    let (execution, _control) = agent_execution_channel(2);
+    execution.set_active_execution_surface(
+        Some(golutra_protocol::AgentExecutionMode::Open),
+        golutra_protocol::AgentToolProfile::Coding,
+    );
+    assert_eq!(
+        execution.active_execution_surface(),
+        golutra_runtime::ActiveExecutionSurface {
+            execution_mode: Some(golutra_protocol::AgentExecutionMode::Open),
+            tool_profile: golutra_protocol::AgentToolProfile::Coding,
+        }
+    );
+}
+
+#[tokio::test]
 async fn embedded_transport_close_awaits_managed_process_shutdown() {
     let workspace = tempdir().expect("workspace");
     let host = RuntimeHost::in_memory().await.expect("host");
@@ -881,6 +937,8 @@ async fn runtime_network_capability_requires_both_host_and_turn_grants() {
 
 #[tokio::test]
 async fn delegated_task_inherits_overrides_and_archives_an_isolated_child() {
+    const DELEGATION_FIXTURE_BUDGET_MS: u64 = 120_000;
+
     let workspace = tempdir().expect("workspace");
     let _provider = IsolatedGlobalMockProvider::install().await;
     let host = RuntimeHost::ephemeral_for_cwd(workspace.path())
@@ -905,6 +963,10 @@ async fn delegated_task_inherits_overrides_and_archives_an_isolated_child() {
         .thread_id;
     let parent_task_id = TaskId::new();
     let (execution, _control) = agent_execution_channel(1);
+    execution.set_active_execution_surface(
+        Some(golutra_protocol::AgentExecutionMode::Open),
+        golutra_protocol::AgentToolProfile::Coding,
+    );
     let execution_cancellation = execution.cancellation_token();
     let parent_worker = tokio::spawn(std::future::pending::<()>());
     let (completion_sender, completion) = watch::channel(false);
@@ -928,7 +990,7 @@ async fn delegated_task_inherits_overrides_and_archives_an_isolated_child() {
             completion,
             delegation: Some(crate::delegation_policy::DelegationContext::root(
                 parent_session_id,
-                Some(10_000),
+                Some(DELEGATION_FIXTURE_BUDGET_MS),
                 Some(2_000),
                 None,
                 execution_cancellation,
@@ -1000,6 +1062,8 @@ async fn delegated_task_inherits_overrides_and_archives_an_isolated_child() {
         .expect("child task payload");
     assert_eq!(inherited_payload["provider_profile"], "mock");
     assert_eq!(inherited_payload["provider_model"], "parent-model");
+    assert_eq!(inherited_payload["execution_mode"], "open");
+    assert_eq!(inherited_payload["tool_profile"], "coding");
     assert_eq!(
         inherited_payload["provider_generation_config"],
         json!({
@@ -1124,6 +1188,8 @@ async fn delegated_task_inherits_overrides_and_archives_an_isolated_child() {
         .and_then(|event| event.payload.get("payload"))
         .expect("overridden child task payload");
     assert_eq!(overridden_payload["provider_model"], "child-model");
+    assert_eq!(overridden_payload["execution_mode"], "open");
+    assert_eq!(overridden_payload["tool_profile"], "coding");
     assert_eq!(
         overridden_payload["provider_generation_config"],
         json!({
@@ -5237,6 +5303,185 @@ fn rollout_redaction_preserves_token_counts_and_redacts_credentials() {
     assert_eq!(payload["nested"]["token"], "<redacted-secret>");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn committed_event_repairs_a_failed_rollout_append_without_false_data_loss() {
+    use std::os::unix::fs::symlink;
+
+    let workspace = tempdir().expect("workspace");
+    let state_parent = tempdir().expect("state parent");
+    let state_home = state_parent.path().join("runtime");
+    let host = RuntimeHost::ephemeral_persistent_for_cwd(workspace.path(), &state_home)
+        .await
+        .expect("host");
+    let session_id = host.default_session_id();
+    let thread_id = host.default_thread_id();
+    let rollout_path = host
+        .runtime_paths
+        .as_ref()
+        .expect("runtime paths")
+        .rollout_path(thread_id);
+    fs::create_dir_all(rollout_path.parent().expect("rollout parent")).expect("rollout parent");
+    let symlink_target = state_home.join("stale-rollout.jsonl");
+    fs::write(&symlink_target, "stale\n").expect("symlink target");
+    symlink(&symlink_target, &rollout_path).expect("rollout symlink");
+    let now = chrono::Utc::now();
+    host.storage
+        .repositories
+        .threads
+        .upsert(&ThreadRecord {
+            thread_id,
+            session_id,
+            parent_thread_id: None,
+            forked_from_turn_id: None,
+            forked_from_sequence_no: None,
+            workspace_root: host.workspace_root_string(),
+            rebound_from_workspace_root: None,
+            rollout_path: Some(rollout_path.display().to_string()),
+            title: "rollout repair".to_owned(),
+            preview: "rollout repair".to_owned(),
+            created_at: now,
+            updated_at: now,
+            recency_at: now,
+            archived: false,
+            removed: false,
+        })
+        .await
+        .expect("thread");
+
+    host.record_event(host_event(
+        0,
+        session_id,
+        None,
+        RuntimeEventType::CommandReceived,
+        RuntimeEventSource::Runtime,
+        json!({"summary": "repair rollout"}),
+    ))
+    .await
+    .expect("canonical event remains successful");
+
+    assert!(
+        !fs::symlink_metadata(&rollout_path)
+            .expect("rebuilt rollout")
+            .file_type()
+            .is_symlink()
+    );
+    assert!(
+        fs::read_to_string(&rollout_path)
+            .expect("rebuilt rollout")
+            .contains("repair rollout")
+    );
+    assert!(
+        !host
+            .execution
+            .rollout_projection_failures
+            .lock()
+            .await
+            .contains_key(&session_id)
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn committed_event_reports_rollout_loss_only_when_rebuild_also_fails() {
+    use std::os::unix::fs::symlink;
+
+    let workspace = tempdir().expect("workspace");
+    let state_parent = tempdir().expect("state parent");
+    let state_home = state_parent.path().join("runtime");
+    let host = RuntimeHost::ephemeral_persistent_for_cwd(workspace.path(), &state_home)
+        .await
+        .expect("host");
+    let session_id = host.default_session_id();
+    let thread_id = host.default_thread_id();
+    let rollout_path = host
+        .runtime_paths
+        .as_ref()
+        .expect("runtime paths")
+        .rollout_path(thread_id);
+    fs::create_dir_all(rollout_path.parent().expect("rollout parent")).expect("rollout parent");
+    let symlink_target = state_home.join("stale-rollout.jsonl");
+    let lock_target = state_home.join("stale-rollout.lock");
+    fs::write(&symlink_target, "stale\n").expect("symlink target");
+    fs::write(&lock_target, "lock\n").expect("lock target");
+    symlink(&symlink_target, &rollout_path).expect("rollout symlink");
+    symlink(&lock_target, rollout::rollout_lock_path(&rollout_path)).expect("lock symlink");
+    let now = chrono::Utc::now();
+    host.storage
+        .repositories
+        .threads
+        .upsert(&ThreadRecord {
+            thread_id,
+            session_id,
+            parent_thread_id: None,
+            forked_from_turn_id: None,
+            forked_from_sequence_no: None,
+            workspace_root: host.workspace_root_string(),
+            rebound_from_workspace_root: None,
+            rollout_path: Some(rollout_path.display().to_string()),
+            title: "rollout failure".to_owned(),
+            preview: "rollout failure".to_owned(),
+            created_at: now,
+            updated_at: now,
+            recency_at: now,
+            archived: false,
+            removed: false,
+        })
+        .await
+        .expect("thread");
+
+    host.record_event(host_event(
+        0,
+        session_id,
+        None,
+        RuntimeEventType::CommandReceived,
+        RuntimeEventSource::Runtime,
+        json!({"summary": "retain canonical event"}),
+    ))
+    .await
+    .expect("projection failure must not mask the canonical commit");
+
+    let projection = host
+        .query(RuntimeQuery {
+            query_id: QueryId::new(),
+            session_id,
+            task_id: None,
+            kind: RuntimeQueryKind::DebugProjection,
+            requester: ActorKind::Cli,
+            cursor: None,
+            timestamp: chrono::Utc::now(),
+        })
+        .await
+        .expect("debug projection");
+    assert_eq!(projection["trace_complete"], false);
+    assert!(
+        projection["missing_sections"]
+            .as_array()
+            .expect("missing sections")
+            .iter()
+            .any(|section| section == "rollout_projection")
+    );
+    assert!(
+        projection["retention_losses"]
+            .as_array()
+            .expect("retention losses")
+            .iter()
+            .any(|loss| loss
+                .as_str()
+                .is_some_and(|loss| loss.starts_with("rollout_projection_rebuild_failed:")))
+    );
+    assert!(
+        host.storage
+            .repositories
+            .events
+            .load(session_id, None, None)
+            .await
+            .expect("canonical events")
+            .iter()
+            .any(|event| event.payload["summary"] == "retain canonical event")
+    );
+}
+
 #[tokio::test]
 async fn rebind_moves_thread_to_current_cwd_and_rebuilds_rollout() {
     let old_workspace = tempdir().expect("old workspace");
@@ -5532,12 +5777,7 @@ async fn first_prompt_sets_thread_title_from_prompt() {
         ))
         .await
         .expect("command");
-    wait_for_status(
-        &transport,
-        transport.default_session_id(),
-        TaskStatus::Completed,
-    )
-    .await;
+    wait_for_terminal_status(&transport, transport.default_session_id()).await;
 
     let thread = transport
         .resume_thread(default_thread_id)
@@ -5567,12 +5807,7 @@ async fn resumed_session_context_includes_previous_conversation_summary() {
         ))
         .await
         .expect("command");
-    wait_for_status(
-        &transport,
-        transport.default_session_id(),
-        TaskStatus::Completed,
-    )
-    .await;
+    wait_for_terminal_status(&transport, transport.default_session_id()).await;
 
     let contributors = transport
         .host
@@ -5720,7 +5955,7 @@ async fn prompt_with_explicit_thread_id_does_not_persist_bootstrap_default() {
         ))
         .await
         .expect("command");
-    wait_for_status(&transport, tui_session_id, TaskStatus::Completed).await;
+    wait_for_terminal_status(&transport, tui_session_id).await;
     let threads = transport.list_threads(10).await.expect("threads");
     let tui_thread = threads
         .iter()
@@ -6606,7 +6841,22 @@ async fn persisted_ephemeral_runtime_retains_isolated_state_and_full_run_bundle(
             .payload
             .pointer("/payload/task_contract/require_objective_validation"),
         Some(&json!(false)),
-        "an explicitly deferred legacy task delegates final objective proof"
+        "an explicitly deferred open task delegates final objective proof"
+    );
+    assert_eq!(
+        task_created.payload.pointer("/payload/execution_mode"),
+        Some(&json!("open")),
+        "the high-level Rust API must use the same explicit default as other new clients"
+    );
+    assert_eq!(
+        task_created.payload.pointer("/payload/tool_profile"),
+        Some(&json!("coding"))
+    );
+    assert_eq!(
+        task_created
+            .payload
+            .pointer("/payload/_task_contract_origin"),
+        Some(&json!("open"))
     );
     assert!(
         !runtime_events
@@ -6679,7 +6929,7 @@ async fn persisted_ephemeral_runtime_retains_isolated_state_and_full_run_bundle(
             .verification
             .as_ref()
             .map(|verification| verification.result),
-        Some(VerificationResult::Pass)
+        Some(VerificationResult::Partial)
     );
     assert!(state_dir.join("debug-export/manifest.json").is_file());
     #[cfg(unix)]
@@ -7459,10 +7709,10 @@ async fn natural_language_mock_write_preserves_delivery_without_claiming_unverif
         .send_command(command(session_id, "write file smoke.txt with content ok"))
         .await
         .expect("command");
-    let state = wait_for_status(&transport, session_id, TaskStatus::Completed).await;
+    let state = wait_for_status(&transport, session_id, TaskStatus::Partial).await;
 
     assert!(ack.accepted);
-    assert_eq!(projection_status(&state), Some(TaskStatus::Completed));
+    assert_eq!(projection_status(&state), Some(TaskStatus::Partial));
     assert_eq!(
         fs::read_to_string(workspace.path().join("smoke.txt")).expect("file"),
         "ok"
@@ -7484,10 +7734,10 @@ async fn natural_language_quoted_write_preserves_content_without_inventing_verif
         .send_command(command(session_id, prompt))
         .await
         .expect("command");
-    let state = wait_for_status(&transport, session_id, TaskStatus::Completed).await;
+    let state = wait_for_status(&transport, session_id, TaskStatus::Partial).await;
 
     assert!(ack.accepted);
-    assert_eq!(projection_status(&state), Some(TaskStatus::Completed));
+    assert_eq!(projection_status(&state), Some(TaskStatus::Partial));
     assert_eq!(
         fs::read_to_string(workspace.path().join("hello.txt")).expect("file"),
         "Hello, world!\n"
@@ -7618,6 +7868,1434 @@ async fn task_contract_is_normalized_into_task_and_queued_turn_events() {
         control.abort_handle.abort();
     }
     sleep(Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn open_turn_keeps_contract_open_and_skips_project_verifier_discovery() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("cargo manifest");
+    let _provider = IsolatedGlobalMockProvider::install().await;
+    let transport = EmbeddedTransport::for_cwd(workspace.path())
+        .await
+        .expect("transport");
+    let session_id = transport.default_session_id();
+
+    transport
+        .send_command(command(session_id, "sleep"))
+        .await
+        .expect("blocking task");
+    wait_for_status(&transport, session_id, TaskStatus::WaitingApproval).await;
+
+    let queued = transport
+        .send_command(command_with_payload(
+            session_id,
+            json!({
+                "prompt": "inspect the workspace and summarize it",
+                "execution_mode": "open",
+            }),
+        ))
+        .await
+        .expect("queued task");
+    assert!(queued.accepted);
+    let steered = transport
+        .send_command(command_with_payload(
+            session_id,
+            json!({
+                "prompt": "fix src/lib.rs and focus on the public API",
+                "steer": true,
+            }),
+        ))
+        .await
+        .expect("steering task");
+    assert!(steered.accepted);
+    let mode_override = transport
+        .send_command(command_with_payload(
+            session_id,
+            json!({
+                "prompt": "change completion mode",
+                "execution_mode": "open",
+                "steer": true,
+            }),
+        ))
+        .await
+        .expect("mode override response");
+    assert!(!mode_override.accepted);
+    assert!(
+        mode_override
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("only tool_profile"))
+    );
+    let profiled_steer = transport
+        .send_command(command_with_payload(
+            session_id,
+            json!({
+                "prompt": "use the full tool surface",
+                "tool_profile": "full",
+                "steer": true,
+            }),
+        ))
+        .await
+        .expect("profile steering task");
+    assert!(profiled_steer.accepted);
+
+    let events = transport
+        .host
+        .storage
+        .repositories
+        .events
+        .load(session_id, None, None)
+        .await
+        .expect("events");
+    let queued_payload = events
+        .iter()
+        .find(|event| event.event_type == RuntimeEventType::TurnQueued)
+        .and_then(|event| event.payload.get("payload"))
+        .expect("queued payload");
+
+    assert_eq!(queued_payload["_task_contract_origin"], "open");
+    assert_eq!(queued_payload["_execution_mode"], "open");
+    assert_eq!(queued_payload["tool_profile"], "coding");
+    assert_eq!(queued_payload["external_verifiers"], json!([]));
+    assert_eq!(
+        queued_payload["task_contract"]["workspace_change"],
+        "optional"
+    );
+    assert_eq!(
+        queued_payload["task_contract"]["require_objective_validation"],
+        false
+    );
+    let steering_payloads = events
+        .iter()
+        .filter(|event| event.event_type == RuntimeEventType::TurnQueued)
+        .filter_map(|event| event.payload.get("payload"))
+        .filter(|payload| payload.get("steer").and_then(Value::as_bool) == Some(true))
+        .collect::<Vec<_>>();
+    assert_eq!(steering_payloads.len(), 2);
+    let steering_payload = steering_payloads[0];
+    assert_eq!(steering_payload["_task_contract_origin"], "active_task");
+    assert!(steering_payload.get("execution_mode").is_none());
+    assert!(steering_payload.get("_execution_mode").is_none());
+    assert!(steering_payload.get("tool_profile").is_none());
+    assert!(steering_payload.get("task_contract").is_none());
+    assert!(steering_payload.get("external_verifiers").is_none());
+    assert!(steering_payload.get("max_elapsed_ms").is_none());
+    assert_eq!(steering_payloads[1]["tool_profile"], "full");
+
+    transport
+        .send_command(runtime_command(
+            session_id,
+            SessionCommandKind::Abort,
+            json!({}),
+        ))
+        .await
+        .expect("release blocking task");
+    if let Some(control) = transport
+        .host
+        .execution
+        .task_controls
+        .lock()
+        .await
+        .get(&session_id)
+    {
+        control.abort_handle.abort();
+    }
+    sleep(Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn steering_without_an_active_task_is_rejected() {
+    let workspace = tempdir().expect("workspace");
+    let _provider = IsolatedGlobalMockProvider::install().await;
+    let transport = EmbeddedTransport::for_cwd(workspace.path())
+        .await
+        .expect("transport");
+    let session_id = transport.default_session_id();
+
+    let ack = transport
+        .send_command(command_with_payload(
+            session_id,
+            json!({
+                "prompt": "continue the active task",
+                "steer": true,
+            }),
+        ))
+        .await
+        .expect("steering response");
+
+    assert!(!ack.accepted);
+    assert_eq!(
+        ack.reason.as_deref(),
+        Some("steering requires an active runtime task")
+    );
+}
+
+#[tokio::test]
+async fn leading_steer_recovery_materializes_the_active_execution_surface() {
+    let workspace = tempdir().expect("workspace");
+    let _provider = IsolatedGlobalMockProvider::install().await;
+    let transport = EmbeddedTransport::for_cwd(workspace.path())
+        .await
+        .expect("transport");
+    let session_id = transport.default_session_id();
+    let task_contract = TaskContract {
+        completion_criteria: vec!["preserve the active task contract".to_owned()],
+        ..TaskContract::default()
+    };
+    let output_schema = json!({
+        "type": "object",
+        "required": ["result"],
+        "properties": {"result": {"type": "string"}}
+    });
+
+    transport
+        .send_command(command_with_payload(
+            session_id,
+            json!({
+                "prompt": "sleep",
+                "execution_mode": "open",
+                "tool_profile": "coding",
+                "task_contract": task_contract,
+                "output_schema": output_schema,
+                "max_elapsed_ms": 120_000,
+                "defer_external_verification": true,
+            }),
+        ))
+        .await
+        .expect("blocking task");
+    wait_for_status(&transport, session_id, TaskStatus::WaitingApproval).await;
+
+    let steer = transport
+        .send_command(command_with_payload(
+            session_id,
+            json!({
+                "prompt": "focus on the public API",
+                "steer": true,
+            }),
+        ))
+        .await
+        .expect("steering task");
+    assert!(steer.accepted);
+    let events = transport
+        .host
+        .storage
+        .repositories
+        .events
+        .load(session_id, None, None)
+        .await
+        .expect("events");
+    let active_task_id = events
+        .iter()
+        .find(|event| {
+            event.event_type == RuntimeEventType::TurnQueued
+                && event
+                    .payload
+                    .pointer("/payload/steer")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+        })
+        .and_then(|event| event.task_id)
+        .expect("active task id");
+
+    let recovered = transport
+        .host
+        .recoverable_pending_turns(session_id, Some(active_task_id))
+        .await
+        .expect("recoverable steer");
+    assert_eq!(recovered.len(), 1);
+    assert!(recovered[0].pending.steer);
+    assert_eq!(recovered[0].pending.task_contract, None);
+    assert_eq!(recovered[0].payload["execution_mode"], "open");
+    assert_eq!(recovered[0].payload["_execution_mode"], "open");
+    assert_eq!(recovered[0].payload["tool_profile"], "coding");
+    assert_eq!(
+        recovered[0].payload["task_contract"]["completion_criteria"],
+        json!(["preserve the active task contract"])
+    );
+    assert_eq!(recovered[0].payload["output_schema"], output_schema);
+    assert!(
+        recovered[0].payload["max_elapsed_ms"]
+            .as_u64()
+            .is_some_and(|remaining| (1..=120_000).contains(&remaining))
+    );
+    assert_eq!(recovered[0].payload["defer_external_verification"], true);
+
+    transport
+        .send_command(runtime_command(
+            session_id,
+            SessionCommandKind::Abort,
+            json!({}),
+        ))
+        .await
+        .expect("release blocking task");
+}
+
+#[tokio::test]
+async fn leading_steer_recovery_uses_the_latest_started_turn_and_remaining_budget() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let session_id = host.default_session_id();
+    let task_id = TaskId::new();
+    let initial_turn_id = TurnId::new();
+    let active_turn_id = TurnId::new();
+    let pending_steer_id = TurnId::new();
+
+    let mut created = host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(task_id),
+        RuntimeEventType::TaskCreated,
+        RuntimeEventSource::Runtime,
+        json!({
+            "payload": {
+                "prompt": "initial turn",
+                "execution_mode": "open",
+                "tool_profile": "coding",
+                "task_contract": TaskContract::conversational(vec!["initial".to_owned()]),
+                "max_elapsed_ms": 120_000,
+            }
+        }),
+    );
+    created.turn_id = Some(initial_turn_id);
+    host.record_event(created).await.expect("initial turn");
+
+    let mut queued = host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(task_id),
+        RuntimeEventType::TurnQueued,
+        RuntimeEventSource::User,
+        json!({
+            "command_id": CommandId::new(),
+            "payload": {
+                "prompt": "strict active turn",
+                "execution_mode": "strict",
+                "tool_profile": "full",
+                "task_contract": TaskContract::conversational(vec!["latest".to_owned()]),
+                "max_elapsed_ms": 5_000,
+                "allow_network": false,
+                "yolo": false,
+            }
+        }),
+    );
+    queued.turn_id = Some(active_turn_id);
+    host.record_event(queued).await.expect("queued active turn");
+
+    let mut started = host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(task_id),
+        RuntimeEventType::TurnStarted,
+        RuntimeEventSource::User,
+        json!({"summary": "queued user turn started"}),
+    );
+    started.turn_id = Some(active_turn_id);
+    let budget_started_at = chrono::Utc::now() - chrono::Duration::milliseconds(1_000);
+    started.timestamp = budget_started_at;
+    host.record_event(started).await.expect("active turn start");
+    let mut step_started = host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(task_id),
+        RuntimeEventType::StepStarted,
+        RuntimeEventSource::Runtime,
+        json!({"summary": "runtime step 0 started"}),
+    );
+    step_started.turn_id = Some(active_turn_id);
+    step_started.timestamp = budget_started_at;
+    host.record_event(step_started)
+        .await
+        .expect("runtime budget start");
+
+    let mut steer = host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(task_id),
+        RuntimeEventType::TurnQueued,
+        RuntimeEventSource::User,
+        json!({
+            "command_id": CommandId::new(),
+            "payload": {
+                "prompt": "continue with the current contract",
+                "steer": true,
+                "allow_network": false,
+                "yolo": false,
+            }
+        }),
+    );
+    steer.turn_id = Some(pending_steer_id);
+    host.record_event(steer).await.expect("pending steer");
+
+    let recovered = host
+        .recoverable_pending_turns(session_id, Some(task_id))
+        .await
+        .expect("recovered turns");
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].payload["execution_mode"], "strict");
+    assert_eq!(recovered[0].payload["tool_profile"], "full");
+    assert_eq!(
+        recovered[0].payload["task_contract"]["completion_criteria"],
+        json!(["latest"])
+    );
+    assert!(
+        recovered[0].payload["max_elapsed_ms"]
+            .as_u64()
+            .is_some_and(|remaining| (3_000..=4_000).contains(&remaining)),
+        "recovery must deduct time already spent by the active turn"
+    );
+}
+
+#[tokio::test]
+async fn leading_steer_recovery_does_not_charge_pre_runtime_admission_time() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let session_id = host.default_session_id();
+    let task_id = TaskId::new();
+    let active_turn_id = TurnId::new();
+    let steer_turn_id = TurnId::new();
+    let mut created = host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(task_id),
+        RuntimeEventType::TaskCreated,
+        RuntimeEventSource::Runtime,
+        json!({
+            "payload": {
+                "prompt": "waiting for provider admission",
+                "execution_mode": "open",
+                "tool_profile": "coding",
+                "task_contract": TaskContract::conversational(vec!["inspect".to_owned()]),
+                "max_elapsed_ms": 5_000,
+                "allow_network": false,
+                "yolo": false,
+            }
+        }),
+    );
+    created.turn_id = Some(active_turn_id);
+    created.timestamp = chrono::Utc::now() - chrono::Duration::minutes(10);
+    host.record_event(created).await.expect("active task");
+    let mut steer = host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(task_id),
+        RuntimeEventType::TurnQueued,
+        RuntimeEventSource::User,
+        json!({
+            "command_id": CommandId::new(),
+            "payload": {
+                "prompt": "continue after admission",
+                "steer": true,
+                "allow_network": false,
+                "yolo": false,
+            }
+        }),
+    );
+    steer.turn_id = Some(steer_turn_id);
+    host.record_event(steer).await.expect("pending steer");
+
+    let recovered = host
+        .recoverable_pending_turns(session_id, Some(task_id))
+        .await
+        .expect("recovered steer");
+    assert_eq!(recovered[0].payload["max_elapsed_ms"], 5_000);
+}
+
+#[tokio::test]
+async fn recovery_transfer_preserves_the_surface_after_a_later_turn_started() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let session_id = host.default_session_id();
+    let task_id = TaskId::new();
+    let first_turn_id = TurnId::new();
+    let second_turn_id = TurnId::new();
+    let steer_turn_id = TurnId::new();
+    let first_payload = json!({
+        "prompt": "first recovered turn",
+        "execution_mode": "open",
+        "tool_profile": "coding",
+        "task_contract": TaskContract::conversational(vec!["first".to_owned()]),
+        "allow_network": false,
+        "yolo": false,
+    });
+    let second_payload = json!({
+        "prompt": "second recovered turn",
+        "execution_mode": "strict",
+        "tool_profile": "full",
+        "task_contract": TaskContract::conversational(vec!["second".to_owned()]),
+        "allow_network": false,
+        "yolo": false,
+    });
+    host.record_event(host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(task_id),
+        RuntimeEventType::TurnQueued,
+        RuntimeEventSource::Runtime,
+        json!({
+            "recovery": "durable_pending_turn_batch",
+            "recovered_pending_turns": [
+                {
+                    "sequence_no": 1,
+                    "turn_id": first_turn_id,
+                    "command_id": CommandId::new(),
+                    "actor": {"kind": "runtime", "id": "recovery-test"},
+                    "payload": first_payload,
+                },
+                {
+                    "sequence_no": 2,
+                    "turn_id": second_turn_id,
+                    "command_id": CommandId::new(),
+                    "actor": {"kind": "runtime", "id": "recovery-test"},
+                    "payload": second_payload,
+                },
+            ],
+        }),
+    ))
+    .await
+    .expect("transfer event");
+    let mut first_started = host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(task_id),
+        RuntimeEventType::TurnStarted,
+        RuntimeEventSource::Runtime,
+        json!({
+            "recovery": "durable_pending_turn",
+            "payload": first_payload,
+        }),
+    );
+    first_started.turn_id = Some(first_turn_id);
+    host.record_event(first_started)
+        .await
+        .expect("first recovered turn");
+    let mut second_started = host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(task_id),
+        RuntimeEventType::TurnStarted,
+        RuntimeEventSource::User,
+        json!({"summary": "queued user turn started"}),
+    );
+    second_started.turn_id = Some(second_turn_id);
+    host.record_event(second_started)
+        .await
+        .expect("second recovered turn");
+    let mut steer = host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(task_id),
+        RuntimeEventType::TurnQueued,
+        RuntimeEventSource::User,
+        json!({
+            "command_id": CommandId::new(),
+            "payload": {
+                "prompt": "continue the second recovered turn",
+                "steer": true,
+                "allow_network": false,
+                "yolo": false,
+            },
+        }),
+    );
+    steer.turn_id = Some(steer_turn_id);
+    host.record_event(steer).await.expect("steering turn");
+
+    let recovered = host
+        .recoverable_pending_turns(session_id, Some(task_id))
+        .await
+        .expect("recoverable steer");
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].payload["execution_mode"], "strict");
+    assert_eq!(recovered[0].payload["tool_profile"], "full");
+    assert_eq!(
+        recovered[0].payload["task_contract"]["completion_criteria"],
+        json!(["second"])
+    );
+    assert!(
+        recovered[0].payload["max_elapsed_ms"]
+            .as_u64()
+            .is_some_and(|remaining| (1..=default_agent_max_elapsed_ms()).contains(&remaining))
+    );
+}
+
+#[tokio::test]
+async fn recovery_transfer_carries_cumulative_governor_and_delegation_state() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let session_id = host.default_session_id();
+    let task_id = TaskId::new();
+    let turn_id = TurnId::new();
+    let captured_at = chrono::Utc::now() - chrono::Duration::milliseconds(25);
+    let delegation = delegation_policy::TimedDelegationRecoveryState {
+        captured_at,
+        state: delegation_policy::DelegationRecoveryState {
+            root_session_id: session_id,
+            parent_session_id: None,
+            parent_task_id: None,
+            parent_thread_id: None,
+            depth: 0,
+            remaining_elapsed_ms: 10_000,
+            local_remaining_elapsed_ms: None,
+            max_tokens: delegation_policy::MIN_DELEGATED_TOKEN_BUDGET,
+            max_cost_microusd: Some(500),
+            started_children: 2,
+            spent_tokens: 7_000,
+            spent_cost_microusd: 125,
+        },
+    };
+    let continuation = RecoveredTaskContinuation {
+        governor_usage: AgentGovernorUsage {
+            iterations: 9,
+            tool_calls: 12,
+            failed_tool_calls: 3,
+            consecutive_failed_tool_calls: 1,
+            estimated_cost_microusd: Some(321),
+        },
+        accounted_cost_response_ids: Vec::new(),
+        delegation: Some(delegation),
+    };
+    let actor = Actor {
+        kind: ActorKind::Runtime,
+        id: "recovery-continuation".to_owned(),
+    };
+    host.record_event(host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(task_id),
+        RuntimeEventType::TurnQueued,
+        RuntimeEventSource::Runtime,
+        json!({
+            "recovery": "durable_pending_turn_batch",
+            RECOVERED_PENDING_TURNS_KEY: [{
+                "sequence_no": 1,
+                "turn_id": turn_id,
+                "command_id": CommandId::new(),
+                "actor": actor,
+                "payload": {
+                    "prompt": "continue after recovery",
+                    "execution_mode": "open",
+                    "tool_profile": "coding",
+                    "allow_network": false,
+                    "yolo": false,
+                },
+            }],
+            RECOVERY_CONTINUATION_KEY: continuation,
+        }),
+    ))
+    .await
+    .expect("transfer event");
+
+    let recovered = host
+        .recoverable_pending_turns(session_id, Some(task_id))
+        .await
+        .expect("recovered continuation");
+    let continuation = recovered[0]
+        .continuation
+        .as_ref()
+        .expect("continuation state");
+    assert_eq!(continuation.governor_usage.tool_calls, 12);
+    assert_eq!(
+        continuation.governor_usage.estimated_cost_microusd,
+        Some(321)
+    );
+    let delegation = continuation.delegation.as_ref().expect("delegation state");
+    assert_eq!(delegation.state.started_children, 2);
+    assert_eq!(delegation.state.spent_cost_microusd, 125);
+    assert!(delegation.state.remaining_elapsed_ms < 10_000);
+}
+
+fn governor_recovery_transfer_event(
+    sequence_no: u64,
+    session_id: SessionId,
+    task_id: TaskId,
+    governor_usage: AgentGovernorUsage,
+    accounted_cost_response_ids: Vec<String>,
+) -> RuntimeEvent {
+    host_event(
+        sequence_no,
+        session_id,
+        Some(task_id),
+        RuntimeEventType::TurnQueued,
+        RuntimeEventSource::Runtime,
+        json!({
+            "recovered_pending_sequence_nos": [],
+            RECOVERY_CONTINUATION_KEY: RecoveredTaskContinuation {
+                governor_usage,
+                accounted_cost_response_ids,
+                delegation: None,
+            },
+        }),
+    )
+}
+
+fn recovered_governor(events: &[RuntimeEvent]) -> RecoveredTaskContinuation {
+    recovered_task_continuation(events, chrono::Utc::now())
+        .expect("valid recovery facts")
+        .expect("governor continuation")
+}
+
+#[test]
+fn recovered_governor_cumulative_counters_do_not_regress_on_stale_facts() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let current = host_event(
+        1,
+        session_id,
+        Some(task_id),
+        RuntimeEventType::GovernorDecided,
+        RuntimeEventSource::Governor,
+        json!({
+            "record": {
+                "iteration": 9,
+                "tool_calls": 12,
+                "failed_tool_calls": 4,
+                "consecutive_failed_tool_calls": 2,
+            }
+        }),
+    );
+    let stale_transfer = governor_recovery_transfer_event(
+        2,
+        session_id,
+        task_id,
+        AgentGovernorUsage {
+            iterations: 3,
+            tool_calls: 5,
+            failed_tool_calls: 1,
+            consecutive_failed_tool_calls: 1,
+            estimated_cost_microusd: None,
+        },
+        Vec::new(),
+    );
+    let stale_governor = host_event(
+        3,
+        session_id,
+        Some(task_id),
+        RuntimeEventType::GovernorDecided,
+        RuntimeEventSource::Governor,
+        json!({
+            "record": {
+                "iteration": 4,
+                "tool_calls": 6,
+                "failed_tool_calls": 2,
+                "consecutive_failed_tool_calls": 1,
+            }
+        }),
+    );
+
+    let usage = recovered_governor(&[current, stale_transfer, stale_governor]).governor_usage;
+    assert_eq!(usage.iterations, 9);
+    assert_eq!(usage.tool_calls, 12);
+    assert_eq!(usage.failed_tool_calls, 4);
+}
+
+#[test]
+fn recovered_governor_does_not_recharge_usage_accounted_by_transfer() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let turn_id = TurnId::new();
+    let response_id = golutra_core::ProviderResponseId::new();
+    let transfer = governor_recovery_transfer_event(
+        1,
+        session_id,
+        task_id,
+        AgentGovernorUsage {
+            estimated_cost_microusd: Some(1_000),
+            ..AgentGovernorUsage::default()
+        },
+        vec![response_id.to_string()],
+    );
+    let usage = TokenUsageRecord {
+        task_id,
+        turn_id,
+        provider_id: "test-provider".to_owned(),
+        model_id: "test-model".to_owned(),
+        request_event_id: golutra_core::ProviderRequestId::new(),
+        response_event_id: response_id,
+        input_tokens: Some(10),
+        output_tokens: Some(5),
+        reasoning_tokens: None,
+        cached_input_tokens: None,
+        tool_result_tokens: None,
+        total_tokens: Some(15),
+        estimated_cost: Some(0.001),
+        budget_snapshot_ref: golutra_core::TokenBudgetSnapshotId::new(),
+        attribution_ref: None,
+        usage_source: "provider".to_owned(),
+    };
+    let old_usage = host_event(
+        2,
+        session_id,
+        Some(task_id),
+        RuntimeEventType::TokenUsageRecorded,
+        RuntimeEventSource::Provider,
+        json!({"record": usage}),
+    );
+
+    let continuation = recovered_governor(&[transfer, old_usage]);
+    assert_eq!(
+        continuation.governor_usage.estimated_cost_microusd,
+        Some(1_000)
+    );
+    assert_eq!(
+        continuation.accounted_cost_response_ids,
+        vec![response_id.to_string()]
+    );
+}
+
+#[test]
+fn recovered_governor_counts_step_started_before_governor_decision() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let turn_id = TurnId::new();
+    let transfer = governor_recovery_transfer_event(
+        1,
+        session_id,
+        task_id,
+        AgentGovernorUsage {
+            iterations: 4,
+            ..AgentGovernorUsage::default()
+        },
+        Vec::new(),
+    );
+    let mut step_started = host_event(
+        2,
+        session_id,
+        Some(task_id),
+        RuntimeEventType::StepStarted,
+        RuntimeEventSource::Runtime,
+        json!({"step": {"step_no": 0, "turn_id": turn_id}}),
+    );
+    step_started.turn_id = Some(turn_id);
+
+    assert_eq!(
+        recovered_governor(&[transfer, step_started])
+            .governor_usage
+            .iterations,
+        5
+    );
+}
+
+#[test]
+fn recovered_governor_counts_failed_model_tool_before_governor_decision() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let tool_call_id = ToolCallId::new();
+    let transfer = governor_recovery_transfer_event(
+        1,
+        session_id,
+        task_id,
+        AgentGovernorUsage {
+            tool_calls: 2,
+            failed_tool_calls: 1,
+            consecutive_failed_tool_calls: 1,
+            ..AgentGovernorUsage::default()
+        },
+        Vec::new(),
+    );
+    let started = host_event(
+        2,
+        session_id,
+        Some(task_id),
+        RuntimeEventType::ToolStarted,
+        RuntimeEventSource::Tool,
+        json!({
+            "tool_call_id": tool_call_id,
+            "provider_tool_call_id": "provider-call-1",
+            "tool_name": "read_file",
+        }),
+    );
+    let failed = host_event(
+        3,
+        session_id,
+        Some(task_id),
+        RuntimeEventType::ToolCompleted,
+        RuntimeEventSource::Tool,
+        json!({
+            "envelope": {
+                "tool_call_id": tool_call_id,
+                "status": "error",
+            }
+        }),
+    );
+
+    let usage = recovered_governor(&[transfer, started, failed]).governor_usage;
+    assert_eq!(usage.tool_calls, 3);
+    assert_eq!(usage.failed_tool_calls, 2);
+    assert_eq!(usage.consecutive_failed_tool_calls, 2);
+}
+
+#[test]
+fn recovered_governor_successful_model_tool_resets_consecutive_failures() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let tool_call_id = ToolCallId::new();
+    let transfer = governor_recovery_transfer_event(
+        1,
+        session_id,
+        task_id,
+        AgentGovernorUsage {
+            tool_calls: 4,
+            failed_tool_calls: 2,
+            consecutive_failed_tool_calls: 2,
+            ..AgentGovernorUsage::default()
+        },
+        Vec::new(),
+    );
+    let started = host_event(
+        2,
+        session_id,
+        Some(task_id),
+        RuntimeEventType::ToolStarted,
+        RuntimeEventSource::Tool,
+        json!({
+            "tool_call_id": tool_call_id,
+            "provider_tool_call_id": "provider-call-2",
+            "tool_name": "read_file",
+        }),
+    );
+    let succeeded = host_event(
+        3,
+        session_id,
+        Some(task_id),
+        RuntimeEventType::ToolCompleted,
+        RuntimeEventSource::Tool,
+        json!({
+            "envelope": {
+                "tool_call_id": tool_call_id,
+                "status": "ok",
+            }
+        }),
+    );
+
+    let usage = recovered_governor(&[transfer, started, succeeded]).governor_usage;
+    assert_eq!(usage.tool_calls, 5);
+    assert_eq!(usage.failed_tool_calls, 2);
+    assert_eq!(usage.consecutive_failed_tool_calls, 0);
+}
+
+#[test]
+fn recovered_governor_ignores_internal_verifier_tools() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let failed_verifier_id = ToolCallId::new();
+    let successful_verifier_id = ToolCallId::new();
+    let baseline = AgentGovernorUsage {
+        iterations: 3,
+        tool_calls: 6,
+        failed_tool_calls: 2,
+        consecutive_failed_tool_calls: 2,
+        estimated_cost_microusd: Some(500),
+    };
+    let transfer = governor_recovery_transfer_event(1, session_id, task_id, baseline, Vec::new());
+    let events = [
+        transfer,
+        host_event(
+            2,
+            session_id,
+            Some(task_id),
+            RuntimeEventType::ToolStarted,
+            RuntimeEventSource::Tool,
+            json!({
+                "tool_call_id": failed_verifier_id,
+                "provider_tool_call_id": null,
+                "tool_name": "external_verifier",
+            }),
+        ),
+        host_event(
+            3,
+            session_id,
+            Some(task_id),
+            RuntimeEventType::ToolCompleted,
+            RuntimeEventSource::Tool,
+            json!({
+                "envelope": {
+                    "tool_call_id": failed_verifier_id,
+                    "status": "error",
+                }
+            }),
+        ),
+        host_event(
+            4,
+            session_id,
+            Some(task_id),
+            RuntimeEventType::ToolStarted,
+            RuntimeEventSource::Tool,
+            json!({
+                "tool_call_id": successful_verifier_id,
+                "provider_tool_call_id": null,
+                "tool_name": "contract_path_verifier",
+            }),
+        ),
+        host_event(
+            5,
+            session_id,
+            Some(task_id),
+            RuntimeEventType::ToolCompleted,
+            RuntimeEventSource::Tool,
+            json!({
+                "envelope": {
+                    "tool_call_id": successful_verifier_id,
+                    "status": "ok",
+                }
+            }),
+        ),
+    ];
+
+    assert_eq!(recovered_governor(&events).governor_usage, baseline);
+}
+
+#[tokio::test]
+async fn inline_recovery_payload_wins_over_its_stale_source_reference() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let session_id = host.default_session_id();
+    let source_task_id = TaskId::new();
+    let recovery_task_id = TaskId::new();
+    let turn_id = TurnId::new();
+    let command_id = CommandId::new();
+    let actor = Actor {
+        kind: ActorKind::Runtime,
+        id: "inline-recovery".to_owned(),
+    };
+    let mut source = host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(source_task_id),
+        RuntimeEventType::TurnQueued,
+        RuntimeEventSource::User,
+        json!({
+            "command_id": command_id,
+            "payload": {"prompt": "stale prompt"},
+        }),
+    );
+    source.turn_id = Some(turn_id);
+    let source_sequence_no = source.sequence_no;
+    host.record_event(source).await.expect("source turn");
+    let transfer = host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(recovery_task_id),
+        RuntimeEventType::TurnQueued,
+        RuntimeEventSource::Runtime,
+        json!({
+            "recovered_pending_sequence_nos": [source_sequence_no],
+            RECOVERED_PENDING_TURNS_KEY: [{
+                "sequence_no": source_sequence_no,
+                "turn_id": turn_id,
+                "command_id": command_id,
+                "actor": actor,
+                "payload": {"prompt": "updated prompt"},
+            }],
+        }),
+    );
+
+    let recovered = recoverable_transfer_turns(&host, session_id, &[transfer])
+        .await
+        .expect("transferred turns");
+    assert_eq!(recovered[&turn_id].payload["prompt"], "updated prompt");
+}
+
+#[tokio::test]
+async fn materialized_leading_steer_survives_a_crash_before_turn_started() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let session_id = host.default_session_id();
+    let task_id = TaskId::new();
+    let turn_id = TurnId::new();
+    host.record_event(host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(task_id),
+        RuntimeEventType::TurnQueued,
+        RuntimeEventSource::Runtime,
+        json!({
+            "recovery": "durable_pending_turn_batch",
+            RECOVERED_PENDING_TURNS_KEY: [{
+                "sequence_no": 1,
+                "turn_id": turn_id,
+                "command_id": CommandId::new(),
+                "actor": {"kind": "runtime", "id": "recovery-test"},
+                "payload": {
+                    "prompt": "materialized steer",
+                    "steer": true,
+                    "execution_mode": "open",
+                    "_execution_mode": "open",
+                    "tool_profile": "coding",
+                    "task_contract": TaskContract::conversational(vec!["continue".to_owned()]),
+                    "_task_contract_origin": "active_task",
+                    "max_elapsed_ms": 5_000,
+                    "allow_network": false,
+                    "yolo": false,
+                },
+            }],
+        }),
+    ))
+    .await
+    .expect("transfer event");
+
+    let recovered = host
+        .recoverable_pending_turns(session_id, Some(task_id))
+        .await
+        .expect("materialized steer recovery");
+    assert_eq!(recovered.len(), 1);
+    assert!(recovered[0].pending.steer);
+    assert_eq!(recovered[0].payload["prompt"], "materialized steer");
+}
+
+#[test]
+fn recovery_transfer_does_not_get_overwritten_by_stale_restarted_turn_metadata() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let captured_at = chrono::Utc::now() - chrono::Duration::milliseconds(10);
+    let continuation = RecoveredTaskContinuation {
+        governor_usage: AgentGovernorUsage::default(),
+        accounted_cost_response_ids: Vec::new(),
+        delegation: Some(delegation_policy::TimedDelegationRecoveryState {
+            captured_at,
+            state: delegation_policy::DelegationRecoveryState {
+                root_session_id: session_id,
+                parent_session_id: None,
+                parent_task_id: None,
+                parent_thread_id: None,
+                depth: 0,
+                remaining_elapsed_ms: 10_000,
+                local_remaining_elapsed_ms: None,
+                max_tokens: delegation_policy::MIN_DELEGATED_TOKEN_BUDGET,
+                max_cost_microusd: Some(500),
+                started_children: 3,
+                spent_tokens: 8_000,
+                spent_cost_microusd: 240,
+            },
+        }),
+    };
+    let stale_metadata = json!({
+        "root_session_id": session_id,
+        "parent_session_id": null,
+        "parent_task_id": null,
+        "parent_thread_id": null,
+        "depth": 0,
+        "budget": {
+            "remaining_elapsed_ms": 30_000,
+            "max_tokens": delegation_policy::MIN_DELEGATED_TOKEN_BUDGET,
+            "max_cost_microusd": 500,
+            "started_children": 0,
+            "spent_tokens": 0,
+            "reserved_tokens": 0,
+            "spent_cost_microusd": 0,
+            "reserved_cost_microusd": 0,
+        },
+    });
+    let transfer = host_event(
+        1,
+        session_id,
+        Some(task_id),
+        RuntimeEventType::TurnQueued,
+        RuntimeEventSource::Runtime,
+        json!({
+            "recovered_pending_sequence_nos": [],
+            RECOVERY_CONTINUATION_KEY: continuation,
+        }),
+    );
+    let restarted = host_event(
+        2,
+        session_id,
+        Some(task_id),
+        RuntimeEventType::TurnStarted,
+        RuntimeEventSource::Runtime,
+        json!({
+            "recovery": "durable_pending_turn",
+            "payload": {"_delegation": stale_metadata},
+        }),
+    );
+
+    let recovered = recovered_task_continuation(&[transfer, restarted], chrono::Utc::now())
+        .expect("recovery continuation");
+    let delegation = recovered
+        .and_then(|continuation| continuation.delegation)
+        .expect("delegation continuation");
+    assert_eq!(delegation.state.started_children, 3);
+    assert_eq!(delegation.state.spent_cost_microusd, 240);
+}
+
+fn canonical_delegation_recovery_state(
+    root_session_id: SessionId,
+    max_tokens: u64,
+    max_cost_microusd: Option<u64>,
+    started_children: usize,
+    spent_tokens: u64,
+) -> delegation_policy::TimedDelegationRecoveryState {
+    delegation_policy::TimedDelegationRecoveryState {
+        captured_at: chrono::Utc::now(),
+        state: delegation_policy::DelegationRecoveryState {
+            root_session_id,
+            parent_session_id: None,
+            parent_task_id: None,
+            parent_thread_id: None,
+            depth: 0,
+            remaining_elapsed_ms: 10_000,
+            local_remaining_elapsed_ms: Some(10_000),
+            max_tokens,
+            max_cost_microusd,
+            started_children,
+            spent_tokens,
+            spent_cost_microusd: 0,
+        },
+    }
+}
+
+fn delegation_recovery_checkpoint_event(
+    sequence_no: u64,
+    session_id: SessionId,
+    task_id: TaskId,
+    recovery: &delegation_policy::TimedDelegationRecoveryState,
+) -> RuntimeEvent {
+    host_event(
+        sequence_no,
+        session_id,
+        Some(task_id),
+        RuntimeEventType::CheckpointCreated,
+        RuntimeEventSource::Runtime,
+        json!({
+            "recovery_kind": "delegation_budget",
+            "delegation_recovery": recovery,
+        }),
+    )
+}
+
+#[test]
+fn delegation_metadata_requires_numeric_reservation_fields() {
+    let session_id = SessionId::new();
+    let metadata = json!({
+        "root_session_id": session_id,
+        "parent_session_id": null,
+        "parent_task_id": null,
+        "parent_thread_id": null,
+        "depth": 0,
+        "budget": {
+            "remaining_elapsed_ms": 10_000,
+            "max_tokens": delegation_policy::MIN_DELEGATED_TOKEN_BUDGET,
+            "max_cost_microusd": null,
+            "active_children": 0,
+            "started_children": 0,
+            "spent_tokens": 0,
+            "reserved_tokens": 0,
+            "spent_cost_microusd": 0,
+            "reserved_cost_microusd": 0,
+        },
+    });
+
+    for key in [
+        "active_children",
+        "reserved_tokens",
+        "reserved_cost_microusd",
+    ] {
+        let mut missing = metadata.clone();
+        missing["budget"]
+            .as_object_mut()
+            .expect("budget object")
+            .remove(key);
+        let error = delegation_recovery_from_metadata(&missing, chrono::Utc::now())
+            .expect_err("missing reservation field must fail closed");
+        assert!(error.to_string().contains(key), "{key}: {error}");
+
+        let mut malformed = metadata.clone();
+        malformed["budget"][key] = json!("0");
+        let error = delegation_recovery_from_metadata(&malformed, chrono::Utc::now())
+            .expect_err("malformed reservation field must fail closed");
+        assert!(error.to_string().contains(key), "{key}: {error}");
+    }
+}
+
+#[test]
+fn canonical_delegation_checkpoint_rejects_foreign_or_child_state() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let foreign = canonical_delegation_recovery_state(
+        SessionId::new(),
+        delegation_policy::MIN_DELEGATED_TOKEN_BUDGET,
+        None,
+        1,
+        0,
+    );
+    let error = recovered_task_continuation(
+        &[delegation_recovery_checkpoint_event(
+            1, session_id, task_id, &foreign,
+        )],
+        chrono::Utc::now(),
+    )
+    .expect_err("foreign root checkpoint must be rejected");
+    assert!(error.to_string().contains("does not match event session"));
+
+    let transfer = host_event(
+        1,
+        session_id,
+        Some(task_id),
+        RuntimeEventType::TurnQueued,
+        RuntimeEventSource::Runtime,
+        json!({
+            "recovered_pending_sequence_nos": [],
+            RECOVERY_CONTINUATION_KEY: RecoveredTaskContinuation {
+                governor_usage: AgentGovernorUsage::default(),
+                accounted_cost_response_ids: Vec::new(),
+                delegation: Some(foreign.clone()),
+            },
+        }),
+    );
+    let error = recovered_task_continuation(&[transfer], chrono::Utc::now())
+        .expect_err("foreign root transfer state must be rejected");
+    assert!(error.to_string().contains("does not match event session"));
+
+    let mut child = canonical_delegation_recovery_state(
+        session_id,
+        delegation_policy::MIN_DELEGATED_TOKEN_BUDGET,
+        None,
+        1,
+        0,
+    );
+    child.state.depth = 1;
+    child.state.parent_session_id = Some(SessionId::new());
+    let error = recovered_task_continuation(
+        &[delegation_recovery_checkpoint_event(
+            1, session_id, task_id, &child,
+        )],
+        chrono::Utc::now(),
+    )
+    .expect_err("child state in the canonical stream must be rejected");
+    assert!(error.to_string().contains("not a canonical root state"));
+}
+
+#[test]
+fn canonical_delegation_checkpoint_rejects_budget_or_child_count_drift() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let baseline = canonical_delegation_recovery_state(
+        session_id,
+        delegation_policy::MIN_DELEGATED_TOKEN_BUDGET,
+        Some(1_000),
+        2,
+        100,
+    );
+    let mut changed_token_cap = baseline.clone();
+    changed_token_cap.state.max_tokens += 1;
+    let mut changed_cost_cap = baseline.clone();
+    changed_cost_cap.state.max_cost_microusd = Some(999);
+    let mut regressed_children = baseline.clone();
+    regressed_children.state.started_children = 1;
+
+    for (label, candidate) in [
+        ("token cap", changed_token_cap),
+        ("cost cap", changed_cost_cap),
+        ("started children", regressed_children),
+    ] {
+        let events = [
+            delegation_recovery_checkpoint_event(1, session_id, task_id, &baseline),
+            delegation_recovery_checkpoint_event(2, session_id, task_id, &candidate),
+        ];
+        assert!(
+            recovered_task_continuation(&events, chrono::Utc::now()).is_err(),
+            "{label} drift must be rejected"
+        );
+    }
+}
+
+#[test]
+fn canonical_delegation_checkpoint_allows_reservation_settlement_usage_drop() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let reservation = canonical_delegation_recovery_state(
+        session_id,
+        delegation_policy::MIN_DELEGATED_TOKEN_BUDGET,
+        Some(1_000),
+        1,
+        delegation_policy::MIN_DELEGATED_TOKEN_BUDGET,
+    );
+    let mut settlement = reservation.clone();
+    settlement.state.spent_tokens = 100;
+    settlement.state.spent_cost_microusd = 10;
+    let events = [
+        delegation_recovery_checkpoint_event(1, session_id, task_id, &reservation),
+        delegation_recovery_checkpoint_event(2, session_id, task_id, &settlement),
+    ];
+
+    let recovered = recovered_task_continuation(&events, chrono::Utc::now())
+        .expect("settlement checkpoint")
+        .and_then(|continuation| continuation.delegation)
+        .expect("delegation state");
+    assert_eq!(recovered.state.spent_tokens, 100);
+    assert_eq!(recovered.state.spent_cost_microusd, 10);
+}
+
+#[test]
+fn delegation_metadata_depth_is_decoded_from_top_level_and_legacy_budget_location() {
+    let session_id = SessionId::new();
+    let base_budget = json!({
+        "remaining_elapsed_ms": 10_000,
+        "max_tokens": delegation_policy::MIN_DELEGATED_TOKEN_BUDGET,
+        "max_cost_microusd": null,
+        "active_children": 1,
+        "started_children": 1,
+        "spent_tokens": 100,
+        "reserved_tokens": 20,
+        "spent_cost_microusd": 0,
+        "reserved_cost_microusd": 0,
+    });
+    let current = json!({
+        "root_session_id": session_id,
+        "parent_session_id": null,
+        "parent_task_id": null,
+        "parent_thread_id": null,
+        "depth": 1,
+        "budget": base_budget,
+    });
+    let current =
+        delegation_recovery_from_metadata(&current, chrono::Utc::now()).expect("current metadata");
+    assert_eq!(current.state.depth, 1);
+    assert_eq!(
+        current.state.spent_tokens,
+        delegation_policy::MIN_DELEGATED_TOKEN_BUDGET
+    );
+
+    let settled = json!({
+        "root_session_id": session_id,
+        "parent_session_id": null,
+        "parent_task_id": null,
+        "parent_thread_id": null,
+        "depth": 1,
+        "budget": {
+            "remaining_elapsed_ms": 10_000,
+            "max_tokens": delegation_policy::MIN_DELEGATED_TOKEN_BUDGET,
+            "max_cost_microusd": null,
+            "active_children": 0,
+            "started_children": 1,
+            "spent_tokens": 100,
+            "reserved_tokens": 0,
+            "spent_cost_microusd": 0,
+            "reserved_cost_microusd": 0,
+        },
+    });
+    let settled =
+        delegation_recovery_from_metadata(&settled, chrono::Utc::now()).expect("settled metadata");
+    assert_eq!(settled.state.spent_tokens, 100);
+
+    let legacy = json!({
+        "root_session_id": session_id,
+        "parent_session_id": null,
+        "parent_task_id": null,
+        "parent_thread_id": null,
+        "budget": {
+            "depth": 2,
+            "remaining_elapsed_ms": 10_000,
+            "max_tokens": delegation_policy::MIN_DELEGATED_TOKEN_BUDGET,
+            "max_cost_microusd": null,
+            "active_children": 0,
+            "started_children": 2,
+            "spent_tokens": 200,
+            "reserved_tokens": 0,
+            "spent_cost_microusd": 0,
+            "reserved_cost_microusd": 0,
+        },
+    });
+    let legacy =
+        delegation_recovery_from_metadata(&legacy, chrono::Utc::now()).expect("legacy metadata");
+    assert_eq!(legacy.state.depth, 2);
+    assert_eq!(legacy.state.started_children, 2);
 }
 
 #[tokio::test]
@@ -8416,6 +10094,8 @@ async fn queued_turn_persists_its_runtime_and_evaluator_options() {
 
 #[tokio::test]
 async fn per_turn_elapsed_budget_clamps_shell_execution() {
+    const MAX_ELAPSED_MS: u64 = 800;
+
     let workspace = tempdir().expect("workspace");
     let _provider = IsolatedGlobalMockProvider::install().await;
     let transport = EmbeddedTransport::for_cwd(workspace.path())
@@ -8429,14 +10109,14 @@ async fn per_turn_elapsed_budget_clamps_shell_execution() {
             json!({
                 "prompt": "sleep",
                 "yolo": true,
-                "max_elapsed_ms": 20,
+                "max_elapsed_ms": MAX_ELAPSED_MS,
                 "task_contract": {"max_correction_rounds": 0}
             }),
         ))
         .await
         .expect("bounded turn");
     assert!(ack.accepted);
-    let state = wait_for_status(&transport, session_id, TaskStatus::Blocked).await;
+    let state = wait_for_terminal_status(&transport, session_id).await;
     let task_id = state["active_task_id"]
         .as_str()
         .expect("task id")
@@ -8456,11 +10136,7 @@ async fn per_turn_elapsed_budget_clamps_shell_execution() {
             && event.payload["envelope"]["structured_facts"]["timed_out"] == true
             && event.payload["envelope"]["structured_facts"]["requested_timeout_ms"]
                 .as_u64()
-                .is_some_and(|timeout| timeout <= 20)
-    }));
-    assert!(events.iter().any(|event| {
-        event.event_type == RuntimeEventType::LoopGuardTriggered
-            && event.payload["trigger"] == "runtime_deadline"
+                .is_some_and(|timeout| timeout < MAX_ELAPSED_MS)
     }));
 }
 
@@ -8494,7 +10170,8 @@ async fn yolo_turn_writes_outside_the_workspace_without_approval() {
         .await
         .expect("yolo command");
     assert!(ack.accepted);
-    wait_for_status(&transport, session_id, TaskStatus::Completed).await;
+    let state = wait_for_terminal_status(&transport, session_id).await;
+    assert_eq!(projection_status(&state), Some(TaskStatus::Partial));
 
     assert_eq!(
         fs::read_to_string(&target).expect("outside result"),
@@ -9600,6 +11277,8 @@ async fn runtime_recovery_rejects_a_pending_batch_that_changes_yolo_capability()
                     yolo,
                     steer: false,
                 },
+                execution: PendingTurnExecutionOptions::default(),
+                continuation: None,
             }
         })
         .collect::<Vec<_>>();
@@ -10126,6 +11805,28 @@ async fn wait_for_status(
         sleep(Duration::from_millis(50)).await;
     }
     panic!("timed out waiting for status {expected:?}");
+}
+
+async fn wait_for_terminal_status(transport: &EmbeddedTransport, session_id: SessionId) -> Value {
+    for _ in 0..40 {
+        let state = transport
+            .query(RuntimeQuery {
+                query_id: QueryId::new(),
+                session_id,
+                task_id: None,
+                kind: RuntimeQueryKind::SessionState,
+                requester: ActorKind::Cli,
+                cursor: None,
+                timestamp: chrono::Utc::now(),
+            })
+            .await
+            .expect("state");
+        if projection_status(&state).is_some_and(TaskStatus::is_terminal) {
+            return state;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    panic!("timed out waiting for terminal status");
 }
 
 async fn wait_for_task_completed_count(

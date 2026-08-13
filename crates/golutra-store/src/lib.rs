@@ -1,3 +1,4 @@
+use fs2::FileExt;
 use golutra_core::{
     ArtifactId, ArtifactRecord, BusyPolicyDecision, CommandId, ContextSnapshot, EventId,
     EvidenceRecord, PostTaskJob, PostTaskJobId, PostTaskJobKind, PostTaskJobStatus, SessionId,
@@ -39,8 +40,22 @@ const CHECKPOINT_ARTIFACT_RETENTION_DAYS: i64 = 30;
 const EPHEMERAL_ARTIFACT_RETENTION_DAYS: i64 = 1;
 const TEMPORARY_ARTIFACT_RETENTION_HOURS: u64 = 1;
 pub const MAX_ARTIFACT_READ_BYTES: u64 = 1024 * 1024;
+const MAX_TOOL_COMPLETION_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_TOOL_COMPLETION_BUNDLE_BYTES: u64 = 160 * 1024 * 1024;
 const SQLITE_OPEN_RETRIES: usize = 120;
 const SQLITE_OPEN_RETRY_DELAY: Duration = Duration::from_millis(50);
+const ARTIFACT_STORE_IDENTITY_FILE: &str = ".store.identity";
+const ARTIFACT_STORE_IDENTITY_FORMAT: &str = "golutra-artifact-store-v1";
+const MAX_ARTIFACT_STORE_IDENTITY_BYTES: u64 = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum StoreTestPausePoint {
+    BundleAfterBlobPublication,
+    ArtifactAfterBlobPublication,
+    EvidenceAfterLock,
+    MaintenanceAfterProtectionSnapshot,
+    MaintenanceAfterTombstone,
+}
 
 pub(crate) use projection::{
     apply_event_to_state, initial_projection, loop_decision_from_event, verification_from_event,
@@ -60,6 +75,8 @@ pub enum StoreError {
     ArtifactChecksum(String),
     #[error("sqlite migration failed: {0}")]
     Migration(String),
+    #[error("invalid tool completion bundle: {0}")]
+    InvalidToolCompletionBundle(String),
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -118,15 +135,25 @@ pub struct EventIntegrity {
     pub event_chain_digest: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PreparedArtifactBlob {
+    artifact_id: ArtifactId,
+    created_final_link: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeStore {
     pool: SqlitePool,
     artifact_root: PathBuf,
+    database_identity: Arc<str>,
     _temporary_artifact_root: Option<Arc<tempfile::TempDir>>,
 }
 
 impl RuntimeStore {
     pub async fn connect(database_url: &str) -> StoreResult<Self> {
+        if is_in_memory_database_url(database_url) {
+            return Self::in_memory().await;
+        }
         let artifact_root = artifact_root_for_database_url(database_url);
         Self::connect_with_artifact_root(database_url, artifact_root).await
     }
@@ -167,12 +194,17 @@ impl RuntimeStore {
             .journal_mode(journal_mode)
             .busy_timeout(Duration::from_secs(5));
         let pool = connect_sqlite_pool_with_retry(options).await?;
+        migrations::run(&pool)
+            .await
+            .map_err(StoreError::Migration)?;
+        let database_identity = initialize_database_identity(&pool).await?;
         let store = Self {
             pool,
             artifact_root: artifact_root.into(),
+            database_identity: database_identity.into(),
             _temporary_artifact_root: None,
         };
-        store.initialize().await?;
+        store.bind_artifact_root_to_database().await?;
         Ok(store)
     }
 
@@ -185,19 +217,31 @@ impl RuntimeStore {
             .max_connections(1)
             .connect_with(options)
             .await?;
+        migrations::run(&pool)
+            .await
+            .map_err(StoreError::Migration)?;
+        let database_identity = initialize_database_identity(&pool).await?;
         let store = Self {
             pool,
             artifact_root: temporary.path().join("artifacts"),
+            database_identity: database_identity.into(),
             _temporary_artifact_root: Some(temporary),
         };
-        store.initialize().await?;
+        store.bind_artifact_root_to_database().await?;
         Ok(store)
     }
 
     pub async fn initialize(&self) -> StoreResult<()> {
         migrations::run(&self.pool)
             .await
-            .map_err(StoreError::Migration)
+            .map_err(StoreError::Migration)?;
+        let database_identity = initialize_database_identity(&self.pool).await?;
+        if database_identity != self.database_identity.as_ref() {
+            return Err(StoreError::ArtifactIo(
+                "runtime database identity changed while the store was open".to_owned(),
+            ));
+        }
+        self.bind_artifact_root_to_database().await
     }
 
     pub async fn command_ack(&self, idempotency_key: &str) -> StoreResult<Option<CommandAck>> {
@@ -343,6 +387,102 @@ impl RuntimeStore {
         let event = append_event_assigning_sequence_in_transaction(&mut transaction, event).await?;
         transaction.commit().await?;
         Ok(event)
+    }
+
+    /// Atomically commits one tool completion and all facts that it references.
+    ///
+    /// Immutable blobs are verified and linked before the SQLite transaction.
+    /// Artifact metadata, evidence, the assigned event sequence, and projections
+    /// then commit together. A failed transaction removes only links created by
+    /// this call, and only after confirming that no metadata owns the link.
+    pub async fn append_tool_completed_bundle(
+        &self,
+        event: RuntimeEvent,
+        artifacts: &[(ArtifactRecord, Vec<u8>)],
+        evidence: &[EvidenceRecord],
+    ) -> StoreResult<RuntimeEvent> {
+        let store = self.clone();
+        let artifacts = artifacts.to_vec();
+        let evidence = evidence.to_vec();
+        await_store_operation(tokio::spawn(async move {
+            store
+                .append_tool_completed_bundle_inner(event, &artifacts, &evidence)
+                .await
+        }))
+        .await
+    }
+
+    async fn append_tool_completed_bundle_inner(
+        &self,
+        event: RuntimeEvent,
+        artifacts: &[(ArtifactRecord, Vec<u8>)],
+        evidence: &[EvidenceRecord],
+    ) -> StoreResult<RuntimeEvent> {
+        validate_tool_completion_bundle(&event, artifacts, evidence)?;
+        let _artifact_lock = self.acquire_artifact_store_lock().await?;
+
+        let mut prepared = Vec::with_capacity(artifacts.len());
+        let mut content_paths = HashMap::<(String, u64), PathBuf>::new();
+        for (artifact, bytes) in artifacts {
+            let content_key = (artifact.checksum.clone(), artifact.size_bytes);
+            let preferred_source = content_paths.get(&content_key).map(PathBuf::as_path);
+            match self
+                .prepare_artifact_blob(artifact, bytes, preferred_source)
+                .await
+            {
+                Ok(blob) => {
+                    content_paths
+                        .entry(content_key)
+                        .or_insert_with(|| self.artifact_blob_path(artifact.artifact_id));
+                    prepared.push(blob);
+                }
+                Err(error) => {
+                    return Err(self
+                        .compensate_prepared_blobs_after_error(&prepared, error)
+                        .await);
+                }
+            }
+        }
+        pause_store_operation_for_test(
+            &self.database_identity,
+            StoreTestPausePoint::BundleAfterBlobPublication,
+        )
+        .await;
+
+        let transaction_result = async {
+            let mut transaction = self.pool.begin().await?;
+            let operation = async {
+                for (artifact, _) in artifacts {
+                    insert_artifact_metadata_in_transaction(&mut transaction, artifact).await?;
+                }
+                for record in evidence {
+                    insert_evidence_in_transaction(&mut transaction, record).await?;
+                }
+                validate_bundle_references_in_transaction(&mut transaction, &event, evidence)
+                    .await?;
+                append_event_assigning_sequence_in_transaction(&mut transaction, event).await
+            }
+            .await;
+
+            match operation {
+                Ok(event) => {
+                    transaction.commit().await?;
+                    Ok(event)
+                }
+                Err(error) => {
+                    transaction.rollback().await?;
+                    Err(error)
+                }
+            }
+        }
+        .await;
+
+        match transaction_result {
+            Ok(event) => Ok(event),
+            Err(error) => Err(self
+                .compensate_prepared_blobs_after_error(&prepared, error)
+                .await),
+        }
     }
 
     pub async fn list_session_states(&self) -> StoreResult<Vec<StateProjection>> {
@@ -831,30 +971,70 @@ impl RuntimeStore {
     }
 
     pub async fn store_artifact(&self, artifact: &ArtifactRecord, bytes: &[u8]) -> StoreResult<()> {
+        let store = self.clone();
+        let artifact = artifact.clone();
+        let bytes = bytes.to_vec();
+        await_store_operation(tokio::spawn(async move {
+            store.store_artifact_inner(&artifact, &bytes).await
+        }))
+        .await
+    }
+
+    async fn store_artifact_inner(
+        &self,
+        artifact: &ArtifactRecord,
+        bytes: &[u8],
+    ) -> StoreResult<()> {
+        verify_artifact_checksum(artifact, bytes)?;
+        let _artifact_lock = self.acquire_artifact_store_lock().await?;
+        let prepared = self.prepare_artifact_blob(artifact, bytes, None).await?;
+        pause_store_operation_for_test(
+            &self.database_identity,
+            StoreTestPausePoint::ArtifactAfterBlobPublication,
+        )
+        .await;
+        let transaction_result = async {
+            let mut transaction = self.pool.begin().await?;
+            let operation =
+                insert_artifact_metadata_in_transaction(&mut transaction, artifact).await;
+            match operation {
+                Ok(()) => transaction.commit().await.map_err(StoreError::from),
+                Err(error) => {
+                    transaction.rollback().await?;
+                    Err(error)
+                }
+            }
+        }
+        .await;
+        match transaction_result {
+            Ok(()) => Ok(()),
+            Err(error) => Err(self
+                .compensate_prepared_blobs_after_error(&[prepared], error)
+                .await),
+        }
+    }
+
+    async fn prepare_artifact_blob(
+        &self,
+        artifact: &ArtifactRecord,
+        bytes: &[u8],
+        preferred_source: Option<&Path>,
+    ) -> StoreResult<PreparedArtifactBlob> {
         verify_artifact_checksum(artifact, bytes)?;
         tokio::fs::create_dir_all(&self.artifact_root)
             .await
             .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
         set_owner_only_dir(&self.artifact_root).await?;
         let final_path = self.artifact_blob_path(artifact.artifact_id);
-        let duplicate_artifact_id: Option<String> = sqlx::query_scalar(
-            "SELECT artifact_id FROM artifact_records
-             WHERE checksum = ? AND size_bytes = ? AND blob_deleted_at IS NULL
-             ORDER BY created_at ASC LIMIT 1",
-        )
-        .bind(&artifact.checksum)
-        .bind(i64::try_from(artifact.size_bytes).unwrap_or(i64::MAX))
-        .fetch_optional(&self.pool)
-        .await?;
-        let linked = if let Some(existing_id) = duplicate_artifact_id {
-            let existing_id = existing_id.parse::<ArtifactId>().map_err(|error| {
-                StoreError::ArtifactIo(format!("stored artifact id is invalid: {error}"))
-            })?;
-            let existing_path = self.artifact_blob_path(existing_id);
-            let existing_bytes = tokio::fs::read(&existing_path)
-                .await
-                .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
-            if existing_bytes != bytes {
+        let duplicate_path = match preferred_source {
+            Some(path) => Some(path.to_path_buf()),
+            None => {
+                self.duplicate_artifact_blob_path(&artifact.checksum, artifact.size_bytes)
+                    .await?
+            }
+        };
+        let linked = if let Some(existing_path) = duplicate_path {
+            if !artifact_blob_matches(&existing_path, bytes).await? {
                 return Err(StoreError::ArtifactIo(format!(
                     "artifact checksum collision for {}",
                     artifact.checksum
@@ -867,78 +1047,167 @@ impl RuntimeStore {
             }
         } else {
             let temporary_path = final_path.with_extension(format!("tmp-{}", uuid::Uuid::now_v7()));
-            let mut temporary = tokio::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&temporary_path)
-                .await
-                .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
-            temporary
-                .write_all(bytes)
-                .await
-                .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
-            set_owner_only_file(&temporary_path).await?;
-            temporary
-                .sync_all()
-                .await
-                .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
-            drop(temporary);
-            let linked = match tokio::fs::hard_link(&temporary_path, &final_path).await {
-                Ok(()) => true,
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => false,
-                Err(error) => return Err(StoreError::ArtifactIo(error.to_string())),
-            };
-            tokio::fs::remove_file(&temporary_path)
-                .await
-                .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
-            linked
+            let write_result = async {
+                let mut temporary = tokio::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&temporary_path)
+                    .await
+                    .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
+                temporary
+                    .write_all(bytes)
+                    .await
+                    .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
+                set_owner_only_file(&temporary_path).await?;
+                temporary
+                    .sync_all()
+                    .await
+                    .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
+                drop(temporary);
+                match tokio::fs::hard_link(&temporary_path, &final_path).await {
+                    Ok(()) => Ok(true),
+                    Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(false),
+                    Err(error) => Err(StoreError::ArtifactIo(error.to_string())),
+                }
+            }
+            .await;
+            let cleanup_result =
+                cleanup_temporary_artifact(&temporary_path, artifact.artifact_id).await;
+            match (write_result, cleanup_result) {
+                (Ok(linked), Ok(())) => linked,
+                (Ok(linked), Err(error)) => {
+                    if linked {
+                        return Err(self
+                            .compensate_prepared_blobs_after_error(
+                                &[PreparedArtifactBlob {
+                                    artifact_id: artifact.artifact_id,
+                                    created_final_link: true,
+                                }],
+                                error,
+                            )
+                            .await);
+                    }
+                    return Err(error);
+                }
+                (Err(error), _) => return Err(error),
+            }
         };
-        sync_artifact_directory(&self.artifact_root).await?;
-        if !linked {
-            let existing_bytes = tokio::fs::read(&final_path)
-                .await
-                .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
-            if existing_bytes != bytes {
+        if let Err(error) = sync_artifact_directory(&self.artifact_root).await {
+            if linked {
+                return Err(self
+                    .compensate_prepared_blobs_after_error(
+                        &[PreparedArtifactBlob {
+                            artifact_id: artifact.artifact_id,
+                            created_final_link: true,
+                        }],
+                        error,
+                    )
+                    .await);
+            }
+            return Err(error);
+        }
+        match artifact_blob_matches(&final_path, bytes).await {
+            Ok(true) => {}
+            Ok(false) => {
+                if linked {
+                    return Err(self
+                        .compensate_prepared_blobs_after_error(
+                            &[PreparedArtifactBlob {
+                                artifact_id: artifact.artifact_id,
+                                created_final_link: true,
+                            }],
+                            StoreError::ArtifactIo(format!(
+                                "artifact {} already has different blob content",
+                                artifact.artifact_id
+                            )),
+                        )
+                        .await);
+                }
                 return Err(StoreError::ArtifactIo(format!(
                     "artifact {} already has different blob content",
                     artifact.artifact_id
                 )));
             }
+            Err(error) => {
+                if linked {
+                    return Err(self
+                        .compensate_prepared_blobs_after_error(
+                            &[PreparedArtifactBlob {
+                                artifact_id: artifact.artifact_id,
+                                created_final_link: true,
+                            }],
+                            error,
+                        )
+                        .await);
+                }
+                return Err(error);
+            }
         }
-        let expires_at = artifact_expiration(artifact).map(|value| value.to_rfc3339());
-        let result = sqlx::query(
-            r#"
-            INSERT OR IGNORE INTO artifact_records (
-                artifact_id, session_id, uri, checksum, artifact_json,
-                created_at, retention_policy, size_bytes, expires_at, blob_deleted_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
-            "#,
+        Ok(PreparedArtifactBlob {
+            artifact_id: artifact.artifact_id,
+            created_final_link: linked,
+        })
+    }
+
+    async fn duplicate_artifact_blob_path(
+        &self,
+        checksum: &str,
+        size_bytes: u64,
+    ) -> StoreResult<Option<PathBuf>> {
+        let duplicate_artifact_id: Option<String> = sqlx::query_scalar(
+            "SELECT artifact_id FROM artifact_records
+             WHERE checksum = ? AND size_bytes = ? AND blob_deleted_at IS NULL
+             ORDER BY created_at ASC LIMIT 1",
         )
-        .bind(artifact.artifact_id.to_string())
-        .bind(artifact.session_id.to_string())
-        .bind(&artifact.uri)
-        .bind(&artifact.checksum)
-        .bind(serde_json::to_string(artifact)?)
-        .bind(artifact.created_at.to_rfc3339())
-        .bind(&artifact.retention_policy)
-        .bind(i64::try_from(artifact.size_bytes).unwrap_or(i64::MAX))
-        .bind(expires_at)
-        .execute(&self.pool)
+        .bind(checksum)
+        .bind(i64::try_from(size_bytes).unwrap_or(i64::MAX))
+        .fetch_optional(&self.pool)
         .await?;
-        if result.rows_affected() == 0
-            && self.load_artifact(artifact.artifact_id).await?.as_ref() != Some(artifact)
-        {
-            return Err(StoreError::ArtifactIo(format!(
-                "artifact {} already has different metadata",
-                artifact.artifact_id
-            )));
+        duplicate_artifact_id
+            .map(|existing_id| {
+                existing_id
+                    .parse::<ArtifactId>()
+                    .map(|id| self.artifact_blob_path(id))
+                    .map_err(|error| {
+                        StoreError::ArtifactIo(format!("stored artifact id is invalid: {error}"))
+                    })
+            })
+            .transpose()
+    }
+
+    async fn compensate_prepared_blobs_after_error(
+        &self,
+        prepared: &[PreparedArtifactBlob],
+        primary_error: StoreError,
+    ) -> StoreError {
+        match self.compensate_prepared_blobs(prepared).await {
+            Ok(()) => primary_error,
+            Err(cleanup_error) => StoreError::ArtifactIo(format!(
+                "{primary_error}; artifact rollback failed: {cleanup_error}"
+            )),
         }
-        if result.rows_affected() == 0 {
-            sqlx::query("UPDATE artifact_records SET blob_deleted_at = NULL WHERE artifact_id = ?")
-                .bind(artifact.artifact_id.to_string())
-                .execute(&self.pool)
-                .await?;
+    }
+
+    async fn compensate_prepared_blobs(
+        &self,
+        prepared: &[PreparedArtifactBlob],
+    ) -> StoreResult<()> {
+        let mut removed = false;
+        for blob in prepared.iter().filter(|blob| blob.created_final_link) {
+            let live_metadata_exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM artifact_records
+                 WHERE artifact_id = ? AND blob_deleted_at IS NULL)",
+            )
+            .bind(blob.artifact_id.to_string())
+            .fetch_one(&self.pool)
+            .await?;
+            if !live_metadata_exists {
+                remove_file_if_present(&self.artifact_blob_path(blob.artifact_id)).await?;
+                removed = true;
+            }
+        }
+        if removed {
+            sync_artifact_directory(&self.artifact_root).await?;
         }
         Ok(())
     }
@@ -1017,6 +1286,86 @@ impl RuntimeStore {
             .await
             .map_err(|error| StoreError::ArtifactIo(format!("{}: {error}", path.display())))?;
         verify_artifact_checksum(&artifact, &bytes)?;
+        Ok(Some(bytes))
+    }
+
+    /// Load one complete artifact while enforcing the caller's allocation budget.
+    ///
+    /// The recorded size is treated as an immutable contract, not as a hint. The
+    /// reader consumes at most one byte beyond that declaration so a growing or
+    /// replaced blob cannot cause an unbounded allocation before validation.
+    pub async fn load_artifact_bytes_bounded(
+        &self,
+        artifact: &ArtifactRecord,
+        max_bytes: u64,
+    ) -> StoreResult<Option<Vec<u8>>> {
+        if artifact.size_bytes == 0 || artifact.size_bytes > max_bytes {
+            return Err(StoreError::ArtifactIo(format!(
+                "artifact {} declared size must be between 1 and {max_bytes} bytes, got {}",
+                artifact.artifact_id, artifact.size_bytes
+            )));
+        }
+        let read_limit = artifact.size_bytes.checked_add(1).ok_or_else(|| {
+            StoreError::ArtifactIo(format!(
+                "artifact {} declared size cannot be bounded safely",
+                artifact.artifact_id
+            ))
+        })?;
+        let expected_size = usize::try_from(artifact.size_bytes).map_err(|_| {
+            StoreError::ArtifactIo(format!(
+                "artifact {} declared size does not fit in memory on this platform",
+                artifact.artifact_id
+            ))
+        })?;
+        let read_capacity = usize::try_from(read_limit).map_err(|_| {
+            StoreError::ArtifactIo(format!(
+                "artifact {} bounded read size does not fit in memory on this platform",
+                artifact.artifact_id
+            ))
+        })?;
+
+        let row = sqlx::query(
+            "SELECT artifact_json, blob_deleted_at FROM artifact_records WHERE artifact_id = ?",
+        )
+        .bind(artifact.artifact_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let stored_artifact: ArtifactRecord =
+            serde_json::from_str(&row.try_get::<String, _>("artifact_json")?)?;
+        if stored_artifact != *artifact {
+            return Err(StoreError::ArtifactIo(format!(
+                "artifact {} metadata changed before bounded read",
+                artifact.artifact_id
+            )));
+        }
+        if row
+            .try_get::<Option<String>, _>("blob_deleted_at")?
+            .is_some()
+        {
+            return Ok(None);
+        }
+
+        let path = self.artifact_blob_path(artifact.artifact_id);
+        let file = tokio::fs::File::open(&path)
+            .await
+            .map_err(|error| StoreError::ArtifactIo(format!("{}: {error}", path.display())))?;
+        let mut bytes = Vec::with_capacity(read_capacity);
+        file.take(read_limit)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|error| StoreError::ArtifactIo(format!("{}: {error}", path.display())))?;
+        if bytes.len() != expected_size {
+            return Err(StoreError::ArtifactIo(format!(
+                "artifact {} size mismatch: read={} recorded={}",
+                artifact.artifact_id,
+                bytes.len(),
+                artifact.size_bytes
+            )));
+        }
+        verify_artifact_checksum(artifact, &bytes)?;
         Ok(Some(bytes))
     }
 
@@ -1586,12 +1935,25 @@ impl RuntimeStore {
         &self,
         now: chrono::DateTime<chrono::Utc>,
     ) -> StoreResult<ArtifactMaintenanceReport> {
-        tokio::fs::create_dir_all(&self.artifact_root)
-            .await
-            .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
-        set_owner_only_dir(&self.artifact_root).await?;
+        let store = self.clone();
+        await_store_operation(tokio::spawn(async move {
+            store.run_artifact_maintenance_inner(now).await
+        }))
+        .await
+    }
+
+    async fn run_artifact_maintenance_inner(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<ArtifactMaintenanceReport> {
+        let _artifact_lock = self.acquire_artifact_store_lock().await?;
         let protected = self.protected_artifact_ids().await?;
         let active_sessions = self.active_session_ids().await?;
+        pause_store_operation_for_test(
+            &self.database_identity,
+            StoreTestPausePoint::MaintenanceAfterProtectionSnapshot,
+        )
+        .await;
         let rows = sqlx::query(
             "SELECT artifact_id, session_id, artifact_json, expires_at
              FROM artifact_records WHERE blob_deleted_at IS NULL",
@@ -1621,27 +1983,138 @@ impl RuntimeStore {
                     report.protected_artifacts_skipped.saturating_add(1);
                 continue;
             }
-            let path = self.artifact_blob_path(artifact_id);
-            match tokio::fs::remove_file(&path).await {
-                Ok(()) => {}
-                Err(error) if error.kind() == ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(StoreError::ArtifactIo(format!(
-                        "{}: {error}",
-                        path.display()
-                    )));
-                }
-            }
             sqlx::query("UPDATE artifact_records SET blob_deleted_at = ? WHERE artifact_id = ?")
                 .bind(now.to_rfc3339())
                 .bind(&artifact_id_text)
                 .execute(&self.pool)
                 .await?;
-            report.artifact_blobs_removed = report.artifact_blobs_removed.saturating_add(1);
         }
+        pause_store_operation_for_test(
+            &self.database_identity,
+            StoreTestPausePoint::MaintenanceAfterTombstone,
+        )
+        .await;
+        report.artifact_blobs_removed = self.prune_tombstoned_artifact_blobs().await?;
+        report.artifact_blobs_removed = report
+            .artifact_blobs_removed
+            .saturating_add(self.prune_orphaned_artifact_blobs().await?);
         report.temporary_artifacts_removed = self.prune_temporary_artifacts().await?;
         sync_artifact_directory(&self.artifact_root).await?;
         Ok(report)
+    }
+
+    /// Serialize blob publication, rollback, and garbage collection across every
+    /// store connection that shares this artifact directory. SQLite transactions
+    /// cannot protect filesystem links, so this lock is the ownership boundary
+    /// that prevents one failed writer from unlinking another writer's blob.
+    async fn acquire_artifact_store_lock(&self) -> StoreResult<std::fs::File> {
+        tokio::fs::create_dir_all(&self.artifact_root)
+            .await
+            .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
+        set_owner_only_dir(&self.artifact_root).await?;
+        let lock_path = self.artifact_root.join(".store.lock");
+        tokio::task::spawn_blocking(move || {
+            if std::fs::symlink_metadata(&lock_path)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                return Err(StoreError::ArtifactIo(format!(
+                    "artifact store lock cannot be a symbolic link: {}",
+                    lock_path.display()
+                )));
+            }
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .map_err(|error| {
+                    StoreError::ArtifactIo(format!("{}: {error}", lock_path.display()))
+                })?;
+            set_owner_only_file_blocking(&lock_path)?;
+            file.lock_exclusive().map_err(|error| {
+                StoreError::ArtifactIo(format!("{}: {error}", lock_path.display()))
+            })?;
+            Ok(file)
+        })
+        .await
+        .map_err(|error| StoreError::ArtifactIo(error.to_string()))?
+    }
+
+    async fn bind_artifact_root_to_database(&self) -> StoreResult<()> {
+        let _artifact_lock = self.acquire_artifact_store_lock().await?;
+        let identity_path = self.artifact_root.join(ARTIFACT_STORE_IDENTITY_FILE);
+        let expected = format!(
+            "{ARTIFACT_STORE_IDENTITY_FORMAT}\n{}\n",
+            self.database_identity
+        );
+        if let Ok(metadata) = tokio::fs::symlink_metadata(&identity_path).await
+            && (metadata.file_type().is_symlink() || !metadata.is_file())
+        {
+            return Err(StoreError::ArtifactIo(format!(
+                "artifact root identity is not a regular file: {}",
+                identity_path.display()
+            )));
+        }
+        match tokio::fs::read(&identity_path).await {
+            Ok(bytes) => {
+                if u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+                    > MAX_ARTIFACT_STORE_IDENTITY_BYTES
+                    || bytes != expected.as_bytes()
+                {
+                    return Err(StoreError::ArtifactIo(format!(
+                        "artifact root {} is bound to a different runtime database",
+                        self.artifact_root.display()
+                    )));
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                let temporary_path =
+                    identity_path.with_extension(format!("identity.tmp-{}", uuid::Uuid::now_v7()));
+                let write_result = async {
+                    let mut temporary = tokio::fs::OpenOptions::new()
+                        .create_new(true)
+                        .write(true)
+                        .open(&temporary_path)
+                        .await
+                        .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
+                    temporary
+                        .write_all(expected.as_bytes())
+                        .await
+                        .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
+                    set_owner_only_file(&temporary_path).await?;
+                    temporary
+                        .sync_all()
+                        .await
+                        .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
+                    drop(temporary);
+                    match tokio::fs::hard_link(&temporary_path, &identity_path).await {
+                        Ok(()) => Ok(()),
+                        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                            let bytes = tokio::fs::read(&identity_path)
+                                .await
+                                .map_err(|error| StoreError::ArtifactIo(error.to_string()))?;
+                            if bytes == expected.as_bytes() {
+                                Ok(())
+                            } else {
+                                Err(StoreError::ArtifactIo(format!(
+                                    "artifact root {} is bound to a different runtime database",
+                                    self.artifact_root.display()
+                                )))
+                            }
+                        }
+                        Err(error) => Err(StoreError::ArtifactIo(error.to_string())),
+                    }
+                }
+                .await;
+                let cleanup_result = remove_file_if_present(&temporary_path).await;
+                write_result?;
+                cleanup_result?;
+                sync_artifact_directory(&self.artifact_root).await?;
+            }
+            Err(error) => return Err(StoreError::ArtifactIo(error.to_string())),
+        }
+        Ok(())
     }
 
     async fn protected_artifact_ids(&self) -> StoreResult<HashSet<ArtifactId>> {
@@ -1692,11 +2165,113 @@ impl RuntimeStore {
         Ok(removed)
     }
 
+    /// Remove final links that have no live SQLite owner. These can only be
+    /// created when a process is cancelled or exits after publishing the blob
+    /// but before committing metadata. The artifact-store lock guarantees no
+    /// current writer is between those two phases while this scan runs.
+    async fn prune_orphaned_artifact_blobs(&self) -> StoreResult<u64> {
+        let rows =
+            sqlx::query("SELECT artifact_id FROM artifact_records WHERE blob_deleted_at IS NULL")
+                .fetch_all(&self.pool)
+                .await?;
+        let live_names = rows
+            .into_iter()
+            .map(|row| row.try_get::<String, _>("artifact_id"))
+            .collect::<Result<HashSet<_>, _>>()?;
+        let mut entries = match tokio::fs::read_dir(&self.artifact_root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(StoreError::ArtifactIo(error.to_string())),
+        };
+        let mut removed = 0_u64;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|error| StoreError::ArtifactIo(error.to_string()))?
+        {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(artifact_id) = name.strip_suffix(".blob") else {
+                continue;
+            };
+            if artifact_id.parse::<ArtifactId>().is_err() || live_names.contains(artifact_id) {
+                continue;
+            }
+            let file_type = match entry.file_type().await {
+                Ok(file_type) => file_type,
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Err(error) => return Err(StoreError::ArtifactIo(error.to_string())),
+            };
+            if !file_type.is_file() && !file_type.is_symlink() {
+                continue;
+            }
+            match tokio::fs::remove_file(entry.path()).await {
+                Ok(()) => removed = removed.saturating_add(1),
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(StoreError::ArtifactIo(error.to_string())),
+            }
+        }
+        Ok(removed)
+    }
+
+    async fn prune_tombstoned_artifact_blobs(&self) -> StoreResult<u64> {
+        let rows = sqlx::query(
+            "SELECT artifact_id FROM artifact_records WHERE blob_deleted_at IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut removed = 0_u64;
+        for row in rows {
+            let artifact_id_text: String = row.try_get("artifact_id")?;
+            let artifact_id = artifact_id_text
+                .parse::<ArtifactId>()
+                .map_err(|_| StoreError::InvalidId(artifact_id_text))?;
+            match tokio::fs::remove_file(self.artifact_blob_path(artifact_id)).await {
+                Ok(()) => removed = removed.saturating_add(1),
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(StoreError::ArtifactIo(error.to_string())),
+            }
+        }
+        Ok(removed)
+    }
+
     fn artifact_blob_path(&self, artifact_id: ArtifactId) -> PathBuf {
         self.artifact_root.join(format!("{artifact_id}.blob"))
     }
 
     pub async fn store_evidence(&self, evidence: &EvidenceRecord) -> StoreResult<()> {
+        let store = self.clone();
+        let evidence = evidence.clone();
+        await_store_operation(tokio::spawn(async move {
+            let _artifact_lock = store.acquire_artifact_store_lock().await?;
+            pause_store_operation_for_test(
+                &store.database_identity,
+                StoreTestPausePoint::EvidenceAfterLock,
+            )
+            .await;
+            store.store_evidence_inner(&evidence).await
+        }))
+        .await
+    }
+
+    async fn store_evidence_inner(&self, evidence: &EvidenceRecord) -> StoreResult<()> {
+        for artifact_id in &evidence.artifact_refs {
+            let live: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM artifact_records
+                 WHERE artifact_id = ? AND blob_deleted_at IS NULL)",
+            )
+            .bind(artifact_id.to_string())
+            .fetch_one(&self.pool)
+            .await?;
+            if !live {
+                return Err(StoreError::ArtifactIo(format!(
+                    "evidence {} references artifact {artifact_id} without a live blob",
+                    evidence.evidence_id
+                )));
+            }
+        }
         sqlx::query(
             r#"
             INSERT INTO evidence_records (evidence_id, claim, evidence_json)
@@ -2088,6 +2663,88 @@ async fn connect_sqlite_pool_with_retry(
     unreachable!("SQLite connection retry loop always returns")
 }
 
+async fn initialize_database_identity(pool: &SqlitePool) -> StoreResult<String> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS runtime_store_identity (
+             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+             database_id TEXT NOT NULL
+         )",
+    )
+    .execute(pool)
+    .await?;
+    let candidate = uuid::Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT OR IGNORE INTO runtime_store_identity (singleton, database_id) VALUES (1, ?)",
+    )
+    .bind(candidate)
+    .execute(pool)
+    .await?;
+    let identity: String =
+        sqlx::query_scalar("SELECT database_id FROM runtime_store_identity WHERE singleton = 1")
+            .fetch_one(pool)
+            .await?;
+    identity
+        .parse::<uuid::Uuid>()
+        .map_err(|error| StoreError::InvalidId(format!("runtime database identity: {error}")))?;
+    Ok(identity)
+}
+
+async fn await_store_operation<T>(
+    operation: tokio::task::JoinHandle<StoreResult<T>>,
+) -> StoreResult<T> {
+    operation
+        .await
+        .map_err(|error| StoreError::ArtifactIo(format!("artifact store task failed: {error}")))?
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct StoreTestPause {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+type StoreTestPauseMap =
+    std::sync::Mutex<HashMap<(String, StoreTestPausePoint), Arc<StoreTestPause>>>;
+
+#[cfg(test)]
+fn install_store_test_pause(
+    database_identity: &str,
+    point: StoreTestPausePoint,
+) -> Arc<StoreTestPause> {
+    let pause = Arc::new(StoreTestPause {
+        reached: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    store_test_pauses()
+        .lock()
+        .expect("store test pause lock")
+        .insert((database_identity.to_owned(), point), pause.clone());
+    pause
+}
+
+#[cfg(test)]
+async fn pause_store_operation_for_test(database_identity: &str, point: StoreTestPausePoint) {
+    let pause = store_test_pauses()
+        .lock()
+        .expect("store test pause lock")
+        .remove(&(database_identity.to_owned(), point));
+    if let Some(pause) = pause {
+        pause.reached.notify_one();
+        pause.release.notified().await;
+    }
+}
+
+#[cfg(not(test))]
+async fn pause_store_operation_for_test(_database_identity: &str, _point: StoreTestPausePoint) {}
+
+#[cfg(test)]
+fn store_test_pauses() -> &'static StoreTestPauseMap {
+    static PAUSES: std::sync::OnceLock<StoreTestPauseMap> = std::sync::OnceLock::new();
+    PAUSES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
 fn is_sqlite_busy_error(error: &sqlx::Error) -> bool {
     matches!(
         error,
@@ -2202,6 +2859,127 @@ async fn next_sequence_in_transaction(
     .await?;
     let sequence_no: i64 = row.try_get("last_sequence_no")?;
     Ok(u64::try_from(sequence_no).unwrap_or(u64::MAX))
+}
+
+async fn insert_artifact_metadata_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    artifact: &ArtifactRecord,
+) -> StoreResult<()> {
+    let expires_at = artifact_expiration(artifact).map(|value| value.to_rfc3339());
+    let result = sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO artifact_records (
+            artifact_id, session_id, uri, checksum, artifact_json,
+            created_at, retention_policy, size_bytes, expires_at, blob_deleted_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+        "#,
+    )
+    .bind(artifact.artifact_id.to_string())
+    .bind(artifact.session_id.to_string())
+    .bind(&artifact.uri)
+    .bind(&artifact.checksum)
+    .bind(serde_json::to_string(artifact)?)
+    .bind(artifact.created_at.to_rfc3339())
+    .bind(&artifact.retention_policy)
+    .bind(i64::try_from(artifact.size_bytes).unwrap_or(i64::MAX))
+    .bind(expires_at)
+    .execute(&mut **transaction)
+    .await?;
+    if result.rows_affected() == 0 {
+        let existing_json: String =
+            sqlx::query_scalar("SELECT artifact_json FROM artifact_records WHERE artifact_id = ?")
+                .bind(artifact.artifact_id.to_string())
+                .fetch_one(&mut **transaction)
+                .await?;
+        let existing: ArtifactRecord = serde_json::from_str(&existing_json)?;
+        if existing != *artifact {
+            return Err(StoreError::ArtifactIo(format!(
+                "artifact {} already has different metadata",
+                artifact.artifact_id
+            )));
+        }
+        sqlx::query("UPDATE artifact_records SET blob_deleted_at = NULL WHERE artifact_id = ?")
+            .bind(artifact.artifact_id.to_string())
+            .execute(&mut **transaction)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn insert_evidence_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    evidence: &EvidenceRecord,
+) -> StoreResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO evidence_records (evidence_id, claim, evidence_json)
+        VALUES (?, ?, ?)
+        "#,
+    )
+    .bind(evidence.evidence_id.to_string())
+    .bind(&evidence.claim)
+    .bind(serde_json::to_string(evidence)?)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn validate_bundle_references_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    event: &RuntimeEvent,
+    evidence: &[EvidenceRecord],
+) -> StoreResult<()> {
+    event
+        .payload
+        .get("envelope")
+        .cloned()
+        .map(serde_json::from_value::<ToolResultEnvelope>)
+        .transpose()?
+        .ok_or_else(|| {
+            StoreError::InvalidToolCompletionBundle(
+                "ToolCompleted payload must contain a tool result envelope".to_owned(),
+            )
+        })?;
+    let mut referenced_artifacts = evidence
+        .iter()
+        .flat_map(|record| record.artifact_refs.iter().copied())
+        .collect::<HashSet<_>>();
+    let mut referenced_evidence = HashSet::new();
+    collect_tool_completion_references(
+        &event.payload,
+        None,
+        &mut referenced_artifacts,
+        &mut referenced_evidence,
+    )?;
+    referenced_artifacts.extend(event.payload_ref);
+    for artifact_id in referenced_artifacts {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM artifact_records WHERE artifact_id = ? AND blob_deleted_at IS NULL)",
+        )
+        .bind(artifact_id.to_string())
+        .fetch_one(&mut **transaction)
+        .await?;
+        if !exists {
+            return Err(StoreError::InvalidToolCompletionBundle(format!(
+                "artifact reference {artifact_id} has no live metadata"
+            )));
+        }
+    }
+    for evidence_id in referenced_evidence {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM evidence_records WHERE evidence_id = ?)",
+        )
+        .bind(evidence_id.to_string())
+        .fetch_one(&mut **transaction)
+        .await?;
+        if !exists {
+            return Err(StoreError::InvalidToolCompletionBundle(format!(
+                "evidence reference {evidence_id} has no record"
+            )));
+        }
+    }
+    Ok(())
 }
 
 async fn append_event_assigning_sequence_in_transaction(
@@ -2401,6 +3179,13 @@ fn artifact_root_for_database_url(database_url: &str) -> PathBuf {
         .join("artifacts")
 }
 
+fn is_in_memory_database_url(database_url: &str) -> bool {
+    database_url
+        .strip_prefix("sqlite:")
+        .map(|value| value.trim_start_matches('/'))
+        .is_some_and(|value| value == ":memory:" || value.starts_with(":memory:?"))
+}
+
 fn verify_artifact_checksum(artifact: &ArtifactRecord, bytes: &[u8]) -> StoreResult<()> {
     let checksum = artifact_checksum(bytes);
     if checksum == artifact.checksum {
@@ -2410,6 +3195,198 @@ fn verify_artifact_checksum(artifact: &ArtifactRecord, bytes: &[u8]) -> StoreRes
             artifact.artifact_id.to_string(),
         ))
     }
+}
+
+fn validate_tool_completion_bundle(
+    event: &RuntimeEvent,
+    artifacts: &[(ArtifactRecord, Vec<u8>)],
+    evidence: &[EvidenceRecord],
+) -> StoreResult<()> {
+    if event.event_type != RuntimeEventType::ToolCompleted {
+        return Err(StoreError::InvalidToolCompletionBundle(
+            "event type must be ToolCompleted".to_owned(),
+        ));
+    }
+    event
+        .payload
+        .get("envelope")
+        .cloned()
+        .map(serde_json::from_value::<ToolResultEnvelope>)
+        .transpose()?
+        .ok_or_else(|| {
+            StoreError::InvalidToolCompletionBundle(
+                "ToolCompleted payload must contain a tool result envelope".to_owned(),
+            )
+        })?;
+    let mut artifact_ids = HashSet::new();
+    let mut total_bytes = 0_u64;
+    for (artifact, bytes) in artifacts {
+        if artifact.session_id != event.session_id {
+            return Err(StoreError::InvalidToolCompletionBundle(format!(
+                "artifact {} belongs to a different session",
+                artifact.artifact_id
+            )));
+        }
+        if !artifact_ids.insert(artifact.artifact_id) {
+            return Err(StoreError::InvalidToolCompletionBundle(format!(
+                "artifact {} appears more than once",
+                artifact.artifact_id
+            )));
+        }
+        if artifact.size_bytes > MAX_TOOL_COMPLETION_ARTIFACT_BYTES {
+            return Err(StoreError::InvalidToolCompletionBundle(format!(
+                "artifact {} exceeds the {MAX_TOOL_COMPLETION_ARTIFACT_BYTES} byte limit",
+                artifact.artifact_id
+            )));
+        }
+        if artifact.size_bytes != u64::try_from(bytes.len()).unwrap_or(u64::MAX) {
+            return Err(StoreError::InvalidToolCompletionBundle(format!(
+                "artifact {} declared {} bytes but received {}",
+                artifact.artifact_id,
+                artifact.size_bytes,
+                bytes.len()
+            )));
+        }
+        total_bytes = total_bytes
+            .checked_add(artifact.size_bytes)
+            .ok_or_else(|| {
+                StoreError::InvalidToolCompletionBundle(
+                    "artifact bundle size overflowed its counter".to_owned(),
+                )
+            })?;
+        if total_bytes > MAX_TOOL_COMPLETION_BUNDLE_BYTES {
+            return Err(StoreError::InvalidToolCompletionBundle(format!(
+                "artifact bundle exceeds {MAX_TOOL_COMPLETION_BUNDLE_BYTES} bytes"
+            )));
+        }
+        verify_artifact_checksum(artifact, bytes)?;
+    }
+    let mut evidence_ids = HashSet::new();
+    for record in evidence {
+        if !evidence_ids.insert(record.evidence_id) {
+            return Err(StoreError::InvalidToolCompletionBundle(format!(
+                "evidence {} appears more than once",
+                record.evidence_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn collect_tool_completion_references(
+    value: &serde_json::Value,
+    key: Option<&str>,
+    artifacts: &mut HashSet<ArtifactId>,
+    evidence: &mut HashSet<golutra_core::EvidenceId>,
+) -> StoreResult<()> {
+    match value {
+        serde_json::Value::Object(values) => {
+            for (key, value) in values {
+                collect_tool_completion_references(value, Some(key), artifacts, evidence)?;
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_tool_completion_references(value, key, artifacts, evidence)?;
+            }
+        }
+        serde_json::Value::String(value) => match key {
+            Some(key) if key == "artifact_ref" || key.ends_with("_artifact_ref") => {
+                artifacts.insert(value.parse().map_err(|error: uuid::Error| {
+                    StoreError::InvalidToolCompletionBundle(format!(
+                        "artifact reference {value} is invalid: {error}"
+                    ))
+                })?);
+            }
+            Some(key) if key == "artifact_refs" || key.ends_with("_artifact_refs") => {
+                artifacts.insert(value.parse().map_err(|error: uuid::Error| {
+                    StoreError::InvalidToolCompletionBundle(format!(
+                        "artifact reference {value} is invalid: {error}"
+                    ))
+                })?);
+            }
+            Some(key) if key == "evidence_ref" || key.ends_with("_evidence_ref") => {
+                evidence.insert(value.parse().map_err(|error: uuid::Error| {
+                    StoreError::InvalidToolCompletionBundle(format!(
+                        "evidence reference {value} is invalid: {error}"
+                    ))
+                })?);
+            }
+            Some(key) if key == "evidence_refs" || key.ends_with("_evidence_refs") => {
+                evidence.insert(value.parse().map_err(|error: uuid::Error| {
+                    StoreError::InvalidToolCompletionBundle(format!(
+                        "evidence reference {value} is invalid: {error}"
+                    ))
+                })?);
+            }
+            _ => {}
+        },
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+    Ok(())
+}
+
+async fn artifact_blob_matches(path: &Path, bytes: &[u8]) -> StoreResult<bool> {
+    let file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(error) => {
+            return Err(StoreError::ArtifactIo(format!(
+                "{}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let read_limit = u64::try_from(bytes.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut existing = Vec::with_capacity(bytes.len().saturating_add(1));
+    file.take(read_limit)
+        .read_to_end(&mut existing)
+        .await
+        .map_err(|error| StoreError::ArtifactIo(format!("{}: {error}", path.display())))?;
+    Ok(existing == bytes)
+}
+
+async fn remove_file_if_present(path: &Path) -> StoreResult<()> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(StoreError::ArtifactIo(format!(
+            "{}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+async fn cleanup_temporary_artifact(path: &Path, artifact_id: ArtifactId) -> StoreResult<()> {
+    #[cfg(not(test))]
+    let _ = artifact_id;
+    #[cfg(test)]
+    if injected_temporary_cleanup_failures()
+        .lock()
+        .expect("temporary cleanup failure lock")
+        .remove(&artifact_id)
+    {
+        return Err(StoreError::ArtifactIo(format!(
+            "injected temporary cleanup failure for {artifact_id}"
+        )));
+    }
+    remove_file_if_present(path).await
+}
+
+#[cfg(test)]
+fn inject_temporary_cleanup_failure(artifact_id: ArtifactId) {
+    injected_temporary_cleanup_failures()
+        .lock()
+        .expect("temporary cleanup failure lock")
+        .insert(artifact_id);
+}
+
+#[cfg(test)]
+fn injected_temporary_cleanup_failures() -> &'static std::sync::Mutex<HashSet<ArtifactId>> {
+    static FAILURES: std::sync::OnceLock<std::sync::Mutex<HashSet<ArtifactId>>> =
+        std::sync::OnceLock::new();
+    FAILURES.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
 }
 
 fn artifact_checksum(bytes: &[u8]) -> String {
@@ -2556,6 +3533,9 @@ async fn sync_artifact_directory(path: &Path) -> StoreResult<()> {
 
 #[cfg(not(unix))]
 async fn sync_artifact_directory(_path: &Path) -> StoreResult<()> {
+    // Rust's standard library exposes no portable directory fsync on Windows.
+    // File contents are flushed before publication, but power-loss durability of
+    // the directory entry remains an explicit platform limitation.
     Ok(())
 }
 
@@ -2580,6 +3560,19 @@ async fn set_owner_only_file(path: &Path) -> StoreResult<()> {
     tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
         .await
         .map_err(|error| StoreError::ArtifactIo(error.to_string()))
+}
+
+#[cfg(unix)]
+fn set_owner_only_file_blocking(path: &Path) -> StoreResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| StoreError::ArtifactIo(error.to_string()))
+}
+
+#[cfg(not(unix))]
+fn set_owner_only_file_blocking(_path: &Path) -> StoreResult<()> {
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -2630,3 +3623,95 @@ fn thread_from_row(row: sqlx::sqlite::SqliteRow) -> StoreResult<ThreadRecord> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod bounded_artifact_tests {
+    use chrono::Utc;
+    use golutra_core::{ArtifactId, ArtifactRecord, RedactionStatus, SessionId};
+
+    use super::*;
+
+    fn artifact_record(bytes: &[u8]) -> ArtifactRecord {
+        ArtifactRecord {
+            artifact_id: ArtifactId::new(),
+            session_id: SessionId::new(),
+            turn_id: None,
+            tool_call_id: None,
+            artifact_type: "replay_fixture".to_owned(),
+            uri: "artifact://fixture/bounded".to_owned(),
+            checksum: artifact_checksum(bytes),
+            size_bytes: u64::try_from(bytes.len()).expect("fixture size"),
+            created_at: Utc::now(),
+            producer: "test".to_owned(),
+            redaction_status: RedactionStatus::Raw,
+            retention_policy: "test".to_owned(),
+            provenance_refs: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_whole_blob_read_rejects_growth_and_same_size_tampering() {
+        let store = RuntimeStore::in_memory().await.expect("store");
+        let bytes = b"fixture";
+        let artifact = artifact_record(bytes);
+        store
+            .store_artifact(&artifact, bytes)
+            .await
+            .expect("artifact");
+        let path = store.artifact_blob_path(artifact.artifact_id);
+        assert_eq!(
+            store
+                .load_artifact_bytes_bounded(&artifact, 16)
+                .await
+                .expect("bounded read")
+                .expect("blob"),
+            bytes
+        );
+        let mut invalid_declaration = artifact.clone();
+        invalid_declaration.size_bytes = 0;
+        assert!(
+            store
+                .load_artifact_bytes_bounded(&invalid_declaration, 16)
+                .await
+                .expect_err("zero-byte declaration must fail")
+                .to_string()
+                .contains("between 1")
+        );
+        invalid_declaration.size_bytes = 17;
+        assert!(
+            store
+                .load_artifact_bytes_bounded(&invalid_declaration, 16)
+                .await
+                .expect_err("over-limit declaration must fail")
+                .to_string()
+                .contains("between 1")
+        );
+        invalid_declaration.size_bytes = 6;
+        assert!(
+            store
+                .load_artifact_bytes_bounded(&invalid_declaration, 16)
+                .await
+                .expect_err("metadata substitution must fail")
+                .to_string()
+                .contains("metadata changed")
+        );
+
+        tokio::fs::write(&path, b"fixture-grown")
+            .await
+            .expect("grow blob");
+        let growth_error = store
+            .load_artifact_bytes_bounded(&artifact, 16)
+            .await
+            .expect_err("growth must fail");
+        assert!(growth_error.to_string().contains("size mismatch"));
+
+        tokio::fs::write(&path, b"changed")
+            .await
+            .expect("tamper blob");
+        let checksum_error = store
+            .load_artifact_bytes_bounded(&artifact, 16)
+            .await
+            .expect_err("same-size tampering must fail");
+        assert!(checksum_error.to_string().contains("checksum"));
+    }
+}

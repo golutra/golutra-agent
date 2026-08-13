@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
-    sync::Mutex as AsyncMutex,
+    sync::{Mutex as AsyncMutex, OnceCell},
     task::JoinHandle,
 };
 
@@ -38,12 +38,35 @@ use crate::{
 
 const BROWSER_LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const DEVICE_LOGIN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const OAUTH_HTTP_CLIENT_INIT_TIMEOUT: Duration = Duration::from_secs(10);
 const OAUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const REFRESH_EARLY_SECONDS: i64 = 5 * 60;
 const MAX_CALLBACK_REQUEST_LINE_BYTES: u64 = 8 * 1024;
 const MAX_CALLBACK_ATTEMPTS: usize = 16;
 const MAX_OAUTH_RESPONSE_BYTES: usize = 1024 * 1024;
 const DEVICE_POLL_SAFETY_MARGIN: Duration = Duration::from_secs(3);
+static OAUTH_HTTP_CLIENT: OnceCell<oauth2::reqwest::Client> = OnceCell::const_new();
+
+async fn oauth_http_client() -> Result<oauth2::reqwest::Client, AuthError> {
+    let client = tokio::time::timeout(
+        OAUTH_HTTP_CLIENT_INIT_TIMEOUT,
+        OAUTH_HTTP_CLIENT.get_or_try_init(|| async {
+            tokio::task::spawn_blocking(|| {
+                oauth2::reqwest::ClientBuilder::new()
+                    .redirect(oauth2::reqwest::redirect::Policy::none())
+                    .connect_timeout(Duration::from_secs(10))
+                    .timeout(OAUTH_HTTP_TIMEOUT)
+                    .build()
+            })
+            .await
+            .map_err(|error| AuthError::OAuth(error.to_string()))?
+            .map_err(|error| AuthError::OAuth(error.to_string()))
+        }),
+    )
+    .await
+    .map_err(|_| AuthError::Timeout)??;
+    Ok(client.clone())
+}
 
 fn is_false(value: &bool) -> bool {
     !*value
@@ -230,7 +253,6 @@ pub struct AuthService {
 struct AuthServiceInner {
     home: PathBuf,
     store: Arc<dyn SecretStore>,
-    http_client: oauth2::reqwest::Client,
     access_cache: Mutex<HashMap<String, CachedAccessToken>>,
     refresh_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
 }
@@ -271,17 +293,10 @@ impl AuthService {
                 "auth service home cannot be empty".to_owned(),
             ));
         }
-        let http_client = oauth2::reqwest::ClientBuilder::new()
-            .redirect(oauth2::reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(OAUTH_HTTP_TIMEOUT)
-            .build()
-            .map_err(|error| AuthError::OAuth(error.to_string()))?;
         Ok(Self {
             inner: Arc::new(AuthServiceInner {
                 home,
                 store,
-                http_client,
                 access_cache: Mutex::new(HashMap::new()),
                 refresh_locks: Mutex::new(HashMap::new()),
             }),
@@ -370,13 +385,12 @@ impl AuthService {
         if let Some(audience) = &descriptor.audience {
             request = request.add_extra_param("audience", audience);
         }
-        let details: StandardDeviceAuthorizationResponse = tokio::time::timeout(
-            OAUTH_HTTP_TIMEOUT,
-            request.request_async(&self.inner.http_client),
-        )
-        .await
-        .map_err(|_| AuthError::Timeout)?
-        .map_err(oauth_request_error)?;
+        let http_client = oauth_http_client().await?;
+        let details: StandardDeviceAuthorizationResponse =
+            tokio::time::timeout(OAUTH_HTTP_TIMEOUT, request.request_async(&http_client))
+                .await
+                .map_err(|_| AuthError::Timeout)?
+                .map_err(oauth_request_error)?;
         let reference = new_reference(source, SecretKind::OAuthTokenSet)?;
 
         Ok(DeviceOAuthLogin {
@@ -402,10 +416,10 @@ impl AuthService {
                     "OpenAI device-auth configuration is missing from descriptor".to_owned(),
                 )
             })?;
+        let http_client = oauth_http_client().await?;
         let response = tokio::time::timeout(
             OAUTH_HTTP_TIMEOUT,
-            self.inner
-                .http_client
+            http_client
                 .post(&device.user_code_endpoint)
                 .header(
                     reqwest::header::USER_AGENT,
@@ -553,12 +567,11 @@ impl AuthService {
             request = request.add_scope(Scope::new(scope.clone()));
         }
         self.clear_cached_token(reference);
-        let token_result = tokio::time::timeout(
-            OAUTH_HTTP_TIMEOUT,
-            request.request_async(&self.inner.http_client),
-        )
-        .await
-        .map_err(|_| AuthError::Timeout)?;
+        let http_client = oauth_http_client().await?;
+        let token_result =
+            tokio::time::timeout(OAUTH_HTTP_TIMEOUT, request.request_async(&http_client))
+                .await
+                .map_err(|_| AuthError::Timeout)?;
         let token = match token_result {
             Ok(token) => token,
             Err(error) => {
@@ -610,12 +623,13 @@ impl AuthService {
         } else {
             return Ok(());
         };
+        let http_client = oauth_http_client().await?;
         tokio::time::timeout(
             OAUTH_HTTP_TIMEOUT,
             client
                 .revoke_token(token)
                 .map_err(|error| AuthError::OAuth(error.to_string()))?
-                .request_async(&self.inner.http_client),
+                .request_async(&http_client),
         )
         .await
         .map_err(|_| AuthError::Timeout)?
@@ -784,12 +798,13 @@ impl BrowserOAuthLogin {
             AuthError::Validation("oauth PKCE verifier was already consumed".to_owned())
         })?;
         let client = oauth_client(&self.descriptor, Some(&self.redirect_url))?;
+        let http_client = oauth_http_client().await?;
         let token = tokio::time::timeout(
             OAUTH_HTTP_TIMEOUT,
             client
                 .exchange_code(AuthorizationCode::new(callback.code))
                 .set_pkce_verifier(verifier)
-                .request_async(&self.service.inner.http_client),
+                .request_async(&http_client),
         )
         .await
         .map_err(|_| AuthError::Timeout)?
@@ -848,11 +863,12 @@ impl DeviceOAuthLogin {
 
     pub async fn complete(self) -> Result<OAuthLoginResult, AuthError> {
         let client = oauth_device_client(&self.descriptor)?;
+        let http_client = oauth_http_client().await?;
         let token = tokio::time::timeout(
             DEVICE_LOGIN_TIMEOUT,
             client
                 .exchange_device_access_token(&self.details)
-                .request_async(&self.service.inner.http_client, tokio::time::sleep, None),
+                .request_async(&http_client, tokio::time::sleep, None),
         )
         .await
         .map_err(|_| AuthError::Timeout)?
@@ -927,12 +943,13 @@ impl OpenAiDeviceOAuthLogin {
         )?;
         validate_non_empty(&grant.code_verifier, "OpenAI device code verifier")?;
         let client = oauth_client(&self.descriptor, Some(&self.device.redirect_uri))?;
+        let http_client = oauth_http_client().await?;
         let token = tokio::time::timeout(
             OAUTH_HTTP_TIMEOUT,
             client
                 .exchange_code(AuthorizationCode::new(grant.authorization_code))
                 .set_pkce_verifier(PkceCodeVerifier::new(grant.code_verifier))
-                .request_async(&self.service.inner.http_client),
+                .request_async(&http_client),
         )
         .await
         .map_err(|_| AuthError::Timeout)?
@@ -943,12 +960,11 @@ impl OpenAiDeviceOAuthLogin {
     }
 
     async fn poll_authorization(&self) -> Result<OpenAiDeviceAuthorizationGrant, AuthError> {
+        let http_client = oauth_http_client().await?;
         loop {
             let response = tokio::time::timeout(
                 OAUTH_HTTP_TIMEOUT,
-                self.service
-                    .inner
-                    .http_client
+                http_client
                     .post(&self.device.token_poll_endpoint)
                     .header(
                         reqwest::header::USER_AGENT,

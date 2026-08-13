@@ -59,6 +59,60 @@ fn yolo_is_global_for_every_tui_entrypoint() {
 }
 
 #[test]
+fn full_tool_profile_is_an_explicit_global_tui_option() {
+    for arguments in [
+        &["golutra-tui", "--tool-profile", "full"][..],
+        &[
+            "golutra-tui",
+            "inspect",
+            "--embedded",
+            "--tool-profile",
+            "full",
+        ][..],
+        &[
+            "golutra-tui",
+            "driver",
+            "--embedded",
+            "--stdio",
+            "--tool-profile",
+            "full",
+        ][..],
+    ] {
+        let args = Args::try_parse_from(arguments).expect("tool-profile TUI arguments");
+        assert_eq!(args.tool_profile, TuiToolProfileArg::Full, "{arguments:?}");
+    }
+}
+
+#[test]
+fn strict_execution_mode_is_an_explicit_global_tui_option() {
+    for arguments in [
+        &["golutra-tui", "--execution-mode", "strict"][..],
+        &[
+            "golutra-tui",
+            "inspect",
+            "--embedded",
+            "--execution-mode",
+            "strict",
+        ][..],
+        &[
+            "golutra-tui",
+            "driver",
+            "--embedded",
+            "--stdio",
+            "--execution-mode",
+            "strict",
+        ][..],
+    ] {
+        let args = Args::try_parse_from(arguments).expect("execution-mode TUI arguments");
+        assert_eq!(
+            args.execution_mode,
+            TuiExecutionModeArg::Strict,
+            "{arguments:?}"
+        );
+    }
+}
+
+#[test]
 fn yolo_is_added_only_to_unrestricted_tui_prompts() {
     let unrestricted = TuiApp::new(
         ThreadId::new(),
@@ -90,6 +144,61 @@ fn yolo_is_added_only_to_unrestricted_tui_prompts() {
         guarded
             .runtime_prompt_payload("inspect files".to_owned())
             .get("yolo")
+            .is_none()
+    );
+}
+
+#[test]
+fn tui_tool_profile_is_explicit_on_prompts_and_inherited_by_steering() {
+    let coding = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    let full = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_tool_profile(TuiToolProfileArg::Full);
+
+    assert_eq!(
+        coding.runtime_prompt_payload("inspect".to_owned())["tool_profile"],
+        "coding"
+    );
+    assert_eq!(
+        full.runtime_prompt_payload("delegate".to_owned())["tool_profile"],
+        "full"
+    );
+    assert!(
+        full.runtime_prompt_payload_with_mode("steer".to_owned(), true)
+            .get("tool_profile")
+            .is_none()
+    );
+
+    let strict = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_execution_mode(TuiExecutionModeArg::Strict);
+    assert_eq!(
+        strict.runtime_prompt_payload("verify".to_owned())["execution_mode"],
+        "strict"
+    );
+    assert!(
+        strict
+            .runtime_prompt_payload_with_mode("steer".to_owned(), true)
+            .get("execution_mode")
             .is_none()
     );
 }

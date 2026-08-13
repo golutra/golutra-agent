@@ -13,6 +13,8 @@ use regex::Regex;
 use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
+use crate::workspace_scan;
+
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_FILES: usize = 100_000;
@@ -122,13 +124,13 @@ fn scan_file(
         result.timed_out = true;
         return;
     }
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return;
-    };
-    if metadata.len() > MAX_FILE_BYTES {
-        return;
-    }
-    let Ok(bytes) = std::fs::read(path) else {
+    let Ok(bytes) = workspace_scan::read_regular_file_bounded(
+        path,
+        workspace_root,
+        MAX_FILE_BYTES,
+        cancellation,
+        *deadline,
+    ) else {
         return;
     };
     result.scanned_files = result.scanned_files.saturating_add(1);

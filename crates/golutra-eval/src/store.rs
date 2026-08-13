@@ -10,7 +10,7 @@ use chrono::Utc;
 use fs2::FileExt;
 use golutra_core::{
     EvaluationPartitionKind, RegressionCampaign, RegressionExecution, RegressionExecutionRole,
-    RegressionExecutionStatus,
+    RegressionExecutionStatus, TaskId,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -477,19 +477,7 @@ impl EvaluationStore {
     }
 
     pub fn record_replay_capsule(&self, capsule: ReplayCapsule) -> Result<bool, EvaluationError> {
-        let complete_inputs_valid = !capsule.provider_exchanges.is_empty()
-            && capsule.runtime_config_digest.starts_with("sha256:")
-            && capsule.source_last_sequence_no.is_some()
-            && capsule.missing_inputs.is_empty();
-        if !capsule.event_chain_digest.starts_with("sha256:")
-            || capsule.runtime_config_digest.trim().is_empty()
-            || (capsule.complete && !complete_inputs_valid)
-            || (!capsule.complete && capsule.missing_inputs.is_empty())
-        {
-            return Err(EvaluationError::Invariant(
-                "replay capsule completeness or digest is invalid".to_owned(),
-            ));
-        }
+        validate_replay_capsule(&capsule)?;
         self.update(|state| {
             let inserted = !state
                 .replay_capsules
@@ -517,43 +505,7 @@ impl EvaluationStore {
                         execution.capsule_id
                     ))
                 })?;
-            if capsule.source_task_id != execution.source_task_id
-                || capsule.mode != execution.mode
-                || execution.provider_exchanges_total
-                    != u32::try_from(capsule.provider_exchanges.len()).unwrap_or(u32::MAX)
-                || execution.tool_results_total
-                    != u32::try_from(capsule.tool_results.len()).unwrap_or(u32::MAX)
-                || execution.provider_exchanges_consumed > execution.provider_exchanges_total
-                || execution.tool_results_consumed > execution.tool_results_total
-                || execution.completed_at < execution.started_at
-            {
-                return Err(EvaluationError::Invariant(
-                    "replay execution source or consumption counts are invalid".to_owned(),
-                ));
-            }
-            let status_valid = match execution.status {
-                crate::ReplayExecutionStatus::Matched => {
-                    capsule.complete
-                        && execution.provider_exchanges_consumed
-                            == execution.provider_exchanges_total
-                        && execution.tool_results_consumed == execution.tool_results_total
-                        && execution.expected_loop_action.is_some()
-                        && execution.expected_loop_action == execution.observed_loop_action
-                        && execution.expected_verification.is_some()
-                        && execution.expected_verification == execution.observed_verification
-                        && execution.mismatches.is_empty()
-                }
-                crate::ReplayExecutionStatus::Diverged => !execution.mismatches.is_empty(),
-                crate::ReplayExecutionStatus::Incomplete => {
-                    !capsule.complete || !execution.mismatches.is_empty()
-                }
-                crate::ReplayExecutionStatus::Failed => !execution.mismatches.is_empty(),
-            };
-            if !status_valid {
-                return Err(EvaluationError::Invariant(
-                    "replay execution status is inconsistent with its evidence".to_owned(),
-                ));
-            }
+            validate_replay_execution(capsule, &execution)?;
             let inserted = !state
                 .replay_executions
                 .iter()
@@ -562,6 +514,91 @@ impl EvaluationStore {
                 value.execution_id.clone()
             });
             Ok(inserted)
+        })
+    }
+
+    /// Atomically replaces the derived replay projection owned by one source task.
+    pub fn replace_replay_projection_for_task(
+        &self,
+        source_task_id: TaskId,
+        capsules: Vec<ReplayCapsule>,
+        executions: Vec<ReplayExecution>,
+    ) -> Result<(), EvaluationError> {
+        let mut capsule_ids = HashSet::new();
+        for capsule in &capsules {
+            if capsule.source_task_id != source_task_id {
+                return Err(EvaluationError::Invariant(format!(
+                    "replay capsule {} does not belong to task {source_task_id}",
+                    capsule.capsule_id
+                )));
+            }
+            validate_replay_capsule(capsule)?;
+            if !capsule_ids.insert(capsule.capsule_id.clone()) {
+                return Err(EvaluationError::Invariant(format!(
+                    "duplicate canonical replay capsule id {}",
+                    capsule.capsule_id
+                )));
+            }
+        }
+
+        let canonical_capsules = capsules
+            .iter()
+            .map(|capsule| (capsule.capsule_id.as_str(), capsule))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut execution_ids = HashSet::new();
+        for execution in &executions {
+            if execution.source_task_id != source_task_id {
+                return Err(EvaluationError::Invariant(format!(
+                    "replay execution {} does not belong to task {source_task_id}",
+                    execution.execution_id
+                )));
+            }
+            if !execution_ids.insert(execution.execution_id.clone()) {
+                return Err(EvaluationError::Invariant(format!(
+                    "duplicate canonical replay execution id {}",
+                    execution.execution_id
+                )));
+            }
+            let capsule = canonical_capsules
+                .get(execution.capsule_id.as_str())
+                .ok_or_else(|| {
+                    EvaluationError::Invariant(format!(
+                        "canonical replay capsule {} is not present for execution {}",
+                        execution.capsule_id, execution.execution_id
+                    ))
+                })?;
+            validate_replay_execution(capsule, execution)?;
+        }
+
+        self.update(move |state| {
+            if let Some(conflict) = state.replay_capsules.iter().find(|capsule| {
+                capsule.source_task_id != source_task_id
+                    && capsule_ids.contains(capsule.capsule_id.as_str())
+            }) {
+                return Err(EvaluationError::Invariant(format!(
+                    "replay capsule id {} is owned by task {}",
+                    conflict.capsule_id, conflict.source_task_id
+                )));
+            }
+            if let Some(conflict) = state.replay_executions.iter().find(|execution| {
+                execution.source_task_id != source_task_id
+                    && execution_ids.contains(execution.execution_id.as_str())
+            }) {
+                return Err(EvaluationError::Invariant(format!(
+                    "replay execution id {} is owned by task {}",
+                    conflict.execution_id, conflict.source_task_id
+                )));
+            }
+
+            state
+                .replay_capsules
+                .retain(|capsule| capsule.source_task_id != source_task_id);
+            state.replay_capsules.extend(capsules);
+            state
+                .replay_executions
+                .retain(|execution| execution.source_task_id != source_task_id);
+            state.replay_executions.extend(executions);
+            Ok(())
         })
     }
 
@@ -2231,6 +2268,66 @@ fn replace_by<T, K: PartialEq>(values: &mut Vec<T>, value: T, key: impl Fn(&T) -
     } else {
         values.push(value);
     }
+}
+
+fn validate_replay_capsule(capsule: &ReplayCapsule) -> Result<(), EvaluationError> {
+    let complete_inputs_valid = !capsule.provider_exchanges.is_empty()
+        && capsule.runtime_config_digest.starts_with("sha256:")
+        && capsule.source_last_sequence_no.is_some()
+        && capsule.missing_inputs.is_empty();
+    if !capsule.event_chain_digest.starts_with("sha256:")
+        || capsule.runtime_config_digest.trim().is_empty()
+        || (capsule.complete && !complete_inputs_valid)
+        || (!capsule.complete && capsule.missing_inputs.is_empty())
+    {
+        return Err(EvaluationError::Invariant(
+            "replay capsule completeness or digest is invalid".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_replay_execution(
+    capsule: &ReplayCapsule,
+    execution: &ReplayExecution,
+) -> Result<(), EvaluationError> {
+    if capsule.source_task_id != execution.source_task_id
+        || capsule.mode != execution.mode
+        || execution.provider_exchanges_total
+            != u32::try_from(capsule.provider_exchanges.len()).unwrap_or(u32::MAX)
+        || execution.tool_results_total
+            != u32::try_from(capsule.tool_results.len()).unwrap_or(u32::MAX)
+        || execution.provider_exchanges_consumed > execution.provider_exchanges_total
+        || execution.tool_results_consumed > execution.tool_results_total
+        || execution.completed_at < execution.started_at
+    {
+        return Err(EvaluationError::Invariant(
+            "replay execution source or consumption counts are invalid".to_owned(),
+        ));
+    }
+    let status_valid = match execution.status {
+        crate::ReplayExecutionStatus::Matched => {
+            capsule.complete
+                && execution.provider_exchanges_consumed == execution.provider_exchanges_total
+                && execution.tool_results_consumed == execution.tool_results_total
+                && execution.expected_loop_action.is_some()
+                && execution.expected_loop_action == execution.observed_loop_action
+                && execution.expected_verification.is_some()
+                && execution.expected_verification == execution.observed_verification
+                && execution.mismatches.is_empty()
+        }
+        crate::ReplayExecutionStatus::Diverged => !execution.mismatches.is_empty(),
+        crate::ReplayExecutionStatus::Incomplete => {
+            !capsule.complete || !execution.mismatches.is_empty()
+        }
+        crate::ReplayExecutionStatus::Failed => !execution.mismatches.is_empty(),
+    };
+    if !status_valid {
+        return Err(EvaluationError::Invariant(
+            "replay execution status is inconsistent with its evidence".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn preserve_improvement_candidate_status(

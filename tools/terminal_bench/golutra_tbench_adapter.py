@@ -54,6 +54,10 @@ _FAILURE_SUMMARY_LINE_RE = re.compile(
 _COMPOSE_HOST_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?$")
 
 
+class TrialResultBindingError(ValueError):
+    """Terminal-Bench result data does not belong to the bound trial."""
+
+
 class GolutraAgent(BaseAgent):
     """Run a locally built Golutra CLI and retain governed runtime data."""
 
@@ -83,6 +87,8 @@ class GolutraAgent(BaseAgent):
         agent_command_timeout_sec: float | None = None,
         graceful_drain_timeout_sec: float = _DEFAULT_GRACEFUL_DRAIN_TIMEOUT_SEC,
         max_external_correction_rounds: int = 1,
+        execution_mode: str | None = None,
+        tool_profile: str | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -111,6 +117,12 @@ class GolutraAgent(BaseAgent):
         if max_external_correction_rounds < 0 or max_external_correction_rounds > 2:
             raise ValueError("max_external_correction_rounds must be between 0 and 2")
         self._max_external_correction_rounds = max_external_correction_rounds
+        self._execution_mode = _optional_choice(
+            "execution_mode", execution_mode, ("open", "strict")
+        )
+        self._tool_profile = _optional_choice(
+            "tool_profile", tool_profile, ("coding", "full")
+        )
         self._agent_command_timeout_override = (
             _positive_timeout(agent_command_timeout_sec)
             if agent_command_timeout_sec is not None
@@ -273,10 +285,11 @@ class GolutraAgent(BaseAgent):
     def _start_result_collector(self, logging_dir: Path | None) -> None:
         if logging_dir is None:
             return
+        trial_root, terminal_bench_task_id = _trial_binding(logging_dir)
         thread = threading.Thread(
             target=self._collect_result,
-            args=(logging_dir.parent,),
-            name=f"golutra-evaluation-{logging_dir.parent.name}",
+            args=(trial_root, terminal_bench_task_id),
+            name=f"golutra-evaluation-{trial_root.name}",
             daemon=False,
         )
         thread.start()
@@ -441,7 +454,9 @@ class GolutraAgent(BaseAgent):
         _write_json_atomic(marker, result)
         return result
 
-    def _collect_result(self, trial_root: Path) -> None:
+    def _collect_result(
+        self, trial_root: Path, terminal_bench_task_id: str
+    ) -> None:
         deadline = time.monotonic() + self._result_collection_timeout_sec
         results_path: Path | None = None
         run_dir: Path | None = None
@@ -470,6 +485,7 @@ class GolutraAgent(BaseAgent):
             assert run_dir is not None
             _remove_if_exists(trial_root / "golutra-evaluation.pending.json")
             results = json.loads(results_path.read_text())
+            trial_result = _select_trial_result(results, terminal_bench_task_id)
             manifest = self._wait_for_terminal_manifest(run_dir, deadline)
             checkpoint_only = manifest.get("terminal_outcome", {}).get("kind") == "in_progress"
             terminal_result = manifest.get("terminal_outcome", {}).get("result", {})
@@ -497,7 +513,9 @@ class GolutraAgent(BaseAgent):
                     },
                 )
                 return
-            parser_results, resolved, failure_mode = _extract_trial_result(results, task_id)
+            parser_results, resolved, failure_mode = _extract_trial_result(
+                trial_result, terminal_bench_task_id
+            )
             evidence_refs = _existing_evidence_refs(trial_root)
             failure_detail = _failure_detail(trial_root)
             assertions = _evaluation_assertions(
@@ -510,8 +528,8 @@ class GolutraAgent(BaseAgent):
             passed = sum(assertion["passed"] for assertion in assertions)
             total = len(assertions)
             phases, terminal_cause = _evaluation_phases(
-                results,
-                task_id,
+                trial_result,
+                terminal_bench_task_id,
                 assertions,
                 resolved,
                 failure_mode,
@@ -528,7 +546,7 @@ class GolutraAgent(BaseAgent):
                 else _trace_identity(run_dir, task_id, session_id)
             )
             record = {
-                "evaluation_id": f"terminal-bench:{results.get('id', trial_root.name)}:{task_id}",
+                "evaluation_id": f"terminal-bench:{trial_result.get('id', results.get('id', trial_root.name))}:{task_id}",
                 "source_task_id": task_id,
                 "evaluator_id": "terminal-bench",
                 "evaluator_version": harness_version,
@@ -536,7 +554,7 @@ class GolutraAgent(BaseAgent):
                 "harness_version": harness_version,
                 "dataset_id": self._dataset_id,
                 "dataset_version": self._dataset_version,
-                "case_id": str(results.get("task_id", task_id)),
+                "case_id": terminal_bench_task_id,
                 "verdict": "pass" if resolved and passed == total else "fail",
                 "score": float(passed),
                 "score_max": float(total) if total else 1.0,
@@ -687,6 +705,17 @@ class GolutraAgent(BaseAgent):
                         "exit_code": completed.returncode,
                     },
                 )
+        except TrialResultBindingError as error:
+            target = run_dir or trial_root
+            _write_json_atomic(
+                target / "terminal-bench-evaluation.pending.json",
+                {
+                    "status": "result_identity_mismatch",
+                    "reason": str(error),
+                    "expected_task_id": terminal_bench_task_id,
+                    "results_path": str(results_path) if results_path else None,
+                },
+            )
         except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as error:
             target = run_dir or trial_root
             pending = {"status": "collector_error", "reason": str(error)}
@@ -824,6 +853,21 @@ class GolutraAgent(BaseAgent):
             for name, value in self._runtime_environment(logging_dir).items()
         )
         network_flag = "--allow-network " if self._proxy_url else ""
+        execution_profile_flags = "".join(
+            flag
+            for flag in (
+                (
+                    f"--execution-mode {self._execution_mode} "
+                    if self._execution_mode is not None
+                    else ""
+                ),
+                (
+                    f"--tool-profile {self._tool_profile} "
+                    if self._tool_profile is not None
+                    else ""
+                ),
+            )
+        )
         setup_elapsed_sec = max(0.0, time.monotonic() - task_started_at)
         finalization_reserve_sec = (
             self._graceful_drain_timeout_sec + _AGENT_COMMAND_TIMEOUT_GRACE_SEC
@@ -838,6 +882,7 @@ class GolutraAgent(BaseAgent):
             f"/installed-agent/golutra --cwd {shlex.quote(workspace_path)} exec "
             "--run-dir /logs/golutra-runtime "
             f"{network_flag}--yolo --approval-mode auto "
+            f"{execution_profile_flags}"
             f"--max-elapsed-ms {runtime_elapsed_budget_ms} "
             "--defer-external-verification -- "
             f"{shlex.quote(rendered_instruction)}"
@@ -942,9 +987,9 @@ def _terminal_bench_service_names(logging_dir: Path | None) -> list[str]:
     run_root = task_root.parent
     try:
         run_metadata = json.loads((run_root / "run_metadata.json").read_text())
-        dataset_path = Path(run_metadata["dataset_path"])
-        if not dataset_path.is_absolute():
-            dataset_path = run_root / dataset_path
+        dataset_path = _terminal_bench_dataset_path(run_metadata, run_root)
+        if dataset_path is None:
+            return []
         compose_path = dataset_path / task_root.name / "docker-compose.yaml"
         if not compose_path.is_file():
             compose_path = compose_path.with_suffix(".yml")
@@ -1023,6 +1068,18 @@ def _positive_timeout(value: object) -> float:
     return timeout
 
 
+def _optional_choice(
+    name: str, value: str | None, choices: tuple[str, ...]
+) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized not in choices:
+        expected = " or ".join(f"`{choice}`" for choice in choices)
+        raise ValueError(f"{name} must be {expected}")
+    return normalized
+
+
 def _remaining_deadline_seconds(deadline: float) -> float:
     return max(0.0, deadline - time.monotonic())
 
@@ -1035,6 +1092,28 @@ def _runtime_elapsed_budget_ms(
 ) -> int:
     available_sec = agent_timeout_sec - setup_elapsed_sec - finalization_reserve_sec
     return max(1_000, math.floor(available_sec * 1_000))
+
+
+def _terminal_bench_dataset_path(
+    run_metadata: dict[str, object], run_root: Path
+) -> Path | None:
+    configured_path = run_metadata.get("dataset_path")
+    if isinstance(configured_path, str) and configured_path.strip():
+        dataset_path = Path(configured_path)
+        return dataset_path if dataset_path.is_absolute() else run_root / dataset_path
+
+    dataset_name = run_metadata.get("dataset_name")
+    dataset_version = run_metadata.get("dataset_version")
+    if not isinstance(dataset_name, str) or not dataset_name.strip():
+        return None
+    if not isinstance(dataset_version, str) or not dataset_version.strip():
+        return None
+
+    try:
+        from terminal_bench.registry.client import RegistryClient
+    except ImportError:
+        return None
+    return Path(RegistryClient.CACHE_DIR) / dataset_name / dataset_version
 
 
 def _terminal_bench_agent_timeout_sec(logging_dir: Path | None) -> float | None:
@@ -1051,7 +1130,9 @@ def _terminal_bench_agent_timeout_sec(logging_dir: Path | None) -> float | None:
         if configured_timeout:
             return _positive_timeout(configured_timeout)
 
-        dataset_path = Path(run_metadata["dataset_path"])
+        dataset_path = _terminal_bench_dataset_path(run_metadata, run_root)
+        if dataset_path is None:
+            return None
         task_config_path = dataset_path / task_root.name / "task.yaml"
         from yaml import safe_load
 
@@ -1065,19 +1146,25 @@ def _terminal_bench_agent_timeout_sec(logging_dir: Path | None) -> float | None:
         return None
 
 
+def _trial_binding(logging_dir: Path) -> tuple[Path, str]:
+    trial_root = logging_dir.parent.resolve()
+    terminal_bench_task_id = trial_root.parent.name
+    if not terminal_bench_task_id:
+        raise ValueError(f"cannot derive Terminal-Bench task identity from {logging_dir}")
+    return trial_root, terminal_bench_task_id
+
+
 def _find_trial_results(trial_root: Path) -> Path | None:
-    candidates = [trial_root / "results.json", trial_root.parent / "results.json"]
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    # Some Terminal-Bench versions place the result one level below the task
-    # root. Keep the search bounded so an aggregate results file is not picked
-    # up from an unrelated sibling trial.
+    """Return only the result file owned by this exact trial directory."""
+    candidate = trial_root / "results.json"
     try:
-        matches = sorted(trial_root.glob("*/results.json"))
+        if not candidate.is_file():
+            return None
+        if candidate.resolve().parent != trial_root.resolve():
+            return None
     except OSError:
         return None
-    return matches[0] if len(matches) == 1 else None
+    return candidate
 
 
 def _find_run_bundle(trial_root: Path) -> Path | None:
@@ -1099,9 +1186,20 @@ def _find_run_bundle(trial_root: Path) -> Path | None:
 def _select_trial_result(results: dict, task_id: str) -> dict:
     if isinstance(results.get("parser_results"), dict) or any(
         key in results
-        for key in ("is_resolved", "failure_mode", "trial_started_at", "test_started_at")
+        for key in (
+            "task_id",
+            "is_resolved",
+            "failure_mode",
+            "trial_started_at",
+            "test_started_at",
+        )
     ):
-        return results
+        actual_task_id = results.get("task_id")
+        if str(actual_task_id) == str(task_id):
+            return results
+        raise TrialResultBindingError(
+            f"result task_id {actual_task_id!r} does not match bound task_id {task_id!r}"
+        )
     aggregate = results.get("results")
     if isinstance(aggregate, list):
         candidates = [
@@ -1111,12 +1209,39 @@ def _select_trial_result(results: dict, task_id: str) -> dict:
             and str(item.get("task_id", item.get("id", ""))) == str(task_id)
         ]
         if len(candidates) == 1:
-            return candidates[0]
+            selected = dict(candidates[0])
+            selected["task_id"] = task_id
+            return selected
+        available = sorted(
+            {
+                str(item.get("task_id", item.get("id")))
+                for item in aggregate
+                if isinstance(item, dict)
+                and item.get("task_id", item.get("id")) is not None
+            }
+        )
+        raise TrialResultBindingError(
+            f"aggregate result has {len(candidates)} records for bound task_id "
+            f"{task_id!r}; available task_ids: {available!r}"
+        )
     if isinstance(aggregate, dict):
         candidate = aggregate.get(task_id)
         if isinstance(candidate, dict):
-            return candidate
-    return results
+            candidate_task_id = candidate.get("task_id", task_id)
+            if str(candidate_task_id) != str(task_id):
+                raise TrialResultBindingError(
+                    f"aggregate result key {task_id!r} contains task_id "
+                    f"{candidate_task_id!r}"
+                )
+            selected = dict(candidate)
+            selected["task_id"] = task_id
+            return selected
+        raise TrialResultBindingError(
+            f"aggregate result has no record for bound task_id {task_id!r}"
+        )
+    raise TrialResultBindingError(
+        f"result has no trial record for bound task_id {task_id!r}"
+    )
 
 
 def _extract_trial_result(results: dict, task_id: str) -> tuple[dict, bool, str | None]:

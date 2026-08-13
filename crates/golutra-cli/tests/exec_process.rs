@@ -155,6 +155,7 @@ async fn exec_run_dir_retains_an_isolated_structured_runtime_bundle() {
     let export_parent = tempdir().expect("export parent");
     let state_dir = export_parent.path().join("runtime");
     let task_contract = export_parent.path().join("task-contract.json");
+    let verifier = std::env::current_exe().expect("current test executable");
     fs::write(
         &task_contract,
         serde_json::to_vec_pretty(&json!({
@@ -187,6 +188,14 @@ async fn exec_run_dir_retains_an_isolated_structured_runtime_bundle() {
             .arg("--allow-network")
             .arg("--approval-mode")
             .arg("auto")
+            .arg("--verify-program")
+            .arg(&verifier)
+            .arg("--verify-arg")
+            .arg("--ignored")
+            .arg("--verify-arg")
+            .arg("--exact")
+            .arg("--verify-arg")
+            .arg("retained_file_verifier_helper")
             .arg("write file retained.txt with content retained")
             .env("GOLUTRA_HOME", home.path())
             .output(),
@@ -289,6 +298,15 @@ async fn exec_run_dir_retains_an_isolated_structured_runtime_bundle() {
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("golutra run bundle retained"),
         "retention receipt belongs on stderr"
+    );
+}
+
+#[test]
+#[ignore = "invoked by the run-dir process test as an external verifier"]
+fn retained_file_verifier_helper() {
+    assert_eq!(
+        fs::read_to_string("retained.txt").expect("retained file"),
+        "retained"
     );
 }
 

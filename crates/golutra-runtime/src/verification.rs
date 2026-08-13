@@ -79,6 +79,7 @@ impl RuntimeVerificationService {
             .command_checks
             .iter()
             .any(|check| check.kind == VerificationCheckKind::ObjectiveValidation && check.passed);
+        let behavior_files_changed = input.code_files_changed;
         let external_verified = input
             .command_checks
             .iter()
@@ -163,11 +164,22 @@ impl RuntimeVerificationService {
                 && workspace_changed
                 && !contract.require_objective_validation
                 && blocking_assertions_satisfied
+                && !behavior_files_changed
             {
                 record.result = VerificationResult::Pass;
                 record
                     .residual_risks
                     .retain(|risk| risk != "some objective checks failed");
+            } else if record.result == VerificationResult::Partial
+                && behavior_files_changed
+                && !objective_validated
+            {
+                record
+                    .residual_risks
+                    .retain(|risk| risk != "some objective checks failed");
+                record
+                    .residual_risks
+                    .push("behavioral changes were not objectively validated".to_owned());
             }
         }
         (record, plan)
@@ -257,11 +269,63 @@ mod tests {
     }
 
     #[test]
-    fn governed_plan_does_not_invent_unrequested_objective_validation() {
+    fn governed_behavior_change_without_objective_validation_remains_partial() {
         let evidence = golutra_core::EvidenceId::new();
         let input = VerificationInput {
             task_id: TaskId::new(),
             objective: "update the workspace".to_owned(),
+            completion_criteria: Vec::new(),
+            evidence_refs: vec![evidence],
+            command_checks: vec![
+                VerificationCheck {
+                    kind: VerificationCheckKind::WorkspaceChange,
+                    name: "workspace_diff".to_owned(),
+                    command: None,
+                    passed: true,
+                    evidence_refs: vec![evidence],
+                    message: "workspace changed".to_owned(),
+                },
+                VerificationCheck {
+                    kind: VerificationCheckKind::Policy,
+                    name: "policy:write_file".to_owned(),
+                    command: None,
+                    passed: true,
+                    evidence_refs: vec![evidence],
+                    message: "policy allowed execution".to_owned(),
+                },
+            ],
+            requires_workspace_evidence: true,
+            code_files_changed: true,
+        };
+        let contract = TaskContract {
+            workspace_change: WorkspaceChangeRequirement::Required,
+            verification: golutra_core::VerificationRequirement::Required,
+            ..TaskContract::default()
+        };
+
+        let service = RuntimeVerificationService::default();
+        let plan = service.plan_governed(&input, &contract);
+        assert!(!plan.assertions.iter().any(|assertion| {
+            assertion.criterion_id == "workspace_validation"
+                || assertion.criterion_id == "tests_or_diagnostics"
+        }));
+        let (record, _) =
+            service.verify_governed(input, plan, &contract, "sha256:test-environment".to_owned());
+        assert_eq!(record.result, VerificationResult::Partial);
+        assert!(
+            record
+                .residual_risks
+                .iter()
+                .any(|risk| risk == "behavioral changes were not objectively validated")
+        );
+    }
+
+    #[test]
+    fn governed_non_code_workspace_change_can_pass_without_a_project_test() {
+        let evidence = golutra_core::EvidenceId::new();
+        let input = VerificationInput {
+            task_id: TaskId::new(),
+            objective: "update a documentation file".to_owned(),
             completion_criteria: Vec::new(),
             evidence_refs: vec![evidence],
             command_checks: vec![
@@ -293,12 +357,9 @@ mod tests {
 
         let service = RuntimeVerificationService::default();
         let plan = service.plan_governed(&input, &contract);
-        assert!(!plan.assertions.iter().any(|assertion| {
-            assertion.criterion_id == "workspace_validation"
-                || assertion.criterion_id == "tests_or_diagnostics"
-        }));
         let (record, _) =
             service.verify_governed(input, plan, &contract, "sha256:test-environment".to_owned());
+
         assert_eq!(record.result, VerificationResult::Pass);
     }
 

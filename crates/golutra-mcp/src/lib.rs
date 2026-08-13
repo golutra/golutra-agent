@@ -16,7 +16,9 @@ use golutra_plugin::{
     EnabledPlugin, PluginError, PluginStore, PluginToolManifest, PluginWorkspaceAccess,
 };
 use golutra_sandbox::{SandboxRequest, SystemSandbox, WorkspaceAccess};
-use golutra_tools::{ExternalToolBackend, ExternalToolOutput, ToolError, ToolRequest};
+use golutra_tools::{
+    ExternalToolBackend, ExternalToolOutput, ToolCapabilities, ToolError, ToolRequest,
+};
 use rmcp::{
     ServiceExt,
     model::{CallToolRequestParams, CallToolResult, ContentBlock, Tool},
@@ -248,6 +250,26 @@ impl ExternalToolBackend for McpToolBackend {
             .collect::<Vec<_>>();
         contracts.sort_by(|left, right| left.tool_name.cmp(&right.tool_name));
         contracts
+    }
+
+    fn capabilities(&self) -> HashMap<String, ToolCapabilities> {
+        self.targets
+            .keys()
+            .map(|tool_name| {
+                (
+                    tool_name.clone(),
+                    ToolCapabilities {
+                        // MCP targets only enter this backend after their immutable package,
+                        // permissions and schemas pass the owner's review/enable lifecycle.
+                        available_in_coding_profile: true,
+                        // A remote read may still depend on server state, so concurrency stays
+                        // serial until the reviewed manifest can express that guarantee.
+                        parallel_read_safe: false,
+                        coding_profile_hidden_arguments: Vec::new(),
+                    },
+                )
+            })
+            .collect()
     }
 
     async fn call(

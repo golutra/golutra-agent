@@ -575,6 +575,8 @@ class ClientTest(unittest.TestCase):
 
         handle = thread.run(
             "inspect the workspace",
+            execution_mode="strict",
+            tool_profile="full",
             output_schema={"type": "object"},
             task_contract={
                 "workspace_change": "required",
@@ -602,6 +604,8 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(handle.wait()["final_message"], "done")
         self.assertEqual(handle.wait()["verification"]["result"], "pass")
         self.assertEqual(calls[0][0], "turn/start")
+        self.assertEqual(calls[0][1]["execution_mode"], "strict")
+        self.assertEqual(calls[0][1]["tool_profile"], "full")
         self.assertEqual(calls[0][1]["completion_criteria"], [" verified "])
         self.assertEqual(calls[0][1]["allow_network"], True)
         self.assertEqual(calls[0][1]["yolo"], True)
@@ -641,7 +645,18 @@ class ClientTest(unittest.TestCase):
         ][-1]
         self.assertEqual(disabled_params["external_verifiers"], [])
 
-        self.assertEqual(thread.steer("continue")["accepted"], True)
+        self.assertEqual(thread.steer("continue", tool_profile="full")["accepted"], True)
+        self.assertIn(
+            (
+                "turn/steer",
+                {
+                    "thread_id": THREAD_ID,
+                    "prompt": "continue",
+                    "tool_profile": "full",
+                },
+            ),
+            calls,
+        )
         self.assertEqual(thread.interrupt()["accepted"], True)
         self.assertEqual(thread.takeover()["accepted"], True)
         self.assertEqual(
@@ -686,6 +701,34 @@ class ClientTest(unittest.TestCase):
             thread.event_page(direction="sideways")
         with self.assertRaises(ValueError):
             thread.steer("   ")
+
+    def test_agent_run_defaults_and_legacy_compatibility(self) -> None:
+        calls: list[tuple[str, dict]] = []
+
+        class FakeAgentClient:
+            def rpc(self, method: str, params: dict) -> dict:
+                calls.append((method, params))
+                return {
+                    "accepted": True,
+                    "command_id": f"command-{len(calls)}",
+                    "cursor": 0,
+                }
+
+        thread = Thread(
+            FakeAgentClient(),
+            {"thread_id": THREAD_ID, "session_id": SESSION_ID},
+        )
+
+        thread.run("new defaults")
+        thread.run_legacy("server defaults")
+        thread.run_legacy_streamed("streamed server defaults")
+
+        self.assertEqual(calls[0][0], "turn/start")
+        self.assertEqual(calls[0][1]["execution_mode"], "open")
+        self.assertEqual(calls[0][1]["tool_profile"], "coding")
+        for _method, params in calls[1:]:
+            self.assertNotIn("execution_mode", params)
+            self.assertNotIn("tool_profile", params)
 
     def test_client_start_and_resume_wrap_rpc_thread_references(self) -> None:
         reference = {

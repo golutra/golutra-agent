@@ -30,9 +30,9 @@ use golutra_project_service::{
     ProjectServiceManager, ProjectServiceSpec, ProjectServiceStartRequest,
 };
 use golutra_protocol::{
-    AgentStreamEvent, AgentTurnOptions, EventFilter, ExternalVerificationSpec, RuntimeEvent,
-    RuntimeEventType, RuntimeQuery, RuntimeQueryKind, SessionCommand, SessionCommandKind,
-    TaskTraceRequest,
+    AgentExecutionMode, AgentStreamEvent, AgentToolProfile, AgentTurnExecutionOptions,
+    AgentTurnOptions, EventFilter, ExternalVerificationSpec, RuntimeEvent, RuntimeEventType,
+    RuntimeQuery, RuntimeQueryKind, SessionCommand, SessionCommandKind, TaskTraceRequest,
 };
 use secrecy::SecretString;
 use std::{
@@ -236,6 +236,14 @@ struct ExecArgs {
     /// Keep the typed task outcome open for a later external evaluator.
     #[arg(long)]
     defer_external_verification: bool,
+    /// Let the provider own planning and stopping (`open`) or apply the
+    /// explicit completion-oriented adapter (`strict`).
+    #[arg(long, value_enum, default_value_t = ExecExecutionModeArg::Open)]
+    execution_mode: ExecExecutionModeArg,
+    /// Expose coding-safe built-ins/extensions (`coding`) or every registered
+    /// extension (`full`) to the provider.
+    #[arg(long, value_enum, default_value_t = ExecToolProfileArg::Coding)]
+    tool_profile: ExecToolProfileArg,
     /// Write isolated runtime state and full owner-only observations to this new directory.
     /// Implies --ephemeral. The legacy --ephemeral-state-dir spelling remains accepted.
     #[arg(
@@ -290,6 +298,36 @@ struct ExecArgs {
     /// How exec resolves runtime requests already classified as requiring approval.
     #[arg(long, value_enum, default_value_t = ExecApprovalModeArg::Prompt)]
     approval_mode: ExecApprovalModeArg,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ExecExecutionModeArg {
+    Open,
+    Strict,
+}
+
+impl From<ExecExecutionModeArg> for AgentExecutionMode {
+    fn from(value: ExecExecutionModeArg) -> Self {
+        match value {
+            ExecExecutionModeArg::Open => Self::Open,
+            ExecExecutionModeArg::Strict => Self::Strict,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ExecToolProfileArg {
+    Coding,
+    Full,
+}
+
+impl From<ExecToolProfileArg> for AgentToolProfile {
+    fn from(value: ExecToolProfileArg) -> Self {
+        match value {
+            ExecToolProfileArg::Coding => Self::Coding,
+            ExecToolProfileArg::Full => Self::Full,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -874,7 +912,7 @@ async fn main() -> miette::Result<()> {
                 .send_command(command(
                     session_id,
                     SessionCommandKind::Prompt,
-                    serde_json::json!({ "prompt": prompt }),
+                    chat_prompt_payload(prompt),
                 ))
                 .await
                 .map_err(|error| miette::miette!("{error}"))?;
@@ -2671,7 +2709,7 @@ async fn run_exec(
         ),
     };
     let mut handle = thread
-        .start_turn(
+        .start_turn_with_execution_options(
             prompt,
             AgentTurnOptions {
                 task_contract,
@@ -2683,6 +2721,10 @@ async fn run_exec(
                 defer_external_verification: args.defer_external_verification,
                 external_verifiers,
                 discover_project_verifiers: !args.no_project_verifier_discovery,
+            },
+            AgentTurnExecutionOptions {
+                execution_mode: args.execution_mode.into(),
+                tool_profile: args.tool_profile.into(),
             },
         )
         .await
@@ -3070,6 +3112,14 @@ async fn wait_for_terminal_state(
             }
         }
     }
+}
+
+fn chat_prompt_payload(prompt: String) -> serde_json::Value {
+    serde_json::json!({
+        "prompt": prompt,
+        "execution_mode": "open",
+        "tool_profile": "coding",
+    })
 }
 
 async fn prompt_for_cli_approval(

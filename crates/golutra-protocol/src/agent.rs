@@ -156,6 +156,51 @@ pub struct AgentTurnResult {
     pub last_sequence_no: Option<u64>,
 }
 
+/// Selects how much deterministic completion policy is allowed to shape one
+/// turn.  The open path leaves planning, tool order, and stopping to the
+/// provider while retaining the runtime's safety, budget, and audit gates.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentExecutionMode {
+    #[default]
+    Open,
+    Strict,
+}
+
+/// Controls the model-visible tool surface without removing the underlying
+/// executor capability or its policy checks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentToolProfile {
+    #[default]
+    Coding,
+    Full,
+}
+
+/// Optional execution-surface override for a steering continuation. Steering
+/// cannot replace the active task contract or execution mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentSteerOptions {
+    #[serde(default)]
+    pub tool_profile: Option<AgentToolProfile>,
+}
+
+/// Selects the model-facing execution surface for a newly started turn.
+///
+/// This is separate from [`AgentTurnOptions`] so adding execution profiles does
+/// not break existing Rust callers that construct that options type directly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentTurnExecutionOptions {
+    /// Open is the default for new clients. Strict is intended for explicit
+    /// completion policy or externally verified turns.
+    #[serde(default)]
+    pub execution_mode: AgentExecutionMode,
+    /// Coding exposes built-in coding, managed process, delegation, and
+    /// host-reviewed coding extensions. Full also exposes other extensions.
+    #[serde(default)]
+    pub tool_profile: AgentToolProfile,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentTurnOptions {
     /// Explicit runtime completion/verification contract.  `None` keeps wire

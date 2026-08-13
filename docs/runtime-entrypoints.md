@@ -73,6 +73,9 @@ golutra --cwd "$PWD" exec \
 golutra --cwd "$PWD" exec \
   --task-contract /absolute/path/to/task-contract.json \
   "implement the requested change"
+golutra --cwd "$PWD" exec \
+  --execution-mode strict --tool-profile full \
+  "run a contract-driven task with managed tools"
 ```
 
 Output rules:
@@ -86,6 +89,38 @@ Output rules:
   same runtime lane;
 - `--ephemeral` uses an isolated embedded runtime and cannot be combined with
   `--daemon` or `--connect`.
+
+New CLI, TUI, App Server and SDK turns use `open` execution with the `coding`
+tool profile by default. `open` leaves planning, tool order and stopping to the
+provider while retaining policy, cancellation, budgets and audit facts. The
+`coding` profile exposes built-in workspace, shell, managed-process and
+delegation tools plus local MCP plugins that completed the owner-reviewed
+`stage -> review -> enable` lifecycle and extensions explicitly marked
+coding-safe by another host backend; `full` additionally exposes every
+registered extension. Use
+`--execution-mode strict` when an unstructured prompt must be translated into a
+deterministic completion contract, and `--tool-profile full` only when the turn
+needs a full-only extension. The interactive TUI accepts both switches,
+for example `golutra-tui --execution-mode strict --tool-profile full`. Explicit
+task contracts and external verifiers remain authoritative completion signals
+even if the caller selected `open`; unrelated payload metadata never changes
+the execution mode.
+
+Raw `SessionCommand` payloads persisted before these fields existed keep the
+legacy completion adapter and full tool surface. This compatibility rule is
+limited to omitted fields; sending `execution_mode: "open"` opts into the new
+model-owned path. Python uses `execution_mode` and `tool_profile`; TypeScript
+uses `executionMode` and `toolProfile`. Ordinary turns normalize the values into
+the durable task payload before execution or queueing.
+
+Steering is a continuation of the active task: it keeps the execution mode,
+task contract, verifiers, elapsed budget and current tool profile while
+appending the new user instruction at the next complete tool-batch boundary. A
+raw steering command may include `tool_profile` to change only the model-visible
+tool surface. The Rust, Python and TypeScript steering APIs expose the same
+optional override. Inherited fields are omitted from the durable queued payload
+so a preceding queued turn remains authoritative when the steer reaches the
+runtime boundary.
 
 `--yolo` is an explicit per-task full-access mode. It is
 available to embedded, `--daemon` and `--connect` exec transports, including
@@ -342,6 +377,29 @@ range reads. Python exposes `Thread.reconcile_task`; TypeScript exposes
 callers to infer success from the final message. They use the same Agent SSE
 projector as `exec` and MCP, so command/turn correlation and terminal status do
 not vary by language.
+
+### Execution defaults and compatibility
+
+The new high-level methods intentionally opt into the model-owned surface:
+
+```text
+Python:     Thread.run / run_streamed       -> execution_mode=open, tool_profile=coding
+TypeScript: Thread.run / runStreamed         -> execution_mode=open, tool_profile=coding
+```
+
+Callers that need the pre-profile behavior can use `Thread.run_legacy` and
+`run_legacy_streamed` in Python, or `Thread.runLegacy` and
+`runLegacyStreamed` in TypeScript. Those methods omit both fields so the server
+keeps interpreting the turn as the legacy completion adapter with the full
+tool surface. The same omission rule applies to older raw `SessionCommand`
+payloads and persisted tasks; it is not a global mutable default. A raw caller
+opts into the new behavior only by sending `execution_mode: "open"` (and may
+send `tool_profile: "coding"` or `"full"`).
+
+This distinction is intentional for compatibility: upgrading the SDK changes
+the default only for its named high-level API, while existing integrations that
+construct protocol payloads directly retain their previous semantics until
+they opt in.
 `Thread.run` also accepts `external_verifiers` in Python and
 `externalVerifiers` in TypeScript. These fields use the generated
 `ExternalVerificationSpec` contract and reach the same Runtime verifier path as

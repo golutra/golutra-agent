@@ -10,13 +10,15 @@ use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::Utc;
 use golutra_core::{
     Actor, ActorKind, ApprovalDecision, ApprovalId, ApprovalResolution, ApprovalScope, CommandId,
     SessionId, TaskStatus, ThreadId, TokenUsageRecord, ToolCallId,
 };
 use golutra_llm::{ProviderGenerationConfig, ProviderReasoningEffort};
 use golutra_protocol::{
-    RuntimeEvent, RuntimeEventType, SessionCommand, SessionCommandKind, StateProjection,
+    AgentToolProfile, RuntimeEvent, RuntimeEventType, SessionCommand, SessionCommandKind,
+    StateProjection,
 };
 use golutra_tools::{TaskDelegationBackend, TaskDelegationOutput, ToolError, ToolRequest};
 use serde_json::{Value, json};
@@ -35,7 +37,8 @@ pub(crate) const DELEGATED_TASK_MARKER: &str = "_delegated_task";
 const DELEGATED_PARENT_THREAD_KEY: &str = "_parent_thread_id";
 pub(crate) const DELEGATED_ADMISSION_TOKEN_KEY: &str = "_delegation_admission_token";
 const DELEGATED_THREAD_TITLE: &str = "Delegated task";
-const DELEGATED_WAIT_GRACE_MS: u64 = 5_000;
+const DELEGATED_COMPLETION_GRACE_MS: u64 = 5_000;
+const DELEGATED_COMPLETION_GRACE_DIVISOR: u64 = 20;
 const DELEGATED_WAIT_POLL_MS: u64 = 50;
 
 type SharedDelegationResult = Result<TaskDelegationOutput, String>;
@@ -347,7 +350,13 @@ async fn delegate_task(
         (control.clone(), context)
     };
 
-    let overrides = delegation_overrides(&parent_control.provider_settings, &request.arguments)?;
+    let active_surface = parent_control.execution.active_execution_surface();
+    let overrides = delegation_overrides(
+        &parent_control.provider_settings,
+        super::NormalizedExecutionMode::from_explicit(active_surface.execution_mode),
+        active_surface.tool_profile,
+        &request.arguments,
+    )?;
     let identity = delegation_identity(
         request,
         task,
@@ -427,6 +436,8 @@ async fn run_delegated_child(
     identity: String,
 ) -> Result<TaskDelegationOutput, ClientError> {
     let (requested_tokens, child_generation_config) = child_generation_config(&overrides)?;
+    let checkpoint_lock = parent_context.checkpoint_lock();
+    let checkpoint_guard = checkpoint_lock.lock().await;
     let child_context = match parent_context.child(
         request.session_id,
         parent_control.task_id,
@@ -440,6 +451,17 @@ async fn run_delegated_child(
             return Ok(delegation_limit_output(limit, &parent_context));
         }
     };
+    let reservation_recovery = parent_context.recovery_state(Utc::now());
+    record_delegation_recovery_checkpoint(
+        host,
+        request,
+        parent_control.task_id,
+        &parent_context,
+        reservation_recovery,
+        "delegation child reservation persisted",
+    )
+    .await?;
+    drop(checkpoint_guard);
     let child_session_id = SessionId(deterministic_uuid(&identity, "session"));
     let child_thread_id = ThreadId(deterministic_uuid(&identity, "thread"));
     let actor = Actor {
@@ -469,6 +491,11 @@ async fn run_delegated_child(
         DELEGATED_TASK_MARKER: true,
         DELEGATED_ADMISSION_TOKEN_KEY: admission_token,
     });
+    apply_inherited_execution_surface(
+        &mut create_payload,
+        overrides.execution_mode,
+        overrides.tool_profile,
+    )?;
     create_payload["_delegation_parent_session_id"] = json!(request.session_id);
     create_payload["_delegation_parent_tool_call_id"] = json!(request.tool_call_id);
     create_payload["_delegation"] = child_context.metadata();
@@ -530,12 +557,19 @@ async fn run_delegated_child(
         DELEGATED_TASK_MARKER: true,
         "allow_network": parent_control.allow_network,
         "yolo": parent_control.yolo,
-        "max_elapsed_ms": child_context.budget.remaining_elapsed_ms().max(1),
+        "max_elapsed_ms": delegated_child_runtime_elapsed_ms(
+            child_context.remaining_elapsed_ms(),
+        ),
         "_delegation_parent_session_id": request.session_id,
         "_delegation_parent_tool_call_id": request.tool_call_id,
         DELEGATED_ADMISSION_TOKEN_KEY: admission_token,
         "_delegation": child_context.metadata(),
     });
+    apply_inherited_execution_surface(
+        &mut prompt_payload,
+        overrides.execution_mode,
+        overrides.tool_profile,
+    )?;
     if let Some(profile) = overrides.profile.clone() {
         prompt_payload["provider_profile"] = profile;
     }
@@ -603,13 +637,7 @@ async fn run_delegated_child(
         .remove(&child_session_id);
 
     let child_state = match timeout(
-        Duration::from_millis(
-            child_context
-                .budget
-                .remaining_elapsed_ms()
-                .saturating_add(DELEGATED_WAIT_GRACE_MS)
-                .max(1),
-        ),
+        Duration::from_millis(child_context.remaining_elapsed_ms().max(1)),
         wait_for_child(host, child_session_id, cancellation, &child_context),
     )
     .await
@@ -695,10 +723,16 @@ async fn run_delegated_child(
         .await;
     }
     let (actual_tokens, actual_cost_microusd) = child_usage(host, child_session_id).await?;
-    child_context.finish(
+    persist_delegation_usage_settlement(
+        host,
+        request,
+        parent_control.task_id,
+        &parent_context,
+        &child_context,
         actual_tokens.unwrap_or(requested_tokens),
         actual_cost_microusd,
-    );
+    )
+    .await?;
     let effective_reasoning_effort = overrides
         .reasoning_effort
         .or_else(|| parent_reasoning_effort(&parent_control.provider_settings))
@@ -746,6 +780,61 @@ async fn run_delegated_child(
             },
         }),
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_delegation_usage_settlement(
+    host: &Arc<RuntimeHost>,
+    request: &ToolRequest,
+    task_id: golutra_core::TaskId,
+    canonical_context: &delegation_policy::DelegationContext,
+    child_context: &delegation_policy::DelegationContext,
+    actual_tokens: u64,
+    actual_cost_microusd: Option<u64>,
+) -> Result<(), ClientError> {
+    let checkpoint_lock = canonical_context.checkpoint_lock();
+    let _checkpoint_guard = checkpoint_lock.lock().await;
+    let recovery =
+        child_context.settlement_recovery_state(Utc::now(), actual_tokens, actual_cost_microusd);
+    let persisted = record_delegation_recovery_checkpoint(
+        host,
+        request,
+        task_id,
+        canonical_context,
+        recovery,
+        "delegation child usage settled",
+    )
+    .await;
+    child_context.finish(actual_tokens, actual_cost_microusd);
+    persisted
+}
+
+async fn record_delegation_recovery_checkpoint(
+    host: &Arc<RuntimeHost>,
+    request: &ToolRequest,
+    current_task_id: golutra_core::TaskId,
+    canonical_context: &delegation_policy::DelegationContext,
+    recovery: delegation_policy::TimedDelegationRecoveryState,
+    summary: &str,
+) -> Result<(), ClientError> {
+    let session_id = canonical_context.root_session_id;
+    let task_id = canonical_context.canonical_task_id(current_task_id);
+    let mut event = super::host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(task_id),
+        RuntimeEventType::CheckpointCreated,
+        golutra_protocol::RuntimeEventSource::Runtime,
+        json!({
+            "summary": summary,
+            "recovery_kind": "delegation_budget",
+            "delegation_recovery": recovery,
+        }),
+    );
+    if session_id == request.session_id {
+        event.turn_id = request.turn_id;
+    }
+    host.record_event(event).await
 }
 
 fn cancelled_delegation_output(reason: &str) -> TaskDelegationOutput {
@@ -837,6 +926,8 @@ struct DelegationOverrides {
     model: Option<Value>,
     generation_config: Option<Value>,
     reasoning_effort: Option<ProviderReasoningEffort>,
+    execution_mode: super::NormalizedExecutionMode,
+    tool_profile: AgentToolProfile,
 }
 
 fn delegation_token_reservation(overrides: &DelegationOverrides) -> u64 {
@@ -874,6 +965,19 @@ fn child_generation_config(overrides: &DelegationOverrides) -> Result<(u64, Valu
     config.max_tokens = Some(max_tokens);
     config.validate().map_err(ClientError::TaskExecution)?;
     Ok((max_tokens, serde_json::to_value(config)?))
+}
+
+fn delegated_child_runtime_elapsed_ms(local_remaining_elapsed_ms: u64) -> u64 {
+    if local_remaining_elapsed_ms <= 1 {
+        return 1;
+    }
+    let completion_grace_ms = local_remaining_elapsed_ms
+        .div_ceil(DELEGATED_COMPLETION_GRACE_DIVISOR)
+        .min(DELEGATED_COMPLETION_GRACE_MS)
+        .min(local_remaining_elapsed_ms - 1);
+    local_remaining_elapsed_ms
+        .saturating_sub(completion_grace_ms)
+        .max(1)
 }
 
 fn blocked_delegation_output(
@@ -975,6 +1079,8 @@ fn summarize_child_usage(events: &[RuntimeEvent]) -> (Option<u64>, Option<u64>) 
 
 fn delegation_overrides(
     parent: &super::ProviderTurnSettings,
+    execution_mode: super::NormalizedExecutionMode,
+    tool_profile: AgentToolProfile,
     arguments: &Value,
 ) -> Result<DelegationOverrides, ClientError> {
     let profile = parent.profile.clone();
@@ -1012,6 +1118,8 @@ fn delegation_overrides(
         model,
         generation_config,
         reasoning_effort,
+        execution_mode,
+        tool_profile,
     })
 }
 
@@ -1080,7 +1188,7 @@ async fn wait_for_child(
         }
         if (cancellation.is_cancelled()
             || context.cancellation().is_cancelled()
-            || context.budget.is_expired())
+            || context.is_expired())
             && !cancelled_child
         {
             cancel_child(host, session_id).await;
@@ -1285,6 +1393,27 @@ fn internal_command(
     }
 }
 
+fn apply_inherited_execution_surface(
+    payload: &mut Value,
+    execution_mode: super::NormalizedExecutionMode,
+    tool_profile: AgentToolProfile,
+) -> Result<(), ClientError> {
+    if matches!(execution_mode, super::NormalizedExecutionMode::Legacy) {
+        // Omitted mode is the compatibility marker for tasks written before
+        // the open/coding surface existed. Do not silently convert those
+        // children to the new contract semantics.
+        if let Some(object) = payload.as_object_mut() {
+            object.remove(super::task_mode::EXECUTION_MODE_KEY);
+        }
+        payload[super::task_mode::TOOL_PROFILE_KEY] = serde_json::to_value(tool_profile)?;
+    } else {
+        payload[super::task_mode::EXECUTION_MODE_KEY] =
+            Value::String(execution_mode.wire_name().to_owned());
+        payload[super::task_mode::TOOL_PROFILE_KEY] = serde_json::to_value(tool_profile)?;
+    }
+    Ok(())
+}
+
 fn delegation_identity(
     request: &ToolRequest,
     task: &str,
@@ -1301,6 +1430,8 @@ fn delegation_identity(
         "provider_profile": overrides.profile,
         "provider_model": overrides.model,
         "provider_generation_config": overrides.generation_config,
+        "execution_mode": overrides.execution_mode.wire_name(),
+        "tool_profile": overrides.tool_profile,
         "allow_network": allow_network,
         "yolo": yolo,
     });
@@ -1513,9 +1644,13 @@ mod tests {
             tool_name: "delegate_task".to_owned(),
             arguments: json!({"task": task}),
         };
-        let overrides =
-            delegation_overrides(&crate::ProviderTurnSettings::default(), &request.arguments)
-                .expect("delegation overrides");
+        let overrides = delegation_overrides(
+            &crate::ProviderTurnSettings::default(),
+            crate::NormalizedExecutionMode::Legacy,
+            AgentToolProfile::Full,
+            &request.arguments,
+        )
+        .expect("delegation overrides");
         let identity = delegation_identity(&request, task, &overrides, false, false)
             .expect("delegation identity");
         let child_session_id = SessionId(deterministic_uuid(&identity, "session"));
@@ -1813,6 +1948,8 @@ mod tests {
             model: None,
             generation_config: None,
             reasoning_effort: None,
+            execution_mode: crate::NormalizedExecutionMode::Legacy,
+            tool_profile: AgentToolProfile::Full,
         };
         let (default_budget, default_config) =
             child_generation_config(&missing_limit).expect("default child config");
@@ -1833,6 +1970,146 @@ mod tests {
             child_generation_config(&bounded).expect("bounded child config");
         assert_eq!(bounded_budget, 2_047);
         assert_eq!(bounded_config["max_tokens"], json!(2_047));
+    }
+
+    #[test]
+    fn child_runtime_budget_reserves_bounded_completion_grace() {
+        assert_eq!(delegated_child_runtime_elapsed_ms(100_000), 95_000);
+        assert_eq!(delegated_child_runtime_elapsed_ms(10_000), 9_500);
+        assert_eq!(delegated_child_runtime_elapsed_ms(20), 19);
+        assert_eq!(delegated_child_runtime_elapsed_ms(2), 1);
+        assert_eq!(delegated_child_runtime_elapsed_ms(1), 1);
+        assert_eq!(delegated_child_runtime_elapsed_ms(0), 1);
+    }
+
+    #[test]
+    fn legacy_delegation_omits_only_the_mode_and_preserves_the_selected_profile() {
+        let mut payload = json!({"execution_mode": "open", "tool_profile": "full"});
+
+        apply_inherited_execution_surface(
+            &mut payload,
+            crate::NormalizedExecutionMode::Legacy,
+            AgentToolProfile::Coding,
+        )
+        .expect("legacy execution surface");
+
+        assert!(payload.get("execution_mode").is_none());
+        assert_eq!(payload["tool_profile"], "coding");
+    }
+
+    #[tokio::test]
+    async fn nested_delegation_checkpoints_use_the_root_recovery_stream() {
+        let host = RuntimeHost::in_memory().await.expect("host");
+        let root_session_id = host.default_session_id();
+        let root_task_id = golutra_core::TaskId::new();
+        let child_session_id = SessionId::new();
+        let child_task_id = golutra_core::TaskId::new();
+        let cancellation = CancellationToken::new();
+        let root = delegation_policy::DelegationContext::root(
+            root_session_id,
+            Some(10_000),
+            Some(1_024),
+            None,
+            cancellation.clone(),
+        );
+        let child = root
+            .child(
+                root_session_id,
+                root_task_id,
+                ThreadId::new(),
+                1_024,
+                None,
+                &cancellation,
+            )
+            .expect("child context");
+        let grandchild = child
+            .child(
+                child_session_id,
+                child_task_id,
+                ThreadId::new(),
+                1_024,
+                None,
+                &cancellation,
+            )
+            .expect("grandchild context");
+        let request = ToolRequest {
+            tool_call_id: ToolCallId::new(),
+            provider_tool_call_id: None,
+            session_id: child_session_id,
+            turn_id: Some(TurnId::new()),
+            tool_name: "delegate_task".to_owned(),
+            arguments: json!({"task": "nested"}),
+        };
+
+        let checkpoint_lock = child.checkpoint_lock();
+        let checkpoint_guard = checkpoint_lock.lock().await;
+        let recovery = child.recovery_state(Utc::now());
+        record_delegation_recovery_checkpoint(
+            &host,
+            &request,
+            child_task_id,
+            &child,
+            recovery,
+            "nested reservation",
+        )
+        .await
+        .expect("root checkpoint");
+        drop(checkpoint_guard);
+        persist_delegation_usage_settlement(
+            &host,
+            &request,
+            child_task_id,
+            &child,
+            &grandchild,
+            1_500,
+            None,
+        )
+        .await
+        .expect("root settlement");
+        persist_delegation_usage_settlement(
+            &host,
+            &request,
+            root_task_id,
+            &root,
+            &child,
+            2_000,
+            None,
+        )
+        .await
+        .expect("parent settlement");
+
+        let root_events = host
+            .storage
+            .store
+            .load_events(root_session_id, Some(root_task_id), None)
+            .await
+            .expect("root events");
+        let child_events = host
+            .storage
+            .store
+            .load_events(child_session_id, Some(child_task_id), None)
+            .await
+            .expect("child events");
+        let checkpoints = root_events
+            .iter()
+            .filter(|event| event.event_type == RuntimeEventType::CheckpointCreated)
+            .collect::<Vec<_>>();
+
+        assert_eq!(checkpoints.len(), 3);
+        assert!(child_events.is_empty());
+        assert!(checkpoints.iter().all(|event| event.turn_id.is_none()));
+        assert_eq!(
+            checkpoints[0].payload["delegation_recovery"]["state"]["started_children"],
+            2
+        );
+        assert_eq!(
+            checkpoints[1].payload["delegation_recovery"]["state"]["spent_tokens"],
+            delegation_policy::MIN_DELEGATED_TOKEN_BUDGET
+        );
+        assert_eq!(
+            checkpoints[2].payload["delegation_recovery"]["state"]["spent_tokens"],
+            3_500
+        );
     }
 
     #[test]

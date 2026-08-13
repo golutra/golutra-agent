@@ -72,6 +72,7 @@ impl CanonicalFactRecorder {
                 ObservationCommand::Event {
                     observation,
                     coalescing,
+                    ..
                 } => {
                     self.commit_with_coalescing(*observation, coalescing)
                         .await?;
@@ -150,13 +151,24 @@ impl RuntimeHost {
         if let AgentLoopTraceEvent::ToolCompleted(report) = &trace_event {
             return self.record_tool_report(task, report).await;
         }
-        if let AgentLoopTraceEvent::PendingTurnStarted(turn) = &trace_event {
-            self.execution
-                .lane_manager
-                .lock()
-                .await
-                .start_queued_turn(task.session_id, turn.turn_id)?;
-        }
+        let queued_turn_start = if let Some(turn) = match &trace_event {
+            AgentLoopTraceEvent::PendingTurnStarted(turn) => Some(turn),
+            AgentLoopTraceEvent::PendingTurnStartedWithExecution(configured) => {
+                Some(&configured.turn)
+            }
+            _ => None,
+        } {
+            Some((
+                self.execution
+                    .lane_manager
+                    .lock()
+                    .await
+                    .prepare_queued_turn_start(task.session_id, turn.turn_id)?,
+                turn.turn_id,
+            ))
+        } else {
+            None
+        };
         let active_turn_id = self
             .execution
             .lane_manager
@@ -167,6 +179,9 @@ impl RuntimeHost {
             .unwrap_or(task.turn_id);
         let event_turn_id = match &trace_event {
             AgentLoopTraceEvent::PendingTurnStarted(turn) => Some(turn.turn_id),
+            AgentLoopTraceEvent::PendingTurnStartedWithExecution(configured) => {
+                Some(configured.turn.turn_id)
+            }
             AgentLoopTraceEvent::AssistantMessage { turn_id, .. } => Some(*turn_id),
             AgentLoopTraceEvent::ApprovalRequested(approval) => Some(approval.turn_id),
             AgentLoopTraceEvent::UserQuestionRequested(request) => Some(request.turn_id),
@@ -232,6 +247,13 @@ impl RuntimeHost {
                 event.payload[payload_key] = Value::String(artifact.artifact_id.to_string());
             }
             self.record_event(event).await?;
+            if let Some((lane_id, turn_id)) = queued_turn_start {
+                self.execution
+                    .lane_manager
+                    .lock()
+                    .await
+                    .commit_queued_turn_start(task.session_id, lane_id, turn_id)?;
+            }
         }
         Ok(())
     }
@@ -500,38 +522,32 @@ impl RuntimeHost {
         event.payload["replay_result_artifact_ref"] =
             Value::String(replay_artifact.artifact_id.to_string());
         event.payload_ref = Some(replay_artifact.artifact_id);
-        self.storage
-            .repositories
-            .artifacts
-            .store(&replay_artifact, &replay_bytes)
-            .await?;
+        let mut artifacts = vec![(replay_artifact, replay_bytes)];
         let mut before_image_refs = Vec::new();
         for (path, mut artifact, bytes) in checkpoint_before_image_artifacts {
             artifact.provenance_refs.push(tool_event_id);
             let checksum = artifact.checksum.clone();
-            let artifact_ref = self.store_or_reuse_artifact(artifact, &bytes).await?;
+            let artifact_ref = artifact.artifact_id;
             before_image_refs.push(json!({
                 "path": path,
                 "artifact_ref": artifact_ref,
                 "checksum": checksum,
             }));
+            artifacts.push((artifact, bytes));
         }
         if !before_image_refs.is_empty() {
             event.payload["checkpoint_before_images"] = Value::Array(before_image_refs);
         }
         if let Some((mut artifact, bytes)) = change_manifest_artifact {
             artifact.provenance_refs.push(tool_event_id);
-            let artifact_ref = self.store_or_reuse_artifact(artifact, &bytes).await?;
+            let artifact_ref = artifact.artifact_id;
             event.payload["change_manifest_artifact_ref"] = Value::String(artifact_ref.to_string());
+            artifacts.push((artifact, bytes));
         }
         if let Some((mut artifact, bytes)) = diff_artifact {
             artifact.provenance_refs.push(tool_event_id);
             event.payload["diff_artifact_ref"] = Value::String(artifact.artifact_id.to_string());
-            self.storage
-                .repositories
-                .artifacts
-                .store(&artifact, &bytes)
-                .await?;
+            artifacts.push((artifact, bytes));
         }
         for artifact in &report.artifacts {
             let content = report
@@ -548,52 +564,18 @@ impl RuntimeHost {
             if !artifact.provenance_refs.contains(&tool_event_id) {
                 artifact.provenance_refs.push(tool_event_id);
             }
-            self.storage
-                .repositories
-                .artifacts
-                .store(&artifact, &content.bytes)
-                .await?;
+            artifacts.push((artifact, content.bytes.clone()));
         }
+        let mut evidence_records = Vec::with_capacity(report.evidence.len());
         for evidence in &report.evidence {
             let mut evidence = evidence.clone();
             if !evidence.source_event_refs.contains(&tool_event_id) {
                 evidence.source_event_refs.push(tool_event_id);
             }
-            self.storage
-                .repositories
-                .artifacts
-                .store_evidence(&evidence)
-                .await?;
+            evidence_records.push(evidence);
         }
-        self.record_event(event).await
-    }
-
-    async fn store_or_reuse_artifact(
-        &self,
-        artifact: ArtifactRecord,
-        bytes: &[u8],
-    ) -> Result<ArtifactId, ClientError> {
-        if let Some(existing) = self
-            .storage
-            .repositories
-            .artifacts
-            .find_by_content(
-                artifact.session_id,
-                &artifact.artifact_type,
-                &artifact.checksum,
-                artifact.size_bytes,
-            )
-            .await?
-        {
-            return Ok(existing.artifact_id);
-        }
-        let artifact_id = artifact.artifact_id;
-        self.storage
-            .repositories
-            .artifacts
-            .store(&artifact, bytes)
-            .await?;
-        Ok(artifact_id)
+        self.record_tool_completed_bundle(event, &artifacts, &evidence_records)
+            .await
     }
 
     pub(super) async fn finish_lane(
@@ -789,8 +771,15 @@ impl RuntimeHost {
         objective: &str,
         reason: &str,
     ) -> Result<golutra_core::VerificationRecord, ClientError> {
-        let requires_workspace_evidence =
-            LegacyTaskAdapter::new(&task.payload, objective).requests_workspace_tools();
+        let execution_mode = execution_mode_from_payload(&task.payload)
+            .map_err(|error| ClientError::TaskExecution(error.to_owned()))?;
+        let mut task_contract = task_contract_from_payload(&task.payload)?;
+        if !explicit_task_contract(&task.payload)
+            && should_apply_legacy_adapter(&task.payload, execution_mode)
+        {
+            LegacyTaskAdapter::new(&task.payload, objective).apply_to(&mut task_contract);
+        }
+        let requires_workspace_evidence = task_contract.requires_workspace_evidence();
         let (verification, plan) = RuntimeVerificationService::default().verify_runtime_failure(
             task.task_id,
             objective,

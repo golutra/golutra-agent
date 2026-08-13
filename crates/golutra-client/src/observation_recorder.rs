@@ -7,12 +7,19 @@
 
 use std::{
     collections::VecDeque,
+    io::Write,
+    mem::size_of,
     sync::{Arc, Mutex},
 };
 
 use golutra_core::{ProviderRequestId, ToolCallId, ToolProgress};
 use golutra_llm::ProviderStreamEvent;
 use golutra_runtime::RuntimeObservation;
+use golutra_tools::{
+    ArtifactContent, FileBeforeImage, MAX_TOOL_ARTIFACT_CONTENT_BYTES,
+    MAX_WORKSPACE_SNAPSHOT_CONTENT_BYTES, ToolExecutionReport,
+};
+use serde::Serialize;
 use tokio::sync::{Notify, oneshot};
 
 /// The synchronous observation seam cannot await a bounded durable queue
@@ -21,7 +28,12 @@ use tokio::sync::{Notify, oneshot};
 /// fact is never silently discarded.
 const MAX_PENDING_LIVE_OBSERVATIONS: usize = 512;
 const MAX_PENDING_COMMANDS: usize = 4_096;
-const MAX_PENDING_COMMAND_BYTES: usize = 64 * 1024 * 1024;
+// A shell/delegation completion may retain 32 MiB on each side of its
+// workspace snapshot plus a bounded raw artifact. The remaining 64 MiB keeps
+// the prior backlog allowance available while that terminal fact is queued.
+const MAX_PENDING_COMMAND_BYTES: usize = 2 * MAX_WORKSPACE_SNAPSHOT_CONTENT_BYTES
+    + 2 * MAX_TOOL_ARTIFACT_CONTENT_BYTES
+    + 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct CoalescingSummary {
@@ -36,6 +48,7 @@ pub(crate) enum ObservationCommand {
     Event {
         observation: Box<RuntimeObservation>,
         coalescing: CoalescingSummary,
+        bytes: usize,
     },
     Flush(oneshot::Sender<Result<(), ObservationSendError>>),
 }
@@ -173,6 +186,7 @@ impl ObservationSender {
                 ObservationCommand::Event {
                     observation: Box::new(observation),
                     coalescing: CoalescingSummary::default(),
+                    bytes: observation_bytes,
                 },
             )
         };
@@ -301,6 +315,7 @@ impl ObservationSender {
         state.commands.push_back(ObservationCommand::Event {
             observation: pending.observation,
             coalescing: pending.coalescing,
+            bytes: pending.bytes,
         });
     }
 
@@ -359,6 +374,7 @@ impl ObservationReceiver {
             return QueuePoll::Command(ObservationCommand::Event {
                 observation: pending.observation,
                 coalescing: pending.coalescing,
+                bytes: pending.bytes,
             });
         }
         QueuePoll::Wait
@@ -406,19 +422,243 @@ fn fits_limits(state: &QueueState, additional_commands: usize, additional_bytes:
 
 fn command_bytes(command: &ObservationCommand) -> usize {
     match command {
-        ObservationCommand::Event { observation, .. } => estimate_observation_bytes(observation),
+        ObservationCommand::Event { bytes, .. } => *bytes,
         ObservationCommand::Flush(_) => 0,
     }
 }
 
 fn estimate_observation_bytes(observation: &RuntimeObservation) -> usize {
-    // RuntimeObservation intentionally remains a non-serializable execution
-    // seam. Its Debug form includes all owned dynamic fields and gives this
-    // queue a conservative, stable-enough accounting proxy without coupling
-    // the recorder to every provider/tool payload type.
-    format!("{observation:?}")
+    let dynamic_bytes = match observation {
+        RuntimeObservation::StepStarted(step) => structured_bytes(step),
+        RuntimeObservation::StepCompleted(completion) => structured_bytes(&(
+            &completion.snapshot,
+            &completion.fingerprint,
+            completion.made_progress,
+            completion.made_material_progress,
+            completion.repeated_no_progress,
+            completion.correction_no_progress_steps,
+            completion.correction_no_progress_elapsed_ms,
+            &completion.advisory,
+            completion.should_stop,
+            &completion.stop_reason,
+        )),
+        RuntimeObservation::StepCheckpointed(checkpoint) => structured_bytes(checkpoint),
+        RuntimeObservation::ContextBuilt {
+            contributors,
+            planned_input_tokens,
+        } => structured_bytes(&(contributors, planned_input_tokens)),
+        RuntimeObservation::ContextCompacted {
+            original_input_tokens,
+            planned_input_tokens,
+            trimmed_contributors,
+        } => structured_bytes(&(
+            original_input_tokens,
+            planned_input_tokens,
+            trimmed_contributors,
+        )),
+        RuntimeObservation::ContextCompactionStarted {
+            original_input_tokens,
+            budget_limit,
+        } => structured_bytes(&(original_input_tokens, budget_limit)),
+        RuntimeObservation::ContextAutoCompacted(record) => structured_bytes(record),
+        RuntimeObservation::ContextCompactionFailed {
+            planned_input_tokens,
+            budget_limit,
+            reason,
+        } => structured_bytes(&(planned_input_tokens, budget_limit, reason)),
+        RuntimeObservation::ContextSnapshot(snapshot) => structured_bytes(snapshot),
+        RuntimeObservation::ContextSnapshotCaptured { snapshot, request } => {
+            structured_bytes(&(snapshot, request))
+        }
+        RuntimeObservation::CandidateReady {
+            turn_id,
+            tool_count,
+            has_assistant_message,
+        } => structured_bytes(&(turn_id, tool_count, has_assistant_message)),
+        RuntimeObservation::VerificationReady { plan_id } => structured_bytes(plan_id),
+        RuntimeObservation::VerificationPlanned(plan) => structured_bytes(plan),
+        RuntimeObservation::VerificationAssertionCompleted(assertion) => {
+            structured_bytes(assertion)
+        }
+        RuntimeObservation::VerificationCompleted { record, terminal } => {
+            structured_bytes(&(record, terminal))
+        }
+        RuntimeObservation::CorrectionIssued(correction) => structured_bytes(correction),
+        RuntimeObservation::ProviderStarted {
+            request_id,
+            provider_id,
+            model_id,
+        } => structured_bytes(&(request_id, provider_id, model_id)),
+        RuntimeObservation::ProviderStreamed {
+            request_id,
+            provider_id,
+            model_id,
+            event,
+        } => structured_bytes(&(request_id, provider_id, model_id, event)),
+        RuntimeObservation::ProviderCompleted {
+            request_id,
+            provider_id,
+            model_id,
+            response,
+        } => structured_bytes(&(request_id, provider_id, model_id, response)),
+        RuntimeObservation::ProviderFailed {
+            request_id,
+            provider_id,
+            model_id,
+            error,
+        } => structured_bytes(&(request_id, provider_id, model_id, error)),
+        RuntimeObservation::TokenUsageRecorded(record) => structured_bytes(record),
+        RuntimeObservation::ToolStarted {
+            tool_call_id,
+            provider_tool_call_id,
+            tool_name,
+            display_arguments,
+            recovery_policy,
+        } => structured_bytes(&(
+            tool_call_id,
+            provider_tool_call_id,
+            tool_name,
+            display_arguments,
+            recovery_policy,
+        )),
+        RuntimeObservation::ToolProgress(progress) => structured_bytes(progress),
+        RuntimeObservation::ToolCompleted(report) => tool_report_bytes(report),
+        RuntimeObservation::PolicyEvaluated(evaluation) => structured_bytes(evaluation),
+        RuntimeObservation::ApprovalRequested(request) => structured_bytes(request),
+        RuntimeObservation::ApprovalResolved(resolution) => structured_bytes(resolution),
+        RuntimeObservation::UserQuestionRequested(request) => structured_bytes(request),
+        RuntimeObservation::UserQuestionResolved(resolution) => structured_bytes(resolution),
+        RuntimeObservation::RetryScheduled { attempt, reason } => {
+            structured_bytes(&(attempt, reason))
+        }
+        RuntimeObservation::ProviderFallback {
+            from_provider,
+            to_provider,
+            reason,
+        } => structured_bytes(&(from_provider, to_provider, reason)),
+        RuntimeObservation::ProviderTransportFallback {
+            provider_id,
+            from_transport,
+            to_transport,
+            reason,
+        } => structured_bytes(&(provider_id, from_transport, to_transport, reason)),
+        RuntimeObservation::LoopGuardTriggered { trigger, reason } => {
+            structured_bytes(&(trigger, reason))
+        }
+        RuntimeObservation::GovernorDecided(decision) => structured_bytes(decision),
+        RuntimeObservation::PendingTurnStarted(turn) => pending_turn_bytes(turn),
+        RuntimeObservation::PendingTurnStartedWithExecution(configured) => {
+            pending_turn_bytes(&configured.turn).saturating_add(structured_bytes(&(
+                configured.execution.execution_mode,
+                configured.execution.tool_profile,
+            )))
+        }
+        RuntimeObservation::AssistantMessage { turn_id, content } => {
+            structured_bytes(&(turn_id, content))
+        }
+    };
+    size_of::<RuntimeObservation>().saturating_add(dynamic_bytes)
+}
+
+fn pending_turn_bytes(turn: &golutra_runtime::PendingAgentTurn) -> usize {
+    structured_bytes(&(
+        turn.command_id,
+        turn.turn_id,
+        &turn.content,
+        &turn.task_contract,
+        &turn.output_schema,
+        &turn.external_verifiers,
+        turn.max_elapsed_ms,
+        turn.defer_external_verification,
+        turn.external_verifiers_require_os_sandbox,
+        turn.allow_network,
+        turn.yolo,
+        turn.steer,
+    ))
+}
+
+fn tool_report_bytes(report: &ToolExecutionReport) -> usize {
+    size_of::<ToolExecutionReport>()
+        .saturating_add(structured_bytes(&report.envelope))
+        .saturating_add(structured_bytes(&report.artifacts))
+        .saturating_add(structured_bytes(&report.evidence))
+        .saturating_add(path_bytes(&report.changed_files))
+        .saturating_add(structured_bytes(&report.policy_evaluation))
+        .saturating_add(artifact_content_bytes(&report.artifact_contents))
+        .saturating_add(file_image_bytes(&report.before_images))
+        .saturating_add(file_image_bytes(&report.after_images))
+        .saturating_add(structured_bytes(&report.metrics))
+}
+
+fn artifact_content_bytes(contents: &[ArtifactContent]) -> usize {
+    contents
         .len()
-        .saturating_add(std::mem::size_of::<RuntimeObservation>())
+        .saturating_mul(size_of::<ArtifactContent>())
+        .saturating_add(
+            contents
+                .iter()
+                .map(|content| content.bytes.capacity())
+                .fold(0_usize, usize::saturating_add),
+        )
+}
+
+fn file_image_bytes(images: &[FileBeforeImage]) -> usize {
+    images
+        .len()
+        .saturating_mul(size_of::<FileBeforeImage>())
+        .saturating_add(
+            images
+                .iter()
+                .map(|image| {
+                    image
+                        .path
+                        .as_os_str()
+                        .as_encoded_bytes()
+                        .len()
+                        .saturating_add(image.content.as_ref().map_or(0, std::vec::Vec::capacity))
+                        .saturating_add(image.metadata.as_ref().map_or(0, structured_bytes))
+                })
+                .fold(0_usize, usize::saturating_add),
+        )
+}
+
+fn path_bytes(paths: &[std::path::PathBuf]) -> usize {
+    paths
+        .len()
+        .saturating_mul(size_of::<std::path::PathBuf>())
+        .saturating_add(
+            paths
+                .iter()
+                .map(|path| path.as_os_str().as_encoded_bytes().len())
+                .fold(0_usize, usize::saturating_add),
+        )
+}
+
+fn structured_bytes<T>(value: &T) -> usize
+where
+    T: Serialize + ?Sized,
+{
+    let mut counter = ByteCounter::default();
+    if serde_json::to_writer(&mut counter, value).is_err() {
+        return usize::MAX;
+    }
+    counter.bytes
+}
+
+#[derive(Default)]
+struct ByteCounter {
+    bytes: usize,
+}
+
+impl Write for ByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(buffer.len());
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn live_key(observation: &RuntimeObservation) -> Option<LiveKey> {
@@ -474,10 +714,14 @@ fn live_event_bytes(observation: &RuntimeObservation) -> u64 {
 #[cfg(test)]
 mod tests {
     use golutra_core::{
-        ProviderRequestId, ToolCallId, ToolProgress, ToolProgressPhase, ToolRecoveryPolicy,
+        ProviderRequestId, SessionId, ToolCallId, ToolProgress, ToolProgressPhase,
+        ToolRecoveryPolicy,
     };
     use golutra_llm::ProviderStreamEvent;
+    use golutra_policy::WorkspacePolicy;
     use golutra_runtime::RuntimeObservation;
+    use golutra_tools::{BasicToolExecutor, ToolRequest};
+    use tempfile::tempdir;
 
     use super::*;
 
@@ -518,6 +762,7 @@ mod tests {
         let Some(ObservationCommand::Event {
             observation,
             coalescing,
+            ..
         }) = receiver.next().await
         else {
             panic!("coalesced event");
@@ -551,6 +796,7 @@ mod tests {
             Some(ObservationCommand::Event {
                 observation,
                 coalescing: CoalescingSummary { omitted_events: 0, .. },
+                ..
             }) if matches!(*observation, RuntimeObservation::ProviderStreamed { .. })
         ));
         assert!(matches!(
@@ -726,6 +972,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn maximum_tool_completion_fits_as_one_durable_observation() {
+        let workspace = tempdir().expect("workspace");
+        let executor = BasicToolExecutor::new(
+            WorkspacePolicy::new(workspace.path()).expect("workspace policy"),
+        );
+        let tool_call_id = ToolCallId::new();
+        let mut report = executor.invalid_request_report(
+            ToolRequest {
+                tool_call_id,
+                provider_tool_call_id: None,
+                session_id: SessionId::new(),
+                turn_id: None,
+                tool_name: "shell".to_owned(),
+                arguments: serde_json::json!({}),
+            },
+            "maximum retained report fixture",
+        );
+        report.artifact_contents[0].bytes = vec![0xff; MAX_TOOL_ARTIFACT_CONTENT_BYTES];
+        report.before_images = vec![FileBeforeImage {
+            path: workspace.path().join("before.bin"),
+            content: Some(vec![0xff; MAX_WORKSPACE_SNAPSHOT_CONTENT_BYTES]),
+            unix_mode: Some(0o644),
+            metadata: None,
+        }];
+        report.after_images = vec![FileBeforeImage {
+            path: workspace.path().join("after.bin"),
+            content: Some(vec![0xff; MAX_WORKSPACE_SNAPSHOT_CONTENT_BYTES]),
+            unix_mode: Some(0o644),
+            metadata: None,
+        }];
+        let observation = RuntimeObservation::ToolCompleted(report);
+
+        assert!(estimate_observation_bytes(&observation) < MAX_PENDING_COMMAND_BYTES);
+        let (sender, receiver) = channel();
+        sender.send(observation).expect("maximum terminal report");
+        sender.close().expect("close");
+
+        let Some(ObservationCommand::Event { observation, .. }) = receiver.next().await else {
+            panic!("maximum terminal report must remain queued");
+        };
+        let RuntimeObservation::ToolCompleted(report) = *observation else {
+            panic!("queued event must remain a tool completion");
+        };
+        assert_eq!(report.envelope.tool_call_id, tool_call_id);
+        assert_eq!(
+            report.artifact_contents[0].bytes.len(),
+            MAX_TOOL_ARTIFACT_CONTENT_BYTES
+        );
+        assert_eq!(
+            report.before_images[0].content.as_ref().map(Vec::len),
+            Some(MAX_WORKSPACE_SNAPSHOT_CONTENT_BYTES)
+        );
+        assert_eq!(
+            report.after_images[0].content.as_ref().map(Vec::len),
+            Some(MAX_WORKSPACE_SNAPSHOT_CONTENT_BYTES)
+        );
+        assert!(receiver.next().await.is_none());
+    }
+
+    #[tokio::test]
     async fn queue_reports_byte_overload_before_mutating_pending_live_state() {
         let (sender, receiver) = channel_with_limits(QueueLimits {
             max_commands: 8,
@@ -778,6 +1084,7 @@ mod tests {
             Some(ObservationCommand::Event {
                 observation,
                 coalescing: CoalescingSummary { omitted_events: 2, .. },
+                ..
             }) if matches!(
                 *observation,
                 RuntimeObservation::ToolProgress(ToolProgress {

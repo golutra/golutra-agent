@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use super::{
     MAX_BACKGROUND_PROCESS_TIMEOUT_MS, MAX_DELEGATED_TASK_CHARS, MAX_FILE_CONTENT_BYTES,
     MAX_PATCH_BYTES, MAX_PATH_ARGUMENT_CHARS, MAX_PATTERN_ARGUMENT_CHARS, MAX_PROCESS_INPUT_CHARS,
-    MAX_SHELL_COMMAND_CHARS, max_poll_wait_ms,
+    MAX_SHELL_COMMAND_CHARS, ToolCapabilities, max_poll_wait_ms,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -114,6 +114,23 @@ impl BuiltinTool {
 
     pub(super) fn contract(self) -> ToolContract {
         contract(self.name(), self.side_effect_type())
+    }
+
+    pub(super) fn capabilities(self) -> ToolCapabilities {
+        ToolCapabilities {
+            // Managed processes and delegation are ordinary coding capabilities. The full
+            // profile is reserved for extensions that their host did not expose to coding.
+            available_in_coding_profile: true,
+            parallel_read_safe: matches!(
+                self,
+                Self::ReadFile
+                    | Self::ListDir
+                    | Self::RgSearch
+                    | Self::SymbolSearch
+                    | Self::FindReferences
+            ),
+            coding_profile_hidden_arguments: Vec::new(),
+        }
     }
 }
 
