@@ -1,9 +1,9 @@
 use std::{
-    fs::{File, OpenOptions},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
+#[cfg(unix)]
 use fs2::FileExt;
 use golutra_client::{RuntimeExecutionOptions, RuntimeTransport};
 use golutra_protocol::{
@@ -11,6 +11,8 @@ use golutra_protocol::{
     DriverResponseEnvelope, RowRange, SnapshotDetail, SnapshotPanes, SnapshotRequest,
     SnapshotScope, TuiFrame, WaitCondition, response,
 };
+#[cfg(unix)]
+use std::fs::{File, OpenOptions};
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     sync::mpsc,
@@ -144,7 +146,7 @@ pub(crate) async fn run_driver_command(args: &Args, command: DriverArgs) -> miet
     }
     #[cfg(not(unix))]
     if command.socket.is_some() {
-        let error = Err(miette::miette!(
+        let error: miette::Result<()> = Err(miette::miette!(
             "unsupported_transport: Unix socket mode is unavailable on this platform"
         ));
         let shutdown = driver.shutdown().await;
