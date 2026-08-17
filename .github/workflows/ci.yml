@@ -38,7 +38,7 @@ jobs:
           npm ci --prefix sdk/typescript
           npm test --prefix sdk/typescript
           npm audit --audit-level=high --prefix sdk/typescript
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Open-source metadata
