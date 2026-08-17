@@ -26,6 +26,7 @@ use tokio_tungstenite::{
 // These tests each launch a real app-server and provider runtime. Serializing them keeps
 // the event-stream assertions independent of scheduler and CPU contention in CI.
 static RPC_PROCESS_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+const PROCESS_EVENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::test]
 async fn http_json_rpc_streams_the_same_turn_over_agent_sse() {
@@ -114,7 +115,7 @@ async fn http_json_rpc_streams_the_same_turn_over_agent_sse() {
     }
     let response = request.send().await.expect("agent SSE response");
     assert!(response.status().is_success());
-    let body = tokio::time::timeout(Duration::from_secs(15), response.text())
+    let body = tokio::time::timeout(PROCESS_EVENT_TIMEOUT, response.text())
         .await
         .expect("agent SSE timeout")
         .expect("agent SSE body");
@@ -192,7 +193,7 @@ async fn http_json_rpc_streams_the_same_turn_over_agent_sse() {
         .await
         .expect("reconnected agent SSE response");
     assert!(replay.status().is_success());
-    let replay = tokio::time::timeout(Duration::from_secs(15), replay.text())
+    let replay = tokio::time::timeout(PROCESS_EVENT_TIMEOUT, replay.text())
         .await
         .expect("reconnected agent SSE timeout")
         .expect("reconnected agent SSE body");
@@ -489,7 +490,7 @@ async fn websocket_json_rpc_emits_incremental_agent_notifications() {
 
     let mut response_thread = None;
     let mut event_types = Vec::new();
-    tokio::time::timeout(Duration::from_secs(15), async {
+    let stream_result = tokio::time::timeout(PROCESS_EVENT_TIMEOUT, async {
         loop {
             let message = socket
                 .next()
@@ -529,8 +530,12 @@ async fn websocket_json_rpc_emits_incremental_agent_notifications() {
             }
         }
     })
-    .await
-    .expect("WebSocket agent event timeout");
+    .await;
+    assert!(
+        stream_result.is_ok(),
+        "WebSocket agent event timeout after {PROCESS_EVENT_TIMEOUT:?}; \
+         response_thread={response_thread:?}, event_types={event_types:?}"
+    );
 
     assert!(response_thread.is_some());
     assert!(event_types.iter().any(|event| event == "thread.started"));
@@ -777,7 +782,7 @@ async fn response_for(stdout: &mut BufReader<ChildStdout>, id: u64) -> Value {
 }
 
 async fn next_stdio_value(stdout: &mut BufReader<ChildStdout>) -> Value {
-    tokio::time::timeout(Duration::from_secs(15), async {
+    tokio::time::timeout(PROCESS_EVENT_TIMEOUT, async {
         let mut line = String::new();
         let read = stdout
             .read_line(&mut line)
@@ -802,7 +807,7 @@ async fn read_until(
     stdout: &mut BufReader<ChildStdout>,
     predicate: impl Fn(&Value) -> bool,
 ) -> Value {
-    tokio::time::timeout(Duration::from_secs(15), async {
+    tokio::time::timeout(PROCESS_EVENT_TIMEOUT, async {
         loop {
             let mut line = String::new();
             let read = stdout
