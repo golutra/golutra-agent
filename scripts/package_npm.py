@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -294,15 +295,16 @@ def _copy_legal_files(root: Path, destination: Path) -> None:
 def _pack(staging_dir: Path, output_path: Path, npm_bin: str) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="golutra-npm-pack-") as temp_dir:
+        npm_args = [
+            npm_bin,
+            "pack",
+            "--ignore-scripts",
+            "--json",
+            "--pack-destination",
+            temp_dir,
+        ]
         result = subprocess.run(
-            [
-                npm_bin,
-                "pack",
-                "--ignore-scripts",
-                "--json",
-                "--pack-destination",
-                temp_dir,
-            ],
+            _npm_command(npm_args),
             cwd=staging_dir,
             check=False,
             capture_output=True,
@@ -327,6 +329,13 @@ def _pack(staging_dir: Path, output_path: Path, npm_bin: str) -> Path:
         output_path.unlink(missing_ok=True)
         shutil.move(packed, output_path)
     return output_path
+
+
+def _npm_command(arguments: list[str]) -> list[str]:
+    if os.name != "nt":
+        return arguments
+    command_processor = os.environ.get("COMSPEC", "cmd.exe")
+    return [command_processor, "/d", "/s", "/c", subprocess.list2cmdline(arguments)]
 
 
 def _verify_tarball(

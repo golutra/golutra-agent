@@ -33,6 +33,22 @@ def fake_pack(staging_dir: Path, output_path: Path, _npm_bin: str) -> Path:
 
 
 class NpmPackageTest(unittest.TestCase):
+    def test_npm_command_uses_the_windows_command_processor_for_npm_cmd(self) -> None:
+        arguments = ["npm", "pack", "--pack-destination", "C:\\build output"]
+        with (
+            patch.object(package_npm.os, "name", "nt"),
+            patch.dict(package_npm.os.environ, {"COMSPEC": "C:\\Windows\\cmd.exe"}),
+        ):
+            command = package_npm._npm_command(arguments)
+
+        self.assertEqual(command[:4], ["C:\\Windows\\cmd.exe", "/d", "/s", "/c"])
+        self.assertEqual(command[4], package_npm.subprocess.list2cmdline(arguments))
+
+    def test_npm_command_executes_directly_outside_windows(self) -> None:
+        arguments = ["npm", "pack"]
+        with patch.object(package_npm.os, "name", "posix"):
+            self.assertIs(package_npm._npm_command(arguments), arguments)
+
     def test_root_package_has_only_selected_platform_dependencies(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir) / "dist"
