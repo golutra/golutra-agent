@@ -1,0 +1,14 @@
+* text=auto eol=lf
+*.sh text eol=lf
+*.ps1 text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.png binary
+*.sqlite binary
+
+# These files are generated from the Rust protocol source of truth.
+schemas/sdk-protocol.schema.json linguist-generated=true
+sdk/typescript/src/generated.ts linguist-generated=true
+sdk/python/src/golutra_sdk/generated.py linguist-generated=true

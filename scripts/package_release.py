@@ -21,7 +21,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 PACKAGE_NAME = "golutra-agent"
 BINARY_SPECS = (
     ("golutra-cli", "golutra"),
@@ -31,6 +31,10 @@ BINARY_SPECS = (
     ("golutra-supervisor", "golutra-supervisor"),
     ("golutra-launcher", "golutra-launcher"),
     ("golutra-eval-worker", "golutra-eval-worker"),
+)
+LEGAL_FILE_SPECS = (
+    ("LICENSE", "LICENSE"),
+    ("NOTICE", "NOTICE"),
 )
 BUILD_PACKAGES = (
     "golutra-cli",
@@ -154,6 +158,7 @@ def package_release(
 
     files: list[dict[str, Any]] = []
     contents: dict[str, bytes] = {}
+    modes: dict[str, int] = {}
     for source_name, installed_name in BINARY_SPECS:
         source = source_dir / f"{source_name}{executable_suffix}"
         if source.is_symlink() or not source.is_file():
@@ -163,13 +168,35 @@ def package_release(
             raise PackageError(f"release binary is empty: {source}")
         destination = f"bin/{installed_name}{executable_suffix}"
         contents[destination] = content
+        modes[destination] = 0o755
         files.append(
             {
                 "path": destination,
+                "kind": "binary",
                 "size": len(content),
                 "sha256": hashlib.sha256(content).hexdigest(),
                 "mode": "0755",
                 "source_binary": source.name,
+            }
+        )
+
+    for source_name, destination in LEGAL_FILE_SPECS:
+        source = root / source_name
+        if source.is_symlink() or not source.is_file():
+            raise PackageError(f"required legal file is missing or unsafe: {source}")
+        content = source.read_bytes()
+        if not content:
+            raise PackageError(f"required legal file is empty: {source}")
+        contents[destination] = content
+        modes[destination] = 0o644
+        files.append(
+            {
+                "path": destination,
+                "kind": "document",
+                "size": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "mode": "0644",
+                "source_file": source.name,
             }
         )
 
@@ -195,9 +222,9 @@ def package_release(
     checksum = Path(f"{archive}.sha256")
 
     if windows:
-        _write_zip(archive, package_root, contents, manifest_bytes, epoch)
+        _write_zip(archive, package_root, contents, modes, manifest_bytes, epoch)
     else:
-        _write_tar_gz(archive, package_root, contents, manifest_bytes, epoch)
+        _write_tar_gz(archive, package_root, contents, modes, manifest_bytes, epoch)
     external_manifest.write_bytes(manifest_bytes)
     archive_digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     checksum.write_text(f"{archive_digest}  {archive.name}\n", encoding="ascii")
@@ -233,6 +260,8 @@ def verify_package(archive: Path) -> dict[str, Any]:
         manifest = json.loads(entries[manifest_path])
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise PackageError(f"archive manifest is invalid: {error}") from error
+    if not isinstance(manifest, dict):
+        raise PackageError("archive manifest must be a JSON object")
     if manifest.get("schema_version") != SCHEMA_VERSION:
         raise PackageError("archive manifest schema is unsupported")
     if manifest.get("package") != PACKAGE_NAME:
@@ -253,10 +282,12 @@ def verify_package(archive: Path) -> dict[str, Any]:
     if not isinstance(files, list) or not files:
         raise PackageError("archive manifest contains no files")
     executable_suffix = ".exe" if "windows" in target else ""
-    expected_relative_paths = {
+    expected_binary_paths = {
         f"bin/{installed_name}{executable_suffix}"
         for _source_name, installed_name in BINARY_SPECS
     }
+    expected_legal_paths = {destination for _source_name, destination in LEGAL_FILE_SPECS}
+    expected_relative_paths = expected_binary_paths | expected_legal_paths
     declared_relative_paths: set[str] = set()
     for record in files:
         if not isinstance(record, dict) or not isinstance(record.get("path"), str):
@@ -279,12 +310,17 @@ def verify_package(archive: Path) -> dict[str, Any]:
             or not _constant_time_equal(record["sha256"], digest)
         ):
             raise PackageError(f"manifest SHA-256 mismatch: {relative_path}")
-        if record.get("mode") != "0755":
+        expected_kind = "binary" if relative_path in expected_binary_paths else "document"
+        expected_mode = "0755" if expected_kind == "binary" else "0644"
+        if record.get("kind") != expected_kind:
+            raise PackageError(f"manifest kind is invalid: {relative_path}")
+        if record.get("mode") != expected_mode:
             raise PackageError(f"manifest mode is invalid: {relative_path}")
-        if modes.get(archive_path, 0) & 0o111 == 0:
-            raise PackageError(f"packaged binary is not executable: {relative_path}")
+        archive_mode = modes.get(archive_path, 0)
+        if archive_mode & 0o777 != int(expected_mode, 8):
+            raise PackageError(f"packaged {expected_kind} mode is invalid: {relative_path}")
     if declared_relative_paths != expected_relative_paths:
-        raise PackageError("archive manifest does not contain the required binary set")
+        raise PackageError("archive manifest does not contain the required file set")
     unexpected = set(entries) - expected_paths
     if unexpected:
         raise PackageError(f"archive contains unmanifested files: {sorted(unexpected)}")
@@ -299,6 +335,7 @@ def _write_tar_gz(
     archive: Path,
     package_root: str,
     contents: dict[str, bytes],
+    modes: dict[str, int],
     manifest: bytes,
     epoch: int,
 ) -> None:
@@ -309,7 +346,11 @@ def _write_tar_gz(
                 _add_tar_directory(output, f"{package_root}/bin", epoch)
                 for relative_path, content in sorted(contents.items()):
                     _add_tar_file(
-                        output, f"{package_root}/{relative_path}", content, 0o755, epoch
+                        output,
+                        f"{package_root}/{relative_path}",
+                        content,
+                        modes[relative_path],
+                        epoch,
                     )
                 _add_tar_file(
                     output, f"{package_root}/manifest.json", manifest, 0o644, epoch
@@ -346,6 +387,7 @@ def _write_zip(
     archive: Path,
     package_root: str,
     contents: dict[str, bytes],
+    modes: dict[str, int],
     manifest: bytes,
     epoch: int,
 ) -> None:
@@ -354,7 +396,11 @@ def _write_zip(
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as output:
         for relative_path, content in sorted(contents.items()):
             _write_zip_file(
-                output, f"{package_root}/{relative_path}", content, 0o755, date_time
+                output,
+                f"{package_root}/{relative_path}",
+                content,
+                modes[relative_path],
+                date_time,
             )
         _write_zip_file(
             output, f"{package_root}/manifest.json", manifest, 0o644, date_time

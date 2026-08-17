@@ -1,9 +1,13 @@
 .DS_Store
 target/
 dist/
+.npm-smoke/
 node_modules/
 sdk/typescript/.test-dist/
 __pycache__/
 *.py[cod]
 .venv/
 .golutra/
+.env
+.env.*
+!.env.example

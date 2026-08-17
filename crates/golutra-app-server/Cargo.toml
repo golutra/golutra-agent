@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+description.workspace = true
+readme.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 async-stream.workspace = true
@@ -14,10 +20,10 @@ chrono.workspace = true
 clap.workspace = true
 fs2.workspace = true
 futures-util.workspace = true
-golutra-client = { path = "../golutra-client" }
+golutra-client = { path = "../golutra-client", version = "0.1.0" }
 golutra-core.workspace = true
 golutra-protocol.workspace = true
-golutra-store = { path = "../golutra-store" }
+golutra-store = { path = "../golutra-store", version = "0.1.0" }
 miette.workspace = true
 secrecy.workspace = true
 serde.workspace = true

@@ -18,7 +18,7 @@ done
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
-cargo build --release \
+cargo build --locked --release \
   -p golutra-cli \
   -p golutra-tui \
   -p golutra-app-server \

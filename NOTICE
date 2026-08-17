@@ -1,0 +1,12 @@
+Golutra Agent
+Copyright 2026 Golutra contributors.
+
+This distribution includes third-party dependencies. Their respective
+copyright and license notices remain applicable. Dependency versions and
+sources are recorded in Cargo.lock and sdk/typescript/package-lock.json;
+the applicable license text and notices remain owned by each dependency.
+
+The README visual assets under assets/readme/ are branding materials supplied
+by the Golutra copyright holder for display in this repository. This permission
+does not grant trademark rights or a general license to reuse the assets
+outside this repository.

@@ -4,6 +4,7 @@ use clap::Parser;
 
 #[derive(Debug, Parser)]
 #[command(name = "golutra-app-server")]
+#[command(version)]
 #[command(about = "Golutra user-level runtime daemon and HTTP app server")]
 struct Args {
     #[arg(long, env = "GOLUTRA_APP_ADDR", default_value = "127.0.0.1:47831")]

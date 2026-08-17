@@ -8,6 +8,7 @@ use golutra_vis::{audit_report, load_all_events, otel_trace};
 
 #[derive(Debug, Parser)]
 #[command(name = "golutra-vis")]
+#[command(version)]
 #[command(about = "Golutra runtime trace, audit, and OpenTelemetry projection")]
 struct Cli {
     #[arg(long)]

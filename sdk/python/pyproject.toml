@@ -7,7 +7,23 @@ name = "golutra-agent-sdk"
 version = "0.1.0"
 description = "Python client for the Golutra Agent runtime protocol"
 requires-python = ">=3.11"
-license = { text = "MIT OR Apache-2.0" }
+license = { text = "Apache-2.0" }
+keywords = ["golutra", "agent", "coding-agent", "runtime", "sdk"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+[project.urls]
+Homepage = "https://github.com/golutra/golutra-agent"
+Repository = "https://github.com/golutra/golutra-agent"
+Issues = "https://github.com/golutra/golutra-agent/issues"
+Security = "https://github.com/golutra/golutra-agent/security"
 
 [tool.setuptools.packages.find]
 where = ["src"]

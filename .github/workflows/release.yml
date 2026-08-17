@@ -9,28 +9,81 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   package:
-    name: Package (${{ matrix.os }})
+    name: Package (${{ matrix.target }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          # Keep the release matrix explicit: the root npm package is generated
+          # from the targets that actually produced a verified native artifact.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            npm_suffix: linux-x64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            npm_suffix: linux-arm64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            npm_suffix: darwin-x64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            npm_suffix: darwin-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            npm_suffix: win32-x64
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            npm_suffix: win32-arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.93.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Build and package release
-        run: python3 scripts/package_release.py --output-dir dist
+      - name: Open-source metadata
+        shell: bash
+        run: python scripts/check_open_source.py
+      - name: Build and package release archive
+        shell: bash
+        run: python scripts/package_release.py --output-dir dist --target "${{ matrix.target }}"
+      - name: Package native npm target
+        shell: bash
+        run: |
+          python scripts/package_npm.py \
+            --package platform \
+            --target "${{ matrix.target }}" \
+            --binary-dir "target/${{ matrix.target }}/release" \
+            --output-dir dist/npm
+      - name: Package matching npm root and run smoke test
+        shell: bash
+        run: |
+          python scripts/package_npm.py \
+            --package root \
+            --targets "${{ matrix.target }}" \
+            --output-dir .npm-smoke
+          root_archive="$(find .npm-smoke -maxdepth 1 -type f -name 'golutra-agent-npm-[0-9]*.tgz' -print -quit)"
+          platform_archive="$(find dist/npm -maxdepth 1 -type f -name 'golutra-agent-npm-${{ matrix.npm_suffix }}-*.tgz' -print -quit)"
+          test -n "$root_archive"
+          test -n "$platform_archive"
+          python scripts/smoke_npm_package.py \
+            --root-tarball "$root_archive" \
+            --platform-tarball "$platform_archive"
       - uses: actions/upload-artifact@v4
         with:
-          name: golutra-agent-${{ runner.os }}-${{ runner.arch }}
-          path: dist/*
+          name: golutra-agent-${{ matrix.target }}
+          path: dist/**
           if-no-files-found: error
 
   publish:
@@ -39,12 +92,128 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
     steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Install OIDC-capable npm
+        run: npm install --global npm@11.17.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - uses: actions/download-artifact@v4
         with:
           path: release-assets
           merge-multiple: true
+      - name: Check release metadata and build root npm package
+        shell: bash
+        run: |
+          python scripts/check_open_source.py
+          version="$(python - <<'PY'
+          import tomllib
+          from pathlib import Path
+          with (Path('Cargo.toml')).open('rb') as source:
+              print(tomllib.load(source)['workspace']['package']['version'])
+          PY
+          )"
+          test "${GITHUB_REF_NAME#v}" = "$version"
+          mapfile -t platform_manifests < <(
+            while IFS= read -r -d '' manifest; do
+              if [[ "$(jq -r '.kind' "$manifest")" = "platform" ]]; then
+                printf '%s\n' "$manifest"
+              fi
+            done < <(
+              find release-assets -type f -name 'golutra-agent-npm-*.tgz.manifest.json' -print0
+            ) | sort
+          )
+          test "${#platform_manifests[@]}" -eq 6
+          for manifest in "${platform_manifests[@]}"; do
+            jq -e --arg version "$version" \
+              '.kind == "platform" and .version == $version and (.target | type == "string") and (.tarball | type == "string")' \
+              "$manifest" >/dev/null
+          done
+          mapfile -t targets < <(
+            printf '%s\n' "${platform_manifests[@]}" \
+              | xargs -r jq -r '.target' \
+              | sort -u
+          )
+          expected_targets=(
+            aarch64-apple-darwin
+            aarch64-pc-windows-msvc
+            aarch64-unknown-linux-gnu
+            x86_64-apple-darwin
+            x86_64-pc-windows-msvc
+            x86_64-unknown-linux-gnu
+          )
+          test "${#targets[@]}" -eq "${#expected_targets[@]}"
+          test "$(printf '%s\n' "${targets[@]}")" = "$(printf '%s\n' "${expected_targets[@]}")"
+          python scripts/package_npm.py \
+            --package root \
+            --version "$version" \
+            --targets "${targets[@]}" \
+            --output-dir release-assets/npm
+          root_manifest="release-assets/npm/golutra-agent-npm-$version.tgz.manifest.json"
+          test -f "$root_manifest"
+          jq . "$root_manifest"
+      - name: Publish platform npm packages with OIDC provenance
+        shell: bash
+        env:
+          NPM_BOOTSTRAP_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}
+        run: |
+          if [[ -n "$NPM_BOOTSTRAP_TOKEN" ]]; then
+            export NODE_AUTH_TOKEN="$NPM_BOOTSTRAP_TOKEN"
+          fi
+          mapfile -t platform_manifests < <(
+            while IFS= read -r -d '' manifest; do
+              if [[ "$(jq -r '.kind' "$manifest")" = "platform" ]]; then
+                printf '%s\n' "$manifest"
+              fi
+            done < <(
+              find release-assets -type f -name 'golutra-agent-npm-*.tgz.manifest.json' -print0
+            ) | sort
+          )
+          test "${#platform_manifests[@]}" -eq 6
+          for manifest in "${platform_manifests[@]}"; do
+            test "$(jq -r '.kind' "$manifest")" = "platform"
+            package="$(jq -r '.package' "$manifest")"
+            version="$(jq -r '.version' "$manifest")"
+            archive="$(jq -r '.tarball' "$manifest")"
+            mapfile -t matches < <(find release-assets -type f -name "$archive" -print)
+            test "${#matches[@]}" -eq 1
+            if [[ "$(npm view "$package@$version" version 2>/dev/null || true)" = "$version" ]]; then
+              echo "$package@$version is already published; skipping"
+              continue
+            fi
+            npm publish "${matches[0]}" \
+              --provenance --access public
+          done
+      - name: Publish npm root package with OIDC provenance
+        shell: bash
+        env:
+          NPM_BOOTSTRAP_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}
+        run: |
+          if [[ -n "$NPM_BOOTSTRAP_TOKEN" ]]; then
+            export NODE_AUTH_TOKEN="$NPM_BOOTSTRAP_TOKEN"
+          fi
+          version="$(python - <<'PY'
+          import tomllib
+          from pathlib import Path
+          with (Path('Cargo.toml')).open('rb') as source:
+              print(tomllib.load(source)['workspace']['package']['version'])
+          PY
+          )"
+          root_archive="release-assets/npm/golutra-agent-npm-$version.tgz"
+          test -f "$root_archive"
+          if [[ "$(npm view "@golutra/agent@$version" version 2>/dev/null || true)" = "$version" ]]; then
+            echo "@golutra/agent@$version is already published; skipping"
+            exit 0
+          fi
+          npm publish "$root_archive" \
+            --provenance --access public
       - uses: softprops/action-gh-release@v2
         with:
-          files: release-assets/*
+          files: release-assets/**
           fail_on_unmatched_files: true

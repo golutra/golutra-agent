@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+description.workspace = true
+readme.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 async-trait.workspace = true
@@ -12,7 +18,7 @@ base64.workspace = true
 eventsource-stream.workspace = true
 futures-util.workspace = true
 genai.workspace = true
-golutra-auth = { path = "../golutra-auth" }
+golutra-auth = { path = "../golutra-auth", version = "0.1.0" }
 golutra-core.workspace = true
 reqwest.workspace = true
 reqwest13.workspace = true

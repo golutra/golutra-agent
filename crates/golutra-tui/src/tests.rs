@@ -2955,12 +2955,12 @@ fn debug_candidates_render_parent_and_switch_from_a_short_prefix() {
 
 #[test]
 fn footer_context_shows_model_and_home_relative_workspace_without_wrapping() {
-    let workspace = Path::new("/Users/skyseek/Desktop/project/open/golutra-agent/golutra-agent");
-    let label = workspace_path_label_with_home(workspace, Some(Path::new("/Users/skyseek")));
+    let workspace = Path::new("/Users/developer/Desktop/project/open/golutra-agent");
+    let label = workspace_path_label_with_home(workspace, Some(Path::new("/Users/developer")));
 
     assert_eq!(
         fit_model_and_workspace("gpt-5.6-sol ultra", &label, 120),
-        "gpt-5.6-sol ultra · ~/Desktop/project/open/golutra-agent/golutra-agent"
+        "gpt-5.6-sol ultra · ~/Desktop/project/open/golutra-agent"
     );
 
     let narrow = fit_model_and_workspace("gpt-5.6-sol ultra", &label, 30);

@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/golutra/golutra-agent/security/advisories/new
+    about: Report security issues privately; do not post credentials or exploit details in a public issue.
+  - name: Documentation
+    url: https://github.com/golutra/golutra-agent/tree/main/docs
+    about: Read the architecture and runtime documentation before opening a usage question.

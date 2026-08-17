@@ -160,9 +160,21 @@ Unix 使用 `scripts/install.sh`，Windows 使用 `scripts/install.ps1`。脚本
 - `golutra-launcher`
 - `golutra-eval-worker`
 
-`python3 scripts/package_release.py` 使用相同 binary 集合生成版本化 `.tar.gz` 或 `.zip`，并同时生成外置 manifest 与 SHA-256 sidecar。manifest 也内嵌在归档中；`--verify ARCHIVE` 会复验 sidecar、归档路径、文件类型、执行位、逐文件 size/hash 和内外 manifest 一致性。归档拒绝 symlink、special file、路径穿越、空 binary 和未声明文件。`SOURCE_DATE_EPOCH` 可固定时间戳；默认使用当前 Git commit 时间，因此相同输入得到相同归档。
+如果只需要交互式 TUI 或脚本 CLI，可以使用 npm 分发：
 
-`.github/workflows/release.yml` 是本仓库独立交付面：tag 或手动触发后分别在 Linux、macOS、Windows 构建，tag 构建只有在 `v<workspace-version>` 完全匹配时才发布。它只交付 Golutra Agent 的 7 个 Rust 入口，不包含 `/Applications/Golutra.app` 或任何外部桌面应用。
+```bash
+npm install -g @golutra/agent
+golutra-tui
+```
+
+`@golutra/agent` 是无状态 JavaScript wrapper，平台原生包通过 npm
+`optionalDependencies` 安装，wrapper 根据 `process.platform` 和 `process.arch`
+选择 binary，并转发 stdio、信号和退出码。它没有 `postinstall` 联网下载步骤；完整的
+app-server、观测、supervisor 和 evaluation 入口仍使用下面的 release archive。
+
+`python3 scripts/package_release.py` 使用相同 binary 集合生成版本化 `.tar.gz` 或 `.zip`，并同时生成外置 manifest 与 SHA-256 sidecar。manifest 也内嵌在归档中；归档根目录还包含 `LICENSE` 和 `NOTICE`。`--verify ARCHIVE` 会复验 sidecar、归档路径、文件类型、执行位、文档权限、逐文件 size/hash 和内外 manifest 一致性。归档拒绝 symlink、special file、路径穿越、空 binary、缺失法律文件和未声明文件。`SOURCE_DATE_EPOCH` 可固定时间戳；默认使用当前 Git commit 时间，因此相同输入得到相同归档。
+
+`.github/workflows/release.yml` 是本仓库独立交付面：tag 或手动触发后分别在 Linux、macOS、Windows 构建，tag 构建只有在 `v<workspace-version>` 完全匹配时才发布。它交付 Golutra Agent 的完整 7 个 Rust 入口归档，并额外发布 `@golutra/agent` 的 CLI/TUI npm wrapper 与当前矩阵生成的原生平台包；npm 发布使用 OIDC provenance，不通过 `postinstall` 联网下载。它不包含 `/Applications/Golutra.app` 或任何外部桌面应用。
 
 升级不会写项目目录。SQLite 使用幂等 migration 和 legacy column backfill；provider v1 明文 env map 只在 provider settings lock 内迁移到 disk SecretRef。rollout 可从 SQLite 重建，未开始 pending turn 可在 owner 重启后恢复，已开始 turn 不做不安全重放。
 

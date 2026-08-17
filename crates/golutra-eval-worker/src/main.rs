@@ -17,6 +17,7 @@ const TASK_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Parser)]
 #[command(name = "golutra-eval-worker", hide = true)]
+#[command(version)]
 struct Cli {
     #[arg(long)]
     home: PathBuf,

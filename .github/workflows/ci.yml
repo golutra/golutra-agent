@@ -6,6 +6,13 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   rust:
     runs-on: ubuntu-latest
@@ -18,9 +25,9 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -30,14 +37,17 @@ jobs:
         run: |
           npm ci --prefix sdk/typescript
           npm test --prefix sdk/typescript
+          npm audit --audit-level=high --prefix sdk/typescript
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Open-source metadata
+        run: python3 scripts/check_open_source.py
       - name: Release packaging smoke
         run: python3 -m unittest discover -s scripts/tests -v
       - name: Protocol generation and Python SDK
         run: |
-          cargo run -p golutra-protocol-fixtures --bin export_sdk_schema -- schemas/sdk-protocol.schema.json
+          cargo run --locked -p golutra-protocol-fixtures --bin export_sdk_schema -- schemas/sdk-protocol.schema.json
           npm run --prefix sdk/typescript generate
           python3 sdk/python/scripts/generate.py
           python3 -m compileall -q sdk/python/src sdk/python/tests
@@ -64,7 +74,7 @@ jobs:
         with:
           toolchain: 1.93.0
       - name: Cross-process Driver lifecycle
-        run: cargo test -p golutra-tui --test tui_driver_process -- --test-threads=1
+        run: cargo test --locked -p golutra-tui --test tui_driver_process -- --test-threads=1
 
   portable-check:
     strategy:
@@ -78,4 +88,4 @@ jobs:
         with:
           toolchain: 1.93.0
       - name: Cross-platform compile
-        run: cargo check --workspace --all-targets
+        run: cargo check --workspace --all-targets --locked

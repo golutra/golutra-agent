@@ -12,7 +12,7 @@
 
 ## qwen-code 参考结论
 
-参考路径：`/Users/skyseek/Desktop/project/open/golutra-agent/project/qwen-code`。
+参考项目：[Qwen Code](https://github.com/QwenLM/qwen-code)。
 
 ### 首次认证触发
 
@@ -64,7 +64,7 @@ Golutra 不应照搬把明文 key 默认写入 workspace。推荐持久化分层
 
 ## Codex 参考结论
 
-参考路径：`/Users/skyseek/Desktop/project/open/golutra-agent/project/codex`。
+参考项目：[OpenAI Codex](https://github.com/openai/codex)。
 
 ### Thread / session 分层
 

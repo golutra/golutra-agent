@@ -1,5 +1,9 @@
 # Golutra Docs
 
+开源维护入口：[open-source-readiness.md](open-source-readiness.md)。贡献、行为规范、
+安全和支持入口位于仓库根目录的 `CONTRIBUTING.md`、`CODE_OF_CONDUCT.md`、
+`SECURITY.md` 和 `SUPPORT.md`。
+
 ## 推荐阅读顺序
 
 1. `ARCHITECTURE.md`：主架构规格，作为实现时的架构真相。

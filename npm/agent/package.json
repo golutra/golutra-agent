@@ -1,0 +1,37 @@
+{
+  "name": "@golutra/agent",
+  "version": "0.0.0-dev",
+  "description": "Golutra coding agent runtime for local development",
+  "license": "Apache-2.0",
+  "bin": {
+    "golutra": "bin/golutra.js",
+    "golutra-tui": "bin/golutra-tui.js"
+  },
+  "files": [
+    "bin",
+    "LICENSE",
+    "NOTICE",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/golutra/golutra-agent.git"
+  },
+  "homepage": "https://github.com/golutra/golutra-agent",
+  "bugs": {
+    "url": "https://github.com/golutra/golutra-agent/issues"
+  },
+  "keywords": [
+    "golutra",
+    "coding-agent",
+    "agent-runtime",
+    "tui"
+  ],
+  "type": "module"
+}

@@ -1,0 +1,55 @@
+name: Feature request
+description: Propose a focused improvement to Golutra Agent
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Prefer a focused proposal with a clear user problem and a measurable outcome.
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Affected surface
+      options:
+        - TUI
+        - CLI
+        - Runtime
+        - App server or transport
+        - Protocol or SDK
+        - Policy or security
+        - Release tooling
+        - Documentation
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: What is difficult or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the smallest useful behavior and its boundaries.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and trade-offs
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence or examples
+      description: Add examples, screenshots, traces, or prior art with sensitive data removed.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched existing issues and this request is not a security report.
+          required: true

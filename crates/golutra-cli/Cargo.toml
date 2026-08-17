@@ -5,19 +5,25 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+description.workspace = true
+readme.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 chrono.workspace = true
 clap.workspace = true
-golutra-app-server = { path = "../golutra-app-server" }
-golutra-auth = { path = "../golutra-auth" }
-golutra-client = { path = "../golutra-client" }
-golutra-code-intelligence = { path = "../golutra-code-intelligence" }
-golutra-config = { path = "../golutra-config" }
+golutra-app-server = { path = "../golutra-app-server", version = "0.1.0" }
+golutra-auth = { path = "../golutra-auth", version = "0.1.0" }
+golutra-client = { path = "../golutra-client", version = "0.1.0" }
+golutra-code-intelligence = { path = "../golutra-code-intelligence", version = "0.1.0" }
+golutra-config = { path = "../golutra-config", version = "0.1.0" }
 golutra-core.workspace = true
-golutra-eval = { path = "../golutra-eval" }
-golutra-llm = { path = "../golutra-llm" }
-golutra-plugin = { path = "../golutra-plugin" }
+golutra-eval = { path = "../golutra-eval", version = "0.1.0" }
+golutra-llm = { path = "../golutra-llm", version = "0.1.0" }
+golutra-plugin = { path = "../golutra-plugin", version = "0.1.0" }
 golutra-project-service.workspace = true
 golutra-protocol.workspace = true
 miette.workspace = true

@@ -11,6 +11,7 @@ const MAX_CONTROL_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "golutra-supervisor")]
+#[command(version)]
 #[command(about = "Golutra governed evolution and release control plane")]
 struct Cli {
     #[arg(long, env = "GOLUTRA_SUPERVISOR_HOME")]

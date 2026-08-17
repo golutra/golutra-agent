@@ -15,7 +15,7 @@
 
 ## qwen-code 调研结论
 
-参考路径：`/Users/skyseek/Desktop/project/open/golutra-agent/project/qwen-code`。
+参考项目：[Qwen Code](https://github.com/QwenLM/qwen-code)。
 
 可吸收的设计点：
 
@@ -33,7 +33,7 @@ Golutra 不直接复制 qwen-code 的配置文件形状。Golutra 的核心仍�
 
 ## Codex 调研结论
 
-参考路径：`/Users/skyseek/Desktop/project/open/golutra-agent/project/codex`。
+参考项目：[OpenAI Codex](https://github.com/openai/codex)。
 
 - Codex 在 `codex-rs/login/src/auth/storage.rs` 用统一 `AuthStorageBackend` 隔离 file、keyring、auto 和 ephemeral storage；keyring account 包含 canonical `CODEX_HOME` hash，避免替代 home 读到真实用户凭据。
 - `AuthCredentialsStoreMode` 明确区分 file/keyring/auto/ephemeral，OAuth token 的存储选择不进入 model provider adapter。
@@ -42,7 +42,7 @@ Golutra 不直接复制 qwen-code 的配置文件形状。Golutra 的核心仍�
 
 ## opencode 调研结论
 
-参考路径：`/Users/skyseek/Desktop/project/open/golutra-agent/project/opencode`。
+参考项目：[OpenCode](https://github.com/anomalyco/opencode)。
 
 - opencode 的 OAuth 不是从任意 endpoint 猜测授权地址，而是 provider auth plugin 注册认证方法和 request loader：OpenAI 使用 browser PKCE 和私有 headless device-auth，xAI 同时提供 browser/device，GitHub Copilot 使用 device flow，GitLab/Poe 等可由外部 plugin 扩展。
 - 授权成功不等于 provider 可用。OpenAI ChatGPT subscription token 必须改走 Codex Responses SSE endpoint并携带 `ChatGPT-Account-Id`；GitHub Copilot 请求必须增加 GitHub API version、intent、initiator 等 header。Golutra 因此把 OAuth method 与固定 runtime adapter 一起注册。

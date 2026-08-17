@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+description.workspace = true
+readme.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 async-trait.workspace = true
@@ -14,19 +20,19 @@ futures-util.workspace = true
 fs2.workspace = true
 jsonschema.workspace = true
 golutra-core.workspace = true
-golutra-config = { path = "../golutra-config" }
-golutra-context = { path = "../golutra-context" }
-golutra-eval = { path = "../golutra-eval" }
-golutra-evolution = { path = "../golutra-evolution" }
-golutra-llm = { path = "../golutra-llm" }
-golutra-memory = { path = "../golutra-memory" }
-golutra-mcp = { path = "../golutra-mcp" }
-golutra-policy = { path = "../golutra-policy" }
-golutra-plugin = { path = "../golutra-plugin" }
+golutra-config = { path = "../golutra-config", version = "0.1.0" }
+golutra-context = { path = "../golutra-context", version = "0.1.0" }
+golutra-eval = { path = "../golutra-eval", version = "0.1.0" }
+golutra-evolution = { path = "../golutra-evolution", version = "0.1.0" }
+golutra-llm = { path = "../golutra-llm", version = "0.1.0" }
+golutra-memory = { path = "../golutra-memory", version = "0.1.0" }
+golutra-mcp = { path = "../golutra-mcp", version = "0.1.0" }
+golutra-policy = { path = "../golutra-policy", version = "0.1.0" }
+golutra-plugin = { path = "../golutra-plugin", version = "0.1.0" }
 golutra-protocol.workspace = true
-golutra-runtime = { path = "../golutra-runtime" }
-golutra-store = { path = "../golutra-store" }
-golutra-tools = { path = "../golutra-tools" }
+golutra-runtime = { path = "../golutra-runtime", version = "0.1.0" }
+golutra-store = { path = "../golutra-store", version = "0.1.0" }
+golutra-tools = { path = "../golutra-tools", version = "0.1.0" }
 reqwest.workspace = true
 ring.workspace = true
 secrecy.workspace = true
@@ -45,4 +51,4 @@ walkdir.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
-golutra-auth = { path = "../golutra-auth" }
+golutra-auth = { path = "../golutra-auth", version = "0.1.0" }

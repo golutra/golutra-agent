@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+description.workspace = true
+readme.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 base64.workspace = true
@@ -13,11 +19,11 @@ clap.workspace = true
 crossterm.workspace = true
 fs2.workspace = true
 futures-util.workspace = true
-golutra-auth = { path = "../golutra-auth" }
-golutra-client = { path = "../golutra-client" }
-golutra-config = { path = "../golutra-config" }
+golutra-auth = { path = "../golutra-auth", version = "0.1.0" }
+golutra-client = { path = "../golutra-client", version = "0.1.0" }
+golutra-config = { path = "../golutra-config", version = "0.1.0" }
 golutra-core.workspace = true
-golutra-llm = { path = "../golutra-llm" }
+golutra-llm = { path = "../golutra-llm", version = "0.1.0" }
 golutra-protocol.workspace = true
 ignore.workspace = true
 miette.workspace = true
@@ -37,4 +43,4 @@ unicode-width.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-golutra-app-server = { path = "../golutra-app-server" }
+golutra-app-server = { path = "../golutra-app-server", version = "0.1.0" }

@@ -49,6 +49,7 @@ mod mcp_server;
 
 #[derive(Debug, Parser)]
 #[command(name = "golutra")]
+#[command(version)]
 #[command(about = "Golutra coding agent runtime CLI")]
 struct Cli {
     #[arg(long, global = true)]

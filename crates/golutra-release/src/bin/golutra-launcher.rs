@@ -3,6 +3,13 @@ use std::{env, ffi::OsString, path::PathBuf, process::Command};
 use golutra_release::ReleaseStore;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if matches!(
+        env::args_os().nth(1),
+        Some(argument) if argument == "--version" || argument == "-V"
+    ) {
+        println!("golutra-launcher {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let release_home = env::var_os("GOLUTRA_RELEASE_HOME")
         .map(PathBuf::from)
         .ok_or("GOLUTRA_RELEASE_HOME is required")?;

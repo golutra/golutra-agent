@@ -1,0 +1,9 @@
+# Default reviewers for the source repository. Keep this account synchronized
+# with the maintainer set documented in GOVERNANCE.md.
+* @seekskyworld
+
+# Security and workflow changes should receive maintainer review.
+/.github/ @seekskyworld
+/LICENSE @seekskyworld
+/NOTICE @seekskyworld
+/SECURITY.md @seekskyworld

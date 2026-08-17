@@ -5,13 +5,19 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+description.workspace = true
+readme.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 async-trait.workspace = true
 chrono.workspace = true
 golutra-core.workspace = true
-golutra-code-intelligence = { path = "../golutra-code-intelligence" }
-golutra-policy = { path = "../golutra-policy" }
+golutra-code-intelligence = { path = "../golutra-code-intelligence", version = "0.1.0" }
+golutra-policy = { path = "../golutra-policy", version = "0.1.0" }
 golutra-sandbox.workspace = true
 jsonschema.workspace = true
 regex.workspace = true

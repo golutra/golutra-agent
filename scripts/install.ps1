@@ -6,7 +6,7 @@ $ErrorActionPreference = "Stop"
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 Push-Location $Root
 try {
-    cargo build --release `
+    cargo build --locked --release `
         -p golutra-cli `
         -p golutra-tui `
         -p golutra-app-server `

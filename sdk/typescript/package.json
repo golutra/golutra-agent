@@ -2,6 +2,21 @@
   "name": "@golutra/agent-sdk",
   "version": "0.1.0",
   "private": true,
+  "description": "TypeScript client for the Golutra Agent runtime protocol",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/golutra/golutra-agent.git",
+    "directory": "sdk/typescript"
+  },
+  "bugs": {
+    "url": "https://github.com/golutra/golutra-agent/issues"
+  },
+  "homepage": "https://github.com/golutra/golutra-agent/tree/main/sdk/typescript",
+  "keywords": ["golutra", "agent", "coding-agent", "runtime", "sdk"],
+  "overrides": {
+    "js-yaml": "4.3.1"
+  },
   "type": "module",
   "exports": {
     ".": "./src/index.ts",

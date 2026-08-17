@@ -39,8 +39,14 @@ resolver = "3"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 repository = "https://github.com/golutra/golutra-agent"
+homepage = "https://github.com/golutra/golutra-agent"
+documentation = "https://github.com/golutra/golutra-agent/tree/main/docs"
+description = "Rust-first local coding agent runtime with a terminal UI, CLI, typed protocol, and SDKs."
+readme = "README.md"
+keywords = ["ai", "agent", "coding-agent", "runtime", "tui"]
+categories = ["command-line-utilities", "development-tools"]
 rust-version = "1.93"
 
 [workspace.dependencies]
@@ -95,11 +101,11 @@ unicode-width = "0.1.14"
 webbrowser = "1.0"
 walkdir = "2.5"
 
-golutra-release = { path = "crates/golutra-release" }
-golutra-supervisor = { path = "crates/golutra-supervisor" }
+golutra-release = { path = "crates/golutra-release", version = "0.1.0" }
+golutra-supervisor = { path = "crates/golutra-supervisor", version = "0.1.0" }
 
-golutra-core = { path = "crates/golutra-core" }
-golutra-protocol = { path = "crates/golutra-protocol" }
-golutra-protocol-fixtures = { path = "crates/golutra-protocol-fixtures" }
-golutra-project-service = { path = "crates/golutra-project-service" }
-golutra-sandbox = { path = "crates/golutra-sandbox" }
+golutra-core = { path = "crates/golutra-core", version = "0.1.0" }
+golutra-protocol = { path = "crates/golutra-protocol", version = "0.1.0" }
+golutra-protocol-fixtures = { path = "crates/golutra-protocol-fixtures", version = "0.1.0" }
+golutra-project-service = { path = "crates/golutra-project-service", version = "0.1.0" }
+golutra-sandbox = { path = "crates/golutra-sandbox", version = "0.1.0" }
