@@ -16,7 +16,9 @@ use tokio::{
 use super::*;
 
 const MAX_IPC_FRAME_BYTES: usize = 128 * 1024;
-const IPC_RESPONSE_HEAD_TIMEOUT: Duration = Duration::from_secs(10);
+// Match the bounded HTTP request lifetime. A command can legitimately spend time opening and
+// migrating its workspace store before the router can produce a response head.
+const IPC_RESPONSE_HEAD_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 struct IpcResponse {

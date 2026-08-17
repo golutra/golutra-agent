@@ -1477,7 +1477,8 @@ async fn daemon_driver_enforces_binding_and_survives_disconnect_and_restart() {
             "text": "sleep"
         }))
         .await;
-    assert_eq!(driver_a.receive("sleep").await["type"], "accepted");
+    let sleep = driver_a.receive("sleep").await;
+    assert_eq!(sleep["type"], "accepted", "initial prompt: {sleep}");
     driver_a
         .send(json!({
             "request_id": "started",
