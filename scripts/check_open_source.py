@@ -276,8 +276,8 @@ def check_repository(root: Path) -> list[str]:
             for runner, target, platform_suffix in (
                 ("ubuntu-latest", "x86_64-unknown-linux-gnu", "linux-x64"),
                 ("ubuntu-24.04-arm", "aarch64-unknown-linux-gnu", "linux-arm64"),
-                ("macos-13", "x86_64-apple-darwin", "darwin-x64"),
-                ("macos-14", "aarch64-apple-darwin", "darwin-arm64"),
+                ("macos-15-intel", "x86_64-apple-darwin", "darwin-x64"),
+                ("macos-15", "aarch64-apple-darwin", "darwin-arm64"),
                 ("windows-latest", "x86_64-pc-windows-msvc", "win32-x64"),
                 ("windows-11-arm", "aarch64-pc-windows-msvc", "win32-arm64"),
             ):
