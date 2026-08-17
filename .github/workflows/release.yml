@@ -80,7 +80,7 @@ jobs:
           python scripts/smoke_npm_package.py \
             --root-tarball "$root_archive" \
             --platform-tarball "$platform_archive"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: golutra-agent-${{ matrix.target }}
           path: dist/**
