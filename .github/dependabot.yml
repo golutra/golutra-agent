@@ -4,22 +4,50 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 2
+    groups:
+      cargo-non-major:
+        patterns:
+          - "*"
+        update-types:
+          - patch
+          - minor
 
   - package-ecosystem: npm
     directory: "/sdk/typescript"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 2
+    groups:
+      typescript-non-major:
+        patterns:
+          - "*"
+        update-types:
+          - patch
+          - minor
 
   - package-ecosystem: pip
     directory: "/sdk/python"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 2
+    groups:
+      python-non-major:
+        patterns:
+          - "*"
+        update-types:
+          - patch
+          - minor
 
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 2
+    groups:
+      actions-non-major:
+        patterns:
+          - "*"
+        update-types:
+          - patch
+          - minor
