@@ -288,7 +288,7 @@ schema validation -> pre hook -> permission -> sandbox -> execute -> post hook -
 | HTTP client | `reqwest` | runtime 自有 HTTP 能力、测试和非 provider 网络调用 |
 | Streaming | `tokio` | LLM stream、tool task、background task |
 | Provider abstraction | 自研 trait | 不把 runtime 绑死到某个 vendor SDK |
-| LLM provider 调用 | `reqwest` + `eventsource-stream` + `genai` | OpenAI-compatible/Responses 使用受控 HTTP adapter，native 协议差异交给 `genai` |
+| LLM provider 调用 | `reqwest` + `eventsource-stream` + `genai` | OpenAI-compatible 使用受控 HTTP adapter；Responses 与其他 native wire 交给 `genai` |
 
 建议核心用 provider abstraction：
 
@@ -322,7 +322,7 @@ Golutra ProviderContract
 
 这样可以获得 `genai` 对 OpenAI、OpenAI Responses、Anthropic、Gemini、Ollama、OpenRouter、Groq、DeepSeek、xAI、Bedrock、Vertex、Moonshot、Aliyun 等 provider 的覆盖，同时保留 Golutra 自己的 request、stream event、tool call、usage、error、capability 和 telemetry 标准。
 
-Golutra 保留独立 `OpenAiCompatibleProvider` 和 ChatGPT OAuth 专用 `OpenAiResponsesProvider`，并用一个 `GenaiProviderAdapter` 承担 Anthropic、Gemini、Vertex 和 model-routed genai。Responses adapter 的存在理由是 subscription token、account header、SSE 和 encrypted reasoning replay 不能由 Chat Completions 兼容层正确表达；不会再并行维护 `AnthropicNativeAdapter`、`GeminiNativeAdapter` 等手写类型。各家 native wire 差异统一交给固定版本的 `genai` 处理，并由协议 golden tests 锁定升级影响。
+Golutra 保留独立 `OpenAiCompatibleProvider`，并保留 ChatGPT OAuth 专用的 `OpenAiResponsesProvider` 类型作为 `genai::Client` 薄适配；`GenaiProviderAdapter` 承担 Anthropic、Gemini、Vertex 和 model-routed genai。Responses 薄适配显式选择 `AdapterKind::OpenAIResp`，只补充 subscription token、account/session header、credential refresh、probe 和 encrypted reasoning replay 元数据，Responses JSON/SSE/tool/usage/reasoning wire 由固定版本的 `genai` 处理。这样不再并行维护 Responses、Anthropic、Gemini 等手写 native parser，并由协议 golden tests 锁定升级影响。
 
 `genai` 只对应 Maka / Vercel AI SDK 的 provider client 层，不承担完整 `streamText` / tool loop / UI stream / agent framework 职责。Golutra 的 agent loop、tool execution、permission、verification、fallback、replay 和 UI projection 仍由 runtime 自己掌控。
 

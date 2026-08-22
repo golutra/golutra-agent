@@ -201,12 +201,12 @@ RuntimeEvent -> UiState projection
 ```text
 Golutra ProviderContract
   -> OpenAiCompatibleProvider -> Chat Completions endpoint
-  -> OpenAiResponsesProvider  -> ChatGPT Codex Responses SSE endpoint
+  -> OpenAiResponsesProvider  -> genai::Client (OpenAIResp) -> Responses SSE endpoint
   -> GenaiProviderAdapter      -> genai::Client
        -> Anthropic / Gemini / Vertex / model-routed genai
 ```
 
-`rust-genai` 是 Golutra 的 native multi-provider adapter；独立 OpenAI-compatible adapter 保留给大量兼容 endpoint 和自定义网关；OpenAI Responses adapter 只服务需要 subscription OAuth、account header 和 encrypted reasoning replay 的 ChatGPT Codex wire。三者都不能让第三方类型进入核心数据模型。
+`rust-genai` 是 Golutra 的 native multi-provider 调用层；独立 OpenAI-compatible adapter 保留给大量兼容 endpoint 和自定义网关。`OpenAiResponsesProvider` 是 `rust-genai` 的薄适配：显式固定 `OpenAIResp`，由上游处理 Responses wire、SSE、tool call、usage 与 reasoning，Golutra 只保留动态凭据、account/session header、probe、401 单次刷新、encrypted reasoning replay 元数据和 contract/error/size/telemetry 边界。三条路径都不能让第三方类型进入核心数据模型。
 
 必须保留：
 
@@ -218,7 +218,7 @@ Golutra ProviderContract
 
 原因：
 
-- OpenAI-compatible adapter 覆盖兼容网关；OpenAI Responses adapter 负责 ChatGPT OAuth/Codex wire；genai adapter 负责 Anthropic、Gemini、Vertex 和按模型 namespace 路由的 provider。
+- OpenAI-compatible adapter 覆盖 Chat Completions 兼容网关；OpenAI Responses 薄适配负责 ChatGPT OAuth/Codex 请求扩展并强制选择 `rust-genai::OpenAIResp`；genai adapter 负责 Anthropic、Gemini、Vertex 和按模型 namespace 路由的 provider。
 - Golutra 不为每家 provider 手写并行 adapter 类型，native wire 差异统一委托给固定版本的 rust-genai，并用 committed golden fixture 锁定升级影响。
 - fallback 需要 loop 层掌握上下文一致性，不能由 adapter 私自处理。
 

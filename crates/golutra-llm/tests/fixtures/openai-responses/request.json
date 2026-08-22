@@ -4,17 +4,14 @@
   ],
   "input": [
     {
-      "content": [
-        {
-          "text": "Say hello.",
-          "type": "input_text"
-        }
-      ],
+      "content": "Say hello.",
       "role": "user"
     }
   ],
-  "instructions": "",
   "model": "gpt-golden",
+  "reasoning": {
+    "summary": "detailed"
+  },
   "store": false,
   "stream": true
 }
