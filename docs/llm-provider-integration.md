@@ -51,9 +51,9 @@ Golutra 不直接复制 qwen-code 的配置文件形状。Golutra 的核心仍�
 
 ## 当前状态
 
-截至 2026-07-15：
+截至 2026-08-21：
 
-- `golutra-llm` 已有 `MockProvider`、独立 OpenAI-compatible live adapter，以及基于固定 `rust-genai 0.7.0-beta.12` 的 `GenaiProviderAdapter`。
+- `golutra-llm` 已有 `MockProvider`、独立 OpenAI-compatible live adapter、基于固定 `rust-genai 0.7.0-beta.12` 的 `GenaiProviderAdapter`，以及显式使用其 `OpenAIResp` adapter 的 Responses 薄适配。
 - 默认 provider 是 mock。
 - CLI 已支持 `golutra provider login`、`set-key`、`oauth-login`、`logout` 和 `use`；`provider login` 可填写 `--enable-thinking`、`--reasoning-effort low|medium|high|xhigh`、`--context-window-size <n>`、`--max-tokens <n>`。TUI 首次进入会检查 provider onboarding 状态。
 - 如果全局用户配置没有 active provider profile，TUI 会打开 provider setup；用户可以先选 Golutra API、Third-party Providers、Custom Provider 或 mock，再按 qwen-code 风格选择协议、base URL、凭据存储、推荐或自定义 model 和高级生成配置，最后在 review 页确认脱敏 install plan 后保存。交互输入的 API key 默认进入 `$GOLUTRA_HOME/credentials.json`，也可只保存已有 envKey 引用。
@@ -79,7 +79,7 @@ Golutra 不直接复制 qwen-code 的配置文件形状。Golutra 的核心仍�
 - `provider current`、运行时 resolver 与 `provider probe` 在没有任何配置时都一致解析为 deterministic mock；显式 live 配置损坏或缺失仍返回错误，不静默 fallback。
 - live 模式下配置缺失会显式失败，不再静默回退到 mock。
 - env 入口继续作为非交互配置协议，并已由 SecretRef 层作为只读 credential source 使用；明文值不会复制进 provider 配置。`golutra-auth` 已实现 browser PKCE、RFC 8628 device flow、OpenAI headless device-auth、token refresh/revoke/logout，LLM adapter 在 401 时只强制刷新并重试一次。受审计 catalog 已内置 OpenAI ChatGPT browser/headless、xAI browser/device 和 GitHub Copilot device；自定义 OAuth 仍要求显式 descriptor，不会从任意 OpenAI-compatible base URL 自动推断授权端点。
-- OpenAI ChatGPT OAuth 使用独立 `openai-responses` adapter：请求发往 Codex Responses SSE endpoint，account id 优先从 token response 的 `id_token` 安全提取，调用时携带 `ChatGPT-Account-Id`，并在 `store=false` 的多轮工具调用中保留/回送 encrypted reasoning item。GitHub Copilot adapter 增加其要求的 API version、intent、initiator 和 User-Agent header。
+- OpenAI ChatGPT OAuth 使用 `openai-responses` 薄适配：固定 `rust-genai::OpenAIResp` 后发往 Responses SSE endpoint，不按模型名重新推断协议；account id 优先从 token response 的 `id_token` 安全提取，调用时携带 `ChatGPT-Account-Id`/`session-id`，并在 `store=false` 的多轮工具调用中保留/回送 encrypted reasoning item。流建立阶段的 401 只允许在首个业务事件前刷新重建一次。GitHub Copilot adapter 增加其要求的 API version、intent、initiator 和 User-Agent header。
 - 已提交六组 provider golden fixture，通过本地 HTTP 捕获实际 adapter wire，覆盖完整 message/tool result 序列化、Responses SSE/reasoning replay、文本和 tool-call 响应、usage/finish reason、auth header 与 401。`just provider-live-smoke` 只读取专用 `GOLUTRA_LIVE_*` 环境变量，不读取正常用户凭据，变量不全时安全跳过。
 - provider capability 已有 declared/discovered 两级来源。OpenAI-compatible probe 从 `/models` 的 supported parameters、context window、max output 和 input modalities 更新 streaming/tools/JSON Schema/reasoning/vision；无法发现的字段保留 declared/unknown，不伪造能力。
 - Custom Provider 的 CLI/TUI/profile 已支持 literal 与 env-ref custom headers；Authorization、Host、Content-Length 等 transport header 和疑似明文 secret 会在保存前拒绝，runtime debug 只暴露 header 名称。
@@ -128,7 +128,7 @@ Golutra 第一阶段按协议能力分类，不按品牌分叉 runtime：
 | --- | --- | --- |
 | `mock` | deterministic provider，用于本地 smoke、replay、测试 | 默认启用 |
 | `openai-compatible` | OpenAI Chat Completions 兼容 endpoint，包括 OpenAI、OpenRouter、DashScope compatible、Ollama/vLLM/LM Studio | 独立 adapter，已可用 |
-| `openai-responses` | OpenAI Responses SSE；当前用于 ChatGPT subscription OAuth | 独立 adapter，支持 encrypted reasoning replay，已可用 |
+| `openai-responses` | OpenAI Responses SSE；当前用于 ChatGPT subscription OAuth 和显式 Responses 网关 | `rust-genai::OpenAIResp` 薄适配，支持 encrypted reasoning replay，已可用 |
 | `anthropic` | Anthropic native Messages API | `GenaiProviderAdapter` 强制 Anthropic wire，已可用 |
 | `gemini` | Google Gemini API | `GenaiProviderAdapter` 强制 Gemini wire，已可用 |
 | `vertex-ai` | Google Vertex AI | `GenaiProviderAdapter` 强制 Vertex wire，需完整 project/location base URL 和 bearer/OAuth token |

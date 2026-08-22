@@ -255,6 +255,8 @@ export GOLUTRA_TUI_DRIVER_LIVE=1
 export GOLUTRA_TUI_DRIVER_LIVE_API_KEY="...dedicated test key..."
 export GOLUTRA_TUI_DRIVER_LIVE_BASE_URL="https://provider.example/v1"
 export GOLUTRA_TUI_DRIVER_LIVE_MODEL="model-id"
+# Optional; defaults to openai-compatible.
+export GOLUTRA_TUI_DRIVER_LIVE_PROTOCOL="openai-responses"
 just tui-driver-live-smoke
 ```
 

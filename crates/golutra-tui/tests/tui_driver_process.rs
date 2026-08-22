@@ -14,7 +14,7 @@ use golutra_auth::{CredentialRef, SecretKind};
 use golutra_client::{RuntimeClient, RuntimeTransport};
 use golutra_config::{ProviderConfigPaths, ProviderProfile, ProviderSettings};
 use golutra_core::{ActorKind, QueryId, RedactionStatus, SessionId, TaskStatus};
-use golutra_llm::ProviderGenerationConfig;
+use golutra_llm::{ProviderGenerationConfig, ProviderProtocol};
 use golutra_protocol::{EventFilter, RuntimeQuery, RuntimeQueryKind, TuiFrame, UserProjection};
 use serde_json::{Value, json};
 use tempfile::tempdir;
@@ -1285,6 +1285,7 @@ async fn live_provider_driver_smoke_is_isolated_and_opt_in() {
     const API_KEY_ENV: &str = "GOLUTRA_TUI_DRIVER_LIVE_API_KEY";
     const BASE_URL_ENV: &str = "GOLUTRA_TUI_DRIVER_LIVE_BASE_URL";
     const MODEL_ENV: &str = "GOLUTRA_TUI_DRIVER_LIVE_MODEL";
+    const PROTOCOL_ENV: &str = "GOLUTRA_TUI_DRIVER_LIVE_PROTOCOL";
     const EXPECTED_RESPONSE: &str = "GOLUTRA_DRIVER_LIVE_OK";
     const SYNTHETIC_SECRET: &str = "sk-golutra-live-redaction-marker-1234567890";
 
@@ -1308,6 +1309,16 @@ async fn live_provider_driver_smoke_is_isolated_and_opt_in() {
     );
     assert!(!base_url.trim().is_empty(), "{BASE_URL_ENV} is empty");
     assert!(!model.trim().is_empty(), "{MODEL_ENV} is empty");
+    let protocol_value = std::env::var(PROTOCOL_ENV)
+        .unwrap_or_else(|_| ProviderProtocol::OpenAiCompatible.id().to_owned());
+    let protocol = ProviderProtocol::from_config_value(&protocol_value).unwrap_or_else(|| {
+        panic!("{PROTOCOL_ENV} contains unsupported protocol `{protocol_value}`")
+    });
+    assert_ne!(
+        protocol,
+        ProviderProtocol::Mock,
+        "{PROTOCOL_ENV} must be live"
+    );
 
     let home = tempdir().expect("isolated live home");
     let workspace = tempdir().expect("isolated live workspace");
@@ -1315,7 +1326,7 @@ async fn live_provider_driver_smoke_is_isolated_and_opt_in() {
     let credential =
         CredentialRef::environment(API_KEY_ENV, SecretKind::ApiKey).expect("live credential ref");
     let mut profile =
-        ProviderProfile::openai_compatible("tui-driver-live", base_url, model, credential)
+        ProviderProfile::live_profile("tui-driver-live", protocol, base_url, model, credential)
             .expect("live provider profile");
     profile.generation_config = Some(ProviderGenerationConfig {
         max_tokens: Some(64),
