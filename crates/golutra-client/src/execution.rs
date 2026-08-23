@@ -284,16 +284,14 @@ impl RuntimeHost {
             token_budget_hint: 128,
             source_refs: vec![format!("workspace:{}", workspace_root.display())],
         });
-        if let Some(project_instructions) = load_project_instructions(&workspace_root).await? {
+        if let Some(project_instructions) = load_project_instruction_bundle(&workspace_root).await?
+        {
             contributors.push(ContextContributor {
                 name: "project_instructions".to_owned(),
                 role: ProviderRole::System,
-                content: project_instructions,
+                content: project_instructions.content,
                 token_budget_hint: 2_048,
-                source_refs: vec![format!(
-                    "file:{}",
-                    workspace_root.join("AGENTS.md").display()
-                )],
+                source_refs: project_instructions.source_refs,
             });
         }
         if let Some(skill_context) = self.active_skill_context(&objective).await? {
@@ -319,9 +317,17 @@ impl RuntimeHost {
             RuntimeEventSource::Memory,
             json!({
                 "summary": format!("retrieved {} project memories", memories.len()),
-                "query": objective,
                 "scope": "project",
-                "retrieved": memories,
+                // durable event 只保留可审计的索引元数据，记忆正文仍只进入当前模型上下文。
+                "retrieved": memories.iter().map(|memory| json!({
+                    "memory_id": memory.record.memory_id,
+                    "relevance_score": memory.relevance_score,
+                    "scope": memory.record.scope,
+                    "confidence": memory.record.confidence,
+                    "source_task_id": memory.record.source_task_id,
+                    "evidence_ids": memory.record.evidence_ids,
+                    "matched_term_count": memory.matched_terms.len(),
+                })).collect::<Vec<_>>(),
             }),
         ))
         .await?;

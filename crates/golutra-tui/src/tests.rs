@@ -79,7 +79,11 @@ fn full_tool_profile_is_an_explicit_global_tui_option() {
         ][..],
     ] {
         let args = Args::try_parse_from(arguments).expect("tool-profile TUI arguments");
-        assert_eq!(args.tool_profile, TuiToolProfileArg::Full, "{arguments:?}");
+        assert_eq!(
+            args.tool_profile,
+            Some(TuiToolProfileArg::Full),
+            "{arguments:?}"
+        );
     }
 }
 
@@ -106,7 +110,7 @@ fn strict_execution_mode_is_an_explicit_global_tui_option() {
         let args = Args::try_parse_from(arguments).expect("execution-mode TUI arguments");
         assert_eq!(
             args.execution_mode,
-            TuiExecutionModeArg::Strict,
+            Some(TuiExecutionModeArg::Strict),
             "{arguments:?}"
         );
     }
@@ -1099,9 +1103,13 @@ fn history_replay_resizes_before_committing_new_content() {
         .map(|cell| cell.symbol())
         .collect::<String>();
     let visible = terminal_buffer_text(&terminal);
+    let live_rows = transcript_render_rows(&app)
+        .into_iter()
+        .map(|row| row.line.to_string())
+        .collect::<Vec<_>>();
     assert!(
-        visible.contains("RESIZE_TAIL") || scrollback.contains("RESIZE_TAIL"),
-        "a row clipped using the stale width must not be committed: visible={visible}; scrollback={scrollback}"
+        live_rows.iter().any(|row| row.contains("RESIZE_TAIL")),
+        "the resized response must remain in the live transcript: visible={visible}; scrollback={scrollback}; live={live_rows:#?}"
     );
 }
 
@@ -1172,14 +1180,18 @@ fn completed_history_keeps_latest_response_next_to_composer() {
         .iter()
         .position(|row| row.contains("latest completed response"))
         .expect("latest response row");
+    let result_row = rows
+        .iter()
+        .position(|row| row.contains("Result · Completed · Unverified"))
+        .expect("result card row");
     let composer_row = rows
         .iter()
         .position(|row| row.contains("Ask Golutra to change code or inspect the workspace"))
         .expect("composer row");
 
     assert!(
-        composer_row.saturating_sub(response_row) <= 3,
-        "latest response must stay immediately above the composer: {rows:#?}"
+        response_row < result_row && composer_row.saturating_sub(result_row) <= 6,
+        "latest response and result card must stay above the composer: {rows:#?}"
     );
 }
 
@@ -1298,6 +1310,7 @@ fn resume_keeps_an_oversized_latest_response_above_the_composer() {
         session_id,
         title: "resume target".to_owned(),
         preview: "long response".to_owned(),
+        metadata: String::new(),
     }]));
     let mut terminal = Terminal::with_options(
         TestBackend::new(80, 24),
@@ -1382,17 +1395,21 @@ fn resume_keeps_an_oversized_latest_response_above_the_composer() {
         .iter()
         .position(|row| row.contains("resumed response row 40"))
         .expect("latest resumed response row must remain live");
+    let result_row = rows
+        .iter()
+        .position(|row| row.contains("Result · Completed · Unverified"))
+        .expect("result card row");
     let composer_row = rows
         .iter()
         .position(|row| row.contains("Ask Golutra to change code or inspect the workspace"))
         .expect("composer row");
-    let blank_rows = rows[response_row.saturating_add(1)..composer_row]
+    let blank_rows = rows[result_row.saturating_add(1)..composer_row]
         .iter()
         .filter(|row| row.trim().is_empty())
         .count();
     assert!(
-        blank_rows <= 1,
-        "resume left a gap before the composer: {rows:#?}"
+        response_row < result_row && blank_rows <= 1,
+        "resume result card left a gap before the composer: {rows:#?}"
     );
 }
 
@@ -1553,17 +1570,21 @@ fn oversized_non_tail_response_can_be_archived_atomically() {
         .iter()
         .position(|row| row.contains("latest response"))
         .expect("latest turn remains live");
+    let result_row = rows
+        .iter()
+        .position(|row| row.contains("Result · Completed · Unverified"))
+        .expect("result card row");
     let composer_row = rows
         .iter()
         .position(|row| row.contains("Ask Golutra to change code or inspect the workspace"))
         .expect("composer row");
-    let blank_rows = rows[latest_row.saturating_add(1)..composer_row]
+    let blank_rows = rows[result_row.saturating_add(1)..composer_row]
         .iter()
         .filter(|row| row.trim().is_empty())
         .count();
     assert!(
-        blank_rows <= 1,
-        "latest live turn should stay next to composer: {rows:#?}"
+        latest_row < result_row && blank_rows <= 1,
+        "latest result card should stay next to composer: {rows:#?}"
     );
 }
 
@@ -1783,17 +1804,21 @@ fn replay_rebuild_clears_provisional_frame_before_committing_history() {
         .iter()
         .position(|row| row.contains("resumed response 30"))
         .expect("latest resumed response row");
+    let result_row = rows
+        .iter()
+        .position(|row| row.contains("Result · Completed · Unverified"))
+        .expect("result card row");
     let composer_row = rows
         .iter()
         .position(|row| row.contains("Ask Golutra to change code or inspect the workspace"))
         .expect("composer row");
-    let blank_rows = rows[latest_row.saturating_add(1)..composer_row]
+    let blank_rows = rows[result_row.saturating_add(1)..composer_row]
         .iter()
         .filter(|row| row.trim().is_empty())
         .count();
     assert!(
-        blank_rows <= 1,
-        "replay left a gap before the composer: {rows:#?}"
+        latest_row < result_row && blank_rows <= 1,
+        "replay result card left a gap before the composer: {rows:#?}"
     );
 }
 
@@ -2948,9 +2973,73 @@ fn debug_candidates_render_parent_and_switch_from_a_short_prefix() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>();
 
-    assert_eq!(candidates.len(), 4);
-    assert!(lines[0].contains("/debug  toggle debug view"));
-    assert!(lines[1].contains("/debug switch  toggle expanded or compact observations"));
+    assert_eq!(candidates.len(), 5);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("/debug  toggle debug view"))
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("/debug switch  toggle expanded or compact observations"))
+    );
+}
+
+#[test]
+fn retry_target_uses_the_latest_prompt_and_previous_turn_boundary() {
+    let session_id = SessionId::new();
+    let first_task = TaskId::new();
+    let second_task = TaskId::new();
+    let first_turn = TurnId::new();
+    let second_turn = TurnId::new();
+    let mut first = transcript_event(
+        1,
+        session_id,
+        first_task,
+        RuntimeEventType::TaskCreated,
+        json!({"payload": {"prompt": "first prompt"}}),
+    );
+    first.turn_id = Some(first_turn);
+    let mut second = transcript_event(
+        2,
+        session_id,
+        second_task,
+        RuntimeEventType::TaskCreated,
+        json!({"payload": {"prompt": "second prompt"}}),
+    );
+    second.turn_id = Some(second_turn);
+    let mut update = transcript_event(
+        3,
+        session_id,
+        second_task,
+        RuntimeEventType::TurnUpdated,
+        json!({"payload": {"prompt": "second prompt with update"}}),
+    );
+    update.turn_id = Some(second_turn);
+
+    let target = retry_target(&[first, second, update]).expect("retry target");
+    assert_eq!(target.prompt, "second prompt with update");
+    assert_eq!(target.turn_id, Some(second_turn));
+    assert_eq!(target.fork_from_turn_id, Some(first_turn));
+}
+
+#[test]
+fn retry_target_starts_a_new_session_when_only_one_turn_exists() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let mut event = transcript_event(
+        1,
+        session_id,
+        task_id,
+        RuntimeEventType::TaskCreated,
+        json!({"payload": {"prompt": "only prompt"}}),
+    );
+    event.turn_id = Some(TurnId::new());
+
+    let target = retry_target(&[event]).expect("retry target");
+    assert_eq!(target.prompt, "only prompt");
+    assert!(target.fork_from_turn_id.is_none());
 }
 
 #[test]
@@ -6983,6 +7072,7 @@ fn resume_item(title: &str) -> ResumeThreadItem {
         session_id: SessionId::new(),
         title: title.to_owned(),
         preview: format!("{title} preview"),
+        metadata: String::new(),
     }
 }
 
@@ -7064,6 +7154,7 @@ async fn session_pickers_support_page_boundary_and_wheel_navigation() {
             session_id: SessionId::new(),
             title: format!("session-{index}"),
             preview: format!("preview-{index}"),
+            metadata: String::new(),
         })
         .collect::<Vec<_>>();
     app.resume_picker = Some(ResumePickerState::new(items.clone()));
@@ -7387,6 +7478,7 @@ async fn export_enters_running_before_poll_and_finishes_asynchronously() {
             session_id,
             title: "export fixture".to_owned(),
             preview: "export this session".to_owned(),
+            metadata: String::new(),
         }]),
         step: ExportFlowStep::Review,
         range_input: ComposerInput::from_text("1"),

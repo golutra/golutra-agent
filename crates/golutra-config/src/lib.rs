@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -42,6 +42,7 @@ pub const GOLUTRA_HOME_ENV: &str = "GOLUTRA_HOME";
 const PROVIDER_FILE: &str = "provider.json";
 const PROVIDER_SETTINGS_VERSION: u32 = 2;
 const GOLUTRA_PROVIDER_GENERATION_CONFIG: &str = "GOLUTRA_PROVIDER_GENERATION_CONFIG";
+const MAX_NON_SECRET_RUNTIME_SETTINGS_BYTES: u64 = 64 * 1024;
 pub const CUSTOM_PROVIDER_API_KEY_ENV_PREFIX: &str = "GOLUTRA_CUSTOM_PROVIDER_API_KEY_";
 const DENIED_ENV_KEYS: &[&str] = &[
     "NODE_OPTIONS",
@@ -79,6 +80,121 @@ pub struct RuntimeConfig {
     pub sandbox_profile: String,
     pub protocol_version: String,
     pub model_catalog: ModelCatalog,
+}
+
+/// 可跨运行复用的非敏感运行时设置；凭据和 token 不属于此结构。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NonSecretRuntimeSettings {
+    pub provider_profile: Option<String>,
+    pub model: Option<String>,
+    pub execution_mode: Option<String>,
+    pub verify_on_change: Option<String>,
+    pub tool_profile: Option<String>,
+    pub reasoning_effort: Option<String>,
+}
+
+impl NonSecretRuntimeSettings {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        validate_optional_setting(&self.provider_profile, "provider_profile", 128)?;
+        validate_optional_setting(&self.model, "model", 256)?;
+        validate_optional_setting(&self.execution_mode, "execution_mode", 32)?;
+        validate_optional_setting(&self.verify_on_change, "verify_on_change", 16)?;
+        validate_optional_setting(&self.tool_profile, "tool_profile", 32)?;
+        validate_optional_setting(&self.reasoning_effort, "reasoning_effort", 32)?;
+        if let Some(mode) = &self.execution_mode
+            && !["open", "strict"]
+                .iter()
+                .any(|allowed| mode.eq_ignore_ascii_case(allowed))
+        {
+            return Err(ConfigError::Validation(
+                "execution_mode must be `open` or `strict`".to_owned(),
+            ));
+        }
+        if let Some(value) = &self.verify_on_change
+            && !["auto", "off", "never"]
+                .iter()
+                .any(|allowed| value.eq_ignore_ascii_case(allowed))
+        {
+            return Err(ConfigError::Validation(
+                "verify_on_change must be `auto`, `off`, or `never`".to_owned(),
+            ));
+        }
+        if let Some(profile) = &self.tool_profile
+            && !["coding", "full"]
+                .iter()
+                .any(|allowed| profile.eq_ignore_ascii_case(allowed))
+        {
+            return Err(ConfigError::Validation(
+                "tool_profile must be `coding` or `full`".to_owned(),
+            ));
+        }
+        if let Some(effort) = &self.reasoning_effort
+            && !["default", "low", "medium", "high", "xhigh"]
+                .iter()
+                .any(|allowed| effort.eq_ignore_ascii_case(allowed))
+        {
+            return Err(ConfigError::Validation(
+                "reasoning_effort must be `default`, `low`, `medium`, `high`, or `xhigh`"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// 按 global → project → session 顺序合并，后者只覆盖已声明字段。
+    #[must_use]
+    pub fn merged(global: &Self, project: &Self, session: &Self) -> Self {
+        Self {
+            provider_profile: session
+                .provider_profile
+                .clone()
+                .or_else(|| project.provider_profile.clone())
+                .or_else(|| global.provider_profile.clone()),
+            model: session
+                .model
+                .clone()
+                .or_else(|| project.model.clone())
+                .or_else(|| global.model.clone()),
+            execution_mode: session
+                .execution_mode
+                .clone()
+                .or_else(|| project.execution_mode.clone())
+                .or_else(|| global.execution_mode.clone()),
+            verify_on_change: session
+                .verify_on_change
+                .clone()
+                .or_else(|| project.verify_on_change.clone())
+                .or_else(|| global.verify_on_change.clone()),
+            tool_profile: session
+                .tool_profile
+                .clone()
+                .or_else(|| project.tool_profile.clone())
+                .or_else(|| global.tool_profile.clone()),
+            reasoning_effort: session
+                .reasoning_effort
+                .clone()
+                .or_else(|| project.reasoning_effort.clone())
+                .or_else(|| global.reasoning_effort.clone()),
+        }
+    }
+}
+
+fn validate_optional_setting(
+    value: &Option<String>,
+    name: &str,
+    max_chars: usize,
+) -> Result<(), ConfigError> {
+    if value.as_deref().is_some_and(|value| {
+        value.trim().is_empty()
+            || value.chars().count() > max_chars
+            || value.chars().any(char::is_control)
+    }) {
+        return Err(ConfigError::Validation(format!(
+            "{name} must contain between 1 and {max_chars} characters"
+        )));
+    }
+    Ok(())
 }
 
 impl RuntimeConfig {
@@ -581,6 +697,111 @@ pub fn load_merged_provider_settings(
     paths: &ProviderConfigPaths,
 ) -> Result<ProviderSettings, ConfigError> {
     load_provider_settings(paths)
+}
+
+/// 读取 global 与 project 的非敏感运行时设置；session 覆盖由调用方在内存中合并。
+pub fn load_non_secret_runtime_settings(
+    paths: &ProviderConfigPaths,
+    workspace_root: impl AsRef<Path>,
+) -> Result<NonSecretRuntimeSettings, ConfigError> {
+    let workspace_root = workspace_root.as_ref().canonicalize().map_err(|error| {
+        ConfigError::Io(format!("{}: {error}", workspace_root.as_ref().display()))
+    })?;
+    let project_dir = workspace_root.join(".golutra");
+    let global_dir = canonicalize_runtime_parent(&paths.home)?;
+    let global =
+        load_non_secret_runtime_layer(&paths.home.join("runtime.json"), Some(&global_dir))?;
+    let project =
+        load_non_secret_runtime_layer(&project_dir.join("runtime.json"), Some(&project_dir))?;
+    let empty = NonSecretRuntimeSettings::default();
+    Ok(NonSecretRuntimeSettings::merged(&global, &project, &empty))
+}
+
+fn canonicalize_runtime_parent(path: &Path) -> Result<PathBuf, ConfigError> {
+    match path.canonicalize() {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path.parent().ok_or_else(|| {
+                ConfigError::Io(format!(
+                    "runtime settings parent is unavailable: {}",
+                    path.display()
+                ))
+            })?;
+            let canonical_parent = parent.canonicalize().map_err(|parent_error| {
+                ConfigError::Io(format!("{}: {parent_error}", parent.display()))
+            })?;
+            Ok(canonical_parent.join(path.file_name().ok_or_else(|| {
+                ConfigError::Io(format!(
+                    "runtime settings path has no name: {}",
+                    path.display()
+                ))
+            })?))
+        }
+        Err(error) => Err(ConfigError::Io(format!("{}: {error}", path.display()))),
+    }
+}
+
+fn load_non_secret_runtime_layer(
+    path: &Path,
+    expected_parent: Option<&Path>,
+) -> Result<NonSecretRuntimeSettings, ConfigError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Default::default());
+        }
+        Err(error) => return Err(ConfigError::Io(format!("{}: {error}", path.display()))),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(ConfigError::Validation(format!(
+            "non-secret runtime settings must not be a symlink: {}",
+            path.display()
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(ConfigError::Validation(format!(
+            "non-secret runtime settings path is not a file: {}",
+            path.display()
+        )));
+    }
+    if metadata.len() > MAX_NON_SECRET_RUNTIME_SETTINGS_BYTES {
+        return Err(ConfigError::Validation(format!(
+            "non-secret runtime settings exceed {MAX_NON_SECRET_RUNTIME_SETTINGS_BYTES} bytes: {}",
+            path.display()
+        )));
+    }
+    let canonical_path = path
+        .canonicalize()
+        .map_err(|error| ConfigError::Io(format!("{}: {error}", path.display())))?;
+    if let Some(expected_parent) = expected_parent {
+        let expected_parent = expected_parent
+            .canonicalize()
+            .map_err(|error| ConfigError::Io(format!("{}: {error}", expected_parent.display())))?;
+        if canonical_path.parent() != Some(expected_parent.as_path()) {
+            return Err(ConfigError::Validation(format!(
+                "non-secret runtime settings resolve outside the expected directory: {}",
+                path.display()
+            )));
+        }
+    }
+    let file = File::open(&canonical_path)
+        .map_err(|error| ConfigError::Io(format!("{}: {error}", path.display())))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_NON_SECRET_RUNTIME_SETTINGS_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| ConfigError::Io(format!("{}: {error}", path.display())))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_NON_SECRET_RUNTIME_SETTINGS_BYTES {
+        return Err(ConfigError::Validation(format!(
+            "non-secret runtime settings exceed {MAX_NON_SECRET_RUNTIME_SETTINGS_BYTES} bytes: {}",
+            path.display()
+        )));
+    }
+    let content = String::from_utf8(bytes)
+        .map_err(|error| ConfigError::Json(format!("{} is not UTF-8: {error}", path.display())))?;
+    let settings: NonSecretRuntimeSettings = serde_json::from_str(&content)
+        .map_err(|error| ConfigError::Json(format!("{}: {error}", path.display())))?;
+    settings.validate()?;
+    Ok(settings)
 }
 
 pub fn load_provider_settings(

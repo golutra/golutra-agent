@@ -1,5 +1,6 @@
 use std::{
     ffi::OsString,
+    fs,
     sync::{Mutex, MutexGuard},
 };
 
@@ -1233,4 +1234,103 @@ fn provider_env_rejects_dangerous_names() {
     .expect_err("dangerous env rejected");
 
     assert!(matches!(error, ConfigError::Validation(_)));
+}
+
+#[test]
+fn non_secret_runtime_settings_merge_by_layer_without_accepting_secrets() {
+    let global = NonSecretRuntimeSettings {
+        model: Some("global-model".to_owned()),
+        verify_on_change: Some("off".to_owned()),
+        ..Default::default()
+    };
+    let project = NonSecretRuntimeSettings {
+        model: Some("project-model".to_owned()),
+        provider_profile: Some("project-profile".to_owned()),
+        ..Default::default()
+    };
+    let session = NonSecretRuntimeSettings {
+        verify_on_change: Some("auto".to_owned()),
+        ..Default::default()
+    };
+    let merged = NonSecretRuntimeSettings::merged(&global, &project, &session);
+    assert_eq!(merged.model.as_deref(), Some("project-model"));
+    assert_eq!(merged.provider_profile.as_deref(), Some("project-profile"));
+    assert_eq!(merged.verify_on_change.as_deref(), Some("auto"));
+
+    let error = serde_json::from_str::<NonSecretRuntimeSettings>(
+        r#"{"model":"safe","api_key":"must-not-be-accepted"}"#,
+    )
+    .expect_err("secret fields must not be part of non-secret settings");
+    assert!(error.to_string().contains("unknown field"));
+}
+
+#[test]
+fn non_secret_runtime_settings_load_project_layer() {
+    let home = tempdir().expect("home");
+    let workspace = tempdir().expect("workspace");
+    let paths = ProviderConfigPaths::from_home(home.path()).expect("paths");
+    fs::create_dir_all(workspace.path().join(".golutra")).expect("project config dir");
+    fs::write(
+        home.path().join("runtime.json"),
+        r#"{"model":"global","verify_on_change":"off"}"#,
+    )
+    .expect("global settings");
+    fs::write(
+        workspace.path().join(".golutra/runtime.json"),
+        r#"{"model":"project","verify_on_change":"auto"}"#,
+    )
+    .expect("project settings");
+
+    let settings = load_non_secret_runtime_settings(&paths, workspace.path()).expect("merged");
+    assert_eq!(settings.model.as_deref(), Some("project"));
+    assert_eq!(settings.verify_on_change.as_deref(), Some("auto"));
+}
+
+#[test]
+fn non_secret_runtime_settings_allow_an_uninitialized_global_home() {
+    let parent = tempdir().expect("parent");
+    let home = parent.path().join("new-home");
+    let workspace = tempdir().expect("workspace");
+    let paths = ProviderConfigPaths::from_home(&home).expect("paths");
+
+    let settings = load_non_secret_runtime_settings(&paths, workspace.path())
+        .expect("missing global home should be treated as empty settings");
+    assert_eq!(settings, NonSecretRuntimeSettings::default());
+}
+
+#[cfg(unix)]
+#[test]
+fn non_secret_runtime_settings_reject_symlinked_layers() {
+    use std::os::unix::fs::symlink;
+
+    let home = tempdir().expect("home");
+    let workspace = tempdir().expect("workspace");
+    let outside = tempdir().expect("outside");
+    let paths = ProviderConfigPaths::from_home(home.path()).expect("paths");
+    fs::create_dir_all(workspace.path().join(".golutra")).expect("project config dir");
+    fs::write(
+        outside.path().join("runtime.json"),
+        r#"{"model":"outside"}"#,
+    )
+    .expect("outside settings");
+    symlink(
+        outside.path().join("runtime.json"),
+        workspace.path().join(".golutra/runtime.json"),
+    )
+    .expect("runtime symlink");
+
+    let error = load_non_secret_runtime_settings(&paths, workspace.path())
+        .expect_err("symlinked project settings must be rejected");
+    assert!(error.to_string().contains("must not be a symlink"));
+}
+
+#[test]
+fn non_secret_runtime_settings_reject_invalid_reasoning_effort() {
+    let error = NonSecretRuntimeSettings {
+        reasoning_effort: Some("extreme".to_owned()),
+        ..Default::default()
+    }
+    .validate()
+    .expect_err("unknown reasoning effort must be rejected");
+    assert!(error.to_string().contains("reasoning_effort"));
 }

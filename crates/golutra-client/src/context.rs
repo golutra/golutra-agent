@@ -160,58 +160,104 @@ pub(crate) fn environment_context_prompt(workspace_root: &Path) -> String {
     )
 }
 
-pub(crate) async fn load_project_instructions(
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectInstructionBundle {
+    pub(crate) content: String,
+    pub(crate) source_refs: Vec<String>,
+}
+
+pub(crate) async fn load_project_instruction_bundle(
     workspace_root: &Path,
-) -> Result<Option<String>, ClientError> {
+) -> Result<Option<ProjectInstructionBundle>, ClientError> {
     const MAX_PROJECT_INSTRUCTIONS_BYTES: u64 = 256 * 1024;
-    let path = workspace_root.join("AGENTS.md");
-    let metadata = match tokio::fs::metadata(&path).await {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(ClientError::Io(format!("{}: {error}", path.display()))),
-    };
-    if !metadata.is_file() {
-        return Err(ClientError::Io(format!(
-            "project instructions path is not a file: {}",
-            path.display()
-        )));
-    }
-    if metadata.len() > MAX_PROJECT_INSTRUCTIONS_BYTES {
-        return Err(ClientError::Io(format!(
-            "project instructions exceed {MAX_PROJECT_INSTRUCTIONS_BYTES} byte limit: {}",
-            path.display()
-        )));
-    }
-    let canonical_path = path
+    const MAX_PROJECT_INSTRUCTIONS_TOTAL_BYTES: usize = 256 * 1024;
+    const MAX_INSTRUCTION_LAYERS: usize = 8;
+    let canonical_root = workspace_root
         .canonicalize()
-        .map_err(|error| ClientError::Io(format!("{}: {error}", path.display())))?;
-    if !canonical_path.starts_with(workspace_root) {
-        return Err(ClientError::Io(format!(
-            "project instructions resolve outside the workspace: {}",
-            path.display()
-        )));
+        .map_err(|error| ClientError::Io(format!("{}: {error}", workspace_root.display())))?;
+    let mut layers = Vec::new();
+    let mut total_bytes = 0_usize;
+    for directory in canonical_root.ancestors().take(MAX_INSTRUCTION_LAYERS) {
+        let path = directory.join("AGENTS.md");
+        let metadata = match tokio::fs::metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if directory.join(".git").exists() {
+                    break;
+                }
+                continue;
+            }
+            Err(error) => return Err(ClientError::Io(format!("{}: {error}", path.display()))),
+        };
+        if !metadata.is_file() {
+            return Err(ClientError::Io(format!(
+                "project instructions path is not a file: {}",
+                path.display()
+            )));
+        }
+        if metadata.len() > MAX_PROJECT_INSTRUCTIONS_BYTES {
+            return Err(ClientError::Io(format!(
+                "project instructions exceed {MAX_PROJECT_INSTRUCTIONS_BYTES} byte limit: {}",
+                path.display()
+            )));
+        }
+        let canonical_path = path
+            .canonicalize()
+            .map_err(|error| ClientError::Io(format!("{}: {error}", path.display())))?;
+        if canonical_path.parent() != Some(directory) {
+            return Err(ClientError::Io(format!(
+                "project instructions resolve outside the workspace: {}",
+                path.display()
+            )));
+        }
+        let file = tokio::fs::File::open(&canonical_path)
+            .await
+            .map_err(|error| ClientError::Io(format!("{}: {error}", path.display())))?;
+        let mut bytes = Vec::new();
+        file.take(MAX_PROJECT_INSTRUCTIONS_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|error| ClientError::Io(format!("{}: {error}", path.display())))?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_PROJECT_INSTRUCTIONS_BYTES {
+            return Err(ClientError::Io(format!(
+                "project instructions exceed {MAX_PROJECT_INSTRUCTIONS_BYTES} byte limit: {}",
+                path.display()
+            )));
+        }
+        let content = String::from_utf8(bytes).map_err(|error| {
+            ClientError::Io(format!("{} is not UTF-8: {error}", path.display()))
+        })?;
+        if !content.trim().is_empty() {
+            total_bytes = total_bytes.saturating_add(content.len());
+            if total_bytes > MAX_PROJECT_INSTRUCTIONS_TOTAL_BYTES {
+                return Err(ClientError::Io(format!(
+                    "layered project instructions exceed {MAX_PROJECT_INSTRUCTIONS_TOTAL_BYTES} byte limit"
+                )));
+            }
+            layers.push((path, content));
+        }
+        if directory.join(".git").exists() {
+            break;
+        }
     }
-    let file = tokio::fs::File::open(&canonical_path)
-        .await
-        .map_err(|error| ClientError::Io(format!("{}: {error}", path.display())))?;
-    let mut bytes = Vec::new();
-    file.take(MAX_PROJECT_INSTRUCTIONS_BYTES.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .await
-        .map_err(|error| ClientError::Io(format!("{}: {error}", path.display())))?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_PROJECT_INSTRUCTIONS_BYTES {
-        return Err(ClientError::Io(format!(
-            "project instructions exceed {MAX_PROJECT_INSTRUCTIONS_BYTES} byte limit: {}",
-            path.display()
-        )));
+    if layers.is_empty() {
+        return Ok(None);
     }
-    let content = String::from_utf8(bytes)
-        .map_err(|error| ClientError::Io(format!("{} is not UTF-8: {error}", path.display())))?;
-    Ok((!content.trim().is_empty()).then(|| {
-        format!(
-            "Repository-provided AGENTS.md instructions follow. Apply them below Golutra's built-in safety rules:\n<project_instructions>\n{}\n</project_instructions>",
-            content.trim()
-        )
+    layers.reverse();
+    let source_refs = layers
+        .iter()
+        .map(|(path, _)| format!("file:{}", path.display()))
+        .collect::<Vec<_>>();
+    let sections = layers
+        .into_iter()
+        .map(|(path, content)| format!("<!-- {} -->\n{}", path.display(), content.trim()))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    Ok(Some(ProjectInstructionBundle {
+        content: format!(
+            "Repository-provided layered AGENTS.md instructions follow. Apply them below Golutra's built-in safety rules:\n<project_instructions>\n{sections}\n</project_instructions>"
+        ),
+        source_refs,
     }))
 }
 

@@ -3097,6 +3097,104 @@ async fn processing_thread_delete_retry_reuses_the_semantic_event_and_rebuilds_r
 }
 
 #[tokio::test]
+async fn privacy_purge_requires_confirmation_and_removes_rollout_idempotently() {
+    let workspace = tempdir().expect("workspace");
+    let _home = IsolatedGlobalMockProvider::empty().await;
+    let host = RuntimeHost::for_cwd(workspace.path()).await.expect("host");
+    let transport = EmbeddedTransport::new(host.clone());
+    let attached_session_id = transport.default_session_id();
+    let target_session_id = SessionId::new();
+    let target_thread_id = ThreadId::new();
+    let now = chrono::Utc::now();
+    let rollout_path = host
+        .runtime_paths
+        .as_ref()
+        .expect("runtime paths")
+        .rollout_path(target_thread_id);
+    host.storage
+        .repositories
+        .threads
+        .upsert(&ThreadRecord {
+            thread_id: target_thread_id,
+            session_id: target_session_id,
+            parent_thread_id: None,
+            forked_from_turn_id: None,
+            forked_from_sequence_no: None,
+            workspace_root: host.workspace_root_string(),
+            rebound_from_workspace_root: None,
+            rollout_path: Some(rollout_path.display().to_string()),
+            title: "private target".to_owned(),
+            preview: "private target".to_owned(),
+            created_at: now,
+            updated_at: now,
+            recency_at: now,
+            archived: false,
+            removed: false,
+        })
+        .await
+        .expect("target thread");
+    fs::write(&rollout_path, "private projection\n").expect("rollout fixture");
+
+    let rejected = transport
+        .send_command(runtime_command(
+            attached_session_id,
+            SessionCommandKind::DeleteThread,
+            json!({"thread_id": target_thread_id, "purge": true}),
+        ))
+        .await
+        .expect("rejected purge");
+    assert!(!rejected.accepted);
+    assert_eq!(
+        rejected.reason.as_deref(),
+        Some("privacy purge requires confirm=PURGE")
+    );
+    assert!(rollout_path.exists());
+
+    let purge = runtime_command(
+        attached_session_id,
+        SessionCommandKind::DeleteThread,
+        json!({
+            "thread_id": target_thread_id,
+            "purge": true,
+            "confirm": "PURGE"
+        }),
+    );
+    let purged = transport.send_command(purge.clone()).await.expect("purge");
+    assert!(purged.accepted);
+    assert_eq!(
+        purged.reason.as_deref(),
+        Some("thread purged; audit tombstone retained")
+    );
+    assert!(!rollout_path.exists());
+    assert!(
+        host.storage
+            .store
+            .thread_by_id(target_thread_id)
+            .await
+            .expect("thread lookup")
+            .expect("tombstone")
+            .removed
+    );
+
+    let retried = transport.send_command(purge).await.expect("purge retry");
+    assert_eq!(retried, purged);
+    assert!(!rollout_path.exists());
+    let events = host
+        .storage
+        .store
+        .load_events(target_session_id, None, None)
+        .await
+        .expect("target events");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == RuntimeEventType::ThreadDeleted)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn successful_task_quarantines_reviews_retrieves_and_rolls_back_project_memory() {
     let transport = EmbeddedTransport::in_memory().await.expect("transport");
     let session_id = SessionId::new();
@@ -3169,6 +3267,27 @@ async fn successful_task_quarantines_reviews_retrieves_and_rolls_back_project_me
         .filter(|event| event.event_type == RuntimeEventType::MemoryRetrieved)
         .filter_map(|event| event.payload.get("retrieved").and_then(Value::as_array))
         .any(|records| !records.is_empty());
+    for event in reviewed_events
+        .iter()
+        .filter(|event| event.event_type == RuntimeEventType::MemoryRetrieved)
+    {
+        assert!(event.payload.get("query").is_none());
+        assert!(
+            event
+                .payload
+                .get("retrieved")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .all(|record| {
+                    record.get("content").is_none()
+                        && record.get("matched_terms").is_none()
+                        && record.get("reason").is_none()
+                        && record.get("matched_term_count").is_some()
+                }),
+            "durable memory retrieval events must not contain memory text"
+        );
+    }
 
     let rollback = transport
         .send_command(SessionCommand {
@@ -8008,6 +8127,87 @@ async fn open_turn_keeps_contract_open_and_skips_project_verifier_discovery() {
 }
 
 #[tokio::test]
+async fn verify_on_change_auto_preserves_contract_and_discovers_one_project_verifier() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("cargo manifest");
+    let _provider = IsolatedGlobalMockProvider::install().await;
+    let transport = EmbeddedTransport::for_cwd(workspace.path())
+        .await
+        .expect("transport");
+    let session_id = transport.default_session_id();
+
+    transport
+        .send_command(command(session_id, "sleep"))
+        .await
+        .expect("blocking task");
+    wait_for_status(&transport, session_id, TaskStatus::WaitingApproval).await;
+
+    let queued = transport
+        .send_command(command_with_payload(
+            session_id,
+            json!({
+                "prompt": "write file queued.txt with content queued",
+                "execution_mode": "open",
+                "verify_on_change": "auto",
+            }),
+        ))
+        .await
+        .expect("queued task");
+    assert!(queued.accepted);
+    let events = transport
+        .host
+        .storage
+        .repositories
+        .events
+        .load(session_id, None, None)
+        .await
+        .expect("events");
+    let payload = events
+        .iter()
+        .find(|event| event.event_type == RuntimeEventType::TurnQueued)
+        .and_then(|event| event.payload.get("payload"))
+        .expect("queued payload");
+    assert_eq!(payload[VERIFY_ON_CHANGE_KEY], "auto");
+    assert_eq!(payload["_task_contract_origin"], "verify_on_change");
+    assert_eq!(
+        payload["task_contract"]["workspace_change"],
+        serde_json::to_value(WorkspaceChangeRequirement::Required).expect("enum")
+    );
+    assert_eq!(
+        payload["task_contract"]["require_objective_validation"],
+        true
+    );
+    assert_eq!(
+        payload["external_verifiers"].as_array().map(Vec::len),
+        Some(1)
+    );
+
+    transport
+        .send_command(runtime_command(
+            session_id,
+            SessionCommandKind::Abort,
+            json!({}),
+        ))
+        .await
+        .expect("release blocking task");
+    if let Some(control) = transport
+        .host
+        .execution
+        .task_controls
+        .lock()
+        .await
+        .get(&session_id)
+    {
+        control.abort_handle.abort();
+    }
+    sleep(Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
 async fn steering_without_an_active_task_is_rejected() {
     let workspace = tempdir().expect("workspace");
     let _provider = IsolatedGlobalMockProvider::install().await;
@@ -10661,6 +10861,44 @@ async fn context_loads_bounded_root_agents_instructions_as_system_context() {
     assert!(instructions.content.contains("Run cargo fmt"));
 }
 
+#[tokio::test]
+async fn context_merges_parent_and_child_agents_instructions_in_order() {
+    let parent = tempdir().expect("parent workspace");
+    let repository = parent.path().join("repo");
+    let workspace = repository.join("packages/app");
+    fs::create_dir_all(&workspace).expect("nested workspace");
+    fs::create_dir(repository.join(".git")).expect("git marker");
+    fs::write(repository.join("AGENTS.md"), "parent rule").expect("parent instructions");
+    fs::write(workspace.join("AGENTS.md"), "child rule").expect("child instructions");
+
+    let instructions = load_project_instruction_bundle(&workspace)
+        .await
+        .expect("layered instructions")
+        .expect("instructions present")
+        .content;
+    assert!(
+        instructions.find("parent rule").expect("parent rule")
+            < instructions.find("child rule").expect("child rule")
+    );
+    let bundle = load_project_instruction_bundle(&workspace)
+        .await
+        .expect("instruction bundle")
+        .expect("bundle present");
+    assert_eq!(bundle.source_refs.len(), 2);
+    assert!(
+        bundle
+            .source_refs
+            .iter()
+            .any(|reference| reference.ends_with("repo/AGENTS.md"))
+    );
+    assert!(
+        bundle
+            .source_refs
+            .iter()
+            .any(|reference| reference.ends_with("packages/app/AGENTS.md"))
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn project_instruction_symlink_cannot_escape_the_workspace() {
@@ -10673,7 +10911,7 @@ async fn project_instruction_symlink_cannot_escape_the_workspace() {
     symlink(&outside_file, workspace.path().join("AGENTS.md")).expect("symlink");
     let canonical_workspace = workspace.path().canonicalize().expect("workspace");
 
-    let error = load_project_instructions(&canonical_workspace)
+    let error = load_project_instruction_bundle(&canonical_workspace)
         .await
         .expect_err("outside symlink must be rejected");
 

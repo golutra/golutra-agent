@@ -185,6 +185,15 @@ pub enum SlashCommand {
     Threads {
         limit: u32,
     },
+    Retry {
+        model: Option<String>,
+    },
+    Doctor {
+        clean: bool,
+    },
+    Purge {
+        thread_id: String,
+    },
     Fork {
         thread_id: String,
         from_turn_id: Option<String>,
@@ -353,6 +362,21 @@ const SEARCHABLE_SLASH_HINTS: &[SlashCommandHint] = &[
         command: "/threads",
         description: "list threads",
         selection: SlashCommandSelection::Execute,
+    },
+    SlashCommandHint {
+        command: "/retry",
+        description: "rerun the last task in a fork with an optional model",
+        selection: SlashCommandSelection::Fill,
+    },
+    SlashCommandHint {
+        command: "/doctor",
+        description: "inspect runtime and artifact storage",
+        selection: SlashCommandSelection::Execute,
+    },
+    SlashCommandHint {
+        command: "/purge",
+        description: "privacy purge an inactive thread after confirmation",
+        selection: SlashCommandSelection::Fill,
     },
     SlashCommandHint {
         command: "/fork",
@@ -623,6 +647,9 @@ pub fn parse_slash_input(input: &str) -> SlashInput {
             SlashInput::Error("/export does not take arguments; select a session first".to_owned())
         }
         "/threads" | "/thread" => parse_threads_command(&tokens),
+        "/retry" => parse_retry_command(&tokens),
+        "/doctor" => parse_doctor_command(&tokens),
+        "/purge" => parse_purge_command(&tokens),
         "/fork" => parse_fork_command(&tokens),
         "/auth" => parse_auth_command(&tokens),
         "/status" => SlashInput::Command(SlashCommand::Status),
@@ -674,6 +701,37 @@ pub fn parse_slash_input(input: &str) -> SlashInput {
         "/clear" => SlashInput::Command(SlashCommand::Clear),
         "/quit" | "/exit" => SlashInput::Command(SlashCommand::Quit),
         other => SlashInput::Error(format!("unknown slash command `{other}`; try /help")),
+    }
+}
+
+fn parse_retry_command(tokens: &[String]) -> SlashInput {
+    match tokens {
+        [_] => SlashInput::Command(SlashCommand::Retry { model: None }),
+        [_, model] if !model.trim().is_empty() => SlashInput::Command(SlashCommand::Retry {
+            model: Some(model.clone()),
+        }),
+        _ => SlashInput::Error("/retry syntax: /retry [model-id]".to_owned()),
+    }
+}
+
+fn parse_doctor_command(tokens: &[String]) -> SlashInput {
+    match tokens {
+        [_] => SlashInput::Command(SlashCommand::Doctor { clean: false }),
+        [_, action] if action == "clean" => {
+            SlashInput::Command(SlashCommand::Doctor { clean: true })
+        }
+        _ => SlashInput::Error("/doctor syntax: /doctor [clean]".to_owned()),
+    }
+}
+
+fn parse_purge_command(tokens: &[String]) -> SlashInput {
+    match tokens {
+        [_, thread_id] if !thread_id.trim().is_empty() => {
+            SlashInput::Command(SlashCommand::Purge {
+                thread_id: thread_id.clone(),
+            })
+        }
+        _ => SlashInput::Error("/purge syntax: /purge <thread-id>".to_owned()),
     }
 }
 
@@ -1475,6 +1533,38 @@ mod tests {
     }
 
     #[test]
+    fn slash_parser_accepts_retry_doctor_and_purge_boundaries() {
+        assert_eq!(
+            parse_slash_input("/retry"),
+            SlashInput::Command(SlashCommand::Retry { model: None })
+        );
+        assert_eq!(
+            parse_slash_input("/retry grok-4.5"),
+            SlashInput::Command(SlashCommand::Retry {
+                model: Some("grok-4.5".to_owned())
+            })
+        );
+        assert_eq!(
+            parse_slash_input("/doctor clean"),
+            SlashInput::Command(SlashCommand::Doctor { clean: true })
+        );
+        assert_eq!(
+            parse_slash_input("/purge 01KWRWH7SC4Z2A0NAV6X84FCYX"),
+            SlashInput::Command(SlashCommand::Purge {
+                thread_id: "01KWRWH7SC4Z2A0NAV6X84FCYX".to_owned()
+            })
+        );
+        assert!(matches!(
+            parse_slash_input("/doctor scrub"),
+            SlashInput::Error(error) if error.contains("/doctor syntax")
+        ));
+        assert!(matches!(
+            parse_slash_input("/purge"),
+            SlashInput::Error(error) if error.contains("/purge syntax")
+        ));
+    }
+
+    #[test]
     fn slash_suggestions_follow_top_level_prefix() {
         assert!(slash_command_suggestions("read README.md").is_empty());
         assert_eq!(
@@ -1493,7 +1583,10 @@ mod tests {
         );
         assert_eq!(
             slash_command_suggestions("/r"),
-            vec!["/resume - open sessions".to_owned()]
+            vec![
+                "/resume - open sessions".to_owned(),
+                "/retry - rerun the last task in a fork with an optional model".to_owned(),
+            ]
         );
         assert!(matches!(
             parse_slash_input("/paste-image"),
@@ -1531,6 +1624,7 @@ mod tests {
         assert_eq!(
             slash_command_suggestions("/d"),
             vec![
+                "/doctor - inspect runtime and artifact storage".to_owned(),
                 "/debug - toggle debug view; use /debug switch for detail".to_owned(),
                 "/debug switch - toggle expanded or compact observations".to_owned(),
                 "/deny - deny pending tool".to_owned(),

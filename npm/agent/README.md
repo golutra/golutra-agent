@@ -4,7 +4,7 @@ Install the Golutra coding agent without a Rust toolchain:
 
 ```bash
 npm install -g @golutra/agent
-golutra-tui
+golutra
 ```
 
 The package contains a small JavaScript launcher and selects the matching
@@ -13,8 +13,16 @@ versioned npm packages; installation does not run a network download script.
 
 The package exposes:
 
-- `golutra`: the scriptable CLI;
-- `golutra-tui`: the interactive terminal UI.
+- `golutra`: the interactive terminal UI when called without arguments, or the
+  scriptable CLI when given a subcommand;
+- `golutra-tui`: an explicit compatibility entry point for the interactive UI.
+
+For a non-interactive turn, use the CLI explicitly:
+
+```bash
+golutra exec "inspect this workspace and run the checks"
+golutra exec --json "summarize the current changes"
+```
 
 For app-server, observation, supervisor, and evaluation binaries, use the
 platform release archive documented at

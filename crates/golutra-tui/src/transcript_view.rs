@@ -2,7 +2,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use golutra_core::{EventId, FileChangeKind, FileChangeSummary, TaskId, ToolResultStatus, TurnId};
+use golutra_core::{
+    EventId, FileChangeKind, FileChangeSummary, TaskId, TaskStatus, ToolResultStatus, TurnId,
+    VerificationIndependence, VerificationRecord, VerificationResult, VerificationSource,
+};
 use golutra_protocol::{RuntimeEvent, RuntimeEventType, UserProjection, VisibleStep};
 use serde_json::Value;
 
@@ -220,18 +223,19 @@ pub(crate) fn transcript_items(app: &TuiApp) -> Vec<TranscriptItem> {
 }
 
 pub(crate) fn transcript_operation_projections(app: &TuiApp) -> Vec<OperationProjection> {
-    transcript_operation_projections_after(app, None)
+    transcript_operation_projections_after(app, None, false)
 }
 
 pub(crate) fn rendered_transcript_operation_projections(app: &TuiApp) -> Vec<OperationProjection> {
     let committed = (app.transcript.history.enabled && app.transcript.search.is_none())
         .then_some(&app.transcript.history.committed_event_ids);
-    transcript_operation_projections_after(app, committed)
+    transcript_operation_projections_after(app, committed, true)
 }
 
 fn transcript_operation_projections_after(
     app: &TuiApp,
     committed_event_ids: Option<&HashSet<EventId>>,
+    include_result_card: bool,
 ) -> Vec<OperationProjection> {
     if app.auth_dialog.is_some() {
         return Vec::new();
@@ -262,6 +266,9 @@ fn transcript_operation_projections_after(
                     .map(plain_projection),
             );
         }
+        if include_result_card && let Some(result_card) = result_card_projection(app) {
+            items.push(result_card);
+        }
     } else {
         items.push(notice_projection(TranscriptItem {
             role: TranscriptRole::System,
@@ -270,6 +277,130 @@ fn transcript_operation_projections_after(
         }));
     }
     items
+}
+
+fn result_card_projection(app: &TuiApp) -> Option<OperationProjection> {
+    let projection = app.projection.as_ref()?;
+    if !projection.status.is_terminal() {
+        return None;
+    }
+    let verification = app
+        .developer_projection
+        .as_ref()
+        .filter(|debug| {
+            debug
+                .task_id
+                .is_none_or(|task_id| Some(task_id) == projection.task_id)
+        })
+        .and_then(|debug| debug.verification.clone())
+        .or_else(|| latest_verification(&app.events, projection.task_id));
+    let independently_verified = verification.as_ref().is_some_and(is_independently_verified);
+    let state = if projection.status == TaskStatus::Failed
+        || projection.status == TaskStatus::Cancelled
+        || projection.status == TaskStatus::Blocked
+        || verification
+            .as_ref()
+            .is_some_and(|record| record.result == VerificationResult::Fail)
+    {
+        "Failed"
+    } else if projection.status == TaskStatus::Partial
+        || verification
+            .as_ref()
+            .is_some_and(|record| record.result == VerificationResult::Partial)
+    {
+        "Partial"
+    } else if independently_verified {
+        "Verified"
+    } else {
+        "Completed · Unverified"
+    };
+    let role = match state {
+        "Verified" => TranscriptRole::Success,
+        "Failed" => TranscriptRole::Error,
+        _ => TranscriptRole::Warning,
+    };
+    let mut detail_body = Vec::new();
+    let files_summary = if let Some(changes) = app.change_projection.summary() {
+        let stats = match (changes.added_lines, changes.removed_lines) {
+            (Some(added), Some(removed)) => format!(" (+{added} -{removed})"),
+            _ => String::new(),
+        };
+        detail_body.extend(
+            changes
+                .files
+                .iter()
+                .take(3)
+                .map(|change| format!("  {}", change.path)),
+        );
+        if changes.files.len() > 3 {
+            detail_body.push(format!("  … {} more files", changes.files.len() - 3));
+        }
+        format!("files changed: {}{stats}", changes.file_count)
+    } else {
+        "files changed: 0".to_owned()
+    };
+    let checks_summary = if let Some(record) = &verification {
+        let passed = record.checks.iter().filter(|check| check.passed).count();
+        detail_body.extend(
+            record
+                .residual_risks
+                .iter()
+                .take(3)
+                .map(|risk| format!("risk: {risk}")),
+        );
+        format!("checks: {passed}/{} passed", record.checks.len())
+    } else {
+        "checks: no independent verification record".to_owned()
+    };
+    let next_action = match state {
+        "Verified" => "next: review the verified diff or continue with a follow-up".to_owned(),
+        "Failed" => "next: inspect the failure, then use /retry [model]".to_owned(),
+        "Partial" => "next: resolve residual risks, then retry or verify again".to_owned(),
+        _ => "next: inspect the diff or use /retry [model] for an independent run".to_owned(),
+    };
+    let mut body = vec![format!("{files_summary} · {checks_summary}"), next_action];
+    if app.transcript.details_expanded {
+        body.splice(1..1, detail_body);
+    }
+    Some(notice_projection(TranscriptItem {
+        role,
+        title: format!("Result · {state}"),
+        body,
+    }))
+}
+
+fn latest_verification(
+    events: &[RuntimeEvent],
+    task_id: Option<TaskId>,
+) -> Option<VerificationRecord> {
+    events
+        .iter()
+        .rev()
+        .filter(|event| {
+            event.event_type == RuntimeEventType::VerificationCompleted
+                && task_id.is_none_or(|task_id| event.task_id == Some(task_id))
+        })
+        .find_map(|event| {
+            event
+                .payload
+                .get("record")
+                .cloned()
+                .or_else(|| Some(event.payload.clone()))
+                .and_then(|value| serde_json::from_value::<VerificationRecord>(value).ok())
+                .filter(|record| task_id.is_none_or(|task_id| record.task_id == task_id))
+        })
+}
+
+fn is_independently_verified(record: &VerificationRecord) -> bool {
+    record.result == VerificationResult::Pass
+        && matches!(
+            record.source,
+            VerificationSource::ExternalVerifier | VerificationSource::Mixed
+        )
+        && record.independence == VerificationIndependence::Independent
+        && !record.checks.is_empty()
+        && record.checks.iter().all(|check| check.passed)
+        && !record.evidence_refs.is_empty()
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1201,7 +1332,10 @@ pub(crate) fn readable_step_label(label: &str) -> String {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use golutra_core::{EventId, SessionId, TaskId, ToolCallId};
+    use golutra_core::{
+        EventId, EvidenceId, SessionId, TaskId, ToolCallId, VerificationCheck,
+        VerificationCheckKind, VerificationId, VerificationIndependence, VerificationSource,
+    };
     use golutra_protocol::RuntimeEventSource;
     use serde_json::json;
 
@@ -1225,6 +1359,89 @@ mod tests {
             event_status_title(RuntimeEventType::TaskUncertain),
             Some("Task Uncertain / reconciliation required")
         );
+    }
+
+    fn verification_for(task_id: TaskId) -> VerificationRecord {
+        VerificationRecord {
+            verification_id: VerificationId::new(),
+            task_id,
+            objective: "verify the change".to_owned(),
+            completion_criteria: vec!["the check passes".to_owned()],
+            checks: vec![VerificationCheck {
+                kind: VerificationCheckKind::ObjectiveValidation,
+                name: "objective:check".to_owned(),
+                command: Some("cargo test".to_owned()),
+                passed: true,
+                evidence_refs: vec![EvidenceId::new()],
+                message: "passed".to_owned(),
+            }],
+            evidence_refs: vec![EvidenceId::new()],
+            result: VerificationResult::Pass,
+            policy_status: "allowed".to_owned(),
+            residual_risks: Vec::new(),
+            plan_id: None,
+            assertions: Vec::new(),
+            source: VerificationSource::ExternalVerifier,
+            independence: VerificationIndependence::Independent,
+            environment_digest: None,
+        }
+    }
+
+    #[test]
+    fn result_card_requires_verification_for_the_current_task() {
+        let current_task = TaskId::new();
+        let old_task = TaskId::new();
+        let mut app = TuiApp::new(
+            golutra_core::ThreadId::new(),
+            SessionId::new(),
+            Some(current_task),
+            false,
+            "ready (mock)".to_owned(),
+            None,
+        );
+        app.projection = Some(UserProjection {
+            session_id: app.session_id,
+            task_id: Some(current_task),
+            status: TaskStatus::Completed,
+            visible_steps: Vec::new(),
+            pending_approval: None,
+            final_message: Some("done".to_owned()),
+            residual_risks: Vec::new(),
+        });
+        let mut event = RuntimeEvent {
+            schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+            causal_context: Default::default(),
+            causal_links: Vec::new(),
+            id: EventId::new(),
+            sequence_no: 1,
+            session_id: app.session_id,
+            turn_id: None,
+            task_id: Some(old_task),
+            parent_event_id: None,
+            event_type: RuntimeEventType::VerificationCompleted,
+            timestamp: Utc::now(),
+            source: RuntimeEventSource::Verifier,
+            payload: json!({"record": verification_for(old_task)}),
+            payload_ref: None,
+            durable: true,
+        };
+        app.events.push(event.clone());
+        let OperationProjection::Notice { item } =
+            result_card_projection(&app).expect("terminal result card")
+        else {
+            panic!("result card must be a notice");
+        };
+        assert_eq!(item.title, "Result · Completed · Unverified");
+
+        event.task_id = Some(current_task);
+        event.payload = json!({"record": verification_for(current_task)});
+        app.events = vec![event];
+        let OperationProjection::Notice { item } =
+            result_card_projection(&app).expect("verified result card")
+        else {
+            panic!("result card must be a notice");
+        };
+        assert_eq!(item.title, "Result · Verified");
     }
 
     fn tool_event(sequence_no: u64, event_type: RuntimeEventType, payload: Value) -> RuntimeEvent {

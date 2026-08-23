@@ -1220,6 +1220,7 @@ fn ensure_task_binding_allows_slash(task_id: Option<TaskId>, text: &str) -> miet
             | SlashCommand::WhatsNew
             | SlashCommand::Export
             | SlashCommand::Threads { .. }
+            | SlashCommand::Doctor { clean: false }
             | SlashCommand::Status
             | SlashCommand::Plan
             | SlashCommand::Tasks

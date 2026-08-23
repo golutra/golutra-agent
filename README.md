@@ -143,9 +143,22 @@ network download script is required:
 
 ```bash
 npm install -g @golutra/agent
-golutra-tui
+golutra
 golutra --help
 ```
+
+`golutra` opens the interactive TUI when no arguments are supplied. Use
+`golutra exec "..."` for a headless turn in scripts or CI; `golutra-tui` remains
+available as an explicit TUI alias.
+
+TUI defaults can be kept without storing secrets in either
+`$GOLUTRA_HOME/runtime.json` (global) or `<workspace>/.golutra/runtime.json`
+(project). Project values override global values, session controls are
+in-memory, and explicit `--execution-mode`/`--tool-profile` flags win over the
+files. The accepted non-secret fields are `provider_profile`, `model`,
+`execution_mode`, `verify_on_change`, `tool_profile`, and `reasoning_effort`.
+Unknown fields and secret-shaped values are rejected; credentials stay in the
+owner-only credential store or environment references.
 
 The current release workflow publishes Linux x64/arm64, macOS x64/arm64, and
 Windows x64/arm64 native packages. The npm distribution contains the
@@ -332,9 +345,17 @@ cargo run -p golutra-tui -- --yolo
 
 ```bash
 npm install -g @golutra/agent
-golutra-tui
+golutra
 golutra --help
 ```
+
+无参数执行 `golutra` 会进入交互式 TUI；脚本和 CI 使用
+`golutra exec "..."` 保持无界面执行，`golutra-tui` 仍作为显式 TUI 别名保留。
+
+TUI 的非敏感默认配置按 `$GOLUTRA_HOME/runtime.json` →
+`<workspace>/.golutra/runtime.json` → 当前 session 内存覆盖合并；显式
+`--execution-mode` 和 `--tool-profile` 参数优先级最高。配置文件不允许未知
+字段或 secret，key/token 仍只通过 credentials 文件或环境引用提供。
 
 当前 release workflow 发布 Linux x64/arm64、macOS x64/arm64 和 Windows x64/arm64。app-server、
 观测、supervisor 与 evaluation 入口仍随下面的完整平台归档分发。

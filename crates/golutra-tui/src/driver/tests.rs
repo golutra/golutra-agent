@@ -517,6 +517,7 @@ fn driver_binding_preflight_keeps_search_local_and_sessions_fixed() {
         session_id: SessionId::new(),
         title: "other session".to_owned(),
         preview: String::new(),
+        metadata: String::new(),
     }]));
     let error = ensure_driver_binding_allows_key(None, &app, &DriverKey::Enter)
         .expect_err("Driver session binding must remain immutable");
@@ -671,6 +672,7 @@ fn snapshot_state_redacts_transient_secrets() {
         session_id: SessionId::new(),
         title: format!("Authorization: Bearer {secret}"),
         preview: format!("token={secret}"),
+        metadata: String::new(),
     }]);
     app.resume_picker = Some(picker.clone());
     app.export_flow = Some(ExportFlowState {
@@ -758,12 +760,14 @@ async fn rejected_mouse_activation_does_not_change_local_selection() {
             session_id: SessionId::new(),
             title: "first".to_owned(),
             preview: String::new(),
+            metadata: String::new(),
         },
         ResumeThreadItem {
             thread_id: ThreadId::new(),
             session_id: SessionId::new(),
             title: "second".to_owned(),
             preview: String::new(),
+            metadata: String::new(),
         },
     ]));
     driver.refresh_active_layout().expect("resume layout");
