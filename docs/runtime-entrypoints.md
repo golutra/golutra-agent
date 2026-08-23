@@ -39,10 +39,33 @@ App Server owns multiple workspace attachments. The workspace still controls
 cwd, file policy, state partition, default session resolution and history
 visibility. It is not a process boundary.
 
-The ordinary no-daemon path remains intentionally simple: `golutra-tui` and
-`golutra` construct an `EmbeddedTransport`, so a single invocation owns its
-local `RuntimeHost`. Use the daemon or App Server surfaces when another
+The ordinary no-daemon path remains intentionally simple: `golutra` without
+arguments and the compatibility alias `golutra-tui` construct an
+`EmbeddedTransport`, so a single invocation owns its local `RuntimeHost`. Use
+`golutra exec` for a headless turn, and use the daemon or App Server surfaces when another
 process must observe or control the same running task.
+
+### Interactive defaults and runtime settings
+
+After npm installation, `golutra` with no arguments opens the TUI. The
+explicit `golutra exec ...` subcommand remains headless and is suitable for
+scripts and CI. TUI runtime defaults are read once at startup from two
+non-secret JSON layers:
+
+```text
+$GOLUTRA_HOME/runtime.json       # global defaults
+<workspace>/.golutra/runtime.json # project overrides
+session controls                  # in-memory overrides for this TUI session
+```
+
+Project values override global values; session controls override both. An
+explicit CLI flag such as `--execution-mode` or `--tool-profile` wins over the
+loaded files. Allowed fields are `provider_profile`, `model`,
+`execution_mode` (`open`/`strict`), `verify_on_change` (`auto`/`off`/`never`),
+`tool_profile` (`coding`/`full`) and `reasoning_effort`
+(`default`/`low`/`medium`/`high`/`xhigh`). Unknown fields, symlinks, malformed
+JSON, secret-shaped fields and files larger than 64 KiB are rejected; API keys
+and tokens remain in the credential store or environment references.
 
 ## 1. Headless Exec
 

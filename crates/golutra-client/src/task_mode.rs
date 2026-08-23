@@ -12,6 +12,7 @@ use serde_json::Value;
 pub(crate) const EXECUTION_MODE_KEY: &str = "execution_mode";
 pub(crate) const TOOL_PROFILE_KEY: &str = "tool_profile";
 pub(crate) const NORMALIZED_EXECUTION_MODE_KEY: &str = "_execution_mode";
+pub(crate) const VERIFY_ON_CHANGE_KEY: &str = "verify_on_change";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NormalizedExecutionMode {
@@ -99,6 +100,20 @@ pub(crate) fn explicit_task_contract(payload: &Value) -> bool {
     payload
         .get("task_contract")
         .is_some_and(|value| !value.is_null())
+}
+
+/// 解析工作区变更后的自动验证开关；未知值必须在命令边界拒绝，避免静默降级。
+pub(crate) fn verify_on_change_auto(payload: &Value) -> Result<bool, &'static str> {
+    match payload.get(VERIFY_ON_CHANGE_KEY) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::String(value)) if value.eq_ignore_ascii_case("auto") => Ok(true),
+        Some(Value::String(value))
+            if value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("never") =>
+        {
+            Ok(false)
+        }
+        Some(_) => Err("verify_on_change must be `auto`, `off`, or `never`"),
+    }
 }
 
 /// External evaluation metadata is an explicit request for objective
@@ -222,6 +237,14 @@ mod tests {
             &json!({"prompt": "write src/lib.rs"}),
             NormalizedExecutionMode::Legacy
         ));
+    }
+
+    #[test]
+    fn verify_on_change_accepts_only_explicit_modes() {
+        assert!(verify_on_change_auto(&json!({"verify_on_change": "auto"})).unwrap());
+        assert!(!verify_on_change_auto(&json!({"verify_on_change": "off"})).unwrap());
+        assert!(!verify_on_change_auto(&json!({})).unwrap());
+        assert!(verify_on_change_auto(&json!({"verify_on_change": true})).is_err());
     }
 
     #[test]

@@ -31,8 +31,8 @@ use golutra_config::{
     BuiltinOAuthMethod, ProviderConfigPaths, ProviderConfigScope, ProviderInstallPlan,
     ProviderProfile, apply_oauth_provider_install_plan_verified,
     apply_provider_install_plan_verified, generate_custom_provider_api_key_env,
-    load_provider_settings, logout_provider_profile_verified, provider_auth_service,
-    provider_onboarding_state, provider_protocol_has_runtime_adapter,
+    load_non_secret_runtime_settings, load_provider_settings, logout_provider_profile_verified,
+    provider_auth_service, provider_onboarding_state, provider_protocol_has_runtime_adapter,
     update_provider_settings_verified,
 };
 use golutra_core::{
@@ -152,11 +152,11 @@ struct Args {
     #[arg(long, global = true)]
     yolo: bool,
     /// Let the model own task completion or require strict completion policy.
-    #[arg(long, global = true, value_enum, default_value_t = TuiExecutionModeArg::Open)]
-    execution_mode: TuiExecutionModeArg,
+    #[arg(long, global = true, value_enum)]
+    execution_mode: Option<TuiExecutionModeArg>,
     /// Expose coding-safe built-ins/extensions or every registered extension.
-    #[arg(long, global = true, value_enum, default_value_t = TuiToolProfileArg::Coding)]
-    tool_profile: TuiToolProfileArg,
+    #[arg(long, global = true, value_enum)]
+    tool_profile: Option<TuiToolProfileArg>,
     #[command(subcommand)]
     command: Option<TuiCommand>,
 }
@@ -190,6 +190,33 @@ impl TuiToolProfileArg {
             Self::Coding => "coding",
             Self::Full => "full",
         }
+    }
+}
+
+fn parse_runtime_reasoning_effort(value: &str) -> Option<golutra_llm::ProviderReasoningEffort> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "low" => Some(golutra_llm::ProviderReasoningEffort::Low),
+        "medium" => Some(golutra_llm::ProviderReasoningEffort::Medium),
+        "high" => Some(golutra_llm::ProviderReasoningEffort::High),
+        "xhigh" => Some(golutra_llm::ProviderReasoningEffort::Xhigh),
+        "default" => None,
+        _ => None,
+    }
+}
+
+fn parse_runtime_execution_mode(value: &str) -> Option<TuiExecutionModeArg> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "open" => Some(TuiExecutionModeArg::Open),
+        "strict" => Some(TuiExecutionModeArg::Strict),
+        _ => None,
+    }
+}
+
+fn parse_runtime_tool_profile(value: &str) -> Option<TuiToolProfileArg> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "coding" => Some(TuiToolProfileArg::Coding),
+        "full" => Some(TuiToolProfileArg::Full),
+        _ => None,
     }
 }
 
@@ -342,6 +369,7 @@ struct TuiApp {
     yolo: bool,
     execution_mode: TuiExecutionModeArg,
     tool_profile: TuiToolProfileArg,
+    verify_on_change: String,
     activity_projection: ActivityProjection,
     activity_snapshot: Option<ActivitySnapshot>,
     activity_snapshot_captured: bool,
@@ -499,6 +527,7 @@ impl TuiApp {
             yolo: false,
             execution_mode: TuiExecutionModeArg::Open,
             tool_profile: TuiToolProfileArg::Coding,
+            verify_on_change: "auto".to_owned(),
             activity_projection: ActivityProjection::default(),
             activity_snapshot: None,
             activity_snapshot_captured: false,
@@ -597,6 +626,44 @@ impl TuiApp {
             }
         }
         self
+    }
+
+    fn with_loaded_runtime_settings(mut self) -> miette::Result<Self> {
+        let paths = ProviderConfigPaths::global()
+            .map_err(|error| miette::miette!("load runtime settings paths: {error}"))?;
+        let settings = load_non_secret_runtime_settings(&paths, &self.workspace_path)
+            .map_err(|error| miette::miette!("load runtime settings: {error}"))?;
+        if let Some(profile) = settings.provider_profile {
+            self.runtime_controls.profile_name = Some(profile);
+        }
+        if let Some(model) = settings.model {
+            self.runtime_controls.custom_model = Some(model);
+        }
+        if let Some(mode) = settings
+            .execution_mode
+            .as_deref()
+            .and_then(parse_runtime_execution_mode)
+        {
+            self.execution_mode = mode;
+        }
+        if let Some(verify_on_change) = settings.verify_on_change {
+            self.verify_on_change = verify_on_change.to_ascii_lowercase();
+        }
+        if let Some(profile) = settings
+            .tool_profile
+            .as_deref()
+            .and_then(parse_runtime_tool_profile)
+        {
+            self.tool_profile = profile;
+        }
+        self.runtime_controls.reasoning_effort = settings
+            .reasoning_effort
+            .as_deref()
+            .and_then(parse_runtime_reasoning_effort);
+        if settings.reasoning_effort.is_some() {
+            self.runtime_controls.reasoning_overridden = true;
+        }
+        Ok(self)
     }
 
     fn palette(&self) -> TuiPalette {
@@ -1998,6 +2065,16 @@ impl TuiApp {
         } else {
             self.runtime_prompt_payload(prompt.clone())
         };
+        self.submit_runtime_payload(transport, prompt, payload)
+            .await
+    }
+
+    async fn submit_runtime_payload(
+        &mut self,
+        transport: &RuntimeTransport,
+        prompt: String,
+        payload: Value,
+    ) -> miette::Result<Option<CommandAck>> {
         let ack = transport
             .send_command(session_command(
                 self.session_id,
@@ -2059,6 +2136,9 @@ impl TuiApp {
         if self.yolo {
             payload["yolo"] = json!(true);
             payload["allow_network"] = json!(true);
+        }
+        if !steer {
+            payload["verify_on_change"] = json!(self.verify_on_change);
         }
         if let Some(profile_name) = &self.runtime_controls.profile_name {
             payload["provider_profile"] = json!(profile_name);
@@ -2148,6 +2228,33 @@ impl TuiApp {
                         .collect()
                 };
                 self.push_system_message("Threads", lines);
+            }
+            SlashCommand::Retry { model } => {
+                self.retry_last_task(transport, model.as_deref()).await?;
+            }
+            SlashCommand::Doctor { clean } => {
+                self.run_storage_doctor(transport, clean).await?;
+            }
+            SlashCommand::Purge { thread_id } => {
+                let target = parse_thread_id(&thread_id)?;
+                if target == self.thread_id {
+                    self.status_message = "the current thread cannot be purged".to_owned();
+                } else {
+                    let ack = transport
+                        .send_command(session_command(
+                            self.session_id,
+                            SessionCommandKind::DeleteThread,
+                            json!({
+                                "thread_id": target,
+                                "purge": true,
+                                "confirm": "PURGE",
+                            }),
+                        ))
+                        .await
+                        .map_err(|error| miette::miette!("thread purge failed: {error}"))?;
+                    self.last_control_ack = Some(ack.clone());
+                    self.status_message = compact_ack_reason(&ack.reason);
+                }
             }
             SlashCommand::Fork {
                 thread_id,
@@ -2344,20 +2451,123 @@ impl TuiApp {
         Ok(())
     }
 
+    async fn retry_last_task(
+        &mut self,
+        transport: &RuntimeTransport,
+        requested_model: Option<&str>,
+    ) -> miette::Result<()> {
+        if has_active_task(self) {
+            self.status_message = "interrupt the active task before retrying".to_owned();
+            return Ok(());
+        }
+        let Some(target) = retry_target(&self.events) else {
+            self.push_system_message("Retry", vec!["no completed prompt is available".to_owned()]);
+            return Ok(());
+        };
+        let prompt = target.prompt.clone();
+        if let Some(previous_turn) = target.fork_from_turn_id {
+            let child = transport
+                .fork_thread(self.thread_id, Some(previous_turn))
+                .await
+                .map_err(|error| miette::miette!("retry fork failed: {error}"))?;
+            self.resume_thread(transport, child.thread_id).await?;
+        } else {
+            self.start_new_session();
+        }
+        let mut payload = self.runtime_prompt_payload(prompt.clone());
+        if let Some(model) = requested_model {
+            let model = model.trim();
+            if model.is_empty()
+                || model.chars().count() > 256
+                || model.chars().any(char::is_control)
+            {
+                return Err(miette::miette!(
+                    "retry model must contain between 1 and 256 non-control characters"
+                ));
+            }
+            payload["provider_model"] = Value::String(model.to_owned());
+        }
+        self.push_system_message(
+            "Retry",
+            vec![format!(
+                "rerunning the same prompt{}",
+                requested_model
+                    .filter(|model| !model.trim().is_empty())
+                    .map(|model| format!(" with {}", model.trim()))
+                    .unwrap_or_default()
+            )],
+        );
+        self.submit_runtime_payload(transport, prompt, payload)
+            .await?;
+        Ok(())
+    }
+
+    async fn run_storage_doctor(
+        &mut self,
+        transport: &RuntimeTransport,
+        clean: bool,
+    ) -> miette::Result<()> {
+        if clean {
+            let ack = transport
+                .send_command(session_command(
+                    self.session_id,
+                    SessionCommandKind::RunStorageMaintenance,
+                    json!({}),
+                ))
+                .await
+                .map_err(|error| miette::miette!("storage maintenance failed: {error}"))?;
+            self.last_control_ack = Some(ack.clone());
+            self.status_message = compact_ack_reason(&ack.reason);
+        }
+        let value = transport
+            .query(RuntimeQuery {
+                query_id: QueryId::new(),
+                session_id: self.session_id,
+                task_id: None,
+                kind: RuntimeQueryKind::StorageStatus,
+                requester: ActorKind::Tui,
+                cursor: None,
+                timestamp: chrono::Utc::now(),
+            })
+            .await
+            .map_err(|error| miette::miette!("storage status failed: {error}"))?;
+        let lines = [
+            ("artifact records", value.get("artifact_records")),
+            ("live blobs", value.get("live_artifact_blobs")),
+            ("expired blobs", value.get("expired_artifact_blobs")),
+            ("live bytes", value.get("live_artifact_bytes")),
+            (
+                "checkpoint directories",
+                value.get("checkpoint_directories"),
+            ),
+            ("rollout files", value.get("rollout_files")),
+        ]
+        .into_iter()
+        .filter_map(|(label, value)| value.map(|value| format!("{label}: {value}")))
+        .collect::<Vec<_>>();
+        self.push_system_message("Storage doctor", lines);
+        Ok(())
+    }
+
     async fn open_resume_picker(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
         let threads = transport
             .list_threads(50)
             .await
             .map_err(|error| miette::miette!("{error}"))?;
-        let items = threads
-            .into_iter()
-            .map(|thread| ResumeThreadItem {
-                thread_id: thread.thread_id,
-                session_id: thread.session_id,
-                title: thread.title,
-                preview: thread.preview,
-            })
-            .collect::<Vec<_>>();
+        let mut items = Vec::with_capacity(threads.len());
+        for thread in threads {
+            items.push(
+                resume_item_with_metadata(
+                    transport,
+                    thread.thread_id,
+                    thread.session_id,
+                    thread.updated_at,
+                    thread.title,
+                    thread.preview,
+                )
+                .await,
+            );
+        }
 
         if items.is_empty() {
             self.push_system_message("Resume", vec!["no sessions in this cwd yet".to_owned()]);
@@ -2377,15 +2587,20 @@ impl TuiApp {
             .list_threads(50)
             .await
             .map_err(|error| miette::miette!("{error}"))?;
-        let items = threads
-            .into_iter()
-            .map(|thread| ResumeThreadItem {
-                thread_id: thread.thread_id,
-                session_id: thread.session_id,
-                title: thread.title,
-                preview: thread.preview,
-            })
-            .collect::<Vec<_>>();
+        let mut items = Vec::with_capacity(threads.len());
+        for thread in threads {
+            items.push(
+                resume_item_with_metadata(
+                    transport,
+                    thread.thread_id,
+                    thread.session_id,
+                    thread.updated_at,
+                    thread.title,
+                    thread.preview,
+                )
+                .await,
+            );
+        }
         if items.is_empty() {
             self.push_system_message("Export", vec!["no sessions in this cwd yet".to_owned()]);
             return Ok(());
@@ -3194,6 +3409,126 @@ impl TuiApp {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RetryTarget {
+    prompt: String,
+    turn_id: Option<TurnId>,
+    fork_from_turn_id: Option<TurnId>,
+}
+
+fn retry_target(events: &[RuntimeEvent]) -> Option<RetryTarget> {
+    let mut prompts = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.event_type,
+                RuntimeEventType::TaskCreated
+                    | RuntimeEventType::TurnQueued
+                    | RuntimeEventType::TurnUpdated
+            )
+        })
+        .filter_map(|event| {
+            let prompt = event
+                .payload
+                .get("payload")
+                .and_then(|payload| payload.get("prompt"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|prompt| !prompt.is_empty())?;
+            Some((event.sequence_no, event.turn_id, prompt.to_owned()))
+        })
+        .collect::<Vec<_>>();
+    prompts.sort_by_key(|(sequence_no, _, _)| *sequence_no);
+    let (_, turn_id, prompt) = prompts.pop()?;
+    let fork_from_turn_id = turn_id.and_then(|turn_id| {
+        prompts
+            .iter()
+            .rev()
+            .filter_map(|(_, candidate, _)| *candidate)
+            .find(|candidate| *candidate != turn_id)
+    });
+    Some(RetryTarget {
+        prompt,
+        turn_id,
+        fork_from_turn_id,
+    })
+}
+
+async fn resume_item_with_metadata(
+    transport: &RuntimeTransport,
+    thread_id: ThreadId,
+    session_id: SessionId,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    title: String,
+    preview: String,
+) -> ResumeThreadItem {
+    let metadata = transport
+        .event_page(EventPageRequest {
+            session_id,
+            task_id: None,
+            cursor: None,
+            direction: EventPageDirection::Backward,
+            limit: 128,
+        })
+        .await
+        .ok()
+        .map(|page| catalog_metadata(&page.events))
+        .unwrap_or_else(|| "status=unknown · verify=unknown · model=unknown".to_owned());
+    let metadata = format!("{metadata} · updated={}", updated_at.to_rfc3339());
+    ResumeThreadItem {
+        thread_id,
+        session_id,
+        title,
+        preview,
+        metadata,
+    }
+}
+
+fn catalog_metadata(events: &[RuntimeEvent]) -> String {
+    let mut status = "idle".to_owned();
+    let mut model = "unknown".to_owned();
+    let mut verification = "unknown".to_owned();
+    let mut ordered = events.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|event| event.sequence_no);
+    for event in ordered {
+        if event.event_type == RuntimeEventType::TaskCreated
+            && let Some(payload) = event.payload.get("payload")
+            && let Some(value) = payload.get("provider_model").and_then(Value::as_str)
+        {
+            model = value.to_owned();
+        }
+        if let Some(value) = event.payload.get("status").and_then(Value::as_str) {
+            status = value.to_owned();
+        } else if let Some(value) = catalog_status_for_event(event.event_type) {
+            status = value.to_owned();
+        }
+        if event.event_type == RuntimeEventType::VerificationCompleted {
+            verification = event
+                .payload
+                .get("record")
+                .and_then(|record| record.get("result"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned();
+        }
+    }
+    format!("status={status} · verify={verification} · model={model}")
+}
+
+fn catalog_status_for_event(event_type: RuntimeEventType) -> Option<&'static str> {
+    match event_type {
+        RuntimeEventType::TaskCreated | RuntimeEventType::TurnStarted => Some("running"),
+        RuntimeEventType::TaskCompleted => Some("completed"),
+        RuntimeEventType::TaskAborted => Some("cancelled"),
+        RuntimeEventType::TaskInterrupted => Some("interrupted"),
+        RuntimeEventType::TaskUncertain => Some("uncertain"),
+        RuntimeEventType::TaskPaused => Some("paused"),
+        RuntimeEventType::ProviderAuthRequired => Some("waiting_authentication"),
+        RuntimeEventType::ApprovalRequested => Some("waiting_approval"),
+        _ => None,
+    }
+}
+
 fn main() -> miette::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -3260,6 +3595,11 @@ async fn run_interactive(
 ) -> miette::Result<()> {
     let task_id = parse_task_id(args.task_id.as_deref())?;
     let (thread_id, session_id) = initial_session(args.session_id.as_deref(), &transport).await?;
+    let continuation_hint = if args.session_id.is_none() {
+        recent_continuation_hint(&transport).await.ok().flatten()
+    } else {
+        None
+    };
     let provider_status = initial_provider_ui_status(&transport, session_id).await;
     let runtime_cwd = transport.cwd().unwrap_or(&cwd).to_path_buf();
     let auth_dialog = (!transport.is_remote()).then(initial_auth_dialog).flatten();
@@ -3272,13 +3612,35 @@ async fn run_interactive(
         auth_dialog,
     )
     .with_yolo(args.yolo)
-    .with_execution_mode(args.execution_mode)
-    .with_tool_profile(args.tool_profile)
+    .with_execution_mode(TuiExecutionModeArg::default())
+    .with_tool_profile(TuiToolProfileArg::default())
     .with_footer_context(runtime_cwd, provider_status.model);
     // The connected runtime stays authoritative for remote provider settings.
-    let mut app = app
-        .with_transport_runtime_controls(&transport)
-        .with_loaded_preferences();
+    let mut app = app.with_transport_runtime_controls(&transport);
+    if !transport.is_remote() {
+        app = app.with_loaded_runtime_settings()?;
+    }
+    if let Some(mode) = args.execution_mode {
+        app = app.with_execution_mode(mode);
+    }
+    if let Some(profile) = args.tool_profile {
+        app = app.with_tool_profile(profile);
+    }
+    app = app.with_loaded_preferences();
+    if let Some(hint) = continuation_hint {
+        app.push_system_message(
+            "继续未完成任务",
+            vec![
+                format!(
+                    "最近线程 {} 状态为 {:?}",
+                    short_id(&hint.thread_id.to_string()),
+                    hint.status
+                ),
+                format!("使用 /resume {} 查看原任务", hint.thread_id),
+                "也可以使用 /retry [model-id] 在新分支重跑最后一轮".to_owned(),
+            ],
+        );
+    }
     app.enable_inline_history();
     let (terminal_width, terminal_height) = crossterm::terminal::size()
         .map_err(|error| miette::miette!("read terminal size: {error}"))?;

@@ -3014,9 +3014,11 @@ mod tests {
         assert!(output.success);
 
         for _ in 0..50 {
-            if marker_path.exists() {
-                assert_eq!(fs::read_to_string(marker_path).expect("marker"), "alive");
-                return;
+            match fs::read_to_string(&marker_path) {
+                Ok(marker) if marker == "alive" => return,
+                Ok(_) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => panic!("failed to read descendant marker: {error}"),
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

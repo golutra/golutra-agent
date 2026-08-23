@@ -218,6 +218,8 @@ def check_repository(root: Path) -> list[str]:
             npm_readme_text = npm_readme.read_text(encoding="utf-8")
             for phrase in (
                 "npm install -g @golutra/agent",
+                "golutra\n",
+                "golutra exec",
                 "golutra-tui",
                 "does not run a network download script",
             ):

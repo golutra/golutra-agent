@@ -180,7 +180,7 @@ pub use application::{
 pub(crate) use context::{
     compact_event_summary, compact_history_text, compact_history_with_summary,
     completion_criteria_from_payload, context_compaction_from_event, conversation_history_line,
-    effective_model_history_events, environment_context_prompt, load_project_instructions,
+    effective_model_history_events, environment_context_prompt, load_project_instruction_bundle,
     memory_context, model_prompt_from_payload, preview_from_payload, prompt_from_payload,
     system_prompt, task_contract_from_payload, title_from_payload,
 };
@@ -232,9 +232,9 @@ pub use run_bundle::{
     RunBundleTerminalOutcome,
 };
 pub(crate) use task_mode::{
-    NormalizedExecutionMode, TOOL_PROFILE_KEY, execution_mode_from_payload, explicit_task_contract,
-    should_apply_legacy_adapter, strict_execution_requested, tool_profile_from_payload,
-    write_normalized_execution_mode,
+    NormalizedExecutionMode, TOOL_PROFILE_KEY, VERIFY_ON_CHANGE_KEY, execution_mode_from_payload,
+    explicit_task_contract, should_apply_legacy_adapter, strict_execution_requested,
+    tool_profile_from_payload, verify_on_change_auto, write_normalized_execution_mode,
 };
 pub use trace::merge_task_trace_page;
 #[cfg(unix)]
@@ -1090,6 +1090,7 @@ fn inherit_steering_execution_surface(
         "allow_network",
         "yolo",
         "defer_external_verification",
+        VERIFY_ON_CHANGE_KEY,
         "provider_profile",
         "provider_model",
         "provider_generation_config",

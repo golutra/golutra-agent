@@ -105,6 +105,10 @@ def smoke(root_archive: Path, platform_archive: Path, node_bin: str) -> None:
                 )
 
         run_command([node_bin, str(root_dir / "bin" / "golutra.js"), "--help"], root_dir)
+        # 静态检查避免在无真实终端时启动交互 TUI 并阻塞 smoke。
+        root_launcher = (root_dir / "bin" / "golutra.js").read_text(encoding="utf-8")
+        if 'process.argv.length === 2 ? "golutra-tui" : "golutra"' not in root_launcher:
+            raise SmokeError("golutra launcher does not route no-argument use to the TUI")
         run_command(
             [node_bin, str(root_dir / "bin" / "golutra-tui.js"), "--help"], root_dir
         )

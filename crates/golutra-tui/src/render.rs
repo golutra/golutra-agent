@@ -1085,6 +1085,10 @@ pub(crate) fn draw_resume_picker(
                     Span::raw("  "),
                     Span::styled(item.preview.clone(), Style::default().fg(palette.muted)),
                 ]),
+                Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(item.metadata.clone(), Style::default().fg(palette.subtle)),
+                ]),
             ];
             if selected && picker.show_details {
                 lines.push(Line::from(vec![
@@ -2339,6 +2343,10 @@ fn draw_resume_picker_with_title(
                     ),
                     Span::raw("  "),
                     Span::styled(item.preview.clone(), Style::default().fg(palette.muted)),
+                ]),
+                Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(item.metadata.clone(), Style::default().fg(palette.subtle)),
                 ]),
             ])
         })

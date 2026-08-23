@@ -64,6 +64,12 @@ fn steering_override_reason(payload: &Value) -> Option<&'static str> {
         return Some("steering cannot change active external-verification behavior");
     }
     if payload
+        .get(VERIFY_ON_CHANGE_KEY)
+        .is_some_and(|value| !value.is_null())
+    {
+        return Some("steering cannot change active verify-on-change behavior");
+    }
+    if payload
         .get(delegation_policy::DELEGATION_COST_BUDGET_KEY)
         .is_some_and(|value| !value.is_null())
     {
@@ -88,6 +94,7 @@ fn normalize_inherited_steering_payload(
             "max_elapsed_ms",
             "defer_external_verification",
             "discover_project_verifiers",
+            VERIFY_ON_CHANGE_KEY,
             EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY,
             delegation_policy::DELEGATION_COST_BUDGET_KEY,
         ] {
@@ -668,6 +675,8 @@ impl RuntimeHost {
                 ));
             }
         };
+        let verify_on_change_auto = verify_on_change_auto(&payload)
+            .map_err(|error| ClientError::TaskExecution(error.to_owned()))?;
         // Yolo is the trusted full-access profile: it also requests network
         // access, while the host still decides whether that capability exists.
         let requested_network = requested_network
@@ -675,7 +684,7 @@ impl RuntimeHost {
                 Some(requested || requested_yolo.unwrap_or(false))
             });
         let mut task_contract = task_contract_from_payload(&payload)?;
-        let contract_origin = if steer {
+        let mut contract_origin = if steer {
             "active_task"
         } else if has_explicit_task_contract {
             "explicit"
@@ -695,11 +704,19 @@ impl RuntimeHost {
                 ));
             }
         };
+        let requests_workspace_change = !steer
+            && (LegacyTaskAdapter::new(&payload, &prompt).requests_workspace_change()
+                || task_contract.requires_workspace_evidence());
+        if verify_on_change_auto && requests_workspace_change && !has_explicit_task_contract {
+            LegacyTaskAdapter::new(&payload, &prompt).apply_to(&mut task_contract);
+            contract_origin = "verify_on_change";
+        }
         if !steer
             && discover_project_verifiers_enabled
             && !defer_external_verification
             && payload.get("external_verifiers").is_none()
-            && strict_execution_requested(&payload, execution_mode)
+            && (strict_execution_requested(&payload, execution_mode)
+                || (verify_on_change_auto && requests_workspace_change))
             && (task_contract.require_objective_validation
                 || task_contract.requires_workspace_evidence())
         {
@@ -722,7 +739,7 @@ impl RuntimeHost {
         }
         if discovered_project_verifiers {
             task_contract = task_contract_from_payload(&payload)?;
-            if apply_legacy_adapter {
+            if apply_legacy_adapter || contract_origin == "verify_on_change" {
                 LegacyTaskAdapter::new(&payload, &prompt).apply_to(&mut task_contract);
             }
         }
@@ -748,6 +765,8 @@ impl RuntimeHost {
             .unwrap_or_default();
         payload["task_contract"] = serde_json::to_value(&task_contract)?;
         payload["_task_contract_origin"] = Value::String(contract_origin.to_owned());
+        payload[VERIFY_ON_CHANGE_KEY] =
+            Value::String(if verify_on_change_auto { "auto" } else { "off" }.to_owned());
         write_normalized_execution_mode(&mut payload, execution_mode);
         if !steer || has_explicit_tool_profile {
             payload[TOOL_PROFILE_KEY] = serde_json::to_value(tool_profile)?;
@@ -1927,11 +1946,26 @@ impl RuntimeHost {
             });
         };
         self.ensure_thread_in_workspace(&thread)?;
+        let purge_requested = command.kind == SessionCommandKind::DeleteThread
+            && command.payload.get("purge") == Some(&Value::Bool(true));
+        if purge_requested
+            && command.payload.get("confirm").and_then(Value::as_str) != Some("PURGE")
+        {
+            return Ok(CommandAck {
+                command_id: command.command_id,
+                accepted: false,
+                reason: Some("privacy purge requires confirm=PURGE".to_owned()),
+            });
+        }
         let (event_type, summary) = match command.kind {
             SessionCommandKind::RenameThread => (RuntimeEventType::ThreadRenamed, "thread renamed"),
             SessionCommandKind::ArchiveThread => {
                 (RuntimeEventType::ThreadArchived, "thread archived")
             }
+            SessionCommandKind::DeleteThread if purge_requested => (
+                RuntimeEventType::ThreadDeleted,
+                "thread purged; audit tombstone retained",
+            ),
             SessionCommandKind::DeleteThread => (
                 RuntimeEventType::ThreadDeleted,
                 "thread removed from history",
@@ -1942,7 +1976,12 @@ impl RuntimeHost {
             .existing_thread_metadata_event(&thread, event_type, command.command_id)
             .await?
         {
-            self.rebuild_thread_rollout(&thread).await?;
+            if purge_requested {
+                self.remove_thread_rollout_projection(thread.thread_id)
+                    .await?;
+            } else {
+                self.rebuild_thread_rollout(&thread).await?;
+            }
             self.publish_live_event(event);
             return Ok(CommandAck {
                 command_id: command.command_id,
@@ -2046,6 +2085,10 @@ impl RuntimeHost {
                 reason: Some(format!("thread {thread_id} was not found")),
             });
         }
+        if purge_requested {
+            self.remove_thread_rollout_projection(thread.thread_id)
+                .await?;
+        }
         Ok(CommandAck {
             command_id: command.command_id,
             accepted: true,
@@ -2140,6 +2183,20 @@ impl RuntimeHost {
                     && event.payload.get("thread_id").and_then(Value::as_str)
                         == Some(thread_id.as_str())
             }))
+    }
+
+    async fn remove_thread_rollout_projection(
+        &self,
+        thread_id: ThreadId,
+    ) -> Result<(), ClientError> {
+        let (Some(workspace_root), Some(paths)) =
+            (self.workspace_root.clone(), self.runtime_paths.clone())
+        else {
+            return Ok(());
+        };
+        let rollout_path = rollout_path_for_workspace(&paths, &workspace_root, thread_id);
+        run_blocking(move || remove_rollout_projection(&rollout_path)).await??;
+        Ok(())
     }
 
     async fn record_thread_metadata_event(

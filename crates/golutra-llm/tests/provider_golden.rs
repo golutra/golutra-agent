@@ -434,14 +434,18 @@ async fn openai_responses_provider_matches_sse_goldens_and_auth_headers() {
     assert_eq!(response.usage.output_tokens, Some(3));
     assert_eq!(response.usage.reasoning_tokens, Some(1));
     assert_eq!(response.usage.total_tokens, Some(15));
+    assert_eq!(response.raw_metadata["response_id"], "resp_golden_text");
 
     let (base_url, _captured) = spawn_provider_sequence(vec![TestProviderResponse::sse(
         200,
         include_str!("fixtures/openai-responses/tool-response.sse"),
     )])
     .await;
+    let mut tool_stream_events = Vec::new();
     let response = openai_responses_provider(base_url)
-        .complete(simple_request("gpt-golden"))
+        .complete_stream(simple_request("gpt-golden"), &mut |event| {
+            tool_stream_events.push(event);
+        })
         .await
         .expect("Responses tool response");
     assert_eq!(response.finish_reason, ProviderFinishReason::ToolCalls);
@@ -450,6 +454,14 @@ async fn openai_responses_provider_matches_sse_goldens_and_auth_headers() {
     assert_eq!(
         response.tool_calls[0].arguments,
         json!({"path": "README.md"})
+    );
+    assert_eq!(
+        tool_stream_events,
+        vec![ProviderStreamEvent::ToolCallDelta {
+            index: 0,
+            tool_call_id: Some("call_read_1".to_owned()),
+            tool_name: Some("read_file".to_owned()),
+        }]
     );
     let replay_items = &response
         .message
@@ -550,7 +562,7 @@ async fn openai_responses_completion_and_probe_refresh_once_after_401() {
         TestProviderResponse::json(401, unauthorized),
         TestProviderResponse::json(
             200,
-            serde_json::json!({"models": [{"slug": "gpt-golden"}]}).to_string(),
+            serde_json::json!({"data": [{"id": "gpt-golden"}]}).to_string(),
         ),
     ])
     .await;
@@ -570,6 +582,70 @@ async fn openai_responses_completion_and_probe_refresh_once_after_401() {
         captured[1].headers.get("authorization").map(String::as_str),
         Some("Bearer golden-refreshed-key")
     );
+}
+
+#[tokio::test]
+async fn openai_responses_forces_rust_genai_responses_routing_for_grok_model() {
+    let (base_url, captured) = spawn_provider_sequence(vec![TestProviderResponse::sse(
+        200,
+        include_str!("fixtures/openai-responses/text-response.sse"),
+    )])
+    .await;
+
+    openai_responses_provider_with_model(base_url, "grok-4.5")
+        .complete(simple_request("grok-4.5"))
+        .await
+        .expect("grok Responses request");
+    let captured = captured.await.expect("grok Responses capture");
+
+    assert_eq!(captured[0].path, "/responses");
+    assert_eq!(captured[0].body["model"], "grok-4.5");
+    assert_eq!(captured[0].body["stream"], true);
+}
+
+#[tokio::test]
+async fn openai_responses_rejects_stream_without_completed_response_id() {
+    let truncated = concat!(
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (base_url, _captured) =
+        spawn_provider_sequence(vec![TestProviderResponse::sse(200, truncated)]).await;
+
+    let error = openai_responses_provider(base_url)
+        .complete(simple_request("gpt-golden"))
+        .await
+        .expect_err("truncated Responses stream");
+
+    assert!(matches!(error, ProviderError::Unavailable { .. }));
+    assert!(error.to_string().contains("response.completed"));
+}
+
+#[tokio::test]
+async fn openai_responses_rejects_oversized_text_before_streaming_it() {
+    const PROVIDER_MESSAGE_LIMIT: usize = 128 * 1024;
+    let response = format!(
+        "event: response.output_text.delta\ndata: {}\n\n",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "x".repeat(PROVIDER_MESSAGE_LIMIT + 1),
+        })
+    );
+    let (base_url, _captured) =
+        spawn_provider_sequence(vec![TestProviderResponse::sse(200, response)]).await;
+    let mut events = Vec::new();
+
+    let error = openai_responses_provider(base_url)
+        .complete_stream(simple_request("gpt-golden"), &mut |event| {
+            events.push(event)
+        })
+        .await
+        .expect_err("oversized Responses text");
+
+    assert!(matches!(error, ProviderError::Malformed { .. }));
+    assert!(error.to_string().contains("assistant message exceeds"));
+    assert!(events.is_empty(), "oversized text must not reach consumers");
 }
 
 #[tokio::test]
@@ -637,6 +713,31 @@ async fn live_provider_smoke_is_opt_in_and_never_reads_normal_user_credentials()
         assert!(response.message.is_some() || !response.tool_calls.is_empty());
     } else {
         eprintln!("skipping openai-compatible live smoke: dedicated env is incomplete");
+    }
+    let responses_key = std::env::var("GOLUTRA_LIVE_OPENAI_RESPONSES_API_KEY").ok();
+    let responses_base_url = std::env::var("GOLUTRA_LIVE_OPENAI_RESPONSES_BASE_URL").ok();
+    let responses_model = std::env::var("GOLUTRA_LIVE_OPENAI_RESPONSES_MODEL").ok();
+    if let (Some(api_key), Some(base_url), Some(model)) =
+        (responses_key, responses_base_url, responses_model)
+    {
+        let response = OpenAiResponsesProvider::from_config(OpenAiResponsesProviderConfig {
+            api_key,
+            api_key_env: "GOLUTRA_LIVE_OPENAI_RESPONSES_API_KEY".to_owned(),
+            provider_id: "openai-responses-live".to_owned(),
+            base_url,
+            model_id: model.clone(),
+            generation_config: ProviderGenerationConfig {
+                max_tokens: Some(32),
+                ..ProviderGenerationConfig::default()
+            },
+            custom_headers: Default::default(),
+        })
+        .complete(simple_request(&model))
+        .await
+        .expect("OpenAI Responses live smoke");
+        assert!(response.message.is_some() || !response.tool_calls.is_empty());
+    } else {
+        eprintln!("skipping OpenAI Responses live smoke: dedicated env is incomplete");
     }
     for protocol in [
         ProviderProtocol::Anthropic,
@@ -750,13 +851,20 @@ fn provider(case: ProtocolCase, base_url: String) -> GenaiProviderAdapter {
 }
 
 fn openai_responses_provider(base_url: String) -> OpenAiResponsesProvider {
+    openai_responses_provider_with_model(base_url, "gpt-golden")
+}
+
+fn openai_responses_provider_with_model(
+    base_url: String,
+    model_id: &str,
+) -> OpenAiResponsesProvider {
     OpenAiResponsesProvider::from_config_with_credential(
         OpenAiResponsesProviderConfig {
             api_key: "<resolved-credential>".to_owned(),
             api_key_env: "golden-refreshing-credential".to_owned(),
             provider_id: "openai-chatgpt".to_owned(),
             base_url,
-            model_id: "gpt-golden".to_owned(),
+            model_id: model_id.to_owned(),
             generation_config: ProviderGenerationConfig::default(),
             custom_headers: Default::default(),
         },

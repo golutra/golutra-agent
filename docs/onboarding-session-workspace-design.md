@@ -55,8 +55,10 @@ Golutra 不应照搬把明文 key 默认写入 workspace。推荐持久化分层
 | --- | --- | --- |
 | 全局 home | `GOLUTRA_HOME`，否则 `~/.golutra` | 用户配置、secret ref、provider catalog |
 | 全局 provider/auth 配置 | `$GOLUTRA_HOME/provider.json` | provider catalog、默认 selection、`credential_ref`、随机 credential revision 和 OAuth 非敏感 metadata |
+| 全局运行默认 | `$GOLUTRA_HOME/runtime.json` | 非敏感 provider/model、execution/tool profile、verify-on-change 和 reasoning 默认 |
 | 全局 runtime facts | `$GOLUTRA_HOME/state/runtime.sqlite` | 所有 cwd 的 session/task/event/projection/thread index，不保存明文 secret |
 | cwd 分区状态 | `$GOLUTRA_HOME/state/workspaces/<cwd-hash>/` | checkpoint、memory、evaluation、evolution、skill、code index、rollout |
+| 项目运行默认 | `<workspace>/.golutra/runtime.json` | 当前项目覆盖全局的非敏感运行默认，不保存 provider secret |
 | thread rollouts | `$GOLUTRA_HOME/state/workspaces/<cwd-hash>/rollouts/<thread-id>.jsonl` | 从 SQLite facts 物化的 versioned、checksum、脱敏历史 |
 | 全局凭据文件 | `$GOLUTRA_HOME/credentials.json`；CI 可使用进程 env | owner-only 明文 API key、OAuth access/refresh token set；项目目录和 provider config 禁止 secret |
 
@@ -326,7 +328,7 @@ TUI 输入框现在先经过 slash command parser：
 ## 当前状态与边界
 
 - 当前 TUI 已有 qwen-code 风格 provider setup：Golutra API、Third-party Providers、Custom Provider、mock 分组选择；第三方内置 OpenAI、OpenRouter、DeepSeek、Qwen/DashScope compatible、xAI、GitHub Copilot 和本地 OpenAI-compatible preset；OpenAI 展示 ChatGPT browser/headless OAuth/API key，xAI 展示 browser/device OAuth/API key，GitHub Copilot 只展示 device OAuth。Custom Provider 可选 OpenAI-compatible、Anthropic、Gemini、Vertex AI、genai，但不自动获得 OAuth。setup 的 API key 路径按 protocol/baseUrl -> credential storage/API key 或 envKey -> model -> advanced config -> review -> install 执行；OAuth 路径直接启动后台授权并在成功后 verified probe/install。review 展示脱敏 `ProviderInstallPlan`、保存路径和同名 profile 覆盖提示；secret/config/probe 失败自动 rollback，成功覆盖会删除旧 credential。
-- 当前 provider/auth 持久化已收敛为全局用户级 `$GOLUTRA_HOME/provider.json` v2和 disk/env SecretRef；磁盘 secret 位于 `$GOLUTRA_HOME/credentials.json`，OAuth browser/device、refresh、revoke/logout 已接通。项目 `.golutra` 不参与 provider 或 runtime 持久化。
+- 当前 provider/auth 持久化已收敛为全局用户级 `$GOLUTRA_HOME/provider.json` v2和 disk/env SecretRef；磁盘 secret 位于 `$GOLUTRA_HOME/credentials.json`，OAuth browser/device、refresh、revoke/logout 已接通。项目 `.golutra/runtime.json` 只保存经过严格校验的非敏感运行默认，不能保存 provider 或 runtime secret；项目值覆盖全局值，session 内存控制和显式 CLI 参数继续拥有更高优先级。
 - 当前全局 `threads` 表、`golutra thread list`、`golutra resume [THREAD_ID]`、`golutra fork THREAD_ID [--from-turn TURN_ID]`、`golutra thread export`、`golutra export <ABSOLUTE_DIR> [--thread-id ID] [--range 1|+N|-N]` 和 `golutra thread rebind --from` 已可用；默认按当前 canonical cwd 过滤，每个显式新 session 使用独立 thread 主键，daemon 重新 attach 会刷新最近 thread/session。Session page/window 通过 Embedded、HTTP 和 Unix IPC 使用同一稳定 cursor/anchor 语义。
 - 当前完成任务会写入 `AssistantMessage`，`UserProjection.final_message` 和 TUI transcript 可在 resume 后恢复最终回复；下一轮 prompt 会携带当前 session 的压缩历史摘要。
 - 当前全局 SQLite 已覆盖多 cwd 事实与索引；TUI 按产品边界只展示当前 canonical cwd 的 session。

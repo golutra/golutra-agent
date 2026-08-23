@@ -1,8 +1,8 @@
 //! TUI 会话选择、命令构造与 ID 解析。
 
-use golutra_client::{DebugExportReceipt, RuntimeTransport};
-use golutra_core::{Actor, ActorKind, CommandId, SessionId, TaskId, ThreadId, TurnId};
-use golutra_protocol::{SessionCommand, SessionCommandKind};
+use golutra_client::{DebugExportReceipt, RuntimeClient, RuntimeTransport};
+use golutra_core::{Actor, ActorKind, CommandId, SessionId, TaskId, TaskStatus, ThreadId, TurnId};
+use golutra_protocol::{RuntimeQuery, RuntimeQueryKind, SessionCommand, SessionCommandKind};
 use serde_json::Value;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -33,6 +33,14 @@ pub(crate) struct ResumeThreadItem {
     pub(crate) session_id: SessionId,
     pub(crate) title: String,
     pub(crate) preview: String,
+    pub(crate) metadata: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContinuationHint {
+    pub(crate) thread_id: ThreadId,
+    pub(crate) session_id: SessionId,
+    pub(crate) status: TaskStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +120,7 @@ impl ResumePickerState {
         for item in self.items.iter_mut().chain(self.all_items.iter_mut()) {
             item.title = redact(&item.title);
             item.preview = redact(&item.preview);
+            item.metadata = redact(&item.metadata);
         }
         self.search.set_text(redact(self.search.text()));
         self.action_input.set_text(redact(self.action_input.text()));
@@ -167,6 +176,7 @@ impl ResumePickerState {
                 query.is_empty()
                     || item.title.to_lowercase().contains(&query)
                     || item.preview.to_lowercase().contains(&query)
+                    || item.metadata.to_lowercase().contains(&query)
                     || item.thread_id.to_string().contains(&query)
                     || item.session_id.to_string().contains(&query)
             })
@@ -255,6 +265,49 @@ pub(crate) async fn initial_session(
         return Ok((thread_id, session_id));
     }
     Ok((ThreadId::new(), SessionId::new()))
+}
+
+pub(crate) async fn recent_continuation_hint(
+    transport: &RuntimeTransport,
+) -> Result<Option<ContinuationHint>, String> {
+    let threads = transport
+        .list_threads(20)
+        .await
+        .map_err(|error| error.to_string())?;
+    for thread in threads {
+        let value = transport
+            .query(RuntimeQuery {
+                query_id: golutra_core::QueryId::new(),
+                session_id: thread.session_id,
+                task_id: None,
+                kind: RuntimeQueryKind::UserProjection,
+                requester: ActorKind::Tui,
+                cursor: None,
+                timestamp: chrono::Utc::now(),
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        let Ok(projection) = serde_json::from_value::<golutra_protocol::UserProjection>(value)
+        else {
+            continue;
+        };
+        if matches!(
+            projection.status,
+            TaskStatus::Interrupted
+                | TaskStatus::Uncertain
+                | TaskStatus::Partial
+                | TaskStatus::WaitingApproval
+                | TaskStatus::WaitingAuthentication
+                | TaskStatus::Paused
+        ) {
+            return Ok(Some(ContinuationHint {
+                thread_id: thread.thread_id,
+                session_id: thread.session_id,
+                status: projection.status,
+            }));
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) fn parse_task_id(value: Option<&str>) -> miette::Result<Option<TaskId>> {

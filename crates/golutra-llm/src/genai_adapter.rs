@@ -224,7 +224,7 @@ impl GenaiProviderAdapter {
             .credential(force_refresh)
             .await
             .map_err(super::provider_credential_error)?;
-        let chat_request = genai_chat_request(request)?;
+        let chat_request = genai_chat_request(request, self.config.protocol)?;
         let options = genai_chat_options(&self.config.generation_config, false)?;
         let response = self
             .client
@@ -242,7 +242,7 @@ impl GenaiProviderAdapter {
                     .credential(true)
                     .await
                     .map_err(super::provider_credential_error)?;
-                let chat_request = genai_chat_request(request)?;
+                let chat_request = genai_chat_request(request, self.config.protocol)?;
                 self.client
                     .exec_chat(
                         self.service_target(api_key.expose_secret())?,
@@ -269,7 +269,7 @@ impl GenaiProviderAdapter {
                 .credential(force_refresh)
                 .await
                 .map_err(super::provider_credential_error)?;
-            let chat_request = genai_chat_request(request)?;
+            let chat_request = genai_chat_request(request, self.config.protocol)?;
             let options = genai_chat_options(&self.config.generation_config, true)?;
             match self
                 .client
@@ -364,7 +364,11 @@ impl super::LlmProvider for GenaiProviderAdapter {
     }
 }
 
-fn genai_chat_request(request: &ProviderRequest) -> Result<ChatRequest, ProviderError> {
+pub(crate) fn genai_chat_request(
+    request: &ProviderRequest,
+    protocol: ProviderProtocol,
+) -> Result<ChatRequest, ProviderError> {
+    let is_openai_responses = protocol == ProviderProtocol::OpenAiResponses;
     let systems = request
         .messages
         .iter()
@@ -376,7 +380,7 @@ fn genai_chat_request(request: &ProviderRequest) -> Result<ChatRequest, Provider
         .messages
         .iter()
         .filter(|message| message.role != ProviderRole::System)
-        .map(genai_message)
+        .map(|message| genai_message(message, is_openai_responses))
         .collect::<Result<Vec<_>, _>>()?;
     let mut chat_request = ChatRequest::new(messages);
     if !systems.is_empty() {
@@ -384,20 +388,40 @@ fn genai_chat_request(request: &ProviderRequest) -> Result<ChatRequest, Provider
     }
     if !request.tools.is_empty() {
         chat_request = chat_request.with_tools(request.tools.iter().map(|contract| {
-            Tool::new(contract.tool_name.clone())
+            let tool = Tool::new(contract.tool_name.clone())
                 .with_description(tool_description(&contract.tool_name))
-                .with_schema(contract.input_schema.clone())
+                .with_schema(contract.input_schema.clone());
+            if is_openai_responses {
+                tool.with_strict(true)
+            } else {
+                tool
+            }
         }));
     }
     Ok(chat_request)
 }
 
-fn genai_message(message: &ProviderMessage) -> Result<ChatMessage, ProviderError> {
+fn genai_message(
+    message: &ProviderMessage,
+    replay_openai_responses_reasoning: bool,
+) -> Result<ChatMessage, ProviderError> {
     match message.role {
         ProviderRole::System => Ok(ChatMessage::system(message.content.clone())),
         ProviderRole::User => Ok(ChatMessage::user(message.content.clone())),
         ProviderRole::Assistant => {
             let mut parts = Vec::new();
+            if replay_openai_responses_reasoning {
+                parts.extend(
+                    message
+                        .metadata
+                        .openai_responses_replay_items
+                        .iter()
+                        .map(openai_responses_thought_signature)
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into_iter()
+                        .map(ContentPart::ThoughtSignature),
+                );
+            }
             if !message.content.is_empty() {
                 parts.push(ContentPart::Text(message.content.clone()));
             }
@@ -432,7 +456,31 @@ fn genai_message(message: &ProviderMessage) -> Result<ChatMessage, ProviderError
     }
 }
 
-fn genai_chat_options(
+fn openai_responses_thought_signature(item: &Value) -> Result<String, ProviderError> {
+    if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+        return Err(ProviderError::Malformed {
+            message: "Responses replay metadata contains an unsupported item".to_owned(),
+        });
+    }
+    let encrypted_content = item
+        .get("encrypted_content")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ProviderError::Malformed {
+            message: "Responses reasoning item has no encrypted_content".to_owned(),
+        })?;
+    if encrypted_content.len() > super::MAX_PROVIDER_MESSAGE_BYTES {
+        return Err(ProviderError::Malformed {
+            message: format!(
+                "Responses encrypted reasoning exceeds {} byte limit",
+                super::MAX_PROVIDER_MESSAGE_BYTES
+            ),
+        });
+    }
+    Ok(encrypted_content.to_owned())
+}
+
+pub(crate) fn genai_chat_options(
     config: &ProviderGenerationConfig,
     streaming: bool,
 ) -> Result<ChatOptions, ProviderError> {
@@ -466,10 +514,21 @@ fn genai_chat_options(
     Ok(options)
 }
 
-fn provider_response_from_genai_stream(
+pub(crate) fn provider_response_from_genai_stream(
     end: StreamEnd,
     model_id: &str,
 ) -> Result<ProviderResponse, ProviderError> {
+    let captured_size = serde_json::to_vec(&end).map_err(|error| ProviderError::Malformed {
+        message: format!("provider stream result could not be serialized: {error}"),
+    })?;
+    if captured_size.len() > super::MAX_PROVIDER_RESPONSE_BYTES {
+        return Err(ProviderError::Malformed {
+            message: format!(
+                "provider response exceeds {} byte limit",
+                super::MAX_PROVIDER_RESPONSE_BYTES
+            ),
+        });
+    }
     let content = end
         .captured_content
         .as_ref()
@@ -674,15 +733,15 @@ fn non_negative_u64(value: Option<i32>) -> Option<u64> {
     value.and_then(|value| u64::try_from(value).ok())
 }
 
-fn map_genai_error(error: genai::Error) -> ProviderError {
+pub(crate) fn map_genai_error(error: genai::Error) -> ProviderError {
     let message = sanitize_provider_error(&error.to_string());
+    if genai_error_http_status(&error) == Some(429) {
+        return ProviderError::RateLimited { message };
+    }
+    if genai_error_http_status(&error).is_some_and(|status| (500..600).contains(&status)) {
+        return ProviderError::Unavailable { message };
+    }
     match error {
-        genai::Error::HttpError { status, .. } if status.as_u16() == 429 => {
-            ProviderError::RateLimited { message }
-        }
-        genai::Error::HttpError { status, .. } if status.is_server_error() => {
-            ProviderError::Unavailable { message }
-        }
         genai::Error::RequiresApiKey { .. }
         | genai::Error::NoAuthResolver { .. }
         | genai::Error::NoAuthData { .. } => ProviderError::NotConfigured { message },
@@ -710,11 +769,31 @@ fn map_genai_error(error: genai::Error) -> ProviderError {
     }
 }
 
-fn genai_error_requires_auth_refresh(error: &genai::Error) -> bool {
+pub(crate) fn genai_error_requires_auth_refresh(error: &genai::Error) -> bool {
     matches!(
         error,
         genai::Error::HttpError { status, .. } if status.as_u16() == 401
     )
+}
+
+pub(crate) fn genai_stream_error_requires_auth_refresh(error: &genai::Error) -> bool {
+    genai_error_http_status(error) == Some(401)
+}
+
+pub(crate) fn genai_error_http_status(error: &genai::Error) -> Option<u16> {
+    match error {
+        genai::Error::HttpError { status, .. } => Some(status.as_u16()),
+        genai::Error::WebStream { error, .. } => error
+            .downcast_ref::<genai::Error>()
+            .and_then(genai_error_http_status),
+        genai::Error::WebAdapterCall { webc_error, .. }
+        | genai::Error::WebModelCall { webc_error, .. } => match webc_error {
+            genai::webc::Error::ResponseFailedStatus { status, .. } => Some(status.as_u16()),
+            genai::webc::Error::Reqwest(error) => error.status().map(|status| status.as_u16()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn native_protocol(protocol: ProviderProtocol) -> &'static str {

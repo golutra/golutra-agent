@@ -1,30 +1,44 @@
-use std::{fmt, sync::Arc};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
+use genai::{
+    Client, Headers, ModelIden, ServiceTarget, WebConfig,
+    adapter::AdapterKind,
+    chat::{ChatOptions, ChatStreamEvent, StreamEnd, ToolCall, ToolChoice},
+    resolver::{AuthData, Endpoint},
+};
 use golutra_auth::{CredentialProvider, FixedCredentialProvider};
-use golutra_core::{ProviderContract, ProviderResponseId, ToolContract};
+use golutra_core::ProviderContract;
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
 use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 
+use super::genai_adapter::{
+    genai_chat_options, genai_chat_request, genai_error_http_status,
+    genai_stream_error_requires_auth_refresh, map_genai_error, provider_response_from_genai_stream,
+};
 use super::{
     GOLUTRA_PROVIDER_AUTH_PROVIDER, MAX_PROVIDER_MESSAGE_BYTES, MAX_PROVIDER_RESPONSE_BYTES,
     MAX_PROVIDER_TOOL_ARGUMENT_BYTES, MAX_PROVIDER_TOOL_CALL_ID_BYTES,
     MAX_PROVIDER_TOOL_NAME_BYTES, ProviderError, ProviderFinishReason, ProviderGenerationConfig,
     ProviderHttpHeaders, ProviderMessage, ProviderMessageMetadata, ProviderProbeResult,
     ProviderProtocol, ProviderRequest, ProviderResponse, ProviderRole, ProviderStreamEvent,
-    ProviderToolCall, ProviderUsage, UsageSource, configured_or_first_env,
-    custom_headers_from_reader, env_mapping, first_env, generation_config_from_reader,
-    missing_env_error, protocol_capabilities, provider_credential_error, provider_error_message,
-    provider_http_client, provider_http_error, provider_transport_error, response_json_or_error,
-    validate_native_base_url,
+    configured_or_first_env, custom_headers_from_reader, env_mapping, first_env,
+    generation_config_from_reader, missing_env_error, protocol_capabilities,
+    provider_credential_error, provider_http_client, provider_http_error, provider_transport_error,
+    response_json_or_error, sanitize_provider_error, validate_native_base_url,
 };
 
 const CHATGPT_ACCOUNT_ID_HEADER: &str = "ChatGPT-Account-Id";
 const DEFAULT_PROVIDER_ID: &str = "openai-chatgpt";
+
+struct StreamedToolCall {
+    index: usize,
+    argument_bytes: usize,
+    announced: bool,
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct OpenAiResponsesProviderConfig {
@@ -41,7 +55,8 @@ pub struct OpenAiResponsesProviderConfig {
 pub struct OpenAiResponsesProvider {
     credential: Arc<dyn CredentialProvider>,
     config: OpenAiResponsesProviderConfig,
-    client: reqwest::Client,
+    client: Client,
+    probe_client: reqwest::Client,
 }
 
 impl fmt::Debug for OpenAiResponsesProviderConfig {
@@ -87,10 +102,15 @@ impl OpenAiResponsesProvider {
         config: OpenAiResponsesProviderConfig,
         credential: Arc<dyn CredentialProvider>,
     ) -> Self {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let web_config = WebConfig::default()
+            .with_connect_timeout(std::time::Duration::from_secs(10))
+            .with_timeout(std::time::Duration::from_secs(3_600));
         Self {
             credential,
             config,
-            client: provider_http_client(),
+            client: Client::builder().with_web_config(web_config).build(),
+            probe_client: provider_http_client(),
         }
     }
 
@@ -111,6 +131,15 @@ impl OpenAiResponsesProvider {
             .ok_or_else(|| missing_env_error(mapping.base_url))?;
         let base_url = validate_native_base_url(&base_url)
             .map_err(|message| ProviderError::NotConfigured { message })?;
+        let generation_config = generation_config_from_reader(&reader)?;
+        if generation_config
+            .max_tokens
+            .is_some_and(|value| value > u64::from(u32::MAX))
+        {
+            return Err(ProviderError::NotConfigured {
+                message: "provider max_tokens exceeds the supported u32 range".to_owned(),
+            });
+        }
         let provider_id = reader(GOLUTRA_PROVIDER_AUTH_PROVIDER)
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_PROVIDER_ID.to_owned());
@@ -120,7 +149,7 @@ impl OpenAiResponsesProvider {
             provider_id,
             base_url,
             model_id,
-            generation_config: generation_config_from_reader(&reader)?,
+            generation_config,
             custom_headers: custom_headers_from_reader(&reader)?,
         })
     }
@@ -137,6 +166,7 @@ impl OpenAiResponsesProvider {
         }
         let discovered_models = value
             .get("models")
+            .or_else(|| value.get("data"))
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
@@ -170,8 +200,8 @@ impl OpenAiResponsesProvider {
 
     async fn send_probe(&self, force_refresh: bool) -> Result<reqwest::Response, ProviderError> {
         let (token, account_id) = self.resolve_credential(force_refresh).await?;
-        self.authenticated_request(
-            self.client.get(format!(
+        self.authenticated_probe_request(
+            self.probe_client.get(format!(
                 "{}/models?client_version={}",
                 self.config.base_url.trim_end_matches('/'),
                 env!("CARGO_PKG_VERSION")
@@ -184,7 +214,7 @@ impl OpenAiResponsesProvider {
         .map_err(provider_transport_error)
     }
 
-    fn authenticated_request(
+    fn authenticated_probe_request(
         &self,
         builder: reqwest::RequestBuilder,
         access_token: &str,
@@ -228,28 +258,186 @@ impl OpenAiResponsesProvider {
         Ok((token, account_id))
     }
 
-    async fn send_completion(
+    fn service_target(&self, api_key: &str) -> ServiceTarget {
+        ServiceTarget {
+            endpoint: Endpoint::from_owned(format!(
+                "{}/",
+                self.config.base_url.trim_end_matches('/')
+            )),
+            auth: AuthData::from_single(api_key.to_owned()),
+            model: ModelIden::new(AdapterKind::OpenAIResp, self.config.model_id.clone()),
+        }
+    }
+
+    fn chat_options(
         &self,
         request: &ProviderRequest,
-        force_refresh: bool,
-    ) -> Result<reqwest::Response, ProviderError> {
-        let (token, account_id) = self.resolve_credential(force_refresh).await?;
-        let body = responses_request_body(request, &self.config)?;
-        self.authenticated_request(
-            self.client
-                .post(format!(
-                    "{}/responses",
-                    self.config.base_url.trim_end_matches('/')
-                ))
-                .header(ACCEPT, "text/event-stream")
-                .header("session-id", request.task_id.to_string())
-                .json(&body),
-            token.expose_secret(),
-            account_id.as_deref(),
+        account_id: Option<&str>,
+    ) -> Result<ChatOptions, ProviderError> {
+        let mut options = genai_chat_options(&self.config.generation_config, true)?
+            .with_extra_headers(self.request_headers(request, account_id));
+        if !request.tools.is_empty() {
+            options = options
+                .with_tool_choice(ToolChoice::Auto)
+                .with_extra_body(json!({"parallel_tool_calls": true}));
+        }
+        Ok(options)
+    }
+
+    fn request_headers(&self, request: &ProviderRequest, account_id: Option<&str>) -> Headers {
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+        headers.insert(
+            USER_AGENT,
+            HeaderValue::from_str(&format!("golutra/{}", env!("CARGO_PKG_VERSION")))
+                .unwrap_or_else(|_| HeaderValue::from_static("golutra")),
+        );
+        headers.insert("originator", HeaderValue::from_static("golutra"));
+        if let Ok(value) = HeaderValue::from_str(&request.task_id.to_string()) {
+            headers.insert("session-id", value);
+        }
+        if let Some(account_id) = account_id
+            && let Ok(value) = HeaderValue::from_str(account_id)
+        {
+            headers.insert(CHATGPT_ACCOUNT_ID_HEADER, value);
+        }
+        headers.extend(self.config.custom_headers.to_header_map());
+        Headers::from(
+            headers
+                .iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|value| (name.as_str().to_owned(), value.to_owned()))
+                })
+                .collect::<Vec<_>>(),
         )
-        .send()
-        .await
-        .map_err(provider_transport_error)
+    }
+
+    async fn execute_stream(
+        &self,
+        request: &ProviderRequest,
+        on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
+    ) -> Result<ProviderResponse, ProviderError> {
+        let mut force_refresh = false;
+        loop {
+            let (token, account_id) = self.resolve_credential(force_refresh).await?;
+            let chat_request = genai_chat_request(request, ProviderProtocol::OpenAiResponses)?;
+            let options = self.chat_options(request, account_id.as_deref())?;
+            let response = match self
+                .client
+                .exec_chat_stream(
+                    self.service_target(token.expose_secret()),
+                    chat_request,
+                    Some(&options),
+                )
+                .await
+            {
+                Ok(response) => response,
+                Err(error)
+                    if !force_refresh && genai_stream_error_requires_auth_refresh(&error) =>
+                {
+                    force_refresh = true;
+                    continue;
+                }
+                Err(error) => return Err(map_responses_genai_error(error)),
+            };
+
+            let model_id = response.model_iden.to_string();
+            let mut stream = response.stream;
+            let mut stream_end = None;
+            let mut retry_with_refresh = false;
+            let mut business_event_seen = false;
+            let mut captured_response_bytes = 0_usize;
+            let mut captured_text_bytes = 0_usize;
+            let mut tool_calls = HashMap::<String, StreamedToolCall>::new();
+
+            while let Some(event) = stream.next().await {
+                let event = match event {
+                    Ok(event) => event,
+                    Err(error)
+                        if !force_refresh
+                            && !business_event_seen
+                            && genai_stream_error_requires_auth_refresh(&error) =>
+                    {
+                        retry_with_refresh = true;
+                        break;
+                    }
+                    Err(error) => return Err(map_responses_genai_error(error)),
+                };
+                match event {
+                    ChatStreamEvent::Start => {}
+                    ChatStreamEvent::ThoughtSignatureChunk(chunk) => {
+                        add_stream_bytes(&mut captured_response_bytes, chunk.content.len())?;
+                    }
+                    ChatStreamEvent::Chunk(chunk) => {
+                        if !chunk.content.is_empty() {
+                            add_stream_bytes(&mut captured_response_bytes, chunk.content.len())?;
+                            add_message_bytes(&mut captured_text_bytes, chunk.content.len())?;
+                            business_event_seen = true;
+                            on_event(ProviderStreamEvent::TextDelta {
+                                text: chunk.content,
+                            });
+                        }
+                    }
+                    ChatStreamEvent::ReasoningChunk(chunk) => {
+                        if !chunk.content.is_empty() {
+                            add_stream_bytes(&mut captured_response_bytes, chunk.content.len())?;
+                            business_event_seen = true;
+                            on_event(ProviderStreamEvent::ReasoningDelta {
+                                text: chunk.content,
+                            });
+                        }
+                    }
+                    ChatStreamEvent::ToolCallChunk(chunk) => {
+                        let call = &chunk.tool_call;
+                        let argument_bytes = validate_streamed_tool_call(call)?;
+                        business_event_seen = true;
+                        let next_index = tool_calls.len();
+                        let state =
+                            tool_calls
+                                .entry(call.call_id.clone())
+                                .or_insert(StreamedToolCall {
+                                    index: next_index,
+                                    argument_bytes: 0,
+                                    announced: false,
+                                });
+                        if argument_bytes > state.argument_bytes {
+                            add_stream_bytes(
+                                &mut captured_response_bytes,
+                                argument_bytes - state.argument_bytes,
+                            )?;
+                            state.argument_bytes = argument_bytes;
+                        }
+                        if !state.announced
+                            && (!call.call_id.is_empty() || !call.fn_name.is_empty())
+                        {
+                            on_event(ProviderStreamEvent::ToolCallDelta {
+                                index: state.index,
+                                tool_call_id: (!call.call_id.is_empty())
+                                    .then(|| call.call_id.clone()),
+                                tool_name: (!call.fn_name.is_empty()).then(|| call.fn_name.clone()),
+                            });
+                            state.announced = true;
+                        }
+                    }
+                    ChatStreamEvent::End(end) => {
+                        stream_end = Some(end);
+                        break;
+                    }
+                }
+            }
+
+            if retry_with_refresh {
+                force_refresh = true;
+                continue;
+            }
+            let end = stream_end.ok_or_else(|| ProviderError::Unavailable {
+                message: "responses stream ended before a terminal event".to_owned(),
+            })?;
+            return responses_provider_response(end, &model_id, &self.config.provider_id);
+        }
     }
 }
 
@@ -257,7 +445,7 @@ impl OpenAiResponsesProvider {
 impl super::LlmProvider for OpenAiResponsesProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
         let mut ignore = |_| {};
-        self.complete_stream(request, &mut ignore).await
+        self.execute_stream(&request, &mut ignore).await
     }
 
     async fn complete_stream(
@@ -265,21 +453,7 @@ impl super::LlmProvider for OpenAiResponsesProvider {
         request: ProviderRequest,
         on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
     ) -> Result<ProviderResponse, ProviderError> {
-        let mut response = self.send_completion(&request, false).await?;
-        if response.status().as_u16() == 401 {
-            response = self.send_completion(&request, true).await?;
-        }
-        let status = response.status();
-        if !status.is_success() {
-            let value = response_json_or_error(response).await?;
-            if status.as_u16() == 429 {
-                return Err(ProviderError::RateLimited {
-                    message: provider_error_message(&value),
-                });
-            }
-            return Err(provider_http_error(status, &value));
-        }
-        responses_provider_response(response, on_event).await
+        self.execute_stream(&request, on_event).await
     }
 
     fn supports_buffered_transport(&self) -> bool {
@@ -291,12 +465,12 @@ impl super::LlmProvider for OpenAiResponsesProvider {
             provider_id: self.config.provider_id.clone(),
             model_id: self.config.model_id.clone(),
             native_protocol: "openai_responses_sse".to_owned(),
-            stream_event_mapping: "responses_sse_delta".to_owned(),
-            tool_call_mapping: "responses_function_call".to_owned(),
-            usage_mapping: "responses_completed_usage".to_owned(),
-            reasoning_mapping: "responses_reasoning_effort".to_owned(),
-            finish_reason_mapping: "responses_completed_or_tool_call".to_owned(),
-            error_mapping: "responses_http_and_sse_error".to_owned(),
+            stream_event_mapping: "rust_genai_responses_stream".to_owned(),
+            tool_call_mapping: "rust_genai_responses_function_calls".to_owned(),
+            usage_mapping: "rust_genai_responses_usage".to_owned(),
+            reasoning_mapping: "rust_genai_responses_reasoning".to_owned(),
+            finish_reason_mapping: "rust_genai_responses_stop_reason".to_owned(),
+            error_mapping: "rust_genai_responses_errors".to_owned(),
             rate_limit_mapping: "http_429".to_owned(),
             cost_model: "subscription".to_owned(),
             capability_matrix_ref: None,
@@ -309,407 +483,133 @@ impl super::LlmProvider for OpenAiResponsesProvider {
     }
 }
 
-fn responses_request_body(
-    request: &ProviderRequest,
-    config: &OpenAiResponsesProviderConfig,
-) -> Result<Value, ProviderError> {
-    let instructions = request
-        .messages
-        .iter()
-        .filter(|message| message.role == ProviderRole::System)
-        .map(|message| message.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    let mut input = Vec::new();
-    for message in request
-        .messages
-        .iter()
-        .filter(|message| message.role != ProviderRole::System)
-    {
-        match message.role {
-            ProviderRole::System => {}
-            ProviderRole::User => input.push(responses_message(message, "user", "input_text")),
-            ProviderRole::Assistant => {
-                input.extend(responses_replay_items(message)?);
-                if !message.content.is_empty() {
-                    input.push(responses_message(message, "assistant", "output_text"));
-                }
-                input.extend(message.tool_calls.iter().map(|call| {
-                    json!({
-                        "type": "function_call",
-                        "call_id": call.tool_call_id,
-                        "name": call.tool_name,
-                        "arguments": call.arguments.to_string(),
-                    })
-                }));
-            }
-            ProviderRole::Tool => {
-                let call_id = message
-                    .tool_call_id
-                    .as_deref()
-                    .filter(|value| !value.trim().is_empty())
-                    .ok_or_else(|| ProviderError::Malformed {
-                        message: "tool response has no non-empty tool_call_id".to_owned(),
-                    })?;
-                input.push(json!({
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": message.content,
-                }));
-            }
-        }
-    }
-
-    let tools = request
-        .tools
-        .iter()
-        .map(responses_tool_schema)
-        .collect::<Vec<_>>();
-    let effort = config
-        .generation_config
-        .reasoning_effort
-        .map(|value| value.as_wire_value())
-        .or(config.generation_config.enable_thinking.then_some("medium"));
-    let mut body = json!({
-        "model": config.model_id,
-        "input": input,
-        "instructions": instructions,
-        "store": false,
-        "stream": true,
-        "include": ["reasoning.encrypted_content"],
-    });
-    if !tools.is_empty() {
-        body["tools"] = Value::Array(tools);
-        body["tool_choice"] = Value::String("auto".to_owned());
-        body["parallel_tool_calls"] = Value::Bool(true);
-    }
-    if let Some(effort) = effort {
-        body["reasoning"] = json!({"effort": effort, "summary": "auto"});
-    }
-    Ok(body)
-}
-
-fn responses_message(message: &ProviderMessage, role: &str, content_type: &str) -> Value {
-    json!({
-        "role": role,
-        "content": [{"type": content_type, "text": message.content}],
-    })
-}
-
-fn responses_replay_items(message: &ProviderMessage) -> Result<Vec<Value>, ProviderError> {
-    message
-        .metadata
-        .openai_responses_replay_items
-        .iter()
-        .map(normalize_reasoning_replay_item)
-        .collect()
-}
-
-fn normalize_reasoning_replay_item(item: &Value) -> Result<Value, ProviderError> {
-    if item.get("type").and_then(Value::as_str) != Some("reasoning") {
-        return Err(ProviderError::Malformed {
-            message: "Responses replay metadata contains an unsupported item".to_owned(),
-        });
-    }
-    let encrypted_content = bounded_non_empty_string(
-        item.get("encrypted_content"),
-        "Responses reasoning item has no encrypted_content",
-        "Responses encrypted reasoning",
-        MAX_PROVIDER_MESSAGE_BYTES,
-    )?;
-    let mut replay = json!({
-        "type": "reasoning",
-        "encrypted_content": encrypted_content,
-    });
-    if let Some(id) = item.get("id") {
-        replay["id"] = Value::String(bounded_non_empty_string(
-            Some(id),
-            "Responses reasoning item has an empty id",
-            "Responses reasoning item id",
-            MAX_PROVIDER_TOOL_CALL_ID_BYTES,
-        )?);
-    }
-    if let Some(summary) = item.get("summary") {
-        if !summary.is_array() {
-            return Err(ProviderError::Malformed {
-                message: "Responses reasoning item summary is not an array".to_owned(),
-            });
-        }
-        if serde_json::to_vec(summary)
-            .map_err(|error| ProviderError::Malformed {
-                message: format!("Responses reasoning summary is invalid: {error}"),
-            })?
-            .len()
-            > MAX_PROVIDER_MESSAGE_BYTES
-        {
-            return Err(ProviderError::Malformed {
-                message: format!(
-                    "Responses reasoning summary exceeds {MAX_PROVIDER_MESSAGE_BYTES} byte limit"
-                ),
-            });
-        }
-        replay["summary"] = summary.clone();
-    }
-    Ok(replay)
-}
-
-fn responses_tool_schema(contract: &ToolContract) -> Value {
-    let description = crate::provider_tool_description(&contract.tool_name);
-    json!({
-        "type": "function",
-        "name": contract.tool_name,
-        "description": description,
-        "parameters": contract.input_schema,
-        "strict": true,
-    })
-}
-
-async fn responses_provider_response(
-    response: reqwest::Response,
-    on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
-) -> Result<ProviderResponse, ProviderError> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BYTES as u64)
-    {
+fn add_stream_bytes(total: &mut usize, bytes: usize) -> Result<(), ProviderError> {
+    *total = total.saturating_add(bytes);
+    if *total > MAX_PROVIDER_RESPONSE_BYTES {
         return Err(ProviderError::Malformed {
             message: format!("provider response exceeds {MAX_PROVIDER_RESPONSE_BYTES} byte limit"),
         });
     }
-    let mut stream = response.bytes_stream().eventsource();
-    let mut parsed_bytes = 0_usize;
-    let mut output_text = String::new();
-    let mut completed_text = None;
-    let mut tool_calls = Vec::new();
-    let mut replay_items = Vec::new();
-    let mut response_id = None;
-    let mut usage_value = json!({});
-    let mut completed = false;
+    Ok(())
+}
 
-    while let Some(event) = stream.next().await {
-        let event = event.map_err(|error| ProviderError::Unavailable {
-            message: super::sanitize_provider_error(&error.to_string()),
-        })?;
-        parsed_bytes = parsed_bytes.saturating_add(event.data.len());
-        if parsed_bytes > MAX_PROVIDER_RESPONSE_BYTES {
-            return Err(ProviderError::Malformed {
-                message: format!(
-                    "provider response exceeds {MAX_PROVIDER_RESPONSE_BYTES} byte limit"
-                ),
-            });
-        }
-        if event.data == "[DONE]" || event.data.trim().is_empty() {
-            continue;
-        }
-        let value: Value =
-            serde_json::from_str(&event.data).map_err(|error| ProviderError::Malformed {
-                message: format!("responses SSE event is invalid JSON: {error}"),
-            })?;
-        match value
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-        {
-            "response.output_text.delta" => {
-                if let Some(delta) = value.get("delta").and_then(Value::as_str) {
-                    if output_text.len().saturating_add(delta.len()) > MAX_PROVIDER_MESSAGE_BYTES {
-                        return Err(ProviderError::Malformed {
-                            message: format!(
-                                "assistant message exceeds {MAX_PROVIDER_MESSAGE_BYTES} byte limit"
-                            ),
-                        });
-                    }
-                    output_text.push_str(delta);
-                    on_event(ProviderStreamEvent::TextDelta {
-                        text: delta.to_owned(),
-                    });
-                }
-            }
-            "response.reasoning_summary_text.delta" => {
-                if let Some(delta) = value.get("delta").and_then(Value::as_str)
-                    && !delta.is_empty()
-                {
-                    on_event(ProviderStreamEvent::ReasoningDelta {
-                        text: delta.to_owned(),
-                    });
-                }
-            }
-            "response.output_item.done" => {
-                if let Some(item) = value.get("item") {
-                    match item.get("type").and_then(Value::as_str).unwrap_or_default() {
-                        "function_call" => {
-                            let call = responses_tool_call(item)?;
-                            on_event(ProviderStreamEvent::ToolCallDelta {
-                                index: tool_calls.len(),
-                                tool_call_id: Some(call.tool_call_id.clone()),
-                                tool_name: Some(call.tool_name.clone()),
-                            });
-                            tool_calls.push(call);
-                        }
-                        "reasoning" => {
-                            replay_items.push(normalize_reasoning_replay_item(item)?);
-                        }
-                        "message" => {
-                            completed_text = responses_completed_message(item)?;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            "response.completed" => {
-                let response = value.get("response").cloned().unwrap_or_else(|| json!({}));
-                response_id = response
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned);
-                usage_value = response.get("usage").cloned().unwrap_or_else(|| json!({}));
-                completed = true;
-            }
-            "response.failed" | "error" => {
-                let error = value.get("response").unwrap_or(&value);
-                return Err(ProviderError::Failed {
-                    message: provider_error_message(error),
-                });
-            }
-            _ => {}
-        }
-    }
-    if !completed {
-        return Err(ProviderError::Unavailable {
-            message: "responses SSE stream ended before response.completed".to_owned(),
+fn add_message_bytes(total: &mut usize, bytes: usize) -> Result<(), ProviderError> {
+    *total = total.saturating_add(bytes);
+    if *total > MAX_PROVIDER_MESSAGE_BYTES {
+        return Err(ProviderError::Malformed {
+            message: format!("assistant message exceeds {MAX_PROVIDER_MESSAGE_BYTES} byte limit"),
         });
     }
-    if output_text.is_empty()
-        && let Some(text) = completed_text
-    {
-        on_event(ProviderStreamEvent::TextDelta { text: text.clone() });
-        output_text = text;
-    }
-    let message =
-        (!output_text.is_empty() || !replay_items.is_empty()).then_some(ProviderMessage {
-            role: ProviderRole::Assistant,
-            content: output_text,
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls: Vec::new(),
-            metadata: ProviderMessageMetadata {
-                openai_responses_replay_items: replay_items,
-            },
+    Ok(())
+}
+
+fn validate_streamed_tool_call(call: &ToolCall) -> Result<usize, ProviderError> {
+    if call.call_id.len() > MAX_PROVIDER_TOOL_CALL_ID_BYTES {
+        return Err(ProviderError::Malformed {
+            message: format!("tool call id exceeds {MAX_PROVIDER_TOOL_CALL_ID_BYTES} byte limit"),
         });
-    let finish_reason = if tool_calls.is_empty() {
-        ProviderFinishReason::Stop
-    } else {
-        ProviderFinishReason::ToolCalls
+    }
+    if call.fn_name.len() > MAX_PROVIDER_TOOL_NAME_BYTES {
+        return Err(ProviderError::Malformed {
+            message: format!("tool name exceeds {MAX_PROVIDER_TOOL_NAME_BYTES} byte limit"),
+        });
+    }
+    let argument_bytes = match call.fn_arguments.as_str() {
+        Some(arguments) => arguments.len(),
+        None => serde_json::to_vec(&call.fn_arguments)
+            .map_err(|error| ProviderError::Malformed {
+                message: format!("tool call arguments could not be serialized: {error}"),
+            })?
+            .len(),
     };
-    Ok(ProviderResponse {
-        response_id: ProviderResponseId::new(),
-        message,
-        tool_calls,
-        usage: responses_usage(&usage_value),
-        finish_reason,
-        raw_metadata: json!({
-            "provider": DEFAULT_PROVIDER_ID,
-            "response_id": response_id,
-            "usage": usage_value,
-        }),
-    })
-}
-
-fn responses_completed_message(item: &Value) -> Result<Option<String>, ProviderError> {
-    let mut text = String::new();
-    for content in item
-        .get("content")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        if content.get("type").and_then(Value::as_str) == Some("output_text")
-            && let Some(value) = content.get("text").and_then(Value::as_str)
-        {
-            if text.len().saturating_add(value.len()) > MAX_PROVIDER_MESSAGE_BYTES {
-                return Err(ProviderError::Malformed {
-                    message: format!(
-                        "assistant message exceeds {MAX_PROVIDER_MESSAGE_BYTES} byte limit"
-                    ),
-                });
-            }
-            text.push_str(value);
-        }
-    }
-    Ok((!text.is_empty()).then_some(text))
-}
-
-fn responses_tool_call(item: &Value) -> Result<ProviderToolCall, ProviderError> {
-    let tool_call_id = bounded_non_empty_string(
-        item.get("call_id"),
-        "responses function call has no call_id",
-        "responses function call id",
-        MAX_PROVIDER_TOOL_CALL_ID_BYTES,
-    )?;
-    let tool_name = bounded_non_empty_string(
-        item.get("name"),
-        "responses function call has no name",
-        "responses function call name",
-        MAX_PROVIDER_TOOL_NAME_BYTES,
-    )?;
-    let arguments = item
-        .get("arguments")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ProviderError::Malformed {
-            message: "responses function call arguments is not a string".to_owned(),
-        })?;
-    if arguments.len() > MAX_PROVIDER_TOOL_ARGUMENT_BYTES {
+    if argument_bytes > MAX_PROVIDER_TOOL_ARGUMENT_BYTES {
         return Err(ProviderError::Malformed {
             message: format!(
                 "tool call arguments exceed {MAX_PROVIDER_TOOL_ARGUMENT_BYTES} byte limit"
             ),
         });
     }
-    let arguments = serde_json::from_str(arguments).map_err(|error| ProviderError::Malformed {
-        message: format!("responses function call arguments is invalid JSON: {error}"),
-    })?;
-    Ok(ProviderToolCall {
-        tool_call_id,
-        tool_name,
-        arguments,
-    })
+    Ok(argument_bytes)
 }
 
-fn bounded_non_empty_string(
-    value: Option<&Value>,
-    missing_message: &str,
-    label: &str,
-    limit: usize,
-) -> Result<String, ProviderError> {
-    let value = value
-        .and_then(Value::as_str)
+fn responses_provider_response(
+    end: StreamEnd,
+    model_id: &str,
+    provider_id: &str,
+) -> Result<ProviderResponse, ProviderError> {
+    let response_id = end
+        .captured_response_id
+        .as_deref()
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| ProviderError::Malformed {
-            message: missing_message.to_owned(),
-        })?;
-    if value.len() > limit {
+        .ok_or_else(|| ProviderError::Unavailable {
+            message: "responses stream ended before response.completed".to_owned(),
+        })?
+        .to_owned();
+    if response_id.len() > MAX_PROVIDER_TOOL_CALL_ID_BYTES {
         return Err(ProviderError::Malformed {
-            message: format!("{label} exceeds {limit} byte limit"),
+            message: format!(
+                "responses response id exceeds {MAX_PROVIDER_TOOL_CALL_ID_BYTES} byte limit"
+            ),
         });
     }
-    Ok(value.to_owned())
+    let replay_items = end
+        .captured_content
+        .as_ref()
+        .map(|content| content.thought_signatures())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|encrypted_content| {
+            if encrypted_content.is_empty() || encrypted_content.len() > MAX_PROVIDER_MESSAGE_BYTES {
+                return Err(ProviderError::Malformed {
+                    message: format!(
+                        "Responses encrypted reasoning exceeds {MAX_PROVIDER_MESSAGE_BYTES} byte limit"
+                    ),
+                });
+            }
+            Ok(json!({
+                "type": "reasoning",
+                "encrypted_content": encrypted_content,
+                "summary": [],
+            }))
+        })
+        .collect::<Result<Vec<_>, ProviderError>>()?;
+    let stop_reason = end.captured_stop_reason.as_ref().map(ToString::to_string);
+    let mut response = provider_response_from_genai_stream(end, model_id)?;
+    if !replay_items.is_empty() {
+        let message = response.message.get_or_insert_with(|| ProviderMessage {
+            role: ProviderRole::Assistant,
+            content: String::new(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: ProviderMessageMetadata::default(),
+        });
+        message.metadata.openai_responses_replay_items = replay_items;
+    }
+    if !response.tool_calls.is_empty() {
+        response.finish_reason = ProviderFinishReason::ToolCalls;
+    }
+    response.raw_metadata = json!({
+        "provider": provider_id,
+        "provider_model": model_id,
+        "response_id": response_id,
+        "stop_reason": stop_reason,
+        "streamed": true,
+        "usage": response.usage.raw,
+    });
+    Ok(response)
 }
 
-fn responses_usage(value: &Value) -> ProviderUsage {
-    ProviderUsage {
-        input_tokens: value.get("input_tokens").and_then(Value::as_u64),
-        output_tokens: value.get("output_tokens").and_then(Value::as_u64),
-        reasoning_tokens: value
-            .get("output_tokens_details")
-            .and_then(|details| details.get("reasoning_tokens"))
-            .and_then(Value::as_u64),
-        cached_input_tokens: value
-            .get("input_tokens_details")
-            .and_then(|details| details.get("cached_tokens"))
-            .and_then(Value::as_u64),
-        total_tokens: value.get("total_tokens").and_then(Value::as_u64),
-        usage_source: UsageSource::Provider,
-        raw: value.clone(),
+fn map_responses_genai_error(error: genai::Error) -> ProviderError {
+    let message = sanitize_provider_error(&error.to_string());
+    match genai_error_http_status(&error) {
+        Some(429) => ProviderError::RateLimited { message },
+        Some(status) if (500..600).contains(&status) => ProviderError::Unavailable { message },
+        Some(_) => ProviderError::Failed { message },
+        None if matches!(error, genai::Error::StreamParse { .. }) => {
+            ProviderError::Failed { message }
+        }
+        None => map_genai_error(error),
     }
 }
 
@@ -741,76 +641,22 @@ fn chatgpt_account_id(access_token: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use golutra_core::{ProviderRequestId, SideEffectType, TaskId, TurnId};
-
-    fn request() -> ProviderRequest {
-        ProviderRequest {
-            request_id: ProviderRequestId::new(),
-            task_id: TaskId::new(),
-            turn_id: TurnId::new(),
-            provider_id: "openai-chatgpt".to_owned(),
-            model_id: "gpt-5.5".to_owned(),
-            messages: vec![
-                ProviderMessage {
-                    role: ProviderRole::System,
-                    content: "Use tools.".to_owned(),
-                    tool_call_id: None,
-                    tool_name: None,
-                    tool_calls: Vec::new(),
-                    metadata: ProviderMessageMetadata::default(),
-                },
-                ProviderMessage {
-                    role: ProviderRole::User,
-                    content: "Read Cargo.toml".to_owned(),
-                    tool_call_id: None,
-                    tool_name: None,
-                    tool_calls: Vec::new(),
-                    metadata: ProviderMessageMetadata::default(),
-                },
-            ],
-            tools: vec![ToolContract {
-                tool_name: "read_file".to_owned(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {"path": {"type": "string"}},
-                    "required": ["path"],
-                    "additionalProperties": false
-                }),
-                output_schema: json!({"type": "object"}),
-                error_schema: json!({"type": "object"}),
-                side_effect_type: SideEffectType::None,
-                idempotency_key_policy: "not_required".to_owned(),
-                timeout_policy: "bounded".to_owned(),
-                cancellation_policy: "supported".to_owned(),
-                retry_policy: "none".to_owned(),
-                artifact_policy: "none".to_owned(),
-                permission_policy_ref: None,
-            }],
-        }
-    }
 
     #[test]
-    fn request_uses_responses_wire_shape() {
-        let body = responses_request_body(
-            &request(),
-            &OpenAiResponsesProviderConfig {
-                api_key: "unused".to_owned(),
-                api_key_env: "test".to_owned(),
-                provider_id: "openai-chatgpt".to_owned(),
-                base_url: "https://chatgpt.com/backend-api/codex".to_owned(),
-                model_id: "gpt-5.5".to_owned(),
-                generation_config: ProviderGenerationConfig::default(),
-                custom_headers: ProviderHttpHeaders::default(),
-            },
-        )
-        .expect("request body");
+    fn config_debug_never_contains_the_api_key() {
+        let provider = OpenAiResponsesProvider::from_config(OpenAiResponsesProviderConfig {
+            api_key: "secret-responses-key".to_owned(),
+            api_key_env: "TEST_RESPONSES_KEY".to_owned(),
+            provider_id: "openai-chatgpt".to_owned(),
+            base_url: "https://api.openai.com/v1".to_owned(),
+            model_id: "gpt-test".to_owned(),
+            generation_config: ProviderGenerationConfig::default(),
+            custom_headers: ProviderHttpHeaders::default(),
+        });
 
-        assert_eq!(body["instructions"], "Use tools.");
-        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
-        assert_eq!(body["tools"][0]["type"], "function");
-        assert_eq!(body["tools"][0]["name"], "read_file");
-        assert_eq!(body["stream"], true);
+        let debug = format!("{provider:?}");
+        assert!(!debug.contains("secret-responses-key"));
+        assert!(debug.contains("TEST_RESPONSES_KEY"));
     }
 
     #[test]
