@@ -160,7 +160,7 @@ export interface AgentSubscriptionRequest {
 export interface ThreadRunOptions {
   /** Let the provider own planning/stopping, or use an explicit contract adapter. */
   executionMode?: "open" | "strict";
-  /** Expose coding-safe tools, or every registered extension. */
+  /** Expose every registered extension, or explicitly restrict to coding-safe tools. */
   toolProfile?: "coding" | "full";
   outputSchema?: Record<string, unknown>;
   taskContract?: TaskContract;
@@ -244,7 +244,7 @@ export class Thread {
     };
     if (useNewDefaults) {
       params.execution_mode = options.executionMode ?? "open";
-      params.tool_profile = options.toolProfile ?? "coding";
+      params.tool_profile = options.toolProfile ?? "full";
     }
     if (options.maxElapsedMs !== undefined) {
       params.max_elapsed_ms = options.maxElapsedMs;

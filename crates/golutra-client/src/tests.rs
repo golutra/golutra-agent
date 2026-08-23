@@ -6969,7 +6969,7 @@ async fn persisted_ephemeral_runtime_retains_isolated_state_and_full_run_bundle(
     );
     assert_eq!(
         task_created.payload.pointer("/payload/tool_profile"),
-        Some(&json!("coding"))
+        Some(&json!("full"))
     );
     assert_eq!(
         task_created
@@ -8078,7 +8078,7 @@ async fn open_turn_keeps_contract_open_and_skips_project_verifier_discovery() {
 
     assert_eq!(queued_payload["_task_contract_origin"], "open");
     assert_eq!(queued_payload["_execution_mode"], "open");
-    assert_eq!(queued_payload["tool_profile"], "coding");
+    assert_eq!(queued_payload["tool_profile"], "full");
     assert_eq!(queued_payload["external_verifiers"], json!([]));
     assert_eq!(
         queued_payload["task_contract"]["workspace_change"],

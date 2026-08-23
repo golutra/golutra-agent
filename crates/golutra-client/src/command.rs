@@ -633,7 +633,7 @@ impl RuntimeHost {
         }
         let execution_mode = execution_mode_from_payload(&payload)
             .map_err(|error| ClientError::TaskExecution(error.to_owned()))?;
-        let tool_profile = tool_profile_from_payload(&payload, execution_mode)
+        let tool_profile = tool_profile_from_payload(&payload)
             .map_err(|error| ClientError::TaskExecution(error.to_owned()))?;
         let has_explicit_task_contract = explicit_task_contract(&payload);
         let apply_legacy_adapter = !steer && should_apply_legacy_adapter(&payload, execution_mode);

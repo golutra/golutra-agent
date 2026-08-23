@@ -113,21 +113,18 @@ Output rules:
 - `--ephemeral` uses an isolated embedded runtime and cannot be combined with
   `--daemon` or `--connect`.
 
-New CLI, TUI, App Server and SDK turns use `open` execution with the `coding`
+New CLI, TUI, App Server and SDK turns use `open` execution with the `full`
 tool profile by default. `open` leaves planning, tool order and stopping to the
 provider while retaining policy, cancellation, budgets and audit facts. The
-`coding` profile exposes built-in workspace, shell, managed-process and
-delegation tools plus local MCP plugins that completed the owner-reviewed
-`stage -> review -> enable` lifecycle and extensions explicitly marked
-coding-safe by another host backend; `full` additionally exposes every
-registered extension. Use
+`full` profile exposes every registered extension; use `--tool-profile coding`
+when a caller deliberately wants a narrower model-visible surface. Use
 `--execution-mode strict` when an unstructured prompt must be translated into a
-deterministic completion contract, and `--tool-profile full` only when the turn
-needs a full-only extension. The interactive TUI accepts both switches,
-for example `golutra-tui --execution-mode strict --tool-profile full`. Explicit
-task contracts and external verifiers remain authoritative completion signals
-even if the caller selected `open`; unrelated payload metadata never changes
-the execution mode.
+deterministic completion contract. The interactive TUI accepts both switches,
+for example `golutra-tui --execution-mode strict --tool-profile coding`.
+Explicit task contracts and external verifiers remain authoritative completion
+signals even if the caller selected `open`; unrelated payload metadata never
+changes the execution mode. Verification-on-change is off by default in the
+interactive UI and can be enabled explicitly through runtime settings.
 
 Raw `SessionCommand` payloads persisted before these fields existed keep the
 legacy completion adapter and full tool surface. This compatibility rule is
@@ -406,8 +403,8 @@ not vary by language.
 The new high-level methods intentionally opt into the model-owned surface:
 
 ```text
-Python:     Thread.run / run_streamed       -> execution_mode=open, tool_profile=coding
-TypeScript: Thread.run / runStreamed         -> execution_mode=open, tool_profile=coding
+Python:     Thread.run / run_streamed       -> execution_mode=open, tool_profile=full
+TypeScript: Thread.run / runStreamed         -> execution_mode=open, tool_profile=full
 ```
 
 Callers that need the pre-profile behavior can use `Thread.run_legacy` and

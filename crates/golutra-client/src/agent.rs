@@ -609,7 +609,7 @@ mod tests {
         )
         .expect("current payload");
         assert_eq!(current["execution_mode"], "open");
-        assert_eq!(current["tool_profile"], "coding");
+        assert_eq!(current["tool_profile"], "full");
 
         let legacy =
             turn_payload("legacy".to_owned(), thread_id, &options, None).expect("legacy payload");

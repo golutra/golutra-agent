@@ -172,8 +172,8 @@ pub enum AgentExecutionMode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentToolProfile {
-    #[default]
     Coding,
+    #[default]
     Full,
 }
 
@@ -195,8 +195,8 @@ pub struct AgentTurnExecutionOptions {
     /// completion policy or externally verified turns.
     #[serde(default)]
     pub execution_mode: AgentExecutionMode,
-    /// Coding exposes built-in coding, managed process, delegation, and
-    /// host-reviewed coding extensions. Full also exposes other extensions.
+    /// Full exposes every registered extension; coding is an explicit
+    /// restriction for callers that need a narrower model-visible surface.
     #[serde(default)]
     pub tool_profile: AgentToolProfile,
 }

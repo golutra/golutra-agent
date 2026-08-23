@@ -151,13 +151,13 @@ impl ConfiguredAgentRun {
     }
 
     /// Select the execution contract for the initial turn. `None` retains
-    /// legacy/full semantics for direct runtime callers. An explicit mode uses
-    /// the protocol's coding profile unless the caller selected a profile.
+    /// legacy/full semantics for direct runtime callers. An explicit mode
+    /// keeps the complete tool surface unless a caller selects a restriction.
     #[must_use]
     pub fn with_execution_mode(mut self, mode: Option<AgentExecutionMode>) -> Self {
         self.execution_mode = mode;
         if !self.tool_profile_is_explicit {
-            self.tool_profile = mode.map(|_| AgentToolProfile::Coding);
+            self.tool_profile = mode.map(|_| AgentToolProfile::Full);
         }
         self.apply_execution_mode_contract(mode);
         self
@@ -506,7 +506,7 @@ mod tests {
         let open =
             ConfiguredAgentRun::new(request()).with_execution_mode(Some(AgentExecutionMode::Open));
         assert_eq!(open.execution_mode, Some(AgentExecutionMode::Open));
-        assert_eq!(open.tool_profile, Some(AgentToolProfile::Coding));
+        assert_eq!(open.tool_profile, Some(AgentToolProfile::Full));
 
         let explicit = ConfiguredAgentRun::new(request())
             .with_execution_surface(AgentExecutionMode::Open, AgentToolProfile::Full);

@@ -24,6 +24,9 @@ golutra exec "inspect this workspace and run the checks"
 golutra exec --json "summarize the current changes"
 ```
 
+Interactive turns keep the complete registered tool surface available by
+default; narrower tool and verification settings are opt-in.
+
 For app-server, observation, supervisor, and evaluation binaries, use the
 platform release archive documented at
 <https://github.com/golutra/golutra-agent/releases>.

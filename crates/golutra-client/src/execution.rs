@@ -737,7 +737,7 @@ impl RuntimeHost {
         let objective = model_prompt_from_payload(&task.payload);
         let execution_mode = execution_mode_from_payload(&task.payload)
             .map_err(|error| ClientError::TaskExecution(error.to_owned()))?;
-        let tool_profile = tool_profile_from_payload(&task.payload, execution_mode)
+        let tool_profile = tool_profile_from_payload(&task.payload)
             .map_err(|error| ClientError::TaskExecution(error.to_owned()))?;
         let has_explicit_task_contract = explicit_task_contract(&task.payload);
         let mut task_contract = task_contract_from_payload(&task.payload)?;

@@ -1057,7 +1057,7 @@ fn inherit_steering_execution_surface(
             "cannot recover a leading steering turn from an invalid active execution mode: {error}"
         ))
     })?;
-    let inherited_tool_profile = tool_profile_from_payload(active_task_payload, execution_mode)
+    let inherited_tool_profile = tool_profile_from_payload(active_task_payload)
         .map_err(|error| {
             ClientError::TaskExecution(format!(
                 "cannot recover a leading steering turn from an invalid active tool profile: {error}"

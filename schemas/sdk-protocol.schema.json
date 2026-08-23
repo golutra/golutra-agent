@@ -747,9 +747,9 @@
           "default": "open"
         },
         "tool_profile": {
-          "description": "Coding exposes built-in coding, managed process, delegation, and\nhost-reviewed coding extensions. Full also exposes other extensions.",
+          "description": "Full exposes every registered extension; coding is an explicit\nrestriction for callers that need a narrower model-visible surface.",
           "$ref": "#/$defs/AgentToolProfile",
-          "default": "coding"
+          "default": "full"
         }
       }
     },

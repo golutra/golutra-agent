@@ -114,14 +114,12 @@ pub(crate) fn recovered_pending_turn_from_event(
     let tool_profile = if steer && payload.get("tool_profile").is_none_or(Value::is_null) {
         None
     } else {
-        Some(
-            tool_profile_from_payload(&payload, effective_execution_mode).map_err(|error| {
-                ClientError::TaskExecution(format!(
-                    "durable queued turn event {} has an invalid tool profile: {error}",
-                    event.id
-                ))
-            })?,
-        )
+        Some(tool_profile_from_payload(&payload).map_err(|error| {
+            ClientError::TaskExecution(format!(
+                "durable queued turn event {} has an invalid tool profile: {error}",
+                event.id
+            ))
+        })?)
     };
     let task_contract = if steer {
         None

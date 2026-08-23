@@ -15,13 +15,13 @@ fn separate_cli_commands_use_the_same_controller_identity() {
 }
 
 #[test]
-fn chat_uses_the_model_owned_coding_defaults() {
+fn chat_uses_the_model_owned_full_defaults() {
     assert_eq!(
         chat_prompt_payload("inspect the workspace".to_owned()),
         serde_json::json!({
             "prompt": "inspect the workspace",
             "execution_mode": "open",
-            "tool_profile": "coding",
+            "tool_profile": "full",
         })
     );
 }

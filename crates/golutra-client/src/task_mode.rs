@@ -71,27 +71,16 @@ pub(crate) fn execution_mode_from_payload(
     }
 }
 
-pub(crate) fn tool_profile_from_payload(
-    payload: &Value,
-    mode: NormalizedExecutionMode,
-) -> Result<AgentToolProfile, &'static str> {
+pub(crate) fn tool_profile_from_payload(payload: &Value) -> Result<AgentToolProfile, &'static str> {
     let Some(value) = payload.get(TOOL_PROFILE_KEY) else {
-        return Ok(if matches!(mode, NormalizedExecutionMode::Legacy) {
-            AgentToolProfile::Full
-        } else {
-            AgentToolProfile::Coding
-        });
+        return Ok(AgentToolProfile::Full);
     };
     match value {
         Value::String(value) if value.eq_ignore_ascii_case("coding") => {
             Ok(AgentToolProfile::Coding)
         }
         Value::String(value) if value.eq_ignore_ascii_case("full") => Ok(AgentToolProfile::Full),
-        Value::Null => Ok(if matches!(mode, NormalizedExecutionMode::Legacy) {
-            AgentToolProfile::Full
-        } else {
-            AgentToolProfile::Coding
-        }),
+        Value::Null => Ok(AgentToolProfile::Full),
         _ => Err("tool_profile must be `coding` or `full`"),
     }
 }
@@ -169,16 +158,15 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn new_clients_default_to_open_coding_while_legacy_payloads_keep_full_tools() {
+    fn new_clients_default_to_open_with_full_tools() {
         let open = json!({"execution_mode": "open"});
         assert_eq!(
             execution_mode_from_payload(&open).expect("open mode"),
             NormalizedExecutionMode::Open
         );
         assert_eq!(
-            tool_profile_from_payload(&open, NormalizedExecutionMode::Open)
-                .expect("coding default"),
-            AgentToolProfile::Coding
+            tool_profile_from_payload(&open).expect("full default"),
+            AgentToolProfile::Full
         );
 
         let legacy = json!({});
@@ -187,8 +175,7 @@ mod tests {
             NormalizedExecutionMode::Legacy
         );
         assert_eq!(
-            tool_profile_from_payload(&legacy, NormalizedExecutionMode::Legacy)
-                .expect("legacy profile"),
+            tool_profile_from_payload(&legacy).expect("legacy profile"),
             AgentToolProfile::Full
         );
         assert!(strict_execution_requested(
@@ -250,20 +237,10 @@ mod tests {
     #[test]
     fn invalid_mode_and_profile_are_rejected() {
         assert!(execution_mode_from_payload(&json!({"execution_mode": "adaptive"})).is_err());
-        assert!(
-            tool_profile_from_payload(
-                &json!({"tool_profile": "everything"}),
-                NormalizedExecutionMode::Open
-            )
-            .is_err()
-        );
+        assert!(tool_profile_from_payload(&json!({"tool_profile": "everything"})).is_err());
         assert_eq!(
-            tool_profile_from_payload(
-                &json!({"tool_profile": null}),
-                NormalizedExecutionMode::Open
-            )
-            .expect("null means inherit"),
-            AgentToolProfile::Coding
+            tool_profile_from_payload(&json!({"tool_profile": null})).expect("null means inherit"),
+            AgentToolProfile::Full
         );
     }
 

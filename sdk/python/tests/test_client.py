@@ -725,7 +725,7 @@ class ClientTest(unittest.TestCase):
 
         self.assertEqual(calls[0][0], "turn/start")
         self.assertEqual(calls[0][1]["execution_mode"], "open")
-        self.assertEqual(calls[0][1]["tool_profile"], "coding")
+        self.assertEqual(calls[0][1]["tool_profile"], "full")
         for _method, params in calls[1:]:
             self.assertNotIn("execution_mode", params)
             self.assertNotIn("tool_profile", params)

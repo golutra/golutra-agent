@@ -912,7 +912,7 @@ impl RuntimeHost {
             let objective = model_prompt_from_payload(&task_payload);
             let execution_mode = execution_mode_from_payload(&task_payload)
                 .map_err(|error| ClientError::TaskExecution(error.to_owned()))?;
-            let tool_profile = tool_profile_from_payload(&task_payload, execution_mode)
+            let tool_profile = tool_profile_from_payload(&task_payload)
                 .map_err(|error| ClientError::TaskExecution(error.to_owned()))?;
             let task_contract = replay_task_contract(&task_payload, &objective)?;
             let max_elapsed_ms = task_payload

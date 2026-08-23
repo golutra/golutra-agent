@@ -241,9 +241,9 @@ struct ExecArgs {
     /// explicit completion-oriented adapter (`strict`).
     #[arg(long, value_enum, default_value_t = ExecExecutionModeArg::Open)]
     execution_mode: ExecExecutionModeArg,
-    /// Expose coding-safe built-ins/extensions (`coding`) or every registered
-    /// extension (`full`) to the provider.
-    #[arg(long, value_enum, default_value_t = ExecToolProfileArg::Coding)]
+    /// Expose every registered extension (`full`) or explicitly restrict the
+    /// provider to coding-safe built-ins/extensions (`coding`).
+    #[arg(long, value_enum, default_value_t = ExecToolProfileArg::Full)]
     tool_profile: ExecToolProfileArg,
     /// Write isolated runtime state and full owner-only observations to this new directory.
     /// Implies --ephemeral. The legacy --ephemeral-state-dir spelling remains accepted.
@@ -3119,7 +3119,7 @@ fn chat_prompt_payload(prompt: String) -> serde_json::Value {
     serde_json::json!({
         "prompt": prompt,
         "execution_mode": "open",
-        "tool_profile": "coding",
+        "tool_profile": "full",
     })
 }
 
