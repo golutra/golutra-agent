@@ -446,6 +446,7 @@ mod tests {
         success: MockProvider,
         event_interval: Duration,
         event_count: usize,
+        heartbeat: bool,
     }
 
     impl FlakyStreamProvider {
@@ -483,9 +484,13 @@ mod tests {
         ) -> Result<ProviderResponse, ProviderError> {
             for _ in 0..self.event_count {
                 sleep(self.event_interval).await;
-                on_event(ProviderStreamEvent::TextDelta {
-                    text: ".".to_owned(),
-                });
+                if self.heartbeat {
+                    on_event(ProviderStreamEvent::Heartbeat);
+                } else {
+                    on_event(ProviderStreamEvent::TextDelta {
+                        text: ".".to_owned(),
+                    });
+                }
             }
             self.success.complete_stream(request, on_event).await
         }
@@ -595,6 +600,7 @@ mod tests {
             success: MockProvider::text_response("done"),
             event_interval: Duration::from_millis(60),
             event_count: 2,
+            heartbeat: false,
         };
         let policy = ProviderSessionPolicy {
             max_stream_retries: 0,
@@ -617,6 +623,43 @@ mod tests {
 
         assert_eq!(response.message.expect("message").content, "done");
         assert_eq!(deltas, 3);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_events_reset_the_idle_deadline_without_becoming_content() {
+        let provider = ProgressingStreamProvider {
+            success: MockProvider::text_response("done"),
+            event_interval: Duration::from_millis(20),
+            event_count: 3,
+            heartbeat: true,
+        };
+        let policy = ProviderSessionPolicy {
+            max_stream_retries: 0,
+            max_request_retries: 0,
+            enable_transport_fallback: false,
+            stream_idle_timeout: Duration::from_millis(45),
+            request_timeout: Duration::from_secs(1),
+        };
+        let session = ProviderSession::new(&provider, None, policy);
+        let mut heartbeats = 0;
+        let mut text_deltas = 0;
+
+        let (response, _) = session
+            .complete(request(), &CancellationToken::new(), &mut |event| {
+                if let ProviderSessionEvent::Streamed { event, .. } = event {
+                    match event {
+                        ProviderStreamEvent::Heartbeat => heartbeats += 1,
+                        ProviderStreamEvent::TextDelta { .. } => text_deltas += 1,
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("heartbeat activity must keep the stream alive");
+
+        assert_eq!(response.message.expect("message").content, "done");
+        assert_eq!(heartbeats, 3);
+        assert_eq!(text_deltas, 1);
     }
 
     #[tokio::test]
@@ -656,6 +699,7 @@ mod tests {
             success: MockProvider::text_response("done"),
             event_interval: Duration::from_millis(10),
             event_count: 100,
+            heartbeat: false,
         };
         let policy = ProviderSessionPolicy {
             max_stream_retries: 10,

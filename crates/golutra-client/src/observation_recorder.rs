@@ -683,6 +683,7 @@ fn live_key(observation: &RuntimeObservation) -> Option<LiveKey> {
 fn live_event_bytes(observation: &RuntimeObservation) -> u64 {
     match observation {
         RuntimeObservation::ProviderStreamed { event, .. } => match event {
+            ProviderStreamEvent::Heartbeat => 0,
             ProviderStreamEvent::TextDelta { text }
             | ProviderStreamEvent::ReasoningDelta { text } => {
                 u64::try_from(text.len()).unwrap_or(u64::MAX)

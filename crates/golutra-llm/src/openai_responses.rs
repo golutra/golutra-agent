@@ -368,6 +368,7 @@ impl OpenAiResponsesProvider {
                 };
                 match event {
                     ChatStreamEvent::Start => {}
+                    ChatStreamEvent::Heartbeat => on_event(ProviderStreamEvent::Heartbeat),
                     ChatStreamEvent::ThoughtSignatureChunk(chunk) => {
                         add_stream_bytes(&mut captured_response_bytes, chunk.content.len())?;
                     }

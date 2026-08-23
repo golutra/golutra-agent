@@ -294,6 +294,7 @@ impl GenaiProviderAdapter {
         while let Some(event) = stream.next().await {
             match event.map_err(map_genai_error)? {
                 ChatStreamEvent::Start | ChatStreamEvent::ThoughtSignatureChunk(_) => {}
+                ChatStreamEvent::Heartbeat => on_event(ProviderStreamEvent::Heartbeat),
                 ChatStreamEvent::Chunk(chunk) => {
                     if !chunk.content.is_empty() {
                         on_event(ProviderStreamEvent::TextDelta {

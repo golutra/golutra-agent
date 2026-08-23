@@ -31,7 +31,7 @@ use golutra_governor::{
 };
 use golutra_llm::{
     LlmProvider, ProviderError, ProviderMessage, ProviderRequest, ProviderResponse, ProviderRole,
-    ProviderToolCall,
+    ProviderStreamEvent, ProviderToolCall,
 };
 use golutra_policy::approval_resource_matches;
 use golutra_protocol::{AgentExecutionMode, AgentToolProfile, ExternalVerificationSpec};
@@ -3080,6 +3080,10 @@ where
         let mut active_provider_id = request.provider_id.clone();
         let mut active_model_id = request.model_id.clone();
         let mut on_event = |event| match event {
+            provider_session::ProviderSessionEvent::Streamed {
+                event: ProviderStreamEvent::Heartbeat,
+                ..
+            } => {}
             provider_session::ProviderSessionEvent::Streamed {
                 provider_id,
                 model_id,

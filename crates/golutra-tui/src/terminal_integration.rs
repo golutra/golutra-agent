@@ -19,7 +19,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
-    backend::{Backend, ClearType, CrosstermBackend, WindowSize},
+    backend::{Backend, ClearType, CrosstermBackend, IntoCrossterm, WindowSize},
     buffer::Cell,
     layout::{Position, Size},
     style::{Color, Modifier},
@@ -63,6 +63,8 @@ impl<W: Write> Write for ContiguousCrosstermBackend<W> {
 }
 
 impl<W: Write> Backend for ContiguousCrosstermBackend<W> {
+    type Error = io::Error;
+
     fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,
@@ -99,7 +101,10 @@ impl<W: Write> Backend for ContiguousCrosstermBackend<W> {
             if cell.fg != foreground || cell.bg != background {
                 queue!(
                     self.writer,
-                    SetColors(Colors::new(cell.fg.into(), cell.bg.into()))
+                    SetColors(Colors::new(
+                        cell.fg.into_crossterm(),
+                        cell.bg.into_crossterm(),
+                    ))
                 )?;
                 foreground = cell.fg;
                 background = cell.bg;
@@ -107,7 +112,7 @@ impl<W: Write> Backend for ContiguousCrosstermBackend<W> {
             if cell.underline_color != underline {
                 queue!(
                     self.writer,
-                    SetUnderlineColor(CrosstermColor::from(cell.underline_color))
+                    SetUnderlineColor(cell.underline_color.into_crossterm())
                 )?;
                 underline = cell.underline_color;
             }
@@ -243,7 +248,7 @@ impl<B> CursorFallbackBackend<B> {
         }
     }
 
-    fn resolve_cursor_position(&mut self, result: io::Result<Position>) -> Position {
+    fn resolve_cursor_position<E>(&mut self, result: Result<Position, E>) -> Position {
         match result {
             Ok(position) => self.last_known_cursor_position = position,
             Err(_) => self.cursor_queries_supported = false,
@@ -263,26 +268,28 @@ impl<B: Write> Write for CursorFallbackBackend<B> {
 }
 
 impl<B: Backend> Backend for CursorFallbackBackend<B> {
-    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    type Error = B::Error;
+
+    fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,
     {
         self.inner.draw(content)
     }
 
-    fn append_lines(&mut self, count: u16) -> io::Result<()> {
+    fn append_lines(&mut self, count: u16) -> Result<(), Self::Error> {
         self.inner.append_lines(count)
     }
 
-    fn hide_cursor(&mut self) -> io::Result<()> {
+    fn hide_cursor(&mut self) -> Result<(), Self::Error> {
         self.inner.hide_cursor()
     }
 
-    fn show_cursor(&mut self) -> io::Result<()> {
+    fn show_cursor(&mut self) -> Result<(), Self::Error> {
         self.inner.show_cursor()
     }
 
-    fn get_cursor_position(&mut self) -> io::Result<Position> {
+    fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
         if !self.cursor_queries_supported {
             return Ok(self.last_known_cursor_position);
         }
@@ -290,30 +297,30 @@ impl<B: Backend> Backend for CursorFallbackBackend<B> {
         Ok(self.resolve_cursor_position(result))
     }
 
-    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> Result<(), Self::Error> {
         let position = position.into();
         self.inner.set_cursor_position(position)?;
         self.last_known_cursor_position = position;
         Ok(())
     }
 
-    fn clear(&mut self) -> io::Result<()> {
+    fn clear(&mut self) -> Result<(), Self::Error> {
         self.inner.clear()
     }
 
-    fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+    fn clear_region(&mut self, clear_type: ClearType) -> Result<(), Self::Error> {
         self.inner.clear_region(clear_type)
     }
 
-    fn size(&self) -> io::Result<Size> {
+    fn size(&self) -> Result<Size, Self::Error> {
         self.inner.size()
     }
 
-    fn window_size(&mut self) -> io::Result<WindowSize> {
+    fn window_size(&mut self) -> Result<WindowSize, Self::Error> {
         self.inner.window_size()
     }
 
-    fn flush(&mut self) -> io::Result<()> {
+    fn flush(&mut self) -> Result<(), Self::Error> {
         self.inner.flush()
     }
 }

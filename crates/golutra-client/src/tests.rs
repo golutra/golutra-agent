@@ -3202,14 +3202,7 @@ async fn deferred_external_verification_survives_provider_failure() {
 
     transport.send_command(prompt).await.expect("failed task");
     wait_for_status(&transport, session_id, TaskStatus::Failed).await;
-    let events = transport
-        .host
-        .storage
-        .repositories
-        .events
-        .load(session_id, None, None)
-        .await
-        .expect("events");
+    let events = wait_for_external_verification_requested(&transport, session_id).await;
     let terminal = events
         .iter()
         .rev()
@@ -3256,14 +3249,7 @@ async fn deferred_external_verification_survives_abort() {
         .expect("abort");
     assert!(abort.accepted);
     wait_for_status(&transport, session_id, TaskStatus::Cancelled).await;
-    let events = transport
-        .host
-        .storage
-        .repositories
-        .events
-        .load(session_id, None, None)
-        .await
-        .expect("events");
+    let events = wait_for_external_verification_requested(&transport, session_id).await;
     let terminal = events
         .iter()
         .rev()
@@ -11858,4 +11844,34 @@ async fn wait_for_task_completed_count(
         sleep(Duration::from_millis(25)).await;
     }
     panic!("session did not record {expected_count} completed tasks");
+}
+
+async fn wait_for_external_verification_requested(
+    transport: &EmbeddedTransport,
+    session_id: SessionId,
+) -> Vec<RuntimeEvent> {
+    for _ in 0..40 {
+        let event_values = transport
+            .replay_events(EventFilter {
+                session_id,
+                task_id: None,
+                after_sequence_no: None,
+            })
+            .await
+            .expect("events");
+        let events = event_values
+            .into_iter()
+            .map(serde_json::from_value::<RuntimeEvent>)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("typed events");
+        if events.iter().any(|event| {
+            event.event_type == RuntimeEventType::ExternalVerificationRequested
+                && event.payload.pointer("/outcome/external_verification")
+                    == Some(&json!("pending"))
+        }) {
+            return events;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    panic!("session did not record the external verification request");
 }

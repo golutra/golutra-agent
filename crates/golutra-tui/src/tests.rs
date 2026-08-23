@@ -1711,7 +1711,9 @@ fn replay_rebuild_clears_provisional_frame_before_committing_history() {
     let mut rebuilds = 0_usize;
     let mut rebuild = |terminal: &mut Terminal<TestBackend>| {
         rebuilds = rebuilds.saturating_add(1);
-        terminal.clear()?;
+        terminal
+            .clear()
+            .map_err(|error| io::Error::other(error.to_string()))?;
         terminal.current_buffer_mut().reset();
         Ok(())
     };

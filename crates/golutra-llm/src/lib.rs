@@ -149,6 +149,8 @@ pub struct ProviderToolCall {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProviderStreamEvent {
+    /// Keeps a long-running provider stream alive without adding user-visible content.
+    Heartbeat,
     TextDelta {
         text: String,
     },

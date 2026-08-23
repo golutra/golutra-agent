@@ -80,6 +80,10 @@ const SESSION_LOGO_GRADIENT: [[u8; 3]; 3] =
 const MIN_INLINE_BOTTOM_ROWS: u16 = 3;
 const HISTORY_OMISSION_MARKER: &str = "…";
 
+fn backend_error_to_io<E: std::error::Error>(error: E) -> io::Error {
+    io::Error::other(error.to_string())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InlineHistoryMode {
     Transcript,
@@ -184,7 +188,7 @@ impl InlineHistoryState {
         // History is inserted before the normal frame draw, while ratatui normally performs its
         // autoresize at the start of that draw. Synchronize the internal inline buffer first so
         // wrapping and insert_before use the same physical dimensions after a resize.
-        terminal.autoresize()?;
+        terminal.autoresize().map_err(backend_error_to_io)?;
         let mode = InlineHistoryMode::from_app(app);
         let buffer_area = terminal.current_buffer_mut().area;
         let width = buffer_area.width.max(1);
@@ -857,12 +861,17 @@ fn committed_prefix_len(
 
 #[cfg(test)]
 fn clear_history_terminal<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
-    let size = terminal.size()?;
-    terminal.set_cursor_position(ratatui::layout::Position::ORIGIN)?;
+    let size = terminal.size().map_err(backend_error_to_io)?;
+    terminal
+        .set_cursor_position(ratatui::layout::Position::ORIGIN)
+        .map_err(backend_error_to_io)?;
     terminal
         .backend_mut()
-        .clear_region(ratatui::backend::ClearType::All)?;
-    terminal.resize(ratatui::layout::Rect::new(0, 0, size.width, size.height))?;
+        .clear_region(ratatui::backend::ClearType::All)
+        .map_err(backend_error_to_io)?;
+    terminal
+        .resize(ratatui::layout::Rect::new(0, 0, size.width, size.height))
+        .map_err(backend_error_to_io)?;
     terminal.current_buffer_mut().reset();
     Ok(())
 }
@@ -1242,11 +1251,13 @@ fn insert_history_batch<B: Backend>(
     }
     let height = u16::try_from(rows)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "history batch is too tall"))?;
-    terminal.insert_before(height, move |buffer| {
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .render(buffer.area, buffer);
-    })
+    terminal
+        .insert_before(height, move |buffer| {
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .render(buffer.area, buffer);
+        })
+        .map_err(backend_error_to_io)
 }
 
 fn insert_tall_history_line<B: Backend>(
@@ -1267,12 +1278,14 @@ fn insert_tall_history_line<B: Backend>(
         let height = u16::try_from(chunk_rows)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "history chunk is too tall"))?;
         let line = line.clone();
-        terminal.insert_before(height, move |buffer| {
-            Paragraph::new(line)
-                .wrap(Wrap { trim: false })
-                .scroll((ratatui_vertical_scroll(offset, height), 0))
-                .render(buffer.area, buffer);
-        })?;
+        terminal
+            .insert_before(height, move |buffer| {
+                Paragraph::new(line)
+                    .wrap(Wrap { trim: false })
+                    .scroll((ratatui_vertical_scroll(offset, height), 0))
+                    .render(buffer.area, buffer);
+            })
+            .map_err(backend_error_to_io)?;
         offset = offset.saturating_add(chunk_rows);
     }
     Ok(())
