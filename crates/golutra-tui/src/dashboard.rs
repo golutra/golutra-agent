@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use golutra_core::TokenUsageRecord;
 use golutra_protocol::{RuntimeEvent, RuntimeEventType};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -167,7 +168,10 @@ fn usage_lines(events: &[RuntimeEvent]) -> Vec<String> {
     let mut output = 0_u64;
     let mut reasoning = 0_u64;
     let mut cached = 0_u64;
-    let mut total = 0_u64;
+    let mut provider_total = 0_u64;
+    let mut aggregate_total = 0_u64;
+    let mut provider_total_complete = true;
+    let mut aggregate_complete = true;
     let mut cost = 0.0_f64;
     let mut samples = 0_u64;
     let mut model = None;
@@ -175,23 +179,34 @@ fn usage_lines(events: &[RuntimeEvent]) -> Vec<String> {
         .iter()
         .filter(|event| event.event_type == RuntimeEventType::TokenUsageRecorded)
     {
-        let Some(record) = event.payload.get("record") else {
+        let Some(record_value) = event.payload.get("record") else {
             continue;
         };
-        input = input.saturating_add(value_u64(record, "input_tokens"));
-        output = output.saturating_add(value_u64(record, "output_tokens"));
-        reasoning = reasoning.saturating_add(value_u64(record, "reasoning_tokens"));
-        cached = cached.saturating_add(value_u64(record, "cached_input_tokens"));
-        total = total.saturating_add(value_u64(record, "total_tokens"));
-        cost += record
-            .get("estimated_cost")
-            .and_then(|value| value.as_f64())
-            .unwrap_or_default();
-        model = record
-            .get("model_id")
-            .and_then(|value| value.as_str())
-            .map(str::to_owned)
-            .or(model);
+        let Ok(record) = serde_json::from_value::<TokenUsageRecord>(record_value.clone()) else {
+            continue;
+        };
+        let usage = record.usage();
+        let input_tokens = usage.input_tokens_total;
+        let output_tokens = usage.output_tokens;
+        input = input.saturating_add(input_tokens.unwrap_or_default());
+        output = output.saturating_add(output_tokens.unwrap_or_default());
+        reasoning = reasoning.saturating_add(usage.reasoning_tokens.unwrap_or_default());
+        cached = cached.saturating_add(usage.cache_read_tokens.unwrap_or_default());
+        if let Some(total) = usage.provider_total_tokens {
+            provider_total = provider_total.saturating_add(total);
+        } else {
+            provider_total_complete = false;
+        }
+        if let Some(aggregate) = input_tokens
+            .zip(output_tokens)
+            .map(|(input, output)| input.saturating_add(output))
+        {
+            aggregate_total = aggregate_total.saturating_add(aggregate);
+        } else {
+            aggregate_complete = false;
+        }
+        cost += record.estimated_cost.unwrap_or_default();
+        model = Some(record.model_id).or(model);
         samples = samples.saturating_add(1);
     }
     let context = events.iter().rev().find_map(|event| {
@@ -212,9 +227,21 @@ fn usage_lines(events: &[RuntimeEvent]) -> Vec<String> {
         format!("Cached       {cached} tokens"),
         format!("Output       {output} tokens"),
         format!("Reasoning    {reasoning} tokens"),
-        format!("Total        {total} tokens"),
+        if provider_total_complete {
+            format!("Total        {provider_total} tokens")
+        } else {
+            "Total        unknown".to_owned()
+        },
         format!("Est. cost    ${cost:.6}"),
     ];
+    if !provider_total_complete || aggregate_total != provider_total {
+        let aggregate = if aggregate_complete {
+            format!("{aggregate_total} tokens")
+        } else {
+            "unknown".to_owned()
+        };
+        lines.insert(7, format!("Aggregate    {aggregate}"));
+    }
     if let Some(context) = context {
         lines.push(format!("Last context {context} planned tokens"));
     }
@@ -226,10 +253,6 @@ fn usage_lines(events: &[RuntimeEvent]) -> Vec<String> {
         lines.push(format!("Rate limit   {}", event_summary(rate_limit)));
     }
     lines
-}
-
-fn value_u64(value: &serde_json::Value, key: &str) -> u64 {
-    value.get(key).and_then(|value| value.as_u64()).unwrap_or(0)
 }
 
 fn event_summary(event: &RuntimeEvent) -> String {
@@ -248,7 +271,10 @@ fn short_id(value: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use golutra_core::{EventId, RUNTIME_EVENT_SCHEMA_VERSION, SessionId, TaskId};
+    use golutra_core::{
+        EventId, ProviderRequestId, ProviderResponseId, RUNTIME_EVENT_SCHEMA_VERSION, SessionId,
+        TaskId, TokenBudgetSnapshotId, TokenUsageRecord, TurnId,
+    };
     use golutra_protocol::RuntimeEventSource;
     use serde_json::json;
 
@@ -278,21 +304,88 @@ mod tests {
         }
     }
 
+    fn usage_record_json(
+        input_tokens: u64,
+        output_tokens: u64,
+        provider_total_tokens: Option<u64>,
+        estimated_cost: f64,
+    ) -> serde_json::Value {
+        serde_json::to_value(TokenUsageRecord {
+            session_id: None,
+            task_id: TaskId::new(),
+            turn_id: TurnId::new(),
+            provider_id: "provider".to_owned(),
+            model_id: "m".to_owned(),
+            request_event_id: ProviderRequestId::new(),
+            response_event_id: ProviderResponseId::new(),
+            input_tokens: Some(input_tokens),
+            output_tokens: Some(output_tokens),
+            reasoning_tokens: None,
+            estimated_cost: Some(estimated_cost),
+            budget_snapshot_ref: TokenBudgetSnapshotId::new(),
+            attribution_ref: None,
+            usage_source: "provider".to_owned(),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            non_cached_input_tokens: Some(input_tokens),
+            tool_schema_tokens_estimated: None,
+            tool_result_tokens_estimated: None,
+            tool_estimated_tokens: None,
+            provider_total_tokens,
+            usage_complete: true,
+            cache_identity: None,
+        })
+        .expect("usage record serializes")
+    }
+
     #[test]
     fn usage_projection_sums_durable_records() {
         let lines = usage_lines(&[
             event(
                 1,
                 RuntimeEventType::TokenUsageRecorded,
-                json!({"record": {"model_id": "m", "input_tokens": 10, "output_tokens": 2, "total_tokens": 12, "estimated_cost": 0.1}}),
+                json!({"record": usage_record_json(10, 2, Some(12), 0.1)}),
             ),
             event(
                 2,
                 RuntimeEventType::TokenUsageRecorded,
-                json!({"record": {"model_id": "m", "input_tokens": 5, "output_tokens": 3, "total_tokens": 8, "estimated_cost": 0.2}}),
+                json!({"record": usage_record_json(5, 3, Some(8), 0.2)}),
             ),
         ]);
         assert!(lines.iter().any(|line| line == "Input        15 tokens"));
         assert!(lines.iter().any(|line| line == "Total        20 tokens"));
+    }
+
+    #[test]
+    fn usage_projection_marks_missing_provider_total_without_hiding_aggregate() {
+        let lines = usage_lines(&[event(
+            1,
+            RuntimeEventType::TokenUsageRecorded,
+            json!({"record": usage_record_json(10, 2, None, 0.0)}),
+        )]);
+
+        assert!(lines.iter().any(|line| line == "Total        unknown"));
+        assert!(lines.iter().any(|line| line == "Aggregate    12 tokens"));
+    }
+
+    #[test]
+    fn usage_projection_ignores_old_record_shape() {
+        let lines = usage_lines(&[event(
+            1,
+            RuntimeEventType::TokenUsageRecorded,
+            json!({
+                "record": {
+                    "model_id": "m",
+                    "input_tokens": 10,
+                    "output_tokens": 2,
+                    "cached_input_tokens": 4,
+                    "tool_result_tokens": 6,
+                    "total_tokens": 12
+                }
+            }),
+        )]);
+
+        assert!(lines.iter().any(|line| line == "Requests     0"));
+        assert!(lines.iter().any(|line| line == "Total        0 tokens"));
     }
 }

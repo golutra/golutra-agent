@@ -119,6 +119,8 @@ Driver 进程退出；`pending_waits` 和 `frame_cache_entries` 是当前连接/
 - snapshot 请求、实际渲染、冻结帧 hit/miss 和 snapshot 延迟的 samples/total/max/last 毫秒聚合。
 - wait 请求、result、timeout、连接断开取消、当前 pending 数和 wait 延迟聚合。
 - runtime sync 尝试、错误和延迟聚合，以及当前冻结帧缓存条目数。
+- 交互渲染 request、实际 redraw、合并次数、stream delta 首帧/末帧延迟，以及显式
+  stream-local 序号可判定时的 gap、duplicate、dropped frame 计数；没有该序号时不推断丢帧。
 
 指标合同不会记录 prompt、按键/粘贴内容、frame 文本、workspace 路径、provider/model、原始错误或任何
 credential/token。它适合被 SDK、CI 或 developer/debug 面板轮询；需要完整执行事实时仍应读取

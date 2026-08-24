@@ -14,10 +14,12 @@ async fn mock_provider_can_emit_a_deterministic_failure() {
             request_id: ProviderRequestId::new(),
             task_id: TaskId::new(),
             turn_id: TurnId::new(),
+            session_id: None,
             provider_id: "mock".to_owned(),
             model_id: "mock".to_owned(),
             messages: Vec::new(),
             tools: Vec::new(),
+            cache_policy: Default::default(),
         })
         .await
         .expect_err("mock failure");
@@ -695,6 +697,7 @@ fn request() -> ProviderRequest {
         request_id: ProviderRequestId::new(),
         task_id: TaskId::new(),
         turn_id: TurnId::new(),
+        session_id: None,
         provider_id: "mock".to_owned(),
         model_id: "mock-model".to_owned(),
         messages: vec![ProviderMessage {
@@ -706,5 +709,83 @@ fn request() -> ProviderRequest {
             metadata: ProviderMessageMetadata::default(),
         }],
         tools: Vec::new(),
+        cache_policy: Default::default(),
     }
+}
+
+#[test]
+fn prompt_cache_identity_is_stable_and_session_scoped() {
+    let mut first = request();
+    first.session_id = Some(golutra_core::SessionId::new());
+    first.cache_policy = golutra_core::PromptCachePolicy::Auto;
+    let second = first.clone();
+    assert_eq!(first.cache_identity(), second.cache_identity());
+
+    let mut changed = first.clone();
+    changed.messages[0].content.push('!');
+    assert_eq!(first.cache_identity(), changed.cache_identity());
+
+    changed.task_id = golutra_core::TaskId::new();
+    assert_eq!(first.cache_identity(), changed.cache_identity());
+
+    changed.provider_id = "other-provider".to_owned();
+    assert_ne!(first.cache_identity(), changed.cache_identity());
+
+    first.cache_policy = golutra_core::PromptCachePolicy::None;
+    assert!(first.cache_identity().is_none());
+}
+
+#[test]
+fn provider_tool_projection_excludes_internal_contract_policy() {
+    let mut contract = golutra_core::ToolContract {
+        tool_name: "read_file".to_owned(),
+        input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        output_schema: json!({"internal": true}),
+        error_schema: json!({"internal": true}),
+        side_effect_type: golutra_core::SideEffectType::None,
+        idempotency_key_policy: "internal".to_owned(),
+        timeout_policy: "internal".to_owned(),
+        cancellation_policy: "internal".to_owned(),
+        retry_policy: "internal".to_owned(),
+        artifact_policy: "internal".to_owned(),
+        permission_policy_ref: Some(golutra_core::PolicyId::new()),
+    };
+    let projected = provider_tool_wire_projection(&contract);
+    assert_eq!(projected["function"]["name"], "read_file");
+    assert!(projected["function"].get("parameters").is_some());
+    assert!(projected.get("output_schema").is_none());
+    assert!(projected["function"].get("retry_policy").is_none());
+
+    contract.input_schema["properties"]["path"] = json!({"type": "string", "maxLength": 32});
+    assert!(estimate_provider_tool_tokens(&[contract]) > 0);
+}
+
+#[test]
+fn openai_cache_fields_are_sent_only_for_supported_endpoint() {
+    let mut request = request();
+    request.session_id = Some(golutra_core::SessionId::new());
+    request.cache_policy = golutra_core::PromptCachePolicy::Long;
+
+    let supported = openai_completion_body(
+        &request,
+        "gpt-test",
+        &ProviderGenerationConfig::default(),
+        false,
+        true,
+    );
+    assert_eq!(
+        supported["prompt_cache_key"].as_str().map(str::len),
+        Some(71)
+    );
+    assert_eq!(supported["prompt_cache_retention"], "24h");
+
+    let custom = openai_completion_body(
+        &request,
+        "gpt-test",
+        &ProviderGenerationConfig::default(),
+        false,
+        false,
+    );
+    assert!(custom.get("prompt_cache_key").is_none());
+    assert!(custom.get("prompt_cache_retention").is_none());
 }

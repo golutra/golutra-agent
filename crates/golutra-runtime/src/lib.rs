@@ -31,7 +31,7 @@ use golutra_governor::{
 };
 use golutra_llm::{
     LlmProvider, ProviderError, ProviderMessage, ProviderRequest, ProviderResponse, ProviderRole,
-    ProviderToolCall,
+    ProviderToolCall, estimate_provider_tool_tokens,
 };
 use golutra_policy::approval_resource_matches;
 use golutra_protocol::{AgentExecutionMode, AgentToolProfile, ExternalVerificationSpec};
@@ -1498,7 +1498,7 @@ where
                     planned_input_tokens: Some(plan.budget_snapshot.planned_input_tokens),
                     actual_input_tokens: usage_record.input_tokens,
                     output_tokens: usage_record.output_tokens,
-                    total_tokens: usage_record.total_tokens,
+                    total_tokens: usage_record.provider_total_tokens,
                     estimated_cost: usage_record.estimated_cost.map(|cost| cost.to_string()),
                     budget_remaining: plan
                         .budget_snapshot
@@ -3639,7 +3639,7 @@ fn provider_tools_for_turn(
     profile: AgentToolProfile,
     registry: &ToolRegistry,
 ) -> Vec<ToolContract> {
-    tools
+    let mut tools = tools
         .iter()
         .filter(|tool| {
             tool_allowed_for_profile(&tool.tool_name, profile, registry)
@@ -3679,7 +3679,9 @@ fn provider_tools_for_turn(
             }
             tool
         })
-        .collect()
+        .collect::<Vec<_>>();
+    tools.sort_by(|left, right| left.tool_name.cmp(&right.tool_name));
+    tools
 }
 
 fn tool_allowed_for_profile(
@@ -3804,14 +3806,7 @@ async fn invoke_parallel_read_calls(
 }
 
 fn estimate_tool_contract_tokens(tools: &[ToolContract]) -> u64 {
-    tools
-        .iter()
-        .map(|contract| {
-            serde_json::to_string(contract)
-                .map(|value| estimate_tokens(&value))
-                .unwrap_or_default()
-        })
-        .sum()
+    estimate_provider_tool_tokens(tools)
 }
 
 fn elapsed_millis(started_at: Instant) -> u64 {

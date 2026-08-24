@@ -182,7 +182,7 @@ pub(crate) use context::{
     completion_criteria_from_payload, context_compaction_from_event, conversation_history_line,
     effective_model_history_events, environment_context_prompt, load_project_instruction_bundle,
     memory_context, model_prompt_from_payload, preview_from_payload, prompt_from_payload,
-    system_prompt, task_contract_from_payload, title_from_payload,
+    select_memories_for_context, system_prompt, task_contract_from_payload, title_from_payload,
 };
 pub use debug_export::{
     DebugExportCoordinator, DebugExportManifest, DebugExportReceipt, DebugExportRequest,
@@ -1007,12 +1007,11 @@ fn recovered_task_continuation(
             )?);
         }
 
-        if event.event_type == RuntimeEventType::TokenUsageRecorded
-            && let Some(record) = event.payload.get("record")
-            && let Ok(record) = serde_json::from_value::<TokenUsageRecord>(record.clone())
-            && governor.observe_token_usage(record)
-        {
-            has_continuation = true;
+        if event.event_type == RuntimeEventType::TokenUsageRecorded {
+            let record = decode_token_usage_record(event)?;
+            if governor.observe_token_usage(record) {
+                has_continuation = true;
+            }
         }
 
         if event.event_type == RuntimeEventType::CheckpointCreated
@@ -1048,6 +1047,21 @@ fn recovered_task_continuation(
     }
 }
 
+fn decode_token_usage_record(event: &RuntimeEvent) -> Result<TokenUsageRecord, ClientError> {
+    let value = event.payload.get("record").ok_or_else(|| {
+        ClientError::TaskExecution(format!(
+            "token usage event at sequence {} is missing its record",
+            event.sequence_no
+        ))
+    })?;
+    serde_json::from_value(value.clone()).map_err(|error| {
+        ClientError::TaskExecution(format!(
+            "token usage event at sequence {} is malformed: {error}",
+            event.sequence_no
+        ))
+    })
+}
+
 fn inherit_steering_execution_surface(
     active_task_payload: &Value,
     steering_payload: &mut Value,
@@ -1057,7 +1071,7 @@ fn inherit_steering_execution_surface(
             "cannot recover a leading steering turn from an invalid active execution mode: {error}"
         ))
     })?;
-    let inherited_tool_profile = tool_profile_from_payload(active_task_payload, execution_mode)
+    let inherited_tool_profile = tool_profile_from_payload(active_task_payload)
         .map_err(|error| {
             ClientError::TaskExecution(format!(
                 "cannot recover a leading steering turn from an invalid active tool profile: {error}"

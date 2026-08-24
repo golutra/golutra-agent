@@ -24,6 +24,10 @@ const MAX_TOOL_CALLS_PER_TASK: u32 = 64;
 const MAX_RUNTIME_MS_PER_TASK: u64 = 10 * 60 * 1_000;
 const MIN_RUNTIME_MS_PER_TASK: u64 = 1_000;
 const SKILL_CONTEXT_LIMIT: usize = 3;
+const MAX_SKILL_CONTEXT_CHARS: usize = 4_096;
+const MAX_SKILL_DESCRIPTION_CHARS: usize = 320;
+const MAX_SKILL_STEPS: usize = 4;
+const MAX_SKILL_STEP_CHARS: usize = 240;
 
 impl RuntimeHost {
     pub(super) async fn handle_plan_evolution_command(
@@ -619,21 +623,52 @@ fn render_skill_context(skills: &[SkillManifest]) -> String {
             format!(
                 "Skill: {}\nWhen relevant: {}\nSteps:\n{}",
                 skill.name,
-                skill.description,
+                compact_skill_text(&skill.description, MAX_SKILL_DESCRIPTION_CHARS),
                 skill
                     .steps
                     .iter()
+                    .take(MAX_SKILL_STEPS)
                     .enumerate()
-                    .map(|(index, step)| format!("{}. {step}", index.saturating_add(1)))
+                    .map(|(index, step)| {
+                        format!(
+                            "{}. {}",
+                            index.saturating_add(1),
+                            compact_skill_text(step, MAX_SKILL_STEP_CHARS)
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join("\n")
             )
         })
         .collect::<Vec<_>>()
         .join("\n\n");
-    format!(
+    let rendered = format!(
         "Verified project skills are optional guidance. Apply only when they match the current objective:\n{rendered}"
-    )
+    );
+    bounded_skill_context(&rendered, MAX_SKILL_CONTEXT_CHARS)
+}
+
+fn compact_skill_text(value: &str, max_chars: usize) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        compact
+    } else {
+        compact.chars().take(max_chars).collect()
+    }
+}
+
+fn bounded_skill_context(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+    const OMITTED_MARKER: &str = "\n[additional skill guidance omitted]";
+    if max_chars < OMITTED_MARKER.chars().count() {
+        return OMITTED_MARKER.chars().take(max_chars).collect();
+    }
+    let content_limit = max_chars.saturating_sub(OMITTED_MARKER.chars().count());
+    let mut bounded = value.chars().take(content_limit).collect::<String>();
+    bounded.push_str(OMITTED_MARKER);
+    bounded
 }
 
 fn skill_ack(command_id: CommandId, skill_id: &str, action: &str) -> CommandAck {

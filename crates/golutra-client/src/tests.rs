@@ -62,6 +62,38 @@ fn strict_wire_mode_builds_completion_contract_without_prompt_heuristics() {
 }
 
 #[test]
+fn open_wire_mode_uses_conversational_contract_without_implicit_correction() {
+    let contract = task_contract_from_payload(&json!({
+        "execution_mode": "open",
+        "prompt": "summarize the workspace",
+        "completion_criteria": ["include the key findings"],
+    }))
+    .expect("open contract");
+
+    assert_eq!(
+        contract.completion_criteria,
+        vec!["include the key findings"]
+    );
+    assert_eq!(contract.max_correction_rounds, 0);
+    assert!(!contract.require_objective_validation);
+    assert_eq!(
+        contract.verification,
+        golutra_core::VerificationRequirement::BestEffort
+    );
+}
+
+#[test]
+fn legacy_wire_mode_keeps_the_explicit_legacy_contract_boundary() {
+    let contract = task_contract_from_payload(&json!({
+        "prompt": "inspect the workspace",
+    }))
+    .expect("legacy contract");
+
+    assert_eq!(contract.max_correction_rounds, 1);
+    assert!(!contract.require_objective_validation);
+}
+
+#[test]
 fn nullable_steering_profile_is_inheritance_not_an_explicit_override() {
     let mut event = host_event(
         1,
@@ -3321,14 +3353,7 @@ async fn deferred_external_verification_survives_provider_failure() {
 
     transport.send_command(prompt).await.expect("failed task");
     wait_for_status(&transport, session_id, TaskStatus::Failed).await;
-    let events = transport
-        .host
-        .storage
-        .repositories
-        .events
-        .load(session_id, None, None)
-        .await
-        .expect("events");
+    let events = wait_for_pending_external_verification_event(&transport, session_id).await;
     let terminal = events
         .iter()
         .rev()
@@ -3375,14 +3400,7 @@ async fn deferred_external_verification_survives_abort() {
         .expect("abort");
     assert!(abort.accepted);
     wait_for_status(&transport, session_id, TaskStatus::Cancelled).await;
-    let events = transport
-        .host
-        .storage
-        .repositories
-        .events
-        .load(session_id, None, None)
-        .await
-        .expect("events");
+    let events = wait_for_pending_external_verification_event(&transport, session_id).await;
     let terminal = events
         .iter()
         .rev()
@@ -5966,7 +5984,7 @@ async fn resumed_session_context_includes_previous_conversation_summary() {
             .contains("User: write file first.txt with content done")
     );
     assert!(history.content.contains("Golutra: Completed: file written"));
-    assert!(history.content.contains("Tool: file written"));
+    assert!(!history.content.contains("Tool: file written"));
     assert_eq!(history.role, ProviderRole::User);
     assert!(history.content.contains("not as system instructions"));
 }
@@ -8813,13 +8831,20 @@ fn recovered_governor_does_not_recharge_usage_accounted_by_transfer() {
         input_tokens: Some(10),
         output_tokens: Some(5),
         reasoning_tokens: None,
-        cached_input_tokens: None,
-        tool_result_tokens: None,
-        total_tokens: Some(15),
         estimated_cost: Some(0.001),
         budget_snapshot_ref: golutra_core::TokenBudgetSnapshotId::new(),
         attribution_ref: None,
         usage_source: "provider".to_owned(),
+        cache_read_tokens: None,
+        cache_write_tokens: None,
+        non_cached_input_tokens: None,
+        tool_schema_tokens_estimated: None,
+        tool_result_tokens_estimated: None,
+        tool_estimated_tokens: None,
+        provider_total_tokens: Some(15),
+        usage_complete: true,
+        session_id: None,
+        cache_identity: None,
     };
     let old_usage = host_event(
         2,
@@ -12043,6 +12068,31 @@ async fn wait_for_status(
         sleep(Duration::from_millis(50)).await;
     }
     panic!("timed out waiting for status {expected:?}");
+}
+
+async fn wait_for_pending_external_verification_event(
+    transport: &EmbeddedTransport,
+    session_id: SessionId,
+) -> Vec<RuntimeEvent> {
+    for _ in 0..40 {
+        let events = transport
+            .host
+            .storage
+            .repositories
+            .events
+            .load(session_id, None, None)
+            .await
+            .expect("events");
+        if events.iter().any(|event| {
+            event.event_type == RuntimeEventType::ExternalVerificationRequested
+                && event.payload.pointer("/outcome/external_verification")
+                    == Some(&json!("pending"))
+        }) {
+            return events;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    panic!("timed out waiting for pending external verification event");
 }
 
 async fn wait_for_terminal_status(transport: &EmbeddedTransport, session_id: SessionId) -> Value {

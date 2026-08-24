@@ -1,9 +1,8 @@
 //! Turn execution mode and model-visible tool profile normalization.
 //!
-//! The wire-facing clients opt into the open path explicitly.  A missing mode
-//! remains a compatibility path for older raw `SessionCommand` callers and
-//! persisted events, so changing the default for new clients does not rewrite
-//! the meaning of old tasks.
+//! The wire-facing clients opt into the open path explicitly. A compact coding
+//! tool surface is the default; full is reserved for callers that need the
+//! low-frequency process, search, or extension tools.
 
 use golutra_core::{TaskContract, VerificationRequirement};
 use golutra_protocol::{AgentExecutionMode, AgentToolProfile};
@@ -71,27 +70,22 @@ pub(crate) fn execution_mode_from_payload(
     }
 }
 
-pub(crate) fn tool_profile_from_payload(
-    payload: &Value,
-    mode: NormalizedExecutionMode,
-) -> Result<AgentToolProfile, &'static str> {
+pub(crate) fn tool_profile_from_payload(payload: &Value) -> Result<AgentToolProfile, &'static str> {
+    let default_profile = match execution_mode_from_payload(payload)? {
+        // Omitted execution_mode is the pre-profile wire shape. Preserve its
+        // complete model-facing surface for persisted and direct Rust callers.
+        NormalizedExecutionMode::Legacy => AgentToolProfile::Full,
+        NormalizedExecutionMode::Open | NormalizedExecutionMode::Strict => AgentToolProfile::Coding,
+    };
     let Some(value) = payload.get(TOOL_PROFILE_KEY) else {
-        return Ok(if matches!(mode, NormalizedExecutionMode::Legacy) {
-            AgentToolProfile::Full
-        } else {
-            AgentToolProfile::Coding
-        });
+        return Ok(default_profile);
     };
     match value {
         Value::String(value) if value.eq_ignore_ascii_case("coding") => {
             Ok(AgentToolProfile::Coding)
         }
         Value::String(value) if value.eq_ignore_ascii_case("full") => Ok(AgentToolProfile::Full),
-        Value::Null => Ok(if matches!(mode, NormalizedExecutionMode::Legacy) {
-            AgentToolProfile::Full
-        } else {
-            AgentToolProfile::Coding
-        }),
+        Value::Null => Ok(default_profile),
         _ => Err("tool_profile must be `coding` or `full`"),
     }
 }
@@ -169,15 +163,14 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn new_clients_default_to_open_coding_while_legacy_payloads_keep_full_tools() {
+    fn new_clients_default_to_open_with_coding_tools() {
         let open = json!({"execution_mode": "open"});
         assert_eq!(
             execution_mode_from_payload(&open).expect("open mode"),
             NormalizedExecutionMode::Open
         );
         assert_eq!(
-            tool_profile_from_payload(&open, NormalizedExecutionMode::Open)
-                .expect("coding default"),
+            tool_profile_from_payload(&open).expect("coding default"),
             AgentToolProfile::Coding
         );
 
@@ -187,8 +180,7 @@ mod tests {
             NormalizedExecutionMode::Legacy
         );
         assert_eq!(
-            tool_profile_from_payload(&legacy, NormalizedExecutionMode::Legacy)
-                .expect("legacy profile"),
+            tool_profile_from_payload(&legacy).expect("legacy profile default"),
             AgentToolProfile::Full
         );
         assert!(strict_execution_requested(
@@ -250,19 +242,17 @@ mod tests {
     #[test]
     fn invalid_mode_and_profile_are_rejected() {
         assert!(execution_mode_from_payload(&json!({"execution_mode": "adaptive"})).is_err());
-        assert!(
-            tool_profile_from_payload(
-                &json!({"tool_profile": "everything"}),
-                NormalizedExecutionMode::Open
-            )
-            .is_err()
+        assert!(tool_profile_from_payload(&json!({"tool_profile": "everything"})).is_err());
+        assert_eq!(
+            tool_profile_from_payload(&json!({"tool_profile": null})).expect("null means inherit"),
+            AgentToolProfile::Full
         );
         assert_eq!(
-            tool_profile_from_payload(
-                &json!({"tool_profile": null}),
-                NormalizedExecutionMode::Open
-            )
-            .expect("null means inherit"),
+            tool_profile_from_payload(&json!({
+                "execution_mode": "open",
+                "tool_profile": null
+            }))
+            .expect("open null means coding"),
             AgentToolProfile::Coding
         );
     }

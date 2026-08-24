@@ -130,7 +130,7 @@ struct RunParameters {
     /// Optional completion policy profile. Defaults to the open model-facing loop.
     #[serde(default)]
     execution_mode: AgentExecutionMode,
-    /// Model-visible tool profile. Defaults to coding-safe tools.
+    /// Model-visible tool profile. Defaults to the compact coding surface.
     #[serde(default)]
     tool_profile: AgentToolProfile,
     /// Include a bounded normalized event sample in the tool result.
@@ -159,7 +159,7 @@ struct ReplyParameters {
     /// Optional completion policy profile. Defaults to the open model-facing loop.
     #[serde(default)]
     execution_mode: AgentExecutionMode,
-    /// Model-visible tool profile. Defaults to coding-safe tools.
+    /// Model-visible tool profile. Defaults to the compact coding surface.
     #[serde(default)]
     tool_profile: AgentToolProfile,
     /// Include a bounded normalized event sample in the tool result.

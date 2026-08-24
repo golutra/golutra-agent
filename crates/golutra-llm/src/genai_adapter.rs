@@ -6,13 +6,15 @@ use genai::{
     Client, ModelIden, ServiceTarget, WebConfig,
     adapter::AdapterKind,
     chat::{
-        ChatMessage, ChatOptions, ChatRequest, ChatStreamEvent, ContentPart, MessageContent,
-        ReasoningEffort, StopReason, StreamEnd, Tool, ToolCall, ToolResponse,
+        CacheControl, ChatMessage, ChatOptions, ChatRequest, ChatStreamEvent, ContentPart,
+        MessageContent, ReasoningEffort, StopReason, StreamEnd, Tool, ToolCall, ToolResponse,
     },
     resolver::{AuthData, Endpoint},
 };
 use golutra_auth::{CredentialProvider, FixedCredentialProvider};
-use golutra_core::{ProviderContract, ProviderRequestId, ProviderResponseId, TaskId, TurnId};
+use golutra_core::{
+    PromptCachePolicy, ProviderContract, ProviderRequestId, ProviderResponseId, TaskId, TurnId,
+};
 use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 
@@ -160,6 +162,7 @@ impl GenaiProviderAdapter {
                 request_id: ProviderRequestId::new(),
                 task_id: TaskId::new(),
                 turn_id: TurnId::new(),
+                session_id: None,
                 provider_id: self.config.protocol.id().to_owned(),
                 model_id: self.config.model_id.clone(),
                 messages: vec![ProviderMessage {
@@ -171,6 +174,7 @@ impl GenaiProviderAdapter {
                     metadata: Default::default(),
                 }],
                 tools: Vec::new(),
+                cache_policy: Default::default(),
             },
         )
         .await?;
@@ -225,7 +229,12 @@ impl GenaiProviderAdapter {
             .await
             .map_err(super::provider_credential_error)?;
         let chat_request = genai_chat_request(request, self.config.protocol)?;
-        let options = genai_chat_options(&self.config.generation_config, false)?;
+        let options = genai_chat_options(
+            &self.config.generation_config,
+            false,
+            request.cache_identity().as_ref(),
+            request.cache_policy,
+        )?;
         let response = self
             .client
             .exec_chat(
@@ -270,7 +279,12 @@ impl GenaiProviderAdapter {
                 .await
                 .map_err(super::provider_credential_error)?;
             let chat_request = genai_chat_request(request, self.config.protocol)?;
-            let options = genai_chat_options(&self.config.generation_config, true)?;
+            let options = genai_chat_options(
+                &self.config.generation_config,
+                true,
+                request.cache_identity().as_ref(),
+                request.cache_policy,
+            )?;
             match self
                 .client
                 .exec_chat_stream(
@@ -483,8 +497,18 @@ fn openai_responses_thought_signature(item: &Value) -> Result<String, ProviderEr
 pub(crate) fn genai_chat_options(
     config: &ProviderGenerationConfig,
     streaming: bool,
+    cache_identity: Option<&golutra_core::CacheIdentity>,
+    cache_policy: PromptCachePolicy,
 ) -> Result<ChatOptions, ProviderError> {
     let mut options = ChatOptions::default().with_capture_raw_body(true);
+    if let Some(identity) = cache_identity {
+        options = options.with_prompt_cache_key(identity.key.clone());
+        options = match cache_policy {
+            PromptCachePolicy::Short => options.with_cache_control(CacheControl::Ephemeral5m),
+            PromptCachePolicy::Long => options.with_cache_control(CacheControl::Ephemeral24h),
+            PromptCachePolicy::Auto | PromptCachePolicy::None => options,
+        };
+    }
     if streaming {
         options = options
             .with_capture_usage(true)
@@ -857,6 +881,8 @@ mod tests {
                 max_tokens: Some(4_096),
             },
             false,
+            None,
+            PromptCachePolicy::Auto,
         )
         .expect("generation options");
 
@@ -865,5 +891,44 @@ mod tests {
             options.reasoning_effort,
             Some(ReasoningEffort::XHigh)
         ));
+    }
+
+    #[test]
+    fn cache_policy_maps_to_stable_key_and_explicit_retention() {
+        let identity = golutra_core::CacheIdentity {
+            session_id: golutra_core::SessionId::new(),
+            thread_id: None,
+            provider_id: "provider".to_owned(),
+            model_id: "model".to_owned(),
+            key: "sha256:test-key".to_owned(),
+        };
+        let short = genai_chat_options(
+            &ProviderGenerationConfig::default(),
+            false,
+            Some(&identity),
+            PromptCachePolicy::Short,
+        )
+        .expect("short cache options");
+        assert_eq!(short.prompt_cache_key.as_deref(), Some("sha256:test-key"));
+        assert_eq!(short.cache_control, Some(CacheControl::Ephemeral5m));
+
+        let long = genai_chat_options(
+            &ProviderGenerationConfig::default(),
+            false,
+            Some(&identity),
+            PromptCachePolicy::Long,
+        )
+        .expect("long cache options");
+        assert_eq!(long.cache_control, Some(CacheControl::Ephemeral24h));
+
+        let none = genai_chat_options(
+            &ProviderGenerationConfig::default(),
+            false,
+            None,
+            PromptCachePolicy::None,
+        )
+        .expect("none cache options");
+        assert!(none.prompt_cache_key.is_none());
+        assert!(none.cache_control.is_none());
     }
 }

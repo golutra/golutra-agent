@@ -396,8 +396,11 @@ impl TuiDriver {
 
     fn metrics(&mut self, pending_waits: usize) -> DriverMetrics {
         self.prune_frames();
-        self.metrics
-            .snapshot(&self.instance_id, pending_waits, self.frame_cache.len())
+        let mut metrics =
+            self.metrics
+                .snapshot(&self.instance_id, pending_waits, self.frame_cache.len());
+        metrics.render = self.app.render_metrics.metrics().driver_snapshot();
+        metrics
     }
 
     fn record_connection(&mut self) {
@@ -1042,11 +1045,13 @@ impl TuiDriver {
     }
 
     fn refresh_active_layout(&mut self) -> miette::Result<()> {
+        self.app.render_metrics.request_at(Instant::now());
         let mut terminal = Terminal::new(TestBackend::new(self.width, self.height))
             .map_err(|error| miette::miette!("render_layout: {error}"))?;
         terminal
             .draw(|frame| draw_ui(frame, &mut self.app))
             .map_err(|error| miette::miette!("render_layout: {error}"))?;
+        self.app.render_metrics.mark_drawn_at(Instant::now());
         Ok(())
     }
 

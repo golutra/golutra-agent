@@ -10,6 +10,12 @@ use tokio::io::AsyncReadExt;
 
 use super::ClientError;
 
+const MAX_MEMORY_CONTEXT_ITEMS: usize = 3;
+const MAX_MEMORY_CONTEXT_CHARS: usize = 768;
+const MIN_MEMORY_RELEVANCE_SCORE: u32 = 50;
+const MAX_HISTORY_LINES: usize = 16;
+const MAX_HISTORY_SUMMARY_CHARS: usize = 2_048;
+
 pub(crate) fn conversation_history_line(event: &RuntimeEvent) -> Option<String> {
     if !event.event_type.is_model_history_fact() {
         return None;
@@ -95,10 +101,13 @@ pub(crate) fn context_compaction_from_event(event: &RuntimeEvent) -> Option<(u64
 pub(crate) fn memory_context(memories: &[RetrievedMemory]) -> String {
     let entries = memories
         .iter()
+        .filter(|memory| memory.relevance_score >= MIN_MEMORY_RELEVANCE_SCORE)
+        .take(MAX_MEMORY_CONTEXT_ITEMS)
         .map(|memory| {
             format!(
-                "- [{} confidence={}] {}",
-                memory.record.memory_id, memory.record.confidence, memory.record.content
+                "- [confidence={}] {}",
+                memory.record.confidence,
+                compact_history_text(&memory.record.content, MAX_MEMORY_CONTEXT_CHARS)
             )
         })
         .collect::<Vec<_>>()
@@ -108,17 +117,23 @@ pub(crate) fn memory_context(memories: &[RetrievedMemory]) -> String {
     )
 }
 
+pub(crate) fn select_memories_for_context(memories: Vec<RetrievedMemory>) -> Vec<RetrievedMemory> {
+    memories
+        .into_iter()
+        .filter(|memory| memory.relevance_score >= MIN_MEMORY_RELEVANCE_SCORE)
+        .take(MAX_MEMORY_CONTEXT_ITEMS)
+        .collect()
+}
+
 pub(crate) fn compact_history_lines(lines: Vec<String>) -> String {
-    const MAX_HISTORY_LINES: usize = 24;
     let start = lines.len().saturating_sub(MAX_HISTORY_LINES);
     lines[start..].join("\n")
 }
 
 pub(crate) fn compact_history_with_summary(summary: Option<String>, lines: Vec<String>) -> String {
-    const MAX_HISTORY_LINES: usize = 24;
     match summary {
         Some(summary) => {
-            let summary = compact_history_text(&summary, 4_000);
+            let summary = compact_history_text(&summary, MAX_HISTORY_SUMMARY_CHARS);
             let recent_limit = MAX_HISTORY_LINES.saturating_sub(1);
             let start = lines.len().saturating_sub(recent_limit);
             std::iter::once(summary)
@@ -334,7 +349,20 @@ pub(crate) fn task_contract_from_payload(payload: &Value) -> Result<TaskContract
         .cloned()
         .map(serde_json::from_value)
         .transpose()?
-        .unwrap_or_default();
+        .unwrap_or_else(|| {
+            let criteria = completion_criteria_from_payload(payload);
+            if matches!(
+                execution_mode,
+                crate::task_mode::NormalizedExecutionMode::Open
+            ) {
+                TaskContract::conversational(criteria)
+            } else {
+                TaskContract {
+                    completion_criteria: criteria,
+                    ..TaskContract::default()
+                }
+            }
+        });
     if contract.completion_criteria.is_empty() {
         contract.completion_criteria = completion_criteria_from_payload(payload);
     }

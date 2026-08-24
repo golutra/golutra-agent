@@ -241,7 +241,7 @@ struct ExecArgs {
     /// explicit completion-oriented adapter (`strict`).
     #[arg(long, value_enum, default_value_t = ExecExecutionModeArg::Open)]
     execution_mode: ExecExecutionModeArg,
-    /// Expose coding-safe built-ins/extensions (`coding`) or every registered
+    /// Expose the compact coding surface (`coding`) or every registered
     /// extension (`full`) to the provider.
     #[arg(long, value_enum, default_value_t = ExecToolProfileArg::Coding)]
     tool_profile: ExecToolProfileArg,

@@ -3,6 +3,7 @@
 use crossterm::terminal::size;
 use ratatui::{
     Frame,
+    buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -141,6 +142,7 @@ pub(crate) fn draw_ui(frame: &mut Frame<'_>, app: &mut TuiApp) {
         }
     }
     draw_bottom_pane(frame, layout.bottom, app);
+    apply_palette_to_buffer(frame.buffer_mut(), app.palette());
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -315,6 +317,8 @@ pub(crate) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             }
         }
     }
+    // 富文本语义色先经过统一 palette 映射，确保主题、高对比度和浅色终端一致。
+    apply_palette_to_lines(&mut lines, palette);
     let content_area = Rect::new(
         area.x,
         area.y.saturating_add(top_padding),
@@ -484,6 +488,42 @@ fn apply_palette_to_lines(lines: &mut [Line<'static>], palette: TuiPalette) {
                 span.style.bg = Some(palette.map_color(color));
             }
         }
+    }
+}
+
+fn apply_palette_to_buffer(buffer: &mut Buffer, palette: TuiPalette) {
+    for cell in &mut buffer.content {
+        cell.fg = palette.map_buffer_color(cell.fg);
+        cell.bg = palette.map_buffer_color(cell.bg);
+    }
+}
+
+#[cfg(test)]
+mod palette_tests {
+    use super::*;
+
+    #[test]
+    fn buffer_palette_keeps_cjk_symbols_and_maps_legacy_tones() {
+        let mut preferences = TuiPreferences::default();
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 2, 1));
+        buffer[(0, 0)].set_symbol("中");
+        buffer[(0, 0)].fg = Color::White;
+        buffer[(0, 0)].bg = Color::DarkGray;
+
+        apply_palette_to_buffer(&mut buffer, preferences.palette());
+        let cell = &buffer[(0, 0)];
+        assert_eq!(cell.symbol(), "中");
+        assert_eq!(cell.fg, Color::Reset);
+        assert_eq!(cell.bg, Color::DarkGray);
+
+        preferences.high_contrast = true;
+        buffer[(0, 0)].fg = Color::White;
+        buffer[(0, 0)].bg = Color::DarkGray;
+        apply_palette_to_buffer(&mut buffer, preferences.palette());
+        let cell = &buffer[(0, 0)];
+        assert_eq!(cell.symbol(), "中");
+        assert_eq!(cell.fg, Color::White);
+        assert_eq!(cell.bg, Color::Gray);
     }
 }
 

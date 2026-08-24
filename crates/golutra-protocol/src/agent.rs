@@ -195,8 +195,8 @@ pub struct AgentTurnExecutionOptions {
     /// completion policy or externally verified turns.
     #[serde(default)]
     pub execution_mode: AgentExecutionMode,
-    /// Coding exposes built-in coding, managed process, delegation, and
-    /// host-reviewed coding extensions. Full also exposes other extensions.
+    /// Coding exposes the compact core surface; full is an explicit opt-in for
+    /// low-frequency search, process and extension tools.
     #[serde(default)]
     pub tool_profile: AgentToolProfile,
 }

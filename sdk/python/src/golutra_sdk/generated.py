@@ -576,6 +576,7 @@ class DriverMetrics(TypedDict, total=False):
     pending_waits: Required[int]
     reconnects: Required[int]
     rejected_connections: Required[int]
+    render: NotRequired[DriverRenderMetrics]
     request_errors: Required[int]
     requests: Required[int]
     snapshot_latency: Required[DriverLatencyMetrics]
@@ -603,6 +604,22 @@ class DriverNotification(TypedDict, total=False):
     status: NotRequired[DriverTaskStatus | None]
 
 DriverNotificationKind: TypeAlias = Literal['heartbeat', 'runtime_event_available', 'state_changed', 'task_terminal']
+
+class DriverRenderMetrics(TypedDict, total=False):
+    coalesced_redraws: Required[int]
+    delta_events: Required[int]
+    dropped_frames: Required[int]
+    duplicate_frames: Required[int]
+    final_frame_latency: Required[DriverLatencyMetrics]
+    final_messages: Required[int]
+    first_deltas: Required[int]
+    first_token_latency: Required[DriverLatencyMetrics]
+    last_deltas: Required[int]
+    pending_redraws: Required[int]
+    pending_streams: Required[int]
+    redraw_requests: Required[int]
+    redraws: Required[int]
+    stream_gaps: Required[int]
 
 class DriverResponseEnvelopeReady(TypedDict, total=False):
     request_id: Required[str]
@@ -2039,6 +2056,7 @@ __all__ = [
     "DriverMouseKind",
     "DriverNotification",
     "DriverNotificationKind",
+    "DriverRenderMetrics",
     "DriverResponseEnvelope",
     "DriverResponseEnvelopeAccepted",
     "DriverResponseEnvelopeCapabilities",

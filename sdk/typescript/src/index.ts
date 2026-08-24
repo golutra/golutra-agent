@@ -160,7 +160,7 @@ export interface AgentSubscriptionRequest {
 export interface ThreadRunOptions {
   /** Let the provider own planning/stopping, or use an explicit contract adapter. */
   executionMode?: "open" | "strict";
-  /** Expose coding-safe tools, or every registered extension. */
+  /** Expose the compact coding surface, or opt into every registered extension. */
   toolProfile?: "coding" | "full";
   outputSchema?: Record<string, unknown>;
   taskContract?: TaskContract;

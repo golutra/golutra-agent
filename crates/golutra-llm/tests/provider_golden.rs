@@ -924,10 +924,12 @@ fn simple_request(model: &str) -> ProviderRequest {
         request_id: ProviderRequestId::new(),
         task_id: TaskId::new(),
         turn_id: TurnId::new(),
+        session_id: None,
         provider_id: "golden".to_owned(),
         model_id: model.to_owned(),
         messages: vec![message(ProviderRole::User, "Say hello.")],
         tools: Vec::new(),
+        cache_policy: Default::default(),
     }
 }
 

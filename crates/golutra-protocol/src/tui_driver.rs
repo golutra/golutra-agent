@@ -314,6 +314,25 @@ pub struct DriverLatencyMetrics {
     pub last_ms: u64,
 }
 
+/// 交互渲染的低基数质量指标，不包含文本、路径或凭据。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DriverRenderMetrics {
+    pub redraw_requests: u64,
+    pub redraws: u64,
+    pub coalesced_redraws: u64,
+    pub pending_redraws: u64,
+    pub delta_events: u64,
+    pub first_deltas: u64,
+    pub last_deltas: u64,
+    pub final_messages: u64,
+    pub stream_gaps: u64,
+    pub duplicate_frames: u64,
+    pub dropped_frames: u64,
+    pub pending_streams: u64,
+    pub first_token_latency: DriverLatencyMetrics,
+    pub final_frame_latency: DriverLatencyMetrics,
+}
+
 /// Operational counters for diagnosing a long-lived Driver instance.
 ///
 /// The values are process-local and cumulative until the Driver exits. The
@@ -341,6 +360,8 @@ pub struct DriverMetrics {
     pub sync_errors: u64,
     pub sync_latency: DriverLatencyMetrics,
     pub frame_cache_entries: u64,
+    #[serde(default)]
+    pub render: DriverRenderMetrics,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -613,6 +634,7 @@ mod tests {
                     sync_errors: 0,
                     sync_latency: DriverLatencyMetrics::default(),
                     frame_cache_entries: 1,
+                    render: DriverRenderMetrics::default(),
                 },
             },
         );

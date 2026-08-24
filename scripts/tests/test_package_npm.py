@@ -1,6 +1,7 @@
 import importlib.util
 import io
 import json
+import os
 import sys
 import tarfile
 import tempfile
@@ -33,6 +34,20 @@ def fake_pack(staging_dir: Path, output_path: Path, _npm_bin: str) -> Path:
 
 
 class NpmPackageTest(unittest.TestCase):
+    @unittest.skipUnless(os.name != "nt", "real PTY smoke is Unix-only")
+    def test_unix_pty_launcher_exits_after_the_first_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            command = [
+                sys.executable,
+                "-c",
+                "import sys; print('GOLUTRA', flush=True); sys.stdin.buffer.read(2)",
+            ]
+            output = smoke_npm_package.run_unix_pty_command(
+                command, Path(temp_dir)
+            )
+
+        self.assertIn("GOLUTRA", output)
+
     def test_npm_command_uses_the_windows_command_processor_for_npm_cmd(self) -> None:
         arguments = ["npm", "pack", "--pack-destination", "C:\\build output"]
         with (

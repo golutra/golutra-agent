@@ -1,0 +1,57 @@
+name: Live Provider Smoke
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-provider-smoke
+  cancel-in-progress: true
+
+jobs:
+  tui-driver-live:
+    name: Controlled live provider TUI smoke
+    runs-on: ubuntu-latest
+    environment: live-provider-smoke
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+      - name: Validate protected smoke budget and inputs
+        env:
+          GOLUTRA_TUI_DRIVER_LIVE: ${{ vars.GOLUTRA_TUI_DRIVER_LIVE }}
+          GOLUTRA_TUI_DRIVER_LIVE_API_KEY: ${{ secrets.GOLUTRA_TUI_DRIVER_LIVE_API_KEY }}
+          GOLUTRA_TUI_DRIVER_LIVE_BASE_URL: ${{ vars.GOLUTRA_TUI_DRIVER_LIVE_BASE_URL }}
+          GOLUTRA_TUI_DRIVER_LIVE_MODEL: ${{ vars.GOLUTRA_TUI_DRIVER_LIVE_MODEL }}
+          GOLUTRA_TUI_DRIVER_LIVE_PROTOCOL: ${{ vars.GOLUTRA_TUI_DRIVER_LIVE_PROTOCOL }}
+          GOLUTRA_TUI_DRIVER_LIVE_MAX_CALLS: ${{ vars.GOLUTRA_TUI_DRIVER_LIVE_MAX_CALLS }}
+          GOLUTRA_TUI_DRIVER_LIVE_MAX_OUTPUT_TOKENS: ${{ vars.GOLUTRA_TUI_DRIVER_LIVE_MAX_OUTPUT_TOKENS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GOLUTRA_TUI_DRIVER_LIVE" = 1
+          test -n "$GOLUTRA_TUI_DRIVER_LIVE_API_KEY"
+          test -n "$GOLUTRA_TUI_DRIVER_LIVE_BASE_URL"
+          test -n "$GOLUTRA_TUI_DRIVER_LIVE_MODEL"
+          test -n "$GOLUTRA_TUI_DRIVER_LIVE_PROTOCOL"
+          test "$GOLUTRA_TUI_DRIVER_LIVE_MAX_CALLS" = 2
+          test "$GOLUTRA_TUI_DRIVER_LIVE_MAX_OUTPUT_TOKENS" = 512
+      - name: Run ignored live provider smoke
+        env:
+          GOLUTRA_TUI_DRIVER_LIVE: "1"
+          GOLUTRA_TUI_DRIVER_LIVE_API_KEY: ${{ secrets.GOLUTRA_TUI_DRIVER_LIVE_API_KEY }}
+          GOLUTRA_TUI_DRIVER_LIVE_BASE_URL: ${{ vars.GOLUTRA_TUI_DRIVER_LIVE_BASE_URL }}
+          GOLUTRA_TUI_DRIVER_LIVE_MODEL: ${{ vars.GOLUTRA_TUI_DRIVER_LIVE_MODEL }}
+          GOLUTRA_TUI_DRIVER_LIVE_PROTOCOL: ${{ vars.GOLUTRA_TUI_DRIVER_LIVE_PROTOCOL }}
+          GOLUTRA_TUI_DRIVER_LIVE_MAX_CALLS: ${{ vars.GOLUTRA_TUI_DRIVER_LIVE_MAX_CALLS }}
+          GOLUTRA_TUI_DRIVER_LIVE_MAX_OUTPUT_TOKENS: ${{ vars.GOLUTRA_TUI_DRIVER_LIVE_MAX_OUTPUT_TOKENS }}
+        run: >-
+          cargo test --locked -p golutra-tui --test tui_driver_process
+          live_provider_driver_smoke_is_isolated_and_opt_in
+          -- --ignored --nocapture --test-threads=1

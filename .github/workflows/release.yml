@@ -77,9 +77,14 @@ jobs:
           platform_archive="$(find dist/npm -maxdepth 1 -type f -name 'golutra-agent-npm-${{ matrix.npm_suffix }}-*.tgz' -print -quit)"
           test -n "$root_archive"
           test -n "$platform_archive"
+          smoke_args=()
+          if [[ "${{ runner.os }}" != "Windows" ]]; then
+            smoke_args+=(--require-pty)
+          fi
           python scripts/smoke_npm_package.py \
             --root-tarball "$root_archive" \
-            --platform-tarball "$platform_archive"
+            --platform-tarball "$platform_archive" \
+            "${smoke_args[@]}"
       - uses: actions/upload-artifact@v4
         with:
           name: golutra-agent-${{ matrix.target }}

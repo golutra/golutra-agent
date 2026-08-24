@@ -118,9 +118,22 @@ impl BuiltinTool {
 
     pub(super) fn capabilities(self) -> ToolCapabilities {
         ToolCapabilities {
-            // Managed processes and delegation are ordinary coding capabilities. The full
-            // profile is reserved for extensions that their host did not expose to coding.
-            available_in_coding_profile: true,
+            // coding 面保留常见文件/搜索和进程观察能力；代码图、进程写入/终止
+            // 以及扩展委派仍由 full profile 显式开启，避免牺牲常用工作流。
+            available_in_coding_profile: matches!(
+                self,
+                Self::ReadFile
+                    | Self::WriteFile
+                    | Self::EditFile
+                    | Self::ApplyPatch
+                    | Self::AskUser
+                    | Self::Shell
+                    | Self::ListDir
+                    | Self::RgSearch
+                    | Self::ProcessList
+                    | Self::ProcessPoll
+                    | Self::ProcessReconnect
+            ),
             parallel_read_safe: matches!(
                 self,
                 Self::ReadFile

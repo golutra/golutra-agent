@@ -154,7 +154,7 @@ fn yolo_is_added_only_to_unrestricted_tui_prompts() {
 
 #[test]
 fn tui_tool_profile_is_explicit_on_prompts_and_inherited_by_steering() {
-    let coding = TuiApp::new(
+    let coding_default = TuiApp::new(
         ThreadId::new(),
         SessionId::new(),
         None,
@@ -173,7 +173,7 @@ fn tui_tool_profile_is_explicit_on_prompts_and_inherited_by_steering() {
     .with_tool_profile(TuiToolProfileArg::Full);
 
     assert_eq!(
-        coding.runtime_prompt_payload("inspect".to_owned())["tool_profile"],
+        coding_default.runtime_prompt_payload("inspect".to_owned())["tool_profile"],
         "coding"
     );
     assert_eq!(
@@ -1038,6 +1038,78 @@ fn inline_session_history_is_inserted_only_once() {
         terminal_buffer_text(&terminal).matches("GOLUTRA").count(),
         1
     );
+}
+
+#[test]
+fn chinese_transcript_text_is_contiguous_and_uses_the_terminal_foreground() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let turn_id = TurnId::new();
+    let mut created = transcript_event(
+        1,
+        session_id,
+        task_id,
+        RuntimeEventType::TaskCreated,
+        json!({"payload": {"prompt": "你好"}}),
+    );
+    created.turn_id = Some(turn_id);
+    let mut assistant = transcript_event(
+        2,
+        session_id,
+        task_id,
+        RuntimeEventType::AssistantMessage,
+        json!({"content": "你好！有什么我可以帮你的吗？"}),
+    );
+    assistant.turn_id = Some(turn_id);
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_footer_context("/workspace", "gpt-test");
+    app.events = vec![created, assistant];
+    app.projection = Some(UserProjection {
+        session_id,
+        task_id: Some(task_id),
+        status: golutra_core::TaskStatus::Completed,
+        visible_steps: Vec::new(),
+        pending_approval: None,
+        final_message: None,
+        residual_risks: Vec::new(),
+    });
+    let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("terminal");
+
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw Chinese transcript");
+
+    let rows = terminal_buffer_display_rows(&terminal);
+    let user_row = rows
+        .iter()
+        .position(|row| row.trim_end() == "› 你好")
+        .expect("contiguous Chinese user row");
+    let assistant_row = rows
+        .iter()
+        .position(|row| row.trim_end() == "• 你好！有什么我可以帮你的吗？")
+        .expect("contiguous Chinese assistant row");
+    let area = terminal.backend().buffer().area;
+    for row in [user_row, assistant_row] {
+        let row = area
+            .top()
+            .saturating_add(u16::try_from(row).expect("row fits u16"));
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .cell((2, row))
+                .expect("first Chinese content cell")
+                .fg,
+            Color::Reset
+        );
+    }
 }
 
 #[test]

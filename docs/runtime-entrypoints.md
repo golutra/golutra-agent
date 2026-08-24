@@ -113,21 +113,19 @@ Output rules:
 - `--ephemeral` uses an isolated embedded runtime and cannot be combined with
   `--daemon` or `--connect`.
 
-New CLI, TUI, App Server and SDK turns use `open` execution with the `coding`
-tool profile by default. `open` leaves planning, tool order and stopping to the
-provider while retaining policy, cancellation, budgets and audit facts. The
-`coding` profile exposes built-in workspace, shell, managed-process and
-delegation tools plus local MCP plugins that completed the owner-reviewed
-`stage -> review -> enable` lifecycle and extensions explicitly marked
-coding-safe by another host backend; `full` additionally exposes every
-registered extension. Use
+New CLI, TUI, App Server and SDK turns use `open` execution with the compact
+`coding` tool profile by default. `open` leaves planning, tool order and
+stopping to the provider while retaining policy, cancellation, budgets and
+audit facts. The `full` profile exposes every registered extension; use
+`--tool-profile full` when a caller needs low-frequency process, code-graph or
+extension tools. Use
 `--execution-mode strict` when an unstructured prompt must be translated into a
-deterministic completion contract, and `--tool-profile full` only when the turn
-needs a full-only extension. The interactive TUI accepts both switches,
-for example `golutra-tui --execution-mode strict --tool-profile full`. Explicit
-task contracts and external verifiers remain authoritative completion signals
-even if the caller selected `open`; unrelated payload metadata never changes
-the execution mode.
+deterministic completion contract. The interactive TUI accepts both switches,
+for example `golutra-tui --execution-mode strict --tool-profile coding`.
+Explicit task contracts and external verifiers remain authoritative completion
+signals even if the caller selected `open`; unrelated payload metadata never
+changes the execution mode. Verification-on-change is off by default in the
+interactive UI and can be enabled explicitly through runtime settings.
 
 Raw `SessionCommand` payloads persisted before these fields existed keep the
 legacy completion adapter and full tool surface. This compatibility rule is

@@ -150,9 +150,9 @@ impl ConfiguredAgentRun {
         self
     }
 
-    /// Select the execution contract for the initial turn. `None` retains
-    /// legacy/full semantics for direct runtime callers. An explicit mode uses
-    /// the protocol's coding profile unless the caller selected a profile.
+    /// Select the execution contract for the initial turn. `None` retains the
+    /// legacy contract for direct runtime callers; `open` keeps the model loop
+    /// conversational even when the request records a workspace mutation.
     #[must_use]
     pub fn with_execution_mode(mut self, mode: Option<AgentExecutionMode>) -> Self {
         self.execution_mode = mode;
@@ -167,7 +167,8 @@ impl ConfiguredAgentRun {
         if !self.task_contract_is_explicit {
             self.run.task_contract = match mode {
                 Some(AgentExecutionMode::Strict) => strict_task_contract(&self.run.request),
-                None | Some(AgentExecutionMode::Open) => default_task_contract(&self.run.request),
+                Some(AgentExecutionMode::Open) => open_task_contract(&self.run.request),
+                None => default_task_contract(&self.run.request),
             };
         }
     }
@@ -194,6 +195,15 @@ fn default_task_contract(request: &AgentTaskRequest) -> TaskContract {
         contract.workspace_change = WorkspaceChangeRequirement::Required;
         contract.require_objective_validation = true;
         contract.max_correction_rounds = 1;
+    }
+    contract
+}
+
+fn open_task_contract(request: &AgentTaskRequest) -> TaskContract {
+    let mut contract = TaskContract::conversational(request.completion_criteria.clone());
+    if request.touched_code {
+        contract.workspace_change = WorkspaceChangeRequirement::Required;
+        contract.require_objective_validation = true;
     }
     contract
 }
@@ -470,6 +480,21 @@ mod tests {
             VerificationRequirement::Required
         );
         assert_eq!(run.task_contract.max_correction_rounds, 1);
+    }
+
+    #[test]
+    fn open_mode_does_not_add_a_correction_round_for_workspace_changes() {
+        let mut request = request();
+        request.touched_code = true;
+        let run =
+            ConfiguredAgentRun::new(request).with_execution_mode(Some(AgentExecutionMode::Open));
+
+        assert_eq!(
+            run.task_contract.workspace_change,
+            WorkspaceChangeRequirement::Required
+        );
+        assert!(run.task_contract.require_objective_validation);
+        assert_eq!(run.task_contract.max_correction_rounds, 0);
     }
 
     #[test]

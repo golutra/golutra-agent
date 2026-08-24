@@ -5,7 +5,8 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use golutra_auth::{CredentialProvider, FixedCredentialProvider};
 use golutra_core::{
-    ProviderContract, ProviderRequestId, ProviderResponseId, TaskId, ToolContract, TurnId,
+    CacheIdentity, NormalizedUsage, PromptCachePolicy, ProviderContract, ProviderRequestId,
+    ProviderResponseId, SessionId, TaskId, ToolContract, TurnId,
 };
 pub use golutra_core::{ProviderUsage, UsageSource};
 use secrecy::ExposeSecret;
@@ -88,10 +89,43 @@ pub struct ProviderRequest {
     pub request_id: ProviderRequestId,
     pub task_id: TaskId,
     pub turn_id: TurnId,
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
     pub provider_id: String,
     pub model_id: String,
     pub messages: Vec<ProviderMessage>,
     pub tools: Vec<ToolContract>,
+    #[serde(default)]
+    pub cache_policy: PromptCachePolicy,
+}
+
+impl ProviderRequest {
+    #[must_use]
+    pub fn cache_identity(&self) -> Option<CacheIdentity> {
+        let session_id = self.session_id?;
+        if self.cache_policy == PromptCachePolicy::None {
+            return None;
+        }
+        let canonical_provider = self.provider_id.trim().to_ascii_lowercase();
+        let canonical_model = self.model_id.trim().to_ascii_lowercase();
+        let prefix = format!(
+            "golutra-prompt-cache-v1\0{}\0{}\0{}",
+            session_id, canonical_provider, canonical_model,
+        );
+        use sha2::{Digest, Sha256};
+        Some(CacheIdentity {
+            session_id,
+            thread_id: None,
+            provider_id: canonical_provider,
+            model_id: canonical_model,
+            key: format!("sha256:{:x}", Sha256::digest(prefix.as_bytes())),
+        })
+    }
+
+    #[must_use]
+    pub fn normalized_usage(&self, usage: &ProviderUsage) -> NormalizedUsage {
+        usage.normalize()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -901,7 +935,13 @@ impl OpenAiCompatibleProvider {
 impl LlmProvider for OpenAiCompatibleProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let body = openai_completion_body(&request, &self.model_id, &self.generation_config, false);
+        let body = openai_completion_body(
+            &request,
+            &self.model_id,
+            &self.generation_config,
+            false,
+            openai_prompt_cache_supported(&self.base_url),
+        );
 
         let response = self.post_with_auth_retry(&url, &body).await?;
         let status = response.status();
@@ -924,7 +964,13 @@ impl LlmProvider for OpenAiCompatibleProvider {
         on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
     ) -> Result<ProviderResponse, ProviderError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let body = openai_completion_body(&request, &self.model_id, &self.generation_config, true);
+        let body = openai_completion_body(
+            &request,
+            &self.model_id,
+            &self.generation_config,
+            true,
+            openai_prompt_cache_supported(&self.base_url),
+        );
         let response = self.post_with_auth_retry(&url, &body).await?;
         let status = response.status();
         if status.as_u16() == 429 {
@@ -1554,7 +1600,7 @@ fn is_sensitive_header(name: &str) -> bool {
         || name == "cookie"
 }
 
-pub(crate) fn provider_tool_description(tool_name: &str) -> &'static str {
+pub fn provider_tool_description(tool_name: &str) -> &'static str {
     match tool_name {
         "read_file" => "Read a UTF-8 text file from the current workspace.",
         "write_file" => {
@@ -1598,7 +1644,11 @@ pub(crate) fn provider_tool_description(tool_name: &str) -> &'static str {
     }
 }
 
-fn openai_tool_schema(contract: &ToolContract) -> Value {
+/// Return the smallest stable tool representation sent by the Chat Completions
+/// transport. Runtime budgeting and context snapshots use the same shape so
+/// internal recovery/policy fields are never charged as model input.
+#[must_use]
+pub fn provider_tool_wire_projection(contract: &ToolContract) -> Value {
     let description = provider_tool_description(&contract.tool_name);
     json!({
         "type": "function",
@@ -1610,11 +1660,30 @@ fn openai_tool_schema(contract: &ToolContract) -> Value {
     })
 }
 
+/// Estimate tool schema tokens from the provider-facing projection, not from
+/// the full internal contract used by the executor and governance layers.
+#[must_use]
+pub fn estimate_provider_tool_tokens(tools: &[ToolContract]) -> u64 {
+    tools
+        .iter()
+        .map(|tool| {
+            serde_json::to_string(&provider_tool_wire_projection(tool))
+                .map(|value| value.chars().count().div_ceil(4) as u64)
+                .unwrap_or_default()
+        })
+        .sum()
+}
+
+fn openai_tool_schema(contract: &ToolContract) -> Value {
+    provider_tool_wire_projection(contract)
+}
+
 fn openai_completion_body(
     request: &ProviderRequest,
     model_id: &str,
     generation_config: &ProviderGenerationConfig,
     streaming: bool,
+    prompt_cache_supported: bool,
 ) -> Value {
     let mut body = json!({
         "model": model_id,
@@ -1628,8 +1697,30 @@ fn openai_completion_body(
         body["stream"] = Value::Bool(true);
         body["stream_options"] = json!({"include_usage": true});
     }
+    if prompt_cache_supported && let Some(identity) = request.cache_identity() {
+        body["prompt_cache_key"] = Value::String(identity.key);
+        match request.cache_policy {
+            golutra_core::PromptCachePolicy::Short => {
+                body["prompt_cache_retention"] = Value::String("5m".to_owned());
+            }
+            golutra_core::PromptCachePolicy::Long => {
+                body["prompt_cache_retention"] = Value::String("24h".to_owned());
+            }
+            golutra_core::PromptCachePolicy::Auto | golutra_core::PromptCachePolicy::None => {}
+        }
+    }
     apply_generation_config_to_openai_body(&mut body, generation_config);
     body
+}
+
+fn openai_prompt_cache_supported(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| {
+            url.host_str()
+                .map(|host| host.eq_ignore_ascii_case("api.openai.com"))
+        })
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Default)]

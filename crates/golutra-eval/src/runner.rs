@@ -63,9 +63,13 @@ impl EvaluationRunner {
                 .iter()
                 .map(|record| record.reasoning_tokens),
         );
-        let total_tokens =
-            sum_optional_tokens(input.token_usage.iter().map(|record| record.total_tokens))
-                .or_else(|| add_optional_tokens(input_tokens, output_tokens));
+        let total_tokens = sum_optional_tokens(
+            input
+                .token_usage
+                .iter()
+                .map(|record| record.provider_total_tokens),
+        )
+        .or_else(|| add_optional_tokens(input_tokens, output_tokens));
         let cost = sum_optional_cost(cost_records.iter().map(|record| record.estimated_cost_usd));
         let cost_source = aggregate_cost_source(&cost_records);
         let security_utility = SecurityUtilityResult {
@@ -397,7 +401,7 @@ fn aggregate_cost_records(records: &[TokenUsageRecord]) -> Vec<CostRecord> {
             input_tokens: record.input_tokens,
             output_tokens: record.output_tokens,
             reasoning_tokens: record.reasoning_tokens,
-            total_tokens: record.total_tokens,
+            total_tokens: record.provider_total_tokens,
             estimated_cost_usd: record.estimated_cost,
             source: record.usage_source.clone(),
             confidence: if record.estimated_cost.is_some() && record.usage_source == "provider" {

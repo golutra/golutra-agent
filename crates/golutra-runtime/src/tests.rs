@@ -18,7 +18,7 @@ use golutra_governor::GovernorLimits;
 use golutra_llm::{
     LlmProvider, MockProvider, ProviderError, ProviderFinishReason, ProviderMessage,
     ProviderRequest, ProviderResponse, ProviderStreamEvent, ProviderToolCall, ProviderUsage,
-    UsageSource,
+    UsageSource, estimate_provider_tool_tokens,
 };
 use golutra_policy::WorkspacePolicy;
 use golutra_protocol::{
@@ -2634,8 +2634,7 @@ async fn accumulated_tool_messages_are_compacted_and_the_turn_continues() {
     let tool_tokens = executor
         .registry()
         .contract("read_file")
-        .and_then(|contract| serde_json::to_string(contract).ok())
-        .map(|contract| estimate_tokens(&contract))
+        .map(|contract| estimate_provider_tool_tokens(std::slice::from_ref(contract)))
         .expect("read_file contract");
     let initial_tokens = estimate_tokens(&contributor.content).saturating_add(tool_tokens);
     let context_builder = ContextBuilder::new(ContextBudgetPolicy {
