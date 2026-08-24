@@ -292,7 +292,7 @@ async fn delegated_task_is_registered_only_with_a_backend_and_tracks_workspace_c
         .contract("delegate_task")
         .expect("delegation contract");
     assert!(
-        executor
+        !executor
             .registry()
             .capabilities("delegate_task")
             .is_some_and(|capabilities| capabilities.available_in_coding_profile)
@@ -877,6 +877,55 @@ async fn write_file_records_changed_file() {
     assert_eq!(
         fs::read_to_string(workspace.path().join("src.txt")).unwrap(),
         "new"
+    );
+    assert_eq!(report.envelope.structured_facts["bytes"], 3);
+    assert!(
+        report.envelope.structured_facts["content_digest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("sha256:"))
+    );
+    assert_eq!(
+        report.envelope.model_visible_excerpt.as_deref(),
+        Some("file written")
+    );
+    assert!(
+        !report
+            .envelope
+            .model_visible_excerpt
+            .as_deref()
+            .is_some_and(|excerpt| excerpt.contains("new"))
+    );
+}
+
+#[tokio::test]
+async fn mutation_results_keep_content_in_artifacts_but_not_model_excerpt() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("src.txt"), "before").expect("fixture");
+    let executor = executor(workspace.path());
+
+    let report = executor
+        .execute(
+            request(
+                "edit_file",
+                json!({"path": "src.txt", "search": "before", "replace": "after"}),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("edit execution");
+
+    assert_eq!(
+        report.envelope.model_visible_excerpt.as_deref(),
+        Some("file edited")
+    );
+    assert_eq!(report.artifact_contents.len(), 1);
+    assert!(String::from_utf8_lossy(&report.artifact_contents[0].bytes).contains("after"));
+    assert!(
+        !report
+            .envelope
+            .model_visible_excerpt
+            .as_deref()
+            .is_some_and(|excerpt| excerpt.contains("after"))
     );
 }
 

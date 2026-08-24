@@ -747,9 +747,9 @@
           "default": "open"
         },
         "tool_profile": {
-          "description": "Full exposes every registered extension; coding is an explicit\nrestriction for callers that need a narrower model-visible surface.",
+          "description": "Coding exposes the compact core surface; full is an explicit opt-in for\nlow-frequency search, process and extension tools.",
           "$ref": "#/$defs/AgentToolProfile",
-          "default": "full"
+          "default": "coding"
         }
       }
     },

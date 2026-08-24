@@ -935,7 +935,13 @@ impl OpenAiCompatibleProvider {
 impl LlmProvider for OpenAiCompatibleProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let body = openai_completion_body(&request, &self.model_id, &self.generation_config, false);
+        let body = openai_completion_body(
+            &request,
+            &self.model_id,
+            &self.generation_config,
+            false,
+            openai_prompt_cache_supported(&self.base_url),
+        );
 
         let response = self.post_with_auth_retry(&url, &body).await?;
         let status = response.status();
@@ -958,7 +964,13 @@ impl LlmProvider for OpenAiCompatibleProvider {
         on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
     ) -> Result<ProviderResponse, ProviderError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let body = openai_completion_body(&request, &self.model_id, &self.generation_config, true);
+        let body = openai_completion_body(
+            &request,
+            &self.model_id,
+            &self.generation_config,
+            true,
+            openai_prompt_cache_supported(&self.base_url),
+        );
         let response = self.post_with_auth_retry(&url, &body).await?;
         let status = response.status();
         if status.as_u16() == 429 {
@@ -1588,7 +1600,7 @@ fn is_sensitive_header(name: &str) -> bool {
         || name == "cookie"
 }
 
-pub(crate) fn provider_tool_description(tool_name: &str) -> &'static str {
+pub fn provider_tool_description(tool_name: &str) -> &'static str {
     match tool_name {
         "read_file" => "Read a UTF-8 text file from the current workspace.",
         "write_file" => {
@@ -1632,7 +1644,11 @@ pub(crate) fn provider_tool_description(tool_name: &str) -> &'static str {
     }
 }
 
-fn openai_tool_schema(contract: &ToolContract) -> Value {
+/// Return the smallest stable tool representation sent by the Chat Completions
+/// transport. Runtime budgeting and context snapshots use the same shape so
+/// internal recovery/policy fields are never charged as model input.
+#[must_use]
+pub fn provider_tool_wire_projection(contract: &ToolContract) -> Value {
     let description = provider_tool_description(&contract.tool_name);
     json!({
         "type": "function",
@@ -1644,11 +1660,30 @@ fn openai_tool_schema(contract: &ToolContract) -> Value {
     })
 }
 
+/// Estimate tool schema tokens from the provider-facing projection, not from
+/// the full internal contract used by the executor and governance layers.
+#[must_use]
+pub fn estimate_provider_tool_tokens(tools: &[ToolContract]) -> u64 {
+    tools
+        .iter()
+        .map(|tool| {
+            serde_json::to_string(&provider_tool_wire_projection(tool))
+                .map(|value| value.chars().count().div_ceil(4) as u64)
+                .unwrap_or_default()
+        })
+        .sum()
+}
+
+fn openai_tool_schema(contract: &ToolContract) -> Value {
+    provider_tool_wire_projection(contract)
+}
+
 fn openai_completion_body(
     request: &ProviderRequest,
     model_id: &str,
     generation_config: &ProviderGenerationConfig,
     streaming: bool,
+    prompt_cache_supported: bool,
 ) -> Value {
     let mut body = json!({
         "model": model_id,
@@ -1662,8 +1697,30 @@ fn openai_completion_body(
         body["stream"] = Value::Bool(true);
         body["stream_options"] = json!({"include_usage": true});
     }
+    if prompt_cache_supported && let Some(identity) = request.cache_identity() {
+        body["prompt_cache_key"] = Value::String(identity.key);
+        match request.cache_policy {
+            golutra_core::PromptCachePolicy::Short => {
+                body["prompt_cache_retention"] = Value::String("5m".to_owned());
+            }
+            golutra_core::PromptCachePolicy::Long => {
+                body["prompt_cache_retention"] = Value::String("24h".to_owned());
+            }
+            golutra_core::PromptCachePolicy::Auto | golutra_core::PromptCachePolicy::None => {}
+        }
+    }
     apply_generation_config_to_openai_body(&mut body, generation_config);
     body
+}
+
+fn openai_prompt_cache_supported(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| {
+            url.host_str()
+                .map(|host| host.eq_ignore_ascii_case("api.openai.com"))
+        })
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Default)]

@@ -182,7 +182,7 @@ pub(crate) use context::{
     completion_criteria_from_payload, context_compaction_from_event, conversation_history_line,
     effective_model_history_events, environment_context_prompt, load_project_instruction_bundle,
     memory_context, model_prompt_from_payload, preview_from_payload, prompt_from_payload,
-    system_prompt, task_contract_from_payload, title_from_payload,
+    select_memories_for_context, system_prompt, task_contract_from_payload, title_from_payload,
 };
 pub use debug_export::{
     DebugExportCoordinator, DebugExportManifest, DebugExportReceipt, DebugExportRequest,

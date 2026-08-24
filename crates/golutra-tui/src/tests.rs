@@ -154,7 +154,7 @@ fn yolo_is_added_only_to_unrestricted_tui_prompts() {
 
 #[test]
 fn tui_tool_profile_is_explicit_on_prompts_and_inherited_by_steering() {
-    let full_default = TuiApp::new(
+    let coding_default = TuiApp::new(
         ThreadId::new(),
         SessionId::new(),
         None,
@@ -173,8 +173,8 @@ fn tui_tool_profile_is_explicit_on_prompts_and_inherited_by_steering() {
     .with_tool_profile(TuiToolProfileArg::Full);
 
     assert_eq!(
-        full_default.runtime_prompt_payload("inspect".to_owned())["tool_profile"],
-        "full"
+        coding_default.runtime_prompt_payload("inspect".to_owned())["tool_profile"],
+        "coding"
     );
     assert_eq!(
         full.runtime_prompt_payload("delegate".to_owned())["tool_profile"],

@@ -3,7 +3,9 @@ use golutra_core::{
     ContextSnapshotId, SessionId, TaskId, TokenBudgetSnapshot, TokenBudgetSnapshotId,
     TokenUsageRecord, ToolContract, TurnId,
 };
-use golutra_llm::{ProviderMessage, ProviderRequest, ProviderRole, ProviderUsage};
+use golutra_llm::{
+    ProviderMessage, ProviderRequest, ProviderRole, ProviderUsage, provider_tool_wire_projection,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -722,6 +724,32 @@ pub fn compile_model_input(
     model_id: impl Into<String>,
     tools: Vec<ToolContract>,
 ) -> Result<ModelInputEnvelope, ContextError> {
+    compile_model_input_with_cache_policy(
+        session_id,
+        plan,
+        task_id,
+        turn_id,
+        provider_id,
+        model_id,
+        tools,
+        golutra_core::PromptCachePolicy::Auto,
+    )
+}
+
+/// Compile model input while preserving the caller's explicit cache policy.
+/// The default wrapper above remains automatic, but callers that know the
+/// provider retention window no longer lose that setting at this boundary.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_model_input_with_cache_policy(
+    session_id: SessionId,
+    plan: &ContextBuildPlan,
+    task_id: TaskId,
+    turn_id: TurnId,
+    provider_id: impl Into<String>,
+    model_id: impl Into<String>,
+    tools: Vec<ToolContract>,
+    cache_policy: golutra_core::PromptCachePolicy,
+) -> Result<ModelInputEnvelope, ContextError> {
     if plan.messages.len() != plan.message_sources.len() {
         return Err(ContextError::ModelInputSourceCardinality {
             message_count: plan.messages.len(),
@@ -739,7 +767,7 @@ pub fn compile_model_input(
     let mut provider_request =
         provider_request_from_plan(plan, task_id, turn_id, provider_id, model_id, tools);
     provider_request.session_id = Some(session_id);
-    provider_request.cache_policy = golutra_core::PromptCachePolicy::Auto;
+    provider_request.cache_policy = cache_policy;
     let audit_snapshot = context_snapshot_from_request(session_id, plan, &provider_request);
     Ok(ModelInputEnvelope {
         provider_request,
@@ -796,7 +824,7 @@ pub fn context_snapshot_from_request(
     let tool_schema_digests = request
         .tools
         .iter()
-        .filter_map(|tool| serde_json::to_vec(tool).ok())
+        .filter_map(|tool| serde_json::to_vec(&provider_tool_wire_projection(tool)).ok())
         .map(|bytes| digest_bytes(&bytes))
         .collect::<Vec<_>>();
     let canonical_request_digest = serde_json::to_vec(request)
@@ -971,7 +999,7 @@ pub fn token_usage_record(
     let tool_schema_digests = request
         .tools
         .iter()
-        .filter_map(|tool| serde_json::to_vec(tool).ok())
+        .filter_map(|tool| serde_json::to_vec(&provider_tool_wire_projection(tool)).ok())
         .map(|bytes| digest_bytes(&bytes))
         .collect::<Vec<_>>();
     let contributor_manifest =
@@ -1693,6 +1721,32 @@ mod tests {
                 .expect("provider request json")
                 .get("events")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn model_input_preserves_explicit_cache_retention_policy() {
+        let task_id = TaskId::new();
+        let turn_id = TurnId::new();
+        let plan = ContextBuilder::default()
+            .build(task_id, turn_id, Vec::new())
+            .expect("context builds");
+
+        let envelope = compile_model_input_with_cache_policy(
+            SessionId::new(),
+            &plan,
+            task_id,
+            turn_id,
+            "mock",
+            "mock-model",
+            Vec::new(),
+            golutra_core::PromptCachePolicy::Long,
+        )
+        .expect("model input compiles");
+
+        assert_eq!(
+            envelope.provider_request().cache_policy,
+            golutra_core::PromptCachePolicy::Long
         );
     }
 

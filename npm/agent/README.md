@@ -24,8 +24,8 @@ golutra exec "inspect this workspace and run the checks"
 golutra exec --json "summarize the current changes"
 ```
 
-Interactive turns keep the complete registered tool surface available by
-default; narrower tool and verification settings are opt-in.
+Interactive turns use the compact coding tool surface by default; pass
+`--tool-profile full` when a task needs low-frequency extensions.
 
 For app-server, observation, supervisor, and evaluation binaries, use the
 platform release archive documented at

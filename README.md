@@ -157,10 +157,10 @@ TUI defaults can be kept without storing secrets in either
 in-memory, and explicit `--execution-mode`/`--tool-profile` flags win over the
 files. The accepted non-secret fields are `provider_profile`, `model`,
 `execution_mode`, `verify_on_change`, `tool_profile`, and `reasoning_effort`.
-New interactive turns expose the complete registered tool surface and keep
-verification-on-change disabled unless enabled explicitly; `coding` and `auto`
-remain available as deliberate restrictions or checks. Unknown fields and
-secret-shaped values are rejected; credentials stay in the
+New interactive turns expose the compact `coding` tool surface and keep
+verification-on-change disabled unless enabled explicitly; pass
+`--tool-profile full` when a task needs low-frequency extensions. Unknown
+fields and secret-shaped values are rejected; credentials stay in the
 owner-only credential store or environment references.
 
 The current release workflow publishes Linux x64/arm64, macOS x64/arm64, and

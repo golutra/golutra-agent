@@ -113,11 +113,12 @@ Output rules:
 - `--ephemeral` uses an isolated embedded runtime and cannot be combined with
   `--daemon` or `--connect`.
 
-New CLI, TUI, App Server and SDK turns use `open` execution with the `full`
-tool profile by default. `open` leaves planning, tool order and stopping to the
-provider while retaining policy, cancellation, budgets and audit facts. The
-`full` profile exposes every registered extension; use `--tool-profile coding`
-when a caller deliberately wants a narrower model-visible surface. Use
+New CLI, TUI, App Server and SDK turns use `open` execution with the compact
+`coding` tool profile by default. `open` leaves planning, tool order and
+stopping to the provider while retaining policy, cancellation, budgets and
+audit facts. The `full` profile exposes every registered extension; use
+`--tool-profile full` when a caller needs low-frequency process, code-graph or
+extension tools. Use
 `--execution-mode strict` when an unstructured prompt must be translated into a
 deterministic completion contract. The interactive TUI accepts both switches,
 for example `golutra-tui --execution-mode strict --tool-profile coding`.
@@ -403,8 +404,8 @@ not vary by language.
 The new high-level methods intentionally opt into the model-owned surface:
 
 ```text
-Python:     Thread.run / run_streamed       -> execution_mode=open, tool_profile=full
-TypeScript: Thread.run / runStreamed         -> execution_mode=open, tool_profile=full
+Python:     Thread.run / run_streamed       -> execution_mode=open, tool_profile=coding
+TypeScript: Thread.run / runStreamed         -> execution_mode=open, tool_profile=coding
 ```
 
 Callers that need the pre-profile behavior can use `Thread.run_legacy` and

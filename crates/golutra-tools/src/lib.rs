@@ -1605,7 +1605,11 @@ impl ToolRuntime {
         let mut report = success_report(
             request,
             "file written",
-            json!({"path": resolved_path, "bytes": content.len()}),
+            json!({
+                "path": resolved_path,
+                "bytes": content.len(),
+                "content_digest": checksum(content.as_bytes()),
+            }),
             content.clone(),
             vec![resolved_path.clone()],
             policy,
@@ -1690,7 +1694,12 @@ impl ToolRuntime {
         let mut report = success_report(
             request,
             "file edited",
-            json!({"path": resolved_path, "replacements": 1}),
+            json!({
+                "path": resolved_path,
+                "replacements": 1,
+                "bytes": edited.len(),
+                "content_digest": checksum(edited.as_bytes()),
+            }),
             edited.clone(),
             vec![resolved_path.clone()],
             policy,
@@ -1863,6 +1872,7 @@ impl ToolRuntime {
             json!({
                 "changed_files": &changed_files,
                 "changed_file_count": changed_count,
+                "patch_digest": checksum(patch.as_bytes()),
                 "workspace_changes_known": true,
             }),
             summary,
@@ -3137,13 +3147,20 @@ fn report(
         confidence: 0.8,
         limitations: "P0 tool evidence records local execution facts only".to_owned(),
     };
+    let model_visible_excerpt = if mutation_tool_name(&request.tool_name) {
+        // 文件副作用的完整内容已经保存在 artifact 中；再次回显会让每个
+        // 后续 turn 重复支付相同 token，模型只需状态摘要和结构化 digest。
+        Some(redacted_summary.clone())
+    } else {
+        Some(excerpt(&redacted_output, DEFAULT_EXCERPT_LIMIT))
+    };
     let envelope = ToolResultEnvelope {
         tool_call_id: request.tool_call_id,
         tool_name: request.tool_name,
         status,
         summary: redacted_summary,
         structured_facts,
-        model_visible_excerpt: Some(excerpt(&redacted_output, DEFAULT_EXCERPT_LIMIT)),
+        model_visible_excerpt,
         raw_artifact_ref: Some(artifact.artifact_id),
         evidence_refs: vec![evidence.evidence_id],
         risk: "p0_local_tool".to_owned(),
@@ -3171,6 +3188,13 @@ fn report(
             ..ToolExecutionMetrics::default()
         },
     }
+}
+
+fn mutation_tool_name(tool_name: &str) -> bool {
+    matches!(
+        BuiltinTool::from_name(tool_name),
+        Some(BuiltinTool::WriteFile | BuiltinTool::EditFile | BuiltinTool::ApplyPatch)
+    )
 }
 
 fn with_metrics(

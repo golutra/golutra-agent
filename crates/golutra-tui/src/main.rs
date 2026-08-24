@@ -179,8 +179,8 @@ impl TuiExecutionModeArg {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 enum TuiToolProfileArg {
-    Coding,
     #[default]
+    Coding,
     Full,
 }
 
@@ -527,7 +527,7 @@ impl TuiApp {
             debug_mode,
             yolo: false,
             execution_mode: TuiExecutionModeArg::Open,
-            tool_profile: TuiToolProfileArg::Full,
+            tool_profile: TuiToolProfileArg::Coding,
             verify_on_change: "off".to_owned(),
             activity_projection: ActivityProjection::default(),
             activity_snapshot: None,

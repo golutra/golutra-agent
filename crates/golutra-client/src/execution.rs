@@ -309,6 +309,7 @@ impl RuntimeHost {
         let memories =
             run_blocking(move || memory_store.retrieve(&memory_query, MemoryScope::Project, 5))
                 .await??;
+        let memories = select_memories_for_context(memories);
         self.record_event(host_event(
             self.next_sequence_no(),
             session_id,
@@ -409,7 +410,15 @@ impl RuntimeHost {
             .map(|(sequence_no, _)| format!("event-sequence:{sequence_no}"));
         let summary_line = context_compaction.map(|(_, content)| format!("Summary: {content}"));
         let history_events = effective_model_history_events(events.iter().filter(|event| {
-            event.sequence_no > compacted_after && event.task_id != Some(current_task_id)
+            event.sequence_no > compacted_after
+                && event.task_id != Some(current_task_id)
+                && matches!(
+                    event.event_type,
+                    RuntimeEventType::TaskCreated
+                        | RuntimeEventType::TurnQueued
+                        | RuntimeEventType::TurnUpdated
+                        | RuntimeEventType::AssistantMessage
+                )
         }));
         let lines = history_events
             .iter()

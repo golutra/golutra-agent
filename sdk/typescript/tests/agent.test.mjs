@@ -188,7 +188,7 @@ test("project verifier discovery distinguishes omission from an explicit opt-out
   await thread.run("disable discovery", { discoverProjectVerifiers: false });
 
   assert.equal(calls[0][1].execution_mode, "open");
-  assert.equal(calls[0][1].tool_profile, "full");
+  assert.equal(calls[0][1].tool_profile, "coding");
   assert.equal("external_verifiers" in calls[0][1], false);
   assert.deepEqual(calls[1][1].external_verifiers, []);
 });
@@ -214,7 +214,7 @@ test("regular runs select new defaults while legacy runs preserve server default
 
   assert.equal(calls[0][0], "turn/start");
   assert.equal(calls[0][1].execution_mode, "open");
-  assert.equal(calls[0][1].tool_profile, "full");
+  assert.equal(calls[0][1].tool_profile, "coding");
   for (const [, params] of calls.slice(1)) {
     assert.equal("execution_mode" in params, false);
     assert.equal("tool_profile" in params, false);
