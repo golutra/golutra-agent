@@ -707,7 +707,8 @@ TokenBudgetSnapshot
   预算、阈值、预估输入、预留输出、超限动作
 
 TokenUsageRecord
-  provider 返回或估算的 input / output / reasoning / cached / total tokens
+  provider 返回或估算的 input / output / reasoning / cache-read / tool-estimate /
+  provider-total tokens；记录必须符合当前 canonical schema
 
 TokenAttribution
   system_prompt / developer_instruction / runtime_context / policy / user_message / assistant_recent / working_summary / memory / evidence / tool_instruction / tool_result_excerpt / output / reasoning / cached_input 的占比

@@ -1007,12 +1007,11 @@ fn recovered_task_continuation(
             )?);
         }
 
-        if event.event_type == RuntimeEventType::TokenUsageRecorded
-            && let Some(record) = event.payload.get("record")
-            && let Ok(record) = serde_json::from_value::<TokenUsageRecord>(record.clone())
-            && governor.observe_token_usage(record)
-        {
-            has_continuation = true;
+        if event.event_type == RuntimeEventType::TokenUsageRecorded {
+            let record = decode_token_usage_record(event)?;
+            if governor.observe_token_usage(record) {
+                has_continuation = true;
+            }
         }
 
         if event.event_type == RuntimeEventType::CheckpointCreated
@@ -1046,6 +1045,21 @@ fn recovered_task_continuation(
     } else {
         Ok(None)
     }
+}
+
+fn decode_token_usage_record(event: &RuntimeEvent) -> Result<TokenUsageRecord, ClientError> {
+    let value = event.payload.get("record").ok_or_else(|| {
+        ClientError::TaskExecution(format!(
+            "token usage event at sequence {} is missing its record",
+            event.sequence_no
+        ))
+    })?;
+    serde_json::from_value(value.clone()).map_err(|error| {
+        ClientError::TaskExecution(format!(
+            "token usage event at sequence {} is malformed: {error}",
+            event.sequence_no
+        ))
+    })
 }
 
 fn inherit_steering_execution_surface(

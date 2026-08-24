@@ -1046,9 +1046,7 @@ fn summarize_child_usage(events: &[RuntimeEvent]) -> (Option<u64>, Option<u64>) 
             cost_complete = false;
             continue;
         };
-        // 新记录在 provider 未报告总量时保留旧字段为空；委派计量只接受
-        // provider 或旧记录明确写入的总量，不能把 input+output 当成事实。
-        let tokens = record.provider_total_tokens.or(record.total_tokens);
+        let tokens = record.provider_total_tokens;
         if let Some(tokens) = tokens {
             total_tokens = total_tokens.saturating_add(tokens);
         } else {
@@ -1839,7 +1837,7 @@ mod tests {
     }
 
     fn usage_record(
-        total_tokens: Option<u64>,
+        provider_total_tokens: Option<u64>,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
         estimated_cost: Option<f64>,
@@ -1854,9 +1852,6 @@ mod tests {
             input_tokens,
             output_tokens,
             reasoning_tokens: None,
-            cached_input_tokens: None,
-            tool_result_tokens: None,
-            total_tokens,
             estimated_cost,
             budget_snapshot_ref: TokenBudgetSnapshotId::new(),
             attribution_ref: None,
@@ -1867,7 +1862,7 @@ mod tests {
             tool_schema_tokens_estimated: None,
             tool_result_tokens_estimated: None,
             tool_estimated_tokens: None,
-            provider_total_tokens: None,
+            provider_total_tokens,
             usage_complete: false,
             session_id: None,
             cache_identity: None,

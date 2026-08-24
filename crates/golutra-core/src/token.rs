@@ -32,8 +32,8 @@ pub struct TokenBudgetSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TokenUsageRecord {
-    #[serde(default)]
     pub session_id: Option<SessionId>,
     pub task_id: TaskId,
     pub turn_id: TurnId,
@@ -44,30 +44,18 @@ pub struct TokenUsageRecord {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
-    pub cached_input_tokens: Option<u64>,
-    pub tool_result_tokens: Option<u64>,
-    pub total_tokens: Option<u64>,
     pub estimated_cost: Option<f64>,
     pub budget_snapshot_ref: TokenBudgetSnapshotId,
     pub attribution_ref: Option<TokenAttribution>,
     pub usage_source: String,
-    #[serde(default)]
     pub cache_read_tokens: Option<u64>,
-    #[serde(default)]
     pub cache_write_tokens: Option<u64>,
-    #[serde(default)]
     pub non_cached_input_tokens: Option<u64>,
-    #[serde(default)]
     pub tool_schema_tokens_estimated: Option<u64>,
-    #[serde(default)]
     pub tool_result_tokens_estimated: Option<u64>,
-    #[serde(default)]
     pub tool_estimated_tokens: Option<u64>,
-    #[serde(default)]
     pub provider_total_tokens: Option<u64>,
-    #[serde(default)]
     pub usage_complete: bool,
-    #[serde(default)]
     pub cache_identity: Option<CacheIdentity>,
 }
 
@@ -76,31 +64,21 @@ impl TokenUsageRecord {
     pub fn usage(&self) -> NormalizedUsage {
         NormalizedUsage {
             input_tokens_total: self.input_tokens,
-            input_tokens_non_cached: self.non_cached_input_tokens.or_else(|| {
-                self.input_tokens
-                    .zip(self.cached_input_tokens)
-                    .and_then(|(input, cached)| (cached <= input).then(|| input - cached))
-            }),
-            cache_read_tokens: self.cache_read_tokens.or(self.cached_input_tokens),
+            input_tokens_non_cached: self.non_cached_input_tokens,
+            cache_read_tokens: self.cache_read_tokens,
             cache_write_tokens: self.cache_write_tokens,
             output_tokens: self.output_tokens,
             reasoning_tokens: self.reasoning_tokens,
-            provider_total_tokens: self.provider_total_tokens.or(self.total_tokens),
+            provider_total_tokens: self.provider_total_tokens,
             estimated_cost: self.estimated_cost,
             tool_schema_tokens_estimated: self.tool_schema_tokens_estimated,
-            tool_result_tokens_estimated: self
-                .tool_result_tokens_estimated
-                .or(self.tool_estimated_tokens)
-                .or(self.tool_result_tokens),
+            tool_result_tokens_estimated: self.tool_result_tokens_estimated,
             usage_source: match self.usage_source.as_str() {
                 "provider" => crate::UsageSource::Provider,
                 "estimated" => crate::UsageSource::Estimated,
                 _ => crate::UsageSource::Unknown,
             },
-            // 旧记录没有该字段时，用已知输入/输出恢复完整性；缺失的
-            // cache/total 明细仍由对应 Option 保持未知。
-            usage_complete: self.usage_complete
-                || (self.input_tokens.is_some() && self.output_tokens.is_some()),
+            usage_complete: self.usage_complete,
         }
     }
 }
@@ -121,9 +99,7 @@ pub struct TokenAttribution {
     pub output_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
-    #[serde(default)]
     pub contributors: Vec<TokenContributorAttribution>,
-    #[serde(default)]
     pub unattributed_input_tokens: Option<u64>,
     pub source: String,
 }
@@ -136,4 +112,80 @@ pub struct TokenContributorAttribution {
     pub estimated_input_tokens: u64,
     pub attributed_input_tokens: Option<u64>,
     pub attribution_method: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record() -> TokenUsageRecord {
+        TokenUsageRecord {
+            session_id: Some(SessionId::new()),
+            task_id: TaskId::new(),
+            turn_id: TurnId::new(),
+            provider_id: "provider".to_owned(),
+            model_id: "model".to_owned(),
+            request_event_id: ProviderRequestId::new(),
+            response_event_id: ProviderResponseId::new(),
+            input_tokens: Some(12),
+            output_tokens: Some(3),
+            reasoning_tokens: Some(1),
+            estimated_cost: Some(0.1),
+            budget_snapshot_ref: TokenBudgetSnapshotId::new(),
+            attribution_ref: None,
+            usage_source: "provider".to_owned(),
+            cache_read_tokens: Some(4),
+            cache_write_tokens: Some(2),
+            non_cached_input_tokens: Some(8),
+            tool_schema_tokens_estimated: Some(5),
+            tool_result_tokens_estimated: Some(6),
+            tool_estimated_tokens: Some(11),
+            provider_total_tokens: Some(15),
+            usage_complete: true,
+            cache_identity: None,
+        }
+    }
+
+    #[test]
+    fn usage_maps_the_canonical_record_fields_without_derivation() {
+        let record = record();
+        let usage = record.usage();
+
+        assert_eq!(usage.input_tokens_non_cached, Some(8));
+        assert_eq!(usage.cache_read_tokens, Some(4));
+        assert_eq!(usage.provider_total_tokens, Some(15));
+        assert_eq!(usage.tool_result_tokens_estimated, Some(6));
+        assert!(usage.usage_complete);
+    }
+
+    #[test]
+    fn old_record_shape_is_rejected() {
+        let mut value = serde_json::to_value(record()).expect("record serializes");
+        let object = value.as_object_mut().expect("record object");
+        object.remove("cache_read_tokens");
+        object.remove("cache_write_tokens");
+        object.remove("non_cached_input_tokens");
+        object.remove("tool_schema_tokens_estimated");
+        object.remove("tool_result_tokens_estimated");
+        object.remove("tool_estimated_tokens");
+        object.remove("provider_total_tokens");
+        object.remove("usage_complete");
+        object.remove("cache_identity");
+        object.insert("cached_input_tokens".to_owned(), serde_json::json!(4));
+        object.insert("tool_result_tokens".to_owned(), serde_json::json!(6));
+        object.insert("total_tokens".to_owned(), serde_json::json!(15));
+
+        assert!(serde_json::from_value::<TokenUsageRecord>(value).is_err());
+    }
+
+    #[test]
+    fn unknown_record_fields_are_rejected() {
+        let mut value = serde_json::to_value(record()).expect("record serializes");
+        value
+            .as_object_mut()
+            .expect("record object")
+            .insert("legacy_total_tokens".to_owned(), serde_json::json!(15));
+
+        assert!(serde_json::from_value::<TokenUsageRecord>(value).is_err());
+    }
 }

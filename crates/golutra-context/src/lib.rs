@@ -967,9 +967,6 @@ pub fn token_usage_record(
     let user_message_tokens = message_tokens(request, ProviderRole::User);
     let assistant_recent_tokens = message_tokens(request, ProviderRole::Assistant);
     let tool_result_tokens = message_tokens(request, ProviderRole::Tool);
-    // 旧总量字段保持 provider 权威。input/output 聚合仍可通过
-    // `NormalizedUsage::aggregate_total` 展示，但不能持久化为 provider 事实。
-    let total_tokens = usage.total_tokens;
     let message_sources = normalized_message_sources(&request.messages, &plan.message_sources);
     let tool_schema_digests = request
         .tools
@@ -1038,9 +1035,6 @@ pub fn token_usage_record(
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         reasoning_tokens: usage.reasoning_tokens,
-        cached_input_tokens: usage.cached_input_tokens,
-        tool_result_tokens: Some(tool_result_tokens),
-        total_tokens,
         estimated_cost: (cost_model == "zero").then_some(0.0),
         budget_snapshot_ref: budget_snapshot.snapshot_id,
         attribution_ref: Some(golutra_core::TokenAttribution {
@@ -1730,10 +1724,9 @@ mod tests {
             "zero",
         );
 
-        assert_eq!(record.total_tokens, Some(15));
+        assert_eq!(record.provider_total_tokens, Some(15));
         assert_eq!(record.estimated_cost, Some(0.0));
         assert_eq!(record.usage_source, "provider");
-        assert_eq!(record.tool_result_tokens, Some(0));
         assert_eq!(record.tool_result_tokens_estimated, Some(0));
         assert_eq!(record.tool_schema_tokens_estimated, None);
         assert_eq!(
@@ -1774,7 +1767,6 @@ mod tests {
             "zero",
         );
 
-        assert_eq!(record.total_tokens, None);
         assert_eq!(record.provider_total_tokens, None);
         assert_eq!(record.usage().provider_total_tokens, None);
         assert_eq!(record.usage().aggregate_total(), Some(15));

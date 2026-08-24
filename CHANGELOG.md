@@ -13,6 +13,12 @@ follow [Semantic Versioning](https://semver.org/) where applicable.
 - Apache-2.0 and NOTICE files in source and binary distributions.
 - Repository metadata checks for public licensing and contribution surfaces.
 
+### Changed
+
+- Token usage events now require the canonical normalized schema. Legacy usage
+  fields and partial records are rejected instead of being migrated or
+  silently reused.
+
 ## [0.1.0] - 2026-08-14
 
 This is the initial public development baseline. See the repository history

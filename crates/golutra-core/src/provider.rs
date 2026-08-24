@@ -141,7 +141,7 @@ fn first_raw_u64(raw: &Value, paths: &[&str]) -> Option<u64> {
 }
 
 impl NormalizedUsage {
-    /// 为旧展示调用方保留聚合总量回退；不会再次叠加 reasoning 或工具估算。
+    /// 在 provider 未返回总量时提供展示层聚合；不会再次叠加 reasoning 或工具估算。
     #[must_use]
     pub fn aggregate_total(&self) -> Option<u64> {
         self.provider_total_tokens.or_else(|| {

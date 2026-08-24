@@ -133,15 +133,17 @@ tool instructions
 tool result excerpts
 ```
 
-`output_tokens` 是 provider 生成的可见 assistant 输出和 tool call 参数。`reasoning_tokens` 是 provider 暴露的隐藏推理消耗。`cached_input_tokens` 是 provider 侧命中的输入缓存部分。`tool_result_tokens` 只统计进入模型输入的工具结果片段，不统计保存在 artifact 中但没有进入 provider request 的 raw output。
+`output_tokens` 是 provider 生成的可见 assistant 输出和 tool call 参数。`reasoning_tokens` 是 provider 暴露的隐藏推理消耗。provider wire 可能使用 `cached_input_tokens` 表示命中的输入缓存，但会话记录统一写成 `cache_read_tokens`。工具结果估算只统计进入模型输入的片段，不统计保存在 artifact 中但没有进入 provider request 的 raw output。
 
 运行时同时写入归一化字段：`cache_read_tokens`、`cache_write_tokens`、`non_cached_input_tokens`、
 `tool_schema_tokens_estimated`、`tool_result_tokens_estimated`、`provider_total_tokens` 和
-`usage_complete`。`total_tokens`/`provider_total_tokens` 只接受 provider 明确返回的总量；当总量缺失
+`usage_complete`。`provider_total_tokens` 只接受 provider 明确返回的总量；当总量缺失
 时，输入与输出之和只能作为标注为 aggregate 的展示值，不能回写成 provider 事实。
 provider 不返回工具分项时，`tool_schema_tokens_estimated` 来自本轮实际发送的 tool contract
 预算，`tool_result_tokens_estimated` 来自进入 request 的 tool result 片段；这两个字段是本地估算，
 不会冒充 provider usage。
+会话事件只接受上述 canonical `TokenUsageRecord` schema；旧字段或缺失 canonical 字段的记录不会
+被迁移、回退或展示，读取时会报告为无效事件。
 
 ### Token 消耗观测链路
 
@@ -187,14 +189,12 @@ TokenUsageRecord
   input_tokens
   output_tokens
   reasoning_tokens
-  cached_input_tokens
   cache_read_tokens
   cache_write_tokens
   non_cached_input_tokens
-  tool_result_tokens
   tool_schema_tokens_estimated
   tool_result_tokens_estimated
-  total_tokens
+  tool_estimated_tokens
   provider_total_tokens
   usage_complete
   cache_identity

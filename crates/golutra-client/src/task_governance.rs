@@ -102,6 +102,14 @@ fn trajectory_summary(events: &[RuntimeEvent]) -> TrajectorySummary {
     summary
 }
 
+fn token_usage_records(events: &[RuntimeEvent]) -> Result<Vec<TokenUsageRecord>, ClientError> {
+    events
+        .iter()
+        .filter(|event| event.event_type == RuntimeEventType::TokenUsageRecorded)
+        .map(decode_token_usage_record)
+        .collect()
+}
+
 pub(super) fn trajectory_failure_family(payload: &Value, status: &str) -> String {
     let tool_name = payload
         .pointer("/envelope/tool_name")
@@ -178,12 +186,7 @@ impl RuntimeHost {
             .iter()
             .map(|report| report.artifacts.len())
             .sum();
-        let token_usage = events
-            .iter()
-            .filter(|event| event.event_type == RuntimeEventType::TokenUsageRecorded)
-            .filter_map(|event| event.payload.get("record").cloned())
-            .filter_map(|record| serde_json::from_value::<TokenUsageRecord>(record).ok())
-            .collect::<Vec<_>>();
+        let token_usage = token_usage_records(&events)?;
         let policy_violation_count = policy_violation_count(&events);
         let provider_config_ref = token_usage.last().map_or_else(
             || "runtime-active-profile".to_owned(),
@@ -433,12 +436,7 @@ impl RuntimeHost {
             .and_then(|event| event.payload.get("record"))
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok());
-        let token_usage = events
-            .iter()
-            .filter(|event| event.event_type == RuntimeEventType::TokenUsageRecorded)
-            .filter_map(|event| event.payload.get("record").cloned())
-            .filter_map(|value| serde_json::from_value::<TokenUsageRecord>(value).ok())
-            .collect::<Vec<_>>();
+        let token_usage = token_usage_records(&events)?;
         let policy_violation_count = policy_violation_count(&events);
         let tool_events = events
             .iter()

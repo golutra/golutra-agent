@@ -283,14 +283,12 @@ TokenUsageRecord
   input_tokens
   output_tokens
   reasoning_tokens
-  cached_input_tokens
   cache_read_tokens
   cache_write_tokens
   non_cached_input_tokens
-  tool_result_tokens
   tool_schema_tokens_estimated
   tool_result_tokens_estimated
-  total_tokens
+  tool_estimated_tokens
   provider_total_tokens
   estimated_cost
   budget_snapshot_ref
@@ -304,6 +302,8 @@ TokenUsageRecord
 
 当 provider 没有返回工具分项时，runtime 仍把本轮 request 中实际发送的 tool schema 和 tool result
 估算写入 `tool_schema_tokens_estimated` / `tool_result_tokens_estimated`，并明确标记为本地估算。
+TokenUsageRecord 只接受当前 schema；缺少 canonical 字段或包含未知字段的历史记录会被拒绝，
+不会迁移或回退到旧字段。
 
 ### TokenAttribution
 

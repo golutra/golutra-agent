@@ -1498,7 +1498,7 @@ where
                     planned_input_tokens: Some(plan.budget_snapshot.planned_input_tokens),
                     actual_input_tokens: usage_record.input_tokens,
                     output_tokens: usage_record.output_tokens,
-                    total_tokens: usage_record.total_tokens,
+                    total_tokens: usage_record.provider_total_tokens,
                     estimated_cost: usage_record.estimated_cost.map(|cost| cost.to_string()),
                     budget_remaining: plan
                         .budget_snapshot
