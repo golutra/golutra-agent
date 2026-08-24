@@ -1696,6 +1696,7 @@ mod tests {
             request_id: ProviderRequestId::new(),
             task_id: TaskId::new(),
             turn_id: TurnId::new(),
+            session_id: None,
             provider_id: provider_id.to_owned(),
             model_id: "test-model".to_owned(),
             messages: vec![ProviderMessage {
@@ -1707,6 +1708,7 @@ mod tests {
                 metadata: ProviderMessageMetadata::default(),
             }],
             tools: Vec::new(),
+            cache_policy: Default::default(),
         }
     }
 

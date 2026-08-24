@@ -373,6 +373,7 @@ struct TuiApp {
     activity_projection: ActivityProjection,
     activity_snapshot: Option<ActivitySnapshot>,
     activity_snapshot_captured: bool,
+    render_metrics: FrameScheduler,
     change_projection: ChangeProjection,
     transcript: TranscriptState,
     developer_observations_expanded: bool,
@@ -531,6 +532,7 @@ impl TuiApp {
             activity_projection: ActivityProjection::default(),
             activity_snapshot: None,
             activity_snapshot_captured: false,
+            render_metrics: FrameScheduler::default(),
             change_projection: ChangeProjection::default(),
             transcript: TranscriptState::default(),
             developer_observations_expanded: true,
@@ -936,6 +938,48 @@ impl TuiApp {
         self.history_start_cursor = self.history_start_cursor.or(Some(event.sequence_no));
         self.cursor = Some(event.sequence_no);
         let event_type = event.event_type;
+        if let Some(turn_id) = event.turn_id {
+            match event_type {
+                RuntimeEventType::ProviderStreamed
+                    if event
+                        .payload
+                        .get("delta")
+                        .and_then(|delta| delta.get("kind"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("text_delta") =>
+                {
+                    let stream_sequence_no = event
+                        .payload
+                        .get("stream_sequence_no")
+                        .and_then(serde_json::Value::as_u64)
+                        .or_else(|| {
+                            event
+                                .payload
+                                .get("delta")
+                                .and_then(|delta| delta.get("stream_sequence_no"))
+                                .and_then(serde_json::Value::as_u64)
+                        });
+                    self.render_metrics.record_delta_at(
+                        turn_id,
+                        stream_sequence_no,
+                        Instant::now(),
+                    );
+                }
+                RuntimeEventType::ProviderCompleted => {
+                    self.render_metrics.record_stream_completed(turn_id);
+                }
+                RuntimeEventType::ProviderFailed if !event_type.is_task_terminal() => {
+                    self.render_metrics.record_stream_ended(turn_id);
+                }
+                RuntimeEventType::AssistantMessage => {
+                    self.render_metrics.record_final_message(turn_id);
+                }
+                _ if event_type.is_task_terminal() => {
+                    self.render_metrics.record_stream_ended(turn_id);
+                }
+                _ => {}
+            }
+        }
         let preserve_transcript_anchor = event_type != RuntimeEventType::ProviderStreamed
             && (!self.transcript.scroll.follow_tail || self.transcript.top_row_override.is_some());
         let transcript_anchor = preserve_transcript_anchor
@@ -3745,25 +3789,25 @@ async fn run_app(
     let mut activity_status = tokio::time::interval(ACTIVITY_STATUS_INTERVAL);
     activity_status.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     activity_status.tick().await;
-    let mut frames = FrameScheduler::default();
     let mut inline_history = InlineHistoryState::new(app.session_id);
 
     let result: miette::Result<()> = async {
         draw_interactive_frame(terminal, &mut app, &mut inline_history)?;
-        frames.mark_drawn_at(Instant::now());
+        app.render_metrics.mark_drawn_at(Instant::now());
 
         while !app.should_quit {
-        let frame_deadline = frames
+        let frame_deadline = app
+            .render_metrics
             .deadline()
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
         tokio::select! {
-            _ = tokio::time::sleep_until(frame_deadline.into()), if frames.deadline().is_some() => {
+            _ = tokio::time::sleep_until(frame_deadline.into()), if app.render_metrics.deadline().is_some() => {
                 draw_interactive_frame(terminal, &mut app, &mut inline_history)?;
-                frames.mark_drawn_at(Instant::now());
+                app.render_metrics.mark_drawn_at(Instant::now());
             }
             runtime_event = controller.recv() => {
                 controller.apply_received(&mut app, runtime_event).await?;
-                frames.request_at(Instant::now());
+                app.render_metrics.request_at(Instant::now());
             }
             terminal_event = terminal_events.next() => {
                 let event = terminal_event
@@ -3795,7 +3839,7 @@ async fn run_app(
                 }
                 _ => {}
                 }
-                frames.request_at(Instant::now());
+                app.render_metrics.request_at(Instant::now());
             }
             _ = maintenance.tick() => {
                 let changed = controller.sync_interactive(&mut app).await?;
@@ -3803,14 +3847,14 @@ async fn run_app(
                     || app.auth_operation.is_some()
                     || app.export_operation.is_some()
                 {
-                    frames.request_at(Instant::now());
+                    app.render_metrics.request_at(Instant::now());
                 }
             }
             _ = activity_status.tick(), if has_active_task(&app) => {
                 let now = Instant::now();
                 if app.activity_refresh_due(now) {
                     app.refresh_activity_snapshot();
-                    frames.request_at(now);
+                    app.render_metrics.request_at(now);
                 }
             }
         }

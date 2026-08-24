@@ -8820,6 +8820,16 @@ fn recovered_governor_does_not_recharge_usage_accounted_by_transfer() {
         budget_snapshot_ref: golutra_core::TokenBudgetSnapshotId::new(),
         attribution_ref: None,
         usage_source: "provider".to_owned(),
+        cache_read_tokens: None,
+        cache_write_tokens: None,
+        non_cached_input_tokens: None,
+        tool_schema_tokens_estimated: None,
+        tool_result_tokens_estimated: None,
+        tool_estimated_tokens: None,
+        provider_total_tokens: None,
+        usage_complete: false,
+        session_id: None,
+        cache_identity: None,
     };
     let old_usage = host_event(
         2,

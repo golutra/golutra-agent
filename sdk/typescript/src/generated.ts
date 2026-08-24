@@ -2427,6 +2427,7 @@ export interface DriverMetrics {
   pending_waits: number;
   reconnects: number;
   rejected_connections: number;
+  render?: DriverRenderMetrics;
   request_errors: number;
   requests: number;
   snapshot_latency: DriverLatencyMetrics;
@@ -2440,6 +2441,26 @@ export interface DriverMetrics {
   wait_requests: number;
   wait_results: number;
   wait_timeouts: number;
+  [k: string]: unknown;
+}
+/**
+ * 交互渲染的低基数质量指标，不包含文本、路径或凭据。
+ */
+export interface DriverRenderMetrics {
+  coalesced_redraws: number;
+  delta_events: number;
+  dropped_frames: number;
+  duplicate_frames: number;
+  final_frame_latency: DriverLatencyMetrics;
+  final_messages: number;
+  first_deltas: number;
+  first_token_latency: DriverLatencyMetrics;
+  last_deltas: number;
+  pending_redraws: number;
+  pending_streams: number;
+  redraw_requests: number;
+  redraws: number;
+  stream_gaps: number;
   [k: string]: unknown;
 }
 /**

@@ -274,8 +274,13 @@ impl OpenAiResponsesProvider {
         request: &ProviderRequest,
         account_id: Option<&str>,
     ) -> Result<ChatOptions, ProviderError> {
-        let mut options = genai_chat_options(&self.config.generation_config, true)?
-            .with_extra_headers(self.request_headers(request, account_id));
+        let mut options = genai_chat_options(
+            &self.config.generation_config,
+            true,
+            request.cache_identity().as_ref(),
+            request.cache_policy,
+        )?
+        .with_extra_headers(self.request_headers(request, account_id));
         if !request.tools.is_empty() {
             options = options
                 .with_tool_choice(ToolChoice::Auto)
@@ -293,7 +298,11 @@ impl OpenAiResponsesProvider {
                 .unwrap_or_else(|_| HeaderValue::from_static("golutra")),
         );
         headers.insert("originator", HeaderValue::from_static("golutra"));
-        if let Ok(value) = HeaderValue::from_str(&request.task_id.to_string()) {
+        let session_affinity = request.session_id.map_or_else(
+            || request.task_id.to_string(),
+            |session_id| session_id.to_string(),
+        );
+        if let Ok(value) = HeaderValue::from_str(&session_affinity) {
             headers.insert("session-id", value);
         }
         if let Some(account_id) = account_id

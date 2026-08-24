@@ -11,9 +11,9 @@ use std::{
 };
 
 use golutra_auth::{CredentialRef, SecretKind};
-use golutra_client::{RuntimeClient, RuntimeTransport};
+use golutra_client::{RuntimeClient, RuntimeExecutionOptions, RuntimeTransport};
 use golutra_config::{ProviderConfigPaths, ProviderProfile, ProviderSettings};
-use golutra_core::{ActorKind, QueryId, RedactionStatus, SessionId, TaskStatus};
+use golutra_core::{ActorKind, QueryId, RedactionStatus, SessionId, TaskStatus, TokenUsageRecord};
 use golutra_llm::{ProviderGenerationConfig, ProviderProtocol};
 use golutra_protocol::{EventFilter, RuntimeQuery, RuntimeQueryKind, TuiFrame, UserProjection};
 use serde_json::{Value, json};
@@ -1187,6 +1187,21 @@ async fn driver_metrics_are_redacted_and_survive_socket_reconnect() {
             .as_u64()
             .is_some_and(|samples| samples >= 1)
     );
+    assert!(
+        metrics["metrics"]["render"]["redraws"]
+            .as_u64()
+            .is_some_and(|redraws| redraws >= 1)
+    );
+    assert!(
+        metrics["metrics"]["render"]["delta_events"]
+            .as_u64()
+            .is_some_and(|deltas| deltas >= 1)
+    );
+    assert!(
+        metrics["metrics"]["render"]["first_token_latency"]["samples"]
+            .as_u64()
+            .is_some_and(|samples| samples >= 1)
+    );
     let metrics_json = serde_json::to_string(&metrics).expect("metrics JSON");
     assert!(!metrics_json.contains("workspace_path"));
     assert!(!metrics_json.contains("prompt"));
@@ -1286,23 +1301,40 @@ async fn live_provider_driver_smoke_is_isolated_and_opt_in() {
     const BASE_URL_ENV: &str = "GOLUTRA_TUI_DRIVER_LIVE_BASE_URL";
     const MODEL_ENV: &str = "GOLUTRA_TUI_DRIVER_LIVE_MODEL";
     const PROTOCOL_ENV: &str = "GOLUTRA_TUI_DRIVER_LIVE_PROTOCOL";
+    const MAX_CALLS_ENV: &str = "GOLUTRA_TUI_DRIVER_LIVE_MAX_CALLS";
+    const MAX_OUTPUT_TOKENS_ENV: &str = "GOLUTRA_TUI_DRIVER_LIVE_MAX_OUTPUT_TOKENS";
     const EXPECTED_RESPONSE: &str = "GOLUTRA_DRIVER_LIVE_OK";
+    const EXPECTED_CJK: &str = "中文验收通过";
     const SYNTHETIC_SECRET: &str = "sk-golutra-live-redaction-marker-1234567890";
 
     if std::env::var(ENABLE_ENV).as_deref() != Ok("1") {
         eprintln!("skipping live TUI Driver smoke: set {ENABLE_ENV}=1 to opt in");
         return;
     }
-    let (Ok(api_key), Ok(base_url), Ok(model)) = (
-        std::env::var(API_KEY_ENV),
-        std::env::var(BASE_URL_ENV),
-        std::env::var(MODEL_ENV),
-    ) else {
-        eprintln!(
-            "skipping live TUI Driver smoke: {API_KEY_ENV}, {BASE_URL_ENV}, and {MODEL_ENV} must all be set"
-        );
-        return;
-    };
+    let api_key = std::env::var(API_KEY_ENV)
+        .unwrap_or_else(|_| panic!("{API_KEY_ENV} must be set when live smoke is enabled"));
+    let base_url = std::env::var(BASE_URL_ENV)
+        .unwrap_or_else(|_| panic!("{BASE_URL_ENV} must be set when live smoke is enabled"));
+    let model = std::env::var(MODEL_ENV)
+        .unwrap_or_else(|_| panic!("{MODEL_ENV} must be set when live smoke is enabled"));
+    let max_calls = std::env::var(MAX_CALLS_ENV)
+        .unwrap_or_else(|_| panic!("{MAX_CALLS_ENV} must be set when live smoke is enabled"))
+        .parse::<u32>()
+        .unwrap_or_else(|_| panic!("{MAX_CALLS_ENV} must be an integer"));
+    let max_output_tokens = std::env::var(MAX_OUTPUT_TOKENS_ENV)
+        .unwrap_or_else(|_| {
+            panic!("{MAX_OUTPUT_TOKENS_ENV} must be set when live smoke is enabled")
+        })
+        .parse::<u64>()
+        .unwrap_or_else(|_| panic!("{MAX_OUTPUT_TOKENS_ENV} must be an integer"));
+    assert!(
+        (1..=2).contains(&max_calls),
+        "{MAX_CALLS_ENV} must be 1 or 2"
+    );
+    assert!(
+        (1..=512).contains(&max_output_tokens),
+        "{MAX_OUTPUT_TOKENS_ENV} must be between 1 and 512"
+    );
     assert!(
         api_key.trim().len() >= 16,
         "{API_KEY_ENV} must contain a real dedicated test credential"
@@ -1329,7 +1361,7 @@ async fn live_provider_driver_smoke_is_isolated_and_opt_in() {
         ProviderProfile::live_profile("tui-driver-live", protocol, base_url, model, credential)
             .expect("live provider profile");
     profile.generation_config = Some(ProviderGenerationConfig {
-        max_tokens: Some(64),
+        max_tokens: Some(max_output_tokens),
         ..ProviderGenerationConfig::default()
     });
     let mut settings = ProviderSettings::default();
@@ -1359,13 +1391,19 @@ async fn live_provider_driver_smoke_is_isolated_and_opt_in() {
             "0",
         ]);
     let mut driver = StdioDriver::spawn_command(command).await;
-    assert_eq!(driver.receive("ready").await["type"], "ready");
+    let ready = driver.receive("ready").await;
+    assert_eq!(ready["type"], "ready");
+    let session_id = ready["session_id"]
+        .as_str()
+        .expect("live session id")
+        .parse::<SessionId>()
+        .expect("valid live session id");
     driver
         .send(json!({
             "request_id": "live-prompt",
             "type": "input_prompt",
             "text": format!(
-                "Reply with exactly {EXPECTED_RESPONSE}. Do not repeat this synthetic credential: Authorization: Bearer {SYNTHETIC_SECRET}"
+                "Reply with exactly {EXPECTED_RESPONSE} {EXPECTED_CJK}. Do not repeat this synthetic credential: Authorization: Bearer {SYNTHETIC_SECRET}"
             )
         }))
         .await;
@@ -1391,6 +1429,25 @@ async fn live_provider_driver_smoke_is_isolated_and_opt_in() {
         "unexpected live terminal state: {terminal}"
     );
 
+    for (request_id, kind) in [
+        ("live-task-terminal", "task_terminal"),
+        ("live-turn-terminal", "turn_terminal"),
+    ] {
+        driver
+            .send(json!({
+                "request_id": request_id,
+                "type": "wait",
+                "until": {"kind": kind},
+                "timeout_ms": 1000
+            }))
+            .await;
+        let terminal = driver.receive(request_id).await;
+        assert_eq!(
+            terminal["type"], "wait_result",
+            "live provider did not reach {kind}: {terminal}"
+        );
+    }
+
     driver
         .send(json!({
             "request_id": "live-frame",
@@ -1409,6 +1466,18 @@ async fn live_provider_driver_smoke_is_isolated_and_opt_in() {
     assert!(
         frame_json.contains(EXPECTED_RESPONSE),
         "provider reply missing: {frame}"
+    );
+    assert!(
+        frame_json.contains(EXPECTED_CJK),
+        "CJK reply missing: {frame}"
+    );
+    assert!(
+        frame_json.contains("ProviderStreamed"),
+        "stream delta event missing: {frame}"
+    );
+    assert!(
+        frame_json.contains("token_records="),
+        "normalized usage projection missing: {frame}"
     );
     assert!(
         frame_json.contains("/Runtime"),
@@ -1430,6 +1499,77 @@ async fn live_provider_driver_smoke_is_isolated_and_opt_in() {
         frame_json.contains("redacted-secret"),
         "synthetic credential was not visibly redacted"
     );
+
+    driver
+        .send(json!({"request_id": "live-metrics", "type": "metrics"}))
+        .await;
+    let metrics = driver.receive("live-metrics").await;
+    assert_eq!(metrics["type"], "metrics");
+    for path in [
+        ["delta_events", ""],
+        ["first_deltas", ""],
+        ["first_token_latency", "samples"],
+        ["final_frame_latency", "samples"],
+    ] {
+        let value = if path[1].is_empty() {
+            &metrics["metrics"]["render"][path[0]]
+        } else {
+            &metrics["metrics"]["render"][path[0]][path[1]]
+        };
+        assert!(
+            value.as_u64().is_some_and(|count| count >= 1),
+            "render metric {}.{} missing: {metrics}",
+            path[0],
+            path[1]
+        );
+    }
+
+    let transport = RuntimeTransport::for_cwd_with_options(
+        workspace.path(),
+        RuntimeExecutionOptions::default(),
+    )
+    .await
+    .expect("open live event transport");
+    let events = transport
+        .replay_events(EventFilter {
+            session_id,
+            task_id: None,
+            after_sequence_no: None,
+        })
+        .await
+        .expect("read live events");
+    let provider_started_count = events
+        .iter()
+        .filter(|event| event.get("event_type").and_then(Value::as_str) == Some("provider_started"))
+        .count();
+    assert!(
+        provider_started_count >= 1,
+        "live provider did not start: {events:?}"
+    );
+    assert!(
+        u32::try_from(provider_started_count).unwrap_or(u32::MAX) <= max_calls,
+        "live provider call budget exceeded: started={provider_started_count}, max={max_calls}"
+    );
+    let usage = events
+        .iter()
+        .find(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("token_usage_recorded")
+        })
+        .and_then(|event| event.get("payload"))
+        .and_then(|payload| payload.get("record"))
+        .cloned()
+        .map(|value| serde_json::from_value::<TokenUsageRecord>(value).expect("usage record"))
+        .expect("live provider usage record");
+    assert!(usage.usage().input_tokens_total.is_some());
+    assert!(usage.usage().output_tokens.is_some());
+    assert!(usage.usage().usage_complete);
+    assert!(
+        serde_json::to_value(&usage)
+            .expect("usage JSON")
+            .get("cache_read_tokens")
+            .is_some()
+    );
+    transport.close().await.expect("close live event transport");
 
     driver
         .send(json!({

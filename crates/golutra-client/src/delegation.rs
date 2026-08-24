@@ -1046,12 +1046,9 @@ fn summarize_child_usage(events: &[RuntimeEvent]) -> (Option<u64>, Option<u64>) 
             cost_complete = false;
             continue;
         };
-        let tokens = record.total_tokens.or_else(|| {
-            record
-                .input_tokens
-                .zip(record.output_tokens)
-                .map(|(input, output)| input.saturating_add(output))
-        });
+        // 新记录在 provider 未报告总量时保留旧字段为空；委派计量只接受
+        // provider 或旧记录明确写入的总量，不能把 input+output 当成事实。
+        let tokens = record.provider_total_tokens.or(record.total_tokens);
         if let Some(tokens) = tokens {
             total_tokens = total_tokens.saturating_add(tokens);
         } else {
@@ -1864,6 +1861,16 @@ mod tests {
             budget_snapshot_ref: TokenBudgetSnapshotId::new(),
             attribution_ref: None,
             usage_source: "provider".to_owned(),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            non_cached_input_tokens: None,
+            tool_schema_tokens_estimated: None,
+            tool_result_tokens_estimated: None,
+            tool_estimated_tokens: None,
+            provider_total_tokens: None,
+            usage_complete: false,
+            session_id: None,
+            cache_identity: None,
         })
         .expect("usage record")
     }
@@ -1892,11 +1899,22 @@ mod tests {
             ),
             usage_event(
                 session_id,
-                Some(usage_record(None, Some(4), Some(6), Some(0.000_007))),
+                Some(usage_record(Some(10), Some(4), Some(6), Some(0.000_007))),
             ),
         ];
 
         assert_eq!(summarize_child_usage(&events), (Some(20), Some(10)));
+    }
+
+    #[test]
+    fn child_usage_keeps_provider_total_unknown_when_only_components_exist() {
+        let session_id = SessionId::new();
+        let events = [usage_event(
+            session_id,
+            Some(usage_record(None, Some(4), Some(6), Some(0.000_007))),
+        )];
+
+        assert_eq!(summarize_child_usage(&events), (None, Some(7)));
     }
 
     #[test]

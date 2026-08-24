@@ -167,7 +167,10 @@ fn usage_lines(events: &[RuntimeEvent]) -> Vec<String> {
     let mut output = 0_u64;
     let mut reasoning = 0_u64;
     let mut cached = 0_u64;
-    let mut total = 0_u64;
+    let mut provider_total = 0_u64;
+    let mut aggregate_total = 0_u64;
+    let mut provider_total_complete = true;
+    let mut aggregate_complete = true;
     let mut cost = 0.0_f64;
     let mut samples = 0_u64;
     let mut model = None;
@@ -178,11 +181,39 @@ fn usage_lines(events: &[RuntimeEvent]) -> Vec<String> {
         let Some(record) = event.payload.get("record") else {
             continue;
         };
-        input = input.saturating_add(value_u64(record, "input_tokens"));
-        output = output.saturating_add(value_u64(record, "output_tokens"));
+        let input_tokens = record.get("input_tokens").and_then(|value| value.as_u64());
+        let output_tokens = record.get("output_tokens").and_then(|value| value.as_u64());
+        input = input.saturating_add(input_tokens.unwrap_or_default());
+        output = output.saturating_add(output_tokens.unwrap_or_default());
         reasoning = reasoning.saturating_add(value_u64(record, "reasoning_tokens"));
-        cached = cached.saturating_add(value_u64(record, "cached_input_tokens"));
-        total = total.saturating_add(value_u64(record, "total_tokens"));
+        cached = cached.saturating_add(
+            record
+                .get("cache_read_tokens")
+                .and_then(|value| value.as_u64())
+                .or_else(|| {
+                    record
+                        .get("cached_input_tokens")
+                        .and_then(|value| value.as_u64())
+                })
+                .unwrap_or_default(),
+        );
+        if let Some(total) = record
+            .get("provider_total_tokens")
+            .and_then(|value| value.as_u64())
+            .or_else(|| record.get("total_tokens").and_then(|value| value.as_u64()))
+        {
+            provider_total = provider_total.saturating_add(total);
+        } else {
+            provider_total_complete = false;
+        }
+        if let Some(aggregate) = input_tokens
+            .zip(output_tokens)
+            .map(|(input, output)| input.saturating_add(output))
+        {
+            aggregate_total = aggregate_total.saturating_add(aggregate);
+        } else {
+            aggregate_complete = false;
+        }
         cost += record
             .get("estimated_cost")
             .and_then(|value| value.as_f64())
@@ -212,9 +243,21 @@ fn usage_lines(events: &[RuntimeEvent]) -> Vec<String> {
         format!("Cached       {cached} tokens"),
         format!("Output       {output} tokens"),
         format!("Reasoning    {reasoning} tokens"),
-        format!("Total        {total} tokens"),
+        if provider_total_complete {
+            format!("Total        {provider_total} tokens")
+        } else {
+            "Total        unknown".to_owned()
+        },
         format!("Est. cost    ${cost:.6}"),
     ];
+    if !provider_total_complete || aggregate_total != provider_total {
+        let aggregate = if aggregate_complete {
+            format!("{aggregate_total} tokens")
+        } else {
+            "unknown".to_owned()
+        };
+        lines.insert(7, format!("Aggregate    {aggregate}"));
+    }
     if let Some(context) = context {
         lines.push(format!("Last context {context} planned tokens"));
     }
@@ -294,5 +337,24 @@ mod tests {
         ]);
         assert!(lines.iter().any(|line| line == "Input        15 tokens"));
         assert!(lines.iter().any(|line| line == "Total        20 tokens"));
+    }
+
+    #[test]
+    fn usage_projection_marks_missing_provider_total_without_hiding_aggregate() {
+        let lines = usage_lines(&[event(
+            1,
+            RuntimeEventType::TokenUsageRecorded,
+            json!({
+                "record": {
+                    "model_id": "m",
+                    "input_tokens": 10,
+                    "output_tokens": 2,
+                    "provider_total_tokens": null
+                }
+            }),
+        )]);
+
+        assert!(lines.iter().any(|line| line == "Total        unknown"));
+        assert!(lines.iter().any(|line| line == "Aggregate    12 tokens"));
     }
 }

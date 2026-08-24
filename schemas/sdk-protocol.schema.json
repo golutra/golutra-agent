@@ -3180,6 +3180,35 @@
           "format": "uint64",
           "minimum": 0
         },
+        "render": {
+          "$ref": "#/$defs/DriverRenderMetrics",
+          "default": {
+            "coalesced_redraws": 0,
+            "delta_events": 0,
+            "dropped_frames": 0,
+            "duplicate_frames": 0,
+            "final_frame_latency": {
+              "last_ms": 0,
+              "max_ms": 0,
+              "samples": 0,
+              "total_ms": 0
+            },
+            "final_messages": 0,
+            "first_deltas": 0,
+            "first_token_latency": {
+              "last_ms": 0,
+              "max_ms": 0,
+              "samples": 0,
+              "total_ms": 0
+            },
+            "last_deltas": 0,
+            "pending_redraws": 0,
+            "pending_streams": 0,
+            "redraw_requests": 0,
+            "redraws": 0,
+            "stream_gaps": 0
+          }
+        },
         "request_errors": {
           "type": "integer",
           "format": "uint64",
@@ -3333,6 +3362,94 @@
         "runtime_event_available",
         "state_changed",
         "task_terminal"
+      ]
+    },
+    "DriverRenderMetrics": {
+      "description": "交互渲染的低基数质量指标，不包含文本、路径或凭据。",
+      "type": "object",
+      "properties": {
+        "coalesced_redraws": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "delta_events": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "dropped_frames": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "duplicate_frames": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "final_frame_latency": {
+          "$ref": "#/$defs/DriverLatencyMetrics"
+        },
+        "final_messages": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "first_deltas": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "first_token_latency": {
+          "$ref": "#/$defs/DriverLatencyMetrics"
+        },
+        "last_deltas": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "pending_redraws": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "pending_streams": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "redraw_requests": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "redraws": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "stream_gaps": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "redraw_requests",
+        "redraws",
+        "coalesced_redraws",
+        "pending_redraws",
+        "delta_events",
+        "first_deltas",
+        "last_deltas",
+        "final_messages",
+        "stream_gaps",
+        "duplicate_frames",
+        "dropped_frames",
+        "pending_streams",
+        "first_token_latency",
+        "final_frame_latency"
       ]
     },
     "DriverResponseEnvelope": {

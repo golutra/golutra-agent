@@ -724,10 +724,12 @@ mod tests {
             request_id: ProviderRequestId::new(),
             task_id: TaskId::new(),
             turn_id: TurnId::new(),
+            session_id: None,
             provider_id: "mock".to_owned(),
             model_id: "mock-model".to_owned(),
             messages: Vec::new(),
             tools: Vec::new(),
+            cache_policy: Default::default(),
         }
     }
 }

@@ -1,7 +1,10 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{ProviderRequestId, ProviderResponseId, TaskId, TokenBudgetSnapshotId, TurnId};
+use crate::{
+    CacheIdentity, NormalizedUsage, ProviderRequestId, ProviderResponseId, SessionId, TaskId,
+    TokenBudgetSnapshotId, TurnId,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -30,6 +33,8 @@ pub struct TokenBudgetSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TokenUsageRecord {
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
     pub task_id: TaskId,
     pub turn_id: TurnId,
     pub provider_id: String,
@@ -46,6 +51,58 @@ pub struct TokenUsageRecord {
     pub budget_snapshot_ref: TokenBudgetSnapshotId,
     pub attribution_ref: Option<TokenAttribution>,
     pub usage_source: String,
+    #[serde(default)]
+    pub cache_read_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_write_tokens: Option<u64>,
+    #[serde(default)]
+    pub non_cached_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub tool_schema_tokens_estimated: Option<u64>,
+    #[serde(default)]
+    pub tool_result_tokens_estimated: Option<u64>,
+    #[serde(default)]
+    pub tool_estimated_tokens: Option<u64>,
+    #[serde(default)]
+    pub provider_total_tokens: Option<u64>,
+    #[serde(default)]
+    pub usage_complete: bool,
+    #[serde(default)]
+    pub cache_identity: Option<CacheIdentity>,
+}
+
+impl TokenUsageRecord {
+    #[must_use]
+    pub fn usage(&self) -> NormalizedUsage {
+        NormalizedUsage {
+            input_tokens_total: self.input_tokens,
+            input_tokens_non_cached: self.non_cached_input_tokens.or_else(|| {
+                self.input_tokens
+                    .zip(self.cached_input_tokens)
+                    .and_then(|(input, cached)| (cached <= input).then(|| input - cached))
+            }),
+            cache_read_tokens: self.cache_read_tokens.or(self.cached_input_tokens),
+            cache_write_tokens: self.cache_write_tokens,
+            output_tokens: self.output_tokens,
+            reasoning_tokens: self.reasoning_tokens,
+            provider_total_tokens: self.provider_total_tokens.or(self.total_tokens),
+            estimated_cost: self.estimated_cost,
+            tool_schema_tokens_estimated: self.tool_schema_tokens_estimated,
+            tool_result_tokens_estimated: self
+                .tool_result_tokens_estimated
+                .or(self.tool_estimated_tokens)
+                .or(self.tool_result_tokens),
+            usage_source: match self.usage_source.as_str() {
+                "provider" => crate::UsageSource::Provider,
+                "estimated" => crate::UsageSource::Estimated,
+                _ => crate::UsageSource::Unknown,
+            },
+            // 旧记录没有该字段时，用已知输入/输出恢复完整性；缺失的
+            // cache/total 明细仍由对应 Option 保持未知。
+            usage_complete: self.usage_complete
+                || (self.input_tokens.is_some() && self.output_tokens.is_some()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

@@ -76,6 +76,21 @@ jobs:
       - name: Cross-process Driver lifecycle
         run: cargo test --locked -p golutra-tui --test tui_driver_process -- --test-threads=1
 
+  tui-pty-acceptance:
+    name: TUI PTY acceptance (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+      - name: Real PTY ANSI/CJK acceptance
+        run: cargo test --locked -p golutra-tui --test pty_acceptance -- --test-threads=1
+
   portable-check:
     strategy:
       fail-fast: false

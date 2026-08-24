@@ -152,6 +152,7 @@ impl DriverMetricsAccumulator {
             sync_errors: self.sync_errors,
             sync_latency: self.sync_latency.snapshot(),
             frame_cache_entries: frame_cache_entries.try_into().unwrap_or(u64::MAX),
+            render: Default::default(),
         }
     }
 }

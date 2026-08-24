@@ -130,9 +130,10 @@ impl TuiPreferences {
     }
 
     pub(crate) const fn palette(&self) -> TuiPalette {
+        // 正文继承终端前景色，避免在浅色终端上强制使用白色导致不可读。
         let mut palette = match self.theme {
             ColorTheme::Classic => TuiPalette {
-                text: Color::White,
+                text: Color::Reset,
                 muted: Color::DarkGray,
                 subtle: Color::Gray,
                 accent: Color::Cyan,
@@ -143,7 +144,7 @@ impl TuiPreferences {
                 selected_foreground: Color::Black,
             },
             ColorTheme::Amber => TuiPalette {
-                text: Color::White,
+                text: Color::Reset,
                 muted: Color::DarkGray,
                 subtle: Color::Gray,
                 accent: Color::Yellow,
@@ -154,7 +155,7 @@ impl TuiPreferences {
                 selected_foreground: Color::Black,
             },
             ColorTheme::Monochrome => TuiPalette {
-                text: Color::White,
+                text: Color::Reset,
                 muted: Color::DarkGray,
                 subtle: Color::Gray,
                 accent: Color::White,
@@ -166,7 +167,7 @@ impl TuiPreferences {
             },
         };
         if self.high_contrast {
-            palette.text = Color::White;
+            palette.text = Color::Reset;
             palette.muted = Color::Gray;
             palette.subtle = Color::White;
             palette.accent = Color::LightCyan;
@@ -212,6 +213,25 @@ impl TuiPalette {
             Color::Yellow | Color::LightYellow => self.warning,
             Color::Red | Color::LightRed => self.error,
             other => other,
+        }
+    }
+
+    pub(crate) fn map_buffer_color(self, color: Color) -> Color {
+        // buffer 中既有原始语义色，也有已经映射后的 palette 色；先保护后者，
+        // 避免 Amber/高对比度等主题在最终遍历时被二次改写。
+        if color == self.text
+            || color == self.muted
+            || color == self.subtle
+            || color == self.accent
+            || color == self.secondary
+            || color == self.success
+            || color == self.warning
+            || color == self.error
+            || color == self.selected_foreground
+        {
+            color
+        } else {
+            self.map_color(color)
         }
     }
 }
@@ -293,5 +313,20 @@ mod tests {
         assert_eq!(palette.muted, Color::Gray);
         assert_eq!(palette.error, Color::LightRed);
         assert_eq!(palette.accent, Color::LightCyan);
+    }
+
+    #[test]
+    fn primary_text_follows_the_terminal_foreground_for_every_theme() {
+        for theme in ColorTheme::ALL {
+            for high_contrast in [false, true] {
+                let preferences = TuiPreferences {
+                    theme,
+                    high_contrast,
+                    ..TuiPreferences::default()
+                };
+
+                assert_eq!(preferences.palette().text, Color::Reset);
+            }
+        }
     }
 }

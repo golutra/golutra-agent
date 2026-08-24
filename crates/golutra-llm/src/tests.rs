@@ -14,10 +14,12 @@ async fn mock_provider_can_emit_a_deterministic_failure() {
             request_id: ProviderRequestId::new(),
             task_id: TaskId::new(),
             turn_id: TurnId::new(),
+            session_id: None,
             provider_id: "mock".to_owned(),
             model_id: "mock".to_owned(),
             messages: Vec::new(),
             tools: Vec::new(),
+            cache_policy: Default::default(),
         })
         .await
         .expect_err("mock failure");
@@ -695,6 +697,7 @@ fn request() -> ProviderRequest {
         request_id: ProviderRequestId::new(),
         task_id: TaskId::new(),
         turn_id: TurnId::new(),
+        session_id: None,
         provider_id: "mock".to_owned(),
         model_id: "mock-model".to_owned(),
         messages: vec![ProviderMessage {
@@ -706,5 +709,28 @@ fn request() -> ProviderRequest {
             metadata: ProviderMessageMetadata::default(),
         }],
         tools: Vec::new(),
+        cache_policy: Default::default(),
     }
+}
+
+#[test]
+fn prompt_cache_identity_is_stable_and_session_scoped() {
+    let mut first = request();
+    first.session_id = Some(golutra_core::SessionId::new());
+    first.cache_policy = golutra_core::PromptCachePolicy::Auto;
+    let second = first.clone();
+    assert_eq!(first.cache_identity(), second.cache_identity());
+
+    let mut changed = first.clone();
+    changed.messages[0].content.push('!');
+    assert_eq!(first.cache_identity(), changed.cache_identity());
+
+    changed.task_id = golutra_core::TaskId::new();
+    assert_eq!(first.cache_identity(), changed.cache_identity());
+
+    changed.provider_id = "other-provider".to_owned();
+    assert_ne!(first.cache_identity(), changed.cache_identity());
+
+    first.cache_policy = golutra_core::PromptCachePolicy::None;
+    assert!(first.cache_identity().is_none());
 }

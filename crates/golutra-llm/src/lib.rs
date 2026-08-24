@@ -5,7 +5,8 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use golutra_auth::{CredentialProvider, FixedCredentialProvider};
 use golutra_core::{
-    ProviderContract, ProviderRequestId, ProviderResponseId, TaskId, ToolContract, TurnId,
+    CacheIdentity, NormalizedUsage, PromptCachePolicy, ProviderContract, ProviderRequestId,
+    ProviderResponseId, SessionId, TaskId, ToolContract, TurnId,
 };
 pub use golutra_core::{ProviderUsage, UsageSource};
 use secrecy::ExposeSecret;
@@ -88,10 +89,43 @@ pub struct ProviderRequest {
     pub request_id: ProviderRequestId,
     pub task_id: TaskId,
     pub turn_id: TurnId,
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
     pub provider_id: String,
     pub model_id: String,
     pub messages: Vec<ProviderMessage>,
     pub tools: Vec<ToolContract>,
+    #[serde(default)]
+    pub cache_policy: PromptCachePolicy,
+}
+
+impl ProviderRequest {
+    #[must_use]
+    pub fn cache_identity(&self) -> Option<CacheIdentity> {
+        let session_id = self.session_id?;
+        if self.cache_policy == PromptCachePolicy::None {
+            return None;
+        }
+        let canonical_provider = self.provider_id.trim().to_ascii_lowercase();
+        let canonical_model = self.model_id.trim().to_ascii_lowercase();
+        let prefix = format!(
+            "golutra-prompt-cache-v1\0{}\0{}\0{}",
+            session_id, canonical_provider, canonical_model,
+        );
+        use sha2::{Digest, Sha256};
+        Some(CacheIdentity {
+            session_id,
+            thread_id: None,
+            provider_id: canonical_provider,
+            model_id: canonical_model,
+            key: format!("sha256:{:x}", Sha256::digest(prefix.as_bytes())),
+        })
+    }
+
+    #[must_use]
+    pub fn normalized_usage(&self, usage: &ProviderUsage) -> NormalizedUsage {
+        usage.normalize()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

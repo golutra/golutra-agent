@@ -700,10 +700,12 @@ pub fn provider_request_from_plan(
         request_id: golutra_core::ProviderRequestId::new(),
         task_id,
         turn_id,
+        session_id: None,
         provider_id: provider_id.into(),
         model_id: model_id.into(),
         messages: plan.messages.clone(),
         tools,
+        cache_policy: golutra_core::PromptCachePolicy::Auto,
     }
 }
 
@@ -734,8 +736,10 @@ pub fn compile_model_input(
         }
     }
 
-    let provider_request =
+    let mut provider_request =
         provider_request_from_plan(plan, task_id, turn_id, provider_id, model_id, tools);
+    provider_request.session_id = Some(session_id);
+    provider_request.cache_policy = golutra_core::PromptCachePolicy::Auto;
     let audit_snapshot = context_snapshot_from_request(session_id, plan, &provider_request);
     Ok(ModelInputEnvelope {
         provider_request,
@@ -963,12 +967,9 @@ pub fn token_usage_record(
     let user_message_tokens = message_tokens(request, ProviderRole::User);
     let assistant_recent_tokens = message_tokens(request, ProviderRole::Assistant);
     let tool_result_tokens = message_tokens(request, ProviderRole::Tool);
-    let total_tokens = usage.total_tokens.or_else(|| {
-        usage
-            .input_tokens
-            .zip(usage.output_tokens)
-            .map(|(input, output)| input.saturating_add(output))
-    });
+    // 旧总量字段保持 provider 权威。input/output 聚合仍可通过
+    // `NormalizedUsage::aggregate_total` 展示，但不能持久化为 provider 事实。
+    let total_tokens = usage.total_tokens;
     let message_sources = normalized_message_sources(&request.messages, &plan.message_sources);
     let tool_schema_digests = request
         .tools
@@ -1019,7 +1020,15 @@ pub fn token_usage_record(
             .map(|contributor| contributor.retained_estimated_tokens)
             .sum::<u64>()
     };
+    let normalized = usage.normalize();
+    let tool_schema_tokens_estimated = normalized
+        .tool_schema_tokens_estimated
+        .or_else(|| (!request.tools.is_empty()).then_some(budget_snapshot.planned_tool_tokens));
+    let tool_result_tokens_estimated = normalized
+        .tool_result_tokens_estimated
+        .or(Some(tool_result_tokens));
     TokenUsageRecord {
+        session_id: request.session_id,
         task_id: request.task_id,
         turn_id: request.turn_id,
         provider_id: request.provider_id.clone(),
@@ -1066,6 +1075,19 @@ pub fn token_usage_record(
             golutra_core::UsageSource::Unknown => "unknown",
         }
         .to_owned(),
+        cache_read_tokens: normalized.cache_read_tokens,
+        cache_write_tokens: normalized.cache_write_tokens,
+        non_cached_input_tokens: normalized.input_tokens_non_cached,
+        tool_schema_tokens_estimated,
+        tool_result_tokens_estimated,
+        tool_estimated_tokens: match (tool_schema_tokens_estimated, tool_result_tokens_estimated) {
+            (Some(schema), Some(result)) => Some(schema.saturating_add(result)),
+            (Some(value), None) | (None, Some(value)) => Some(value),
+            (None, None) => None,
+        },
+        provider_total_tokens: normalized.provider_total_tokens,
+        usage_complete: normalized.usage_complete,
+        cache_identity: request.cache_identity(),
     }
 }
 
@@ -1712,6 +1734,8 @@ mod tests {
         assert_eq!(record.estimated_cost, Some(0.0));
         assert_eq!(record.usage_source, "provider");
         assert_eq!(record.tool_result_tokens, Some(0));
+        assert_eq!(record.tool_result_tokens_estimated, Some(0));
+        assert_eq!(record.tool_schema_tokens_estimated, None);
         assert_eq!(
             record
                 .attribution_ref
@@ -1720,6 +1744,40 @@ mod tests {
             Some("mixed")
         );
         assert_eq!(record.budget_snapshot_ref, plan.budget_snapshot.snapshot_id);
+    }
+
+    #[test]
+    fn missing_provider_total_remains_unknown_in_new_usage_records() {
+        let task_id = TaskId::new();
+        let turn_id = TurnId::new();
+        let plan = ContextBuilder::default()
+            .build(task_id, turn_id, Vec::new())
+            .expect("context builds");
+        let request =
+            provider_request_from_plan(&plan, task_id, turn_id, "mock", "mock-model", Vec::new());
+        let usage = ProviderUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            reasoning_tokens: None,
+            cached_input_tokens: None,
+            total_tokens: None,
+            usage_source: UsageSource::Provider,
+            raw: serde_json::json!({}),
+        };
+
+        let record = token_usage_record(
+            &plan,
+            &request,
+            golutra_core::ProviderResponseId::new(),
+            &plan.budget_snapshot,
+            &usage,
+            "zero",
+        );
+
+        assert_eq!(record.total_tokens, None);
+        assert_eq!(record.provider_total_tokens, None);
+        assert_eq!(record.usage().provider_total_tokens, None);
+        assert_eq!(record.usage().aggregate_total(), Some(15));
     }
 
     #[test]
@@ -1796,6 +1854,9 @@ mod tests {
 
         assert_eq!(attributed_total, 101);
         assert_eq!(attribution.unattributed_input_tokens, Some(0));
+        assert_eq!(record.tool_schema_tokens_estimated, Some(13));
+        assert_eq!(record.tool_result_tokens_estimated, Some(0));
+        assert_eq!(record.tool_estimated_tokens, Some(13));
         assert!(attribution.contributors.iter().any(|contributor| {
             contributor.contributor == "objective" && contributor.source_refs == ["task:objective"]
         }));
