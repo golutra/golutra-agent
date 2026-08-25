@@ -894,6 +894,17 @@ impl RuntimeHost {
             .with_network_access(self.network_access_enabled(requested_network))
             .with_unrestricted_access(yolo)
             .with_process_supervisor(self.execution.process_supervisor.clone());
+        let executor = match self.execution.web_search_backend.get_or_init(|| {
+            HttpWebSearchBackend::from_env()
+                .map(|backend| backend.map(Arc::new))
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(Some(backend)) => executor.with_web_search_backend(backend.clone()),
+            Ok(None) => executor,
+            Err(error) => {
+                return Err(ClientError::TaskExecution(error.clone()));
+            }
+        };
         let Some(paths) = self
             .runtime_paths
             .as_ref()

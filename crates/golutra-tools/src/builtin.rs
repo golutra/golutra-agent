@@ -24,6 +24,9 @@ pub(super) enum BuiltinTool {
     FindReferences,
     AskUser,
     Shell,
+    WebSearch,
+    ShellSession,
+    Subagent,
     ProcessList,
     ProcessPoll,
     ProcessWrite,
@@ -33,17 +36,25 @@ pub(super) enum BuiltinTool {
 }
 
 impl BuiltinTool {
-    pub(super) const P0_DEFAULT: [Self; 15] = [
+    /// 稳定的 provider 工具面；其他变体仅供 runtime 内部或回放使用。
+    pub(super) const P0_DEFAULT: [Self; 8] = [
         Self::ReadFile,
         Self::WriteFile,
         Self::EditFile,
         Self::ApplyPatch,
+        Self::Shell,
+        Self::WebSearch,
+        Self::ShellSession,
+        Self::Subagent,
+    ];
+
+    /// 为验证和回放保留的 runtime 能力，不得投影给 provider。
+    pub(super) const INTERNAL: [Self; 10] = [
         Self::ListDir,
         Self::RgSearch,
         Self::SymbolSearch,
         Self::FindReferences,
         Self::AskUser,
-        Self::Shell,
         Self::ProcessList,
         Self::ProcessPoll,
         Self::ProcessWrite,
@@ -63,6 +74,9 @@ impl BuiltinTool {
             "find_references" => Self::FindReferences,
             "ask_user" => Self::AskUser,
             "shell" => Self::Shell,
+            "web_search" => Self::WebSearch,
+            "shell_session" => Self::ShellSession,
+            "subagent" => Self::Subagent,
             "process_list" => Self::ProcessList,
             "process_poll" => Self::ProcessPoll,
             "process_write" => Self::ProcessWrite,
@@ -85,6 +99,9 @@ impl BuiltinTool {
             Self::FindReferences => "find_references",
             Self::AskUser => "ask_user",
             Self::Shell => "shell",
+            Self::WebSearch => "web_search",
+            Self::ShellSession => "shell_session",
+            Self::Subagent => "subagent",
             Self::ProcessList => "process_list",
             Self::ProcessPoll => "process_poll",
             Self::ProcessWrite => "process_write",
@@ -97,9 +114,13 @@ impl BuiltinTool {
     pub(super) const fn side_effect_type(self) -> SideEffectType {
         match self {
             Self::WriteFile | Self::EditFile | Self::ApplyPatch => SideEffectType::File,
-            Self::Shell | Self::ProcessWrite | Self::ProcessTerminate | Self::DelegateTask => {
-                SideEffectType::Process
-            }
+            Self::Shell
+            | Self::ShellSession
+            | Self::Subagent
+            | Self::ProcessWrite
+            | Self::ProcessTerminate
+            | Self::DelegateTask => SideEffectType::Process,
+            Self::WebSearch => SideEffectType::Network,
             Self::ReadFile
             | Self::ListDir
             | Self::RgSearch
@@ -118,21 +139,17 @@ impl BuiltinTool {
 
     pub(super) fn capabilities(self) -> ToolCapabilities {
         ToolCapabilities {
-            // coding 面保留常见文件/搜索和进程观察能力；代码图、进程写入/终止
-            // 以及扩展委派仍由 full profile 显式开启，避免牺牲常用工作流。
+            // coding profile 只开放稳定的 provider 工具面。
             available_in_coding_profile: matches!(
                 self,
                 Self::ReadFile
                     | Self::WriteFile
                     | Self::EditFile
                     | Self::ApplyPatch
-                    | Self::AskUser
                     | Self::Shell
-                    | Self::ListDir
-                    | Self::RgSearch
-                    | Self::ProcessList
-                    | Self::ProcessPoll
-                    | Self::ProcessReconnect
+                    | Self::WebSearch
+                    | Self::ShellSession
+                    | Self::Subagent
             ),
             parallel_read_safe: matches!(
                 self,
@@ -168,6 +185,20 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
             &["path", "search"],
         ),
         "apply_patch" => object_schema(&[("patch", MAX_PATCH_BYTES)], &["patch"], &["patch"]),
+        "web_search" => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "query": {"type": "string", "minLength": 1, "maxLength": 2048},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 20},
+                "domains": {
+                    "type": "array",
+                    "maxItems": 10,
+                    "items": {"type": "string", "minLength": 1, "maxLength": 253}
+                }
+            },
+            "required": ["query"]
+        }),
         "list_dir" => object_schema(&[("path", MAX_PATH_ARGUMENT_CHARS)], &[], &[]),
         "rg_search" => object_schema(
             &[
@@ -217,7 +248,7 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
             },
             "required": ["questions"]
         }),
-        "delegate_task" => json!({
+        "delegate_task" | "subagent" => json!({
             "type": "object",
             "additionalProperties": false,
             "properties": {
@@ -276,6 +307,7 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
             },
             "required": ["command"]
         }),
+        "shell_session" => shell_session_schema(),
         "process_list" => object_schema(&[], &[], &[]),
         "process_poll" => process_session_schema(false, true),
         "process_write" => process_session_schema(true, true),
@@ -318,6 +350,21 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
         artifact_policy: "raw_output_to_artifact_ref".to_owned(),
         permission_policy_ref: None,
     }
+}
+
+fn shell_session_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "action": {"type": "string", "enum": ["wait", "write", "terminate"]},
+            "process_id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "cursor": {"type": "integer", "minimum": 0},
+            "input": {"type": "string", "maxLength": MAX_PROCESS_INPUT_CHARS},
+            "wait_ms": {"type": "integer", "minimum": 0, "maximum": max_poll_wait_ms()}
+        },
+        "required": ["action", "process_id"]
+    })
 }
 
 fn query_schema(field: &str) -> Value {

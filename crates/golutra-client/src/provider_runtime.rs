@@ -131,8 +131,11 @@ pub(crate) fn mock_provider_plan(
         return configured_provider_plan(
             provider_env.as_ref(),
             MockProvider::tool_call(
-                "list_dir",
-                json!({"path": string_payload(payload, "path", ".")}),
+                "shell",
+                json!({
+                    "command": "ls -la",
+                    "workdir": string_payload(payload, "path", ".")
+                }),
             ),
             false,
             true,
@@ -250,8 +253,11 @@ pub(crate) fn isolated_mock_provider_plan(
         } else if lower.contains("list") || lower.contains("ls") {
             (
                 MockProvider::tool_call(
-                    "list_dir",
-                    json!({"path": string_payload(payload, "path", ".")}),
+                    "shell",
+                    json!({
+                        "command": "ls -la",
+                        "workdir": string_payload(payload, "path", ".")
+                    }),
                 ),
                 false,
                 true,

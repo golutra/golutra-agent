@@ -630,7 +630,8 @@ impl WorkspacePolicy {
     }
 
     fn shell_command_is_preapproved(&self, parts: &[String]) -> bool {
-        parts == ["pwd"]
+        matches!(parts, [command] if command == "pwd" || command == "ls")
+            || matches!(parts, [command, flags] if command == "ls" && flags == "-la")
     }
 
     fn evaluation(
@@ -1728,7 +1729,12 @@ mod tests {
         let workspace = tempdir().expect("workspace");
         let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
 
-        assert_eq!(policy.evaluate_shell("pwd").decision, PolicyDecision::Allow);
+        for command in ["pwd", "ls", "ls -la"] {
+            assert_eq!(
+                policy.evaluate_shell(command).decision,
+                PolicyDecision::Allow
+            );
+        }
         for command in [
             "cargo test -p golutra-core",
             "git status --short",

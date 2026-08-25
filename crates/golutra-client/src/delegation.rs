@@ -1636,13 +1636,13 @@ mod tests {
             provider_tool_call_id: Some("replayed-delegated-child".to_owned()),
             session_id: parent_session_id,
             turn_id: Some(TurnId::new()),
-            tool_name: "delegate_task".to_owned(),
+            tool_name: "subagent".to_owned(),
             arguments: json!({"task": task}),
         };
         let overrides = delegation_overrides(
             &crate::ProviderTurnSettings::default(),
             crate::NormalizedExecutionMode::Legacy,
-            AgentToolProfile::Full,
+            AgentToolProfile::Coding,
             &request.arguments,
         )
         .expect("delegation overrides");
@@ -2035,22 +2035,12 @@ mod tests {
                 &cancellation,
             )
             .expect("child context");
-        let grandchild = child
-            .child(
-                child_session_id,
-                child_task_id,
-                ThreadId::new(),
-                1_024,
-                None,
-                &cancellation,
-            )
-            .expect("grandchild context");
         let request = ToolRequest {
             tool_call_id: ToolCallId::new(),
             provider_tool_call_id: None,
             session_id: child_session_id,
             turn_id: Some(TurnId::new()),
-            tool_name: "delegate_task".to_owned(),
+            tool_name: "subagent".to_owned(),
             arguments: json!({"task": "nested"}),
         };
 
@@ -2068,17 +2058,6 @@ mod tests {
         .await
         .expect("root checkpoint");
         drop(checkpoint_guard);
-        persist_delegation_usage_settlement(
-            &host,
-            &request,
-            child_task_id,
-            &child,
-            &grandchild,
-            1_500,
-            None,
-        )
-        .await
-        .expect("root settlement");
         persist_delegation_usage_settlement(
             &host,
             &request,
@@ -2108,20 +2087,16 @@ mod tests {
             .filter(|event| event.event_type == RuntimeEventType::CheckpointCreated)
             .collect::<Vec<_>>();
 
-        assert_eq!(checkpoints.len(), 3);
+        assert_eq!(checkpoints.len(), 2);
         assert!(child_events.is_empty());
         assert!(checkpoints.iter().all(|event| event.turn_id.is_none()));
         assert_eq!(
             checkpoints[0].payload["delegation_recovery"]["state"]["started_children"],
-            2
+            1
         );
         assert_eq!(
             checkpoints[1].payload["delegation_recovery"]["state"]["spent_tokens"],
-            delegation_policy::MIN_DELEGATED_TOKEN_BUDGET
-        );
-        assert_eq!(
-            checkpoints[2].payload["delegation_recovery"]["state"]["spent_tokens"],
-            3_500
+            2_000
         );
     }
 

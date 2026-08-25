@@ -163,7 +163,7 @@ fn replay_contracts_register_without_a_live_external_backend() {
     assert_eq!(
         runtime.registry().capabilities(&external.tool_name),
         Some(&ToolCapabilities {
-            available_in_coding_profile: true,
+            available_in_coding_profile: false,
             parallel_read_safe: false,
             coding_profile_hidden_arguments: Vec::new(),
         })
@@ -238,7 +238,7 @@ impl TaskDelegationBackend for FakeTaskDelegationBackend {
 async fn registry_contains_p0_tools() {
     let registry = ToolRegistry::p0_default();
     let names = registry
-        .contracts()
+        .provider_contracts()
         .into_iter()
         .map(|contract| contract.tool_name.as_str())
         .collect::<Vec<_>>();
@@ -247,25 +247,22 @@ async fn registry_contains_p0_tools() {
         names,
         vec![
             "apply_patch",
-            "ask_user",
             "edit_file",
-            "find_references",
-            "list_dir",
-            "process_list",
-            "process_poll",
-            "process_reconnect",
-            "process_terminate",
-            "process_write",
             "read_file",
-            "rg_search",
             "shell",
-            "symbol_search",
+            "shell_session",
+            "subagent",
+            "web_search",
             "write_file"
         ]
     );
-    let search = registry.contract("rg_search").expect("rg contract");
-    assert_eq!(search.side_effect_type, SideEffectType::None);
-    assert_eq!(search.retry_policy, "retry_allowed");
+    assert!(registry.contract("list_dir").is_some());
+    assert!(registry.provider_contracts().iter().all(|contract| {
+        !matches!(
+            contract.tool_name.as_str(),
+            "list_dir" | "rg_search" | "process_poll" | "ask_user"
+        )
+    }));
 }
 
 #[tokio::test]
@@ -280,7 +277,7 @@ async fn delegated_task_is_registered_only_with_a_backend_and_tracks_workspace_c
         .with_task_delegation_backend(backend.clone())
         .expect("delegation backend registers");
     let request = request(
-        "delegate_task",
+        "subagent",
         json!({
             "task": "inspect and update the delegated fixture",
             "model": "test-model",
@@ -289,12 +286,12 @@ async fn delegated_task_is_registered_only_with_a_backend_and_tracks_workspace_c
     );
     let contract = executor
         .registry()
-        .contract("delegate_task")
+        .contract("subagent")
         .expect("delegation contract");
     assert!(
-        !executor
+        executor
             .registry()
-            .capabilities("delegate_task")
+            .capabilities("subagent")
             .is_some_and(|capabilities| capabilities.available_in_coding_profile)
     );
     assert_eq!(contract.side_effect_type, SideEffectType::Process);
@@ -353,7 +350,7 @@ async fn delegated_task_rejects_invalid_effort_and_can_be_removed_for_children()
         .with_task_delegation_backend(backend.clone())
         .expect("delegation backend registers");
     let invalid = request(
-        "delegate_task",
+        "subagent",
         json!({"task": "inspect", "reasoning_effort": "extreme"}),
     );
     assert!(matches!(
@@ -362,10 +359,10 @@ async fn delegated_task_rejects_invalid_effort_and_can_be_removed_for_children()
     ));
     assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
 
-    let child = executor.without_tool("delegate_task");
-    assert!(child.registry().contract("delegate_task").is_none());
+    let child = executor.without_tool("subagent");
+    assert!(child.registry().contract("subagent").is_none());
     assert!(matches!(
-        child.evaluate(&request("delegate_task", json!({"task": "inspect"}))),
+        child.evaluate(&request("subagent", json!({"task": "inspect"}))),
         Err(ToolError::UnknownTool(_))
     ));
 }
@@ -379,7 +376,7 @@ async fn delegated_task_receives_the_enclosing_runtime_deadline() {
             cancelled: cancelled.clone(),
         }))
         .expect("delegation backend registers");
-    let request = request("delegate_task", json!({"task": "wait for cancellation"}));
+    let request = request("subagent", json!({"task": "wait for cancellation"}));
     let policy = executor.evaluate(&request).expect("delegation policy");
     let deadline = tokio::time::Instant::now() + Duration::from_millis(25);
     let report = tokio::time::timeout(
@@ -2100,6 +2097,97 @@ async fn background_process_supports_cursor_reconnect_stdin_and_terminal_diff() 
             .changed_files
             .iter()
             .any(|path| path.ends_with("background.txt"))
+    );
+}
+
+#[tokio::test]
+async fn shell_session_unifies_event_wait_write_and_terminate() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(
+        workspace.path().join("session.sh"),
+        "printf 'ready\\n'\nread value\nprintf 'received:%s\\n' \"$value\"\n",
+    )
+    .expect("session script");
+    let executor = executor(workspace.path());
+    let session_id = SessionId::new();
+    let start = execute_approved(
+        &executor,
+        request_for_session(
+            session_id,
+            "shell",
+            json!({
+                "command": "sh session.sh",
+                "background": true,
+                "yield_time_ms": 1_000,
+            }),
+        ),
+        CancellationToken::new(),
+    )
+    .await;
+    let process_id = start.envelope.structured_facts["process_id"]
+        .as_str()
+        .expect("process id")
+        .to_owned();
+    let cursor = start.envelope.structured_facts["output_cursor"]
+        .as_u64()
+        .expect("cursor");
+    let waited = executor
+        .execute(
+            request_for_session(
+                session_id,
+                "shell_session",
+                json!({
+                    "action": "wait",
+                    "process_id": process_id,
+                    "cursor": cursor,
+                    "wait_ms": 0,
+                }),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("session wait");
+    assert_eq!(waited.envelope.structured_facts["process_state"], "running");
+    let next_cursor = waited.envelope.structured_facts["output_cursor"]
+        .as_u64()
+        .expect("next cursor");
+    let written = executor
+        .execute(
+            request_for_session(
+                session_id,
+                "shell_session",
+                json!({
+                    "action": "write",
+                    "process_id": process_id,
+                    "cursor": next_cursor,
+                    "input": "done\n",
+                    "wait_ms": 1_000,
+                }),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("session write");
+    assert!(artifact_text(&written).contains("received:done"));
+    let terminal = executor
+        .execute(
+            request_for_session(
+                session_id,
+                "shell_session",
+                json!({
+                    "action": "wait",
+                    "process_id": process_id,
+                    "cursor": written.envelope.structured_facts["output_cursor"],
+                    "wait_ms": 1_000,
+                }),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("session terminal wait");
+    assert_eq!(
+        terminal.envelope.structured_facts["process_state"],
+        "exited"
     );
 }
 

@@ -255,6 +255,7 @@ struct ManagedProcess {
     command_display: String,
     pid: Option<u32>,
     stdin: Mutex<Option<ChildStdin>>,
+    operation: Mutex<()>,
     output: Mutex<OutputJournal>,
     state: Mutex<ProcessStateRecord>,
     control: CancellationToken,
@@ -507,6 +508,7 @@ impl ProcessSupervisor {
             command_display: request.command_display,
             pid,
             stdin: Mutex::new(Some(stdin)),
+            operation: Mutex::new(()),
             output: Mutex::new(OutputJournal::default()),
             state: Mutex::new(ProcessStateRecord {
                 state: ProcessState::Running,
@@ -623,6 +625,8 @@ impl ProcessSupervisor {
     ) -> Result<ProcessSnapshot, ToolError> {
         let entry = self.entry(session_id, process_id).await?;
         self.touch(&entry).await;
+        // 只串行化 stdin 和终止控制，等待事件时不持有该锁。
+        let _operation_guard = entry.operation.lock().await;
         {
             let state = entry.state.lock().await;
             if state.state.is_terminal() {
@@ -642,6 +646,7 @@ impl ProcessSupervisor {
             ToolError::Execution(format!("process stdin flush failed: {error}"))
         })?;
         drop(stdin_guard);
+        drop(_operation_guard);
         self.poll_for(&entry, cursor, wait_ms).await
     }
 
@@ -652,7 +657,10 @@ impl ProcessSupervisor {
         cursor: u64,
     ) -> Result<ProcessSnapshot, ToolError> {
         let entry = self.entry(session_id, process_id).await?;
-        entry.control.cancel();
+        {
+            let _operation_guard = entry.operation.lock().await;
+            entry.control.cancel();
+        }
         let snapshot = self.wait_for_terminal(&entry, cursor, 5_000).await;
         if snapshot.state.is_terminal() {
             Ok(snapshot)

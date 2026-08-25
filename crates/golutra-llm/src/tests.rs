@@ -220,10 +220,11 @@ fn provider_tool_descriptions_own_file_and_question_usage_details() {
         provider_tool_description("apply_patch"),
         "Golutra workspace tool."
     );
-    let delegate = provider_tool_description("delegate_task");
-    assert!(delegate.contains("self-contained task"));
-    assert!(delegate.contains("does not receive this conversation"));
-    assert!(delegate.contains("reasoning_effort"));
+    let subagent = provider_tool_description("subagent");
+    assert!(subagent.contains("self-contained child task"));
+    assert!(subagent.contains("cannot create another subagent"));
+    assert!(provider_tool_description("web_search").contains("network"));
+    assert!(provider_tool_description("shell_session").contains("background"));
     assert_ne!(
         provider_tool_description("process_list"),
         "Golutra workspace tool."

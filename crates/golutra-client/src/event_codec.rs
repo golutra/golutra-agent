@@ -1283,7 +1283,7 @@ mod tests {
         assert!(recovered.pending.external_verifiers_require_os_sandbox);
         assert_eq!(
             recovered.execution.tool_profile,
-            Some(golutra_protocol::AgentToolProfile::Full)
+            Some(golutra_protocol::AgentToolProfile::Coding)
         );
     }
 

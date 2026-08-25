@@ -574,20 +574,6 @@ struct ParallelReadProvider {
 }
 
 #[cfg(unix)]
-#[derive(Debug, Clone)]
-struct ParallelDeadlineProvider {
-    calls: Arc<AtomicUsize>,
-    contract: golutra_core::ProviderContract,
-}
-
-#[cfg(unix)]
-#[derive(Debug)]
-struct ParallelReadBackend {
-    contracts: Vec<golutra_core::ToolContract>,
-    barrier: Arc<tokio::sync::Barrier>,
-}
-
-#[cfg(unix)]
 #[async_trait]
 impl LlmProvider for ParallelReadProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
@@ -598,12 +584,12 @@ impl LlmProvider for ParallelReadProvider {
                 vec![
                     ProviderToolCall {
                         tool_call_id: "parallel-read-first".to_owned(),
-                        tool_name: "external_parallel_first".to_owned(),
+                        tool_name: "read_file".to_owned(),
                         arguments: json!({"path": "first.txt"}),
                     },
                     ProviderToolCall {
                         tool_call_id: "parallel-read-second".to_owned(),
-                        tool_name: "external_parallel_second".to_owned(),
+                        tool_name: "read_file".to_owned(),
                         arguments: json!({"path": "second.txt"}),
                     },
                 ],
@@ -656,152 +642,6 @@ impl LlmProvider for ParallelReadProvider {
     }
 }
 
-#[cfg(unix)]
-#[async_trait]
-impl ExternalToolBackend for ParallelReadBackend {
-    fn contracts(&self) -> Vec<golutra_core::ToolContract> {
-        self.contracts.clone()
-    }
-
-    fn capabilities(&self) -> HashMap<String, ToolCapabilities> {
-        self.contracts
-            .iter()
-            .map(|contract| {
-                (
-                    contract.tool_name.clone(),
-                    ToolCapabilities {
-                        available_in_coding_profile: true,
-                        parallel_read_safe: true,
-                        coding_profile_hidden_arguments: Vec::new(),
-                    },
-                )
-            })
-            .collect()
-    }
-
-    async fn call(
-        &self,
-        request: &golutra_tools::ToolRequest,
-        _cancellation: CancellationToken,
-    ) -> Result<ExternalToolOutput, golutra_tools::ToolError> {
-        self.barrier.wait().await;
-        let content = match request.tool_name.as_str() {
-            "external_parallel_first" => "first\n",
-            "external_parallel_second" => "second\n",
-            unexpected => panic!("unexpected parallel fixture tool {unexpected}"),
-        };
-        Ok(ExternalToolOutput {
-            summary: "parallel read completed".to_owned(),
-            content: content.to_owned(),
-            structured_facts: json!({}),
-            is_error: false,
-        })
-    }
-}
-
-#[cfg(unix)]
-#[async_trait]
-impl LlmProvider for ParallelDeadlineProvider {
-    async fn complete(&self, _request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
-        let call = self.calls.fetch_add(1, Ordering::SeqCst);
-        let (message, tool_calls, finish_reason) = if call == 0 {
-            (
-                None,
-                vec![
-                    ProviderToolCall {
-                        tool_call_id: "deadline-read-first".to_owned(),
-                        tool_name: "external_deadline_first".to_owned(),
-                        arguments: json!({"path": "first.txt"}),
-                    },
-                    ProviderToolCall {
-                        tool_call_id: "deadline-read-second".to_owned(),
-                        tool_name: "external_deadline_second".to_owned(),
-                        arguments: json!({"path": "second.txt"}),
-                    },
-                ],
-                ProviderFinishReason::ToolCalls,
-            )
-        } else {
-            (
-                Some(ProviderMessage {
-                    role: ProviderRole::Assistant,
-                    content: "deadline batch complete".to_owned(),
-                    tool_call_id: None,
-                    tool_name: None,
-                    tool_calls: Vec::new(),
-                    metadata: Default::default(),
-                }),
-                Vec::new(),
-                ProviderFinishReason::Stop,
-            )
-        };
-        Ok(ProviderResponse {
-            response_id: golutra_core::ProviderResponseId::new(),
-            message,
-            tool_calls,
-            usage: ProviderUsage {
-                input_tokens: Some(10),
-                output_tokens: Some(5),
-                reasoning_tokens: None,
-                cached_input_tokens: None,
-                total_tokens: Some(15),
-                usage_source: UsageSource::Estimated,
-                raw: json!({"round": call}),
-            },
-            finish_reason,
-            raw_metadata: json!({"round": call}),
-        })
-    }
-
-    fn contract(&self) -> golutra_core::ProviderContract {
-        self.contract.clone()
-    }
-}
-
-#[cfg(unix)]
-#[derive(Debug)]
-struct ParallelDeadlineBackend {
-    contracts: Vec<golutra_core::ToolContract>,
-}
-
-#[cfg(unix)]
-#[async_trait]
-impl ExternalToolBackend for ParallelDeadlineBackend {
-    fn contracts(&self) -> Vec<golutra_core::ToolContract> {
-        self.contracts.clone()
-    }
-
-    fn capabilities(&self) -> HashMap<String, ToolCapabilities> {
-        self.contracts
-            .iter()
-            .map(|contract| {
-                (
-                    contract.tool_name.clone(),
-                    ToolCapabilities {
-                        available_in_coding_profile: true,
-                        parallel_read_safe: true,
-                        coding_profile_hidden_arguments: Vec::new(),
-                    },
-                )
-            })
-            .collect()
-    }
-
-    async fn call(
-        &self,
-        _request: &golutra_tools::ToolRequest,
-        _cancellation: CancellationToken,
-    ) -> Result<ExternalToolOutput, golutra_tools::ToolError> {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        Ok(ExternalToolOutput {
-            summary: "late external response".to_owned(),
-            content: "late".to_owned(),
-            structured_facts: json!({}),
-            is_error: false,
-        })
-    }
-}
-
 #[async_trait]
 impl LlmProvider for ToolProfileBoundaryProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
@@ -813,7 +653,7 @@ impl LlmProvider for ToolProfileBoundaryProvider {
                 request
                     .tools
                     .iter()
-                    .any(|tool| tool.tool_name == "process_list"),
+                    .any(|tool| tool.tool_name == "shell_session"),
             );
         Ok(ProviderResponse {
             response_id: golutra_core::ProviderResponseId::new(),
@@ -877,7 +717,7 @@ impl LlmProvider for SteeringBoundaryProvider {
                 request
                     .tools
                     .iter()
-                    .any(|tool| tool.tool_name == "process_list"),
+                    .any(|tool| tool.tool_name == "shell_session"),
                 Ordering::SeqCst,
             );
             (
@@ -3013,7 +2853,7 @@ async fn delegation_requires_a_checkpoint_even_when_the_workspace_is_empty() {
         }))
         .expect("delegation backend");
     let provider = MockProvider::tool_call(
-        "delegate_task",
+        "subagent",
         json!({"task": "return a concise independent result"}),
     );
     let harness = AgentHarness::new(provider, ContextBuilder::default(), executor)
@@ -3032,7 +2872,7 @@ async fn delegation_requires_a_checkpoint_even_when_the_workspace_is_empty() {
                 output_schema: None,
                 touched_code: false,
                 contributors: Vec::new(),
-                tools: vec!["delegate_task".to_owned()],
+                tools: vec!["subagent".to_owned()],
             })
             .with_tool_profile(AgentToolProfile::Full),
             control,
@@ -3045,7 +2885,7 @@ async fn delegation_requires_a_checkpoint_even_when_the_workspace_is_empty() {
     let report = outcome
         .tool_reports
         .iter()
-        .find(|report| report.envelope.tool_name == "delegate_task")
+        .find(|report| report.envelope.tool_name == "subagent")
         .expect("delegation report");
     assert_eq!(report.envelope.status, ToolResultStatus::Error);
     assert!(report.artifact_contents.iter().any(|content| {
@@ -3054,7 +2894,7 @@ async fn delegation_requires_a_checkpoint_even_when_the_workspace_is_empty() {
     assert!(trace.iter().any(|event| matches!(
         event,
         AgentLoopTraceEvent::ToolCompleted(report)
-            if report.envelope.tool_name == "delegate_task"
+            if report.envelope.tool_name == "subagent"
     )));
 }
 
@@ -4713,7 +4553,7 @@ fn parallel_read_candidate_uses_registry_capabilities_and_read_contracts() {
         .expect("external capability fixtures register");
     let registry = executor.registry();
 
-    assert!(provider_batch_is_parallel_read_candidate(
+    assert!(!provider_batch_is_parallel_read_candidate(
         &[
             read("read", "read_file"),
             read("external", "external_workspace_inspect"),
@@ -4837,7 +4677,7 @@ fn parallel_read_candidate_enforces_the_active_tool_profile() {
         AgentToolProfile::Coding,
         executor.registry(),
     ));
-    assert!(provider_batch_is_parallel_read_candidate(
+    assert!(!provider_batch_is_parallel_read_candidate(
         &[
             call("builtin", "read_file", json!({"path": "README.md"})),
             call("full", "external_full_only_read", json!({})),
@@ -4859,16 +4699,12 @@ fn parallel_read_candidate_enforces_the_active_tool_profile() {
         AgentToolProfile::Coding,
         executor.registry(),
     );
-    let hidden = coding_tools
-        .iter()
-        .find(|tool| tool.tool_name == "external_hidden_read")
-        .expect("coding-visible external tool");
     assert!(
-        hidden.input_schema["properties"]
-            .get("owner_control")
-            .is_none()
+        !coding_tools
+            .iter()
+            .any(|tool| tool.tool_name == "external_hidden_read")
     );
-    assert_eq!(hidden.input_schema["required"], json!([]));
+    assert_eq!(coding_tools.len(), 8);
 }
 
 #[test]
@@ -4906,15 +4742,16 @@ fn coding_profile_keeps_builtin_coding_capabilities_and_hides_undeclared_extensi
         executor.registry(),
     );
 
-    assert!(coding.iter().any(|tool| tool.tool_name == "process_list"));
-    assert!(full.iter().any(|tool| tool.tool_name == "process_list"));
+    assert!(!coding.iter().any(|tool| tool.tool_name == "process_list"));
+    assert!(!full.iter().any(|tool| tool.tool_name == "process_list"));
     assert!(
         !coding
             .iter()
             .any(|tool| tool.tool_name == "external_full_only")
     );
     assert!(
-        full.iter()
+        !full
+            .iter()
             .any(|tool| tool.tool_name == "external_full_only")
     );
     let coding_shell = coding
@@ -4945,7 +4782,10 @@ fn coding_profile_keeps_builtin_coding_capabilities_and_hides_undeclared_extensi
         arguments,
     };
     for request in [
-        request("process_list", json!({})),
+        request(
+            "shell_session",
+            json!({"action": "wait", "process_id": "p"}),
+        ),
         request(
             "shell",
             json!({"command": "cargo test", "background": true}),
@@ -4982,7 +4822,7 @@ fn coding_profile_keeps_builtin_coding_capabilities_and_hides_undeclared_extensi
             AgentToolProfile::Full,
             executor.registry(),
         ),
-        None
+        Some("tool is not part of the active Pi-plus provider surface")
     );
 }
 
@@ -4990,6 +4830,8 @@ fn coding_profile_keeps_builtin_coding_capabilities_and_hides_undeclared_extensi
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pure_read_batch_executes_concurrently_and_commits_results_in_source_order() {
     let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("first.txt"), "first\n").expect("first fixture");
+    fs::write(workspace.path().join("second.txt"), "second\n").expect("second fixture");
     let calls = Arc::new(AtomicUsize::new(0));
     let saw_source_order = Arc::new(AtomicBool::new(false));
     let provider = ParallelReadProvider {
@@ -4997,23 +4839,7 @@ async fn pure_read_batch_executes_concurrently_and_commits_results_in_source_ord
         saw_source_order: saw_source_order.clone(),
         contract: MockProvider::text_response("unused").contract(),
     };
-    let base_executor =
-        BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
-    let mut first_contract = base_executor
-        .registry()
-        .contract("read_file")
-        .expect("read contract")
-        .clone();
-    first_contract.tool_name = "external_parallel_first".to_owned();
-    let mut second_contract = first_contract.clone();
-    second_contract.tool_name = "external_parallel_second".to_owned();
-    let executor = base_executor
-        .with_external_backend(Arc::new(ParallelReadBackend {
-            contracts: vec![first_contract, second_contract],
-            barrier: Arc::new(tokio::sync::Barrier::new(2)),
-        }))
-        .expect("parallel read backend registers")
-        .with_unrestricted_access(true);
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
     let agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor);
     let mut trace = Vec::new();
 
@@ -5029,10 +4855,7 @@ async fn pure_read_batch_executes_concurrently_and_commits_results_in_source_ord
                 output_schema: None,
                 touched_code: false,
                 contributors: Vec::new(),
-                tools: vec![
-                    "external_parallel_first".to_owned(),
-                    "external_parallel_second".to_owned(),
-                ],
+                tools: vec!["read_file".to_owned()],
             },
             |event| trace.push(event),
         ),
@@ -5066,83 +4889,6 @@ async fn pure_read_batch_executes_concurrently_and_commits_results_in_source_ord
             .collect::<Vec<_>>(),
         [Some("first\n"), Some("second\n")]
     );
-}
-
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn parallel_read_batch_returns_timeout_reports_at_the_runtime_deadline() {
-    let workspace = tempdir().expect("workspace");
-    fs::write(workspace.path().join("first.pipe"), "first\n").expect("first fixture");
-    fs::write(workspace.path().join("second.pipe"), "second\n").expect("second fixture");
-
-    let calls = Arc::new(AtomicUsize::new(0));
-    let provider = ParallelDeadlineProvider {
-        calls: calls.clone(),
-        contract: MockProvider::text_response("unused").contract(),
-    };
-    let base_executor =
-        BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
-    let mut first_contract = base_executor
-        .registry()
-        .contract("read_file")
-        .expect("read contract")
-        .clone();
-    first_contract.tool_name = "external_deadline_first".to_owned();
-    let mut second_contract = first_contract.clone();
-    second_contract.tool_name = "external_deadline_second".to_owned();
-    let executor = base_executor
-        .with_external_backend(Arc::new(ParallelDeadlineBackend {
-            contracts: vec![first_contract, second_contract],
-        }))
-        .expect("deadline backend registers")
-        .with_unrestricted_access(true);
-    let agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor).with_governor(
-        RuntimeGovernor::new(GovernorLimits {
-            max_elapsed_ms: 250,
-            ..GovernorLimits::default()
-        }),
-    );
-    let mut trace = Vec::new();
-
-    let outcome = tokio::time::timeout(
-        Duration::from_secs(2),
-        agent_loop.run_with_trace(
-            AgentTaskRequest {
-                session_id: SessionId::new(),
-                task_id: TaskId::new(),
-                turn_id: TurnId::new(),
-                objective: "inspect both streams within the deadline".to_owned(),
-                completion_criteria: Vec::new(),
-                output_schema: None,
-                touched_code: false,
-                contributors: Vec::new(),
-                tools: vec![
-                    "external_deadline_first".to_owned(),
-                    "external_deadline_second".to_owned(),
-                ],
-            },
-            |event| trace.push(event),
-        ),
-    )
-    .await
-    .expect("parallel batch must settle at the runtime deadline")
-    .expect("runtime returns an outcome");
-
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        1,
-        "deadline stops before a second provider round"
-    );
-    assert_eq!(outcome.tool_reports.len(), 2);
-    assert!(outcome.tool_reports.iter().all(|report| {
-        report.envelope.status == ToolResultStatus::Timeout
-            && report.envelope.structured_facts["deadline_stage"] == "execution"
-    }));
-    let completed = trace
-        .iter()
-        .filter(|event| matches!(event, AgentLoopTraceEvent::ToolCompleted(_)))
-        .count();
-    assert_eq!(completed, 2);
 }
 
 #[tokio::test]
@@ -5192,7 +4938,7 @@ async fn steering_turn_is_injected_after_the_complete_tool_batch() {
                 output_schema: None,
                 touched_code: false,
                 contributors: Vec::new(),
-                tools: vec!["read_file".to_owned(), "process_list".to_owned()],
+                tools: vec!["read_file".to_owned(), "shell_session".to_owned()],
             },
             TaskContract {
                 required_paths: vec!["README.md".to_owned()],
@@ -5287,7 +5033,7 @@ async fn queued_turn_applies_its_own_tool_profile() {
                 output_schema: None,
                 touched_code: false,
                 contributors: Vec::new(),
-                tools: vec!["read_file".to_owned(), "process_list".to_owned()],
+                tools: vec!["read_file".to_owned(), "shell_session".to_owned()],
             })
             .with_tool_profile(AgentToolProfile::Coding),
             control,
@@ -5314,7 +5060,7 @@ async fn queued_turn_applies_its_own_tool_profile() {
 }
 
 #[tokio::test]
-async fn legacy_append_turn_keeps_legacy_full_execution_surface() {
+async fn appended_turn_uses_the_default_coding_surface() {
     let workspace = tempdir().expect("workspace");
     let calls = Arc::new(AtomicUsize::new(0));
     let process_tool_visibility = Arc::new(Mutex::new(Vec::new()));
@@ -5331,7 +5077,7 @@ async fn legacy_append_turn_keeps_legacy_full_execution_surface() {
         .append_turn(PendingAgentTurn {
             command_id: CommandId::new(),
             turn_id: queued_turn_id,
-            content: "continue with the legacy tool surface".to_owned(),
+            content: "continue with the default tool surface".to_owned(),
             task_contract: Some(TaskContract::conversational(Vec::new())),
             output_schema: None,
             external_verifiers: Vec::new(),
@@ -5357,7 +5103,7 @@ async fn legacy_append_turn_keeps_legacy_full_execution_surface() {
                 output_schema: None,
                 touched_code: false,
                 contributors: Vec::new(),
-                tools: vec!["read_file".to_owned(), "process_list".to_owned()],
+                tools: vec!["read_file".to_owned(), "shell_session".to_owned()],
             })
             .with_execution_surface(AgentExecutionMode::Open, AgentToolProfile::Coding),
             control,
@@ -5382,13 +5128,13 @@ async fn legacy_append_turn_keeps_legacy_full_execution_surface() {
         handle.active_execution_surface(),
         super::ActiveExecutionSurface {
             execution_mode: None,
-            tool_profile: AgentToolProfile::Full,
+            tool_profile: AgentToolProfile::Coding,
         }
     );
 }
 
 #[tokio::test]
-async fn configured_pending_turn_without_a_mode_restores_the_legacy_surface() {
+async fn configured_pending_turn_without_a_mode_uses_the_default_surface() {
     let workspace = tempdir().expect("workspace");
     let calls = Arc::new(AtomicUsize::new(0));
     let process_tool_visibility = Arc::new(Mutex::new(Vec::new()));
@@ -5405,7 +5151,7 @@ async fn configured_pending_turn_without_a_mode_restores_the_legacy_surface() {
         .append_configured_turn(ConfiguredPendingAgentTurn::new(PendingAgentTurn {
             command_id: CommandId::new(),
             turn_id: queued_turn_id,
-            content: "start a compatibility turn".to_owned(),
+            content: "start a default-surface turn".to_owned(),
             task_contract: Some(TaskContract::conversational(Vec::new())),
             output_schema: None,
             external_verifiers: Vec::new(),
@@ -5425,19 +5171,19 @@ async fn configured_pending_turn_without_a_mode_restores_the_legacy_surface() {
                 session_id: SessionId::new(),
                 task_id: TaskId::new(),
                 turn_id: TurnId::new(),
-                objective: "inspect with the full profile".to_owned(),
+                objective: "inspect with the default profile".to_owned(),
                 completion_criteria: Vec::new(),
                 output_schema: None,
                 touched_code: false,
                 contributors: Vec::new(),
-                tools: vec!["read_file".to_owned(), "process_list".to_owned()],
+                tools: vec!["read_file".to_owned(), "shell_session".to_owned()],
             })
             .with_execution_surface(AgentExecutionMode::Open, AgentToolProfile::Full),
             control,
             |_| {},
         )
         .await
-        .expect("compatibility follow-up completes");
+        .expect("default-surface follow-up completes");
 
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(
@@ -5451,7 +5197,7 @@ async fn configured_pending_turn_without_a_mode_restores_the_legacy_surface() {
         handle.active_execution_surface(),
         super::ActiveExecutionSurface {
             execution_mode: None,
-            tool_profile: AgentToolProfile::Full,
+            tool_profile: AgentToolProfile::Coding,
         }
     );
 }
@@ -5505,7 +5251,7 @@ async fn configured_pending_turn_explicit_surface_overrides_the_active_surface()
                 output_schema: None,
                 touched_code: false,
                 contributors: Vec::new(),
-                tools: vec!["read_file".to_owned(), "process_list".to_owned()],
+                tools: vec!["read_file".to_owned(), "shell_session".to_owned()],
             })
             .with_execution_surface(AgentExecutionMode::Open, AgentToolProfile::Full),
             control,

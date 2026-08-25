@@ -38,7 +38,7 @@ use golutra_protocol::{AgentExecutionMode, AgentToolProfile, ExternalVerificatio
 use golutra_tools::{
     CONTRACT_FILE_CONTENT_VERIFIER_TOOL, CONTRACT_PATH_VERIFIER_TOOL, FileBeforeImage, ToolError,
     ToolExecutionReport, ToolInvocation, ToolRegistry, ToolRequest, ToolRuntime,
-    VerifierExecutionRequest, model_visible_tool_result, redact_tool_arguments,
+    VerifierExecutionRequest, is_pi_plus_tool, model_visible_tool_result, redact_tool_arguments,
 };
 use golutra_verify::VerificationInput;
 use serde_json::{Value, json};
@@ -155,7 +155,7 @@ impl Default for ActiveExecutionSurface {
     fn default() -> Self {
         Self {
             execution_mode: None,
-            tool_profile: AgentToolProfile::Full,
+            tool_profile: AgentToolProfile::Coding,
         }
     }
 }
@@ -215,21 +215,17 @@ pub struct PendingAgentTurn {
     pub steer: bool,
 }
 
-/// Optional execution-surface override carried alongside a queued turn.
+/// 随 queued turn 传递的可选 execution surface 覆盖项。
 ///
-/// This is intentionally separate from [`PendingAgentTurn`]. The latter is a
-/// long-lived public struct that downstream Rust callers may construct with a
-/// struct literal, so adding fields to it would be a source-incompatible API
-/// change.
+/// 该结构与 [`PendingAgentTurn`] 分离，因为后者是下游 Rust 调用方可能用
+/// struct literal 构造的长期公共结构，直接增加字段会造成源码不兼容。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PendingTurnExecutionOptions {
-    /// An ordinary queued turn may select an explicit mode. `None` preserves
-    /// the pre-mode wire contract and therefore starts a legacy turn; only a
-    /// steering turn inherits the active mode.
+    /// 普通 queued turn 可选择显式模式；`None` 保留 pre-mode wire 契约并启动
+    /// legacy turn，只有 steering turn 会继承当前模式。
     pub execution_mode: Option<AgentExecutionMode>,
-    /// `None` selects the legacy full profile when execution_mode is absent,
-    /// otherwise it inherits the active profile. `Some` selects a profile for
-    /// the queued turn.
+    /// execution_mode 缺省时，`None` 选择默认 coding profile；否则继承当前
+    /// profile。`Some` 为 queued turn 显式选择 profile。
     pub tool_profile: Option<AgentToolProfile>,
 }
 
@@ -1036,7 +1032,7 @@ where
         let mut current_execution_mode = turn_overrides.execution_mode;
         let mut current_tool_profile = turn_overrides
             .tool_profile
-            .unwrap_or(AgentToolProfile::Full);
+            .unwrap_or(AgentToolProfile::Coding);
         control.set_active_execution_surface(current_execution_mode, current_tool_profile);
         let mut current_governor =
             governor_with_max_elapsed_ms(&self.governor, current_max_elapsed_ms);
@@ -1162,7 +1158,7 @@ where
                             current_execution_mode = None;
                             current_tool_profile = pending_execution
                                 .tool_profile
-                                .unwrap_or(AgentToolProfile::Full);
+                                .unwrap_or(AgentToolProfile::Coding);
                         } else {
                             current_execution_mode = pending_execution.execution_mode;
                             if let Some(tool_profile) = pending_execution.tool_profile {
@@ -2120,7 +2116,7 @@ where
                                             let checkpoint = if may_execute
                                                 && (matches!(
                                                     tool_request.tool_name.as_str(),
-                                                    "shell" | "delegate_task"
+                                                    "shell" | "subagent"
                                                 ) || !preparation.before_images.is_empty())
                                                 && let Some(recorder) =
                                                     &self.before_side_effect_recorder
@@ -3642,7 +3638,8 @@ fn provider_tools_for_turn(
     let mut tools = tools
         .iter()
         .filter(|tool| {
-            tool_allowed_for_profile(&tool.tool_name, profile, registry)
+            is_pi_plus_tool(&tool.tool_name)
+                && tool_allowed_for_profile(&tool.tool_name, profile, registry)
                 && (!matches!(
                     contract.workspace_change,
                     WorkspaceChangeRequirement::Forbidden
@@ -3700,6 +3697,9 @@ fn tool_profile_rejection_reason(
     profile: AgentToolProfile,
     registry: &ToolRegistry,
 ) -> Option<&'static str> {
+    if !is_pi_plus_tool(&request.tool_name) {
+        return Some("tool is not part of the active Pi-plus provider surface");
+    }
     if !tool_allowed_for_profile(&request.tool_name, profile, registry) {
         return Some(
             "tool is not available in the active coding profile; select the full tool profile explicitly",
@@ -3733,7 +3733,8 @@ fn provider_batch_is_parallel_read_candidate(
         && tool_calls.len() > 1
         && u32::try_from(tool_calls.len()).is_ok_and(|count| count <= remaining_failure_budget)
         && tool_calls.iter().all(|tool_call| {
-            tool_allowed_for_profile(&tool_call.tool_name, profile, registry)
+            is_pi_plus_tool(&tool_call.tool_name)
+                && tool_allowed_for_profile(&tool_call.tool_name, profile, registry)
                 && registry
                     .capabilities(&tool_call.tool_name)
                     .is_some_and(|capabilities| {

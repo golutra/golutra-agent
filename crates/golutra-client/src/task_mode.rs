@@ -1,8 +1,6 @@
 //! Turn execution mode and model-visible tool profile normalization.
 //!
-//! The wire-facing clients opt into the open path explicitly. A compact coding
-//! tool surface is the default; full is reserved for callers that need the
-//! low-frequency process, search, or extension tools.
+//! wire-facing 客户端显式进入 open 路径；紧凑 coding 工具面是默认值，full 仅由宿主显式选择。
 
 use golutra_core::{TaskContract, VerificationRequirement};
 use golutra_protocol::{AgentExecutionMode, AgentToolProfile};
@@ -72,9 +70,8 @@ pub(crate) fn execution_mode_from_payload(
 
 pub(crate) fn tool_profile_from_payload(payload: &Value) -> Result<AgentToolProfile, &'static str> {
     let default_profile = match execution_mode_from_payload(payload)? {
-        // Omitted execution_mode is the pre-profile wire shape. Preserve its
-        // complete model-facing surface for persisted and direct Rust callers.
-        NormalizedExecutionMode::Legacy => AgentToolProfile::Full,
+        // 未提供 execution_mode 时同样使用紧凑 provider 工具面。
+        NormalizedExecutionMode::Legacy => AgentToolProfile::Coding,
         NormalizedExecutionMode::Open | NormalizedExecutionMode::Strict => AgentToolProfile::Coding,
     };
     let Some(value) = payload.get(TOOL_PROFILE_KEY) else {
@@ -181,7 +178,7 @@ mod tests {
         );
         assert_eq!(
             tool_profile_from_payload(&legacy).expect("legacy profile default"),
-            AgentToolProfile::Full
+            AgentToolProfile::Coding
         );
         assert!(strict_execution_requested(
             &legacy,
@@ -245,7 +242,7 @@ mod tests {
         assert!(tool_profile_from_payload(&json!({"tool_profile": "everything"})).is_err());
         assert_eq!(
             tool_profile_from_payload(&json!({"tool_profile": null})).expect("null means inherit"),
-            AgentToolProfile::Full
+            AgentToolProfile::Coding
         );
         assert_eq!(
             tool_profile_from_payload(&json!({

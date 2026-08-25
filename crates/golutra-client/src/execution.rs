@@ -830,11 +830,11 @@ impl RuntimeHost {
             ))
             .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
         if delegated_task {
-            tool_executor = tool_executor.without_tool("ask_user");
+            tool_executor = tool_executor.without_tool("subagent");
         }
         let workspace_tool_names = tool_executor
             .registry()
-            .contracts()
+            .provider_contracts()
             .into_iter()
             .map(|contract| contract.tool_name.clone())
             .collect::<Vec<_>>();

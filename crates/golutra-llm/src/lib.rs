@@ -1612,6 +1612,15 @@ pub fn provider_tool_description(tool_name: &str) -> &'static str {
         "apply_patch" => {
             "Atomically apply a unified diff to one or more workspace-relative files. Use this for focused multi-file or multi-hunk edits."
         }
+        "web_search" => {
+            "Search the web when network access is explicitly enabled. Return concise source-backed results rather than raw pages."
+        }
+        "shell_session" => {
+            "Wait for, write to, or terminate a runtime-owned background shell process. Use the returned cursor to request only new output."
+        }
+        "subagent" => {
+            "Run one isolated, self-contained child task and return a bounded summary, facts, and artifact references. Child tasks cannot create another subagent."
+        }
         "list_dir" => "List entries in a workspace-relative directory.",
         "rg_search" => "Search workspace files with ripgrep.",
         "symbol_search" => "Search the workspace code graph for matching symbol definitions.",

@@ -70,6 +70,7 @@ mod process;
 mod process_supervisor;
 mod project_verifier;
 mod text_search;
+mod web_search;
 mod workspace_scan;
 
 pub(crate) use process::{
@@ -83,8 +84,26 @@ pub(crate) use process_supervisor::{
     default_start_wait_ms, max_poll_wait_ms,
 };
 pub use project_verifier::{DiscoveredProjectVerifier, discover_project_verifiers};
+pub use web_search::HttpWebSearchBackend;
 
 use builtin::BuiltinTool;
+
+/// 面向 provider 的稳定契约，保持默认模型工具面足够小。
+pub const PI_PLUS_TOOL_NAMES: [&str; 8] = [
+    "read_file",
+    "write_file",
+    "edit_file",
+    "shell",
+    "web_search",
+    "shell_session",
+    "subagent",
+    "apply_patch",
+];
+
+#[must_use]
+pub fn is_pi_plus_tool(tool_name: &str) -> bool {
+    PI_PLUS_TOOL_NAMES.contains(&tool_name)
+}
 
 #[derive(Debug, Error)]
 pub enum ToolError {
@@ -220,6 +239,16 @@ pub trait TaskDelegationBackend: std::fmt::Debug + Send + Sync {
     ) -> Result<TaskDelegationOutput, ToolError>;
 }
 
+/// 由宿主拥有的搜索适配器；替换具体 provider 时不改变 agent loop 的工具契约。
+#[async_trait]
+pub trait WebSearchBackend: std::fmt::Debug + Send + Sync {
+    async fn search(
+        &self,
+        request: &ToolRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ExternalToolOutput, ToolError>;
+}
+
 #[async_trait]
 pub trait ExternalToolBackend: std::fmt::Debug + Send + Sync {
     fn contracts(&self) -> Vec<ToolContract>;
@@ -269,7 +298,10 @@ impl ToolRegistry {
     pub fn p0_default() -> Self {
         let mut contracts = HashMap::new();
         let mut capabilities = HashMap::new();
-        for tool in BuiltinTool::P0_DEFAULT {
+        for tool in BuiltinTool::P0_DEFAULT
+            .into_iter()
+            .chain(BuiltinTool::INTERNAL)
+        {
             let contract = tool.contract();
             capabilities.insert(contract.tool_name.clone(), tool.capabilities());
             contracts.insert(contract.tool_name.clone(), contract);
@@ -283,6 +315,18 @@ impl ToolRegistry {
     #[must_use]
     pub fn contracts(&self) -> Vec<&ToolContract> {
         let mut contracts = self.contracts.values().collect::<Vec<_>>();
+        contracts.sort_by(|left, right| left.tool_name.cmp(&right.tool_name));
+        contracts
+    }
+
+    /// 返回允许进入 provider 请求的稳定工具契约。
+    #[must_use]
+    pub fn provider_contracts(&self) -> Vec<&ToolContract> {
+        let mut contracts = self
+            .contracts
+            .values()
+            .filter(|contract| is_pi_plus_tool(&contract.tool_name))
+            .collect::<Vec<_>>();
         contracts.sort_by(|left, right| left.tool_name.cmp(&right.tool_name));
         contracts
     }
@@ -364,6 +408,7 @@ pub struct ToolRuntime {
     sandbox: SystemSandbox,
     allow_network: bool,
     external_backend: Option<Arc<dyn ExternalToolBackend>>,
+    web_search_backend: Option<Arc<dyn WebSearchBackend>>,
     delegation_backend: Option<Arc<dyn TaskDelegationBackend>>,
     replay_backend: Option<Arc<dyn ToolReplayBackend>>,
     process_supervisor: ProcessSupervisor,
@@ -378,6 +423,7 @@ impl ToolRuntime {
             sandbox: SystemSandbox::detect(),
             allow_network: false,
             external_backend: None,
+            web_search_backend: None,
             delegation_backend: None,
             replay_backend: None,
             process_supervisor: ProcessSupervisor::new(),
@@ -602,6 +648,11 @@ impl ToolRuntime {
         self
     }
 
+    pub fn with_web_search_backend(mut self, backend: Arc<dyn WebSearchBackend>) -> Self {
+        self.web_search_backend = Some(backend);
+        self
+    }
+
     pub fn with_external_backend(
         mut self,
         backend: Arc<dyn ExternalToolBackend>,
@@ -633,7 +684,7 @@ impl ToolRuntime {
                 (
                     contract.tool_name.clone(),
                     ToolCapabilities {
-                        available_in_coding_profile: true,
+                        available_in_coding_profile: is_pi_plus_tool(&contract.tool_name),
                         parallel_read_safe: false,
                         coding_profile_hidden_arguments: Vec::new(),
                     },
@@ -648,11 +699,15 @@ impl ToolRuntime {
         mut self,
         backend: Arc<dyn TaskDelegationBackend>,
     ) -> Result<Self, ToolError> {
-        let tool = BuiltinTool::DelegateTask;
-        self.registry.register_external(
-            [tool.contract()],
-            HashMap::from([(tool.name().to_owned(), tool.capabilities())]),
-        )?;
+        let tool = BuiltinTool::Subagent;
+        if self.registry.contract(tool.name()).is_none() {
+            self.registry
+                .contracts
+                .insert(tool.name().to_owned(), tool.contract());
+            self.registry
+                .capabilities
+                .insert(tool.name().to_owned(), tool.capabilities());
+        }
         self.delegation_backend = Some(backend);
         Ok(self)
     }
@@ -663,7 +718,10 @@ impl ToolRuntime {
     pub fn without_tool(mut self, tool_name: &str) -> Self {
         self.registry.contracts.remove(tool_name);
         self.registry.capabilities.remove(tool_name);
-        if BuiltinTool::from_name(tool_name) == Some(BuiltinTool::DelegateTask) {
+        if matches!(
+            BuiltinTool::from_name(tool_name),
+            Some(BuiltinTool::Subagent | BuiltinTool::DelegateTask)
+        ) {
             self.delegation_backend = None;
         }
         self
@@ -1005,6 +1063,8 @@ impl ToolRuntime {
                     .filter(|workdir_policy| workdir_policy.decision != PolicyDecision::Allow)
                     .unwrap_or(shell_policy)
             }
+            Some(BuiltinTool::WebSearch) => web_search_policy(self.allow_network, request),
+            Some(BuiltinTool::ShellSession) => process_control_policy(request),
             Some(BuiltinTool::ProcessList) => process_list_policy(request),
             Some(
                 BuiltinTool::ProcessPoll
@@ -1012,7 +1072,9 @@ impl ToolRuntime {
                 | BuiltinTool::ProcessTerminate
                 | BuiltinTool::ProcessReconnect,
             ) => process_control_policy(request),
-            Some(BuiltinTool::DelegateTask) if self.delegation_backend.is_some() => {
+            Some(BuiltinTool::Subagent | BuiltinTool::DelegateTask)
+                if self.delegation_backend.is_some() =>
+            {
                 delegation_policy(request)
             }
             None if self.external_backend.is_some() => {
@@ -1024,7 +1086,8 @@ impl ToolRuntime {
                 policy.resource = format!("external-tool:{}", request.tool_name);
                 policy
             }
-            Some(BuiltinTool::AskUser | BuiltinTool::DelegateTask) | None => {
+            Some(BuiltinTool::AskUser | BuiltinTool::Subagent | BuiltinTool::DelegateTask)
+            | None => {
                 return Err(ToolError::UnknownTool(request.tool_name.clone()));
             }
         };
@@ -1118,7 +1181,7 @@ impl ToolRuntime {
                     workspace_snapshot: Some(snapshot),
                 })
             }
-            Some(BuiltinTool::DelegateTask) => {
+            Some(BuiltinTool::Subagent | BuiltinTool::DelegateTask) => {
                 let snapshot = workspace_scan::capture(self.policy.workspace_root()).await;
                 Ok(SideEffectPreparation {
                     before_images: snapshot.before_images(),
@@ -1353,7 +1416,12 @@ impl ToolRuntime {
                         )
                         .await
                     }
-                    Some(BuiltinTool::DelegateTask) => {
+                    Some(BuiltinTool::WebSearch) => {
+                        self.web_search(request, policy, execution_cancellation.clone())
+                            .await
+                    }
+                    Some(BuiltinTool::ShellSession) => self.shell_session(request, policy).await,
+                    Some(BuiltinTool::Subagent | BuiltinTool::DelegateTask) => {
                         self.delegate_task(
                             request,
                             policy,
@@ -1525,7 +1593,9 @@ impl ToolRuntime {
             policy,
         );
         match BuiltinTool::from_name(&result.envelope.tool_name) {
-            Some(BuiltinTool::DelegateTask) => result.envelope.risk = "delegated_agent".to_owned(),
+            Some(BuiltinTool::Subagent | BuiltinTool::DelegateTask) => {
+                result.envelope.risk = "delegated_agent".to_owned()
+            }
             None => result.envelope.risk = "external_mcp_tool".to_owned(),
             _ => {}
         }
@@ -2355,7 +2425,7 @@ impl ToolRuntime {
         let backend = self
             .delegation_backend
             .as_ref()
-            .ok_or_else(|| ToolError::UnknownTool("delegate_task".to_owned()))?;
+            .ok_or_else(|| ToolError::UnknownTool("subagent".to_owned()))?;
         let output = backend
             .delegate(&request, cancellation.child_token())
             .await?;
@@ -2497,6 +2567,82 @@ impl ToolRuntime {
             .terminate(request.session_id, &process_id, cursor)
             .await?;
         Ok(supervised_process_report(request, policy, snapshot))
+    }
+
+    async fn shell_session(
+        &self,
+        request: ToolRequest,
+        policy: PolicyEvaluation,
+    ) -> Result<ToolExecutionReport, ToolError> {
+        let action = string_arg(&request.arguments, "action")?;
+        let process_id = string_arg(&request.arguments, "process_id")?;
+        let cursor = process_cursor(&request.arguments);
+        let snapshot = match action.as_str() {
+            "wait" => {
+                let wait_ms = process_wait_ms(&request.arguments, default_poll_wait_ms());
+                self.process_supervisor
+                    .poll(request.session_id, &process_id, cursor, wait_ms)
+                    .await?
+            }
+            "write" => {
+                let input = string_arg(&request.arguments, "input")?;
+                let wait_ms = process_wait_ms(&request.arguments, 250);
+                self.process_supervisor
+                    .write(request.session_id, &process_id, &input, cursor, wait_ms)
+                    .await?
+            }
+            "terminate" => {
+                self.process_supervisor
+                    .terminate(request.session_id, &process_id, cursor)
+                    .await?
+            }
+            _ => {
+                return Err(ToolError::InvalidArguments(
+                    "shell_session action must be wait, write, or terminate".to_owned(),
+                ));
+            }
+        };
+        Ok(supervised_process_report(request, policy, snapshot))
+    }
+
+    async fn web_search(
+        &self,
+        request: ToolRequest,
+        policy: PolicyEvaluation,
+        cancellation: CancellationToken,
+    ) -> Result<ToolExecutionReport, ToolError> {
+        let backend = self.web_search_backend.as_ref().ok_or_else(|| {
+            ToolError::Execution("web search backend is not configured".to_owned())
+        })?;
+        let result = tokio::select! {
+            () = cancellation.cancelled() => {
+                return Ok(cancelled_report_with_policy(
+                    request,
+                    policy,
+                    "web search cancelled",
+                ));
+            }
+            result = backend.search(&request, cancellation.clone()) => result,
+        }?;
+        let status = if result.is_error {
+            ToolResultStatus::Error
+        } else {
+            ToolResultStatus::Ok
+        };
+        let mut report = external_report(
+            request,
+            status,
+            &result.summary,
+            result.structured_facts,
+            result.content,
+            policy,
+        );
+        // 搜索结果已经在 structured_facts 中按字段保留，模型摘要不再重复回显原始 JSON。
+        report.envelope.model_visible_excerpt = Some(result.summary.clone());
+        report.envelope.risk = "web_search".to_owned();
+        report.envelope.verification_hint =
+            Some("web search output is external, time-sensitive evidence".to_owned());
+        Ok(report)
     }
 
     async fn execute_external(
@@ -3253,6 +3399,22 @@ fn process_control_policy(request: &ToolRequest) -> PolicyEvaluation {
     policy
 }
 
+fn web_search_policy(allow_network: bool, request: &ToolRequest) -> PolicyEvaluation {
+    let decision = if allow_network {
+        PolicyDecision::Allow
+    } else {
+        PolicyDecision::Block
+    };
+    let reason = if allow_network {
+        "web search is enabled by the enclosing runtime"
+    } else {
+        "web search requires explicit network access"
+    };
+    let mut policy = execution_policy(request, decision, reason);
+    policy.resource = "web-search".to_owned();
+    policy
+}
+
 fn delegation_policy(request: &ToolRequest) -> PolicyEvaluation {
     let mut policy = execution_policy(
         request,
@@ -3297,7 +3459,9 @@ fn supervised_process_report(
     snapshot: ProcessSnapshot,
 ) -> ToolExecutionReport {
     let state = process_state_name(snapshot.state);
-    let requested_termination = request.tool_name == "process_terminate";
+    let requested_termination = request.tool_name == "process_terminate"
+        || (request.tool_name == "shell_session"
+            && request.arguments.get("action").and_then(Value::as_str) == Some("terminate"));
     let status = match snapshot.state {
         ProcessState::Running | ProcessState::Exited => ToolResultStatus::Ok,
         ProcessState::Failed => ToolResultStatus::Error,
