@@ -119,16 +119,17 @@ pub(crate) fn merge_debug_projection(
     previous
 }
 
-pub(crate) fn replace_debug_event_history(
+pub(crate) fn replace_debug_event_history_with_window(
     projection: &mut DebugProjection,
     mut events: Vec<golutra_protocol::RuntimeEvent>,
+    has_more_before: bool,
 ) {
     events.sort_by_key(|event| event.sequence_no);
     events.dedup_by_key(|event| event.sequence_no);
     projection.events = events;
     projection.event_window.start_cursor = projection.events.first().map(|event| event.sequence_no);
     projection.event_window.end_cursor = projection.events.last().map(|event| event.sequence_no);
-    projection.event_window.has_more_before = false;
+    projection.event_window.has_more_before = has_more_before;
     refresh_debug_completeness(projection);
 }
 

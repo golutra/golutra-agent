@@ -21,14 +21,15 @@ impl PostTaskCoordinator {
         }
     }
 
-    pub(crate) fn start(host: &Arc<RuntimeHost>) {
+    pub(crate) fn start(host: &Arc<RuntimeHost>) -> tokio::task::JoinHandle<()> {
         let coordinator = Self {
             host: Arc::downgrade(host),
         };
         let worker_id = format!("{}:{}", host.instance_id, std::process::id());
+        let shutdown = host.execution.shutdown.clone();
         tokio::spawn(async move {
-            coordinator.run(worker_id).await;
-        });
+            coordinator.run(worker_id, shutdown).await;
+        })
     }
 
     pub async fn status(&self, task_id: TaskId) -> Result<Option<PostTaskJob>, ClientError> {
@@ -59,8 +60,11 @@ impl PostTaskCoordinator {
         Ok(job)
     }
 
-    async fn run(self, worker_id: String) {
+    async fn run(self, worker_id: String, shutdown: tokio_util::sync::CancellationToken) {
         loop {
+            if shutdown.is_cancelled() {
+                return;
+            }
             let Some(host) = self.host.upgrade() else {
                 return;
             };
@@ -73,7 +77,10 @@ impl PostTaskCoordinator {
                 .is_err()
             {
                 drop(host);
-                tokio::time::sleep(Duration::from_millis(POST_TASK_JOB_IDLE_POLL_MILLIS)).await;
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(Duration::from_millis(POST_TASK_JOB_IDLE_POLL_MILLIS)) => {}
+                }
                 continue;
             }
             let workspace_id = host.workspace_id.to_string();
@@ -92,7 +99,10 @@ impl PostTaskCoordinator {
                 Ok(Some(job)) => self.process(job, &worker_id).await,
                 Ok(None) | Err(_) => {
                     drop(host);
-                    tokio::time::sleep(Duration::from_millis(POST_TASK_JOB_IDLE_POLL_MILLIS)).await;
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return,
+                        _ = tokio::time::sleep(Duration::from_millis(POST_TASK_JOB_IDLE_POLL_MILLIS)) => {}
+                    }
                 }
             }
         }

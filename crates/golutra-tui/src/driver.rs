@@ -260,12 +260,12 @@ impl TuiDriver {
             metrics: DriverMetricsAccumulator::default(),
         };
         if let Err(error) = driver.controller_mode().await {
-            let _ = driver.controller.shutdown().await;
+            let _ = driver.shutdown().await;
             cleanup.close().await;
             return Err(error);
         }
         if let Err(error) = driver.refresh_active_layout() {
-            let _ = driver.controller.shutdown().await;
+            let _ = driver.shutdown().await;
             cleanup.close().await;
             return Err(error);
         }
@@ -292,6 +292,7 @@ impl TuiDriver {
     }
 
     pub(crate) async fn shutdown(&mut self) -> miette::Result<()> {
+        self.app.shutdown_pending_operations().await;
         self.controller.shutdown().await
     }
 
@@ -880,7 +881,11 @@ impl TuiDriver {
             )
             .await
             .map_err(|error| miette::miette!("debug_projection: {error}"))?;
-            replace_debug_event_history(&mut projection, self.app.events.clone());
+            replace_debug_event_history_with_window(
+                &mut projection,
+                self.app.events.clone(),
+                self.app.history_has_more_before,
+            );
             self.app.developer_projection = Some(projection);
             self.app.developer_error = None;
         }

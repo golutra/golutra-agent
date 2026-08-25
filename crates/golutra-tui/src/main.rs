@@ -1,5 +1,6 @@
 use std::{
     collections::HashSet,
+    future::pending,
     io::{self, Stdout},
     path::{Path, PathBuf},
     sync::{
@@ -57,13 +58,16 @@ use golutra_tui::{
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use secrecy::SecretString;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 static TUI_ACTOR_ID: LazyLock<String> =
     LazyLock::new(|| format!("golutra-tui-{}-{}", std::process::id(), Uuid::now_v7()));
 const TUI_HISTORY_PAGE_SIZE: u32 = 256;
+const TUI_EVENT_HISTORY_LIMIT: usize = 4_096;
+const TUI_EVENT_HISTORY_BYTE_LIMIT: usize = 512 * 1024;
+const TUI_EVENT_HISTORY_TRIM_BATCH: usize = 256;
 
 mod activity_view;
 mod activity_widget;
@@ -387,6 +391,112 @@ struct TuiApp {
     should_quit: bool,
     last_prompt_ack: Option<CommandAck>,
     last_control_ack: Option<CommandAck>,
+}
+
+/// 交互层只保留可回放的有限窗口；持久事件仍由 RuntimeStore 提供分页读取。
+/// 这样高频流式事件不会把 TUI 的生命周期绑定到整段会话历史。
+impl TuiApp {
+    fn retained_event_bytes(&self) -> usize {
+        self.events
+            .iter()
+            .map(ui_event_memory_bytes)
+            .fold(0_usize, usize::saturating_add)
+    }
+
+    fn trim_event_history(&mut self) -> bool {
+        // 字节预算只在固定批次检查，避免每个流式 delta 都线性扫描整个窗口。
+        if self.events.len() < TUI_EVENT_HISTORY_LIMIT
+            && !self
+                .events
+                .len()
+                .is_multiple_of(TUI_EVENT_HISTORY_TRIM_BATCH)
+        {
+            return false;
+        }
+        let total_bytes = self.retained_event_bytes();
+        if self.events.len() <= TUI_EVENT_HISTORY_LIMIT
+            && total_bytes <= TUI_EVENT_HISTORY_BYTE_LIMIT
+        {
+            return false;
+        }
+
+        let target_count = TUI_EVENT_HISTORY_LIMIT.saturating_sub(TUI_EVENT_HISTORY_TRIM_BATCH);
+        let target_bytes = TUI_EVENT_HISTORY_BYTE_LIMIT.saturating_mul(3) / 4;
+        let mut remove_count = 0_usize;
+        let mut remaining_bytes = total_bytes;
+        while remove_count + 1 < self.events.len()
+            && (self.events.len().saturating_sub(remove_count) > target_count
+                || remaining_bytes > target_bytes)
+        {
+            remaining_bytes =
+                remaining_bytes.saturating_sub(ui_event_memory_bytes(&self.events[remove_count]));
+            remove_count += 1;
+        }
+        if remove_count == 0 {
+            return false;
+        }
+        self.events.drain(..remove_count);
+        self.history_start_cursor = self.events.first().map(|event| event.sequence_no);
+        true
+    }
+
+    fn replace_event_history(&mut self, mut events: Vec<RuntimeEvent>, has_more_before: bool) {
+        events.sort_by_key(|event| event.sequence_no);
+        events.dedup_by_key(|event| event.sequence_no);
+        self.events = events;
+        let trimmed = self.trim_event_history();
+        self.history_has_more_before = has_more_before || trimmed;
+        self.history_start_cursor = self.events.first().map(|event| event.sequence_no);
+    }
+
+    fn append_event_to_history(&mut self, event: RuntimeEvent) {
+        self.events.push(event);
+        if self.trim_event_history() {
+            self.history_has_more_before = true;
+        }
+    }
+
+    pub(crate) async fn shutdown_pending_operations(&mut self) {
+        if let Some(operation) = self.auth_operation.take() {
+            operation.cancellation.cancel();
+            shutdown_join_handle(operation.task).await;
+        }
+        if let Some(operation) = self.export_operation.take() {
+            shutdown_join_handle(operation.task).await;
+        }
+    }
+}
+
+impl Drop for TuiApp {
+    fn drop(&mut self) {
+        // 正常退出由 shutdown_pending_operations 等待；Drop 只负责取消仍未交接的任务，
+        // 避免 panic 或构造失败路径把 OAuth/export JoinHandle 变成 detached task。
+        if let Some(operation) = self.auth_operation.as_ref() {
+            operation.cancellation.cancel();
+            operation.task.abort();
+        }
+        if let Some(operation) = self.export_operation.as_ref() {
+            operation.task.abort();
+        }
+    }
+}
+
+async fn shutdown_join_handle<T>(mut task: JoinHandle<T>) {
+    if tokio::time::timeout(Duration::from_millis(250), &mut task)
+        .await
+        .is_err()
+    {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+fn ui_event_memory_bytes(event: &RuntimeEvent) -> usize {
+    256_usize.saturating_add(
+        serde_json::to_vec(&event.payload)
+            .map(|payload| payload.len())
+            .unwrap_or_default(),
+    )
 }
 
 async fn load_runtime_refresh_snapshot(
@@ -771,7 +881,11 @@ impl TuiApp {
                         None => projection,
                     };
                     if !self.events.is_empty() {
-                        replace_debug_event_history(&mut projection, self.events.clone());
+                        replace_debug_event_history_with_window(
+                            &mut projection,
+                            self.events.clone(),
+                            self.history_has_more_before,
+                        );
                     }
                     self.developer_projection = Some(projection);
                     self.developer_error = None;
@@ -800,12 +914,10 @@ impl TuiApp {
     }
 
     fn apply_loaded_history(&mut self, history: LoadedEventHistory) {
-        self.events = history.events;
+        self.replace_event_history(history.events, history.has_more_before);
         self.invalidate_transcript_layout();
         self.rebuild_event_projections();
-        self.history_start_cursor = history.start_cursor;
         self.cursor = history.end_cursor;
-        self.history_has_more_before = false;
         self.history_load_requested = false;
         self.sync_transcript_row_count(0);
         self.clamp_transcript_scroll();
@@ -816,7 +928,11 @@ impl TuiApp {
         match result {
             Ok(mut projection) => {
                 if !self.events.is_empty() {
-                    replace_debug_event_history(&mut projection, self.events.clone());
+                    replace_debug_event_history_with_window(
+                        &mut projection,
+                        self.events.clone(),
+                        self.history_has_more_before,
+                    );
                 }
                 self.developer_projection = Some(projection);
                 self.developer_error = None;
@@ -850,7 +966,7 @@ impl TuiApp {
     }
 
     async fn load_recent_history(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
-        let history = load_complete_event_history(transport, self.session_id, self.task_id)
+        let history = load_recent_event_history(transport, self.session_id, self.task_id)
             .await
             .map_err(|error| miette::miette!("{error}"))?;
         self.apply_loaded_history(history);
@@ -861,7 +977,7 @@ impl TuiApp {
         &mut self,
         transport: &RuntimeTransport,
     ) -> miette::Result<()> {
-        let history = load_complete_event_history(transport, self.session_id, self.task_id)
+        let history = load_recent_event_history(transport, self.session_id, self.task_id)
             .await
             .map_err(|error| miette::miette!("{error}"))?;
         self.begin_history_replay();
@@ -891,12 +1007,21 @@ impl TuiApp {
             self.history_has_more_before = false;
             return Ok(());
         }
+        let previous_start_cursor = self.history_start_cursor;
         older.append(&mut self.events);
-        self.events = older;
+        self.replace_event_history(older, page.has_more);
+        let made_progress = previous_start_cursor.is_none_or(|previous| {
+            self.history_start_cursor
+                .is_some_and(|current| current < previous)
+        });
+        if !made_progress {
+            // 窗口预算可能淘汰了刚加载的页，或存储返回了重复页。停止继续请求，
+            // 否则每次触顶都会重复同一个游标并制造无效 I/O。
+            self.history_has_more_before = false;
+            self.status_message = "history replay window limit reached".to_owned();
+        }
         self.invalidate_transcript_layout();
         self.rebuild_event_projections();
-        self.history_start_cursor = page.start_cursor;
-        self.history_has_more_before = page.has_more;
         let current_rows = self.current_transcript_row_count();
         if let Some(top_row) = self.transcript.top_row_override {
             let prepended_rows = current_rows.saturating_sub(self.transcript.scroll.row_count);
@@ -1023,7 +1148,7 @@ impl TuiApp {
         }
         self.activity_projection.apply(&event);
         self.change_projection.apply(&event);
-        self.events.push(event);
+        self.append_event_to_history(event);
         if matches!(
             event_type,
             RuntimeEventType::TurnStarted | RuntimeEventType::TurnCancelled
@@ -3790,6 +3915,10 @@ async fn run_app(
     activity_status.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     activity_status.tick().await;
     let mut inline_history = InlineHistoryState::new(app.session_id);
+    let parent_watch = ParentDeathWatch::new();
+    let parent_watch_enabled = parent_watch.enabled();
+    let parent_watch_future = parent_watch.wait();
+    tokio::pin!(parent_watch_future);
 
     let result: miette::Result<()> = async {
         draw_interactive_frame(terminal, &mut app, &mut inline_history)?;
@@ -3841,6 +3970,10 @@ async fn run_app(
                 }
                 app.render_metrics.request_at(Instant::now());
             }
+            _ = &mut parent_watch_future, if parent_watch_enabled => {
+                app.status_message = "parent process exited; shutting down".to_owned();
+                app.should_quit = true;
+            }
             _ = maintenance.tick() => {
                 let changed = controller.sync_interactive(&mut app).await?;
                 if changed
@@ -3863,6 +3996,7 @@ async fn run_app(
         Ok(())
     }
     .await;
+    app.shutdown_pending_operations().await;
     let shutdown = controller.shutdown().await;
     result.and(shutdown)
 }
@@ -3883,6 +4017,57 @@ fn draw_interactive_frame(
 
 const INTERACTIVE_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(80);
 const ACTIVITY_STATUS_INTERVAL: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, Copy)]
+struct ParentDeathWatch {
+    initial_parent: Option<i32>,
+}
+
+impl ParentDeathWatch {
+    fn new() -> Self {
+        #[cfg(unix)]
+        {
+            let parent = nix::unistd::getppid().as_raw();
+            Self {
+                initial_parent: (parent > 1).then_some(parent),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {
+                initial_parent: None,
+            }
+        }
+    }
+
+    fn enabled(self) -> bool {
+        self.initial_parent.is_some()
+    }
+
+    async fn wait(self) {
+        let Some(initial_parent) = self.initial_parent else {
+            pending::<()>().await;
+            return;
+        };
+        loop {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            #[cfg(unix)]
+            {
+                let current_parent = nix::unistd::getppid().as_raw();
+                // 父进程变化（通常会被 reparent 到 PID 1）说明终端宿主已经
+                // 消失；普通 shell 嵌套不会在 TUI 启动后改变父 PID。
+                if current_parent != initial_parent {
+                    return;
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = initial_parent;
+                pending::<()>().await;
+            }
+        }
+    }
+}
 
 async fn handle_key(
     key: KeyEvent,

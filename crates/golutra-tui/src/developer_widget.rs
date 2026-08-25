@@ -157,7 +157,11 @@ pub(crate) fn developer_fact_history_lines(app: &TuiApp, width: u16) -> Vec<Line
     };
     let mut projection = projection.clone();
     if !app.events.is_empty() {
-        replace_debug_event_history(&mut projection, app.events.clone());
+        replace_debug_event_history_with_window(
+            &mut projection,
+            app.events.clone(),
+            app.history_has_more_before,
+        );
     }
     developer_panel_rows_with_changes(&projection, app.change_projection.summary(), 0)
         .into_iter()

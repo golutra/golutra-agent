@@ -13,6 +13,34 @@ pub(crate) struct LoadedEventHistory {
     pub(crate) events: Vec<RuntimeEvent>,
     pub(crate) start_cursor: Option<u64>,
     pub(crate) end_cursor: Option<u64>,
+    pub(crate) has_more_before: bool,
+}
+
+const COMPLETE_HISTORY_EVENT_LIMIT: usize = 32_768;
+const COMPLETE_HISTORY_BYTE_LIMIT: usize = 32 * 1024 * 1024;
+
+/// 首屏只读取最近一页；更早事件由 TUI 在用户向上滚动时按游标加载。
+pub(crate) async fn load_recent_event_history(
+    transport: &RuntimeTransport,
+    session_id: SessionId,
+    task_id: Option<TaskId>,
+) -> Result<LoadedEventHistory, String> {
+    let page = transport
+        .event_page(EventPageRequest {
+            session_id,
+            task_id,
+            cursor: None,
+            direction: EventPageDirection::Backward,
+            limit: TUI_HISTORY_PAGE_SIZE,
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(LoadedEventHistory {
+        start_cursor: page.start_cursor,
+        end_cursor: page.end_cursor,
+        events: page.events,
+        has_more_before: page.has_more,
+    })
 }
 
 pub(crate) async fn load_complete_event_history(
@@ -44,6 +72,7 @@ where
 {
     let mut cursor = None;
     let mut events = BTreeMap::<u64, RuntimeEvent>::new();
+    let mut event_bytes = 0_usize;
 
     loop {
         let page = load_page(EventPageRequest {
@@ -57,7 +86,19 @@ where
 
         let next_cursor = page.start_cursor;
         for event in page.events {
-            events.entry(event.sequence_no).or_insert(event);
+            if events.contains_key(&event.sequence_no) {
+                continue;
+            }
+            event_bytes = event_bytes.saturating_add(runtime_event_size(&event));
+            if events.len() >= COMPLETE_HISTORY_EVENT_LIMIT
+                || event_bytes > COMPLETE_HISTORY_BYTE_LIMIT
+            {
+                return Err(format!(
+                    "event history exceeds the bounded replay budget ({} events or {} bytes)",
+                    COMPLETE_HISTORY_EVENT_LIMIT, COMPLETE_HISTORY_BYTE_LIMIT
+                ));
+            }
+            events.insert(event.sequence_no, event);
         }
 
         if !page.has_more {
@@ -79,7 +120,18 @@ where
         start_cursor: events.first().map(|event| event.sequence_no),
         end_cursor: events.last().map(|event| event.sequence_no),
         events,
+        has_more_before: false,
     })
+}
+
+fn runtime_event_size(event: &RuntimeEvent) -> usize {
+    // 负载通常占事件内存的大头；固定余量覆盖 ID、时间戳和因果元数据，
+    // 避免为预算计算再次序列化完整事件。
+    256_usize.saturating_add(
+        serde_json::to_vec(&event.payload)
+            .map(|payload| payload.len())
+            .unwrap_or_default(),
+    )
 }
 
 #[cfg(test)]

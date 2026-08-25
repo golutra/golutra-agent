@@ -6,6 +6,7 @@ use tokio::{runtime::Handle, task::JoinHandle};
 
 const ABNORMAL_RECORDER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const HOST_SHUTDOWN_GRACE_TIMEOUT: Duration = Duration::from_millis(250);
+const BACKGROUND_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct AbortOnDropJoinHandle<T> {
     handle: Option<JoinHandle<T>>,
@@ -138,6 +139,30 @@ impl RuntimeHost {
                 .await
             {
                 failures.push("runtime task supervisors did not finish shutdown".to_owned());
+            }
+        }
+
+        let post_task_worker = {
+            let mut worker = self
+                .execution
+                .post_task_worker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            worker.take()
+        };
+        if let Some(worker) = post_task_worker {
+            let mut worker = worker;
+            match tokio::time::timeout(BACKGROUND_WORKER_SHUTDOWN_TIMEOUT, &mut worker).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) if error.is_cancelled() => {}
+                Ok(Err(error)) => {
+                    failures.push(format!("post-task worker stopped unexpectedly: {error}"))
+                }
+                Err(_) => {
+                    worker.abort();
+                    let _ = worker.await;
+                    failures.push("post-task worker did not finish shutdown".to_owned());
+                }
             }
         }
 

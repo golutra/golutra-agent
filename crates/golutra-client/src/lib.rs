@@ -393,6 +393,7 @@ struct RuntimeHostStorageState {
 #[derive(Debug)]
 struct RuntimeHostExecutionState {
     shutdown: CancellationToken,
+    post_task_worker: StdMutex<Option<tokio::task::JoinHandle<()>>>,
     lane_manager: Mutex<RuntimeLaneManager>,
     event_bus: broadcast::Sender<RuntimeEvent>,
     live_subscriptions: StdMutex<Vec<LiveSubscription>>,
@@ -437,6 +438,11 @@ impl Drop for RuntimeHost {
         // Tokio runtime is alive so process supervisors can finish bookkeeping.
         self.execution.shutdown.cancel();
         self.execution.process_supervisor.shutdown();
+        if let Ok(mut worker) = self.execution.post_task_worker.lock()
+            && let Some(worker) = worker.take()
+        {
+            worker.abort();
+        }
     }
 }
 
@@ -1729,6 +1735,7 @@ impl RuntimeHost {
             },
             execution: RuntimeHostExecutionState {
                 shutdown: CancellationToken::new(),
+                post_task_worker: StdMutex::new(None),
                 lane_manager: Mutex::new(RuntimeLaneManager::new()),
                 event_bus,
                 live_subscriptions: StdMutex::new(Vec::new()),
@@ -1762,7 +1769,12 @@ impl RuntimeHost {
             .jobs
             .recover_expired(&host.workspace_id.to_string(), chrono::Utc::now())
             .await?;
-        post_task::PostTaskCoordinator::start(&host);
+        let post_task_worker = post_task::PostTaskCoordinator::start(&host);
+        *host
+            .execution
+            .post_task_worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(post_task_worker);
         Ok(host)
     }
 
@@ -1887,8 +1899,12 @@ impl RuntimeHost {
         self.ensure_session_in_workspace(filter.session_id).await?;
         let mut live = self.execution.event_bus.subscribe();
         let (sender, receiver) = mpsc::channel(256);
+        let shutdown = self.execution.shutdown.clone();
         tokio::spawn(async move {
             let mut cursor = filter.after_sequence_no;
+            if sender.is_closed() || shutdown.is_cancelled() {
+                return;
+            }
             match self.send_replay_pages(&filter, &mut cursor, &sender).await {
                 Ok(true) => {}
                 Ok(false) => return,
@@ -1898,7 +1914,12 @@ impl RuntimeHost {
                 }
             }
             loop {
-                match live.recv().await {
+                let received = tokio::select! {
+                    _ = sender.closed() => return,
+                    _ = shutdown.cancelled() => return,
+                    received = live.recv() => received,
+                };
+                match received {
                     Ok(event) if event_matches_filter(&event, &filter, cursor) => {
                         cursor = Some(event.sequence_no);
                         if sender.send(Ok(event)).await.is_err() {
@@ -1907,6 +1928,9 @@ impl RuntimeHost {
                     }
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if sender.is_closed() || shutdown.is_cancelled() {
+                            return;
+                        }
                         match self.send_replay_pages(&filter, &mut cursor, &sender).await {
                             Ok(true) => {}
                             Ok(false) => return,
