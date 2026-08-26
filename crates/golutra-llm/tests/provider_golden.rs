@@ -48,6 +48,7 @@ struct TestProviderResponse {
     status: u16,
     content_type: &'static str,
     body: String,
+    headers: Vec<(String, String)>,
 }
 
 impl TestProviderResponse {
@@ -56,6 +57,7 @@ impl TestProviderResponse {
             status,
             content_type: "application/json",
             body: body.into(),
+            headers: Vec::new(),
         }
     }
 
@@ -64,7 +66,13 @@ impl TestProviderResponse {
             status,
             content_type: "text/event-stream",
             body: body.into(),
+            headers: Vec::new(),
         }
+    }
+
+    fn header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.to_owned(), value.to_owned()));
+        self
     }
 }
 
@@ -328,6 +336,53 @@ async fn openai_compatible_stream_emits_ordered_text_deltas_and_usage() {
             .map(|message| message.content.as_str()),
         Some("golden stream")
     );
+}
+
+#[tokio::test]
+async fn openai_compatible_sse_error_status_is_classified_as_retryable() {
+    let error_stream = concat!(
+        "event: error\n",
+        "data: {\"error\":{\"status\":502,\"code\":\"bad_gateway\",\"message\":\"upstream unavailable\"}}\n\n",
+    );
+    let (base_url, _captured) = spawn_provider_sequence(vec![
+        TestProviderResponse::sse(200, error_stream)
+            .header("retry-after", "1")
+            .header("x-request-id", "req-sse-502"),
+    ])
+    .await;
+    let provider = OpenAiCompatibleProvider::new(TEST_API_KEY, base_url, "gpt-golden");
+    let error = provider
+        .complete_stream(simple_request("gpt-golden"), &mut |_| {})
+        .await
+        .expect_err("SSE error event");
+
+    assert_eq!(error.http_status(), Some(502));
+    assert_eq!(error.retry_after(), Some(std::time::Duration::from_secs(1)));
+    assert_eq!(
+        error
+            .metadata()
+            .and_then(|metadata| metadata.request_id.as_deref()),
+        Some("req-sse-502")
+    );
+}
+
+#[tokio::test]
+async fn openai_compatible_http_503_preserves_retry_after_metadata() {
+    let (base_url, _captured) = spawn_provider_sequence(vec![
+        TestProviderResponse::json(503, r#"{"error":{"message":"busy"}}"#)
+            .header("retry-after", "2")
+            .header("x-request-id", "req-http-503"),
+    ])
+    .await;
+    let provider = OpenAiCompatibleProvider::new(TEST_API_KEY, base_url, "gpt-golden");
+    let error = provider
+        .complete(simple_request("gpt-golden"))
+        .await
+        .expect_err("HTTP 503");
+
+    assert_eq!(error.http_status(), Some(503));
+    assert_eq!(error.retry_after(), Some(std::time::Duration::from_secs(2)));
+    assert!(matches!(error, ProviderError::WithMetadata { .. }));
 }
 
 #[tokio::test]
@@ -1032,9 +1087,14 @@ async fn spawn_provider_sequence(
                 "Unauthorized"
             };
             let message = format!(
-                "HTTP/1.1 {} {reason}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                "HTTP/1.1 {} {reason}\r\ncontent-type: {}\r\n{}content-length: {}\r\nconnection: close\r\n\r\n{}",
                 response.status,
                 response.content_type,
+                response
+                    .headers
+                    .iter()
+                    .map(|(name, value)| format!("{name}: {value}\r\n"))
+                    .collect::<String>(),
                 response.body.len(),
                 response.body
             );

@@ -22,13 +22,14 @@ use super::genai_adapter::{
 use super::{
     GOLUTRA_PROVIDER_AUTH_PROVIDER, MAX_PROVIDER_MESSAGE_BYTES, MAX_PROVIDER_RESPONSE_BYTES,
     MAX_PROVIDER_TOOL_ARGUMENT_BYTES, MAX_PROVIDER_TOOL_CALL_ID_BYTES,
-    MAX_PROVIDER_TOOL_NAME_BYTES, ProviderError, ProviderFinishReason, ProviderGenerationConfig,
-    ProviderHttpHeaders, ProviderMessage, ProviderMessageMetadata, ProviderProbeResult,
-    ProviderProtocol, ProviderRequest, ProviderResponse, ProviderRole, ProviderStreamEvent,
-    configured_or_first_env, custom_headers_from_reader, env_mapping, first_env,
-    generation_config_from_reader, missing_env_error, protocol_capabilities,
-    provider_credential_error, provider_http_client, provider_http_error, provider_transport_error,
-    response_json_or_error, sanitize_provider_error, validate_native_base_url,
+    MAX_PROVIDER_TOOL_NAME_BYTES, ProviderError, ProviderErrorMetadata, ProviderFinishReason,
+    ProviderGenerationConfig, ProviderHttpHeaders, ProviderMessage, ProviderMessageMetadata,
+    ProviderProbeResult, ProviderProtocol, ProviderRequest, ProviderResponse, ProviderRole,
+    ProviderStreamEvent, configured_or_first_env, custom_headers_from_reader, env_mapping,
+    first_env, generation_config_from_reader, missing_env_error, protocol_capabilities,
+    provider_credential_error, provider_http_client, provider_http_error_with_headers,
+    provider_transport_error, response_json_or_error, sanitize_provider_error,
+    validate_native_base_url,
 };
 
 const CHATGPT_ACCOUNT_ID_HEADER: &str = "ChatGPT-Account-Id";
@@ -160,9 +161,10 @@ impl OpenAiResponsesProvider {
             response = self.send_probe(true).await?;
         }
         let status = response.status();
+        let headers = response.headers().clone();
         let value = response_json_or_error(response).await?;
         if !status.is_success() {
-            return Err(provider_http_error(status, &value));
+            return Err(provider_http_error_with_headers(status, &headers, &value));
         }
         let discovered_models = value
             .get("models")
@@ -611,7 +613,8 @@ fn responses_provider_response(
 
 fn map_responses_genai_error(error: genai::Error) -> ProviderError {
     let message = sanitize_provider_error(&error.to_string());
-    match genai_error_http_status(&error) {
+    let status = genai_error_http_status(&error);
+    let mapped = match status {
         Some(429) => ProviderError::RateLimited { message },
         Some(status) if (500..600).contains(&status) => ProviderError::Unavailable { message },
         Some(_) => ProviderError::Failed { message },
@@ -619,6 +622,14 @@ fn map_responses_genai_error(error: genai::Error) -> ProviderError {
             ProviderError::Failed { message }
         }
         None => map_genai_error(error),
+    };
+    if status.is_some_and(|status| status == 429 || (500..600).contains(&status)) {
+        mapped.with_metadata(ProviderErrorMetadata {
+            http_status: status,
+            ..ProviderErrorMetadata::default()
+        })
+    } else {
+        mapped
     }
 }
 

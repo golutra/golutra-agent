@@ -19,10 +19,10 @@ use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 
 use super::{
-    ProviderError, ProviderFinishReason, ProviderGenerationConfig, ProviderHttpHeaders,
-    ProviderMessage, ProviderProbeResult, ProviderProtocol, ProviderRequest, ProviderResponse,
-    ProviderRole, ProviderStreamEvent, ProviderToolCall, ProviderUsage, UsageSource,
-    configured_or_first_env, custom_headers_from_reader, env_mapping, first_env,
+    ProviderError, ProviderErrorMetadata, ProviderFinishReason, ProviderGenerationConfig,
+    ProviderHttpHeaders, ProviderMessage, ProviderProbeResult, ProviderProtocol, ProviderRequest,
+    ProviderResponse, ProviderRole, ProviderStreamEvent, ProviderToolCall, ProviderUsage,
+    UsageSource, configured_or_first_env, custom_headers_from_reader, env_mapping, first_env,
     generation_config_from_reader, missing_env_error, protocol_capabilities,
     provider_tool_schema_projection, sanitize_provider_error, selected_protocol_from_reader,
     validate_native_base_url,
@@ -403,17 +403,49 @@ pub(crate) fn genai_chat_request(
     }
     if !request.tools.is_empty() {
         chat_request = chat_request.with_tools(request.tools.iter().map(|contract| {
+            let schema = provider_tool_schema_projection(&contract.input_schema);
             let tool = Tool::new(contract.tool_name.clone())
                 .with_description(tool_description(&contract.tool_name))
-                .with_schema(provider_tool_schema_projection(&contract.input_schema));
+                .with_schema(schema.clone());
             if is_openai_responses {
-                tool.with_strict(true)
+                // Responses strict 要求对象的每个属性都列入 `required`；运行时工具
+                // 有意暴露可选控制项（例如 shell 超时），因此保留完整 schema，
+                // 仅在投影 schema 不满足该契约时关闭 strict 解码。
+                tool.with_strict(responses_schema_supports_strict(&schema))
             } else {
                 tool
             }
         }));
     }
     Ok(chat_request)
+}
+
+fn responses_schema_supports_strict(schema: &Value) -> bool {
+    match schema {
+        Value::Object(object) => {
+            if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+                let required = object
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<std::collections::HashSet<_>>()
+                    })
+                    .unwrap_or_default();
+                if properties
+                    .keys()
+                    .any(|name| !required.contains(name.as_str()))
+                {
+                    return false;
+                }
+            }
+            object.values().all(responses_schema_supports_strict)
+        }
+        Value::Array(values) => values.iter().all(responses_schema_supports_strict),
+        _ => true,
+    }
 }
 
 fn genai_message(
@@ -655,7 +687,11 @@ fn provider_response_from_genai(
             })
         })
         .collect::<Result<Vec<_>, ProviderError>>()?;
-    let usage = provider_usage_from_genai(&response.usage)?;
+    let raw_usage = response
+        .captured_raw_body
+        .as_ref()
+        .and_then(raw_usage_value);
+    let usage = provider_usage_from_genai_with_raw(&response.usage, raw_usage.as_ref())?;
     let finish_reason = finish_reason_from_genai(response.stop_reason.as_ref());
     let raw_metadata = response.captured_raw_body.unwrap_or_else(|| {
         json!({
@@ -681,9 +717,39 @@ fn provider_response_from_genai(
 }
 
 fn provider_usage_from_genai(usage: &genai::chat::Usage) -> Result<ProviderUsage, ProviderError> {
-    let usage_raw = serde_json::to_value(usage).map_err(|error| ProviderError::Malformed {
-        message: format!("genai usage could not be serialized: {error}"),
-    })?;
+    provider_usage_from_genai_with_raw(usage, None)
+}
+
+fn provider_usage_from_genai_with_raw(
+    usage: &genai::chat::Usage,
+    raw_usage: Option<&Value>,
+) -> Result<ProviderUsage, ProviderError> {
+    let serialized_usage =
+        serde_json::to_value(usage).map_err(|error| ProviderError::Malformed {
+            message: format!("genai usage could not be serialized: {error}"),
+        })?;
+    let mut usage_raw = raw_usage.cloned().unwrap_or(serialized_usage);
+    let cache_read_tokens = usage
+        .prompt_tokens_details
+        .as_ref()
+        .and_then(|details| non_negative_u64(details.cached_tokens));
+    let cache_write_tokens = usage
+        .prompt_tokens_details
+        .as_ref()
+        .and_then(|details| non_negative_u64(details.cache_creation_tokens));
+    // genai 会把零计数映射为 None；出现正的 cache read 即证明本轮命中，
+    // 省略的写入计数应按 provider 语义保留为 0，并写回 canonical normalizer 使用的原始对象。
+    if cache_read_tokens.is_some_and(|tokens| tokens > 0) && cache_write_tokens.is_none() {
+        let details = usage_raw
+            .as_object_mut()
+            .and_then(|object| object.get_mut("prompt_tokens_details"))
+            .and_then(Value::as_object_mut);
+        if let Some(details) = details {
+            details
+                .entry("cache_write_tokens".to_owned())
+                .or_insert_with(|| Value::from(0_u64));
+        }
+    }
     Ok(ProviderUsage {
         input_tokens: non_negative_u64(usage.prompt_tokens),
         output_tokens: non_negative_u64(usage.completion_tokens),
@@ -699,6 +765,12 @@ fn provider_usage_from_genai(usage: &genai::chat::Usage) -> Result<ProviderUsage
         usage_source: UsageSource::Provider,
         raw: usage_raw,
     })
+}
+
+fn raw_usage_value(raw_body: &Value) -> Option<Value> {
+    ["/usage", "/response/usage"]
+        .iter()
+        .find_map(|path| raw_body.pointer(path).cloned())
 }
 
 fn finish_reason_from_genai(reason: Option<&StopReason>) -> ProviderFinishReason {
@@ -760,37 +832,46 @@ fn non_negative_u64(value: Option<i32>) -> Option<u64> {
 
 pub(crate) fn map_genai_error(error: genai::Error) -> ProviderError {
     let message = sanitize_provider_error(&error.to_string());
-    if genai_error_http_status(&error) == Some(429) {
-        return ProviderError::RateLimited { message };
-    }
-    if genai_error_http_status(&error).is_some_and(|status| (500..600).contains(&status)) {
-        return ProviderError::Unavailable { message };
-    }
-    match error {
-        genai::Error::RequiresApiKey { .. }
-        | genai::Error::NoAuthResolver { .. }
-        | genai::Error::NoAuthData { .. } => ProviderError::NotConfigured { message },
-        genai::Error::InvalidJsonResponseElement { .. }
-        | genai::Error::ChatResponseGeneration { .. }
-        | genai::Error::SerdeJson(_) => ProviderError::Malformed { message },
-        _ if message.to_ascii_lowercase().contains("timed out") => {
-            ProviderError::Timeout { message }
+    let status = genai_error_http_status(&error);
+    let mapped = if status == Some(429) {
+        ProviderError::RateLimited { message }
+    } else if status.is_some_and(|status| (500..600).contains(&status)) {
+        ProviderError::Unavailable { message }
+    } else {
+        match error {
+            genai::Error::RequiresApiKey { .. }
+            | genai::Error::NoAuthResolver { .. }
+            | genai::Error::NoAuthData { .. } => ProviderError::NotConfigured { message },
+            genai::Error::InvalidJsonResponseElement { .. }
+            | genai::Error::ChatResponseGeneration { .. }
+            | genai::Error::SerdeJson(_) => ProviderError::Malformed { message },
+            _ if message.to_ascii_lowercase().contains("timed out") => {
+                ProviderError::Timeout { message }
+            }
+            _ if [
+                "stream",
+                "connection",
+                "connect",
+                "disconnect",
+                "reset",
+                "transport",
+                "broken pipe",
+            ]
+            .iter()
+            .any(|marker| message.to_ascii_lowercase().contains(marker)) =>
+            {
+                ProviderError::Unavailable { message }
+            }
+            _ => ProviderError::Failed { message },
         }
-        _ if [
-            "stream",
-            "connection",
-            "connect",
-            "disconnect",
-            "reset",
-            "transport",
-            "broken pipe",
-        ]
-        .iter()
-        .any(|marker| message.to_ascii_lowercase().contains(marker)) =>
-        {
-            ProviderError::Unavailable { message }
-        }
-        _ => ProviderError::Failed { message },
+    };
+    if status.is_some_and(|status| status == 429 || (500..600).contains(&status)) {
+        mapped.with_metadata(ProviderErrorMetadata {
+            http_status: status,
+            ..ProviderErrorMetadata::default()
+        })
+    } else {
+        mapped
     }
 }
 
@@ -934,6 +1015,57 @@ mod tests {
     }
 
     #[test]
+    fn genai_usage_projects_cache_write_zero_on_a_cache_hit() {
+        let usage = genai::chat::Usage {
+            prompt_tokens: Some(100),
+            prompt_tokens_details: Some(genai::chat::PromptTokensDetails {
+                cache_creation_tokens: None,
+                cache_creation_details: None,
+                cached_tokens: Some(64),
+                audio_tokens: None,
+            }),
+            completion_tokens: Some(5),
+            completion_tokens_details: None,
+            total_tokens: Some(105),
+        };
+
+        let projected = provider_usage_from_genai(&usage).expect("genai usage");
+        let normalized = projected.normalize();
+        assert_eq!(normalized.input_tokens_non_cached, Some(36));
+        assert_eq!(normalized.cache_read_tokens, Some(64));
+        assert_eq!(normalized.cache_write_tokens, Some(0));
+    }
+
+    #[test]
+    fn genai_usage_prefers_raw_response_breakdown() {
+        let usage = genai::chat::Usage {
+            prompt_tokens: Some(100),
+            prompt_tokens_details: Some(genai::chat::PromptTokensDetails {
+                cache_creation_tokens: None,
+                cache_creation_details: None,
+                cached_tokens: Some(64),
+                audio_tokens: None,
+            }),
+            completion_tokens: Some(5),
+            completion_tokens_details: None,
+            total_tokens: Some(105),
+        };
+        let raw = json!({
+            "input_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 64, "cache_write_tokens": 0},
+            "output_tokens": 5,
+            "total_tokens": 105
+        });
+
+        let projected =
+            provider_usage_from_genai_with_raw(&usage, Some(&raw)).expect("genai raw usage");
+        let normalized = projected.normalize();
+        assert_eq!(normalized.cache_read_tokens, Some(64));
+        assert_eq!(normalized.cache_write_tokens, Some(0));
+        assert_eq!(normalized.input_tokens_non_cached, Some(36));
+    }
+
+    #[test]
     fn genai_request_uses_compact_schema_for_strict_responses_tools() {
         let request = ProviderRequest {
             request_id: ProviderRequestId::new(),
@@ -994,5 +1126,52 @@ mod tests {
             tool.schema.as_ref().expect("schema")["properties"]["path"]["description"],
             "workspace-relative path"
         );
+    }
+
+    #[test]
+    fn genai_request_disables_strict_for_optional_responses_tool_fields() {
+        let request = ProviderRequest {
+            request_id: ProviderRequestId::new(),
+            task_id: TaskId::new(),
+            turn_id: TurnId::new(),
+            session_id: None,
+            provider_id: "openai-responses".to_owned(),
+            model_id: "gpt-test".to_owned(),
+            messages: vec![ProviderMessage {
+                role: ProviderRole::User,
+                content: "run the command".to_owned(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+                metadata: Default::default(),
+            }],
+            tools: vec![golutra_core::ToolContract {
+                tool_name: "shell".to_owned(),
+                input_schema: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "command": {"type": "string"},
+                        "background": {"type": "boolean"}
+                    },
+                    "required": ["command"]
+                }),
+                output_schema: json!({}),
+                error_schema: json!({}),
+                side_effect_type: golutra_core::SideEffectType::None,
+                idempotency_key_policy: "none".to_owned(),
+                timeout_policy: "bounded".to_owned(),
+                cancellation_policy: "supported".to_owned(),
+                retry_policy: "none".to_owned(),
+                artifact_policy: "none".to_owned(),
+                permission_policy_ref: None,
+            }],
+            cache_policy: PromptCachePolicy::None,
+        };
+
+        let chat_request =
+            genai_chat_request(&request, ProviderProtocol::OpenAiResponses).expect("genai request");
+        let tool = &chat_request.tools.expect("tool list")[0];
+        assert_eq!(tool.strict, Some(false));
     }
 }

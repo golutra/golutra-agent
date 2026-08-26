@@ -1725,7 +1725,7 @@ impl RuntimeHost {
             let probe = match probe {
                 Ok(probe) => probe,
                 Err(error) => {
-                    let event_type = if matches!(error, ProviderError::RateLimited { .. }) {
+                    let event_type = if error.is_rate_limited() {
                         RuntimeEventType::ProviderRateLimited
                     } else {
                         RuntimeEventType::ProviderAuthFailed

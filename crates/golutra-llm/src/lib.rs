@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt, sync::Arc};
+use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
@@ -9,6 +9,7 @@ use golutra_core::{
     ProviderResponseId, SessionId, TaskId, ToolContract, TurnId,
 };
 pub use golutra_core::{ProviderUsage, UsageSource};
+use reqwest::header::HeaderMap;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -66,6 +67,25 @@ const MAX_PROVIDER_TOOL_NAME_BYTES: usize = 128;
 const MAX_PROVIDER_CUSTOM_HEADERS: usize = 32;
 const MAX_PROVIDER_HEADER_VALUE_BYTES: usize = 8 * 1024;
 
+/// 脱敏后的 provider 诊断元数据，只用于重试决策和可行动的观测。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderErrorMetadata {
+    pub http_status: Option<u16>,
+    pub provider_code: Option<String>,
+    pub retry_after: Option<Duration>,
+    pub request_id: Option<String>,
+}
+
+impl ProviderErrorMetadata {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.http_status.is_none()
+            && self.provider_code.is_none()
+            && self.retry_after.is_none()
+            && self.request_id.is_none()
+    }
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ProviderError {
     #[error("provider failed: {message}")]
@@ -82,6 +102,53 @@ pub enum ProviderError {
     Timeout { message: String },
     #[error("provider request was cancelled")]
     Cancelled,
+    /// 保留原有语义错误，同时携带脱敏 HTTP/provider 诊断信息。
+    #[error("{error}")]
+    WithMetadata {
+        error: Box<ProviderError>,
+        metadata: ProviderErrorMetadata,
+    },
+}
+
+impl ProviderError {
+    #[must_use]
+    pub fn with_metadata(self, metadata: ProviderErrorMetadata) -> Self {
+        if metadata.is_empty() {
+            self
+        } else {
+            Self::WithMetadata {
+                error: Box::new(self),
+                metadata,
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn metadata(&self) -> Option<&ProviderErrorMetadata> {
+        match self {
+            Self::WithMetadata { metadata, .. } => Some(metadata),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn retry_after(&self) -> Option<Duration> {
+        self.metadata().and_then(|metadata| metadata.retry_after)
+    }
+
+    #[must_use]
+    pub fn http_status(&self) -> Option<u16> {
+        self.metadata().and_then(|metadata| metadata.http_status)
+    }
+
+    #[must_use]
+    pub fn is_rate_limited(&self) -> bool {
+        match self {
+            Self::RateLimited { .. } => true,
+            Self::WithMetadata { error, .. } => error.is_rate_limited(),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -893,14 +960,17 @@ impl OpenAiCompatibleProvider {
         let url = format!("{}/models", self.base_url.trim_end_matches('/'));
         let response = self.get_with_auth_retry(&url).await?;
         let status = response.status();
+        let headers = response.headers().clone();
         let value = response_json_or_error(response).await?;
         if status.as_u16() == 429 {
-            return Err(ProviderError::RateLimited {
-                message: provider_error_message(&value),
-            });
+            return Err(provider_error_from_value(
+                &value,
+                Some(status.as_u16()),
+                &headers,
+            ));
         }
         if !status.is_success() {
-            return Err(provider_http_error(status, &value));
+            return Err(provider_http_error_with_headers(status, &headers, &value));
         }
         let discovered_models = value
             .get("data")
@@ -945,14 +1015,17 @@ impl LlmProvider for OpenAiCompatibleProvider {
 
         let response = self.post_with_auth_retry(&url, &body).await?;
         let status = response.status();
+        let headers = response.headers().clone();
         let value = response_json_or_error(response).await?;
         if status.as_u16() == 429 {
-            return Err(ProviderError::RateLimited {
-                message: provider_error_message(&value),
-            });
+            return Err(provider_error_from_value(
+                &value,
+                Some(status.as_u16()),
+                &headers,
+            ));
         }
         if !status.is_success() {
-            return Err(provider_http_error(status, &value));
+            return Err(provider_http_error_with_headers(status, &headers, &value));
         }
 
         provider_response_from_openai(value, request.task_id, request.turn_id)
@@ -974,14 +1047,18 @@ impl LlmProvider for OpenAiCompatibleProvider {
         let response = self.post_with_auth_retry(&url, &body).await?;
         let status = response.status();
         if status.as_u16() == 429 {
+            let headers = response.headers().clone();
             let value = response_json_or_error(response).await?;
-            return Err(ProviderError::RateLimited {
-                message: provider_error_message(&value),
-            });
+            return Err(provider_error_from_value(
+                &value,
+                Some(status.as_u16()),
+                &headers,
+            ));
         }
         if !status.is_success() {
+            let headers = response.headers().clone();
             let value = response_json_or_error(response).await?;
-            return Err(provider_http_error(status, &value));
+            return Err(provider_http_error_with_headers(status, &headers, &value));
         }
         provider_response_from_openai_stream(response, on_event).await
     }
@@ -1820,8 +1897,13 @@ fn openai_prompt_cache_supported(base_url: &str) -> bool {
     reqwest::Url::parse(base_url)
         .ok()
         .and_then(|url| {
-            url.host_str()
-                .map(|host| host.eq_ignore_ascii_case("api.openai.com"))
+            url.host_str().map(|host| {
+                // 仅这两个端点实现了请求投影依赖的 OpenAI prompt-cache 扩展；
+                // 保持白名单收窄，避免向任意兼容网关意外发送 provider 专属字段。
+                ["api.openai.com", "api.golutra.cn"]
+                    .iter()
+                    .any(|supported| host.eq_ignore_ascii_case(supported))
+            })
         })
         .unwrap_or(false)
 }
@@ -1845,6 +1927,8 @@ async fn provider_response_from_openai_stream(
             message: format!("provider response exceeds {MAX_PROVIDER_RESPONSE_BYTES} byte limit"),
         });
     }
+    let response_status = response.status().as_u16();
+    let response_headers = response.headers().clone();
     let mut stream = response.bytes_stream().eventsource();
     let mut parsed_bytes = 0_usize;
     let mut output_text = String::new();
@@ -1855,8 +1939,15 @@ async fn provider_response_from_openai_stream(
     let mut stream_terminated = false;
 
     while let Some(event) = stream.next().await {
-        let event = event.map_err(|error| ProviderError::Unavailable {
-            message: sanitize_provider_error(&error.to_string()),
+        let event = event.map_err(|error| {
+            ProviderError::Unavailable {
+                message: sanitize_provider_error(&error.to_string()),
+            }
+            .with_metadata(provider_error_metadata(
+                Some(response_status),
+                &response_headers,
+                None,
+            ))
         })?;
         parsed_bytes = parsed_bytes.saturating_add(event.data.len());
         if parsed_bytes > MAX_PROVIDER_RESPONSE_BYTES {
@@ -1877,10 +1968,14 @@ async fn provider_response_from_openai_stream(
             serde_json::from_str(&event.data).map_err(|error| ProviderError::Malformed {
                 message: format!("chat completion SSE event is invalid JSON: {error}"),
             })?;
-        if value.get("error").is_some() {
-            return Err(ProviderError::Failed {
-                message: provider_error_message(&value),
-            });
+        if value.get("error").is_some()
+            || value.get("type").and_then(Value::as_str) == Some("error")
+        {
+            return Err(provider_error_from_value(
+                &value,
+                Some(response_status),
+                &response_headers,
+            ));
         }
         response_id = response_id.or_else(|| {
             value
@@ -1981,7 +2076,12 @@ async fn provider_response_from_openai_stream(
     if !stream_terminated {
         return Err(ProviderError::Unavailable {
             message: "chat completion SSE stream ended before a terminal event".to_owned(),
-        });
+        }
+        .with_metadata(provider_error_metadata(
+            Some(response_status),
+            &response_headers,
+            None,
+        )));
     }
 
     let tool_calls = tool_calls
@@ -2015,28 +2115,7 @@ async fn provider_response_from_openai_stream(
         response_id: ProviderResponseId::new(),
         message,
         tool_calls,
-        usage: ProviderUsage {
-            input_tokens: usage_value.get("prompt_tokens").and_then(Value::as_u64),
-            output_tokens: usage_value.get("completion_tokens").and_then(Value::as_u64),
-            reasoning_tokens: usage_value
-                .get("completion_tokens_details")
-                .and_then(|details| details.get("reasoning_tokens"))
-                .and_then(Value::as_u64),
-            cached_input_tokens: usage_value
-                .get("prompt_tokens_details")
-                .and_then(|details| details.get("cached_tokens"))
-                .and_then(Value::as_u64),
-            total_tokens: usage_value.get("total_tokens").and_then(Value::as_u64),
-            usage_source: if usage_value
-                .as_object()
-                .is_some_and(|value| value.is_empty())
-            {
-                UsageSource::Unknown
-            } else {
-                UsageSource::Provider
-            },
-            raw: usage_value.clone(),
-        },
+        usage: provider_usage_from_openai_value(usage_value.clone()),
         finish_reason,
         raw_metadata: json!({
             "provider": "openai-compatible",
@@ -2105,15 +2184,7 @@ fn provider_response_from_openai(
         response_id: ProviderResponseId::new(),
         message: content,
         tool_calls,
-        usage: ProviderUsage {
-            input_tokens: usage_value.get("prompt_tokens").and_then(Value::as_u64),
-            output_tokens: usage_value.get("completion_tokens").and_then(Value::as_u64),
-            reasoning_tokens: None,
-            cached_input_tokens: None,
-            total_tokens: usage_value.get("total_tokens").and_then(Value::as_u64),
-            usage_source: UsageSource::Provider,
-            raw: usage_value,
-        },
+        usage: provider_usage_from_openai_value(usage_value),
         finish_reason: finish_reason_from_openai(
             choice
                 .get("finish_reason")
@@ -2121,6 +2192,80 @@ fn provider_response_from_openai(
                 .unwrap_or_default(),
         ),
         raw_metadata: value,
+    })
+}
+
+fn provider_usage_from_openai_value(usage_value: Value) -> ProviderUsage {
+    let input_tokens = first_usage_u64(
+        &usage_value,
+        &[
+            "/prompt_tokens",
+            "/input_tokens",
+            "/prompt_tokens_total",
+            "/input_tokens_total",
+        ],
+    );
+    let output_tokens = first_usage_u64(
+        &usage_value,
+        &[
+            "/completion_tokens",
+            "/output_tokens",
+            "/completion_tokens_total",
+            "/output_tokens_total",
+        ],
+    );
+    let reasoning_tokens = first_usage_u64(
+        &usage_value,
+        &[
+            "/completion_tokens_details/reasoning_tokens",
+            "/output_tokens_details/reasoning_tokens",
+            "/reasoning_tokens",
+        ],
+    );
+    let cached_input_tokens = first_usage_u64(
+        &usage_value,
+        &[
+            "/prompt_tokens_details/cached_tokens",
+            "/input_tokens_details/cached_tokens",
+            "/prompt_tokens_details/cache_read_tokens",
+            "/input_tokens_details/cache_read_tokens",
+            "/prompt_tokens_details/cache_read_input_tokens",
+            "/input_tokens_details/cache_read_input_tokens",
+            "/cached_input_tokens",
+            "/cache_read_tokens",
+        ],
+    );
+    let total_tokens = first_usage_u64(
+        &usage_value,
+        &["/total_tokens", "/total_token_count", "/total_tokens_count"],
+    );
+    let usage_source = if usage_value
+        .as_object()
+        .is_some_and(|value| value.is_empty())
+    {
+        UsageSource::Unknown
+    } else {
+        UsageSource::Provider
+    };
+    ProviderUsage {
+        input_tokens,
+        output_tokens,
+        reasoning_tokens,
+        cached_input_tokens,
+        total_tokens,
+        usage_source,
+        raw: usage_value,
+    }
+}
+
+fn first_usage_u64(value: &Value, paths: &[&str]) -> Option<u64> {
+    paths.iter().find_map(|path| {
+        value.pointer(path).and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
+                .or_else(|| value.as_str().and_then(|value| value.trim().parse().ok()))
+        })
     })
 }
 
@@ -2218,6 +2363,211 @@ fn provider_error_message(value: &Value) -> String {
     }
 }
 
+fn provider_error_status(value: &Value) -> Option<u16> {
+    [
+        value.get("error").and_then(|error| error.get("status")),
+        value
+            .get("error")
+            .and_then(|error| error.get("status_code")),
+        value.get("status"),
+        value.get("http_status"),
+        value.get("status_code"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(value_as_status)
+}
+
+fn value_as_status(value: &Value) -> Option<u16> {
+    value
+        .as_u64()
+        .and_then(|status| u16::try_from(status).ok())
+        .or_else(|| {
+            value
+                .as_str()
+                .and_then(|status| status.trim().parse::<u16>().ok())
+        })
+}
+
+fn provider_error_code(value: &Value) -> Option<String> {
+    value
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .or_else(|| value.get("code"))
+        .and_then(|code| {
+            code.as_str()
+                .map(ToOwned::to_owned)
+                .or_else(|| code.as_u64().map(|code| code.to_string()))
+        })
+        .map(|code| sanitize_provider_error(&code))
+        .filter(|code| !code.is_empty())
+}
+
+fn provider_error_type(value: &Value) -> Option<String> {
+    value
+        .get("error")
+        .and_then(|error| error.get("type"))
+        .or_else(|| value.get("error_type"))
+        .and_then(Value::as_str)
+        .map(sanitize_provider_error)
+        .filter(|error_type| !error_type.is_empty())
+}
+
+fn provider_error_retry_after(value: &Value) -> Option<Duration> {
+    let retry_after_ms = value
+        .get("error")
+        .and_then(|error| error.get("retry_after_ms"))
+        .or_else(|| value.get("retry_after_ms"));
+    if let Some(milliseconds) = retry_after_ms.and_then(Value::as_u64) {
+        return Some(Duration::from_millis(milliseconds.min(60_000)));
+    }
+    let retry_after = value
+        .get("error")
+        .and_then(|error| error.get("retry_after"))
+        .or_else(|| value.get("retry_after"))?;
+    retry_after
+        .as_u64()
+        .or_else(|| {
+            retry_after
+                .as_str()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+        })
+        .map(|seconds| Duration::from_secs(seconds.min(60)))
+}
+
+fn retry_after_from_headers(headers: &HeaderMap) -> Option<Duration> {
+    if let Some(milliseconds) = headers
+        .get("retry-after-ms")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        return Some(Duration::from_millis(milliseconds.min(60_000)));
+    }
+    headers
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|seconds| Duration::from_secs(seconds.min(60)))
+}
+
+fn request_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    ["x-request-id", "request-id", "openai-request-id"]
+        .into_iter()
+        .find_map(|name| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(sanitize_provider_error)
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn request_id_from_value(value: &Value) -> Option<String> {
+    value
+        .get("error")
+        .and_then(|error| error.get("request_id").or_else(|| error.get("requestId")))
+        .or_else(|| value.get("request_id"))
+        .and_then(Value::as_str)
+        .map(sanitize_provider_error)
+        .filter(|value| !value.is_empty())
+}
+
+fn provider_error_metadata(
+    status: Option<u16>,
+    headers: &HeaderMap,
+    value: Option<&Value>,
+) -> ProviderErrorMetadata {
+    let payload_status = value.and_then(provider_error_status);
+    let payload_retry_after = value.and_then(provider_error_retry_after);
+    let payload_request_id = value.and_then(request_id_from_value);
+    ProviderErrorMetadata {
+        http_status: status.filter(|status| *status >= 400).or(payload_status),
+        provider_code: value.and_then(provider_error_code),
+        retry_after: payload_retry_after.or_else(|| retry_after_from_headers(headers)),
+        request_id: payload_request_id.or_else(|| request_id_from_headers(headers)),
+    }
+}
+
+fn provider_error_kind(status: Option<u16>, value: &Value) -> ProviderError {
+    let message = provider_error_message(value);
+    match status {
+        Some(429) => ProviderError::RateLimited { message },
+        Some(status) if (500..600).contains(&status) => ProviderError::Unavailable { message },
+        Some(_) => ProviderError::Failed { message },
+        None => {
+            // 网关常用 code/type 表达瞬态错误，不能只依赖 HTTP status 或 message。
+            let marker_text = format!(
+                "{} {} {}",
+                message,
+                provider_error_code(value).unwrap_or_default(),
+                provider_error_type(value).unwrap_or_default()
+            )
+            .to_ascii_lowercase();
+            if [
+                "rate limit",
+                "rate_limit",
+                "rate limited",
+                "too many requests",
+                "quota exceeded",
+            ]
+            .iter()
+            .any(|marker| marker_text.contains(marker))
+            {
+                ProviderError::RateLimited { message }
+            } else if [
+                "bad gateway",
+                "bad_gateway",
+                "gateway timeout",
+                "gateway_timeout",
+                "service unavailable",
+                "service_unavailable",
+                "temporarily unavailable",
+                "temporarily_unavailable",
+                "server error",
+                "server_error",
+                "internal server",
+                "internal_error",
+                "internal_server_error",
+                "upstream",
+                "overloaded",
+                "overload",
+                "connection reset",
+                "502",
+                "503",
+                "504",
+            ]
+            .iter()
+            .any(|marker| marker_text.contains(marker))
+            {
+                ProviderError::Unavailable { message }
+            } else {
+                ProviderError::Failed { message }
+            }
+        }
+    }
+}
+
+fn provider_error_from_value(
+    value: &Value,
+    response_status: Option<u16>,
+    headers: &HeaderMap,
+) -> ProviderError {
+    // 实际 HTTP 状态是服务端行为的权威来源；只有成功响应里的 SSE/JSON
+    // 错误事件才使用 payload status。
+    let status = response_status
+        .filter(|status| *status >= 400)
+        .or_else(|| provider_error_status(value));
+    let mapped = provider_error_kind(status, value);
+    if matches!(
+        &mapped,
+        ProviderError::Unavailable { .. } | ProviderError::RateLimited { .. }
+    ) {
+        mapped.with_metadata(provider_error_metadata(status, headers, Some(value)))
+    } else {
+        mapped
+    }
+}
+
 fn provider_credential_error(error: golutra_auth::AuthError) -> ProviderError {
     ProviderError::NotConfigured {
         message: sanitize_provider_error(&error.to_string()),
@@ -2250,13 +2600,12 @@ fn provider_http_client() -> reqwest::Client {
         .expect("static reqwest client configuration is valid")
 }
 
-fn provider_http_error(status: reqwest::StatusCode, value: &Value) -> ProviderError {
-    let message = provider_error_message(value);
-    if status.is_server_error() {
-        ProviderError::Unavailable { message }
-    } else {
-        ProviderError::Failed { message }
-    }
+fn provider_http_error_with_headers(
+    status: reqwest::StatusCode,
+    headers: &HeaderMap,
+    value: &Value,
+) -> ProviderError {
+    provider_error_from_value(value, Some(status.as_u16()), headers)
 }
 
 async fn response_json_or_error(response: reqwest::Response) -> Result<Value, ProviderError> {

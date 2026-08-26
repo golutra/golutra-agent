@@ -63,20 +63,46 @@ impl ProviderUsage {
                     "/input_tokens_details/cached_tokens",
                     "/input_tokens_details/cache_read_tokens",
                     "/input_tokens_details/cache_read_input_tokens",
+                    "/input_tokens_details/cache_read",
+                    "/prompt_tokens_details/cached_input_tokens",
+                    "/prompt_tokens_details/cached_input",
+                    "/input_tokens_details/cached_input_tokens",
+                    "/input_tokens_details/cached_input",
                     "/usage/prompt_tokens_details/cached_tokens",
                     "/usage/prompt_tokens_details/cache_read_tokens",
                     "/usage/prompt_tokens_details/cache_read_input_tokens",
+                    "/usage/input_tokens_details/cached_tokens",
+                    "/usage/input_tokens_details/cache_read_tokens",
+                    "/usage/input_tokens_details/cache_read_input_tokens",
                     "/cache_read_tokens",
                     "/cache_read_input_tokens",
+                    "/cached_tokens",
+                    "/cached_input_tokens",
                     "/usage/cache_read_tokens",
                     "/usage/cache_read_input_tokens",
                 ],
             )
         });
-        let input_tokens_non_cached = self
-            .input_tokens
-            .zip(cache_read_tokens)
-            .and_then(|(input, cached)| (cached <= input).then(|| input - cached));
+        let input_tokens_non_cached = first_raw_u64(
+            &self.raw,
+            &[
+                "/input_tokens_non_cached",
+                "/non_cached_input_tokens",
+                "/uncached_input_tokens",
+                "/prompt_tokens_details/uncached_tokens",
+                "/prompt_tokens_details/input_tokens_non_cached",
+                "/input_tokens_details/uncached_tokens",
+                "/input_tokens_details/input_tokens_non_cached",
+                "/usage/input_tokens_non_cached",
+                "/usage/non_cached_input_tokens",
+                "/usage/uncached_input_tokens",
+            ],
+        )
+        .or_else(|| {
+            self.input_tokens
+                .zip(cache_read_tokens)
+                .and_then(|(input, cached)| (cached <= input).then(|| input - cached))
+        });
         let cache_write_tokens = first_raw_u64(
             &self.raw,
             &[
@@ -86,9 +112,13 @@ impl ProviderUsage {
                 "/input_tokens_details/cache_creation_tokens",
                 "/input_tokens_details/cache_write_tokens",
                 "/input_tokens_details/cache_creation_input_tokens",
+                "/input_tokens_details/cache_write",
                 "/usage/prompt_tokens_details/cache_creation_tokens",
                 "/usage/prompt_tokens_details/cache_write_tokens",
                 "/usage/prompt_tokens_details/cache_creation_input_tokens",
+                "/usage/input_tokens_details/cache_creation_tokens",
+                "/usage/input_tokens_details/cache_write_tokens",
+                "/usage/input_tokens_details/cache_creation_input_tokens",
                 "/cache_write_tokens",
                 "/cache_creation_tokens",
                 "/cache_creation_input_tokens",
@@ -96,7 +126,10 @@ impl ProviderUsage {
                 "/usage/cache_creation_tokens",
                 "/usage/cache_creation_input_tokens",
             ],
-        );
+        )
+        // 兼容网关在缓存命中时通常省略写入计数；正的读取计数已证明本轮命中，
+        // 因此把省略的写入项投影为 provider 语义上的 0，避免在边界处丢失分项。
+        .or_else(|| cache_read_tokens.filter(|tokens| *tokens > 0).map(|_| 0));
         let tool_schema_tokens_estimated = self
             .raw
             .get("tool_schema_tokens")
@@ -137,7 +170,14 @@ impl ProviderUsage {
 fn first_raw_u64(raw: &Value, paths: &[&str]) -> Option<u64> {
     paths
         .iter()
-        .find_map(|path| raw.pointer(path).and_then(Value::as_u64))
+        .find_map(|path| raw.pointer(path).and_then(non_negative_u64))
+}
+
+fn non_negative_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
+        .or_else(|| value.as_str().and_then(|value| value.trim().parse().ok()))
 }
 
 impl NormalizedUsage {
@@ -241,5 +281,58 @@ mod tests {
         assert_eq!(normalized.cache_read_tokens, Some(7));
         assert_eq!(normalized.cache_write_tokens, Some(5));
         assert_eq!(normalized.input_tokens_non_cached, Some(13));
+    }
+
+    #[test]
+    fn normalize_projects_responses_breakdown_and_explicit_zero_write() {
+        let usage = ProviderUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(5),
+            reasoning_tokens: None,
+            cached_input_tokens: None,
+            total_tokens: Some(105),
+            usage_source: UsageSource::Provider,
+            raw: serde_json::json!({
+                "input_tokens_details": {
+                    "cached_tokens": 64,
+                    "cache_write_tokens": 0
+                }
+            }),
+        };
+
+        let normalized = usage.normalize();
+        assert_eq!(normalized.input_tokens_non_cached, Some(36));
+        assert_eq!(normalized.cache_read_tokens, Some(64));
+        assert_eq!(normalized.cache_write_tokens, Some(0));
+    }
+
+    #[test]
+    fn normalize_projects_uncached_alias_before_deriving() {
+        let usage = ProviderUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(5),
+            reasoning_tokens: None,
+            cached_input_tokens: Some(64),
+            total_tokens: Some(105),
+            usage_source: UsageSource::Provider,
+            raw: serde_json::json!({"uncached_input_tokens": 30}),
+        };
+
+        assert_eq!(usage.normalize().input_tokens_non_cached, Some(30));
+    }
+
+    #[test]
+    fn normalize_projects_zero_write_for_positive_cache_hit_when_omitted() {
+        let usage = ProviderUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(5),
+            reasoning_tokens: None,
+            cached_input_tokens: Some(64),
+            total_tokens: Some(105),
+            usage_source: UsageSource::Provider,
+            raw: Value::Null,
+        };
+
+        assert_eq!(usage.normalize().cache_write_tokens, Some(0));
     }
 }

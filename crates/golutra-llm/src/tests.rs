@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use serde_json::json;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -765,6 +767,90 @@ fn provider_error_message_reads_string_error() {
 }
 
 #[test]
+fn provider_error_classifies_transient_payload_and_preserves_retry_metadata() {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "retry-after",
+        reqwest::header::HeaderValue::from_static("3"),
+    );
+    headers.insert(
+        "x-request-id",
+        reqwest::header::HeaderValue::from_static("req-golden-1"),
+    );
+    let error = provider_error_from_value(
+        &json!({
+            "error": {
+                "status": 502,
+                "code": "bad_gateway",
+                "message": "upstream temporarily unavailable"
+            }
+        }),
+        Some(200),
+        &headers,
+    );
+
+    assert!(matches!(error, ProviderError::WithMetadata { .. }));
+    assert_eq!(error.http_status(), Some(502));
+    assert_eq!(error.retry_after(), Some(Duration::from_secs(3)));
+    assert_eq!(
+        error
+            .metadata()
+            .and_then(|metadata| metadata.provider_code.as_deref()),
+        Some("bad_gateway")
+    );
+    assert_eq!(
+        error
+            .metadata()
+            .and_then(|metadata| metadata.request_id.as_deref()),
+        Some("req-golden-1")
+    );
+}
+
+#[test]
+fn successful_http_status_does_not_hide_transient_sse_payload_status() {
+    let error = provider_error_from_value(
+        &json!({
+            "error": {"status": 503, "message": "service unavailable"}
+        }),
+        Some(200),
+        &reqwest::header::HeaderMap::new(),
+    );
+
+    assert_eq!(error.http_status(), Some(503));
+    assert!(matches!(error, ProviderError::WithMetadata { .. }));
+}
+
+#[test]
+fn actual_http_status_wins_over_conflicting_error_payload_status() {
+    let error = provider_error_from_value(
+        &json!({
+            "error": {"status": 400, "message": "rate limited"}
+        }),
+        Some(429),
+        &reqwest::header::HeaderMap::new(),
+    );
+
+    assert_eq!(error.http_status(), Some(429));
+    assert!(error.is_rate_limited());
+}
+
+#[test]
+fn transient_error_type_is_classified_without_http_status() {
+    let error = provider_error_from_value(
+        &json!({
+            "type": "error",
+            "error": {"type": "server_error"},
+            "message": "request failed"
+        }),
+        Some(200),
+        &reqwest::header::HeaderMap::new(),
+    );
+
+    assert!(matches!(error, ProviderError::Unavailable { .. }));
+    assert_eq!(error.http_status(), None);
+}
+
+#[test]
 fn provider_error_message_redacts_api_key_fragments() {
     let value = json!({
         "error": {
@@ -891,4 +977,46 @@ fn openai_cache_fields_are_sent_only_for_supported_endpoint() {
     );
     assert!(custom.get("prompt_cache_key").is_none());
     assert!(custom.get("prompt_cache_retention").is_none());
+}
+
+#[test]
+fn prompt_cache_support_includes_golutra_gateway_only() {
+    assert!(openai_prompt_cache_supported("https://api.golutra.cn/v1"));
+    assert!(openai_prompt_cache_supported("https://api.openai.com/v1"));
+    assert!(!openai_prompt_cache_supported(
+        "https://compatible.example/v1"
+    ));
+}
+
+#[test]
+fn openai_usage_projects_cache_breakdown_aliases() {
+    let response = provider_response_from_openai(
+        json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "input_tokens": 100,
+                "input_tokens_details": {
+                    "cached_tokens": 64,
+                    "cache_write_tokens": 0
+                },
+                "output_tokens": 5,
+                "output_tokens_details": {"reasoning_tokens": 2},
+                "total_tokens": 105
+            }
+        }),
+        TaskId::new(),
+        TurnId::new(),
+    )
+    .expect("OpenAI usage response");
+    let usage = response.usage.normalize();
+
+    assert_eq!(usage.input_tokens_total, Some(100));
+    assert_eq!(usage.input_tokens_non_cached, Some(36));
+    assert_eq!(usage.cache_read_tokens, Some(64));
+    assert_eq!(usage.cache_write_tokens, Some(0));
+    assert_eq!(usage.output_tokens, Some(5));
+    assert_eq!(usage.reasoning_tokens, Some(2));
 }
