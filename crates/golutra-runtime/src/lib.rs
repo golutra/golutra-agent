@@ -9,7 +9,8 @@ use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use golutra_context::{
     ContextBuilder, ContextContributor, ContextError, ContextMessageSource, ModelInputVisibility,
-    compile_model_input, estimate_message_tokens, estimate_tokens, token_usage_record,
+    compile_model_input, estimate_message_tokens, estimate_tokens,
+    token_usage_record_with_cache_identity,
 };
 use golutra_core::{
     ApprovalDecision, ApprovalId, ApprovalRequest, ApprovalResolution, ApprovalScope, BudgetState,
@@ -1463,13 +1464,14 @@ where
                 {
                     last_assistant_message = Some(message.content.trim().to_owned());
                 }
-                let usage_record = token_usage_record(
+                let usage_record = token_usage_record_with_cache_identity(
                     &plan,
                     &completed_request,
                     provider_response.response_id,
                     &plan.budget_snapshot,
                     &provider_response.usage,
                     &provider_contract.cost_model,
+                    self.cache_identity_for_completed_request(&completed_request),
                 );
                 // Persist accounting before the completion boundary. A crash
                 // after the provider returned but before the derived usage
@@ -3151,6 +3153,19 @@ where
         }
         result
     }
+
+    fn cache_identity_for_completed_request(
+        &self,
+        request: &ProviderRequest,
+    ) -> Option<golutra_core::CacheIdentity> {
+        if self.provider.contract().provider_id == request.provider_id {
+            return self.provider.cache_identity_for_request(request);
+        }
+        self.fallback_provider
+            .as_ref()
+            .filter(|provider| provider.contract().provider_id == request.provider_id)
+            .and_then(|provider| provider.cache_identity_for_request(request))
+    }
 }
 
 fn update_tool_failure_counts(status: ToolResultStatus, total: &mut u32, consecutive: &mut u32) {
@@ -3635,6 +3650,9 @@ fn provider_tools_for_turn(
     profile: AgentToolProfile,
     registry: &ToolRegistry,
 ) -> Vec<ToolContract> {
+    if matches!(profile, AgentToolProfile::None) {
+        return Vec::new();
+    }
     let mut tools = tools
         .iter()
         .filter(|tool| {
@@ -3686,10 +3704,13 @@ fn tool_allowed_for_profile(
     profile: AgentToolProfile,
     registry: &ToolRegistry,
 ) -> bool {
-    matches!(profile, AgentToolProfile::Full)
-        || registry
+    match profile {
+        AgentToolProfile::None => false,
+        AgentToolProfile::Full => true,
+        AgentToolProfile::Coding => registry
             .capabilities(tool_name)
-            .is_some_and(|capabilities| capabilities.available_in_coding_profile)
+            .is_some_and(|capabilities| capabilities.available_in_coding_profile),
+    }
 }
 
 fn tool_profile_rejection_reason(
@@ -3701,6 +3722,9 @@ fn tool_profile_rejection_reason(
         return Some("tool is not part of the active Pi-plus provider surface");
     }
     if !tool_allowed_for_profile(&request.tool_name, profile, registry) {
+        if matches!(profile, AgentToolProfile::None) {
+            return Some("the active tool profile disables provider tools");
+        }
         return Some(
             "tool is not available in the active coding profile; select the full tool profile explicitly",
         );

@@ -117,6 +117,9 @@ impl AttachmentLeaseState {
     async fn wait_idle_unbounded(&self) {
         loop {
             let notified = self.idle.notified();
+            tokio::pin!(notified);
+            // 先登记等待再检查计数，避免最后一个 lease 在窗口内释放后错过通知。
+            notified.as_mut().enable();
             if self.active() == 0 {
                 return;
             }

@@ -4,6 +4,7 @@ use golutra_core::{
     BUILD_PROVENANCE_SCHEMA_VERSION, BuildProvenance, RUN_PROVENANCE_SCHEMA_VERSION, RunId,
     RunProvenance, TaskId, WorkspaceId,
 };
+use ring::digest::{Context, SHA256};
 use sha2::{Digest, Sha256};
 
 use super::runtime_identity;
@@ -75,11 +76,16 @@ fn capture_build_provenance() -> BuildProvenance {
         rustc_version: option_env!("GOLUTRA_BUILD_RUSTC_VERSION")
             .unwrap_or("unknown")
             .to_owned(),
-        binary_checksum: std::env::current_exe()
-            .ok()
-            .as_deref()
-            .and_then(digest_file),
+        // Release builds inject the artifact checksum. Local builds leave it
+        // absent so startup never scans the running executable.
+        binary_checksum: binary_checksum_from_metadata(option_env!(
+            "GOLUTRA_BUILD_BINARY_CHECKSUM"
+        )),
     }
+}
+
+fn binary_checksum_from_metadata(value: Option<&str>) -> Option<String> {
+    non_empty(value)
 }
 
 fn non_empty(value: Option<&str>) -> Option<String> {
@@ -105,13 +111,56 @@ fn digest_parts(parts: &[&str]) -> String {
 
 fn digest_file(path: &Path) -> Option<String> {
     let mut file = File::open(path).ok()?;
-    let mut digest = Sha256::new();
+    let mut digest = Context::new(&SHA256);
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         let read = file.read(&mut buffer).ok()?;
         if read == 0 {
-            return Some(format!("sha256:{:x}", digest.finalize()));
+            return Some(format_digest(digest.finish().as_ref()));
         }
         digest.update(&buffer[..read]);
+    }
+}
+
+fn format_digest(bytes: &[u8]) -> String {
+    let mut value = String::with_capacity(7 + bytes.len() * 2);
+    value.push_str("sha256:");
+    for byte in bytes {
+        use std::fmt::Write;
+        let _ = write!(value, "{byte:02x}");
+    }
+    value
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use sha2::{Digest, Sha256};
+
+    use super::{binary_checksum_from_metadata, digest_file, format_digest};
+
+    #[test]
+    fn binary_checksum_is_optional_build_metadata() {
+        assert_eq!(binary_checksum_from_metadata(None), None);
+        assert_eq!(
+            binary_checksum_from_metadata(Some("  sha256:build-artifact  ")),
+            Some("sha256:build-artifact".to_owned())
+        );
+    }
+
+    #[test]
+    fn digest_format_matches_the_wire_checksum_shape() {
+        assert_eq!(format_digest(&[0x00, 0xab, 0xff]), "sha256:00abff");
+    }
+
+    #[test]
+    fn binary_checksum_keeps_sha256_semantics() {
+        let file = tempfile::NamedTempFile::new().expect("temporary checksum file");
+        let bytes = b"provenance checksum regression";
+        fs::write(file.path(), bytes).expect("write checksum file");
+        let expected = format!("sha256:{:x}", Sha256::digest(bytes));
+
+        assert_eq!(digest_file(file.path()), Some(expected));
     }
 }

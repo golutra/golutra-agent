@@ -62,6 +62,16 @@ class CompareBenchmarkTest(unittest.TestCase):
         self.assertEqual(canonical["uncached_input_tokens"], 3)
         self.assertEqual(canonical["field_sources"]["uncached_input_tokens"], "reported")
 
+        legacy_alias = benchmark.normalize_golutra_usage(
+            {
+                "input_tokens": 10,
+                "cached_input_tokens": 7,
+                "output_tokens": 2,
+            }
+        )
+        self.assertIsNone(legacy_alias["cache_read_tokens"])
+        self.assertIsNone(legacy_alias["uncached_input_tokens"])
+
         pi_missing_cache = benchmark.normalize_pi_usage({"input": 10, "output": 2})
         self.assertIsNone(pi_missing_cache["cache_read_tokens"])
         self.assertIsNone(pi_missing_cache["cache_write_tokens"])
@@ -249,6 +259,82 @@ class CompareBenchmarkTest(unittest.TestCase):
         self.assertEqual(summary["usage_coverage"]["total_tokens"]["status"], "partial")
         self.assertEqual(summary["usage_coverage"]["total_tokens"]["partial_requests"], 1)
 
+    def test_aggregate_does_not_promote_unknown_task_to_complete(self) -> None:
+        complete = benchmark.empty_metrics()
+        complete["prompt_tokens"] = 10
+        complete["usage_coverage"] = {
+            "prompt_tokens": {
+                "reported_requests": 1,
+                "expected_requests": 1,
+                "complete": True,
+                "status": "complete",
+                "source": "reported",
+            }
+        }
+        unknown = benchmark.empty_metrics()
+        # A stale zero must not be treated as an observed provider value.
+        unknown["prompt_tokens"] = 0
+        unknown["usage_coverage"] = {
+            "prompt_tokens": {
+                "reported_requests": 0,
+                "expected_requests": 1,
+                "complete": False,
+                "status": "unknown",
+            }
+        }
+
+        summary = benchmark.aggregate_metrics(
+            [{"golutra": complete}, {"golutra": unknown}], "golutra"
+        )
+
+        self.assertIsNone(summary["prompt_tokens"])
+        self.assertEqual(summary["prompt_tokens_partial"], 10)
+        self.assertFalse(summary["usage_coverage"]["prompt_tokens"]["complete"])
+        self.assertEqual(summary["usage_coverage"]["prompt_tokens"]["status"], "partial")
+        self.assertEqual(summary["usage_coverage"]["prompt_tokens"]["unknown_requests"], 1)
+
+    def test_aggregate_requires_explicit_coverage_for_zero_values(self) -> None:
+        metrics = benchmark.empty_metrics()
+        metrics["cache_write_tokens"] = 0
+        metrics["usage_coverage"] = {
+            "cache_write_tokens": {
+                "reported_requests": 0,
+                "expected_requests": 1,
+                "complete": False,
+                "status": "unknown",
+            }
+        }
+
+        summary = benchmark.aggregate_metrics([{"golutra": metrics}], "golutra")
+
+        self.assertIsNone(summary["cache_write_tokens"])
+        self.assertNotIn("cache_write_tokens_partial", summary)
+        self.assertEqual(
+            benchmark.display_field(summary, "cache_write_tokens"),
+            "-",
+        )
+
+    def test_tool_result_unknown_is_applicable_when_tool_result_was_seen(self) -> None:
+        metrics = benchmark.empty_metrics()
+        metrics["request_count"] = 1
+        metrics["tool_result_count"] = 1
+        metrics["usage_coverage"] = {
+            "tool_result_tokens_estimated": {
+                "reported_requests": 0,
+                "expected_requests": 0,
+                "estimated_count": 0,
+                "complete": False,
+                "status": "unknown",
+            }
+        }
+
+        state = benchmark.usage_coverage_state(
+            metrics, "tool_result_tokens_estimated"
+        )
+
+        self.assertTrue(state["applicable"])
+        self.assertEqual(state["status"], "unknown")
+
     def test_pi_parser_counts_execution_result_once_and_estimates_output(self) -> None:
         stdout = "\n".join(
             [
@@ -276,6 +362,19 @@ class CompareBenchmarkTest(unittest.TestCase):
             0,
         )
         self.assertTrue(metrics["usage_coverage"]["tool_result_tokens_estimated"]["complete"])
+
+    def test_pi_parser_keeps_missing_tool_estimate_unknown(self) -> None:
+        metrics = benchmark.parse_pi(
+            json.dumps({"type": "agent_end"}),
+            10.0,
+            0,
+        )
+
+        self.assertIsNone(metrics["tool_result_tokens_estimated"])
+        self.assertEqual(
+            metrics["usage_coverage"]["tool_result_tokens_estimated"]["status"],
+            "unknown",
+        )
 
     def test_pi_parser_uses_process_event_as_missing_turn_anchor(self) -> None:
         stdout = "\n".join(

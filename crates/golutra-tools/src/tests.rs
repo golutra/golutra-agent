@@ -2158,6 +2158,11 @@ async fn background_process_supports_cursor_reconnect_stdin_and_terminal_diff() 
         start.envelope.structured_facts["survives_runtime_exit"],
         false
     );
+    assert_eq!(start.envelope.structured_facts["terminal"], false);
+    assert_eq!(
+        start.envelope.structured_facts["wait_strategy"],
+        "event_driven_cursor"
+    );
     assert!(start.envelope.summary.contains("post-runtime consumers"));
     assert!(start.envelope.summary.contains("detached process"));
     let process_id = start.envelope.structured_facts["process_id"]
@@ -2167,6 +2172,14 @@ async fn background_process_supports_cursor_reconnect_stdin_and_terminal_diff() 
     let first_cursor = start.envelope.structured_facts["output_cursor"]
         .as_u64()
         .expect("output cursor");
+    assert_eq!(
+        start.envelope.structured_facts["next_action"]["tool"],
+        "shell_session"
+    );
+    assert_eq!(
+        start.envelope.structured_facts["next_action"]["cursor"],
+        first_cursor
+    );
     assert!(first_cursor > 0);
     assert!(artifact_text(&start).contains("first"));
 
@@ -2251,6 +2264,11 @@ async fn background_process_supports_cursor_reconnect_stdin_and_terminal_diff() 
     assert_eq!(
         terminal.envelope.structured_facts["survives_runtime_exit"],
         false
+    );
+    assert_eq!(terminal.envelope.structured_facts["terminal"], true);
+    assert_eq!(
+        terminal.envelope.structured_facts["next_action"]["kind"],
+        "terminal"
     );
     assert!(
         terminal
@@ -2588,6 +2606,274 @@ async fn process_supervisor_can_terminate_all_running_session_processes() {
     assert_eq!(
         listed.envelope.structured_facts["processes"][0]["process_state"],
         "terminated"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_supervisor_clears_pid_after_reaching_terminal_state() {
+    let workspace = tempdir().expect("workspace");
+    let supervisor = ProcessSupervisor::new();
+    let sandbox = SystemSandbox::process_only();
+    let session_id = SessionId::new();
+    let args = vec!["-c".to_owned(), "printf ready\\n; exit 0".to_owned()];
+    let workspace_before = workspace_scan::capture(workspace.path()).await;
+    let started = supervisor
+        .start(ProcessStartRequest {
+            process_id: "clear-pid".to_owned(),
+            session_id,
+            program: "/bin/sh",
+            args: &args,
+            command_display: "clear pid fixture".to_owned(),
+            cwd: workspace.path(),
+            workspace_root: workspace.path(),
+            timeout_ms: 5_000,
+            wait_ms: 1_000,
+            cancellation: CancellationToken::new(),
+            sandbox: &sandbox,
+            workspace_access: WorkspaceAccess::ReadWrite,
+            allow_network: false,
+            workspace_before,
+        })
+        .await
+        .expect("process starts");
+    let terminal = if started.state.is_terminal() {
+        started
+    } else {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            supervisor.poll(session_id, "clear-pid", started.output_cursor, 2_000),
+        )
+        .await
+        .expect("wait for terminal remains bounded")
+        .expect("process reaches terminal")
+    };
+    assert!(terminal.state.is_terminal());
+    assert_eq!(
+        supervisor
+            .retained_pid_for_test(session_id, "clear-pid")
+            .await,
+        None,
+        "terminal processes must release their OS PID handle"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_supervisor_terminal_terminate_does_not_signal_stale_pid() {
+    let workspace = tempdir().expect("workspace");
+    let supervisor = ProcessSupervisor::new();
+    let sandbox = SystemSandbox::process_only();
+    let session_id = SessionId::new();
+    let args = vec!["-c".to_owned(), "printf ready\\n; exit 0".to_owned()];
+    let workspace_before = workspace_scan::capture(workspace.path()).await;
+    let started = supervisor
+        .start(ProcessStartRequest {
+            process_id: "stale-pid".to_owned(),
+            session_id,
+            program: "/bin/sh",
+            args: &args,
+            command_display: "stale pid fixture".to_owned(),
+            cwd: workspace.path(),
+            workspace_root: workspace.path(),
+            timeout_ms: 5_000,
+            wait_ms: 1_000,
+            cancellation: CancellationToken::new(),
+            sandbox: &sandbox,
+            workspace_access: WorkspaceAccess::ReadWrite,
+            allow_network: false,
+            workspace_before,
+        })
+        .await
+        .expect("process starts");
+    let terminal = if started.state.is_terminal() {
+        started
+    } else {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            supervisor.poll(session_id, "stale-pid", started.output_cursor, 2_000),
+        )
+        .await
+        .expect("wait for terminal remains bounded")
+        .expect("process reaches terminal")
+    };
+    assert!(terminal.state.is_terminal());
+    assert_eq!(
+        supervisor
+            .retained_pid_for_test(session_id, "stale-pid")
+            .await,
+        None
+    );
+
+    // Bait: a live unrelated process. If terminate() still signals the injected
+    // PID after terminal publication, this child will die.
+    let mut bait = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn bait process");
+    let bait_pid = bait.id();
+    assert!(
+        supervisor
+            .inject_pid_for_test(session_id, "stale-pid", bait_pid)
+            .await,
+        "terminal entry accepts injected stale pid for the regression"
+    );
+
+    let after_terminate = supervisor
+        .terminate(session_id, "stale-pid", terminal.output_cursor)
+        .await
+        .expect("terminate on terminal process remains idempotent");
+    assert!(after_terminate.state.is_terminal());
+
+    let bait_status = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &bait_pid.to_string()])
+        .output()
+        .expect("inspect bait status");
+    let bait_is_running = bait_status.status.success()
+        && String::from_utf8_lossy(&bait_status.stdout)
+            .lines()
+            .any(|line| !line.trim().is_empty() && !line.trim_start().starts_with('Z'));
+    let _ = bait.kill();
+    let _ = bait.wait();
+    assert!(
+        bait_is_running,
+        "terminate after terminal must not signal a stale/recycled PID"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_supervisor_caps_retained_terminal_process_memory() {
+    let workspace = tempdir().expect("workspace");
+    let supervisor = ProcessSupervisor::new();
+    let sandbox = SystemSandbox::process_only();
+    let session_id = SessionId::new();
+    let limit = max_terminal_processes();
+    for index in 0..(limit + 4) {
+        let process_id = format!("terminal-cap-{index}");
+        let args = vec!["-c".to_owned(), format!("printf '{index}\\n'; exit 0")];
+        let workspace_before = workspace_scan::capture(workspace.path()).await;
+        let process_id_for_poll = process_id.clone();
+        let started = supervisor
+            .start(ProcessStartRequest {
+                process_id,
+                session_id,
+                program: "/bin/sh",
+                args: &args,
+                command_display: format!("terminal cap fixture {index}"),
+                cwd: workspace.path(),
+                workspace_root: workspace.path(),
+                timeout_ms: 5_000,
+                wait_ms: 1_000,
+                cancellation: CancellationToken::new(),
+                sandbox: &sandbox,
+                workspace_access: WorkspaceAccess::ReadWrite,
+                allow_network: false,
+                workspace_before,
+            })
+            .await
+            .expect("terminal process starts");
+        let terminal = if started.state.is_terminal() {
+            started
+        } else {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                supervisor.poll(
+                    session_id,
+                    &process_id_for_poll,
+                    started.output_cursor,
+                    2_000,
+                ),
+            )
+            .await
+            .expect("wait for terminal remains bounded")
+            .expect("process reaches terminal")
+        };
+        assert!(terminal.state.is_terminal());
+    }
+    // list() prunes before reading, so the post-insert overflow from the final
+    // start is trimmed before we assert the retention cap.
+    let listed = supervisor.list(session_id).await;
+    let retained = supervisor.retained_process_count_for_test().await;
+    assert!(
+        retained <= limit,
+        "retained terminal processes {retained} exceeded cap {limit}"
+    );
+    assert_eq!(listed.len(), retained);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_supervisor_terminate_session_eagerly_kills_descendants() {
+    let workspace = tempdir().expect("workspace");
+    let supervisor = ProcessSupervisor::new();
+    let sandbox = SystemSandbox::process_only();
+    let session_id = SessionId::new();
+    let args = vec![
+        "-c".to_owned(),
+        "sleep 30 & child=$!; printf 'child=%s\\n' \"$child\"; wait".to_owned(),
+    ];
+    let workspace_before = workspace_scan::capture(workspace.path()).await;
+    let started = tokio::time::timeout(
+        Duration::from_secs(2),
+        supervisor.start(ProcessStartRequest {
+            process_id: "terminate-session-descendant".to_owned(),
+            session_id,
+            program: "/bin/sh",
+            args: &args,
+            command_display: "terminate session descendant fixture".to_owned(),
+            cwd: workspace.path(),
+            workspace_root: workspace.path(),
+            timeout_ms: 30_000,
+            wait_ms: 1_000,
+            cancellation: CancellationToken::new(),
+            sandbox: &sandbox,
+            workspace_access: WorkspaceAccess::ReadWrite,
+            allow_network: false,
+            workspace_before,
+        }),
+    )
+    .await
+    .expect("process start remains bounded")
+    .expect("process starts");
+    assert_eq!(started.state, ProcessState::Running);
+    let child_pid = started
+        .output
+        .lines()
+        .find_map(|line| line.strip_prefix("child=")?.trim().parse::<i32>().ok())
+        .expect("descendant pid is reported");
+
+    let terminated = tokio::time::timeout(
+        Duration::from_secs(2),
+        supervisor.terminate_session(session_id),
+    )
+    .await
+    .expect("terminate_session remains bounded")
+    .expect("session processes terminate");
+    assert_eq!(terminated, 1);
+
+    let terminal = supervisor
+        .reconnect(session_id, "terminate-session-descendant", 0)
+        .await
+        .expect("terminal process remains queryable");
+    assert!(terminal.state.is_terminal());
+    let descendant_status = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &child_pid.to_string()])
+        .output()
+        .expect("inspect descendant status");
+    let descendant_is_running = descendant_status.status.success()
+        && String::from_utf8_lossy(&descendant_status.stdout)
+            .lines()
+            .any(|line| !line.trim().is_empty() && !line.trim_start().starts_with('Z'));
+    assert!(
+        !descendant_is_running,
+        "managed descendant survived terminate_session"
+    );
+    assert_eq!(
+        supervisor
+            .retained_pid_for_test(session_id, "terminate-session-descendant")
+            .await,
+        None
     );
 }
 

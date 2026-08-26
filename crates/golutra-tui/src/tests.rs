@@ -207,6 +207,34 @@ fn tui_tool_profile_is_explicit_on_prompts_and_inherited_by_steering() {
     );
 }
 
+#[test]
+fn tui_history_bounds_a_single_oversized_event_payload() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        true,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    let oversized = transcript_event(
+        1,
+        session_id,
+        task_id,
+        RuntimeEventType::ProviderStreamed,
+        json!({"delta": "x".repeat(TUI_EVENT_HISTORY_BYTE_LIMIT * 2)}),
+    );
+
+    app.append_event_to_history(oversized);
+
+    assert_eq!(app.events.len(), 1);
+    assert!(app.retained_event_bytes() <= TUI_EVENT_HISTORY_BYTE_LIMIT);
+    assert_eq!(app.events[0].payload["_truncated"], json!(true));
+    assert_eq!(app.events[0].sequence_no, 1);
+}
+
 #[tokio::test]
 async fn remote_transport_attaches_to_the_real_app_server_and_resolves_a_session() {
     let _guard = env_lock_guard().await;

@@ -161,7 +161,7 @@ export interface ThreadRunOptions {
   /** Let the provider own planning/stopping, or use an explicit contract adapter. */
   executionMode?: "open" | "strict";
   /** Expose the compact coding surface, or opt into every registered extension. */
-  toolProfile?: "coding" | "full";
+  toolProfile?: "coding" | "full" | "none";
   outputSchema?: Record<string, unknown>;
   taskContract?: TaskContract;
   completionCriteria?: readonly string[];
@@ -180,7 +180,7 @@ export type LegacyThreadRunOptions = Omit<
 
 export interface SteerOptions {
   /** Override only the model-visible tool surface for this continuation. */
-  toolProfile?: "coding" | "full";
+  toolProfile?: "coding" | "full" | "none";
 }
 
 export interface ReconcileTaskOptions {

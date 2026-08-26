@@ -344,6 +344,9 @@ impl ObservationReceiver {
     pub(crate) async fn next(&self) -> Option<ObservationCommand> {
         loop {
             let notified = self.queue.notify.notified();
+            tokio::pin!(notified);
+            // 先登记等待再检查队列，避免生产者在检查窗口内通知后被遗漏。
+            notified.as_mut().enable();
             match self.try_next() {
                 QueuePoll::Command(command) => return Some(command),
                 QueuePoll::Closed => return None,

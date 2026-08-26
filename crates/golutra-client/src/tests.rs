@@ -2482,6 +2482,12 @@ async fn governed_runtime_facade_routes_the_canonical_task_and_trace_chain() {
 async fn completed_task_allows_next_prompt_in_same_session() {
     let transport = EmbeddedTransport::in_memory().await.expect("transport");
     let session_id = SessionId::new();
+    let initial_instance_id = transport
+        .host
+        .runtime_info("test://runtime")
+        .await
+        .expect("runtime info")
+        .instance_id;
 
     let first = transport
         .send_command(command(session_id, "hi"))
@@ -2509,11 +2515,36 @@ async fn completed_task_allows_next_prompt_in_same_session() {
             .count(),
         2
     );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == RuntimeEventType::TaskCompleted)
+            .count(),
+        2
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == RuntimeEventType::AssistantMessage)
+            .count(),
+        2
+    );
     assert!(
         events
             .iter()
             .all(|event| event.event_type != RuntimeEventType::BusyPolicyDecided)
     );
+    assert_eq!(
+        transport
+            .host
+            .runtime_info("test://runtime")
+            .await
+            .expect("runtime info after turns")
+            .instance_id,
+        initial_instance_id,
+        "consecutive turns must reuse the same cwd-bound runtime host"
+    );
+    transport.close().await.expect("close reused runtime host");
 }
 
 #[tokio::test]

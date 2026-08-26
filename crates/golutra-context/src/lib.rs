@@ -1,7 +1,7 @@
 use golutra_core::{
-    BudgetOverflowAction, ContextContributorSnapshot, ContextMessageSnapshot, ContextSnapshot,
-    ContextSnapshotId, SessionId, TaskId, TokenBudgetSnapshot, TokenBudgetSnapshotId,
-    TokenUsageRecord, ToolContract, TurnId,
+    BudgetOverflowAction, CacheIdentity, ContextContributorSnapshot, ContextMessageSnapshot,
+    ContextSnapshot, ContextSnapshotId, SessionId, TaskId, TokenBudgetSnapshot,
+    TokenBudgetSnapshotId, TokenUsageRecord, ToolContract, TurnId,
 };
 use golutra_llm::{
     ProviderMessage, ProviderRequest, ProviderRole, ProviderUsage, provider_tool_wire_projection,
@@ -991,6 +991,29 @@ pub fn token_usage_record(
     usage: &ProviderUsage,
     cost_model: &str,
 ) -> TokenUsageRecord {
+    token_usage_record_with_cache_identity(
+        plan,
+        request,
+        response_event_id,
+        budget_snapshot,
+        usage,
+        cost_model,
+        request.cache_identity(),
+    )
+}
+
+/// Build usage attribution while preserving the provider-specific cache route
+/// identity used on the wire.
+#[must_use]
+pub fn token_usage_record_with_cache_identity(
+    plan: &ContextBuildPlan,
+    request: &ProviderRequest,
+    response_event_id: golutra_core::ProviderResponseId,
+    budget_snapshot: &TokenBudgetSnapshot,
+    usage: &ProviderUsage,
+    cost_model: &str,
+    cache_identity: Option<CacheIdentity>,
+) -> TokenUsageRecord {
     let system_prompt_tokens = message_tokens(request, ProviderRole::System);
     let user_message_tokens = message_tokens(request, ProviderRole::User);
     let assistant_recent_tokens = message_tokens(request, ProviderRole::Assistant);
@@ -1109,7 +1132,7 @@ pub fn token_usage_record(
         },
         provider_total_tokens: normalized.provider_total_tokens,
         usage_complete: normalized.usage_complete,
-        cache_identity: request.cache_identity(),
+        cache_identity,
     }
 }
 

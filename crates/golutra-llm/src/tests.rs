@@ -925,6 +925,25 @@ fn prompt_cache_identity_is_stable_and_session_scoped() {
 }
 
 #[test]
+fn provider_cache_identity_isolated_by_protocol_endpoint() {
+    let mut request = request();
+    request.session_id = Some(golutra_core::SessionId::new());
+    request.cache_policy = golutra_core::PromptCachePolicy::Auto;
+    let first = OpenAiCompatibleProvider::new("test-key", "https://gateway-a.example/v1", "model");
+    let second = OpenAiCompatibleProvider::new("test-key", "https://gateway-b.example/v1", "model");
+
+    assert_ne!(
+        first.cache_identity_for_request(&request),
+        second.cache_identity_for_request(&request),
+        "identical session/provider/model names must not share endpoint caches"
+    );
+    assert_eq!(
+        first.cache_identity_for_request(&request),
+        first.cache_identity_for_request(&request)
+    );
+}
+
+#[test]
 fn provider_tool_projection_excludes_internal_contract_policy() {
     let mut contract = golutra_core::ToolContract {
         tool_name: "read_file".to_owned(),
@@ -977,6 +996,35 @@ fn openai_cache_fields_are_sent_only_for_supported_endpoint() {
     );
     assert!(custom.get("prompt_cache_key").is_none());
     assert!(custom.get("prompt_cache_retention").is_none());
+}
+
+#[test]
+fn openai_tools_request_parallel_tool_calls_explicitly() {
+    let mut request = request();
+    request.tools.push(golutra_core::ToolContract {
+        tool_name: "read_file".to_owned(),
+        input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        output_schema: json!({}),
+        error_schema: json!({}),
+        side_effect_type: golutra_core::SideEffectType::None,
+        idempotency_key_policy: "none".to_owned(),
+        timeout_policy: "bounded".to_owned(),
+        cancellation_policy: "supported".to_owned(),
+        retry_policy: "none".to_owned(),
+        artifact_policy: "none".to_owned(),
+        permission_policy_ref: None,
+    });
+
+    let body = openai_completion_body(
+        &request,
+        "gpt-test",
+        &ProviderGenerationConfig::default(),
+        false,
+        false,
+    );
+
+    assert_eq!(body["tool_choice"], "auto");
+    assert_eq!(body["parallel_tool_calls"], true);
 }
 
 #[test]

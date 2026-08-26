@@ -24,6 +24,7 @@ fn main() {
         "cargo:rerun-if-changed={}",
         workspace.join(".git/index").display()
     );
+    println!("cargo:rerun-if-env-changed=GOLUTRA_BUILD_BINARY_CHECKSUM");
     emit_tracked_reruns(&workspace);
 
     let commit = git_text(&workspace, &["rev-parse", "HEAD"]);
@@ -58,6 +59,10 @@ fn main() {
         &env::var("PROFILE").unwrap_or_else(|_| "unknown".into()),
     );
     emit("GOLUTRA_BUILD_FEATURES", &features.join(","));
+    emit(
+        "GOLUTRA_BUILD_BINARY_CHECKSUM",
+        &env::var("GOLUTRA_BUILD_BINARY_CHECKSUM").unwrap_or_default(),
+    );
 }
 
 fn emit(name: &str, value: &str) {

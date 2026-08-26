@@ -92,7 +92,7 @@ class AgentThreadRef(TypedDict, total=False):
     thread_id: Required[str]
     workspace_root: NotRequired[str | None]
 
-AgentToolProfile: TypeAlias = Literal['coding', 'full']
+AgentToolProfile: TypeAlias = Literal['coding', 'full'] | Literal['none']
 
 class AgentTurnExecutionOptions(TypedDict, total=False):
     execution_mode: NotRequired[AgentExecutionMode]

@@ -169,6 +169,14 @@ pub struct ProviderRequest {
 impl ProviderRequest {
     #[must_use]
     pub fn cache_identity(&self) -> Option<CacheIdentity> {
+        self.cache_identity_with_namespace("default")
+    }
+
+    /// Build a cache identity that is isolated by the actual provider route.
+    /// The namespace is a stable protocol/endpoint fingerprint supplied by the
+    /// adapter; request bodies and volatile task ids deliberately stay out of it.
+    #[must_use]
+    pub fn cache_identity_with_namespace(&self, namespace: &str) -> Option<CacheIdentity> {
         let session_id = self.session_id?;
         if self.cache_policy == PromptCachePolicy::None {
             return None;
@@ -176,8 +184,11 @@ impl ProviderRequest {
         let canonical_provider = self.provider_id.trim().to_ascii_lowercase();
         let canonical_model = self.model_id.trim().to_ascii_lowercase();
         let prefix = format!(
-            "golutra-prompt-cache-v1\0{}\0{}\0{}",
-            session_id, canonical_provider, canonical_model,
+            "golutra-prompt-cache-v2\0{}\0{}\0{}\0{}",
+            session_id,
+            canonical_provider,
+            canonical_model,
+            namespace.trim(),
         );
         use sha2::{Digest, Sha256};
         Some(CacheIdentity {
@@ -507,6 +518,18 @@ pub trait LlmProvider: Send + Sync {
     /// are backed by the same streaming protocol.
     fn supports_buffered_transport(&self) -> bool {
         true
+    }
+
+    /// Stable route identity used to isolate prompt caches across protocols and
+    /// endpoints that happen to expose the same provider/model names.
+    fn cache_namespace(&self) -> String {
+        let contract = self.contract();
+        format!("{}\0{}", contract.native_protocol, contract.provider_id)
+    }
+
+    #[must_use]
+    fn cache_identity_for_request(&self, request: &ProviderRequest) -> Option<CacheIdentity> {
+        request.cache_identity_with_namespace(&self.cache_namespace())
     }
 
     async fn complete_stream(
@@ -1005,12 +1028,14 @@ impl OpenAiCompatibleProvider {
 impl LlmProvider for OpenAiCompatibleProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let body = openai_completion_body(
+        let cache_identity = self.cache_identity_for_request(&request);
+        let body = openai_completion_body_with_identity(
             &request,
             &self.model_id,
             &self.generation_config,
             false,
             openai_prompt_cache_supported(&self.base_url),
+            cache_identity.as_ref(),
         );
 
         let response = self.post_with_auth_retry(&url, &body).await?;
@@ -1037,12 +1062,14 @@ impl LlmProvider for OpenAiCompatibleProvider {
         on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
     ) -> Result<ProviderResponse, ProviderError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let body = openai_completion_body(
+        let cache_identity = self.cache_identity_for_request(&request);
+        let body = openai_completion_body_with_identity(
             &request,
             &self.model_id,
             &self.generation_config,
             true,
             openai_prompt_cache_supported(&self.base_url),
+            cache_identity.as_ref(),
         );
         let response = self.post_with_auth_retry(&url, &body).await?;
         let status = response.status();
@@ -1087,6 +1114,10 @@ impl LlmProvider for OpenAiCompatibleProvider {
             .map(|fixture| format!("tests/fixtures/openai-compatible/{fixture}.json"))
             .collect(),
         }
+    }
+
+    fn cache_namespace(&self) -> String {
+        route_cache_namespace("openai_chat_completions", &self.base_url)
     }
 }
 
@@ -1296,6 +1327,18 @@ impl LlmProvider for ConfiguredProvider {
             | Self::Gemini(provider)
             | Self::VertexAi(provider)
             | Self::Genai(provider) => provider.supports_buffered_transport(),
+        }
+    }
+
+    fn cache_namespace(&self) -> String {
+        match self {
+            Self::Mock(provider) => provider.cache_namespace(),
+            Self::OpenAiCompatible(provider) => provider.cache_namespace(),
+            Self::OpenAiResponses(provider) => provider.cache_namespace(),
+            Self::Anthropic(provider)
+            | Self::Gemini(provider)
+            | Self::VertexAi(provider)
+            | Self::Genai(provider) => provider.cache_namespace(),
         }
     }
 
@@ -1589,6 +1632,12 @@ fn mock_contract() -> ProviderContract {
     }
 }
 
+pub(crate) fn route_cache_namespace(protocol: &str, base_url: &str) -> String {
+    // URL 本身只作为哈希输入，不进入日志或 provider payload；去掉末尾斜杠
+    // 后同一路由的配置变体不会平白拆分缓存。
+    format!("{protocol}\0{}", base_url.trim().trim_end_matches('/'))
+}
+
 fn openai_message(message: &ProviderMessage) -> Value {
     let mut value = json!({
         "role": match message.role {
@@ -1858,12 +1907,32 @@ fn openai_tool_schema(contract: &ToolContract) -> Value {
     provider_tool_wire_projection(contract)
 }
 
+#[cfg(test)]
 fn openai_completion_body(
     request: &ProviderRequest,
     model_id: &str,
     generation_config: &ProviderGenerationConfig,
     streaming: bool,
     prompt_cache_supported: bool,
+) -> Value {
+    let cache_identity = request.cache_identity();
+    openai_completion_body_with_identity(
+        request,
+        model_id,
+        generation_config,
+        streaming,
+        prompt_cache_supported,
+        cache_identity.as_ref(),
+    )
+}
+
+fn openai_completion_body_with_identity(
+    request: &ProviderRequest,
+    model_id: &str,
+    generation_config: &ProviderGenerationConfig,
+    streaming: bool,
+    prompt_cache_supported: bool,
+    cache_identity: Option<&CacheIdentity>,
 ) -> Value {
     let mut body = json!({
         "model": model_id,
@@ -1872,13 +1941,16 @@ fn openai_completion_body(
     if !request.tools.is_empty() {
         body["tools"] = Value::Array(request.tools.iter().map(openai_tool_schema).collect());
         body["tool_choice"] = Value::String("auto".to_owned());
+        // 明确要求 provider 在一次响应中并行发出彼此独立的工具调用，
+        // 避免兼容端点因默认值差异把多文件任务退化为串行回合。
+        body["parallel_tool_calls"] = Value::Bool(true);
     }
     if streaming {
         body["stream"] = Value::Bool(true);
         body["stream_options"] = json!({"include_usage": true});
     }
-    if prompt_cache_supported && let Some(identity) = request.cache_identity() {
-        body["prompt_cache_key"] = Value::String(identity.key);
+    if prompt_cache_supported && let Some(identity) = cache_identity {
+        body["prompt_cache_key"] = Value::String(identity.key.clone());
         match request.cache_policy {
             golutra_core::PromptCachePolicy::Short => {
                 body["prompt_cache_retention"] = Value::String("5m".to_owned());
@@ -2435,7 +2507,7 @@ fn provider_error_retry_after(value: &Value) -> Option<Duration> {
         .map(|seconds| Duration::from_secs(seconds.min(60)))
 }
 
-fn retry_after_from_headers(headers: &HeaderMap) -> Option<Duration> {
+pub(crate) fn retry_after_from_headers(headers: &HeaderMap) -> Option<Duration> {
     if let Some(milliseconds) = headers
         .get("retry-after-ms")
         .and_then(|value| value.to_str().ok())
@@ -2450,7 +2522,7 @@ fn retry_after_from_headers(headers: &HeaderMap) -> Option<Duration> {
         .map(|seconds| Duration::from_secs(seconds.min(60)))
 }
 
-fn request_id_from_headers(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn request_id_from_headers(headers: &HeaderMap) -> Option<String> {
     ["x-request-id", "request-id", "openai-request-id"]
         .into_iter()
         .find_map(|name| {

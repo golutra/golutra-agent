@@ -104,6 +104,12 @@ impl RuntimeHost {
         // The guard is released before waiting for supervisors because delegated cleanup can
         // issue an internal archive command.
         self.cancel_active_work().await;
+        // A queued governance request is represented by the durable terminal event and can be
+        // recreated by the next host. Shutdown must not wait for a request that is being dropped
+        // together with the worker.
+        self.execution
+            .post_task_schedule_pending
+            .store(0, Ordering::SeqCst);
         drop(command_guard);
         if !self.wait_for_active_work_until(deadline).await {
             // A stuck worker must not keep a host-owned delegation task alive
@@ -133,6 +139,7 @@ impl RuntimeHost {
             }
             self.execution.delegation_admissions.lock().await.clear();
             self.execution.delegation_operations.lock().await.clear();
+            self.signal_active_work_change();
 
             if !self
                 .wait_for_active_work_until(Instant::now() + HOST_SHUTDOWN_GRACE_TIMEOUT)
@@ -165,6 +172,11 @@ impl RuntimeHost {
                 }
             }
         }
+
+        self.execution
+            .post_task_schedule_pending
+            .store(0, Ordering::SeqCst);
+        self.signal_active_work_change();
 
         if failures.is_empty() {
             Ok(())
@@ -200,6 +212,11 @@ impl RuntimeHost {
 
     async fn wait_for_active_work_until(&self, deadline: Instant) -> bool {
         loop {
+            let notification = self.execution.active_work_notify.notified();
+            tokio::pin!(notification);
+            // Register before inspecting the maps so a completion between the
+            // check and await cannot leave shutdown asleep until its deadline.
+            notification.as_mut().enable();
             let tasks_active = !self.execution.task_controls.lock().await.is_empty();
             let operations_active = {
                 let mut operations = self.execution.delegation_operations.lock().await;
@@ -212,7 +229,12 @@ impl RuntimeHost {
             if Instant::now() >= deadline {
                 return false;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::select! {
+                _ = &mut notification => {}
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                    return false;
+                }
+            }
         }
     }
 }
@@ -309,8 +331,11 @@ impl RuntimeHost {
             token_budget_hint: 128,
             source_refs: vec![format!("workspace:{}", workspace_root.display())],
         });
-        if let Some(project_instructions) = load_project_instruction_bundle(&workspace_root).await?
-        {
+        let project_instructions = load_project_instruction_bundle(&workspace_root);
+        let skill_context = self.active_skill_context(&objective);
+        let (project_instructions, skill_context) =
+            tokio::join!(project_instructions, skill_context);
+        if let Some(project_instructions) = project_instructions? {
             contributors.push(ContextContributor {
                 name: "project_instructions".to_owned(),
                 role: ProviderRole::System,
@@ -319,7 +344,7 @@ impl RuntimeHost {
                 source_refs: project_instructions.source_refs,
             });
         }
-        if let Some(skill_context) = self.active_skill_context(&objective).await? {
+        if let Some(skill_context) = skill_context? {
             contributors.push(ContextContributor {
                 name: "project_skills".to_owned(),
                 role: ProviderRole::System,
@@ -329,13 +354,18 @@ impl RuntimeHost {
             });
         }
 
-        // 历史读取必须在当前任务的 durable 事件可见后进行；本阶段保持 memory/history
-        // 串行，优先保证恢复会话的快照一致性，避免读到尚未落盘的 assistant 事件。
+        // 两路查询都只读已有 durable 状态，可以并发执行；MemoryRetrieved 事件仍在
+        // 检索完成后按原顺序写入，避免把有副作用的计数更新移到错误边界之外。
         let memory_store = self.storage.memory_store.clone();
         let memory_query = objective.clone();
-        let memories =
+        let memories = async move {
             run_blocking(move || memory_store.retrieve(&memory_query, MemoryScope::Project, 5))
-                .await??;
+                .await?
+                .map_err(ClientError::from)
+        };
+        let history = self.conversation_history_summary(session_id, current_task_id);
+        let (memories, history) = tokio::join!(memories, history);
+        let memories = memories?;
         let memories = select_memories_for_context(memories);
         self.record_event(host_event(
             self.next_sequence_no(),
@@ -372,10 +402,7 @@ impl RuntimeHost {
             });
         }
 
-        if let Some((history, source_refs)) = self
-            .conversation_history_summary(session_id, current_task_id)
-            .await?
-        {
+        if let Some((history, source_refs)) = history? {
             contributors.push(ContextContributor {
                 name: "conversation_history".to_owned(),
                 role: ProviderRole::User,
@@ -414,6 +441,8 @@ impl RuntimeHost {
         session_id: SessionId,
         current_task_id: TaskId,
     ) -> Result<Option<(String, Vec<String>)>, ClientError> {
+        // 两个查询必须读取同一条时间线；串行化可避免压缩事件与历史事件来自不同
+        // SQLite 快照，进而造成重复/遗漏并使后续 cache 前缀不稳定。
         let events = self
             .storage
             .repositories
@@ -600,6 +629,7 @@ impl RuntimeHost {
             },
         );
         drop(task_controls);
+        self.signal_active_work_change();
         let supervisor = self.clone();
         let supervised_task = task.clone();
         tokio::spawn(async move {
@@ -735,6 +765,7 @@ impl RuntimeHost {
             .lock()
             .await
             .retain(|_, operation| !operation.belongs_to(session_id) || !operation.is_complete());
+        self.signal_active_work_change();
     }
 
     pub(super) async fn cleanup_delegation_operation(
@@ -761,6 +792,8 @@ impl RuntimeHost {
         {
             operations.remove(identity);
         }
+        drop(operations);
+        self.signal_active_work_change();
     }
 
     pub(super) async fn run_agent_task(
@@ -981,23 +1014,8 @@ impl RuntimeHost {
         );
         self.finish_lane_with_outcome(&final_task, terminal_status, task_outcome)
             .await?;
-        if let Err(error) = self
-            .promote_successful_task_memory(
-                &final_task,
-                &final_objective,
-                &outcome,
-                terminal_status,
-            )
-            .await
-        {
-            self.record_post_task_governance_failure(
-                &final_task,
-                "memory_quarantine",
-                false,
-                &error,
-            )
-            .await;
-        }
+        // 记忆隔离和评估都在 host-owned post-task worker 中执行；终态事件提交后立即
+        // 释放执行 worker，避免非用户关键的治理 IO 拉长端到端尾延迟。
         self.schedule_task_evaluation_best_effort(
             &final_task,
             HostedTaskEvaluation {

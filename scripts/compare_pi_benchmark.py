@@ -298,10 +298,9 @@ ESTIMATED_USAGE_FIELDS = frozenset(
 def normalize_golutra_usage(record: dict[str, Any]) -> dict[str, Any]:
     raw_input = as_number(record.get("input_tokens"))
     canonical_uncached = as_number(record.get("non_cached_input_tokens"))
-    cache_read_value = record.get("cache_read_tokens")
-    if cache_read_value is None:
-        cache_read_value = record.get("cached_input_tokens")
-    cache_read = as_number(cache_read_value)
+    # 持久化记录只接受 canonical cache_read_tokens；provider wire 的别名
+    # 必须在 Rust 适配层归一化，基准解析器不能替旧会话字段兜底。
+    cache_read = as_number(record.get("cache_read_tokens"))
     output = as_number(record.get("output_tokens"))
     provider_total = as_number(record.get("provider_total_tokens"))
     total = provider_total
@@ -800,16 +799,13 @@ class ProviderRequestTracker:
 
 def usage_record_from_provider_completed(event: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
     usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
-    cache_read = usage.get("cache_read_tokens")
-    if cache_read is None:
-        cache_read = usage.get("cached_input_tokens")
     return {
         "request_event_id": provider_request_key(event, payload, fallback_event_id=True),
         "input_tokens": usage.get("input_tokens"),
         "non_cached_input_tokens": usage.get("non_cached_input_tokens"),
         "output_tokens": usage.get("output_tokens"),
         "reasoning_tokens": usage.get("reasoning_tokens"),
-        "cache_read_tokens": cache_read,
+        "cache_read_tokens": usage.get("cache_read_tokens"),
         "cache_write_tokens": usage.get("cache_write_tokens"),
         "provider_total_tokens": usage.get("total_tokens"),
         "usage_source": usage.get("usage_source", "provider"),
@@ -1120,7 +1116,12 @@ def parse_pi(
     metrics["request_count"] = len(usage_records)
     apply_usage_records(metrics, usage_records.values(), metrics["request_count"])
     metrics["tool_names"] = sorted(tool_names)
-    metrics["tool_result_tokens_estimated"] = sum(estimated_results.values())
+    # No tool-result event is different from a measured zero-token result.  A
+    # missing estimate must remain unknown so aggregate reports do not turn it
+    # into a misleading numeric zero.
+    metrics["tool_result_tokens_estimated"] = (
+        sum(estimated_results.values()) if estimated_results else None
+    )
     estimate_coverage = {
         "reported_requests": 0,
         "expected_requests": 0,
@@ -1334,7 +1335,85 @@ def display_metric(value: Any) -> str:
     return "-" if value is None else str(value)
 
 
+def usage_coverage_entry(metrics: dict[str, Any], field: str) -> dict[str, Any]:
+    coverage = metrics.get("usage_coverage")
+    if not isinstance(coverage, dict):
+        return {}
+    entry = coverage.get(field)
+    return entry if isinstance(entry, dict) else {}
+
+
+def usage_coverage_state(metrics: dict[str, Any], field: str) -> dict[str, Any]:
+    """Return normalized coverage counts for one task/usage field.
+
+    A parser may intentionally emit ``unknown`` with zero expected requests
+    when a field is not applicable (for example, no tool result was produced).
+    Missing coverage on a task that did issue requests is different: it is an
+    unknown measurement and must count against aggregate completeness.
+    """
+    entry = usage_coverage_entry(metrics, field)
+    request_count = as_number(metrics.get("request_count")) or 0
+    expected_value = as_number(entry.get("expected_requests"))
+    expected = expected_value if expected_value is not None else request_count
+    reported = as_number(entry.get("reported_requests")) or 0
+    estimated = as_number(entry.get("estimated_count")) or 0
+    status = entry.get("status")
+    value = metrics.get(field)
+    tool_result_count = as_number(metrics.get("tool_result_count")) or 0
+    explicitly_not_applicable = (
+        field in ESTIMATED_USAGE_FIELDS
+        and expected_value == 0
+        and reported == 0
+        and estimated == 0
+        and status == "unknown"
+        and (field != "tool_result_tokens_estimated" or tool_result_count == 0)
+    )
+    has_value_without_count = (
+        value is not None
+        and status != "complete"
+        and expected == 0
+        and reported == 0
+        and estimated == 0
+    )
+    missing_for_active_task = not entry and request_count > 0
+    applicable = (
+        not explicitly_not_applicable
+        and (
+            expected > 0
+            or reported > 0
+            or estimated > 0
+            or status == "partial"
+            or (
+                field == "tool_result_tokens_estimated"
+                and tool_result_count > 0
+            )
+        )
+    )
+    if has_value_without_count or missing_for_active_task:
+        applicable = True
+        status = "unknown"
+        if expected == 0:
+            expected = max(1, request_count)
+    return {
+        "reported": reported,
+        "expected": expected,
+        "estimated": estimated,
+        "status": status,
+        "applicable": applicable,
+        "source": entry.get("source"),
+    }
+
+
 def display_field(metrics: dict[str, Any], field: str) -> str:
+    # A numeric value is only displayable when its coverage says that it was
+    # observed.  This keeps an accidental zero from masquerading as a provider
+    # measurement when the corresponding usage field is unknown.
+    coverage = usage_coverage_entry(metrics, field)
+    if field in USAGE_FIELDS and coverage.get("status") not in {
+        "complete",
+        "partial",
+    }:
+        return "-"
     value = metrics.get(field)
     if value is not None:
         return str(value)
@@ -1510,9 +1589,43 @@ def aggregate_metrics(tasks: list[dict[str, Any]], engine: str) -> dict[str, Any
     summary: dict[str, Any] = {
         "task_count": len(metrics),
         "passed_tasks": sum(1 for metric in metrics if metric.get("verification", {}).get("passed")),
-        "usage_complete": all(metric.get("usage_complete") is True for metric in metrics),
+        "usage_complete": bool(metrics)
+        and all(metric.get("usage_complete") is True for metric in metrics),
     }
     for field in numeric_fields:
+        if field in USAGE_FIELDS:
+            # Usage fields are valid only within their per-task coverage
+            # contract.  In particular, do not sum a stale/zero value when a
+            # provider omitted that field and the parser marked it unknown.
+            known_values: list[int] = []
+            applicable_count = 0
+            all_complete = True
+            for metric in metrics:
+                coverage = usage_coverage_state(metric, field)
+                if not coverage["applicable"]:
+                    continue
+                applicable_count += 1
+                if coverage["status"] not in {
+                    "complete",
+                    "partial",
+                }:
+                    all_complete = False
+                    continue
+                if coverage["status"] != "complete":
+                    all_complete = False
+                value = metric.get(field)
+                if value is None:
+                    value = metric.get(f"{field}_partial")
+                normalized = as_number(value)
+                if normalized is None:
+                    all_complete = False
+                    continue
+                known_values.append(normalized)
+            all_complete = all_complete and applicable_count > 0
+            summary[field] = sum(known_values) if all_complete else None
+            if known_values and not all_complete:
+                summary[f"{field}_partial"] = sum(known_values)
+            continue
         complete_values = [metric.get(field) for metric in metrics]
         if metrics and all(value is not None for value in complete_values):
             summary[field] = sum(complete_values)
@@ -1529,24 +1642,43 @@ def aggregate_metrics(tasks: list[dict[str, Any]], engine: str) -> dict[str, Any
             summary[f"{field}_partial"] = sum(reported)
     usage_coverage: dict[str, dict[str, Any]] = {}
     for field in USAGE_FIELDS:
-        field_coverage = [metric.get("usage_coverage", {}).get(field, {}) for metric in metrics]
-        reported = sum(int(entry.get("reported_requests", 0)) for entry in field_coverage)
-        expected = sum(int(entry.get("expected_requests", 0)) for entry in field_coverage)
-        estimated = sum(int(entry.get("estimated_count", 0)) for entry in field_coverage)
-        partial = any(entry.get("status") == "partial" for entry in field_coverage)
-        unknown = any(entry.get("status") == "unknown" for entry in field_coverage)
+        field_coverage = [usage_coverage_state(metric, field) for metric in metrics]
+        applicable_coverage = [entry for entry in field_coverage if entry["applicable"]]
+        reported = sum(entry["reported"] for entry in applicable_coverage)
+        expected = sum(entry["expected"] for entry in applicable_coverage)
+        estimated = sum(entry["estimated"] for entry in applicable_coverage)
+        statuses = [entry["status"] for entry in applicable_coverage]
+        partial = any(status == "partial" for status in statuses)
+        # Missing or malformed coverage is unknown too.  Treating it as an
+        # empty dictionary must not let another task make the aggregate look
+        # complete.
+        unknown = any(status not in {"complete", "partial"} for status in statuses)
         partial_requests = sum(
             max(
                 0,
-                int(entry.get("expected_requests", 0))
-                - int(entry.get("reported_requests", 0)),
+                entry["expected"] - entry["reported"],
             )
-            for entry in field_coverage
-            if entry.get("status") == "partial"
+            for entry in applicable_coverage
+            if entry["status"] == "partial"
         )
-        sources = {str(entry.get("source")) for entry in field_coverage if entry.get("source")}
-        complete = expected > 0 and reported == expected
-        estimate_only = estimated > 0 and reported == 0 and not unknown
+        unknown_requests = sum(
+            max(
+                0,
+                entry["expected"] - entry["reported"],
+            )
+            for entry in applicable_coverage
+            if entry["status"] not in {"complete", "partial"}
+        )
+        sources = {
+            str(entry["source"])
+            for entry in applicable_coverage
+            if entry["source"]
+        }
+        # Any unknown task keeps the aggregate from claiming complete
+        # coverage, even when the known tasks happen to line up exactly.
+        complete = expected > 0 and reported == expected and not unknown and not partial
+        estimate_only = estimated > 0 and reported == 0 and not unknown and not partial
+        has_known_values = reported > 0 or estimated > 0
         coverage_entry = {
             "reported_requests": reported,
             "expected_requests": expected,
@@ -1554,11 +1686,13 @@ def aggregate_metrics(tasks: list[dict[str, Any]], engine: str) -> dict[str, Any
             "status": (
                 "complete"
                 if complete or estimate_only
-                else ("partial" if partial or reported or estimated else "unknown")
+                else ("partial" if partial or has_known_values else "unknown")
             ),
         }
         if partial_requests:
             coverage_entry["partial_requests"] = partial_requests
+        if unknown_requests:
+            coverage_entry["unknown_requests"] = unknown_requests
         if estimated:
             coverage_entry["estimated_count"] = estimated
         usage_coverage[field] = coverage_entry

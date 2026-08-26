@@ -4705,6 +4705,19 @@ fn parallel_read_candidate_enforces_the_active_tool_profile() {
             .any(|tool| tool.tool_name == "external_hidden_read")
     );
     assert_eq!(coding_tools.len(), 8);
+
+    let none_tools = provider_tools_for_turn(
+        &executor
+            .registry()
+            .contracts()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>(),
+        &TaskContract::conversational(Vec::new()),
+        AgentToolProfile::None,
+        executor.registry(),
+    );
+    assert!(none_tools.is_empty());
 }
 
 #[test]
@@ -4823,6 +4836,14 @@ fn coding_profile_keeps_builtin_coding_capabilities_and_hides_undeclared_extensi
             executor.registry(),
         ),
         Some("tool is not part of the active Pi-plus provider surface")
+    );
+    assert_eq!(
+        tool_profile_rejection_reason(
+            &request("read_file", json!({"path": "README.md"})),
+            AgentToolProfile::None,
+            executor.registry(),
+        ),
+        Some("the active tool profile disables provider tools")
     );
 }
 

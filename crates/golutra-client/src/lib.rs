@@ -58,7 +58,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
-    sync::{Mutex, broadcast, mpsc, oneshot, watch},
+    sync::{Mutex, Notify, broadcast, mpsc, oneshot, watch},
     task::AbortHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -86,7 +86,6 @@ const MAX_ROLLOUT_LINE_BYTES: usize = 20 * 1024 * 1024;
 const ROLLOUT_FORMAT_VERSION: u32 = 1;
 const POST_TASK_JOB_MAX_ATTEMPTS: u32 = 3;
 const POST_TASK_JOB_LEASE_MINUTES: i64 = 5;
-const POST_TASK_JOB_POLL_MILLIS: u64 = 250;
 const POST_TASK_JOB_IDLE_POLL_MILLIS: u64 = 1_000;
 const EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY: &str = "_external_verifiers_require_os_sandbox";
 const TASK_CONTROL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -221,8 +220,9 @@ pub(crate) use provider_runtime::{
 };
 pub use rollout::{RolloutEnvelope, RolloutExport, ThreadRebindResult, redact_runtime_value};
 pub(crate) use rollout::{
-    append_rollout_line, normalize_rebind_source, rebuild_rollout_file, remove_rollout_projection,
-    rollout_line, rollout_path_for_workspace, rollout_projection_files,
+    append_rollout_line, append_rollout_line_relaxed, normalize_rebind_source,
+    rebuild_rollout_file, remove_rollout_projection, rollout_line, rollout_path_for_workspace,
+    rollout_projection_files,
 };
 #[cfg(test)]
 pub(crate) use rollout::{redact_rollout_value, rollout_lock_path};
@@ -395,6 +395,8 @@ struct RuntimeHostStorageState {
 struct RuntimeHostExecutionState {
     shutdown: CancellationToken,
     post_task_worker: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    post_task_schedule_tx: mpsc::UnboundedSender<post_task::PostTaskScheduleRequest>,
+    post_task_schedule_pending: AtomicU64,
     lane_manager: Mutex<RuntimeLaneManager>,
     event_bus: broadcast::Sender<RuntimeEvent>,
     live_subscriptions: StdMutex<Vec<LiveSubscription>>,
@@ -405,6 +407,8 @@ struct RuntimeHostExecutionState {
     task_controls: Mutex<HashMap<SessionId, HostedTaskControl>>,
     delegation_admissions: Mutex<HashMap<SessionId, delegation::DelegationAdmission>>,
     delegation_operations: Mutex<HashMap<String, Arc<delegation::DelegationOperation>>>,
+    active_work_notify: Notify,
+    rollout_threads: Mutex<HashMap<SessionId, Arc<ThreadRecord>>>,
     provider_auth_waiters: Mutex<HashMap<SessionId, PendingProviderAuth>>,
     web_search_backend: std::sync::OnceLock<Result<Option<Arc<HttpWebSearchBackend>>, String>>,
     process_supervisor: ProcessSupervisor,
@@ -1397,6 +1401,10 @@ impl BeforeSideEffectRecorder for HostedCheckpointRecorder {
 }
 
 impl RuntimeHost {
+    pub(crate) fn signal_active_work_change(&self) {
+        self.execution.active_work_notify.notify_waiters();
+    }
+
     /// Shut down runtime-owned managed processes and wait for each supervisor
     /// to persist its terminal state before the host is torn down.
     pub async fn close(&self) -> Result<(), ClientError> {
@@ -1690,6 +1698,7 @@ impl RuntimeHost {
             temporary_root,
         } = storage;
         let (event_bus, _) = broadcast::channel(512);
+        let (post_task_schedule_tx, post_task_schedule_rx) = mpsc::unbounded_channel();
         let max_sequence_no = store.max_sequence_no().await?;
         let next_sequence_no = max_sequence_no.saturating_add(1);
         let memory_store = runtime_paths
@@ -1738,6 +1747,8 @@ impl RuntimeHost {
             execution: RuntimeHostExecutionState {
                 shutdown: CancellationToken::new(),
                 post_task_worker: StdMutex::new(None),
+                post_task_schedule_tx,
+                post_task_schedule_pending: AtomicU64::new(0),
                 lane_manager: Mutex::new(RuntimeLaneManager::new()),
                 event_bus,
                 live_subscriptions: StdMutex::new(Vec::new()),
@@ -1748,6 +1759,8 @@ impl RuntimeHost {
                 task_controls: Mutex::new(HashMap::new()),
                 delegation_admissions: Mutex::new(HashMap::new()),
                 delegation_operations: Mutex::new(HashMap::new()),
+                active_work_notify: Notify::new(),
+                rollout_threads: Mutex::new(HashMap::new()),
                 provider_auth_waiters: Mutex::new(HashMap::new()),
                 web_search_backend: std::sync::OnceLock::new(),
                 process_supervisor: ProcessSupervisor::new(),
@@ -1772,7 +1785,7 @@ impl RuntimeHost {
             .jobs
             .recover_expired(&host.workspace_id.to_string(), chrono::Utc::now())
             .await?;
-        let post_task_worker = post_task::PostTaskCoordinator::start(&host);
+        let post_task_worker = post_task::PostTaskCoordinator::start(&host, post_task_schedule_rx);
         *host
             .execution
             .post_task_worker
@@ -2469,6 +2482,9 @@ impl RuntimeHost {
                 }
             }
         }
+        // Event-backed waiters (post-task evaluation and lifecycle observers) wake immediately
+        // after the durable event is visible instead of polling SQLite on a fixed interval.
+        self.signal_active_work_change();
         Ok(())
     }
 
@@ -2580,6 +2596,11 @@ impl RuntimeHost {
     ) -> Result<(), ClientError> {
         let Some(paths) = &self.runtime_paths else {
             thread.rollout_path = None;
+            self.execution
+                .rollout_threads
+                .lock()
+                .await
+                .insert(thread.session_id, Arc::new(thread.clone()));
             return Ok(());
         };
         let expected = paths.rollout_path(thread.thread_id).display().to_string();
@@ -2588,29 +2609,54 @@ impl RuntimeHost {
             thread.updated_at = chrono::Utc::now();
             self.storage.repositories.threads.upsert(thread).await?;
         }
+        self.execution
+            .rollout_threads
+            .lock()
+            .await
+            .insert(thread.session_id, Arc::new(thread.clone()));
         Ok(())
     }
 
     async fn append_rollout_event(&self, event: &RuntimeEvent) -> Result<(), ClientError> {
-        let Some(mut thread) = self
-            .storage
-            .repositories
-            .threads
-            .by_session(event.session_id)
-            .await?
-        else {
-            return Ok(());
+        let thread = if let Some(thread) = self
+            .execution
+            .rollout_threads
+            .lock()
+            .await
+            .get(&event.session_id)
+            .cloned()
+        {
+            thread
+        } else {
+            let Some(mut thread) = self
+                .storage
+                .repositories
+                .threads
+                .by_session(event.session_id)
+                .await?
+            else {
+                return Ok(());
+            };
+            self.ensure_thread_rollout_path(&mut thread).await?;
+            Arc::new(thread)
         };
-        self.ensure_thread_rollout_path(&mut thread).await?;
         let Some(path) = thread.rollout_path.as_deref().map(PathBuf::from) else {
             return Ok(());
         };
         if !path.exists() {
-            self.rebuild_thread_rollout(&thread).await?;
+            self.rebuild_thread_rollout(thread.as_ref()).await?;
             return Ok(());
         }
-        let line = rollout_line(&thread, event)?;
-        run_blocking(move || append_rollout_line(&path, &line)).await??;
+        let line = rollout_line(thread.as_ref(), event)?;
+        let durable_boundary = matches!(
+            event.event_type.class(),
+            golutra_protocol::RuntimeEventClass::Control
+        ) || event.event_type.is_task_terminal();
+        if durable_boundary {
+            run_blocking(move || append_rollout_line(&path, &line)).await??;
+        } else {
+            run_blocking(move || append_rollout_line_relaxed(&path, &line)).await??;
+        }
         Ok(())
     }
 

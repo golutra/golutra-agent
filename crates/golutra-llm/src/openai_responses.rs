@@ -16,12 +16,13 @@ use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 
 use super::genai_adapter::{
-    genai_chat_options, genai_chat_request, genai_error_http_status,
+    genai_chat_options, genai_chat_request, genai_error_http_status, genai_error_metadata,
     genai_stream_error_requires_auth_refresh, map_genai_error, provider_response_from_genai_stream,
+    restore_wire_tool_name,
 };
 use super::{
-    GOLUTRA_PROVIDER_AUTH_PROVIDER, MAX_PROVIDER_MESSAGE_BYTES, MAX_PROVIDER_RESPONSE_BYTES,
-    MAX_PROVIDER_TOOL_ARGUMENT_BYTES, MAX_PROVIDER_TOOL_CALL_ID_BYTES,
+    GOLUTRA_PROVIDER_AUTH_PROVIDER, LlmProvider, MAX_PROVIDER_MESSAGE_BYTES,
+    MAX_PROVIDER_RESPONSE_BYTES, MAX_PROVIDER_TOOL_ARGUMENT_BYTES, MAX_PROVIDER_TOOL_CALL_ID_BYTES,
     MAX_PROVIDER_TOOL_NAME_BYTES, ProviderError, ProviderErrorMetadata, ProviderFinishReason,
     ProviderGenerationConfig, ProviderHttpHeaders, ProviderMessage, ProviderMessageMetadata,
     ProviderProbeResult, ProviderProtocol, ProviderRequest, ProviderResponse, ProviderRole,
@@ -279,7 +280,7 @@ impl OpenAiResponsesProvider {
         let mut options = genai_chat_options(
             &self.config.generation_config,
             true,
-            request.cache_identity().as_ref(),
+            self.cache_identity_for_request(request).as_ref(),
             request.cache_policy,
         )?
         .with_extra_headers(self.request_headers(request, account_id));
@@ -428,7 +429,8 @@ impl OpenAiResponsesProvider {
                                 index: state.index,
                                 tool_call_id: (!call.call_id.is_empty())
                                     .then(|| call.call_id.clone()),
-                                tool_name: (!call.fn_name.is_empty()).then(|| call.fn_name.clone()),
+                                tool_name: (!call.fn_name.is_empty())
+                                    .then(|| restore_wire_tool_name(&call.fn_name)),
                             });
                             state.announced = true;
                         }
@@ -469,6 +471,10 @@ impl super::LlmProvider for OpenAiResponsesProvider {
 
     fn supports_buffered_transport(&self) -> bool {
         false
+    }
+
+    fn cache_namespace(&self) -> String {
+        super::route_cache_namespace("openai_responses_sse", &self.config.base_url)
     }
 
     fn contract(&self) -> ProviderContract {
@@ -614,6 +620,7 @@ fn responses_provider_response(
 fn map_responses_genai_error(error: genai::Error) -> ProviderError {
     let message = sanitize_provider_error(&error.to_string());
     let status = genai_error_http_status(&error);
+    let metadata = genai_error_metadata(&error);
     let mapped = match status {
         Some(429) => ProviderError::RateLimited { message },
         Some(status) if (500..600).contains(&status) => ProviderError::Unavailable { message },
@@ -625,8 +632,8 @@ fn map_responses_genai_error(error: genai::Error) -> ProviderError {
     };
     if status.is_some_and(|status| status == 429 || (500..600).contains(&status)) {
         mapped.with_metadata(ProviderErrorMetadata {
-            http_status: status,
-            ..ProviderErrorMetadata::default()
+            http_status: status.or(metadata.http_status),
+            ..metadata
         })
     } else {
         mapped

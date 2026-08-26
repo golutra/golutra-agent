@@ -175,6 +175,9 @@ pub enum AgentToolProfile {
     #[default]
     Coding,
     Full,
+    /// 显式关闭纯对话或结构化输出回合的 provider 工具声明；宿主执行器仍保留
+    /// 策略、回放和恢复能力，只有模型可见的工具列表为空。
+    None,
 }
 
 /// Optional execution-surface override for a steering continuation. Steering

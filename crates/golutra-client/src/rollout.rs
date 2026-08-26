@@ -128,6 +128,17 @@ pub(crate) fn is_sensitive_rollout_key(key: &str) -> bool {
 }
 
 pub(crate) fn append_rollout_line(path: &Path, line: &[u8]) -> Result<(), ClientError> {
+    append_rollout_line_with_sync(path, line, true)
+}
+
+/// Append a projection after its canonical SQLite event is durable. High
+/// frequency execution events do not need a second fsync; terminal/control
+/// events continue using `append_rollout_line` for crash-visible boundaries.
+pub(crate) fn append_rollout_line_relaxed(path: &Path, line: &[u8]) -> Result<(), ClientError> {
+    append_rollout_line_with_sync(path, line, false)
+}
+
+fn append_rollout_line_with_sync(path: &Path, line: &[u8], sync: bool) -> Result<(), ClientError> {
     let parent = path.parent().ok_or_else(|| {
         ClientError::Io(format!("rollout path has no parent: {}", path.display()))
     })?;
@@ -147,7 +158,8 @@ pub(crate) fn append_rollout_line(path: &Path, line: &[u8]) -> Result<(), Client
     set_owner_only_file(path)?;
     file.write_all(line)
         .and_then(|()| file.write_all(b"\n"))
-        .and_then(|()| file.sync_data())
+        .and_then(|()| file.flush())
+        .and_then(|()| if sync { file.sync_data() } else { Ok(()) })
         .map_err(|error| ClientError::Io(format!("{}: {error}", path.display())))?;
     FileExt::unlock(&lock).map_err(|error| ClientError::Io(format!("{}: {error}", path.display())))
 }

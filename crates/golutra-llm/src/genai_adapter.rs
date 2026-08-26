@@ -7,7 +7,8 @@ use genai::{
     adapter::AdapterKind,
     chat::{
         CacheControl, ChatMessage, ChatOptions, ChatRequest, ChatStreamEvent, ContentPart,
-        MessageContent, ReasoningEffort, StopReason, StreamEnd, Tool, ToolCall, ToolResponse,
+        MessageContent, ReasoningEffort, StopReason, StreamEnd, Tool, ToolCall, ToolName,
+        ToolResponse,
     },
     resolver::{AuthData, Endpoint},
 };
@@ -19,13 +20,14 @@ use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 
 use super::{
-    ProviderError, ProviderErrorMetadata, ProviderFinishReason, ProviderGenerationConfig,
-    ProviderHttpHeaders, ProviderMessage, ProviderProbeResult, ProviderProtocol, ProviderRequest,
-    ProviderResponse, ProviderRole, ProviderStreamEvent, ProviderToolCall, ProviderUsage,
-    UsageSource, configured_or_first_env, custom_headers_from_reader, env_mapping, first_env,
-    generation_config_from_reader, missing_env_error, protocol_capabilities,
-    provider_tool_schema_projection, sanitize_provider_error, selected_protocol_from_reader,
-    validate_native_base_url,
+    LlmProvider, ProviderError, ProviderErrorMetadata, ProviderFinishReason,
+    ProviderGenerationConfig, ProviderHttpHeaders, ProviderMessage, ProviderProbeResult,
+    ProviderProtocol, ProviderRequest, ProviderResponse, ProviderRole, ProviderStreamEvent,
+    ProviderToolCall, ProviderUsage, UsageSource, configured_or_first_env,
+    custom_headers_from_reader, env_mapping, first_env, generation_config_from_reader,
+    missing_env_error, protocol_capabilities, provider_tool_schema_projection,
+    request_id_from_headers, retry_after_from_headers, sanitize_provider_error,
+    selected_protocol_from_reader, validate_native_base_url,
 };
 
 #[derive(Clone, PartialEq, Eq)]
@@ -233,7 +235,7 @@ impl GenaiProviderAdapter {
         let options = genai_chat_options(
             &self.config.generation_config,
             false,
-            request.cache_identity().as_ref(),
+            self.cache_identity_for_request(request).as_ref(),
             request.cache_policy,
         )?;
         let response = self
@@ -283,7 +285,7 @@ impl GenaiProviderAdapter {
             let options = genai_chat_options(
                 &self.config.generation_config,
                 true,
-                request.cache_identity().as_ref(),
+                self.cache_identity_for_request(request).as_ref(),
                 request.cache_policy,
             )?;
             match self
@@ -329,7 +331,7 @@ impl GenaiProviderAdapter {
                         tool_call_id: (!chunk.tool_call.call_id.is_empty())
                             .then(|| chunk.tool_call.call_id.clone()),
                         tool_name: (!chunk.tool_call.fn_name.is_empty())
-                            .then(|| chunk.tool_call.fn_name.clone()),
+                            .then(|| restore_wire_tool_name(&chunk.tool_call.fn_name)),
                     });
                     tool_delta_index = tool_delta_index.saturating_add(1);
                 }
@@ -377,6 +379,10 @@ impl super::LlmProvider for GenaiProviderAdapter {
             golden_fixture_refs: golden_fixture_refs(self.config.protocol),
         }
     }
+
+    fn cache_namespace(&self) -> String {
+        super::route_cache_namespace(native_protocol(self.config.protocol), &self.config.base_url)
+    }
 }
 
 pub(crate) fn genai_chat_request(
@@ -404,7 +410,11 @@ pub(crate) fn genai_chat_request(
     if !request.tools.is_empty() {
         chat_request = chat_request.with_tools(request.tools.iter().map(|contract| {
             let schema = provider_tool_schema_projection(&contract.input_schema);
-            let tool = Tool::new(contract.tool_name.clone())
+            // rust-genai reserves the literal `web_search` name for its native
+            // provider tool on several adapters. Golutra owns a regular
+            // function with that name, so use a stable wire alias and restore
+            // it at the provider response boundary.
+            let tool = Tool::new(ToolName::Custom(wire_tool_name(&contract.tool_name)))
                 .with_description(tool_description(&contract.tool_name))
                 .with_schema(schema.clone());
             if is_openai_responses {
@@ -418,6 +428,24 @@ pub(crate) fn genai_chat_request(
         }));
     }
     Ok(chat_request)
+}
+
+const WEB_SEARCH_WIRE_ALIAS: &str = "golutra_web_search";
+
+fn wire_tool_name(name: &str) -> String {
+    if name == "web_search" {
+        WEB_SEARCH_WIRE_ALIAS.to_owned()
+    } else {
+        name.to_owned()
+    }
+}
+
+pub(crate) fn restore_wire_tool_name(name: &str) -> String {
+    if name == WEB_SEARCH_WIRE_ALIAS {
+        "web_search".to_owned()
+    } else {
+        name.to_owned()
+    }
 }
 
 fn responses_schema_supports_strict(schema: &Value) -> bool {
@@ -475,7 +503,7 @@ fn genai_message(
             parts.extend(message.tool_calls.iter().map(|tool_call| {
                 ContentPart::ToolCall(ToolCall {
                     call_id: tool_call.tool_call_id.clone(),
-                    fn_name: tool_call.tool_name.clone(),
+                    fn_name: wire_tool_name(&tool_call.tool_name),
                     fn_arguments: tool_call.arguments.clone(),
                     thought_signatures: None,
                 })
@@ -496,7 +524,7 @@ fn genai_message(
                 .as_deref()
                 .filter(|value| !value.trim().is_empty())
             {
-                response = response.with_fn_name(tool_name);
+                response = response.with_fn_name(wire_tool_name(tool_name));
             }
             Ok(ChatMessage::from(response))
         }
@@ -609,7 +637,7 @@ pub(crate) fn provider_response_from_genai_stream(
             validate_tool_call(&call.call_id, &call.fn_name, &call.fn_arguments)?;
             Ok(ProviderToolCall {
                 tool_call_id: call.call_id.clone(),
-                tool_name: call.fn_name.clone(),
+                tool_name: restore_wire_tool_name(&call.fn_name),
                 arguments: call.fn_arguments.clone(),
             })
         })
@@ -682,7 +710,7 @@ fn provider_response_from_genai(
             validate_tool_call(&call.call_id, &call.fn_name, &call.fn_arguments)?;
             Ok(ProviderToolCall {
                 tool_call_id: call.call_id.clone(),
-                tool_name: call.fn_name.clone(),
+                tool_name: restore_wire_tool_name(&call.fn_name),
                 arguments: call.fn_arguments.clone(),
             })
         })
@@ -833,6 +861,7 @@ fn non_negative_u64(value: Option<i32>) -> Option<u64> {
 pub(crate) fn map_genai_error(error: genai::Error) -> ProviderError {
     let message = sanitize_provider_error(&error.to_string());
     let status = genai_error_http_status(&error);
+    let metadata = genai_error_metadata(&error);
     let mapped = if status == Some(429) {
         ProviderError::RateLimited { message }
     } else if status.is_some_and(|status| (500..600).contains(&status)) {
@@ -867,8 +896,8 @@ pub(crate) fn map_genai_error(error: genai::Error) -> ProviderError {
     };
     if status.is_some_and(|status| status == 429 || (500..600).contains(&status)) {
         mapped.with_metadata(ProviderErrorMetadata {
-            http_status: status,
-            ..ProviderErrorMetadata::default()
+            http_status: status.or(metadata.http_status),
+            ..metadata
         })
     } else {
         mapped
@@ -891,14 +920,59 @@ pub(crate) fn genai_error_http_status(error: &genai::Error) -> Option<u16> {
         genai::Error::HttpError { status, .. } => Some(status.as_u16()),
         genai::Error::WebStream { error, .. } => error
             .downcast_ref::<genai::Error>()
-            .and_then(genai_error_http_status),
+            .and_then(genai_error_http_status)
+            .or_else(|| {
+                error
+                    .downcast_ref::<genai::webc::Error>()
+                    .and_then(webc_error_http_status)
+            }),
         genai::Error::WebAdapterCall { webc_error, .. }
-        | genai::Error::WebModelCall { webc_error, .. } => match webc_error {
-            genai::webc::Error::ResponseFailedStatus { status, .. } => Some(status.as_u16()),
-            genai::webc::Error::Reqwest(error) => error.status().map(|status| status.as_u16()),
-            _ => None,
-        },
+        | genai::Error::WebModelCall { webc_error, .. } => webc_error_http_status(webc_error),
         _ => None,
+    }
+}
+
+/// 从 rust-genai 的错误包装层提取可重试请求的脱敏元数据。
+pub(crate) fn genai_error_metadata(error: &genai::Error) -> ProviderErrorMetadata {
+    match error {
+        genai::Error::WebStream { error, .. } => error
+            .downcast_ref::<genai::Error>()
+            .map(genai_error_metadata)
+            .or_else(|| {
+                error
+                    .downcast_ref::<genai::webc::Error>()
+                    .map(webc_error_metadata)
+            })
+            .unwrap_or_default(),
+        genai::Error::WebAdapterCall { webc_error, .. }
+        | genai::Error::WebModelCall { webc_error, .. } => webc_error_metadata(webc_error),
+        _ => ProviderErrorMetadata::default(),
+    }
+}
+
+fn webc_error_http_status(error: &genai::webc::Error) -> Option<u16> {
+    match error {
+        genai::webc::Error::ResponseFailedStatus { status, .. } => Some(status.as_u16()),
+        genai::webc::Error::Reqwest(error) => error.status().map(|status| status.as_u16()),
+        _ => None,
+    }
+}
+
+fn webc_error_metadata(error: &genai::webc::Error) -> ProviderErrorMetadata {
+    match error {
+        genai::webc::Error::ResponseFailedStatus {
+            status, headers, ..
+        } => ProviderErrorMetadata {
+            http_status: Some(status.as_u16()),
+            retry_after: retry_after_from_headers(headers),
+            request_id: request_id_from_headers(headers),
+            ..ProviderErrorMetadata::default()
+        },
+        genai::webc::Error::Reqwest(error) => ProviderErrorMetadata {
+            http_status: error.status().map(|status| status.as_u16()),
+            ..ProviderErrorMetadata::default()
+        },
+        _ => ProviderErrorMetadata::default(),
     }
 }
 
@@ -1012,6 +1086,52 @@ mod tests {
         .expect("none cache options");
         assert!(none.prompt_cache_key.is_none());
         assert!(none.cache_control.is_none());
+    }
+
+    #[test]
+    fn responses_web_stream_preserves_http_status_from_webc_error() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "retry-after",
+            reqwest::header::HeaderValue::from_static("2"),
+        );
+        headers.insert(
+            "x-request-id",
+            reqwest::header::HeaderValue::from_static("req-stream-502"),
+        );
+        let webc_error = genai::webc::Error::ResponseFailedStatus {
+            status: reqwest::StatusCode::BAD_GATEWAY,
+            body: "gateway unavailable".to_owned(),
+            headers: Box::new(headers),
+        };
+        let error = genai::Error::WebStream {
+            model_iden: genai::ModelIden::new(AdapterKind::OpenAIResp, "gpt-test"),
+            cause: webc_error.to_string(),
+            error: Box::new(webc_error),
+        };
+
+        assert_eq!(genai_error_http_status(&error), Some(502));
+        let mapped = map_genai_error(error);
+        assert_eq!(
+            mapped.retry_after(),
+            Some(std::time::Duration::from_secs(2))
+        );
+        assert_eq!(
+            mapped
+                .metadata()
+                .and_then(|metadata| metadata.request_id.as_deref()),
+            Some("req-stream-502")
+        );
+        assert!(matches!(
+            mapped,
+            ProviderError::WithMetadata {
+                error,
+                metadata: ProviderErrorMetadata {
+                    http_status: Some(502),
+                    ..
+                }
+            } if matches!(*error, ProviderError::Unavailable { .. })
+        ));
     }
 
     #[test]
@@ -1173,5 +1293,53 @@ mod tests {
             genai_chat_request(&request, ProviderProtocol::OpenAiResponses).expect("genai request");
         let tool = &chat_request.tools.expect("tool list")[0];
         assert_eq!(tool.strict, Some(false));
+    }
+
+    #[test]
+    fn web_search_is_sent_as_a_custom_function_and_restored_on_return() {
+        assert_eq!(wire_tool_name("web_search"), "golutra_web_search");
+        assert_eq!(restore_wire_tool_name("golutra_web_search"), "web_search");
+
+        let request = ProviderRequest {
+            request_id: ProviderRequestId::new(),
+            task_id: TaskId::new(),
+            turn_id: TurnId::new(),
+            session_id: None,
+            provider_id: "openai-responses".to_owned(),
+            model_id: "gpt-test".to_owned(),
+            messages: vec![ProviderMessage {
+                role: ProviderRole::User,
+                content: "search".to_owned(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+                metadata: Default::default(),
+            }],
+            tools: vec![golutra_core::ToolContract {
+                tool_name: "web_search".to_owned(),
+                input_schema: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                }),
+                output_schema: json!({}),
+                error_schema: json!({}),
+                side_effect_type: golutra_core::SideEffectType::None,
+                idempotency_key_policy: "none".to_owned(),
+                timeout_policy: "bounded".to_owned(),
+                cancellation_policy: "supported".to_owned(),
+                retry_policy: "none".to_owned(),
+                artifact_policy: "none".to_owned(),
+                permission_policy_ref: None,
+            }],
+            cache_policy: PromptCachePolicy::None,
+        };
+
+        let chat_request =
+            genai_chat_request(&request, ProviderProtocol::OpenAiResponses).expect("request");
+        let tool = &chat_request.tools.expect("tool list")[0];
+        assert_eq!(tool.name.as_ref(), "golutra_web_search");
+        assert!(tool.schema.is_some(), "custom function must retain schema");
     }
 }

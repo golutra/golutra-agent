@@ -68,6 +68,8 @@ const TUI_HISTORY_PAGE_SIZE: u32 = 256;
 const TUI_EVENT_HISTORY_LIMIT: usize = 4_096;
 const TUI_EVENT_HISTORY_BYTE_LIMIT: usize = 512 * 1024;
 const TUI_EVENT_HISTORY_TRIM_BATCH: usize = 256;
+const TUI_EVENT_PAYLOAD_LIMIT: usize = 64 * 1024;
+const TUI_EVENT_PAYLOAD_PREVIEW_LIMIT: usize = 4 * 1024;
 
 mod activity_view;
 mod activity_widget;
@@ -186,6 +188,7 @@ enum TuiToolProfileArg {
     #[default]
     Coding,
     Full,
+    None,
 }
 
 impl TuiToolProfileArg {
@@ -193,6 +196,7 @@ impl TuiToolProfileArg {
         match self {
             Self::Coding => "coding",
             Self::Full => "full",
+            Self::None => "none",
         }
     }
 }
@@ -220,6 +224,7 @@ fn parse_runtime_tool_profile(value: &str) -> Option<TuiToolProfileArg> {
     match value.trim().to_ascii_lowercase().as_str() {
         "coding" => Some(TuiToolProfileArg::Coding),
         "full" => Some(TuiToolProfileArg::Full),
+        "none" => Some(TuiToolProfileArg::None),
         _ => None,
     }
 }
@@ -404,6 +409,11 @@ impl TuiApp {
     }
 
     fn trim_event_history(&mut self) -> bool {
+        // 事件可能来自外部回放，单条 payload 不能因为“最后一条必须保留”而
+        // 绕过总预算；完整内容仍由 durable artifact/payload_ref 承载。
+        for event in &mut self.events {
+            bound_event_payload(event);
+        }
         // 字节预算只在固定批次检查，避免每个流式 delta 都线性扫描整个窗口。
         if self.events.len() < TUI_EVENT_HISTORY_LIMIT
             && !self
@@ -443,6 +453,9 @@ impl TuiApp {
     fn replace_event_history(&mut self, mut events: Vec<RuntimeEvent>, has_more_before: bool) {
         events.sort_by_key(|event| event.sequence_no);
         events.dedup_by_key(|event| event.sequence_no);
+        for event in &mut events {
+            bound_event_payload(event);
+        }
         self.events = events;
         let trimmed = self.trim_event_history();
         self.history_has_more_before = has_more_before || trimmed;
@@ -450,6 +463,8 @@ impl TuiApp {
     }
 
     fn append_event_to_history(&mut self, event: RuntimeEvent) {
+        let mut event = event;
+        bound_event_payload(&mut event);
         self.events.push(event);
         if self.trim_event_history() {
             self.history_has_more_before = true;
@@ -497,6 +512,22 @@ fn ui_event_memory_bytes(event: &RuntimeEvent) -> usize {
             .map(|payload| payload.len())
             .unwrap_or_default(),
     )
+}
+
+fn bound_event_payload(event: &mut RuntimeEvent) {
+    let Ok(serialized) = serde_json::to_vec(&event.payload) else {
+        return;
+    };
+    if serialized.len() <= TUI_EVENT_PAYLOAD_LIMIT {
+        return;
+    }
+    let preview_end = serialized.len().min(TUI_EVENT_PAYLOAD_PREVIEW_LIMIT);
+    let preview = String::from_utf8_lossy(&serialized[..preview_end]);
+    event.payload = json!({
+        "_truncated": true,
+        "original_bytes": serialized.len(),
+        "preview": preview,
+    });
 }
 
 async fn load_runtime_refresh_snapshot(

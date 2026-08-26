@@ -357,6 +357,15 @@ impl EmbeddedTransport {
     /// Whether the host still has process-local work that a later attachment
     /// must be able to observe or cancel.
     pub async fn has_active_work(&self) -> bool {
+        if self
+            .host
+            .execution
+            .post_task_schedule_pending
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            return true;
+        }
         if !self.host.execution.task_controls.lock().await.is_empty() {
             return true;
         }

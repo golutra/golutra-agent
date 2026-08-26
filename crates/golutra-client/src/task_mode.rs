@@ -82,8 +82,9 @@ pub(crate) fn tool_profile_from_payload(payload: &Value) -> Result<AgentToolProf
             Ok(AgentToolProfile::Coding)
         }
         Value::String(value) if value.eq_ignore_ascii_case("full") => Ok(AgentToolProfile::Full),
+        Value::String(value) if value.eq_ignore_ascii_case("none") => Ok(AgentToolProfile::None),
         Value::Null => Ok(default_profile),
-        _ => Err("tool_profile must be `coding` or `full`"),
+        _ => Err("tool_profile must be `coding`, `full`, or `none`"),
     }
 }
 
@@ -251,6 +252,11 @@ mod tests {
             }))
             .expect("open null means coding"),
             AgentToolProfile::Coding
+        );
+        assert_eq!(
+            tool_profile_from_payload(&json!({"tool_profile": "none"}))
+                .expect("none explicitly disables tools"),
+            AgentToolProfile::None
         );
     }
 

@@ -86,6 +86,8 @@ pub(crate) use process::{
 #[cfg(test)]
 pub(crate) use process::{MAX_PIPE_OUTPUT_BYTES, join_pipe_reader, run_process, spawn_pipe_reader};
 pub use process_supervisor::ProcessSupervisor;
+#[cfg(test)]
+pub(crate) use process_supervisor::max_terminal_processes;
 pub(crate) use process_supervisor::{
     ProcessSnapshot, ProcessStartRequest, ProcessState, ProcessSummary, default_poll_wait_ms,
     default_start_wait_ms, max_poll_wait_ms,
@@ -3457,6 +3459,8 @@ fn process_summary_value(summary: ProcessSummary) -> Value {
         "output_bytes": summary.output_bytes,
         "output_lines": summary.output_lines,
         "output_truncated": summary.output_truncated,
+        "terminal": summary.state.is_terminal(),
+        "next_action": process_next_action(summary.state, &summary.process_id, summary.output_cursor),
     })
 }
 
@@ -3477,6 +3481,9 @@ fn supervised_process_report(
         ProcessState::Cancelled | ProcessState::Terminated => ToolResultStatus::Cancelled,
     };
     let workspace_changes_known = snapshot.workspace_changes_known;
+    let terminal = snapshot.state.is_terminal();
+    let next_action =
+        process_next_action(snapshot.state, &snapshot.process_id, snapshot.output_cursor);
     let mut result = report(
         request,
         status,
@@ -3502,6 +3509,9 @@ fn supervised_process_report(
             "workspace_changes_known": workspace_changes_known,
             "process_lifetime_scope": "runtime",
             "survives_runtime_exit": false,
+            "terminal": terminal,
+            "wait_strategy": "event_driven_cursor",
+            "next_action": next_action,
             "workspace_change_count": if workspace_changes_known {
                 snapshot.changed_files.len()
             } else {
@@ -3544,6 +3554,22 @@ fn process_state_name(state: ProcessState) -> &'static str {
         ProcessState::Cancelled => "cancelled",
         ProcessState::Terminated => "terminated",
         ProcessState::Failed => "failed",
+    }
+}
+
+fn process_next_action(state: ProcessState, process_id: &str, cursor: u64) -> Value {
+    if state == ProcessState::Running {
+        // 把下一步所需的最小参数直接交给模型，避免它重复读取或重置 cursor。
+        json!({
+            "kind": "wait",
+            "tool": "shell_session",
+            "action": "wait",
+            "process_id": process_id,
+            "cursor": cursor,
+            "wait_ms": default_poll_wait_ms(),
+        })
+    } else {
+        json!({"kind": "terminal", "process_state": process_state_name(state)})
     }
 }
 
@@ -3794,6 +3820,9 @@ const PROCESS_MODEL_FACTS: &[&str] = &[
     "workspace_change_count",
     "process_lifetime_scope",
     "survives_runtime_exit",
+    "terminal",
+    "wait_strategy",
+    "next_action",
     "error",
     "reason",
     "blocked",

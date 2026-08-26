@@ -13,7 +13,7 @@ export type AgentItemStatus = "in_progress" | "completed" | "failed" | "cancelle
  * Controls the model-visible tool surface without removing the underlying
  * executor capability or its policy checks.
  */
-export type AgentToolProfile = "coding" | "full";
+export type AgentToolProfile = ("coding" | "full") | "none";
 export type AgentStreamEvent =
   | {
       session_id: string;
@@ -896,7 +896,7 @@ export interface AgentTurnExecutionOptions {
    * Controls the model-visible tool surface without removing the underlying
    * executor capability or its policy checks.
    */
-  tool_profile?: "coding" | "full";
+  tool_profile?: ("coding" | "full") | "none";
   [k: string]: unknown;
 }
 export interface AgentTurnOptions {
