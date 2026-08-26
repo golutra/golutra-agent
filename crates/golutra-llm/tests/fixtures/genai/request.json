@@ -33,7 +33,7 @@
         "type": "function",
         "function": {
           "name": "read_file",
-          "description": "Read a UTF-8 text file from the current workspace.",
+          "description": "Read a UTF-8 text file in the workspace.",
           "parameters": {
             "type": "object",
             "properties": {"path": {"type": "string"}},

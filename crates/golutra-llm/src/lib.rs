@@ -1602,24 +1602,18 @@ fn is_sensitive_header(name: &str) -> bool {
 
 pub fn provider_tool_description(tool_name: &str) -> &'static str {
     match tool_name {
-        "read_file" => "Read a UTF-8 text file from the current workspace.",
-        "write_file" => {
-            "Create or replace a workspace-relative UTF-8 file with the complete supplied content. Honor an explicit working or output directory; when the requested deliverable has only a basename and no directory context, place it in the workspace root."
-        }
-        "edit_file" => {
-            "Edit a workspace-relative UTF-8 file by replacing the first exact search match with the complete supplied replacement."
-        }
-        "apply_patch" => {
-            "Atomically apply a unified diff to one or more workspace-relative files. Use this for focused multi-file or multi-hunk edits."
-        }
+        "read_file" => "Read a UTF-8 text file in the workspace.",
+        "write_file" => "Write complete UTF-8 content to a workspace-relative file.",
+        "edit_file" => "Replace the first exact match in a workspace-relative UTF-8 file.",
+        "apply_patch" => "Apply a unified diff atomically to workspace-relative files.",
         "web_search" => {
-            "Search the web when network access is explicitly enabled. Return concise source-backed results rather than raw pages."
+            "Search the web when network access is enabled; return concise source-backed results."
         }
         "shell_session" => {
-            "Wait for, write to, or terminate a runtime-owned background shell process. Use the returned cursor to request only new output."
+            "Manage a runtime-owned background shell process: wait, write, or terminate; use its cursor for new output."
         }
         "subagent" => {
-            "Run one isolated, self-contained child task and return a bounded summary, facts, and artifact references. Child tasks cannot create another subagent."
+            "Run one isolated child task and return a bounded summary and artifact references; it cannot create another child."
         }
         "list_dir" => "List entries in a workspace-relative directory.",
         "rg_search" => "Search workspace files with ripgrep.",
@@ -1632,7 +1626,7 @@ pub fn provider_tool_description(tool_name: &str) -> &'static str {
             "Delegate one complete, self-contained task to an isolated child agent and wait for its result. The child does not receive this conversation. Omit model and reasoning_effort to inherit the current agent settings; specify either field only when the task benefits from an explicit override."
         }
         "shell" => {
-            "Run a workspace command as inert argv; include the program and every argument in command. Use workdir to run from a workspace subdirectory without changing the workspace boundary. A complete quoted foreground Python heredoc such as python - <<'PY' is passed directly on stdin; for other pipes, redirection, or compound scripts, explicitly invoke an available shell with the complete script as one argument. When a required local dependency is missing, inspect the project's package-manager conventions, prefer a project-scoped installation when practical, and validate after installing. With background=true, timeout_ms is the absolute process lifetime and yield_time_ms only controls the initial wait. Managed background processes are runtime-scoped and stop when the runtime ends. If another process or evaluator must connect after the final response, do not use background=true; use a platform-appropriate lifecycle mechanism outside runtime ownership, detach standard streams as required, and verify availability before returning."
+            "Run a workspace command as argv. Use workdir for a workspace subdirectory; pass a quoted Python heredoc on stdin, or invoke an available shell for pipes, redirects, and compound scripts. With background=true, timeout_ms is the absolute process lifetime, yield_time_ms only the initial wait, and the runtime owns the process until it ends; do not use it for processes that must outlive the runtime."
         }
         "process_list" => {
             "List managed background processes owned by the current session, including redacted commands, states, exit codes, and output statistics. This does not consume process output or advance a cursor."
@@ -1653,6 +1647,106 @@ pub fn provider_tool_description(tool_name: &str) -> &'static str {
     }
 }
 
+// 发送给模型的 schema 只保留表达调用结构和必要语义的字段；长度、范围和格式等边界
+// 仍由 runtime 使用原始 ToolContract 校验。保留紧凑的参数描述，避免压缩输入时损伤
+// 模型对 shell、子代理等高风险参数的使用判断。
+const PROVIDER_SCHEMA_BOUNDARY_KEYS: &[&str] = &[
+    "title",
+    "$comment",
+    "default",
+    "examples",
+    "deprecated",
+    "readOnly",
+    "writeOnly",
+    "minLength",
+    "maxLength",
+    "pattern",
+    "format",
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "multipleOf",
+    "minItems",
+    "maxItems",
+    "uniqueItems",
+    "minProperties",
+    "maxProperties",
+    "contentEncoding",
+    "contentMediaType",
+];
+
+const MAX_PROVIDER_SCHEMA_DESCRIPTION_CHARS: usize = 512;
+
+fn is_provider_schema_boundary_key(key: &str) -> bool {
+    PROVIDER_SCHEMA_BOUNDARY_KEYS.contains(&key)
+}
+
+fn project_provider_schema_description(value: &Value) -> Value {
+    let Some(description) = value.as_str() else {
+        return value.clone();
+    };
+    let compact = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    Value::String(
+        compact
+            .chars()
+            .take(MAX_PROVIDER_SCHEMA_DESCRIPTION_CHARS)
+            .collect(),
+    )
+}
+
+fn project_provider_schema_map(value: &Value) -> Value {
+    let Some(properties) = value.as_object() else {
+        return project_provider_schema_value(value);
+    };
+
+    Value::Object(
+        properties
+            .iter()
+            .map(|(name, schema)| (name.clone(), project_provider_schema_value(schema)))
+            .collect(),
+    )
+}
+
+fn project_provider_schema_value(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .filter_map(|(key, child)| {
+                    if is_provider_schema_boundary_key(key) {
+                        return None;
+                    }
+
+                    let projected = match key.as_str() {
+                        "description" => project_provider_schema_description(child),
+                        // 这些字段的 map key 是用户属性名，不能误删名为 `description` 的属性。
+                        "properties" | "patternProperties" | "$defs" | "definitions"
+                        | "dependentSchemas" => project_provider_schema_map(child),
+                        // enum、const、required 携带的是数据，不是嵌套 schema 对象。
+                        "enum" | "const" | "required" => child.clone(),
+                        _ => project_provider_schema_value(child),
+                    };
+                    Some((key.clone(), projected))
+                })
+                .collect(),
+        ),
+        Value::Array(values) => {
+            Value::Array(values.iter().map(project_provider_schema_value).collect())
+        }
+        _ => value.clone(),
+    }
+}
+
+/// 将内部 JSON Schema 投影为紧凑的 provider-facing 形式。
+///
+/// 工具执行仍以内部 schema 为准；`additionalProperties: false` 等结构字段
+/// 会保留，确保 strict Responses 工具继续满足 provider 的契约。
+#[must_use]
+pub fn provider_tool_schema_projection(schema: &Value) -> Value {
+    project_provider_schema_value(schema)
+}
+
 /// Return the smallest stable tool representation sent by the Chat Completions
 /// transport. Runtime budgeting and context snapshots use the same shape so
 /// internal recovery/policy fields are never charged as model input.
@@ -1664,7 +1758,7 @@ pub fn provider_tool_wire_projection(contract: &ToolContract) -> Value {
         "function": {
             "name": contract.tool_name,
             "description": description,
-            "parameters": contract.input_schema
+            "parameters": provider_tool_schema_projection(&contract.input_schema)
         }
     })
 }

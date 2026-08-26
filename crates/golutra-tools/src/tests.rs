@@ -782,6 +782,166 @@ fn model_visible_tool_result_excludes_governance_and_artifact_metadata() {
     assert!(serialized.len() <= MAX_MODEL_TOOL_RESULT_BYTES);
 }
 
+fn projection_envelope(
+    tool_name: &str,
+    status: ToolResultStatus,
+    summary: &str,
+    structured_facts: Value,
+    model_visible_excerpt: Option<&str>,
+) -> ToolResultEnvelope {
+    ToolResultEnvelope {
+        tool_call_id: ToolCallId::new(),
+        tool_name: tool_name.to_owned(),
+        status,
+        summary: summary.to_owned(),
+        structured_facts,
+        model_visible_excerpt: model_visible_excerpt.map(ToOwned::to_owned),
+        raw_artifact_ref: Some(ArtifactId::new()),
+        evidence_refs: vec![EvidenceId::new()],
+        risk: "internal-only-risk".to_owned(),
+        verification_hint: Some("internal-only-hint".to_owned()),
+    }
+}
+
+#[test]
+fn model_visible_tool_result_projects_provider_tools_without_duplicate_payloads() {
+    let read: Value = serde_json::from_str(&model_visible_tool_result(&projection_envelope(
+        "read_file",
+        ToolResultStatus::Ok,
+        "file read",
+        json!({
+            "path": "src/lib.rs",
+            "bytes": 12,
+            "continuation": {"next_cursor": 12},
+            "content": "duplicate-content",
+            "content_digest": "drop-me",
+        }),
+        Some("file content"),
+    )))
+    .expect("read projection");
+    assert_eq!(read["structured_facts"]["path"], "src/lib.rs");
+    assert_eq!(read["structured_facts"]["continuation"]["next_cursor"], 12);
+    assert!(read["structured_facts"].get("content").is_none());
+    assert!(read["structured_facts"].get("content_digest").is_none());
+    assert_eq!(read["model_visible_excerpt"], "file content");
+    assert!(read.get("summary").is_none());
+
+    let mutation: Value = serde_json::from_str(&model_visible_tool_result(&projection_envelope(
+        "apply_patch",
+        ToolResultStatus::Ok,
+        "patch applied",
+        json!({
+            "changed_files": ["src/lib.rs"],
+            "changed_file_count": 1,
+            "patch_digest": "drop-me",
+            "summary": "drop-me-too",
+        }),
+        Some("the full patch output is durable"),
+    )))
+    .expect("mutation projection");
+    assert_eq!(mutation["structured_facts"]["changed_file_count"], 1);
+    assert!(mutation["structured_facts"].get("patch_digest").is_none());
+    assert_eq!(mutation["summary"], "patch applied");
+    assert!(mutation.get("model_visible_excerpt").is_none());
+
+    let shell: Value = serde_json::from_str(&model_visible_tool_result(&projection_envelope(
+        "shell_session",
+        ToolResultStatus::Ok,
+        "background process is running",
+        json!({
+            "process_id": "proc-1",
+            "process_state": "running",
+            "output_cursor": 42,
+            "exit_code": null,
+            "command": "drop-command",
+        }),
+        Some("new output"),
+    )))
+    .expect("shell projection");
+    assert_eq!(shell["structured_facts"]["process_id"], "proc-1");
+    assert_eq!(shell["structured_facts"]["output_cursor"], 42);
+    assert!(shell["structured_facts"].get("command").is_none());
+    assert_eq!(shell["model_visible_excerpt"], "new output");
+    assert!(shell.get("summary").is_none());
+
+    let search: Value = serde_json::from_str(&model_visible_tool_result(&projection_envelope(
+        "web_search",
+        ToolResultStatus::Ok,
+        "web search returned 1 results",
+        json!({
+            "query": "rust async",
+            "results": [{
+                "title": "Rust",
+                "url": "https://example.com",
+                "snippet": "useful",
+                "summary": "drop-duplicate",
+            }],
+            "source": "drop-source",
+        }),
+        Some("web search returned 1 results"),
+    )))
+    .expect("search projection");
+    assert_eq!(search["structured_facts"]["query"], "rust async");
+    assert_eq!(search["structured_facts"]["results"][0]["title"], "Rust");
+    assert!(
+        search["structured_facts"]["results"][0]
+            .get("summary")
+            .is_none()
+    );
+    assert!(search["structured_facts"].get("source").is_none());
+    assert!(search.get("summary").is_none());
+    assert!(search.get("model_visible_excerpt").is_none());
+
+    let child: Value = serde_json::from_str(&model_visible_tool_result(&projection_envelope(
+        "subagent",
+        ToolResultStatus::Ok,
+        "child completed",
+        json!({
+            "task": "drop-task",
+            "effective_model": "drop-model",
+            "child_status": "completed",
+            "workspace_change_count": 0,
+        }),
+        Some("child facts and content"),
+    )))
+    .expect("subagent projection");
+    assert_eq!(child["structured_facts"]["child_status"], "completed");
+    assert_eq!(child["structured_facts"]["workspace_change_count"], 0);
+    assert!(child["structured_facts"].get("task").is_none());
+    assert!(child["structured_facts"].get("effective_model").is_none());
+    assert_eq!(child["summary"], "child completed");
+    assert_eq!(child["model_visible_excerpt"], "child facts and content");
+}
+
+#[test]
+fn model_visible_tool_result_keeps_failure_facts_and_size_bound() {
+    let envelope = projection_envelope(
+        "shell",
+        ToolResultStatus::Timeout,
+        "process timed out while waiting for output",
+        json!({
+            "timed_out": true,
+            "exit_code": null,
+            "reason": "deadline exceeded",
+            "output": "x".repeat(64 * 1024),
+        }),
+        Some(&"partial output ".repeat(8 * 1024)),
+    );
+    let serialized = model_visible_tool_result(&envelope);
+    let projection: Value = serde_json::from_str(&serialized).expect("failure projection");
+    assert_eq!(projection["status"], "timeout");
+    assert_eq!(projection["structured_facts"]["timed_out"], true);
+    assert_eq!(
+        projection["structured_facts"]["reason"],
+        "deadline exceeded"
+    );
+    assert_eq!(
+        projection["summary"],
+        "process timed out while waiting for output"
+    );
+    assert!(serialized.len() <= MAX_MODEL_TOOL_RESULT_BYTES);
+}
+
 #[test]
 fn model_visible_tool_result_bounds_large_facts_and_output() {
     let envelope = ToolResultEnvelope {

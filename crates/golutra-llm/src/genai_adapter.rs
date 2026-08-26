@@ -24,7 +24,8 @@ use super::{
     ProviderRole, ProviderStreamEvent, ProviderToolCall, ProviderUsage, UsageSource,
     configured_or_first_env, custom_headers_from_reader, env_mapping, first_env,
     generation_config_from_reader, missing_env_error, protocol_capabilities,
-    sanitize_provider_error, selected_protocol_from_reader, validate_native_base_url,
+    provider_tool_schema_projection, sanitize_provider_error, selected_protocol_from_reader,
+    validate_native_base_url,
 };
 
 #[derive(Clone, PartialEq, Eq)]
@@ -404,7 +405,7 @@ pub(crate) fn genai_chat_request(
         chat_request = chat_request.with_tools(request.tools.iter().map(|contract| {
             let tool = Tool::new(contract.tool_name.clone())
                 .with_description(tool_description(&contract.tool_name))
-                .with_schema(contract.input_schema.clone());
+                .with_schema(provider_tool_schema_projection(&contract.input_schema));
             if is_openai_responses {
                 tool.with_strict(true)
             } else {
@@ -930,5 +931,68 @@ mod tests {
         .expect("none cache options");
         assert!(none.prompt_cache_key.is_none());
         assert!(none.cache_control.is_none());
+    }
+
+    #[test]
+    fn genai_request_uses_compact_schema_for_strict_responses_tools() {
+        let request = ProviderRequest {
+            request_id: ProviderRequestId::new(),
+            task_id: TaskId::new(),
+            turn_id: TurnId::new(),
+            session_id: None,
+            provider_id: "openai-responses".to_owned(),
+            model_id: "gpt-test".to_owned(),
+            messages: vec![ProviderMessage {
+                role: ProviderRole::User,
+                content: "use the tool".to_owned(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+                metadata: Default::default(),
+            }],
+            tools: vec![golutra_core::ToolContract {
+                tool_name: "read_file".to_owned(),
+                input_schema: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "maxLength": 128,
+                            "description": "workspace-relative path"
+                        }
+                    },
+                    "required": ["path"]
+                }),
+                output_schema: json!({}),
+                error_schema: json!({}),
+                side_effect_type: golutra_core::SideEffectType::None,
+                idempotency_key_policy: "none".to_owned(),
+                timeout_policy: "bounded".to_owned(),
+                cancellation_policy: "supported".to_owned(),
+                retry_policy: "none".to_owned(),
+                artifact_policy: "none".to_owned(),
+                permission_policy_ref: None,
+            }],
+            cache_policy: PromptCachePolicy::None,
+        };
+
+        let chat_request =
+            genai_chat_request(&request, ProviderProtocol::OpenAiResponses).expect("genai request");
+        let tool = &chat_request.tools.expect("tool list")[0];
+        assert_eq!(tool.strict, Some(true));
+        assert_eq!(
+            tool.schema.as_ref().expect("schema")["additionalProperties"],
+            false
+        );
+        assert!(
+            tool.schema.as_ref().expect("schema")["properties"]["path"]
+                .get("maxLength")
+                .is_none()
+        );
+        assert_eq!(
+            tool.schema.as_ref().expect("schema")["properties"]["path"]["description"],
+            "workspace-relative path"
+        );
     }
 }

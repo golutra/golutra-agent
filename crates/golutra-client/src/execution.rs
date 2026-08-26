@@ -329,6 +329,8 @@ impl RuntimeHost {
             });
         }
 
+        // 历史读取必须在当前任务的 durable 事件可见后进行；本阶段保持 memory/history
+        // 串行，优先保证恢复会话的快照一致性，避免读到尚未落盘的 assistant 事件。
         let memory_store = self.storage.memory_store.clone();
         let memory_query = objective.clone();
         let memories =

@@ -10881,6 +10881,19 @@ async fn context_loads_bounded_root_agents_instructions_as_system_context() {
         .iter()
         .find(|contributor| contributor.name == "project_instructions")
         .expect("project instructions");
+    let contributor_names = contributors
+        .iter()
+        .map(|contributor| contributor.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        contributor_names,
+        vec![
+            "system",
+            "environment_context",
+            "project_instructions",
+            "objective"
+        ]
+    );
 
     assert_eq!(instructions.role, ProviderRole::System);
     assert!(instructions.content.contains("Run cargo fmt"));

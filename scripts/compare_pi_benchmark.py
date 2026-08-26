@@ -11,10 +11,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -30,6 +32,22 @@ class Task:
     expected_files: dict[str, str]
     expected_response: str | None = None
     response_match: str = "non_empty"
+
+
+@dataclass(frozen=True)
+class ProcessCapture:
+    stdout: str
+    stderr: str
+    return_code: int
+    elapsed_ms: float
+    stdout_line_times_ms: tuple[float, ...]
+
+
+PROCESS_STOP_TIMEOUT_SECONDS = 3.0
+PIPE_DRAIN_TIMEOUT_SECONDS = 1.0
+PIPE_CLOSE_JOIN_SECONDS = 0.2
+# durable 事件与 projection 的时间可能有极小调度抖动，超过该范围不再猜测同轮。
+PROVIDER_START_MATCH_TOLERANCE_MS = 1.0
 
 
 TASKS: tuple[Task, ...] = (
@@ -124,16 +142,61 @@ def timestamp_ms(value: Any) -> float | None:
 
 
 def iter_json_lines(text: str) -> Iterable[dict[str, Any]]:
-    for line in text.splitlines():
+    for value, _ in iter_timed_json_lines(text):
+        yield value
+
+
+def iter_timed_json_lines(
+    text: str,
+    line_times_ms: Iterable[float] | None = None,
+) -> Iterable[tuple[dict[str, Any], float | None]]:
+    lines = text.splitlines()
+    arrivals = list(line_times_ms) if line_times_ms is not None else None
+    if arrivals is not None:
+        if len(arrivals) != len(lines) or any(value is None for value in arrivals):
+            raise ValueError("line_times_ms must contain one timestamp for every stdout line")
+    for index, line in enumerate(lines):
+        arrival_ms = arrivals[index] if arrivals is not None else None
         try:
             value = json.loads(line)
         except json.JSONDecodeError:
             continue
         if isinstance(value, dict):
-            yield value
+            yield value, arrival_ms
 
 
 def nested_runtime_events(events: Iterable[dict[str, Any]]) -> Iterable[dict[str, Any]]:
+    timed = ((event, None) for event in events)
+    for event, _ in nested_runtime_events_timed(timed):
+        yield event
+
+
+_RUNTIME_EVENT_PRESENTATION_KEYS = frozenset(
+    {"id", "runtime_event_id", "sequence_no", "parent_event_id", "causal_links", "payload_ref"}
+)
+
+
+def runtime_event_fingerprint(event: dict[str, Any]) -> str:
+    """为缺少 durable id 的事件生成与投影形态无关的身份。"""
+    canonical = {
+        key: value
+        for key, value in event.items()
+        if key not in _RUNTIME_EVENT_PRESENTATION_KEYS
+    }
+    payload = canonical.get("payload")
+    if (
+        isinstance(payload, dict)
+        and payload.get("timestamp") == canonical.get("timestamp")
+    ):
+        payload = dict(payload)
+        payload.pop("timestamp", None)
+        canonical["payload"] = payload
+    return json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def nested_runtime_events_timed(
+    events: Iterable[tuple[dict[str, Any], float | None]],
+) -> Iterable[tuple[dict[str, Any], float | None]]:
     """Normalize durable runtime events and their item projections.
 
     Golutra's JSONL stream exposes provider/tool events twice in two different
@@ -144,7 +207,8 @@ def nested_runtime_events(events: Iterable[dict[str, Any]]) -> Iterable[dict[str
     based.
     """
     seen_ids: set[str] = set()
-    for outer in events:
+    seen_fingerprints: set[str] = set()
+    for outer, arrival_ms in events:
         candidates: list[dict[str, Any]] = []
         if outer.get("type") == "runtime.event" and isinstance(outer.get("event"), dict):
             candidates.append(outer["event"])
@@ -161,9 +225,13 @@ def nested_runtime_events(events: Iterable[dict[str, Any]]) -> Iterable[dict[str
             event_id = str(event.get("id") or "")
             if event_id and event_id in seen_ids:
                 continue
+            fingerprint = runtime_event_fingerprint(event)
+            if fingerprint in seen_fingerprints:
+                continue
+            seen_fingerprints.add(fingerprint)
             if event_id:
                 seen_ids.add(event_id)
-            yield event
+            yield event, arrival_ms
 
 
 def empty_metrics() -> dict[str, Any]:
@@ -171,34 +239,248 @@ def empty_metrics() -> dict[str, Any]:
         "completed": False,
         "return_code": None,
         "elapsed_ms": None,
-        "startup_ms": None,
+        "process_first_event_ms": None,
+        "model_prep_ms": None,
         "first_token_ms": None,
+        "turn_first_token_ms": None,
+        "provider_first_token_ms": None,
         "terminal_ms": None,
         "request_count": 0,
         "tool_call_count": 0,
         "tool_result_count": 0,
         "tool_names": [],
-        "input_tokens": None,
-        "non_cached_input_tokens": None,
+        "raw_input_tokens": None,
+        "prompt_tokens": None,
+        "uncached_input_tokens": None,
         "planned_input_tokens": None,
         "output_tokens": None,
         "reasoning_tokens": None,
         "cache_read_tokens": None,
         "cache_write_tokens": None,
+        "provider_total_tokens": None,
         "total_tokens": None,
         "tool_schema_tokens_estimated": None,
         "tool_result_tokens_estimated": None,
         "usage_source": "unknown",
+        "usage_complete": False,
+        "usage_record_count": 0,
+        "usage_coverage": {},
+        "prompt_semantics": "context",
+        "total_semantics": "provider_billing",
         "cost": None,
         "cost_source": "unknown",
         "final_message": "",
     }
 
 
-def add_counter(metrics: dict[str, Any], field: str, value: int | None) -> None:
-    if value is None:
-        return
-    metrics[field] = (metrics[field] or 0) + value
+USAGE_FIELDS = (
+    "raw_input_tokens",
+    "prompt_tokens",
+    "uncached_input_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "provider_total_tokens",
+    "total_tokens",
+    "tool_schema_tokens_estimated",
+    "tool_result_tokens_estimated",
+)
+
+ESTIMATED_USAGE_FIELDS = frozenset(
+    {
+        "tool_schema_tokens_estimated",
+        "tool_result_tokens_estimated",
+    }
+)
+
+
+def normalize_golutra_usage(record: dict[str, Any]) -> dict[str, Any]:
+    raw_input = as_number(record.get("input_tokens"))
+    canonical_uncached = as_number(record.get("non_cached_input_tokens"))
+    cache_read_value = record.get("cache_read_tokens")
+    if cache_read_value is None:
+        cache_read_value = record.get("cached_input_tokens")
+    cache_read = as_number(cache_read_value)
+    output = as_number(record.get("output_tokens"))
+    provider_total = as_number(record.get("provider_total_tokens"))
+    total = provider_total
+    total_partial = None
+    field_sources: dict[str, str] = {}
+    if raw_input is not None:
+        field_sources["raw_input_tokens"] = "reported"
+        field_sources["prompt_tokens"] = "reported"
+    if canonical_uncached is not None:
+        uncached = canonical_uncached
+        field_sources["uncached_input_tokens"] = "reported"
+    elif raw_input is not None and cache_read is not None:
+        uncached = max(0, raw_input - cache_read)
+        field_sources["uncached_input_tokens"] = "derived"
+    else:
+        uncached = None
+    if output is not None:
+        field_sources["output_tokens"] = "reported"
+    if cache_read is not None:
+        field_sources["cache_read_tokens"] = "reported"
+    cache_write = as_number(record.get("cache_write_tokens"))
+    if cache_write is not None:
+        field_sources["cache_write_tokens"] = "reported"
+    reasoning = as_number(record.get("reasoning_tokens"))
+    if reasoning is not None:
+        field_sources["reasoning_tokens"] = "reported"
+    if provider_total is not None:
+        field_sources["provider_total_tokens"] = "reported"
+    if total is None and raw_input is not None and output is not None:
+        if cache_write is not None:
+            total = raw_input + output + cache_write
+            field_sources["total_tokens"] = "derived"
+        else:
+            total_partial = raw_input + output
+            field_sources["total_tokens"] = "derived"
+    elif total is not None:
+        field_sources["total_tokens"] = "reported"
+    tool_schema = as_number(record.get("tool_schema_tokens_estimated"))
+    tool_result = as_number(record.get("tool_result_tokens_estimated"))
+    if tool_schema is not None:
+        field_sources["tool_schema_tokens_estimated"] = "estimated"
+    if tool_result is not None:
+        field_sources["tool_result_tokens_estimated"] = "estimated"
+    complete = record.get("usage_complete")
+    required_fields = raw_input is not None and output is not None and total is not None
+    if isinstance(complete, bool):
+        complete = complete and required_fields
+    else:
+        complete = required_fields
+    return {
+        "raw_input_tokens": raw_input,
+        "prompt_tokens": raw_input,
+        "uncached_input_tokens": uncached,
+        "output_tokens": output,
+        "reasoning_tokens": reasoning,
+        "cache_read_tokens": cache_read,
+        "cache_write_tokens": cache_write,
+        "provider_total_tokens": provider_total,
+        "total_tokens": total,
+        "total_tokens_partial": total_partial,
+        "tool_schema_tokens_estimated": tool_schema,
+        "tool_result_tokens_estimated": tool_result,
+        "usage_source": str(record.get("usage_source") or "unknown"),
+        "usage_complete": complete,
+        "field_sources": field_sources,
+    }
+
+
+def normalize_pi_usage(usage: dict[str, Any]) -> dict[str, Any]:
+    raw_input = as_number(usage.get("input"))
+    cache_read = as_number(usage.get("cacheRead"))
+    cache_write = as_number(usage.get("cacheWrite"))
+    field_sources: dict[str, str] = {}
+    if raw_input is not None:
+        field_sources["raw_input_tokens"] = "reported"
+        field_sources["uncached_input_tokens"] = "reported"
+    if cache_read is not None:
+        field_sources["cache_read_tokens"] = "reported"
+    if cache_write is not None:
+        field_sources["cache_write_tokens"] = "reported"
+    prompt = None
+    if raw_input is not None and cache_read is not None:
+        # ``input`` 是未命中缓存的上下文；cache read 属于上下文 prompt，
+        # cache write 则只保留为计费分项。
+        prompt = raw_input + cache_read
+        field_sources["prompt_tokens"] = "derived"
+    output = as_number(usage.get("output"))
+    if output is not None:
+        field_sources["output_tokens"] = "reported"
+    provider_total = as_number(usage.get("totalTokens"))
+    total = provider_total
+    if (
+        total is None
+        and raw_input is not None
+        and output is not None
+        and cache_read is not None
+        and cache_write is not None
+    ):
+        # Pi 的 provider total 同时包含 cache read 和 cache write 计费量。
+        total = raw_input + output + cache_read + cache_write
+        field_sources["total_tokens"] = "derived"
+    elif total is not None:
+        field_sources["provider_total_tokens"] = "reported"
+        field_sources["total_tokens"] = "reported"
+    reasoning = as_number(usage.get("reasoning"))
+    if reasoning is None:
+        reasoning = as_number(usage.get("reasoningTokens"))
+    if reasoning is not None:
+        field_sources["reasoning_tokens"] = "reported"
+    return {
+        "raw_input_tokens": raw_input,
+        "prompt_tokens": prompt,
+        "uncached_input_tokens": raw_input,
+        "output_tokens": output,
+        "reasoning_tokens": reasoning,
+        "cache_read_tokens": cache_read,
+        "cache_write_tokens": cache_write,
+        "provider_total_tokens": provider_total,
+        "total_tokens": total,
+        "tool_schema_tokens_estimated": None,
+        "tool_result_tokens_estimated": None,
+        "usage_source": "provider",
+        "usage_complete": raw_input is not None and output is not None and total is not None,
+        "field_sources": field_sources,
+    }
+
+
+def apply_usage_records(
+    metrics: dict[str, Any],
+    records: Iterable[dict[str, Any]],
+    expected_requests: int,
+) -> None:
+    usage_records = list(records)
+    metrics["usage_record_count"] = len(usage_records)
+    metrics["usage_complete"] = (
+        expected_requests > 0
+        and len(usage_records) == expected_requests
+        and all(record.get("usage_complete") is True for record in usage_records)
+    )
+    metrics["usage_source"] = ",".join(
+        sorted({str(record.get("usage_source") or "unknown") for record in usage_records})
+    ) or "unknown"
+    coverage: dict[str, dict[str, Any]] = {}
+    for field in USAGE_FIELDS:
+        values = [record[field] for record in usage_records if record.get(field) is not None]
+        partial_field = f"{field}_partial"
+        known_values = [
+            record[field] if record.get(field) is not None else record.get(partial_field)
+            for record in usage_records
+            if record.get(field) is not None or record.get(partial_field) is not None
+        ]
+        complete = expected_requests > 0 and len(values) == expected_requests
+        field_sources = {
+            str(record.get("field_sources", {}).get(field))
+            for record in usage_records
+            if (record.get(field) is not None or record.get(partial_field) is not None)
+            and isinstance(record.get("field_sources"), dict)
+            and record.get("field_sources", {}).get(field)
+        }
+        status = "complete" if complete else ("partial" if known_values else "unknown")
+        coverage_entry = {
+            "reported_requests": len(values),
+            "expected_requests": expected_requests,
+            "complete": complete,
+            "status": status,
+        }
+        if known_values and field in ESTIMATED_USAGE_FIELDS:
+            coverage_entry["source"] = "estimated"
+            coverage_entry["estimated_count"] = len(known_values)
+        elif field_sources:
+            source = field_sources.pop() if len(field_sources) == 1 else "mixed"
+            coverage_entry["source"] = source
+        coverage[field] = coverage_entry
+        metrics[field] = sum(values) if complete else None
+        if known_values and not complete:
+            metrics[partial_field] = sum(known_values)
+        else:
+            metrics.pop(partial_field, None)
+    metrics["usage_coverage"] = coverage
 
 
 def event_payload(event: dict[str, Any]) -> dict[str, Any]:
@@ -206,26 +488,328 @@ def event_payload(event: dict[str, Any]) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def event_provider_request_id(event: dict[str, Any], payload: dict[str, Any]) -> str:
+def provider_request_key(
+    event: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    fallback_event_id: bool = False,
+) -> str:
+    """为同一 provider round 的所有投影返回稳定一致的身份标识。
+
+    JSONL 流可能同时以 ``runtime.event`` 和 ``item.data`` 暴露同一事实。
+    事件 id 标识的是投影，不一定是 provider 请求，因此请求统计应优先使用
+    传播的 request/round/response id，只有最后才退回事件 id。
+    """
+    record = payload.get("record")
+    record = record if isinstance(record, dict) else {}
     context = event.get("causal_context")
-    context_id = context.get("provider_request_id") if isinstance(context, dict) else None
-    return str(
-        payload.get("provider_request_id")
-        or event.get("provider_request_id")
-        or context_id
-        or event.get("id")
-        or ""
+    context = context if isinstance(context, dict) else {}
+    candidates = (
+        record.get("request_event_id"),
+        record.get("provider_request_id"),
+        payload.get("provider_request_id"),
+        event.get("provider_request_id"),
+        context.get("provider_request_id"),
+        record.get("provider_round_id"),
+        payload.get("provider_round_id"),
+        event.get("provider_round_id"),
+        context.get("provider_round_id"),
+        record.get("response_event_id"),
+        record.get("provider_response_id"),
+        payload.get("provider_response_id"),
+        event.get("provider_response_id"),
+        context.get("provider_response_id"),
+        record.get("step_id"),
+        payload.get("step_id"),
+        event.get("step_id"),
+        context.get("step_id"),
     )
+    for candidate in candidates:
+        if candidate is not None and str(candidate):
+            return str(candidate)
+    if fallback_event_id:
+        return str(event.get("id") or "")
+    return ""
+
+
+@dataclass
+class _SyntheticProviderRequest:
+    key: str
+    started_ms: float | None
+    completed_ms: float | None = None
+    closed: bool = False
+
+
+def provider_event_timestamp(event: dict[str, Any], payload: dict[str, Any]) -> float | None:
+    """提取用于请求关联的持久事件时间。
+
+    投影记录可能把时间放在事件、payload 或 usage record 上。这里不使用
+    stdout 到达时间，因为迟到行的到达时间不能代表其所属 provider round。
+    """
+    record = payload.get("record")
+    record = record if isinstance(record, dict) else {}
+    for candidate in (
+        event.get("timestamp"),
+        payload.get("timestamp"),
+        record.get("timestamp"),
+    ):
+        timestamp = timestamp_ms(candidate)
+        if timestamp is not None:
+            return timestamp
+    return None
+
+
+class ProviderRequestTracker:
+    """在导出器省略 request 标识时，按时间区间关联 provider 事件。
+
+    显式 id 可能在无 id 的 round 完成后才到达。只有当持久时间戳落在该
+    round 的时间区间内才建立 alias；没有时间戳时，除非只有一个尚未完成
+    的 synthetic round 且没有已完成候选，否则保留独立 id，避免误挂当前轮。
+    """
+
+    def __init__(self) -> None:
+        self._next_fallback = 0
+        self._active: list[str] = []
+        self._synthetic: dict[str, _SyntheticProviderRequest] = {}
+        self._aliases: dict[str, str] = {}
+        self._known: set[str] = set()
+        self._explicit_started: dict[str, float | None] = {}
+        self._last: str | None = None
+
+    def _new_fallback(self, timestamp: float | None) -> str:
+        key = f"synthetic-provider-request:{self._next_fallback}"
+        self._next_fallback += 1
+        self._active.append(key)
+        self._synthetic[key] = _SyntheticProviderRequest(key, timestamp)
+        self._known.add(key)
+        self._last = key
+        return key
+
+    def _synthetic_for_timestamp(self, timestamp: float | None) -> str | None:
+        if timestamp is None:
+            return None
+        completed = [
+            request
+            for request in self._synthetic.values()
+            if request.closed
+            and request.completed_ms is not None
+            and request.started_ms is not None
+            and request.started_ms <= timestamp
+            and timestamp <= request.completed_ms
+        ]
+        if completed:
+            # 迟到数据与较新的 active round 重叠时，优先已完成区间，再取
+            # 起始时间最近的候选。
+            return max(completed, key=lambda request: request.started_ms or float("-inf")).key
+        active = [
+            request
+            for request in self._synthetic.values()
+            if not request.closed
+            and request.started_ms is not None
+            and request.started_ms <= timestamp
+        ]
+        if active:
+            return max(active, key=lambda request: request.started_ms or float("-inf")).key
+        return None
+
+    def _resolve_explicit(self, explicit: str, timestamp: float | None) -> str:
+        alias = self._aliases.get(explicit)
+        if alias is not None:
+            return alias
+        if explicit in self._known:
+            return explicit
+        candidate = self._synthetic_for_timestamp(timestamp)
+        if candidate is not None:
+            self._aliases[explicit] = candidate
+            return candidate
+        if timestamp is None:
+            active = [
+                request
+                for request in self._synthetic.values()
+                if not request.closed
+            ]
+            completed = [request for request in self._synthetic.values() if request.closed]
+            if len(active) == 1 and not completed:
+                self._aliases[explicit] = active[0].key
+                return active[0].key
+        # 没有足够时间信息时保留显式 id，不能猜测它属于哪个 synthetic。
+        self._known.add(explicit)
+        return explicit
+
+    def _resolve_explicit_start(self, explicit: str, timestamp: float | None) -> str:
+        alias = self._aliases.get(explicit)
+        if alias is not None:
+            synthetic = self._synthetic.get(alias)
+            if synthetic is None or synthetic.closed:
+                self._aliases.pop(explicit, None)
+            elif (
+                timestamp is None
+                or (
+                    synthetic.started_ms is not None
+                    and abs(timestamp - synthetic.started_ms)
+                    <= PROVIDER_START_MATCH_TOLERANCE_MS
+                )
+            ):
+                return alias
+            else:
+                self._aliases.pop(explicit, None)
+        if explicit in self._known:
+            return explicit
+
+        def matches_start(request: _SyntheticProviderRequest) -> bool:
+            if request.closed:
+                return False
+            if timestamp is None:
+                return request.started_ms is None
+            return (
+                request.started_ms is not None
+                and abs(timestamp - request.started_ms) <= PROVIDER_START_MATCH_TOLERANCE_MS
+            )
+
+        candidates = [request for request in self._synthetic.values() if matches_start(request)]
+        if len(candidates) == 1:
+            self._aliases[explicit] = candidates[0].key
+            return candidates[0].key
+        if timestamp is None:
+            active = [request for request in self._synthetic.values() if not request.closed]
+            completed = [request for request in self._synthetic.values() if request.closed]
+            if len(active) == 1 and not completed:
+                self._aliases[explicit] = active[0].key
+                return active[0].key
+        self._known.add(explicit)
+        return explicit
+
+    def _resolve_without_explicit(
+        self,
+        timestamp: float | None,
+        *,
+        prefer_oldest: bool = False,
+    ) -> str:
+        active_keys = [
+            key
+            for key in self._active
+            if key not in self._synthetic or not self._synthetic[key].closed
+        ]
+        if prefer_oldest:
+            if len(active_keys) > 1:
+                oldest = self._oldest_active_key(active_keys)
+                if oldest is not None:
+                    return oldest
+        candidate = self._synthetic_for_timestamp(timestamp)
+        if candidate is not None:
+            return candidate
+        if prefer_oldest:
+            if active_keys:
+                oldest = self._oldest_active_key(active_keys)
+                if oldest is not None:
+                    return oldest
+            if self._active:
+                return self._active[0]
+        if self._active:
+            return self._active[-1]
+        if self._last is not None:
+            return self._last
+        return self._new_fallback(timestamp)
+
+    def _oldest_active_key(self, active_keys: list[str]) -> str | None:
+        timed = []
+        for index, key in enumerate(active_keys):
+            synthetic = self._synthetic.get(key)
+            started = (
+                synthetic.started_ms
+                if synthetic is not None
+                else self._explicit_started.get(key)
+            )
+            if started is not None:
+                timed.append((started, index, key))
+        if timed:
+            return min(timed, key=lambda entry: entry[0])[2]
+        return active_keys[0] if active_keys else None
+
+    def _active_round_for_start(self, timestamp: float | None) -> str | None:
+        if len(self._active) != 1:
+            return None
+        key = self._active[0]
+        synthetic = self._synthetic.get(key)
+        if synthetic is not None and synthetic.closed:
+            return None
+        started = (
+            synthetic.started_ms
+            if synthetic is not None
+            else self._explicit_started.get(key)
+        )
+        if timestamp is None:
+            return key
+        if started is not None and abs(timestamp - started) <= PROVIDER_START_MATCH_TOLERANCE_MS:
+            return key
+        return None
+
+    def resolve(
+        self,
+        event: dict[str, Any],
+        payload: dict[str, Any],
+        event_type: str,
+    ) -> str:
+        timestamp = provider_event_timestamp(event, payload)
+        explicit = provider_request_key(event, payload)
+        if explicit:
+            if event_type == "provider_started":
+                key = self._resolve_explicit_start(explicit, timestamp)
+                synthetic = self._synthetic.get(key)
+                if synthetic is not None and synthetic.closed and key != explicit:
+                    self._aliases.pop(explicit, None)
+                    key = explicit
+                    self._known.add(key)
+                self._known.add(key)
+            else:
+                key = self._resolve_explicit(explicit, timestamp)
+            synthetic = self._synthetic.get(key)
+            if (
+                event_type == "provider_started"
+                and key not in self._active
+                and (synthetic is None or not synthetic.closed)
+            ):
+                self._active.append(key)
+            if event_type == "provider_started" and synthetic is None:
+                self._explicit_started.setdefault(key, timestamp)
+            self._known.add(key)
+            self._last = key
+        elif event_type == "provider_started":
+            active_round = self._active_round_for_start(timestamp)
+            if active_round is not None:
+                self._last = active_round
+                return active_round
+            return self._new_fallback(timestamp)
+        else:
+            key = self._resolve_without_explicit(
+                timestamp,
+                prefer_oldest=event_type == "provider_completed",
+            )
+
+        if event_type == "provider_completed":
+            self._active = [candidate for candidate in self._active if candidate != key]
+            synthetic = self._synthetic.get(key)
+            if synthetic is not None and not synthetic.closed:
+                synthetic.closed = True
+                synthetic.completed_ms = timestamp
+            if synthetic is None:
+                self._explicit_started.pop(key, None)
+            self._last = key
+        return key
 
 
 def usage_record_from_provider_completed(event: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
     usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+    cache_read = usage.get("cache_read_tokens")
+    if cache_read is None:
+        cache_read = usage.get("cached_input_tokens")
     return {
-        "request_event_id": event_provider_request_id(event, payload),
+        "request_event_id": provider_request_key(event, payload, fallback_event_id=True),
         "input_tokens": usage.get("input_tokens"),
+        "non_cached_input_tokens": usage.get("non_cached_input_tokens"),
         "output_tokens": usage.get("output_tokens"),
         "reasoning_tokens": usage.get("reasoning_tokens"),
-        "cache_read_tokens": usage.get("cache_read_tokens", usage.get("cached_input_tokens")),
+        "cache_read_tokens": cache_read,
         "cache_write_tokens": usage.get("cache_write_tokens"),
         "provider_total_tokens": usage.get("total_tokens"),
         "usage_source": usage.get("usage_source", "provider"),
@@ -239,47 +823,113 @@ def has_provider_delta(delta: dict[str, Any]) -> bool:
     )
 
 
-def parse_golutra(stdout: str, elapsed_ms: float, return_code: int, run_dir: Path) -> dict[str, Any]:
+def has_pi_delta(update: dict[str, Any]) -> bool:
+    if update.get("type") not in {"text_delta", "thinking_delta", "toolcall_delta"}:
+        return False
+    return update.get("delta") not in (None, "", [], {})
+
+
+def observed_time(event: dict[str, Any], arrival_ms: float | None) -> float | None:
+    if arrival_ms is not None:
+        return arrival_ms
+    direct = timestamp_ms(event.get("timestamp"))
+    if direct is not None:
+        return direct
+    for key in ("message", "partial"):
+        candidate = event.get(key)
+        if isinstance(candidate, dict):
+            nested = timestamp_ms(candidate.get("timestamp"))
+            if nested is not None:
+                return nested
+    update = event.get("assistantMessageEvent")
+    if isinstance(update, dict):
+        partial = update.get("partial")
+        if isinstance(partial, dict):
+            nested = timestamp_ms(partial.get("timestamp"))
+            if nested is not None:
+                return nested
+    messages = event.get("messages")
+    if isinstance(messages, list):
+        timestamps = [
+            timestamp_ms(message.get("timestamp"))
+            for message in messages
+            if isinstance(message, dict)
+        ]
+        present = [value for value in timestamps if value is not None]
+        if present:
+            return max(present)
+    return None
+
+
+def elapsed_between(end: float | None, start: float | None) -> float | None:
+    if end is None or start is None:
+        return None
+    return round(max(0.0, end - start), 1)
+
+
+def parse_golutra(
+    stdout: str,
+    elapsed_ms: float,
+    return_code: int,
+    run_dir: Path,
+    line_times_ms: Iterable[float] | None = None,
+) -> dict[str, Any]:
     metrics = empty_metrics()
     metrics["return_code"] = return_code
     metrics["elapsed_ms"] = round(elapsed_ms, 1)
-    events = list(iter_json_lines(stdout))
-    nested = list(nested_runtime_events(events))
+    metrics["raw_input_semantics"] = "includes_cache_read"
+    timed_events = list(iter_timed_json_lines(stdout, line_times_ms))
+    nested_timed = list(nested_runtime_events_timed(timed_events))
+    uses_arrival_clock = line_times_ms is not None
+    first_event = min(
+        (
+            observed_time(event, arrival)
+            for event, arrival in timed_events
+            if observed_time(event, arrival) is not None
+        ),
+        default=None,
+    )
+    process_origin = 0.0 if uses_arrival_clock else first_event
+    metrics["process_first_event_ms"] = elapsed_between(first_event, process_origin)
     turn_starts = [
-        timestamp_ms(event.get("timestamp"))
-        for event in events
+        observed_time(event, arrival)
+        for event, arrival in timed_events
         if event.get("type") == "turn.started"
     ]
     turn_starts.extend(
-        timestamp_ms(event.get("timestamp"))
-        for event in nested
+        observed_time(event, arrival)
+        for event, arrival in nested_timed
         if event.get("event_type") in {"turn_started", "turn.started"}
     )
-    provider_starts = [timestamp_ms(event.get("timestamp")) for event in nested if event.get("event_type") == "provider_started"]
+    provider_starts = [
+        observed_time(event, arrival)
+        for event, arrival in nested_timed
+        if event.get("event_type") == "provider_started"
+    ]
     turn_start = min((value for value in turn_starts if value is not None), default=None)
     provider_start = min((value for value in provider_starts if value is not None), default=None)
-    first = provider_start or turn_start
-    if turn_start is not None and provider_start is not None:
-        metrics["startup_ms"] = round(max(0.0, provider_start - turn_start), 1)
+    metrics["model_prep_ms"] = elapsed_between(provider_start, turn_start)
     first_token = None
     terminal = None
     seen_requests: set[str] = set()
-    seen_usage: set[str] = set()
+    request_tracker = ProviderRequestTracker()
+    usage_records: dict[str, dict[str, Any]] = {}
+    fallback_usage_records: dict[str, dict[str, Any]] = {}
     tool_names: set[str] = set()
     observed_tool_calls = 0
-    for event in events:
+    for event, arrival in timed_events:
         event_type = event.get("type")
         if event_type == "turn.completed":
             metrics["completed"] = event.get("status") == "completed"
             metrics["final_message"] = str(event.get("final_message") or "")[:512]
-            terminal = timestamp_ms(event.get("timestamp"))
+            terminal = observed_time(event, arrival)
         elif event_type == "turn.failed":
             metrics["final_message"] = str(event.get("error") or event.get("final_message") or "")[:512]
-            terminal = timestamp_ms(event.get("timestamp"))
-    for event in nested:
+            terminal = observed_time(event, arrival)
+    for event, arrival in nested_timed:
         event_type = str(event.get("event_type") or "")
         payload = event_payload(event)
-        event_time = timestamp_ms(event.get("timestamp"))
+        event_time = observed_time(event, arrival)
         if event_type == "context_built" and metrics["planned_input_tokens"] is None:
             metrics["planned_input_tokens"] = as_number(payload.get("planned_input_tokens"))
         if event_type in {"turn_completed", "turn.completed"} and terminal is None:
@@ -289,40 +939,22 @@ def parse_golutra(stdout: str, elapsed_ms: float, return_code: int, run_dir: Pat
             metrics["completed"] = False
             terminal = event_time
         if event_type == "provider_started":
-            request_id = event_provider_request_id(event, payload)
-            if request_id and request_id not in seen_requests:
-                seen_requests.add(request_id)
+            request_id = request_tracker.resolve(event, payload, event_type)
+            seen_requests.add(request_id)
         if event_type == "provider_streamed" and first_token is None:
             delta = payload.get("delta") if isinstance(payload.get("delta"), dict) else {}
             if has_provider_delta(delta):
                 first_token = event_time
         if event_type == "token_usage_recorded":
             record = payload.get("record") if isinstance(payload.get("record"), dict) else {}
-            request_id = str(
-                record.get("request_event_id")
-                or record.get("provider_request_id")
-                or event_provider_request_id(event, payload)
-            )
-            if request_id in seen_usage:
-                continue
-            seen_usage.add(request_id)
-            for source, target in (
-                ("input_tokens", "input_tokens"),
-                ("non_cached_input_tokens", "non_cached_input_tokens"),
-                ("output_tokens", "output_tokens"),
-                ("reasoning_tokens", "reasoning_tokens"),
-                ("cache_read_tokens", "cache_read_tokens"),
-                ("cache_write_tokens", "cache_write_tokens"),
-                ("provider_total_tokens", "total_tokens"),
-                ("tool_schema_tokens_estimated", "tool_schema_tokens_estimated"),
-                ("tool_result_tokens_estimated", "tool_result_tokens_estimated"),
-            ):
-                add_counter(metrics, target, as_number(record.get(source)))
+            request_id = request_tracker.resolve(event, payload, event_type)
+            if request_id:
+                usage_records[request_id] = normalize_golutra_usage(record)
+                seen_requests.add(request_id)
             if metrics["planned_input_tokens"] is None:
                 metrics["planned_input_tokens"] = as_number(record.get("planned_input_tokens"))
-            metrics["usage_source"] = str(record.get("usage_source") or "unknown")
             if record.get("estimated_cost") is not None:
-                metrics["cost"] = record.get("estimated_cost")
+                metrics["cost"] = (metrics["cost"] or 0) + record["estimated_cost"]
                 metrics["cost_source"] = "estimated"
         if "tool" in event_type:
             envelope = payload.get("envelope") if isinstance(payload.get("envelope"), dict) else {}
@@ -339,21 +971,14 @@ def parse_golutra(stdout: str, elapsed_ms: float, return_code: int, run_dir: Pat
             if isinstance(name, str) and name and not is_external_verifier:
                 tool_names.add(name)
         if event_type == "provider_completed":
-            request_id = event_provider_request_id(event, payload)
-            if request_id and request_id not in seen_usage and isinstance(payload.get("usage"), dict):
-                seen_usage.add(request_id)
-                fallback_record = usage_record_from_provider_completed(event, payload)
-                for source, target in (
-                    ("input_tokens", "input_tokens"),
-                    ("non_cached_input_tokens", "non_cached_input_tokens"),
-                    ("output_tokens", "output_tokens"),
-                    ("reasoning_tokens", "reasoning_tokens"),
-                    ("cache_read_tokens", "cache_read_tokens"),
-                    ("cache_write_tokens", "cache_write_tokens"),
-                    ("provider_total_tokens", "total_tokens"),
-                ):
-                    add_counter(metrics, target, as_number(fallback_record.get(source)))
-                metrics["usage_source"] = str(fallback_record.get("usage_source") or "provider")
+            request_id = request_tracker.resolve(event, payload, event_type)
+            seen_requests.add(request_id)
+            if request_id and isinstance(payload.get("usage"), dict):
+                fallback_record = normalize_golutra_usage(
+                    usage_record_from_provider_completed(event, payload)
+                )
+                fallback_record["request_event_id"] = request_id
+                fallback_usage_records[request_id] = fallback_record
             count = as_number(payload.get("tool_call_count"))
             if count is not None:
                 metrics["tool_call_count"] = max(metrics["tool_call_count"], count)
@@ -362,20 +987,16 @@ def parse_golutra(stdout: str, elapsed_ms: float, return_code: int, run_dir: Pat
                     name = call.get("name") or call.get("tool_name")
                     if isinstance(name, str) and name:
                         tool_names.add(name)
-        if event_type == "token_usage_recorded":
-            record = event_payload(event).get("record")
-            request_id = str(record.get("request_event_id") or "") if isinstance(record, dict) else ""
-            if request_id:
-                seen_requests.add(request_id)
     metrics["tool_call_count"] = max(metrics["tool_call_count"], observed_tool_calls)
-    metrics["request_count"] = len(seen_requests | seen_usage)
+    normalized_usage = dict(fallback_usage_records)
+    normalized_usage.update(usage_records)
+    metrics["request_count"] = len(seen_requests | set(normalized_usage))
+    apply_usage_records(metrics, normalized_usage.values(), metrics["request_count"])
     metrics["tool_names"] = sorted(tool_names)
-    if first_token is not None and first is not None:
-        metrics["first_token_ms"] = round(max(0.0, first_token - first), 1)
-    if terminal is not None and first is not None:
-        metrics["terminal_ms"] = round(max(0.0, terminal - first), 1)
-    if metrics["total_tokens"] is None and metrics["input_tokens"] is not None and metrics["output_tokens"] is not None:
-        metrics["total_tokens"] = metrics["input_tokens"] + metrics["output_tokens"]
+    metrics["first_token_ms"] = elapsed_between(first_token, process_origin)
+    metrics["turn_first_token_ms"] = elapsed_between(first_token, turn_start)
+    metrics["provider_first_token_ms"] = elapsed_between(first_token, provider_start)
+    metrics["terminal_ms"] = elapsed_between(terminal, process_origin)
     manifest = run_dir / "manifest.json"
     if manifest.is_file():
         try:
@@ -384,6 +1005,7 @@ def parse_golutra(stdout: str, elapsed_ms: float, return_code: int, run_dir: Pat
             metrics["provider"] = data.get("terminal_outcome", {}).get("result", {}).get("status")
         except (OSError, json.JSONDecodeError):
             pass
+    metrics["completed"] = bool(metrics["completed"]) and return_code == 0
     return metrics
 
 
@@ -395,27 +1017,48 @@ def extract_text(content: Any) -> str:
     return "\n".join(str(block.get("text", "")) for block in content if isinstance(block, dict) and block.get("type") == "text")
 
 
-def parse_pi(stdout: str, elapsed_ms: float, return_code: int) -> dict[str, Any]:
+def parse_pi(
+    stdout: str,
+    elapsed_ms: float,
+    return_code: int,
+    line_times_ms: Iterable[float] | None = None,
+) -> dict[str, Any]:
     metrics = empty_metrics()
     metrics["return_code"] = return_code
     metrics["elapsed_ms"] = round(elapsed_ms, 1)
-    events = list(iter_json_lines(stdout))
-    usage_seen: set[str] = set()
-    first_event = None
+    metrics["raw_input_semantics"] = "excludes_cache_read_and_write"
+    timed_events = list(iter_timed_json_lines(stdout, line_times_ms))
+    uses_arrival_clock = line_times_ms is not None
+    process_first_event = min(
+        (
+            observed_time(event, arrival)
+            for event, arrival in timed_events
+            if observed_time(event, arrival) is not None
+        ),
+        default=None,
+    )
+    process_origin = 0.0 if uses_arrival_clock else process_first_event
+    metrics["process_first_event_ms"] = elapsed_between(process_first_event, process_origin)
+    usage_records: dict[str, dict[str, Any]] = {}
+    session_start = None
+    turn_start = None
     first_token = None
     terminal = None
     last_message_time = None
     tool_names: set[str] = set()
     tool_calls_seen: set[str] = set()
     tool_results_seen: set[str] = set()
-    for event in events:
+    estimated_results: dict[str, int] = {}
+    for event, arrival in timed_events:
         event_type = event.get("type")
-        if first_event is None and event_type == "session":
-            first_event = timestamp_ms(event.get("timestamp"))
+        if session_start is None and event_type == "session":
+            session_start = observed_time(event, arrival)
+        if turn_start is None and event_type == "turn_start":
+            turn_start = observed_time(event, arrival)
         if event_type == "message_update":
             update = event.get("assistantMessageEvent")
-            if isinstance(update, dict) and update.get("type") in {"text_delta", "thinking_delta", "toolcall_delta"} and first_token is None:
-                first_token = timestamp_ms((update.get("partial") or {}).get("timestamp"))
+            if isinstance(update, dict) and has_pi_delta(update) and first_token is None:
+                first_token = observed_time(event, arrival)
         if event_type == "message_end":
             message = event.get("message")
             if not isinstance(message, dict):
@@ -429,22 +1072,13 @@ def parse_pi(stdout: str, elapsed_ms: float, return_code: int) -> dict[str, Any]
             if message.get("role") != "assistant":
                 continue
             usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
-            last_message_time = timestamp_ms(message.get("timestamp")) or last_message_time
-            response_id = str(message.get("responseId") or message.get("timestamp") or len(usage_seen))
-            if response_id in usage_seen:
+            message_time = observed_time(event, arrival)
+            if message_time is not None:
+                last_message_time = message_time
+            response_id = str(message.get("responseId") or message.get("timestamp") or len(usage_records))
+            if response_id in usage_records:
                 continue
-            usage_seen.add(response_id)
-            metrics["request_count"] += 1
-            for source, target in (
-                ("input", "input_tokens"),
-                ("reasoning", "reasoning_tokens"),
-                ("reasoningTokens", "reasoning_tokens"),
-                ("output", "output_tokens"),
-                ("cacheRead", "cache_read_tokens"),
-                ("cacheWrite", "cache_write_tokens"),
-                ("totalTokens", "total_tokens"),
-            ):
-                add_counter(metrics, target, as_number(usage.get(source)))
+            usage_records[response_id] = normalize_pi_usage(usage)
             metrics["final_message"] = extract_text(message.get("content"))[:512]
             cost = usage.get("cost")
             if isinstance(cost, dict):
@@ -468,6 +1102,9 @@ def parse_pi(stdout: str, elapsed_ms: float, return_code: int) -> dict[str, Any]
                 metrics["tool_result_count"] += 1
             if isinstance(event.get("toolName"), str):
                 tool_names.add(event["toolName"])
+            result = event.get("result") or event.get("toolResult") or {}
+            content = result.get("content") if isinstance(result, dict) else ""
+            estimated_results[result_id] = max(0, len(extract_text(content)) + 3) // 4
         elif event_type == "tool_execution_start":
             call_id = str(event.get("toolCallId") or event.get("timestamp") or "")
             if call_id not in tool_calls_seen:
@@ -476,39 +1113,184 @@ def parse_pi(stdout: str, elapsed_ms: float, return_code: int) -> dict[str, Any]
             if isinstance(event.get("toolName"), str):
                 tool_names.add(event["toolName"])
         elif event_type == "agent_end":
-            terminal = timestamp_ms(event.get("timestamp"))
+            terminal = observed_time(event, arrival)
             metrics["completed"] = return_code == 0
-    terminal = terminal or last_message_time
+    if terminal is None:
+        terminal = last_message_time
+    metrics["request_count"] = len(usage_records)
+    apply_usage_records(metrics, usage_records.values(), metrics["request_count"])
     metrics["tool_names"] = sorted(tool_names)
-    metrics["tool_result_tokens_estimated"] = 0
-    for event in events:
-        if event.get("type") in {"tool_result", "tool_execution_end"}:
-            result = event.get("result") or event.get("toolResult") or {}
-            metrics["tool_result_tokens_estimated"] += max(0, len(extract_text(result.get("content") if isinstance(result, dict) else "")) + 3) // 4
-    metrics["usage_source"] = metrics["usage_source"] or "unknown"
-    if first_token is not None and first_event is not None:
-        metrics["first_token_ms"] = round(max(0.0, first_token - first_event), 1)
-    if terminal is not None and first_event is not None:
-        metrics["terminal_ms"] = round(max(0.0, terminal - first_event), 1)
-    if metrics["total_tokens"] is None and metrics["input_tokens"] is not None and metrics["output_tokens"] is not None:
-        metrics["total_tokens"] = metrics["input_tokens"] + metrics["output_tokens"]
+    metrics["tool_result_tokens_estimated"] = sum(estimated_results.values())
+    estimate_coverage = {
+        "reported_requests": 0,
+        "expected_requests": 0,
+        "estimated_count": len(estimated_results),
+        "complete": bool(estimated_results),
+        "status": "complete" if estimated_results else "unknown",
+    }
+    if estimated_results:
+        estimate_coverage["source"] = "estimated"
+    metrics["usage_coverage"]["tool_result_tokens_estimated"] = estimate_coverage
+    metrics["first_token_ms"] = elapsed_between(first_token, process_origin)
+    turn_anchor = turn_start if turn_start is not None else session_start
+    if turn_anchor is None:
+        turn_anchor = process_first_event
+    metrics["turn_first_token_ms"] = elapsed_between(first_token, turn_anchor)
+    metrics["terminal_ms"] = elapsed_between(terminal, process_origin)
     return metrics
 
 
-def run_process(command: list[str], cwd: Path, env: dict[str, str], timeout: float, stdout_path: Path, stderr_path: Path) -> tuple[str, str, int, float]:
-    started = time.monotonic()
+def drain_process_stream(
+    stream: Any,
+    lines: list[str],
+    started: float,
+    line_times_ms: list[float] | None = None,
+) -> None:
     try:
-        result = subprocess.run(command, cwd=cwd, env=env, text=True, capture_output=True, timeout=timeout, check=False)
-        returncode = result.returncode
-        stdout, stderr = result.stdout, result.stderr
-    except subprocess.TimeoutExpired as error:
+        for line in stream:
+            lines.append(line)
+            if line_times_ms is not None:
+                line_times_ms.append((time.monotonic() - started) * 1000)
+    except (OSError, ValueError):
+        pass
+    finally:
+        try:
+            stream.close()
+        except (OSError, ValueError):
+            pass
+
+
+def close_process_stream(stream: Any) -> None:
+    try:
+        file_descriptor = stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        try:
+            stream.close()
+        except (AttributeError, OSError, ValueError):
+            pass
+        return
+    try:
+        os.close(file_descriptor)
+    except (OSError, ValueError):
+        pass
+
+
+def join_pipe_reader(thread: threading.Thread, stream: Any, deadline: float) -> None:
+    remaining = max(0.0, deadline - time.monotonic())
+    thread.join(timeout=remaining)
+    if thread.is_alive():
+        close_process_stream(stream)
+        thread.join(timeout=PIPE_CLOSE_JOIN_SECONDS)
+
+
+def terminate_windows_process_tree(process_id: int) -> None:
+    try:
+        subprocess.run(
+            ["taskkill", "/PID", str(process_id), "/T", "/F"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=PROCESS_STOP_TIMEOUT_SECONDS,
+        )
+    except (OSError, ProcessLookupError, subprocess.TimeoutExpired):
+        pass
+
+
+def stop_timed_out_process(process: subprocess.Popen[str]) -> None:
+    if os.name == "nt":
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+        terminate_windows_process_tree(process.pid)
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+    try:
+        process.wait(timeout=PROCESS_STOP_TIMEOUT_SECONDS)
+        return
+    except ProcessLookupError:
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        if os.name == "nt":
+            terminate_windows_process_tree(process.pid)
+        else:
+            os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=PROCESS_STOP_TIMEOUT_SECONDS)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        pass
+
+
+def run_process(
+    command: list[str],
+    cwd: Path,
+    env: dict[str, str],
+    timeout: float,
+    stdout_path: Path,
+    stderr_path: Path,
+) -> ProcessCapture:
+    started = time.monotonic()
+    popen_options: dict[str, Any] = {
+        "cwd": cwd,
+        "env": env,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "bufsize": 1,
+    }
+    if os.name == "nt":
+        popen_options["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        popen_options["start_new_session"] = True
+    process = subprocess.Popen(command, **popen_options)
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    stdout_line_times_ms: list[float] = []
+    stdout_worker = threading.Thread(
+        target=drain_process_stream,
+        args=(process.stdout, stdout_lines, started, stdout_line_times_ms),
+        daemon=True,
+    )
+    stderr_worker = threading.Thread(
+        target=drain_process_stream,
+        args=(process.stderr, stderr_lines, started),
+        daemon=True,
+    )
+    stdout_worker.start()
+    stderr_worker.start()
+    try:
+        returncode = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
         returncode = 124
-        stdout = error.stdout or ""
-        stderr = (error.stderr or "") + "\nprocess timed out"
+        stop_timed_out_process(process)
+        stderr_lines.append("\nprocess timed out\n")
+    pipe_deadline = time.monotonic() + PIPE_DRAIN_TIMEOUT_SECONDS
+    join_pipe_reader(stdout_worker, process.stdout, pipe_deadline)
+    join_pipe_reader(stderr_worker, process.stderr, pipe_deadline)
     elapsed_ms = (time.monotonic() - started) * 1000
+    stdout = "".join(stdout_lines)
+    stderr = "".join(stderr_lines)
+    stdout_path.parent.mkdir(parents=True, exist_ok=True)
     stdout_path.write_text(stdout, encoding="utf-8", errors="replace")
     stderr_path.write_text(stderr, encoding="utf-8", errors="replace")
-    return stdout, stderr, returncode, elapsed_ms
+    return ProcessCapture(
+        stdout=stdout,
+        stderr=stderr,
+        return_code=returncode,
+        elapsed_ms=elapsed_ms,
+        stdout_line_times_ms=tuple(stdout_line_times_ms),
+    )
 
 
 def verify_files(workspace: Path, expected: dict[str, str]) -> dict[str, Any]:
@@ -539,9 +1321,10 @@ def verify_response(task: Task, final_message: str) -> dict[str, Any]:
 def task_verification(task: Task, metrics: dict[str, Any], workspace: Path) -> dict[str, Any]:
     files = verify_files(workspace, task.expected_files)
     response = verify_response(task, str(metrics.get("final_message") or ""))
+    execution_completed = bool(metrics.get("completed")) and metrics.get("return_code") == 0
     return {
-        "passed": bool(metrics.get("completed")) and files["passed"] and response["passed"],
-        "execution_completed": bool(metrics.get("completed")),
+        "passed": execution_completed and files["passed"] and response["passed"],
+        "execution_completed": execution_completed,
         "files": files,
         "response": response,
     }
@@ -549,6 +1332,14 @@ def task_verification(task: Task, metrics: dict[str, Any], workspace: Path) -> d
 
 def display_metric(value: Any) -> str:
     return "-" if value is None else str(value)
+
+
+def display_field(metrics: dict[str, Any], field: str) -> str:
+    value = metrics.get(field)
+    if value is not None:
+        return str(value)
+    partial = metrics.get(f"{field}_partial")
+    return f"{partial}*" if partial is not None else "-"
 
 
 def prepare_workspace(source: Path, destination: Path, seeds: dict[str, str]) -> None:
@@ -600,7 +1391,7 @@ def run_task(task: Task, args: argparse.Namespace, root: Path) -> dict[str, Any]
         str(args.max_elapsed_ms),
         task.prompt,
     ]
-    golutra_stdout, _, golutra_code, golutra_elapsed = run_process(
+    golutra_capture = run_process(
         golutra_command,
         args.workspace,
         os.environ.copy(),
@@ -608,7 +1399,13 @@ def run_task(task: Task, args: argparse.Namespace, root: Path) -> dict[str, Any]
         task_root / "golutra.stdout.jsonl",
         task_root / "golutra.stderr.log",
     )
-    golutra_metrics = parse_golutra(golutra_stdout, golutra_elapsed, golutra_code, golutra_run)
+    golutra_metrics = parse_golutra(
+        golutra_capture.stdout,
+        golutra_capture.elapsed_ms,
+        golutra_capture.return_code,
+        golutra_run,
+        golutra_capture.stdout_line_times_ms,
+    )
     pi_session = task_root / "pi-session"
     pi_session.mkdir(parents=True)
     pi_entry = args.pi_root / "packages" / "coding-agent" / "src" / "cli.ts"
@@ -635,7 +1432,7 @@ def run_task(task: Task, args: argparse.Namespace, root: Path) -> dict[str, Any]
     ]
     pi_env = os.environ.copy()
     pi_env["PI_CODING_AGENT_DIR"] = str(args.pi_agent_dir.resolve())
-    pi_stdout, _, pi_code, pi_elapsed = run_process(
+    pi_capture = run_process(
         pi_command,
         pi_workspace,
         pi_env,
@@ -643,7 +1440,12 @@ def run_task(task: Task, args: argparse.Namespace, root: Path) -> dict[str, Any]
         task_root / "pi.stdout.jsonl",
         task_root / "pi.stderr.log",
     )
-    pi_metrics = parse_pi(pi_stdout, pi_elapsed, pi_code)
+    pi_metrics = parse_pi(
+        pi_capture.stdout,
+        pi_capture.elapsed_ms,
+        pi_capture.return_code,
+        pi_capture.stdout_line_times_ms,
+    )
     return {
         "task_id": task.task_id,
         "prompt": task.prompt,
@@ -659,30 +1461,30 @@ def markdown_report(report: dict[str, Any]) -> str:
         "",
         f"Generated: {report['generated_at']}",
         "",
-        "| Task | G total | Pi total | G input/output/reasoning | Pi input/output/reasoning | G cache R/W | Pi cache R/W | G req/tools | Pi req/tools | G startup/first/terminal ms | Pi first/terminal ms | Pass |",
+        "| Task | G total | Pi total | G context prompt/uncached/output/reasoning | Pi context prompt/uncached/output/reasoning | G cache R/W | Pi cache R/W | G req/tools | Pi req/tools | G prep/provider-first/terminal ms | Pi turn-first/terminal ms | Pass |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     for row in report["tasks"]:
         g, p = row["golutra"], row["pi"]
         passed = g["verification"]["passed"] and p["verification"]["passed"]
         lines.append(
-            f"| {row['task_id']} | {display_metric(g.get('total_tokens'))} | {display_metric(p.get('total_tokens'))} | {display_metric(g.get('input_tokens'))} / {display_metric(g.get('output_tokens'))} / {display_metric(g.get('reasoning_tokens'))} | {display_metric(p.get('input_tokens'))} / {display_metric(p.get('output_tokens'))} / {display_metric(p.get('reasoning_tokens'))} | {display_metric(g.get('cache_read_tokens'))} / {display_metric(g.get('cache_write_tokens'))} | {display_metric(p.get('cache_read_tokens'))} / {display_metric(p.get('cache_write_tokens'))} | {display_metric(g.get('request_count'))} / {display_metric(g.get('tool_call_count'))} | {display_metric(p.get('request_count'))} / {display_metric(p.get('tool_call_count'))} | {display_metric(g.get('startup_ms'))} / {display_metric(g.get('first_token_ms'))} / {display_metric(g.get('terminal_ms'))} | {display_metric(p.get('first_token_ms'))} / {display_metric(p.get('terminal_ms'))} | {'yes' if passed else 'no'} |"
+            f"| {row['task_id']} | {display_field(g, 'total_tokens')} | {display_field(p, 'total_tokens')} | {display_field(g, 'prompt_tokens')} / {display_field(g, 'uncached_input_tokens')} / {display_field(g, 'output_tokens')} / {display_field(g, 'reasoning_tokens')} | {display_field(p, 'prompt_tokens')} / {display_field(p, 'uncached_input_tokens')} / {display_field(p, 'output_tokens')} / {display_field(p, 'reasoning_tokens')} | {display_field(g, 'cache_read_tokens')} / {display_field(g, 'cache_write_tokens')} | {display_field(p, 'cache_read_tokens')} / {display_field(p, 'cache_write_tokens')} | {display_metric(g.get('request_count'))} / {display_metric(g.get('tool_call_count'))} | {display_metric(p.get('request_count'))} / {display_metric(p.get('tool_call_count'))} | {display_metric(g.get('model_prep_ms'))} / {display_metric(g.get('provider_first_token_ms'))} / {display_metric(g.get('terminal_ms'))} | {display_metric(p.get('turn_first_token_ms'))} / {display_metric(p.get('terminal_ms'))} | {'yes' if passed else 'no'} |"
         )
     lines.extend(
         [
             "",
-            "Token values are provider-reported unless the field name says estimated; cache is read/write tokens; first/terminal are measured from the provider/session start.",
+            "Context prompt is Golutra raw input (which includes cache reads) and Pi raw input + cache read; cache write is a separate billing field and is excluded from prompt. Total/provider total retain provider billing semantics. Timings use host monotonic stdout arrival; terminal is process-relative. An asterisk marks a partial provider field; a dash is unknown. JSON usage coverage reports status=complete|partial|unknown and local estimates with source=estimated.",
             "",
             "## Aggregate",
             "",
-            "| Engine | Passed | Total | Input | Output | Reasoning | Cache read/write | Tool schema estimate | Tool result estimate | Avg startup ms | Avg elapsed ms |",
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Engine | Passed | Total | Context prompt | Uncached | Output | Reasoning | Cache read/write | Tool schema estimate | Tool result estimate | Avg prep/provider-first/first ms | Avg elapsed ms |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for engine in ("golutra", "pi"):
         summary = report["summary"][engine]
         lines.append(
-            f"| {engine} | {summary['passed_tasks']}/{summary['task_count']} | {display_metric(summary['total_tokens'])} | {display_metric(summary['input_tokens'])} | {display_metric(summary['output_tokens'])} | {display_metric(summary['reasoning_tokens'])} | {display_metric(summary['cache_read_tokens'])} / {display_metric(summary['cache_write_tokens'])} | {display_metric(summary['tool_schema_tokens_estimated'])} | {display_metric(summary['tool_result_tokens_estimated'])} | {display_metric(summary['avg_startup_ms'])} | {display_metric(summary['avg_elapsed_ms'])} |"
+            f"| {engine} | {summary['passed_tasks']}/{summary['task_count']} | {display_field(summary, 'total_tokens')} | {display_field(summary, 'prompt_tokens')} | {display_field(summary, 'uncached_input_tokens')} | {display_field(summary, 'output_tokens')} | {display_field(summary, 'reasoning_tokens')} | {display_field(summary, 'cache_read_tokens')} / {display_field(summary, 'cache_write_tokens')} | {display_field(summary, 'tool_schema_tokens_estimated')} | {display_field(summary, 'tool_result_tokens_estimated')} | {display_metric(summary.get('avg_model_prep_ms'))} / {display_metric(summary.get('avg_provider_first_token_ms'))} / {display_metric(summary.get('avg_first_token_ms'))} | {display_metric(summary.get('avg_elapsed_ms'))} |"
         )
     return "\n".join(lines) + "\n"
 
@@ -690,12 +1492,14 @@ def markdown_report(report: dict[str, Any]) -> str:
 def aggregate_metrics(tasks: list[dict[str, Any]], engine: str) -> dict[str, Any]:
     metrics = [row[engine] for row in tasks]
     numeric_fields = (
-        "input_tokens",
-        "non_cached_input_tokens",
+        "raw_input_tokens",
+        "prompt_tokens",
+        "uncached_input_tokens",
         "output_tokens",
         "reasoning_tokens",
         "cache_read_tokens",
         "cache_write_tokens",
+        "provider_total_tokens",
         "total_tokens",
         "tool_schema_tokens_estimated",
         "tool_result_tokens_estimated",
@@ -706,14 +1510,72 @@ def aggregate_metrics(tasks: list[dict[str, Any]], engine: str) -> dict[str, Any
     summary: dict[str, Any] = {
         "task_count": len(metrics),
         "passed_tasks": sum(1 for metric in metrics if metric.get("verification", {}).get("passed")),
+        "usage_complete": all(metric.get("usage_complete") is True for metric in metrics),
     }
     for field in numeric_fields:
-        values = [metric.get(field) for metric in metrics if metric.get(field) is not None]
-        summary[field] = sum(values) if values else None
+        complete_values = [metric.get(field) for metric in metrics]
+        if metrics and all(value is not None for value in complete_values):
+            summary[field] = sum(complete_values)
+            continue
+        partial_values = [
+            metric.get(field)
+            if metric.get(field) is not None
+            else metric.get(f"{field}_partial")
+            for metric in metrics
+        ]
+        reported = [value for value in partial_values if value is not None]
+        summary[field] = None
+        if reported:
+            summary[f"{field}_partial"] = sum(reported)
+    usage_coverage: dict[str, dict[str, Any]] = {}
+    for field in USAGE_FIELDS:
+        field_coverage = [metric.get("usage_coverage", {}).get(field, {}) for metric in metrics]
+        reported = sum(int(entry.get("reported_requests", 0)) for entry in field_coverage)
+        expected = sum(int(entry.get("expected_requests", 0)) for entry in field_coverage)
+        estimated = sum(int(entry.get("estimated_count", 0)) for entry in field_coverage)
+        partial = any(entry.get("status") == "partial" for entry in field_coverage)
+        unknown = any(entry.get("status") == "unknown" for entry in field_coverage)
+        partial_requests = sum(
+            max(
+                0,
+                int(entry.get("expected_requests", 0))
+                - int(entry.get("reported_requests", 0)),
+            )
+            for entry in field_coverage
+            if entry.get("status") == "partial"
+        )
+        sources = {str(entry.get("source")) for entry in field_coverage if entry.get("source")}
+        complete = expected > 0 and reported == expected
+        estimate_only = estimated > 0 and reported == 0 and not unknown
+        coverage_entry = {
+            "reported_requests": reported,
+            "expected_requests": expected,
+            "complete": complete or estimate_only,
+            "status": (
+                "complete"
+                if complete or estimate_only
+                else ("partial" if partial or reported or estimated else "unknown")
+            ),
+        }
+        if partial_requests:
+            coverage_entry["partial_requests"] = partial_requests
+        if estimated:
+            coverage_entry["estimated_count"] = estimated
+        usage_coverage[field] = coverage_entry
+        if sources:
+            usage_coverage[field]["source"] = sources.pop() if len(sources) == 1 else "mixed"
+    summary["usage_coverage"] = usage_coverage
     elapsed = [metric["elapsed_ms"] for metric in metrics if metric.get("elapsed_ms") is not None]
     summary["avg_elapsed_ms"] = round(sum(elapsed) / len(elapsed), 1) if elapsed else None
-    startup = [metric["startup_ms"] for metric in metrics if metric.get("startup_ms") is not None]
-    summary["avg_startup_ms"] = round(sum(startup) / len(startup), 1) if startup else None
+    for field in (
+        "model_prep_ms",
+        "provider_first_token_ms",
+        "first_token_ms",
+        "turn_first_token_ms",
+        "terminal_ms",
+    ):
+        values = [metric[field] for metric in metrics if metric.get(field) is not None]
+        summary[f"avg_{field}"] = round(sum(values) / len(values), 1) if values else None
     return summary
 
 
@@ -733,7 +1595,7 @@ def main() -> int:
     else:
         work_root = Path(tempfile.mkdtemp(prefix="golutra-pi-benchmark-"))
     report = {
-        "schema_version": 2,
+        "schema_version": 3,
         "generated_at": now_iso(),
         "conditions": {
             "golutra": str(Path(args.golutra).resolve()),
@@ -746,6 +1608,12 @@ def main() -> int:
             "project_verifier_discovery": False,
             "functional_assertions": "harness_response_and_fixture_files",
             "external_verifier": str(Path(__file__).with_name("verify_compare_task.py").resolve()),
+            "timing_source": "host_monotonic_stdout_arrival",
+            "token_semantics": "context_prompt;golutra=raw_input_includes_cache_read;pi=raw_input_plus_cache_read;cache_write=billing_separate;total=provider_billing",
+            "prompt_tokens_semantics": "context_prompt",
+            "cache_write_tokens_semantics": "billing_only_excluded_from_prompt",
+            "total_tokens_semantics": "provider_billing_total",
+            "missing_usage_semantics": "coverage_status_partial_or_unknown",
         },
         "tasks": [],
         "work_root": str(work_root),

@@ -163,9 +163,21 @@ async fn mock_provider_returns_tool_call() {
 fn openai_tool_parameters_come_from_the_runtime_tool_contract() {
     let input_schema = json!({
         "type": "object",
-        "properties": {"custom": {"type": "integer"}},
+        "properties": {
+            "custom": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10,
+                "description": "runtime-only bound"
+            },
+            "description": {"type": "string", "maxLength": 32}
+        },
         "required": ["custom"],
-        "additionalProperties": false
+        "additionalProperties": false,
+        "oneOf": [
+            {"type": "object", "properties": {"custom": {"type": "integer"}}},
+            {"type": "null"}
+        ]
     });
     let contract = ToolContract {
         tool_name: "custom_tool".to_owned(),
@@ -183,34 +195,44 @@ fn openai_tool_parameters_come_from_the_runtime_tool_contract() {
 
     let schema = openai_tool_schema(&contract);
 
-    assert_eq!(schema["function"]["parameters"], input_schema);
+    let parameters = &schema["function"]["parameters"];
+    assert_eq!(parameters["type"], "object");
+    assert_eq!(parameters["required"], json!(["custom"]));
+    assert_eq!(parameters["additionalProperties"], false);
+    assert!(parameters["properties"]["custom"].get("minimum").is_none());
+    assert!(parameters["properties"]["custom"].get("maximum").is_none());
+    assert_eq!(
+        parameters["properties"]["custom"]["description"],
+        "runtime-only bound"
+    );
+    assert_eq!(parameters["properties"]["description"]["type"], "string");
+    assert!(
+        parameters["properties"]["description"]
+            .get("maxLength")
+            .is_none()
+    );
+    assert_eq!(parameters["oneOf"][0]["type"], "object");
+    assert_eq!(parameters["oneOf"][1]["type"], "null");
 }
 
 #[test]
 fn shell_provider_description_distinguishes_lifetime_from_initial_wait() {
     let description = provider_tool_description("shell");
 
-    assert!(description.contains("inert argv"));
-    assert!(description.contains("program and every argument"));
+    assert!(description.contains("as argv"));
     assert!(description.contains("Python heredoc"));
-    assert!(description.contains("package-manager conventions"));
-    assert!(description.contains("project-scoped installation"));
     assert!(description.contains("timeout_ms is the absolute process lifetime"));
-    assert!(description.contains("yield"));
-    assert!(description.contains("only controls the initial wait"));
-    assert!(description.contains("runtime-scoped"));
-    assert!(description.contains("do not use background=true"));
-    assert!(description.contains("platform-appropriate lifecycle mechanism"));
-    assert!(description.contains("verify availability before returning"));
-    assert!(!description.contains("nohup"));
+    assert!(description.contains("yield_time_ms only the initial wait"));
+    assert!(description.contains("runtime owns the process"));
+    assert!(description.contains("must outlive the runtime"));
+    assert!(description.len() < 400);
 }
 
 #[test]
 fn provider_tool_descriptions_own_file_and_question_usage_details() {
     let write_file = provider_tool_description("write_file");
-    assert!(write_file.contains("complete supplied content"));
-    assert!(write_file.contains("explicit working or output directory"));
-    assert!(write_file.contains("workspace root"));
+    assert!(write_file.contains("complete UTF-8 content"));
+    assert!(write_file.contains("workspace-relative file"));
 
     let ask_user = provider_tool_description("ask_user");
     assert!(ask_user.contains("consequential decision"));
@@ -221,8 +243,8 @@ fn provider_tool_descriptions_own_file_and_question_usage_details() {
         "Golutra workspace tool."
     );
     let subagent = provider_tool_description("subagent");
-    assert!(subagent.contains("self-contained child task"));
-    assert!(subagent.contains("cannot create another subagent"));
+    assert!(subagent.contains("isolated child task"));
+    assert!(subagent.contains("cannot create another child"));
     assert!(provider_tool_description("web_search").contains("network"));
     assert!(provider_tool_description("shell_session").contains("background"));
     assert_ne!(
@@ -244,6 +266,86 @@ fn provider_tool_descriptions_own_file_and_question_usage_details() {
     assert_ne!(
         provider_tool_description("process_reconnect"),
         "Golutra workspace tool."
+    );
+}
+
+#[test]
+fn provider_schema_projection_keeps_strict_structure_and_nested_combinators() {
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "items": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 4,
+                "items": {
+                    "type": "string",
+                    "pattern": "^[a-z]+$"
+                }
+            }
+        },
+        "required": ["items"],
+        "anyOf": [
+            {"type": "object", "additionalProperties": false},
+            {"type": "null"}
+        ],
+        "allOf": [{"type": "object", "properties": {"items": {"type": "array"}}}]
+    });
+
+    let projected = provider_tool_schema_projection(&schema);
+    assert_eq!(projected["additionalProperties"], false);
+    assert_eq!(projected["required"], json!(["items"]));
+    assert!(projected["properties"]["items"].get("minItems").is_none());
+    assert!(projected["properties"]["items"].get("maxItems").is_none());
+    assert!(
+        projected["properties"]["items"]["items"]
+            .get("pattern")
+            .is_none()
+    );
+    assert_eq!(projected["anyOf"][0]["additionalProperties"], false);
+    assert_eq!(
+        projected["allOf"][0]["properties"]["items"]["type"],
+        "array"
+    );
+}
+
+#[test]
+fn provider_schema_projection_keeps_compact_parameter_semantics() {
+    let schema = json!({
+        "type": "object",
+        "description": "  Use   this parameter for a bounded operation.  ",
+        "properties": {
+            "command": {
+                "type": "string",
+                "description": "  A command with   important shell semantics.  ",
+                "maxLength": 64
+            }
+        }
+    });
+
+    let projected = provider_tool_schema_projection(&schema);
+    assert_eq!(
+        projected["description"],
+        "Use this parameter for a bounded operation."
+    );
+    assert_eq!(
+        projected["properties"]["command"]["description"],
+        "A command with important shell semantics."
+    );
+
+    let long_description = "x ".repeat(400);
+    let bounded = provider_tool_schema_projection(&json!({
+        "type": "string",
+        "description": long_description
+    }));
+    assert_eq!(
+        bounded["description"]
+            .as_str()
+            .expect("description")
+            .chars()
+            .count(),
+        512
     );
 }
 

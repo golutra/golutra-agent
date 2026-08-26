@@ -33,7 +33,7 @@
     "tools": [
       {
         "name": "read_file",
-        "description": "Read a UTF-8 text file from the current workspace.",
+        "description": "Read a UTF-8 text file in the workspace.",
         "input_schema": {
           "type": "object",
           "properties": {"path": {"type": "string"}},
