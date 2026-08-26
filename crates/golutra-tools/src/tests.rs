@@ -427,13 +427,13 @@ fn shell_contract_explains_how_to_submit_compound_commands() {
         .expect("workdir description");
     assert!(timeout.contains("absolute process lifetime"));
     assert!(background.contains("runtime-scoped"));
-    assert!(background.contains("do not use background=true"));
-    assert!(background.contains("platform-appropriate lifecycle mechanism"));
-    assert!(background.contains("verify availability before returning"));
-    assert!(yield_time.contains("initial wait"));
-    assert!(yield_time.contains("does not extend"));
+    assert!(background.contains("stops when the runtime ends"));
+    assert!(background.contains("shell_session"));
+    let yield_time_lower = yield_time.to_ascii_lowercase();
+    assert!(yield_time_lower.contains("initial wait"));
+    assert!(yield_time_lower.contains("does not extend"));
     assert!(workdir.contains("working directory"));
-    assert!(workdir.contains("workspace root"));
+    assert!(workdir.contains("workspace-relative"));
 }
 
 #[tokio::test]
