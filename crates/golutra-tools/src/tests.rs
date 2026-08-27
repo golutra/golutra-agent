@@ -2928,6 +2928,11 @@ async fn process_supervisor_shutdown_waits_for_terminal_bookkeeping_and_descenda
         .await
         .expect("terminal process remains queryable");
     assert!(terminal.state.is_terminal());
+    assert_eq!(
+        terminal.state,
+        ProcessState::Cancelled,
+        "supervisor shutdown must preserve its cancellation reason"
+    );
     let descendant_status = std::process::Command::new("ps")
         .args(["-o", "stat=", "-p", &child_pid.to_string()])
         .output()

@@ -442,8 +442,10 @@ impl Drop for RuntimeHost {
     fn drop(&mut self) {
         // Drop cannot await. Explicit owners should call `close()` while the
         // Tokio runtime is alive so process supervisors can finish bookkeeping.
-        self.execution.shutdown.cancel();
+        // 先锁存并终止受管进程，再广播 runtime 取消，避免通用收尾先让
+        // child.wait 完成并把一次受控终止误记为自然失败。
         self.execution.process_supervisor.shutdown();
+        self.execution.shutdown.cancel();
         if let Ok(mut worker) = self.execution.post_task_worker.lock()
             && let Some(worker) = worker.take()
         {

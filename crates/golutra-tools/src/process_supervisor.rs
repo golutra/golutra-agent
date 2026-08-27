@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -58,6 +58,79 @@ pub(crate) enum ProcessState {
 impl ProcessState {
     pub(crate) const fn is_terminal(self) -> bool {
         !matches!(self, Self::Running)
+    }
+}
+
+/// 终止原因按优先级锁存，避免 child.wait 与取消信号的调度顺序改写用户可见终态。
+/// 优先级为显式 terminate > 取消 > 超时；较高优先级可以覆盖较低优先级。
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TerminationReason {
+    TimedOut = 1,
+    Cancelled = 2,
+    Terminated = 3,
+}
+
+impl TerminationReason {
+    fn for_state(state: ProcessState) -> Option<Self> {
+        match state {
+            ProcessState::TimedOut => Some(Self::TimedOut),
+            ProcessState::Cancelled => Some(Self::Cancelled),
+            ProcessState::Terminated => Some(Self::Terminated),
+            ProcessState::Running | ProcessState::Exited | ProcessState::Failed => None,
+        }
+    }
+
+    const fn state(self) -> ProcessState {
+        match self {
+            Self::TimedOut => ProcessState::TimedOut,
+            Self::Cancelled => ProcessState::Cancelled,
+            Self::Terminated => ProcessState::Terminated,
+        }
+    }
+
+    const fn code(self) -> u8 {
+        self as u8
+    }
+
+    const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::TimedOut),
+            2 => Some(Self::Cancelled),
+            3 => Some(Self::Terminated),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct TerminationIntent {
+    reason: AtomicU8,
+}
+
+impl TerminationIntent {
+    fn request(&self, state: ProcessState) {
+        let Some(reason) = TerminationReason::for_state(state) else {
+            return;
+        };
+        let requested = reason.code();
+        let mut current = self.reason.load(Ordering::Acquire);
+        while current < requested {
+            match self.reason.compare_exchange_weak(
+                current,
+                requested,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn state(&self) -> Option<ProcessState> {
+        TerminationReason::from_code(self.reason.load(Ordering::Acquire))
+            .map(TerminationReason::state)
     }
 }
 
@@ -260,6 +333,7 @@ struct ManagedProcess {
     /// cannot be signaled by a late terminate/shutdown path.
     pid: StdMutex<Option<u32>>,
     pid_registration: StdMutex<Option<PidRegistration>>,
+    termination_intent: Arc<TerminationIntent>,
     stdin: Mutex<Option<ChildStdin>>,
     operation: Mutex<()>,
     output: Mutex<OutputJournal>,
@@ -298,10 +372,11 @@ struct SupervisorInner {
     terminating_sessions: StdMutex<HashMap<SessionId, usize>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct PidRegistration {
     token: u64,
     pid: u32,
+    termination_intent: Arc<TerminationIntent>,
 }
 
 struct TerminatingSessionGuard {
@@ -317,18 +392,26 @@ impl Drop for TerminatingSessionGuard {
 
 impl Drop for SupervisorInner {
     fn drop(&mut self) {
+        self.terminate_active_processes(ProcessState::Cancelled);
         self.shutdown.cancel();
-        self.kill_active_processes();
     }
 }
 
 impl SupervisorInner {
-    fn register_pid(&self, pid: Option<u32>) -> Option<PidRegistration> {
+    fn register_pid(
+        &self,
+        pid: Option<u32>,
+        termination_intent: Arc<TerminationIntent>,
+    ) -> Option<PidRegistration> {
         let pid = pid?;
         let token = self.next_pid_token.fetch_add(1, Ordering::Relaxed);
-        let registration = PidRegistration { token, pid };
+        let registration = PidRegistration {
+            token,
+            pid,
+            termination_intent,
+        };
         if let Ok(mut active) = self.active_pids.lock() {
-            active.insert(token, registration);
+            active.insert(token, registration.clone());
             Some(registration)
         } else {
             None
@@ -338,27 +421,29 @@ impl SupervisorInner {
     fn unregister_pid(&self, registration: Option<PidRegistration>) {
         if let Some(registration) = registration
             && let Ok(mut active) = self.active_pids.lock()
-            && active
-                .get(&registration.token)
-                .is_some_and(|current| *current == registration)
+            && active.get(&registration.token).is_some_and(|current| {
+                current.token == registration.token
+                    && current.pid == registration.pid
+                    && Arc::ptr_eq(
+                        &current.termination_intent,
+                        &registration.termination_intent,
+                    )
+            })
         {
             active.remove(&registration.token);
         }
     }
 
-    fn kill_active_processes(&self) {
-        let pids = self
+    fn terminate_active_processes(&self, state: ProcessState) {
+        // 先锁存原因，再发信号；child.wait 即使抢先完成也只能发布该原因。
+        let active = self
             .active_pids
             .lock()
-            .map(|active| {
-                active
-                    .values()
-                    .map(|registration| registration.pid)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        for pid in pids {
-            process::terminate_process_group(Some(pid));
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for registration in active.values() {
+            registration.termination_intent.request(state);
+            // 持有注册表锁直到发信号，避免 PID 释放与信号发送之间出现复用窗口。
+            process::terminate_process_group(Some(registration.pid));
         }
     }
 
@@ -486,8 +571,9 @@ impl ProcessSupervisor {
     /// [`Self::shutdown_and_wait`] when the caller still owns an async runtime
     /// and needs terminal bookkeeping to complete before teardown.
     pub fn shutdown(&self) {
+        self.inner
+            .terminate_active_processes(ProcessState::Cancelled);
         self.inner.shutdown.cancel();
-        self.inner.kill_active_processes();
     }
 
     /// Cancel all running processes and wait for their supervisors to record a
@@ -500,6 +586,8 @@ impl ProcessSupervisor {
     /// closes the window in which a descendant could outlive the direct child
     /// while the Tokio runtime is being torn down.
     pub async fn shutdown_and_wait(&self) -> Result<(), ToolError> {
+        self.inner
+            .terminate_active_processes(ProcessState::Cancelled);
         self.inner.shutdown.cancel();
         let start_guard = self.inner.start_gate.lock().await;
         let entries = self
@@ -515,9 +603,9 @@ impl ProcessSupervisor {
         let mut running = Vec::new();
         for entry in entries {
             if !entry.state.lock().await.state.is_terminal() {
-                entry.control.cancel();
+                entry.termination_intent.request(ProcessState::Cancelled);
                 // Do this synchronously before awaiting terminal bookkeeping so
-                // descendants are terminated even if cancellation scheduling is
+                // descendants are terminated even if the shutdown token is
                 // delayed on a nearly-tearing-down runtime.
                 let pid = take_pid(&self.inner, &entry);
                 process::terminate_process_group(pid);
@@ -683,7 +771,11 @@ impl ProcessSupervisor {
                 );
             }
         };
-        let Some(pid_registration) = self.inner.register_pid(pid) else {
+        let termination_intent = Arc::new(TerminationIntent::default());
+        let Some(pid_registration) = self
+            .inner
+            .register_pid(pid, Arc::clone(&termination_intent))
+        else {
             return Err(
                 abort_spawned_child(child, pid, "process PID registry is unavailable").await,
             );
@@ -703,6 +795,7 @@ impl ProcessSupervisor {
             command_display: request.command_display,
             pid: StdMutex::new(pid),
             pid_registration: StdMutex::new(Some(pid_registration)),
+            termination_intent,
             stdin: Mutex::new(Some(stdin)),
             operation: Mutex::new(()),
             output: Mutex::new(OutputJournal::default()),
@@ -861,6 +954,7 @@ impl ProcessSupervisor {
                 // Already terminal: never signal a retained/stale PID.
                 return Ok(snapshot(&entry, cursor).await);
             }
+            entry.termination_intent.request(ProcessState::Terminated);
             entry.control.cancel();
             // Mirror shutdown_and_wait: kill the process group eagerly so a
             // descendant cannot outlive the wait window while cancellation is
@@ -909,6 +1003,7 @@ impl ProcessSupervisor {
         let mut running = Vec::new();
         for entry in entries {
             if !entry.state.lock().await.state.is_terminal() {
+                entry.termination_intent.request(ProcessState::Terminated);
                 entry.control.cancel();
                 // Same eager kill as shutdown_and_wait: do not wait for the
                 // supervisor cancellation branch to schedule before descendants
@@ -1125,60 +1220,59 @@ async fn supervise_process(
     let child_id = child.id();
     let mut wait = Box::pin(child.wait());
     let mut timeout_sleep = Box::pin(tokio::time::sleep(timeout));
-    let (exit_code, override_state) = tokio::select! {
+    let exit_code = tokio::select! {
+        biased;
+        _ = process_control.cancelled() => {
+            entry.termination_intent.request(ProcessState::Terminated);
+            process::terminate_process_group(child_id);
+            wait.await.ok().and_then(|status| status.code())
+        }
+        _ = task_cancellation.cancelled() => {
+            entry.termination_intent.request(ProcessState::Cancelled);
+            process::terminate_process_group(child_id);
+            wait.await.ok().and_then(|status| status.code())
+        }
+        _ = shutdown.cancelled() => {
+            entry.termination_intent.request(ProcessState::Cancelled);
+            process::terminate_process_group(child_id);
+            wait.await.ok().and_then(|status| status.code())
+        }
+        _ = &mut timeout_sleep => {
+            entry.termination_intent.request(ProcessState::TimedOut);
+            process::terminate_process_group(child_id);
+            wait.await.ok().and_then(|status| status.code())
+        }
         result = &mut wait => {
             // 先在同一无 await 路径终止继承管道的后代，随后才允许旧 PID
             // 被释放和复用；reader drain 不再需要对旧 PID 发信号。
             let exit_code = result.ok().and_then(|status| status.code());
             process::terminate_process_group_only(child_id);
-            // shutdown()/terminate() 会先同步杀掉进程组，再由这里完成
-            // child.wait()。在高负载或并行测试下，wait 分支可能先于
-            // CancellationToken 分支被调度；采样取消原因，避免把外部
-            // 终止的非零退出误报成自然失败。
-            let override_state = if process_control.is_cancelled() {
-                Some(ProcessState::Terminated)
-            } else if task_cancellation.is_cancelled() || shutdown.is_cancelled() {
-                Some(ProcessState::Cancelled)
-            } else {
-                None
-            };
-            (exit_code, override_state)
-        },
-        _ = process_control.cancelled() => {
-            process::terminate_process_group(child_id);
-            let exit_code = wait.await.ok().and_then(|status| status.code());
-            (exit_code, Some(ProcessState::Terminated))
-        }
-        _ = task_cancellation.cancelled() => {
-            process::terminate_process_group(child_id);
-            let exit_code = wait.await.ok().and_then(|status| status.code());
-            (exit_code, Some(ProcessState::Cancelled))
-        }
-        _ = shutdown.cancelled() => {
-            process::terminate_process_group(child_id);
-            let exit_code = wait.await.ok().and_then(|status| status.code());
-            (exit_code, Some(ProcessState::Cancelled))
-        }
-        _ = &mut timeout_sleep => {
-            process::terminate_process_group(child_id);
-            let exit_code = wait.await.ok().and_then(|status| status.code());
-            (exit_code, Some(ProcessState::TimedOut))
+            // 取消可能和 child.wait 同时完成；在最终发布前再次锁存已发出的原因。
+            if process_control.is_cancelled() {
+                entry.termination_intent.request(ProcessState::Terminated);
+            }
+            if task_cancellation.is_cancelled() || shutdown.is_cancelled() {
+                entry.termination_intent.request(ProcessState::Cancelled);
+            }
+            exit_code
         }
     };
     release_process_pid(&entry, &supervisor_inner);
     drain_process_readers(stdout_reader, stderr_reader).await;
     let changes = workspace_scan::compare(&workspace_root, workspace_before).await;
-    let state = override_state.unwrap_or_else(|| {
-        if exit_code == Some(0) {
-            ProcessState::Exited
-        } else {
-            ProcessState::Failed
-        }
-    });
     // Serialize terminal publication with terminate()/write() via the operation
     // lock. PID ownership was released immediately after child wait above.
     let _operation_guard = entry.operation.lock().await;
     *entry.stdin.lock().await = None;
+    // 必须在发布锁内读取原因，避免等待锁期间新到达的 terminate 请求被自然退出覆盖。
+    let state = entry
+        .termination_intent
+        .state()
+        .unwrap_or(if exit_code == Some(0) {
+            ProcessState::Exited
+        } else {
+            ProcessState::Failed
+        });
     {
         let mut record = entry.state.lock().await;
         record.state = state;
