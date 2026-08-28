@@ -26,7 +26,7 @@ use super::{
     MAX_PROVIDER_TOOL_NAME_BYTES, ProviderError, ProviderErrorMetadata, ProviderFinishReason,
     ProviderGenerationConfig, ProviderHttpHeaders, ProviderMessage, ProviderMessageMetadata,
     ProviderProbeResult, ProviderProtocol, ProviderRequest, ProviderResponse, ProviderRole,
-    ProviderStreamEvent, SESSION_AFFINITY_HEADER, configured_or_first_env,
+    ProviderStreamEvent, ProviderUsage, SESSION_AFFINITY_HEADER, configured_or_first_env,
     custom_headers_from_reader, env_mapping, first_env, generation_config_from_reader,
     missing_env_error, protocol_capabilities, provider_credential_error, provider_http_client,
     provider_http_error_with_headers, provider_transport_error, response_json_or_error,
@@ -279,6 +279,7 @@ impl OpenAiResponsesProvider {
     ) -> Result<ChatOptions, ProviderError> {
         let mut options = genai_chat_options(
             &self.config.generation_config,
+            request.max_output_tokens,
             true,
             self.cache_identity_for_request(request).as_ref(),
             request.cache_policy,
@@ -591,6 +592,7 @@ fn responses_provider_response(
         .collect::<Result<Vec<_>, ProviderError>>()?;
     let stop_reason = end.captured_stop_reason.as_ref().map(ToString::to_string);
     let mut response = provider_response_from_genai_stream(end, model_id)?;
+    apply_responses_cache_semantics(&mut response.usage);
     if !replay_items.is_empty() {
         let message = response.message.get_or_insert_with(|| ProviderMessage {
             role: ProviderRole::Assistant,
@@ -614,6 +616,36 @@ fn responses_provider_response(
         "usage": response.usage.raw,
     });
     Ok(response)
+}
+
+fn apply_responses_cache_semantics(usage: &mut ProviderUsage) {
+    if usage.usage_source != golutra_core::UsageSource::Provider || usage.input_tokens.is_none() {
+        return;
+    }
+    // Responses 在 input token details 中定义缓存读取，但没有独立的缓存写入计费项。
+    // rust-genai 会把 wire 零值折叠为 None，因此必须在协议边界恢复真实零值。
+    if usage.cached_input_tokens.is_none() {
+        usage.cached_input_tokens = Some(0);
+    }
+    if !usage.raw.is_object() {
+        usage.raw = json!({});
+    }
+    let object = usage.raw.as_object_mut().expect("usage raw is an object");
+    let details = object
+        .entry("input_tokens_details".to_owned())
+        .or_insert_with(|| json!({}));
+    if !details.is_object() {
+        *details = json!({});
+    }
+    let details = details
+        .as_object_mut()
+        .expect("usage details are an object");
+    details
+        .entry("cached_tokens".to_owned())
+        .or_insert_with(|| Value::from(usage.cached_input_tokens.unwrap_or_default()));
+    details
+        .entry("cache_write_tokens".to_owned())
+        .or_insert_with(|| Value::from(0_u64));
 }
 
 fn map_responses_genai_error(error: genai::Error) -> ProviderError {
@@ -693,5 +725,45 @@ mod tests {
         let token = format!("{header}.{payload}.signature");
 
         assert_eq!(chatgpt_account_id(&token).as_deref(), Some("acct-test"));
+    }
+
+    #[test]
+    fn responses_usage_restores_cold_cache_zeroes() {
+        let mut usage = ProviderUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(5),
+            reasoning_tokens: None,
+            cached_input_tokens: None,
+            total_tokens: Some(105),
+            usage_source: golutra_core::UsageSource::Provider,
+            raw: json!({"input_tokens": 100, "output_tokens": 5}),
+        };
+
+        apply_responses_cache_semantics(&mut usage);
+        let normalized = usage.normalize();
+
+        assert_eq!(normalized.cache_read_tokens, Some(0));
+        assert_eq!(normalized.cache_write_tokens, Some(0));
+        assert_eq!(normalized.input_tokens_non_cached, Some(100));
+    }
+
+    #[test]
+    fn responses_usage_preserves_a_real_cache_hit() {
+        let mut usage = ProviderUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(5),
+            reasoning_tokens: None,
+            cached_input_tokens: Some(64),
+            total_tokens: Some(105),
+            usage_source: golutra_core::UsageSource::Provider,
+            raw: json!({"input_tokens": 100, "output_tokens": 5}),
+        };
+
+        apply_responses_cache_semantics(&mut usage);
+        let normalized = usage.normalize();
+
+        assert_eq!(normalized.cache_read_tokens, Some(64));
+        assert_eq!(normalized.cache_write_tokens, Some(0));
+        assert_eq!(normalized.input_tokens_non_cached, Some(36));
     }
 }

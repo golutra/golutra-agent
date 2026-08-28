@@ -1709,6 +1709,7 @@ mod tests {
             }],
             tools: Vec::new(),
             cache_policy: Default::default(),
+            max_output_tokens: None,
         }
     }
 

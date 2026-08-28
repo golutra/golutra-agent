@@ -1,6 +1,6 @@
 //! Runtime 领域记录与持久化协议事件之间的转换。
 
-use golutra_context::ContextCompactionRecord;
+use golutra_context::{ContextCompactionRecord, parse_compaction_summary_envelope};
 use golutra_core::{
     Actor, ActorKind, ArtifactId, ArtifactRecord, CommandId, ContextSnapshot, EventId, LoopAction,
     RedactionStatus, SessionId, TaskContract, TaskId, TaskStatus, ThreadId, TurnId,
@@ -426,10 +426,12 @@ pub(crate) fn context_compaction_artifact(
         RedactionStatus::Redacted
     };
     if let Some(object) = redacted.as_object_mut() {
-        object.insert(
-            "source_checksum".to_owned(),
-            Value::String(record.checksum.clone()),
-        );
+        let source_checksum = parse_compaction_summary_envelope(&record.summary)
+            .ok_or_else(|| {
+                ClientError::TaskExecution("compaction summary envelope is invalid".to_owned())
+            })?
+            .checksum;
+        object.insert("source_checksum".to_owned(), Value::String(source_checksum));
         let replacement = object
             .get("replacement_messages")
             .cloned()

@@ -142,6 +142,13 @@ tool result excerpts
 provider 不返回工具分项时，`tool_schema_tokens_estimated` 来自本轮实际发送的 tool contract
 预算，`tool_result_tokens_estimated` 来自进入 request 的 tool result 片段；这两个字段是本地估算，
 不会冒充 provider usage。
+缓存零值只在协议适配边界恢复：OpenAI Responses 定义 `cached_tokens`，且不提供独立的
+cache-write 计数，因此完整 usage 中被依赖库折叠的零值会投影为 `cache_read_tokens: 0` 和
+`cache_write_tokens: 0`。通用 provider 未声明相同语义时仍保留 `unknown`，不能根据一次命中
+反推未返回的写入计数。
+首轮 objective 与 resume 历史必须复用同一个 canonical model prompt：裁掉外层空白，并以
+相同顺序投影附件引用。只要旧用户消息在恢复时发生一个字节的变化，稳定 cache key 也无法
+挽救已经变化的 provider 前缀。
 会话事件只接受上述 canonical `TokenUsageRecord` schema；旧字段或缺失 canonical 字段的记录不会
 被迁移、回退或展示，读取时会报告为无效事件。
 
@@ -341,6 +348,10 @@ CompactionRecord
 
 - 不能切断 tool call 和 tool result 配对。
 - 不能丢失未解决问题、权限状态、修改文件和关键 evidence。
+- 活动会话树和 token budget 负责选择待摘要区间与最近完整 tail；context 层不承担主摘要语义。
+- 自动压缩和显式 `/compact` 都使用当前 provider 发起无工具的语义摘要请求；模型接收保留角色的完整待压缩历史和可选上一版摘要，返回固定章节的 continuation checkpoint。摘要输出按本轮预算设置单请求上限，自动压缩的流式增量不进入用户界面，但请求仍产生 ProviderStarted、TokenUsageRecorded、ProviderCompleted 或 ProviderFailed。
+- 摘要请求使用独立 affinity，不改变正常会话的稳定 cache chain。provider 不可用、请求失败或返回空内容时，才使用有界的确定性 facts 退路。
+- durable summary 只保存严格的 canonical envelope：`summary`、`source_range`、`token_counts`、`checksum`。`source_range` 是本次摘要输入内零基、左闭右开的消息序号，不混用 session event sequence；旧 facts schema 不解析、不迁移。
 - compact 前后的 context projection 必须可 replay。
 - compact 只改变模型投影；原 RuntimeEvent、tool output artifact、evidence 和 owner-only replay request 必须继续保留。
 - compact 失败要进入 LoopDecision，不能无限重试。

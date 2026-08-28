@@ -1114,6 +1114,7 @@ fn simple_request(model: &str) -> ProviderRequest {
         messages: vec![message(ProviderRole::User, "Say hello.")],
         tools: Vec::new(),
         cache_policy: Default::default(),
+        max_output_tokens: None,
     }
 }
 

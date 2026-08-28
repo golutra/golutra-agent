@@ -178,6 +178,7 @@ impl GenaiProviderAdapter {
                 }],
                 tools: Vec::new(),
                 cache_policy: Default::default(),
+                max_output_tokens: None,
             },
         )
         .await?;
@@ -232,6 +233,7 @@ impl GenaiProviderAdapter {
         let chat_request = genai_chat_request(request, self.config.protocol)?;
         let options = genai_chat_options(
             &self.config.generation_config,
+            request.max_output_tokens,
             false,
             self.cache_identity_for_request(request).as_ref(),
             request.cache_policy,
@@ -281,6 +283,7 @@ impl GenaiProviderAdapter {
         let chat_request = genai_chat_request(request, self.config.protocol)?;
         let options = genai_chat_options(
             &self.config.generation_config,
+            request.max_output_tokens,
             true,
             self.cache_identity_for_request(request).as_ref(),
             request.cache_policy,
@@ -551,6 +554,7 @@ fn openai_responses_thought_signature(item: &Value) -> Result<String, ProviderEr
 
 pub(crate) fn genai_chat_options(
     config: &ProviderGenerationConfig,
+    request_max_output_tokens: Option<u64>,
     streaming: bool,
     cache_identity: Option<&golutra_core::CacheIdentity>,
     cache_policy: PromptCachePolicy,
@@ -571,10 +575,10 @@ pub(crate) fn genai_chat_options(
             .with_capture_reasoning_content(true)
             .with_capture_tool_calls(true);
     }
-    if let Some(max_tokens) = config.max_tokens {
+    if let Some(max_tokens) = request_max_output_tokens.or(config.max_tokens) {
         options = options.with_max_tokens(u32::try_from(max_tokens).map_err(|_| {
             ProviderError::NotConfigured {
-                message: "provider max_tokens exceeds the supported u32 range".to_owned(),
+                message: "provider max output tokens exceeds the supported u32 range".to_owned(),
             }
         })?);
     }
@@ -750,7 +754,7 @@ fn provider_usage_from_genai_with_raw(
     // normal network responses.  Do not eagerly serialize the typed genai
     // usage before `unwrap_or`: that allocation used to happen even when the
     // raw value was available and was paid on every streamed turn.
-    let mut usage_raw = match raw_usage {
+    let usage_raw = match raw_usage {
         Some(raw_usage) => raw_usage.clone(),
         None => serde_json::to_value(usage).map_err(|error| ProviderError::Malformed {
             message: format!("genai usage could not be serialized: {error}"),
@@ -778,42 +782,6 @@ fn provider_usage_from_genai_with_raw(
                 ],
             )
         });
-    let cache_write_tokens = usage
-        .prompt_tokens_details
-        .as_ref()
-        .and_then(|details| non_negative_u64(details.cache_creation_tokens))
-        .or_else(|| {
-            super::first_usage_u64(
-                &usage_raw,
-                &[
-                    "/cache_creation_tokens",
-                    "/cache_write_tokens",
-                    "/cacheCreationTokens",
-                    "/cacheWriteTokens",
-                    "/prompt_tokens_details/cache_creation_tokens",
-                    "/prompt_tokens_details/cache_write_tokens",
-                    "/prompt_tokens_details/cacheCreationTokens",
-                    "/prompt_tokens_details/cacheWriteTokens",
-                    "/input_tokens_details/cache_creation_tokens",
-                    "/input_tokens_details/cache_write_tokens",
-                    "/input_tokens_details/cacheCreationTokens",
-                    "/input_tokens_details/cacheWriteTokens",
-                ],
-            )
-        });
-    // genai 会把零计数映射为 None；出现正的 cache read 即证明本轮命中，
-    // 省略的写入计数应按 provider 语义保留为 0，并写回 canonical normalizer 使用的原始对象。
-    if cache_read_tokens.is_some_and(|tokens| tokens > 0) && cache_write_tokens.is_none() {
-        let details = usage_raw
-            .as_object_mut()
-            .and_then(|object| object.get_mut("prompt_tokens_details"))
-            .and_then(Value::as_object_mut);
-        if let Some(details) = details {
-            details
-                .entry("cache_write_tokens".to_owned())
-                .or_insert_with(|| Value::from(0_u64));
-        }
-    }
     Ok(ProviderUsage {
         input_tokens: non_negative_u64(usage.prompt_tokens).or_else(|| {
             super::first_usage_u64(
@@ -854,10 +822,7 @@ fn provider_usage_from_genai_with_raw(
                     ],
                 )
             }),
-        cached_input_tokens: usage
-            .prompt_tokens_details
-            .as_ref()
-            .and_then(|details| non_negative_u64(details.cached_tokens)),
+        cached_input_tokens: cache_read_tokens,
         total_tokens: non_negative_u64(usage.total_tokens).or_else(|| {
             super::first_usage_u64(
                 &usage_raw,
@@ -1107,7 +1072,7 @@ mod tests {
     }
 
     #[test]
-    fn generation_config_maps_reasoning_effort_and_output_limit() {
+    fn request_output_limit_overrides_generation_config() {
         let options = genai_chat_options(
             &ProviderGenerationConfig {
                 enable_thinking: true,
@@ -1115,13 +1080,14 @@ mod tests {
                 context_window_size: Some(128_000),
                 max_tokens: Some(4_096),
             },
+            Some(1_024),
             false,
             None,
             PromptCachePolicy::Auto,
         )
         .expect("generation options");
 
-        assert_eq!(options.max_tokens, Some(4_096));
+        assert_eq!(options.max_tokens, Some(1_024));
         assert!(matches!(
             options.reasoning_effort,
             Some(ReasoningEffort::XHigh)
@@ -1139,6 +1105,7 @@ mod tests {
         };
         let short = genai_chat_options(
             &ProviderGenerationConfig::default(),
+            None,
             false,
             Some(&identity),
             PromptCachePolicy::Short,
@@ -1149,6 +1116,7 @@ mod tests {
 
         let long = genai_chat_options(
             &ProviderGenerationConfig::default(),
+            None,
             false,
             Some(&identity),
             PromptCachePolicy::Long,
@@ -1158,6 +1126,7 @@ mod tests {
 
         let none = genai_chat_options(
             &ProviderGenerationConfig::default(),
+            None,
             false,
             None,
             PromptCachePolicy::None,
@@ -1214,7 +1183,7 @@ mod tests {
     }
 
     #[test]
-    fn genai_usage_projects_cache_write_zero_on_a_cache_hit() {
+    fn genai_usage_keeps_omitted_cache_write_unknown() {
         let usage = genai::chat::Usage {
             prompt_tokens: Some(100),
             prompt_tokens_details: Some(genai::chat::PromptTokensDetails {
@@ -1232,19 +1201,14 @@ mod tests {
         let normalized = projected.normalize();
         assert_eq!(normalized.input_tokens_non_cached, Some(36));
         assert_eq!(normalized.cache_read_tokens, Some(64));
-        assert_eq!(normalized.cache_write_tokens, Some(0));
+        assert_eq!(normalized.cache_write_tokens, None);
     }
 
     #[test]
     fn genai_usage_prefers_raw_response_breakdown() {
         let usage = genai::chat::Usage {
             prompt_tokens: Some(100),
-            prompt_tokens_details: Some(genai::chat::PromptTokensDetails {
-                cache_creation_tokens: None,
-                cache_creation_details: None,
-                cached_tokens: Some(64),
-                audio_tokens: None,
-            }),
+            prompt_tokens_details: None,
             completion_tokens: Some(5),
             completion_tokens_details: None,
             total_tokens: Some(105),
@@ -1258,6 +1222,7 @@ mod tests {
 
         let projected =
             provider_usage_from_genai_with_raw(&usage, Some(&raw)).expect("genai raw usage");
+        assert_eq!(projected.cached_input_tokens, Some(64));
         let normalized = projected.normalize();
         assert_eq!(normalized.cache_read_tokens, Some(64));
         assert_eq!(normalized.cache_write_tokens, Some(0));
@@ -1306,6 +1271,7 @@ mod tests {
                 permission_policy_ref: None,
             }],
             cache_policy: PromptCachePolicy::None,
+            max_output_tokens: None,
         };
 
         let chat_request =
@@ -1366,6 +1332,7 @@ mod tests {
                 permission_policy_ref: None,
             }],
             cache_policy: PromptCachePolicy::None,
+            max_output_tokens: None,
         };
 
         let chat_request =
@@ -1413,6 +1380,7 @@ mod tests {
                 permission_policy_ref: None,
             }],
             cache_policy: PromptCachePolicy::None,
+            max_output_tokens: None,
         };
 
         let chat_request =

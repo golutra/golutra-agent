@@ -174,6 +174,8 @@ pub struct ProviderRequest {
     pub tools: Vec<ToolContract>,
     #[serde(default)]
     pub cache_policy: PromptCachePolicy,
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
 }
 
 impl ProviderRequest {
@@ -2246,6 +2248,9 @@ fn openai_completion_body_with_identity(
         }
     }
     apply_generation_config_to_openai_body(&mut body, generation_config);
+    if let Some(max_output_tokens) = request.max_output_tokens {
+        body["max_tokens"] = Value::Number(max_output_tokens.into());
+    }
     body
 }
 

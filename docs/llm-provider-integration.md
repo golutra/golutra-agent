@@ -500,6 +500,7 @@ runtime command 不承载 bearer/basic/header/query 等明文 credential value�
 - tool calling 是否可用。
 - JSON/schema response 是否可用。
 - usage 是否完整返回；缺失时 usage source 标记为 `unknown` 或 `estimated`。
+- cache breakdown 按所选协议解释：Responses 的冷缓存零值必须保留；Chat Completions 或通用适配器未返回分项时保持 `unknown`，不能仅凭相同 base URL 假定 usage shape 相同。
 - rate limit / quota 错误是否能归一化。
 - provider 错误是否能映射为 `NotConfigured`、`RateLimited`、`ProviderFailed` 或 `MalformedResponse`。
 

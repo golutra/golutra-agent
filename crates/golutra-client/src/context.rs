@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use golutra_context::{ContextContributor, estimate_tokens};
+use golutra_context::{ContextContributor, estimate_tokens, parse_compaction_summary_envelope};
 use golutra_core::{EventId, SessionId, TaskContract, TaskId, TurnId, VerificationRequirement};
 use golutra_evolution::SkillManifest;
 use golutra_llm::ProviderRole;
@@ -400,9 +400,7 @@ pub(crate) fn conversation_history_contributor(event: &RuntimeEvent) -> Option<C
     let (role, content) = match event.event_type {
         RuntimeEventType::TaskCreated
         | RuntimeEventType::TurnQueued
-        | RuntimeEventType::TurnUpdated => {
-            (ProviderRole::User, event_user_prompt(event)?.to_owned())
-        }
+        | RuntimeEventType::TurnUpdated => (ProviderRole::User, event_model_prompt(event)?),
         RuntimeEventType::AssistantMessage => (
             ProviderRole::Assistant,
             event
@@ -490,6 +488,12 @@ fn event_user_prompt(event: &RuntimeEvent) -> Option<&str> {
         .or_else(|| event.payload.get("prompt"))
         .and_then(Value::as_str)
         .filter(|prompt| !prompt.trim().is_empty())
+}
+
+fn event_model_prompt(event: &RuntimeEvent) -> Option<String> {
+    let payload = event.payload.get("payload").unwrap_or(&event.payload);
+    let prompt = model_prompt_from_payload(payload);
+    (!prompt.is_empty()).then_some(prompt)
 }
 
 /// Keep the newest complete conversational turns within a token budget.
@@ -607,6 +611,7 @@ pub(crate) fn context_compaction_from_event(event: &RuntimeEvent) -> Option<(u64
         .payload
         .get("content")
         .and_then(Value::as_str)
+        .filter(|content| parse_compaction_summary_envelope(content).is_some())
         .map(|content| (event.sequence_no, content.to_owned()))
 }
 
@@ -1014,7 +1019,9 @@ pub(crate) fn prompt_from_payload(payload: &Value) -> String {
 }
 
 pub(crate) fn model_prompt_from_payload(payload: &Value) -> String {
-    let mut prompt = prompt_from_payload(payload);
+    // 首轮请求和持久化历史必须使用完全相同的字节；否则尾随空白或附件投影
+    // 会在 resume 时改变旧消息，导致 provider 无法复用已缓存的稳定前缀。
+    let mut prompt = prompt_from_payload(payload).trim().to_owned();
     let references = payload
         .get("attachments")
         .and_then(Value::as_array)
@@ -1190,18 +1197,56 @@ mod tests {
     #[test]
     fn model_prompt_adds_bounded_attachment_references_without_changing_display_prompt() {
         let payload = serde_json::json!({
-            "prompt": "inspect the screenshot",
+            "prompt": "  inspect the screenshot\n\n",
             "attachments": [
                 {"path": "artifacts/screen.png", "kind": "image", "bytes": 42},
                 {"path": "notes.txt", "kind": "text", "bytes": 10}
             ]
         });
 
-        assert_eq!(prompt_from_payload(&payload), "inspect the screenshot");
+        assert_eq!(
+            prompt_from_payload(&payload),
+            "  inspect the screenshot\n\n"
+        );
         let model = model_prompt_from_payload(&payload);
         assert!(model.starts_with("inspect the screenshot\n\n"));
         assert!(model.contains("- image: artifacts/screen.png"));
         assert!(model.contains("- text: notes.txt"));
+        assert_eq!(model.trim_end().len(), model.len());
+    }
+
+    #[test]
+    fn historical_user_turn_reuses_the_canonical_model_prompt() {
+        let session_id = SessionId::new();
+        let task_id = TaskId::new();
+        let turn_id = TurnId::new();
+        let payload = serde_json::json!({
+            "prompt": "  inspect the screenshot\n\n",
+            "attachments": [
+                {"path": "artifacts/screen.png", "kind": "image", "bytes": 42}
+            ]
+        });
+        let event = RuntimeEvent {
+            schema_version: RUNTIME_EVENT_SCHEMA_VERSION,
+            causal_context: Default::default(),
+            causal_links: Vec::new(),
+            id: EventId::new(),
+            sequence_no: 1,
+            session_id,
+            turn_id: Some(turn_id),
+            task_id: Some(task_id),
+            parent_event_id: None,
+            event_type: RuntimeEventType::TaskCreated,
+            timestamp: Utc::now(),
+            source: RuntimeEventSource::Runtime,
+            payload: serde_json::json!({"payload": payload.clone()}),
+            payload_ref: None,
+            durable: true,
+        };
+
+        let historical = conversation_history_contributor(&event).expect("user history");
+        assert_eq!(historical.role, ProviderRole::User);
+        assert_eq!(historical.content, model_prompt_from_payload(&payload));
     }
 
     #[test]

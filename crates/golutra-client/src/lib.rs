@@ -12,9 +12,14 @@ use std::{
 use async_trait::async_trait;
 use fs2::FileExt;
 use golutra_config::{ProviderConfigPaths, load_provider_runtime_env_from_paths};
+pub(crate) use golutra_context::estimate_message_tokens;
 #[cfg(test)]
 pub(crate) use golutra_context::estimate_tokens;
-use golutra_context::{ContextContributor, structured_compaction_summary};
+use golutra_context::{
+    CompactionSourceRange, ContextContributor, compaction_source_checksum,
+    compaction_summary_envelope, deterministic_compaction_fallback,
+    parse_compaction_summary_envelope,
+};
 use golutra_core::{
     Actor, ApprovalDecision, ApprovalId, ApprovalResolution, ArtifactId, ArtifactRecord,
     BusyPolicy, CommandId, EventId, MemoryId, PolicyBlockDisposition, PolicyDecision,
@@ -31,7 +36,10 @@ use golutra_eval::{
     TrajectorySummary,
 };
 use golutra_evolution::{EvolutionError, EvolutionStore};
-use golutra_llm::{ConfiguredProvider, ProviderError, ProviderRole, protocol_capabilities};
+use golutra_llm::{
+    ConfiguredProvider, LlmProvider, ProviderError, ProviderMessage, ProviderRole,
+    protocol_capabilities,
+};
 use golutra_mcp::McpToolBackend;
 use golutra_memory::{MemoryError, MemoryFeedbackKind, MemoryScope, MemoryStore};
 use golutra_plugin::PluginStore;
@@ -49,7 +57,8 @@ use golutra_runtime::{
     ConfiguredPendingAgentTurn, PendingAgentTurn, PendingTurnExecutionOptions, RuntimeLaneError,
     RuntimeLaneManager, RuntimeObservation, RuntimeObservationSink, RuntimeVerificationService,
     WorkspaceCheckpointManager, agent_execution_channel_with_cancellation,
-    default_agent_max_elapsed_ms, is_active_status,
+    auxiliary_provider_usage_record, compaction_summary_context_snapshot,
+    compaction_summary_request, default_agent_max_elapsed_ms, is_active_status,
 };
 use golutra_store::{CommandClaim, RuntimeRepositories, RuntimeStore, StoreError, ThreadRecord};
 use golutra_tools::{
@@ -183,9 +192,9 @@ pub(crate) use context::history_contributors_with_budget;
 pub(crate) use context::{
     CachedProjectInstructions, ContextResourceCache, MAX_CACHED_HISTORY_EVENTS,
     ProjectInstructionBundle, bound_cached_history, compact_event_summary, compact_history_text,
-    completion_criteria_from_payload, context_compaction_from_event, conversation_history_line,
-    effective_model_history_events, environment_context_prompt,
-    history_contributors_from_cached_facts, is_history_cache_event,
+    completion_criteria_from_payload, context_compaction_from_event,
+    conversation_history_contributor, conversation_history_line, effective_model_history_events,
+    environment_context_prompt, history_contributors_from_cached_facts, is_history_cache_event,
     load_project_instruction_bundle, memory_context_with_budget, model_prompt_from_payload,
     preview_from_payload, project_instruction_fingerprint, prompt_from_payload,
     select_memories_for_context_with_budget, system_prompt, task_contract_from_payload,

@@ -12,6 +12,7 @@ use std::{
 use golutra_context::{
     ContextBudgetPolicy, ContextBuilder, ContextContributor, ContextMessageSource,
     ContextWindowManager, estimate_message_tokens, estimate_tokens,
+    parse_compaction_summary_envelope,
 };
 use golutra_core::{
     Actor, ActorKind, BudgetOverflowAction, BusyPolicy, PolicyBlockDisposition, TaskStatus,
@@ -486,6 +487,74 @@ enum FallbackTestProvider {
 struct SixRoundProvider {
     calls: Arc<AtomicUsize>,
     contract: golutra_core::ProviderContract,
+}
+
+#[derive(Debug, Clone)]
+struct SemanticSummaryProvider;
+
+#[async_trait]
+impl LlmProvider for SemanticSummaryProvider {
+    async fn complete(&self, _request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        Ok(ProviderResponse {
+            response_id: golutra_core::ProviderResponseId::new(),
+            message: Some(ProviderMessage {
+                role: ProviderRole::Assistant,
+                content: "semantic continuation summary".to_owned(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+                metadata: Default::default(),
+            }),
+            tool_calls: Vec::new(),
+            usage: ProviderUsage {
+                input_tokens: Some(80),
+                output_tokens: Some(6),
+                reasoning_tokens: None,
+                cached_input_tokens: Some(0),
+                total_tokens: Some(86),
+                usage_source: UsageSource::Provider,
+                raw: json!({"input_tokens_details": {"cached_tokens": 0}}),
+            },
+            finish_reason: ProviderFinishReason::Stop,
+            raw_metadata: json!({}),
+        })
+    }
+
+    async fn complete_stream(
+        &self,
+        request: ProviderRequest,
+        on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
+    ) -> Result<ProviderResponse, ProviderError> {
+        on_event(ProviderStreamEvent::ReasoningDelta {
+            text: "hidden reasoning".to_owned(),
+        });
+        on_event(ProviderStreamEvent::TextDelta {
+            text: "semantic continuation summary".to_owned(),
+        });
+        self.complete(request).await
+    }
+
+    fn supports_buffered_transport(&self) -> bool {
+        false
+    }
+
+    fn contract(&self) -> golutra_core::ProviderContract {
+        golutra_core::ProviderContract {
+            provider_id: "semantic-summary".to_owned(),
+            model_id: "summary-model".to_owned(),
+            native_protocol: "test_semantic_stream".to_owned(),
+            stream_event_mapping: "test".to_owned(),
+            tool_call_mapping: "none".to_owned(),
+            usage_mapping: "test".to_owned(),
+            reasoning_mapping: "test".to_owned(),
+            finish_reason_mapping: "test".to_owned(),
+            error_mapping: "test".to_owned(),
+            rate_limit_mapping: "test".to_owned(),
+            cost_model: "zero".to_owned(),
+            capability_matrix_ref: None,
+            golden_fixture_refs: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2547,6 +2616,161 @@ async fn accumulated_tool_messages_are_compacted_and_the_turn_continues() {
             ..
         }
     )));
+}
+
+#[tokio::test]
+async fn semantic_compaction_records_usage_without_exposing_summary_stream() {
+    let task = AgentTaskRequest {
+        session_id: SessionId::new(),
+        task_id: TaskId::new(),
+        turn_id: TurnId::new(),
+        objective: "continue a long task".to_owned(),
+        completion_criteria: Vec::new(),
+        output_schema: None,
+        touched_code: false,
+        contributors: Vec::new(),
+        tools: Vec::new(),
+    };
+    let mut messages = vec![ProviderMessage {
+        role: ProviderRole::System,
+        content: "protected".to_owned(),
+        tool_call_id: None,
+        tool_name: None,
+        tool_calls: Vec::new(),
+        metadata: Default::default(),
+    }];
+    messages.extend((0..12).map(|index| ProviderMessage {
+        role: ProviderRole::User,
+        content: format!("history {index} {}", "detail ".repeat(80)),
+        tool_call_id: None,
+        tool_name: None,
+        tool_calls: Vec::new(),
+        metadata: Default::default(),
+    }));
+    let mut record = ContextWindowManager::new(512)
+        .compact_if_needed(task.turn_id, 1, &messages, &[], 0)
+        .expect("compaction plan")
+        .expect("context exceeds budget");
+    assert!(record.supports_model_summary());
+
+    let workspace = tempdir().expect("workspace");
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let agent_loop = AgentLoop::new(SemanticSummaryProvider, ContextBuilder::default(), executor);
+    let (_handle, mut control) = agent_execution_channel(1);
+    let mut trace = Vec::new();
+    let mut cost = None;
+
+    let summary = agent_loop
+        .semantic_compaction_summary(
+            &task,
+            task.turn_id,
+            &record,
+            None,
+            &mut control,
+            &mut |event| trace.push(event),
+            &mut cost,
+        )
+        .await
+        .expect("semantic summary");
+    assert!(record.apply_model_summary(&summary));
+    let envelope = parse_compaction_summary_envelope(&record.summary).expect("envelope");
+    let snapshot_id = trace.iter().find_map(|event| match event {
+        AgentLoopTraceEvent::ContextSnapshotCaptured { snapshot, .. } => {
+            Some(snapshot.budget_snapshot.snapshot_id)
+        }
+        _ => None,
+    });
+
+    assert_eq!(envelope.summary, "semantic continuation summary");
+    assert_eq!(record.strategy, "model_summary_tail");
+    assert!(snapshot_id.is_some());
+    assert!(trace.iter().any(|event| matches!(
+        event,
+        AgentLoopTraceEvent::TokenUsageRecorded(record)
+            if record.session_id == Some(task.session_id)
+                && Some(record.budget_snapshot_ref) == snapshot_id
+                && record.input_tokens == Some(80)
+                && record.output_tokens == Some(6)
+    )));
+    assert!(
+        trace
+            .iter()
+            .any(|event| matches!(event, AgentLoopTraceEvent::ProviderCompleted { .. }))
+    );
+    assert!(
+        !trace
+            .iter()
+            .any(|event| matches!(event, AgentLoopTraceEvent::ProviderStreamed { .. }))
+    );
+}
+
+#[test]
+fn compaction_summary_request_is_structured_tool_free_and_output_bounded() {
+    let messages = vec![
+        ProviderMessage {
+            role: ProviderRole::User,
+            content: "inspect src/lib.rs without changing the public API".to_owned(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        },
+        ProviderMessage {
+            role: ProviderRole::Assistant,
+            content: "updated parse_config and cargo test passed".to_owned(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        },
+    ];
+
+    let request = compaction_summary_request(
+        TaskId::new(),
+        TurnId::new(),
+        "provider".to_owned(),
+        "model".to_owned(),
+        Some("existing checkpoint".to_owned()),
+        &messages,
+        512,
+    )
+    .expect("summary request");
+    let source: serde_json::Value =
+        serde_json::from_str(&request.messages[1].content).expect("summary source JSON");
+    let session_id = SessionId::new();
+    let snapshot =
+        compaction_summary_context_snapshot(&ContextBuilder::default(), session_id, &request)
+            .expect("summary context snapshot");
+
+    assert!(request.tools.is_empty());
+    assert_eq!(request.cache_policy, PromptCachePolicy::None);
+    assert_eq!(request.max_output_tokens, Some(512));
+    assert_eq!(source["previous_summary"], "existing checkpoint");
+    assert_eq!(source["history"][0]["role"], "user");
+    assert_eq!(source["history"][1]["role"], "assistant");
+    assert_eq!(
+        source["history"][0]["content"],
+        "inspect src/lib.rs without changing the public API"
+    );
+    assert!(request.messages[0].content.contains("## Remaining Work"));
+    assert_eq!(snapshot.session_id, session_id);
+    assert_eq!(snapshot.provider_request_id, request.request_id);
+    assert_eq!(snapshot.budget_snapshot.max_output, 512);
+    assert_eq!(
+        snapshot.budget_snapshot.budget_policy,
+        "auxiliary_compaction_summary"
+    );
+
+    let tiny_context = ContextBuilder::new(ContextBudgetPolicy {
+        context_window: 64,
+        max_output: 32,
+        budget_limit: 32,
+        action_if_exceeded: BudgetOverflowAction::Compact,
+    });
+    assert!(
+        compaction_summary_context_snapshot(&tiny_context, session_id, &request).is_none(),
+        "an oversized summary request must use the local fallback"
+    );
 }
 
 #[tokio::test]

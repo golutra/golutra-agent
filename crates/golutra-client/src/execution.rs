@@ -1,7 +1,7 @@
 //! Context construction, task supervision, AgentLoop, and provider auth lifecycles.
 
 use super::*;
-use golutra_context::{estimate_tokens, structured_compaction_summary};
+use golutra_context::{estimate_tokens, fit_compaction_context_content};
 use golutra_llm::ProviderGenerationConfig;
 use tokio::{runtime::Handle, task::JoinHandle};
 
@@ -701,20 +701,17 @@ impl RuntimeHost {
             .min(MAX_WORKING_SUMMARY_TOKENS);
         let mut contributors = Vec::new();
         let mut summary_tokens = 0;
-        if let Some((sequence_no, summary)) = compaction {
-            // 当前摘要是 canonical 结构，重新按预算编码可保持 JSON 完整；
-            // 不对结构化内容做字符级截断，也不解释旧的非结构化格式。
-            let summary = structured_compaction_summary(Some(&summary), &[], summary_budget);
-            if !summary.is_empty() {
-                summary_tokens = estimate_tokens(&summary);
-                contributors.push(ContextContributor {
-                    name: "working_summary".to_owned(),
-                    role: ProviderRole::User,
-                    content: summary,
-                    token_budget_hint: 0,
-                    source_refs: vec![format!("event-sequence:{sequence_no}")],
-                });
-            }
+        if let Some((sequence_no, summary)) = compaction
+            && let Some(content) = fit_compaction_context_content(&summary, summary_budget)
+        {
+            summary_tokens = estimate_tokens(&content);
+            contributors.push(ContextContributor {
+                name: "working_summary".to_owned(),
+                role: ProviderRole::User,
+                content,
+                token_budget_hint: 0,
+                source_refs: vec![format!("event-sequence:{sequence_no}")],
+            });
         }
         let history_budget = token_budget.saturating_sub(summary_tokens);
         let history = if let Some(facts) = history_facts {

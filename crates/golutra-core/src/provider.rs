@@ -126,10 +126,7 @@ impl ProviderUsage {
                 "/usage/cache_creation_tokens",
                 "/usage/cache_creation_input_tokens",
             ],
-        )
-        // 兼容网关在缓存命中时通常省略写入计数；正的读取计数已证明本轮命中，
-        // 因此把省略的写入项投影为 provider 语义上的 0，避免在边界处丢失分项。
-        .or_else(|| cache_read_tokens.filter(|tokens| *tokens > 0).map(|_| 0));
+        );
         let tool_schema_tokens_estimated = self
             .raw
             .get("tool_schema_tokens")
@@ -322,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_projects_zero_write_for_positive_cache_hit_when_omitted() {
+    fn normalize_does_not_invent_provider_specific_cache_write_semantics() {
         let usage = ProviderUsage {
             input_tokens: Some(100),
             output_tokens: Some(5),
@@ -333,6 +330,6 @@ mod tests {
             raw: Value::Null,
         };
 
-        assert_eq!(usage.normalize().cache_write_tokens, Some(0));
+        assert_eq!(usage.normalize().cache_write_tokens, None);
     }
 }

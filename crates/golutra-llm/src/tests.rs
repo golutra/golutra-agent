@@ -22,6 +22,7 @@ async fn mock_provider_can_emit_a_deterministic_failure() {
             messages: Vec::new(),
             tools: Vec::new(),
             cache_policy: Default::default(),
+            max_output_tokens: None,
         })
         .await
         .expect_err("mock failure");
@@ -899,6 +900,7 @@ fn request() -> ProviderRequest {
         }],
         tools: Vec::new(),
         cache_policy: Default::default(),
+        max_output_tokens: None,
     }
 }
 
@@ -1113,6 +1115,24 @@ fn openai_cache_fields_are_sent_only_for_supported_endpoint() {
     );
     assert!(custom.get("prompt_cache_key").is_none());
     assert!(custom.get("prompt_cache_retention").is_none());
+}
+
+#[test]
+fn openai_request_output_limit_overrides_the_profile_default() {
+    let mut request = request();
+    request.max_output_tokens = Some(256);
+    let body = openai_completion_body(
+        &request,
+        "gpt-test",
+        &ProviderGenerationConfig {
+            max_tokens: Some(4_096),
+            ..ProviderGenerationConfig::default()
+        },
+        false,
+        false,
+    );
+
+    assert_eq!(body["max_tokens"], 256);
 }
 
 #[test]

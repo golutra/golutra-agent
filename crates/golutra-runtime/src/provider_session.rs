@@ -917,6 +917,7 @@ mod tests {
             messages: Vec::new(),
             tools: Vec::new(),
             cache_policy: Default::default(),
+            max_output_tokens: None,
         }
     }
 }

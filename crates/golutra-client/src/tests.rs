@@ -59,6 +59,16 @@ fn history_projection_event(
     }
 }
 
+fn test_compaction_summary(summary: &str) -> String {
+    compaction_summary_envelope(
+        summary,
+        CompactionSourceRange { start: 1, end: 2 },
+        estimate_tokens(summary),
+        compaction_source_checksum(summary),
+        u64::MAX,
+    )
+}
+
 #[test]
 fn history_budget_keeps_newest_complete_turn_and_bounds_oversized_content() {
     let older_turn = TurnId::new();
@@ -120,8 +130,7 @@ fn only_compaction_events_define_the_history_compaction_boundary() {
     );
     assert!(context_compaction_from_event(&assistant).is_none());
 
-    let stable_summary =
-        structured_compaction_summary(None, &["Runtime: stable summary".to_owned()], u64::MAX);
+    let stable_summary = test_compaction_summary("Runtime: stable summary");
     let compaction = history_projection_event(
         2,
         turn_id,
@@ -133,8 +142,16 @@ fn only_compaction_events_define_the_history_compaction_boundary() {
         Some((2, stable_summary))
     );
 
-    let observation = history_projection_event(
+    let legacy = history_projection_event(
         3,
+        turn_id,
+        RuntimeEventType::CompactionCompleted,
+        json!({"content": "<historical_compaction>{\"version\":1,\"facts\":[]}</historical_compaction>"}),
+    );
+    assert!(context_compaction_from_event(&legacy).is_none());
+
+    let observation = history_projection_event(
+        4,
         turn_id,
         RuntimeEventType::CompactionCompleted,
         json!({"summary": "compaction metrics only"}),
@@ -150,7 +167,7 @@ fn cached_history_keeps_the_latest_compaction_and_bounds_the_recent_tail() {
         1,
         turn_id,
         RuntimeEventType::CompactionCompleted,
-        json!({"content": "baseline"}),
+        json!({"content": test_compaction_summary("baseline")}),
     )];
     events.extend(
         (2..=(MAX_CACHED_HISTORY_EVENTS as u64 + 8)).map(|sequence_no| {
@@ -6253,8 +6270,7 @@ async fn session_history_cache_appends_new_facts_and_observes_compaction() {
             .any(|contributor| { contributor.content.contains("second appended request") })
     );
 
-    let compacted_baseline =
-        structured_compaction_summary(None, &["Runtime: compacted baseline".to_owned()], u64::MAX);
+    let compacted_baseline = test_compaction_summary("Runtime: compacted baseline");
     host.record_event(host_event(
         host.next_sequence_no(),
         session_id,
@@ -6270,7 +6286,8 @@ async fn session_history_cache_appends_new_facts_and_observes_compaction() {
         .await
         .expect("compacted context");
     assert!(compacted.iter().any(|contributor| {
-        contributor.name == "working_summary" && contributor.content == compacted_baseline
+        contributor.name == "working_summary"
+            && contributor.content.contains("Runtime: compacted baseline")
     }));
 }
 
@@ -6663,6 +6680,19 @@ async fn explicit_compaction_is_reused_by_follow_up_context() {
         })
         .await
         .expect("compact");
+    let compacted_events = transport
+        .host
+        .storage
+        .store
+        .load_events(session_id, None, None)
+        .await
+        .expect("compacted events");
+    let envelope = compacted_events
+        .iter()
+        .rev()
+        .find_map(context_compaction_from_event)
+        .and_then(|(_, summary)| parse_compaction_summary_envelope(&summary))
+        .expect("current compaction envelope");
     let contributors = transport
         .host
         .context_contributors_for_task(session_id, TaskId::new(), "continue".to_owned(), None)
@@ -6694,6 +6724,8 @@ async fn explicit_compaction_is_reused_by_follow_up_context() {
         .await
         .expect("repeated compact");
     assert!(compact.accepted);
+    assert_eq!(envelope.source_range.start, 0);
+    assert!(envelope.source_range.end > 0);
     assert!(summary.content.contains("hello before compact"));
     assert!(history.is_empty() || !history.contains("hello before compact"));
     assert!(!repeated.accepted);
@@ -6707,8 +6739,7 @@ async fn explicit_compaction_is_reused_by_follow_up_context() {
 async fn explicit_compaction_extends_the_latest_automatic_summary() {
     let host = RuntimeHost::in_memory().await.expect("host");
     let session_id = host.default_session_id();
-    let automatic_summary =
-        structured_compaction_summary(None, &["User: durable objective".to_owned()], u64::MAX);
+    let automatic_summary = test_compaction_summary("User: durable objective");
     host.record_event(host_event(
         host.next_sequence_no(),
         session_id,
@@ -6764,9 +6795,9 @@ async fn explicit_compaction_extends_the_latest_automatic_summary() {
         .expect("latest compaction");
 
     assert!(ack.accepted);
-    assert!(summary.contains("durable objective"));
-    assert!(summary.contains("new durable result"));
-    assert_eq!(summary.matches("<historical_compaction>").count(), 1);
+    let summary = parse_compaction_summary_envelope(&summary).expect("current envelope");
+    assert!(summary.summary.contains("durable objective"));
+    assert!(summary.summary.contains("new durable result"));
 }
 
 #[tokio::test]
@@ -11548,7 +11579,7 @@ fn context_compaction_persists_a_redacted_baseline_outside_the_event_payload() {
     let record = ContextCompactionRecord {
         turn_id: task.turn_id,
         mode: "automatic".to_owned(),
-        strategy: "protected_prefix_summary_tail".to_owned(),
+        strategy: "fallback_facts_tail".to_owned(),
         original_message_count: 3,
         replacement_message_count: 2,
         dropped_message_count: 1,
@@ -11559,7 +11590,7 @@ fn context_compaction_persists_a_redacted_baseline_outside_the_event_payload() {
         compaction_limit: 80,
         target_input_tokens: 64,
         budget_limit: 80,
-        summary: "provider call completed".to_owned(),
+        summary: test_compaction_summary("provider call completed"),
         checksum: "sha256:source".to_owned(),
         replacement_messages: vec![ProviderMessage {
             role: ProviderRole::User,
@@ -11571,6 +11602,9 @@ fn context_compaction_persists_a_redacted_baseline_outside_the_event_payload() {
         }],
         replacement_sources: Vec::new(),
         message_decisions: Vec::new(),
+        summary_source_messages: Vec::new(),
+        summary_source_sources: Vec::new(),
+        summary_token_budget: 0,
     };
 
     let (artifact, bytes) =
@@ -11584,9 +11618,18 @@ fn context_compaction_persists_a_redacted_baseline_outside_the_event_payload() {
     assert_eq!(artifact.redaction_status, RedactionStatus::Redacted);
     assert!(!encoded.contains("plain-secret-value"));
     assert!(encoded.contains("<redacted-secret>"));
-    assert_eq!(artifact_payload["source_checksum"], "sha256:source");
+    assert_eq!(
+        artifact_payload["source_checksum"],
+        compaction_source_checksum("provider call completed")
+    );
     assert_ne!(artifact_payload["checksum"], "sha256:source");
-    assert_eq!(payload["content"], "provider call completed");
+    let summary = payload["content"].as_str().expect("summary envelope");
+    assert_eq!(
+        parse_compaction_summary_envelope(summary)
+            .expect("current envelope")
+            .summary,
+        "provider call completed"
+    );
     assert!(payload.get("replacement_messages").is_none());
 }
 

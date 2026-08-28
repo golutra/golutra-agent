@@ -87,6 +87,15 @@ impl CanonicalFactRecorder {
 }
 
 impl RuntimeHost {
+    pub(super) async fn record_auxiliary_trace_observation(
+        &self,
+        task: &HostedAgentTask,
+        trace_event: RuntimeObservation,
+    ) -> Result<(), ClientError> {
+        self.record_trace_observation(task, trace_event, CoalescingSummary::default())
+            .await
+    }
+
     async fn record_trace_observation(
         &self,
         task: &HostedAgentTask,
