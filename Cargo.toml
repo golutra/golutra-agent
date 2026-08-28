@@ -74,7 +74,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 reqwest13 = { package = "reqwest", version = "0.13.4", default-features = false, features = ["rustls-no-provider"] }
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rmcp = { version = "2.2.0", default-features = false, features = ["client", "macros", "server", "transport-child-process", "transport-io"] }
+rmcp = { version = "3.1.4", default-features = false, features = ["client", "macros", "server", "transport-child-process", "transport-io"] }
 schemars = { version = "1.0", features = ["chrono04", "uuid1"] }
 secrecy = "0.10"
 serde = { version = "1.0", features = ["derive"] }
