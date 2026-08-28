@@ -35,7 +35,7 @@ pub(crate) async fn run_inspect_command(args: &Args, command: InspectArgs) -> mi
     let mut driver = TuiDriver::launch(
         transport,
         DriverLaunchOptions {
-            session: command.session.as_deref().or(args.session_id.as_deref()),
+            resume: args.resume.as_deref(),
             task_id: args.task_id.as_deref(),
             debug: args.debug,
             yolo: args.yolo,
@@ -126,7 +126,7 @@ pub(crate) async fn run_driver_command(args: &Args, command: DriverArgs) -> miet
     let mut driver = TuiDriver::launch(
         transport,
         DriverLaunchOptions {
-            session: command.session.as_deref().or(args.session_id.as_deref()),
+            resume: args.resume.as_deref(),
             task_id: args.task_id.as_deref(),
             debug: args.debug,
             yolo: args.yolo,

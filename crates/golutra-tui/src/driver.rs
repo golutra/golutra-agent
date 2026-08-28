@@ -191,7 +191,7 @@ pub(crate) struct TuiDriver {
 
 #[derive(Debug, Clone, Copy)]
 struct DriverLaunchOptions<'a> {
-    session: Option<&'a str>,
+    resume: Option<&'a str>,
     task_id: Option<&'a str>,
     debug: bool,
     yolo: bool,
@@ -210,7 +210,7 @@ impl TuiDriver {
         // cleanup owner before any validation or lookup can return early.
         let mut cleanup = TransportCleanupGuard::new(transport.clone());
         validate_dimensions(options.width, options.height)?;
-        let (thread_id, session_id) = resolve_driver_session(options.session, &transport).await?;
+        let (thread_id, session_id) = resolve_driver_session(options.resume, &transport).await?;
         let task_id = parse_task_id(options.task_id)?;
         validate_task_id(task_id, session_id, &transport).await?;
         let provider_status = initial_provider_ui_status(&transport, session_id).await;

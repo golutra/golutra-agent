@@ -535,7 +535,7 @@ TUI P0 功能：
 - 在 `golutra-client` 定义 `RuntimeClient` trait。
 - 实现 `RuntimeHost`，统一持有 `RuntimeStore`、`RuntimeLaneManager`、`EventBus` 和 session/task 生命周期。
 - 把 provider/tool `AgentLoop` 作为 RuntimeHost 后台执行器接入，并把 Verification/LoopDecision/ToolResult 写回 event store。
-- 实现 cwd thread resolver，支持最近 session、显式 `--session` 和孤儿 active task 恢复。
+- 实现 cwd thread resolver，支持最近 session、统一的 `--resume VALUE` 字符串 key 和孤儿 active task 恢复。
 - 实现 `EmbeddedTransport`，它持有完整 `RuntimeHost` 并连接全局 durable store，不能只包一份临时 `RuntimeStore`。
 - 默认在 CLI/TUI 进程内运行 durable Embedded host；显式 daemon/remote 模式通过 `HttpSseTransport` 和 attachment 协议连接同一套 runtime 语义。
 - `golutra-cli` 只把用户输入转为 `SessionCommand`。

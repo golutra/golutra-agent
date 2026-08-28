@@ -122,6 +122,10 @@ extension tools. Use
 `--execution-mode strict` when an unstructured prompt must be translated into a
 deterministic completion contract. The interactive TUI accepts both switches,
 for example `golutra-tui --execution-mode strict --tool-profile coding`.
+Use `golutra-tui --resume <value>` to start or resume the workspace session
+identified by a string key. Leading and trailing whitespace is ignored;
+internal whitespace is rejected. A new key is persisted immediately with a
+stable session ID, so later invocations resume the same session.
 Explicit task contracts and external verifiers remain authoritative completion
 signals even if the caller selected `open`; unrelated payload metadata never
 changes the execution mode. Verification-on-change is off by default in the

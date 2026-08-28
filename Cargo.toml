@@ -95,7 +95,7 @@ tokio-stream = "0.1"
 tokio-tungstenite = "0.29"
 tokio-util = { version = "0.7", features = ["rt"] }
 tower = { version = "0.5", features = ["util"] }
-uuid = { version = "1.17", features = ["serde", "v4", "v7"] }
+uuid = { version = "1.17", features = ["serde", "v4", "v5", "v7"] }
 unicode-segmentation = "1.13"
 unicode-width = "0.1.14"
 webbrowser = "1.0"

@@ -144,8 +144,9 @@ struct Args {
     daemon: bool,
     #[arg(long, global = true, value_name = "URL", conflicts_with = "daemon")]
     connect: Option<String>,
-    #[arg(long, global = true, value_name = "UUID")]
-    session_id: Option<String>,
+    /// Start or resume the workspace session identified by this string key.
+    #[arg(long, global = true, value_name = "VALUE")]
+    resume: Option<String>,
     #[arg(long, global = true, value_name = "UUID")]
     task_id: Option<String>,
     #[arg(long, global = true)]
@@ -251,8 +252,6 @@ struct InspectArgs {
     #[arg(long)]
     embedded: bool,
     #[arg(long)]
-    session: Option<String>,
-    #[arg(long)]
     prompt: Option<String>,
     #[arg(long)]
     wait: Option<String>,
@@ -280,8 +279,6 @@ struct DriverArgs {
     socket: Option<PathBuf>,
     #[arg(long)]
     embedded: bool,
-    #[arg(long)]
-    session: Option<String>,
     #[arg(long, default_value_t = 160)]
     width: u16,
     #[arg(long, default_value_t = 40)]
@@ -3794,8 +3791,12 @@ async fn run_interactive(
     transport: RuntimeTransport,
 ) -> miette::Result<()> {
     let task_id = parse_task_id(args.task_id.as_deref())?;
-    let (thread_id, session_id) = initial_session(args.session_id.as_deref(), &transport).await?;
-    let continuation_hint = if args.session_id.is_none() {
+    let (thread_id, session_id) = if let Some(resume_id) = args.resume.as_deref() {
+        resume_session(resume_id, &transport).await?
+    } else {
+        initial_session()
+    };
+    let continuation_hint = if args.resume.is_none() {
         recent_continuation_hint(&transport).await.ok().flatten()
     } else {
         None

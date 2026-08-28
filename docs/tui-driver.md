@@ -23,7 +23,7 @@ TuiRuntimeController -> RuntimeTransport -> RuntimeHost
 
 ```bash
 golutra-tui --cwd /absolute/workspace inspect \
-  --session new \
+  --resume review-run \
   --prompt "inspect this workspace" \
   --view response+developer \
   --width 160 \
@@ -36,7 +36,7 @@ golutra-tui --cwd /absolute/workspace inspect \
 ```bash
 golutra-tui --cwd /absolute/workspace driver \
   --stdio \
-  --session new \
+  --resume coding-run \
   --width 160 \
   --height 40
 ```
@@ -47,21 +47,18 @@ golutra-tui --cwd /absolute/workspace driver \
 install -d -m 700 "$HOME/.golutra/tui-driver"
 golutra-tui --cwd /absolute/workspace driver \
   --socket "$HOME/.golutra/tui-driver/session.sock" \
-  --session current
+  --resume socket-run
 ```
 
 Driver 默认连接用户级 `golutra-app-server`。`--embedded` 创建仅供隔离测试使用的进程内 RuntimeHost；`--connect URL` 使用经过认证的 HTTP/SSE runtime。daemon transport 下，Driver 退出或 socket 断开不会取消 runtime task。embedded transport 的 runtime 生命周期属于 Driver 进程，进程退出后不能继续执行任务。
 
 ## Workspace、Session 和 Task 绑定
 
-一个 Driver 实例在启动时固定绑定一个 canonical workspace 和一个 session：
-
-| `--session` | 语义 |
-| --- | --- |
-| 省略或 `new` | 创建随机的新 session/thread；首个 prompt 才持久化 thread |
-| `current` | 使用 runtime attachment 当前广告的 default session；有历史时即当前 workspace 最新 thread |
-| `new:<uuid>` | 使用调用方指定的新 session ID；已存在时返回 `session_exists` |
-| `<uuid>` | 只允许绑定当前 workspace 已存在的 session，否则返回 `session_not_found` 或 workspace 错误 |
+一个 Driver 实例在启动时固定绑定一个 canonical workspace 和一个 session。
+`--resume VALUE` 与交互 TUI 使用同一字符串 key 语义：首尾空白忽略，
+内部空白拒绝；同一 workspace 的同一 VALUE 映射到稳定 SessionId。未命中时
+启动阶段立即创建并持久化 thread/session，命中时恢复已有会话。省略
+`--resume` 时创建一次性的随机 session/thread。
 
 全局 `--task-id <uuid>` 是可选的严格过滤。该 task 必须已有事件并属于所选 session，否则启动失败并返回 `task_not_found`。Driver 不会把其他 workspace 或其他 session 的 task 静默映射到当前视图。
 
