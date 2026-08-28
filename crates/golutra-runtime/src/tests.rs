@@ -4764,6 +4764,30 @@ fn objective_tool_projection_expands_on_an_unplanned_valid_call() {
         vec!["read_file"]
     );
 
+    let unclassified = provider_tools_for_objective(
+        &all_tools,
+        &contract,
+        AgentToolProfile::Coding,
+        executor.registry(),
+        "Start with the coding profile",
+    );
+    assert_eq!(unclassified.len(), 8);
+
+    let explicit_background_tool = provider_tools_for_objective(
+        &all_tools,
+        &contract,
+        AgentToolProfile::Coding,
+        executor.registry(),
+        "Use shell_session",
+    );
+    assert_eq!(
+        explicit_background_tool
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["shell", "shell_session"]
+    );
+
     let expanded = expand_provider_tools_for_calls(
         &mut selected,
         &all_tools,

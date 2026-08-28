@@ -27,11 +27,12 @@ pub(crate) fn metadata_fingerprint(metadata: &fs::Metadata) -> String {
     {
         use std::os::windows::fs::MetadataExt;
         format!(
-            "{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}",
             metadata.len(),
             modified,
-            metadata.volume_serial_number().unwrap_or(0),
-            metadata.file_index().unwrap_or(0)
+            metadata.creation_time(),
+            metadata.last_write_time(),
+            metadata.file_attributes()
         )
     }
     #[cfg(not(any(unix, windows)))]

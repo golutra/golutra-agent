@@ -3829,7 +3829,7 @@ fn provider_tools_for_objective(
     let has_shell_signal = contains_any(
         &normalized,
         &[
-            "shell", "bash", "command", "terminal", "run ", "test", "命令", "终端", "运行", "测试",
+            "shell", "bash", "command", "terminal", "run", "test", "命令", "终端", "运行", "测试",
         ],
     );
     let has_search_signal = contains_any(
@@ -3840,7 +3840,15 @@ fn provider_tools_for_objective(
     );
     let has_background_signal = contains_any(
         &normalized,
-        &["background", "wait", "process", "后台", "等待", "进程"],
+        &[
+            "background",
+            "wait",
+            "process",
+            "shell_session",
+            "后台",
+            "等待",
+            "进程",
+        ],
     );
     let has_delegate_signal = contains_any(
         &normalized,
@@ -3962,7 +3970,24 @@ fn expand_provider_tools_for_calls(
 }
 
 fn contains_any(value: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| value.contains(needle))
+    needles.iter().any(|needle| {
+        if needle.is_ascii() {
+            value.match_indices(needle).any(|(start, matched)| {
+                let end = start + matched.len();
+                let begins_at_boundary = value[..start]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|character| !character.is_ascii_alphanumeric());
+                let ends_at_boundary = value[end..]
+                    .chars()
+                    .next()
+                    .is_none_or(|character| !character.is_ascii_alphanumeric());
+                begins_at_boundary && ends_at_boundary
+            })
+        } else {
+            value.contains(needle)
+        }
+    })
 }
 
 /// A user can explicitly request a pure response.  In that case sending the

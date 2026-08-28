@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use std::{
+    collections::HashMap,
     ffi::OsString,
     fs,
     os::unix::fs::{FileTypeExt, PermissionsExt, symlink},
@@ -64,6 +65,7 @@ struct StdioDriver {
     input: ChildStdin,
     output: Lines<BufReader<ChildStdout>>,
     stderr: Arc<StdMutex<String>>,
+    pending: HashMap<String, Value>,
 }
 
 impl StdioDriver {
@@ -107,6 +109,7 @@ impl StdioDriver {
             input,
             output,
             stderr,
+            pending: HashMap::new(),
         }
     }
 
@@ -118,6 +121,9 @@ impl StdioDriver {
     }
 
     async fn receive(&mut self, request_id: &str) -> Value {
+        if let Some(value) = self.pending.remove(request_id) {
+            return value;
+        }
         let stderr = Arc::clone(&self.stderr);
         tokio::time::timeout(Duration::from_secs(20), async {
             loop {
@@ -134,6 +140,9 @@ impl StdioDriver {
                     .unwrap_or_else(|error| panic!("stdout was not NDJSON: {error}: {line}"));
                 if value["request_id"] == request_id {
                     return value;
+                }
+                if let Some(pending_id) = value["request_id"].as_str() {
+                    self.pending.insert(pending_id.to_owned(), value);
                 }
             }
         })
