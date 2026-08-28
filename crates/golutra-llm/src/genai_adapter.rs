@@ -20,10 +20,10 @@ use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 
 use super::{
-    LlmProvider, ProviderError, ProviderErrorMetadata, ProviderFinishReason,
-    ProviderGenerationConfig, ProviderHttpHeaders, ProviderMessage, ProviderProbeResult,
-    ProviderProtocol, ProviderRequest, ProviderResponse, ProviderRole, ProviderStreamEvent,
-    ProviderToolCall, ProviderUsage, UsageSource, configured_or_first_env,
+    LlmProvider, ProviderCacheMode, ProviderCacheProfile, ProviderError, ProviderErrorMetadata,
+    ProviderFinishReason, ProviderGenerationConfig, ProviderHttpHeaders, ProviderMessage,
+    ProviderProbeResult, ProviderProtocol, ProviderRequest, ProviderResponse, ProviderRole,
+    ProviderStreamEvent, ProviderToolCall, ProviderUsage, UsageSource, configured_or_first_env,
     custom_headers_from_reader, env_mapping, first_env, generation_config_from_reader,
     missing_env_error, protocol_capabilities, provider_tool_schema_for_contract,
     request_id_from_headers, retry_after_from_headers, sanitize_provider_error,
@@ -45,6 +45,7 @@ pub struct GenaiProviderConfig {
 pub struct GenaiProviderAdapter {
     config: GenaiProviderConfig,
     credential: Arc<dyn CredentialProvider>,
+    cache_profile: ProviderCacheProfile,
     client: Client,
 }
 
@@ -99,9 +100,11 @@ impl GenaiProviderAdapter {
             // way of an active long-running stream.
             .with_timeout(std::time::Duration::from_secs(3_600))
             .with_default_headers(config.custom_headers.to_header_map());
+        let cache_profile = ProviderCacheProfile::for_route(config.protocol, &config.base_url);
         Self {
             config,
             credential,
+            cache_profile,
             client: Client::builder().with_web_config(web_config).build(),
         }
     }
@@ -166,6 +169,7 @@ impl GenaiProviderAdapter {
                 task_id: TaskId::new(),
                 turn_id: TurnId::new(),
                 session_id: None,
+                cache_scope: None,
                 provider_id: self.config.protocol.id().to_owned(),
                 model_id: self.config.model_id.clone(),
                 messages: vec![ProviderMessage {
@@ -237,6 +241,7 @@ impl GenaiProviderAdapter {
             false,
             self.cache_identity_for_request(request).as_ref(),
             request.cache_policy,
+            self.cache_profile,
         )?;
         let api_key = self
             .credential
@@ -287,6 +292,7 @@ impl GenaiProviderAdapter {
             true,
             self.cache_identity_for_request(request).as_ref(),
             request.cache_policy,
+            self.cache_profile,
         )?;
         let mut force_refresh = false;
         let response = loop {
@@ -558,16 +564,29 @@ pub(crate) fn genai_chat_options(
     streaming: bool,
     cache_identity: Option<&golutra_core::CacheIdentity>,
     cache_policy: PromptCachePolicy,
+    cache_profile: ProviderCacheProfile,
 ) -> Result<ChatOptions, ProviderError> {
     let mut options = ChatOptions::default().with_capture_raw_body(true);
-    if let Some(identity) = cache_identity {
+    if cache_profile.prompt_cache_key(cache_policy)
+        && let Some(identity) = cache_identity
+    {
         options = options.with_prompt_cache_key(identity.key.clone());
-        options = match cache_policy {
-            PromptCachePolicy::Short => options.with_cache_control(CacheControl::Ephemeral5m),
-            PromptCachePolicy::Long => options.with_cache_control(CacheControl::Ephemeral24h),
-            PromptCachePolicy::Auto | PromptCachePolicy::None => options,
-        };
     }
+    options = match (cache_profile.mode, cache_policy) {
+        (_, PromptCachePolicy::None) | (ProviderCacheMode::Disabled, _) => options,
+        (ProviderCacheMode::Responses, PromptCachePolicy::Long) => {
+            options.with_cache_control(CacheControl::Ephemeral24h)
+        }
+        (ProviderCacheMode::Responses, PromptCachePolicy::Auto | PromptCachePolicy::Short) => {
+            options
+        }
+        (ProviderCacheMode::Anthropic, PromptCachePolicy::Long) => {
+            options.with_cache_control(CacheControl::Ephemeral1h)
+        }
+        (ProviderCacheMode::Anthropic, PromptCachePolicy::Auto | PromptCachePolicy::Short) => {
+            options.with_cache_control(CacheControl::Ephemeral5m)
+        }
+    };
     if streaming {
         options = options
             .with_capture_usage(true)
@@ -1084,6 +1103,10 @@ mod tests {
             false,
             None,
             PromptCachePolicy::Auto,
+            ProviderCacheProfile::for_route(
+                ProviderProtocol::Genai,
+                "https://compatible.example/v1",
+            ),
         )
         .expect("generation options");
 
@@ -1095,12 +1118,13 @@ mod tests {
     }
 
     #[test]
-    fn cache_policy_maps_to_stable_key_and_explicit_retention() {
+    fn cache_profile_maps_each_protocol_without_leaking_fields() {
         let identity = golutra_core::CacheIdentity {
             session_id: golutra_core::SessionId::new(),
             thread_id: None,
             provider_id: "provider".to_owned(),
             model_id: "model".to_owned(),
+            route_namespace: "test".to_owned(),
             key: "sha256:test-key".to_owned(),
         };
         let short = genai_chat_options(
@@ -1109,10 +1133,14 @@ mod tests {
             false,
             Some(&identity),
             PromptCachePolicy::Short,
+            ProviderCacheProfile::for_route(
+                ProviderProtocol::OpenAiResponses,
+                "https://api.golutra.cn/v1",
+            ),
         )
         .expect("short cache options");
         assert_eq!(short.prompt_cache_key.as_deref(), Some("sha256:test-key"));
-        assert_eq!(short.cache_control, Some(CacheControl::Ephemeral5m));
+        assert!(short.cache_control.is_none());
 
         let long = genai_chat_options(
             &ProviderGenerationConfig::default(),
@@ -1120,6 +1148,10 @@ mod tests {
             false,
             Some(&identity),
             PromptCachePolicy::Long,
+            ProviderCacheProfile::for_route(
+                ProviderProtocol::OpenAiResponses,
+                "https://api.golutra.cn/v1",
+            ),
         )
         .expect("long cache options");
         assert_eq!(long.cache_control, Some(CacheControl::Ephemeral24h));
@@ -1130,10 +1162,62 @@ mod tests {
             false,
             None,
             PromptCachePolicy::None,
+            ProviderCacheProfile::for_route(
+                ProviderProtocol::OpenAiResponses,
+                "https://api.golutra.cn/v1",
+            ),
         )
         .expect("none cache options");
         assert!(none.prompt_cache_key.is_none());
         assert!(none.cache_control.is_none());
+
+        let anthropic = genai_chat_options(
+            &ProviderGenerationConfig::default(),
+            None,
+            false,
+            Some(&identity),
+            PromptCachePolicy::Auto,
+            ProviderCacheProfile::for_route(
+                ProviderProtocol::Anthropic,
+                "https://api.anthropic.com/v1",
+            ),
+        )
+        .expect("Anthropic cache options");
+        assert!(anthropic.prompt_cache_key.is_none());
+        assert_eq!(anthropic.cache_control, Some(CacheControl::Ephemeral5m));
+
+        let anthropic_long = genai_chat_options(
+            &ProviderGenerationConfig::default(),
+            None,
+            false,
+            Some(&identity),
+            PromptCachePolicy::Long,
+            ProviderCacheProfile::for_route(
+                ProviderProtocol::Anthropic,
+                "https://api.anthropic.com/v1",
+            ),
+        )
+        .expect("Anthropic long cache options");
+        assert!(anthropic_long.prompt_cache_key.is_none());
+        assert_eq!(
+            anthropic_long.cache_control,
+            Some(CacheControl::Ephemeral1h)
+        );
+
+        let unknown = genai_chat_options(
+            &ProviderGenerationConfig::default(),
+            None,
+            false,
+            Some(&identity),
+            PromptCachePolicy::Long,
+            ProviderCacheProfile::for_route(
+                ProviderProtocol::Genai,
+                "https://compatible.example/v1",
+            ),
+        )
+        .expect("unknown gateway options");
+        assert!(unknown.prompt_cache_key.is_none());
+        assert!(unknown.cache_control.is_none());
     }
 
     #[test]
@@ -1236,6 +1320,7 @@ mod tests {
             task_id: TaskId::new(),
             turn_id: TurnId::new(),
             session_id: None,
+            cache_scope: None,
             provider_id: "openai-responses".to_owned(),
             model_id: "gpt-test".to_owned(),
             messages: vec![ProviderMessage {
@@ -1300,6 +1385,7 @@ mod tests {
             task_id: TaskId::new(),
             turn_id: TurnId::new(),
             session_id: None,
+            cache_scope: None,
             provider_id: "openai-responses".to_owned(),
             model_id: "gpt-test".to_owned(),
             messages: vec![ProviderMessage {
@@ -1351,6 +1437,7 @@ mod tests {
             task_id: TaskId::new(),
             turn_id: TurnId::new(),
             session_id: None,
+            cache_scope: None,
             provider_id: "openai-responses".to_owned(),
             model_id: "gpt-test".to_owned(),
             messages: vec![ProviderMessage {

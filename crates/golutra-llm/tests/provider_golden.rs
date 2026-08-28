@@ -223,7 +223,6 @@ async fn openai_compatible_provider_matches_goldens() {
     .await;
     let provider = OpenAiCompatibleProvider::new(TEST_API_KEY, base_url, "gpt-golden");
     let session_id = SessionId::new();
-    let session_header = session_id.to_string();
     let mut request = comprehensive_request("gpt-golden");
     request.session_id = Some(session_id);
     let response = provider
@@ -246,10 +245,7 @@ async fn openai_compatible_provider_matches_goldens() {
         captured.headers.get("authorization"),
         Some(&format!("Bearer {TEST_API_KEY}"))
     );
-    assert_eq!(
-        captured.headers.get("session-id").map(String::as_str),
-        Some(session_header.as_str())
-    );
+    assert!(!captured.headers.contains_key("session-id"));
     assert_eq!(response.finish_reason, ProviderFinishReason::Stop);
     assert_eq!(response.usage.total_tokens, Some(15));
     assert_eq!(
@@ -423,7 +419,6 @@ async fn openai_compatible_custom_headers_are_applied_without_debug_values() {
     let debug = format!("{config:?}");
     let provider = OpenAiCompatibleProvider::from_config(config);
     let session_id = SessionId::new();
-    let session_header = session_id.to_string();
     let mut request = simple_request("gpt-golden");
     request.session_id = Some(session_id);
     provider
@@ -440,19 +435,22 @@ async fn openai_compatible_custom_headers_are_applied_without_debug_values() {
         captured.headers.get("x-client-name").map(String::as_str),
         Some("golutra-golden")
     );
-    assert_eq!(
-        captured.headers.get("session-id").map(String::as_str),
-        Some(session_header.as_str())
-    );
+    assert!(!captured.headers.contains_key("session-id"));
     assert!(!debug.contains("fake-supplemental-key"));
 }
 
 #[tokio::test]
 async fn openai_responses_internal_affinity_overrides_the_custom_session_header() {
-    let (base_url, captured) = spawn_provider_sequence(vec![TestProviderResponse::sse(
-        200,
-        include_str!("fixtures/openai-responses/text-response.sse"),
-    )])
+    let (base_url, captured) = spawn_provider_sequence(vec![
+        TestProviderResponse::sse(
+            200,
+            include_str!("fixtures/openai-responses/text-response.sse"),
+        ),
+        TestProviderResponse::sse(
+            200,
+            include_str!("fixtures/openai-responses/text-response.sse"),
+        ),
+    ])
     .await;
     let config = OpenAiResponsesProvider::config_from_env_reader(|key| match key {
         "GOLUTRA_PROVIDER_PROTOCOL" => Some("openai-responses".to_owned()),
@@ -472,14 +470,20 @@ async fn openai_responses_internal_affinity_overrides_the_custom_session_header(
     request.session_id = Some(session_id);
 
     provider
-        .complete(request)
+        .complete(request.clone())
         .await
         .expect("Responses custom header request");
+    request.cache_policy = PromptCachePolicy::None;
+    provider
+        .complete(request)
+        .await
+        .expect("Responses cache-disabled custom header request");
     let captured = captured.await.expect("Responses custom header capture");
     assert_eq!(
         captured[0].headers.get("session-id").map(String::as_str),
         Some(session_header.as_str())
     );
+    assert!(!captured[1].headers.contains_key("session-id"));
 }
 
 #[tokio::test]
@@ -797,7 +801,7 @@ async fn openai_responses_projects_stable_cache_identity_and_retention() {
     let other_key = requests[2].body["prompt_cache_key"]
         .as_str()
         .expect("isolated request cache key");
-    assert_eq!(first_key.len(), 64);
+    assert_eq!(first_key, session_id.to_string());
     assert_eq!(first_key, second_key);
     assert_ne!(first_key, other_key);
     let session_header = session_id.to_string();
@@ -815,10 +819,7 @@ async fn openai_responses_projects_stable_cache_identity_and_retention() {
     );
     assert!(requests[3].body.get("prompt_cache_key").is_none());
     assert!(requests[3].body.get("prompt_cache_retention").is_none());
-    assert_eq!(
-        requests[3].headers.get("session-id").map(String::as_str),
-        Some(session_header.as_str())
-    );
+    assert!(!requests[3].headers.contains_key("session-id"));
 }
 
 #[tokio::test]
@@ -1143,6 +1144,7 @@ fn simple_request(model: &str) -> ProviderRequest {
         task_id: TaskId::new(),
         turn_id: TurnId::new(),
         session_id: None,
+        cache_scope: None,
         provider_id: "golden".to_owned(),
         model_id: model.to_owned(),
         messages: vec![message(ProviderRole::User, "Say hello.")],

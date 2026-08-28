@@ -23,10 +23,10 @@ use super::genai_adapter::{
 use super::{
     GOLUTRA_PROVIDER_AUTH_PROVIDER, LlmProvider, MAX_PROVIDER_MESSAGE_BYTES,
     MAX_PROVIDER_RESPONSE_BYTES, MAX_PROVIDER_TOOL_ARGUMENT_BYTES, MAX_PROVIDER_TOOL_CALL_ID_BYTES,
-    MAX_PROVIDER_TOOL_NAME_BYTES, ProviderError, ProviderErrorMetadata, ProviderFinishReason,
-    ProviderGenerationConfig, ProviderHttpHeaders, ProviderMessage, ProviderMessageMetadata,
-    ProviderProbeResult, ProviderProtocol, ProviderRequest, ProviderResponse, ProviderRole,
-    ProviderStreamEvent, ProviderUsage, SESSION_AFFINITY_HEADER, configured_or_first_env,
+    MAX_PROVIDER_TOOL_NAME_BYTES, ProviderCacheProfile, ProviderError, ProviderErrorMetadata,
+    ProviderFinishReason, ProviderGenerationConfig, ProviderHttpHeaders, ProviderMessage,
+    ProviderMessageMetadata, ProviderProbeResult, ProviderProtocol, ProviderRequest,
+    ProviderResponse, ProviderRole, ProviderStreamEvent, ProviderUsage, configured_or_first_env,
     custom_headers_from_reader, env_mapping, first_env, generation_config_from_reader,
     missing_env_error, protocol_capabilities, provider_credential_error, provider_http_client,
     provider_http_error_with_headers, provider_transport_error, response_json_or_error,
@@ -57,6 +57,7 @@ pub struct OpenAiResponsesProviderConfig {
 pub struct OpenAiResponsesProvider {
     credential: Arc<dyn CredentialProvider>,
     config: OpenAiResponsesProviderConfig,
+    cache_profile: ProviderCacheProfile,
     client: Client,
     probe_client: reqwest::Client,
 }
@@ -108,9 +109,12 @@ impl OpenAiResponsesProvider {
         let web_config = WebConfig::default()
             .with_connect_timeout(std::time::Duration::from_secs(10))
             .with_timeout(std::time::Duration::from_secs(3_600));
+        let cache_profile =
+            ProviderCacheProfile::for_route(ProviderProtocol::OpenAiResponses, &config.base_url);
         Self {
             credential,
             config,
+            cache_profile,
             client: Client::builder().with_web_config(web_config).build(),
             probe_client: provider_http_client(),
         }
@@ -236,6 +240,8 @@ impl OpenAiResponsesProvider {
             headers.insert(CHATGPT_ACCOUNT_ID_HEADER, value);
         }
         headers.extend(self.config.custom_headers.to_header_map());
+        // affinity 是 provider 能力，不允许自定义 header 绕过 profile gate。
+        headers.remove(super::SESSION_AFFINITY_HEADER);
         builder.bearer_auth(access_token).headers(headers)
     }
 
@@ -283,6 +289,7 @@ impl OpenAiResponsesProvider {
             true,
             self.cache_identity_for_request(request).as_ref(),
             request.cache_policy,
+            self.cache_profile,
         )?
         .with_extra_headers(self.request_headers(request, account_id));
         let mut reasoning = json!({"summary": "auto"});
@@ -311,8 +318,13 @@ impl OpenAiResponsesProvider {
         );
         headers.insert("originator", HeaderValue::from_static("golutra"));
         headers.extend(self.config.custom_headers.to_header_map());
-        if let Ok(value) = HeaderValue::from_str(&request.affinity_id()) {
-            headers.insert(SESSION_AFFINITY_HEADER, value);
+        // affinity 是 provider 能力，不允许自定义 header 绕过 profile gate。
+        headers.remove(super::SESSION_AFFINITY_HEADER);
+        if let Some(header) = self.cache_profile.affinity_header(request.cache_policy)
+            && let Ok(value) = HeaderValue::from_str(&request.affinity_id())
+            && let Ok(name) = reqwest::header::HeaderName::from_bytes(header.as_bytes())
+        {
+            headers.insert(name, value);
         }
         if let Some(account_id) = account_id
             && let Ok(value) = HeaderValue::from_str(account_id)

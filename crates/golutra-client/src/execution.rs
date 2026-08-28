@@ -1192,6 +1192,9 @@ impl RuntimeHost {
             .get(crate::delegation::DELEGATED_TASK_MARKER)
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let prompt_cache_scope = self
+            .prompt_cache_scope(task.session_id, delegated_task)
+            .await?;
         tool_executor = tool_executor
             .with_task_delegation_backend(Arc::new(
                 crate::delegation::RuntimeTaskDelegationBackend::new(Arc::downgrade(&self)),
@@ -1283,6 +1286,7 @@ impl RuntimeHost {
             },
         })
         .with_task_contract(task_contract)
+        .with_cache_scope(prompt_cache_scope)
         .with_execution_mode(execution_mode.explicit())
         .with_tool_profile(tool_profile)
         .with_deferred_external_verification(defer_external_verification)

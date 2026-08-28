@@ -1115,6 +1115,7 @@ pub fn provider_request_from_plan(
         task_id,
         turn_id,
         session_id: None,
+        cache_scope: None,
         provider_id: provider_id.into(),
         model_id: model_id.into(),
         messages: plan.messages.clone(),

@@ -652,6 +652,68 @@ struct ToolProfileBoundaryProvider {
     contract: golutra_core::ProviderContract,
 }
 
+#[derive(Debug, Clone)]
+struct PrefixContractProvider {
+    calls: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<ProviderRequest>>>,
+    contract: golutra_core::ProviderContract,
+}
+
+#[async_trait]
+impl LlmProvider for PrefixContractProvider {
+    async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(request);
+        let (message, tool_calls, finish_reason) = if call == 0 {
+            (
+                None,
+                vec![ProviderToolCall {
+                    tool_call_id: "prefix-read".to_owned(),
+                    tool_name: "read_file".to_owned(),
+                    arguments: json!({"path": "README.md"}),
+                }],
+                ProviderFinishReason::ToolCalls,
+            )
+        } else {
+            (
+                Some(ProviderMessage {
+                    role: ProviderRole::Assistant,
+                    content: format!("provider round {call} complete"),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: Vec::new(),
+                    metadata: Default::default(),
+                }),
+                Vec::new(),
+                ProviderFinishReason::Stop,
+            )
+        };
+        Ok(ProviderResponse {
+            response_id: golutra_core::ProviderResponseId::new(),
+            message,
+            tool_calls,
+            usage: ProviderUsage {
+                input_tokens: Some(64),
+                output_tokens: Some(8),
+                reasoning_tokens: None,
+                cached_input_tokens: None,
+                total_tokens: Some(72),
+                usage_source: UsageSource::Estimated,
+                raw: json!({"round": call}),
+            },
+            finish_reason,
+            raw_metadata: json!({"round": call}),
+        })
+    }
+
+    fn contract(&self) -> golutra_core::ProviderContract {
+        self.contract.clone()
+    }
+}
+
 #[cfg(unix)]
 #[derive(Debug, Clone)]
 struct ParallelReadProvider {
@@ -2659,10 +2721,12 @@ async fn semantic_compaction_records_usage_without_exposing_summary_stream() {
     let (_handle, mut control) = agent_execution_channel(1);
     let mut trace = Vec::new();
     let mut cost = None;
+    let cache_scope = golutra_llm::PromptCacheScope::session(task.session_id, None);
 
     let summary = agent_loop
         .semantic_compaction_summary(
             &task,
+            &cache_scope,
             task.turn_id,
             &record,
             None,
@@ -2725,11 +2789,13 @@ fn compaction_summary_request_is_structured_tool_free_and_output_bounded() {
         },
     ];
 
+    let session_id = SessionId::new();
+    let contract = MockProvider::text_response("unused").contract();
     let request = compaction_summary_request(
         TaskId::new(),
         TurnId::new(),
-        "provider".to_owned(),
-        "model".to_owned(),
+        &contract,
+        golutra_llm::PromptCacheScope::session(session_id, None).compaction(),
         Some("existing checkpoint".to_owned()),
         &messages,
         512,
@@ -2737,13 +2803,16 @@ fn compaction_summary_request_is_structured_tool_free_and_output_bounded() {
     .expect("summary request");
     let source: serde_json::Value =
         serde_json::from_str(&request.messages[1].content).expect("summary source JSON");
-    let session_id = SessionId::new();
     let snapshot =
         compaction_summary_context_snapshot(&ContextBuilder::default(), session_id, &request)
             .expect("summary context snapshot");
 
     assert!(request.tools.is_empty());
-    assert_eq!(request.cache_policy, PromptCachePolicy::None);
+    assert_eq!(request.cache_policy, PromptCachePolicy::Auto);
+    assert_eq!(
+        request.cache_scope.as_ref().expect("cache scope").key(),
+        session_id.to_string()
+    );
     assert_eq!(request.max_output_tokens, Some(512));
     assert_eq!(source["previous_summary"], "existing checkpoint");
     assert_eq!(source["history"][0]["role"], "user");
@@ -5492,6 +5561,101 @@ async fn appended_turn_uses_the_default_coding_surface() {
             execution_mode: None,
             tool_profile: AgentToolProfile::Coding,
         }
+    );
+}
+
+#[tokio::test]
+async fn provider_requests_append_messages_and_freeze_tools_within_one_context_segment() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("README.md"), "stable prefix fixture").expect("README fixture");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = PrefixContractProvider {
+        calls: calls.clone(),
+        requests: requests.clone(),
+        contract: MockProvider::text_response("unused").contract(),
+    };
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let harness = AgentHarness::new(provider, ContextBuilder::default(), executor);
+    let (handle, control) = agent_execution_channel(2);
+    let queued_turn_id = TurnId::new();
+    handle
+        .append_turn(PendingAgentTurn {
+            command_id: CommandId::new(),
+            turn_id: queued_turn_id,
+            content: "continue inspecting README.md".to_owned(),
+            task_contract: Some(TaskContract::conversational(Vec::new())),
+            output_schema: None,
+            external_verifiers: Vec::new(),
+            max_elapsed_ms: None,
+            defer_external_verification: false,
+            external_verifiers_require_os_sandbox: false,
+            allow_network: false,
+            yolo: false,
+            steer: false,
+        })
+        .await
+        .expect("queued turn");
+    let session_id = SessionId::new();
+    let outcome = harness
+        .execute_configured(
+            ConfiguredAgentRun::new(AgentTaskRequest {
+                session_id,
+                task_id: TaskId::new(),
+                turn_id: TurnId::new(),
+                objective: "inspect README.md".to_owned(),
+                completion_criteria: Vec::new(),
+                output_schema: None,
+                touched_code: false,
+                contributors: vec![
+                    ContextContributor {
+                        name: "system".to_owned(),
+                        role: ProviderRole::System,
+                        content: "You inspect files.".to_owned(),
+                        token_budget_hint: 0,
+                        source_refs: vec!["test:system".to_owned()],
+                    },
+                    ContextContributor {
+                        name: "objective".to_owned(),
+                        role: ProviderRole::User,
+                        content: "inspect README.md".to_owned(),
+                        token_budget_hint: 0,
+                        source_refs: vec!["test:objective".to_owned()],
+                    },
+                ],
+                tools: vec!["read_file".to_owned()],
+            })
+            .with_execution_surface(AgentExecutionMode::Open, AgentToolProfile::Coding),
+            control,
+            |_| {},
+        )
+        .await
+        .expect("context segment completes");
+
+    assert_eq!(outcome.final_turn_id, queued_turn_id);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    let requests = requests
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(requests.len(), 3);
+    for pair in requests.windows(2) {
+        let previous = &pair[0];
+        let next = &pair[1];
+        assert!(next.messages.len() >= previous.messages.len());
+        assert_eq!(
+            &next.messages[..previous.messages.len()],
+            previous.messages.as_slice()
+        );
+        assert_eq!(next.tools, previous.tools);
+        assert_eq!(next.cache_scope, previous.cache_scope);
+        assert_eq!(next.cache_policy, previous.cache_policy);
+        assert_eq!(next.provider_id, previous.provider_id);
+        assert_eq!(next.model_id, previous.model_id);
+        assert_eq!(next.max_output_tokens, previous.max_output_tokens);
+    }
+    assert_eq!(
+        requests[0].cache_scope.as_ref().expect("cache scope").key(),
+        session_id.to_string()
     );
 }
 

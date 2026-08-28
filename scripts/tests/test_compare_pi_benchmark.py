@@ -146,6 +146,14 @@ class CompareBenchmarkTest(unittest.TestCase):
         self.assertEqual(metrics["terminal_ms"], 50.0)
         self.assertTrue(metrics["usage_complete"])
         self.assertTrue(metrics["completed"])
+        request = metrics["provider_requests"][0]
+        self.assertEqual(request["request_index"], 0)
+        self.assertEqual(request["prompt_tokens"], 20)
+        self.assertEqual(request["uncached_input_tokens"], 12)
+        self.assertEqual(request["cache_read_tokens"], 8)
+        self.assertEqual(request["cache_hit_ratio"], 0.4)
+        self.assertEqual(request["ttft_ms"], 15.0)
+        self.assertEqual(request["terminal_latency_ms"], 30.0)
 
     def test_golutra_parser_excludes_caller_verifier_from_model_tools(self) -> None:
         stdout = json.dumps(
@@ -224,6 +232,30 @@ class CompareBenchmarkTest(unittest.TestCase):
         self.assertEqual(metrics["turn_first_token_ms"], 198.0)
         self.assertEqual(metrics["terminal_ms"], 220.0)
         self.assertTrue(metrics["usage_complete"])
+        request = metrics["provider_requests"][0]
+        self.assertEqual(request["prompt_tokens"], 16)
+        self.assertEqual(request["uncached_input_tokens"], 12)
+        self.assertEqual(request["cache_read_tokens"], 4)
+        self.assertEqual(request["cache_hit_ratio"], 0.25)
+        self.assertEqual(request["ttft_ms"], 198.0)
+        self.assertEqual(request["terminal_latency_ms"], 208.0)
+
+    def test_provider_request_metrics_keep_unknown_cache_unknown(self) -> None:
+        request = benchmark.provider_request_metrics(
+            "request-1",
+            0,
+            {"started_ms": 10.0, "completed_ms": 20.0},
+            benchmark.normalize_golutra_usage(
+                {"input_tokens": 10, "output_tokens": 2}
+            ),
+        )
+
+        self.assertIsNone(request["cache_hit_ratio"])
+        self.assertIsNone(request["cache_read_tokens"])
+        self.assertEqual(
+            request["usage_coverage"]["cache_read_tokens"]["status"],
+            "unknown",
+        )
 
     def test_pi_prompt_is_unknown_without_cache_read(self) -> None:
         usage = benchmark.normalize_pi_usage({"input": 12, "output": 3, "cacheWrite": 1})
@@ -403,6 +435,117 @@ class CompareBenchmarkTest(unittest.TestCase):
         self.assertTrue(benchmark.verify_response(exact, "BENCH_OK\n")["passed"])
         self.assertFalse(benchmark.verify_response(exact, "BENCH_OK: extra")["passed"])
         self.assertTrue(benchmark.verify_response(mutation, "Done.")["passed"])
+
+    def test_cache_scenario_projection_selects_only_the_kpi_request(self) -> None:
+        first = {"request_index": 0, "cache_hit_ratio": 0.0}
+        second = {"request_index": 1, "cache_hit_ratio": 0.9}
+        metrics = {
+            "provider_requests": [
+                {**first, "tool_call_count": 1},
+                second,
+            ],
+            "tool_call_count": 1,
+        }
+
+        projection = benchmark.cache_scenario_projection(
+            "same_session_tool_round",
+            metrics,
+            {"passed": True},
+        )
+
+        self.assertTrue(projection["eligible"])
+        self.assertEqual(projection["evaluation_request_index"], 1)
+        self.assertIs(projection["request"], second)
+
+    def test_cache_scenario_projection_rejects_a_toolless_round(self) -> None:
+        projection = benchmark.cache_scenario_projection(
+            "same_session_tool_round",
+            {
+                "provider_requests": [
+                    {"request_index": 0, "tool_call_count": 0},
+                    {"request_index": 1},
+                ],
+                "tool_call_count": 1,
+            },
+            {"passed": True},
+        )
+
+        self.assertFalse(projection["eligible"])
+
+    def test_pi_request_timing_starts_before_assistant_stream(self) -> None:
+        stdout = "\n".join(
+            [
+                json.dumps({"type": "turn_start"}),
+                json.dumps(
+                    {
+                        "type": "message_start",
+                        "message": {"role": "assistant"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {
+                            "type": "text_delta",
+                            "delta": "ok",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "message_end",
+                        "message": {
+                            "role": "assistant",
+                            "responseId": "response-1",
+                            "content": [{"type": "text", "text": "ok"}],
+                            "usage": {
+                                "input": 1,
+                                "output": 1,
+                                "cacheRead": 0,
+                                "cacheWrite": 0,
+                                "totalTokens": 2,
+                            },
+                        },
+                    }
+                ),
+                json.dumps({"type": "agent_end"}),
+            ]
+        )
+
+        metrics = benchmark.parse_pi(
+            stdout,
+            30.0,
+            0,
+            [2.0, 10.0, 20.0, 25.0, 30.0],
+        )
+
+        self.assertEqual(metrics["provider_requests"][0]["ttft_ms"], 18.0)
+
+    def test_provider_tracker_closes_failed_round_before_next_start(self) -> None:
+        tracker = benchmark.ProviderRequestTracker()
+        failed = tracker.resolve({"timestamp": 100}, {}, "provider_started")
+        self.assertEqual(
+            tracker.resolve({"timestamp": 120}, {}, "provider_failed"),
+            failed,
+        )
+
+        following = tracker.resolve({"timestamp": 200}, {}, "provider_started")
+
+        self.assertNotEqual(following, failed)
+
+    def test_run_bundle_thread_id_reads_only_the_observation_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            manifest = run_dir / "observations" / "manifest.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(
+                json.dumps({"sessions": [{"thread_id": "thread-1"}]}),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(benchmark.run_bundle_thread_id(run_dir), "thread-1")
+            manifest.write_text("not-json", encoding="utf-8")
+            self.assertIsNone(benchmark.run_bundle_thread_id(run_dir))
 
     def test_golutra_parser_deduplicates_usage_by_request(self) -> None:
         runtime = {

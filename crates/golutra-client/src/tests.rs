@@ -5356,6 +5356,175 @@ async fn prompt_updates_resumed_thread_metadata_by_session() {
 }
 
 #[tokio::test]
+async fn prompt_cache_scope_uses_only_trusted_thread_lineage() {
+    let workspace = tempdir().expect("workspace");
+    let _provider = IsolatedGlobalMockProvider::install().await;
+    let transport = EmbeddedTransport::for_cwd(workspace.path())
+        .await
+        .expect("transport");
+    let parent_session_id = transport.default_session_id();
+    let parent_thread_id = transport.default_thread_id();
+    transport
+        .send_command(command(parent_session_id, "establish parent cache scope"))
+        .await
+        .expect("parent command");
+    wait_for_status(&transport, parent_session_id, TaskStatus::Completed).await;
+    let session_scope = transport
+        .host
+        .prompt_cache_scope(parent_session_id, false)
+        .await
+        .expect("session scope");
+    assert_eq!(
+        session_scope.kind(),
+        golutra_llm::PromptCacheScopeKind::Session
+    );
+    assert_eq!(session_scope.key(), parent_session_id.to_string());
+    assert_eq!(session_scope.thread_id(), Some(parent_thread_id));
+
+    let fork = transport
+        .fork_thread(parent_thread_id, None)
+        .await
+        .expect("fork");
+    let fork_scope = transport
+        .host
+        .prompt_cache_scope(fork.session_id, false)
+        .await
+        .expect("fork scope");
+    assert_eq!(fork_scope.kind(), golutra_llm::PromptCacheScopeKind::Fork);
+    assert_eq!(fork_scope.key(), parent_session_id.to_string());
+    assert_eq!(fork_scope.thread_id(), Some(fork.thread_id));
+
+    let nested_fork = transport
+        .fork_thread(fork.thread_id, None)
+        .await
+        .expect("nested fork");
+    let nested_scope = transport
+        .host
+        .prompt_cache_scope(nested_fork.session_id, false)
+        .await
+        .expect("nested fork scope");
+    assert_eq!(nested_scope.kind(), golutra_llm::PromptCacheScopeKind::Fork);
+    assert_eq!(nested_scope.key(), parent_session_id.to_string());
+
+    let now = chrono::Utc::now();
+    let delegated_session_id = SessionId::new();
+    let delegated_thread_id = ThreadId::new();
+    transport
+        .host
+        .storage
+        .repositories
+        .threads
+        .upsert(&ThreadRecord {
+            thread_id: delegated_thread_id,
+            session_id: delegated_session_id,
+            parent_thread_id: Some(parent_thread_id),
+            forked_from_turn_id: None,
+            forked_from_sequence_no: None,
+            workspace_root: transport.host.workspace_root_string(),
+            rebound_from_workspace_root: None,
+            rollout_path: None,
+            title: "delegated".to_owned(),
+            preview: String::new(),
+            created_at: now,
+            updated_at: now,
+            recency_at: now,
+            archived: false,
+            removed: false,
+        })
+        .await
+        .expect("delegated thread");
+    let delegated_scope = transport
+        .host
+        .prompt_cache_scope(delegated_session_id, true)
+        .await
+        .expect("delegated scope");
+    assert_eq!(
+        delegated_scope.kind(),
+        golutra_llm::PromptCacheScopeKind::Subagent
+    );
+    assert_eq!(delegated_scope.key(), parent_session_id.to_string());
+}
+
+#[tokio::test]
+async fn prompt_cache_scope_rejects_broken_parent_lineage() {
+    let workspace = tempdir().expect("workspace");
+    let transport = EmbeddedTransport::for_cwd(workspace.path())
+        .await
+        .expect("transport");
+    let now = chrono::Utc::now();
+    let thread_record =
+        |thread_id: ThreadId, session_id: SessionId, parent_thread_id: Option<ThreadId>| {
+            ThreadRecord {
+                thread_id,
+                session_id,
+                parent_thread_id,
+                forked_from_turn_id: None,
+                forked_from_sequence_no: Some(1),
+                workspace_root: transport.host.workspace_root_string(),
+                rebound_from_workspace_root: None,
+                rollout_path: None,
+                title: "cache lineage fixture".to_owned(),
+                preview: String::new(),
+                created_at: now,
+                updated_at: now,
+                recency_at: now,
+                archived: false,
+                removed: false,
+            }
+        };
+
+    let orphan_session_id = SessionId::new();
+    transport
+        .host
+        .storage
+        .repositories
+        .threads
+        .upsert(&thread_record(
+            ThreadId::new(),
+            orphan_session_id,
+            Some(ThreadId::new()),
+        ))
+        .await
+        .expect("orphan thread");
+    let orphan_error = transport
+        .host
+        .prompt_cache_scope(orphan_session_id, false)
+        .await
+        .expect_err("missing parent must be rejected");
+    assert!(matches!(
+        orphan_error,
+        ClientError::InvalidSession(message) if message.contains("was not found")
+    ));
+
+    let first_thread_id = ThreadId::new();
+    let first_session_id = SessionId::new();
+    let second_thread_id = ThreadId::new();
+    let second_session_id = SessionId::new();
+    for record in [
+        thread_record(first_thread_id, first_session_id, Some(second_thread_id)),
+        thread_record(second_thread_id, second_session_id, Some(first_thread_id)),
+    ] {
+        transport
+            .host
+            .storage
+            .repositories
+            .threads
+            .upsert(&record)
+            .await
+            .expect("cycle fixture");
+    }
+    let cycle_error = transport
+        .host
+        .prompt_cache_scope(first_session_id, false)
+        .await
+        .expect_err("parent cycle must be rejected");
+    assert!(matches!(
+        cycle_error,
+        ClientError::InvalidSession(message) if message.contains("parent thread cycle")
+    ));
+}
+
+#[tokio::test]
 async fn rollout_jsonl_is_complete_checksummed_redacted_and_owner_only() {
     let workspace = tempdir().expect("workspace");
     let _provider = IsolatedGlobalMockProvider::install().await;

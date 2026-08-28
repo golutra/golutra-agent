@@ -17,6 +17,7 @@ async fn mock_provider_can_emit_a_deterministic_failure() {
             task_id: TaskId::new(),
             turn_id: TurnId::new(),
             session_id: None,
+            cache_scope: None,
             provider_id: "mock".to_owned(),
             model_id: "mock".to_owned(),
             messages: Vec::new(),
@@ -888,6 +889,7 @@ fn request() -> ProviderRequest {
         task_id: TaskId::new(),
         turn_id: TurnId::new(),
         session_id: None,
+        cache_scope: None,
         provider_id: "mock".to_owned(),
         model_id: "mock-model".to_owned(),
         messages: vec![ProviderMessage {
@@ -907,10 +909,15 @@ fn request() -> ProviderRequest {
 #[test]
 fn prompt_cache_identity_is_stable_and_session_scoped() {
     let mut first = request();
-    first.session_id = Some(golutra_core::SessionId::new());
+    let session_id = golutra_core::SessionId::new();
+    first.session_id = Some(session_id);
     first.cache_policy = golutra_core::PromptCachePolicy::Auto;
     let second = first.clone();
     assert_eq!(first.cache_identity(), second.cache_identity());
+    assert_eq!(
+        first.cache_identity().expect("cache identity").key,
+        session_id.to_string()
+    );
 
     let mut changed = first.clone();
     changed.messages[0].content.push('!');
@@ -933,6 +940,46 @@ fn provider_affinity_prefers_session_and_falls_back_to_task() {
     let session_id = golutra_core::SessionId::new();
     request.session_id = Some(session_id);
     assert_eq!(request.affinity_id(), session_id.to_string());
+
+    let thread_id = golutra_core::ThreadId::new();
+    let parent_session_id = golutra_core::SessionId::new();
+    request.cache_scope = Some(PromptCacheScope::subagent(
+        session_id,
+        thread_id,
+        parent_session_id,
+    ));
+    assert_eq!(request.affinity_id(), parent_session_id.to_string());
+}
+
+#[test]
+fn trusted_parent_cache_scopes_use_readable_wire_keys() {
+    let session_id = golutra_core::SessionId::new();
+    let thread_id = golutra_core::ThreadId::new();
+    let parent_session_id = golutra_core::SessionId::new();
+    let cases = [
+        (
+            PromptCacheScope::fork(session_id, thread_id, parent_session_id),
+            PromptCacheScopeKind::Fork,
+            parent_session_id.to_string(),
+        ),
+        (
+            PromptCacheScope::subagent(session_id, thread_id, parent_session_id),
+            PromptCacheScopeKind::Subagent,
+            parent_session_id.to_string(),
+        ),
+    ];
+
+    for (scope, kind, key) in cases {
+        assert_eq!(scope.kind(), kind);
+        assert_eq!(scope.key(), key);
+        assert_eq!(scope.thread_id(), Some(thread_id));
+    }
+    assert_eq!(
+        PromptCacheScope::session(session_id, Some(thread_id))
+            .compaction()
+            .key(),
+        session_id.to_string()
+    );
 }
 
 #[test]
@@ -943,11 +990,17 @@ fn provider_cache_identity_isolated_by_protocol_endpoint() {
     let first = OpenAiCompatibleProvider::new("test-key", "https://gateway-a.example/v1", "model");
     let second = OpenAiCompatibleProvider::new("test-key", "https://gateway-b.example/v1", "model");
 
+    let first_identity = first
+        .cache_identity_for_request(&request)
+        .expect("first identity");
+    let second_identity = second
+        .cache_identity_for_request(&request)
+        .expect("second identity");
     assert_ne!(
-        first.cache_identity_for_request(&request),
-        second.cache_identity_for_request(&request),
+        first_identity, second_identity,
         "identical session/provider/model names must not share endpoint caches"
     );
+    assert_eq!(first_identity.key, second_identity.key);
     assert_eq!(
         first.cache_identity_for_request(&request),
         first.cache_identity_for_request(&request)
@@ -1090,7 +1143,8 @@ fn provider_tool_projection_uses_the_same_wire_alias_as_transports() {
 #[test]
 fn openai_cache_fields_are_sent_only_for_supported_endpoint() {
     let mut request = request();
-    request.session_id = Some(golutra_core::SessionId::new());
+    let session_id = golutra_core::SessionId::new();
+    request.session_id = Some(session_id);
     request.cache_policy = golutra_core::PromptCachePolicy::Long;
 
     let supported = openai_completion_body(
@@ -1100,10 +1154,7 @@ fn openai_cache_fields_are_sent_only_for_supported_endpoint() {
         false,
         true,
     );
-    assert_eq!(
-        supported["prompt_cache_key"].as_str().map(str::len),
-        Some(64)
-    );
+    assert_eq!(supported["prompt_cache_key"], session_id.to_string());
     assert_eq!(supported["prompt_cache_retention"], "24h");
 
     let custom = openai_completion_body(
@@ -1165,12 +1216,38 @@ fn openai_tools_request_parallel_tool_calls_explicitly() {
 }
 
 #[test]
-fn prompt_cache_support_includes_golutra_gateway_only() {
-    assert!(openai_prompt_cache_supported("https://api.golutra.cn/v1"));
-    assert!(openai_prompt_cache_supported("https://api.openai.com/v1"));
-    assert!(!openai_prompt_cache_supported(
-        "https://compatible.example/v1"
-    ));
+fn provider_cache_profile_gates_compatible_gateway_fields() {
+    let golutra = ProviderCacheProfile::for_route(
+        ProviderProtocol::OpenAiCompatible,
+        "https://api.golutra.cn/v1",
+    );
+    assert!(golutra.prompt_cache_key(golutra_core::PromptCachePolicy::Auto));
+    assert_eq!(
+        golutra.affinity_header(golutra_core::PromptCachePolicy::Auto),
+        Some(SESSION_AFFINITY_HEADER)
+    );
+
+    let unknown = ProviderCacheProfile::for_route(
+        ProviderProtocol::OpenAiCompatible,
+        "https://compatible.example/v1",
+    );
+    assert!(!unknown.prompt_cache_key(golutra_core::PromptCachePolicy::Long));
+    assert!(
+        unknown
+            .affinity_header(golutra_core::PromptCachePolicy::Long)
+            .is_none()
+    );
+
+    let disabled = ProviderCacheProfile::for_route(
+        ProviderProtocol::OpenAiResponses,
+        "https://responses.example/v1",
+    );
+    assert!(!disabled.prompt_cache_key(golutra_core::PromptCachePolicy::None));
+    assert!(
+        disabled
+            .affinity_header(golutra_core::PromptCachePolicy::None)
+            .is_none()
+    );
 }
 
 #[test]

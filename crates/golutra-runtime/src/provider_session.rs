@@ -912,6 +912,7 @@ mod tests {
             task_id: TaskId::new(),
             turn_id: TurnId::new(),
             session_id: None,
+            cache_scope: None,
             provider_id: "mock".to_owned(),
             model_id: "mock-model".to_owned(),
             messages: Vec::new(),

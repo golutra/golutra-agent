@@ -202,11 +202,12 @@ pub enum PromptCachePolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CacheIdentity {
     pub session_id: SessionId,
-    /// 为未来 projection 预留的持久 thread id；请求编译时仍以 session id 作为稳定 wire 身份。
+    /// 当前请求所属的持久 thread；wire key 可以由可信父线程作用域派生。
     #[serde(default)]
     pub thread_id: Option<ThreadId>,
     pub provider_id: String,
     pub model_id: String,
+    pub route_namespace: String,
     pub key: String,
 }
 

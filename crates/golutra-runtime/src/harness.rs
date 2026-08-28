@@ -10,7 +10,7 @@ use golutra_context::ContextBuilder;
 use golutra_core::{
     ApprovalResolution, TaskContract, VerificationRequirement, WorkspaceChangeRequirement,
 };
-use golutra_llm::LlmProvider;
+use golutra_llm::{LlmProvider, PromptCacheScope};
 use golutra_protocol::{AgentExecutionMode, AgentToolProfile};
 use golutra_tools::ToolRuntime;
 use tokio::task::JoinHandle;
@@ -28,6 +28,7 @@ pub struct AgentRun {
     pub request: AgentTaskRequest,
     pub task_contract: TaskContract,
     pub replay_context: Option<AgentReplayContext>,
+    pub cache_scope: PromptCacheScope,
     pub max_elapsed_ms: Option<u64>,
     pub defer_external_verification: Option<bool>,
 }
@@ -36,10 +37,12 @@ impl AgentRun {
     #[must_use]
     pub fn new(request: AgentTaskRequest) -> Self {
         let task_contract = default_task_contract(&request);
+        let cache_scope = PromptCacheScope::session(request.session_id, None);
         Self {
             request,
             task_contract,
             replay_context: None,
+            cache_scope,
             max_elapsed_ms: None,
             defer_external_verification: None,
         }
@@ -54,6 +57,12 @@ impl AgentRun {
     #[must_use]
     pub fn with_replay_context(mut self, replay_context: AgentReplayContext) -> Self {
         self.replay_context = Some(replay_context);
+        self
+    }
+
+    #[must_use]
+    pub fn with_cache_scope(mut self, cache_scope: PromptCacheScope) -> Self {
+        self.cache_scope = cache_scope;
         self
     }
 
@@ -112,6 +121,12 @@ impl ConfiguredAgentRun {
     #[must_use]
     pub fn with_replay_context(mut self, replay_context: AgentReplayContext) -> Self {
         self.run.replay_context = Some(replay_context);
+        self
+    }
+
+    #[must_use]
+    pub fn with_cache_scope(mut self, cache_scope: PromptCacheScope) -> Self {
+        self.run.cache_scope = cache_scope;
         self
     }
 
@@ -309,8 +324,12 @@ where
     where
         S: RuntimeObservationSink,
     {
-        self.execute_inner(run, AgentTurnOverrides::default(), control, sink)
-            .await
+        let turn_overrides = AgentTurnOverrides {
+            max_elapsed_ms: run.max_elapsed_ms,
+            defer_external_verification: run.defer_external_verification,
+            ..AgentTurnOverrides::default()
+        };
+        self.execute_inner(run, turn_overrides, control, sink).await
     }
 
     pub async fn execute_configured<S>(
@@ -352,11 +371,9 @@ where
     {
         self.loop_core
             .run_with_control_trace_contract_and_replay_context(
-                run.request,
+                run,
                 control,
                 move |observation| sink.emit(observation),
-                run.task_contract,
-                run.replay_context,
                 turn_overrides,
             )
             .await

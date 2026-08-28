@@ -2650,6 +2650,10 @@ impl RuntimeHost {
         if !self.force_mock_provider
             && let Some((task_id, turn_id)) = trace_ids
         {
+            let prompt_cache_scope = self
+                .prompt_cache_scope(session_id, false)
+                .await?
+                .compaction();
             let provider_config_paths = self.provider_config_paths.clone();
             let provider_route_cache = Arc::clone(&self.execution.provider_route_cache);
             let provider_plan = run_blocking(move || {
@@ -2671,8 +2675,8 @@ impl RuntimeHost {
                     && let Some(provider_request) = compaction_summary_request(
                         task_id,
                         turn_id,
-                        contract.provider_id.clone(),
-                        contract.model_id.clone(),
+                        &contract,
+                        prompt_cache_scope,
                         previous_summary,
                         &source_messages,
                         EXPLICIT_COMPACTION_TOKEN_BUDGET,

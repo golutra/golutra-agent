@@ -29,7 +29,13 @@
     ],
     "model": "claude-test",
     "stream": false,
-    "system": "You are concise.",
+    "system": [
+      {
+        "type": "text",
+        "text": "You are concise.",
+        "cache_control": {"type": "ephemeral", "ttl": "5m"}
+      }
+    ],
     "tools": [
       {
         "name": "read_file",
