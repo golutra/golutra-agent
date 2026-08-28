@@ -13,6 +13,8 @@ use async_trait::async_trait;
 use fs2::FileExt;
 use golutra_config::{ProviderConfigPaths, load_provider_runtime_env_from_paths};
 use golutra_context::ContextContributor;
+#[cfg(test)]
+pub(crate) use golutra_context::estimate_tokens;
 use golutra_core::{
     Actor, ApprovalDecision, ApprovalId, ApprovalResolution, ArtifactId, ArtifactRecord,
     BusyPolicy, CommandId, EventId, MemoryId, PolicyBlockDisposition, PolicyDecision,
@@ -74,7 +76,6 @@ const PROVISIONAL_COMMAND_ACK_REASON: &str = "command accepted for processing";
 const EVENT_REPLAY_PAGE_SIZE: u32 = 256;
 const MAX_EVENT_PAGE_SIZE: u32 = 512;
 const CHECKPOINTS_TO_RETAIN_PER_WORKSPACE: usize = 20;
-const MAX_HISTORY_SOURCE_EVENTS: u32 = 512;
 const MAX_HTTP_JSON_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RUN_BUNDLE_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
@@ -177,25 +178,32 @@ pub use application::{
     GovernedRuntime, RuntimeApplication, RuntimeCommandService, RuntimeGovernanceService,
     RuntimeQueryService, RuntimeSessionService, TaskTraceService,
 };
+pub(crate) use context::history_contributors_with_budget;
 pub(crate) use context::{
-    compact_event_summary, compact_history_text, compact_history_with_summary,
-    completion_criteria_from_payload, context_compaction_from_event, conversation_history_line,
-    effective_model_history_events, environment_context_prompt, load_project_instruction_bundle,
-    memory_context, model_prompt_from_payload, preview_from_payload, prompt_from_payload,
-    select_memories_for_context, system_prompt, task_contract_from_payload, title_from_payload,
+    CachedProjectInstructions, ContextResourceCache, MAX_CACHED_HISTORY_EVENTS,
+    ProjectInstructionBundle, bound_cached_history, compact_event_summary, compact_history_text,
+    compact_history_with_summary, completion_criteria_from_payload, context_compaction_from_event,
+    conversation_history_line, effective_model_history_events, environment_context_prompt,
+    history_contributors_from_cached_facts, is_history_cache_event,
+    load_project_instruction_bundle, memory_context_with_budget, model_prompt_from_payload,
+    preview_from_payload, project_instruction_fingerprint, prompt_from_payload,
+    select_memories_for_context_with_budget, system_prompt, task_contract_from_payload,
+    title_from_payload, truncate_to_token_budget,
 };
 pub use debug_export::{
     DebugExportCoordinator, DebugExportManifest, DebugExportReceipt, DebugExportRequest,
     ExportedArtifactManifest, ExportedArtifactState, ExportedSessionManifest, ExportedTaskManifest,
     parse_session_range,
 };
+#[cfg(test)]
+pub(crate) use event_codec::context_request_artifact;
 pub(crate) use event_codec::redact_provider_json;
 pub(crate) use event_codec::{
     agent_event, agent_event_for_turn, candidate_id_from_payload, context_compaction_artifact,
-    context_replay_request_artifact, context_request_artifact, event_matches_filter, host_event,
-    parent_thread_id_from_payload, provider_raw_artifact, provider_response_replay_artifact,
-    recovered_pending_turn_from_event, task_status_from_loop_action, thread_id_from_payload,
-    thread_title_for_prompt, trace_event_payload, with_command_payload,
+    context_request_artifacts, event_matches_filter, host_event, parent_thread_id_from_payload,
+    provider_raw_artifact, provider_response_replay_artifact, recovered_pending_turn_from_event,
+    task_status_from_loop_action, thread_id_from_payload, thread_title_for_prompt,
+    trace_event_payload, with_command_payload,
 };
 pub use event_codec::{event_sequence_no, projection_status};
 pub(crate) use execution_trace::CanonicalFactRecorder;
@@ -215,8 +223,11 @@ pub(crate) use paths::{ensure_private_dir, set_owner_only_file, workspace_hash};
 pub use post_task::PostTaskCoordinator;
 #[cfg(test)]
 pub(crate) use provider_runtime::configured_provider_plan;
+#[cfg(test)]
+pub(crate) use provider_runtime::mock_provider_plan;
 pub(crate) use provider_runtime::{
-    MockProviderPlan, isolated_mock_provider_plan, mock_provider_plan, pin_provider_turn_settings,
+    MockProviderPlan, ProviderRouteCache, cached_mock_provider_plan, isolated_mock_provider_plan,
+    pin_provider_turn_settings,
 };
 pub use rollout::{RolloutEnvelope, RolloutExport, ThreadRebindResult, redact_runtime_value};
 pub(crate) use rollout::{
@@ -405,6 +416,8 @@ struct RuntimeHostExecutionState {
     causal_ledger: Mutex<causal_recorder::CausalLedger>,
     command_mutex: Mutex<()>,
     task_controls: Mutex<HashMap<SessionId, HostedTaskControl>>,
+    context_resources: StdMutex<ContextResourceCache>,
+    provider_route_cache: Arc<StdMutex<ProviderRouteCache>>,
     delegation_admissions: Mutex<HashMap<SessionId, delegation::DelegationAdmission>>,
     delegation_operations: Mutex<HashMap<String, Arc<delegation::DelegationOperation>>>,
     active_work_notify: Notify,
@@ -1759,6 +1772,8 @@ impl RuntimeHost {
                 causal_ledger: Mutex::new(causal_recorder::CausalLedger::default()),
                 command_mutex: Mutex::new(()),
                 task_controls: Mutex::new(HashMap::new()),
+                context_resources: StdMutex::new(ContextResourceCache::default()),
+                provider_route_cache: Arc::new(StdMutex::new(ProviderRouteCache::default())),
                 delegation_admissions: Mutex::new(HashMap::new()),
                 delegation_operations: Mutex::new(HashMap::new()),
                 active_work_notify: Notify::new(),
@@ -2451,6 +2466,14 @@ impl RuntimeHost {
 
     async fn publish_committed_event(&self, event: RuntimeEvent) -> Result<(), ClientError> {
         self.publish_live_event(event.clone());
+        // The event has already crossed the durable append boundary. Update a
+        // warm history entry immediately; cross-process writers are picked up
+        // by the bounded cursor refresh in `cached_history_events`.
+        self.execution
+            .context_resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe_committed_event(&event);
         match self.append_rollout_event(&event).await {
             Ok(()) => {
                 self.execution

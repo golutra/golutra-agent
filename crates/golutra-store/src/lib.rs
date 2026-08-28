@@ -509,6 +509,17 @@ impl RuntimeStore {
         Ok(u64::try_from(max_sequence_no).unwrap_or_default())
     }
 
+    pub async fn max_sequence_no_for_session(&self, session_id: SessionId) -> StoreResult<u64> {
+        let row = sqlx::query(
+            "SELECT COALESCE(MAX(sequence_no), 0) AS max_sequence_no FROM runtime_events WHERE session_id = ?",
+        )
+        .bind(session_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        let max_sequence_no: i64 = row.try_get("max_sequence_no")?;
+        Ok(u64::try_from(max_sequence_no).unwrap_or_default())
+    }
+
     pub async fn load_events(
         &self,
         session_id: SessionId,
@@ -639,6 +650,95 @@ impl RuntimeStore {
                 Ok(serde_json::from_str(&event_json)?)
             })
             .collect()
+    }
+
+    /// 按升序分页读取会进入模型上下文的历史事实。
+    ///
+    /// `through_sequence_no` 固定本次读取的快照边界，因此并发追加的事件
+    /// 会留给下一轮，而不会改变当前缓存批次的内容。
+    pub async fn load_model_history_page(
+        &self,
+        session_id: SessionId,
+        after_sequence_no: Option<u64>,
+        through_sequence_no: u64,
+        limit: u32,
+    ) -> StoreResult<Vec<RuntimeEvent>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"
+            SELECT event_json
+            FROM runtime_events
+            WHERE session_id = ?
+              AND sequence_no > ?
+              AND sequence_no <= ?
+              AND event_type IN (
+                  'TaskCreated', 'TurnQueued', 'TurnUpdated', 'TurnCancelled',
+                  'AssistantMessage', 'ToolCompleted', 'TaskCompleted',
+                  'TaskAborted', 'TaskInterrupted', 'TaskUncertain',
+                  'CandidateReady', 'VerificationReady', 'CompactionCompleted'
+              )
+            ORDER BY sequence_no ASC
+            LIMIT ?
+            "#,
+        )
+        .bind(session_id.to_string())
+        .bind(i64::try_from(after_sequence_no.unwrap_or_default()).unwrap_or(i64::MAX))
+        .bind(i64::try_from(through_sequence_no).unwrap_or(i64::MAX))
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let event_json: String = row.try_get("event_json")?;
+                Ok(serde_json::from_str(&event_json)?)
+            })
+            .collect()
+    }
+
+    /// 读取快照边界内最新的一段模型历史，结果统一按时间升序返回。
+    pub async fn load_recent_model_history(
+        &self,
+        session_id: SessionId,
+        through_sequence_no: u64,
+        limit: u32,
+    ) -> StoreResult<Vec<RuntimeEvent>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"
+            SELECT event_json
+            FROM runtime_events
+            WHERE session_id = ?
+              AND sequence_no <= ?
+              AND event_type IN (
+                  'TaskCreated', 'TurnQueued', 'TurnUpdated', 'TurnCancelled',
+                  'AssistantMessage', 'ToolCompleted', 'TaskCompleted',
+                  'TaskAborted', 'TaskInterrupted', 'TaskUncertain',
+                  'CandidateReady', 'VerificationReady', 'CompactionCompleted'
+              )
+            ORDER BY sequence_no DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(session_id.to_string())
+        .bind(i64::try_from(through_sequence_no).unwrap_or(i64::MAX))
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut events = rows
+            .into_iter()
+            .map(|row| {
+                let event_json: String = row.try_get("event_json")?;
+                Ok(serde_json::from_str(&event_json)?)
+            })
+            .collect::<StoreResult<Vec<RuntimeEvent>>>()?;
+        events.reverse();
+        Ok(events)
     }
 
     pub async fn load_events_before(

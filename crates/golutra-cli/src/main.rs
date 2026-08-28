@@ -2894,7 +2894,9 @@ async fn export_exec_run_bundle(
     terminal_outcome: RunBundleTerminalOutcome,
 ) -> Result<(), golutra_client::ClientError> {
     let receipt = RunBundleExporter::new(transport)
-        .export_fast(RunBundleExportRequest {
+        // 终态导出是用户可见的交付物，必须包含完整的脱敏 debug-export。
+        // 运行中的 checkpoint 仍走 fast 路径，因此不会拖慢首个 provider 事件。
+        .export(RunBundleExportRequest {
             destination: destination.clone(),
             selection: golutra_client::SessionWindowRequest {
                 anchor_thread_id: thread_id,
@@ -2906,12 +2908,21 @@ async fn export_exec_run_bundle(
             terminal_outcome,
         })
         .await?;
+    let debug_export = receipt
+        .debug_export_path
+        .as_deref()
+        .map(|path| destination.join(path).display().to_string())
+        .unwrap_or_else(|| "unavailable".to_owned());
     eprintln!(
-        "golutra run bundle retained at {}; observations: {}; redacted debug export: deferred until an explicit bundle refresh; complete: {}",
+        "golutra run bundle retained at {}; observations: {}; redacted debug export: {}; complete: {}",
         destination.display(),
         destination.join(&receipt.observations_path).display(),
+        debug_export,
         receipt.complete,
     );
+    if let Some(error) = receipt.debug_export_error {
+        eprintln!("redacted debug export failed without losing raw observations: {error}");
+    }
     Ok(())
 }
 

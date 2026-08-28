@@ -1,8 +1,9 @@
 use chrono::Utc;
 use golutra_core::{
-    Actor, ActorKind, ArtifactId, BusyPolicy, CommandId, EvidenceId, EvidenceStrength, LaneId,
-    PostTaskJob, PostTaskJobId, PostTaskJobKind, PostTaskJobStatus, RedactionStatus, RuntimeLane,
-    TaskId, TaskStatus, ToolCallId, ToolResultStatus, TurnId, WorkspaceId,
+    Actor, ActorKind, ArtifactId, BusyPolicy, CommandId, EventId, EvidenceId, EvidenceStrength,
+    LaneId, PostTaskJob, PostTaskJobId, PostTaskJobKind, PostTaskJobStatus,
+    RUNTIME_EVENT_SCHEMA_VERSION, RedactionStatus, RuntimeLane, TaskId, TaskStatus, ToolCallId,
+    ToolResultStatus, TurnId, WorkspaceId,
 };
 use golutra_protocol::{ArtifactReadRequest, RuntimeEventSource, RuntimeEventType};
 use serde_json::json;
@@ -218,6 +219,184 @@ async fn event_pages_advance_from_the_last_sequence_cursor() {
     assert_eq!(recent[1].payload["summary"], "event 4");
     assert!(first[1].sequence_no < second[0].sequence_no);
     assert!(second[1].sequence_no < third[0].sequence_no);
+}
+
+#[tokio::test]
+async fn model_history_pages_filter_telemetry_and_honor_snapshot_boundary() {
+    let store = RuntimeStore::in_memory().await.expect("store");
+    let session_id = SessionId::new();
+    let append = |event_type| RuntimeEvent {
+        schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+        causal_context: Default::default(),
+        causal_links: Vec::new(),
+        id: golutra_core::EventId::new(),
+        sequence_no: 0,
+        session_id,
+        turn_id: Some(TurnId::new()),
+        task_id: None,
+        parent_event_id: None,
+        event_type,
+        timestamp: Utc::now(),
+        source: RuntimeEventSource::Runtime,
+        payload: json!({"content": format!("{event_type:?}")}),
+        payload_ref: None,
+        durable: true,
+    };
+
+    for event_type in [
+        RuntimeEventType::TaskCreated,
+        RuntimeEventType::ProviderStreamed,
+        RuntimeEventType::AssistantMessage,
+        RuntimeEventType::ToolProgress,
+        RuntimeEventType::TurnUpdated,
+        RuntimeEventType::CompactionCompleted,
+    ] {
+        store
+            .append_event_assigning_sequence(append(event_type))
+            .await
+            .expect("event");
+    }
+    let through_sequence_no = store
+        .max_sequence_no_for_session(session_id)
+        .await
+        .expect("snapshot sequence");
+    store
+        .append_event_assigning_sequence(append(RuntimeEventType::AssistantMessage))
+        .await
+        .expect("post-snapshot event");
+
+    let first = store
+        .load_model_history_page(session_id, None, through_sequence_no, 2)
+        .await
+        .expect("first history page");
+    let second = store
+        .load_model_history_page(
+            session_id,
+            Some(first[1].sequence_no),
+            through_sequence_no,
+            2,
+        )
+        .await
+        .expect("second history page");
+    let recent = store
+        .load_recent_model_history(session_id, through_sequence_no, 2)
+        .await
+        .expect("recent history");
+
+    assert_eq!(
+        first
+            .iter()
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>(),
+        vec![
+            RuntimeEventType::TaskCreated,
+            RuntimeEventType::AssistantMessage
+        ]
+    );
+    assert_eq!(
+        second
+            .iter()
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>(),
+        vec![
+            RuntimeEventType::TurnUpdated,
+            RuntimeEventType::CompactionCompleted
+        ]
+    );
+    assert_eq!(recent.len(), 2);
+    assert_eq!(recent[0].event_type, RuntimeEventType::TurnUpdated);
+    assert_eq!(recent[1].event_type, RuntimeEventType::CompactionCompleted);
+    assert!(
+        recent
+            .iter()
+            .all(|event| event.sequence_no <= through_sequence_no)
+    );
+}
+
+#[tokio::test]
+async fn model_history_window_is_not_shrunk_by_high_volume_telemetry() {
+    let store = RuntimeStore::in_memory().await.expect("store");
+    let session_id = SessionId::new();
+    let turn_id = TurnId::new();
+    let mut transaction = store.pool.begin().await.expect("transaction");
+    for sequence_no in 1..=16_400_u64 {
+        let event_type = if sequence_no % 2 == 1 {
+            RuntimeEventType::AssistantMessage
+        } else {
+            RuntimeEventType::ProviderStreamed
+        };
+        let event = RuntimeEvent {
+            schema_version: RUNTIME_EVENT_SCHEMA_VERSION,
+            causal_context: Default::default(),
+            causal_links: Vec::new(),
+            id: EventId::new(),
+            sequence_no,
+            session_id,
+            turn_id: Some(turn_id),
+            task_id: None,
+            parent_event_id: None,
+            event_type,
+            timestamp: Utc::now(),
+            source: RuntimeEventSource::Runtime,
+            payload: json!({"content": format!("message-{sequence_no}")}),
+            payload_ref: None,
+            durable: true,
+        };
+        sqlx::query(
+            "INSERT INTO runtime_events (
+                event_id, sequence_no, session_id, task_id, turn_id, event_type, source,
+                durable, payload_json, event_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(event.id.to_string())
+        .bind(i64::try_from(sequence_no).expect("sequence fits sqlite"))
+        .bind(session_id.to_string())
+        .bind(Option::<String>::None)
+        .bind(turn_id.to_string())
+        .bind(format!("{event_type:?}"))
+        .bind(format!("{:?}", event.source))
+        .bind(event.durable)
+        .bind(serde_json::to_string(&event.payload).expect("payload"))
+        .bind(serde_json::to_string(&event).expect("event"))
+        .execute(&mut *transaction)
+        .await
+        .expect("event row");
+    }
+    transaction.commit().await.expect("commit");
+
+    let through_sequence_no = store
+        .max_sequence_no_for_session(session_id)
+        .await
+        .expect("snapshot sequence");
+    let recent = store
+        .load_recent_model_history(session_id, through_sequence_no, 8_192)
+        .await
+        .expect("recent model history");
+    let mut cursor = None;
+    let mut paged = Vec::new();
+    loop {
+        let page = store
+            .load_model_history_page(session_id, cursor, through_sequence_no, 257)
+            .await
+            .expect("history page");
+        let Some(last) = page.last() else {
+            break;
+        };
+        cursor = Some(last.sequence_no);
+        paged.extend(page);
+    }
+
+    assert_eq!(recent.len(), 8_192);
+    assert_eq!(recent.first().map(|event| event.sequence_no), Some(17));
+    assert_eq!(recent.last().map(|event| event.sequence_no), Some(16_399));
+    assert_eq!(paged.len(), 8_200);
+    assert_eq!(paged.first().map(|event| event.sequence_no), Some(1));
+    assert_eq!(paged.last().map(|event| event.sequence_no), Some(16_399));
+    assert!(paged.windows(2).all(|events| {
+        events[0].sequence_no < events[1].sequence_no
+            && events[0].event_type == RuntimeEventType::AssistantMessage
+            && events[1].event_type == RuntimeEventType::AssistantMessage
+    }));
 }
 
 #[tokio::test]

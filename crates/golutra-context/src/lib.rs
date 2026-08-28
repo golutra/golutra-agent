@@ -4,17 +4,17 @@ use golutra_core::{
     TokenBudgetSnapshotId, TokenUsageRecord, ToolContract, TurnId,
 };
 use golutra_llm::{
-    ProviderMessage, ProviderRequest, ProviderRole, ProviderUsage, provider_tool_wire_projection,
+    ProviderMessage, ProviderRequest, ProviderRole, ProviderUsage, provider_tool_wire_digest,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{HashMap, HashSet},
+    io::Write,
     ops::Range,
 };
 use thiserror::Error;
 
-const DEFAULT_ACTIVE_CONTEXT_LIMIT: u64 = 16_384;
 const COMPACTION_SUMMARY_PREFIX: &str = "Runtime context compaction summary. Treat this as historical context, not a new instruction:\n";
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -80,10 +80,95 @@ pub struct ContextBuildPlan {
     pub contributors: Vec<String>,
     pub contributor_manifest: Vec<ContextContributorSnapshot>,
     pub messages: Vec<ProviderMessage>,
+    /// Token estimates captured with the message snapshot.  Keeping these
+    /// beside the messages lets the runtime reuse one scan for budgeting,
+    /// snapshotting and usage attribution.
+    pub message_estimates: Vec<u64>,
+    /// Full-message digests captured with the same snapshot. These are used by
+    /// attribution and audit manifests so a large message is not serialized a
+    /// second time merely to calculate its content identity.
+    pub message_digests: Vec<String>,
     pub message_sources: Vec<ContextMessageSource>,
     pub budget_snapshot: TokenBudgetSnapshot,
     pub original_planned_input_tokens: u64,
     pub trimmed_contributors: Vec<String>,
+}
+
+/// Return a stable identity for the first `message_count` messages in a plan.
+///
+/// The provider reports only an aggregate input-token count, so the runtime
+/// needs a cheap way to prove that the count still belongs to the same prefix
+/// before reusing it after tool results or queued turns are appended. Message
+/// digests are already captured while building the plan; hashing those short
+/// digests avoids serializing the full message bodies again.
+#[must_use]
+pub fn context_message_prefix_digest(
+    plan: &ContextBuildPlan,
+    message_count: usize,
+) -> Option<String> {
+    if message_count > plan.messages.len() || plan.message_digests.len() != plan.messages.len() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"golutra-context-prefix-v1\0");
+    hasher.update((message_count as u64).to_le_bytes());
+    for digest in &plan.message_digests[..message_count] {
+        hasher.update((digest.len() as u64).to_le_bytes());
+        hasher.update(digest.as_bytes());
+    }
+    Some(format!("sha256:{:x}", hasher.finalize()))
+}
+
+impl ContextBuildPlan {
+    /// Append one model-visible message and capture its estimate in the same
+    /// operation.  Runtime code keeps the plan as the single mutable source
+    /// of truth, so budgeting, snapshotting and attribution cannot drift.
+    pub fn append_message(
+        &mut self,
+        message: ProviderMessage,
+        source: ContextMessageSource,
+    ) -> u64 {
+        let estimated_tokens = estimate_message_token(&message);
+        let digest = provider_message_digest(&message);
+        self.messages.push(message);
+        self.message_estimates.push(estimated_tokens);
+        self.message_digests.push(digest);
+        self.message_sources.push(source);
+        estimated_tokens
+    }
+
+    /// Replace the working set after compaction and return its new estimate.
+    pub fn replace_messages(
+        &mut self,
+        messages: Vec<ProviderMessage>,
+        sources: Vec<ContextMessageSource>,
+    ) -> u64 {
+        let estimates = messages
+            .iter()
+            .map(estimate_message_token)
+            .collect::<Vec<_>>();
+        let digests = messages.iter().map(provider_message_digest).collect();
+        let total = sum_estimates(&estimates);
+        self.messages = messages;
+        self.message_estimates = estimates;
+        self.message_digests = digests;
+        self.message_sources = sources;
+        total
+    }
+
+    #[must_use]
+    pub fn estimated_message_tokens(&self) -> u64 {
+        sum_estimates(&self.message_estimates)
+    }
+}
+
+/// A provider-reported input-token checkpoint for the current message prefix.
+/// The runtime may use it to account only for messages appended afterwards;
+/// callers must invalidate it whenever the prefix or tool contract changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObservedContextPrefix {
+    pub message_count: usize,
+    pub input_tokens: u64,
 }
 
 /// The only value that crosses the Runtime OS -> provider boundary.
@@ -178,23 +263,75 @@ impl ContextWindowManager {
         messages: &[ProviderMessage],
         planned_tool_tokens: u64,
     ) -> Option<u64> {
-        let original_estimated_tokens =
-            estimate_message_tokens(messages).saturating_add(planned_tool_tokens);
-        let active_context_limit = self.budget_limit.min(DEFAULT_ACTIVE_CONTEXT_LIMIT);
-        if original_estimated_tokens <= active_context_limit {
+        let message_estimates = messages
+            .iter()
+            .map(estimate_message_token)
+            .collect::<Vec<_>>();
+        self.required_compaction_limit_with_estimates(
+            protected_prefix_len,
+            messages,
+            &message_estimates,
+            planned_tool_tokens,
+        )
+    }
+
+    /// 使用调用方已经计算的消息 token，避免同一轮重复扫描完整上下文。
+    #[must_use]
+    pub fn required_compaction_limit_with_estimates(
+        &self,
+        protected_prefix_len: usize,
+        messages: &[ProviderMessage],
+        message_estimates: &[u64],
+        planned_tool_tokens: u64,
+    ) -> Option<u64> {
+        self.required_compaction_limit_with_observed_prefix(
+            protected_prefix_len,
+            messages,
+            message_estimates,
+            planned_tool_tokens,
+            None,
+        )
+    }
+
+    /// Like [`required_compaction_limit_with_estimates`], but uses a trusted
+    /// provider input count for the already-observed message prefix. This
+    /// mirrors Pi's usage baseline while retaining a conservative local
+    /// estimate for messages appended after that request.
+    #[must_use]
+    pub fn required_compaction_limit_with_observed_prefix(
+        &self,
+        _protected_prefix_len: usize,
+        messages: &[ProviderMessage],
+        message_estimates: &[u64],
+        planned_tool_tokens: u64,
+        observed_prefix: Option<ObservedContextPrefix>,
+    ) -> Option<u64> {
+        if self.budget_limit == 0 {
+            return None;
+        }
+        let fallback_estimates;
+        let message_estimates = if message_estimates.len() == messages.len() {
+            message_estimates
+        } else {
+            fallback_estimates = messages
+                .iter()
+                .map(estimate_message_token)
+                .collect::<Vec<_>>();
+            &fallback_estimates
+        };
+        let original_estimated_tokens = context_tokens_with_observed_prefix(
+            messages,
+            message_estimates,
+            planned_tool_tokens,
+            observed_prefix,
+        );
+        if original_estimated_tokens <= self.budget_limit {
             return None;
         }
 
-        let protected_prefix_len = protected_prefix_len.min(messages.len());
-        let protected_tokens = estimate_message_tokens(&messages[..protected_prefix_len])
-            .saturating_add(planned_tool_tokens);
-        if protected_tokens < active_context_limit {
-            Some(active_context_limit)
-        } else if original_estimated_tokens > self.budget_limit {
-            Some(self.budget_limit)
-        } else {
-            None
-        }
+        // 即使稳定前缀本身已超预算，也返回硬上限，让执行层得到明确的
+        // CompactionImpossible，而不是把溢出静默当成“无需压缩”。
+        Some(self.budget_limit)
     }
 
     pub fn compact_if_needed(
@@ -205,18 +342,86 @@ impl ContextWindowManager {
         message_sources: &[ContextMessageSource],
         planned_tool_tokens: u64,
     ) -> Result<Option<ContextCompactionRecord>, ContextError> {
-        let original_estimated_tokens =
-            estimate_message_tokens(messages).saturating_add(planned_tool_tokens);
-        let Some(compaction_limit) =
-            self.required_compaction_limit(protected_prefix_len, messages, planned_tool_tokens)
-        else {
-            return Ok(None);
+        let message_estimates = messages
+            .iter()
+            .map(estimate_message_token)
+            .collect::<Vec<_>>();
+        self.compact_if_needed_with_estimates(
+            turn_id,
+            protected_prefix_len,
+            messages,
+            message_sources,
+            &message_estimates,
+            planned_tool_tokens,
+        )
+    }
+
+    /// 在已知消息 token 的情况下执行压缩；消息列表和估算必须来自同一快照。
+    pub fn compact_if_needed_with_estimates(
+        &self,
+        turn_id: TurnId,
+        protected_prefix_len: usize,
+        messages: &[ProviderMessage],
+        message_sources: &[ContextMessageSource],
+        message_estimates: &[u64],
+        planned_tool_tokens: u64,
+    ) -> Result<Option<ContextCompactionRecord>, ContextError> {
+        self.compact_if_needed_with_observed_prefix(
+            turn_id,
+            protected_prefix_len,
+            messages,
+            message_sources,
+            message_estimates,
+            planned_tool_tokens,
+            None,
+        )
+    }
+
+    /// Compact using a provider checkpoint for the current prefix. The
+    /// checkpoint affects the trigger and recorded pre-compaction total; the
+    /// actual replacement still uses per-message estimates so a compaction
+    /// never relies on an unverifiable distribution of provider tokens.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compact_if_needed_with_observed_prefix(
+        &self,
+        turn_id: TurnId,
+        protected_prefix_len: usize,
+        messages: &[ProviderMessage],
+        message_sources: &[ContextMessageSource],
+        message_estimates: &[u64],
+        planned_tool_tokens: u64,
+        observed_prefix: Option<ObservedContextPrefix>,
+    ) -> Result<Option<ContextCompactionRecord>, ContextError> {
+        let fallback_estimates;
+        let message_estimates = if message_estimates.len() == messages.len() {
+            message_estimates
+        } else {
+            fallback_estimates = messages
+                .iter()
+                .map(estimate_message_token)
+                .collect::<Vec<_>>();
+            &fallback_estimates
         };
+        let original_estimated_tokens = context_tokens_with_observed_prefix(
+            messages,
+            message_estimates,
+            planned_tool_tokens,
+            observed_prefix,
+        );
+        if self.budget_limit == 0 || original_estimated_tokens <= self.budget_limit {
+            return Ok(None);
+        }
 
         let protected_prefix_len = protected_prefix_len.min(messages.len());
         let protected = messages[..protected_prefix_len].to_vec();
-        let protected_tokens =
-            estimate_message_tokens(&protected).saturating_add(planned_tool_tokens);
+        let protected_message_tokens = sum_estimates(&message_estimates[..protected_prefix_len]);
+        let protected_tokens = protected_context_tokens(
+            protected_prefix_len,
+            message_estimates,
+            planned_tool_tokens,
+            observed_prefix,
+        );
+        let compaction_limit = self.budget_limit;
         if protected_tokens >= compaction_limit {
             return Err(ContextError::CompactionImpossible {
                 planned: protected_tokens,
@@ -232,14 +437,22 @@ impl ContextWindowManager {
             .max(protected_tokens.saturating_add(hard_available.min(128)))
             .min(compaction_limit);
         let target_available = target_limit.saturating_sub(protected_tokens);
-        let summary_reserve = target_available.saturating_div(4).clamp(32, 1_024);
+        let minimum_summary_reserve = estimate_tokens(COMPACTION_SUMMARY_PREFIX).saturating_add(8);
+        let summary_reserve = target_available
+            .saturating_div(4)
+            .max(minimum_summary_reserve)
+            .min(1_024)
+            .min(target_available);
         let tail_budget = target_available.saturating_sub(summary_reserve);
         let tail = &messages[protected_prefix_len..];
         let groups = message_groups(tail);
         let mut retained_groups = Vec::<Range<usize>>::new();
         let mut retained_tokens = 0_u64;
         for group in groups.iter().rev() {
-            let group_tokens = estimate_message_tokens(&tail[group.clone()]);
+            let group_tokens = sum_estimates(
+                &message_estimates
+                    [protected_prefix_len + group.start..protected_prefix_len + group.end],
+            );
             if retained_tokens.saturating_add(group_tokens) > tail_budget {
                 break;
             }
@@ -252,12 +465,16 @@ impl ContextWindowManager {
             .first()
             .map_or(tail.len(), |group| group.start);
         let mut retained = tail[retained_start..].to_vec();
+        let mut retained_message_tokens = retained_tokens;
         if retained.is_empty() && !tail.is_empty() && tail_budget > 0 {
             let latest_group = groups
                 .last()
                 .cloned()
                 .unwrap_or(tail.len().saturating_sub(1)..tail.len());
             retained = compact_message_group(&tail[latest_group], tail_budget);
+            // This path rewrites content/tool arguments, so the original
+            // estimates no longer describe the replacement messages.
+            retained_message_tokens = estimate_message_tokens(&retained);
         }
         let dropped_end = tail.len().saturating_sub(retained.len());
         let dropped = &tail[..dropped_end];
@@ -275,8 +492,10 @@ impl ContextWindowManager {
         let normalized_sources = normalized_message_sources(messages, message_sources);
         let mut replacement_messages = protected;
         let mut replacement_sources = normalized_sources[..protected_prefix_len].to_vec();
+        let mut summary_message_tokens = 0_u64;
         if !summary.is_empty() {
             summary_message.content.push_str(&summary);
+            summary_message_tokens = estimate_message_token(&summary_message);
             replacement_messages.push(summary_message);
             let mut source_refs = normalized_sources
                 [protected_prefix_len..protected_prefix_len + dropped_end]
@@ -308,7 +527,7 @@ impl ContextWindowManager {
         let message_decisions = messages
             .iter()
             .enumerate()
-            .map(|(index, message)| {
+            .map(|(index, _message)| {
                 let retained = replacement_source_by_original.contains(&index);
                 ContextCompactionDecision {
                     original_index: u32::try_from(index).unwrap_or(u32::MAX),
@@ -320,11 +539,9 @@ impl ContextWindowManager {
                     } else {
                         "summarized".to_owned()
                     },
-                    original_estimated_tokens: estimate_message_tokens(std::slice::from_ref(
-                        message,
-                    )),
+                    original_estimated_tokens: message_estimates[index],
                     retained_estimated_tokens: if retained {
-                        estimate_message_tokens(std::slice::from_ref(message))
+                        message_estimates[index]
                     } else {
                         0
                     },
@@ -332,25 +549,23 @@ impl ContextWindowManager {
             })
             .collect();
 
-        let replacement_estimated_tokens =
-            estimate_message_tokens(&replacement_messages).saturating_add(planned_tool_tokens);
+        let replacement_estimated_tokens = protected_message_tokens
+            .saturating_add(summary_message_tokens)
+            .saturating_add(retained_message_tokens)
+            .saturating_add(planned_tool_tokens);
         if replacement_estimated_tokens > compaction_limit {
             return Err(ContextError::CompactionImpossible {
                 planned: replacement_estimated_tokens,
                 limit: compaction_limit,
             });
         }
-        let checksum =
-            digest_bytes(&serde_json::to_vec(&replacement_messages).unwrap_or_else(|_| Vec::new()));
+        let checksum = serialized_digest(&replacement_messages);
         Ok(Some(ContextCompactionRecord {
             turn_id,
             mode: "automatic".to_owned(),
-            strategy: if compaction_limit < self.budget_limit {
-                "active_working_set_summary_tail"
-            } else {
-                "protected_prefix_summary_tail"
-            }
-            .to_owned(),
+            // 压缩上限就是当前 provider budget；保留真实的策略名，避免
+            // 已不存在的 active-working-set 分支污染评估和回放指标。
+            strategy: "protected_prefix_summary_tail".to_owned(),
             original_message_count: messages.len(),
             replacement_message_count: replacement_messages.len(),
             dropped_message_count,
@@ -370,6 +585,39 @@ impl ContextWindowManager {
     }
 }
 
+/// Estimate the protected prefix without charging the provider tool schema
+/// twice when the observed input count already includes it. When the observed
+/// checkpoint covers only part of the protected prefix, only the newly added
+/// message estimates are appended. When it covers more than the protected
+/// prefix, subtract the known suffix and keep the local estimate as a
+/// conservative floor for provider-specific framing overhead.
+fn protected_context_tokens(
+    protected_prefix_len: usize,
+    message_estimates: &[u64],
+    planned_tool_tokens: u64,
+    observed_prefix: Option<ObservedContextPrefix>,
+) -> u64 {
+    let protected_prefix_len = protected_prefix_len.min(message_estimates.len());
+    let local_estimate = sum_estimates(&message_estimates[..protected_prefix_len])
+        .saturating_add(planned_tool_tokens);
+    let Some(observed) =
+        observed_prefix.filter(|observed| observed.message_count <= message_estimates.len())
+    else {
+        return local_estimate;
+    };
+
+    let observed_estimate = if observed.message_count < protected_prefix_len {
+        observed.input_tokens.saturating_add(sum_estimates(
+            &message_estimates[observed.message_count..protected_prefix_len],
+        ))
+    } else {
+        observed.input_tokens.saturating_sub(sum_estimates(
+            &message_estimates[protected_prefix_len..observed.message_count],
+        ))
+    };
+    local_estimate.max(observed_estimate)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextBudgetPolicy {
     pub context_window: u64,
@@ -384,7 +632,7 @@ impl Default for ContextBudgetPolicy {
             context_window: 8_192,
             max_output: 1_024,
             budget_limit: 6_000,
-            action_if_exceeded: BudgetOverflowAction::Trim,
+            action_if_exceeded: BudgetOverflowAction::Compact,
         }
     }
 }
@@ -410,6 +658,27 @@ impl ContextBuilder {
         self.policy.budget_limit
     }
 
+    /// Return the stable provider prefix length for a projected message list.
+    ///
+    /// Static instructions stay at the front of every request so a provider
+    /// can reuse that prefix. Conversation state and tool results are the
+    /// compactable working set and must never be protected accidentally.
+    #[must_use]
+    pub fn stable_prefix_len(
+        &self,
+        messages: &[ProviderMessage],
+        sources: &[ContextMessageSource],
+    ) -> usize {
+        messages
+            .iter()
+            .enumerate()
+            .take_while(|(index, message)| {
+                !sources.get(*index).is_some_and(is_dynamic_context_source)
+                    && !matches!(message.role, ProviderRole::Assistant | ProviderRole::Tool)
+            })
+            .count()
+    }
+
     pub fn build(
         &self,
         task_id: TaskId,
@@ -420,10 +689,8 @@ impl ContextBuilder {
             .iter()
             .map(|contributor| estimate_tokens(&contributor.content))
             .collect::<Vec<_>>();
-        let original_planned_input_tokens = contributors
-            .iter()
-            .map(|contributor| estimate_tokens(&contributor.content))
-            .sum::<u64>();
+        let original_planned_input_tokens = sum_estimates(&original_contributor_tokens);
+        let mut retained_contributor_tokens = original_contributor_tokens.clone();
         let mut trimmed_contributors = Vec::new();
         if original_planned_input_tokens > self.policy.budget_limit {
             match self.policy.action_if_exceeded {
@@ -439,93 +706,100 @@ impl ContextBuilder {
                         limit: self.policy.budget_limit,
                     });
                 }
-                BudgetOverflowAction::Trim | BudgetOverflowAction::Compact => {
-                    trimmed_contributors =
-                        trim_contributors(&mut contributors, self.policy.budget_limit);
+                BudgetOverflowAction::Trim => {
+                    trimmed_contributors = trim_contributors_with_estimates(
+                        &mut contributors,
+                        &mut retained_contributor_tokens,
+                        self.policy.budget_limit,
+                    );
                 }
+                // Compact only after the complete provider message sequence
+                // (including queued turns and tool calls) is available.
+                BudgetOverflowAction::Compact => {}
             }
         }
-        let planned_input_tokens = contributors
-            .iter()
-            .map(|contributor| estimate_tokens(&contributor.content))
-            .sum::<u64>();
-        if planned_input_tokens > self.policy.budget_limit {
+        let planned_input_tokens = sum_estimates(&retained_contributor_tokens);
+        if planned_input_tokens > self.policy.budget_limit
+            && !matches!(
+                self.policy.action_if_exceeded,
+                BudgetOverflowAction::Compact
+            )
+        {
             return Err(ContextError::BudgetExceeded {
                 planned: planned_input_tokens,
                 limit: self.policy.budget_limit,
             });
         }
 
-        let contributor_manifest = contributors
+        let trimmed_set = trimmed_contributors
             .iter()
-            .enumerate()
-            .map(|(index, contributor)| {
-                let retained_estimated_tokens = estimate_tokens(&contributor.content);
-                let trimmed = trimmed_contributors
-                    .iter()
-                    .any(|name| name == &contributor.name);
-                ContextContributorSnapshot {
-                    name: contributor.name.clone(),
-                    role: format!("{:?}", contributor.role).to_lowercase(),
-                    source_refs: if contributor.source_refs.is_empty() {
-                        vec![format!("contributor:{}", contributor.name)]
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let mut contributor_manifest = Vec::with_capacity(contributors.len());
+        let mut message_sources = Vec::with_capacity(contributors.len());
+        let mut messages = Vec::with_capacity(contributors.len());
+        let mut message_estimates = Vec::with_capacity(contributors.len());
+        let mut message_digests = Vec::with_capacity(contributors.len());
+        let mut contributor_names = Vec::with_capacity(contributors.len());
+        for (index, contributor) in contributors.into_iter().enumerate() {
+            let retained_estimated_tokens = retained_contributor_tokens[index];
+            let trimmed = trimmed_set.contains(contributor.name.as_str());
+            let source_refs = if contributor.source_refs.is_empty() {
+                vec![format!("contributor:{}", contributor.name)]
+            } else {
+                contributor.source_refs.clone()
+            };
+            contributor_manifest.push(ContextContributorSnapshot {
+                name: contributor.name.clone(),
+                role: format!("{:?}", contributor.role).to_lowercase(),
+                source_refs: source_refs.clone(),
+                included: true,
+                trimmed,
+                original_estimated_tokens: original_contributor_tokens[index],
+                retained_estimated_tokens,
+                strategy: if trimmed {
+                    if matches!(contributor.name.as_str(), "conversation_history" | "memory") {
+                        "retain_tail".to_owned()
                     } else {
-                        contributor.source_refs.clone()
-                    },
-                    included: true,
-                    trimmed,
-                    original_estimated_tokens: original_contributor_tokens[index],
-                    retained_estimated_tokens,
-                    strategy: if trimmed {
-                        if matches!(contributor.name.as_str(), "conversation_history" | "memory") {
-                            "retain_tail".to_owned()
-                        } else {
-                            "retain_head".to_owned()
-                        }
-                    } else {
-                        "include_full".to_owned()
-                    },
-                    estimated_tokens: retained_estimated_tokens,
-                    content_digest: digest_bytes(contributor.content.as_bytes()),
-                    redacted_content_ref: None,
-                    invalidation_refs: Vec::new(),
-                    message_indexes: vec![u32::try_from(index).unwrap_or(u32::MAX)],
-                }
-            })
-            .collect::<Vec<_>>();
-        let message_sources = contributors
-            .iter()
-            .map(|contributor| ContextMessageSource {
-                contributor: contributor.name.clone(),
-                source_refs: if contributor.source_refs.is_empty() {
-                    vec![format!("contributor:{}", contributor.name)]
+                        "retain_head".to_owned()
+                    }
                 } else {
-                    contributor.source_refs.clone()
+                    "include_full".to_owned()
                 },
+                estimated_tokens: retained_estimated_tokens,
+                content_digest: digest_bytes(contributor.content.as_bytes()),
+                redacted_content_ref: None,
+                invalidation_refs: Vec::new(),
+                message_indexes: vec![u32::try_from(index).unwrap_or(u32::MAX)],
+            });
+            message_sources.push(ContextMessageSource {
+                contributor: contributor.name.clone(),
+                source_refs,
                 origin: "initial_contributor".to_owned(),
                 visibility: ModelInputVisibility::ModelVisible,
-            })
-            .collect::<Vec<_>>();
-        let messages = contributors
-            .iter()
-            .map(|contributor| ProviderMessage {
+            });
+            let message = ProviderMessage {
                 role: contributor.role,
-                content: contributor.content.clone(),
+                content: contributor.content,
                 tool_call_id: None,
                 tool_name: None,
                 tool_calls: Vec::new(),
                 metadata: Default::default(),
-            })
-            .collect::<Vec<_>>();
-        let contributor_names = contributors
-            .into_iter()
-            .map(|contributor| contributor.name)
-            .collect::<Vec<_>>();
+            };
+            // `build` creates an empty metadata object for every message, so
+            // the contributor estimate is also the exact message estimate.
+            message_digests.push(provider_message_digest(&message));
+            messages.push(message);
+            message_estimates.push(retained_estimated_tokens);
+            contributor_names.push(contributor.name);
+        }
 
         Ok(ContextBuildPlan {
             contributors: contributor_names,
             contributor_manifest,
             messages,
+            message_estimates,
+            message_digests,
             message_sources,
             original_planned_input_tokens,
             trimmed_contributors,
@@ -540,7 +814,7 @@ impl ContextBuilder {
                 planned_tool_tokens: 0,
                 planned_summary_tokens: 0,
                 budget_limit: self.policy.budget_limit,
-                budget_policy: "p0_static_budget".to_owned(),
+                budget_policy: "token_window_compaction".to_owned(),
                 action_if_exceeded: self.policy.action_if_exceeded,
             },
         })
@@ -556,19 +830,31 @@ impl ContextBuilder {
         turn_id: TurnId,
         messages: Vec<ProviderMessage>,
     ) -> Result<ContextBuildPlan, ContextError> {
-        let planned_input_tokens = estimate_message_tokens(&messages);
-        if planned_input_tokens > self.policy.budget_limit {
+        let message_estimates = messages
+            .iter()
+            .map(estimate_message_token)
+            .collect::<Vec<_>>();
+        let planned_input_tokens = sum_estimates(&message_estimates);
+        if planned_input_tokens > self.policy.budget_limit
+            && !matches!(
+                self.policy.action_if_exceeded,
+                BudgetOverflowAction::Compact
+            )
+        {
             return Err(ContextError::BudgetExceeded {
                 planned: planned_input_tokens,
                 limit: self.policy.budget_limit,
             });
         }
+        let message_digests = messages
+            .iter()
+            .map(provider_message_digest)
+            .collect::<Vec<_>>();
         let contributor_manifest = messages
             .iter()
             .enumerate()
             .map(|(index, message)| {
-                let encoded = serde_json::to_vec(message).unwrap_or_default();
-                let estimated_tokens = estimate_message_tokens(std::slice::from_ref(message));
+                let estimated_tokens = message_estimates[index];
                 ContextContributorSnapshot {
                     name: format!("replay_message_{index}"),
                     role: format!("{:?}", message.role).to_lowercase(),
@@ -579,7 +865,7 @@ impl ContextBuilder {
                     retained_estimated_tokens: estimated_tokens,
                     strategy: "replay_exact".to_owned(),
                     estimated_tokens,
-                    content_digest: digest_bytes(&encoded),
+                    content_digest: message_digests[index].clone(),
                     redacted_content_ref: None,
                     invalidation_refs: Vec::new(),
                     message_indexes: vec![u32::try_from(index).unwrap_or(u32::MAX)],
@@ -602,6 +888,8 @@ impl ContextBuilder {
                 .collect(),
             contributor_manifest,
             messages,
+            message_estimates,
+            message_digests,
             message_sources,
             original_planned_input_tokens: planned_input_tokens,
             trimmed_contributors: Vec::new(),
@@ -623,16 +911,28 @@ impl ContextBuilder {
     }
 }
 
-fn trim_contributors(contributors: &mut [ContextContributor], budget_limit: u64) -> Vec<String> {
+fn trim_contributors_with_estimates(
+    contributors: &mut [ContextContributor],
+    estimates: &mut [u64],
+    budget_limit: u64,
+) -> Vec<String> {
+    debug_assert_eq!(contributors.len(), estimates.len());
     let mut trimmed = Vec::new();
-    for contributor in contributors.iter_mut() {
-        let current_tokens = estimate_tokens(&contributor.content);
+    let mut total = sum_estimates(estimates);
+    for (index, contributor) in contributors.iter_mut().enumerate() {
+        let current_tokens = estimates[index];
         if contributor.token_budget_hint > 0 && current_tokens > contributor.token_budget_hint {
-            contributor.content = truncate_contributor(
+            let content = truncate_contributor(
                 &contributor.name,
                 &contributor.content,
                 contributor.token_budget_hint,
             );
+            let retained_tokens = estimate_tokens(&content);
+            total = total
+                .saturating_sub(estimates[index])
+                .saturating_add(retained_tokens);
+            estimates[index] = retained_tokens;
+            contributor.content = content;
             trimmed.push(contributor.name.clone());
         }
     }
@@ -646,21 +946,24 @@ fn trim_contributors(contributors: &mut [ContextContributor], budget_limit: u64)
         "objective",
     ];
     for name in TRIM_PRIORITY {
-        let total = contributors
-            .iter()
-            .map(|contributor| estimate_tokens(&contributor.content))
-            .sum::<u64>();
         if total <= budget_limit {
             break;
         }
-        if let Some(contributor) = contributors
+        if let Some((index, contributor)) = contributors
             .iter_mut()
-            .find(|contributor| contributor.name == *name)
+            .enumerate()
+            .find(|(_, contributor)| contributor.name == *name)
         {
-            let current_tokens = estimate_tokens(&contributor.content);
+            let current_tokens = estimates[index];
             let overflow = total.saturating_sub(budget_limit);
             let target = current_tokens.saturating_sub(overflow).max(16);
-            contributor.content = truncate_contributor(name, &contributor.content, target);
+            let content = truncate_contributor(name, &contributor.content, target);
+            let retained_tokens = estimate_tokens(&content);
+            total = total
+                .saturating_sub(estimates[index])
+                .saturating_add(retained_tokens);
+            estimates[index] = retained_tokens;
+            contributor.content = content;
             if !trimmed.iter().any(|trimmed_name| trimmed_name == name) {
                 trimmed.push((*name).to_owned());
             }
@@ -696,8 +999,11 @@ pub fn provider_request_from_plan(
     turn_id: TurnId,
     provider_id: impl Into<String>,
     model_id: impl Into<String>,
-    tools: Vec<ToolContract>,
+    mut tools: Vec<ToolContract>,
 ) -> ProviderRequest {
+    // Registry insertion order is an implementation detail. A canonical tool
+    // order keeps the provider prefix byte-stable across turns and processes.
+    tools.sort_by(|left, right| left.tool_name.cmp(&right.tool_name));
     ProviderRequest {
         request_id: golutra_core::ProviderRequestId::new(),
         task_id,
@@ -750,6 +1056,73 @@ pub fn compile_model_input_with_cache_policy(
     tools: Vec<ToolContract>,
     cache_policy: golutra_core::PromptCachePolicy,
 ) -> Result<ModelInputEnvelope, ContextError> {
+    let message_estimates = plan
+        .messages
+        .iter()
+        .map(estimate_message_token)
+        .collect::<Vec<_>>();
+    compile_model_input_with_cache_policy_and_estimates(
+        session_id,
+        plan,
+        task_id,
+        turn_id,
+        provider_id,
+        model_id,
+        tools,
+        cache_policy,
+        &message_estimates,
+    )
+}
+
+/// Compile model input using estimates captured with the current message
+/// snapshot.  The provider request and its audit snapshot therefore share one
+/// token view, without rescanning message content at the wire boundary.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_model_input_with_cache_policy_and_estimates(
+    session_id: SessionId,
+    plan: &ContextBuildPlan,
+    task_id: TaskId,
+    turn_id: TurnId,
+    provider_id: impl Into<String>,
+    model_id: impl Into<String>,
+    tools: Vec<ToolContract>,
+    cache_policy: golutra_core::PromptCachePolicy,
+    message_estimates: &[u64],
+) -> Result<ModelInputEnvelope, ContextError> {
+    let tool_schema_digests = tools
+        .iter()
+        .map(provider_tool_wire_digest)
+        .collect::<Vec<_>>();
+    compile_model_input_with_cache_policy_and_estimates_and_tool_digests(
+        session_id,
+        plan,
+        task_id,
+        turn_id,
+        provider_id,
+        model_id,
+        tools,
+        cache_policy,
+        message_estimates,
+        &tool_schema_digests,
+    )
+}
+
+/// Compile model input when the caller already has the exact provider-facing
+/// tool digests. This keeps the runtime's stable tool set on one projection
+/// cache lookup per contract per turn.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_model_input_with_cache_policy_and_estimates_and_tool_digests(
+    session_id: SessionId,
+    plan: &ContextBuildPlan,
+    task_id: TaskId,
+    turn_id: TurnId,
+    provider_id: impl Into<String>,
+    model_id: impl Into<String>,
+    tools: Vec<ToolContract>,
+    cache_policy: golutra_core::PromptCachePolicy,
+    message_estimates: &[u64],
+    tool_schema_digests: &[String],
+) -> Result<ModelInputEnvelope, ContextError> {
     if plan.messages.len() != plan.message_sources.len() {
         return Err(ContextError::ModelInputSourceCardinality {
             message_count: plan.messages.len(),
@@ -768,7 +1141,15 @@ pub fn compile_model_input_with_cache_policy(
         provider_request_from_plan(plan, task_id, turn_id, provider_id, model_id, tools);
     provider_request.session_id = Some(session_id);
     provider_request.cache_policy = cache_policy;
-    let audit_snapshot = context_snapshot_from_request(session_id, plan, &provider_request);
+    let audit_snapshot =
+        context_snapshot_from_request_with_estimates_and_tool_digests_and_message_digests(
+            session_id,
+            plan,
+            &provider_request,
+            message_estimates,
+            tool_schema_digests,
+            &plan.message_digests,
+        );
     Ok(ModelInputEnvelope {
         provider_request,
         audit_snapshot,
@@ -794,23 +1175,164 @@ fn is_observation_source(source: &ContextMessageSource) -> bool {
         || HIDDEN_CONTRIBUTORS.contains(&source.contributor.as_str())
 }
 
+fn is_dynamic_context_source(source: &ContextMessageSource) -> bool {
+    let contributor = source.contributor.as_str();
+    matches!(
+        contributor,
+        "memory"
+            | "conversation_history"
+            | "project_skills"
+            | "objective"
+            | "user_message"
+            | "assistant_recent"
+            | "runtime_context"
+            | "verification_feedback"
+            | "tool_result_excerpt"
+            | "working_summary"
+    ) || contributor.starts_with("history:")
+        || contributor.starts_with("replay_message_")
+        || matches!(
+            source.origin.as_str(),
+            "pending_turn"
+                | "compaction_summary"
+                | "runtime_history"
+                | "tool_result_compaction"
+                | "runtime_recovery"
+                | "runtime_deadline_advisory"
+                | "runtime_progress_advisory"
+                | "verification_feedback"
+        )
+}
+
 #[must_use]
 pub fn context_snapshot_from_request(
     session_id: SessionId,
     plan: &ContextBuildPlan,
     request: &ProviderRequest,
 ) -> ContextSnapshot {
-    let message_sources = normalized_message_sources(&request.messages, &plan.message_sources);
+    let message_estimates = if plan.message_estimates.len() == request.messages.len()
+        && plan.messages == request.messages
+    {
+        plan.message_estimates.as_slice()
+    } else {
+        // A request may intentionally replace the plan's messages during
+        // replay; calculate a fresh snapshot only for that divergent list.
+        return context_snapshot_from_request_with_estimates_and_tool_digests_and_message_digests(
+            session_id,
+            plan,
+            request,
+            &request
+                .messages
+                .iter()
+                .map(estimate_message_token)
+                .collect::<Vec<_>>(),
+            &request
+                .tools
+                .iter()
+                .map(provider_tool_wire_digest)
+                .collect::<Vec<_>>(),
+            &[],
+        );
+    };
+    let tool_schema_digests = request
+        .tools
+        .iter()
+        .map(provider_tool_wire_digest)
+        .collect::<Vec<_>>();
+    context_snapshot_from_request_with_estimates_and_tool_digests_and_message_digests(
+        session_id,
+        plan,
+        request,
+        message_estimates,
+        &tool_schema_digests,
+        &plan.message_digests,
+    )
+}
+
+/// Build a context snapshot from estimates belonging to `request.messages`.
+/// Callers that already prepared the request for budgeting should use this
+/// variant to keep context preparation linear in the number of messages.
+#[must_use]
+pub fn context_snapshot_from_request_with_estimates(
+    session_id: SessionId,
+    plan: &ContextBuildPlan,
+    request: &ProviderRequest,
+    message_estimates: &[u64],
+) -> ContextSnapshot {
+    let tool_schema_digests = request
+        .tools
+        .iter()
+        .map(provider_tool_wire_digest)
+        .collect::<Vec<_>>();
+    context_snapshot_from_request_with_estimates_and_tool_digests_and_message_digests(
+        session_id,
+        plan,
+        request,
+        message_estimates,
+        &tool_schema_digests,
+        matching_message_digests(plan, request),
+    )
+}
+
+/// Build a context snapshot while reusing a caller-owned tool digest list.
+/// The list is validated by length and falls back to a local projection when
+/// an external caller supplies a stale set.
+#[must_use]
+pub fn context_snapshot_from_request_with_estimates_and_tool_digests(
+    session_id: SessionId,
+    plan: &ContextBuildPlan,
+    request: &ProviderRequest,
+    message_estimates: &[u64],
+    tool_schema_digests: &[String],
+) -> ContextSnapshot {
+    context_snapshot_from_request_with_estimates_and_tool_digests_and_message_digests(
+        session_id,
+        plan,
+        request,
+        message_estimates,
+        tool_schema_digests,
+        matching_message_digests(plan, request),
+    )
+}
+
+fn context_snapshot_from_request_with_estimates_and_tool_digests_and_message_digests(
+    session_id: SessionId,
+    plan: &ContextBuildPlan,
+    request: &ProviderRequest,
+    message_estimates: &[u64],
+    tool_schema_digests: &[String],
+    message_digests: &[String],
+) -> ContextSnapshot {
+    let fallback_estimates;
+    let message_estimates = if message_estimates.len() == request.messages.len() {
+        message_estimates
+    } else {
+        fallback_estimates = request
+            .messages
+            .iter()
+            .map(estimate_message_token)
+            .collect::<Vec<_>>();
+        &fallback_estimates
+    };
+    let normalized_sources;
+    let message_sources: &[ContextMessageSource] = if plan.message_sources.len()
+        == request.messages.len()
+    {
+        &plan.message_sources
+    } else {
+        normalized_sources = normalized_message_sources(&request.messages, &plan.message_sources);
+        &normalized_sources
+    };
     let message_manifest = request
         .messages
         .iter()
-        .zip(&message_sources)
+        .zip(message_sources.iter())
         .enumerate()
         .map(|(index, (message, source))| ContextMessageSnapshot {
             index: u32::try_from(index).unwrap_or(u32::MAX),
             role: format!("{:?}", message.role).to_lowercase(),
             content_digest: digest_bytes(message.content.as_bytes()),
-            estimated_tokens: estimate_tokens(&message.content),
+            estimated_tokens: message_estimates[index],
             tool_call_ids: message
                 .tool_calls
                 .iter()
@@ -821,15 +1343,18 @@ pub fn context_snapshot_from_request(
             origin: source.origin.clone(),
         })
         .collect::<Vec<_>>();
-    let tool_schema_digests = request
-        .tools
-        .iter()
-        .filter_map(|tool| serde_json::to_vec(&provider_tool_wire_projection(tool)).ok())
-        .map(|bytes| digest_bytes(&bytes))
-        .collect::<Vec<_>>();
-    let canonical_request_digest = serde_json::to_vec(request)
-        .map(|bytes| digest_bytes(&bytes))
-        .unwrap_or_else(|_| digest_bytes(request.provider_id.as_bytes()));
+    let fallback_tool_schema_digests;
+    let tool_schema_digests = if tool_schema_digests.len() == request.tools.len() {
+        tool_schema_digests
+    } else {
+        fallback_tool_schema_digests = request
+            .tools
+            .iter()
+            .map(provider_tool_wire_digest)
+            .collect::<Vec<_>>();
+        &fallback_tool_schema_digests
+    };
+    let canonical_request_digest = canonical_provider_request_digest(request, tool_schema_digests);
     ContextSnapshot {
         snapshot_id: ContextSnapshotId::new(),
         session_id,
@@ -838,14 +1363,16 @@ pub fn context_snapshot_from_request(
         provider_request_id: request.request_id,
         provider_id: request.provider_id.clone(),
         model_id: request.model_id.clone(),
-        contributor_manifest: attributed_contributor_manifest(
+        contributor_manifest: attributed_contributor_manifest_with_estimates(
             plan,
             request,
-            &message_sources,
-            &tool_schema_digests,
+            message_sources,
+            tool_schema_digests,
+            message_estimates,
+            message_digests,
         ),
         message_manifest,
-        tool_schema_digests,
+        tool_schema_digests: tool_schema_digests.to_vec(),
         generation_config_digest: None,
         budget_snapshot: plan.budget_snapshot.clone(),
         canonical_request_digest,
@@ -853,6 +1380,17 @@ pub fn context_snapshot_from_request(
         restricted_request_artifact_ref: None,
         estimate_source: "character_div_4".to_owned(),
         created_at: chrono::Utc::now(),
+    }
+}
+
+fn matching_message_digests<'a>(
+    plan: &'a ContextBuildPlan,
+    request: &ProviderRequest,
+) -> &'a [String] {
+    if plan.messages == request.messages && plan.message_digests.len() == request.messages.len() {
+        &plan.message_digests
+    } else {
+        &[]
     }
 }
 
@@ -882,21 +1420,32 @@ fn normalized_message_sources(
         .collect()
 }
 
-fn attributed_contributor_manifest(
+fn attributed_contributor_manifest_with_estimates(
     plan: &ContextBuildPlan,
     request: &ProviderRequest,
     sources: &[ContextMessageSource],
     tool_schema_digests: &[String],
+    message_estimates: &[u64],
+    message_digests: &[String],
 ) -> Vec<ContextContributorSnapshot> {
     let base = plan
         .contributor_manifest
         .iter()
         .map(|contributor| (contributor.name.as_str(), contributor))
-        .collect::<BTreeMap<_, _>>();
-    let mut grouped = BTreeMap::<String, ContextContributorSnapshot>::new();
+        .collect::<HashMap<_, _>>();
+    // 归因顺序必须跟 provider message 的首次出现顺序一致。按名称排序会
+    // 改写审计输出，也会让同一请求在不同回放路径上产生不同前缀。
+    let mut grouped = HashMap::<String, ContextContributorSnapshot>::new();
+    let mut contributor_order = Vec::<String>::new();
     for (index, (message, source)) in request.messages.iter().zip(sources).enumerate() {
-        let estimated_tokens = estimate_message_tokens(std::slice::from_ref(message));
+        let estimated_tokens = message_estimates
+            .get(index)
+            .copied()
+            .unwrap_or_else(|| estimate_message_token(message));
         let has_base_contributor = base.contains_key(source.contributor.as_str());
+        if !grouped.contains_key(&source.contributor) {
+            contributor_order.push(source.contributor.clone());
+        }
         let entry = grouped
             .entry(source.contributor.clone())
             .or_insert_with(|| {
@@ -943,16 +1492,23 @@ fn attributed_contributor_manifest(
         entry.source_refs.extend(source.source_refs.iter().cloned());
         entry.source_refs.sort();
         entry.source_refs.dedup();
-        entry.content_digest.push_str(&digest_bytes(
-            &serde_json::to_vec(message).unwrap_or_default(),
-        ));
+        if let Some(message_digest) = message_digests.get(index) {
+            entry.content_digest.push_str(message_digest);
+        } else {
+            let message_digest = provider_message_digest(message);
+            entry.content_digest.push_str(&message_digest);
+        }
     }
     for contributor in grouped.values_mut() {
         contributor.content_digest = digest_bytes(contributor.content_digest.as_bytes());
     }
     if plan.budget_snapshot.planned_tool_tokens > 0 {
+        let tool_name = "tool_instructions".to_owned();
+        if !grouped.contains_key(&tool_name) {
+            contributor_order.push(tool_name.clone());
+        }
         grouped.insert(
-            "tool_instructions".to_owned(),
+            tool_name,
             ContextContributorSnapshot {
                 name: "tool_instructions".to_owned(),
                 role: "tool_schema".to_owned(),
@@ -974,12 +1530,102 @@ fn attributed_contributor_manifest(
             },
         );
     }
-    grouped.into_values().collect()
+    contributor_order
+        .into_iter()
+        .filter_map(|name| grouped.remove(&name))
+        .collect()
 }
 
 fn digest_bytes(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("sha256:{:x}", digest)
+}
+
+fn provider_message_digest(message: &ProviderMessage) -> String {
+    serialized_digest(message)
+}
+
+fn serialized_digest<T: Serialize + ?Sized>(value: &T) -> String {
+    let mut writer = DigestWriter(Sha256::new());
+    if serde_json::to_writer(&mut writer, value).is_err() {
+        return digest_bytes(&[]);
+    }
+    format!("sha256:{:x}", writer.0.finalize())
+}
+
+/// A serde sink that hashes serialized JSON without materializing a second
+/// message-sized `Vec<u8>` on the context hot path.
+struct DigestWriter(Sha256);
+
+impl Write for DigestWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Hash the provider-facing request without serializing internal tool policy
+/// fields. Length-delimited components make the identity deterministic while
+/// avoiding a second large JSON allocation for every streamed turn.
+fn canonical_provider_request_digest(
+    request: &ProviderRequest,
+    tool_schema_digests: &[String],
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"golutra-provider-request-v3\0");
+    digest_field(&mut digest, request.provider_id.as_bytes());
+    digest_field(&mut digest, request.model_id.as_bytes());
+    digest_field(
+        &mut digest,
+        format!("{:?}", request.cache_policy).as_bytes(),
+    );
+    digest_field(
+        &mut digest,
+        request
+            .session_id
+            .map(|id| id.to_string())
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    digest_field(&mut digest, request.task_id.to_string().as_bytes());
+    digest_field(&mut digest, request.turn_id.to_string().as_bytes());
+    for message in &request.messages {
+        digest_field(&mut digest, format!("{:?}", message.role).as_bytes());
+        digest_field(&mut digest, message.content.as_bytes());
+        digest_field(
+            &mut digest,
+            message
+                .tool_call_id
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        digest_field(
+            &mut digest,
+            message.tool_name.as_deref().unwrap_or_default().as_bytes(),
+        );
+        for call in &message.tool_calls {
+            digest_field(&mut digest, call.tool_call_id.as_bytes());
+            digest_field(&mut digest, call.tool_name.as_bytes());
+            let arguments = serde_json::to_vec(&call.arguments).unwrap_or_default();
+            digest_field(&mut digest, &arguments);
+        }
+        let metadata = serde_json::to_vec(&message.metadata).unwrap_or_default();
+        digest_field(&mut digest, &metadata);
+    }
+    for tool_digest in tool_schema_digests {
+        digest_field(&mut digest, tool_digest.as_bytes());
+    }
+    format!("sha256:{:x}", digest.finalize())
+}
+
+fn digest_field(digest: &mut Sha256, field: &[u8]) {
+    digest.update(u64::try_from(field.len()).unwrap_or(u64::MAX).to_le_bytes());
+    digest.update(field);
 }
 
 #[must_use]
@@ -991,7 +1637,20 @@ pub fn token_usage_record(
     usage: &ProviderUsage,
     cost_model: &str,
 ) -> TokenUsageRecord {
-    token_usage_record_with_cache_identity(
+    let fallback_estimates;
+    let message_estimates = if plan.message_estimates.len() == request.messages.len()
+        && plan.messages == request.messages
+    {
+        plan.message_estimates.as_slice()
+    } else {
+        fallback_estimates = request
+            .messages
+            .iter()
+            .map(estimate_message_token)
+            .collect::<Vec<_>>();
+        &fallback_estimates
+    };
+    token_usage_record_with_cache_identity_and_estimates(
         plan,
         request,
         response_event_id,
@@ -999,6 +1658,7 @@ pub fn token_usage_record(
         usage,
         cost_model,
         request.cache_identity(),
+        message_estimates,
     )
 }
 
@@ -1014,19 +1674,141 @@ pub fn token_usage_record_with_cache_identity(
     cost_model: &str,
     cache_identity: Option<CacheIdentity>,
 ) -> TokenUsageRecord {
-    let system_prompt_tokens = message_tokens(request, ProviderRole::System);
-    let user_message_tokens = message_tokens(request, ProviderRole::User);
-    let assistant_recent_tokens = message_tokens(request, ProviderRole::Assistant);
-    let tool_result_tokens = message_tokens(request, ProviderRole::Tool);
-    let message_sources = normalized_message_sources(&request.messages, &plan.message_sources);
+    let fallback_estimates;
+    let message_estimates = if plan.message_estimates.len() == request.messages.len()
+        && plan.messages == request.messages
+    {
+        plan.message_estimates.as_slice()
+    } else {
+        fallback_estimates = request
+            .messages
+            .iter()
+            .map(estimate_message_token)
+            .collect::<Vec<_>>();
+        &fallback_estimates
+    };
+    token_usage_record_with_cache_identity_and_estimates(
+        plan,
+        request,
+        response_event_id,
+        budget_snapshot,
+        usage,
+        cost_model,
+        cache_identity,
+        message_estimates,
+    )
+}
+
+/// Build usage attribution using message estimates already computed by the
+/// runtime. Keeping this as a separate entry point avoids rescanning every
+/// message for each budget, snapshot, and accounting view in one turn.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn token_usage_record_with_cache_identity_and_estimates(
+    plan: &ContextBuildPlan,
+    request: &ProviderRequest,
+    response_event_id: golutra_core::ProviderResponseId,
+    budget_snapshot: &TokenBudgetSnapshot,
+    usage: &ProviderUsage,
+    cost_model: &str,
+    cache_identity: Option<CacheIdentity>,
+    message_estimates: &[u64],
+) -> TokenUsageRecord {
     let tool_schema_digests = request
         .tools
         .iter()
-        .filter_map(|tool| serde_json::to_vec(&provider_tool_wire_projection(tool)).ok())
-        .map(|bytes| digest_bytes(&bytes))
+        .map(provider_tool_wire_digest)
         .collect::<Vec<_>>();
-    let contributor_manifest =
-        attributed_contributor_manifest(plan, request, &message_sources, &tool_schema_digests);
+    token_usage_record_with_cache_identity_and_estimates_and_tool_digests(
+        plan,
+        request,
+        response_event_id,
+        budget_snapshot,
+        usage,
+        cost_model,
+        cache_identity,
+        message_estimates,
+        &tool_schema_digests,
+    )
+}
+
+/// Build usage attribution with both message estimates and provider tool
+/// digests supplied by the caller. Runtime uses this path after preparing a
+/// stable tool set, so schema projection is not repeated for every provider
+/// response.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn token_usage_record_with_cache_identity_and_estimates_and_tool_digests(
+    plan: &ContextBuildPlan,
+    request: &ProviderRequest,
+    response_event_id: golutra_core::ProviderResponseId,
+    budget_snapshot: &TokenBudgetSnapshot,
+    usage: &ProviderUsage,
+    cost_model: &str,
+    cache_identity: Option<CacheIdentity>,
+    message_estimates: &[u64],
+    tool_schema_digests: &[String],
+) -> TokenUsageRecord {
+    let fallback_estimates;
+    let message_estimates = if message_estimates.len() == request.messages.len() {
+        message_estimates
+    } else {
+        fallback_estimates = request
+            .messages
+            .iter()
+            .map(estimate_message_token)
+            .collect::<Vec<_>>();
+        &fallback_estimates
+    };
+    let mut system_prompt_tokens = 0_u64;
+    let mut user_message_tokens = 0_u64;
+    let mut assistant_recent_tokens = 0_u64;
+    let mut tool_result_tokens = 0_u64;
+    for (index, message) in request.messages.iter().enumerate() {
+        let tokens = message_estimates[index];
+        match message.role {
+            ProviderRole::System => {
+                system_prompt_tokens = system_prompt_tokens.saturating_add(tokens)
+            }
+            ProviderRole::User => user_message_tokens = user_message_tokens.saturating_add(tokens),
+            ProviderRole::Assistant => {
+                assistant_recent_tokens = assistant_recent_tokens.saturating_add(tokens)
+            }
+            ProviderRole::Tool => tool_result_tokens = tool_result_tokens.saturating_add(tokens),
+        }
+    }
+    let normalized_sources;
+    let message_sources: &[ContextMessageSource] = if plan.message_sources.len()
+        == request.messages.len()
+    {
+        &plan.message_sources
+    } else {
+        normalized_sources = normalized_message_sources(&request.messages, &plan.message_sources);
+        &normalized_sources
+    };
+    let fallback_tool_schema_digests;
+    let tool_schema_digests = if tool_schema_digests.len() == request.tools.len() {
+        tool_schema_digests
+    } else {
+        fallback_tool_schema_digests = request
+            .tools
+            .iter()
+            .map(provider_tool_wire_digest)
+            .collect::<Vec<_>>();
+        &fallback_tool_schema_digests
+    };
+    let contributor_manifest = attributed_contributor_manifest_with_estimates(
+        plan,
+        request,
+        message_sources,
+        tool_schema_digests,
+        message_estimates,
+        if plan.messages == request.messages {
+            &plan.message_digests
+        } else {
+            &[]
+        },
+    );
     let attributed_input_tokens = usage.input_tokens.map(|actual| {
         proportional_token_attribution(
             actual,
@@ -1169,24 +1951,93 @@ fn proportional_token_attribution(actual: u64, weights: &[u64]) -> Vec<u64> {
 }
 
 pub fn estimate_message_tokens(messages: &[ProviderMessage]) -> u64 {
-    messages
-        .iter()
-        .map(|message| {
-            estimate_tokens(&message.content)
-                .saturating_add(
-                    message
-                        .tool_calls
-                        .iter()
-                        .map(|call| estimate_tokens(&call.arguments.to_string()))
-                        .sum::<u64>(),
-                )
-                .saturating_add(
-                    serde_json::to_string(&message.metadata)
-                        .map(|metadata| estimate_tokens(&metadata))
-                        .unwrap_or_default(),
-                )
-        })
-        .sum()
+    messages.iter().map(estimate_message_token).sum()
+}
+
+/// Return the estimated input size for a message list, replacing the prefix
+/// estimate with a provider-reported checkpoint when it still applies.
+#[must_use]
+pub fn context_tokens_with_observed_prefix(
+    messages: &[ProviderMessage],
+    message_estimates: &[u64],
+    planned_tool_tokens: u64,
+    observed_prefix: Option<ObservedContextPrefix>,
+) -> u64 {
+    let fallback_estimates;
+    let estimates = if message_estimates.len() == messages.len() {
+        message_estimates
+    } else {
+        fallback_estimates = messages
+            .iter()
+            .map(estimate_message_token)
+            .collect::<Vec<_>>();
+        &fallback_estimates
+    };
+    context_tokens_with_observed_prefix_and_total(
+        messages,
+        estimates,
+        sum_estimates(estimates),
+        planned_tool_tokens,
+        observed_prefix,
+    )
+}
+
+/// Fast variant for callers that maintain the running message total while
+/// appending messages.  A provider input checkpoint already includes the tool
+/// schema because it was measured on the complete request; adding
+/// `planned_tool_tokens` on that path would double-count it.
+#[must_use]
+pub fn context_tokens_with_observed_prefix_and_total(
+    messages: &[ProviderMessage],
+    message_estimates: &[u64],
+    total_message_tokens: u64,
+    planned_tool_tokens: u64,
+    observed_prefix: Option<ObservedContextPrefix>,
+) -> u64 {
+    let fallback_estimates;
+    let estimates = if message_estimates.len() == messages.len() {
+        message_estimates
+    } else {
+        fallback_estimates = messages
+            .iter()
+            .map(estimate_message_token)
+            .collect::<Vec<_>>();
+        &fallback_estimates
+    };
+    if let Some(observed) =
+        observed_prefix.filter(|observed| observed.message_count <= messages.len())
+    {
+        observed
+            .input_tokens
+            .saturating_add(sum_estimates(&estimates[observed.message_count..]))
+    } else {
+        total_message_tokens.saturating_add(planned_tool_tokens)
+    }
+}
+
+#[must_use]
+pub fn estimate_message_token(message: &ProviderMessage) -> u64 {
+    let metadata_tokens = if message.metadata.openai_responses_replay_items.is_empty() {
+        0
+    } else {
+        serde_json::to_string(&message.metadata)
+            .map(|metadata| estimate_tokens(&metadata))
+            .unwrap_or_default()
+    };
+    estimate_tokens(&message.content)
+        .saturating_add(
+            message
+                .tool_calls
+                .iter()
+                .map(|call| estimate_tokens(&call.arguments.to_string()))
+                .sum::<u64>(),
+        )
+        .saturating_add(metadata_tokens)
+}
+
+#[must_use]
+fn sum_estimates(estimates: &[u64]) -> u64 {
+    estimates.iter().copied().fold(0, u64::saturating_add)
 }
 
 fn message_groups(messages: &[ProviderMessage]) -> Vec<Range<usize>> {
@@ -1289,15 +2140,6 @@ fn truncate_to_tokens(value: &str, token_budget: u64) -> String {
     compact_text(value, token_budget)
 }
 
-fn message_tokens(request: &ProviderRequest, role: ProviderRole) -> u64 {
-    request
-        .messages
-        .iter()
-        .filter(|message| message.role == role)
-        .map(|message| estimate_tokens(&message.content))
-        .fold(0_u64, u64::saturating_add)
-}
-
 #[must_use]
 pub fn estimate_tokens(content: &str) -> u64 {
     content.chars().count().div_ceil(4) as u64
@@ -1306,8 +2148,115 @@ pub fn estimate_tokens(content: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use golutra_llm::{ProviderToolCall, UsageSource};
+    use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn stable_prefix_keeps_task_local_system_sources() {
+        let builder = ContextBuilder::default();
+        let messages = vec![
+            ProviderMessage {
+                role: ProviderRole::System,
+                content: "system".to_owned(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+                metadata: Default::default(),
+            },
+            ProviderMessage {
+                role: ProviderRole::System,
+                content: "environment".to_owned(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+                metadata: Default::default(),
+            },
+            ProviderMessage {
+                role: ProviderRole::System,
+                content: "skill metadata".to_owned(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+                metadata: Default::default(),
+            },
+            ProviderMessage {
+                role: ProviderRole::System,
+                content: "schema".to_owned(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+                metadata: Default::default(),
+            },
+        ];
+        let sources = vec![
+            ContextMessageSource {
+                contributor: "system".to_owned(),
+                source_refs: Vec::new(),
+                origin: "initial_contributor".to_owned(),
+                visibility: ModelInputVisibility::ModelVisible,
+            },
+            ContextMessageSource {
+                contributor: "environment_context".to_owned(),
+                source_refs: Vec::new(),
+                origin: "initial_contributor".to_owned(),
+                visibility: ModelInputVisibility::ModelVisible,
+            },
+            ContextMessageSource {
+                contributor: "project_skills".to_owned(),
+                source_refs: Vec::new(),
+                origin: "initial_contributor".to_owned(),
+                visibility: ModelInputVisibility::ModelVisible,
+            },
+            ContextMessageSource {
+                contributor: "output_schema".to_owned(),
+                source_refs: Vec::new(),
+                origin: "initial_contributor".to_owned(),
+                visibility: ModelInputVisibility::ModelVisible,
+            },
+        ];
+
+        // schema 与 skill 是任务级动态输入，不能切断可跨任务复用的静态前缀。
+        assert_eq!(builder.stable_prefix_len(&messages, &sources), 2);
+    }
+
+    #[test]
+    fn provider_tool_order_is_canonical() {
+        let task_id = TaskId::new();
+        let turn_id = TurnId::new();
+        let plan = ContextBuilder::default()
+            .build(task_id, turn_id, Vec::new())
+            .expect("context plan");
+        let tool = |name: &str| ToolContract {
+            tool_name: name.to_owned(),
+            input_schema: json!({"type": "object"}),
+            output_schema: json!({"type": "object"}),
+            error_schema: json!({"type": "object"}),
+            side_effect_type: golutra_core::SideEffectType::None,
+            idempotency_key_policy: "none".to_owned(),
+            timeout_policy: "bounded".to_owned(),
+            cancellation_policy: "cooperative".to_owned(),
+            retry_policy: "none".to_owned(),
+            artifact_policy: "none".to_owned(),
+            permission_policy_ref: None,
+        };
+        let request = provider_request_from_plan(
+            &plan,
+            task_id,
+            turn_id,
+            "mock",
+            "model",
+            vec![tool("shell"), tool("read_file")],
+        );
+        assert_eq!(
+            request
+                .tools
+                .iter()
+                .map(|tool| tool.tool_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read_file", "shell"]
+        );
+    }
 
     #[test]
     fn automatic_compaction_preserves_prefix_and_latest_tool_pair() {
@@ -1425,7 +2374,7 @@ mod tests {
     }
 
     #[test]
-    fn active_working_set_compacts_before_the_provider_hard_limit() {
+    fn compaction_uses_the_declared_provider_budget() {
         let turn_id = TurnId::new();
         let mut messages = vec![ProviderMessage {
             role: ProviderRole::System,
@@ -1458,13 +2407,12 @@ mod tests {
             });
         }
 
-        let manager = ContextWindowManager::new(96_000);
+        let manager = ContextWindowManager::new(16_384);
         let original_tokens = estimate_message_tokens(&messages);
-        assert!(original_tokens > DEFAULT_ACTIVE_CONTEXT_LIMIT);
-        assert!(original_tokens < 96_000);
+        assert!(original_tokens > 16_384);
         assert_eq!(
             manager.required_compaction_limit(1, &messages, 0),
-            Some(DEFAULT_ACTIVE_CONTEXT_LIMIT)
+            Some(16_384)
         );
 
         let record = manager
@@ -1472,11 +2420,85 @@ mod tests {
             .expect("working-set compaction")
             .expect("working set exceeded");
 
-        assert_eq!(record.budget_limit, 96_000);
-        assert_eq!(record.compaction_limit, DEFAULT_ACTIVE_CONTEXT_LIMIT);
-        assert_eq!(record.strategy, "active_working_set_summary_tail");
+        assert_eq!(record.budget_limit, 16_384);
+        assert_eq!(record.compaction_limit, 16_384);
+        assert_eq!(record.strategy, "protected_prefix_summary_tail");
         assert!(record.replacement_estimated_tokens <= record.target_input_tokens);
         assert!(record.replacement_estimated_tokens < original_tokens);
+    }
+
+    #[test]
+    fn observed_prefix_budget_does_not_double_count_tool_schema() {
+        let estimates = [8, 12, 20];
+        let messages = (0..estimates.len())
+            .map(|index| ProviderMessage {
+                role: ProviderRole::User,
+                content: format!("message-{index}"),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+                metadata: Default::default(),
+            })
+            .collect::<Vec<_>>();
+        let observed = ObservedContextPrefix {
+            message_count: 1,
+            // The provider count already includes the complete tool schema.
+            input_tokens: 100,
+        };
+
+        assert_eq!(
+            context_tokens_with_observed_prefix_and_total(
+                &messages,
+                &estimates,
+                estimates.iter().sum(),
+                40,
+                Some(observed),
+            ),
+            132,
+            "only messages appended after the checkpoint are estimated locally"
+        );
+        assert_eq!(
+            protected_context_tokens(2, &estimates, 40, Some(observed)),
+            112,
+            "the observed prefix carries the tool schema exactly once"
+        );
+    }
+
+    #[test]
+    fn observed_prefix_protection_uses_local_floor_when_checkpoint_is_smaller() {
+        let estimates = [30, 30, 30];
+        let observed = ObservedContextPrefix {
+            message_count: 3,
+            input_tokens: 40,
+        };
+
+        assert_eq!(
+            protected_context_tokens(1, &estimates, 20, Some(observed)),
+            50,
+            "a provider undercount must not reduce the local protected budget"
+        );
+    }
+
+    #[test]
+    fn context_message_prefix_digest_is_bounded_by_the_captured_plan() {
+        let plan = ContextBuilder::default()
+            .build(
+                TaskId::new(),
+                TurnId::new(),
+                vec![ContextContributor {
+                    name: "system".to_owned(),
+                    role: ProviderRole::System,
+                    content: "stable".to_owned(),
+                    token_budget_hint: 0,
+                    source_refs: Vec::new(),
+                }],
+            )
+            .expect("context plan");
+
+        let first = context_message_prefix_digest(&plan, 1).expect("prefix digest");
+        assert_eq!(first, context_message_prefix_digest(&plan, 1).unwrap());
+        assert_ne!(first, context_message_prefix_digest(&plan, 0).unwrap());
+        assert!(context_message_prefix_digest(&plan, 2).is_none());
     }
 
     #[test]
@@ -2032,7 +3054,19 @@ mod tests {
             },
         ];
 
-        let manifest = attributed_contributor_manifest(&plan, &request, &sources, &[]);
+        let message_estimates = request
+            .messages
+            .iter()
+            .map(estimate_message_token)
+            .collect::<Vec<_>>();
+        let manifest = attributed_contributor_manifest_with_estimates(
+            &plan,
+            &request,
+            &sources,
+            &[],
+            &message_estimates,
+            &[],
+        );
         let tool_results = manifest
             .iter()
             .find(|entry| entry.name == "tool_result_excerpt")

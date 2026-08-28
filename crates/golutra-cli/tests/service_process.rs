@@ -8,20 +8,20 @@ fn project_service_registry_is_stored_below_runtime_state() {
     let workspace = tempfile::tempdir().expect("workspace");
     let fake_bin = tempfile::tempdir().expect("fake bin");
     let fake_tmux = fake_bin.path().join("tmux");
-    let fake_state = home.path().join("fake-tmux-session");
     fs::write(
         &fake_tmux,
         r#"#!/bin/sh
+state="$TMUX_TMPDIR/fake-tmux-session"
 case "$1" in
   has-session)
-    if test -f "$FAKE_TMUX_STATE"; then
+    if test -f "$state"; then
       exit 0
     fi
     printf "can't find session: fake\n" >&2
     exit 1
     ;;
-  new-session) : > "$FAKE_TMUX_STATE" ;;
-  kill-session) rm -f "$FAKE_TMUX_STATE" ;;
+  new-session) : > "$state" ;;
+  kill-session) rm -f "$state" ;;
   capture-pane) printf 'fake service log\n' ;;
   *) exit 2 ;;
 esac
@@ -37,7 +37,7 @@ esac
 
     let output = Command::new(env!("CARGO_BIN_EXE_golutra-cli"))
         .env("GOLUTRA_HOME", home.path())
-        .env("FAKE_TMUX_STATE", &fake_state)
+        .env("TMUX_TMPDIR", home.path())
         .env("PATH", &path)
         .arg("--cwd")
         .arg(workspace.path())
@@ -62,7 +62,7 @@ esac
 
     let stop = Command::new(env!("CARGO_BIN_EXE_golutra-cli"))
         .env("GOLUTRA_HOME", home.path())
-        .env("FAKE_TMUX_STATE", &fake_state)
+        .env("TMUX_TMPDIR", home.path())
         .env("PATH", &path)
         .arg("--cwd")
         .arg(workspace.path())

@@ -1264,6 +1264,13 @@ async fn supervise_process(
     // lock. PID ownership was released immediately after child wait above.
     let _operation_guard = entry.operation.lock().await;
     *entry.stdin.lock().await = None;
+    // 在发布锁内再次锁存取消原因，覆盖 child.wait 与终态发布之间的竞态窗口。
+    if process_control.is_cancelled() {
+        entry.termination_intent.request(ProcessState::Terminated);
+    }
+    if task_cancellation.is_cancelled() || shutdown.is_cancelled() {
+        entry.termination_intent.request(ProcessState::Cancelled);
+    }
     // 必须在发布锁内读取原因，避免等待锁期间新到达的 terminate 请求被自然退出覆盖。
     let state = entry
         .termination_intent

@@ -1780,6 +1780,15 @@ impl RuntimeHost {
             .await?;
         }
 
+        // Provider auth/configuration may have changed without changing the
+        // task payload. Drop the route snapshot so the next turn observes the
+        // newly verified credential and endpoint immediately.
+        self.execution
+            .provider_route_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+
         let requested_id = provider_auth_request_id_from_payload(&command.payload)?;
         let pending = {
             let mut waiters = self.execution.provider_auth_waiters.lock().await;
@@ -2550,12 +2559,9 @@ impl RuntimeHost {
                 ),
             });
         }
-        let events = self
-            .storage
-            .repositories
-            .events
-            .load_recent(session_id, None, None, MAX_HISTORY_SOURCE_EVENTS)
-            .await?;
+        // 复用模型历史缓存，避免显式压缩把整个 session（含 telemetry）
+        // 一次性物化；缓存已保留最新压缩边界和有界的对话尾部。
+        let events = self.cached_history_events(session_id).await?;
         let explicit_compaction = self
             .storage
             .repositories

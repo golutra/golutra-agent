@@ -332,16 +332,19 @@ impl OpenAiResponsesProvider {
         request: &ProviderRequest,
         on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
     ) -> Result<ProviderResponse, ProviderError> {
+        // The request shape and cache options do not depend on credentials.
+        // Reuse them across a 401 refresh so retries spend their time on the
+        // network instead of rebuilding the full message/tool projection.
+        let chat_request = genai_chat_request(request, ProviderProtocol::OpenAiResponses)?;
         let mut force_refresh = false;
         loop {
             let (token, account_id) = self.resolve_credential(force_refresh).await?;
-            let chat_request = genai_chat_request(request, ProviderProtocol::OpenAiResponses)?;
             let options = self.chat_options(request, account_id.as_deref())?;
             let response = match self
                 .client
                 .exec_chat_stream(
                     self.service_target(token.expose_secret()),
-                    chat_request,
+                    chat_request.clone(),
                     Some(&options),
                 )
                 .await

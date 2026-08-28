@@ -7,6 +7,30 @@ use tokio::{runtime::Handle, task::JoinHandle};
 const ABNORMAL_RECORDER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const HOST_SHUTDOWN_GRACE_TIMEOUT: Duration = Duration::from_millis(250);
 const BACKGROUND_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const MEMORY_CANDIDATE_MIN: usize = 8;
+const MEMORY_CANDIDATE_MAX: usize = 64;
+const HISTORY_CACHE_PAGE_SIZE: u32 = 512;
+
+fn context_budget_share(budget: u64, numerator: u64, denominator: u64) -> u64 {
+    if budget == u64::MAX {
+        return u64::MAX;
+    }
+    budget
+        .saturating_mul(numerator)
+        .saturating_div(denominator.max(1))
+}
+
+fn memory_candidate_limit(context_budget: u64) -> usize {
+    if context_budget == 0 {
+        return 0;
+    }
+    if context_budget == u64::MAX {
+        return MEMORY_CANDIDATE_MAX;
+    }
+    usize::try_from(context_budget.saturating_div(32))
+        .unwrap_or(MEMORY_CANDIDATE_MAX)
+        .clamp(MEMORY_CANDIDATE_MIN, MEMORY_CANDIDATE_MAX)
+}
 
 struct AbortOnDropJoinHandle<T> {
     handle: Option<JoinHandle<T>>,
@@ -309,12 +333,31 @@ impl Drop for HostedObservationRecorder {
 }
 
 impl RuntimeHost {
+    #[cfg(test)]
     pub(super) async fn context_contributors_for_task(
         &self,
         session_id: SessionId,
         current_task_id: TaskId,
         objective: String,
         output_schema: Option<&Value>,
+    ) -> Result<Vec<ContextContributor>, ClientError> {
+        self.context_contributors_for_task_with_budget(
+            session_id,
+            current_task_id,
+            objective,
+            output_schema,
+            u64::MAX,
+        )
+        .await
+    }
+
+    pub(super) async fn context_contributors_for_task_with_budget(
+        &self,
+        session_id: SessionId,
+        current_task_id: TaskId,
+        objective: String,
+        output_schema: Option<&Value>,
+        context_budget: u64,
     ) -> Result<Vec<ContextContributor>, ClientError> {
         let workspace_root = self.execution_workspace_root()?;
         let mut contributors = vec![ContextContributor {
@@ -331,8 +374,11 @@ impl RuntimeHost {
             token_budget_hint: 128,
             source_refs: vec![format!("workspace:{}", workspace_root.display())],
         });
-        let project_instructions = load_project_instruction_bundle(&workspace_root);
-        let skill_context = self.active_skill_context(&objective);
+        let project_instructions = self.cached_project_instruction_bundle(&workspace_root);
+        let skill_context = self.active_skill_context_with_budget(
+            &objective,
+            context_budget_share(context_budget, 1, 8),
+        );
         let (project_instructions, skill_context) =
             tokio::join!(project_instructions, skill_context);
         if let Some(project_instructions) = project_instructions? {
@@ -344,57 +390,71 @@ impl RuntimeHost {
                 source_refs: project_instructions.source_refs,
             });
         }
-        if let Some(skill_context) = skill_context? {
-            contributors.push(ContextContributor {
-                name: "project_skills".to_owned(),
-                role: ProviderRole::System,
-                content: skill_context,
-                token_budget_hint: 1_024,
-                source_refs: vec!["runtime:active_skills".to_owned()],
-            });
-        }
 
         // 两路查询都只读已有 durable 状态，可以并发执行；MemoryRetrieved 事件仍在
         // 检索完成后按原顺序写入，避免把有副作用的计数更新移到错误边界之外。
         let memory_store = self.storage.memory_store.clone();
         let memory_query = objective.clone();
+        let memory_limit = memory_candidate_limit(context_budget_share(context_budget, 1, 8));
         let memories = async move {
-            run_blocking(move || memory_store.retrieve(&memory_query, MemoryScope::Project, 5))
-                .await?
-                .map_err(ClientError::from)
+            run_blocking(move || {
+                memory_store.retrieve(&memory_query, MemoryScope::Project, memory_limit)
+            })
+            .await?
+            .map_err(ClientError::from)
         };
-        let history = self.conversation_history_summary(session_id, current_task_id);
+        let history = self.conversation_history_projection(
+            session_id,
+            current_task_id,
+            context_budget_share(context_budget, 2, 5),
+        );
         let (memories, history) = tokio::join!(memories, history);
         let memories = memories?;
-        let memories = select_memories_for_context(memories);
-        self.record_event(host_event(
-            self.next_sequence_no(),
-            session_id,
-            Some(current_task_id),
-            RuntimeEventType::MemoryRetrieved,
-            RuntimeEventSource::Memory,
-            json!({
-                "summary": format!("retrieved {} project memories", memories.len()),
-                "scope": "project",
-                // durable event 只保留可审计的索引元数据，记忆正文仍只进入当前模型上下文。
-                "retrieved": memories.iter().map(|memory| json!({
-                    "memory_id": memory.record.memory_id,
-                    "relevance_score": memory.relevance_score,
-                    "scope": memory.record.scope,
-                    "confidence": memory.record.confidence,
-                    "source_task_id": memory.record.source_task_id,
-                    "evidence_ids": memory.record.evidence_ids,
-                    "matched_term_count": memory.matched_terms.len(),
-                })).collect::<Vec<_>>(),
-            }),
-        ))
-        .await?;
+        let memories = select_memories_for_context_with_budget(
+            memories,
+            context_budget_share(context_budget, 1, 8),
+        );
+        let history = history?;
+        // 没有命中时不写空的 durable 事件。空检索是正常路径，绕过 SQLite、
+        // rollout 和通知写入可以把首个 provider 请求留在纯读取热路径上。
+        if !memories.is_empty() {
+            self.record_event(host_event(
+                self.next_sequence_no(),
+                session_id,
+                Some(current_task_id),
+                RuntimeEventType::MemoryRetrieved,
+                RuntimeEventSource::Memory,
+                json!({
+                    "summary": format!("retrieved {} project memories", memories.len()),
+                    "scope": "project",
+                    // durable event 只保留可审计的索引元数据，记忆正文仍只进入当前模型上下文。
+                    "retrieved": memories.iter().map(|memory| json!({
+                        "memory_id": memory.record.memory_id,
+                        "relevance_score": memory.relevance_score,
+                        "scope": memory.record.scope,
+                        "confidence": memory.record.confidence,
+                        "source_task_id": memory.record.source_task_id,
+                        "evidence_ids": memory.record.evidence_ids,
+                        "matched_term_count": memory.matched_terms.len(),
+                    })).collect::<Vec<_>>(),
+                }),
+            ))
+            .await?;
+        }
+        // 历史是会话中唯一持续增长的前缀；放在每任务变化的 memory 之前，
+        // 让 provider 可以复用从 system/project 到历史的连续 cache prefix。
+        contributors.extend(history);
         if !memories.is_empty() {
             contributors.push(ContextContributor {
                 name: "memory".to_owned(),
-                role: ProviderRole::System,
-                content: memory_context(&memories),
-                token_budget_hint: 512,
+                // memory 是每个任务变化的证据，把它放在 user context，避免
+                // rust-genai 将动态内容拼进静态 system prompt，破坏前缀缓存。
+                role: ProviderRole::User,
+                content: memory_context_with_budget(
+                    &memories,
+                    context_budget_share(context_budget, 1, 8),
+                ),
+                token_budget_hint: 0,
                 source_refs: memories
                     .iter()
                     .map(|memory| format!("memory:{}", memory.record.memory_id))
@@ -402,101 +462,314 @@ impl RuntimeHost {
             });
         }
 
-        if let Some((history, source_refs)) = history? {
-            contributors.push(ContextContributor {
-                name: "conversation_history".to_owned(),
-                role: ProviderRole::User,
-                content: history,
-                token_budget_hint: 1024,
-                source_refs,
-            });
-        }
-
-        if let Some(output_schema) = output_schema.filter(|value| !value.is_null()) {
-            let schema = serde_json::to_string(output_schema)?;
-            contributors.push(ContextContributor {
-                name: "output_schema".to_owned(),
-                role: ProviderRole::System,
-                content: format!(
-                    "The final assistant response must contain only JSON that validates against this JSON Schema. Do not wrap it in Markdown:\n{schema}"
-                ),
-                token_budget_hint: 1_024,
-                source_refs: vec![format!("task:{current_task_id}:output_schema")],
-            });
-        }
-
         contributors.push(ContextContributor {
             name: "objective".to_owned(),
             role: ProviderRole::User,
             content: objective,
-            token_budget_hint: 512,
+            token_budget_hint: 0,
             source_refs: vec![format!("task:{current_task_id}:objective")],
         });
+
+        // Skill selection depends on the objective. Keep it in the dynamic
+        // user segment so the stable system/project prefix remains reusable
+        // across unrelated tasks.
+        if let Some(skill_context) = skill_context? {
+            contributors.push(ContextContributor {
+                name: "project_skills".to_owned(),
+                role: ProviderRole::User,
+                content: skill_context,
+                token_budget_hint: 1_024,
+                source_refs: vec!["runtime:active_skills".to_owned()],
+            });
+        }
+
+        // The schema is task-local. Keep it beside the objective in the
+        // dynamic user segment so a schema change does not invalidate the
+        // reusable system/project prefix for subsequent turns.
+        if let Some(output_schema) = output_schema.filter(|value| !value.is_null()) {
+            let schema = serde_json::to_string(output_schema)?;
+            contributors.push(ContextContributor {
+                name: "output_schema".to_owned(),
+                role: ProviderRole::User,
+                content: format!(
+                    "The final assistant response must contain only JSON that validates against this JSON Schema. Do not wrap it in Markdown:\n{schema}"
+                ),
+                token_budget_hint: 0,
+                source_refs: vec![format!("task:{current_task_id}:output_schema")],
+            });
+        }
 
         Ok(contributors)
     }
 
-    pub(super) async fn conversation_history_summary(
+    async fn cached_project_instruction_bundle(
+        &self,
+        workspace_root: &Path,
+    ) -> Result<Option<ProjectInstructionBundle>, ClientError> {
+        let canonical_root = workspace_root
+            .canonicalize()
+            .map_err(|error| ClientError::Io(format!("{}: {error}", workspace_root.display())))?;
+        if let Some(bundle) = self
+            .execution
+            .context_resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .project_instructions
+            .as_ref()
+            .filter(|cached| {
+                cached.root == canonical_root
+                    && cached.checked_at.elapsed()
+                        < super::context::PROJECT_INSTRUCTIONS_REFRESH_INTERVAL
+            })
+            .map(|cached| cached.bundle.clone())
+        {
+            return Ok(bundle);
+        }
+        let (_, fingerprint) = project_instruction_fingerprint(&canonical_root).await?;
+        if let Some(cached) = self
+            .execution
+            .context_resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .project_instructions
+            .as_ref()
+            .filter(|cached| cached.root == canonical_root && cached.fingerprint == fingerprint)
+            .cloned()
+        {
+            return Ok(cached.bundle);
+        }
+        let bundle = load_project_instruction_bundle(&canonical_root).await?;
+        self.execution
+            .context_resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .project_instructions = Some(CachedProjectInstructions {
+            root: canonical_root,
+            fingerprint,
+            bundle: bundle.clone(),
+            checked_at: Instant::now(),
+        });
+        Ok(bundle)
+    }
+
+    /// Read the session tree from newest to oldest until the token budget is
+    /// covered. Durable history facts are incrementally cached per session;
+    /// retention is still decided by message tokens and the latest compaction
+    /// boundary, so the cache never changes the provider-visible policy.
+    async fn conversation_history_projection(
         &self,
         session_id: SessionId,
         current_task_id: TaskId,
-    ) -> Result<Option<(String, Vec<String>)>, ClientError> {
-        // 两个查询必须读取同一条时间线；串行化可避免压缩事件与历史事件来自不同
-        // SQLite 快照，进而造成重复/遗漏并使后续 cache 前缀不稳定。
-        let events = self
-            .storage
-            .repositories
-            .events
-            .load_recent(session_id, None, None, MAX_HISTORY_SOURCE_EVENTS)
-            .await?;
-        let context_compaction = self
-            .storage
-            .repositories
-            .events
-            .latest_context_compaction(session_id)
-            .await?
-            .as_ref()
-            .and_then(context_compaction_from_event);
-        let compacted_after = context_compaction
+        token_budget: u64,
+    ) -> Result<Vec<ContextContributor>, ClientError> {
+        let cached_events = self.cached_history_events(session_id).await?;
+        let compaction = self
+            .execution
+            .context_resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .history_compaction(session_id)
+            .or_else(|| {
+                cached_events
+                    .iter()
+                    .rev()
+                    .find_map(context_compaction_from_event)
+            });
+        let compacted_after = compaction
             .as_ref()
             .map(|(sequence_no, _)| *sequence_no)
             .unwrap_or_default();
-        let summary_source_ref = context_compaction
-            .as_ref()
-            .map(|(sequence_no, _)| format!("event-sequence:{sequence_no}"));
-        let summary_line = context_compaction.map(|(_, content)| format!("Summary: {content}"));
-        let history_events = effective_model_history_events(events.iter().filter(|event| {
-            event.sequence_no > compacted_after
-                && event.task_id != Some(current_task_id)
-                && matches!(
-                    event.event_type,
-                    RuntimeEventType::TaskCreated
-                        | RuntimeEventType::TurnQueued
-                        | RuntimeEventType::TurnUpdated
-                        | RuntimeEventType::AssistantMessage
-                )
-        }));
-        let lines = history_events
-            .iter()
-            .filter_map(|event| conversation_history_line(event))
-            .collect::<Vec<_>>();
+        let mut contributors = Vec::new();
+        let summary_budget = if token_budget == u64::MAX {
+            u64::MAX
+        } else {
+            token_budget.saturating_div(4)
+        };
+        let history_budget = if token_budget == u64::MAX {
+            u64::MAX
+        } else {
+            token_budget.saturating_sub(summary_budget)
+        };
+        if let Some((sequence_no, summary)) = compaction {
+            let summary = truncate_to_token_budget(&summary, summary_budget);
+            if !summary.is_empty() {
+                contributors.push(ContextContributor {
+                    name: "working_summary".to_owned(),
+                    role: ProviderRole::User,
+                    content: summary,
+                    token_budget_hint: 0,
+                    source_refs: vec![format!("event-sequence:{sequence_no}")],
+                });
+            }
+        }
+        let history = {
+            let facts = self
+                .execution
+                .context_resources
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .history_facts(session_id);
+            if let Some(facts) = facts {
+                let history_facts = facts.iter().filter(|fact| {
+                    fact.sequence_no > compacted_after && fact.task_id != Some(current_task_id)
+                });
+                history_contributors_from_cached_facts(history_facts, history_budget)
+            } else {
+                // Cache eviction is unusual, but falling back to the durable
+                // event projector keeps context assembly correct under pressure.
+                let history_events = cached_events.iter().filter(|event| {
+                    event.sequence_no > compacted_after && event.task_id != Some(current_task_id)
+                });
+                history_contributors_with_budget(history_events, history_budget)
+            }
+        };
+        contributors.extend(history);
+        Ok(contributors)
+    }
 
-        if summary_line.is_none() && lines.is_empty() {
-            return Ok(None);
+    /// Load model-history facts once and append only newly committed session
+    /// events on later turns. A global sequence check also catches updates
+    /// written by another runtime process without rescanning every page.
+    pub(super) async fn cached_history_events(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Arc<Vec<RuntimeEvent>>, ClientError> {
+        let events_repository = self.storage.repositories.events.clone();
+        let cached = self
+            .execution
+            .context_resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .history(session_id);
+
+        if let Some(entry) = cached.as_ref()
+            && !ContextResourceCache::history_refresh_due(entry)
+        {
+            return Ok(Arc::clone(&entry.events));
+            // The cursor is checked below only after the short refresh window.
         }
 
-        let mut source_refs = history_events
+        let session_sequence = events_repository
+            .max_sequence_for_session(session_id)
+            .await?;
+        if let Some(entry) = cached.as_ref()
+            && session_sequence == entry.last_session_sequence
+        {
+            let mut resources = self
+                .execution
+                .context_resources
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(events) = resources.mark_history_checked(session_id) {
+                return Ok(events);
+            }
+            // The entry was evicted while SQLite was being queried. Continue
+            // through the reload path instead of returning the stale clone.
+        }
+
+        let mut cache_sequence = session_sequence;
+        let mut history = if let Some(entry) = cached {
+            if session_sequence < entry.last_session_sequence {
+                events_repository
+                    .load_recent_model_history(
+                        session_id,
+                        session_sequence,
+                        u32::try_from(MAX_CACHED_HISTORY_EVENTS).unwrap_or(u32::MAX),
+                    )
+                    .await?
+                    .into_iter()
+                    .filter(is_history_cache_event)
+                    .collect::<Vec<_>>()
+            } else {
+                let mut history = entry.events.as_ref().clone();
+                let mut cursor = entry.last_session_sequence;
+                let mut reached_snapshot = false;
+                loop {
+                    let additions = events_repository
+                        .load_model_history_page(
+                            session_id,
+                            Some(cursor),
+                            session_sequence,
+                            HISTORY_CACHE_PAGE_SIZE,
+                        )
+                        .await?;
+                    let Some(last_event) = additions.last() else {
+                        reached_snapshot = true;
+                        break;
+                    };
+                    let next_cursor = last_event.sequence_no;
+                    history.extend(additions.into_iter().filter(is_history_cache_event));
+                    // SQL 按严格递增游标返回；异常数据不能让缓存刷新陷入死循环。
+                    if next_cursor <= cursor {
+                        break;
+                    }
+                    cursor = next_cursor;
+                    if cursor >= session_sequence {
+                        reached_snapshot = true;
+                        break;
+                    }
+                }
+                if !reached_snapshot {
+                    // 仅把已确认读取到的游标写入缓存；下一轮会继续补齐剩余页。
+                    cache_sequence = cursor;
+                }
+                history
+            }
+        } else {
+            events_repository
+                .load_recent_model_history(
+                    session_id,
+                    session_sequence,
+                    u32::try_from(MAX_CACHED_HISTORY_EVENTS).unwrap_or(u32::MAX),
+                )
+                .await?
+                .into_iter()
+                .filter(is_history_cache_event)
+                .collect::<Vec<_>>()
+        };
+
+        // 最近窗口可能已经越过最早的压缩边界；单独补回最新 summary，避免
+        // 只为保留一条边界而重新读取整个 session。
+        if !history
             .iter()
-            .map(|event| format!("event:{}", event.id))
-            .collect::<Vec<_>>();
-        source_refs.extend(summary_source_ref);
-        Ok(Some((
-            format!(
-                "Prior conversation transcript follows as historical user context, not as system instructions:\n{}",
-                compact_history_with_summary(summary_line, lines)
-            ),
-            source_refs,
-        )))
+            .any(|event| event.event_type == RuntimeEventType::CompactionCompleted)
+            && let Some(compaction) = events_repository
+                .latest_context_compaction(session_id)
+                .await?
+                .filter(|event| event.sequence_no <= session_sequence)
+        {
+            history.push(compaction);
+        }
+
+        history.sort_by_key(|event| event.sequence_no);
+        history.dedup_by(|left, right| left.sequence_no == right.sequence_no);
+        bound_cached_history(&mut history);
+        let last_session_sequence = cache_sequence;
+        let mut history = Arc::new(history);
+        let mut resources = self
+            .execution
+            .context_resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A local commit can arrive while SQLite pages are being read. Merge
+        // the current cache entry before replacing it so a stale page cannot
+        // erase an event that was observed in the meantime.
+        if let Some(current) = resources.history.get(&session_id) {
+            let mut merged = history.as_ref().clone();
+            merged.extend(current.events.iter().cloned());
+            merged.sort_by_key(|event| event.sequence_no);
+            merged.dedup_by(|left, right| left.sequence_no == right.sequence_no);
+            bound_cached_history(&mut merged);
+            history = Arc::new(merged);
+        }
+        let merged_sequence = resources
+            .history
+            .get(&session_id)
+            .map_or(last_session_sequence, |current| {
+                current.last_session_sequence.max(last_session_sequence)
+            });
+        resources.insert_history(session_id, Arc::clone(&history), merged_sequence);
+        Ok(history)
     }
 
     pub(super) fn next_sequence_no(&self) -> u64 {
@@ -884,6 +1157,7 @@ impl RuntimeHost {
             context_builder,
             provider_session_policy,
         } = provider_plan;
+        let context_budget = context_builder.budget_limit();
         let legacy_task = LegacyTaskAdapter::new(&task.payload, &objective);
         if !has_explicit_task_contract && should_apply_legacy_adapter(&task.payload, execution_mode)
         {
@@ -913,11 +1187,12 @@ impl RuntimeHost {
             None => harness,
         };
         let contributors = self
-            .context_contributors_for_task(
+            .context_contributors_for_task_with_budget(
                 task.session_id,
                 task.task_id,
                 objective.clone(),
                 task.payload.get("output_schema"),
+                context_budget,
             )
             .await?;
         let trace_recorder = HostedObservationRecorder::spawn(self.clone(), task.clone());
@@ -1045,8 +1320,17 @@ impl RuntimeHost {
                 let provider_config_paths = self.provider_config_paths.clone();
                 let payload = task.payload.clone();
                 let objective = objective.to_owned();
+                let provider_route_cache = Arc::clone(&self.execution.provider_route_cache);
                 run_blocking(move || {
-                    mock_provider_plan(provider_config_paths.as_ref(), &payload, &objective)
+                    let mut cache = provider_route_cache
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    cached_mock_provider_plan(
+                        &mut cache,
+                        provider_config_paths.as_ref(),
+                        &payload,
+                        &objective,
+                    )
                 })
                 .await?
             };

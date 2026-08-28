@@ -1,4 +1,12 @@
-use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap, VecDeque},
+    fmt,
+    sync::{
+        Arc, OnceLock, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
@@ -13,6 +21,7 @@ use reqwest::header::HeaderMap;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 mod genai_adapter;
@@ -191,12 +200,17 @@ impl ProviderRequest {
             namespace.trim(),
         );
         use sha2::{Digest, Sha256};
+        // OpenAI-compatible gateways (and Pi) cap prompt cache keys at 64
+        // characters.  Keep a 256-bit-derived key while reserving the limit
+        // for the wire protocol; truncating the hex digest still leaves more
+        // than enough collision resistance for a session-affinity key.
+        let digest = format!("{:x}", Sha256::digest(prefix.as_bytes()));
         Some(CacheIdentity {
             session_id,
             thread_id: None,
             provider_id: canonical_provider,
             model_id: canonical_model,
-            key: format!("sha256:{:x}", Sha256::digest(prefix.as_bytes())),
+            key: format!("sha256:{}", &digest[..57]),
         })
     }
 
@@ -1652,7 +1666,7 @@ fn openai_message(message: &ProviderMessage) -> Value {
         value["tool_call_id"] = Value::String(tool_call_id.clone());
     }
     if let Some(tool_name) = &message.tool_name {
-        value["name"] = Value::String(tool_name.clone());
+        value["name"] = Value::String(provider_tool_wire_name(tool_name));
     }
     if !message.tool_calls.is_empty() {
         value["tool_calls"] = Value::Array(
@@ -1671,7 +1685,7 @@ fn openai_assistant_tool_call(tool_call: &ProviderToolCall) -> Value {
         "id": tool_call.tool_call_id,
         "type": "function",
         "function": {
-            "name": tool_call.tool_name,
+            "name": provider_tool_wire_name(&tool_call.tool_name),
             "arguments": tool_call.arguments.to_string(),
         }
     })
@@ -1773,6 +1787,28 @@ pub fn provider_tool_description(tool_name: &str) -> &'static str {
     }
 }
 
+/// Names used in provider tool payloads. `web_search` is an internal runtime
+/// capability name, while several OpenAI-compatible adapters reserve that
+/// literal for a native tool. Keeping the alias here makes projection,
+/// accounting, and every transport share one wire representation.
+pub(crate) const WEB_SEARCH_WIRE_ALIAS: &str = "golutra_web_search";
+
+pub(crate) fn provider_tool_wire_name(name: &str) -> String {
+    if name == "web_search" {
+        WEB_SEARCH_WIRE_ALIAS.to_owned()
+    } else {
+        name.to_owned()
+    }
+}
+
+pub(crate) fn restore_provider_tool_wire_name(name: &str) -> String {
+    if name == WEB_SEARCH_WIRE_ALIAS {
+        "web_search".to_owned()
+    } else {
+        name.to_owned()
+    }
+}
+
 // 发送给模型的 schema 只保留表达调用结构和必要语义的字段；长度、范围和格式等边界
 // 仍由 runtime 使用原始 ToolContract 校验。保留紧凑的参数描述，避免压缩输入时损伤
 // 模型对 shell、子代理等高风险参数的使用判断。
@@ -1870,7 +1906,253 @@ fn project_provider_schema_value(value: &Value) -> Value {
 /// 会保留，确保 strict Responses 工具继续满足 provider 的契约。
 #[must_use]
 pub fn provider_tool_schema_projection(schema: &Value) -> Value {
-    project_provider_schema_value(schema)
+    canonicalize_json(&project_provider_schema_value(schema))
+}
+
+const PROVIDER_TOOL_PROJECTION_CACHE_CAPACITY: usize = 128;
+
+static PROVIDER_TOOL_PROJECTION_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static PROVIDER_TOOL_PROJECTION_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug)]
+struct CachedProviderToolProjection {
+    schema: Value,
+    wire: Value,
+    digest: String,
+    token_count: u64,
+}
+
+#[derive(Debug, Default)]
+struct ProviderToolProjectionCache {
+    entries: HashMap<ProviderToolProjectionCacheKey, Arc<CachedProviderToolProjection>>,
+    order: VecDeque<ProviderToolProjectionCacheKey>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ProviderToolProjectionCacheKey([u8; 32]);
+
+static PROVIDER_TOOL_PROJECTION_CACHE: OnceLock<RwLock<ProviderToolProjectionCache>> =
+    OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderToolProjectionCacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub entries: usize,
+}
+
+fn provider_tool_projection_cache() -> &'static RwLock<ProviderToolProjectionCache> {
+    PROVIDER_TOOL_PROJECTION_CACHE
+        .get_or_init(|| RwLock::new(ProviderToolProjectionCache::default()))
+}
+
+fn provider_tool_projection_cache_key(
+    contract: &ToolContract,
+    canonical_schema_digest: &[u8; 32],
+) -> ProviderToolProjectionCacheKey {
+    // Registry contracts are immutable during a turn. Hashing the canonical
+    // tree directly keeps equivalent map insertion orders together while
+    // avoiding a full normalized JSON allocation on every cache hit.
+    let wire_name = provider_tool_wire_name(&contract.tool_name);
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"provider-tool-projection-v4\0");
+    bytes.extend_from_slice(wire_name.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(provider_tool_description(&contract.tool_name).as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(canonical_schema_digest);
+    let digest = Sha256::digest(bytes);
+    let mut key = [0_u8; 32];
+    key.copy_from_slice(&digest);
+    ProviderToolProjectionCacheKey(key)
+}
+
+fn cached_provider_tool_projection(contract: &ToolContract) -> Arc<CachedProviderToolProjection> {
+    // This digest is deliberately cheaper than canonicalization: cache hits
+    // only walk the source tree and never allocate a second JSON value.
+    let canonical_schema_digest = canonical_json_digest(&contract.input_schema);
+    let key = provider_tool_projection_cache_key(contract, &canonical_schema_digest);
+    let cache = provider_tool_projection_cache();
+    {
+        let mut cache = cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = cache.entries.get(&key).cloned() {
+            // Keep the deque as a true access-order list. A plain insertion
+            // order silently turns the bounded cache into FIFO under load.
+            cache.order.retain(|candidate| candidate != &key);
+            cache.order.push_back(key);
+            PROVIDER_TOOL_PROJECTION_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+            return entry;
+        }
+    }
+
+    PROVIDER_TOOL_PROJECTION_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+
+    // JSON 对象顺序不影响 schema 语义，但会影响 provider 的字节前缀；
+    // 统一排序后，等价的工具定义共享同一份投影和缓存身份。
+    let canonical_schema = canonicalize_json(&contract.input_schema);
+    let schema = project_provider_schema_value(&canonical_schema);
+    let wire = json!({
+        "type": "function",
+        "function": {
+            "name": provider_tool_wire_name(&contract.tool_name),
+            "description": provider_tool_description(&contract.tool_name),
+            "parameters": schema
+        }
+    });
+    let serialized = serde_json::to_string(&wire).unwrap_or_default();
+    let entry = Arc::new(CachedProviderToolProjection {
+        schema: wire
+            .get("function")
+            .and_then(Value::as_object)
+            .and_then(|function| function.get("parameters"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        digest: format!("sha256:{:x}", Sha256::digest(serialized.as_bytes())),
+        token_count: serialized.chars().count().div_ceil(4) as u64,
+        wire,
+    });
+
+    let mut cache = cache
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(existing) = cache.entries.get(&key).cloned() {
+        cache.order.retain(|candidate| candidate != &key);
+        cache.order.push_back(key);
+        return existing;
+    }
+    cache.entries.insert(key, Arc::clone(&entry));
+    cache.order.push_back(key);
+    while cache.entries.len() > PROVIDER_TOOL_PROJECTION_CACHE_CAPACITY {
+        let Some(oldest) = cache.order.pop_front() else {
+            break;
+        };
+        // A stale deque entry should never evict a newer value with the same
+        // key. This guard also repairs the order if a future caller changes
+        // insertion behavior.
+        if cache.entries.remove(&oldest).is_none() {
+            continue;
+        }
+    }
+    entry
+}
+
+/// Compute a canonical JSON digest without materializing a sorted clone. The
+/// output is only a cache identity; provider wire values are still built from
+/// `canonicalize_json` on a miss so their existing ordering contract remains.
+fn canonical_json_digest(value: &Value) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    canonical_json_digest_into(value, &mut digest);
+    let finalized = digest.finalize();
+    let mut result = [0_u8; 32];
+    result.copy_from_slice(&finalized);
+    result
+}
+
+fn canonical_json_digest_into(value: &Value, digest: &mut Sha256) {
+    match value {
+        Value::Null => digest.update(b"n"),
+        Value::Bool(value) => {
+            digest.update(b"b");
+            digest.update([u8::from(*value)]);
+        }
+        Value::Number(value) => {
+            digest.update(b"d");
+            digest_field_bytes(digest, value.to_string().as_bytes());
+        }
+        Value::String(value) => {
+            digest.update(b"s");
+            digest_field_bytes(digest, value.as_bytes());
+        }
+        Value::Array(values) => {
+            digest.update(b"a");
+            digest.update((values.len() as u64).to_le_bytes());
+            for value in values {
+                canonical_json_digest_into(value, digest);
+            }
+        }
+        Value::Object(object) => {
+            digest.update(b"o");
+            digest.update((object.len() as u64).to_le_bytes());
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            for key in keys {
+                digest_field_bytes(digest, key.as_bytes());
+                // The key was collected from this object, so the lookup is
+                // infallible unless the map is concurrently mutated (which a
+                // serde_json::Value reference does not permit).
+                if let Some(child) = object.get(key) {
+                    canonical_json_digest_into(child, digest);
+                }
+            }
+        }
+    }
+}
+
+fn digest_field_bytes(digest: &mut Sha256, field: &[u8]) {
+    digest.update((field.len() as u64).to_le_bytes());
+    digest.update(field);
+}
+
+/// Return inexpensive process-local cache counters for diagnostics and
+/// benchmark reports.  The cache itself remains bounded and private.
+#[must_use]
+pub fn provider_tool_projection_cache_stats() -> ProviderToolProjectionCacheStats {
+    let entries = provider_tool_projection_cache()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entries
+        .len();
+    ProviderToolProjectionCacheStats {
+        hits: PROVIDER_TOOL_PROJECTION_CACHE_HITS.load(Ordering::Relaxed),
+        misses: PROVIDER_TOOL_PROJECTION_CACHE_MISSES.load(Ordering::Relaxed),
+        entries,
+    }
+}
+
+fn canonicalize_json(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut entries = object.iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(right.0));
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, child)| (key.clone(), canonicalize_json(child)))
+                    .collect(),
+            )
+        }
+        Value::Array(values) => Value::Array(values.iter().map(canonicalize_json).collect()),
+        _ => value.clone(),
+    }
+}
+
+/// Return the cached provider schema for a complete tool contract.
+#[must_use]
+pub(crate) fn provider_tool_schema_for_contract(contract: &ToolContract) -> Value {
+    cached_provider_tool_projection(contract).schema.clone()
+}
+
+/// Return the digest of the exact provider-facing tool wire value.
+#[must_use]
+pub fn provider_tool_wire_digest(contract: &ToolContract) -> String {
+    cached_provider_tool_projection(contract).digest.clone()
+}
+
+/// Return the cached estimate for the exact provider-facing tool wire value.
+#[must_use]
+pub fn provider_tool_wire_tokens(contract: &ToolContract) -> u64 {
+    cached_provider_tool_projection(contract).token_count
+}
+
+/// Return the digest and token estimate from one projection-cache lookup.
+/// Runtime hot paths commonly need both values for the same contract; keeping
+/// this pair together avoids serializing and hashing the source schema twice.
+#[must_use]
+pub fn provider_tool_wire_stats(contract: &ToolContract) -> (String, u64) {
+    let cached = cached_provider_tool_projection(contract);
+    (cached.digest.clone(), cached.token_count)
 }
 
 /// Return the smallest stable tool representation sent by the Chat Completions
@@ -1878,29 +2160,14 @@ pub fn provider_tool_schema_projection(schema: &Value) -> Value {
 /// internal recovery/policy fields are never charged as model input.
 #[must_use]
 pub fn provider_tool_wire_projection(contract: &ToolContract) -> Value {
-    let description = provider_tool_description(&contract.tool_name);
-    json!({
-        "type": "function",
-        "function": {
-            "name": contract.tool_name,
-            "description": description,
-            "parameters": provider_tool_schema_projection(&contract.input_schema)
-        }
-    })
+    cached_provider_tool_projection(contract).wire.clone()
 }
 
 /// Estimate tool schema tokens from the provider-facing projection, not from
 /// the full internal contract used by the executor and governance layers.
 #[must_use]
 pub fn estimate_provider_tool_tokens(tools: &[ToolContract]) -> u64 {
-    tools
-        .iter()
-        .map(|tool| {
-            serde_json::to_string(&provider_tool_wire_projection(tool))
-                .map(|value| value.chars().count().div_ceil(4) as u64)
-                .unwrap_or_default()
-        })
-        .sum()
+    tools.iter().map(provider_tool_wire_tokens).sum()
 }
 
 fn openai_tool_schema(contract: &ToolContract) -> Value {
@@ -2275,6 +2542,10 @@ fn provider_usage_from_openai_value(usage_value: Value) -> ProviderUsage {
             "/input_tokens",
             "/prompt_tokens_total",
             "/input_tokens_total",
+            "/promptTokens",
+            "/inputTokens",
+            "/promptTokensTotal",
+            "/inputTokensTotal",
         ],
     );
     let output_tokens = first_usage_u64(
@@ -2284,6 +2555,10 @@ fn provider_usage_from_openai_value(usage_value: Value) -> ProviderUsage {
             "/output_tokens",
             "/completion_tokens_total",
             "/output_tokens_total",
+            "/completionTokens",
+            "/outputTokens",
+            "/completionTokensTotal",
+            "/outputTokensTotal",
         ],
     );
     let reasoning_tokens = first_usage_u64(
@@ -2292,6 +2567,11 @@ fn provider_usage_from_openai_value(usage_value: Value) -> ProviderUsage {
             "/completion_tokens_details/reasoning_tokens",
             "/output_tokens_details/reasoning_tokens",
             "/reasoning_tokens",
+            "/completionTokensDetails/reasoningTokens",
+            "/outputTokensDetails/reasoningTokens",
+            "/completionTokensDetails/reasoning_tokens",
+            "/outputTokensDetails/reasoning_tokens",
+            "/reasoningTokens",
         ],
     );
     let cached_input_tokens = first_usage_u64(
@@ -2305,11 +2585,27 @@ fn provider_usage_from_openai_value(usage_value: Value) -> ProviderUsage {
             "/input_tokens_details/cache_read_input_tokens",
             "/cached_input_tokens",
             "/cache_read_tokens",
+            "/promptTokensDetails/cachedTokens",
+            "/inputTokensDetails/cachedTokens",
+            "/promptTokensDetails/cacheReadTokens",
+            "/inputTokensDetails/cacheReadTokens",
+            "/promptTokensDetails/cacheReadInputTokens",
+            "/inputTokensDetails/cacheReadInputTokens",
+            "/cachedInputTokens",
+            "/cacheReadTokens",
+            "/cacheReadInputTokens",
         ],
     );
     let total_tokens = first_usage_u64(
         &usage_value,
-        &["/total_tokens", "/total_token_count", "/total_tokens_count"],
+        &[
+            "/total_tokens",
+            "/total_token_count",
+            "/total_tokens_count",
+            "/totalTokens",
+            "/totalTokenCount",
+            "/totalTokensCount",
+        ],
     );
     let usage_source = if usage_value
         .as_object()
@@ -2396,7 +2692,7 @@ fn provider_tool_call_from_openai(value: &Value) -> Result<ProviderToolCall, Pro
     }
     Ok(ProviderToolCall {
         tool_call_id: tool_call_id.to_owned(),
-        tool_name: tool_name.to_owned(),
+        tool_name: restore_provider_tool_wire_name(tool_name),
         arguments,
     })
 }

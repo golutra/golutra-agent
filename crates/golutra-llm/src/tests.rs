@@ -969,6 +969,114 @@ fn provider_tool_projection_excludes_internal_contract_policy() {
 }
 
 #[test]
+fn provider_tool_projection_is_canonical_and_schema_changes_invalidate_digest() {
+    let contract = |input_schema: Value| golutra_core::ToolContract {
+        tool_name: "read_file".to_owned(),
+        input_schema,
+        output_schema: json!({}),
+        error_schema: json!({}),
+        side_effect_type: golutra_core::SideEffectType::None,
+        idempotency_key_policy: "none".to_owned(),
+        timeout_policy: "bounded".to_owned(),
+        cancellation_policy: "supported".to_owned(),
+        retry_policy: "none".to_owned(),
+        artifact_policy: "none".to_owned(),
+        permission_policy_ref: None,
+    };
+    let first = contract(
+        serde_json::from_str(
+            r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"number"}}}"#,
+        )
+        .expect("first schema"),
+    );
+    let reordered = contract(
+        serde_json::from_str(
+            r#"{"properties":{"b":{"type":"number"},"a":{"type":"string"}},"type":"object"}"#,
+        )
+        .expect("reordered schema"),
+    );
+    assert_eq!(
+        provider_tool_wire_projection(&first),
+        provider_tool_wire_projection(&reordered)
+    );
+    assert_eq!(
+        provider_tool_wire_digest(&first),
+        provider_tool_wire_digest(&reordered)
+    );
+    assert_eq!(
+        provider_tool_wire_tokens(&first),
+        provider_tool_wire_tokens(&reordered)
+    );
+
+    let mut changed_schema = first.input_schema.clone();
+    changed_schema["properties"]["a"]["type"] = json!("integer");
+    let changed = contract(changed_schema);
+    assert_ne!(
+        provider_tool_wire_digest(&first),
+        provider_tool_wire_digest(&changed)
+    );
+}
+
+#[test]
+fn provider_tool_projection_cache_reuses_equivalent_wire_values() {
+    let contract = golutra_core::ToolContract {
+        tool_name: "read_file".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        }),
+        output_schema: json!({}),
+        error_schema: json!({}),
+        side_effect_type: golutra_core::SideEffectType::None,
+        idempotency_key_policy: "none".to_owned(),
+        timeout_policy: "bounded".to_owned(),
+        cancellation_policy: "supported".to_owned(),
+        retry_policy: "none".to_owned(),
+        artifact_policy: "none".to_owned(),
+        permission_policy_ref: None,
+    };
+    let before = provider_tool_projection_cache_stats();
+    let _ = provider_tool_wire_stats(&contract);
+    let _ = provider_tool_wire_stats(&contract);
+    let after = provider_tool_projection_cache_stats();
+
+    assert!(after.hits > before.hits);
+    assert!(after.entries >= 1);
+}
+
+#[test]
+fn provider_tool_projection_uses_the_same_wire_alias_as_transports() {
+    let contract = golutra_core::ToolContract {
+        tool_name: "web_search".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"]
+        }),
+        output_schema: json!({}),
+        error_schema: json!({}),
+        side_effect_type: golutra_core::SideEffectType::None,
+        idempotency_key_policy: "none".to_owned(),
+        timeout_policy: "bounded".to_owned(),
+        cancellation_policy: "supported".to_owned(),
+        retry_policy: "none".to_owned(),
+        artifact_policy: "none".to_owned(),
+        permission_policy_ref: None,
+    };
+    let wire = provider_tool_wire_projection(&contract);
+    assert_eq!(wire["function"]["name"], "golutra_web_search");
+    assert_eq!(
+        provider_tool_wire_tokens(&contract),
+        serde_json::to_string(&wire)
+            .expect("wire JSON")
+            .chars()
+            .count()
+            .div_ceil(4) as u64
+    );
+}
+
+#[test]
 fn openai_cache_fields_are_sent_only_for_supported_endpoint() {
     let mut request = request();
     request.session_id = Some(golutra_core::SessionId::new());
@@ -983,7 +1091,7 @@ fn openai_cache_fields_are_sent_only_for_supported_endpoint() {
     );
     assert_eq!(
         supported["prompt_cache_key"].as_str().map(str::len),
-        Some(71)
+        Some(64)
     );
     assert_eq!(supported["prompt_cache_retention"], "24h");
 

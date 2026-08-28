@@ -497,7 +497,7 @@ fn estimate_observation_bytes(observation: &RuntimeObservation) -> usize {
             provider_id,
             model_id,
             event,
-        } => structured_bytes(&(request_id, provider_id, model_id, event)),
+        } => streamed_observation_bytes(request_id, provider_id, model_id, event),
         RuntimeObservation::ProviderCompleted {
             request_id,
             provider_id,
@@ -524,7 +524,7 @@ fn estimate_observation_bytes(observation: &RuntimeObservation) -> usize {
             display_arguments,
             recovery_policy,
         )),
-        RuntimeObservation::ToolProgress(progress) => structured_bytes(progress),
+        RuntimeObservation::ToolProgress(progress) => tool_progress_observation_bytes(progress),
         RuntimeObservation::ToolCompleted(report) => tool_report_bytes(report),
         RuntimeObservation::PolicyEvaluated(evaluation) => structured_bytes(evaluation),
         RuntimeObservation::ApprovalRequested(request) => structured_bytes(request),
@@ -561,6 +561,67 @@ fn estimate_observation_bytes(observation: &RuntimeObservation) -> usize {
         }
     };
     size_of::<RuntimeObservation>().saturating_add(dynamic_bytes)
+}
+
+// Provider deltas and tool progress are the only observations that can arrive
+// hundreds of times during one request. Their JSON shape is fixed; account for
+// the variable strings directly instead of running serde_json for every delta.
+// The fixed allowance covers enum/object keys, numeric fields, UUID encoding,
+// and future harmless serde metadata. String lengths include JSON escaping, so
+// this remains a conservative queue bound for arbitrary UTF-8/control input.
+const LIVE_OBSERVATION_FIXED_OVERHEAD: usize = 1_024;
+
+fn streamed_observation_bytes(
+    request_id: &ProviderRequestId,
+    provider_id: &str,
+    model_id: &str,
+    event: &ProviderStreamEvent,
+) -> usize {
+    let event_bytes = match event {
+        ProviderStreamEvent::TextDelta { text } | ProviderStreamEvent::ReasoningDelta { text } => {
+            json_string_bytes(text).saturating_add(32)
+        }
+        ProviderStreamEvent::ToolCallDelta {
+            index,
+            tool_call_id,
+            tool_name,
+        } => json_string_bytes(&index.to_string())
+            .saturating_add(tool_call_id.as_deref().map_or(4, json_string_bytes))
+            .saturating_add(tool_name.as_deref().map_or(4, json_string_bytes))
+            .saturating_add(64),
+    };
+    size_of::<RuntimeObservation>()
+        .saturating_add(LIVE_OBSERVATION_FIXED_OVERHEAD)
+        .saturating_add(json_string_bytes(&request_id.to_string()))
+        .saturating_add(json_string_bytes(provider_id))
+        .saturating_add(json_string_bytes(model_id))
+        .saturating_add(event_bytes)
+}
+
+fn tool_progress_observation_bytes(progress: &ToolProgress) -> usize {
+    size_of::<RuntimeObservation>()
+        .saturating_add(LIVE_OBSERVATION_FIXED_OVERHEAD)
+        .saturating_add(json_string_bytes(&progress.tool_call_id.to_string()))
+        .saturating_add(json_string_bytes(&progress.tool_name))
+        .saturating_add(progress.detail.as_deref().map_or(4, json_string_bytes))
+        .saturating_add(
+            progress
+                .output_excerpt
+                .as_deref()
+                .map_or(4, json_string_bytes),
+        )
+}
+
+fn json_string_bytes(value: &str) -> usize {
+    // serde_json emits non-ASCII UTF-8 as-is. ASCII controls and quote/backslash
+    // are the only bytes that can expand in the default compact serializer.
+    2usize.saturating_add(value.as_bytes().iter().fold(0usize, |total, byte| {
+        total.saturating_add(match byte {
+            b'"' | b'\\' | 0x08 | 0x0c | 0x0a | 0x0d | 0x09 => 2,
+            0x00..=0x1f => 6,
+            _ => 1,
+        })
+    }))
 }
 
 fn pending_turn_bytes(turn: &golutra_runtime::PendingAgentTurn) -> usize {
@@ -724,6 +785,7 @@ mod tests {
     use golutra_policy::WorkspacePolicy;
     use golutra_runtime::RuntimeObservation;
     use golutra_tools::{BasicToolExecutor, ToolRequest};
+    use serde_json::json;
     use tempfile::tempdir;
 
     use super::*;
@@ -748,6 +810,62 @@ mod tests {
                 text: text.to_owned(),
             },
         }
+    }
+
+    fn serialized_observation_bytes(observation: &RuntimeObservation) -> usize {
+        let wire = match observation {
+            RuntimeObservation::ProviderStreamed {
+                request_id,
+                provider_id,
+                model_id,
+                event,
+            } => json!({
+                "type": "provider_streamed",
+                "request_id": request_id.to_string(),
+                "provider_id": provider_id,
+                "model_id": model_id,
+                "event": event,
+            }),
+            RuntimeObservation::ToolProgress(progress) => json!({
+                "type": "tool_progress",
+                "tool_call_id": progress.tool_call_id.to_string(),
+                "tool_name": progress.tool_name,
+                "phase": format!("{:?}", progress.phase),
+                "elapsed_ms": progress.elapsed_ms,
+                "output_bytes": progress.output_bytes,
+                "output_lines": progress.output_lines,
+                "detail": progress.detail,
+                "output_excerpt": progress.output_excerpt,
+            }),
+            _ => return 0,
+        };
+        structured_bytes(&wire)
+    }
+
+    #[test]
+    fn live_byte_estimates_are_conservative_without_json_allocation() {
+        let request_id = ProviderRequestId::new();
+        let long_text = "x".repeat(4_096);
+        for text in ["plain", "中文\n\"\\", long_text.as_str()] {
+            let observation = streamed_with_request(request_id, text);
+            assert!(
+                estimate_observation_bytes(&observation)
+                    >= serialized_observation_bytes(&observation),
+                "stream estimate must cover serialized observation"
+            );
+        }
+
+        let progress = RuntimeObservation::ToolProgress(ToolProgress {
+            tool_call_id: ToolCallId::new(),
+            tool_name: "shell_session".to_owned(),
+            phase: ToolProgressPhase::Output,
+            elapsed_ms: 123,
+            output_bytes: 456,
+            output_lines: 7,
+            detail: Some("\u{0000}中文 detail".to_owned()),
+            output_excerpt: Some("line\n\"\\".repeat(512)),
+        });
+        assert!(estimate_observation_bytes(&progress) >= serialized_observation_bytes(&progress));
     }
 
     #[tokio::test]

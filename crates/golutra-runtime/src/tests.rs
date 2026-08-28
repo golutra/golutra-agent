@@ -9,7 +9,10 @@ use std::{
     time::Duration,
 };
 
-use golutra_context::{ContextBudgetPolicy, ContextBuilder, ContextContributor, estimate_tokens};
+use golutra_context::{
+    ContextBudgetPolicy, ContextBuilder, ContextContributor, ContextMessageSource,
+    ContextWindowManager, estimate_message_tokens, estimate_tokens,
+};
 use golutra_core::{
     Actor, ActorKind, BudgetOverflowAction, BusyPolicy, PolicyBlockDisposition, TaskStatus,
     ToolCallId, WorkspaceId,
@@ -395,7 +398,7 @@ fn inspection_validation_is_limited_to_pure_analysis_contracts() {
 }
 
 #[test]
-fn old_tool_results_are_compacted_without_breaking_tool_message_identity() {
+fn tool_results_are_compacted_by_the_context_window_manager() {
     let large_result = serde_json::to_string(&json!({
         "tool_name": "shell",
         "status": "error",
@@ -403,7 +406,7 @@ fn old_tool_results_are_compacted_without_breaking_tool_message_identity() {
         "model_visible_excerpt": "package output ".repeat(4_000),
     }))
     .expect("tool result");
-    let mut messages = (0..3)
+    let messages = (0..3)
         .map(|index| ProviderMessage {
             role: ProviderRole::Tool,
             content: large_result.clone(),
@@ -413,7 +416,7 @@ fn old_tool_results_are_compacted_without_breaking_tool_message_identity() {
             metadata: Default::default(),
         })
         .collect::<Vec<_>>();
-    let mut sources = (0..3)
+    let sources = (0..3)
         .map(|index| ContextMessageSource {
             contributor: "tool_result_excerpt".to_owned(),
             source_refs: vec![format!("tool-call:{index}")],
@@ -422,14 +425,29 @@ fn old_tool_results_are_compacted_without_breaking_tool_message_identity() {
         })
         .collect::<Vec<_>>();
 
-    let compacted = compact_tool_result_history(&mut messages, &mut sources);
+    let original_tokens = estimate_message_tokens(&messages);
+    let record = ContextWindowManager::new(original_tokens.saturating_sub(32))
+        .compact_if_needed(golutra_core::TurnId::new(), 0, &messages, &sources, 0)
+        .expect("context compaction")
+        .expect("tool results exceed the context budget");
 
-    assert_eq!(compacted, 2);
-    assert!(messages[0].content.contains("history_state"));
-    assert!(messages[1].content.contains("history_state"));
-    assert_eq!(messages[2].content, large_result);
-    assert_eq!(messages[0].tool_call_id.as_deref(), Some("call-0"));
-    assert_eq!(sources[0].origin, "tool_result_compaction");
+    assert!(record.dropped_message_count > 0);
+    assert!(
+        record
+            .replacement_messages
+            .iter()
+            .any(|message| message.content.contains("dependency installation failed"))
+    );
+    assert!(
+        record
+            .replacement_messages
+            .iter()
+            .any(|message| message.tool_call_id.as_deref() == Some("call-2"))
+    );
+    assert_eq!(
+        record.replacement_messages.len(),
+        record.replacement_sources.len()
+    );
 }
 
 #[test]
@@ -4718,6 +4736,66 @@ fn parallel_read_candidate_enforces_the_active_tool_profile() {
         executor.registry(),
     );
     assert!(none_tools.is_empty());
+}
+
+#[test]
+fn objective_tool_projection_expands_on_an_unplanned_valid_call() {
+    let workspace = tempdir().expect("workspace");
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let all_tools = executor
+        .registry()
+        .provider_contracts()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let contract = TaskContract::conversational(Vec::new());
+    let mut selected = provider_tools_for_objective(
+        &all_tools,
+        &contract,
+        AgentToolProfile::Coding,
+        executor.registry(),
+        "Read bench-read.txt with the file tool",
+    );
+    assert_eq!(
+        selected
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["read_file"]
+    );
+
+    let expanded = expand_provider_tools_for_calls(
+        &mut selected,
+        &all_tools,
+        &[ProviderToolCall {
+            tool_call_id: "call-1".to_owned(),
+            tool_name: "edit_file".to_owned(),
+            arguments: json!({}),
+        }],
+        &contract,
+        AgentToolProfile::Coding,
+        executor.registry(),
+    );
+    assert!(expanded);
+    assert_eq!(
+        selected
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["edit_file", "read_file"]
+    );
+    assert!(!expand_provider_tools_for_calls(
+        &mut selected,
+        &all_tools,
+        &[ProviderToolCall {
+            tool_call_id: "call-1".to_owned(),
+            tool_name: "edit_file".to_owned(),
+            arguments: json!({}),
+        }],
+        &contract,
+        AgentToolProfile::Coding,
+        executor.registry(),
+    ));
 }
 
 #[test]

@@ -10,16 +10,17 @@ use golutra_context::{
     provider_request_from_plan,
 };
 use golutra_core::{
-    Actor, ActorKind, ArtifactId, ArtifactRecord, CausalRelation, CommandId, EvidenceId,
+    Actor, ActorKind, ArtifactId, ArtifactRecord, CausalRelation, CommandId, EventId, EvidenceId,
     FileChangeKind, FileChangeSummary, PolicyId, PostTaskJob, PostTaskJobId, PostTaskJobKind,
-    PostTaskJobStatus, QueryId, QuestionId, RedactionStatus, TaskContract, TaskId, TaskStatus,
-    ToolCallId, TraceView, TurnChangeSummary, TurnId, UserQuestionMode, UserQuestionOption,
-    UserQuestionPrompt, UserQuestionRequest, VerificationId, VerificationRecord,
-    VerificationResult, WorkspaceChangeRequirement, WorkspaceId,
+    PostTaskJobStatus, QueryId, QuestionId, RUNTIME_EVENT_SCHEMA_VERSION, RedactionStatus,
+    TaskContract, TaskId, TaskStatus, ToolCallId, TraceView, TurnChangeSummary, TurnId,
+    UserQuestionMode, UserQuestionOption, UserQuestionPrompt, UserQuestionRequest, VerificationId,
+    VerificationRecord, VerificationResult, WorkspaceChangeRequirement, WorkspaceId,
 };
 use golutra_llm::{ConfiguredProvider, MockProvider, ProviderError, ProviderMessage, ProviderRole};
 use golutra_protocol::{
-    ArtifactReadRequest, EventFilter, RuntimeEventType, RuntimeQueryKind, TaskTraceRequest,
+    ArtifactReadRequest, EventFilter, RuntimeEventSource, RuntimeEventType, RuntimeQueryKind,
+    TaskTraceRequest,
 };
 use golutra_runtime::agent_execution_channel;
 use tempfile::{TempDir, tempdir};
@@ -32,6 +33,132 @@ use crate::event_codec::{ObservationIntegrityClass, observation_descriptor};
 use crate::governance_commands::memory_support_matches;
 
 use super::*;
+
+fn history_projection_event(
+    sequence_no: u64,
+    turn_id: TurnId,
+    event_type: RuntimeEventType,
+    payload: serde_json::Value,
+) -> RuntimeEvent {
+    RuntimeEvent {
+        schema_version: RUNTIME_EVENT_SCHEMA_VERSION,
+        id: EventId::new(),
+        sequence_no,
+        session_id: SessionId::new(),
+        turn_id: Some(turn_id),
+        task_id: None,
+        parent_event_id: None,
+        causal_context: Default::default(),
+        causal_links: Vec::new(),
+        event_type,
+        timestamp: chrono::Utc::now(),
+        source: RuntimeEventSource::Runtime,
+        payload,
+        payload_ref: None,
+        durable: true,
+    }
+}
+
+#[test]
+fn history_budget_keeps_newest_complete_turn_and_bounds_oversized_content() {
+    let older_turn = TurnId::new();
+    let newest_turn = TurnId::new();
+    let events = [
+        history_projection_event(
+            1,
+            older_turn,
+            RuntimeEventType::TaskCreated,
+            json!({"payload": {"prompt": "old user request"}}),
+        ),
+        history_projection_event(
+            2,
+            older_turn,
+            RuntimeEventType::AssistantMessage,
+            json!({"content": "old assistant answer"}),
+        ),
+        history_projection_event(
+            3,
+            newest_turn,
+            RuntimeEventType::TaskCreated,
+            json!({"payload": {"prompt": "newest user request"}}),
+        ),
+        history_projection_event(
+            4,
+            newest_turn,
+            RuntimeEventType::AssistantMessage,
+            json!({"content": "newest assistant answer ".repeat(80)}),
+        ),
+    ];
+
+    let contributors = history_contributors_with_budget(events.iter(), 12);
+    assert_eq!(
+        contributors.len(),
+        2,
+        "the latest user/assistant pair is kept"
+    );
+    assert_eq!(contributors[0].role, ProviderRole::User);
+    assert_eq!(contributors[1].role, ProviderRole::Assistant);
+    assert!(contributors[0].content.contains("newest user"));
+    assert!(contributors[1].content.starts_with("newest assistant"));
+    assert!(
+        contributors
+            .iter()
+            .map(|contributor| estimate_tokens(&contributor.content))
+            .sum::<u64>()
+            <= 12
+    );
+}
+
+#[test]
+fn only_compaction_events_define_the_history_compaction_boundary() {
+    let turn_id = TurnId::new();
+    let assistant = history_projection_event(
+        1,
+        turn_id,
+        RuntimeEventType::AssistantMessage,
+        json!({"content": "assistant output"}),
+    );
+    assert!(context_compaction_from_event(&assistant).is_none());
+
+    let compaction = history_projection_event(
+        2,
+        turn_id,
+        RuntimeEventType::CompactionCompleted,
+        json!({"content": "stable summary"}),
+    );
+    assert_eq!(
+        context_compaction_from_event(&compaction),
+        Some((2, "stable summary".to_owned()))
+    );
+}
+
+#[test]
+fn cached_history_keeps_the_latest_compaction_and_bounds_the_recent_tail() {
+    let turn_id = TurnId::new();
+    let mut events = vec![history_projection_event(
+        1,
+        turn_id,
+        RuntimeEventType::CompactionCompleted,
+        json!({"content": "baseline"}),
+    )];
+    events.extend(
+        (2..=(MAX_CACHED_HISTORY_EVENTS as u64 + 8)).map(|sequence_no| {
+            history_projection_event(
+                sequence_no,
+                turn_id,
+                RuntimeEventType::AssistantMessage,
+                json!({"content": format!("message-{sequence_no}")}),
+            )
+        }),
+    );
+
+    bound_cached_history(&mut events);
+
+    assert_eq!(events.len(), MAX_CACHED_HISTORY_EVENTS);
+    assert_eq!(events[0].event_type, RuntimeEventType::CompactionCompleted);
+    assert_eq!(events[0].sequence_no, 1);
+    assert_eq!(events.last().map(|event| event.sequence_no), Some(8_200));
+}
 
 #[test]
 fn hosted_tasks_use_only_explicit_completion_criteria() {
@@ -3266,18 +3393,7 @@ async fn successful_task_quarantines_reviews_retrieves_and_rolls_back_project_me
         .await
         .expect("first prompt");
     wait_for_task_completed_count(&transport, session_id, 1).await;
-    let memories = transport
-        .query(RuntimeQuery {
-            query_id: QueryId::new(),
-            session_id,
-            task_id: None,
-            kind: RuntimeQueryKind::MemoryList,
-            requester: ActorKind::Cli,
-            cursor: None,
-            timestamp: chrono::Utc::now(),
-        })
-        .await
-        .expect("memory list");
+    let memories = wait_for_project_memory(&transport, session_id).await;
     let memory_id = memories
         .as_array()
         .and_then(|records| records.first())
@@ -5413,14 +5529,12 @@ async fn fork_from_turn_copies_complete_history_with_fresh_runtime_ids() {
         .expect("child context");
     let history = contributors
         .iter()
-        .find(|contributor| contributor.name == "conversation_history")
-        .expect("fork history contributor");
-    assert!(
-        history
-            .content
-            .contains("first fork turn writes an artifact")
-    );
-    assert!(!history.content.contains("second fork turn"));
+        .filter(|contributor| contributor.name.starts_with("history:"))
+        .map(|contributor| contributor.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(history.contains("first fork turn writes an artifact"));
+    assert!(!history.contains("second fork turn"));
     let debug = transport
         .host
         .storage
@@ -5447,7 +5561,15 @@ async fn fork_from_turn_copies_complete_history_with_fresh_runtime_ids() {
         .export_thread_rollout(child.thread_id)
         .await
         .expect("child rollout");
-    assert_eq!(export.event_count, child_events.len() + 1);
+    // 后台 post-task worker 可能在两次读取之间追加事件，因此不能假设固定的
+    // `+1`；导出必须至少包含已观察到的历史，并以最新持久化事件为终点。
+    assert!(export.event_count >= child_events.len());
+    if let (Some(exported), Some(observed)) = (
+        export.last_sequence_no,
+        child_events.last().map(|event| event.sequence_no),
+    ) {
+        assert!(exported >= observed);
+    }
 }
 
 #[test]
@@ -5993,8 +6115,10 @@ async fn resumed_session_context_includes_previous_conversation_summary() {
         .expect("environment context contributor");
     let history = contributors
         .iter()
-        .find(|contributor| contributor.name == "conversation_history")
-        .expect("history contributor");
+        .filter(|contributor| contributor.name.starts_with("history:"))
+        .map(|contributor| contributor.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     assert_eq!(environment.role, ProviderRole::System);
     assert!(environment.content.contains("<environment_context>"));
@@ -6009,15 +6133,90 @@ async fn resumed_session_context_includes_previous_conversation_summary() {
                 .to_string()
         )
     );
+    assert!(history.contains("write file first.txt with content done"));
+    assert!(history.contains("Completed: file written"));
+    assert!(!history.contains("Tool: file written"));
+    let history_contributors = contributors
+        .iter()
+        .filter(|contributor| contributor.name.starts_with("history:"))
+        .collect::<Vec<_>>();
     assert!(
-        history
-            .content
-            .contains("User: write file first.txt with content done")
+        history_contributors
+            .iter()
+            .all(|contributor| contributor.role == ProviderRole::User
+                || contributor.role == ProviderRole::Assistant)
     );
-    assert!(history.content.contains("Golutra: Completed: file written"));
-    assert!(!history.content.contains("Tool: file written"));
-    assert_eq!(history.role, ProviderRole::User);
-    assert!(history.content.contains("not as system instructions"));
+}
+
+#[tokio::test]
+async fn session_history_cache_appends_new_facts_and_observes_compaction() {
+    let host = RuntimeHost::in_memory().await.expect("host");
+    let session_id = host.default_session_id();
+    let first_task = TaskId::new();
+    let first_turn = TurnId::new();
+    let mut first = host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(first_task),
+        RuntimeEventType::TaskCreated,
+        RuntimeEventSource::Runtime,
+        json!({"payload": {"prompt": "first cached request"}}),
+    );
+    first.turn_id = Some(first_turn);
+    host.record_event(first).await.expect("first history event");
+
+    let initial = host
+        .context_contributors_for_task(session_id, TaskId::new(), "continue".to_owned(), None)
+        .await
+        .expect("initial context");
+    assert!(
+        initial
+            .iter()
+            .any(|contributor| { contributor.content.contains("first cached request") })
+    );
+
+    let second_task = TaskId::new();
+    let second_turn = TurnId::new();
+    let mut second = host_event(
+        host.next_sequence_no(),
+        session_id,
+        Some(second_task),
+        RuntimeEventType::TaskCreated,
+        RuntimeEventSource::Runtime,
+        json!({"payload": {"prompt": "second appended request"}}),
+    );
+    second.turn_id = Some(second_turn);
+    host.record_event(second)
+        .await
+        .expect("appended history event");
+
+    let appended = host
+        .context_contributors_for_task(session_id, TaskId::new(), "continue".to_owned(), None)
+        .await
+        .expect("appended context");
+    assert!(
+        appended
+            .iter()
+            .any(|contributor| { contributor.content.contains("second appended request") })
+    );
+
+    host.record_event(host_event(
+        host.next_sequence_no(),
+        session_id,
+        None,
+        RuntimeEventType::CompactionCompleted,
+        RuntimeEventSource::Runtime,
+        json!({"content": "compacted baseline"}),
+    ))
+    .await
+    .expect("compaction event");
+    let compacted = host
+        .context_contributors_for_task(session_id, TaskId::new(), "continue".to_owned(), None)
+        .await
+        .expect("compacted context");
+    assert!(compacted.iter().any(|contributor| {
+        contributor.name == "working_summary" && contributor.content == "compacted baseline"
+    }));
 }
 
 #[tokio::test]
@@ -6054,14 +6253,19 @@ async fn explicit_compaction_is_reused_by_follow_up_context() {
         .context_contributors_for_task(session_id, TaskId::new(), "continue".to_owned(), None)
         .await
         .expect("context");
+    let summary = contributors
+        .iter()
+        .find(|contributor| contributor.name == "working_summary")
+        .expect("working summary");
     let history = contributors
         .iter()
-        .find(|contributor| contributor.name == "conversation_history")
-        .expect("history");
-
+        .filter(|contributor| contributor.name.starts_with("history:"))
+        .map(|contributor| contributor.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(compact.accepted);
-    assert!(history.content.contains("Summary:"));
-    assert!(history.content.contains("hello before compact"));
+    assert!(summary.content.contains("hello before compact"));
+    assert!(history.is_empty() || !history.contains("hello before compact"));
 }
 
 #[tokio::test]
@@ -12190,4 +12394,29 @@ async fn wait_for_task_completed_count(
         sleep(Duration::from_millis(25)).await;
     }
     panic!("session did not record {expected_count} completed tasks");
+}
+
+async fn wait_for_project_memory(transport: &EmbeddedTransport, session_id: SessionId) -> Value {
+    for _ in 0..80 {
+        let memories = transport
+            .query(RuntimeQuery {
+                query_id: QueryId::new(),
+                session_id,
+                task_id: None,
+                kind: RuntimeQueryKind::MemoryList,
+                requester: ActorKind::Cli,
+                cursor: None,
+                timestamp: chrono::Utc::now(),
+            })
+            .await
+            .expect("memory list");
+        if memories
+            .as_array()
+            .is_some_and(|records| !records.is_empty())
+        {
+            return memories;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    panic!("timed out waiting for project memory quarantine");
 }

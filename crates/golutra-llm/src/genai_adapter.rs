@@ -25,7 +25,7 @@ use super::{
     ProviderProtocol, ProviderRequest, ProviderResponse, ProviderRole, ProviderStreamEvent,
     ProviderToolCall, ProviderUsage, UsageSource, configured_or_first_env,
     custom_headers_from_reader, env_mapping, first_env, generation_config_from_reader,
-    missing_env_error, protocol_capabilities, provider_tool_schema_projection,
+    missing_env_error, protocol_capabilities, provider_tool_schema_for_contract,
     request_id_from_headers, retry_after_from_headers, sanitize_provider_error,
     selected_protocol_from_reader, validate_native_base_url,
 };
@@ -226,11 +226,9 @@ impl GenaiProviderAdapter {
         request: &ProviderRequest,
         force_refresh: bool,
     ) -> Result<ProviderResponse, ProviderError> {
-        let api_key = self
-            .credential
-            .credential(force_refresh)
-            .await
-            .map_err(super::provider_credential_error)?;
+        // Request shaping is deterministic for a logical attempt. Build it
+        // once so an authentication refresh retries the network call without
+        // re-projecting every message and tool schema.
         let chat_request = genai_chat_request(request, self.config.protocol)?;
         let options = genai_chat_options(
             &self.config.generation_config,
@@ -238,11 +236,16 @@ impl GenaiProviderAdapter {
             self.cache_identity_for_request(request).as_ref(),
             request.cache_policy,
         )?;
+        let api_key = self
+            .credential
+            .credential(force_refresh)
+            .await
+            .map_err(super::provider_credential_error)?;
         let response = self
             .client
             .exec_chat(
                 self.service_target(api_key.expose_secret())?,
-                chat_request,
+                chat_request.clone(),
                 Some(&options),
             )
             .await;
@@ -254,7 +257,6 @@ impl GenaiProviderAdapter {
                     .credential(true)
                     .await
                     .map_err(super::provider_credential_error)?;
-                let chat_request = genai_chat_request(request, self.config.protocol)?;
                 self.client
                     .exec_chat(
                         self.service_target(api_key.expose_secret())?,
@@ -274,6 +276,15 @@ impl GenaiProviderAdapter {
         request: &ProviderRequest,
         on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
     ) -> Result<ProviderResponse, ProviderError> {
+        // Keep the shaped request and options stable across a credential
+        // refresh. This is especially valuable for long tool schemas.
+        let chat_request = genai_chat_request(request, self.config.protocol)?;
+        let options = genai_chat_options(
+            &self.config.generation_config,
+            true,
+            self.cache_identity_for_request(request).as_ref(),
+            request.cache_policy,
+        )?;
         let mut force_refresh = false;
         let response = loop {
             let api_key = self
@@ -281,18 +292,11 @@ impl GenaiProviderAdapter {
                 .credential(force_refresh)
                 .await
                 .map_err(super::provider_credential_error)?;
-            let chat_request = genai_chat_request(request, self.config.protocol)?;
-            let options = genai_chat_options(
-                &self.config.generation_config,
-                true,
-                self.cache_identity_for_request(request).as_ref(),
-                request.cache_policy,
-            )?;
             match self
                 .client
                 .exec_chat_stream(
                     self.service_target(api_key.expose_secret())?,
-                    chat_request,
+                    chat_request.clone(),
                     Some(&options),
                 )
                 .await
@@ -409,7 +413,7 @@ pub(crate) fn genai_chat_request(
     }
     if !request.tools.is_empty() {
         chat_request = chat_request.with_tools(request.tools.iter().map(|contract| {
-            let schema = provider_tool_schema_projection(&contract.input_schema);
+            let schema = provider_tool_schema_for_contract(contract);
             // rust-genai reserves the literal `web_search` name for its native
             // provider tool on several adapters. Golutra owns a regular
             // function with that name, so use a stable wire alias and restore
@@ -430,22 +434,12 @@ pub(crate) fn genai_chat_request(
     Ok(chat_request)
 }
 
-const WEB_SEARCH_WIRE_ALIAS: &str = "golutra_web_search";
-
 fn wire_tool_name(name: &str) -> String {
-    if name == "web_search" {
-        WEB_SEARCH_WIRE_ALIAS.to_owned()
-    } else {
-        name.to_owned()
-    }
+    super::provider_tool_wire_name(name)
 }
 
 pub(crate) fn restore_wire_tool_name(name: &str) -> String {
-    if name == WEB_SEARCH_WIRE_ALIAS {
-        "web_search".to_owned()
-    } else {
-        name.to_owned()
-    }
+    super::restore_provider_tool_wire_name(name)
 }
 
 fn responses_schema_supports_strict(schema: &Value) -> bool {
@@ -752,19 +746,61 @@ fn provider_usage_from_genai_with_raw(
     usage: &genai::chat::Usage,
     raw_usage: Option<&Value>,
 ) -> Result<ProviderUsage, ProviderError> {
-    let serialized_usage =
-        serde_json::to_value(usage).map_err(|error| ProviderError::Malformed {
+    // The raw response body already contains the provider's usage shape on
+    // normal network responses.  Do not eagerly serialize the typed genai
+    // usage before `unwrap_or`: that allocation used to happen even when the
+    // raw value was available and was paid on every streamed turn.
+    let mut usage_raw = match raw_usage {
+        Some(raw_usage) => raw_usage.clone(),
+        None => serde_json::to_value(usage).map_err(|error| ProviderError::Malformed {
             message: format!("genai usage could not be serialized: {error}"),
-        })?;
-    let mut usage_raw = raw_usage.cloned().unwrap_or(serialized_usage);
+        })?,
+    };
     let cache_read_tokens = usage
         .prompt_tokens_details
         .as_ref()
-        .and_then(|details| non_negative_u64(details.cached_tokens));
+        .and_then(|details| non_negative_u64(details.cached_tokens))
+        .or_else(|| {
+            super::first_usage_u64(
+                &usage_raw,
+                &[
+                    "/cached_tokens",
+                    "/cache_read_tokens",
+                    "/cacheReadTokens",
+                    "/cache_read_input_tokens",
+                    "/cacheReadInputTokens",
+                    "/prompt_tokens_details/cached_tokens",
+                    "/prompt_tokens_details/cache_read_tokens",
+                    "/prompt_tokens_details/cacheReadTokens",
+                    "/input_tokens_details/cached_tokens",
+                    "/input_tokens_details/cache_read_tokens",
+                    "/input_tokens_details/cacheReadTokens",
+                ],
+            )
+        });
     let cache_write_tokens = usage
         .prompt_tokens_details
         .as_ref()
-        .and_then(|details| non_negative_u64(details.cache_creation_tokens));
+        .and_then(|details| non_negative_u64(details.cache_creation_tokens))
+        .or_else(|| {
+            super::first_usage_u64(
+                &usage_raw,
+                &[
+                    "/cache_creation_tokens",
+                    "/cache_write_tokens",
+                    "/cacheCreationTokens",
+                    "/cacheWriteTokens",
+                    "/prompt_tokens_details/cache_creation_tokens",
+                    "/prompt_tokens_details/cache_write_tokens",
+                    "/prompt_tokens_details/cacheCreationTokens",
+                    "/prompt_tokens_details/cacheWriteTokens",
+                    "/input_tokens_details/cache_creation_tokens",
+                    "/input_tokens_details/cache_write_tokens",
+                    "/input_tokens_details/cacheCreationTokens",
+                    "/input_tokens_details/cacheWriteTokens",
+                ],
+            )
+        });
     // genai 会把零计数映射为 None；出现正的 cache read 即证明本轮命中，
     // 省略的写入计数应按 provider 语义保留为 0，并写回 canonical normalizer 使用的原始对象。
     if cache_read_tokens.is_some_and(|tokens| tokens > 0) && cache_write_tokens.is_none() {
@@ -779,17 +815,60 @@ fn provider_usage_from_genai_with_raw(
         }
     }
     Ok(ProviderUsage {
-        input_tokens: non_negative_u64(usage.prompt_tokens),
-        output_tokens: non_negative_u64(usage.completion_tokens),
+        input_tokens: non_negative_u64(usage.prompt_tokens).or_else(|| {
+            super::first_usage_u64(
+                &usage_raw,
+                &[
+                    "/prompt_tokens",
+                    "/input_tokens",
+                    "/promptTokens",
+                    "/inputTokens",
+                ],
+            )
+        }),
+        output_tokens: non_negative_u64(usage.completion_tokens).or_else(|| {
+            super::first_usage_u64(
+                &usage_raw,
+                &[
+                    "/completion_tokens",
+                    "/output_tokens",
+                    "/completionTokens",
+                    "/outputTokens",
+                ],
+            )
+        }),
         reasoning_tokens: usage
             .completion_tokens_details
             .as_ref()
-            .and_then(|details| non_negative_u64(details.reasoning_tokens)),
+            .and_then(|details| non_negative_u64(details.reasoning_tokens))
+            .or_else(|| {
+                super::first_usage_u64(
+                    &usage_raw,
+                    &[
+                        "/completion_tokens_details/reasoning_tokens",
+                        "/output_tokens_details/reasoning_tokens",
+                        "/completionTokensDetails/reasoningTokens",
+                        "/outputTokensDetails/reasoningTokens",
+                        "/reasoning_tokens",
+                        "/reasoningTokens",
+                    ],
+                )
+            }),
         cached_input_tokens: usage
             .prompt_tokens_details
             .as_ref()
             .and_then(|details| non_negative_u64(details.cached_tokens)),
-        total_tokens: non_negative_u64(usage.total_tokens),
+        total_tokens: non_negative_u64(usage.total_tokens).or_else(|| {
+            super::first_usage_u64(
+                &usage_raw,
+                &[
+                    "/total_tokens",
+                    "/totalTokens",
+                    "/total_token_count",
+                    "/totalTokenCount",
+                ],
+            )
+        }),
         usage_source: UsageSource::Provider,
         raw: usage_raw,
     })

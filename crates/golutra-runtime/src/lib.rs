@@ -8,9 +8,11 @@ use std::{
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use golutra_context::{
-    ContextBuilder, ContextContributor, ContextError, ContextMessageSource, ModelInputVisibility,
-    compile_model_input, estimate_message_tokens, estimate_tokens,
-    token_usage_record_with_cache_identity,
+    ContextBuildPlan, ContextBuilder, ContextContributor, ContextError, ContextMessageSource,
+    ModelInputVisibility, ObservedContextPrefix,
+    compile_model_input_with_cache_policy_and_estimates_and_tool_digests,
+    context_message_prefix_digest, context_tokens_with_observed_prefix_and_total, estimate_tokens,
+    token_usage_record_with_cache_identity_and_estimates_and_tool_digests,
 };
 use golutra_core::{
     ApprovalDecision, ApprovalId, ApprovalRequest, ApprovalResolution, ApprovalScope, BudgetState,
@@ -32,7 +34,7 @@ use golutra_governor::{
 };
 use golutra_llm::{
     LlmProvider, ProviderError, ProviderMessage, ProviderRequest, ProviderResponse, ProviderRole,
-    ProviderToolCall, estimate_provider_tool_tokens,
+    ProviderToolCall, provider_tool_wire_stats,
 };
 use golutra_policy::approval_resource_matches;
 use golutra_protocol::{AgentExecutionMode, AgentToolProfile, ExternalVerificationSpec};
@@ -43,6 +45,28 @@ use golutra_tools::{
 };
 use golutra_verify::VerificationInput;
 use serde_json::{Value, json};
+
+fn append_plan_message(
+    plan: &mut ContextBuildPlan,
+    message: ProviderMessage,
+    source: ContextMessageSource,
+    message_token_total: &mut u64,
+) {
+    *message_token_total = message_token_total.saturating_add(plan.append_message(message, source));
+}
+
+/// Provider input reported for the last successful request. As in Pi, this is
+/// a checkpoint for the message prefix; only messages appended afterwards are
+/// estimated locally. Any tool or provider-route change invalidates it.
+#[derive(Debug, Clone)]
+struct ObservedContextUsage {
+    message_count: usize,
+    input_tokens: u64,
+    message_prefix_digest: String,
+    tool_digest: String,
+    provider_id: String,
+    model_id: String,
+}
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{Notify, mpsc, watch};
@@ -1087,13 +1111,18 @@ where
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         };
-        let mut provider_tools = provider_tools_for_turn(
+        let mut provider_tools = provider_tools_for_objective(
             &all_provider_tools,
             &current_task_contract,
             current_tool_profile,
             self.tool_executor.registry(),
+            &current_objective,
         );
-        let mut planned_tool_tokens = estimate_tool_contract_tokens(&provider_tools);
+        if objective_disables_tools(&current_objective) {
+            provider_tools.clear();
+        }
+        let (mut provider_tool_schema_digests, mut planned_tool_tokens, mut provider_tool_digest) =
+            provider_tool_snapshot(&provider_tools);
         let base_plan_result = match replay_context.as_ref() {
             Some(replay_context) => self.context_builder.build_from_messages(
                 request.task_id,
@@ -1124,9 +1153,14 @@ where
                 trimmed_contributors: base_plan.trimmed_contributors.clone(),
             });
         }
-        let mut messages = base_plan.messages.clone();
-        let mut message_sources = base_plan.message_sources.clone();
-        let protected_prefix_len = base_plan.messages.len();
+        let protected_prefix_len = self
+            .context_builder
+            .stable_prefix_len(&base_plan.messages, &base_plan.message_sources);
+        // 计划只在任务开始时创建一次；后续回合原地更新消息和预算，避免先深拷贝
+        // 初始消息再立即覆盖的无效分配。
+        let mut plan = base_plan;
+        let mut message_token_total = plan.estimated_message_tokens();
+        let mut observed_context_usage: Option<ObservedContextUsage> = None;
         let context_window_manager = self.context_builder.window_manager();
         let mut turn_state = TurnState::new(current_turn_id);
         let mut pending_turn_at_boundary: Option<TakenPendingTurn> = None;
@@ -1143,13 +1177,22 @@ where
                     if pending_turn.steer {
                         if let Some(tool_profile) = pending_execution.tool_profile {
                             current_tool_profile = tool_profile;
-                            provider_tools = provider_tools_for_turn(
+                            provider_tools = provider_tools_for_objective(
                                 &all_provider_tools,
                                 &current_task_contract,
                                 current_tool_profile,
                                 self.tool_executor.registry(),
+                                &current_objective,
                             );
-                            planned_tool_tokens = estimate_tool_contract_tokens(&provider_tools);
+                            if objective_disables_tools(&current_objective) {
+                                provider_tools.clear();
+                            }
+                            (
+                                provider_tool_schema_digests,
+                                planned_tool_tokens,
+                                provider_tool_digest,
+                            ) = provider_tool_snapshot(&provider_tools);
+                            observed_context_usage = None;
                         }
                         turn_state.continue_after_steer(current_turn_id);
                     } else {
@@ -1190,13 +1233,22 @@ where
                         current_task_contract
                             .validate()
                             .map_err(AgentLoopError::TaskContract)?;
-                        provider_tools = provider_tools_for_turn(
+                        provider_tools = provider_tools_for_objective(
                             &all_provider_tools,
                             &current_task_contract,
                             current_tool_profile,
                             self.tool_executor.registry(),
+                            &current_objective,
                         );
-                        planned_tool_tokens = estimate_tool_contract_tokens(&provider_tools);
+                        if objective_disables_tools(&current_objective) {
+                            provider_tools.clear();
+                        }
+                        (
+                            provider_tool_schema_digests,
+                            planned_tool_tokens,
+                            provider_tool_digest,
+                        ) = provider_tool_snapshot(&provider_tools);
+                        observed_context_usage = None;
                         current_completion_criteria =
                             current_task_contract.completion_criteria.clone();
                         current_turn_touched_code =
@@ -1229,20 +1281,24 @@ where
                             )
                         };
                     trace(pending_started);
-                    messages.push(ProviderMessage {
-                        role: ProviderRole::User,
-                        content: pending_turn.content,
-                        tool_call_id: None,
-                        tool_name: None,
-                        tool_calls: Vec::new(),
-                        metadata: Default::default(),
-                    });
-                    message_sources.push(ContextMessageSource {
-                        contributor: "user_message".to_owned(),
-                        source_refs: vec![format!("turn:{}", current_turn_id)],
-                        origin: "pending_turn".to_owned(),
-                        visibility: ModelInputVisibility::ModelVisible,
-                    });
+                    append_plan_message(
+                        &mut plan,
+                        ProviderMessage {
+                            role: ProviderRole::User,
+                            content: pending_turn.content,
+                            tool_call_id: None,
+                            tool_name: None,
+                            tool_calls: Vec::new(),
+                            metadata: Default::default(),
+                        },
+                        ContextMessageSource {
+                            contributor: "user_message".to_owned(),
+                            source_refs: vec![format!("turn:{}", current_turn_id)],
+                            origin: "pending_turn".to_owned(),
+                            visibility: ModelInputVisibility::ModelVisible,
+                        },
+                        &mut message_token_total,
+                    );
                 }
                 let step_snapshot = step_machine.begin(current_turn_id);
                 let iteration = governor_usage
@@ -1250,48 +1306,57 @@ where
                     .saturating_add(step_snapshot.step_no);
                 trace(AgentLoopTraceEvent::StepStarted(step_snapshot.clone()));
                 control.wait_until_runnable().await?;
-                let tool_history_before = estimate_message_tokens(&messages);
-                let compacted_tool_results =
-                    compact_tool_result_history(&mut messages, &mut message_sources);
-                if compacted_tool_results > 0 {
-                    trace(AgentLoopTraceEvent::ContextCompacted {
-                        original_input_tokens: tool_history_before,
-                        planned_input_tokens: estimate_message_tokens(&messages),
-                        trimmed_contributors: vec!["tool_result_history".to_owned()],
-                    });
-                }
-                let mut plan = base_plan.clone();
-                plan.messages = messages.clone();
-                plan.message_sources = message_sources.clone();
+                debug_assert_eq!(plan.messages.len(), plan.message_estimates.len());
                 plan.budget_snapshot.turn_id = current_turn_id;
                 plan.budget_snapshot.planned_tool_tokens = planned_tool_tokens;
+                let primary_contract = self.provider.contract();
+                let observed_prefix = observed_context_usage
+                    .as_ref()
+                    .filter(|observed| {
+                        observed.message_count <= plan.messages.len()
+                            && context_message_prefix_digest(&plan, observed.message_count)
+                                .is_some_and(|digest| digest == observed.message_prefix_digest)
+                            && observed.tool_digest == provider_tool_digest
+                            && observed.provider_id == primary_contract.provider_id
+                            && observed.model_id == primary_contract.model_id
+                    })
+                    .map(|observed| ObservedContextPrefix {
+                        message_count: observed.message_count,
+                        input_tokens: observed.input_tokens,
+                    });
                 plan.budget_snapshot.planned_input_tokens =
-                    estimate_message_tokens(&messages).saturating_add(planned_tool_tokens);
-                if let Some(compaction_limit) = context_window_manager.required_compaction_limit(
-                    protected_prefix_len,
-                    &messages,
-                    planned_tool_tokens,
-                ) {
+                    context_tokens_with_observed_prefix_and_total(
+                        &plan.messages,
+                        &plan.message_estimates,
+                        message_token_total,
+                        planned_tool_tokens,
+                        observed_prefix,
+                    );
+                if plan.budget_snapshot.planned_input_tokens > plan.budget_snapshot.budget_limit {
+                    let compaction_limit = plan.budget_snapshot.budget_limit;
                     trace(AgentLoopTraceEvent::ContextCompactionStarted {
                         original_input_tokens: plan.budget_snapshot.planned_input_tokens,
                         budget_limit: compaction_limit,
                     });
-                    match context_window_manager.compact_if_needed(
+                    match context_window_manager.compact_if_needed_with_observed_prefix(
                         current_turn_id,
                         protected_prefix_len,
-                        &messages,
-                        &message_sources,
+                        &plan.messages,
+                        &plan.message_sources,
+                        &plan.message_estimates,
                         planned_tool_tokens,
+                        observed_prefix,
                     ) {
                         Ok(Some(record)) => {
-                            messages = record.replacement_messages.clone();
-                            message_sources = record.replacement_sources.clone();
-                            plan.messages = messages.clone();
-                            plan.message_sources = message_sources.clone();
+                            message_token_total = plan.replace_messages(
+                                record.replacement_messages.clone(),
+                                record.replacement_sources.clone(),
+                            );
                             plan.budget_snapshot.planned_input_tokens =
                                 record.replacement_estimated_tokens;
                             plan.budget_snapshot.planned_summary_tokens =
                                 estimate_tokens(&record.summary);
+                            observed_context_usage = None;
                             trace(AgentLoopTraceEvent::ContextAutoCompacted(record));
                         }
                         Ok(None) => {}
@@ -1392,28 +1457,40 @@ where
                     break;
                 }
                 let provider_contract = self.provider.contract();
-                let model_input = compile_model_input(
-                    request.session_id,
-                    &plan,
-                    request.task_id,
-                    current_turn_id,
-                    provider_contract.provider_id.clone(),
-                    provider_contract.model_id.clone(),
-                    provider_tools.clone(),
-                )?;
+                let model_input =
+                    compile_model_input_with_cache_policy_and_estimates_and_tool_digests(
+                        request.session_id,
+                        &plan,
+                        request.task_id,
+                        current_turn_id,
+                        provider_contract.provider_id.clone(),
+                        provider_contract.model_id.clone(),
+                        provider_tools.clone(),
+                        // Auto keeps the stable session key while allowing each
+                        // adapter to select its native retention behavior.  A
+                        // hard-coded long TTL adds provider-specific fields to
+                        // every request and can disable the gateway default.
+                        golutra_core::PromptCachePolicy::Auto,
+                        &plan.message_estimates,
+                        &provider_tool_schema_digests,
+                    )?;
                 let (provider_request, context_snapshot) = model_input.into_parts();
+                let request_for_trace = provider_request.clone();
                 trace(AgentLoopTraceEvent::ContextSnapshotCaptured {
                     snapshot: context_snapshot,
-                    request: provider_request.clone(),
+                    request: request_for_trace,
                 });
+                let provider_request_id = provider_request.request_id;
+                let provider_id = provider_request.provider_id.clone();
+                let model_id = provider_request.model_id.clone();
                 trace(AgentLoopTraceEvent::ProviderStarted {
-                    request_id: provider_request.request_id,
-                    provider_id: provider_request.provider_id.clone(),
-                    model_id: provider_request.model_id.clone(),
+                    request_id: provider_request_id,
+                    provider_id: provider_id.clone(),
+                    model_id: model_id.clone(),
                 });
                 let provider_result = self
                     .complete_with_retry(
-                        provider_request.clone(),
+                        provider_request,
                         runtime_deadline,
                         &mut control,
                         &mut trace,
@@ -1436,9 +1513,9 @@ where
                     }
                     Err(provider_session::ProviderSessionError::Provider(error)) => {
                         trace(AgentLoopTraceEvent::ProviderFailed {
-                            request_id: provider_request.request_id,
-                            provider_id: provider_request.provider_id.clone(),
-                            model_id: provider_request.model_id.clone(),
+                            request_id: provider_request_id,
+                            provider_id,
+                            model_id,
                             error: error.to_string(),
                         });
                         finish_runtime_step(
@@ -1464,15 +1541,33 @@ where
                 {
                     last_assistant_message = Some(message.content.trim().to_owned());
                 }
-                let usage_record = token_usage_record_with_cache_identity(
-                    &plan,
-                    &completed_request,
-                    provider_response.response_id,
-                    &plan.budget_snapshot,
-                    &provider_response.usage,
-                    &provider_contract.cost_model,
-                    self.cache_identity_for_completed_request(&completed_request),
-                );
+                let usage_record =
+                    token_usage_record_with_cache_identity_and_estimates_and_tool_digests(
+                        &plan,
+                        &completed_request,
+                        provider_response.response_id,
+                        &plan.budget_snapshot,
+                        &provider_response.usage,
+                        &provider_contract.cost_model,
+                        self.cache_identity_for_completed_request(&completed_request),
+                        &plan.message_estimates,
+                        &provider_tool_schema_digests,
+                    );
+                if usage_record.usage_source == "provider"
+                    && let Some(input_tokens) = usage_record.input_tokens
+                    && plan.messages == completed_request.messages
+                    && let Some(message_prefix_digest) =
+                        context_message_prefix_digest(&plan, completed_request.messages.len())
+                {
+                    observed_context_usage = Some(ObservedContextUsage {
+                        message_count: completed_request.messages.len(),
+                        input_tokens,
+                        message_prefix_digest,
+                        tool_digest: provider_tool_digest.clone(),
+                        provider_id: completed_request.provider_id.clone(),
+                        model_id: completed_request.model_id.clone(),
+                    });
+                }
                 // Persist accounting before the completion boundary. A crash
                 // after the provider returned but before the derived usage
                 // event must not make a recovered governor forget the cost.
@@ -1511,6 +1606,28 @@ where
                     .to_owned(),
                 };
 
+                // 意图投影会让常见首请求保持精简。模型若确实调用了首轮未加载、
+                // 但仍在批准工具面内的工具，则在下一请求补入该能力，并使已观测的
+                // 前缀计数失效，因为工具 schema 也是前缀的一部分。
+                if !provider_response.tool_calls.is_empty()
+                    && !objective_disables_tools(&current_objective)
+                    && expand_provider_tools_for_calls(
+                        &mut provider_tools,
+                        &all_provider_tools,
+                        &provider_response.tool_calls,
+                        &current_task_contract,
+                        current_tool_profile,
+                        self.tool_executor.registry(),
+                    )
+                {
+                    (
+                        provider_tool_schema_digests,
+                        planned_tool_tokens,
+                        provider_tool_digest,
+                    ) = provider_tool_snapshot(&provider_tools);
+                    observed_context_usage = None;
+                }
+
                 if let Some(content) = provider_response
                     .message
                     .as_ref()
@@ -1527,16 +1644,20 @@ where
 
                 if provider_response.tool_calls.is_empty() {
                     if let Some(message) = provider_response.message {
-                        message_sources.push(ContextMessageSource {
-                            contributor: "assistant_recent".to_owned(),
-                            source_refs: vec![format!(
-                                "provider-response:{}",
-                                provider_response.response_id
-                            )],
-                            origin: "provider_response".to_owned(),
-                            visibility: ModelInputVisibility::ModelVisible,
-                        });
-                        messages.push(message);
+                        append_plan_message(
+                            &mut plan,
+                            message,
+                            ContextMessageSource {
+                                contributor: "assistant_recent".to_owned(),
+                                source_refs: vec![format!(
+                                    "provider-response:{}",
+                                    provider_response.response_id
+                                )],
+                                origin: "provider_response".to_owned(),
+                                visibility: ModelInputVisibility::ModelVisible,
+                            },
+                            &mut message_token_total,
+                        );
                         empty_response_count = 0;
                     } else {
                         empty_response_count = empty_response_count.saturating_add(1);
@@ -1553,21 +1674,25 @@ where
                                 attempt: empty_response_count,
                                 reason: "provider returned an empty response".to_owned(),
                             });
-                            messages.push(ProviderMessage {
-                                role: ProviderRole::User,
-                                content: "Return a concrete response or a valid tool call."
-                                    .to_owned(),
-                                tool_call_id: None,
-                                tool_name: None,
-                                tool_calls: Vec::new(),
-                                metadata: Default::default(),
-                            });
-                            message_sources.push(ContextMessageSource {
-                                contributor: "runtime_context".to_owned(),
-                                source_refs: vec!["runtime:empty-response-recovery".to_owned()],
-                                origin: "runtime_recovery".to_owned(),
-                                visibility: ModelInputVisibility::ModelVisible,
-                            });
+                            append_plan_message(
+                                &mut plan,
+                                ProviderMessage {
+                                    role: ProviderRole::User,
+                                    content: "Return a concrete response or a valid tool call."
+                                        .to_owned(),
+                                    tool_call_id: None,
+                                    tool_name: None,
+                                    tool_calls: Vec::new(),
+                                    metadata: Default::default(),
+                                },
+                                ContextMessageSource {
+                                    contributor: "runtime_context".to_owned(),
+                                    source_refs: vec!["runtime:empty-response-recovery".to_owned()],
+                                    origin: "runtime_recovery".to_owned(),
+                                    visibility: ModelInputVisibility::ModelVisible,
+                                },
+                                &mut message_token_total,
+                            );
                             continue;
                         }
                         let reason = "provider returned empty responses repeatedly".to_owned();
@@ -1631,31 +1756,35 @@ where
                 let tool_reports_before_step = tool_reports.len();
                 let mut failed_signatures_this_step = HashSet::new();
                 let mut successful_signatures_this_step = HashSet::new();
-                messages.push(ProviderMessage {
-                    role: ProviderRole::Assistant,
-                    content: provider_response
-                        .message
-                        .as_ref()
-                        .map(|message| message.content.clone())
-                        .unwrap_or_default(),
-                    tool_call_id: None,
-                    tool_name: None,
-                    tool_calls: provider_response.tool_calls.clone(),
-                    metadata: provider_response
-                        .message
-                        .as_ref()
-                        .map(|message| message.metadata.clone())
-                        .unwrap_or_default(),
-                });
-                message_sources.push(ContextMessageSource {
-                    contributor: "assistant_recent".to_owned(),
-                    source_refs: vec![format!(
-                        "provider-response:{}",
-                        provider_response.response_id
-                    )],
-                    origin: "provider_tool_request".to_owned(),
-                    visibility: ModelInputVisibility::ModelVisible,
-                });
+                append_plan_message(
+                    &mut plan,
+                    ProviderMessage {
+                        role: ProviderRole::Assistant,
+                        content: provider_response
+                            .message
+                            .as_ref()
+                            .map(|message| message.content.clone())
+                            .unwrap_or_default(),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls: provider_response.tool_calls.clone(),
+                        metadata: provider_response
+                            .message
+                            .as_ref()
+                            .map(|message| message.metadata.clone())
+                            .unwrap_or_default(),
+                    },
+                    ContextMessageSource {
+                        contributor: "assistant_recent".to_owned(),
+                        source_refs: vec![format!(
+                            "provider-response:{}",
+                            provider_response.response_id
+                        )],
+                        origin: "provider_tool_request".to_owned(),
+                        visibility: ModelInputVisibility::ModelVisible,
+                    },
+                    &mut message_token_total,
+                );
                 let parallel_read_candidate = provider_batch_is_parallel_read_candidate(
                     &provider_response.tool_calls,
                     replay_context.is_some(),
@@ -2302,20 +2431,27 @@ where
                         });
                         runtime_deadline_guard_emitted = true;
                     }
-                    messages.push(ProviderMessage {
-                        role: ProviderRole::Tool,
-                        content: model_visible_tool_result(&report.envelope),
-                        tool_call_id: Some(provider_tool_call_id),
-                        tool_name: Some(report.envelope.tool_name.clone()),
-                        tool_calls: Vec::new(),
-                        metadata: Default::default(),
-                    });
-                    message_sources.push(ContextMessageSource {
-                        contributor: "tool_result_excerpt".to_owned(),
-                        source_refs: vec![format!("tool-call:{}", report.envelope.tool_call_id)],
-                        origin: "tool_result".to_owned(),
-                        visibility: ModelInputVisibility::ModelVisible,
-                    });
+                    append_plan_message(
+                        &mut plan,
+                        ProviderMessage {
+                            role: ProviderRole::Tool,
+                            content: model_visible_tool_result(&report.envelope),
+                            tool_call_id: Some(provider_tool_call_id),
+                            tool_name: Some(report.envelope.tool_name.clone()),
+                            tool_calls: Vec::new(),
+                            metadata: Default::default(),
+                        },
+                        ContextMessageSource {
+                            contributor: "tool_result_excerpt".to_owned(),
+                            source_refs: vec![format!(
+                                "tool-call:{}",
+                                report.envelope.tool_call_id
+                            )],
+                            origin: "tool_result".to_owned(),
+                            visibility: ModelInputVisibility::ModelVisible,
+                        },
+                        &mut message_token_total,
+                    );
                     tool_reports.push(report);
                     if strategy_was_blocked && blocked_family_failures >= 3 {
                         let reason = format!(
@@ -2400,45 +2536,53 @@ where
                         elapsed_millis(current_turn_started_at),
                     )
                 {
-                    messages.push(ProviderMessage {
-                        role: ProviderRole::User,
-                        content: advisory,
-                        tool_call_id: None,
-                        tool_name: None,
-                        tool_calls: Vec::new(),
-                        metadata: Default::default(),
-                    });
-                    message_sources.push(ContextMessageSource {
-                        contributor: "runtime_context".to_owned(),
-                        source_refs: vec![format!(
-                            "runtime:deadline-advisory:{}",
-                            step_completion.snapshot.step_no
-                        )],
-                        origin: "runtime_deadline_advisory".to_owned(),
-                        visibility: ModelInputVisibility::ModelVisible,
-                    });
+                    append_plan_message(
+                        &mut plan,
+                        ProviderMessage {
+                            role: ProviderRole::User,
+                            content: advisory,
+                            tool_call_id: None,
+                            tool_name: None,
+                            tool_calls: Vec::new(),
+                            metadata: Default::default(),
+                        },
+                        ContextMessageSource {
+                            contributor: "runtime_context".to_owned(),
+                            source_refs: vec![format!(
+                                "runtime:deadline-advisory:{}",
+                                step_completion.snapshot.step_no
+                            )],
+                            origin: "runtime_deadline_advisory".to_owned(),
+                            visibility: ModelInputVisibility::ModelVisible,
+                        },
+                        &mut message_token_total,
+                    );
                     deadline_advisory_emitted = true;
                 }
                 if let Some(advisory) = step_completion.advisory.as_deref() {
-                    messages.push(ProviderMessage {
-                        role: ProviderRole::User,
-                        content: format!(
-                            "Runtime progress advisory: {advisory}. Use the evidence already gathered and take a materially different action before repeating this strategy."
-                        ),
-                        tool_call_id: None,
-                        tool_name: None,
-                        tool_calls: Vec::new(),
-                        metadata: Default::default(),
-                    });
-                    message_sources.push(ContextMessageSource {
-                        contributor: "runtime_context".to_owned(),
-                        source_refs: vec![format!(
-                            "runtime:progress-advisory:{}",
-                            step_completion.snapshot.step_no
-                        )],
-                        origin: "runtime_progress_advisory".to_owned(),
-                        visibility: ModelInputVisibility::ModelVisible,
-                    });
+                    append_plan_message(
+                        &mut plan,
+                        ProviderMessage {
+                            role: ProviderRole::User,
+                            content: format!(
+                                "Runtime progress advisory: {advisory}. Use the evidence already gathered and take a materially different action before repeating this strategy."
+                            ),
+                            tool_call_id: None,
+                            tool_name: None,
+                            tool_calls: Vec::new(),
+                            metadata: Default::default(),
+                        },
+                        ContextMessageSource {
+                            contributor: "runtime_context".to_owned(),
+                            source_refs: vec![format!(
+                                "runtime:progress-advisory:{}",
+                                step_completion.snapshot.step_no
+                            )],
+                            origin: "runtime_progress_advisory".to_owned(),
+                            visibility: ModelInputVisibility::ModelVisible,
+                        },
+                        &mut message_token_total,
+                    );
                 }
                 if step_completion.should_stop {
                     let reason = step_completion.stop_reason.clone().unwrap_or_else(|| {
@@ -2976,24 +3120,28 @@ where
                 turn_state.issue_correction(golutra_core::ContinuationReason::VerificationFailed);
                 step_machine.begin_correction(elapsed_millis(current_turn_started_at));
                 trace(AgentLoopTraceEvent::CorrectionIssued(correction.clone()));
-                messages.push(ProviderMessage {
-                    role: ProviderRole::User,
-                    content: correction.as_model_instruction(),
-                    tool_call_id: None,
-                    tool_name: None,
-                    tool_calls: Vec::new(),
-                    metadata: Default::default(),
-                });
-                message_sources.push(ContextMessageSource {
-                    contributor: "verification_feedback".to_owned(),
-                    source_refs: correction
-                        .evidence_refs
-                        .iter()
-                        .map(|evidence| format!("evidence:{evidence}"))
-                        .collect(),
-                    origin: "verification_feedback".to_owned(),
-                    visibility: ModelInputVisibility::ModelVisible,
-                });
+                append_plan_message(
+                    &mut plan,
+                    ProviderMessage {
+                        role: ProviderRole::User,
+                        content: correction.as_model_instruction(),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls: Vec::new(),
+                        metadata: Default::default(),
+                    },
+                    ContextMessageSource {
+                        contributor: "verification_feedback".to_owned(),
+                        source_refs: correction
+                            .evidence_refs
+                            .iter()
+                            .map(|evidence| format!("evidence:{evidence}"))
+                            .collect(),
+                        origin: "verification_feedback".to_owned(),
+                        visibility: ModelInputVisibility::ModelVisible,
+                    },
+                    &mut message_token_total,
+                );
                 tool_reports.retain(|report| {
                     !matches!(
                         report.envelope.tool_name.as_str(),
@@ -3206,56 +3354,6 @@ fn digest_value(value: &Value) -> String {
     let mut digest = Sha256::new();
     digest.update(serde_json::to_vec(value).unwrap_or_default());
     format!("{:x}", digest.finalize())
-}
-
-const MAX_MODEL_TOOL_HISTORY_TOKENS: u64 = 2_048;
-
-fn compact_tool_result_history(
-    messages: &mut [ProviderMessage],
-    sources: &mut [ContextMessageSource],
-) -> usize {
-    let mut retained_tokens = 0_u64;
-    let mut compacted = 0_usize;
-    for index in (0..messages.len()).rev() {
-        if messages[index].role != ProviderRole::Tool {
-            continue;
-        }
-        let message_tokens = estimate_message_tokens(std::slice::from_ref(&messages[index]));
-        if retained_tokens == 0
-            || retained_tokens.saturating_add(message_tokens) <= MAX_MODEL_TOOL_HISTORY_TOKENS
-        {
-            retained_tokens = retained_tokens.saturating_add(message_tokens);
-            continue;
-        }
-        if sources
-            .get(index)
-            .is_some_and(|source| source.origin == "tool_result_compaction")
-        {
-            retained_tokens = retained_tokens.saturating_add(message_tokens);
-            continue;
-        }
-        messages[index].content = compacted_tool_result_message(&messages[index].content);
-        if let Some(source) = sources.get_mut(index) {
-            source.origin = "tool_result_compaction".to_owned();
-        }
-        retained_tokens = retained_tokens.saturating_add(estimate_message_tokens(
-            std::slice::from_ref(&messages[index]),
-        ));
-        compacted = compacted.saturating_add(1);
-    }
-    compacted
-}
-
-fn compacted_tool_result_message(content: &str) -> String {
-    let parsed = serde_json::from_str::<serde_json::Value>(content).unwrap_or_default();
-    serde_json::to_string(&serde_json::json!({
-        "tool_name": parsed.get("tool_name").and_then(serde_json::Value::as_str),
-        "status": parsed.get("status").cloned().unwrap_or(serde_json::Value::Null),
-        "summary": parsed.get("summary").and_then(serde_json::Value::as_str),
-        "history_state": "compacted",
-        "detail": "full result remains available in runtime artifacts",
-    }))
-    .unwrap_or_else(|_| "{\"history_state\":\"compacted\"}".to_owned())
 }
 
 fn update_repeated_failure_streak(
@@ -3699,6 +3797,194 @@ fn provider_tools_for_turn(
     tools
 }
 
+/// Select the smallest useful provider surface for the first request of a
+/// turn.  The executor still owns the complete registry: this is only a wire
+/// optimization, and an unexpected tool call expands the surface before the
+/// call is executed.  Keeping the initial catalog small materially reduces
+/// prompt tokens for focused tasks while preserving the full coding profile
+/// for ambiguous requests and explicit `full` turns.
+fn provider_tools_for_objective(
+    tools: &[ToolContract],
+    contract: &TaskContract,
+    profile: AgentToolProfile,
+    registry: &ToolRegistry,
+    objective: &str,
+) -> Vec<ToolContract> {
+    let available = provider_tools_for_turn(tools, contract, profile, registry);
+    if available.is_empty() || matches!(profile, AgentToolProfile::Full) {
+        return available;
+    }
+    if objective_disables_tools(objective) {
+        return Vec::new();
+    }
+
+    let normalized = objective.trim().to_ascii_lowercase();
+    let has_file_signal = contains_any(
+        &normalized,
+        &[
+            "file", "path", "read", "write", "edit", "replace", "update", "create", "文件", "路径",
+            "读取", "写入", "编辑", "修改", "创建",
+        ],
+    );
+    let has_shell_signal = contains_any(
+        &normalized,
+        &[
+            "shell", "bash", "command", "terminal", "run ", "test", "命令", "终端", "运行", "测试",
+        ],
+    );
+    let has_search_signal = contains_any(
+        &normalized,
+        &[
+            "web", "internet", "online", "search", "联网", "网络", "搜索",
+        ],
+    );
+    let has_background_signal = contains_any(
+        &normalized,
+        &["background", "wait", "process", "后台", "等待", "进程"],
+    );
+    let has_delegate_signal = contains_any(
+        &normalized,
+        &["subagent", "delegate", "child agent", "子代理", "委派"],
+    );
+
+    // No reliable intent signal means the model should retain the complete
+    // catalog rather than losing a capability because of an overly aggressive
+    // lexical guess.
+    if !(has_file_signal
+        || has_shell_signal
+        || has_search_signal
+        || has_background_signal
+        || has_delegate_signal)
+    {
+        return available;
+    }
+
+    let mut wanted = HashSet::<&str>::new();
+    if has_file_signal {
+        // Reading is the safe common first step for both edits and writes.
+        wanted.insert("read_file");
+        if contains_any(&normalized, &["write", "create", "写入", "创建", "生成"]) {
+            wanted.insert("write_file");
+        }
+        if contains_any(
+            &normalized,
+            &["edit", "replace", "update", "修改", "编辑", "替换", "更新"],
+        ) {
+            wanted.insert("edit_file");
+        }
+        if contains_any(&normalized, &["patch", "diff", "补丁"]) {
+            wanted.insert("apply_patch");
+        }
+    }
+    if has_shell_signal {
+        wanted.insert("shell");
+    }
+    if has_background_signal {
+        wanted.insert("shell");
+        wanted.insert("shell_session");
+    }
+    if has_search_signal {
+        wanted.insert("web_search");
+    }
+    if has_delegate_signal {
+        wanted.insert("subagent");
+    }
+
+    let selected = available
+        .into_iter()
+        .filter(|tool| wanted.contains(tool.tool_name.as_str()))
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        // Keep a usable fallback if the objective mentions a capability that
+        // the current registry/profile does not expose.
+        provider_tools_for_turn(tools, contract, profile, registry)
+    } else {
+        selected
+    }
+}
+
+/// 补入初始意图投影遗漏、但实际被模型调用的合法工具。
+/// registry 仍是执行和 profile 过滤的唯一权威；此函数只改变下一回合发送给
+/// provider 的工具目录。
+fn expand_provider_tools_for_calls(
+    provider_tools: &mut Vec<ToolContract>,
+    all_provider_tools: &[ToolContract],
+    tool_calls: &[ProviderToolCall],
+    contract: &TaskContract,
+    profile: AgentToolProfile,
+    registry: &ToolRegistry,
+) -> bool {
+    if matches!(profile, AgentToolProfile::None) {
+        return false;
+    }
+
+    let mut changed = false;
+    for tool_call in tool_calls {
+        if provider_tools
+            .iter()
+            .any(|tool| tool.tool_name == tool_call.tool_name)
+        {
+            continue;
+        }
+        let Some(contract_ref) = all_provider_tools
+            .iter()
+            .find(|tool| tool.tool_name == tool_call.tool_name)
+            .or_else(|| registry.contract(&tool_call.tool_name))
+        else {
+            continue;
+        };
+        if !is_pi_plus_tool(&contract_ref.tool_name)
+            || !tool_allowed_for_profile(&contract_ref.tool_name, profile, registry)
+            || (matches!(
+                contract.workspace_change,
+                WorkspaceChangeRequirement::Forbidden
+            ) && contract_ref.side_effect_type != SideEffectType::None)
+        {
+            continue;
+        }
+
+        // 复用统一的 profile 投影，确保 coding profile 隐藏参数的处理与首轮一致。
+        let mut projected = provider_tools_for_turn(
+            std::slice::from_ref(contract_ref),
+            contract,
+            profile,
+            registry,
+        );
+        if let Some(projected) = projected.pop() {
+            provider_tools.push(projected);
+            changed = true;
+        }
+    }
+    if changed {
+        provider_tools.sort_by(|left, right| left.tool_name.cmp(&right.tool_name));
+    }
+    changed
+}
+
+fn contains_any(value: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| value.contains(needle))
+}
+
+/// A user can explicitly request a pure response.  In that case sending the
+/// complete tool catalog only adds prompt tokens and gives the model a
+/// capability it was told not to use.  This fast path is deliberately
+/// opt-in; ordinary conversational prompts retain the full coding surface.
+fn objective_disables_tools(objective: &str) -> bool {
+    let normalized = objective.trim().to_ascii_lowercase();
+    [
+        "do not use tools",
+        "don't use tools",
+        "without using tools",
+        "without tools",
+        "no tools",
+        "不使用工具",
+        "不要使用工具",
+        "无需工具",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+}
+
 fn tool_allowed_for_profile(
     tool_name: &str,
     profile: AgentToolProfile,
@@ -3830,8 +4116,39 @@ async fn invoke_parallel_read_calls(
         .into()
 }
 
-fn estimate_tool_contract_tokens(tools: &[ToolContract]) -> u64 {
-    estimate_provider_tool_tokens(tools)
+fn provider_tool_snapshot(tools: &[ToolContract]) -> (Vec<String>, u64, String) {
+    let mut digests = Vec::with_capacity(tools.len());
+    let mut token_count = 0_u64;
+    for tool in tools {
+        let (digest, tokens) = provider_tool_wire_stats(tool);
+        digests.push(digest);
+        token_count = token_count.saturating_add(tokens);
+    }
+    let digest = provider_tools_digest_from_digests(&mut digests);
+    (digests, token_count, digest)
+}
+
+fn provider_tools_digest_from_digests(digests: &mut [String]) -> String {
+    // `provider_tools_for_turn` returns name-sorted contracts. Keep the
+    // defensive ordering guarantee for external callers while avoiding a
+    // second allocation when the list is already canonical.
+    if !digests.windows(2).all(|pair| pair[0] <= pair[1]) {
+        digests.sort_unstable();
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"[");
+    for (index, value) in digests.iter().enumerate() {
+        if index > 0 {
+            digest.update(b",");
+        }
+        // Provider tool digests are hexadecimal strings and therefore require
+        // no JSON escaping; this is byte-for-byte the compact JSON array form.
+        digest.update(b"\"");
+        digest.update(value.as_bytes());
+        digest.update(b"\"");
+    }
+    digest.update(b"]");
+    format!("{:x}", digest.finalize())
 }
 
 fn elapsed_millis(started_at: Instant) -> u64 {

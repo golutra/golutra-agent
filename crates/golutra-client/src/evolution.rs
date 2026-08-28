@@ -1,7 +1,8 @@
 //! 受治理的开放式任务执行与 Skill 生命周期编排。
 
-use std::{fs, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashSet, fs, path::PathBuf, sync::Arc, time::Duration};
 
+use golutra_context::estimate_tokens;
 use golutra_core::{Actor, ActorKind, CommandId, SessionId, TaskStatus};
 use golutra_evolution::{
     EnvironmentRecipe, EvolutionPlanner, GeneratedTaskExecution, OpenEndedBudget,
@@ -13,6 +14,9 @@ use golutra_protocol::{
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use super::context::{
+    skill_context_fingerprint, skill_manifest_fingerprint, truncate_to_token_budget,
+};
 use super::{
     ClientError, RuntimeExecutionOptions, RuntimeHost, RuntimeHostStorage, RuntimePaths,
     RuntimeStore, ensure_private_dir, host_event, run_blocking, set_owner_only_file,
@@ -23,11 +27,8 @@ const MAX_SELECTED_TASKS: u32 = 20;
 const MAX_TOOL_CALLS_PER_TASK: u32 = 64;
 const MAX_RUNTIME_MS_PER_TASK: u64 = 10 * 60 * 1_000;
 const MIN_RUNTIME_MS_PER_TASK: u64 = 1_000;
-const SKILL_CONTEXT_LIMIT: usize = 3;
-const MAX_SKILL_CONTEXT_CHARS: usize = 4_096;
-const MAX_SKILL_DESCRIPTION_CHARS: usize = 320;
-const MAX_SKILL_STEPS: usize = 4;
-const MAX_SKILL_STEP_CHARS: usize = 240;
+#[cfg(test)]
+const DEFAULT_SKILL_CONTEXT_BUDGET: u64 = 1_024;
 
 impl RuntimeHost {
     pub(super) async fn handle_plan_evolution_command(
@@ -342,17 +343,70 @@ impl RuntimeHost {
         Ok(skill_ack(command.command_id, &skill_id, "rolled back"))
     }
 
+    #[cfg(test)]
     pub(super) async fn active_skill_context(
         &self,
         objective: &str,
     ) -> Result<Option<String>, ClientError> {
-        let evolution_store = self.storage.evolution_store.clone();
-        let objective = objective.to_owned();
-        let manifests = run_blocking(move || {
-            evolution_store.active_skill_context(&objective, SKILL_CONTEXT_LIMIT)
-        })
-        .await??;
-        Ok((!manifests.is_empty()).then(|| render_skill_context(&manifests)))
+        self.active_skill_context_with_budget(objective, DEFAULT_SKILL_CONTEXT_BUDGET)
+            .await
+    }
+
+    pub(super) async fn active_skill_context_with_budget(
+        &self,
+        objective: &str,
+        token_budget: u64,
+    ) -> Result<Option<String>, ClientError> {
+        let skill_path = self
+            .runtime_paths
+            .as_ref()
+            .map(|paths| paths.evolution_file.as_path());
+        let manifest_fingerprint = skill_manifest_fingerprint(skill_path);
+        let fingerprint = format!(
+            "{}\0budget:{}",
+            skill_context_fingerprint(skill_path, objective),
+            token_budget
+        );
+        if let Some(cached) = self
+            .execution
+            .context_resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .skill(&fingerprint)
+        {
+            return Ok(cached.value);
+        }
+
+        let manifests = if let Some(manifests) = self
+            .execution
+            .context_resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .skill_index(&manifest_fingerprint)
+        {
+            manifests
+        } else {
+            let evolution_store = self.storage.evolution_store.clone();
+            let loaded =
+                run_blocking(move || evolution_store.installed_skill_manifests()).await??;
+            let manifests = Arc::new(loaded);
+            self.execution
+                .context_resources
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert_skill_index(manifest_fingerprint, Arc::clone(&manifests));
+            manifests
+        };
+
+        let selected = select_skill_manifests(&manifests, objective);
+        let value = render_skill_context(&selected, token_budget);
+        let mut cache = self
+            .execution
+            .context_resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.insert_skill(fingerprint, value.clone());
+        Ok(value)
     }
 
     async fn execute_generated_task(
@@ -550,7 +604,13 @@ impl RuntimeHost {
                 "record": record,
             }),
         ))
-        .await
+        .await?;
+        self.execution
+            .context_resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .invalidate_skill_index();
+        Ok(())
     }
 }
 
@@ -616,36 +676,74 @@ fn task_status_name(status: TaskStatus) -> &'static str {
     }
 }
 
-fn render_skill_context(skills: &[SkillManifest]) -> String {
-    let rendered = skills
+fn select_skill_manifests(manifests: &[SkillManifest], objective: &str) -> Vec<SkillManifest> {
+    let objective_terms = skill_terms(objective);
+    let mut matches = manifests
         .iter()
-        .map(|skill| {
-            format!(
-                "Skill: {}\nWhen relevant: {}\nSteps:\n{}",
-                skill.name,
-                compact_skill_text(&skill.description, MAX_SKILL_DESCRIPTION_CHARS),
-                skill
-                    .steps
-                    .iter()
-                    .take(MAX_SKILL_STEPS)
-                    .enumerate()
-                    .map(|(index, step)| {
-                        format!(
-                            "{}. {}",
-                            index.saturating_add(1),
-                            compact_skill_text(step, MAX_SKILL_STEP_CHARS)
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )
+        .filter_map(|manifest| {
+            let skill_terms = skill_terms(&format!("{} {}", manifest.name, manifest.description));
+            let score = objective_terms.intersection(&skill_terms).count();
+            (score > 0).then_some((score, manifest))
         })
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    let rendered = format!(
-        "Verified project skills are optional guidance. Apply only when they match the current objective:\n{rendered}"
-    );
-    bounded_skill_context(&rendered, MAX_SKILL_CONTEXT_CHARS)
+        .collect::<Vec<_>>();
+    // Explicit tie-breaking makes the rendered suffix stable across state
+    // rewrites, which improves provider prefix reuse and replay diffs.
+    matches.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.skill_id.cmp(&right.1.skill_id))
+    });
+    matches
+        .into_iter()
+        .map(|(_, manifest)| manifest.clone())
+        .collect()
+}
+
+fn skill_terms(value: &str) -> HashSet<String> {
+    value
+        .split(|character: char| !character.is_alphanumeric() && character != '_')
+        .map(str::to_ascii_lowercase)
+        .filter(|term| term.len() >= 2)
+        .collect()
+}
+
+fn render_skill_context(skills: &[SkillManifest], token_budget: u64) -> Option<String> {
+    if skills.is_empty() || token_budget == 0 {
+        return None;
+    }
+    const HEADER: &str = "Verified project skills are optional metadata. Apply only when they match the current objective:\n";
+    let header_tokens = estimate_tokens(HEADER);
+    if token_budget != u64::MAX && token_budget <= header_tokens {
+        return Some(truncate_to_token_budget(HEADER, token_budget));
+    }
+
+    let mut used = header_tokens;
+    let mut rendered = Vec::new();
+    for skill in skills {
+        let block = format!(
+            "Skill: {}\nSkill id: {}\nWhen relevant: {}\nFull guidance is loaded only when this skill is relevant.",
+            skill.name,
+            skill.skill_id,
+            compact_skill_text(&skill.description, 320),
+        );
+        let separator = if rendered.is_empty() { "" } else { "\n\n" };
+        let candidate = format!("{separator}{block}");
+        let available = token_budget.saturating_sub(used);
+        if available == 0 {
+            break;
+        }
+        let fitted = truncate_to_token_budget(&candidate, available);
+        if fitted.is_empty() {
+            break;
+        }
+        used = used.saturating_add(estimate_tokens(&fitted));
+        rendered.push(fitted);
+        if token_budget != u64::MAX && used >= token_budget {
+            break;
+        }
+    }
+    (!rendered.is_empty()).then(|| format!("{HEADER}{}", rendered.join("")))
 }
 
 fn compact_skill_text(value: &str, max_chars: usize) -> String {
@@ -655,20 +753,6 @@ fn compact_skill_text(value: &str, max_chars: usize) -> String {
     } else {
         compact.chars().take(max_chars).collect()
     }
-}
-
-fn bounded_skill_context(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_owned();
-    }
-    const OMITTED_MARKER: &str = "\n[additional skill guidance omitted]";
-    if max_chars < OMITTED_MARKER.chars().count() {
-        return OMITTED_MARKER.chars().take(max_chars).collect();
-    }
-    let content_limit = max_chars.saturating_sub(OMITTED_MARKER.chars().count());
-    let mut bounded = value.chars().take(content_limit).collect::<String>();
-    bounded.push_str(OMITTED_MARKER);
-    bounded
 }
 
 fn skill_ack(command_id: CommandId, skill_id: &str, action: &str) -> CommandAck {

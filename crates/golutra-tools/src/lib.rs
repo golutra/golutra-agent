@@ -69,6 +69,9 @@ const DEADLINE_CLEANUP_TIMEOUT: Duration = Duration::from_millis(250);
 const CODE_INDEX_BUILD_CONCURRENCY: usize = 1;
 static CODE_INDEX_BUILD_PERMITS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(CODE_INDEX_BUILD_CONCURRENCY)));
+// Sandbox capability is process-wide. Detecting the launcher for every task
+// adds filesystem probes to the critical path without changing the result.
+static DETECTED_SANDBOX: LazyLock<SystemSandbox> = LazyLock::new(SystemSandbox::detect);
 pub const CONTRACT_FILE_CONTENT_VERIFIER_TOOL: &str = "contract_file_content_verifier";
 pub const CONTRACT_PATH_VERIFIER_TOOL: &str = "contract_path_verifier";
 
@@ -429,7 +432,7 @@ impl ToolRuntime {
         Self {
             policy,
             registry: ToolRegistry::p0_default(),
-            sandbox: SystemSandbox::detect(),
+            sandbox: (*DETECTED_SANDBOX).clone(),
             allow_network: false,
             external_backend: None,
             web_search_backend: None,

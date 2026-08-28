@@ -13,7 +13,9 @@ use std::{
 use golutra_auth::{CredentialRef, SecretKind};
 use golutra_client::{RuntimeClient, RuntimeExecutionOptions, RuntimeTransport};
 use golutra_config::{ProviderConfigPaths, ProviderProfile, ProviderSettings};
-use golutra_core::{ActorKind, QueryId, RedactionStatus, SessionId, TaskStatus, TokenUsageRecord};
+use golutra_core::{
+    ActorKind, QueryId, RedactionStatus, SessionId, TaskId, TaskStatus, TokenUsageRecord,
+};
 use golutra_llm::{ProviderGenerationConfig, ProviderProtocol};
 use golutra_protocol::{EventFilter, RuntimeQuery, RuntimeQueryKind, TuiFrame, UserProjection};
 use serde_json::{Value, json};
@@ -1783,10 +1785,19 @@ async fn daemon_driver_enforces_binding_and_survives_disconnect_and_restart() {
     close_socket_driver(&mut driver_b, &mut child_b, "close-b").await;
     close_socket_driver(&mut driver_a, &mut child_a, "close-a").await;
     let terminal = wait_for_terminal_projection(&transport, session_id).await;
-    assert!(
-        matches!(terminal.status, TaskStatus::Completed | TaskStatus::Partial),
-        "unexpected terminal projection after approval: {terminal:?}"
-    );
+    if !matches!(terminal.status, TaskStatus::Completed | TaskStatus::Partial) {
+        let events = transport
+            .replay_events(EventFilter {
+                session_id,
+                task_id: Some(task_id.parse::<TaskId>().expect("task id")),
+                after_sequence_no: None,
+            })
+            .await
+            .expect("query terminal events");
+        panic!(
+            "unexpected terminal projection after approval: {terminal:?}; task events: {events:?}"
+        );
+    }
     let terminal_status = terminal.status;
     assert_eq!(
         terminal.task_id.map(|id| id.to_string()),

@@ -2,7 +2,10 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
 use golutra_auth::{AuthError, CredentialMetadata, CredentialProvider};
-use golutra_core::{PolicyId, ProviderRequestId, SideEffectType, TaskId, ToolContract, TurnId};
+use golutra_core::{
+    PolicyId, PromptCachePolicy, ProviderRequestId, SessionId, SideEffectType, TaskId,
+    ToolContract, TurnId,
+};
 use golutra_llm::{
     GenaiProviderAdapter, GenaiProviderConfig, LlmProvider, OpenAiCompatibleProvider,
     OpenAiCompatibleProviderConfig, OpenAiResponsesProvider, OpenAiResponsesProviderConfig,
@@ -656,6 +659,80 @@ async fn openai_responses_forces_rust_genai_responses_routing_for_grok_model() {
     assert_eq!(captured[0].path, "/responses");
     assert_eq!(captured[0].body["model"], "grok-4.5");
     assert_eq!(captured[0].body["stream"], true);
+}
+
+#[tokio::test]
+async fn openai_responses_projects_stable_cache_identity_and_retention() {
+    let response = include_str!("fixtures/openai-responses/text-response.sse");
+    let (base_url, captured) = spawn_provider_sequence(vec![
+        TestProviderResponse::sse(200, response),
+        TestProviderResponse::sse(200, response),
+        TestProviderResponse::sse(200, response),
+        TestProviderResponse::sse(200, response),
+    ])
+    .await;
+    let provider = openai_responses_provider(base_url);
+    let session_id = SessionId::new();
+    let mut first = simple_request("gpt-golden");
+    first.session_id = Some(session_id);
+    first.cache_policy = PromptCachePolicy::Long;
+
+    provider
+        .complete(first.clone())
+        .await
+        .expect("first cached Responses request");
+    provider
+        .complete(first.clone())
+        .await
+        .expect("second cached Responses request");
+
+    let mut other_session = first.clone();
+    other_session.session_id = Some(SessionId::new());
+    provider
+        .complete(other_session)
+        .await
+        .expect("isolated cached Responses request");
+
+    let mut disabled = first;
+    disabled.cache_policy = PromptCachePolicy::None;
+    provider
+        .complete(disabled)
+        .await
+        .expect("cache-disabled Responses request");
+
+    let requests = captured.await.expect("Responses cache request capture");
+    assert_eq!(requests.len(), 4);
+    let first_key = requests[0].body["prompt_cache_key"]
+        .as_str()
+        .expect("first request cache key");
+    let second_key = requests[1].body["prompt_cache_key"]
+        .as_str()
+        .expect("second request cache key");
+    let other_key = requests[2].body["prompt_cache_key"]
+        .as_str()
+        .expect("isolated request cache key");
+    assert_eq!(first_key.len(), 64);
+    assert_eq!(first_key, second_key);
+    assert_ne!(first_key, other_key);
+    let session_header = session_id.to_string();
+    for request in &requests[..3] {
+        assert_eq!(request.path, "/responses");
+        assert_eq!(request.body["prompt_cache_retention"], "24h");
+    }
+    assert_eq!(
+        requests[0].headers.get("session-id").map(String::as_str),
+        Some(session_header.as_str())
+    );
+    assert_eq!(
+        requests[1].headers.get("session-id").map(String::as_str),
+        Some(session_header.as_str())
+    );
+    assert!(requests[3].body.get("prompt_cache_key").is_none());
+    assert!(requests[3].body.get("prompt_cache_retention").is_none());
+    assert_eq!(
+        requests[3].headers.get("session-id").map(String::as_str),
+        Some(session_header.as_str())
+    );
 }
 
 #[tokio::test]
