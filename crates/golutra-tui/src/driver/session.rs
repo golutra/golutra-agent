@@ -1,3 +1,4 @@
+use super::{MAX_DRIVER_INPUT_BYTES, TuiApp};
 use crossterm::event::{KeyCode, MouseButton, MouseEvent, MouseEventKind};
 use golutra_client::{RuntimeClient, RuntimeTransport};
 use golutra_core::{SessionId, TaskId, TaskStatus, ThreadId, TurnId};
@@ -5,9 +6,6 @@ use golutra_protocol::{
     DriverKey, DriverMouseEvent, DriverMouseKind, EventPageDirection, EventPageRequest,
     RuntimeEvent, TUI_DRIVER_MAX_HEIGHT, TUI_DRIVER_MAX_WIDTH,
 };
-use uuid::Uuid;
-
-use super::{MAX_DRIVER_INPUT_BYTES, TuiApp};
 
 pub(super) fn validate_dimensions(width: u16, height: u16) -> miette::Result<()> {
     if !(40..=TUI_DRIVER_MAX_WIDTH).contains(&width) {
@@ -44,48 +42,11 @@ pub(super) async fn resolve_driver_session(
     value: Option<&str>,
     transport: &RuntimeTransport,
 ) -> miette::Result<(ThreadId, SessionId)> {
-    let value = value.map(str::trim).filter(|value| !value.is_empty());
-    match value {
-        None | Some("new") => Ok((ThreadId::new(), SessionId::new())),
-        Some("current") => {
-            let session_id = transport.default_session_id();
-            let thread_id = transport.default_thread_id();
-            Ok((thread_id, session_id))
-        }
-        Some(value) if value.starts_with("new:") => {
-            let session_id = parse_session_id(&value[4..])?;
-            if transport
-                .thread_for_session(session_id)
-                .await
-                .map_err(|error| miette::miette!("{error}"))?
-                .is_some()
-            {
-                return Err(miette::miette!(
-                    "session_exists: session `{session_id}` already exists; use its UUID without the new prefix"
-                ));
-            }
-            Ok((ThreadId::new(), session_id))
-        }
-        Some(value) => {
-            let session_id = parse_session_id(value)?;
-            let thread = transport
-                .thread_for_session(session_id)
-                .await
-                .map_err(|error| miette::miette!("{error}"))?
-                .ok_or_else(|| {
-                    miette::miette!(
-                        "session_not_found: session `{session_id}` does not exist in this workspace"
-                    )
-                })?;
-            Ok((thread.thread_id, thread.session_id))
-        }
+    if let Some(value) = value {
+        crate::resume_session(value, transport).await
+    } else {
+        Ok(crate::initial_session())
     }
-}
-
-fn parse_session_id(value: &str) -> miette::Result<SessionId> {
-    Uuid::parse_str(value)
-        .map(SessionId)
-        .map_err(|error| miette::miette!("invalid_session: {error}"))
 }
 
 pub(super) async fn validate_task_id(

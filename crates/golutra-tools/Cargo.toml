@@ -14,6 +14,7 @@ categories.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+futures-util.workspace = true
 chrono.workspace = true
 golutra-core.workspace = true
 golutra-code-intelligence = { path = "../golutra-code-intelligence", version = "0.1.0" }
@@ -21,6 +22,7 @@ golutra-policy = { path = "../golutra-policy", version = "0.1.0" }
 golutra-sandbox.workspace = true
 jsonschema.workspace = true
 regex.workspace = true
+reqwest.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 shlex.workspace = true

@@ -12,7 +12,9 @@ use std::{
 use async_trait::async_trait;
 use fs2::FileExt;
 use golutra_config::{ProviderConfigPaths, load_provider_runtime_env_from_paths};
-use golutra_context::ContextContributor;
+#[cfg(test)]
+pub(crate) use golutra_context::estimate_tokens;
+use golutra_context::{ContextContributor, structured_compaction_summary};
 use golutra_core::{
     Actor, ApprovalDecision, ApprovalId, ApprovalResolution, ArtifactId, ArtifactRecord,
     BusyPolicy, CommandId, EventId, MemoryId, PolicyBlockDisposition, PolicyDecision,
@@ -51,13 +53,14 @@ use golutra_runtime::{
 };
 use golutra_store::{CommandClaim, RuntimeRepositories, RuntimeStore, StoreError, ThreadRecord};
 use golutra_tools::{
-    FileBeforeImage, ProcessSupervisor, ToolRequest, ToolRuntime, discover_project_verifiers,
+    FileBeforeImage, HttpWebSearchBackend, ProcessSupervisor, ToolRequest, ToolRuntime,
+    discover_project_verifiers,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
-    sync::{Mutex, broadcast, mpsc, oneshot, watch},
+    sync::{Mutex, Notify, broadcast, mpsc, oneshot, watch},
     task::AbortHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -73,7 +76,6 @@ const PROVISIONAL_COMMAND_ACK_REASON: &str = "command accepted for processing";
 const EVENT_REPLAY_PAGE_SIZE: u32 = 256;
 const MAX_EVENT_PAGE_SIZE: u32 = 512;
 const CHECKPOINTS_TO_RETAIN_PER_WORKSPACE: usize = 20;
-const MAX_HISTORY_SOURCE_EVENTS: u32 = 512;
 const MAX_HTTP_JSON_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RUN_BUNDLE_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
@@ -85,7 +87,6 @@ const MAX_ROLLOUT_LINE_BYTES: usize = 20 * 1024 * 1024;
 const ROLLOUT_FORMAT_VERSION: u32 = 1;
 const POST_TASK_JOB_MAX_ATTEMPTS: u32 = 3;
 const POST_TASK_JOB_LEASE_MINUTES: i64 = 5;
-const POST_TASK_JOB_POLL_MILLIS: u64 = 250;
 const POST_TASK_JOB_IDLE_POLL_MILLIS: u64 = 1_000;
 const EXTERNAL_VERIFIERS_REQUIRE_OS_SANDBOX_KEY: &str = "_external_verifiers_require_os_sandbox";
 const TASK_CONTROL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -149,6 +150,7 @@ mod evolution;
 mod execution;
 mod execution_trace;
 mod external_evaluation;
+mod file_identity;
 mod governance;
 mod governance_commands;
 mod legacy_task;
@@ -177,25 +179,32 @@ pub use application::{
     GovernedRuntime, RuntimeApplication, RuntimeCommandService, RuntimeGovernanceService,
     RuntimeQueryService, RuntimeSessionService, TaskTraceService,
 };
+pub(crate) use context::history_contributors_with_budget;
 pub(crate) use context::{
-    compact_event_summary, compact_history_text, compact_history_with_summary,
+    CachedProjectInstructions, ContextResourceCache, MAX_CACHED_HISTORY_EVENTS,
+    ProjectInstructionBundle, bound_cached_history, compact_event_summary, compact_history_text,
     completion_criteria_from_payload, context_compaction_from_event, conversation_history_line,
-    effective_model_history_events, environment_context_prompt, load_project_instruction_bundle,
-    memory_context, model_prompt_from_payload, preview_from_payload, prompt_from_payload,
-    select_memories_for_context, system_prompt, task_contract_from_payload, title_from_payload,
+    effective_model_history_events, environment_context_prompt,
+    history_contributors_from_cached_facts, is_history_cache_event,
+    load_project_instruction_bundle, memory_context_with_budget, model_prompt_from_payload,
+    preview_from_payload, project_instruction_fingerprint, prompt_from_payload,
+    select_memories_for_context_with_budget, system_prompt, task_contract_from_payload,
+    title_from_payload, truncate_to_token_budget,
 };
 pub use debug_export::{
     DebugExportCoordinator, DebugExportManifest, DebugExportReceipt, DebugExportRequest,
     ExportedArtifactManifest, ExportedArtifactState, ExportedSessionManifest, ExportedTaskManifest,
     parse_session_range,
 };
+#[cfg(test)]
+pub(crate) use event_codec::context_request_artifact;
 pub(crate) use event_codec::redact_provider_json;
 pub(crate) use event_codec::{
     agent_event, agent_event_for_turn, candidate_id_from_payload, context_compaction_artifact,
-    context_replay_request_artifact, context_request_artifact, event_matches_filter, host_event,
-    parent_thread_id_from_payload, provider_raw_artifact, provider_response_replay_artifact,
-    recovered_pending_turn_from_event, task_status_from_loop_action, thread_id_from_payload,
-    thread_title_for_prompt, trace_event_payload, with_command_payload,
+    context_request_artifacts, event_matches_filter, host_event, parent_thread_id_from_payload,
+    provider_raw_artifact, provider_response_replay_artifact, recovered_pending_turn_from_event,
+    task_status_from_loop_action, thread_id_from_payload, thread_title_for_prompt,
+    trace_event_payload, with_command_payload,
 };
 pub use event_codec::{event_sequence_no, projection_status};
 pub(crate) use execution_trace::CanonicalFactRecorder;
@@ -215,13 +224,19 @@ pub(crate) use paths::{ensure_private_dir, set_owner_only_file, workspace_hash};
 pub use post_task::PostTaskCoordinator;
 #[cfg(test)]
 pub(crate) use provider_runtime::configured_provider_plan;
+#[cfg(test)]
+pub(crate) use provider_runtime::mock_provider_plan;
+#[cfg(test)]
+pub(crate) use provider_runtime::pin_provider_turn_settings;
 pub(crate) use provider_runtime::{
-    MockProviderPlan, isolated_mock_provider_plan, mock_provider_plan, pin_provider_turn_settings,
+    MockProviderPlan, ProviderRouteCache, cached_mock_provider_plan, isolated_mock_provider_plan,
+    pin_provider_turn_settings_cached,
 };
 pub use rollout::{RolloutEnvelope, RolloutExport, ThreadRebindResult, redact_runtime_value};
 pub(crate) use rollout::{
-    append_rollout_line, normalize_rebind_source, rebuild_rollout_file, remove_rollout_projection,
-    rollout_line, rollout_path_for_workspace, rollout_projection_files,
+    append_rollout_line, append_rollout_line_relaxed, normalize_rebind_source,
+    rebuild_rollout_file, remove_rollout_projection, rollout_line, rollout_path_for_workspace,
+    rollout_projection_files,
 };
 #[cfg(test)]
 pub(crate) use rollout::{redact_rollout_value, rollout_lock_path};
@@ -393,6 +408,9 @@ struct RuntimeHostStorageState {
 #[derive(Debug)]
 struct RuntimeHostExecutionState {
     shutdown: CancellationToken,
+    post_task_worker: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    post_task_schedule_tx: mpsc::UnboundedSender<post_task::PostTaskScheduleRequest>,
+    post_task_schedule_pending: AtomicU64,
     lane_manager: Mutex<RuntimeLaneManager>,
     event_bus: broadcast::Sender<RuntimeEvent>,
     live_subscriptions: StdMutex<Vec<LiveSubscription>>,
@@ -401,9 +419,14 @@ struct RuntimeHostExecutionState {
     causal_ledger: Mutex<causal_recorder::CausalLedger>,
     command_mutex: Mutex<()>,
     task_controls: Mutex<HashMap<SessionId, HostedTaskControl>>,
+    context_resources: StdMutex<ContextResourceCache>,
+    provider_route_cache: Arc<StdMutex<ProviderRouteCache>>,
     delegation_admissions: Mutex<HashMap<SessionId, delegation::DelegationAdmission>>,
     delegation_operations: Mutex<HashMap<String, Arc<delegation::DelegationOperation>>>,
+    active_work_notify: Notify,
+    rollout_threads: Mutex<HashMap<SessionId, Arc<ThreadRecord>>>,
     provider_auth_waiters: Mutex<HashMap<SessionId, PendingProviderAuth>>,
+    web_search_backend: std::sync::OnceLock<Result<Option<Arc<HttpWebSearchBackend>>, String>>,
     process_supervisor: ProcessSupervisor,
     workspace_change_tracker: Mutex<change_tracker::WorkspaceChangeTracker>,
     rollout_projection_failures: Mutex<HashMap<SessionId, String>>,
@@ -435,8 +458,15 @@ impl Drop for RuntimeHost {
     fn drop(&mut self) {
         // Drop cannot await. Explicit owners should call `close()` while the
         // Tokio runtime is alive so process supervisors can finish bookkeeping.
-        self.execution.shutdown.cancel();
+        // 先锁存并终止受管进程，再广播 runtime 取消，避免通用收尾先让
+        // child.wait 完成并把一次受控终止误记为自然失败。
         self.execution.process_supervisor.shutdown();
+        self.execution.shutdown.cancel();
+        if let Ok(mut worker) = self.execution.post_task_worker.lock()
+            && let Some(worker) = worker.take()
+        {
+            worker.abort();
+        }
     }
 }
 
@@ -1389,6 +1419,10 @@ impl BeforeSideEffectRecorder for HostedCheckpointRecorder {
 }
 
 impl RuntimeHost {
+    pub(crate) fn signal_active_work_change(&self) {
+        self.execution.active_work_notify.notify_waiters();
+    }
+
     /// Shut down runtime-owned managed processes and wait for each supervisor
     /// to persist its terminal state before the host is torn down.
     pub async fn close(&self) -> Result<(), ClientError> {
@@ -1658,9 +1692,7 @@ impl RuntimeHost {
             execution_options,
         })
         .await?;
-        host.synchronize_workspace_rollouts().await?;
         host.recover_orphaned_tasks().await?;
-        host.run_storage_maintenance().await?;
         Ok(host)
     }
 
@@ -1682,6 +1714,7 @@ impl RuntimeHost {
             temporary_root,
         } = storage;
         let (event_bus, _) = broadcast::channel(512);
+        let (post_task_schedule_tx, post_task_schedule_rx) = mpsc::unbounded_channel();
         let max_sequence_no = store.max_sequence_no().await?;
         let next_sequence_no = max_sequence_no.saturating_add(1);
         let memory_store = runtime_paths
@@ -1729,6 +1762,9 @@ impl RuntimeHost {
             },
             execution: RuntimeHostExecutionState {
                 shutdown: CancellationToken::new(),
+                post_task_worker: StdMutex::new(None),
+                post_task_schedule_tx,
+                post_task_schedule_pending: AtomicU64::new(0),
                 lane_manager: Mutex::new(RuntimeLaneManager::new()),
                 event_bus,
                 live_subscriptions: StdMutex::new(Vec::new()),
@@ -1737,9 +1773,14 @@ impl RuntimeHost {
                 causal_ledger: Mutex::new(causal_recorder::CausalLedger::default()),
                 command_mutex: Mutex::new(()),
                 task_controls: Mutex::new(HashMap::new()),
+                context_resources: StdMutex::new(ContextResourceCache::default()),
+                provider_route_cache: Arc::new(StdMutex::new(ProviderRouteCache::default())),
                 delegation_admissions: Mutex::new(HashMap::new()),
                 delegation_operations: Mutex::new(HashMap::new()),
+                active_work_notify: Notify::new(),
+                rollout_threads: Mutex::new(HashMap::new()),
                 provider_auth_waiters: Mutex::new(HashMap::new()),
+                web_search_backend: std::sync::OnceLock::new(),
                 process_supervisor: ProcessSupervisor::new(),
                 workspace_change_tracker: Mutex::new(
                     change_tracker::WorkspaceChangeTracker::default(),
@@ -1762,7 +1803,12 @@ impl RuntimeHost {
             .jobs
             .recover_expired(&host.workspace_id.to_string(), chrono::Utc::now())
             .await?;
-        post_task::PostTaskCoordinator::start(&host);
+        let post_task_worker = post_task::PostTaskCoordinator::start(&host, post_task_schedule_rx);
+        *host
+            .execution
+            .post_task_worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(post_task_worker);
         Ok(host)
     }
 
@@ -1887,8 +1933,12 @@ impl RuntimeHost {
         self.ensure_session_in_workspace(filter.session_id).await?;
         let mut live = self.execution.event_bus.subscribe();
         let (sender, receiver) = mpsc::channel(256);
+        let shutdown = self.execution.shutdown.clone();
         tokio::spawn(async move {
             let mut cursor = filter.after_sequence_no;
+            if sender.is_closed() || shutdown.is_cancelled() {
+                return;
+            }
             match self.send_replay_pages(&filter, &mut cursor, &sender).await {
                 Ok(true) => {}
                 Ok(false) => return,
@@ -1898,7 +1948,12 @@ impl RuntimeHost {
                 }
             }
             loop {
-                match live.recv().await {
+                let received = tokio::select! {
+                    _ = sender.closed() => return,
+                    _ = shutdown.cancelled() => return,
+                    received = live.recv() => received,
+                };
+                match received {
                     Ok(event) if event_matches_filter(&event, &filter, cursor) => {
                         cursor = Some(event.sequence_no);
                         if sender.send(Ok(event)).await.is_err() {
@@ -1907,6 +1962,9 @@ impl RuntimeHost {
                     }
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if sender.is_closed() || shutdown.is_cancelled() {
+                            return;
+                        }
                         match self.send_replay_pages(&filter, &mut cursor, &sender).await {
                             Ok(true) => {}
                             Ok(false) => return,
@@ -1958,20 +2016,14 @@ impl RuntimeHost {
         let Some(workspace_root) = self.workspace_root_string() else {
             return Ok(0);
         };
-        let threads = self
+        let states = self
             .storage
             .repositories
-            .threads
-            .list(Some(&workspace_root), u32::MAX)
+            .projections
+            .workspace_states(&workspace_root)
             .await?;
         let mut recovered = 0;
-        for thread in threads {
-            let state = self
-                .storage
-                .repositories
-                .projections
-                .state(thread.session_id, None)
-                .await?;
+        for state in states {
             let orphan_is_active = state.task_status.is_active();
             let may_have_pending_turns = state
                 .runtime_lane
@@ -2409,6 +2461,13 @@ impl RuntimeHost {
 
     async fn publish_committed_event(&self, event: RuntimeEvent) -> Result<(), ClientError> {
         self.publish_live_event(event.clone());
+        // durable append 完成后立即推进热历史；其他进程写入由活动叶节点的
+        // 有界刷新发现，不再扫描 session sequence。
+        self.execution
+            .context_resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe_committed_event(&event);
         match self.append_rollout_event(&event).await {
             Ok(()) => {
                 self.execution
@@ -2442,6 +2501,9 @@ impl RuntimeHost {
                 }
             }
         }
+        // Event-backed waiters (post-task evaluation and lifecycle observers) wake immediately
+        // after the durable event is visible instead of polling SQLite on a fixed interval.
+        self.signal_active_work_change();
         Ok(())
     }
 
@@ -2468,6 +2530,9 @@ impl RuntimeHost {
     }
 
     async fn run_storage_maintenance(&self) -> Result<StorageMaintenanceReport, ClientError> {
+        // rollout 是 SQLite 的可重建投影，与 artifact/checkpoint 清理共用显式
+        // maintenance 边界，避免每次 host 启动都扫描并重写整个 workspace。
+        self.synchronize_workspace_rollouts().await?;
         let now = chrono::Utc::now();
         let artifact_report = self.storage.store.run_artifact_maintenance(now).await?;
         let checkpoint_directories_removed = if let (Some(workspace_root), Some(paths)) =
@@ -2553,6 +2618,11 @@ impl RuntimeHost {
     ) -> Result<(), ClientError> {
         let Some(paths) = &self.runtime_paths else {
             thread.rollout_path = None;
+            self.execution
+                .rollout_threads
+                .lock()
+                .await
+                .insert(thread.session_id, Arc::new(thread.clone()));
             return Ok(());
         };
         let expected = paths.rollout_path(thread.thread_id).display().to_string();
@@ -2561,29 +2631,54 @@ impl RuntimeHost {
             thread.updated_at = chrono::Utc::now();
             self.storage.repositories.threads.upsert(thread).await?;
         }
+        self.execution
+            .rollout_threads
+            .lock()
+            .await
+            .insert(thread.session_id, Arc::new(thread.clone()));
         Ok(())
     }
 
     async fn append_rollout_event(&self, event: &RuntimeEvent) -> Result<(), ClientError> {
-        let Some(mut thread) = self
-            .storage
-            .repositories
-            .threads
-            .by_session(event.session_id)
-            .await?
-        else {
-            return Ok(());
+        let thread = if let Some(thread) = self
+            .execution
+            .rollout_threads
+            .lock()
+            .await
+            .get(&event.session_id)
+            .cloned()
+        {
+            thread
+        } else {
+            let Some(mut thread) = self
+                .storage
+                .repositories
+                .threads
+                .by_session(event.session_id)
+                .await?
+            else {
+                return Ok(());
+            };
+            self.ensure_thread_rollout_path(&mut thread).await?;
+            Arc::new(thread)
         };
-        self.ensure_thread_rollout_path(&mut thread).await?;
         let Some(path) = thread.rollout_path.as_deref().map(PathBuf::from) else {
             return Ok(());
         };
         if !path.exists() {
-            self.rebuild_thread_rollout(&thread).await?;
+            self.rebuild_thread_rollout(thread.as_ref()).await?;
             return Ok(());
         }
-        let line = rollout_line(&thread, event)?;
-        run_blocking(move || append_rollout_line(&path, &line)).await??;
+        let line = rollout_line(thread.as_ref(), event)?;
+        let durable_boundary = matches!(
+            event.event_type.class(),
+            golutra_protocol::RuntimeEventClass::Control
+        ) || event.event_type.is_task_terminal();
+        if durable_boundary {
+            run_blocking(move || append_rollout_line(&path, &line)).await??;
+        } else {
+            run_blocking(move || append_rollout_line_relaxed(&path, &line)).await??;
+        }
         Ok(())
     }
 

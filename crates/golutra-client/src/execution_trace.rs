@@ -98,10 +98,9 @@ impl RuntimeHost {
                 mut snapshot,
                 request,
             } => {
-                let (redacted_artifact, redacted_bytes) =
-                    context_request_artifact(task, &snapshot, &request)?;
-                let (restricted_artifact, restricted_bytes) =
-                    context_replay_request_artifact(task, &snapshot, &request)?;
+                let artifacts = context_request_artifacts(task, &snapshot, &request)?;
+                let (redacted_artifact, redacted_bytes) = artifacts.redacted;
+                let (restricted_artifact, restricted_bytes) = artifacts.replay;
                 snapshot.redacted_request_artifact_ref = Some(redacted_artifact.artifact_id);
                 snapshot.restricted_request_artifact_ref = Some(restricted_artifact.artifact_id);
                 for contributor in &mut snapshot.contributor_manifest {
@@ -894,6 +893,17 @@ impl RuntimeHost {
             .with_network_access(self.network_access_enabled(requested_network))
             .with_unrestricted_access(yolo)
             .with_process_supervisor(self.execution.process_supervisor.clone());
+        let executor = match self.execution.web_search_backend.get_or_init(|| {
+            HttpWebSearchBackend::from_env()
+                .map(|backend| backend.map(Arc::new))
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(Some(backend)) => executor.with_web_search_backend(backend.clone()),
+            Ok(None) => executor,
+            Err(error) => {
+                return Err(ClientError::TaskExecution(error.clone()));
+            }
+        };
         let Some(paths) = self
             .runtime_paths
             .as_ref()
@@ -901,6 +911,12 @@ impl RuntimeHost {
         else {
             return Ok(executor);
         };
+        // A fresh installation has no plugin registry. Avoid creating the
+        // plugin store and taking its lock for every ordinary task; the next
+        // task will observe a registry as soon as a plugin is installed.
+        if !paths.home.join("plugins").join("registry.json").is_file() {
+            return Ok(executor);
+        }
         let home = paths.home.clone();
         let scratch_root = paths.mcp_scratch_dir.clone();
         let backend = run_blocking(move || {

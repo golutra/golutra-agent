@@ -288,12 +288,65 @@ pub(crate) fn provider_raw_artifact(
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn context_request_artifact(
     task: &HostedAgentTask,
     snapshot: &ContextSnapshot,
     request: &ProviderRequest,
 ) -> Result<(ArtifactRecord, Vec<u8>), ClientError> {
-    let raw = serde_json::to_value(request)?;
+    let raw_bytes = serde_json::to_vec(request)?;
+    let (redacted_bytes, redaction_status) = redacted_request_bytes(&raw_bytes)?;
+    let artifact = context_request_artifact_record(
+        task,
+        snapshot,
+        "context_request_redacted",
+        "artifact://context",
+        redaction_status,
+        "debug_default",
+        &redacted_bytes,
+    );
+    Ok((artifact, redacted_bytes))
+}
+
+/// 从一次原始序列化同时生成脱敏和回放 artifact，避免热路径重复遍历消息。
+pub(crate) struct ContextRequestArtifacts {
+    pub(crate) redacted: (ArtifactRecord, Vec<u8>),
+    pub(crate) replay: (ArtifactRecord, Vec<u8>),
+}
+
+pub(crate) fn context_request_artifacts(
+    task: &HostedAgentTask,
+    snapshot: &ContextSnapshot,
+    request: &ProviderRequest,
+) -> Result<ContextRequestArtifacts, ClientError> {
+    let raw_bytes = serde_json::to_vec(request)?;
+    let (redacted_bytes, redaction_status) = redacted_request_bytes(&raw_bytes)?;
+    let redacted = context_request_artifact_record(
+        task,
+        snapshot,
+        "context_request_redacted",
+        "artifact://context",
+        redaction_status,
+        "debug_default",
+        &redacted_bytes,
+    );
+    let replay = context_request_artifact_record(
+        task,
+        snapshot,
+        "provider_request_replay",
+        "artifact://replay/provider-request",
+        RedactionStatus::Raw,
+        "replay_owner_access",
+        &raw_bytes,
+    );
+    Ok(ContextRequestArtifacts {
+        redacted: (redacted, redacted_bytes),
+        replay: (replay, raw_bytes),
+    })
+}
+
+fn redacted_request_bytes(raw_bytes: &[u8]) -> Result<(Vec<u8>, RedactionStatus), ClientError> {
+    let raw: Value = serde_json::from_slice(raw_bytes)?;
     let mut redacted = raw.clone();
     redact_provider_json(&mut redacted);
     let redaction_status = if redacted == raw {
@@ -301,55 +354,35 @@ pub(crate) fn context_request_artifact(
     } else {
         RedactionStatus::Redacted
     };
-    let bytes = serde_json::to_vec(&redacted)?;
-    let checksum = Sha256::digest(&bytes);
-    let artifact_id = ArtifactId::new();
-    Ok((
-        ArtifactRecord {
-            artifact_id,
-            session_id: task.session_id,
-            turn_id: Some(snapshot.turn_id),
-            tool_call_id: None,
-            artifact_type: "context_request_redacted".to_owned(),
-            uri: format!("artifact://context/{artifact_id}"),
-            checksum: format!("sha256:{checksum:x}"),
-            size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-            created_at: chrono::Utc::now(),
-            producer: "context-builder".to_owned(),
-            redaction_status,
-            retention_policy: "debug_default".to_owned(),
-            provenance_refs: Vec::new(),
-        },
-        bytes,
-    ))
+    Ok((serde_json::to_vec(&redacted)?, redaction_status))
 }
 
-pub(crate) fn context_replay_request_artifact(
+fn context_request_artifact_record(
     task: &HostedAgentTask,
     snapshot: &ContextSnapshot,
-    request: &ProviderRequest,
-) -> Result<(ArtifactRecord, Vec<u8>), ClientError> {
-    let bytes = serde_json::to_vec(request)?;
-    let checksum = Sha256::digest(&bytes);
+    artifact_type: &str,
+    uri_prefix: &str,
+    redaction_status: RedactionStatus,
+    retention_policy: &str,
+    bytes: &[u8],
+) -> ArtifactRecord {
     let artifact_id = ArtifactId::new();
-    Ok((
-        ArtifactRecord {
-            artifact_id,
-            session_id: task.session_id,
-            turn_id: Some(snapshot.turn_id),
-            tool_call_id: None,
-            artifact_type: "provider_request_replay".to_owned(),
-            uri: format!("artifact://replay/provider-request/{artifact_id}"),
-            checksum: format!("sha256:{checksum:x}"),
-            size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-            created_at: chrono::Utc::now(),
-            producer: "context-builder".to_owned(),
-            redaction_status: RedactionStatus::Raw,
-            retention_policy: "replay_owner_access".to_owned(),
-            provenance_refs: Vec::new(),
-        },
-        bytes,
-    ))
+    let checksum = Sha256::digest(bytes);
+    ArtifactRecord {
+        artifact_id,
+        session_id: task.session_id,
+        turn_id: Some(snapshot.turn_id),
+        tool_call_id: None,
+        artifact_type: artifact_type.to_owned(),
+        uri: format!("{uri_prefix}/{artifact_id}"),
+        checksum: format!("sha256:{checksum:x}"),
+        size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        created_at: chrono::Utc::now(),
+        producer: "context-builder".to_owned(),
+        redaction_status,
+        retention_policy: retention_policy.to_owned(),
+        provenance_refs: Vec::new(),
+    }
 }
 
 pub(crate) fn provider_response_replay_artifact(
@@ -1283,7 +1316,7 @@ mod tests {
         assert!(recovered.pending.external_verifiers_require_os_sandbox);
         assert_eq!(
             recovered.execution.tool_profile,
-            Some(golutra_protocol::AgentToolProfile::Full)
+            Some(golutra_protocol::AgentToolProfile::Coding)
         );
     }
 

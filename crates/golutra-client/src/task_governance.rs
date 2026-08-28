@@ -128,22 +128,84 @@ pub(super) fn trajectory_failure_family(payload: &Value, status: &str) -> String
     format!("{tool_name}:{status}:{}", compact_event_summary(summary))
 }
 
+struct TaskEvaluationMetadata {
+    objective: String,
+    task_status: TaskStatus,
+    verification: Option<golutra_core::VerificationRecord>,
+    tool_count: usize,
+    artifact_count: usize,
+    failure_summary: Option<String>,
+    latency: Duration,
+}
+
 impl RuntimeHost {
     pub(super) async fn schedule_task_evaluation_best_effort(
         &self,
         task: &HostedAgentTask,
         input: HostedTaskEvaluation<'_>,
     ) {
-        let result = async {
-            let evaluation_input = self.evaluate_completed_task(task, input).await?;
-            self.enqueue_deep_task_evaluation(task, evaluation_input)
-                .await
-        }
-        .await;
-        if let Err(error) = result {
-            self.record_post_task_governance_failure(task, "evaluation_scheduling", true, &error)
+        let request = post_task::PostTaskScheduleRequest {
+            task: task.clone(),
+            objective: input.objective.to_owned(),
+            task_status: input.task_status,
+            verification: input.verification.clone(),
+            tool_count: input.tool_reports.len(),
+            artifact_count: input
+                .tool_reports
+                .iter()
+                .map(|report| report.artifacts.len())
+                .sum(),
+            failure_summary: input.failure_summary.clone(),
+            latency: input.latency,
+        };
+        self.execution
+            .post_task_schedule_pending
+            .fetch_add(1, Ordering::SeqCst);
+        if self.execution.post_task_schedule_tx.send(request).is_err() {
+            self.execution
+                .post_task_schedule_pending
+                .fetch_sub(1, Ordering::SeqCst);
+            if !self.execution.shutdown.is_cancelled() {
+                self.record_post_task_governance_failure(
+                    task,
+                    "evaluation_scheduling",
+                    true,
+                    &ClientError::TaskExecution("post-task worker is unavailable".to_owned()),
+                )
                 .await;
+            }
         }
+        self.signal_active_work_change();
+    }
+
+    /// 在 host-owned worker 中执行终态后的最小评估和 durable job 排队。
+    pub(super) async fn schedule_task_evaluation_now(
+        &self,
+        request: post_task::PostTaskScheduleRequest,
+    ) -> Result<(), ClientError> {
+        let evaluation_input = self
+            .build_task_evaluation_input(
+                &request.task,
+                TaskEvaluationMetadata {
+                    objective: request.objective,
+                    task_status: request.task_status,
+                    verification: request.verification,
+                    tool_count: request.tool_count,
+                    artifact_count: request.artifact_count,
+                    failure_summary: request.failure_summary,
+                    latency: request.latency,
+                },
+            )
+            .await?;
+        let bundle = self
+            .storage
+            .governance
+            .evaluate_minimal(evaluation_input.clone());
+        // 终态已经提交；治理失败只影响治理投影，不得改写用户任务结果。
+        let _ = self.record_task_evaluation(&request.task, bundle).await?;
+        self.enqueue_deep_task_evaluation(&request.task, evaluation_input)
+            .await?;
+        Ok(())
     }
 
     pub(super) async fn record_post_task_governance_failure(
@@ -170,10 +232,45 @@ impl RuntimeHost {
             .await;
     }
 
+    #[cfg(test)]
     pub(super) async fn evaluate_completed_task(
         &self,
         task: &HostedAgentTask,
         input: HostedTaskEvaluation<'_>,
+    ) -> Result<TaskEvaluationInput, ClientError> {
+        let artifact_count = input
+            .tool_reports
+            .iter()
+            .map(|report| report.artifacts.len())
+            .sum();
+        let evaluation_input = self
+            .build_task_evaluation_input(
+                task,
+                TaskEvaluationMetadata {
+                    objective: input.objective.to_owned(),
+                    task_status: input.task_status,
+                    verification: input.verification,
+                    tool_count: input.tool_reports.len(),
+                    artifact_count,
+                    failure_summary: input.failure_summary,
+                    latency: input.latency,
+                },
+            )
+            .await?;
+        let bundle = self
+            .storage
+            .governance
+            .evaluate_minimal(evaluation_input.clone());
+        // Post-task governance is durable but does not rewrite the already-decided user task
+        // status. The deep worker will retry a failed persistence attempt independently.
+        let _ = self.record_task_evaluation(task, bundle).await?;
+        Ok(evaluation_input)
+    }
+
+    async fn build_task_evaluation_input(
+        &self,
+        task: &HostedAgentTask,
+        metadata: TaskEvaluationMetadata,
     ) -> Result<TaskEvaluationInput, ClientError> {
         let events = self
             .storage
@@ -181,11 +278,6 @@ impl RuntimeHost {
             .events
             .load(task.session_id, Some(task.task_id), None)
             .await?;
-        let artifact_count = input
-            .tool_reports
-            .iter()
-            .map(|report| report.artifacts.len())
-            .sum();
         let token_usage = token_usage_records(&events)?;
         let policy_violation_count = policy_violation_count(&events);
         let provider_config_ref = token_usage.last().map_or_else(
@@ -194,27 +286,20 @@ impl RuntimeHost {
         );
         let evaluation_input = TaskEvaluationInput {
             task_id: task.task_id,
-            objective: input.objective.to_owned(),
-            task_status: input.task_status,
-            verification: input.verification,
+            objective: metadata.objective,
+            task_status: metadata.task_status,
+            verification: metadata.verification,
             event_count: events.len(),
-            artifact_count,
-            tool_count: input.tool_reports.len(),
-            latency_ms: Some(u64::try_from(input.latency.as_millis()).unwrap_or(u64::MAX)),
-            failure_summary: input.failure_summary,
+            artifact_count: metadata.artifact_count,
+            tool_count: metadata.tool_count,
+            latency_ms: Some(u64::try_from(metadata.latency.as_millis()).unwrap_or(u64::MAX)),
+            failure_summary: metadata.failure_summary,
             token_usage,
             provider_config_ref,
             runtime_config_ref: format!("golutra-runtime:{}", env!("CARGO_PKG_VERSION")),
             policy_violation_count: u32::try_from(policy_violation_count).unwrap_or(u32::MAX),
             trajectory_summary: trajectory_summary(&events),
         };
-        let bundle = self
-            .storage
-            .governance
-            .evaluate_minimal(evaluation_input.clone());
-        // Post-task governance is durable but does not rewrite the already-decided user task
-        // status. The deep worker will retry a failed persistence attempt independently.
-        let _ = self.record_task_evaluation(task, bundle).await?;
         Ok(evaluation_input)
     }
 
@@ -514,13 +599,17 @@ impl RuntimeHost {
             .map(|control| control.completion.clone());
         if let Some(completion) = task_completion.as_mut() {
             while !*completion.borrow() && Instant::now() < deadline {
+                let notification = self.execution.active_work_notify.notified();
+                tokio::pin!(notification);
+                notification.as_mut().enable();
                 tokio::select! {
                     changed = completion.changed() => {
                         if changed.is_err() {
                             break;
                         }
                     }
-                    () = tokio::time::sleep(Duration::from_millis(POST_TASK_JOB_POLL_MILLIS)) => {}
+                    _ = &mut notification => {}
+                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => break,
                 }
             }
         }
@@ -534,6 +623,10 @@ impl RuntimeHost {
             .find(|(_, control)| control.task_id == task_id)
             .map(|(session_id, _)| *session_id);
         loop {
+            let notification = self.execution.active_work_notify.notified();
+            tokio::pin!(notification);
+            // 注册通知后再读取 durable 状态，避免事件恰好在检查前提交而丢失唤醒。
+            notification.as_mut().enable();
             let job = self.storage.repositories.jobs.get_for_task(task_id).await;
             if session_id.is_none() {
                 session_id = job
@@ -599,7 +692,10 @@ impl RuntimeHost {
             {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(POST_TASK_JOB_POLL_MILLIS)).await;
+            tokio::select! {
+                _ = &mut notification => {}
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => return,
+            }
         }
     }
 
@@ -839,38 +935,86 @@ impl RuntimeHost {
         Ok(())
     }
 
-    pub(super) async fn promote_successful_task_memory(
+    /// 从 durable 事件恢复终态后的 memory 输入。进程可能在终态事件提交后立即退出，
+    /// 因此这条路径必须与在线执行共享同一幂等 quarantine 逻辑。
+    pub(super) async fn promote_reconstructed_task_memory(
+        &self,
+        task: &HostedAgentTask,
+        input: &TaskEvaluationInput,
+    ) -> Result<(), ClientError> {
+        let Some(verification) = input.verification.as_ref() else {
+            return Ok(());
+        };
+        if input.task_status != TaskStatus::Completed || verification.evidence_refs.is_empty() {
+            return Ok(());
+        }
+        let events = self
+            .storage
+            .repositories
+            .events
+            .load(task.session_id, Some(task.task_id), None)
+            .await?;
+        if events.iter().any(|event| {
+            matches!(
+                event.event_type,
+                RuntimeEventType::MemoryCandidateQuarantined
+                    | RuntimeEventType::MemoryPromotionRejected
+            )
+        }) {
+            return Ok(());
+        }
+        let final_message = events
+            .iter()
+            .rev()
+            .find(|event| event.event_type == RuntimeEventType::AssistantMessage)
+            .and_then(|event| event.payload.get("content"))
+            .and_then(Value::as_str)
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or("verified completion");
+        let tool_facts = events
+            .iter()
+            .filter(|event| event.event_type == RuntimeEventType::ToolCompleted)
+            .filter_map(|event| event.payload.get("summary").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("; ");
+        self.quarantine_task_memory(
+            task,
+            &input.objective,
+            final_message,
+            &tool_facts,
+            verification.evidence_refs.clone(),
+        )
+        .await
+    }
+
+    async fn quarantine_task_memory(
         &self,
         task: &HostedAgentTask,
         objective: &str,
-        outcome: &golutra_runtime::AgentLoopOutcome,
-        terminal_status: TaskStatus,
+        final_message: &str,
+        tool_facts: &str,
+        evidence_refs: Vec<golutra_core::EvidenceId>,
     ) -> Result<(), ClientError> {
-        if terminal_status != TaskStatus::Completed
-            || outcome.candidate_ready_for_external_verification
-            || outcome.verification.evidence_refs.is_empty()
+        let task_id = task.task_id;
+        let existing_records = {
+            let store = self.storage.memory_store.clone();
+            run_blocking(move || store.list()).await??
+        };
+        if existing_records
+            .iter()
+            .any(|record| record.source_task_id == task_id)
         {
             return Ok(());
         }
-        let tool_facts = outcome
-            .tool_reports
-            .iter()
-            .map(|report| report.envelope.summary.as_str())
-            .collect::<Vec<_>>()
-            .join("; ");
-        let final_message = outcome
-            .final_message
-            .as_deref()
-            .unwrap_or("verified completion");
         let promotion = self
             .storage
             .governance
             .quarantine_verified_memory(
-                task.task_id,
+                task_id,
                 objective,
                 final_message,
-                &tool_facts,
-                outcome.verification.evidence_refs.clone(),
+                tool_facts,
+                evidence_refs,
             )
             .await?;
         match promotion {

@@ -7,7 +7,8 @@ use genai::{
     adapter::AdapterKind,
     chat::{
         CacheControl, ChatMessage, ChatOptions, ChatRequest, ChatStreamEvent, ContentPart,
-        MessageContent, ReasoningEffort, StopReason, StreamEnd, Tool, ToolCall, ToolResponse,
+        MessageContent, ReasoningEffort, StopReason, StreamEnd, Tool, ToolCall, ToolName,
+        ToolResponse,
     },
     resolver::{AuthData, Endpoint},
 };
@@ -19,12 +20,14 @@ use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 
 use super::{
-    ProviderError, ProviderFinishReason, ProviderGenerationConfig, ProviderHttpHeaders,
-    ProviderMessage, ProviderProbeResult, ProviderProtocol, ProviderRequest, ProviderResponse,
-    ProviderRole, ProviderStreamEvent, ProviderToolCall, ProviderUsage, UsageSource,
-    configured_or_first_env, custom_headers_from_reader, env_mapping, first_env,
-    generation_config_from_reader, missing_env_error, protocol_capabilities,
-    sanitize_provider_error, selected_protocol_from_reader, validate_native_base_url,
+    LlmProvider, ProviderError, ProviderErrorMetadata, ProviderFinishReason,
+    ProviderGenerationConfig, ProviderHttpHeaders, ProviderMessage, ProviderProbeResult,
+    ProviderProtocol, ProviderRequest, ProviderResponse, ProviderRole, ProviderStreamEvent,
+    ProviderToolCall, ProviderUsage, UsageSource, configured_or_first_env,
+    custom_headers_from_reader, env_mapping, first_env, generation_config_from_reader,
+    missing_env_error, protocol_capabilities, provider_tool_schema_for_contract,
+    request_id_from_headers, retry_after_from_headers, sanitize_provider_error,
+    selected_protocol_from_reader, validate_native_base_url,
 };
 
 #[derive(Clone, PartialEq, Eq)]
@@ -223,23 +226,26 @@ impl GenaiProviderAdapter {
         request: &ProviderRequest,
         force_refresh: bool,
     ) -> Result<ProviderResponse, ProviderError> {
+        // Request shaping is deterministic for a logical attempt. Build it
+        // once so an authentication refresh retries the network call without
+        // re-projecting every message and tool schema.
+        let chat_request = genai_chat_request(request, self.config.protocol)?;
+        let options = genai_chat_options(
+            &self.config.generation_config,
+            false,
+            self.cache_identity_for_request(request).as_ref(),
+            request.cache_policy,
+        )?;
         let api_key = self
             .credential
             .credential(force_refresh)
             .await
             .map_err(super::provider_credential_error)?;
-        let chat_request = genai_chat_request(request, self.config.protocol)?;
-        let options = genai_chat_options(
-            &self.config.generation_config,
-            false,
-            request.cache_identity().as_ref(),
-            request.cache_policy,
-        )?;
         let response = self
             .client
             .exec_chat(
                 self.service_target(api_key.expose_secret())?,
-                chat_request,
+                chat_request.clone(),
                 Some(&options),
             )
             .await;
@@ -251,7 +257,6 @@ impl GenaiProviderAdapter {
                     .credential(true)
                     .await
                     .map_err(super::provider_credential_error)?;
-                let chat_request = genai_chat_request(request, self.config.protocol)?;
                 self.client
                     .exec_chat(
                         self.service_target(api_key.expose_secret())?,
@@ -271,6 +276,15 @@ impl GenaiProviderAdapter {
         request: &ProviderRequest,
         on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
     ) -> Result<ProviderResponse, ProviderError> {
+        // Keep the shaped request and options stable across a credential
+        // refresh. This is especially valuable for long tool schemas.
+        let chat_request = genai_chat_request(request, self.config.protocol)?;
+        let options = genai_chat_options(
+            &self.config.generation_config,
+            true,
+            self.cache_identity_for_request(request).as_ref(),
+            request.cache_policy,
+        )?;
         let mut force_refresh = false;
         let response = loop {
             let api_key = self
@@ -278,18 +292,11 @@ impl GenaiProviderAdapter {
                 .credential(force_refresh)
                 .await
                 .map_err(super::provider_credential_error)?;
-            let chat_request = genai_chat_request(request, self.config.protocol)?;
-            let options = genai_chat_options(
-                &self.config.generation_config,
-                true,
-                request.cache_identity().as_ref(),
-                request.cache_policy,
-            )?;
             match self
                 .client
                 .exec_chat_stream(
                     self.service_target(api_key.expose_secret())?,
-                    chat_request,
+                    chat_request.clone(),
                     Some(&options),
                 )
                 .await
@@ -328,7 +335,7 @@ impl GenaiProviderAdapter {
                         tool_call_id: (!chunk.tool_call.call_id.is_empty())
                             .then(|| chunk.tool_call.call_id.clone()),
                         tool_name: (!chunk.tool_call.fn_name.is_empty())
-                            .then(|| chunk.tool_call.fn_name.clone()),
+                            .then(|| restore_wire_tool_name(&chunk.tool_call.fn_name)),
                     });
                     tool_delta_index = tool_delta_index.saturating_add(1);
                 }
@@ -376,6 +383,10 @@ impl super::LlmProvider for GenaiProviderAdapter {
             golden_fixture_refs: golden_fixture_refs(self.config.protocol),
         }
     }
+
+    fn cache_namespace(&self) -> String {
+        super::route_cache_namespace(native_protocol(self.config.protocol), &self.config.base_url)
+    }
 }
 
 pub(crate) fn genai_chat_request(
@@ -402,17 +413,61 @@ pub(crate) fn genai_chat_request(
     }
     if !request.tools.is_empty() {
         chat_request = chat_request.with_tools(request.tools.iter().map(|contract| {
-            let tool = Tool::new(contract.tool_name.clone())
+            let schema = provider_tool_schema_for_contract(contract);
+            // rust-genai reserves the literal `web_search` name for its native
+            // provider tool on several adapters. Golutra owns a regular
+            // function with that name, so use a stable wire alias and restore
+            // it at the provider response boundary.
+            let tool = Tool::new(ToolName::Custom(wire_tool_name(&contract.tool_name)))
                 .with_description(tool_description(&contract.tool_name))
-                .with_schema(contract.input_schema.clone());
+                .with_schema(schema.clone());
             if is_openai_responses {
-                tool.with_strict(true)
+                // Responses strict 要求对象的每个属性都列入 `required`；运行时工具
+                // 有意暴露可选控制项（例如 shell 超时），因此保留完整 schema，
+                // 仅在投影 schema 不满足该契约时关闭 strict 解码。
+                tool.with_strict(responses_schema_supports_strict(&schema))
             } else {
                 tool
             }
         }));
     }
     Ok(chat_request)
+}
+
+fn wire_tool_name(name: &str) -> String {
+    super::provider_tool_wire_name(name)
+}
+
+pub(crate) fn restore_wire_tool_name(name: &str) -> String {
+    super::restore_provider_tool_wire_name(name)
+}
+
+fn responses_schema_supports_strict(schema: &Value) -> bool {
+    match schema {
+        Value::Object(object) => {
+            if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+                let required = object
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<std::collections::HashSet<_>>()
+                    })
+                    .unwrap_or_default();
+                if properties
+                    .keys()
+                    .any(|name| !required.contains(name.as_str()))
+                {
+                    return false;
+                }
+            }
+            object.values().all(responses_schema_supports_strict)
+        }
+        Value::Array(values) => values.iter().all(responses_schema_supports_strict),
+        _ => true,
+    }
 }
 
 fn genai_message(
@@ -442,7 +497,7 @@ fn genai_message(
             parts.extend(message.tool_calls.iter().map(|tool_call| {
                 ContentPart::ToolCall(ToolCall {
                     call_id: tool_call.tool_call_id.clone(),
-                    fn_name: tool_call.tool_name.clone(),
+                    fn_name: wire_tool_name(&tool_call.tool_name),
                     fn_arguments: tool_call.arguments.clone(),
                     thought_signatures: None,
                 })
@@ -463,7 +518,7 @@ fn genai_message(
                 .as_deref()
                 .filter(|value| !value.trim().is_empty())
             {
-                response = response.with_fn_name(tool_name);
+                response = response.with_fn_name(wire_tool_name(tool_name));
             }
             Ok(ChatMessage::from(response))
         }
@@ -576,7 +631,7 @@ pub(crate) fn provider_response_from_genai_stream(
             validate_tool_call(&call.call_id, &call.fn_name, &call.fn_arguments)?;
             Ok(ProviderToolCall {
                 tool_call_id: call.call_id.clone(),
-                tool_name: call.fn_name.clone(),
+                tool_name: restore_wire_tool_name(&call.fn_name),
                 arguments: call.fn_arguments.clone(),
             })
         })
@@ -649,12 +704,16 @@ fn provider_response_from_genai(
             validate_tool_call(&call.call_id, &call.fn_name, &call.fn_arguments)?;
             Ok(ProviderToolCall {
                 tool_call_id: call.call_id.clone(),
-                tool_name: call.fn_name.clone(),
+                tool_name: restore_wire_tool_name(&call.fn_name),
                 arguments: call.fn_arguments.clone(),
             })
         })
         .collect::<Result<Vec<_>, ProviderError>>()?;
-    let usage = provider_usage_from_genai(&response.usage)?;
+    let raw_usage = response
+        .captured_raw_body
+        .as_ref()
+        .and_then(raw_usage_value);
+    let usage = provider_usage_from_genai_with_raw(&response.usage, raw_usage.as_ref())?;
     let finish_reason = finish_reason_from_genai(response.stop_reason.as_ref());
     let raw_metadata = response.captured_raw_body.unwrap_or_else(|| {
         json!({
@@ -680,24 +739,145 @@ fn provider_response_from_genai(
 }
 
 fn provider_usage_from_genai(usage: &genai::chat::Usage) -> Result<ProviderUsage, ProviderError> {
-    let usage_raw = serde_json::to_value(usage).map_err(|error| ProviderError::Malformed {
-        message: format!("genai usage could not be serialized: {error}"),
-    })?;
+    provider_usage_from_genai_with_raw(usage, None)
+}
+
+fn provider_usage_from_genai_with_raw(
+    usage: &genai::chat::Usage,
+    raw_usage: Option<&Value>,
+) -> Result<ProviderUsage, ProviderError> {
+    // The raw response body already contains the provider's usage shape on
+    // normal network responses.  Do not eagerly serialize the typed genai
+    // usage before `unwrap_or`: that allocation used to happen even when the
+    // raw value was available and was paid on every streamed turn.
+    let mut usage_raw = match raw_usage {
+        Some(raw_usage) => raw_usage.clone(),
+        None => serde_json::to_value(usage).map_err(|error| ProviderError::Malformed {
+            message: format!("genai usage could not be serialized: {error}"),
+        })?,
+    };
+    let cache_read_tokens = usage
+        .prompt_tokens_details
+        .as_ref()
+        .and_then(|details| non_negative_u64(details.cached_tokens))
+        .or_else(|| {
+            super::first_usage_u64(
+                &usage_raw,
+                &[
+                    "/cached_tokens",
+                    "/cache_read_tokens",
+                    "/cacheReadTokens",
+                    "/cache_read_input_tokens",
+                    "/cacheReadInputTokens",
+                    "/prompt_tokens_details/cached_tokens",
+                    "/prompt_tokens_details/cache_read_tokens",
+                    "/prompt_tokens_details/cacheReadTokens",
+                    "/input_tokens_details/cached_tokens",
+                    "/input_tokens_details/cache_read_tokens",
+                    "/input_tokens_details/cacheReadTokens",
+                ],
+            )
+        });
+    let cache_write_tokens = usage
+        .prompt_tokens_details
+        .as_ref()
+        .and_then(|details| non_negative_u64(details.cache_creation_tokens))
+        .or_else(|| {
+            super::first_usage_u64(
+                &usage_raw,
+                &[
+                    "/cache_creation_tokens",
+                    "/cache_write_tokens",
+                    "/cacheCreationTokens",
+                    "/cacheWriteTokens",
+                    "/prompt_tokens_details/cache_creation_tokens",
+                    "/prompt_tokens_details/cache_write_tokens",
+                    "/prompt_tokens_details/cacheCreationTokens",
+                    "/prompt_tokens_details/cacheWriteTokens",
+                    "/input_tokens_details/cache_creation_tokens",
+                    "/input_tokens_details/cache_write_tokens",
+                    "/input_tokens_details/cacheCreationTokens",
+                    "/input_tokens_details/cacheWriteTokens",
+                ],
+            )
+        });
+    // genai 会把零计数映射为 None；出现正的 cache read 即证明本轮命中，
+    // 省略的写入计数应按 provider 语义保留为 0，并写回 canonical normalizer 使用的原始对象。
+    if cache_read_tokens.is_some_and(|tokens| tokens > 0) && cache_write_tokens.is_none() {
+        let details = usage_raw
+            .as_object_mut()
+            .and_then(|object| object.get_mut("prompt_tokens_details"))
+            .and_then(Value::as_object_mut);
+        if let Some(details) = details {
+            details
+                .entry("cache_write_tokens".to_owned())
+                .or_insert_with(|| Value::from(0_u64));
+        }
+    }
     Ok(ProviderUsage {
-        input_tokens: non_negative_u64(usage.prompt_tokens),
-        output_tokens: non_negative_u64(usage.completion_tokens),
+        input_tokens: non_negative_u64(usage.prompt_tokens).or_else(|| {
+            super::first_usage_u64(
+                &usage_raw,
+                &[
+                    "/prompt_tokens",
+                    "/input_tokens",
+                    "/promptTokens",
+                    "/inputTokens",
+                ],
+            )
+        }),
+        output_tokens: non_negative_u64(usage.completion_tokens).or_else(|| {
+            super::first_usage_u64(
+                &usage_raw,
+                &[
+                    "/completion_tokens",
+                    "/output_tokens",
+                    "/completionTokens",
+                    "/outputTokens",
+                ],
+            )
+        }),
         reasoning_tokens: usage
             .completion_tokens_details
             .as_ref()
-            .and_then(|details| non_negative_u64(details.reasoning_tokens)),
+            .and_then(|details| non_negative_u64(details.reasoning_tokens))
+            .or_else(|| {
+                super::first_usage_u64(
+                    &usage_raw,
+                    &[
+                        "/completion_tokens_details/reasoning_tokens",
+                        "/output_tokens_details/reasoning_tokens",
+                        "/completionTokensDetails/reasoningTokens",
+                        "/outputTokensDetails/reasoningTokens",
+                        "/reasoning_tokens",
+                        "/reasoningTokens",
+                    ],
+                )
+            }),
         cached_input_tokens: usage
             .prompt_tokens_details
             .as_ref()
             .and_then(|details| non_negative_u64(details.cached_tokens)),
-        total_tokens: non_negative_u64(usage.total_tokens),
+        total_tokens: non_negative_u64(usage.total_tokens).or_else(|| {
+            super::first_usage_u64(
+                &usage_raw,
+                &[
+                    "/total_tokens",
+                    "/totalTokens",
+                    "/total_token_count",
+                    "/totalTokenCount",
+                ],
+            )
+        }),
         usage_source: UsageSource::Provider,
         raw: usage_raw,
     })
+}
+
+fn raw_usage_value(raw_body: &Value) -> Option<Value> {
+    ["/usage", "/response/usage"]
+        .iter()
+        .find_map(|path| raw_body.pointer(path).cloned())
 }
 
 fn finish_reason_from_genai(reason: Option<&StopReason>) -> ProviderFinishReason {
@@ -759,37 +939,47 @@ fn non_negative_u64(value: Option<i32>) -> Option<u64> {
 
 pub(crate) fn map_genai_error(error: genai::Error) -> ProviderError {
     let message = sanitize_provider_error(&error.to_string());
-    if genai_error_http_status(&error) == Some(429) {
-        return ProviderError::RateLimited { message };
-    }
-    if genai_error_http_status(&error).is_some_and(|status| (500..600).contains(&status)) {
-        return ProviderError::Unavailable { message };
-    }
-    match error {
-        genai::Error::RequiresApiKey { .. }
-        | genai::Error::NoAuthResolver { .. }
-        | genai::Error::NoAuthData { .. } => ProviderError::NotConfigured { message },
-        genai::Error::InvalidJsonResponseElement { .. }
-        | genai::Error::ChatResponseGeneration { .. }
-        | genai::Error::SerdeJson(_) => ProviderError::Malformed { message },
-        _ if message.to_ascii_lowercase().contains("timed out") => {
-            ProviderError::Timeout { message }
+    let status = genai_error_http_status(&error);
+    let metadata = genai_error_metadata(&error);
+    let mapped = if status == Some(429) {
+        ProviderError::RateLimited { message }
+    } else if status.is_some_and(|status| (500..600).contains(&status)) {
+        ProviderError::Unavailable { message }
+    } else {
+        match error {
+            genai::Error::RequiresApiKey { .. }
+            | genai::Error::NoAuthResolver { .. }
+            | genai::Error::NoAuthData { .. } => ProviderError::NotConfigured { message },
+            genai::Error::InvalidJsonResponseElement { .. }
+            | genai::Error::ChatResponseGeneration { .. }
+            | genai::Error::SerdeJson(_) => ProviderError::Malformed { message },
+            _ if message.to_ascii_lowercase().contains("timed out") => {
+                ProviderError::Timeout { message }
+            }
+            _ if [
+                "stream",
+                "connection",
+                "connect",
+                "disconnect",
+                "reset",
+                "transport",
+                "broken pipe",
+            ]
+            .iter()
+            .any(|marker| message.to_ascii_lowercase().contains(marker)) =>
+            {
+                ProviderError::Unavailable { message }
+            }
+            _ => ProviderError::Failed { message },
         }
-        _ if [
-            "stream",
-            "connection",
-            "connect",
-            "disconnect",
-            "reset",
-            "transport",
-            "broken pipe",
-        ]
-        .iter()
-        .any(|marker| message.to_ascii_lowercase().contains(marker)) =>
-        {
-            ProviderError::Unavailable { message }
-        }
-        _ => ProviderError::Failed { message },
+    };
+    if status.is_some_and(|status| status == 429 || (500..600).contains(&status)) {
+        mapped.with_metadata(ProviderErrorMetadata {
+            http_status: status.or(metadata.http_status),
+            ..metadata
+        })
+    } else {
+        mapped
     }
 }
 
@@ -809,14 +999,59 @@ pub(crate) fn genai_error_http_status(error: &genai::Error) -> Option<u16> {
         genai::Error::HttpError { status, .. } => Some(status.as_u16()),
         genai::Error::WebStream { error, .. } => error
             .downcast_ref::<genai::Error>()
-            .and_then(genai_error_http_status),
+            .and_then(genai_error_http_status)
+            .or_else(|| {
+                error
+                    .downcast_ref::<genai::webc::Error>()
+                    .and_then(webc_error_http_status)
+            }),
         genai::Error::WebAdapterCall { webc_error, .. }
-        | genai::Error::WebModelCall { webc_error, .. } => match webc_error {
-            genai::webc::Error::ResponseFailedStatus { status, .. } => Some(status.as_u16()),
-            genai::webc::Error::Reqwest(error) => error.status().map(|status| status.as_u16()),
-            _ => None,
-        },
+        | genai::Error::WebModelCall { webc_error, .. } => webc_error_http_status(webc_error),
         _ => None,
+    }
+}
+
+/// 从 rust-genai 的错误包装层提取可重试请求的脱敏元数据。
+pub(crate) fn genai_error_metadata(error: &genai::Error) -> ProviderErrorMetadata {
+    match error {
+        genai::Error::WebStream { error, .. } => error
+            .downcast_ref::<genai::Error>()
+            .map(genai_error_metadata)
+            .or_else(|| {
+                error
+                    .downcast_ref::<genai::webc::Error>()
+                    .map(webc_error_metadata)
+            })
+            .unwrap_or_default(),
+        genai::Error::WebAdapterCall { webc_error, .. }
+        | genai::Error::WebModelCall { webc_error, .. } => webc_error_metadata(webc_error),
+        _ => ProviderErrorMetadata::default(),
+    }
+}
+
+fn webc_error_http_status(error: &genai::webc::Error) -> Option<u16> {
+    match error {
+        genai::webc::Error::ResponseFailedStatus { status, .. } => Some(status.as_u16()),
+        genai::webc::Error::Reqwest(error) => error.status().map(|status| status.as_u16()),
+        _ => None,
+    }
+}
+
+fn webc_error_metadata(error: &genai::webc::Error) -> ProviderErrorMetadata {
+    match error {
+        genai::webc::Error::ResponseFailedStatus {
+            status, headers, ..
+        } => ProviderErrorMetadata {
+            http_status: Some(status.as_u16()),
+            retry_after: retry_after_from_headers(headers),
+            request_id: request_id_from_headers(headers),
+            ..ProviderErrorMetadata::default()
+        },
+        genai::webc::Error::Reqwest(error) => ProviderErrorMetadata {
+            http_status: error.status().map(|status| status.as_u16()),
+            ..ProviderErrorMetadata::default()
+        },
+        _ => ProviderErrorMetadata::default(),
     }
 }
 
@@ -930,5 +1165,260 @@ mod tests {
         .expect("none cache options");
         assert!(none.prompt_cache_key.is_none());
         assert!(none.cache_control.is_none());
+    }
+
+    #[test]
+    fn responses_web_stream_preserves_http_status_from_webc_error() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "retry-after",
+            reqwest::header::HeaderValue::from_static("2"),
+        );
+        headers.insert(
+            "x-request-id",
+            reqwest::header::HeaderValue::from_static("req-stream-502"),
+        );
+        let webc_error = genai::webc::Error::ResponseFailedStatus {
+            status: reqwest::StatusCode::BAD_GATEWAY,
+            body: "gateway unavailable".to_owned(),
+            headers: Box::new(headers),
+        };
+        let error = genai::Error::WebStream {
+            model_iden: genai::ModelIden::new(AdapterKind::OpenAIResp, "gpt-test"),
+            cause: webc_error.to_string(),
+            error: Box::new(webc_error),
+        };
+
+        assert_eq!(genai_error_http_status(&error), Some(502));
+        let mapped = map_genai_error(error);
+        assert_eq!(
+            mapped.retry_after(),
+            Some(std::time::Duration::from_secs(2))
+        );
+        assert_eq!(
+            mapped
+                .metadata()
+                .and_then(|metadata| metadata.request_id.as_deref()),
+            Some("req-stream-502")
+        );
+        assert!(matches!(
+            mapped,
+            ProviderError::WithMetadata {
+                error,
+                metadata: ProviderErrorMetadata {
+                    http_status: Some(502),
+                    ..
+                }
+            } if matches!(*error, ProviderError::Unavailable { .. })
+        ));
+    }
+
+    #[test]
+    fn genai_usage_projects_cache_write_zero_on_a_cache_hit() {
+        let usage = genai::chat::Usage {
+            prompt_tokens: Some(100),
+            prompt_tokens_details: Some(genai::chat::PromptTokensDetails {
+                cache_creation_tokens: None,
+                cache_creation_details: None,
+                cached_tokens: Some(64),
+                audio_tokens: None,
+            }),
+            completion_tokens: Some(5),
+            completion_tokens_details: None,
+            total_tokens: Some(105),
+        };
+
+        let projected = provider_usage_from_genai(&usage).expect("genai usage");
+        let normalized = projected.normalize();
+        assert_eq!(normalized.input_tokens_non_cached, Some(36));
+        assert_eq!(normalized.cache_read_tokens, Some(64));
+        assert_eq!(normalized.cache_write_tokens, Some(0));
+    }
+
+    #[test]
+    fn genai_usage_prefers_raw_response_breakdown() {
+        let usage = genai::chat::Usage {
+            prompt_tokens: Some(100),
+            prompt_tokens_details: Some(genai::chat::PromptTokensDetails {
+                cache_creation_tokens: None,
+                cache_creation_details: None,
+                cached_tokens: Some(64),
+                audio_tokens: None,
+            }),
+            completion_tokens: Some(5),
+            completion_tokens_details: None,
+            total_tokens: Some(105),
+        };
+        let raw = json!({
+            "input_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 64, "cache_write_tokens": 0},
+            "output_tokens": 5,
+            "total_tokens": 105
+        });
+
+        let projected =
+            provider_usage_from_genai_with_raw(&usage, Some(&raw)).expect("genai raw usage");
+        let normalized = projected.normalize();
+        assert_eq!(normalized.cache_read_tokens, Some(64));
+        assert_eq!(normalized.cache_write_tokens, Some(0));
+        assert_eq!(normalized.input_tokens_non_cached, Some(36));
+    }
+
+    #[test]
+    fn genai_request_uses_compact_schema_for_strict_responses_tools() {
+        let request = ProviderRequest {
+            request_id: ProviderRequestId::new(),
+            task_id: TaskId::new(),
+            turn_id: TurnId::new(),
+            session_id: None,
+            provider_id: "openai-responses".to_owned(),
+            model_id: "gpt-test".to_owned(),
+            messages: vec![ProviderMessage {
+                role: ProviderRole::User,
+                content: "use the tool".to_owned(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+                metadata: Default::default(),
+            }],
+            tools: vec![golutra_core::ToolContract {
+                tool_name: "read_file".to_owned(),
+                input_schema: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "maxLength": 128,
+                            "description": "workspace-relative path"
+                        }
+                    },
+                    "required": ["path"]
+                }),
+                output_schema: json!({}),
+                error_schema: json!({}),
+                side_effect_type: golutra_core::SideEffectType::None,
+                idempotency_key_policy: "none".to_owned(),
+                timeout_policy: "bounded".to_owned(),
+                cancellation_policy: "supported".to_owned(),
+                retry_policy: "none".to_owned(),
+                artifact_policy: "none".to_owned(),
+                permission_policy_ref: None,
+            }],
+            cache_policy: PromptCachePolicy::None,
+        };
+
+        let chat_request =
+            genai_chat_request(&request, ProviderProtocol::OpenAiResponses).expect("genai request");
+        let tool = &chat_request.tools.expect("tool list")[0];
+        assert_eq!(tool.strict, Some(true));
+        assert_eq!(
+            tool.schema.as_ref().expect("schema")["additionalProperties"],
+            false
+        );
+        assert!(
+            tool.schema.as_ref().expect("schema")["properties"]["path"]
+                .get("maxLength")
+                .is_none()
+        );
+        assert_eq!(
+            tool.schema.as_ref().expect("schema")["properties"]["path"]["description"],
+            "workspace-relative path"
+        );
+    }
+
+    #[test]
+    fn genai_request_disables_strict_for_optional_responses_tool_fields() {
+        let request = ProviderRequest {
+            request_id: ProviderRequestId::new(),
+            task_id: TaskId::new(),
+            turn_id: TurnId::new(),
+            session_id: None,
+            provider_id: "openai-responses".to_owned(),
+            model_id: "gpt-test".to_owned(),
+            messages: vec![ProviderMessage {
+                role: ProviderRole::User,
+                content: "run the command".to_owned(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+                metadata: Default::default(),
+            }],
+            tools: vec![golutra_core::ToolContract {
+                tool_name: "shell".to_owned(),
+                input_schema: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "command": {"type": "string"},
+                        "background": {"type": "boolean"}
+                    },
+                    "required": ["command"]
+                }),
+                output_schema: json!({}),
+                error_schema: json!({}),
+                side_effect_type: golutra_core::SideEffectType::None,
+                idempotency_key_policy: "none".to_owned(),
+                timeout_policy: "bounded".to_owned(),
+                cancellation_policy: "supported".to_owned(),
+                retry_policy: "none".to_owned(),
+                artifact_policy: "none".to_owned(),
+                permission_policy_ref: None,
+            }],
+            cache_policy: PromptCachePolicy::None,
+        };
+
+        let chat_request =
+            genai_chat_request(&request, ProviderProtocol::OpenAiResponses).expect("genai request");
+        let tool = &chat_request.tools.expect("tool list")[0];
+        assert_eq!(tool.strict, Some(false));
+    }
+
+    #[test]
+    fn web_search_is_sent_as_a_custom_function_and_restored_on_return() {
+        assert_eq!(wire_tool_name("web_search"), "golutra_web_search");
+        assert_eq!(restore_wire_tool_name("golutra_web_search"), "web_search");
+
+        let request = ProviderRequest {
+            request_id: ProviderRequestId::new(),
+            task_id: TaskId::new(),
+            turn_id: TurnId::new(),
+            session_id: None,
+            provider_id: "openai-responses".to_owned(),
+            model_id: "gpt-test".to_owned(),
+            messages: vec![ProviderMessage {
+                role: ProviderRole::User,
+                content: "search".to_owned(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+                metadata: Default::default(),
+            }],
+            tools: vec![golutra_core::ToolContract {
+                tool_name: "web_search".to_owned(),
+                input_schema: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                }),
+                output_schema: json!({}),
+                error_schema: json!({}),
+                side_effect_type: golutra_core::SideEffectType::None,
+                idempotency_key_policy: "none".to_owned(),
+                timeout_policy: "bounded".to_owned(),
+                cancellation_policy: "supported".to_owned(),
+                retry_policy: "none".to_owned(),
+                artifact_policy: "none".to_owned(),
+                permission_policy_ref: None,
+            }],
+            cache_policy: PromptCachePolicy::None,
+        };
+
+        let chat_request =
+            genai_chat_request(&request, ProviderProtocol::OpenAiResponses).expect("request");
+        let tool = &chat_request.tools.expect("tool list")[0];
+        assert_eq!(tool.name.as_ref(), "golutra_web_search");
+        assert!(tool.schema.is_some(), "custom function must retain schema");
     }
 }

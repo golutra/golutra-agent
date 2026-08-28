@@ -29,6 +29,12 @@ const RUN_BUNDLE_FORMAT_VERSION: u32 = 2;
 const OBSERVATION_FORMAT_VERSION: u32 = 1;
 const MAX_PRIOR_TRACE_BYTES: u64 = 256 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BundleWriteMode {
+    Durable,
+    Fast,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunBundleExportRequest {
     /// The run directory. It already exists and contains `state/` because the
@@ -186,7 +192,28 @@ impl<'a> RunBundleExporter<'a> {
         request: RunBundleExportRequest,
     ) -> Result<RunBundleReceipt, ClientError> {
         let prior_manifest = load_existing_manifest(&request.destination)?;
-        self.export_with_mode(request, prior_manifest, true).await
+        self.export_with_mode(
+            request,
+            prior_manifest,
+            true,
+            true,
+            BundleWriteMode::Durable,
+        )
+        .await
+    }
+
+    /// Persist the terminal execution projection without waiting for durable
+    /// post-task evaluation or copying the redacted debug bundle.  The raw
+    /// runtime database and owner-only observations are still written
+    /// atomically; callers that need the heavier audit projection can run
+    /// [`Self::refresh`] after the user-visible result has been delivered.
+    pub async fn export_fast(
+        &self,
+        request: RunBundleExportRequest,
+    ) -> Result<RunBundleReceipt, ClientError> {
+        let prior_manifest = load_existing_manifest(&request.destination)?;
+        self.export_with_mode(request, prior_manifest, false, false, BundleWriteMode::Fast)
+            .await
     }
 
     /// Persist a recoverable snapshot while an exec turn is still running.
@@ -201,7 +228,26 @@ impl<'a> RunBundleExporter<'a> {
         request: RunBundleExportRequest,
     ) -> Result<RunBundleReceipt, ClientError> {
         let prior_manifest = load_existing_manifest(&request.destination)?;
-        self.export_with_mode(request, prior_manifest, false).await
+        self.export_with_mode(
+            request,
+            prior_manifest,
+            false,
+            true,
+            BundleWriteMode::Durable,
+        )
+        .await
+    }
+
+    /// Persist only the recovery projection needed to reopen an interrupted
+    /// run. The redacted debug export is deferred until the terminal export so
+    /// large artifact copies cannot delay the provider's first event.
+    pub async fn checkpoint_fast(
+        &self,
+        request: RunBundleExportRequest,
+    ) -> Result<RunBundleReceipt, ClientError> {
+        let prior_manifest = load_existing_manifest(&request.destination)?;
+        self.export_with_mode(request, prior_manifest, false, false, BundleWriteMode::Fast)
+            .await
     }
 
     /// Rebuild derived observations after an evaluator overlay was appended
@@ -225,6 +271,8 @@ impl<'a> RunBundleExporter<'a> {
             },
             Some(manifest),
             true,
+            true,
+            BundleWriteMode::Durable,
         )
         .await
     }
@@ -234,6 +282,8 @@ impl<'a> RunBundleExporter<'a> {
         request: RunBundleExportRequest,
         prior_manifest: Option<RunBundleManifest>,
         wait_for_evaluation: bool,
+        include_debug_export: bool,
+        write_mode: BundleWriteMode,
     ) -> Result<RunBundleReceipt, ClientError> {
         let replace_existing = prior_manifest.is_some();
         validate_run_root(&request.destination)?;
@@ -251,42 +301,54 @@ impl<'a> RunBundleExporter<'a> {
         if let Some(prior_manifest) = &prior_manifest {
             validate_append_only_refresh(&request.destination, prior_manifest, &snapshot)?;
         }
-        let observations = write_observations(&request.destination, &snapshot, replace_existing)?;
+        let observations = write_observations(
+            &request.destination,
+            &snapshot,
+            replace_existing,
+            write_mode,
+        )?;
 
-        let debug_export_path = request.destination.join("debug-export");
-        let debug_staging_path = replace_existing.then(|| {
-            request
-                .destination
-                .join(format!(".debug-export-refresh-{}", uuid::Uuid::now_v7()))
-        });
-        let debug_destination = debug_staging_path
-            .as_ref()
-            .unwrap_or(&debug_export_path)
-            .clone();
-        let debug_export = match DebugExportCoordinator::new(self.transport)
-            .export_snapshot(snapshot.clone(), debug_destination.clone())
-            .await
-        {
-            Ok(receipt) => {
-                if replace_existing
-                    && let Err(error) = swap_directory(&debug_destination, &debug_export_path)
-                {
-                    let _ = remove_path_if_present(&debug_destination);
-                    return Err(error);
+        let debug_export = if include_debug_export {
+            let debug_export_path = request.destination.join("debug-export");
+            let debug_staging_path = replace_existing.then(|| {
+                request
+                    .destination
+                    .join(format!(".debug-export-refresh-{}", uuid::Uuid::now_v7()))
+            });
+            let debug_destination = debug_staging_path
+                .as_ref()
+                .unwrap_or(&debug_export_path)
+                .clone();
+            match DebugExportCoordinator::new(self.transport)
+                .export_snapshot(snapshot.clone(), debug_destination.clone())
+                .await
+            {
+                Ok(receipt) => {
+                    if replace_existing
+                        && let Err(error) = swap_directory(&debug_destination, &debug_export_path)
+                    {
+                        let _ = remove_path_if_present(&debug_destination);
+                        return Err(error);
+                    }
+                    DebugExportOutcome::Exported {
+                        path: "debug-export".to_owned(),
+                        receipt: debug_export_receipt(receipt),
+                    }
                 }
-                DebugExportOutcome::Exported {
-                    path: "debug-export".to_owned(),
-                    receipt: debug_export_receipt(receipt),
+                Err(error) => {
+                    if replace_existing {
+                        let _ = remove_path_if_present(&debug_destination);
+                    }
+                    DebugExportOutcome::Failed {
+                        path: "debug-export".to_owned(),
+                        error: error.to_string(),
+                    }
                 }
             }
-            Err(error) => {
-                if replace_existing {
-                    let _ = remove_path_if_present(&debug_destination);
-                }
-                DebugExportOutcome::Failed {
-                    path: "debug-export".to_owned(),
-                    error: error.to_string(),
-                }
+        } else {
+            DebugExportOutcome::Failed {
+                path: "debug-export".to_owned(),
+                error: "deferred until terminal run export".to_owned(),
             }
         };
 
@@ -371,6 +433,7 @@ fn write_observations(
     run_root: &Path,
     snapshot: &RuntimeObservationSnapshot,
     replace_existing: bool,
+    write_mode: BundleWriteMode,
 ) -> Result<ObservationBundleManifest, ClientError> {
     let destination = run_root.join("observations");
     if !replace_existing {
@@ -387,7 +450,9 @@ fn write_observations(
     let mut files = Vec::new();
     let mut sessions = Vec::with_capacity(snapshot.sessions.len());
     for session in &snapshot.sessions {
-        sessions.push(write_session_observations(staging, session, &mut files)?);
+        sessions.push(write_session_observations(
+            staging, session, &mut files, write_mode,
+        )?);
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
     let manifest = ObservationBundleManifest {
@@ -403,8 +468,10 @@ fn write_observations(
         files,
     };
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
-    write_new_file(&staging.join("manifest.json"), &manifest_bytes)?;
-    sync_tree(staging)?;
+    write_new_file_with_mode(&staging.join("manifest.json"), &manifest_bytes, write_mode)?;
+    if write_mode == BundleWriteMode::Durable {
+        sync_tree(staging)?;
+    }
     let staging_path = temporary.keep();
     if replace_existing {
         if let Err(error) = swap_directory(&staging_path, &destination) {
@@ -925,25 +992,29 @@ fn write_session_observations(
     staging: &Path,
     session: &ObservedSession,
     files: &mut Vec<RunBundleFile>,
+    write_mode: BundleWriteMode,
 ) -> Result<ObservationSessionManifest, ClientError> {
     let relative_root = format!("sessions/{}", session.summary.session_id);
     let session_root = staging.join(&relative_root);
     create_private_dir(&session_root)?;
     create_private_dir(&session_root.join("tasks"))?;
-    files.push(write_json_file(
+    files.push(write_json_file_with_mode(
         &session_root.join("thread.json"),
         &session.thread,
         format!("observations/{relative_root}/thread.json"),
+        write_mode,
     )?);
-    files.push(write_json_lines_file(
+    files.push(write_json_lines_file_with_mode(
         &session_root.join("events.jsonl"),
         &session.events,
         format!("observations/{relative_root}/events.jsonl"),
+        write_mode,
     )?);
-    files.push(write_json_lines_file(
+    files.push(write_json_lines_file_with_mode(
         &session_root.join("conversation.jsonl"),
         &session.conversation,
         format!("observations/{relative_root}/conversation.jsonl"),
+        write_mode,
     )?);
     let mut tasks = Vec::with_capacity(session.tasks.len());
     for task in &session.tasks {
@@ -951,10 +1022,11 @@ fn write_session_observations(
         let task_root = staging.join(&task_relative_root);
         create_private_dir(&task_root)?;
         let trace_path = format!("observations/{task_relative_root}/trace.json");
-        files.push(write_json_file(
+        files.push(write_json_file_with_mode(
             &task_root.join("trace.json"),
             &task.trace,
             trace_path.clone(),
+            write_mode,
         )?);
         tasks.push(ObservationTaskManifest {
             task_id: task.task_id.to_string(),
@@ -1179,30 +1251,32 @@ fn create_private_dir(path: &Path) -> Result<(), ClientError> {
     set_owner_only_dir(path)
 }
 
-fn write_json_file<T: Serialize>(
+fn write_json_file_with_mode<T: Serialize>(
     path: &Path,
     value: &T,
     bundle_path: String,
+    write_mode: BundleWriteMode,
 ) -> Result<RunBundleFile, ClientError> {
     let bytes = serde_json::to_vec_pretty(value)?;
-    let file = write_new_file(path, &bytes)?;
+    let file = write_new_file_with_mode(path, &bytes, write_mode)?;
     Ok(RunBundleFile {
         path: bundle_path,
         ..file
     })
 }
 
-fn write_json_lines_file<T: Serialize>(
+fn write_json_lines_file_with_mode<T: Serialize>(
     path: &Path,
     values: &[T],
     bundle_path: String,
+    write_mode: BundleWriteMode,
 ) -> Result<RunBundleFile, ClientError> {
     let mut bytes = Vec::new();
     for value in values {
         serde_json::to_writer(&mut bytes, value)?;
         bytes.push(b'\n');
     }
-    let file = write_new_file(path, &bytes)?;
+    let file = write_new_file_with_mode(path, &bytes, write_mode)?;
     Ok(RunBundleFile {
         path: bundle_path,
         ..file
@@ -1210,6 +1284,14 @@ fn write_json_lines_file<T: Serialize>(
 }
 
 fn write_new_file(path: &Path, bytes: &[u8]) -> Result<RunBundleFile, ClientError> {
+    write_new_file_with_mode(path, bytes, BundleWriteMode::Durable)
+}
+
+fn write_new_file_with_mode(
+    path: &Path,
+    bytes: &[u8],
+    write_mode: BundleWriteMode,
+) -> Result<RunBundleFile, ClientError> {
     if fs::symlink_metadata(path).is_ok() {
         return Err(ClientError::Io(format!(
             "run bundle file already exists: {}",
@@ -1223,8 +1305,10 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> Result<RunBundleFile, ClientErro
         .map_err(|error| bundle_io(path, error))?;
     set_owner_only_file(path)?;
     file.write_all(bytes)
-        .and_then(|()| file.sync_all())
         .map_err(|error| bundle_io(path, error))?;
+    if write_mode == BundleWriteMode::Durable {
+        file.sync_all().map_err(|error| bundle_io(path, error))?;
+    }
     Ok(RunBundleFile {
         path: String::new(),
         bytes: bytes.len() as u64,

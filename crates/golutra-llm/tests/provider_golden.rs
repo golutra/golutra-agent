@@ -2,7 +2,10 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
 use golutra_auth::{AuthError, CredentialMetadata, CredentialProvider};
-use golutra_core::{PolicyId, ProviderRequestId, SideEffectType, TaskId, ToolContract, TurnId};
+use golutra_core::{
+    PolicyId, PromptCachePolicy, ProviderRequestId, SessionId, SideEffectType, TaskId,
+    ToolContract, TurnId,
+};
 use golutra_llm::{
     GenaiProviderAdapter, GenaiProviderConfig, LlmProvider, OpenAiCompatibleProvider,
     OpenAiCompatibleProviderConfig, OpenAiResponsesProvider, OpenAiResponsesProviderConfig,
@@ -48,6 +51,7 @@ struct TestProviderResponse {
     status: u16,
     content_type: &'static str,
     body: String,
+    headers: Vec<(String, String)>,
 }
 
 impl TestProviderResponse {
@@ -56,6 +60,7 @@ impl TestProviderResponse {
             status,
             content_type: "application/json",
             body: body.into(),
+            headers: Vec::new(),
         }
     }
 
@@ -64,7 +69,13 @@ impl TestProviderResponse {
             status,
             content_type: "text/event-stream",
             body: body.into(),
+            headers: Vec::new(),
         }
+    }
+
+    fn header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.to_owned(), value.to_owned()));
+        self
     }
 }
 
@@ -210,8 +221,12 @@ async fn openai_compatible_provider_matches_goldens() {
     )
     .await;
     let provider = OpenAiCompatibleProvider::new(TEST_API_KEY, base_url, "gpt-golden");
+    let session_id = SessionId::new();
+    let session_header = session_id.to_string();
+    let mut request = comprehensive_request("gpt-golden");
+    request.session_id = Some(session_id);
     let response = provider
-        .complete(comprehensive_request("gpt-golden"))
+        .complete(request)
         .await
         .expect("OpenAI-compatible text response");
     let captured = captured.await.expect("OpenAI-compatible request");
@@ -229,6 +244,10 @@ async fn openai_compatible_provider_matches_goldens() {
     assert_eq!(
         captured.headers.get("authorization"),
         Some(&format!("Bearer {TEST_API_KEY}"))
+    );
+    assert_eq!(
+        captured.headers.get("session-id").map(String::as_str),
+        Some(session_header.as_str())
     );
     assert_eq!(response.finish_reason, ProviderFinishReason::Stop);
     assert_eq!(response.usage.total_tokens, Some(15));
@@ -331,6 +350,53 @@ async fn openai_compatible_stream_emits_ordered_text_deltas_and_usage() {
 }
 
 #[tokio::test]
+async fn openai_compatible_sse_error_status_is_classified_as_retryable() {
+    let error_stream = concat!(
+        "event: error\n",
+        "data: {\"error\":{\"status\":502,\"code\":\"bad_gateway\",\"message\":\"upstream unavailable\"}}\n\n",
+    );
+    let (base_url, _captured) = spawn_provider_sequence(vec![
+        TestProviderResponse::sse(200, error_stream)
+            .header("retry-after", "1")
+            .header("x-request-id", "req-sse-502"),
+    ])
+    .await;
+    let provider = OpenAiCompatibleProvider::new(TEST_API_KEY, base_url, "gpt-golden");
+    let error = provider
+        .complete_stream(simple_request("gpt-golden"), &mut |_| {})
+        .await
+        .expect_err("SSE error event");
+
+    assert_eq!(error.http_status(), Some(502));
+    assert_eq!(error.retry_after(), Some(std::time::Duration::from_secs(1)));
+    assert_eq!(
+        error
+            .metadata()
+            .and_then(|metadata| metadata.request_id.as_deref()),
+        Some("req-sse-502")
+    );
+}
+
+#[tokio::test]
+async fn openai_compatible_http_503_preserves_retry_after_metadata() {
+    let (base_url, _captured) = spawn_provider_sequence(vec![
+        TestProviderResponse::json(503, r#"{"error":{"message":"busy"}}"#)
+            .header("retry-after", "2")
+            .header("x-request-id", "req-http-503"),
+    ])
+    .await;
+    let provider = OpenAiCompatibleProvider::new(TEST_API_KEY, base_url, "gpt-golden");
+    let error = provider
+        .complete(simple_request("gpt-golden"))
+        .await
+        .expect_err("HTTP 503");
+
+    assert_eq!(error.http_status(), Some(503));
+    assert_eq!(error.retry_after(), Some(std::time::Duration::from_secs(2)));
+    assert!(matches!(error, ProviderError::WithMetadata { .. }));
+}
+
+#[tokio::test]
 async fn openai_compatible_custom_headers_are_applied_without_debug_values() {
     let (base_url, captured) = spawn_provider(
         200,
@@ -346,6 +412,7 @@ async fn openai_compatible_custom_headers_are_applied_without_debug_values() {
             json!({
                 "X-Api-Key": "fake-supplemental-key",
                 "X-Client-Name": "golutra-golden",
+                "Session-Id": "external-affinity-must-not-win",
             })
             .to_string(),
         ),
@@ -354,8 +421,12 @@ async fn openai_compatible_custom_headers_are_applied_without_debug_values() {
     .expect("custom header config");
     let debug = format!("{config:?}");
     let provider = OpenAiCompatibleProvider::from_config(config);
+    let session_id = SessionId::new();
+    let session_header = session_id.to_string();
+    let mut request = simple_request("gpt-golden");
+    request.session_id = Some(session_id);
     provider
-        .complete(simple_request("gpt-golden"))
+        .complete(request)
         .await
         .expect("custom header request");
     let captured = captured.await.expect("custom header capture");
@@ -368,7 +439,46 @@ async fn openai_compatible_custom_headers_are_applied_without_debug_values() {
         captured.headers.get("x-client-name").map(String::as_str),
         Some("golutra-golden")
     );
+    assert_eq!(
+        captured.headers.get("session-id").map(String::as_str),
+        Some(session_header.as_str())
+    );
     assert!(!debug.contains("fake-supplemental-key"));
+}
+
+#[tokio::test]
+async fn openai_responses_internal_affinity_overrides_the_custom_session_header() {
+    let (base_url, captured) = spawn_provider_sequence(vec![TestProviderResponse::sse(
+        200,
+        include_str!("fixtures/openai-responses/text-response.sse"),
+    )])
+    .await;
+    let config = OpenAiResponsesProvider::config_from_env_reader(|key| match key {
+        "GOLUTRA_PROVIDER_PROTOCOL" => Some("openai-responses".to_owned()),
+        "GOLUTRA_PROVIDER_API_KEY" => Some(TEST_API_KEY.to_owned()),
+        "GOLUTRA_PROVIDER_MODEL" => Some("gpt-golden".to_owned()),
+        "GOLUTRA_PROVIDER_BASE_URL" => Some(base_url.clone()),
+        "GOLUTRA_PROVIDER_CUSTOM_HEADERS" => {
+            Some(json!({"Session-Id": "external-affinity-must-not-win"}).to_string())
+        }
+        _ => None,
+    })
+    .expect("Responses custom header config");
+    let provider = OpenAiResponsesProvider::from_config(config);
+    let session_id = SessionId::new();
+    let session_header = session_id.to_string();
+    let mut request = simple_request("gpt-golden");
+    request.session_id = Some(session_id);
+
+    provider
+        .complete(request)
+        .await
+        .expect("Responses custom header request");
+    let captured = captured.await.expect("Responses custom header capture");
+    assert_eq!(
+        captured[0].headers.get("session-id").map(String::as_str),
+        Some(session_header.as_str())
+    );
 }
 
 #[tokio::test]
@@ -601,6 +711,80 @@ async fn openai_responses_forces_rust_genai_responses_routing_for_grok_model() {
     assert_eq!(captured[0].path, "/responses");
     assert_eq!(captured[0].body["model"], "grok-4.5");
     assert_eq!(captured[0].body["stream"], true);
+}
+
+#[tokio::test]
+async fn openai_responses_projects_stable_cache_identity_and_retention() {
+    let response = include_str!("fixtures/openai-responses/text-response.sse");
+    let (base_url, captured) = spawn_provider_sequence(vec![
+        TestProviderResponse::sse(200, response),
+        TestProviderResponse::sse(200, response),
+        TestProviderResponse::sse(200, response),
+        TestProviderResponse::sse(200, response),
+    ])
+    .await;
+    let provider = openai_responses_provider(base_url);
+    let session_id = SessionId::new();
+    let mut first = simple_request("gpt-golden");
+    first.session_id = Some(session_id);
+    first.cache_policy = PromptCachePolicy::Long;
+
+    provider
+        .complete(first.clone())
+        .await
+        .expect("first cached Responses request");
+    provider
+        .complete(first.clone())
+        .await
+        .expect("second cached Responses request");
+
+    let mut other_session = first.clone();
+    other_session.session_id = Some(SessionId::new());
+    provider
+        .complete(other_session)
+        .await
+        .expect("isolated cached Responses request");
+
+    let mut disabled = first;
+    disabled.cache_policy = PromptCachePolicy::None;
+    provider
+        .complete(disabled)
+        .await
+        .expect("cache-disabled Responses request");
+
+    let requests = captured.await.expect("Responses cache request capture");
+    assert_eq!(requests.len(), 4);
+    let first_key = requests[0].body["prompt_cache_key"]
+        .as_str()
+        .expect("first request cache key");
+    let second_key = requests[1].body["prompt_cache_key"]
+        .as_str()
+        .expect("second request cache key");
+    let other_key = requests[2].body["prompt_cache_key"]
+        .as_str()
+        .expect("isolated request cache key");
+    assert_eq!(first_key.len(), 64);
+    assert_eq!(first_key, second_key);
+    assert_ne!(first_key, other_key);
+    let session_header = session_id.to_string();
+    for request in &requests[..3] {
+        assert_eq!(request.path, "/responses");
+        assert_eq!(request.body["prompt_cache_retention"], "24h");
+    }
+    assert_eq!(
+        requests[0].headers.get("session-id").map(String::as_str),
+        Some(session_header.as_str())
+    );
+    assert_eq!(
+        requests[1].headers.get("session-id").map(String::as_str),
+        Some(session_header.as_str())
+    );
+    assert!(requests[3].body.get("prompt_cache_key").is_none());
+    assert!(requests[3].body.get("prompt_cache_retention").is_none());
+    assert_eq!(
+        requests[3].headers.get("session-id").map(String::as_str),
+        Some(session_header.as_str())
+    );
 }
 
 #[tokio::test]
@@ -1032,9 +1216,14 @@ async fn spawn_provider_sequence(
                 "Unauthorized"
             };
             let message = format!(
-                "HTTP/1.1 {} {reason}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                "HTTP/1.1 {} {reason}\r\ncontent-type: {}\r\n{}content-length: {}\r\nconnection: close\r\n\r\n{}",
                 response.status,
                 response.content_type,
+                response
+                    .headers
+                    .iter()
+                    .map(|(name, value)| format!("{name}: {value}\r\n"))
+                    .collect::<String>(),
                 response.body.len(),
                 response.body
             );

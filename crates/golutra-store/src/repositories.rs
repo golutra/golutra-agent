@@ -96,6 +96,13 @@ impl EventRepository {
             .await
     }
 
+    pub async fn latest_model_history(
+        &self,
+        session_id: SessionId,
+    ) -> StoreResult<Option<RuntimeEvent>> {
+        self.store.load_latest_model_history_event(session_id).await
+    }
+
     pub async fn session_for_task(&self, task_id: TaskId) -> StoreResult<Option<SessionId>> {
         self.store.session_for_task(task_id).await
     }
@@ -165,18 +172,16 @@ impl EventRepository {
             .await
     }
 
-    pub async fn latest_explicit_compaction(
+    pub async fn active_context_window(
         &self,
         session_id: SessionId,
-    ) -> StoreResult<Option<RuntimeEvent>> {
-        self.store.load_latest_explicit_compaction(session_id).await
-    }
-
-    pub async fn latest_context_compaction(
-        &self,
-        session_id: SessionId,
-    ) -> StoreResult<Option<RuntimeEvent>> {
-        self.store.load_latest_context_compaction(session_id).await
+        leaf_event_id: golutra_core::EventId,
+        recent_limit: u32,
+        max_depth: u32,
+    ) -> StoreResult<Vec<RuntimeEvent>> {
+        self.store
+            .load_active_context_window(session_id, leaf_event_id, recent_limit, max_depth)
+            .await
     }
 
     pub async fn claim_command(
@@ -236,6 +241,15 @@ impl ProjectionRepository {
 
     pub async fn all_states(&self) -> StoreResult<Vec<StateProjection>> {
         self.store.list_session_states().await
+    }
+
+    pub async fn workspace_states(
+        &self,
+        workspace_root: &str,
+    ) -> StoreResult<Vec<StateProjection>> {
+        self.store
+            .list_workspace_session_states(workspace_root)
+            .await
     }
 }
 

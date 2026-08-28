@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use serde_json::json;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -163,9 +165,21 @@ async fn mock_provider_returns_tool_call() {
 fn openai_tool_parameters_come_from_the_runtime_tool_contract() {
     let input_schema = json!({
         "type": "object",
-        "properties": {"custom": {"type": "integer"}},
+        "properties": {
+            "custom": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10,
+                "description": "runtime-only bound"
+            },
+            "description": {"type": "string", "maxLength": 32}
+        },
         "required": ["custom"],
-        "additionalProperties": false
+        "additionalProperties": false,
+        "oneOf": [
+            {"type": "object", "properties": {"custom": {"type": "integer"}}},
+            {"type": "null"}
+        ]
     });
     let contract = ToolContract {
         tool_name: "custom_tool".to_owned(),
@@ -183,34 +197,44 @@ fn openai_tool_parameters_come_from_the_runtime_tool_contract() {
 
     let schema = openai_tool_schema(&contract);
 
-    assert_eq!(schema["function"]["parameters"], input_schema);
+    let parameters = &schema["function"]["parameters"];
+    assert_eq!(parameters["type"], "object");
+    assert_eq!(parameters["required"], json!(["custom"]));
+    assert_eq!(parameters["additionalProperties"], false);
+    assert!(parameters["properties"]["custom"].get("minimum").is_none());
+    assert!(parameters["properties"]["custom"].get("maximum").is_none());
+    assert_eq!(
+        parameters["properties"]["custom"]["description"],
+        "runtime-only bound"
+    );
+    assert_eq!(parameters["properties"]["description"]["type"], "string");
+    assert!(
+        parameters["properties"]["description"]
+            .get("maxLength")
+            .is_none()
+    );
+    assert_eq!(parameters["oneOf"][0]["type"], "object");
+    assert_eq!(parameters["oneOf"][1]["type"], "null");
 }
 
 #[test]
 fn shell_provider_description_distinguishes_lifetime_from_initial_wait() {
     let description = provider_tool_description("shell");
 
-    assert!(description.contains("inert argv"));
-    assert!(description.contains("program and every argument"));
+    assert!(description.contains("as argv"));
     assert!(description.contains("Python heredoc"));
-    assert!(description.contains("package-manager conventions"));
-    assert!(description.contains("project-scoped installation"));
     assert!(description.contains("timeout_ms is the absolute process lifetime"));
-    assert!(description.contains("yield"));
-    assert!(description.contains("only controls the initial wait"));
-    assert!(description.contains("runtime-scoped"));
-    assert!(description.contains("do not use background=true"));
-    assert!(description.contains("platform-appropriate lifecycle mechanism"));
-    assert!(description.contains("verify availability before returning"));
-    assert!(!description.contains("nohup"));
+    assert!(description.contains("yield_time_ms only the initial wait"));
+    assert!(description.contains("runtime owns the process"));
+    assert!(description.contains("must outlive the runtime"));
+    assert!(description.len() < 400);
 }
 
 #[test]
 fn provider_tool_descriptions_own_file_and_question_usage_details() {
     let write_file = provider_tool_description("write_file");
-    assert!(write_file.contains("complete supplied content"));
-    assert!(write_file.contains("explicit working or output directory"));
-    assert!(write_file.contains("workspace root"));
+    assert!(write_file.contains("complete UTF-8 content"));
+    assert!(write_file.contains("workspace-relative file"));
 
     let ask_user = provider_tool_description("ask_user");
     assert!(ask_user.contains("consequential decision"));
@@ -220,10 +244,11 @@ fn provider_tool_descriptions_own_file_and_question_usage_details() {
         provider_tool_description("apply_patch"),
         "Golutra workspace tool."
     );
-    let delegate = provider_tool_description("delegate_task");
-    assert!(delegate.contains("self-contained task"));
-    assert!(delegate.contains("does not receive this conversation"));
-    assert!(delegate.contains("reasoning_effort"));
+    let subagent = provider_tool_description("subagent");
+    assert!(subagent.contains("isolated child task"));
+    assert!(subagent.contains("cannot create another child"));
+    assert!(provider_tool_description("web_search").contains("network"));
+    assert!(provider_tool_description("shell_session").contains("background"));
     assert_ne!(
         provider_tool_description("process_list"),
         "Golutra workspace tool."
@@ -243,6 +268,86 @@ fn provider_tool_descriptions_own_file_and_question_usage_details() {
     assert_ne!(
         provider_tool_description("process_reconnect"),
         "Golutra workspace tool."
+    );
+}
+
+#[test]
+fn provider_schema_projection_keeps_strict_structure_and_nested_combinators() {
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "items": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 4,
+                "items": {
+                    "type": "string",
+                    "pattern": "^[a-z]+$"
+                }
+            }
+        },
+        "required": ["items"],
+        "anyOf": [
+            {"type": "object", "additionalProperties": false},
+            {"type": "null"}
+        ],
+        "allOf": [{"type": "object", "properties": {"items": {"type": "array"}}}]
+    });
+
+    let projected = provider_tool_schema_projection(&schema);
+    assert_eq!(projected["additionalProperties"], false);
+    assert_eq!(projected["required"], json!(["items"]));
+    assert!(projected["properties"]["items"].get("minItems").is_none());
+    assert!(projected["properties"]["items"].get("maxItems").is_none());
+    assert!(
+        projected["properties"]["items"]["items"]
+            .get("pattern")
+            .is_none()
+    );
+    assert_eq!(projected["anyOf"][0]["additionalProperties"], false);
+    assert_eq!(
+        projected["allOf"][0]["properties"]["items"]["type"],
+        "array"
+    );
+}
+
+#[test]
+fn provider_schema_projection_keeps_compact_parameter_semantics() {
+    let schema = json!({
+        "type": "object",
+        "description": "  Use   this parameter for a bounded operation.  ",
+        "properties": {
+            "command": {
+                "type": "string",
+                "description": "  A command with   important shell semantics.  ",
+                "maxLength": 64
+            }
+        }
+    });
+
+    let projected = provider_tool_schema_projection(&schema);
+    assert_eq!(
+        projected["description"],
+        "Use this parameter for a bounded operation."
+    );
+    assert_eq!(
+        projected["properties"]["command"]["description"],
+        "A command with important shell semantics."
+    );
+
+    let long_description = "x ".repeat(400);
+    let bounded = provider_tool_schema_projection(&json!({
+        "type": "string",
+        "description": long_description
+    }));
+    assert_eq!(
+        bounded["description"]
+            .as_str()
+            .expect("description")
+            .chars()
+            .count(),
+        512
     );
 }
 
@@ -662,6 +767,90 @@ fn provider_error_message_reads_string_error() {
 }
 
 #[test]
+fn provider_error_classifies_transient_payload_and_preserves_retry_metadata() {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "retry-after",
+        reqwest::header::HeaderValue::from_static("3"),
+    );
+    headers.insert(
+        "x-request-id",
+        reqwest::header::HeaderValue::from_static("req-golden-1"),
+    );
+    let error = provider_error_from_value(
+        &json!({
+            "error": {
+                "status": 502,
+                "code": "bad_gateway",
+                "message": "upstream temporarily unavailable"
+            }
+        }),
+        Some(200),
+        &headers,
+    );
+
+    assert!(matches!(error, ProviderError::WithMetadata { .. }));
+    assert_eq!(error.http_status(), Some(502));
+    assert_eq!(error.retry_after(), Some(Duration::from_secs(3)));
+    assert_eq!(
+        error
+            .metadata()
+            .and_then(|metadata| metadata.provider_code.as_deref()),
+        Some("bad_gateway")
+    );
+    assert_eq!(
+        error
+            .metadata()
+            .and_then(|metadata| metadata.request_id.as_deref()),
+        Some("req-golden-1")
+    );
+}
+
+#[test]
+fn successful_http_status_does_not_hide_transient_sse_payload_status() {
+    let error = provider_error_from_value(
+        &json!({
+            "error": {"status": 503, "message": "service unavailable"}
+        }),
+        Some(200),
+        &reqwest::header::HeaderMap::new(),
+    );
+
+    assert_eq!(error.http_status(), Some(503));
+    assert!(matches!(error, ProviderError::WithMetadata { .. }));
+}
+
+#[test]
+fn actual_http_status_wins_over_conflicting_error_payload_status() {
+    let error = provider_error_from_value(
+        &json!({
+            "error": {"status": 400, "message": "rate limited"}
+        }),
+        Some(429),
+        &reqwest::header::HeaderMap::new(),
+    );
+
+    assert_eq!(error.http_status(), Some(429));
+    assert!(error.is_rate_limited());
+}
+
+#[test]
+fn transient_error_type_is_classified_without_http_status() {
+    let error = provider_error_from_value(
+        &json!({
+            "type": "error",
+            "error": {"type": "server_error"},
+            "message": "request failed"
+        }),
+        Some(200),
+        &reqwest::header::HeaderMap::new(),
+    );
+
+    assert!(matches!(error, ProviderError::Unavailable { .. }));
+    assert_eq!(error.http_status(), None);
+}
+
+#[test]
 fn provider_error_message_redacts_api_key_fragments() {
     let value = json!({
         "error": {
@@ -736,6 +925,34 @@ fn prompt_cache_identity_is_stable_and_session_scoped() {
 }
 
 #[test]
+fn provider_affinity_prefers_session_and_falls_back_to_task() {
+    let mut request = request();
+    assert_eq!(request.affinity_id(), request.task_id.to_string());
+    let session_id = golutra_core::SessionId::new();
+    request.session_id = Some(session_id);
+    assert_eq!(request.affinity_id(), session_id.to_string());
+}
+
+#[test]
+fn provider_cache_identity_isolated_by_protocol_endpoint() {
+    let mut request = request();
+    request.session_id = Some(golutra_core::SessionId::new());
+    request.cache_policy = golutra_core::PromptCachePolicy::Auto;
+    let first = OpenAiCompatibleProvider::new("test-key", "https://gateway-a.example/v1", "model");
+    let second = OpenAiCompatibleProvider::new("test-key", "https://gateway-b.example/v1", "model");
+
+    assert_ne!(
+        first.cache_identity_for_request(&request),
+        second.cache_identity_for_request(&request),
+        "identical session/provider/model names must not share endpoint caches"
+    );
+    assert_eq!(
+        first.cache_identity_for_request(&request),
+        first.cache_identity_for_request(&request)
+    );
+}
+
+#[test]
 fn provider_tool_projection_excludes_internal_contract_policy() {
     let mut contract = golutra_core::ToolContract {
         tool_name: "read_file".to_owned(),
@@ -761,6 +978,114 @@ fn provider_tool_projection_excludes_internal_contract_policy() {
 }
 
 #[test]
+fn provider_tool_projection_is_canonical_and_schema_changes_invalidate_digest() {
+    let contract = |input_schema: Value| golutra_core::ToolContract {
+        tool_name: "read_file".to_owned(),
+        input_schema,
+        output_schema: json!({}),
+        error_schema: json!({}),
+        side_effect_type: golutra_core::SideEffectType::None,
+        idempotency_key_policy: "none".to_owned(),
+        timeout_policy: "bounded".to_owned(),
+        cancellation_policy: "supported".to_owned(),
+        retry_policy: "none".to_owned(),
+        artifact_policy: "none".to_owned(),
+        permission_policy_ref: None,
+    };
+    let first = contract(
+        serde_json::from_str(
+            r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"number"}}}"#,
+        )
+        .expect("first schema"),
+    );
+    let reordered = contract(
+        serde_json::from_str(
+            r#"{"properties":{"b":{"type":"number"},"a":{"type":"string"}},"type":"object"}"#,
+        )
+        .expect("reordered schema"),
+    );
+    assert_eq!(
+        provider_tool_wire_projection(&first),
+        provider_tool_wire_projection(&reordered)
+    );
+    assert_eq!(
+        provider_tool_wire_digest(&first),
+        provider_tool_wire_digest(&reordered)
+    );
+    assert_eq!(
+        provider_tool_wire_tokens(&first),
+        provider_tool_wire_tokens(&reordered)
+    );
+
+    let mut changed_schema = first.input_schema.clone();
+    changed_schema["properties"]["a"]["type"] = json!("integer");
+    let changed = contract(changed_schema);
+    assert_ne!(
+        provider_tool_wire_digest(&first),
+        provider_tool_wire_digest(&changed)
+    );
+}
+
+#[test]
+fn provider_tool_projection_cache_reuses_equivalent_wire_values() {
+    let contract = golutra_core::ToolContract {
+        tool_name: "read_file".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        }),
+        output_schema: json!({}),
+        error_schema: json!({}),
+        side_effect_type: golutra_core::SideEffectType::None,
+        idempotency_key_policy: "none".to_owned(),
+        timeout_policy: "bounded".to_owned(),
+        cancellation_policy: "supported".to_owned(),
+        retry_policy: "none".to_owned(),
+        artifact_policy: "none".to_owned(),
+        permission_policy_ref: None,
+    };
+    let before = provider_tool_projection_cache_stats();
+    let _ = provider_tool_wire_stats(&contract);
+    let _ = provider_tool_wire_stats(&contract);
+    let after = provider_tool_projection_cache_stats();
+
+    assert!(after.hits > before.hits);
+    assert!(after.entries >= 1);
+}
+
+#[test]
+fn provider_tool_projection_uses_the_same_wire_alias_as_transports() {
+    let contract = golutra_core::ToolContract {
+        tool_name: "web_search".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"]
+        }),
+        output_schema: json!({}),
+        error_schema: json!({}),
+        side_effect_type: golutra_core::SideEffectType::None,
+        idempotency_key_policy: "none".to_owned(),
+        timeout_policy: "bounded".to_owned(),
+        cancellation_policy: "supported".to_owned(),
+        retry_policy: "none".to_owned(),
+        artifact_policy: "none".to_owned(),
+        permission_policy_ref: None,
+    };
+    let wire = provider_tool_wire_projection(&contract);
+    assert_eq!(wire["function"]["name"], "golutra_web_search");
+    assert_eq!(
+        provider_tool_wire_tokens(&contract),
+        serde_json::to_string(&wire)
+            .expect("wire JSON")
+            .chars()
+            .count()
+            .div_ceil(4) as u64
+    );
+}
+
+#[test]
 fn openai_cache_fields_are_sent_only_for_supported_endpoint() {
     let mut request = request();
     request.session_id = Some(golutra_core::SessionId::new());
@@ -775,7 +1100,7 @@ fn openai_cache_fields_are_sent_only_for_supported_endpoint() {
     );
     assert_eq!(
         supported["prompt_cache_key"].as_str().map(str::len),
-        Some(71)
+        Some(64)
     );
     assert_eq!(supported["prompt_cache_retention"], "24h");
 
@@ -788,4 +1113,75 @@ fn openai_cache_fields_are_sent_only_for_supported_endpoint() {
     );
     assert!(custom.get("prompt_cache_key").is_none());
     assert!(custom.get("prompt_cache_retention").is_none());
+}
+
+#[test]
+fn openai_tools_request_parallel_tool_calls_explicitly() {
+    let mut request = request();
+    request.tools.push(golutra_core::ToolContract {
+        tool_name: "read_file".to_owned(),
+        input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        output_schema: json!({}),
+        error_schema: json!({}),
+        side_effect_type: golutra_core::SideEffectType::None,
+        idempotency_key_policy: "none".to_owned(),
+        timeout_policy: "bounded".to_owned(),
+        cancellation_policy: "supported".to_owned(),
+        retry_policy: "none".to_owned(),
+        artifact_policy: "none".to_owned(),
+        permission_policy_ref: None,
+    });
+
+    let body = openai_completion_body(
+        &request,
+        "gpt-test",
+        &ProviderGenerationConfig::default(),
+        false,
+        false,
+    );
+
+    assert_eq!(body["tool_choice"], "auto");
+    assert_eq!(body["parallel_tool_calls"], true);
+}
+
+#[test]
+fn prompt_cache_support_includes_golutra_gateway_only() {
+    assert!(openai_prompt_cache_supported("https://api.golutra.cn/v1"));
+    assert!(openai_prompt_cache_supported("https://api.openai.com/v1"));
+    assert!(!openai_prompt_cache_supported(
+        "https://compatible.example/v1"
+    ));
+}
+
+#[test]
+fn openai_usage_projects_cache_breakdown_aliases() {
+    let response = provider_response_from_openai(
+        json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "input_tokens": 100,
+                "input_tokens_details": {
+                    "cached_tokens": 64,
+                    "cache_write_tokens": 0
+                },
+                "output_tokens": 5,
+                "output_tokens_details": {"reasoning_tokens": 2},
+                "total_tokens": 105
+            }
+        }),
+        TaskId::new(),
+        TurnId::new(),
+    )
+    .expect("OpenAI usage response");
+    let usage = response.usage.normalize();
+
+    assert_eq!(usage.input_tokens_total, Some(100));
+    assert_eq!(usage.input_tokens_non_cached, Some(36));
+    assert_eq!(usage.cache_read_tokens, Some(64));
+    assert_eq!(usage.cache_write_tokens, Some(0));
+    assert_eq!(usage.output_tokens, Some(5));
+    assert_eq!(usage.reasoning_tokens, Some(2));
 }

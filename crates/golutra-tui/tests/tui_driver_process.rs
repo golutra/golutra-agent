@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use std::{
+    collections::HashMap,
     ffi::OsString,
     fs,
     os::unix::fs::{FileTypeExt, PermissionsExt, symlink},
@@ -13,7 +14,9 @@ use std::{
 use golutra_auth::{CredentialRef, SecretKind};
 use golutra_client::{RuntimeClient, RuntimeExecutionOptions, RuntimeTransport};
 use golutra_config::{ProviderConfigPaths, ProviderProfile, ProviderSettings};
-use golutra_core::{ActorKind, QueryId, RedactionStatus, SessionId, TaskStatus, TokenUsageRecord};
+use golutra_core::{
+    ActorKind, QueryId, RedactionStatus, SessionId, TaskId, TaskStatus, TokenUsageRecord,
+};
 use golutra_llm::{ProviderGenerationConfig, ProviderProtocol};
 use golutra_protocol::{EventFilter, RuntimeQuery, RuntimeQueryKind, TuiFrame, UserProjection};
 use serde_json::{Value, json};
@@ -62,6 +65,7 @@ struct StdioDriver {
     input: ChildStdin,
     output: Lines<BufReader<ChildStdout>>,
     stderr: Arc<StdMutex<String>>,
+    pending: HashMap<String, Value>,
 }
 
 impl StdioDriver {
@@ -105,6 +109,7 @@ impl StdioDriver {
             input,
             output,
             stderr,
+            pending: HashMap::new(),
         }
     }
 
@@ -116,6 +121,9 @@ impl StdioDriver {
     }
 
     async fn receive(&mut self, request_id: &str) -> Value {
+        if let Some(value) = self.pending.remove(request_id) {
+            return value;
+        }
         let stderr = Arc::clone(&self.stderr);
         tokio::time::timeout(Duration::from_secs(20), async {
             loop {
@@ -132,6 +140,9 @@ impl StdioDriver {
                     .unwrap_or_else(|error| panic!("stdout was not NDJSON: {error}: {line}"));
                 if value["request_id"] == request_id {
                     return value;
+                }
+                if let Some(pending_id) = value["request_id"].as_str() {
+                    self.pending.insert(pending_id.to_owned(), value);
                 }
             }
         })
@@ -240,8 +251,8 @@ async fn inspect_and_stdio_driver_execute_real_offscreen_tui() {
         .args([
             "--embedded",
             "--yolo",
-            "--session",
-            "new",
+            "--resume",
+            "inspect-offscreen-session",
             "--prompt",
             &format!("hello Authorization: Bearer {secret}"),
             "--timeout-ms",
@@ -290,8 +301,8 @@ async fn inspect_and_stdio_driver_execute_real_offscreen_tui() {
         &[
             "--embedded",
             "--stdio",
-            "--session",
-            "new",
+            "--resume",
+            "stdio-offscreen-session",
             "--debug",
             "--width",
             "120",
@@ -904,8 +915,8 @@ async fn inspect_accepts_yolo_and_marks_the_full_screen() {
         .arg("inspect")
         .args([
             "--embedded",
-            "--session",
-            "new",
+            "--resume",
+            "inspect-yolo-session",
             "--yolo",
             "--view",
             "screen",
@@ -1219,8 +1230,8 @@ async fn stdio_driver_emits_heartbeat_and_honors_idle_timeout() {
         &[
             "--embedded",
             "--stdio",
-            "--session",
-            "new",
+            "--resume",
+            "heartbeat-session",
             "--heartbeat-secs",
             "1",
             "--idle-timeout-secs",
@@ -1256,8 +1267,8 @@ async fn direct_quit_closes_an_initial_provider_setup_modal() {
         &[
             "--embedded",
             "--stdio",
-            "--session",
-            "new",
+            "--resume",
+            "provider-setup-session",
             "--heartbeat-secs",
             "0",
             "--idle-timeout-secs",
@@ -1379,8 +1390,8 @@ async fn live_provider_driver_smoke_is_isolated_and_opt_in() {
         .args([
             "--embedded",
             "--stdio",
-            "--session",
-            "new",
+            "--resume",
+            "live-provider-session",
             "--width",
             "160",
             "--height",
@@ -1606,8 +1617,7 @@ async fn daemon_driver_enforces_binding_and_survives_disconnect_and_restart() {
     fs::create_dir(&socket_dir).expect("daemon socket dir");
     fs::set_permissions(&socket_dir, fs::Permissions::from_mode(0o700))
         .expect("daemon socket mode");
-    let session_id = SessionId::new();
-    let session_spec = format!("new:{session_id}");
+    let session_spec = "daemon-driver-session".to_owned();
     let socket_a = socket_dir.join("a.sock");
     let mut child_a = spawn_socket_driver(
         home.path(),
@@ -1618,7 +1628,11 @@ async fn daemon_driver_enforces_binding_and_survives_disconnect_and_restart() {
     );
     let mut driver_a = SocketConnection::connect(&socket_a).await;
     let ready_a = driver_a.receive("ready").await;
-    assert_eq!(ready_a["session_id"], session_id.to_string());
+    let session_id = ready_a["session_id"]
+        .as_str()
+        .expect("daemon session id")
+        .parse::<SessionId>()
+        .expect("valid daemon session id");
     assert_eq!(ready_a["controller_mode"], "controller");
 
     driver_a
@@ -1686,7 +1700,7 @@ async fn daemon_driver_enforces_binding_and_survives_disconnect_and_restart() {
     }
     assert_eq!(approval["type"], "wait_result", "approval wait: {approval}");
 
-    let waiting_inspect = inspect_command(home.path(), workspace.path(), &session_id.to_string())
+    let waiting_inspect = inspect_command(home.path(), workspace.path(), &session_spec)
         .args([
             "--wait",
             "approval-required",
@@ -1706,7 +1720,7 @@ async fn daemon_driver_enforces_binding_and_survives_disconnect_and_restart() {
         workspace.path(),
         &socket_b,
         false,
-        &session_id.to_string(),
+        &session_spec,
     );
     let mut driver_b = SocketConnection::connect(&socket_b).await;
     assert_eq!(
@@ -1783,10 +1797,19 @@ async fn daemon_driver_enforces_binding_and_survives_disconnect_and_restart() {
     close_socket_driver(&mut driver_b, &mut child_b, "close-b").await;
     close_socket_driver(&mut driver_a, &mut child_a, "close-a").await;
     let terminal = wait_for_terminal_projection(&transport, session_id).await;
-    assert!(
-        matches!(terminal.status, TaskStatus::Completed | TaskStatus::Partial),
-        "unexpected terminal projection after approval: {terminal:?}"
-    );
+    if !matches!(terminal.status, TaskStatus::Completed | TaskStatus::Partial) {
+        let events = transport
+            .replay_events(EventFilter {
+                session_id,
+                task_id: Some(task_id.parse::<TaskId>().expect("task id")),
+                after_sequence_no: None,
+            })
+            .await
+            .expect("query terminal events");
+        panic!(
+            "unexpected terminal projection after approval: {terminal:?}; task events: {events:?}"
+        );
+    }
     let terminal_status = terminal.status;
     assert_eq!(
         terminal.task_id.map(|id| id.to_string()),
@@ -1800,8 +1823,8 @@ async fn daemon_driver_enforces_binding_and_survives_disconnect_and_restart() {
         &task_id,
         &[
             "--stdio",
-            "--session",
-            &session_id.to_string(),
+            "--resume",
+            &session_spec,
             "--heartbeat-secs",
             "0",
             "--idle-timeout-secs",
@@ -1940,14 +1963,16 @@ async fn daemon_driver_enforces_binding_and_survives_disconnect_and_restart() {
 
     let duplicate = tui_command(home.path(), workspace.path())
         .arg("inspect")
-        .args(["--session", &session_spec, "--view", "session"])
+        .args(["--resume", &session_spec, "--view", "session"])
         .output()
         .await
         .expect("duplicate explicit session");
-    assert!(!duplicate.status.success());
-    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("session_exists"));
+    assert_command_success(&duplicate, "duplicate explicit session");
+    let duplicate_frame: TuiFrame =
+        serde_json::from_slice(&duplicate.stdout).expect("duplicate frame");
+    assert_eq!(duplicate_frame.session_id, session_id.to_string());
 
-    let existing = inspect_command(home.path(), workspace.path(), &session_id.to_string())
+    let existing = inspect_command(home.path(), workspace.path(), &session_spec)
         .args(["--view", "task"])
         .output()
         .await
@@ -1958,16 +1983,20 @@ async fn daemon_driver_enforces_binding_and_survives_disconnect_and_restart() {
     assert_eq!(existing_frame.session_id, session_id.to_string());
     assert_eq!(existing_frame.task_id.as_deref(), Some(task_id.as_str()));
 
-    let current = inspect_command(home.path(), workspace.path(), "current")
-        .args(["--view", "session"])
-        .output()
-        .await
-        .expect("current session inspect");
+    let current = inspect_command(
+        home.path(),
+        workspace.path(),
+        &format!("  {session_spec}  "),
+    )
+    .args(["--view", "session"])
+    .output()
+    .await
+    .expect("current session inspect");
     assert_command_success(&current, "current session inspect");
     let current_frame: TuiFrame = serde_json::from_slice(&current.stdout).expect("current frame");
     assert_eq!(current_frame.session_id, session_id.to_string());
 
-    let second = inspect_command(home.path(), workspace.path(), "new")
+    let second = inspect_command(home.path(), workspace.path(), "second-session")
         .args([
             "--prompt",
             "second session",
@@ -1989,21 +2018,22 @@ async fn daemon_driver_enforces_binding_and_survives_disconnect_and_restart() {
         .arg("--task-id")
         .arg(&second_task)
         .arg("inspect")
-        .args(["--session", &session_id.to_string(), "--view", "task"])
+        .args(["--resume", &session_spec, "--view", "task"])
         .output()
         .await
         .expect("task mismatch inspect");
     assert!(!mismatch.status.success());
     assert!(String::from_utf8_lossy(&mismatch.stderr).contains("task_not_found"));
 
-    let workspace_mismatch =
-        inspect_command(home.path(), other_workspace.path(), &session_id.to_string())
-            .args(["--view", "session"])
-            .output()
-            .await
-            .expect("workspace mismatch inspect");
-    assert!(!workspace_mismatch.status.success());
-    assert!(String::from_utf8_lossy(&workspace_mismatch.stderr).contains("workspace"));
+    let workspace_mismatch = inspect_command(home.path(), other_workspace.path(), &session_spec)
+        .args(["--view", "session"])
+        .output()
+        .await
+        .expect("workspace mismatch inspect");
+    assert_command_success(&workspace_mismatch, "workspace-scoped alias inspect");
+    let workspace_frame: TuiFrame =
+        serde_json::from_slice(&workspace_mismatch.stdout).expect("workspace frame");
+    assert_ne!(workspace_frame.session_id, session_id.to_string());
 
     let socket_c = socket_dir.join("c.sock");
     let mut child_c = spawn_socket_driver(
@@ -2011,7 +2041,7 @@ async fn daemon_driver_enforces_binding_and_survives_disconnect_and_restart() {
         workspace.path(),
         &socket_c,
         false,
-        &session_id.to_string(),
+        &session_spec,
     );
     let mut before_restart = SocketConnection::connect(&socket_c).await;
     let ready_before = before_restart.receive("ready").await;
@@ -2156,9 +2186,9 @@ fn tui_command(home: &Path, cwd: &Path) -> Command {
     command
 }
 
-fn inspect_command(home: &Path, cwd: &Path, session: &str) -> Command {
+fn inspect_command(home: &Path, cwd: &Path, resume: &str) -> Command {
     let mut command = tui_command(home, cwd);
-    command.arg("inspect").arg("--session").arg(session);
+    command.arg("inspect").arg("--resume").arg(resume);
     command
 }
 
@@ -2167,15 +2197,15 @@ fn socket_driver_command(
     cwd: &Path,
     socket: &Path,
     embedded: bool,
-    session: &str,
+    resume: &str,
 ) -> Command {
     let mut command = tui_command(home, cwd);
     command
         .arg("driver")
         .arg("--socket")
         .arg(socket)
-        .arg("--session")
-        .arg(session)
+        .arg("--resume")
+        .arg(resume)
         .args(["--heartbeat-secs", "0", "--idle-timeout-secs", "0"]);
     if embedded {
         command.arg("--embedded");
@@ -2188,9 +2218,9 @@ fn spawn_socket_driver(
     cwd: &Path,
     socket: &Path,
     embedded: bool,
-    session: &str,
+    resume: &str,
 ) -> ChildGuard {
-    let mut command = socket_driver_command(home, cwd, socket, embedded, session);
+    let mut command = socket_driver_command(home, cwd, socket, embedded, resume);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())

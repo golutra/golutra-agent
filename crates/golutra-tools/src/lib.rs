@@ -55,6 +55,13 @@ const MAX_MODEL_TOOL_RESULT_COMPACT_EXCERPT_CHARS: usize = 512;
 const MAX_MODEL_TOOL_RESULT_FACT_STRING_CHARS: usize = 4 * 1024;
 const MAX_MODEL_TOOL_RESULT_ITEMS: usize = 32;
 const MAX_MODEL_TOOL_RESULT_DEPTH: usize = 5;
+const MAX_MODEL_TOOL_OUTPUT_CHARS: usize = 2 * 1024;
+const MAX_MODEL_TOOL_REASON_CHARS: usize = 512;
+const MAX_MODEL_TOOL_SEARCH_QUERY_CHARS: usize = 512;
+const MAX_MODEL_TOOL_SEARCH_RESULTS: usize = 8;
+const MAX_MODEL_TOOL_SEARCH_TITLE_CHARS: usize = 160;
+const MAX_MODEL_TOOL_SEARCH_URL_CHARS: usize = 512;
+const MAX_MODEL_TOOL_SEARCH_SNIPPET_CHARS: usize = 320;
 const EXTERNAL_TOOL_TIMEOUT_MS: u64 = if cfg!(test) { 100 } else { 30_000 };
 const MAX_VERIFIER_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
 const MAX_VERIFIER_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
@@ -62,6 +69,9 @@ const DEADLINE_CLEANUP_TIMEOUT: Duration = Duration::from_millis(250);
 const CODE_INDEX_BUILD_CONCURRENCY: usize = 1;
 static CODE_INDEX_BUILD_PERMITS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(CODE_INDEX_BUILD_CONCURRENCY)));
+// Sandbox capability is process-wide. Detecting the launcher for every task
+// adds filesystem probes to the critical path without changing the result.
+static DETECTED_SANDBOX: LazyLock<SystemSandbox> = LazyLock::new(SystemSandbox::detect);
 pub const CONTRACT_FILE_CONTENT_VERIFIER_TOOL: &str = "contract_file_content_verifier";
 pub const CONTRACT_PATH_VERIFIER_TOOL: &str = "contract_path_verifier";
 
@@ -70,6 +80,7 @@ mod process;
 mod process_supervisor;
 mod project_verifier;
 mod text_search;
+mod web_search;
 mod workspace_scan;
 
 pub(crate) use process::{
@@ -78,13 +89,33 @@ pub(crate) use process::{
 #[cfg(test)]
 pub(crate) use process::{MAX_PIPE_OUTPUT_BYTES, join_pipe_reader, run_process, spawn_pipe_reader};
 pub use process_supervisor::ProcessSupervisor;
+#[cfg(test)]
+pub(crate) use process_supervisor::max_terminal_processes;
 pub(crate) use process_supervisor::{
     ProcessSnapshot, ProcessStartRequest, ProcessState, ProcessSummary, default_poll_wait_ms,
     default_start_wait_ms, max_poll_wait_ms,
 };
 pub use project_verifier::{DiscoveredProjectVerifier, discover_project_verifiers};
+pub use web_search::HttpWebSearchBackend;
 
 use builtin::BuiltinTool;
+
+/// 面向 provider 的稳定契约，保持默认模型工具面足够小。
+pub const PI_PLUS_TOOL_NAMES: [&str; 8] = [
+    "read_file",
+    "write_file",
+    "edit_file",
+    "shell",
+    "web_search",
+    "shell_session",
+    "subagent",
+    "apply_patch",
+];
+
+#[must_use]
+pub fn is_pi_plus_tool(tool_name: &str) -> bool {
+    PI_PLUS_TOOL_NAMES.contains(&tool_name)
+}
 
 #[derive(Debug, Error)]
 pub enum ToolError {
@@ -220,6 +251,16 @@ pub trait TaskDelegationBackend: std::fmt::Debug + Send + Sync {
     ) -> Result<TaskDelegationOutput, ToolError>;
 }
 
+/// 由宿主拥有的搜索适配器；替换具体 provider 时不改变 agent loop 的工具契约。
+#[async_trait]
+pub trait WebSearchBackend: std::fmt::Debug + Send + Sync {
+    async fn search(
+        &self,
+        request: &ToolRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ExternalToolOutput, ToolError>;
+}
+
 #[async_trait]
 pub trait ExternalToolBackend: std::fmt::Debug + Send + Sync {
     fn contracts(&self) -> Vec<ToolContract>;
@@ -269,7 +310,10 @@ impl ToolRegistry {
     pub fn p0_default() -> Self {
         let mut contracts = HashMap::new();
         let mut capabilities = HashMap::new();
-        for tool in BuiltinTool::P0_DEFAULT {
+        for tool in BuiltinTool::P0_DEFAULT
+            .into_iter()
+            .chain(BuiltinTool::INTERNAL)
+        {
             let contract = tool.contract();
             capabilities.insert(contract.tool_name.clone(), tool.capabilities());
             contracts.insert(contract.tool_name.clone(), contract);
@@ -283,6 +327,18 @@ impl ToolRegistry {
     #[must_use]
     pub fn contracts(&self) -> Vec<&ToolContract> {
         let mut contracts = self.contracts.values().collect::<Vec<_>>();
+        contracts.sort_by(|left, right| left.tool_name.cmp(&right.tool_name));
+        contracts
+    }
+
+    /// 返回允许进入 provider 请求的稳定工具契约。
+    #[must_use]
+    pub fn provider_contracts(&self) -> Vec<&ToolContract> {
+        let mut contracts = self
+            .contracts
+            .values()
+            .filter(|contract| is_pi_plus_tool(&contract.tool_name))
+            .collect::<Vec<_>>();
         contracts.sort_by(|left, right| left.tool_name.cmp(&right.tool_name));
         contracts
     }
@@ -364,6 +420,7 @@ pub struct ToolRuntime {
     sandbox: SystemSandbox,
     allow_network: bool,
     external_backend: Option<Arc<dyn ExternalToolBackend>>,
+    web_search_backend: Option<Arc<dyn WebSearchBackend>>,
     delegation_backend: Option<Arc<dyn TaskDelegationBackend>>,
     replay_backend: Option<Arc<dyn ToolReplayBackend>>,
     process_supervisor: ProcessSupervisor,
@@ -375,9 +432,10 @@ impl ToolRuntime {
         Self {
             policy,
             registry: ToolRegistry::p0_default(),
-            sandbox: SystemSandbox::detect(),
+            sandbox: (*DETECTED_SANDBOX).clone(),
             allow_network: false,
             external_backend: None,
+            web_search_backend: None,
             delegation_backend: None,
             replay_backend: None,
             process_supervisor: ProcessSupervisor::new(),
@@ -602,6 +660,11 @@ impl ToolRuntime {
         self
     }
 
+    pub fn with_web_search_backend(mut self, backend: Arc<dyn WebSearchBackend>) -> Self {
+        self.web_search_backend = Some(backend);
+        self
+    }
+
     pub fn with_external_backend(
         mut self,
         backend: Arc<dyn ExternalToolBackend>,
@@ -633,7 +696,7 @@ impl ToolRuntime {
                 (
                     contract.tool_name.clone(),
                     ToolCapabilities {
-                        available_in_coding_profile: true,
+                        available_in_coding_profile: is_pi_plus_tool(&contract.tool_name),
                         parallel_read_safe: false,
                         coding_profile_hidden_arguments: Vec::new(),
                     },
@@ -648,11 +711,15 @@ impl ToolRuntime {
         mut self,
         backend: Arc<dyn TaskDelegationBackend>,
     ) -> Result<Self, ToolError> {
-        let tool = BuiltinTool::DelegateTask;
-        self.registry.register_external(
-            [tool.contract()],
-            HashMap::from([(tool.name().to_owned(), tool.capabilities())]),
-        )?;
+        let tool = BuiltinTool::Subagent;
+        if self.registry.contract(tool.name()).is_none() {
+            self.registry
+                .contracts
+                .insert(tool.name().to_owned(), tool.contract());
+            self.registry
+                .capabilities
+                .insert(tool.name().to_owned(), tool.capabilities());
+        }
         self.delegation_backend = Some(backend);
         Ok(self)
     }
@@ -663,7 +730,10 @@ impl ToolRuntime {
     pub fn without_tool(mut self, tool_name: &str) -> Self {
         self.registry.contracts.remove(tool_name);
         self.registry.capabilities.remove(tool_name);
-        if BuiltinTool::from_name(tool_name) == Some(BuiltinTool::DelegateTask) {
+        if matches!(
+            BuiltinTool::from_name(tool_name),
+            Some(BuiltinTool::Subagent | BuiltinTool::DelegateTask)
+        ) {
             self.delegation_backend = None;
         }
         self
@@ -1005,6 +1075,8 @@ impl ToolRuntime {
                     .filter(|workdir_policy| workdir_policy.decision != PolicyDecision::Allow)
                     .unwrap_or(shell_policy)
             }
+            Some(BuiltinTool::WebSearch) => web_search_policy(self.allow_network, request),
+            Some(BuiltinTool::ShellSession) => process_control_policy(request),
             Some(BuiltinTool::ProcessList) => process_list_policy(request),
             Some(
                 BuiltinTool::ProcessPoll
@@ -1012,7 +1084,9 @@ impl ToolRuntime {
                 | BuiltinTool::ProcessTerminate
                 | BuiltinTool::ProcessReconnect,
             ) => process_control_policy(request),
-            Some(BuiltinTool::DelegateTask) if self.delegation_backend.is_some() => {
+            Some(BuiltinTool::Subagent | BuiltinTool::DelegateTask)
+                if self.delegation_backend.is_some() =>
+            {
                 delegation_policy(request)
             }
             None if self.external_backend.is_some() => {
@@ -1024,7 +1098,8 @@ impl ToolRuntime {
                 policy.resource = format!("external-tool:{}", request.tool_name);
                 policy
             }
-            Some(BuiltinTool::AskUser | BuiltinTool::DelegateTask) | None => {
+            Some(BuiltinTool::AskUser | BuiltinTool::Subagent | BuiltinTool::DelegateTask)
+            | None => {
                 return Err(ToolError::UnknownTool(request.tool_name.clone()));
             }
         };
@@ -1118,7 +1193,7 @@ impl ToolRuntime {
                     workspace_snapshot: Some(snapshot),
                 })
             }
-            Some(BuiltinTool::DelegateTask) => {
+            Some(BuiltinTool::Subagent | BuiltinTool::DelegateTask) => {
                 let snapshot = workspace_scan::capture(self.policy.workspace_root()).await;
                 Ok(SideEffectPreparation {
                     before_images: snapshot.before_images(),
@@ -1353,7 +1428,12 @@ impl ToolRuntime {
                         )
                         .await
                     }
-                    Some(BuiltinTool::DelegateTask) => {
+                    Some(BuiltinTool::WebSearch) => {
+                        self.web_search(request, policy, execution_cancellation.clone())
+                            .await
+                    }
+                    Some(BuiltinTool::ShellSession) => self.shell_session(request, policy).await,
+                    Some(BuiltinTool::Subagent | BuiltinTool::DelegateTask) => {
                         self.delegate_task(
                             request,
                             policy,
@@ -1525,7 +1605,9 @@ impl ToolRuntime {
             policy,
         );
         match BuiltinTool::from_name(&result.envelope.tool_name) {
-            Some(BuiltinTool::DelegateTask) => result.envelope.risk = "delegated_agent".to_owned(),
+            Some(BuiltinTool::Subagent | BuiltinTool::DelegateTask) => {
+                result.envelope.risk = "delegated_agent".to_owned()
+            }
             None => result.envelope.risk = "external_mcp_tool".to_owned(),
             _ => {}
         }
@@ -2355,7 +2437,7 @@ impl ToolRuntime {
         let backend = self
             .delegation_backend
             .as_ref()
-            .ok_or_else(|| ToolError::UnknownTool("delegate_task".to_owned()))?;
+            .ok_or_else(|| ToolError::UnknownTool("subagent".to_owned()))?;
         let output = backend
             .delegate(&request, cancellation.child_token())
             .await?;
@@ -2497,6 +2579,82 @@ impl ToolRuntime {
             .terminate(request.session_id, &process_id, cursor)
             .await?;
         Ok(supervised_process_report(request, policy, snapshot))
+    }
+
+    async fn shell_session(
+        &self,
+        request: ToolRequest,
+        policy: PolicyEvaluation,
+    ) -> Result<ToolExecutionReport, ToolError> {
+        let action = string_arg(&request.arguments, "action")?;
+        let process_id = string_arg(&request.arguments, "process_id")?;
+        let cursor = process_cursor(&request.arguments);
+        let snapshot = match action.as_str() {
+            "wait" => {
+                let wait_ms = process_wait_ms(&request.arguments, default_poll_wait_ms());
+                self.process_supervisor
+                    .poll(request.session_id, &process_id, cursor, wait_ms)
+                    .await?
+            }
+            "write" => {
+                let input = string_arg(&request.arguments, "input")?;
+                let wait_ms = process_wait_ms(&request.arguments, 250);
+                self.process_supervisor
+                    .write(request.session_id, &process_id, &input, cursor, wait_ms)
+                    .await?
+            }
+            "terminate" => {
+                self.process_supervisor
+                    .terminate(request.session_id, &process_id, cursor)
+                    .await?
+            }
+            _ => {
+                return Err(ToolError::InvalidArguments(
+                    "shell_session action must be wait, write, or terminate".to_owned(),
+                ));
+            }
+        };
+        Ok(supervised_process_report(request, policy, snapshot))
+    }
+
+    async fn web_search(
+        &self,
+        request: ToolRequest,
+        policy: PolicyEvaluation,
+        cancellation: CancellationToken,
+    ) -> Result<ToolExecutionReport, ToolError> {
+        let backend = self.web_search_backend.as_ref().ok_or_else(|| {
+            ToolError::Execution("web search backend is not configured".to_owned())
+        })?;
+        let result = tokio::select! {
+            () = cancellation.cancelled() => {
+                return Ok(cancelled_report_with_policy(
+                    request,
+                    policy,
+                    "web search cancelled",
+                ));
+            }
+            result = backend.search(&request, cancellation.clone()) => result,
+        }?;
+        let status = if result.is_error {
+            ToolResultStatus::Error
+        } else {
+            ToolResultStatus::Ok
+        };
+        let mut report = external_report(
+            request,
+            status,
+            &result.summary,
+            result.structured_facts,
+            result.content,
+            policy,
+        );
+        // 搜索结果已经在 structured_facts 中按字段保留，模型摘要不再重复回显原始 JSON。
+        report.envelope.model_visible_excerpt = Some(result.summary.clone());
+        report.envelope.risk = "web_search".to_owned();
+        report.envelope.verification_hint =
+            Some("web search output is external, time-sensitive evidence".to_owned());
+        Ok(report)
     }
 
     async fn execute_external(
@@ -3253,6 +3411,22 @@ fn process_control_policy(request: &ToolRequest) -> PolicyEvaluation {
     policy
 }
 
+fn web_search_policy(allow_network: bool, request: &ToolRequest) -> PolicyEvaluation {
+    let decision = if allow_network {
+        PolicyDecision::Allow
+    } else {
+        PolicyDecision::Block
+    };
+    let reason = if allow_network {
+        "web search is enabled by the enclosing runtime"
+    } else {
+        "web search requires explicit network access"
+    };
+    let mut policy = execution_policy(request, decision, reason);
+    policy.resource = "web-search".to_owned();
+    policy
+}
+
 fn delegation_policy(request: &ToolRequest) -> PolicyEvaluation {
     let mut policy = execution_policy(
         request,
@@ -3288,6 +3462,8 @@ fn process_summary_value(summary: ProcessSummary) -> Value {
         "output_bytes": summary.output_bytes,
         "output_lines": summary.output_lines,
         "output_truncated": summary.output_truncated,
+        "terminal": summary.state.is_terminal(),
+        "next_action": process_next_action(summary.state, &summary.process_id, summary.output_cursor),
     })
 }
 
@@ -3297,7 +3473,9 @@ fn supervised_process_report(
     snapshot: ProcessSnapshot,
 ) -> ToolExecutionReport {
     let state = process_state_name(snapshot.state);
-    let requested_termination = request.tool_name == "process_terminate";
+    let requested_termination = request.tool_name == "process_terminate"
+        || (request.tool_name == "shell_session"
+            && request.arguments.get("action").and_then(Value::as_str) == Some("terminate"));
     let status = match snapshot.state {
         ProcessState::Running | ProcessState::Exited => ToolResultStatus::Ok,
         ProcessState::Failed => ToolResultStatus::Error,
@@ -3306,6 +3484,9 @@ fn supervised_process_report(
         ProcessState::Cancelled | ProcessState::Terminated => ToolResultStatus::Cancelled,
     };
     let workspace_changes_known = snapshot.workspace_changes_known;
+    let terminal = snapshot.state.is_terminal();
+    let next_action =
+        process_next_action(snapshot.state, &snapshot.process_id, snapshot.output_cursor);
     let mut result = report(
         request,
         status,
@@ -3331,6 +3512,9 @@ fn supervised_process_report(
             "workspace_changes_known": workspace_changes_known,
             "process_lifetime_scope": "runtime",
             "survives_runtime_exit": false,
+            "terminal": terminal,
+            "wait_strategy": "event_driven_cursor",
+            "next_action": next_action,
             "workspace_change_count": if workspace_changes_known {
                 snapshot.changed_files.len()
             } else {
@@ -3373,6 +3557,22 @@ fn process_state_name(state: ProcessState) -> &'static str {
         ProcessState::Cancelled => "cancelled",
         ProcessState::Terminated => "terminated",
         ProcessState::Failed => "failed",
+    }
+}
+
+fn process_next_action(state: ProcessState, process_id: &str, cursor: u64) -> Value {
+    if state == ProcessState::Running {
+        // 把下一步所需的最小参数直接交给模型，避免它重复读取或重置 cursor。
+        json!({
+            "kind": "wait",
+            "tool": "shell_session",
+            "action": "wait",
+            "process_id": process_id,
+            "cursor": cursor,
+            "wait_ms": default_poll_wait_ms(),
+        })
+    } else {
+        json!({"kind": "terminal", "process_state": process_state_name(state)})
     }
 }
 
@@ -3477,78 +3677,290 @@ pub fn model_visible_tool_result(envelope: &ToolResultEnvelope) -> String {
         &redact_sensitive_text(&envelope.summary).0,
         MAX_MODEL_TOOL_RESULT_SUMMARY_CHARS,
     );
-    let facts = project_model_tool_value(
-        &redact_sensitive_value(envelope.structured_facts.clone()),
-        0,
-    );
+    let facts = redact_sensitive_value(envelope.structured_facts.clone());
     let excerpt = envelope.model_visible_excerpt.as_deref().map(|value| {
         bounded_text(
             &redact_sensitive_text(value).0,
             MAX_MODEL_TOOL_RESULT_EXCERPT_CHARS,
         )
     });
-    let mut projection = model_tool_result_value(
-        &envelope.tool_name,
-        envelope.status,
-        summary.clone(),
-        facts,
-        excerpt.clone(),
-    );
-    if serialized_value_len(&projection) > MAX_MODEL_TOOL_RESULT_BYTES {
-        projection["structured_facts"] = compact_model_tool_value(&projection["structured_facts"]);
+    let known = is_pi_plus_tool(&envelope.tool_name);
+    let (facts, summary, excerpt, keep_summary, keep_excerpt) = match envelope.tool_name.as_str() {
+        "read_file" => {
+            let content = excerpt.or_else(|| {
+                facts
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(|value| bounded_text(value, MAX_MODEL_TOOL_RESULT_EXCERPT_CHARS))
+            });
+            (
+                selected_model_facts(&facts, READ_FILE_MODEL_FACTS),
+                summary,
+                content,
+                envelope.status != ToolResultStatus::Ok,
+                true,
+            )
+        }
+        "write_file" | "edit_file" | "apply_patch" => (
+            selected_model_facts(&facts, MUTATION_MODEL_FACTS),
+            summary,
+            None,
+            // mutation 的结构化事实只说明路径和计数，短摘要仍是模型判断
+            // 写入是否成功所需的语义；完整内容和 patch 输出继续留在 durable artifact。
+            true,
+            false,
+        ),
+        "shell" | "shell_session" => (
+            selected_model_facts(&facts, PROCESS_MODEL_FACTS),
+            summary,
+            excerpt.map(|value| bounded_text(&value, MAX_MODEL_TOOL_OUTPUT_CHARS)),
+            envelope.status != ToolResultStatus::Ok,
+            true,
+        ),
+        "web_search" => (
+            project_search_model_facts(&facts),
+            summary,
+            None,
+            envelope.status != ToolResultStatus::Ok,
+            false,
+        ),
+        "subagent" => {
+            let keep_excerpt = excerpt.as_deref().is_some_and(|value| value != summary);
+            (
+                project_subagent_model_facts(&facts),
+                summary,
+                excerpt.map(|value| bounded_text(&value, MAX_MODEL_TOOL_OUTPUT_CHARS)),
+                true,
+                keep_excerpt,
+            )
+        }
+        _ => (
+            project_model_tool_value(&facts, 0),
+            summary,
+            excerpt,
+            !known,
+            !known,
+        ),
+    };
+    let mut projection = model_tool_result_base(&envelope.tool_name, envelope.status);
+    if let Value::Object(object) = &mut projection {
+        object.insert("structured_facts".to_owned(), facts);
+        if keep_summary {
+            object.insert(
+                "summary".to_owned(),
+                Value::String(bounded_text(
+                    &summary,
+                    if known {
+                        MAX_MODEL_TOOL_REASON_CHARS
+                    } else {
+                        MAX_MODEL_TOOL_RESULT_SUMMARY_CHARS
+                    },
+                )),
+            );
+        }
+        if keep_excerpt && let Some(excerpt) = excerpt.filter(|value| !value.is_empty()) {
+            object.insert("model_visible_excerpt".to_owned(), Value::String(excerpt));
+        }
     }
-    if serialized_value_len(&projection) > MAX_MODEL_TOOL_RESULT_BYTES {
-        projection["structured_facts"] = json!({"_golutra_truncated": true});
-        if let Some(output) = projection
-            .get("model_visible_excerpt")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
+    serialize_model_tool_projection(projection, &envelope.tool_name, envelope.status, &summary)
+}
+
+const READ_FILE_MODEL_FACTS: &[&str] = &[
+    "path",
+    "bytes",
+    "lines",
+    "truncated",
+    "continuation",
+    "next_cursor",
+    "cursor",
+    "offset",
+    "total_bytes",
+    "total_lines",
+    "has_more",
+    "eof",
+    "error",
+    "reason",
+    "timed_out",
+    "cancelled",
+    "blocked",
+];
+
+const MUTATION_MODEL_FACTS: &[&str] = &[
+    "path",
+    "changed_files",
+    "changed_file_count",
+    "workspace_change_count",
+    "workspace_changes_known",
+    "workspace_mutation_detected",
+    "bytes",
+    "replacements",
+    "conflict",
+    "search_found",
+    "max_bytes",
+    "exit_code",
+    "timed_out",
+    "cancelled",
+    "error",
+    "reason",
+    "checkpointed_paths",
+    "resolved_paths",
+    "output_truncated",
+    "blocked",
+];
+
+const PROCESS_MODEL_FACTS: &[&str] = &[
+    "process_id",
+    "process_state",
+    "exit_code",
+    "timed_out",
+    "cancelled",
+    "output_cursor",
+    "output_lost",
+    "output_bytes",
+    "output_lines",
+    "output_truncated",
+    "workspace_changes_known",
+    "workspace_change_count",
+    "process_lifetime_scope",
+    "survives_runtime_exit",
+    "terminal",
+    "wait_strategy",
+    "next_action",
+    "error",
+    "reason",
+    "blocked",
+];
+
+fn model_tool_result_base(tool_name: &str, status: ToolResultStatus) -> Value {
+    json!({
+        "tool_name": bounded_text(tool_name, 128),
+        "status": status,
+    })
+}
+
+fn selected_model_facts(value: &Value, keys: &[&str]) -> Value {
+    let Some(source) = value.as_object() else {
+        return project_model_tool_value(value, 0);
+    };
+    let mut projected = serde_json::Map::new();
+    for key in keys {
+        if let Some(value) = source.get(*key) {
+            projected.insert((*key).to_owned(), project_model_tool_value(value, 0));
+        }
+    }
+    Value::Object(projected)
+}
+
+fn project_search_model_facts(value: &Value) -> Value {
+    let Some(source) = value.as_object() else {
+        return project_model_tool_value(value, 0);
+    };
+    let mut projected = serde_json::Map::new();
+    for key in ["query", "result_count", "cached", "error", "reason"] {
+        if let Some(value) = source.get(key) {
+            let value = if key == "query" {
+                value
+                    .as_str()
+                    .map(|query| {
+                        Value::String(bounded_text(query, MAX_MODEL_TOOL_SEARCH_QUERY_CHARS))
+                    })
+                    .unwrap_or_else(|| project_model_tool_value(value, 0))
+            } else {
+                project_model_tool_value(value, 0)
+            };
+            projected.insert(key.to_owned(), value);
+        }
+    }
+    if let Some(results) = source.get("results").and_then(Value::as_array) {
+        let results = results
+            .iter()
+            .take(MAX_MODEL_TOOL_SEARCH_RESULTS)
+            .filter_map(|result| {
+                let object = result.as_object()?;
+                let mut item = serde_json::Map::new();
+                for (key, limit) in [
+                    ("title", MAX_MODEL_TOOL_SEARCH_TITLE_CHARS),
+                    ("url", MAX_MODEL_TOOL_SEARCH_URL_CHARS),
+                    ("snippet", MAX_MODEL_TOOL_SEARCH_SNIPPET_CHARS),
+                ] {
+                    if let Some(value) = object.get(key).and_then(Value::as_str) {
+                        item.insert(key.to_owned(), Value::String(bounded_text(value, limit)));
+                    }
+                }
+                (!item.is_empty()).then_some(Value::Object(item))
+            })
+            .collect::<Vec<_>>();
+        projected.insert("results".to_owned(), Value::Array(results));
+    }
+    Value::Object(projected)
+}
+
+fn project_subagent_model_facts(value: &Value) -> Value {
+    let Some(source) = value.as_object() else {
+        return project_model_tool_value(value, 0);
+    };
+    let mut projected = serde_json::Map::new();
+    for (key, value) in source {
+        if key.starts_with("child_")
+            || matches!(
+                key.as_str(),
+                "completed"
+                    | "success"
+                    | "workspace_changes_known"
+                    | "workspace_change_count"
+                    | "changed_files"
+                    | "artifact_ref"
+                    | "artifact_refs"
+                    | "evidence_ref"
+                    | "evidence_refs"
+                    | "result_ref"
+                    | "error"
+                    | "reason"
+                    | "cancelled"
+                    | "timed_out"
+                    | "blocked"
+                    | "partial"
+                    | "truncated"
+                    | "continuation"
+            )
         {
-            projection["model_visible_excerpt"] = Value::String(bounded_text(
-                &output,
+            projected.insert(bounded_text(key, 96), project_model_tool_value(value, 0));
+        }
+    }
+    Value::Object(projected)
+}
+
+fn serialize_model_tool_projection(
+    mut projection: Value,
+    tool_name: &str,
+    status: ToolResultStatus,
+    summary: &str,
+) -> String {
+    if serialized_value_len(&projection) > MAX_MODEL_TOOL_RESULT_BYTES
+        && let Value::Object(object) = &mut projection
+    {
+        if let Some(facts) = object.get_mut("structured_facts") {
+            *facts = compact_model_tool_value(facts);
+        }
+        if let Some(value) = object.get_mut("model_visible_excerpt")
+            && let Some(text) = value.as_str()
+        {
+            *value = Value::String(bounded_text(
+                text,
                 MAX_MODEL_TOOL_RESULT_COMPACT_EXCERPT_CHARS,
             ));
         }
     }
-    let serialized = serde_json::to_string(&projection).unwrap_or_else(|_| {
-        "{\"status\":\"error\",\"summary\":\"tool result could not be serialized\"}".to_owned()
-    });
-    if serialized.len() <= MAX_MODEL_TOOL_RESULT_BYTES {
-        return serialized;
+    if serialized_value_len(&projection) <= MAX_MODEL_TOOL_RESULT_BYTES {
+        return serde_json::to_string(&projection)
+            .unwrap_or_else(|_| "{\"status\":\"error\"}".to_owned());
     }
-
-    serde_json::to_string(&json!({
-        "tool_name": bounded_text(&envelope.tool_name, 128),
-        "status": envelope.status,
-        "summary": bounded_text(&summary, 512),
-        "structured_facts": {"_golutra_truncated": true},
-        "model_visible_excerpt": excerpt.map(|value| bounded_text(&value, 128)),
-    }))
-    .unwrap_or_else(|_| "{\"status\":\"error\"}".to_owned())
-}
-
-fn model_tool_result_value(
-    tool_name: &str,
-    status: ToolResultStatus,
-    summary: String,
-    facts: Value,
-    excerpt: Option<String>,
-) -> Value {
-    let mut object = serde_json::Map::new();
-    object.insert(
-        "tool_name".to_owned(),
-        Value::String(bounded_text(tool_name, 128)),
-    );
-    object.insert(
-        "status".to_owned(),
-        serde_json::to_value(status).unwrap_or(Value::Null),
-    );
-    object.insert("summary".to_owned(), Value::String(summary));
-    object.insert("structured_facts".to_owned(), facts);
-    if let Some(excerpt) = excerpt {
-        object.insert("model_visible_excerpt".to_owned(), Value::String(excerpt));
+    let mut fallback = model_tool_result_base(tool_name, status);
+    if status != ToolResultStatus::Ok {
+        fallback["summary"] = Value::String(bounded_text(summary, MAX_MODEL_TOOL_REASON_CHARS));
     }
-    Value::Object(object)
+    fallback["structured_facts"] = json!({"_golutra_truncated": true});
+    serde_json::to_string(&fallback).unwrap_or_else(|_| "{\"status\":\"error\"}".to_owned())
 }
 
 fn project_model_tool_value(value: &Value, depth: usize) -> Value {

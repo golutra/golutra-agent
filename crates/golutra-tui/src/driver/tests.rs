@@ -702,7 +702,7 @@ async fn snapshot_render_restores_every_transient_input_surface() {
     let mut driver = TuiDriver::launch(
         transport,
         DriverLaunchOptions {
-            session: None,
+            resume: None,
             task_id: None,
             debug: true,
             yolo: false,
@@ -741,7 +741,7 @@ async fn rejected_mouse_activation_does_not_change_local_selection() {
     let mut driver = TuiDriver::launch(
         transport,
         DriverLaunchOptions {
-            session: None,
+            resume: None,
             task_id: None,
             debug: false,
             yolo: false,
@@ -883,7 +883,7 @@ async fn snapshot_render_does_not_mutate_the_active_pane_layout() {
     let mut driver = TuiDriver::launch(
         transport,
         DriverLaunchOptions {
-            session: None,
+            resume: None,
             task_id: None,
             debug: true,
             yolo: false,

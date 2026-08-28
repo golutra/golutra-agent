@@ -16,7 +16,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-pub(crate) const MAX_DELEGATION_DEPTH: u8 = 2;
+pub(crate) const MAX_DELEGATION_DEPTH: u8 = 1;
 pub(crate) const DELEGATION_COST_BUDGET_KEY: &str = "_delegation_cost_budget_microusd";
 pub(crate) const MAX_DELEGATED_ACTIVE_CHILDREN: usize = 2;
 pub(crate) const MAX_DELEGATED_TOTAL_CHILDREN: usize = 8;
@@ -656,23 +656,21 @@ mod tests {
                 &cancellation,
             )
             .expect("child");
-        let grandchild = child
-            .child(
+        let root_remaining = root.remaining_elapsed_ms();
+        let child_remaining = child.remaining_elapsed_ms();
+        assert!(child_remaining < root_remaining);
+        assert!(child_remaining <= delegated_child_elapsed_ms(root_remaining.saturating_add(2)));
+        assert!(matches!(
+            child.child(
                 SessionId::new(),
                 TaskId::new(),
                 ThreadId::new(),
                 1_024,
                 None,
                 &cancellation,
-            )
-            .expect("grandchild");
-
-        let root_remaining = root.remaining_elapsed_ms();
-        let child_remaining = child.remaining_elapsed_ms();
-        let grandchild_remaining = grandchild.remaining_elapsed_ms();
-        assert!(child_remaining < root_remaining);
-        assert!(grandchild_remaining < child_remaining);
-        assert!(child_remaining <= delegated_child_elapsed_ms(root_remaining.saturating_add(2)));
+            ),
+            Err(DelegationLimit::Depth)
+        ));
     }
 
     #[test]
@@ -856,18 +854,8 @@ mod tests {
                 &cancellation,
             )
             .expect("reusable child slot");
-        let grandchild = child
-            .child(
-                parent_session,
-                parent_task,
-                parent_thread,
-                1_024,
-                Some(0),
-                &cancellation,
-            )
-            .expect("grandchild");
         assert!(matches!(
-            grandchild.child(
+            child.child(
                 parent_session,
                 parent_task,
                 parent_thread,

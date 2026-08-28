@@ -165,11 +165,16 @@ fn task_lines(events: &[RuntimeEvent]) -> Vec<String> {
 
 fn usage_lines(events: &[RuntimeEvent]) -> Vec<String> {
     let mut input = 0_u64;
+    let mut uncached_input = 0_u64;
     let mut output = 0_u64;
     let mut reasoning = 0_u64;
-    let mut cached = 0_u64;
+    let mut cache_read = 0_u64;
+    let mut cache_write = 0_u64;
     let mut provider_total = 0_u64;
     let mut aggregate_total = 0_u64;
+    let mut uncached_input_complete = true;
+    let mut cache_read_complete = true;
+    let mut cache_write_complete = true;
     let mut provider_total_complete = true;
     let mut aggregate_complete = true;
     let mut cost = 0.0_f64;
@@ -189,9 +194,23 @@ fn usage_lines(events: &[RuntimeEvent]) -> Vec<String> {
         let input_tokens = usage.input_tokens_total;
         let output_tokens = usage.output_tokens;
         input = input.saturating_add(input_tokens.unwrap_or_default());
+        if let Some(tokens) = usage.input_tokens_non_cached {
+            uncached_input = uncached_input.saturating_add(tokens);
+        } else {
+            uncached_input_complete = false;
+        }
         output = output.saturating_add(output_tokens.unwrap_or_default());
         reasoning = reasoning.saturating_add(usage.reasoning_tokens.unwrap_or_default());
-        cached = cached.saturating_add(usage.cache_read_tokens.unwrap_or_default());
+        if let Some(tokens) = usage.cache_read_tokens {
+            cache_read = cache_read.saturating_add(tokens);
+        } else {
+            cache_read_complete = false;
+        }
+        if let Some(tokens) = usage.cache_write_tokens {
+            cache_write = cache_write.saturating_add(tokens);
+        } else {
+            cache_write_complete = false;
+        }
         if let Some(total) = usage.provider_total_tokens {
             provider_total = provider_total.saturating_add(total);
         } else {
@@ -224,7 +243,18 @@ fn usage_lines(events: &[RuntimeEvent]) -> Vec<String> {
         ),
         format!("Requests     {samples}"),
         format!("Input        {input} tokens"),
-        format!("Cached       {cached} tokens"),
+        format!(
+            "Uncached input {}",
+            usage_value(uncached_input, uncached_input_complete)
+        ),
+        format!(
+            "Cache read   {}",
+            usage_value(cache_read, cache_read_complete)
+        ),
+        format!(
+            "Cache write  {}",
+            usage_value(cache_write, cache_write_complete)
+        ),
         format!("Output       {output} tokens"),
         format!("Reasoning    {reasoning} tokens"),
         if provider_total_complete {
@@ -253,6 +283,14 @@ fn usage_lines(events: &[RuntimeEvent]) -> Vec<String> {
         lines.push(format!("Rate limit   {}", event_summary(rate_limit)));
     }
     lines
+}
+
+fn usage_value(value: u64, complete: bool) -> String {
+    if complete {
+        format!("{value} tokens")
+    } else {
+        "unknown".to_owned()
+    }
 }
 
 fn event_summary(event: &RuntimeEvent) -> String {
@@ -310,6 +348,26 @@ mod tests {
         provider_total_tokens: Option<u64>,
         estimated_cost: f64,
     ) -> serde_json::Value {
+        usage_record_json_with_breakdown(
+            input_tokens,
+            output_tokens,
+            provider_total_tokens,
+            estimated_cost,
+            Some(input_tokens),
+            None,
+            None,
+        )
+    }
+
+    fn usage_record_json_with_breakdown(
+        input_tokens: u64,
+        output_tokens: u64,
+        provider_total_tokens: Option<u64>,
+        estimated_cost: f64,
+        non_cached_input_tokens: Option<u64>,
+        cache_read_tokens: Option<u64>,
+        cache_write_tokens: Option<u64>,
+    ) -> serde_json::Value {
         serde_json::to_value(TokenUsageRecord {
             session_id: None,
             task_id: TaskId::new(),
@@ -325,9 +383,9 @@ mod tests {
             budget_snapshot_ref: TokenBudgetSnapshotId::new(),
             attribution_ref: None,
             usage_source: "provider".to_owned(),
-            cache_read_tokens: None,
-            cache_write_tokens: None,
-            non_cached_input_tokens: Some(input_tokens),
+            cache_read_tokens,
+            cache_write_tokens,
+            non_cached_input_tokens,
             tool_schema_tokens_estimated: None,
             tool_result_tokens_estimated: None,
             tool_estimated_tokens: None,
@@ -344,16 +402,44 @@ mod tests {
             event(
                 1,
                 RuntimeEventType::TokenUsageRecorded,
-                json!({"record": usage_record_json(10, 2, Some(12), 0.1)}),
+                json!({
+                    "record": usage_record_json_with_breakdown(
+                        10, 2, Some(12), 0.1, Some(6), Some(4), Some(2)
+                    )
+                }),
             ),
             event(
                 2,
                 RuntimeEventType::TokenUsageRecorded,
-                json!({"record": usage_record_json(5, 3, Some(8), 0.2)}),
+                json!({
+                    "record": usage_record_json_with_breakdown(
+                        5, 3, Some(8), 0.2, Some(3), Some(2), Some(0)
+                    )
+                }),
             ),
         ]);
         assert!(lines.iter().any(|line| line == "Input        15 tokens"));
+        assert!(lines.iter().any(|line| line == "Uncached input 9 tokens"));
+        assert!(lines.iter().any(|line| line == "Cache read   6 tokens"));
+        assert!(lines.iter().any(|line| line == "Cache write  2 tokens"));
         assert!(lines.iter().any(|line| line == "Total        20 tokens"));
+    }
+
+    #[test]
+    fn usage_projection_marks_unprojected_breakdowns_as_unknown() {
+        let lines = usage_lines(&[event(
+            1,
+            RuntimeEventType::TokenUsageRecorded,
+            json!({
+                "record": usage_record_json_with_breakdown(
+                    10, 2, Some(12), 0.0, None, None, None
+                )
+            }),
+        )]);
+
+        assert!(lines.iter().any(|line| line == "Uncached input unknown"));
+        assert!(lines.iter().any(|line| line == "Cache read   unknown"));
+        assert!(lines.iter().any(|line| line == "Cache write  unknown"));
     }
 
     #[test]

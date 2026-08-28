@@ -9,7 +9,10 @@
 use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicU8, AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -27,6 +30,8 @@ use tokio_util::sync::CancellationToken;
 use super::{ToolError, process, workspace_scan};
 
 const MAX_PROCESSES: usize = 64;
+const MAX_TERMINAL_PROCESSES: usize = 32;
+const MAX_TERMINAL_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_POLL_WAIT_MS: u64 = 30_000;
 const DEFAULT_POLL_WAIT_MS: u64 = 5_000;
@@ -39,8 +44,6 @@ const READER_DRAIN_TIMEOUT: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(2)
 };
-const READER_DRAIN_GRACE: Duration = Duration::from_millis(250);
-const READER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProcessState {
@@ -55,6 +58,79 @@ pub(crate) enum ProcessState {
 impl ProcessState {
     pub(crate) const fn is_terminal(self) -> bool {
         !matches!(self, Self::Running)
+    }
+}
+
+/// 终止原因按优先级锁存，避免 child.wait 与取消信号的调度顺序改写用户可见终态。
+/// 优先级为显式 terminate > 取消 > 超时；较高优先级可以覆盖较低优先级。
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TerminationReason {
+    TimedOut = 1,
+    Cancelled = 2,
+    Terminated = 3,
+}
+
+impl TerminationReason {
+    fn for_state(state: ProcessState) -> Option<Self> {
+        match state {
+            ProcessState::TimedOut => Some(Self::TimedOut),
+            ProcessState::Cancelled => Some(Self::Cancelled),
+            ProcessState::Terminated => Some(Self::Terminated),
+            ProcessState::Running | ProcessState::Exited | ProcessState::Failed => None,
+        }
+    }
+
+    const fn state(self) -> ProcessState {
+        match self {
+            Self::TimedOut => ProcessState::TimedOut,
+            Self::Cancelled => ProcessState::Cancelled,
+            Self::Terminated => ProcessState::Terminated,
+        }
+    }
+
+    const fn code(self) -> u8 {
+        self as u8
+    }
+
+    const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::TimedOut),
+            2 => Some(Self::Cancelled),
+            3 => Some(Self::Terminated),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct TerminationIntent {
+    reason: AtomicU8,
+}
+
+impl TerminationIntent {
+    fn request(&self, state: ProcessState) {
+        let Some(reason) = TerminationReason::for_state(state) else {
+            return;
+        };
+        let requested = reason.code();
+        let mut current = self.reason.load(Ordering::Acquire);
+        while current < requested {
+            match self.reason.compare_exchange_weak(
+                current,
+                requested,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn state(&self) -> Option<ProcessState> {
+        TerminationReason::from_code(self.reason.load(Ordering::Acquire))
+            .map(TerminationReason::state)
     }
 }
 
@@ -253,8 +329,13 @@ struct ManagedProcess {
     session_id: SessionId,
     request_identity: ProcessRequestIdentity,
     command_display: String,
-    pid: Option<u32>,
+    /// Cleared once the process reaches a terminal state so a recycled OS PID
+    /// cannot be signaled by a late terminate/shutdown path.
+    pid: StdMutex<Option<u32>>,
+    pid_registration: StdMutex<Option<PidRegistration>>,
+    termination_intent: Arc<TerminationIntent>,
     stdin: Mutex<Option<ChildStdin>>,
+    operation: Mutex<()>,
     output: Mutex<OutputJournal>,
     state: Mutex<ProcessStateRecord>,
     control: CancellationToken,
@@ -273,7 +354,10 @@ impl std::fmt::Debug for ManagedProcess {
             .field("id", &self.id)
             .field("session_id", &self.session_id)
             .field("command_display", &self.command_display)
-            .field("pid", &self.pid)
+            .field(
+                "pid",
+                &self.pid.try_lock().map(|guard| *guard).unwrap_or(None),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -282,11 +366,169 @@ struct SupervisorInner {
     processes: Mutex<HashMap<String, Arc<ManagedProcess>>>,
     start_gate: Mutex<()>,
     shutdown: CancellationToken,
+    // Drop 不能 await Tokio mutex；同步 PID 表保证 runtime 消失时仍能立即清理进程组。
+    active_pids: StdMutex<HashMap<u64, PidRegistration>>,
+    next_pid_token: AtomicU64,
+    terminating_sessions: StdMutex<HashMap<SessionId, usize>>,
+}
+
+#[derive(Debug, Clone)]
+struct PidRegistration {
+    token: u64,
+    pid: u32,
+    termination_intent: Arc<TerminationIntent>,
+}
+
+struct TerminatingSessionGuard {
+    inner: Arc<SupervisorInner>,
+    session_id: SessionId,
+}
+
+impl Drop for TerminatingSessionGuard {
+    fn drop(&mut self) {
+        self.inner.clear_session_terminating(self.session_id);
+    }
 }
 
 impl Drop for SupervisorInner {
     fn drop(&mut self) {
+        self.terminate_active_processes(ProcessState::Cancelled);
         self.shutdown.cancel();
+    }
+}
+
+impl SupervisorInner {
+    fn register_pid(
+        &self,
+        pid: Option<u32>,
+        termination_intent: Arc<TerminationIntent>,
+    ) -> Option<PidRegistration> {
+        let pid = pid?;
+        let token = self.next_pid_token.fetch_add(1, Ordering::Relaxed);
+        let registration = PidRegistration {
+            token,
+            pid,
+            termination_intent,
+        };
+        if let Ok(mut active) = self.active_pids.lock() {
+            active.insert(token, registration.clone());
+            Some(registration)
+        } else {
+            None
+        }
+    }
+
+    fn unregister_pid(&self, registration: Option<PidRegistration>) {
+        if let Some(registration) = registration
+            && let Ok(mut active) = self.active_pids.lock()
+            && active.get(&registration.token).is_some_and(|current| {
+                current.token == registration.token
+                    && current.pid == registration.pid
+                    && Arc::ptr_eq(
+                        &current.termination_intent,
+                        &registration.termination_intent,
+                    )
+            })
+        {
+            active.remove(&registration.token);
+        }
+    }
+
+    fn terminate_active_processes(&self, state: ProcessState) {
+        // 先锁存原因，再发信号；child.wait 即使抢先完成也只能发布该原因。
+        let active = self
+            .active_pids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for registration in active.values() {
+            registration.termination_intent.request(state);
+            // 持有注册表锁直到发信号，避免 PID 释放与信号发送之间出现复用窗口。
+            process::terminate_process_group(Some(registration.pid));
+        }
+    }
+
+    fn mark_session_terminating(&self, session_id: SessionId) {
+        if let Ok(mut sessions) = self.terminating_sessions.lock() {
+            *sessions.entry(session_id).or_default() += 1;
+        }
+    }
+
+    fn clear_session_terminating(&self, session_id: SessionId) {
+        if let Ok(mut sessions) = self.terminating_sessions.lock()
+            && let Some(count) = sessions.get_mut(&session_id)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                sessions.remove(&session_id);
+            }
+        }
+    }
+
+    fn is_session_terminating(&self, session_id: SessionId) -> bool {
+        self.terminating_sessions
+            .lock()
+            .map(|sessions| sessions.get(&session_id).is_some_and(|count| *count > 0))
+            .unwrap_or(true)
+    }
+
+    async fn prune(&self) {
+        let now = Instant::now();
+        let entries = self
+            .processes
+            .lock()
+            .await
+            .iter()
+            .map(|(id, entry)| (id.clone(), Arc::clone(entry)))
+            .collect::<Vec<_>>();
+        let mut terminal = Vec::new();
+        for (id, entry) in entries {
+            let (state, completed_at) = {
+                let state = entry.state.lock().await;
+                (state.state, state.completed_at)
+            };
+            if !state.is_terminal() {
+                continue;
+            }
+            let last_touched = *entry.last_touched.lock().await;
+            let retained_bytes = entry.output.lock().await.retained_bytes;
+            let retention_anchor = completed_at.unwrap_or(last_touched).max(last_touched);
+            terminal.push((
+                id,
+                retention_anchor,
+                now.duration_since(retention_anchor),
+                retained_bytes,
+            ));
+        }
+        // 保留最近完成的 journal；同时限制总字节，防止大量短任务在 retention 窗口内堆积。
+        terminal.sort_by_key(|(_, retention_anchor, _, _)| *retention_anchor);
+        let mut remove = Vec::new();
+        let mut retained_bytes = terminal
+            .iter()
+            .map(|(_, _, _, bytes)| *bytes)
+            .sum::<usize>();
+        let count_overflow = terminal.len().saturating_sub(MAX_TERMINAL_PROCESSES);
+        for (index, (id, _, age, bytes)) in terminal.iter().enumerate() {
+            if index < count_overflow
+                || *age > MAX_RETENTION
+                || retained_bytes > MAX_TERMINAL_OUTPUT_BYTES
+            {
+                remove.push(id.clone());
+                retained_bytes = retained_bytes.saturating_sub(*bytes);
+            }
+        }
+        remove.sort();
+        remove.dedup();
+        let mut processes = self.processes.lock().await;
+        for id in remove {
+            if processes.get(&id).is_some_and(|entry| {
+                entry
+                    .state
+                    .try_lock()
+                    .is_ok_and(|state| state.state.is_terminal())
+            }) {
+                processes.remove(&id);
+            }
+        }
     }
 }
 
@@ -317,6 +559,9 @@ impl ProcessSupervisor {
                 processes: Mutex::new(HashMap::new()),
                 start_gate: Mutex::new(()),
                 shutdown: CancellationToken::new(),
+                active_pids: StdMutex::new(HashMap::new()),
+                next_pid_token: AtomicU64::new(1),
+                terminating_sessions: StdMutex::new(HashMap::new()),
             }),
         }
     }
@@ -326,6 +571,8 @@ impl ProcessSupervisor {
     /// [`Self::shutdown_and_wait`] when the caller still owns an async runtime
     /// and needs terminal bookkeeping to complete before teardown.
     pub fn shutdown(&self) {
+        self.inner
+            .terminate_active_processes(ProcessState::Cancelled);
         self.inner.shutdown.cancel();
     }
 
@@ -339,6 +586,8 @@ impl ProcessSupervisor {
     /// closes the window in which a descendant could outlive the direct child
     /// while the Tokio runtime is being torn down.
     pub async fn shutdown_and_wait(&self) -> Result<(), ToolError> {
+        self.inner
+            .terminate_active_processes(ProcessState::Cancelled);
         self.inner.shutdown.cancel();
         let start_guard = self.inner.start_gate.lock().await;
         let entries = self
@@ -354,11 +603,12 @@ impl ProcessSupervisor {
         let mut running = Vec::new();
         for entry in entries {
             if !entry.state.lock().await.state.is_terminal() {
-                entry.control.cancel();
+                entry.termination_intent.request(ProcessState::Cancelled);
                 // Do this synchronously before awaiting terminal bookkeeping so
-                // descendants are terminated even if cancellation scheduling is
+                // descendants are terminated even if the shutdown token is
                 // delayed on a nearly-tearing-down runtime.
-                process::terminate_process_group(entry.pid);
+                let pid = take_pid(&self.inner, &entry);
+                process::terminate_process_group(pid);
                 running.push(entry);
             }
         }
@@ -367,15 +617,19 @@ impl ProcessSupervisor {
         }
 
         let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
-        let mut unfinished = Vec::new();
-        for entry in &running {
+        let waits = running.iter().map(|entry| async {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             let wait_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
-            let snapshot = self.wait_for_terminal(entry, 0, wait_ms).await;
-            if !snapshot.state.is_terminal() {
-                unfinished.push(entry.id.clone());
-            }
-        }
+            (
+                entry.id.clone(),
+                self.wait_for_terminal(entry, 0, wait_ms).await,
+            )
+        });
+        let snapshots = futures_util::future::join_all(waits).await;
+        let unfinished = snapshots
+            .into_iter()
+            .filter_map(|(id, snapshot)| (!snapshot.state.is_terminal()).then_some(id))
+            .collect::<Vec<_>>();
         if unfinished.is_empty() {
             Ok(())
         } else {
@@ -404,6 +658,11 @@ impl ProcessSupervisor {
         if self.inner.shutdown.is_cancelled() {
             return Err(ToolError::Execution(
                 "process supervisor is shutting down".to_owned(),
+            ));
+        }
+        if self.inner.is_session_terminating(request.session_id) {
+            return Err(ToolError::Execution(
+                "process session is being terminated".to_owned(),
             ));
         }
         if let Some(existing) = self
@@ -488,25 +747,57 @@ impl ProcessSupervisor {
             .spawn()
             .map_err(|error| ToolError::Execution(error.to_string()))?;
         let pid = child.id();
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| ToolError::Execution("process stdin pipe is unavailable".to_owned()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| ToolError::Execution("process stdout pipe is unavailable".to_owned()))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| ToolError::Execution("process stderr pipe is unavailable".to_owned()))?;
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                return Err(
+                    abort_spawned_child(child, pid, "process stdin pipe is unavailable").await,
+                );
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                return Err(
+                    abort_spawned_child(child, pid, "process stdout pipe is unavailable").await,
+                );
+            }
+        };
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                return Err(
+                    abort_spawned_child(child, pid, "process stderr pipe is unavailable").await,
+                );
+            }
+        };
+        let termination_intent = Arc::new(TerminationIntent::default());
+        let Some(pid_registration) = self
+            .inner
+            .register_pid(pid, Arc::clone(&termination_intent))
+        else {
+            return Err(
+                abort_spawned_child(child, pid, "process PID registry is unavailable").await,
+            );
+        };
+        // shutdown() may race with the final pre-spawn check. Register first,
+        // then abort immediately so that race cannot leave an unowned child.
+        if self.inner.shutdown.is_cancelled() {
+            self.inner.unregister_pid(Some(pid_registration));
+            return Err(
+                abort_spawned_child(child, pid, "process supervisor is shutting down").await,
+            );
+        }
         let entry = Arc::new(ManagedProcess {
             id: request.process_id,
             session_id: request.session_id,
             request_identity,
             command_display: request.command_display,
-            pid,
+            pid: StdMutex::new(pid),
+            pid_registration: StdMutex::new(Some(pid_registration)),
+            termination_intent,
             stdin: Mutex::new(Some(stdin)),
+            operation: Mutex::new(()),
             output: Mutex::new(OutputJournal::default()),
             state: Mutex::new(ProcessStateRecord {
                 state: ProcessState::Running,
@@ -539,6 +830,7 @@ impl ProcessSupervisor {
         let workspace_root = request.workspace_root.to_path_buf();
         let workspace_before = request.workspace_before;
         let timeout = Duration::from_millis(request.timeout_ms.max(1));
+        let supervisor_inner = Arc::downgrade(&self.inner);
         tokio::spawn(supervise_process(
             Arc::clone(&entry),
             child,
@@ -551,6 +843,7 @@ impl ProcessSupervisor {
             workspace_root,
             workspace_before,
             timeout,
+            supervisor_inner,
         ));
         drop(start_guard);
 
@@ -623,6 +916,8 @@ impl ProcessSupervisor {
     ) -> Result<ProcessSnapshot, ToolError> {
         let entry = self.entry(session_id, process_id).await?;
         self.touch(&entry).await;
+        // 只串行化 stdin 和终止控制，等待事件时不持有该锁。
+        let _operation_guard = entry.operation.lock().await;
         {
             let state = entry.state.lock().await;
             if state.state.is_terminal() {
@@ -642,6 +937,7 @@ impl ProcessSupervisor {
             ToolError::Execution(format!("process stdin flush failed: {error}"))
         })?;
         drop(stdin_guard);
+        drop(_operation_guard);
         self.poll_for(&entry, cursor, wait_ms).await
     }
 
@@ -652,7 +948,21 @@ impl ProcessSupervisor {
         cursor: u64,
     ) -> Result<ProcessSnapshot, ToolError> {
         let entry = self.entry(session_id, process_id).await?;
-        entry.control.cancel();
+        {
+            let _operation_guard = entry.operation.lock().await;
+            if entry.state.lock().await.state.is_terminal() {
+                // Already terminal: never signal a retained/stale PID.
+                return Ok(snapshot(&entry, cursor).await);
+            }
+            entry.termination_intent.request(ProcessState::Terminated);
+            entry.control.cancel();
+            // Mirror shutdown_and_wait: kill the process group eagerly so a
+            // descendant cannot outlive the wait window while cancellation is
+            // still propagating through the supervisor task. take() so a racing
+            // terminal publication cannot leave us signaling after release.
+            let pid = take_pid(&self.inner, &entry);
+            process::terminate_process_group(pid);
+        }
         let snapshot = self.wait_for_terminal(&entry, cursor, 5_000).await;
         if snapshot.state.is_terminal() {
             Ok(snapshot)
@@ -672,10 +982,14 @@ impl ProcessSupervisor {
     /// misbehaving process from serially extending cleanup for every sibling.
     pub async fn terminate_session(&self, session_id: SessionId) -> Result<usize, ToolError> {
         self.prune().await;
-        // Keep the launch gate until every selected process has reached a terminal
-        // state. Otherwise a concurrent start can register a new process after the
-        // snapshot above and escape this session-wide termination request.
-        let _start_guard = self.inner.start_gate.lock().await;
+        // 只在收集并标记目标 session 时持有全局 gate；等待结束不能阻塞其他
+        // session 启动。start() 会在标记期间拒绝该 session 的新进程。
+        let start_guard = self.inner.start_gate.lock().await;
+        self.inner.mark_session_terminating(session_id);
+        let _terminating_guard = TerminatingSessionGuard {
+            inner: Arc::clone(&self.inner),
+            session_id,
+        };
         let entries = self
             .inner
             .processes
@@ -685,10 +999,17 @@ impl ProcessSupervisor {
             .filter(|entry| entry.session_id == session_id)
             .cloned()
             .collect::<Vec<_>>();
+        drop(start_guard);
         let mut running = Vec::new();
         for entry in entries {
             if !entry.state.lock().await.state.is_terminal() {
+                entry.termination_intent.request(ProcessState::Terminated);
                 entry.control.cancel();
+                // Same eager kill as shutdown_and_wait: do not wait for the
+                // supervisor cancellation branch to schedule before descendants
+                // are terminated.
+                let pid = take_pid(&self.inner, &entry);
+                process::terminate_process_group(pid);
                 running.push(entry);
             }
         }
@@ -696,16 +1017,20 @@ impl ProcessSupervisor {
             return Ok(0);
         }
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut unfinished = Vec::new();
-        for entry in &running {
-            let remaining = deadline.saturating_duration_since(Instant::now());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let waits = running.iter().map(|entry| async {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             let wait_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
-            let snapshot = self.wait_for_terminal(entry, 0, wait_ms).await;
-            if !snapshot.state.is_terminal() {
-                unfinished.push(entry.id.clone());
-            }
-        }
+            (
+                entry.id.clone(),
+                self.wait_for_terminal(entry, 0, wait_ms).await,
+            )
+        });
+        let snapshots = futures_util::future::join_all(waits).await;
+        let unfinished = snapshots
+            .into_iter()
+            .filter_map(|(id, snapshot)| (!snapshot.state.is_terminal()).then_some(id))
+            .collect::<Vec<_>>();
         if unfinished.is_empty() {
             Ok(running.len())
         } else {
@@ -770,6 +1095,9 @@ impl ProcessSupervisor {
         loop {
             self.touch(entry).await;
             let notification = entry.notify.notified();
+            tokio::pin!(notification);
+            // 在读取快照前注册通知，避免输出恰好在检查窗口到达时丢失唤醒。
+            notification.as_mut().enable();
             let snapshot = snapshot(entry, cursor).await;
             if snapshot.state.is_terminal()
                 || snapshot.output_cursor > cursor
@@ -779,7 +1107,7 @@ impl ProcessSupervisor {
                 return Ok(snapshot);
             }
             tokio::select! {
-                _ = notification => {}
+                _ = &mut notification => {}
                 _ = tokio::time::sleep_until(deadline) => return Ok(snapshot),
             }
         }
@@ -814,35 +1142,33 @@ impl ProcessSupervisor {
     }
 
     async fn prune(&self) {
-        let now = Instant::now();
-        let entries = self
-            .inner
-            .processes
-            .lock()
-            .await
-            .iter()
-            .map(|(id, entry)| (id.clone(), Arc::clone(entry)))
-            .collect::<Vec<_>>();
-        let mut stale = Vec::new();
-        for (id, entry) in entries {
-            let state = entry.state.lock().await;
-            let last_touched = *entry.last_touched.lock().await;
-            let retention_anchor = state.completed_at.unwrap_or(last_touched).max(last_touched);
-            if state.state.is_terminal() && now.duration_since(retention_anchor) > MAX_RETENTION {
-                stale.push(id);
-            }
-        }
-        let mut processes = self.inner.processes.lock().await;
-        for id in stale {
-            if processes.get(&id).is_some_and(|entry| {
-                entry
-                    .state
-                    .try_lock()
-                    .is_ok_and(|state| state.state.is_terminal())
-            }) {
-                processes.remove(&id);
-            }
-        }
+        self.inner.prune().await;
+    }
+}
+
+async fn abort_spawned_child(mut child: Child, pid: Option<u32>, message: &str) -> ToolError {
+    // 管道初始化失败时 `kill_on_drop` 只保证直接子进程，显式终止进程组才能
+    // 收回已经继承管道的后代；随后 wait 负责回收 child，避免僵尸进程。
+    process::terminate_process_group(pid);
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    ToolError::Execution(message.to_owned())
+}
+
+fn take_pid(inner: &SupervisorInner, entry: &ManagedProcess) -> Option<u32> {
+    let pid = entry.pid.lock().ok().and_then(|mut guard| guard.take());
+    let registration = entry
+        .pid_registration
+        .lock()
+        .ok()
+        .and_then(|mut registration| registration.take());
+    inner.unregister_pid(registration);
+    pid
+}
+
+fn clear_pid(entry: &ManagedProcess) {
+    if let Ok(mut guard) = entry.pid.lock() {
+        *guard = None;
     }
 }
 
@@ -889,42 +1215,71 @@ async fn supervise_process(
     workspace_root: PathBuf,
     workspace_before: workspace_scan::WorkspaceSnapshot,
     timeout: Duration,
+    supervisor_inner: std::sync::Weak<SupervisorInner>,
 ) {
     let child_id = child.id();
     let mut wait = Box::pin(child.wait());
     let mut timeout_sleep = Box::pin(tokio::time::sleep(timeout));
-    let (exit_code, override_state) = tokio::select! {
-        result = &mut wait => (result.ok().and_then(|status| status.code()), None),
+    let exit_code = tokio::select! {
+        biased;
         _ = process_control.cancelled() => {
+            entry.termination_intent.request(ProcessState::Terminated);
             process::terminate_process_group(child_id);
-            let exit_code = wait.await.ok().and_then(|status| status.code());
-            (exit_code, Some(ProcessState::Terminated))
+            wait.await.ok().and_then(|status| status.code())
         }
         _ = task_cancellation.cancelled() => {
+            entry.termination_intent.request(ProcessState::Cancelled);
             process::terminate_process_group(child_id);
-            let exit_code = wait.await.ok().and_then(|status| status.code());
-            (exit_code, Some(ProcessState::Cancelled))
+            wait.await.ok().and_then(|status| status.code())
         }
         _ = shutdown.cancelled() => {
+            entry.termination_intent.request(ProcessState::Cancelled);
             process::terminate_process_group(child_id);
-            let exit_code = wait.await.ok().and_then(|status| status.code());
-            (exit_code, Some(ProcessState::Cancelled))
+            wait.await.ok().and_then(|status| status.code())
         }
         _ = &mut timeout_sleep => {
+            entry.termination_intent.request(ProcessState::TimedOut);
             process::terminate_process_group(child_id);
-            let exit_code = wait.await.ok().and_then(|status| status.code());
-            (exit_code, Some(ProcessState::TimedOut))
+            wait.await.ok().and_then(|status| status.code())
+        }
+        result = &mut wait => {
+            // 先在同一无 await 路径终止继承管道的后代，随后才允许旧 PID
+            // 被释放和复用；reader drain 不再需要对旧 PID 发信号。
+            let exit_code = result.ok().and_then(|status| status.code());
+            process::terminate_process_group_only(child_id);
+            // 取消可能和 child.wait 同时完成；在最终发布前再次锁存已发出的原因。
+            if process_control.is_cancelled() {
+                entry.termination_intent.request(ProcessState::Terminated);
+            }
+            if task_cancellation.is_cancelled() || shutdown.is_cancelled() {
+                entry.termination_intent.request(ProcessState::Cancelled);
+            }
+            exit_code
         }
     };
-    drain_process_readers(child_id, stdout_reader, stderr_reader).await;
+    release_process_pid(&entry, &supervisor_inner);
+    drain_process_readers(stdout_reader, stderr_reader).await;
     let changes = workspace_scan::compare(&workspace_root, workspace_before).await;
-    let state = override_state.unwrap_or_else(|| {
-        if exit_code == Some(0) {
+    // Serialize terminal publication with terminate()/write() via the operation
+    // lock. PID ownership was released immediately after child wait above.
+    let _operation_guard = entry.operation.lock().await;
+    *entry.stdin.lock().await = None;
+    // 在发布锁内再次锁存取消原因，覆盖 child.wait 与终态发布之间的竞态窗口。
+    if process_control.is_cancelled() {
+        entry.termination_intent.request(ProcessState::Terminated);
+    }
+    if task_cancellation.is_cancelled() || shutdown.is_cancelled() {
+        entry.termination_intent.request(ProcessState::Cancelled);
+    }
+    // 必须在发布锁内读取原因，避免等待锁期间新到达的 terminate 请求被自然退出覆盖。
+    let state = entry
+        .termination_intent
+        .state()
+        .unwrap_or(if exit_code == Some(0) {
             ProcessState::Exited
         } else {
             ProcessState::Failed
-        }
-    });
+        });
     {
         let mut record = entry.state.lock().await;
         record.state = state;
@@ -932,47 +1287,51 @@ async fn supervise_process(
         record.workspace_scan = Some(changes);
         record.completed_at = Some(Instant::now());
     }
+    drop(_operation_guard);
+    if let Some(inner) = supervisor_inner.upgrade() {
+        inner.prune().await;
+    }
     entry.notify.notify_waiters();
     entry.terminal_notify.notify_waiters();
 }
 
-async fn drain_process_readers(
-    child_id: Option<u32>,
-    stdout_reader: JoinHandle<()>,
-    stderr_reader: JoinHandle<()>,
+fn release_process_pid(
+    entry: &ManagedProcess,
+    supervisor_inner: &std::sync::Weak<SupervisorInner>,
 ) {
-    if !readers_finished_within(&stdout_reader, &stderr_reader, READER_DRAIN_TIMEOUT).await {
-        // A descendant can outlive the direct child while retaining inherited pipe handles. It is
-        // still part of this managed process group, so terminate it before abandoning the readers.
-        process::terminate_process_group_only(child_id);
-        if !readers_finished_within(&stdout_reader, &stderr_reader, READER_DRAIN_GRACE).await {
-            if !stdout_reader.is_finished() {
-                stdout_reader.abort();
-            }
-            if !stderr_reader.is_finished() {
-                stderr_reader.abort();
-            }
-        }
+    clear_pid(entry);
+    let registration = entry
+        .pid_registration
+        .lock()
+        .ok()
+        .and_then(|mut registration| registration.take());
+    if let Some(inner) = supervisor_inner.upgrade() {
+        inner.unregister_pid(registration);
     }
-    let _ = stdout_reader.await;
-    let _ = stderr_reader.await;
 }
 
-async fn readers_finished_within(
-    stdout_reader: &JoinHandle<()>,
-    stderr_reader: &JoinHandle<()>,
-    timeout: Duration,
-) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if stdout_reader.is_finished() && stderr_reader.is_finished() {
-            return true;
-        }
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
-            return false;
-        }
-        tokio::time::sleep(READER_POLL_INTERVAL.min(deadline - now)).await;
+async fn drain_process_readers(stdout_reader: JoinHandle<()>, stderr_reader: JoinHandle<()>) {
+    let mut stdout_reader = stdout_reader;
+    let mut stderr_reader = stderr_reader;
+    // The process group has already been terminated before this point. Join
+    // both pipe readers directly and use one deadline as the only fallback;
+    // polling their completion status adds latency without improving safety.
+    let timed_out = tokio::time::timeout(READER_DRAIN_TIMEOUT, async {
+        let _ = tokio::join!(&mut stdout_reader, &mut stderr_reader);
+    })
+    .await
+    .is_err();
+    if timed_out {
+        stdout_reader.abort();
+        stderr_reader.abort();
+    }
+    // A successful join has already polled both handles to completion. Only
+    // await handles that still have work after the timeout/abort branch.
+    if !stdout_reader.is_finished() {
+        let _ = stdout_reader.await;
+    }
+    if !stderr_reader.is_finished() {
+        let _ = stderr_reader.await;
     }
 }
 
@@ -1032,4 +1391,45 @@ pub(crate) fn default_poll_wait_ms() -> u64 {
 
 pub(crate) fn max_poll_wait_ms() -> u64 {
     MAX_POLL_WAIT_MS
+}
+
+#[cfg(test)]
+pub(crate) fn max_terminal_processes() -> usize {
+    MAX_TERMINAL_PROCESSES
+}
+
+#[cfg(test)]
+impl ProcessSupervisor {
+    pub(crate) async fn retained_pid_for_test(
+        &self,
+        session_id: SessionId,
+        process_id: &str,
+    ) -> Option<u32> {
+        let entry = self.entry(session_id, process_id).await.ok()?;
+        entry.pid.lock().ok().and_then(|guard| *guard)
+    }
+
+    pub(crate) async fn retained_process_count_for_test(&self) -> usize {
+        self.inner.processes.lock().await.len()
+    }
+
+    pub(crate) async fn inject_pid_for_test(
+        &self,
+        session_id: SessionId,
+        process_id: &str,
+        pid: u32,
+    ) -> bool {
+        let Ok(entry) = self.entry(session_id, process_id).await else {
+            return false;
+        };
+        if !entry.state.lock().await.state.is_terminal() {
+            return false;
+        }
+        if let Ok(mut guard) = entry.pid.lock() {
+            *guard = Some(pid);
+        } else {
+            return false;
+        }
+        true
+    }
 }

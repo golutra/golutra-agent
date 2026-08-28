@@ -40,7 +40,6 @@ use std::{
     num::NonZeroU64,
 };
 use tokio::io::AsyncReadExt;
-use tokio::time::{Duration, sleep};
 use uuid::Uuid;
 
 const CLI_ACTOR_ID: &str = "golutra-cli";
@@ -320,6 +319,7 @@ impl From<ExecExecutionModeArg> for AgentExecutionMode {
 enum ExecToolProfileArg {
     Coding,
     Full,
+    None,
 }
 
 impl From<ExecToolProfileArg> for AgentToolProfile {
@@ -327,6 +327,7 @@ impl From<ExecToolProfileArg> for AgentToolProfile {
         match value {
             ExecToolProfileArg::Coding => Self::Coding,
             ExecToolProfileArg::Full => Self::Full,
+            ExecToolProfileArg::None => Self::None,
         }
     }
 }
@@ -2731,18 +2732,23 @@ async fn run_exec(
         .await
         .map_err(|error| miette::miette!("{error}"))?;
 
-    // Leave a recoverable identity/event boundary before consuming the turn.
-    // An external harness can terminate the caller while the runtime is still
-    // working, so a later collector must be able to reopen this run.
-    if let Some(destination) = run_dir.as_ref()
-        && let Err(error) =
-            checkpoint_exec_run_bundle(transport, thread.thread_id(), destination.clone()).await
-    {
-        let _ = handle.interrupt().await;
-        return Err(miette::miette!(
-            "initial runtime data checkpoint failed: {error}"
-        ));
-    }
+    // Leave a recoverable identity/event boundary without delaying the first
+    // provider event. Exporting observations and the redacted debug bundle can
+    // involve large synchronous files; run it beside event consumption and
+    // join before the terminal export so both writers never overlap.
+    let initial_checkpoint = run_dir.as_ref().map(|destination| {
+        let checkpoint_transport = transport.clone();
+        let checkpoint_destination = destination.clone();
+        let checkpoint_thread_id = thread.thread_id();
+        tokio::spawn(async move {
+            checkpoint_exec_run_bundle(
+                &checkpoint_transport,
+                checkpoint_thread_id,
+                checkpoint_destination,
+            )
+            .await
+        })
+    });
 
     let turn_result = async {
         let mut interrupt_requested = false;
@@ -2775,6 +2781,11 @@ async fn run_exec(
             };
             if json_output {
                 println!("{}", serde_json::to_string(&event)?);
+                std::io::stdout().flush().map_err(|error| {
+                    golutra_client::ClientError::Io(format!(
+                        "failed to flush JSON event output: {error}"
+                    ))
+                })?;
             } else {
                 report_exec_progress(&event);
             }
@@ -2809,6 +2820,16 @@ async fn run_exec(
     }
     .await;
 
+    let checkpoint_result = match initial_checkpoint {
+        Some(checkpoint) => match checkpoint.await {
+            Ok(result) => result,
+            Err(error) => Err(golutra_client::ClientError::TaskExecution(format!(
+                "initial runtime data checkpoint task failed: {error}"
+            ))),
+        },
+        None => Ok(()),
+    };
+
     let export_result = if let Some(destination) = run_dir {
         let terminal_outcome = match &turn_result {
             Ok(result) => RunBundleTerminalOutcome::Result {
@@ -2818,7 +2839,23 @@ async fn run_exec(
                 error: error.to_string(),
             },
         };
-        export_exec_run_bundle(transport, thread.thread_id(), destination, terminal_outcome).await
+        let terminal_export =
+            export_exec_run_bundle(transport, thread.thread_id(), destination, terminal_outcome)
+                .await;
+        match checkpoint_result {
+            Ok(()) => terminal_export,
+            Err(checkpoint_error) => match terminal_export {
+                Ok(()) => {
+                    eprintln!(
+                        "initial runtime data checkpoint failed; terminal export recovered the run: {checkpoint_error}"
+                    );
+                    Ok(())
+                }
+                Err(export_error) => Err(golutra_client::ClientError::TaskExecution(format!(
+                    "initial checkpoint failed: {checkpoint_error}; terminal export failed: {export_error}"
+                ))),
+            },
+        }
     } else {
         Ok(())
     };
@@ -2857,6 +2894,8 @@ async fn export_exec_run_bundle(
     terminal_outcome: RunBundleTerminalOutcome,
 ) -> Result<(), golutra_client::ClientError> {
     let receipt = RunBundleExporter::new(transport)
+        // 终态导出是用户可见的交付物，必须包含完整的脱敏 debug-export。
+        // 运行中的 checkpoint 仍走 fast 路径，因此不会拖慢首个 provider 事件。
         .export(RunBundleExportRequest {
             destination: destination.clone(),
             selection: golutra_client::SessionWindowRequest {
@@ -2893,7 +2932,7 @@ async fn checkpoint_exec_run_bundle(
     destination: std::path::PathBuf,
 ) -> Result<(), golutra_client::ClientError> {
     let receipt = RunBundleExporter::new(transport)
-        .checkpoint(RunBundleExportRequest {
+        .checkpoint_fast(RunBundleExportRequest {
             destination: destination.clone(),
             selection: golutra_client::SessionWindowRequest {
                 anchor_thread_id: thread_id,
@@ -3021,11 +3060,38 @@ async fn wait_for_terminal_state(
     transport: &RuntimeTransport,
     session_id: SessionId,
 ) -> miette::Result<serde_json::Value> {
-    let mut interrupt_count = 0_u8;
-    let mut handled_approval = None;
-    let mut reported_auth_required = false;
-    loop {
-        let state = transport
+    fn state_status(state: &serde_json::Value) -> Option<TaskStatus> {
+        state
+            .get("task_status")
+            .and_then(|value| serde_json::from_value::<TaskStatus>(value.clone()).ok())
+    }
+
+    fn status_event(event: &RuntimeEvent) -> bool {
+        matches!(
+            event.event_type,
+            RuntimeEventType::TaskCreated
+                | RuntimeEventType::TurnStarted
+                | RuntimeEventType::TaskCompleted
+                | RuntimeEventType::TaskAbortRequested
+                | RuntimeEventType::TaskAborted
+                | RuntimeEventType::TaskInterrupted
+                | RuntimeEventType::TaskUncertain
+                | RuntimeEventType::TaskReconciled
+                | RuntimeEventType::TaskPaused
+                | RuntimeEventType::TaskResumed
+                | RuntimeEventType::ApprovalRequested
+                | RuntimeEventType::ApprovalResolved
+                | RuntimeEventType::ProviderAuthRequired
+                | RuntimeEventType::ProviderAuthSubmitted
+                | RuntimeEventType::ProviderAuthCancelled
+        )
+    }
+
+    async fn read_state(
+        transport: &RuntimeTransport,
+        session_id: SessionId,
+    ) -> miette::Result<serde_json::Value> {
+        transport
             .query(RuntimeQuery {
                 query_id: golutra_core::QueryId::new(),
                 session_id,
@@ -3036,10 +3102,34 @@ async fn wait_for_terminal_state(
                 timestamp: chrono::Utc::now(),
             })
             .await
-            .map_err(|error| miette::miette!("{error}"))?;
-        let status = state
-            .get("task_status")
-            .and_then(|value| serde_json::from_value::<TaskStatus>(value.clone()).ok());
+            .map_err(|error| miette::miette!("{error}"))
+    }
+
+    let mut interrupt_count = 0_u8;
+    let mut handled_approval = None;
+    let mut reported_auth_required = false;
+    let mut state = read_state(transport, session_id).await?;
+    if state_status(&state).is_some_and(is_terminal_status) {
+        return Ok(state);
+    }
+
+    // Subscribe from the state cursor. The server replays the small race window
+    // between the initial query and subscription, then keeps the connection
+    // live; no periodic status query is needed while the task is running.
+    let cursor = state
+        .get("last_sequence_no")
+        .and_then(serde_json::Value::as_u64);
+    let mut events = transport
+        .subscribe(EventFilter {
+            session_id,
+            task_id: None,
+            after_sequence_no: cursor,
+        })
+        .await
+        .map_err(|error| miette::miette!("{error}"))?;
+
+    loop {
+        let status = state_status(&state);
         if status.is_some_and(is_terminal_status) {
             return Ok(state);
         }
@@ -3072,6 +3162,7 @@ async fn wait_for_terminal_state(
                     ));
                 }
                 handled_approval = Some(approval_id);
+                state = read_state(transport, session_id).await?;
             }
         } else {
             handled_approval = None;
@@ -3088,7 +3179,20 @@ async fn wait_for_terminal_state(
         }
 
         tokio::select! {
-            _ = sleep(Duration::from_millis(100)) => {}
+            event = events.recv() => {
+                match event {
+                    Some(Ok(event)) if status_event(&event) => {
+                        state = read_state(transport, session_id).await?;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => return Err(miette::miette!("{error}")),
+                    None => {
+                        return Err(miette::miette!(
+                            "runtime event stream ended before the task reached a terminal state"
+                        ));
+                    }
+                }
+            }
             signal = tokio::signal::ctrl_c() => {
                 signal.map_err(|error| miette::miette!("failed to listen for Ctrl+C: {error}"))?;
                 if interrupt_count > 0 {

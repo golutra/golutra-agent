@@ -163,7 +163,7 @@ fn replay_contracts_register_without_a_live_external_backend() {
     assert_eq!(
         runtime.registry().capabilities(&external.tool_name),
         Some(&ToolCapabilities {
-            available_in_coding_profile: true,
+            available_in_coding_profile: false,
             parallel_read_safe: false,
             coding_profile_hidden_arguments: Vec::new(),
         })
@@ -238,7 +238,7 @@ impl TaskDelegationBackend for FakeTaskDelegationBackend {
 async fn registry_contains_p0_tools() {
     let registry = ToolRegistry::p0_default();
     let names = registry
-        .contracts()
+        .provider_contracts()
         .into_iter()
         .map(|contract| contract.tool_name.as_str())
         .collect::<Vec<_>>();
@@ -247,25 +247,22 @@ async fn registry_contains_p0_tools() {
         names,
         vec![
             "apply_patch",
-            "ask_user",
             "edit_file",
-            "find_references",
-            "list_dir",
-            "process_list",
-            "process_poll",
-            "process_reconnect",
-            "process_terminate",
-            "process_write",
             "read_file",
-            "rg_search",
             "shell",
-            "symbol_search",
+            "shell_session",
+            "subagent",
+            "web_search",
             "write_file"
         ]
     );
-    let search = registry.contract("rg_search").expect("rg contract");
-    assert_eq!(search.side_effect_type, SideEffectType::None);
-    assert_eq!(search.retry_policy, "retry_allowed");
+    assert!(registry.contract("list_dir").is_some());
+    assert!(registry.provider_contracts().iter().all(|contract| {
+        !matches!(
+            contract.tool_name.as_str(),
+            "list_dir" | "rg_search" | "process_poll" | "ask_user"
+        )
+    }));
 }
 
 #[tokio::test]
@@ -280,7 +277,7 @@ async fn delegated_task_is_registered_only_with_a_backend_and_tracks_workspace_c
         .with_task_delegation_backend(backend.clone())
         .expect("delegation backend registers");
     let request = request(
-        "delegate_task",
+        "subagent",
         json!({
             "task": "inspect and update the delegated fixture",
             "model": "test-model",
@@ -289,12 +286,12 @@ async fn delegated_task_is_registered_only_with_a_backend_and_tracks_workspace_c
     );
     let contract = executor
         .registry()
-        .contract("delegate_task")
+        .contract("subagent")
         .expect("delegation contract");
     assert!(
-        !executor
+        executor
             .registry()
-            .capabilities("delegate_task")
+            .capabilities("subagent")
             .is_some_and(|capabilities| capabilities.available_in_coding_profile)
     );
     assert_eq!(contract.side_effect_type, SideEffectType::Process);
@@ -353,7 +350,7 @@ async fn delegated_task_rejects_invalid_effort_and_can_be_removed_for_children()
         .with_task_delegation_backend(backend.clone())
         .expect("delegation backend registers");
     let invalid = request(
-        "delegate_task",
+        "subagent",
         json!({"task": "inspect", "reasoning_effort": "extreme"}),
     );
     assert!(matches!(
@@ -362,10 +359,10 @@ async fn delegated_task_rejects_invalid_effort_and_can_be_removed_for_children()
     ));
     assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
 
-    let child = executor.without_tool("delegate_task");
-    assert!(child.registry().contract("delegate_task").is_none());
+    let child = executor.without_tool("subagent");
+    assert!(child.registry().contract("subagent").is_none());
     assert!(matches!(
-        child.evaluate(&request("delegate_task", json!({"task": "inspect"}))),
+        child.evaluate(&request("subagent", json!({"task": "inspect"}))),
         Err(ToolError::UnknownTool(_))
     ));
 }
@@ -379,7 +376,7 @@ async fn delegated_task_receives_the_enclosing_runtime_deadline() {
             cancelled: cancelled.clone(),
         }))
         .expect("delegation backend registers");
-    let request = request("delegate_task", json!({"task": "wait for cancellation"}));
+    let request = request("subagent", json!({"task": "wait for cancellation"}));
     let policy = executor.evaluate(&request).expect("delegation policy");
     let deadline = tokio::time::Instant::now() + Duration::from_millis(25);
     let report = tokio::time::timeout(
@@ -430,13 +427,13 @@ fn shell_contract_explains_how_to_submit_compound_commands() {
         .expect("workdir description");
     assert!(timeout.contains("absolute process lifetime"));
     assert!(background.contains("runtime-scoped"));
-    assert!(background.contains("do not use background=true"));
-    assert!(background.contains("platform-appropriate lifecycle mechanism"));
-    assert!(background.contains("verify availability before returning"));
-    assert!(yield_time.contains("initial wait"));
-    assert!(yield_time.contains("does not extend"));
+    assert!(background.contains("stops when the runtime ends"));
+    assert!(background.contains("shell_session"));
+    let yield_time_lower = yield_time.to_ascii_lowercase();
+    assert!(yield_time_lower.contains("initial wait"));
+    assert!(yield_time_lower.contains("does not extend"));
     assert!(workdir.contains("working directory"));
-    assert!(workdir.contains("workspace root"));
+    assert!(workdir.contains("workspace-relative"));
 }
 
 #[tokio::test]
@@ -782,6 +779,166 @@ fn model_visible_tool_result_excludes_governance_and_artifact_metadata() {
     assert!(projection.get("verification_hint").is_none());
     assert!(!serialized.contains("high-risk-internal-value"));
     assert!(!serialized.contains("internal governance hint"));
+    assert!(serialized.len() <= MAX_MODEL_TOOL_RESULT_BYTES);
+}
+
+fn projection_envelope(
+    tool_name: &str,
+    status: ToolResultStatus,
+    summary: &str,
+    structured_facts: Value,
+    model_visible_excerpt: Option<&str>,
+) -> ToolResultEnvelope {
+    ToolResultEnvelope {
+        tool_call_id: ToolCallId::new(),
+        tool_name: tool_name.to_owned(),
+        status,
+        summary: summary.to_owned(),
+        structured_facts,
+        model_visible_excerpt: model_visible_excerpt.map(ToOwned::to_owned),
+        raw_artifact_ref: Some(ArtifactId::new()),
+        evidence_refs: vec![EvidenceId::new()],
+        risk: "internal-only-risk".to_owned(),
+        verification_hint: Some("internal-only-hint".to_owned()),
+    }
+}
+
+#[test]
+fn model_visible_tool_result_projects_provider_tools_without_duplicate_payloads() {
+    let read: Value = serde_json::from_str(&model_visible_tool_result(&projection_envelope(
+        "read_file",
+        ToolResultStatus::Ok,
+        "file read",
+        json!({
+            "path": "src/lib.rs",
+            "bytes": 12,
+            "continuation": {"next_cursor": 12},
+            "content": "duplicate-content",
+            "content_digest": "drop-me",
+        }),
+        Some("file content"),
+    )))
+    .expect("read projection");
+    assert_eq!(read["structured_facts"]["path"], "src/lib.rs");
+    assert_eq!(read["structured_facts"]["continuation"]["next_cursor"], 12);
+    assert!(read["structured_facts"].get("content").is_none());
+    assert!(read["structured_facts"].get("content_digest").is_none());
+    assert_eq!(read["model_visible_excerpt"], "file content");
+    assert!(read.get("summary").is_none());
+
+    let mutation: Value = serde_json::from_str(&model_visible_tool_result(&projection_envelope(
+        "apply_patch",
+        ToolResultStatus::Ok,
+        "patch applied",
+        json!({
+            "changed_files": ["src/lib.rs"],
+            "changed_file_count": 1,
+            "patch_digest": "drop-me",
+            "summary": "drop-me-too",
+        }),
+        Some("the full patch output is durable"),
+    )))
+    .expect("mutation projection");
+    assert_eq!(mutation["structured_facts"]["changed_file_count"], 1);
+    assert!(mutation["structured_facts"].get("patch_digest").is_none());
+    assert_eq!(mutation["summary"], "patch applied");
+    assert!(mutation.get("model_visible_excerpt").is_none());
+
+    let shell: Value = serde_json::from_str(&model_visible_tool_result(&projection_envelope(
+        "shell_session",
+        ToolResultStatus::Ok,
+        "background process is running",
+        json!({
+            "process_id": "proc-1",
+            "process_state": "running",
+            "output_cursor": 42,
+            "exit_code": null,
+            "command": "drop-command",
+        }),
+        Some("new output"),
+    )))
+    .expect("shell projection");
+    assert_eq!(shell["structured_facts"]["process_id"], "proc-1");
+    assert_eq!(shell["structured_facts"]["output_cursor"], 42);
+    assert!(shell["structured_facts"].get("command").is_none());
+    assert_eq!(shell["model_visible_excerpt"], "new output");
+    assert!(shell.get("summary").is_none());
+
+    let search: Value = serde_json::from_str(&model_visible_tool_result(&projection_envelope(
+        "web_search",
+        ToolResultStatus::Ok,
+        "web search returned 1 results",
+        json!({
+            "query": "rust async",
+            "results": [{
+                "title": "Rust",
+                "url": "https://example.com",
+                "snippet": "useful",
+                "summary": "drop-duplicate",
+            }],
+            "source": "drop-source",
+        }),
+        Some("web search returned 1 results"),
+    )))
+    .expect("search projection");
+    assert_eq!(search["structured_facts"]["query"], "rust async");
+    assert_eq!(search["structured_facts"]["results"][0]["title"], "Rust");
+    assert!(
+        search["structured_facts"]["results"][0]
+            .get("summary")
+            .is_none()
+    );
+    assert!(search["structured_facts"].get("source").is_none());
+    assert!(search.get("summary").is_none());
+    assert!(search.get("model_visible_excerpt").is_none());
+
+    let child: Value = serde_json::from_str(&model_visible_tool_result(&projection_envelope(
+        "subagent",
+        ToolResultStatus::Ok,
+        "child completed",
+        json!({
+            "task": "drop-task",
+            "effective_model": "drop-model",
+            "child_status": "completed",
+            "workspace_change_count": 0,
+        }),
+        Some("child facts and content"),
+    )))
+    .expect("subagent projection");
+    assert_eq!(child["structured_facts"]["child_status"], "completed");
+    assert_eq!(child["structured_facts"]["workspace_change_count"], 0);
+    assert!(child["structured_facts"].get("task").is_none());
+    assert!(child["structured_facts"].get("effective_model").is_none());
+    assert_eq!(child["summary"], "child completed");
+    assert_eq!(child["model_visible_excerpt"], "child facts and content");
+}
+
+#[test]
+fn model_visible_tool_result_keeps_failure_facts_and_size_bound() {
+    let envelope = projection_envelope(
+        "shell",
+        ToolResultStatus::Timeout,
+        "process timed out while waiting for output",
+        json!({
+            "timed_out": true,
+            "exit_code": null,
+            "reason": "deadline exceeded",
+            "output": "x".repeat(64 * 1024),
+        }),
+        Some(&"partial output ".repeat(8 * 1024)),
+    );
+    let serialized = model_visible_tool_result(&envelope);
+    let projection: Value = serde_json::from_str(&serialized).expect("failure projection");
+    assert_eq!(projection["status"], "timeout");
+    assert_eq!(projection["structured_facts"]["timed_out"], true);
+    assert_eq!(
+        projection["structured_facts"]["reason"],
+        "deadline exceeded"
+    );
+    assert_eq!(
+        projection["summary"],
+        "process timed out while waiting for output"
+    );
     assert!(serialized.len() <= MAX_MODEL_TOOL_RESULT_BYTES);
 }
 
@@ -2001,6 +2158,11 @@ async fn background_process_supports_cursor_reconnect_stdin_and_terminal_diff() 
         start.envelope.structured_facts["survives_runtime_exit"],
         false
     );
+    assert_eq!(start.envelope.structured_facts["terminal"], false);
+    assert_eq!(
+        start.envelope.structured_facts["wait_strategy"],
+        "event_driven_cursor"
+    );
     assert!(start.envelope.summary.contains("post-runtime consumers"));
     assert!(start.envelope.summary.contains("detached process"));
     let process_id = start.envelope.structured_facts["process_id"]
@@ -2010,6 +2172,14 @@ async fn background_process_supports_cursor_reconnect_stdin_and_terminal_diff() 
     let first_cursor = start.envelope.structured_facts["output_cursor"]
         .as_u64()
         .expect("output cursor");
+    assert_eq!(
+        start.envelope.structured_facts["next_action"]["tool"],
+        "shell_session"
+    );
+    assert_eq!(
+        start.envelope.structured_facts["next_action"]["cursor"],
+        first_cursor
+    );
     assert!(first_cursor > 0);
     assert!(artifact_text(&start).contains("first"));
 
@@ -2095,11 +2265,107 @@ async fn background_process_supports_cursor_reconnect_stdin_and_terminal_diff() 
         terminal.envelope.structured_facts["survives_runtime_exit"],
         false
     );
+    assert_eq!(terminal.envelope.structured_facts["terminal"], true);
+    assert_eq!(
+        terminal.envelope.structured_facts["next_action"]["kind"],
+        "terminal"
+    );
     assert!(
         terminal
             .changed_files
             .iter()
             .any(|path| path.ends_with("background.txt"))
+    );
+}
+
+#[tokio::test]
+async fn shell_session_unifies_event_wait_write_and_terminate() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(
+        workspace.path().join("session.sh"),
+        "printf 'ready\\n'\nread value\nprintf 'received:%s\\n' \"$value\"\n",
+    )
+    .expect("session script");
+    let executor = executor(workspace.path());
+    let session_id = SessionId::new();
+    let start = execute_approved(
+        &executor,
+        request_for_session(
+            session_id,
+            "shell",
+            json!({
+                "command": "sh session.sh",
+                "background": true,
+                "yield_time_ms": 1_000,
+            }),
+        ),
+        CancellationToken::new(),
+    )
+    .await;
+    let process_id = start.envelope.structured_facts["process_id"]
+        .as_str()
+        .expect("process id")
+        .to_owned();
+    let cursor = start.envelope.structured_facts["output_cursor"]
+        .as_u64()
+        .expect("cursor");
+    let waited = executor
+        .execute(
+            request_for_session(
+                session_id,
+                "shell_session",
+                json!({
+                    "action": "wait",
+                    "process_id": process_id,
+                    "cursor": cursor,
+                    "wait_ms": 0,
+                }),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("session wait");
+    assert_eq!(waited.envelope.structured_facts["process_state"], "running");
+    let next_cursor = waited.envelope.structured_facts["output_cursor"]
+        .as_u64()
+        .expect("next cursor");
+    let written = executor
+        .execute(
+            request_for_session(
+                session_id,
+                "shell_session",
+                json!({
+                    "action": "write",
+                    "process_id": process_id,
+                    "cursor": next_cursor,
+                    "input": "done\n",
+                    "wait_ms": 1_000,
+                }),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("session write");
+    assert!(artifact_text(&written).contains("received:done"));
+    let terminal = executor
+        .execute(
+            request_for_session(
+                session_id,
+                "shell_session",
+                json!({
+                    "action": "wait",
+                    "process_id": process_id,
+                    "cursor": written.envelope.structured_facts["output_cursor"],
+                    "wait_ms": 1_000,
+                }),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("session terminal wait");
+    assert_eq!(
+        terminal.envelope.structured_facts["process_state"],
+        "exited"
     );
 }
 
@@ -2345,6 +2611,274 @@ async fn process_supervisor_can_terminate_all_running_session_processes() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn process_supervisor_clears_pid_after_reaching_terminal_state() {
+    let workspace = tempdir().expect("workspace");
+    let supervisor = ProcessSupervisor::new();
+    let sandbox = SystemSandbox::process_only();
+    let session_id = SessionId::new();
+    let args = vec!["-c".to_owned(), "printf ready\\n; exit 0".to_owned()];
+    let workspace_before = workspace_scan::capture(workspace.path()).await;
+    let started = supervisor
+        .start(ProcessStartRequest {
+            process_id: "clear-pid".to_owned(),
+            session_id,
+            program: "/bin/sh",
+            args: &args,
+            command_display: "clear pid fixture".to_owned(),
+            cwd: workspace.path(),
+            workspace_root: workspace.path(),
+            timeout_ms: 5_000,
+            wait_ms: 1_000,
+            cancellation: CancellationToken::new(),
+            sandbox: &sandbox,
+            workspace_access: WorkspaceAccess::ReadWrite,
+            allow_network: false,
+            workspace_before,
+        })
+        .await
+        .expect("process starts");
+    let terminal = if started.state.is_terminal() {
+        started
+    } else {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            supervisor.poll(session_id, "clear-pid", started.output_cursor, 2_000),
+        )
+        .await
+        .expect("wait for terminal remains bounded")
+        .expect("process reaches terminal")
+    };
+    assert!(terminal.state.is_terminal());
+    assert_eq!(
+        supervisor
+            .retained_pid_for_test(session_id, "clear-pid")
+            .await,
+        None,
+        "terminal processes must release their OS PID handle"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_supervisor_terminal_terminate_does_not_signal_stale_pid() {
+    let workspace = tempdir().expect("workspace");
+    let supervisor = ProcessSupervisor::new();
+    let sandbox = SystemSandbox::process_only();
+    let session_id = SessionId::new();
+    let args = vec!["-c".to_owned(), "printf ready\\n; exit 0".to_owned()];
+    let workspace_before = workspace_scan::capture(workspace.path()).await;
+    let started = supervisor
+        .start(ProcessStartRequest {
+            process_id: "stale-pid".to_owned(),
+            session_id,
+            program: "/bin/sh",
+            args: &args,
+            command_display: "stale pid fixture".to_owned(),
+            cwd: workspace.path(),
+            workspace_root: workspace.path(),
+            timeout_ms: 5_000,
+            wait_ms: 1_000,
+            cancellation: CancellationToken::new(),
+            sandbox: &sandbox,
+            workspace_access: WorkspaceAccess::ReadWrite,
+            allow_network: false,
+            workspace_before,
+        })
+        .await
+        .expect("process starts");
+    let terminal = if started.state.is_terminal() {
+        started
+    } else {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            supervisor.poll(session_id, "stale-pid", started.output_cursor, 2_000),
+        )
+        .await
+        .expect("wait for terminal remains bounded")
+        .expect("process reaches terminal")
+    };
+    assert!(terminal.state.is_terminal());
+    assert_eq!(
+        supervisor
+            .retained_pid_for_test(session_id, "stale-pid")
+            .await,
+        None
+    );
+
+    // Bait: a live unrelated process. If terminate() still signals the injected
+    // PID after terminal publication, this child will die.
+    let mut bait = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn bait process");
+    let bait_pid = bait.id();
+    assert!(
+        supervisor
+            .inject_pid_for_test(session_id, "stale-pid", bait_pid)
+            .await,
+        "terminal entry accepts injected stale pid for the regression"
+    );
+
+    let after_terminate = supervisor
+        .terminate(session_id, "stale-pid", terminal.output_cursor)
+        .await
+        .expect("terminate on terminal process remains idempotent");
+    assert!(after_terminate.state.is_terminal());
+
+    let bait_status = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &bait_pid.to_string()])
+        .output()
+        .expect("inspect bait status");
+    let bait_is_running = bait_status.status.success()
+        && String::from_utf8_lossy(&bait_status.stdout)
+            .lines()
+            .any(|line| !line.trim().is_empty() && !line.trim_start().starts_with('Z'));
+    let _ = bait.kill();
+    let _ = bait.wait();
+    assert!(
+        bait_is_running,
+        "terminate after terminal must not signal a stale/recycled PID"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_supervisor_caps_retained_terminal_process_memory() {
+    let workspace = tempdir().expect("workspace");
+    let supervisor = ProcessSupervisor::new();
+    let sandbox = SystemSandbox::process_only();
+    let session_id = SessionId::new();
+    let limit = max_terminal_processes();
+    for index in 0..(limit + 4) {
+        let process_id = format!("terminal-cap-{index}");
+        let args = vec!["-c".to_owned(), format!("printf '{index}\\n'; exit 0")];
+        let workspace_before = workspace_scan::capture(workspace.path()).await;
+        let process_id_for_poll = process_id.clone();
+        let started = supervisor
+            .start(ProcessStartRequest {
+                process_id,
+                session_id,
+                program: "/bin/sh",
+                args: &args,
+                command_display: format!("terminal cap fixture {index}"),
+                cwd: workspace.path(),
+                workspace_root: workspace.path(),
+                timeout_ms: 5_000,
+                wait_ms: 1_000,
+                cancellation: CancellationToken::new(),
+                sandbox: &sandbox,
+                workspace_access: WorkspaceAccess::ReadWrite,
+                allow_network: false,
+                workspace_before,
+            })
+            .await
+            .expect("terminal process starts");
+        let terminal = if started.state.is_terminal() {
+            started
+        } else {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                supervisor.poll(
+                    session_id,
+                    &process_id_for_poll,
+                    started.output_cursor,
+                    2_000,
+                ),
+            )
+            .await
+            .expect("wait for terminal remains bounded")
+            .expect("process reaches terminal")
+        };
+        assert!(terminal.state.is_terminal());
+    }
+    // list() prunes before reading, so the post-insert overflow from the final
+    // start is trimmed before we assert the retention cap.
+    let listed = supervisor.list(session_id).await;
+    let retained = supervisor.retained_process_count_for_test().await;
+    assert!(
+        retained <= limit,
+        "retained terminal processes {retained} exceeded cap {limit}"
+    );
+    assert_eq!(listed.len(), retained);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_supervisor_terminate_session_eagerly_kills_descendants() {
+    let workspace = tempdir().expect("workspace");
+    let supervisor = ProcessSupervisor::new();
+    let sandbox = SystemSandbox::process_only();
+    let session_id = SessionId::new();
+    let args = vec![
+        "-c".to_owned(),
+        "sleep 30 & child=$!; printf 'child=%s\\n' \"$child\"; wait".to_owned(),
+    ];
+    let workspace_before = workspace_scan::capture(workspace.path()).await;
+    let started = tokio::time::timeout(
+        Duration::from_secs(2),
+        supervisor.start(ProcessStartRequest {
+            process_id: "terminate-session-descendant".to_owned(),
+            session_id,
+            program: "/bin/sh",
+            args: &args,
+            command_display: "terminate session descendant fixture".to_owned(),
+            cwd: workspace.path(),
+            workspace_root: workspace.path(),
+            timeout_ms: 30_000,
+            wait_ms: 1_000,
+            cancellation: CancellationToken::new(),
+            sandbox: &sandbox,
+            workspace_access: WorkspaceAccess::ReadWrite,
+            allow_network: false,
+            workspace_before,
+        }),
+    )
+    .await
+    .expect("process start remains bounded")
+    .expect("process starts");
+    assert_eq!(started.state, ProcessState::Running);
+    let child_pid = started
+        .output
+        .lines()
+        .find_map(|line| line.strip_prefix("child=")?.trim().parse::<i32>().ok())
+        .expect("descendant pid is reported");
+
+    let terminated = tokio::time::timeout(
+        Duration::from_secs(2),
+        supervisor.terminate_session(session_id),
+    )
+    .await
+    .expect("terminate_session remains bounded")
+    .expect("session processes terminate");
+    assert_eq!(terminated, 1);
+
+    let terminal = supervisor
+        .reconnect(session_id, "terminate-session-descendant", 0)
+        .await
+        .expect("terminal process remains queryable");
+    assert!(terminal.state.is_terminal());
+    let descendant_status = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &child_pid.to_string()])
+        .output()
+        .expect("inspect descendant status");
+    let descendant_is_running = descendant_status.status.success()
+        && String::from_utf8_lossy(&descendant_status.stdout)
+            .lines()
+            .any(|line| !line.trim().is_empty() && !line.trim_start().starts_with('Z'));
+    assert!(
+        !descendant_is_running,
+        "managed descendant survived terminate_session"
+    );
+    assert_eq!(
+        supervisor
+            .retained_pid_for_test(session_id, "terminate-session-descendant")
+            .await,
+        None
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn process_supervisor_shutdown_waits_for_terminal_bookkeeping_and_descendants() {
     let workspace = tempdir().expect("workspace");
     let supervisor = ProcessSupervisor::new();
@@ -2394,6 +2928,11 @@ async fn process_supervisor_shutdown_waits_for_terminal_bookkeeping_and_descenda
         .await
         .expect("terminal process remains queryable");
     assert!(terminal.state.is_terminal());
+    assert_eq!(
+        terminal.state,
+        ProcessState::Cancelled,
+        "supervisor shutdown must preserve its cancellation reason"
+    );
     let descendant_status = std::process::Command::new("ps")
         .args(["-o", "stat=", "-p", &child_pid.to_string()])
         .output()

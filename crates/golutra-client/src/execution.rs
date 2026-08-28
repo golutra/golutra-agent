@@ -1,11 +1,36 @@
 //! Context construction, task supervision, AgentLoop, and provider auth lifecycles.
 
 use super::*;
+use golutra_context::{estimate_tokens, structured_compaction_summary};
 use golutra_llm::ProviderGenerationConfig;
 use tokio::{runtime::Handle, task::JoinHandle};
 
 const ABNORMAL_RECORDER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const HOST_SHUTDOWN_GRACE_TIMEOUT: Duration = Duration::from_millis(250);
+const BACKGROUND_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const MEMORY_CANDIDATE_MIN: usize = 8;
+const MEMORY_CANDIDATE_MAX: usize = 64;
+// memory 与 skill 是按需证据，使用绝对上限防止它们挤占持续增长的会话历史；
+// 上限不是预留配额，未命中或未用完的 token 会全部回流给活动历史。
+const MAX_MEMORY_CONTEXT_TOKENS: u64 = 1_024;
+const MAX_SKILL_CONTEXT_TOKENS: u64 = 1_024;
+// compaction 保存旧事实，最近尾部保存当前工作状态；绝对边界避免随大窗口膨胀，
+// 同时让 summary 未用额度继续留给最近历史。
+const MIN_RECENT_HISTORY_TOKENS: u64 = 1_024;
+const MAX_WORKING_SUMMARY_TOKENS: u64 = 2_048;
+const ACTIVE_PATH_COMPACTION_MAX_DEPTH: u32 = 65_536;
+
+fn memory_candidate_limit(context_budget: u64) -> usize {
+    if context_budget == 0 {
+        return 0;
+    }
+    if context_budget == u64::MAX {
+        return MEMORY_CANDIDATE_MAX;
+    }
+    usize::try_from(context_budget.saturating_div(32))
+        .unwrap_or(MEMORY_CANDIDATE_MAX)
+        .clamp(MEMORY_CANDIDATE_MIN, MEMORY_CANDIDATE_MAX)
+}
 
 struct AbortOnDropJoinHandle<T> {
     handle: Option<JoinHandle<T>>,
@@ -103,6 +128,12 @@ impl RuntimeHost {
         // The guard is released before waiting for supervisors because delegated cleanup can
         // issue an internal archive command.
         self.cancel_active_work().await;
+        // A queued governance request is represented by the durable terminal event and can be
+        // recreated by the next host. Shutdown must not wait for a request that is being dropped
+        // together with the worker.
+        self.execution
+            .post_task_schedule_pending
+            .store(0, Ordering::SeqCst);
         drop(command_guard);
         if !self.wait_for_active_work_until(deadline).await {
             // A stuck worker must not keep a host-owned delegation task alive
@@ -132,6 +163,7 @@ impl RuntimeHost {
             }
             self.execution.delegation_admissions.lock().await.clear();
             self.execution.delegation_operations.lock().await.clear();
+            self.signal_active_work_change();
 
             if !self
                 .wait_for_active_work_until(Instant::now() + HOST_SHUTDOWN_GRACE_TIMEOUT)
@@ -140,6 +172,35 @@ impl RuntimeHost {
                 failures.push("runtime task supervisors did not finish shutdown".to_owned());
             }
         }
+
+        let post_task_worker = {
+            let mut worker = self
+                .execution
+                .post_task_worker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            worker.take()
+        };
+        if let Some(worker) = post_task_worker {
+            let mut worker = worker;
+            match tokio::time::timeout(BACKGROUND_WORKER_SHUTDOWN_TIMEOUT, &mut worker).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) if error.is_cancelled() => {}
+                Ok(Err(error)) => {
+                    failures.push(format!("post-task worker stopped unexpectedly: {error}"))
+                }
+                Err(_) => {
+                    worker.abort();
+                    let _ = worker.await;
+                    failures.push("post-task worker did not finish shutdown".to_owned());
+                }
+            }
+        }
+
+        self.execution
+            .post_task_schedule_pending
+            .store(0, Ordering::SeqCst);
+        self.signal_active_work_change();
 
         if failures.is_empty() {
             Ok(())
@@ -175,6 +236,11 @@ impl RuntimeHost {
 
     async fn wait_for_active_work_until(&self, deadline: Instant) -> bool {
         loop {
+            let notification = self.execution.active_work_notify.notified();
+            tokio::pin!(notification);
+            // Register before inspecting the maps so a completion between the
+            // check and await cannot leave shutdown asleep until its deadline.
+            notification.as_mut().enable();
             let tasks_active = !self.execution.task_controls.lock().await.is_empty();
             let operations_active = {
                 let mut operations = self.execution.delegation_operations.lock().await;
@@ -187,7 +253,12 @@ impl RuntimeHost {
             if Instant::now() >= deadline {
                 return false;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::select! {
+                _ = &mut notification => {}
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                    return false;
+                }
+            }
         }
     }
 }
@@ -262,12 +333,31 @@ impl Drop for HostedObservationRecorder {
 }
 
 impl RuntimeHost {
+    #[cfg(test)]
     pub(super) async fn context_contributors_for_task(
         &self,
         session_id: SessionId,
         current_task_id: TaskId,
         objective: String,
         output_schema: Option<&Value>,
+    ) -> Result<Vec<ContextContributor>, ClientError> {
+        self.context_contributors_for_task_with_budget(
+            session_id,
+            current_task_id,
+            objective,
+            output_schema,
+            u64::MAX,
+        )
+        .await
+    }
+
+    pub(super) async fn context_contributors_for_task_with_budget(
+        &self,
+        session_id: SessionId,
+        current_task_id: TaskId,
+        objective: String,
+        output_schema: Option<&Value>,
+        context_budget: u64,
     ) -> Result<Vec<ContextContributor>, ClientError> {
         let workspace_root = self.execution_workspace_root()?;
         let mut contributors = vec![ContextContributor {
@@ -284,8 +374,27 @@ impl RuntimeHost {
             token_budget_hint: 128,
             source_refs: vec![format!("workspace:{}", workspace_root.display())],
         });
-        if let Some(project_instructions) = load_project_instruction_bundle(&workspace_root).await?
-        {
+        let project_instructions = self.cached_project_instruction_bundle(&workspace_root);
+        let skill_context =
+            self.active_skill_context_with_budget(&objective, MAX_SKILL_CONTEXT_TOKENS);
+
+        // 四路来源互不依赖且只读取已有状态，并行加载可把首次 provider 请求
+        // 的准备时间收敛到最慢一路；MemoryRetrieved 仍在选择完成后有序落库。
+        let memory_store = self.storage.memory_store.clone();
+        let memory_query = objective.clone();
+        let memory_limit = memory_candidate_limit(context_budget.min(MAX_MEMORY_CONTEXT_TOKENS));
+        let memories = async move {
+            run_blocking(move || {
+                memory_store.retrieve(&memory_query, MemoryScope::Project, memory_limit)
+            })
+            .await?
+            .map_err(ClientError::from)
+        };
+        let history = self.cached_history_events(session_id);
+        let (project_instructions, skill_context, memories, history) =
+            tokio::join!(project_instructions, skill_context, memories, history);
+        let history = history?;
+        if let Some(project_instructions) = project_instructions? {
             contributors.push(ContextContributor {
                 name: "project_instructions".to_owned(),
                 role: ProviderRole::System,
@@ -294,153 +403,436 @@ impl RuntimeHost {
                 source_refs: project_instructions.source_refs,
             });
         }
-        if let Some(skill_context) = self.active_skill_context(&objective).await? {
+
+        let objective_contributor = ContextContributor {
+            name: "objective".to_owned(),
+            role: ProviderRole::User,
+            content: objective,
+            token_budget_hint: 0,
+            source_refs: vec![format!("task:{current_task_id}:objective")],
+        };
+        let output_schema_contributor = output_schema
+            .filter(|value| !value.is_null())
+            .map(|output_schema| {
+                let schema = serde_json::to_string(output_schema)?;
+                Ok::<_, ClientError>(ContextContributor {
+                    name: "output_schema".to_owned(),
+                    role: ProviderRole::User,
+                    content: format!(
+                        "The final assistant response must contain only JSON that validates against this JSON Schema. Do not wrap it in Markdown:\n{schema}"
+                    ),
+                    token_budget_hint: 0,
+                    source_refs: vec![format!("task:{current_task_id}:output_schema")],
+                })
+            })
+            .transpose()?;
+        let mandatory_tokens = contributors
+            .iter()
+            .chain(std::iter::once(&objective_contributor))
+            .chain(output_schema_contributor.iter())
+            .fold(0_u64, |total, contributor| {
+                total.saturating_add(estimate_tokens(&contributor.content))
+            });
+        let mut remaining_budget = context_budget.saturating_sub(mandatory_tokens);
+        let recent_history_reserve = self.conversation_history_recent_reserve(
+            session_id,
+            current_task_id,
+            history.as_ref(),
+            remaining_budget,
+        );
+        let mut optional_budget = remaining_budget.saturating_sub(recent_history_reserve);
+
+        let memories = select_memories_for_context_with_budget(
+            memories?,
+            optional_budget.min(MAX_MEMORY_CONTEXT_TOKENS),
+        );
+        let memory_contributor = (!memories.is_empty()).then(|| ContextContributor {
+            name: "memory".to_owned(),
+            // memory 是每个任务变化的证据，把它放在 user context，避免
+            // rust-genai 将动态内容拼进静态 system prompt，破坏前缀缓存。
+            role: ProviderRole::User,
+            content: memory_context_with_budget(
+                &memories,
+                optional_budget.min(MAX_MEMORY_CONTEXT_TOKENS),
+            ),
+            token_budget_hint: 0,
+            source_refs: memories
+                .iter()
+                .map(|memory| format!("memory:{}", memory.record.memory_id))
+                .collect(),
+        });
+        if let Some(memory) = memory_contributor.as_ref() {
+            let memory_tokens = estimate_tokens(&memory.content);
+            optional_budget = optional_budget.saturating_sub(memory_tokens);
+            remaining_budget = remaining_budget.saturating_sub(memory_tokens);
+        }
+
+        let skill_context = skill_context?
+            .map(|content| {
+                truncate_to_token_budget(&content, optional_budget.min(MAX_SKILL_CONTEXT_TOKENS))
+            })
+            .filter(|content| !content.is_empty());
+        if let Some(skill_context) = skill_context.as_ref() {
+            let skill_tokens = estimate_tokens(skill_context);
+            remaining_budget = remaining_budget.saturating_sub(skill_tokens);
+        }
+
+        let history = self.conversation_history_projection(
+            session_id,
+            current_task_id,
+            history.as_ref(),
+            remaining_budget,
+            recent_history_reserve,
+        );
+        // 没有命中时不写空的 durable 事件。空检索是正常路径，绕过 SQLite、
+        // rollout 和通知写入可以把首个 provider 请求留在纯读取热路径上。
+        if !memories.is_empty() {
+            self.record_event(host_event(
+                self.next_sequence_no(),
+                session_id,
+                Some(current_task_id),
+                RuntimeEventType::MemoryRetrieved,
+                RuntimeEventSource::Memory,
+                json!({
+                    "summary": format!("retrieved {} project memories", memories.len()),
+                    "scope": "project",
+                    // durable event 只保留可审计的索引元数据，记忆正文仍只进入当前模型上下文。
+                    "retrieved": memories.iter().map(|memory| json!({
+                        "memory_id": memory.record.memory_id,
+                        "relevance_score": memory.relevance_score,
+                        "scope": memory.record.scope,
+                        "confidence": memory.record.confidence,
+                        "source_task_id": memory.record.source_task_id,
+                        "evidence_ids": memory.record.evidence_ids,
+                        "matched_term_count": memory.matched_terms.len(),
+                    })).collect::<Vec<_>>(),
+                }),
+            ))
+            .await?;
+        }
+        // 历史是会话中唯一持续增长的前缀；放在每任务变化的 memory 之前，
+        // 让 provider 可以复用从 system/project 到历史的连续 cache prefix。
+        contributors.extend(history);
+        if let Some(memory) = memory_contributor {
+            contributors.push(memory);
+        }
+
+        contributors.push(objective_contributor);
+
+        // skill 选择依赖当前目标，因此保留在动态 user 段，避免无关任务变化
+        // 破坏 system/project 稳定前缀。
+        if let Some(skill_context) = skill_context {
             contributors.push(ContextContributor {
                 name: "project_skills".to_owned(),
-                role: ProviderRole::System,
+                role: ProviderRole::User,
                 content: skill_context,
                 token_budget_hint: 1_024,
                 source_refs: vec!["runtime:active_skills".to_owned()],
             });
         }
 
-        let memory_store = self.storage.memory_store.clone();
-        let memory_query = objective.clone();
-        let memories =
-            run_blocking(move || memory_store.retrieve(&memory_query, MemoryScope::Project, 5))
-                .await??;
-        let memories = select_memories_for_context(memories);
-        self.record_event(host_event(
-            self.next_sequence_no(),
-            session_id,
-            Some(current_task_id),
-            RuntimeEventType::MemoryRetrieved,
-            RuntimeEventSource::Memory,
-            json!({
-                "summary": format!("retrieved {} project memories", memories.len()),
-                "scope": "project",
-                // durable event 只保留可审计的索引元数据，记忆正文仍只进入当前模型上下文。
-                "retrieved": memories.iter().map(|memory| json!({
-                    "memory_id": memory.record.memory_id,
-                    "relevance_score": memory.relevance_score,
-                    "scope": memory.record.scope,
-                    "confidence": memory.record.confidence,
-                    "source_task_id": memory.record.source_task_id,
-                    "evidence_ids": memory.record.evidence_ids,
-                    "matched_term_count": memory.matched_terms.len(),
-                })).collect::<Vec<_>>(),
-            }),
-        ))
-        .await?;
-        if !memories.is_empty() {
-            contributors.push(ContextContributor {
-                name: "memory".to_owned(),
-                role: ProviderRole::System,
-                content: memory_context(&memories),
-                token_budget_hint: 512,
-                source_refs: memories
-                    .iter()
-                    .map(|memory| format!("memory:{}", memory.record.memory_id))
-                    .collect(),
-            });
+        // schema 也是任务局部内容，放在动态段末尾以保护可复用前缀。
+        if let Some(output_schema) = output_schema_contributor {
+            contributors.push(output_schema);
         }
-
-        if let Some((history, source_refs)) = self
-            .conversation_history_summary(session_id, current_task_id)
-            .await?
-        {
-            contributors.push(ContextContributor {
-                name: "conversation_history".to_owned(),
-                role: ProviderRole::User,
-                content: history,
-                token_budget_hint: 1024,
-                source_refs,
-            });
-        }
-
-        if let Some(output_schema) = output_schema.filter(|value| !value.is_null()) {
-            let schema = serde_json::to_string(output_schema)?;
-            contributors.push(ContextContributor {
-                name: "output_schema".to_owned(),
-                role: ProviderRole::System,
-                content: format!(
-                    "The final assistant response must contain only JSON that validates against this JSON Schema. Do not wrap it in Markdown:\n{schema}"
-                ),
-                token_budget_hint: 1_024,
-                source_refs: vec![format!("task:{current_task_id}:output_schema")],
-            });
-        }
-
-        contributors.push(ContextContributor {
-            name: "objective".to_owned(),
-            role: ProviderRole::User,
-            content: objective,
-            token_budget_hint: 512,
-            source_refs: vec![format!("task:{current_task_id}:objective")],
-        });
 
         Ok(contributors)
     }
 
-    pub(super) async fn conversation_history_summary(
+    /// 最近历史保存当前工作状态，必须先于 memory/skill 获得有限预算。
+    /// 这里只投影最多一个 reserve 的尾部，避免为预算决策扫描或复制整段历史。
+    fn conversation_history_recent_reserve(
         &self,
         session_id: SessionId,
         current_task_id: TaskId,
-    ) -> Result<Option<(String, Vec<String>)>, ClientError> {
-        let events = self
-            .storage
-            .repositories
-            .events
-            .load_recent(session_id, None, None, MAX_HISTORY_SOURCE_EVENTS)
-            .await?;
-        let context_compaction = self
-            .storage
-            .repositories
-            .events
-            .latest_context_compaction(session_id)
-            .await?
+        cached_events: &[RuntimeEvent],
+        available_budget: u64,
+    ) -> u64 {
+        let reserve_cap = available_budget.min(MIN_RECENT_HISTORY_TOKENS);
+        if reserve_cap == 0 {
+            return 0;
+        }
+        let compacted_after = self
+            .execution
+            .context_resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .history_compaction(session_id)
+            .map(|(sequence_no, _)| sequence_no)
+            .unwrap_or_default();
+        let cached_facts = self
+            .execution
+            .context_resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .history_facts(session_id);
+        if let Some(facts) = cached_facts.as_ref() {
+            let mut reserved = 0_u64;
+            for fact in facts.iter().rev().filter(|fact| {
+                fact.sequence_no > compacted_after && fact.task_id != Some(current_task_id)
+            }) {
+                reserved = reserved
+                    .saturating_add(estimate_tokens(&fact.contributor.content))
+                    .min(reserve_cap);
+                if reserved == reserve_cap {
+                    break;
+                }
+            }
+            return reserved;
+        }
+
+        history_contributors_with_budget(
+            cached_events.iter().filter(|event| {
+                event.sequence_no > compacted_after && event.task_id != Some(current_task_id)
+            }),
+            reserve_cap,
+        )
+        .iter()
+        .fold(0_u64, |total, contributor| {
+            total.saturating_add(estimate_tokens(&contributor.content))
+        })
+        .min(reserve_cap)
+    }
+
+    async fn cached_project_instruction_bundle(
+        &self,
+        workspace_root: &Path,
+    ) -> Result<Option<ProjectInstructionBundle>, ClientError> {
+        let canonical_root = workspace_root
+            .canonicalize()
+            .map_err(|error| ClientError::Io(format!("{}: {error}", workspace_root.display())))?;
+        if let Some(bundle) = self
+            .execution
+            .context_resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .project_instructions
             .as_ref()
-            .and_then(context_compaction_from_event);
-        let compacted_after = context_compaction
+            .filter(|cached| {
+                cached.root == canonical_root
+                    && cached.checked_at.elapsed()
+                        < super::context::PROJECT_INSTRUCTIONS_REFRESH_INTERVAL
+            })
+            .map(|cached| cached.bundle.clone())
+        {
+            return Ok(bundle);
+        }
+        let (_, fingerprint) = project_instruction_fingerprint(&canonical_root).await?;
+        {
+            let mut resources = self
+                .execution
+                .context_resources
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cached) = resources
+                .project_instructions
+                .as_mut()
+                .filter(|cached| cached.root == canonical_root && cached.fingerprint == fingerprint)
+            {
+                cached.checked_at = Instant::now();
+                return Ok(cached.bundle.clone());
+            }
+        }
+        let bundle = load_project_instruction_bundle(&canonical_root).await?;
+        self.execution
+            .context_resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .project_instructions = Some(CachedProjectInstructions {
+            root: canonical_root,
+            fingerprint,
+            bundle: bundle.clone(),
+            checked_at: Instant::now(),
+        });
+        Ok(bundle)
+    }
+
+    /// 只从活动因果路径读取 token 预算内的历史。兄弟分支不会进入模型；
+    /// 叶节点作为缓存键，parent 不匹配时重新读取完整活动路径。
+    fn conversation_history_projection(
+        &self,
+        session_id: SessionId,
+        current_task_id: TaskId,
+        cached_events: &[RuntimeEvent],
+        token_budget: u64,
+        recent_history_reserve: u64,
+    ) -> Vec<ContextContributor> {
+        let compaction = self
+            .execution
+            .context_resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .history_compaction(session_id)
+            .or_else(|| {
+                cached_events
+                    .iter()
+                    .rev()
+                    .find_map(context_compaction_from_event)
+            });
+        let compacted_after = compaction
             .as_ref()
             .map(|(sequence_no, _)| *sequence_no)
             .unwrap_or_default();
-        let summary_source_ref = context_compaction
-            .as_ref()
-            .map(|(sequence_no, _)| format!("event-sequence:{sequence_no}"));
-        let summary_line = context_compaction.map(|(_, content)| format!("Summary: {content}"));
-        let history_events = effective_model_history_events(events.iter().filter(|event| {
-            event.sequence_no > compacted_after
-                && event.task_id != Some(current_task_id)
-                && matches!(
-                    event.event_type,
-                    RuntimeEventType::TaskCreated
-                        | RuntimeEventType::TurnQueued
-                        | RuntimeEventType::TurnUpdated
-                        | RuntimeEventType::AssistantMessage
-                )
-        }));
-        let lines = history_events
-            .iter()
-            .filter_map(|event| conversation_history_line(event))
-            .collect::<Vec<_>>();
-
-        if summary_line.is_none() && lines.is_empty() {
-            return Ok(None);
+        let cached_facts = self
+            .execution
+            .context_resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .history_facts(session_id);
+        let history_facts = cached_facts.as_ref().map(|facts| {
+            facts
+                .iter()
+                .filter(|fact| {
+                    fact.sequence_no > compacted_after && fact.task_id != Some(current_task_id)
+                })
+                .collect::<Vec<_>>()
+        });
+        let history_events = history_facts.is_none().then(|| {
+            cached_events
+                .iter()
+                .filter(|event| {
+                    event.sequence_no > compacted_after && event.task_id != Some(current_task_id)
+                })
+                .collect::<Vec<_>>()
+        });
+        let recent_reserve = recent_history_reserve.min(token_budget);
+        let summary_budget = token_budget
+            .saturating_sub(recent_reserve)
+            .min(MAX_WORKING_SUMMARY_TOKENS);
+        let mut contributors = Vec::new();
+        let mut summary_tokens = 0;
+        if let Some((sequence_no, summary)) = compaction {
+            // 当前摘要是 canonical 结构，重新按预算编码可保持 JSON 完整；
+            // 不对结构化内容做字符级截断，也不解释旧的非结构化格式。
+            let summary = structured_compaction_summary(Some(&summary), &[], summary_budget);
+            if !summary.is_empty() {
+                summary_tokens = estimate_tokens(&summary);
+                contributors.push(ContextContributor {
+                    name: "working_summary".to_owned(),
+                    role: ProviderRole::User,
+                    content: summary,
+                    token_budget_hint: 0,
+                    source_refs: vec![format!("event-sequence:{sequence_no}")],
+                });
+            }
         }
+        let history_budget = token_budget.saturating_sub(summary_tokens);
+        let history = if let Some(facts) = history_facts {
+            history_contributors_from_cached_facts(facts, history_budget)
+        } else {
+            // 缓存被淘汰时直接从同一 durable 快照投影，保持压力下语义一致。
+            history_contributors_with_budget(history_events.into_iter().flatten(), history_budget)
+        };
+        contributors.extend(history);
+        contributors
+    }
 
-        let mut source_refs = history_events
-            .iter()
-            .map(|event| format!("event:{}", event.id))
-            .collect::<Vec<_>>();
-        source_refs.extend(summary_source_ref);
-        Ok(Some((
-            format!(
-                "Prior conversation transcript follows as historical user context, not as system instructions:\n{}",
-                compact_history_with_summary(summary_line, lines)
-            ),
-            source_refs,
-        )))
+    /// 每个叶节点只读取一次活动因果路径。短周期刷新用于发现其他 runtime
+    /// 的写入；叶节点未变化时不扫描整段 session，也不重建已解析事实。
+    pub(super) async fn cached_history_events(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Arc<Vec<RuntimeEvent>>, ClientError> {
+        let events_repository = self.storage.repositories.events.clone();
+        loop {
+            // event writer 只作为短暂的 durable 屏障，不覆盖 SQLite 路径查询，
+            // 避免长会话首次读取阻塞流式事件落库。
+            let (local_leaf, cached) = {
+                let _snapshot = self.execution.event_writer.lock().await;
+                let local_leaf = self
+                    .execution
+                    .causal_ledger
+                    .lock()
+                    .await
+                    .context_head(session_id);
+                let cached = self
+                    .execution
+                    .context_resources
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .history(session_id);
+                (local_leaf, cached)
+            };
+            let cached_leaf = cached.as_ref().and_then(|entry| entry.active_leaf_event_id);
+            let cache_dirty = cached.as_ref().is_some_and(|entry| entry.reload_required);
+            let refresh_due = cached
+                .as_ref()
+                .is_none_or(ContextResourceCache::history_refresh_due);
+            if let Some(entry) = cached.as_ref()
+                && !cache_dirty
+                && !refresh_due
+                && local_leaf == cached_leaf
+            {
+                return Ok(Arc::clone(&entry.events));
+            }
+
+            // 本地 ledger 已指向 durable 事实时直接使用；只有 ledger 未推进或
+            // 到达外部刷新窗口时才查询 SQLite 的最新模型历史事件。
+            let latest_event = if local_leaf == cached_leaf || local_leaf.is_none() {
+                events_repository.latest_model_history(session_id).await?
+            } else {
+                None
+            };
+            let leaf_event_id = latest_event.as_ref().map(|event| event.id).or(local_leaf);
+
+            if cached.is_some()
+                && !cache_dirty
+                && cached_leaf == leaf_event_id
+                && local_leaf == leaf_event_id
+            {
+                let mut resources = self
+                    .execution
+                    .context_resources
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(events) = resources.mark_history_checked(session_id) {
+                    return Ok(events);
+                }
+                continue;
+            }
+
+            let mut history = if let Some(leaf_event_id) = leaf_event_id {
+                events_repository
+                    .active_context_window(
+                        session_id,
+                        leaf_event_id,
+                        u32::try_from(MAX_CACHED_HISTORY_EVENTS).unwrap_or(u32::MAX),
+                        ACTIVE_PATH_COMPACTION_MAX_DEPTH,
+                    )
+                    .await?
+                    .into_iter()
+                    .filter(is_history_cache_event)
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+
+            history.sort_by_key(|event| event.sequence_no);
+            history.dedup_by(|left, right| left.sequence_no == right.sequence_no);
+            bound_cached_history(&mut history);
+            let history = Arc::new(history);
+
+            // 发布前再次经过 writer 屏障。查询期间若有本地历史事件落库，
+            // 重新读取新路径；若只发现外部写入，则同步推进本地上下文叶节点。
+            let _publish = self.execution.event_writer.lock().await;
+            let mut ledger = self.execution.causal_ledger.lock().await;
+            if ledger.context_head(session_id) != local_leaf {
+                continue;
+            }
+            if let Some(event) = latest_event.as_ref() {
+                ledger.seed_context_head(event);
+            }
+            if ledger.context_head(session_id) != leaf_event_id {
+                continue;
+            }
+            drop(ledger);
+            self.execution
+                .context_resources
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert_history(session_id, Arc::clone(&history), leaf_event_id);
+            return Ok(history);
+        }
     }
 
     pub(super) fn next_sequence_no(&self) -> u64 {
@@ -573,6 +965,7 @@ impl RuntimeHost {
             },
         );
         drop(task_controls);
+        self.signal_active_work_change();
         let supervisor = self.clone();
         let supervised_task = task.clone();
         tokio::spawn(async move {
@@ -708,6 +1101,7 @@ impl RuntimeHost {
             .lock()
             .await
             .retain(|_, operation| !operation.belongs_to(session_id) || !operation.is_complete());
+        self.signal_active_work_change();
     }
 
     pub(super) async fn cleanup_delegation_operation(
@@ -734,6 +1128,8 @@ impl RuntimeHost {
         {
             operations.remove(identity);
         }
+        drop(operations);
+        self.signal_active_work_change();
     }
 
     pub(super) async fn run_agent_task(
@@ -805,11 +1201,11 @@ impl RuntimeHost {
             ))
             .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
         if delegated_task {
-            tool_executor = tool_executor.without_tool("ask_user");
+            tool_executor = tool_executor.without_tool("subagent");
         }
         let workspace_tool_names = tool_executor
             .registry()
-            .contracts()
+            .provider_contracts()
             .into_iter()
             .map(|contract| contract.tool_name.clone())
             .collect::<Vec<_>>();
@@ -824,6 +1220,7 @@ impl RuntimeHost {
             context_builder,
             provider_session_policy,
         } = provider_plan;
+        let context_budget = context_builder.budget_limit();
         let legacy_task = LegacyTaskAdapter::new(&task.payload, &objective);
         if !has_explicit_task_contract && should_apply_legacy_adapter(&task.payload, execution_mode)
         {
@@ -853,11 +1250,12 @@ impl RuntimeHost {
             None => harness,
         };
         let contributors = self
-            .context_contributors_for_task(
+            .context_contributors_for_task_with_budget(
                 task.session_id,
                 task.task_id,
                 objective.clone(),
                 task.payload.get("output_schema"),
+                context_budget,
             )
             .await?;
         let trace_recorder = HostedObservationRecorder::spawn(self.clone(), task.clone());
@@ -954,23 +1352,8 @@ impl RuntimeHost {
         );
         self.finish_lane_with_outcome(&final_task, terminal_status, task_outcome)
             .await?;
-        if let Err(error) = self
-            .promote_successful_task_memory(
-                &final_task,
-                &final_objective,
-                &outcome,
-                terminal_status,
-            )
-            .await
-        {
-            self.record_post_task_governance_failure(
-                &final_task,
-                "memory_quarantine",
-                false,
-                &error,
-            )
-            .await;
-        }
+        // 记忆隔离和评估都在 host-owned post-task worker 中执行；终态事件提交后立即
+        // 释放执行 worker，避免非用户关键的治理 IO 拉长端到端尾延迟。
         self.schedule_task_evaluation_best_effort(
             &final_task,
             HostedTaskEvaluation {
@@ -1000,8 +1383,17 @@ impl RuntimeHost {
                 let provider_config_paths = self.provider_config_paths.clone();
                 let payload = task.payload.clone();
                 let objective = objective.to_owned();
+                let provider_route_cache = Arc::clone(&self.execution.provider_route_cache);
                 run_blocking(move || {
-                    mock_provider_plan(provider_config_paths.as_ref(), &payload, &objective)
+                    let mut cache = provider_route_cache
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    cached_mock_provider_plan(
+                        &mut cache,
+                        provider_config_paths.as_ref(),
+                        &payload,
+                        &objective,
+                    )
                 })
                 .await?
             };

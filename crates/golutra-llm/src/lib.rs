@@ -1,4 +1,12 @@
-use std::{collections::BTreeMap, fmt, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap, VecDeque},
+    fmt,
+    sync::{
+        Arc, OnceLock, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
@@ -9,9 +17,11 @@ use golutra_core::{
     ProviderResponseId, SessionId, TaskId, ToolContract, TurnId,
 };
 pub use golutra_core::{ProviderUsage, UsageSource};
+use reqwest::header::HeaderMap;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 mod genai_adapter;
@@ -65,6 +75,26 @@ const MAX_PROVIDER_TOOL_CALL_ID_BYTES: usize = 256;
 const MAX_PROVIDER_TOOL_NAME_BYTES: usize = 128;
 const MAX_PROVIDER_CUSTOM_HEADERS: usize = 32;
 const MAX_PROVIDER_HEADER_VALUE_BYTES: usize = 8 * 1024;
+const SESSION_AFFINITY_HEADER: &str = "session-id";
+
+/// 脱敏后的 provider 诊断元数据，只用于重试决策和可行动的观测。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderErrorMetadata {
+    pub http_status: Option<u16>,
+    pub provider_code: Option<String>,
+    pub retry_after: Option<Duration>,
+    pub request_id: Option<String>,
+}
+
+impl ProviderErrorMetadata {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.http_status.is_none()
+            && self.provider_code.is_none()
+            && self.retry_after.is_none()
+            && self.request_id.is_none()
+    }
+}
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ProviderError {
@@ -82,6 +112,53 @@ pub enum ProviderError {
     Timeout { message: String },
     #[error("provider request was cancelled")]
     Cancelled,
+    /// 保留原有语义错误，同时携带脱敏 HTTP/provider 诊断信息。
+    #[error("{error}")]
+    WithMetadata {
+        error: Box<ProviderError>,
+        metadata: ProviderErrorMetadata,
+    },
+}
+
+impl ProviderError {
+    #[must_use]
+    pub fn with_metadata(self, metadata: ProviderErrorMetadata) -> Self {
+        if metadata.is_empty() {
+            self
+        } else {
+            Self::WithMetadata {
+                error: Box::new(self),
+                metadata,
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn metadata(&self) -> Option<&ProviderErrorMetadata> {
+        match self {
+            Self::WithMetadata { metadata, .. } => Some(metadata),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn retry_after(&self) -> Option<Duration> {
+        self.metadata().and_then(|metadata| metadata.retry_after)
+    }
+
+    #[must_use]
+    pub fn http_status(&self) -> Option<u16> {
+        self.metadata().and_then(|metadata| metadata.http_status)
+    }
+
+    #[must_use]
+    pub fn is_rate_limited(&self) -> bool {
+        match self {
+            Self::RateLimited { .. } => true,
+            Self::WithMetadata { error, .. } => error.is_rate_limited(),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,8 +177,23 @@ pub struct ProviderRequest {
 }
 
 impl ProviderRequest {
+    fn affinity_id(&self) -> String {
+        self.session_id.map_or_else(
+            || self.task_id.to_string(),
+            |session_id| session_id.to_string(),
+        )
+    }
+
     #[must_use]
     pub fn cache_identity(&self) -> Option<CacheIdentity> {
+        self.cache_identity_with_namespace("default")
+    }
+
+    /// Build a cache identity that is isolated by the actual provider route.
+    /// The namespace is a stable protocol/endpoint fingerprint supplied by the
+    /// adapter; request bodies and volatile task ids deliberately stay out of it.
+    #[must_use]
+    pub fn cache_identity_with_namespace(&self, namespace: &str) -> Option<CacheIdentity> {
         let session_id = self.session_id?;
         if self.cache_policy == PromptCachePolicy::None {
             return None;
@@ -109,16 +201,22 @@ impl ProviderRequest {
         let canonical_provider = self.provider_id.trim().to_ascii_lowercase();
         let canonical_model = self.model_id.trim().to_ascii_lowercase();
         let prefix = format!(
-            "golutra-prompt-cache-v1\0{}\0{}\0{}",
-            session_id, canonical_provider, canonical_model,
+            "golutra-prompt-cache-v2\0{}\0{}\0{}\0{}",
+            session_id,
+            canonical_provider,
+            canonical_model,
+            namespace.trim(),
         );
         use sha2::{Digest, Sha256};
+        // OpenAI-compatible 网关通常把 prompt cache key 限制为 64 字符；
+        // 截断十六进制摘要仍保留足够的 session affinity 碰撞安全余量。
+        let digest = format!("{:x}", Sha256::digest(prefix.as_bytes()));
         Some(CacheIdentity {
             session_id,
             thread_id: None,
             provider_id: canonical_provider,
             model_id: canonical_model,
-            key: format!("sha256:{:x}", Sha256::digest(prefix.as_bytes())),
+            key: format!("sha256:{}", &digest[..57]),
         })
     }
 
@@ -442,6 +540,18 @@ pub trait LlmProvider: Send + Sync {
         true
     }
 
+    /// Stable route identity used to isolate prompt caches across protocols and
+    /// endpoints that happen to expose the same provider/model names.
+    fn cache_namespace(&self) -> String {
+        let contract = self.contract();
+        format!("{}\0{}", contract.native_protocol, contract.provider_id)
+    }
+
+    #[must_use]
+    fn cache_identity_for_request(&self, request: &ProviderRequest) -> Option<CacheIdentity> {
+        request.cache_identity_with_namespace(&self.cache_namespace())
+    }
+
     async fn complete_stream(
         &self,
         request: ProviderRequest,
@@ -691,6 +801,7 @@ impl OpenAiCompatibleProvider {
         builder: reqwest::RequestBuilder,
         token: &str,
         initiator: &str,
+        affinity_id: Option<&str>,
     ) -> reqwest::RequestBuilder {
         let builder = builder.bearer_auth(token);
         let builder = if self.provider_id == "github-copilot" {
@@ -705,7 +816,12 @@ impl OpenAiCompatibleProvider {
         } else {
             builder
         };
-        builder.headers(self.custom_headers.to_header_map())
+        let builder = builder.headers(self.custom_headers.to_header_map());
+        if let Some(affinity_id) = affinity_id {
+            builder.header(SESSION_AFFINITY_HEADER, affinity_id)
+        } else {
+            builder
+        }
     }
 
     #[must_use]
@@ -833,7 +949,7 @@ impl OpenAiCompatibleProvider {
             .await
             .map_err(provider_credential_error)?;
         let response = self
-            .authenticated_request(self.client.get(url), token.expose_secret(), "user")
+            .authenticated_request(self.client.get(url), token.expose_secret(), "user", None)
             .send()
             .await
             .map_err(provider_transport_error)?;
@@ -845,7 +961,7 @@ impl OpenAiCompatibleProvider {
             .credential(true)
             .await
             .map_err(provider_credential_error)?;
-        self.authenticated_request(self.client.get(url), token.expose_secret(), "user")
+        self.authenticated_request(self.client.get(url), token.expose_secret(), "user", None)
             .send()
             .await
             .map_err(provider_transport_error)
@@ -855,6 +971,7 @@ impl OpenAiCompatibleProvider {
         &self,
         url: &str,
         body: &Value,
+        affinity_id: &str,
     ) -> Result<reqwest::Response, ProviderError> {
         let token = self
             .credential
@@ -867,6 +984,7 @@ impl OpenAiCompatibleProvider {
                 self.client.post(url).json(body),
                 token.expose_secret(),
                 initiator,
+                Some(affinity_id),
             )
             .send()
             .await
@@ -883,6 +1001,7 @@ impl OpenAiCompatibleProvider {
             self.client.post(url).json(body),
             token.expose_secret(),
             initiator,
+            Some(affinity_id),
         )
         .send()
         .await
@@ -893,14 +1012,17 @@ impl OpenAiCompatibleProvider {
         let url = format!("{}/models", self.base_url.trim_end_matches('/'));
         let response = self.get_with_auth_retry(&url).await?;
         let status = response.status();
+        let headers = response.headers().clone();
         let value = response_json_or_error(response).await?;
         if status.as_u16() == 429 {
-            return Err(ProviderError::RateLimited {
-                message: provider_error_message(&value),
-            });
+            return Err(provider_error_from_value(
+                &value,
+                Some(status.as_u16()),
+                &headers,
+            ));
         }
         if !status.is_success() {
-            return Err(provider_http_error(status, &value));
+            return Err(provider_http_error_with_headers(status, &headers, &value));
         }
         let discovered_models = value
             .get("data")
@@ -935,24 +1057,30 @@ impl OpenAiCompatibleProvider {
 impl LlmProvider for OpenAiCompatibleProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let body = openai_completion_body(
+        let cache_identity = self.cache_identity_for_request(&request);
+        let body = openai_completion_body_with_identity(
             &request,
             &self.model_id,
             &self.generation_config,
             false,
             openai_prompt_cache_supported(&self.base_url),
+            cache_identity.as_ref(),
         );
+        let affinity_id = request.affinity_id();
 
-        let response = self.post_with_auth_retry(&url, &body).await?;
+        let response = self.post_with_auth_retry(&url, &body, &affinity_id).await?;
         let status = response.status();
+        let headers = response.headers().clone();
         let value = response_json_or_error(response).await?;
         if status.as_u16() == 429 {
-            return Err(ProviderError::RateLimited {
-                message: provider_error_message(&value),
-            });
+            return Err(provider_error_from_value(
+                &value,
+                Some(status.as_u16()),
+                &headers,
+            ));
         }
         if !status.is_success() {
-            return Err(provider_http_error(status, &value));
+            return Err(provider_http_error_with_headers(status, &headers, &value));
         }
 
         provider_response_from_openai(value, request.task_id, request.turn_id)
@@ -964,24 +1092,31 @@ impl LlmProvider for OpenAiCompatibleProvider {
         on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
     ) -> Result<ProviderResponse, ProviderError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let body = openai_completion_body(
+        let cache_identity = self.cache_identity_for_request(&request);
+        let body = openai_completion_body_with_identity(
             &request,
             &self.model_id,
             &self.generation_config,
             true,
             openai_prompt_cache_supported(&self.base_url),
+            cache_identity.as_ref(),
         );
-        let response = self.post_with_auth_retry(&url, &body).await?;
+        let affinity_id = request.affinity_id();
+        let response = self.post_with_auth_retry(&url, &body, &affinity_id).await?;
         let status = response.status();
         if status.as_u16() == 429 {
+            let headers = response.headers().clone();
             let value = response_json_or_error(response).await?;
-            return Err(ProviderError::RateLimited {
-                message: provider_error_message(&value),
-            });
+            return Err(provider_error_from_value(
+                &value,
+                Some(status.as_u16()),
+                &headers,
+            ));
         }
         if !status.is_success() {
+            let headers = response.headers().clone();
             let value = response_json_or_error(response).await?;
-            return Err(provider_http_error(status, &value));
+            return Err(provider_http_error_with_headers(status, &headers, &value));
         }
         provider_response_from_openai_stream(response, on_event).await
     }
@@ -1010,6 +1145,10 @@ impl LlmProvider for OpenAiCompatibleProvider {
             .map(|fixture| format!("tests/fixtures/openai-compatible/{fixture}.json"))
             .collect(),
         }
+    }
+
+    fn cache_namespace(&self) -> String {
+        route_cache_namespace("openai_chat_completions", &self.base_url)
     }
 }
 
@@ -1219,6 +1358,18 @@ impl LlmProvider for ConfiguredProvider {
             | Self::Gemini(provider)
             | Self::VertexAi(provider)
             | Self::Genai(provider) => provider.supports_buffered_transport(),
+        }
+    }
+
+    fn cache_namespace(&self) -> String {
+        match self {
+            Self::Mock(provider) => provider.cache_namespace(),
+            Self::OpenAiCompatible(provider) => provider.cache_namespace(),
+            Self::OpenAiResponses(provider) => provider.cache_namespace(),
+            Self::Anthropic(provider)
+            | Self::Gemini(provider)
+            | Self::VertexAi(provider)
+            | Self::Genai(provider) => provider.cache_namespace(),
         }
     }
 
@@ -1512,6 +1663,12 @@ fn mock_contract() -> ProviderContract {
     }
 }
 
+pub(crate) fn route_cache_namespace(protocol: &str, base_url: &str) -> String {
+    // URL 本身只作为哈希输入，不进入日志或 provider payload；去掉末尾斜杠
+    // 后同一路由的配置变体不会平白拆分缓存。
+    format!("{protocol}\0{}", base_url.trim().trim_end_matches('/'))
+}
+
 fn openai_message(message: &ProviderMessage) -> Value {
     let mut value = json!({
         "role": match message.role {
@@ -1526,7 +1683,7 @@ fn openai_message(message: &ProviderMessage) -> Value {
         value["tool_call_id"] = Value::String(tool_call_id.clone());
     }
     if let Some(tool_name) = &message.tool_name {
-        value["name"] = Value::String(tool_name.clone());
+        value["name"] = Value::String(provider_tool_wire_name(tool_name));
     }
     if !message.tool_calls.is_empty() {
         value["tool_calls"] = Value::Array(
@@ -1545,7 +1702,7 @@ fn openai_assistant_tool_call(tool_call: &ProviderToolCall) -> Value {
         "id": tool_call.tool_call_id,
         "type": "function",
         "function": {
-            "name": tool_call.tool_name,
+            "name": provider_tool_wire_name(&tool_call.tool_name),
             "arguments": tool_call.arguments.to_string(),
         }
     })
@@ -1602,15 +1759,18 @@ fn is_sensitive_header(name: &str) -> bool {
 
 pub fn provider_tool_description(tool_name: &str) -> &'static str {
     match tool_name {
-        "read_file" => "Read a UTF-8 text file from the current workspace.",
-        "write_file" => {
-            "Create or replace a workspace-relative UTF-8 file with the complete supplied content. Honor an explicit working or output directory; when the requested deliverable has only a basename and no directory context, place it in the workspace root."
+        "read_file" => "Read a UTF-8 text file in the workspace.",
+        "write_file" => "Write complete UTF-8 content to a workspace-relative file.",
+        "edit_file" => "Replace the first exact match in a workspace-relative UTF-8 file.",
+        "apply_patch" => "Apply a unified diff atomically to workspace-relative files.",
+        "web_search" => {
+            "Search the web when network access is enabled; return concise source-backed results."
         }
-        "edit_file" => {
-            "Edit a workspace-relative UTF-8 file by replacing the first exact search match with the complete supplied replacement."
+        "shell_session" => {
+            "Manage a runtime-owned background shell process: wait, write, or terminate; use its cursor for new output."
         }
-        "apply_patch" => {
-            "Atomically apply a unified diff to one or more workspace-relative files. Use this for focused multi-file or multi-hunk edits."
+        "subagent" => {
+            "Run one isolated child task and return a bounded summary and artifact references; it cannot create another child."
         }
         "list_dir" => "List entries in a workspace-relative directory.",
         "rg_search" => "Search workspace files with ripgrep.",
@@ -1623,7 +1783,7 @@ pub fn provider_tool_description(tool_name: &str) -> &'static str {
             "Delegate one complete, self-contained task to an isolated child agent and wait for its result. The child does not receive this conversation. Omit model and reasoning_effort to inherit the current agent settings; specify either field only when the task benefits from an explicit override."
         }
         "shell" => {
-            "Run a workspace command as inert argv; include the program and every argument in command. Use workdir to run from a workspace subdirectory without changing the workspace boundary. A complete quoted foreground Python heredoc such as python - <<'PY' is passed directly on stdin; for other pipes, redirection, or compound scripts, explicitly invoke an available shell with the complete script as one argument. When a required local dependency is missing, inspect the project's package-manager conventions, prefer a project-scoped installation when practical, and validate after installing. With background=true, timeout_ms is the absolute process lifetime and yield_time_ms only controls the initial wait. Managed background processes are runtime-scoped and stop when the runtime ends. If another process or evaluator must connect after the final response, do not use background=true; use a platform-appropriate lifecycle mechanism outside runtime ownership, detach standard streams as required, and verify availability before returning."
+            "Run a workspace command as argv. Use workdir for a workspace subdirectory; pass a quoted Python heredoc on stdin, or invoke an available shell for pipes, redirects, and compound scripts. With background=true, timeout_ms is the absolute process lifetime, yield_time_ms only the initial wait, and the runtime owns the process until it ends; do not use it for processes that must outlive the runtime."
         }
         "process_list" => {
             "List managed background processes owned by the current session, including redacted commands, states, exit codes, and output statistics. This does not consume process output or advance a cursor."
@@ -1644,46 +1804,419 @@ pub fn provider_tool_description(tool_name: &str) -> &'static str {
     }
 }
 
+/// Names used in provider tool payloads. `web_search` is an internal runtime
+/// capability name, while several OpenAI-compatible adapters reserve that
+/// literal for a native tool. Keeping the alias here makes projection,
+/// accounting, and every transport share one wire representation.
+pub(crate) const WEB_SEARCH_WIRE_ALIAS: &str = "golutra_web_search";
+
+pub(crate) fn provider_tool_wire_name(name: &str) -> String {
+    if name == "web_search" {
+        WEB_SEARCH_WIRE_ALIAS.to_owned()
+    } else {
+        name.to_owned()
+    }
+}
+
+pub(crate) fn restore_provider_tool_wire_name(name: &str) -> String {
+    if name == WEB_SEARCH_WIRE_ALIAS {
+        "web_search".to_owned()
+    } else {
+        name.to_owned()
+    }
+}
+
+// 发送给模型的 schema 只保留表达调用结构和必要语义的字段；长度、范围和格式等边界
+// 仍由 runtime 使用原始 ToolContract 校验。保留紧凑的参数描述，避免压缩输入时损伤
+// 模型对 shell、子代理等高风险参数的使用判断。
+const PROVIDER_SCHEMA_BOUNDARY_KEYS: &[&str] = &[
+    "title",
+    "$comment",
+    "default",
+    "examples",
+    "deprecated",
+    "readOnly",
+    "writeOnly",
+    "minLength",
+    "maxLength",
+    "pattern",
+    "format",
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "multipleOf",
+    "minItems",
+    "maxItems",
+    "uniqueItems",
+    "minProperties",
+    "maxProperties",
+    "contentEncoding",
+    "contentMediaType",
+];
+
+const MAX_PROVIDER_SCHEMA_DESCRIPTION_CHARS: usize = 512;
+
+fn is_provider_schema_boundary_key(key: &str) -> bool {
+    PROVIDER_SCHEMA_BOUNDARY_KEYS.contains(&key)
+}
+
+fn project_provider_schema_description(value: &Value) -> Value {
+    let Some(description) = value.as_str() else {
+        return value.clone();
+    };
+    let compact = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    Value::String(
+        compact
+            .chars()
+            .take(MAX_PROVIDER_SCHEMA_DESCRIPTION_CHARS)
+            .collect(),
+    )
+}
+
+fn project_provider_schema_map(value: &Value) -> Value {
+    let Some(properties) = value.as_object() else {
+        return project_provider_schema_value(value);
+    };
+
+    Value::Object(
+        properties
+            .iter()
+            .map(|(name, schema)| (name.clone(), project_provider_schema_value(schema)))
+            .collect(),
+    )
+}
+
+fn project_provider_schema_value(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .filter_map(|(key, child)| {
+                    if is_provider_schema_boundary_key(key) {
+                        return None;
+                    }
+
+                    let projected = match key.as_str() {
+                        "description" => project_provider_schema_description(child),
+                        // 这些字段的 map key 是用户属性名，不能误删名为 `description` 的属性。
+                        "properties" | "patternProperties" | "$defs" | "definitions"
+                        | "dependentSchemas" => project_provider_schema_map(child),
+                        // enum、const、required 携带的是数据，不是嵌套 schema 对象。
+                        "enum" | "const" | "required" => child.clone(),
+                        _ => project_provider_schema_value(child),
+                    };
+                    Some((key.clone(), projected))
+                })
+                .collect(),
+        ),
+        Value::Array(values) => {
+            Value::Array(values.iter().map(project_provider_schema_value).collect())
+        }
+        _ => value.clone(),
+    }
+}
+
+/// 将内部 JSON Schema 投影为紧凑的 provider-facing 形式。
+///
+/// 工具执行仍以内部 schema 为准；`additionalProperties: false` 等结构字段
+/// 会保留，确保 strict Responses 工具继续满足 provider 的契约。
+#[must_use]
+pub fn provider_tool_schema_projection(schema: &Value) -> Value {
+    canonicalize_json(&project_provider_schema_value(schema))
+}
+
+const PROVIDER_TOOL_PROJECTION_CACHE_CAPACITY: usize = 128;
+
+static PROVIDER_TOOL_PROJECTION_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static PROVIDER_TOOL_PROJECTION_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug)]
+struct CachedProviderToolProjection {
+    schema: Value,
+    wire: Value,
+    digest: String,
+    token_count: u64,
+}
+
+#[derive(Debug, Default)]
+struct ProviderToolProjectionCache {
+    entries: HashMap<ProviderToolProjectionCacheKey, Arc<CachedProviderToolProjection>>,
+    order: VecDeque<ProviderToolProjectionCacheKey>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ProviderToolProjectionCacheKey([u8; 32]);
+
+static PROVIDER_TOOL_PROJECTION_CACHE: OnceLock<RwLock<ProviderToolProjectionCache>> =
+    OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderToolProjectionCacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub entries: usize,
+}
+
+fn provider_tool_projection_cache() -> &'static RwLock<ProviderToolProjectionCache> {
+    PROVIDER_TOOL_PROJECTION_CACHE
+        .get_or_init(|| RwLock::new(ProviderToolProjectionCache::default()))
+}
+
+fn provider_tool_projection_cache_key(
+    contract: &ToolContract,
+    canonical_schema_digest: &[u8; 32],
+) -> ProviderToolProjectionCacheKey {
+    // Registry contracts are immutable during a turn. Hashing the canonical
+    // tree directly keeps equivalent map insertion orders together while
+    // avoiding a full normalized JSON allocation on every cache hit.
+    let wire_name = provider_tool_wire_name(&contract.tool_name);
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"provider-tool-projection-v4\0");
+    bytes.extend_from_slice(wire_name.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(provider_tool_description(&contract.tool_name).as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(canonical_schema_digest);
+    let digest = Sha256::digest(bytes);
+    let mut key = [0_u8; 32];
+    key.copy_from_slice(&digest);
+    ProviderToolProjectionCacheKey(key)
+}
+
+fn cached_provider_tool_projection(contract: &ToolContract) -> Arc<CachedProviderToolProjection> {
+    // This digest is deliberately cheaper than canonicalization: cache hits
+    // only walk the source tree and never allocate a second JSON value.
+    let canonical_schema_digest = canonical_json_digest(&contract.input_schema);
+    let key = provider_tool_projection_cache_key(contract, &canonical_schema_digest);
+    let cache = provider_tool_projection_cache();
+    {
+        let mut cache = cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = cache.entries.get(&key).cloned() {
+            // Keep the deque as a true access-order list. A plain insertion
+            // order silently turns the bounded cache into FIFO under load.
+            cache.order.retain(|candidate| candidate != &key);
+            cache.order.push_back(key);
+            PROVIDER_TOOL_PROJECTION_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+            return entry;
+        }
+    }
+
+    PROVIDER_TOOL_PROJECTION_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+
+    // JSON 对象顺序不影响 schema 语义，但会影响 provider 的字节前缀；
+    // 统一排序后，等价的工具定义共享同一份投影和缓存身份。
+    let canonical_schema = canonicalize_json(&contract.input_schema);
+    let schema = project_provider_schema_value(&canonical_schema);
+    let wire = json!({
+        "type": "function",
+        "function": {
+            "name": provider_tool_wire_name(&contract.tool_name),
+            "description": provider_tool_description(&contract.tool_name),
+            "parameters": schema
+        }
+    });
+    let serialized = serde_json::to_string(&wire).unwrap_or_default();
+    let entry = Arc::new(CachedProviderToolProjection {
+        schema: wire
+            .get("function")
+            .and_then(Value::as_object)
+            .and_then(|function| function.get("parameters"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        digest: format!("sha256:{:x}", Sha256::digest(serialized.as_bytes())),
+        token_count: serialized.chars().count().div_ceil(4) as u64,
+        wire,
+    });
+
+    let mut cache = cache
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(existing) = cache.entries.get(&key).cloned() {
+        cache.order.retain(|candidate| candidate != &key);
+        cache.order.push_back(key);
+        return existing;
+    }
+    cache.entries.insert(key, Arc::clone(&entry));
+    cache.order.push_back(key);
+    while cache.entries.len() > PROVIDER_TOOL_PROJECTION_CACHE_CAPACITY {
+        let Some(oldest) = cache.order.pop_front() else {
+            break;
+        };
+        // A stale deque entry should never evict a newer value with the same
+        // key. This guard also repairs the order if a future caller changes
+        // insertion behavior.
+        if cache.entries.remove(&oldest).is_none() {
+            continue;
+        }
+    }
+    entry
+}
+
+/// Compute a canonical JSON digest without materializing a sorted clone. The
+/// output is only a cache identity; provider wire values are still built from
+/// `canonicalize_json` on a miss so their existing ordering contract remains.
+fn canonical_json_digest(value: &Value) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    canonical_json_digest_into(value, &mut digest);
+    let finalized = digest.finalize();
+    let mut result = [0_u8; 32];
+    result.copy_from_slice(&finalized);
+    result
+}
+
+fn canonical_json_digest_into(value: &Value, digest: &mut Sha256) {
+    match value {
+        Value::Null => digest.update(b"n"),
+        Value::Bool(value) => {
+            digest.update(b"b");
+            digest.update([u8::from(*value)]);
+        }
+        Value::Number(value) => {
+            digest.update(b"d");
+            digest_field_bytes(digest, value.to_string().as_bytes());
+        }
+        Value::String(value) => {
+            digest.update(b"s");
+            digest_field_bytes(digest, value.as_bytes());
+        }
+        Value::Array(values) => {
+            digest.update(b"a");
+            digest.update((values.len() as u64).to_le_bytes());
+            for value in values {
+                canonical_json_digest_into(value, digest);
+            }
+        }
+        Value::Object(object) => {
+            digest.update(b"o");
+            digest.update((object.len() as u64).to_le_bytes());
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            for key in keys {
+                digest_field_bytes(digest, key.as_bytes());
+                // The key was collected from this object, so the lookup is
+                // infallible unless the map is concurrently mutated (which a
+                // serde_json::Value reference does not permit).
+                if let Some(child) = object.get(key) {
+                    canonical_json_digest_into(child, digest);
+                }
+            }
+        }
+    }
+}
+
+fn digest_field_bytes(digest: &mut Sha256, field: &[u8]) {
+    digest.update((field.len() as u64).to_le_bytes());
+    digest.update(field);
+}
+
+/// Return inexpensive process-local cache counters for diagnostics and
+/// benchmark reports.  The cache itself remains bounded and private.
+#[must_use]
+pub fn provider_tool_projection_cache_stats() -> ProviderToolProjectionCacheStats {
+    let entries = provider_tool_projection_cache()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entries
+        .len();
+    ProviderToolProjectionCacheStats {
+        hits: PROVIDER_TOOL_PROJECTION_CACHE_HITS.load(Ordering::Relaxed),
+        misses: PROVIDER_TOOL_PROJECTION_CACHE_MISSES.load(Ordering::Relaxed),
+        entries,
+    }
+}
+
+fn canonicalize_json(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut entries = object.iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(right.0));
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, child)| (key.clone(), canonicalize_json(child)))
+                    .collect(),
+            )
+        }
+        Value::Array(values) => Value::Array(values.iter().map(canonicalize_json).collect()),
+        _ => value.clone(),
+    }
+}
+
+/// Return the cached provider schema for a complete tool contract.
+#[must_use]
+pub(crate) fn provider_tool_schema_for_contract(contract: &ToolContract) -> Value {
+    cached_provider_tool_projection(contract).schema.clone()
+}
+
+/// Return the digest of the exact provider-facing tool wire value.
+#[must_use]
+pub fn provider_tool_wire_digest(contract: &ToolContract) -> String {
+    cached_provider_tool_projection(contract).digest.clone()
+}
+
+/// Return the cached estimate for the exact provider-facing tool wire value.
+#[must_use]
+pub fn provider_tool_wire_tokens(contract: &ToolContract) -> u64 {
+    cached_provider_tool_projection(contract).token_count
+}
+
+/// Return the digest and token estimate from one projection-cache lookup.
+/// Runtime hot paths commonly need both values for the same contract; keeping
+/// this pair together avoids serializing and hashing the source schema twice.
+#[must_use]
+pub fn provider_tool_wire_stats(contract: &ToolContract) -> (String, u64) {
+    let cached = cached_provider_tool_projection(contract);
+    (cached.digest.clone(), cached.token_count)
+}
+
 /// Return the smallest stable tool representation sent by the Chat Completions
 /// transport. Runtime budgeting and context snapshots use the same shape so
 /// internal recovery/policy fields are never charged as model input.
 #[must_use]
 pub fn provider_tool_wire_projection(contract: &ToolContract) -> Value {
-    let description = provider_tool_description(&contract.tool_name);
-    json!({
-        "type": "function",
-        "function": {
-            "name": contract.tool_name,
-            "description": description,
-            "parameters": contract.input_schema
-        }
-    })
+    cached_provider_tool_projection(contract).wire.clone()
 }
 
 /// Estimate tool schema tokens from the provider-facing projection, not from
 /// the full internal contract used by the executor and governance layers.
 #[must_use]
 pub fn estimate_provider_tool_tokens(tools: &[ToolContract]) -> u64 {
-    tools
-        .iter()
-        .map(|tool| {
-            serde_json::to_string(&provider_tool_wire_projection(tool))
-                .map(|value| value.chars().count().div_ceil(4) as u64)
-                .unwrap_or_default()
-        })
-        .sum()
+    tools.iter().map(provider_tool_wire_tokens).sum()
 }
 
 fn openai_tool_schema(contract: &ToolContract) -> Value {
     provider_tool_wire_projection(contract)
 }
 
+#[cfg(test)]
 fn openai_completion_body(
     request: &ProviderRequest,
     model_id: &str,
     generation_config: &ProviderGenerationConfig,
     streaming: bool,
     prompt_cache_supported: bool,
+) -> Value {
+    let cache_identity = request.cache_identity();
+    openai_completion_body_with_identity(
+        request,
+        model_id,
+        generation_config,
+        streaming,
+        prompt_cache_supported,
+        cache_identity.as_ref(),
+    )
+}
+
+fn openai_completion_body_with_identity(
+    request: &ProviderRequest,
+    model_id: &str,
+    generation_config: &ProviderGenerationConfig,
+    streaming: bool,
+    prompt_cache_supported: bool,
+    cache_identity: Option<&CacheIdentity>,
 ) -> Value {
     let mut body = json!({
         "model": model_id,
@@ -1692,13 +2225,16 @@ fn openai_completion_body(
     if !request.tools.is_empty() {
         body["tools"] = Value::Array(request.tools.iter().map(openai_tool_schema).collect());
         body["tool_choice"] = Value::String("auto".to_owned());
+        // 明确要求 provider 在一次响应中并行发出彼此独立的工具调用，
+        // 避免兼容端点因默认值差异把多文件任务退化为串行回合。
+        body["parallel_tool_calls"] = Value::Bool(true);
     }
     if streaming {
         body["stream"] = Value::Bool(true);
         body["stream_options"] = json!({"include_usage": true});
     }
-    if prompt_cache_supported && let Some(identity) = request.cache_identity() {
-        body["prompt_cache_key"] = Value::String(identity.key);
+    if prompt_cache_supported && let Some(identity) = cache_identity {
+        body["prompt_cache_key"] = Value::String(identity.key.clone());
         match request.cache_policy {
             golutra_core::PromptCachePolicy::Short => {
                 body["prompt_cache_retention"] = Value::String("5m".to_owned());
@@ -1717,8 +2253,13 @@ fn openai_prompt_cache_supported(base_url: &str) -> bool {
     reqwest::Url::parse(base_url)
         .ok()
         .and_then(|url| {
-            url.host_str()
-                .map(|host| host.eq_ignore_ascii_case("api.openai.com"))
+            url.host_str().map(|host| {
+                // 仅这两个端点实现了请求投影依赖的 OpenAI prompt-cache 扩展；
+                // 保持白名单收窄，避免向任意兼容网关意外发送 provider 专属字段。
+                ["api.openai.com", "api.golutra.cn"]
+                    .iter()
+                    .any(|supported| host.eq_ignore_ascii_case(supported))
+            })
         })
         .unwrap_or(false)
 }
@@ -1742,6 +2283,8 @@ async fn provider_response_from_openai_stream(
             message: format!("provider response exceeds {MAX_PROVIDER_RESPONSE_BYTES} byte limit"),
         });
     }
+    let response_status = response.status().as_u16();
+    let response_headers = response.headers().clone();
     let mut stream = response.bytes_stream().eventsource();
     let mut parsed_bytes = 0_usize;
     let mut output_text = String::new();
@@ -1752,8 +2295,15 @@ async fn provider_response_from_openai_stream(
     let mut stream_terminated = false;
 
     while let Some(event) = stream.next().await {
-        let event = event.map_err(|error| ProviderError::Unavailable {
-            message: sanitize_provider_error(&error.to_string()),
+        let event = event.map_err(|error| {
+            ProviderError::Unavailable {
+                message: sanitize_provider_error(&error.to_string()),
+            }
+            .with_metadata(provider_error_metadata(
+                Some(response_status),
+                &response_headers,
+                None,
+            ))
         })?;
         parsed_bytes = parsed_bytes.saturating_add(event.data.len());
         if parsed_bytes > MAX_PROVIDER_RESPONSE_BYTES {
@@ -1774,10 +2324,14 @@ async fn provider_response_from_openai_stream(
             serde_json::from_str(&event.data).map_err(|error| ProviderError::Malformed {
                 message: format!("chat completion SSE event is invalid JSON: {error}"),
             })?;
-        if value.get("error").is_some() {
-            return Err(ProviderError::Failed {
-                message: provider_error_message(&value),
-            });
+        if value.get("error").is_some()
+            || value.get("type").and_then(Value::as_str) == Some("error")
+        {
+            return Err(provider_error_from_value(
+                &value,
+                Some(response_status),
+                &response_headers,
+            ));
         }
         response_id = response_id.or_else(|| {
             value
@@ -1878,7 +2432,12 @@ async fn provider_response_from_openai_stream(
     if !stream_terminated {
         return Err(ProviderError::Unavailable {
             message: "chat completion SSE stream ended before a terminal event".to_owned(),
-        });
+        }
+        .with_metadata(provider_error_metadata(
+            Some(response_status),
+            &response_headers,
+            None,
+        )));
     }
 
     let tool_calls = tool_calls
@@ -1912,28 +2471,7 @@ async fn provider_response_from_openai_stream(
         response_id: ProviderResponseId::new(),
         message,
         tool_calls,
-        usage: ProviderUsage {
-            input_tokens: usage_value.get("prompt_tokens").and_then(Value::as_u64),
-            output_tokens: usage_value.get("completion_tokens").and_then(Value::as_u64),
-            reasoning_tokens: usage_value
-                .get("completion_tokens_details")
-                .and_then(|details| details.get("reasoning_tokens"))
-                .and_then(Value::as_u64),
-            cached_input_tokens: usage_value
-                .get("prompt_tokens_details")
-                .and_then(|details| details.get("cached_tokens"))
-                .and_then(Value::as_u64),
-            total_tokens: usage_value.get("total_tokens").and_then(Value::as_u64),
-            usage_source: if usage_value
-                .as_object()
-                .is_some_and(|value| value.is_empty())
-            {
-                UsageSource::Unknown
-            } else {
-                UsageSource::Provider
-            },
-            raw: usage_value.clone(),
-        },
+        usage: provider_usage_from_openai_value(usage_value.clone()),
         finish_reason,
         raw_metadata: json!({
             "provider": "openai-compatible",
@@ -2002,15 +2540,7 @@ fn provider_response_from_openai(
         response_id: ProviderResponseId::new(),
         message: content,
         tool_calls,
-        usage: ProviderUsage {
-            input_tokens: usage_value.get("prompt_tokens").and_then(Value::as_u64),
-            output_tokens: usage_value.get("completion_tokens").and_then(Value::as_u64),
-            reasoning_tokens: None,
-            cached_input_tokens: None,
-            total_tokens: usage_value.get("total_tokens").and_then(Value::as_u64),
-            usage_source: UsageSource::Provider,
-            raw: usage_value,
-        },
+        usage: provider_usage_from_openai_value(usage_value),
         finish_reason: finish_reason_from_openai(
             choice
                 .get("finish_reason")
@@ -2018,6 +2548,109 @@ fn provider_response_from_openai(
                 .unwrap_or_default(),
         ),
         raw_metadata: value,
+    })
+}
+
+fn provider_usage_from_openai_value(usage_value: Value) -> ProviderUsage {
+    let input_tokens = first_usage_u64(
+        &usage_value,
+        &[
+            "/prompt_tokens",
+            "/input_tokens",
+            "/prompt_tokens_total",
+            "/input_tokens_total",
+            "/promptTokens",
+            "/inputTokens",
+            "/promptTokensTotal",
+            "/inputTokensTotal",
+        ],
+    );
+    let output_tokens = first_usage_u64(
+        &usage_value,
+        &[
+            "/completion_tokens",
+            "/output_tokens",
+            "/completion_tokens_total",
+            "/output_tokens_total",
+            "/completionTokens",
+            "/outputTokens",
+            "/completionTokensTotal",
+            "/outputTokensTotal",
+        ],
+    );
+    let reasoning_tokens = first_usage_u64(
+        &usage_value,
+        &[
+            "/completion_tokens_details/reasoning_tokens",
+            "/output_tokens_details/reasoning_tokens",
+            "/reasoning_tokens",
+            "/completionTokensDetails/reasoningTokens",
+            "/outputTokensDetails/reasoningTokens",
+            "/completionTokensDetails/reasoning_tokens",
+            "/outputTokensDetails/reasoning_tokens",
+            "/reasoningTokens",
+        ],
+    );
+    let cached_input_tokens = first_usage_u64(
+        &usage_value,
+        &[
+            "/prompt_tokens_details/cached_tokens",
+            "/input_tokens_details/cached_tokens",
+            "/prompt_tokens_details/cache_read_tokens",
+            "/input_tokens_details/cache_read_tokens",
+            "/prompt_tokens_details/cache_read_input_tokens",
+            "/input_tokens_details/cache_read_input_tokens",
+            "/cached_input_tokens",
+            "/cache_read_tokens",
+            "/promptTokensDetails/cachedTokens",
+            "/inputTokensDetails/cachedTokens",
+            "/promptTokensDetails/cacheReadTokens",
+            "/inputTokensDetails/cacheReadTokens",
+            "/promptTokensDetails/cacheReadInputTokens",
+            "/inputTokensDetails/cacheReadInputTokens",
+            "/cachedInputTokens",
+            "/cacheReadTokens",
+            "/cacheReadInputTokens",
+        ],
+    );
+    let total_tokens = first_usage_u64(
+        &usage_value,
+        &[
+            "/total_tokens",
+            "/total_token_count",
+            "/total_tokens_count",
+            "/totalTokens",
+            "/totalTokenCount",
+            "/totalTokensCount",
+        ],
+    );
+    let usage_source = if usage_value
+        .as_object()
+        .is_some_and(|value| value.is_empty())
+    {
+        UsageSource::Unknown
+    } else {
+        UsageSource::Provider
+    };
+    ProviderUsage {
+        input_tokens,
+        output_tokens,
+        reasoning_tokens,
+        cached_input_tokens,
+        total_tokens,
+        usage_source,
+        raw: usage_value,
+    }
+}
+
+fn first_usage_u64(value: &Value, paths: &[&str]) -> Option<u64> {
+    paths.iter().find_map(|path| {
+        value.pointer(path).and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
+                .or_else(|| value.as_str().and_then(|value| value.trim().parse().ok()))
+        })
     })
 }
 
@@ -2076,7 +2709,7 @@ fn provider_tool_call_from_openai(value: &Value) -> Result<ProviderToolCall, Pro
     }
     Ok(ProviderToolCall {
         tool_call_id: tool_call_id.to_owned(),
-        tool_name: tool_name.to_owned(),
+        tool_name: restore_provider_tool_wire_name(tool_name),
         arguments,
     })
 }
@@ -2115,6 +2748,211 @@ fn provider_error_message(value: &Value) -> String {
     }
 }
 
+fn provider_error_status(value: &Value) -> Option<u16> {
+    [
+        value.get("error").and_then(|error| error.get("status")),
+        value
+            .get("error")
+            .and_then(|error| error.get("status_code")),
+        value.get("status"),
+        value.get("http_status"),
+        value.get("status_code"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(value_as_status)
+}
+
+fn value_as_status(value: &Value) -> Option<u16> {
+    value
+        .as_u64()
+        .and_then(|status| u16::try_from(status).ok())
+        .or_else(|| {
+            value
+                .as_str()
+                .and_then(|status| status.trim().parse::<u16>().ok())
+        })
+}
+
+fn provider_error_code(value: &Value) -> Option<String> {
+    value
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .or_else(|| value.get("code"))
+        .and_then(|code| {
+            code.as_str()
+                .map(ToOwned::to_owned)
+                .or_else(|| code.as_u64().map(|code| code.to_string()))
+        })
+        .map(|code| sanitize_provider_error(&code))
+        .filter(|code| !code.is_empty())
+}
+
+fn provider_error_type(value: &Value) -> Option<String> {
+    value
+        .get("error")
+        .and_then(|error| error.get("type"))
+        .or_else(|| value.get("error_type"))
+        .and_then(Value::as_str)
+        .map(sanitize_provider_error)
+        .filter(|error_type| !error_type.is_empty())
+}
+
+fn provider_error_retry_after(value: &Value) -> Option<Duration> {
+    let retry_after_ms = value
+        .get("error")
+        .and_then(|error| error.get("retry_after_ms"))
+        .or_else(|| value.get("retry_after_ms"));
+    if let Some(milliseconds) = retry_after_ms.and_then(Value::as_u64) {
+        return Some(Duration::from_millis(milliseconds.min(60_000)));
+    }
+    let retry_after = value
+        .get("error")
+        .and_then(|error| error.get("retry_after"))
+        .or_else(|| value.get("retry_after"))?;
+    retry_after
+        .as_u64()
+        .or_else(|| {
+            retry_after
+                .as_str()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+        })
+        .map(|seconds| Duration::from_secs(seconds.min(60)))
+}
+
+pub(crate) fn retry_after_from_headers(headers: &HeaderMap) -> Option<Duration> {
+    if let Some(milliseconds) = headers
+        .get("retry-after-ms")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        return Some(Duration::from_millis(milliseconds.min(60_000)));
+    }
+    headers
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|seconds| Duration::from_secs(seconds.min(60)))
+}
+
+pub(crate) fn request_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    ["x-request-id", "request-id", "openai-request-id"]
+        .into_iter()
+        .find_map(|name| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(sanitize_provider_error)
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn request_id_from_value(value: &Value) -> Option<String> {
+    value
+        .get("error")
+        .and_then(|error| error.get("request_id").or_else(|| error.get("requestId")))
+        .or_else(|| value.get("request_id"))
+        .and_then(Value::as_str)
+        .map(sanitize_provider_error)
+        .filter(|value| !value.is_empty())
+}
+
+fn provider_error_metadata(
+    status: Option<u16>,
+    headers: &HeaderMap,
+    value: Option<&Value>,
+) -> ProviderErrorMetadata {
+    let payload_status = value.and_then(provider_error_status);
+    let payload_retry_after = value.and_then(provider_error_retry_after);
+    let payload_request_id = value.and_then(request_id_from_value);
+    ProviderErrorMetadata {
+        http_status: status.filter(|status| *status >= 400).or(payload_status),
+        provider_code: value.and_then(provider_error_code),
+        retry_after: payload_retry_after.or_else(|| retry_after_from_headers(headers)),
+        request_id: payload_request_id.or_else(|| request_id_from_headers(headers)),
+    }
+}
+
+fn provider_error_kind(status: Option<u16>, value: &Value) -> ProviderError {
+    let message = provider_error_message(value);
+    match status {
+        Some(429) => ProviderError::RateLimited { message },
+        Some(status) if (500..600).contains(&status) => ProviderError::Unavailable { message },
+        Some(_) => ProviderError::Failed { message },
+        None => {
+            // 网关常用 code/type 表达瞬态错误，不能只依赖 HTTP status 或 message。
+            let marker_text = format!(
+                "{} {} {}",
+                message,
+                provider_error_code(value).unwrap_or_default(),
+                provider_error_type(value).unwrap_or_default()
+            )
+            .to_ascii_lowercase();
+            if [
+                "rate limit",
+                "rate_limit",
+                "rate limited",
+                "too many requests",
+                "quota exceeded",
+            ]
+            .iter()
+            .any(|marker| marker_text.contains(marker))
+            {
+                ProviderError::RateLimited { message }
+            } else if [
+                "bad gateway",
+                "bad_gateway",
+                "gateway timeout",
+                "gateway_timeout",
+                "service unavailable",
+                "service_unavailable",
+                "temporarily unavailable",
+                "temporarily_unavailable",
+                "server error",
+                "server_error",
+                "internal server",
+                "internal_error",
+                "internal_server_error",
+                "upstream",
+                "overloaded",
+                "overload",
+                "connection reset",
+                "502",
+                "503",
+                "504",
+            ]
+            .iter()
+            .any(|marker| marker_text.contains(marker))
+            {
+                ProviderError::Unavailable { message }
+            } else {
+                ProviderError::Failed { message }
+            }
+        }
+    }
+}
+
+fn provider_error_from_value(
+    value: &Value,
+    response_status: Option<u16>,
+    headers: &HeaderMap,
+) -> ProviderError {
+    // 实际 HTTP 状态是服务端行为的权威来源；只有成功响应里的 SSE/JSON
+    // 错误事件才使用 payload status。
+    let status = response_status
+        .filter(|status| *status >= 400)
+        .or_else(|| provider_error_status(value));
+    let mapped = provider_error_kind(status, value);
+    if matches!(
+        &mapped,
+        ProviderError::Unavailable { .. } | ProviderError::RateLimited { .. }
+    ) {
+        mapped.with_metadata(provider_error_metadata(status, headers, Some(value)))
+    } else {
+        mapped
+    }
+}
+
 fn provider_credential_error(error: golutra_auth::AuthError) -> ProviderError {
     ProviderError::NotConfigured {
         message: sanitize_provider_error(&error.to_string()),
@@ -2147,13 +2985,12 @@ fn provider_http_client() -> reqwest::Client {
         .expect("static reqwest client configuration is valid")
 }
 
-fn provider_http_error(status: reqwest::StatusCode, value: &Value) -> ProviderError {
-    let message = provider_error_message(value);
-    if status.is_server_error() {
-        ProviderError::Unavailable { message }
-    } else {
-        ProviderError::Failed { message }
-    }
+fn provider_http_error_with_headers(
+    status: reqwest::StatusCode,
+    headers: &HeaderMap,
+    value: &Value,
+) -> ProviderError {
+    provider_error_from_value(value, Some(status.as_u16()), headers)
 }
 
 async fn response_json_or_error(response: reqwest::Response) -> Result<Value, ProviderError> {

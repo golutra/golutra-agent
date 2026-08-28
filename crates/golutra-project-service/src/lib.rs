@@ -1703,6 +1703,12 @@ async fn run_backend_command_with_timeout(
     command
         .args(args)
         .current_dir(cwd)
+        // Clear the parent environment, then re-apply only the runtime sockets /
+        // hosts backends need. This keeps systemd --user DBus, Docker host/
+        // context, and tmux HOME/socket available without copying provider
+        // credentials into durable service environments.
+        .env_clear()
+        .envs(sanitized_backend_environment())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1815,6 +1821,68 @@ async fn run_backend_command_with_timeout(
         stderr,
         truncated: stdout_truncated || stderr_truncated,
     })
+}
+
+fn sanitized_backend_environment() -> BTreeMap<std::ffi::OsString, std::ffi::OsString> {
+    std::env::vars_os()
+        .filter(|(key, _)| backend_environment_key_allowed(key))
+        .collect()
+}
+
+fn backend_environment_key_allowed(key: &std::ffi::OsStr) -> bool {
+    let key = key.to_string_lossy().to_ascii_uppercase();
+    // Defense in depth: never forward credential-shaped names even if a future
+    // allowlist entry accidentally overlaps one.
+    if [
+        "KEY",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "CREDENTIAL",
+        "AUTHORIZATION",
+        "COOKIE",
+        "PASSWD",
+        "PRIVATE",
+    ]
+    .iter()
+    .any(|fragment| key.contains(fragment))
+    {
+        return false;
+    }
+    matches!(
+        key.as_str(),
+        "PATH"
+            | "HOME"
+            | "USER"
+            | "LOGNAME"
+            | "SHELL"
+            | "LANG"
+            | "LC_ALL"
+            | "LC_CTYPE"
+            | "TERM"
+            | "TMPDIR"
+            | "TMP"
+            | "TEMP"
+            | "XDG_RUNTIME_DIR"
+            | "XDG_CONFIG_HOME"
+            | "XDG_DATA_HOME"
+            | "XDG_STATE_HOME"
+            | "DBUS_SESSION_BUS_ADDRESS"
+            | "DBUS_SYSTEM_BUS_ADDRESS"
+            | "TMUX"
+            | "TMUX_TMPDIR"
+            | "DOCKER_HOST"
+            | "DOCKER_CONTEXT"
+            | "DOCKER_CONFIG"
+            | "DOCKER_CERT_PATH"
+            | "DOCKER_TLS_VERIFY"
+            | "COMPOSE_PROJECT_NAME"
+            | "COMPOSE_FILE"
+            | "SYSTEMD_EXEC_PID"
+            | "MANAGERPID"
+            | "INVOCATION_ID"
+            | "JOURNAL_STREAM"
+    ) || key.starts_with("LC_")
 }
 
 async fn terminate_backend_child(child: &mut tokio::process::Child, process_id: Option<u32>) {
@@ -2354,6 +2422,26 @@ mod tests {
         }
     }
 
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvironmentRestore {
+        values: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl Drop for EnvironmentRestore {
+        fn drop(&mut self) {
+            for (key, value) in &self.values {
+                // SAFETY: the test owns ENV_LOCK for the complete guard lifetime.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
     #[derive(Debug, Clone)]
     struct FakeAdapter {
         state: Arc<AsyncMutex<FakeBackendState>>,
@@ -2851,6 +2939,124 @@ mod tests {
             inspect_systemd_user_unit("web.service", &unrecognized_success).state,
             ProjectServiceState::Unknown
         );
+    }
+
+    #[test]
+    fn backend_environment_filter_keeps_session_and_runtime_transport_variables() {
+        assert!(backend_environment_key_allowed(std::ffi::OsStr::new(
+            "PATH"
+        )));
+        assert!(backend_environment_key_allowed(std::ffi::OsStr::new(
+            "HOME"
+        )));
+        assert!(backend_environment_key_allowed(std::ffi::OsStr::new(
+            "DBUS_SESSION_BUS_ADDRESS"
+        )));
+        assert!(backend_environment_key_allowed(std::ffi::OsStr::new(
+            "XDG_RUNTIME_DIR"
+        )));
+        assert!(backend_environment_key_allowed(std::ffi::OsStr::new(
+            "DOCKER_HOST"
+        )));
+        assert!(backend_environment_key_allowed(std::ffi::OsStr::new(
+            "DOCKER_CONTEXT"
+        )));
+        assert!(backend_environment_key_allowed(std::ffi::OsStr::new(
+            "TMUX"
+        )));
+        assert!(backend_environment_key_allowed(std::ffi::OsStr::new(
+            "TMUX_TMPDIR"
+        )));
+        assert!(!backend_environment_key_allowed(std::ffi::OsStr::new(
+            "OPENAI_API_KEY"
+        )));
+        assert!(!backend_environment_key_allowed(std::ffi::OsStr::new(
+            "GITHUB_TOKEN"
+        )));
+        assert!(!backend_environment_key_allowed(std::ffi::OsStr::new(
+            "HTTPS_PROXY"
+        )));
+        assert!(!backend_environment_key_allowed(std::ffi::OsStr::new(
+            "UNRELATED_CUSTOM_VAR"
+        )));
+    }
+
+    #[test]
+    fn sanitized_backend_environment_allowlists_live_runtime_values() {
+        let _environment_lock = ENV_LOCK.lock().expect("environment lock");
+        const KEYS: [&str; 9] = [
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "DOCKER_HOST",
+            "DOCKER_CONTEXT",
+            "TMUX",
+            "HOME",
+            "OPENAI_API_KEY",
+            "GITHUB_TOKEN",
+            "UNRELATED_CUSTOM_VAR",
+        ];
+        let _restore = EnvironmentRestore {
+            values: KEYS
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect(),
+        };
+        // SAFETY: test-only env mutations are serialized by ENV_LOCK and the
+        // EnvironmentRestore guard restores the exact previous values.
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", "/run/user/golutra-test");
+            std::env::set_var(
+                "DBUS_SESSION_BUS_ADDRESS",
+                "unix:path=/run/user/golutra-test/bus",
+            );
+            std::env::set_var("DOCKER_HOST", "unix:///var/run/docker.sock");
+            std::env::set_var("DOCKER_CONTEXT", "desktop-linux");
+            std::env::set_var("TMUX", "/tmp/tmux-1000/default");
+            std::env::set_var("HOME", "/home/golutra-test");
+            std::env::set_var("OPENAI_API_KEY", "sk-test-should-not-leak");
+            std::env::set_var("GITHUB_TOKEN", "ghp_should-not-leak");
+            std::env::set_var("UNRELATED_CUSTOM_VAR", "should-not-leak");
+        }
+        let values = sanitized_backend_environment();
+        assert_eq!(
+            values
+                .get(std::ffi::OsStr::new("XDG_RUNTIME_DIR"))
+                .map(std::ffi::OsString::as_os_str),
+            Some(std::ffi::OsStr::new("/run/user/golutra-test"))
+        );
+        assert_eq!(
+            values
+                .get(std::ffi::OsStr::new("DBUS_SESSION_BUS_ADDRESS"))
+                .map(std::ffi::OsString::as_os_str),
+            Some(std::ffi::OsStr::new("unix:path=/run/user/golutra-test/bus"))
+        );
+        assert_eq!(
+            values
+                .get(std::ffi::OsStr::new("DOCKER_HOST"))
+                .map(std::ffi::OsString::as_os_str),
+            Some(std::ffi::OsStr::new("unix:///var/run/docker.sock"))
+        );
+        assert_eq!(
+            values
+                .get(std::ffi::OsStr::new("DOCKER_CONTEXT"))
+                .map(std::ffi::OsString::as_os_str),
+            Some(std::ffi::OsStr::new("desktop-linux"))
+        );
+        assert_eq!(
+            values
+                .get(std::ffi::OsStr::new("TMUX"))
+                .map(std::ffi::OsString::as_os_str),
+            Some(std::ffi::OsStr::new("/tmp/tmux-1000/default"))
+        );
+        assert_eq!(
+            values
+                .get(std::ffi::OsStr::new("HOME"))
+                .map(std::ffi::OsString::as_os_str),
+            Some(std::ffi::OsStr::new("/home/golutra-test"))
+        );
+        assert!(!values.contains_key(std::ffi::OsStr::new("OPENAI_API_KEY")));
+        assert!(!values.contains_key(std::ffi::OsStr::new("GITHUB_TOKEN")));
+        assert!(!values.contains_key(std::ffi::OsStr::new("UNRELATED_CUSTOM_VAR")));
     }
 
     #[tokio::test]

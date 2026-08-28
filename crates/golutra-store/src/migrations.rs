@@ -16,7 +16,7 @@ use tokio::time::sleep;
 
 use crate::artifact_expiration;
 
-const CURRENT_VERSION: i64 = 2;
+const CURRENT_VERSION: i64 = 4;
 const MIGRATION_LOCK_RETRIES: usize = 40;
 const MIGRATION_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
 
@@ -212,6 +212,8 @@ const MIGRATION_1: &[&str] = &[
 
 const MIGRATION_1_NAME: &str = "base_schema";
 const MIGRATION_2_NAME: &str = "legacy_columns_and_indexes";
+const MIGRATION_3_NAME: &str = "model_history_index";
+const MIGRATION_4_NAME: &str = "model_history_facts_index";
 const LEGACY_MIGRATION_1_CHECKSUM: &str = "sha256:golutra-v1-base-20260808";
 const LEGACY_MIGRATION_2_CHECKSUM: &str = "sha256:golutra-v2-legacy-columns-20260808";
 const MIGRATION_2_COLUMNS: &[(&str, &str, &str)] = &[
@@ -312,6 +314,33 @@ const MIGRATION_2_SQL: &[&str] = &[
     UPDATE_ARTIFACT_METADATA_SQL,
 ];
 
+// 查询模型历史时固定带 session、sequence 和 event_type 条件；这个部分索引
+// 让增量上下文刷新只触碰可投影的事件，避免在长会话 telemetry 上做全索引扫描。
+const MIGRATION_3: &[&str] = &[r#"
+    CREATE INDEX IF NOT EXISTS idx_runtime_events_model_history_session_sequence
+    ON runtime_events (session_id, sequence_no)
+    WHERE event_type IN (
+        'TaskCreated', 'TurnQueued', 'TurnUpdated', 'TurnCancelled',
+        'AssistantMessage', 'CompactionCompleted'
+    )
+    "#];
+
+// 工具完成和任务终态也是模型恢复所需的历史事实。单独的版本迁移替换
+// 旧部分索引，确保已有数据库不会只更新 checksum 却继续使用旧索引。
+const MIGRATION_4: &[&str] = &[
+    "DROP INDEX IF EXISTS idx_runtime_events_model_history_session_sequence",
+    r#"
+    CREATE INDEX IF NOT EXISTS idx_runtime_events_model_history_session_sequence
+    ON runtime_events (session_id, sequence_no)
+    WHERE event_type IN (
+        'TaskCreated', 'TurnQueued', 'TurnUpdated', 'TurnCancelled',
+        'AssistantMessage', 'ToolCompleted', 'TaskCompleted',
+        'TaskAborted', 'TaskInterrupted', 'TaskUncertain',
+        'CandidateReady', 'VerificationReady', 'CompactionCompleted'
+    )
+    "#,
+];
+
 // This checksum was produced by the first versioned migration runner before its procedural
 // signature was derived directly from the SQL and column definitions above.
 const PREVIOUS_MIGRATION_2_SIGNATURE: &[&str] = &[
@@ -358,6 +387,20 @@ fn migration_checksum(version: i64) -> String {
             }
             digest.update([0_u8]);
             digest.update(ARTIFACT_BACKFILL_FORMAT_VERSION.as_bytes());
+        }
+        3 => {
+            digest.update(MIGRATION_3_NAME.as_bytes());
+            for statement in MIGRATION_3 {
+                digest.update([0_u8]);
+                digest.update(statement.as_bytes());
+            }
+        }
+        4 => {
+            digest.update(MIGRATION_4_NAME.as_bytes());
+            for statement in MIGRATION_4 {
+                digest.update([0_u8]);
+                digest.update(statement.as_bytes());
+            }
         }
         _ => return format!("sha256:unsupported-migration-{version}"),
     }
@@ -491,6 +534,24 @@ async fn apply_pending(connection: &mut SqliteConnection) -> Result<(), String> 
         migration_2(connection).await?;
         record_migration(connection, 2, MIGRATION_2_NAME, &migration_checksum(2)).await?;
     }
+    if current < 3 {
+        for statement in MIGRATION_3 {
+            sqlx::query(statement)
+                .execute(&mut *connection)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        record_migration(connection, 3, MIGRATION_3_NAME, &migration_checksum(3)).await?;
+    }
+    if current < 4 {
+        for statement in MIGRATION_4 {
+            sqlx::query(statement)
+                .execute(&mut *connection)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        record_migration(connection, 4, MIGRATION_4_NAME, &migration_checksum(4)).await?;
+    }
     Ok(())
 }
 
@@ -523,6 +584,8 @@ fn validate_applied(applied: &[(i64, String, String)]) -> Result<(), String> {
         let expected_name = match *version {
             1 => MIGRATION_1_NAME,
             2 => MIGRATION_2_NAME,
+            3 => MIGRATION_3_NAME,
+            4 => MIGRATION_4_NAME,
             _ => return Err(format!("schema migration version {version} is unsupported")),
         };
         if name != expected_name || !migration_checksum_matches(*version, checksum) {
@@ -716,6 +779,7 @@ mod tests {
         );
         assert_eq!(rows[0].try_get::<i64, _>("version").expect("version"), 1);
         assert_eq!(rows[1].try_get::<i64, _>("version").expect("version"), 2);
+        assert_eq!(rows[2].try_get::<i64, _>("version").expect("version"), 3);
         assert_eq!(
             rows[0].try_get::<String, _>("checksum").expect("checksum"),
             migration_checksum(1)
@@ -723,6 +787,10 @@ mod tests {
         assert_eq!(
             rows[1].try_get::<String, _>("checksum").expect("checksum"),
             migration_checksum(2)
+        );
+        assert_eq!(
+            rows[2].try_get::<String, _>("checksum").expect("checksum"),
+            migration_checksum(3)
         );
     }
 
@@ -779,6 +847,28 @@ mod tests {
             .collect::<HashSet<_>>();
         assert!(columns.contains("removed"));
         assert!(columns.contains("rollout_path"));
+    }
+
+    #[tokio::test]
+    async fn model_history_partial_index_is_present() {
+        let directory = tempdir().expect("directory");
+        let path = directory.path().join("history-index.sqlite");
+        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+            .expect("options")
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("pool");
+        run(&pool).await.expect("migrations");
+        let sql: Option<String> = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_runtime_events_model_history_session_sequence'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .expect("index query");
+        assert!(sql.is_some_and(|sql| sql.contains("event_type IN")));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

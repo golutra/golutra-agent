@@ -195,32 +195,60 @@ pub(crate) async fn run_process_with_progress(
     let mut child = command
         .spawn()
         .map_err(|error| ToolError::Execution(error.to_string()))?;
+    let child_id = child.id();
     let input = request.stdin;
-    let stdin =
-        if input.is_some() {
-            Some(child.stdin.take().ok_or_else(|| {
-                ToolError::Execution("process stdin pipe is unavailable".to_owned())
-            })?)
-        } else {
-            None
-        };
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| ToolError::Execution("process stdout pipe is unavailable".to_owned()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| ToolError::Execution("process stderr pipe is unavailable".to_owned()))?;
+    let stdin = if input.is_some() {
+        match child.stdin.take() {
+            Some(stdin) => Some(stdin),
+            None => {
+                return Err(abort_spawned_child(
+                    child,
+                    child_id,
+                    "process stdin pipe is unavailable",
+                )
+                .await);
+            }
+        }
+    } else {
+        None
+    };
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            return Err(
+                abort_spawned_child(child, child_id, "process stdout pipe is unavailable").await,
+            );
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            return Err(
+                abort_spawned_child(child, child_id, "process stderr pipe is unavailable").await,
+            );
+        }
+    };
     let (progress_tx, mut progress_rx) = channel(PIPE_MESSAGE_CAPACITY);
-    spawn_stream_reader(stdout, ProcessStream::Stdout, progress_tx.clone());
-    spawn_stream_reader(stderr, ProcessStream::Stderr, progress_tx);
+    let reader_cancellation = CancellationToken::new();
+    let stdout_reader = spawn_stream_reader(
+        stdout,
+        ProcessStream::Stdout,
+        progress_tx.clone(),
+        reader_cancellation.clone(),
+    );
+    let stderr_reader = spawn_stream_reader(
+        stderr,
+        ProcessStream::Stderr,
+        progress_tx,
+        reader_cancellation.clone(),
+    );
     let timeout = tokio::time::sleep(Duration::from_millis(request.timeout_ms));
     tokio::pin!(timeout);
     let stdin_write = write_process_stdin(stdin, input);
     tokio::pin!(stdin_write);
 
-    let child_id = child.id();
+    let mut cleanup =
+        ProcessCleanupGuard::new(child_id, reader_cancellation, stdout_reader, stderr_reader);
     let mut child_wait = Box::pin(child.wait());
     let mut status = None;
     let mut timed_out = false;
@@ -250,6 +278,7 @@ pub(crate) async fn run_process_with_progress(
             }
             result = &mut child_wait, if status.is_none() => {
                 status = Some(result.map_err(|error| ToolError::Execution(error.to_string()))?);
+                cleanup.mark_child_reaped();
                 // A shell can exit while a descendant still owns inherited pipes. The
                 // process group remains the execution boundary, so settle it before
                 // waiting for the pipe readers.
@@ -336,6 +365,8 @@ pub(crate) async fn run_process_with_progress(
     } else {
         format!("{stdout_text}\n{stderr_text}")
     };
+    cleanup.join_readers().await;
+    cleanup.disarm();
     Ok(ShellOutput {
         exit_code: status.code(),
         timed_out,
@@ -349,6 +380,75 @@ pub(crate) async fn run_process_with_progress(
         output_truncated,
         network_access: request.allow_network,
     })
+}
+
+struct ProcessCleanupGuard {
+    process_id: Option<u32>,
+    reader_cancellation: CancellationToken,
+    readers: Vec<tokio::task::JoinHandle<()>>,
+    child_reaped: bool,
+    armed: bool,
+}
+
+async fn abort_spawned_child(
+    mut child: tokio::process::Child,
+    pid: Option<u32>,
+    message: &str,
+) -> ToolError {
+    // 管道尚未交给 reader 时，guard 还不存在；这里必须主动清理整个进程组，
+    // 否则 kill_on_drop 只会结束直接 child，后台孙进程仍可能持有管道。
+    terminate_process_group(pid);
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    ToolError::Execution(message.to_owned())
+}
+
+impl ProcessCleanupGuard {
+    fn new(
+        process_id: Option<u32>,
+        reader_cancellation: CancellationToken,
+        stdout_reader: tokio::task::JoinHandle<()>,
+        stderr_reader: tokio::task::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            process_id,
+            reader_cancellation,
+            readers: vec![stdout_reader, stderr_reader],
+            child_reaped: false,
+            armed: true,
+        }
+    }
+
+    fn mark_child_reaped(&mut self) {
+        self.child_reaped = true;
+    }
+
+    async fn join_readers(&mut self) {
+        for reader in self.readers.drain(..) {
+            let _ = reader.await;
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProcessCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.reader_cancellation.cancel();
+        if self.child_reaped {
+            terminate_process_group_only(self.process_id);
+        } else {
+            terminate_process_group(self.process_id);
+        }
+        for reader in &self.readers {
+            reader.abort();
+        }
+    }
 }
 
 async fn write_process_stdin(
@@ -531,14 +631,23 @@ impl OutputBuffer {
     }
 }
 
-fn spawn_stream_reader<R>(mut reader: R, stream: ProcessStream, sender: Sender<PipeMessage>)
+fn spawn_stream_reader<R>(
+    mut reader: R,
+    stream: ProcessStream,
+    sender: Sender<PipeMessage>,
+    cancellation: CancellationToken,
+) -> tokio::task::JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
         let mut buffer = [0_u8; 8192];
         loop {
-            match reader.read(&mut buffer).await {
+            let read_result = tokio::select! {
+                _ = cancellation.cancelled() => break,
+                result = reader.read(&mut buffer) => result,
+            };
+            match read_result {
                 Ok(0) => {
                     let _ = sender.send(PipeMessage::Done(stream)).await;
                     break;
@@ -558,7 +667,7 @@ where
                 }
             }
         }
-    });
+    })
 }
 
 #[cfg(test)]

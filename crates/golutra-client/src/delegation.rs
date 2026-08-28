@@ -23,11 +23,7 @@ use golutra_protocol::{
 use golutra_tools::{TaskDelegationBackend, TaskDelegationOutput, ToolError, ToolRequest};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::{
-    sync::watch,
-    task::AbortHandle,
-    time::{sleep, timeout},
-};
+use tokio::{sync::watch, task::AbortHandle, time::timeout};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -39,7 +35,7 @@ pub(crate) const DELEGATED_ADMISSION_TOKEN_KEY: &str = "_delegation_admission_to
 const DELEGATED_THREAD_TITLE: &str = "Delegated task";
 const DELEGATED_COMPLETION_GRACE_MS: u64 = 5_000;
 const DELEGATED_COMPLETION_GRACE_DIVISOR: u64 = 20;
-const DELEGATED_WAIT_POLL_MS: u64 = 50;
+const DELEGATED_CANCEL_GRACE_MS: u64 = 5_000;
 
 type SharedDelegationResult = Result<TaskDelegationOutput, String>;
 
@@ -379,6 +375,7 @@ async fn delegate_task(
                     host.execution.shutdown.child_token(),
                 ));
                 entry.insert(operation.clone());
+                host.signal_active_work_change();
                 (operation, Some(()))
             }
         }
@@ -411,6 +408,7 @@ async fn delegate_task(
         )
         .await;
         operation_for_cleanup.complete(&result);
+        operation_host.signal_active_work_change();
         operation_host
             .cleanup_delegation_operation(
                 operation_parent_session_id,
@@ -1170,6 +1168,11 @@ async fn wait_for_child(
     let mut denied_approval = None;
     let mut cancelled_child = false;
     let context_cancellation = context.cancellation();
+    let mut event_bus = host.execution.event_bus.subscribe();
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_millis(context.remaining_elapsed_ms().max(1));
+    let mut cancellation_deadline = None;
+    let mut event_bus_open = true;
     loop {
         host.reconcile_replayed_delegated_prompt(session_id).await?;
         let state = host
@@ -1188,6 +1191,9 @@ async fn wait_for_child(
         {
             cancel_child(host, session_id).await;
             cancelled_child = true;
+            cancellation_deadline = Some(
+                tokio::time::Instant::now() + Duration::from_millis(DELEGATED_CANCEL_GRACE_MS),
+            );
         }
         if state.task_status == TaskStatus::WaitingApproval
             && denied_approval.as_deref() != state.pending_approval.as_deref()
@@ -1217,26 +1223,77 @@ async fn wait_for_child(
                 .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
             denied_approval = Some(approval_id.to_string());
         }
-        if state.task_status == TaskStatus::WaitingAuthentication {
+        if state.task_status == TaskStatus::WaitingAuthentication && !cancelled_child {
             cancel_child(host, session_id).await;
             cancelled_child = true;
+            cancellation_deadline = Some(
+                tokio::time::Instant::now() + Duration::from_millis(DELEGATED_CANCEL_GRACE_MS),
+            );
         }
-        if let Some(receiver) = completion.as_mut() {
-            tokio::select! {
-                _ = cancellation.cancelled(), if !cancelled_child => {}
-                _ = context_cancellation.cancelled(), if !cancelled_child => {}
-                changed = receiver.changed() => {
-                    if changed.is_err() {
-                        completion = None;
+
+        // Child state is durable and completion is signalled by the worker;
+        // wait on those notifications instead of issuing fixed-interval
+        // projection queries. Runtime events cover intermediate transitions
+        // (approval/authentication/paused) while the completion watch covers
+        // the final worker cleanup race.
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled(), if !cancelled_child => {
+                cancel_child(host, session_id).await;
+                cancelled_child = true;
+                cancellation_deadline = Some(
+                    tokio::time::Instant::now() + Duration::from_millis(DELEGATED_CANCEL_GRACE_MS),
+                );
+            }
+            _ = context_cancellation.cancelled(), if !cancelled_child => {
+                cancel_child(host, session_id).await;
+                cancelled_child = true;
+                cancellation_deadline = Some(
+                    tokio::time::Instant::now() + Duration::from_millis(DELEGATED_CANCEL_GRACE_MS),
+                );
+            }
+            _ = tokio::time::sleep_until(deadline), if !cancelled_child => {
+                cancel_child(host, session_id).await;
+                cancelled_child = true;
+                cancellation_deadline = Some(
+                    tokio::time::Instant::now() + Duration::from_millis(DELEGATED_CANCEL_GRACE_MS),
+                );
+            }
+            _ = async {
+                if let Some(deadline) = cancellation_deadline {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            }, if cancellation_deadline.is_some() => {
+                // 取消后仍没有终态时强制结束 worker，避免 delegated parent
+                // 一直占住 session lane 或遗留不可达的子任务。
+                abort_child(host, session_id).await;
+                return Err(ClientError::TaskExecution(
+                    "delegated child did not reach a terminal state after cancellation"
+                        .to_owned(),
+                ));
+            }
+            changed = async {
+                match completion.as_mut() {
+                    Some(receiver) => receiver.changed().await.ok(),
+                    None => None,
+                }
+            } => {
+                if changed.is_none() {
+                    completion = None;
+                }
+            }
+            event = event_bus.recv(), if event_bus_open => {
+                match event {
+                    Ok(event) if event.session_id == session_id => {}
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // The durable projection remains authoritative if the
+                        // in-process event bus is closed during host shutdown.
+                        event_bus_open = false;
                     }
                 }
-                _ = sleep(Duration::from_millis(DELEGATED_WAIT_POLL_MS)) => {}
-            }
-        } else {
-            tokio::select! {
-                _ = cancellation.cancelled(), if !cancelled_child => {}
-                _ = context_cancellation.cancelled(), if !cancelled_child => {}
-                _ = sleep(Duration::from_millis(DELEGATED_WAIT_POLL_MS)) => {}
             }
         }
     }
@@ -1252,6 +1309,20 @@ async fn cancel_child(host: &Arc<RuntimeHost>, session_id: SessionId) {
         .cloned()
     {
         control.execution.cancel();
+    }
+}
+
+async fn abort_child(host: &Arc<RuntimeHost>, session_id: SessionId) {
+    if let Some(control) = host
+        .execution
+        .task_controls
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned()
+    {
+        control.execution.cancel();
+        control.abort_handle.abort();
     }
 }
 
@@ -1636,13 +1707,13 @@ mod tests {
             provider_tool_call_id: Some("replayed-delegated-child".to_owned()),
             session_id: parent_session_id,
             turn_id: Some(TurnId::new()),
-            tool_name: "delegate_task".to_owned(),
+            tool_name: "subagent".to_owned(),
             arguments: json!({"task": task}),
         };
         let overrides = delegation_overrides(
             &crate::ProviderTurnSettings::default(),
             crate::NormalizedExecutionMode::Legacy,
-            AgentToolProfile::Full,
+            AgentToolProfile::Coding,
             &request.arguments,
         )
         .expect("delegation overrides");
@@ -2035,22 +2106,12 @@ mod tests {
                 &cancellation,
             )
             .expect("child context");
-        let grandchild = child
-            .child(
-                child_session_id,
-                child_task_id,
-                ThreadId::new(),
-                1_024,
-                None,
-                &cancellation,
-            )
-            .expect("grandchild context");
         let request = ToolRequest {
             tool_call_id: ToolCallId::new(),
             provider_tool_call_id: None,
             session_id: child_session_id,
             turn_id: Some(TurnId::new()),
-            tool_name: "delegate_task".to_owned(),
+            tool_name: "subagent".to_owned(),
             arguments: json!({"task": "nested"}),
         };
 
@@ -2068,17 +2129,6 @@ mod tests {
         .await
         .expect("root checkpoint");
         drop(checkpoint_guard);
-        persist_delegation_usage_settlement(
-            &host,
-            &request,
-            child_task_id,
-            &child,
-            &grandchild,
-            1_500,
-            None,
-        )
-        .await
-        .expect("root settlement");
         persist_delegation_usage_settlement(
             &host,
             &request,
@@ -2108,20 +2158,16 @@ mod tests {
             .filter(|event| event.event_type == RuntimeEventType::CheckpointCreated)
             .collect::<Vec<_>>();
 
-        assert_eq!(checkpoints.len(), 3);
+        assert_eq!(checkpoints.len(), 2);
         assert!(child_events.is_empty());
         assert!(checkpoints.iter().all(|event| event.turn_id.is_none()));
         assert_eq!(
             checkpoints[0].payload["delegation_recovery"]["state"]["started_children"],
-            2
+            1
         );
         assert_eq!(
             checkpoints[1].payload["delegation_recovery"]["state"]["spent_tokens"],
-            delegation_policy::MIN_DELEGATED_TOKEN_BUDGET
-        );
-        assert_eq!(
-            checkpoints[2].payload["delegation_recovery"]["state"]["spent_tokens"],
-            3_500
+            2_000
         );
     }
 

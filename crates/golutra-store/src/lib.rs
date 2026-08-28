@@ -499,6 +499,35 @@ impl RuntimeStore {
             .collect()
     }
 
+    /// 一次读取指定 workspace 中仍可恢复的 session 投影，避免 runtime
+    /// 启动时先枚举 thread、再逐个查询 projection 的 N+1 往返。
+    pub async fn list_workspace_session_states(
+        &self,
+        workspace_root: &str,
+    ) -> StoreResult<Vec<StateProjection>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT projection.projection_json
+            FROM state_projections AS projection
+            INNER JOIN threads AS thread
+                ON thread.session_id = projection.session_id
+            WHERE thread.workspace_root = ?
+              AND thread.removed = 0
+            ORDER BY projection.last_sequence_no ASC
+            "#,
+        )
+        .bind(workspace_root)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let projection_json: String = row.try_get("projection_json")?;
+                Ok(serde_json::from_str(&projection_json)?)
+            })
+            .collect()
+    }
+
     pub async fn max_sequence_no(&self) -> StoreResult<u64> {
         let row = sqlx::query(
             "SELECT COALESCE(MAX(sequence_no), 0) AS max_sequence_no FROM runtime_events",
@@ -538,6 +567,44 @@ impl RuntimeStore {
                 Ok(serde_json::from_str(&event_json)?)
             })
             .collect()
+    }
+
+    /// 返回会改变模型上下文的最新事件。
+    ///
+    /// 命令完成、遥测和治理事件可能晚于模型事实写入，但不应成为上下文
+    /// 树的叶节点。该查询与模型历史部分索引保持一致，只读取上下文事件。
+    pub async fn load_latest_model_history_event(
+        &self,
+        session_id: SessionId,
+    ) -> StoreResult<Option<RuntimeEvent>> {
+        let row = sqlx::query(
+            r#"
+            SELECT event_json
+            FROM runtime_events
+            WHERE session_id = ?
+              AND event_type IN (
+                  'TaskCreated', 'TurnQueued', 'TurnUpdated', 'TurnCancelled',
+                  'AssistantMessage', 'ToolCompleted', 'TaskCompleted',
+                  'TaskAborted', 'TaskInterrupted', 'TaskUncertain',
+                  'CandidateReady', 'VerificationReady', 'CompactionCompleted'
+              )
+              AND (
+                  event_type != 'CompactionCompleted'
+                  OR json_extract(payload_json, '$.content') IS NOT NULL
+              )
+            ORDER BY sequence_no DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(session_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|row| {
+            let event_json: String = row.try_get("event_json")?;
+            Ok(serde_json::from_str(&event_json)?)
+        })
+        .transpose()
     }
 
     pub async fn session_for_task(&self, task_id: TaskId) -> StoreResult<Option<SessionId>> {
@@ -630,6 +697,73 @@ impl RuntimeStore {
         .bind(task_id.map(|id| id.to_string()))
         .bind(i64::try_from(after_sequence_no.unwrap_or_default()).unwrap_or(i64::MAX))
         .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let event_json: String = row.try_get("event_json")?;
+                Ok(serde_json::from_str(&event_json)?)
+            })
+            .collect()
+    }
+
+    /// 读取以 `leaf_event_id` 结尾的活动上下文窗口。
+    ///
+    /// canonical event JSON 保存 parent 引用，递归查询可在一次 SQLite 往返中
+    /// 同时取得最近尾部与路径内最近的 compaction，且不读取兄弟分支。递归在
+    /// compaction 处停止；parent sequence 必须严格递减以阻断损坏数据中的环，
+    /// 深度上限继续约束超长路径的内存占用。
+    pub async fn load_active_context_window(
+        &self,
+        session_id: SessionId,
+        leaf_event_id: EventId,
+        recent_limit: u32,
+        max_depth: u32,
+    ) -> StoreResult<Vec<RuntimeEvent>> {
+        if max_depth == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"
+            WITH RECURSIVE event_path AS (
+                SELECT event_id, event_json, event_type, sequence_no,
+                       json_extract(event_json, '$.parent_event_id') AS parent_event_id,
+                       0 AS depth
+                FROM runtime_events
+                WHERE session_id = ? AND event_id = ?
+
+                UNION ALL
+
+                SELECT parent.event_id, parent.event_json, parent.event_type, parent.sequence_no,
+                       json_extract(parent.event_json, '$.parent_event_id') AS parent_event_id,
+                       event_path.depth + 1 AS depth
+                FROM runtime_events AS parent
+                JOIN event_path
+                  ON parent.session_id = ?
+                 AND parent.event_id = event_path.parent_event_id
+                WHERE event_path.depth + 1 < ?
+                  AND NOT (
+                      event_path.event_type = 'CompactionCompleted'
+                      AND json_extract(event_path.event_json, '$.payload.content') IS NOT NULL
+                  )
+                  AND parent.sequence_no < event_path.sequence_no
+            )
+            SELECT event_json
+            FROM event_path
+            WHERE depth < ?
+               OR (
+                   event_type = 'CompactionCompleted'
+                   AND json_extract(event_json, '$.payload.content') IS NOT NULL
+               )
+            ORDER BY sequence_no ASC
+            "#,
+        )
+        .bind(session_id.to_string())
+        .bind(leaf_event_id.to_string())
+        .bind(session_id.to_string())
+        .bind(i64::from(max_depth))
+        .bind(i64::from(recent_limit))
         .fetch_all(&self.pool)
         .await?;
 
@@ -747,56 +881,6 @@ impl RuntimeStore {
             .collect::<StoreResult<Vec<RuntimeEvent>>>()?;
         events.reverse();
         Ok(events)
-    }
-
-    pub async fn load_latest_explicit_compaction(
-        &self,
-        session_id: SessionId,
-    ) -> StoreResult<Option<RuntimeEvent>> {
-        let row = sqlx::query(
-            r#"
-            SELECT event_json
-            FROM runtime_events
-            WHERE session_id = ?
-              AND event_type = 'CompactionCompleted'
-              AND json_extract(payload_json, '$.mode') = 'explicit'
-            ORDER BY sequence_no DESC
-            LIMIT 1
-            "#,
-        )
-        .bind(session_id.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(|row| {
-            let event_json: String = row.try_get("event_json")?;
-            Ok(serde_json::from_str(&event_json)?)
-        })
-        .transpose()
-    }
-
-    pub async fn load_latest_context_compaction(
-        &self,
-        session_id: SessionId,
-    ) -> StoreResult<Option<RuntimeEvent>> {
-        let row = sqlx::query(
-            r#"
-            SELECT event_json
-            FROM runtime_events
-            WHERE session_id = ?
-              AND event_type = 'CompactionCompleted'
-              AND json_extract(payload_json, '$.content') IS NOT NULL
-            ORDER BY sequence_no DESC
-            LIMIT 1
-            "#,
-        )
-        .bind(session_id.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(|row| {
-            let event_json: String = row.try_get("event_json")?;
-            Ok(serde_json::from_str(&event_json)?)
-        })
-        .transpose()
     }
 
     pub fn reduce_state(session_id: SessionId, events: &[RuntimeEvent]) -> StateProjection {

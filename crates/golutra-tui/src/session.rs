@@ -3,7 +3,7 @@
 use golutra_client::{DebugExportReceipt, RuntimeClient, RuntimeTransport};
 use golutra_core::{Actor, ActorKind, CommandId, SessionId, TaskId, TaskStatus, ThreadId, TurnId};
 use golutra_protocol::{RuntimeQuery, RuntimeQueryKind, SessionCommand, SessionCommandKind};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -249,22 +249,63 @@ pub(crate) fn session_command(
     }
 }
 
-pub(crate) async fn initial_session(
-    value: Option<&str>,
+pub(crate) fn initial_session() -> (ThreadId, SessionId) {
+    (ThreadId::new(), SessionId::new())
+}
+
+pub(crate) async fn resume_session(
+    value: &str,
     transport: &RuntimeTransport,
 ) -> miette::Result<(ThreadId, SessionId)> {
-    if let Some(value) = value {
-        let session_id = Uuid::parse_str(value)
-            .map(SessionId)
-            .map_err(|error| miette::miette!("invalid session id: {error}"))?;
-        let thread_id = transport
-            .thread_for_session(session_id)
-            .await
-            .map_err(|error| miette::miette!("{error}"))?
-            .map_or_else(ThreadId::new, |thread| thread.thread_id);
-        return Ok((thread_id, session_id));
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(miette::miette!("resume key cannot be empty"));
     }
-    Ok((ThreadId::new(), SessionId::new()))
+    if value.chars().any(char::is_whitespace) {
+        return Err(miette::miette!(
+            "resume key cannot contain whitespace: {value}"
+        ));
+    }
+
+    let session_id = resume_alias_session_id(value, transport);
+    if let Some(thread) = transport
+        .thread_for_session(session_id)
+        .await
+        .map_err(|error| miette::miette!("{error}"))?
+    {
+        return Ok((thread.thread_id, thread.session_id));
+    }
+
+    let thread_id = ThreadId::new();
+    let acknowledgement = transport
+        .send_command(session_command(
+            session_id,
+            SessionCommandKind::Create,
+            json!({"_thread_id": thread_id.to_string()}),
+        ))
+        .await
+        .map_err(|error| miette::miette!("{error}"))?;
+    let thread = transport
+        .thread_for_session(session_id)
+        .await
+        .map_err(|error| miette::miette!("{error}"))?;
+    if let Some(thread) = thread {
+        return Ok((thread.thread_id, thread.session_id));
+    }
+    let reason = acknowledgement
+        .reason
+        .unwrap_or_else(|| "session creation did not persist a thread".to_owned());
+    Err(miette::miette!("failed to create resume session: {reason}"))
+}
+
+fn resume_alias_session_id(value: &str, transport: &RuntimeTransport) -> SessionId {
+    const RESUME_ALIAS_NAMESPACE: Uuid = Uuid::from_u128(0x5ae3_10d2_9488_59ed_a50c_b6b7_fcaf_ee16);
+    let workspace = transport.cwd().map_or_else(
+        || transport.workspace_id().to_string(),
+        |cwd| cwd.display().to_string(),
+    );
+    let identity = format!("{workspace}\0{value}");
+    SessionId(Uuid::new_v5(&RESUME_ALIAS_NAMESPACE, identity.as_bytes()))
 }
 
 pub(crate) async fn recent_continuation_hint(

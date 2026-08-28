@@ -356,6 +356,18 @@ impl EvolutionStore {
             .collect())
     }
 
+    /// 返回已安装技能的稳定索引快照。调用方可在进程内缓存该快照，按每次
+    /// objective 的 token 预算做轻量筛选，避免重复读取和解析 evolution 状态。
+    pub fn installed_skill_manifests(&self) -> Result<Vec<SkillManifest>, EvolutionError> {
+        Ok(self
+            .snapshot()?
+            .skills
+            .into_iter()
+            .filter(|record| record.status == SkillLifecycleStatus::Installed)
+            .map(|record| record.manifest)
+            .collect())
+    }
+
     fn with_state<T>(
         &self,
         operation: impl FnOnce(&mut EvolutionState) -> Result<T, EvolutionError>,

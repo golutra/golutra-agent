@@ -59,7 +59,9 @@ impl TuiRuntimeController {
     }
 
     pub(crate) async fn shutdown(&mut self) -> miette::Result<()> {
-        self.abort_interactive_refresh();
+        if let Some(refresh) = self.interactive_refresh.take() {
+            super::shutdown_join_handle(refresh.task).await;
+        }
         self.transport
             .close()
             .await

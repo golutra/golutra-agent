@@ -8,6 +8,20 @@ use std::sync::{Arc, Weak};
 
 use super::*;
 
+/// 终态事件提交后的轻量调度请求。请求本身不携带工具产物，避免在主执行路径复制大对象；
+/// worker 会从 durable 事件重建完整评估输入。
+#[derive(Debug)]
+pub(crate) struct PostTaskScheduleRequest {
+    pub(crate) task: HostedAgentTask,
+    pub(crate) objective: String,
+    pub(crate) task_status: TaskStatus,
+    pub(crate) verification: Option<golutra_core::VerificationRecord>,
+    pub(crate) tool_count: usize,
+    pub(crate) artifact_count: usize,
+    pub(crate) failure_summary: Option<String>,
+    pub(crate) latency: Duration,
+}
+
 #[derive(Debug, Clone)]
 pub struct PostTaskCoordinator {
     host: Weak<RuntimeHost>,
@@ -21,14 +35,18 @@ impl PostTaskCoordinator {
         }
     }
 
-    pub(crate) fn start(host: &Arc<RuntimeHost>) {
+    pub(crate) fn start(
+        host: &Arc<RuntimeHost>,
+        schedule_rx: mpsc::UnboundedReceiver<PostTaskScheduleRequest>,
+    ) -> tokio::task::JoinHandle<()> {
         let coordinator = Self {
             host: Arc::downgrade(host),
         };
         let worker_id = format!("{}:{}", host.instance_id, std::process::id());
+        let shutdown = host.execution.shutdown.clone();
         tokio::spawn(async move {
-            coordinator.run(worker_id).await;
-        });
+            coordinator.run(worker_id, shutdown, schedule_rx).await;
+        })
     }
 
     pub async fn status(&self, task_id: TaskId) -> Result<Option<PostTaskJob>, ClientError> {
@@ -59,8 +77,26 @@ impl PostTaskCoordinator {
         Ok(job)
     }
 
-    async fn run(self, worker_id: String) {
+    async fn run(
+        self,
+        worker_id: String,
+        shutdown: tokio_util::sync::CancellationToken,
+        mut schedule_rx: mpsc::UnboundedReceiver<PostTaskScheduleRequest>,
+    ) {
         loop {
+            // 新建 host 已在启动边界恢复过过期租约。先等本地调度或周期检查，
+            // 避免空 worker 与首个 provider 上下文同时争抢单连接 SQLite。
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                request = schedule_rx.recv() => {
+                    match request {
+                        Some(request) => self.process_schedule(request).await,
+                        None => return,
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(POST_TASK_JOB_IDLE_POLL_MILLIS)) => {}
+            }
             let Some(host) = self.host.upgrade() else {
                 return;
             };
@@ -72,8 +108,6 @@ impl PostTaskCoordinator {
                 .await
                 .is_err()
             {
-                drop(host);
-                tokio::time::sleep(Duration::from_millis(POST_TASK_JOB_IDLE_POLL_MILLIS)).await;
                 continue;
             }
             let workspace_id = host.workspace_id.to_string();
@@ -88,14 +122,26 @@ impl PostTaskCoordinator {
                     chrono::Duration::minutes(POST_TASK_JOB_LEASE_MINUTES),
                 )
                 .await;
-            match claimed {
-                Ok(Some(job)) => self.process(job, &worker_id).await,
-                Ok(None) | Err(_) => {
-                    drop(host);
-                    tokio::time::sleep(Duration::from_millis(POST_TASK_JOB_IDLE_POLL_MILLIS)).await;
-                }
+            if let Ok(Some(job)) = claimed {
+                self.process(job, &worker_id).await;
             }
         }
+    }
+
+    async fn process_schedule(&self, request: PostTaskScheduleRequest) {
+        let Some(host) = self.host.upgrade() else {
+            return;
+        };
+        let task = request.task.clone();
+        let result = host.schedule_task_evaluation_now(request).await;
+        if let Err(error) = result {
+            host.record_post_task_governance_failure(&task, "evaluation_scheduling", true, &error)
+                .await;
+        }
+        host.execution
+            .post_task_schedule_pending
+            .fetch_sub(1, Ordering::SeqCst);
+        host.signal_active_work_change();
     }
 
     async fn process(&self, job: PostTaskJob, worker_id: &str) {
@@ -157,6 +203,10 @@ impl PostTaskCoordinator {
                 }),
             ))
             .await;
+        if let Err(error) = host.promote_reconstructed_task_memory(&task, &input).await {
+            host.record_post_task_governance_failure(&task, "memory_quarantine", false, &error)
+                .await;
+        }
         let bundle = host.storage.governance.evaluate_deep(input);
         let result = host.record_task_evaluation(&task, bundle).await;
         match result {

@@ -731,10 +731,19 @@
     },
     "AgentToolProfile": {
       "description": "Controls the model-visible tool surface without removing the underlying\nexecutor capability or its policy checks.",
-      "type": "string",
-      "enum": [
-        "coding",
-        "full"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "coding",
+            "full"
+          ]
+        },
+        {
+          "description": "显式关闭纯对话或结构化输出回合的 provider 工具声明；宿主执行器仍保留\n策略、回放和恢复能力，只有模型可见的工具列表为空。",
+          "type": "string",
+          "const": "none"
+        }
       ]
     },
     "AgentTurnExecutionOptions": {

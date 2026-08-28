@@ -1,9 +1,10 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, LazyLock, Mutex, RwLock},
+    time::UNIX_EPOCH,
 };
 
 use chrono::{DateTime, Utc};
@@ -122,6 +123,13 @@ pub struct RetrievedMemory {
     pub reason: String,
 }
 
+#[derive(Debug)]
+struct ScoredMemory {
+    index: usize,
+    relevance_score: u32,
+    matched_terms: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryPromotionDecisionKind {
@@ -211,7 +219,40 @@ pub enum MemoryError {
 pub struct MemoryStore {
     path: Option<PathBuf>,
     lock: Arc<Mutex<()>>,
-    in_memory_records: Arc<Mutex<Vec<MemoryRecord>>>,
+    cached_records: Arc<RwLock<Option<MemoryCacheEntry>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MemoryFileFingerprint {
+    len: u64,
+    modified_nanos: u128,
+}
+
+#[derive(Debug, Clone)]
+struct MemoryCacheEntry {
+    fingerprint: Option<MemoryFileFingerprint>,
+    records: Arc<Vec<MemoryRecord>>,
+    search_index: Arc<Vec<MemorySearchIndex>>,
+    /// 倒排索引把检索从“扫描全部记忆”降为“只评分命中 term 的记录”。
+    /// 它与 records 共享同一快照，更新时整体替换，避免读线程看到半成品。
+    term_index: Arc<HashMap<String, Vec<usize>>>,
+}
+
+#[derive(Debug, Clone)]
+struct MemorySearchIndex {
+    terms: HashSet<String>,
+    normalized_content: String,
+}
+
+impl MemoryCacheEntry {
+    fn empty(fingerprint: Option<MemoryFileFingerprint>) -> Self {
+        Self {
+            fingerprint,
+            records: Arc::new(Vec::new()),
+            search_index: Arc::new(Vec::new()),
+            term_index: Arc::new(HashMap::new()),
+        }
+    }
 }
 
 impl MemoryStore {
@@ -220,7 +261,7 @@ impl MemoryStore {
         Self {
             path: Some(path.into()),
             lock: Arc::new(Mutex::new(())),
-            in_memory_records: Arc::new(Mutex::new(Vec::new())),
+            cached_records: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -229,7 +270,7 @@ impl MemoryStore {
         Self {
             path: None,
             lock: Arc::new(Mutex::new(())),
-            in_memory_records: Arc::new(Mutex::new(Vec::new())),
+            cached_records: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -383,23 +424,35 @@ impl MemoryStore {
         if query_terms.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let _guard = self.lock.lock().map_err(|_| MemoryError::LockPoisoned)?;
-        let _file_lock = self.acquire_file_lock()?;
-        let mut records = self.load_unlocked()?;
-        let expired_changed =
-            migrate_legacy_active_memory(&mut records) || mark_expired(&mut records);
+        // Retrieval sits directly on the provider request hot path. It is a
+        // read-only operation: avoid taking the cross-process lock and avoid
+        // persisting access counters on every prompt. Governance/list paths
+        // still perform the durable lifecycle updates.
+        let cache = self.load_cached_for_read()?;
+        let records = cache.records.as_ref();
         let now = Utc::now();
         let normalized_query = normalize_content(query);
-        let mut retrieved = records
-            .iter_mut()
-            .filter(|record| record.status == MemoryStatus::Active)
-            .filter(|record| record.invalidation_refs.is_empty())
-            .filter(|record| record.scope == scope)
-            .filter(|record| record.expires_at.is_none_or(|expiry| expiry > now))
-            .filter_map(|record| {
-                let content_terms = terms(&record.content);
+        let candidate_indices = query_terms
+            .iter()
+            .filter_map(|term| cache.term_index.get(term))
+            .flatten()
+            .copied()
+            .collect::<HashSet<_>>();
+        let mut scored = candidate_indices
+            .into_iter()
+            .filter_map(|index| {
+                let record = records.get(index)?;
+                if record.status != MemoryStatus::Active
+                    || !record.invalidation_refs.is_empty()
+                    || is_legacy_automatic_memory(record)
+                    || record.scope != scope
+                    || record.expires_at.is_some_and(|expiry| expiry <= now)
+                {
+                    return None;
+                }
+                let content_index = cache.search_index.get(index)?;
                 let mut matched_terms = query_terms
-                    .intersection(&content_terms)
+                    .intersection(&content_index.terms)
                     .cloned()
                     .collect::<Vec<_>>();
                 matched_terms.sort();
@@ -408,7 +461,7 @@ impl MemoryStore {
                 }
                 let phrase_bonus = u32::from(
                     !normalized_query.is_empty()
-                        && normalize_content(&record.content).contains(&normalized_query),
+                        && content_index.normalized_content.contains(&normalized_query),
                 ) * 200;
                 let recency_bonus =
                     u32::from(now.signed_duration_since(record.created_at).num_days() <= 30) * 25;
@@ -419,32 +472,41 @@ impl MemoryStore {
                     .saturating_add(recency_bonus)
                     .saturating_add(record.helpful_count.saturating_mul(50));
                 let penalty = record.irrelevant_count.saturating_mul(100);
-                record.access_count = record.access_count.saturating_add(1);
-                record.last_accessed_at = Some(now);
-                Some(RetrievedMemory {
+                Some(ScoredMemory {
+                    index,
                     relevance_score: positive.saturating_sub(penalty),
+                    matched_terms,
+                })
+            })
+            .collect::<Vec<_>>();
+        scored.sort_by(|left, right| {
+            let left_record = &records[left.index];
+            let right_record = &records[right.index];
+            right
+                .relevance_score
+                .cmp(&left.relevance_score)
+                .then_with(|| right_record.created_at.cmp(&left_record.created_at))
+                .then_with(|| right_record.memory_id.cmp(&left_record.memory_id))
+        });
+        scored.truncate(limit);
+        let retrieved = scored
+            .into_iter()
+            .map(|candidate| {
+                let record = &records[candidate.index];
+                RetrievedMemory {
+                    relevance_score: candidate.relevance_score,
                     reason: format!(
                         "matched {} term(s), confidence {}, helpful {}, irrelevant {}",
-                        matched_terms.len(),
+                        candidate.matched_terms.len(),
                         record.confidence,
                         record.helpful_count,
                         record.irrelevant_count
                     ),
-                    matched_terms,
+                    matched_terms: candidate.matched_terms,
                     record: record.clone(),
-                })
+                }
             })
             .collect::<Vec<_>>();
-        retrieved.sort_by(|left, right| {
-            right
-                .relevance_score
-                .cmp(&left.relevance_score)
-                .then_with(|| right.record.created_at.cmp(&left.record.created_at))
-        });
-        retrieved.truncate(limit);
-        if !retrieved.is_empty() || expired_changed {
-            self.save_unlocked(&records)?;
-        }
         Ok(retrieved)
     }
 
@@ -562,15 +624,119 @@ impl MemoryStore {
     fn load_unlocked(&self) -> Result<Vec<MemoryRecord>, MemoryError> {
         let Some(path) = &self.path else {
             return self
-                .in_memory_records
-                .lock()
-                .map(|records| records.clone())
+                .cached_records
+                .read()
+                .map(|cache| {
+                    cache
+                        .as_ref()
+                        .map(|entry| entry.records.as_ref().clone())
+                        .unwrap_or_default()
+                })
                 .map_err(|_| MemoryError::LockPoisoned);
         };
-        match read_bounded_memory_file(path)? {
-            Some(bytes) => serde_json::from_slice(&bytes).map_err(MemoryError::from),
-            None => Ok(Vec::new()),
+        let snapshot = read_memory_file_snapshot(path)?;
+        let records = match snapshot.bytes {
+            Some(bytes) => serde_json::from_slice(&bytes).map_err(MemoryError::from)?,
+            None => Vec::new(),
+        };
+        self.update_cached_records(snapshot.fingerprint, records.clone())?;
+        Ok(records)
+    }
+
+    /// Return a snapshot suitable for read-heavy provider context assembly.
+    /// The metadata check makes external atomic replacements visible without
+    /// imposing a file lock on every retrieval. A second metadata check closes
+    /// the race where a writer replaces the file while it is being parsed.
+    fn load_cached_for_read(&self) -> Result<MemoryCacheEntry, MemoryError> {
+        let Some(path) = &self.path else {
+            return self
+                .cached_records
+                .read()
+                .map(|cache| {
+                    cache
+                        .as_ref()
+                        .cloned()
+                        .unwrap_or_else(|| MemoryCacheEntry::empty(None))
+                })
+                .map_err(|_| MemoryError::LockPoisoned);
+        };
+
+        for _ in 0..2 {
+            let fingerprint = memory_file_fingerprint(path)?;
+            if let Some(entry) = self
+                .cached_records
+                .read()
+                .map_err(|_| MemoryError::LockPoisoned)?
+                .as_ref()
+                .filter(|entry| entry.fingerprint == fingerprint)
+                .cloned()
+            {
+                return Ok(entry);
+            }
+
+            let snapshot = read_memory_file_snapshot(path)?;
+            let records = match snapshot.bytes {
+                Some(bytes) => serde_json::from_slice(&bytes).map_err(MemoryError::from)?,
+                None => Vec::new(),
+            };
+            if memory_file_fingerprint(path)? != snapshot.fingerprint {
+                continue;
+            }
+            self.update_cached_records(snapshot.fingerprint, records)?;
+            return self
+                .cached_records
+                .read()
+                .map_err(|_| MemoryError::LockPoisoned)?
+                .as_ref()
+                .cloned()
+                .ok_or(MemoryError::LockPoisoned);
         }
+
+        // A highly active external writer should not make retrieval fail just
+        // because metadata changed between two reads. The final snapshot is
+        // still internally valid JSON and will be checked again next call.
+        let snapshot = read_memory_file_snapshot(path)?;
+        let records = match snapshot.bytes {
+            Some(bytes) => serde_json::from_slice(&bytes).map_err(MemoryError::from)?,
+            None => Vec::new(),
+        };
+        self.update_cached_records(snapshot.fingerprint, records)?;
+        self.cached_records
+            .read()
+            .map_err(|_| MemoryError::LockPoisoned)?
+            .as_ref()
+            .cloned()
+            .ok_or(MemoryError::LockPoisoned)
+    }
+
+    fn update_cached_records(
+        &self,
+        fingerprint: Option<MemoryFileFingerprint>,
+        records: Vec<MemoryRecord>,
+    ) -> Result<(), MemoryError> {
+        let search_index = records
+            .iter()
+            .map(|record| MemorySearchIndex {
+                terms: terms(&record.content),
+                normalized_content: normalize_content(&record.content),
+            })
+            .collect::<Vec<_>>();
+        let mut term_index = HashMap::<String, Vec<usize>>::new();
+        for (index, content_index) in search_index.iter().enumerate() {
+            for term in &content_index.terms {
+                term_index.entry(term.clone()).or_default().push(index);
+            }
+        }
+        *self
+            .cached_records
+            .write()
+            .map_err(|_| MemoryError::LockPoisoned)? = Some(MemoryCacheEntry {
+            fingerprint,
+            search_index: Arc::new(search_index),
+            records: Arc::new(records),
+            term_index: Arc::new(term_index),
+        });
+        Ok(())
     }
 
     fn save_unlocked(&self, records: &[MemoryRecord]) -> Result<(), MemoryError> {
@@ -581,10 +747,7 @@ impl MemoryStore {
             )));
         }
         let Some(path) = &self.path else {
-            *self
-                .in_memory_records
-                .lock()
-                .map_err(|_| MemoryError::LockPoisoned)? = records.to_vec();
+            self.update_cached_records(None, records.to_vec())?;
             return Ok(());
         };
         if let Some(parent) = path.parent() {
@@ -611,14 +774,43 @@ impl MemoryStore {
         if let Some(parent) = path.parent() {
             sync_memory_directory(parent)?;
         }
+        self.update_cached_records(memory_file_fingerprint(path)?, records.to_vec())?;
         Ok(())
     }
 }
 
-fn read_bounded_memory_file(path: &Path) -> Result<Option<Vec<u8>>, MemoryError> {
+#[derive(Debug)]
+struct MemoryFileSnapshot {
+    fingerprint: Option<MemoryFileFingerprint>,
+    bytes: Option<Vec<u8>>,
+}
+
+fn memory_file_fingerprint(path: &Path) -> Result<Option<MemoryFileFingerprint>, MemoryError> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(MemoryError::Io(error.to_string())),
+    };
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |value| value.as_nanos());
+    Ok(Some(MemoryFileFingerprint {
+        len: metadata.len(),
+        modified_nanos,
+    }))
+}
+
+fn read_memory_file_snapshot(path: &Path) -> Result<MemoryFileSnapshot, MemoryError> {
     let file = match File::open(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(MemoryFileSnapshot {
+                fingerprint: None,
+                bytes: None,
+            });
+        }
         Err(error) => return Err(MemoryError::Io(error.to_string())),
     };
     let metadata = file
@@ -640,7 +832,18 @@ fn read_bounded_memory_file(path: &Path) -> Result<Option<Vec<u8>>, MemoryError>
             path.display()
         )));
     }
-    Ok(Some(bytes))
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |value| value.as_nanos());
+    Ok(MemoryFileSnapshot {
+        fingerprint: Some(MemoryFileFingerprint {
+            len: metadata.len(),
+            modified_nanos,
+        }),
+        bytes: Some(bytes),
+    })
 }
 
 #[must_use]
@@ -711,15 +914,7 @@ fn next_memory_version(records: &[MemoryRecord]) -> u64 {
 fn migrate_legacy_active_memory(records: &mut [MemoryRecord]) -> bool {
     let mut changed = false;
     for record in records {
-        let legacy_automatic = record.status == MemoryStatus::Active
-            && record.scope == MemoryScope::Project
-            && record.claim.is_none()
-            && record.supporting_task_ids.is_empty()
-            && record
-                .promotion_reviewer
-                .as_deref()
-                .is_none_or(|reviewer| reviewer == "system");
-        if legacy_automatic {
+        if is_legacy_automatic_memory(record) {
             record.status = MemoryStatus::Quarantined;
             record.invalidation_refs.push(
                 "legacy single-task project memory requires independent evidence or review"
@@ -729,6 +924,17 @@ fn migrate_legacy_active_memory(records: &mut [MemoryRecord]) -> bool {
         }
     }
     changed
+}
+
+fn is_legacy_automatic_memory(record: &MemoryRecord) -> bool {
+    record.status == MemoryStatus::Active
+        && record.scope == MemoryScope::Project
+        && record.claim.is_none()
+        && record.supporting_task_ids.is_empty()
+        && record
+            .promotion_reviewer
+            .as_deref()
+            .is_none_or(|reviewer| reviewer == "system")
 }
 
 fn mark_expired(records: &mut [MemoryRecord]) -> bool {
@@ -1030,6 +1236,57 @@ mod tests {
 
         assert_eq!(first.list().expect("shared records").len(), 2);
         assert!(path.with_extension("lock").exists());
+    }
+
+    #[test]
+    fn retrieval_is_read_only_and_does_not_rewrite_access_metadata() {
+        let directory = tempdir().expect("directory");
+        let path = directory.path().join("memory.json");
+        let store = MemoryStore::new(&path);
+        activate_project_memory(
+            &store,
+            &propose_project_memory(TaskId::new(), vec![EvidenceId::new()]),
+            "cached runtime retrieval stays cheap",
+        );
+        let before = fs::read(&path).expect("memory before retrieval");
+
+        let first = store
+            .retrieve("cached runtime", MemoryScope::Project, 3)
+            .expect("first retrieval");
+        let second = store
+            .retrieve("cached runtime", MemoryScope::Project, 3)
+            .expect("second retrieval");
+        let after = fs::read(&path).expect("memory after retrieval");
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(before, after, "provider retrieval must not rewrite state");
+        assert_eq!(second[0].record.access_count, 0);
+    }
+
+    #[test]
+    fn read_snapshot_invalidates_after_an_independent_file_update() {
+        let directory = tempdir().expect("directory");
+        let path = directory.path().join("memory.json");
+        let first = MemoryStore::new(&path);
+        let second = MemoryStore::new(&path);
+
+        assert!(
+            first
+                .retrieve("new runtime fact", MemoryScope::Project, 3)
+                .expect("empty retrieval")
+                .is_empty()
+        );
+        activate_project_memory(
+            &second,
+            &propose_project_memory(TaskId::new(), vec![EvidenceId::new()]),
+            "new runtime fact is persisted by another process",
+        );
+
+        let retrieved = first
+            .retrieve("new runtime fact", MemoryScope::Project, 3)
+            .expect("retrieval after external update");
+        assert_eq!(retrieved.len(), 1);
     }
 
     #[test]

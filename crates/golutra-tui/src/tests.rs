@@ -33,6 +33,27 @@ fn remote_subcommand_is_an_explicit_app_server_transport() {
 }
 
 #[test]
+fn resume_accepts_an_arbitrary_utf8_argument_as_a_string() {
+    let resume_key = "  任意-session_#1&symbols  ";
+    let args =
+        Args::try_parse_from(["golutra-tui", "--resume", resume_key]).expect("resume arguments");
+
+    assert_eq!(args.resume.as_deref(), Some(resume_key));
+}
+
+#[test]
+fn legacy_session_id_option_is_no_longer_accepted() {
+    let error = Args::try_parse_from([
+        "golutra-tui",
+        "--session-id",
+        "019f476f-7d5c-7eb3-8947-dfbd02c96cfc",
+    ])
+    .expect_err("session-id must be removed");
+
+    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+}
+
+#[test]
 fn yolo_is_global_for_every_tui_entrypoint() {
     for arguments in [
         &["golutra-tui", "--yolo"][..],
@@ -207,6 +228,34 @@ fn tui_tool_profile_is_explicit_on_prompts_and_inherited_by_steering() {
     );
 }
 
+#[test]
+fn tui_history_bounds_a_single_oversized_event_payload() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        true,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    let oversized = transcript_event(
+        1,
+        session_id,
+        task_id,
+        RuntimeEventType::ProviderStreamed,
+        json!({"delta": "x".repeat(TUI_EVENT_HISTORY_BYTE_LIMIT * 2)}),
+    );
+
+    app.append_event_to_history(oversized);
+
+    assert_eq!(app.events.len(), 1);
+    assert!(app.retained_event_bytes() <= TUI_EVENT_HISTORY_BYTE_LIMIT);
+    assert_eq!(app.events[0].payload["_truncated"], json!(true));
+    assert_eq!(app.events[0].sequence_no, 1);
+}
+
 #[tokio::test]
 async fn remote_transport_attaches_to_the_real_app_server_and_resolves_a_session() {
     let _guard = env_lock_guard().await;
@@ -256,9 +305,7 @@ async fn remote_transport_attaches_to_the_real_app_server_and_resolves_a_session
             last_error.unwrap_or_else(|| "unknown error".to_owned())
         )
     });
-    let (thread_id, session_id) = initial_session(None, &transport)
-        .await
-        .expect("initial remote session");
+    let (thread_id, session_id) = initial_session();
     let canonical_cwd = cwd.path().canonicalize().expect("canonical cwd");
     assert_eq!(transport.cwd(), Some(canonical_cwd.as_path()));
     let RuntimeTransport::Remote(remote) = &transport else {
@@ -395,49 +442,64 @@ async fn spawn_oauth_probe_server() -> String {
 #[tokio::test]
 async fn initial_session_without_argument_starts_new_thread_and_session() {
     let transport = RuntimeTransport::in_memory().await.expect("transport");
-    let (thread_id, session_id) = initial_session(None, &transport)
-        .await
-        .expect("initial session");
+    let (thread_id, session_id) = initial_session();
 
     assert_ne!(thread_id, transport.default_thread_id());
     assert_ne!(session_id, transport.default_session_id());
 }
 
 #[tokio::test]
-async fn initial_session_with_argument_keeps_explicit_session() {
+async fn resume_session_rejects_an_empty_key() {
     let transport = RuntimeTransport::in_memory().await.expect("transport");
-    let explicit_session_id = SessionId::new();
-    let (thread_id, session_id) =
-        initial_session(Some(&explicit_session_id.to_string()), &transport)
-            .await
-            .expect("initial session");
-
-    assert_ne!(thread_id, transport.default_thread_id());
-    assert_eq!(session_id, explicit_session_id);
+    let error = resume_session("  ", &transport)
+        .await
+        .expect_err("empty resume key must fail");
+    assert!(error.to_string().contains("cannot be empty"));
 }
 
 #[tokio::test]
-async fn initial_session_resolves_the_thread_owned_by_an_existing_session() {
+async fn resume_session_rejects_internal_whitespace() {
     let transport = RuntimeTransport::in_memory().await.expect("transport");
-    let session_id = SessionId::new();
-    let thread_id = ThreadId::new();
-    transport
-        .send_command(session_command(
-            session_id,
-            SessionCommandKind::Prompt,
-            json!({
-                "prompt": "existing session",
-                "_thread_id": thread_id.to_string(),
-            }),
-        ))
+    let error = resume_session("named\tsession", &transport)
         .await
-        .expect("prompt");
+        .expect_err("internal whitespace must fail");
+    assert!(error.to_string().contains("cannot contain whitespace"));
+}
 
-    let resolved = initial_session(Some(&session_id.to_string()), &transport)
+#[tokio::test]
+async fn resume_session_maps_an_arbitrary_key_to_a_stable_session() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let resume_key = "任意-session_#1&symbols";
+
+    let (thread_id, session_id) = resume_session(resume_key, &transport)
         .await
-        .expect("initial session");
+        .expect("new resume alias");
+    let stored = transport
+        .thread_for_session(session_id)
+        .await
+        .expect("stored thread")
+        .expect("resume session must be persisted before the first prompt");
+    assert_eq!(
+        (stored.thread_id, stored.session_id),
+        (thread_id, session_id)
+    );
 
-    assert_eq!(resolved, (thread_id, session_id));
+    let resumed = resume_session(&format!("  {resume_key}  "), &transport)
+        .await
+        .expect("existing resume alias");
+    assert_eq!(resumed, (thread_id, session_id));
+}
+
+#[tokio::test]
+async fn resume_session_treats_an_unknown_uuid_as_an_alias() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let unknown_session_id = SessionId::new();
+
+    let (_, mapped_session_id) = resume_session(&unknown_session_id.to_string(), &transport)
+        .await
+        .expect("unknown UUID alias");
+
+    assert_ne!(mapped_session_id, unknown_session_id);
 }
 
 #[tokio::test]

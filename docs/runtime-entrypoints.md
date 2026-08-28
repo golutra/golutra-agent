@@ -122,6 +122,10 @@ extension tools. Use
 `--execution-mode strict` when an unstructured prompt must be translated into a
 deterministic completion contract. The interactive TUI accepts both switches,
 for example `golutra-tui --execution-mode strict --tool-profile coding`.
+Use `golutra-tui --resume <value>` to start or resume the workspace session
+identified by a string key. Leading and trailing whitespace is ignored;
+internal whitespace is rejected. A new key is persisted immediately with a
+stable session ID, so later invocations resume the same session.
 Explicit task contracts and external verifiers remain authoritative completion
 signals even if the caller selected `open`; unrelated payload metadata never
 changes the execution mode. Verification-on-change is off by default in the
@@ -220,12 +224,16 @@ For an active `exec --run-dir` turn, Golutra first writes an atomic checkpoint
 whose top-level terminal outcome is `in_progress`. This checkpoint is not a
 success claim: it records the session/task identity, the event prefix and the
 raw state needed for recovery. The normal terminal export replaces it with a
-`result` or `error` outcome. If a supervisor or benchmark harness kills the
-CLI before that export, the checkpoint remains reopenable through
-`--run-bundle`; runtime recovery may append interruption facts, and a later
-evaluator can refresh the observations without guessing the missing terminal
-result. Such a bundle remains explicitly non-terminal until its manifest is
-refreshed.
+`result` or `error` outcome. The terminal path writes only the raw state and
+owner-only observations needed by callers, so a large redacted debug export or
+post-task evaluation cannot delay the user-visible result. Use an explicit
+bundle refresh (for example, `golutra --run-bundle <DIR> eval ingest ...`) when
+the portable debug projection is needed. If a supervisor or benchmark harness
+kills the CLI before the terminal export, the checkpoint remains reopenable
+through `--run-bundle`; runtime recovery may append interruption facts, and a
+later evaluator can refresh the observations without guessing the missing
+terminal result. Such a bundle remains explicitly non-terminal until its
+manifest is refreshed.
 
 Golutra continues to read the active provider profile and credentials from
 the configured global `GOLUTRA_HOME`, and never copies them into the run
