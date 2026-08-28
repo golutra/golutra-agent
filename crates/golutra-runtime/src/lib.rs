@@ -4021,6 +4021,9 @@ fn provider_tools_for_objective(
             &normalized,
             &["edit", "replace", "update", "修改", "编辑", "替换", "更新"],
         ) {
+            // 意图分类无法可靠区分整文件替换与局部编辑，因此同时保留两种写入原语，
+            // 避免已给出完整内容的任务被迫增加一次读取往返。
+            wanted.insert("write_file");
             wanted.insert("edit_file");
         }
         if contains_any(&normalized, &["patch", "diff", "补丁"]) {

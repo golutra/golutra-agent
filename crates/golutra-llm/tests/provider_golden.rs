@@ -10,7 +10,8 @@ use golutra_llm::{
     GenaiProviderAdapter, GenaiProviderConfig, LlmProvider, OpenAiCompatibleProvider,
     OpenAiCompatibleProviderConfig, OpenAiResponsesProvider, OpenAiResponsesProviderConfig,
     ProviderError, ProviderFinishReason, ProviderGenerationConfig, ProviderMessage,
-    ProviderProtocol, ProviderRequest, ProviderRole, ProviderStreamEvent, ProviderToolCall,
+    ProviderProtocol, ProviderReasoningEffort, ProviderRequest, ProviderRole, ProviderStreamEvent,
+    ProviderToolCall,
 };
 use secrecy::SecretString;
 use serde::Deserialize;
@@ -637,6 +638,39 @@ async fn openai_responses_provider_matches_sse_goldens_and_auth_headers() {
         .expect_err("Responses SSE error");
     assert!(matches!(error, ProviderError::Failed { .. }));
     assert!(error.to_string().contains("golden responses failure"));
+}
+
+#[tokio::test]
+async fn openai_responses_auto_summary_preserves_reasoning_effort_and_parallel_tools() {
+    let (base_url, captured) = spawn_provider_sequence(vec![TestProviderResponse::sse(
+        200,
+        include_str!("fixtures/openai-responses/text-response.sse"),
+    )])
+    .await;
+    let provider = OpenAiResponsesProvider::from_config(OpenAiResponsesProviderConfig {
+        api_key: TEST_API_KEY.to_owned(),
+        api_key_env: "GOLDEN_TEST_API_KEY".to_owned(),
+        provider_id: "openai-responses-golden".to_owned(),
+        base_url,
+        model_id: "gpt-golden".to_owned(),
+        generation_config: ProviderGenerationConfig {
+            reasoning_effort: Some(ProviderReasoningEffort::High),
+            ..ProviderGenerationConfig::default()
+        },
+        custom_headers: Default::default(),
+    });
+
+    provider
+        .complete(comprehensive_request("gpt-golden"))
+        .await
+        .expect("Responses reasoning options request");
+    let captured = captured.await.expect("Responses reasoning options capture");
+    let body = &captured[0].body;
+
+    assert_eq!(body["reasoning"]["summary"], "auto");
+    assert_eq!(body["reasoning"]["effort"], "high");
+    assert_eq!(body["parallel_tool_calls"], true);
+    assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
 }
 
 #[tokio::test]

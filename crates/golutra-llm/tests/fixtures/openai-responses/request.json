@@ -10,7 +10,7 @@
   ],
   "model": "gpt-golden",
   "reasoning": {
-    "summary": "detailed"
+    "summary": "auto"
   },
   "store": false,
   "stream": true

@@ -4988,6 +4988,21 @@ fn objective_tool_projection_expands_on_an_unplanned_valid_call() {
         vec!["read_file"]
     );
 
+    let mutation_tools = provider_tools_for_objective(
+        &all_tools,
+        &contract,
+        AgentToolProfile::Coding,
+        executor.registry(),
+        "Use file tools to update both files",
+    );
+    assert_eq!(
+        mutation_tools
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["edit_file", "read_file", "write_file"]
+    );
+
     let unclassified = provider_tools_for_objective(
         &all_tools,
         &contract,

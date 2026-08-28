@@ -285,12 +285,20 @@ impl OpenAiResponsesProvider {
             request.cache_policy,
         )?
         .with_extra_headers(self.request_headers(request, account_id));
-        if !request.tools.is_empty() {
-            options = options
-                .with_tool_choice(ToolChoice::Auto)
-                .with_extra_body(json!({"parallel_tool_calls": true}));
+        let mut reasoning = json!({"summary": "auto"});
+        if let Some(effort) = options
+            .reasoning_effort
+            .as_ref()
+            .and_then(|effort| effort.as_keyword())
+        {
+            reasoning["effort"] = Value::String(effort.to_owned());
         }
-        Ok(options)
+        let mut extra_body = json!({"reasoning": reasoning});
+        if !request.tools.is_empty() {
+            options = options.with_tool_choice(ToolChoice::Auto);
+            extra_body["parallel_tool_calls"] = Value::Bool(true);
+        }
+        Ok(options.with_extra_body(extra_body))
     }
 
     fn request_headers(&self, request: &ProviderRequest, account_id: Option<&str>) -> Headers {
