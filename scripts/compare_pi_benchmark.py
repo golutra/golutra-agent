@@ -264,6 +264,8 @@ def nested_runtime_events_timed(
 def empty_metrics() -> dict[str, Any]:
     return {
         "completed": False,
+        # 原生 runtime 的终态与包装进程返回码分开记录，避免验证失败被伪装成生命周期失败。
+        "runtime_terminal_success": False,
         "return_code": None,
         "elapsed_ms": None,
         "process_first_event_ms": None,
@@ -1009,13 +1011,15 @@ def parse_golutra(
     fallback_usage_records: dict[str, dict[str, Any]] = {}
     tool_names: set[str] = set()
     observed_tool_calls = 0
+    terminal_success: bool | None = None
     for event, arrival in timed_events:
         event_type = event.get("type")
         if event_type == "turn.completed":
-            metrics["completed"] = event.get("status") == "completed"
+            terminal_success = event.get("status") == "completed"
             metrics["final_message"] = str(event.get("final_message") or "")[:512]
             terminal = observed_time(event, arrival)
         elif event_type == "turn.failed":
+            terminal_success = False
             metrics["final_message"] = str(event.get("error") or event.get("final_message") or "")[:512]
             terminal = observed_time(event, arrival)
     for event, arrival in nested_timed:
@@ -1025,10 +1029,10 @@ def parse_golutra(
         if event_type == "context_built" and metrics["planned_input_tokens"] is None:
             metrics["planned_input_tokens"] = as_number(payload.get("planned_input_tokens"))
         if event_type in {"turn_completed", "turn.completed"} and terminal is None:
-            metrics["completed"] = str(payload.get("status") or "completed").lower() == "completed"
+            terminal_success = str(payload.get("status") or "completed").lower() == "completed"
             terminal = event_time
         elif event_type in {"turn_failed", "turn.failed"} and terminal is None:
-            metrics["completed"] = False
+            terminal_success = False
             terminal = event_time
         if event_type == "provider_started":
             request_id = request_tracker.resolve(event, payload, event_type)
@@ -1129,7 +1133,8 @@ def parse_golutra(
             metrics["provider"] = data.get("terminal_outcome", {}).get("result", {}).get("status")
         except (OSError, json.JSONDecodeError):
             pass
-    metrics["completed"] = bool(metrics["completed"]) and return_code == 0
+    metrics["runtime_terminal_success"] = terminal_success is True
+    metrics["completed"] = metrics["runtime_terminal_success"] and return_code == 0
     return metrics
 
 
@@ -1172,6 +1177,7 @@ def parse_pi(
     current_request_start = None
     current_request_first_token = None
     terminal = None
+    terminal_success: bool | None = None
     last_message_time = None
     tool_names: set[str] = set()
     tool_calls_seen: set[str] = set()
@@ -1266,7 +1272,7 @@ def parse_pi(
                 tool_names.add(event["toolName"])
         elif event_type == "agent_end":
             terminal = observed_time(event, arrival)
-            metrics["completed"] = return_code == 0
+            terminal_success = True
     if terminal is None:
         terminal = last_message_time
     metrics["request_count"] = len(usage_records)
@@ -1302,6 +1308,8 @@ def parse_pi(
         turn_anchor = process_first_event
     metrics["turn_first_token_ms"] = elapsed_between(first_token, turn_anchor)
     metrics["terminal_ms"] = elapsed_between(terminal, process_origin)
+    metrics["runtime_terminal_success"] = terminal_success is True
+    metrics["completed"] = metrics["runtime_terminal_success"] and return_code == 0
     return metrics
 
 

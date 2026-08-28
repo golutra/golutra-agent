@@ -185,6 +185,7 @@ class CompareBenchmarkTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             metrics = benchmark.parse_golutra(stdout, 1.0, 7, Path(directory))
             verification = benchmark.task_verification(benchmark.TASKS[0], metrics, Path(directory))
+        self.assertTrue(metrics["runtime_terminal_success"])
         self.assertFalse(metrics["completed"])
         self.assertFalse(verification["passed"])
         self.assertFalse(verification["execution_completed"])
@@ -232,6 +233,7 @@ class CompareBenchmarkTest(unittest.TestCase):
         self.assertEqual(metrics["turn_first_token_ms"], 198.0)
         self.assertEqual(metrics["terminal_ms"], 220.0)
         self.assertTrue(metrics["usage_complete"])
+        self.assertTrue(metrics["runtime_terminal_success"])
         request = metrics["provider_requests"][0]
         self.assertEqual(request["prompt_tokens"], 16)
         self.assertEqual(request["uncached_input_tokens"], 12)

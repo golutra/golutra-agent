@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "kind": "golutra_terminal_smoke",
+  "generated_at": "2026-08-28T22:37:10.300Z",
+  "conditions": {
+    "model": "gpt-5.5",
+    "protocol": "openai-responses",
+    "reasoning_effort": "medium",
+    "provider_endpoint": "https://api.golutra.cn",
+    "workspace": "isolated_minimal_unittest_fixture",
+    "verification_scope": "runtime_objective_test_smoke_only",
+    "credentials": "owner_only_temporary_home_not_serialized"
+  },
+  "task": "Run python3 -m unittest discover -s tests -v without modifying files and reply SMOKE_OK.",
+  "result": {
+    "smoke_passed": true,
+    "objective_test_command_pass": true,
+    "runtime_terminal_success": true,
+    "process_return_code": 0,
+    "completed": true,
+    "request_count": 2,
+    "tool_call_count": 1,
+    "prompt_tokens": 1254,
+    "uncached_input_tokens": 1254,
+    "cache_read_tokens": 0,
+    "cache_write_tokens": 0,
+    "output_tokens": 201,
+    "final_message": "SMOKE_OK",
+    "usage_source": "provider"
+  },
+  "notes": [
+    "The Python unittest execution evidence was recognized from the standard Ran N tests output.",
+    "This is a cold single-turn smoke; cache read 0 is expected and is not a session-cache measurement."
+  ]
+}

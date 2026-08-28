@@ -1848,6 +1848,12 @@ static POSITIVE_RUNNING_TESTS: LazyLock<Regex> = LazyLock::new(|| {
         .expect("positive running-test regex")
 });
 
+// Python unittest 使用 `Ran N tests` 报告执行数量，而不是 `passed` 摘要；数量必须
+// 大于零，避免没有发现测试的命令被误判为成功。
+static POSITIVE_PYTHON_UNITTEST: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^ran\s+[1-9][0-9]*\s+tests?\b").expect("python unittest summary regex")
+});
+
 static POSITIVE_TEST_RESULT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"^test\s+result\b.*\b[1-9][0-9]*\s+(?:passed|failed|tests?\s+passed|tests?\s+failed)\b",
@@ -1887,6 +1893,7 @@ static POSITIVE_TEST_STATUS_SUMMARY: LazyLock<Regex> = LazyLock::new(|| {
 fn line_reports_explicit_test_execution(line: &str) -> bool {
     let line = line.trim().to_ascii_lowercase();
     POSITIVE_RUNNING_TESTS.is_match(&line)
+        || POSITIVE_PYTHON_UNITTEST.is_match(&line)
         || POSITIVE_TEST_RESULT.is_match(&line)
         || POSITIVE_NAMED_TEST_SUMMARY.is_match(&line)
         || POSITIVE_TESTS_COMPLETED.is_match(&line)

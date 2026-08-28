@@ -3987,10 +3987,13 @@ fn test_output_classifier_requires_an_executed_test() {
         "test result: ok. 3 passed; 0 failed; 0 ignored"
     ));
     assert!(line_reports_executed_tests("running 1 test"));
+    assert!(line_reports_executed_tests("Ran 1 test in 0.001s"));
+    assert!(line_reports_executed_tests("Ran 2 tests in 0.010s"));
     assert!(!line_reports_executed_tests(
         "test result: ok. 0 passed; 0 failed; 0 ignored"
     ));
     assert!(!line_reports_executed_tests("running 0 tests"));
+    assert!(!line_reports_executed_tests("Ran 0 tests in 0.000s"));
     assert!(line_reports_executed_tests("2 passed in 0.10s"));
     assert!(!line_reports_executed_tests("7 successful uploads"));
     assert!(!line_reports_executed_tests("7 checks completed"));
@@ -4005,6 +4008,10 @@ fn objective_test_evidence_supports_common_runner_formats() {
             "test result: ok. 3 passed; 0 failed; 0 ignored",
         ),
         ("python -m pytest", "2 passed in 0.10s"),
+        (
+            "python3 -m unittest discover -s tests -v",
+            "Ran 2 tests in 0.010s\n\nOK",
+        ),
         ("npm test", "Tests: 4 passed, 4 total"),
         ("pnpm test", "Tests  3 passed (3)"),
         ("go test ./...", "ok  example.test/pkg  0.01s"),
