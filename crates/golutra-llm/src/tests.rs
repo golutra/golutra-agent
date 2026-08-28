@@ -925,6 +925,15 @@ fn prompt_cache_identity_is_stable_and_session_scoped() {
 }
 
 #[test]
+fn provider_affinity_prefers_session_and_falls_back_to_task() {
+    let mut request = request();
+    assert_eq!(request.affinity_id(), request.task_id.to_string());
+    let session_id = golutra_core::SessionId::new();
+    request.session_id = Some(session_id);
+    assert_eq!(request.affinity_id(), session_id.to_string());
+}
+
+#[test]
 fn provider_cache_identity_isolated_by_protocol_endpoint() {
     let mut request = request();
     request.session_id = Some(golutra_core::SessionId::new());

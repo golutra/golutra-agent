@@ -84,17 +84,18 @@ impl PostTaskCoordinator {
         mut schedule_rx: mpsc::UnboundedReceiver<PostTaskScheduleRequest>,
     ) {
         loop {
-            if shutdown.is_cancelled() {
-                return;
-            }
-            // 先处理本地刚提交的终态调度，避免固定轮询把用户可见的后台阶段推迟一秒。
-            match schedule_rx.try_recv() {
-                Ok(request) => {
-                    self.process_schedule(request).await;
-                    continue;
+            // 新建 host 已在启动边界恢复过过期租约。先等本地调度或周期检查，
+            // 避免空 worker 与首个 provider 上下文同时争抢单连接 SQLite。
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                request = schedule_rx.recv() => {
+                    match request {
+                        Some(request) => self.process_schedule(request).await,
+                        None => return,
+                    }
                 }
-                Err(mpsc::error::TryRecvError::Disconnected) => return,
-                Err(mpsc::error::TryRecvError::Empty) => {}
+                _ = tokio::time::sleep(Duration::from_millis(POST_TASK_JOB_IDLE_POLL_MILLIS)) => {}
             }
             let Some(host) = self.host.upgrade() else {
                 return;
@@ -107,17 +108,6 @@ impl PostTaskCoordinator {
                 .await
                 .is_err()
             {
-                drop(host);
-                tokio::select! {
-                    _ = shutdown.cancelled() => return,
-                    request = schedule_rx.recv() => {
-                        match request {
-                            Some(request) => self.process_schedule(request).await,
-                            None => return,
-                        }
-                    }
-                    _ = tokio::time::sleep(Duration::from_millis(POST_TASK_JOB_IDLE_POLL_MILLIS)) => {}
-                }
                 continue;
             }
             let workspace_id = host.workspace_id.to_string();
@@ -132,21 +122,8 @@ impl PostTaskCoordinator {
                     chrono::Duration::minutes(POST_TASK_JOB_LEASE_MINUTES),
                 )
                 .await;
-            match claimed {
-                Ok(Some(job)) => self.process(job, &worker_id).await,
-                Ok(None) | Err(_) => {
-                    drop(host);
-                    tokio::select! {
-                        _ = shutdown.cancelled() => return,
-                        request = schedule_rx.recv() => {
-                            match request {
-                                Some(request) => self.process_schedule(request).await,
-                                None => return,
-                            }
-                        }
-                        _ = tokio::time::sleep(Duration::from_millis(POST_TASK_JOB_IDLE_POLL_MILLIS)) => {}
-                    }
-                }
+            if let Ok(Some(job)) = claimed {
+                self.process(job, &worker_id).await;
             }
         }
     }

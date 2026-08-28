@@ -6,6 +6,8 @@ use golutra_core::{
 };
 use golutra_protocol::pending_user_question;
 
+const EXPLICIT_COMPACTION_TOKEN_BUDGET: u64 = 2_048;
+
 fn queued_turn_id_from_payload(payload: &Value) -> Option<TurnId> {
     payload
         .get("turn_id")
@@ -1060,8 +1062,16 @@ impl RuntimeHost {
             None
         };
         let provider_config_paths = self.provider_config_paths.clone();
+        let provider_route_cache = Arc::clone(&self.execution.provider_route_cache);
         payload = run_blocking(move || {
-            pin_provider_turn_settings(provider_config_paths.as_ref(), &mut payload);
+            let mut cache = provider_route_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pin_provider_turn_settings_cached(
+                &mut cache,
+                provider_config_paths.as_ref(),
+                &mut payload,
+            );
             payload
         })
         .await?;
@@ -2562,15 +2572,8 @@ impl RuntimeHost {
         // 复用模型历史缓存，避免显式压缩把整个 session（含 telemetry）
         // 一次性物化；缓存已保留最新压缩边界和有界的对话尾部。
         let events = self.cached_history_events(session_id).await?;
-        let explicit_compaction = self
-            .storage
-            .repositories
-            .events
-            .latest_explicit_compaction(session_id)
-            .await?
-            .as_ref()
-            .and_then(context_compaction_from_event);
-        let compacted_after = explicit_compaction
+        let latest_compaction = events.iter().rev().find_map(context_compaction_from_event);
+        let compacted_after = latest_compaction
             .as_ref()
             .map(|(sequence_no, _)| *sequence_no)
             .unwrap_or_default();
@@ -2582,16 +2585,19 @@ impl RuntimeHost {
         .into_iter()
         .filter_map(conversation_history_line)
         .collect::<Vec<_>>();
-        if explicit_compaction.is_none() && lines.is_empty() {
+        if lines.is_empty() {
             return Ok(CommandAck {
                 command_id: command.command_id,
                 accepted: false,
-                reason: Some("session has no conversation history to compact".to_owned()),
+                reason: Some("session has no new conversation history to compact".to_owned()),
             });
         }
-        let summary = compact_history_with_summary(
-            explicit_compaction.map(|(_, content)| format!("Summary: {content}")),
-            lines,
+        let summary = structured_compaction_summary(
+            latest_compaction
+                .as_ref()
+                .map(|(_, content)| content.as_str()),
+            &lines,
+            EXPLICIT_COMPACTION_TOKEN_BUDGET,
         );
         let active_task_id = self
             .storage

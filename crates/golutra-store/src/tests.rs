@@ -222,14 +222,238 @@ async fn event_pages_advance_from_the_last_sequence_cursor() {
 }
 
 #[tokio::test]
-async fn model_history_pages_filter_telemetry_and_honor_snapshot_boundary() {
+async fn active_context_window_excludes_siblings_and_preserves_compaction() {
+    let store = RuntimeStore::in_memory().await.expect("store");
+    let session_id = SessionId::new();
+    let append = |parent_event_id: Option<EventId>, event_type, content: &str| {
+        let store = store.clone();
+        let content = content.to_owned();
+        async move {
+            store
+                .append_event_assigning_sequence(RuntimeEvent {
+                    schema_version: RUNTIME_EVENT_SCHEMA_VERSION,
+                    causal_context: Default::default(),
+                    causal_links: Vec::new(),
+                    id: EventId::new(),
+                    sequence_no: 0,
+                    session_id,
+                    turn_id: Some(TurnId::new()),
+                    task_id: None,
+                    parent_event_id,
+                    event_type,
+                    timestamp: Utc::now(),
+                    source: RuntimeEventSource::Runtime,
+                    payload: json!({"content": content}),
+                    payload_ref: None,
+                    durable: true,
+                })
+                .await
+                .expect("event")
+        }
+    };
+
+    let root = append(None, RuntimeEventType::AssistantMessage, "root").await;
+    let sibling = append(
+        Some(root.id),
+        RuntimeEventType::CompactionCompleted,
+        "sibling summary",
+    )
+    .await;
+    let active = append(Some(root.id), RuntimeEventType::AssistantMessage, "active").await;
+    let active_compaction = append(
+        Some(active.id),
+        RuntimeEventType::CompactionCompleted,
+        "active summary",
+    )
+    .await;
+    let compaction_observation = store
+        .append_event_assigning_sequence(RuntimeEvent {
+            schema_version: RUNTIME_EVENT_SCHEMA_VERSION,
+            causal_context: Default::default(),
+            causal_links: Vec::new(),
+            id: EventId::new(),
+            sequence_no: 0,
+            session_id,
+            turn_id: Some(TurnId::new()),
+            task_id: None,
+            parent_event_id: Some(active_compaction.id),
+            event_type: RuntimeEventType::CompactionCompleted,
+            timestamp: Utc::now(),
+            source: RuntimeEventSource::Runtime,
+            payload: json!({"summary": "compaction metrics only"}),
+            payload_ref: None,
+            durable: true,
+        })
+        .await
+        .expect("compaction observation");
+    let recent = append(
+        Some(compaction_observation.id),
+        RuntimeEventType::AssistantMessage,
+        "recent",
+    )
+    .await;
+    let leaf = append(Some(recent.id), RuntimeEventType::AssistantMessage, "leaf").await;
+
+    let path = store
+        .load_active_context_window(session_id, leaf.id, 16, 16)
+        .await
+        .expect("active path");
+    assert_eq!(
+        path.iter().map(|event| event.id).collect::<Vec<_>>(),
+        vec![
+            active_compaction.id,
+            compaction_observation.id,
+            recent.id,
+            leaf.id
+        ]
+    );
+    assert!(!path.iter().any(|event| event.id == sibling.id));
+
+    let bounded = store
+        .load_active_context_window(session_id, leaf.id, 2, 16)
+        .await
+        .expect("bounded path");
+    assert_eq!(bounded.len(), 3);
+    assert_eq!(bounded[0].id, active_compaction.id);
+    assert_eq!(bounded[1].id, recent.id);
+    assert_eq!(bounded[2].id, leaf.id);
+    assert_ne!(bounded[0].id, sibling.id);
+}
+
+#[tokio::test]
+async fn active_context_window_stops_at_parent_cycles() {
+    let store = RuntimeStore::in_memory().await.expect("store");
+    let session_id = SessionId::new();
+    let first_id = EventId::new();
+    let second_id = EventId::new();
+    for (id, parent_event_id, content) in [
+        (first_id, Some(second_id), "cycle-first"),
+        (second_id, Some(first_id), "cycle-second"),
+    ] {
+        store
+            .append_event_assigning_sequence(RuntimeEvent {
+                schema_version: RUNTIME_EVENT_SCHEMA_VERSION,
+                causal_context: Default::default(),
+                causal_links: Vec::new(),
+                id,
+                sequence_no: 0,
+                session_id,
+                turn_id: Some(TurnId::new()),
+                task_id: None,
+                parent_event_id,
+                event_type: RuntimeEventType::AssistantMessage,
+                timestamp: Utc::now(),
+                source: RuntimeEventSource::Runtime,
+                payload: json!({"content": content}),
+                payload_ref: None,
+                durable: true,
+            })
+            .await
+            .expect("cycle event");
+    }
+
+    let path = store
+        .load_active_context_window(session_id, second_id, 16, 16)
+        .await
+        .expect("cycle-safe path");
+    assert_eq!(path.len(), 2);
+    assert_eq!(
+        path.iter().map(|event| event.id).collect::<HashSet<_>>(),
+        HashSet::from([first_id, second_id])
+    );
+}
+
+#[tokio::test]
+async fn active_context_window_honors_the_recursion_depth_limit() {
+    let store = RuntimeStore::in_memory().await.expect("store");
+    let session_id = SessionId::new();
+    let mut parent_event_id = None;
+    let mut leaf_event_id = None;
+    for index in 0..6 {
+        let event = store
+            .append_event_assigning_sequence(RuntimeEvent {
+                schema_version: RUNTIME_EVENT_SCHEMA_VERSION,
+                causal_context: Default::default(),
+                causal_links: Vec::new(),
+                id: EventId::new(),
+                sequence_no: 0,
+                session_id,
+                turn_id: Some(TurnId::new()),
+                task_id: None,
+                parent_event_id,
+                event_type: RuntimeEventType::AssistantMessage,
+                timestamp: Utc::now(),
+                source: RuntimeEventSource::Runtime,
+                payload: json!({"content": format!("node-{index}")}),
+                payload_ref: None,
+                durable: true,
+            })
+            .await
+            .expect("chain event");
+        parent_event_id = Some(event.id);
+        leaf_event_id = Some(event.id);
+    }
+
+    let path = store
+        .load_active_context_window(session_id, leaf_event_id.expect("leaf event"), 16, 3)
+        .await
+        .expect("depth-bounded path");
+    assert_eq!(
+        path.iter()
+            .map(|event| event.payload["content"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec!["node-3", "node-4", "node-5"]
+    );
+}
+
+#[tokio::test]
+async fn active_context_window_handles_long_session_paths() {
+    let store = RuntimeStore::in_memory().await.expect("store");
+    let session_id = SessionId::new();
+    let mut parent_event_id = None;
+    for index in 0..1_100_u32 {
+        let event = store
+            .append_event_assigning_sequence(RuntimeEvent {
+                schema_version: RUNTIME_EVENT_SCHEMA_VERSION,
+                causal_context: Default::default(),
+                causal_links: Vec::new(),
+                id: EventId::new(),
+                sequence_no: 0,
+                session_id,
+                turn_id: Some(TurnId::new()),
+                task_id: None,
+                parent_event_id,
+                event_type: RuntimeEventType::AssistantMessage,
+                timestamp: Utc::now(),
+                source: RuntimeEventSource::Runtime,
+                payload: json!({"content": format!("node-{index}")}),
+                payload_ref: None,
+                durable: true,
+            })
+            .await
+            .expect("chain event");
+        parent_event_id = Some(event.id);
+    }
+
+    let path = store
+        .load_active_context_window(session_id, parent_event_id.expect("leaf event"), 32, 2_048)
+        .await
+        .expect("long active path");
+
+    assert_eq!(path.len(), 32);
+    assert_eq!(path[0].payload["content"], "node-1068");
+    assert_eq!(path[31].payload["content"], "node-1099");
+}
+
+#[tokio::test]
+async fn latest_model_history_event_ignores_newer_telemetry() {
     let store = RuntimeStore::in_memory().await.expect("store");
     let session_id = SessionId::new();
     let append = |event_type| RuntimeEvent {
-        schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+        schema_version: RUNTIME_EVENT_SCHEMA_VERSION,
         causal_context: Default::default(),
         causal_links: Vec::new(),
-        id: golutra_core::EventId::new(),
+        id: EventId::new(),
         sequence_no: 0,
         session_id,
         turn_id: Some(TurnId::new()),
@@ -238,240 +462,35 @@ async fn model_history_pages_filter_telemetry_and_honor_snapshot_boundary() {
         event_type,
         timestamp: Utc::now(),
         source: RuntimeEventSource::Runtime,
-        payload: json!({"content": format!("{event_type:?}")}),
+        payload: json!({"summary": format!("{event_type:?}")}),
         payload_ref: None,
         durable: true,
     };
 
-    for event_type in [
-        RuntimeEventType::TaskCreated,
-        RuntimeEventType::ProviderStreamed,
-        RuntimeEventType::AssistantMessage,
-        RuntimeEventType::ToolProgress,
-        RuntimeEventType::TurnUpdated,
-        RuntimeEventType::CompactionCompleted,
-    ] {
-        store
-            .append_event_assigning_sequence(append(event_type))
-            .await
-            .expect("event");
-    }
-    let through_sequence_no = store
-        .max_sequence_no_for_session(session_id)
-        .await
-        .expect("snapshot sequence");
-    store
+    let history = store
         .append_event_assigning_sequence(append(RuntimeEventType::AssistantMessage))
         .await
-        .expect("post-snapshot event");
-
-    let first = store
-        .load_model_history_page(session_id, None, through_sequence_no, 2)
-        .await
-        .expect("first history page");
-    let second = store
-        .load_model_history_page(
-            session_id,
-            Some(first[1].sequence_no),
-            through_sequence_no,
-            2,
-        )
-        .await
-        .expect("second history page");
-    let recent = store
-        .load_recent_model_history(session_id, through_sequence_no, 2)
-        .await
-        .expect("recent history");
-
-    assert_eq!(
-        first
-            .iter()
-            .map(|event| event.event_type)
-            .collect::<Vec<_>>(),
-        vec![
-            RuntimeEventType::TaskCreated,
-            RuntimeEventType::AssistantMessage
-        ]
-    );
-    assert_eq!(
-        second
-            .iter()
-            .map(|event| event.event_type)
-            .collect::<Vec<_>>(),
-        vec![
-            RuntimeEventType::TurnUpdated,
-            RuntimeEventType::CompactionCompleted
-        ]
-    );
-    assert_eq!(recent.len(), 2);
-    assert_eq!(recent[0].event_type, RuntimeEventType::TurnUpdated);
-    assert_eq!(recent[1].event_type, RuntimeEventType::CompactionCompleted);
-    assert!(
-        recent
-            .iter()
-            .all(|event| event.sequence_no <= through_sequence_no)
-    );
-}
-
-#[tokio::test]
-async fn model_history_window_is_not_shrunk_by_high_volume_telemetry() {
-    let store = RuntimeStore::in_memory().await.expect("store");
-    let session_id = SessionId::new();
-    let turn_id = TurnId::new();
-    let mut transaction = store.pool.begin().await.expect("transaction");
-    for sequence_no in 1..=16_400_u64 {
-        let event_type = if sequence_no % 2 == 1 {
-            RuntimeEventType::AssistantMessage
-        } else {
-            RuntimeEventType::ProviderStreamed
-        };
-        let event = RuntimeEvent {
-            schema_version: RUNTIME_EVENT_SCHEMA_VERSION,
-            causal_context: Default::default(),
-            causal_links: Vec::new(),
-            id: EventId::new(),
-            sequence_no,
-            session_id,
-            turn_id: Some(turn_id),
-            task_id: None,
-            parent_event_id: None,
-            event_type,
-            timestamp: Utc::now(),
-            source: RuntimeEventSource::Runtime,
-            payload: json!({"content": format!("message-{sequence_no}")}),
-            payload_ref: None,
-            durable: true,
-        };
-        sqlx::query(
-            "INSERT INTO runtime_events (
-                event_id, sequence_no, session_id, task_id, turn_id, event_type, source,
-                durable, payload_json, event_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(event.id.to_string())
-        .bind(i64::try_from(sequence_no).expect("sequence fits sqlite"))
-        .bind(session_id.to_string())
-        .bind(Option::<String>::None)
-        .bind(turn_id.to_string())
-        .bind(format!("{event_type:?}"))
-        .bind(format!("{:?}", event.source))
-        .bind(event.durable)
-        .bind(serde_json::to_string(&event.payload).expect("payload"))
-        .bind(serde_json::to_string(&event).expect("event"))
-        .execute(&mut *transaction)
-        .await
-        .expect("event row");
-    }
-    transaction.commit().await.expect("commit");
-
-    let through_sequence_no = store
-        .max_sequence_no_for_session(session_id)
-        .await
-        .expect("snapshot sequence");
-    let recent = store
-        .load_recent_model_history(session_id, through_sequence_no, 8_192)
-        .await
-        .expect("recent model history");
-    let mut cursor = None;
-    let mut paged = Vec::new();
-    loop {
-        let page = store
-            .load_model_history_page(session_id, cursor, through_sequence_no, 257)
-            .await
-            .expect("history page");
-        let Some(last) = page.last() else {
-            break;
-        };
-        cursor = Some(last.sequence_no);
-        paged.extend(page);
-    }
-
-    assert_eq!(recent.len(), 8_192);
-    assert_eq!(recent.first().map(|event| event.sequence_no), Some(17));
-    assert_eq!(recent.last().map(|event| event.sequence_no), Some(16_399));
-    assert_eq!(paged.len(), 8_200);
-    assert_eq!(paged.first().map(|event| event.sequence_no), Some(1));
-    assert_eq!(paged.last().map(|event| event.sequence_no), Some(16_399));
-    assert!(paged.windows(2).all(|events| {
-        events[0].sequence_no < events[1].sequence_no
-            && events[0].event_type == RuntimeEventType::AssistantMessage
-            && events[1].event_type == RuntimeEventType::AssistantMessage
-    }));
-}
-
-#[tokio::test]
-async fn loads_the_latest_explicit_compaction_without_materializing_history() {
-    let store = RuntimeStore::in_memory().await.expect("store");
-    let session_id = SessionId::new();
-    for (mode, content) in [
-        ("explicit", "first summary"),
-        ("automatic", "automatic summary"),
-        ("explicit", "latest summary"),
-    ] {
-        store
-            .append_event_assigning_sequence(RuntimeEvent {
-                schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
-                causal_context: Default::default(),
-                causal_links: Vec::new(),
-                id: golutra_core::EventId::new(),
-                sequence_no: 0,
-                session_id,
-                turn_id: None,
-                task_id: None,
-                parent_event_id: None,
-                event_type: RuntimeEventType::CompactionCompleted,
-                timestamp: Utc::now(),
-                source: RuntimeEventSource::Runtime,
-                payload: json!({"mode": mode, "content": content}),
-                payload_ref: None,
-                durable: true,
-            })
-            .await
-            .expect("compaction");
-    }
-
-    let event = store
-        .load_latest_explicit_compaction(session_id)
-        .await
-        .expect("query")
-        .expect("explicit compaction");
-
-    assert_eq!(event.payload["content"], "latest summary");
-
+        .expect("history event");
     store
-        .append_event_assigning_sequence(RuntimeEvent {
-            schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
-            causal_context: Default::default(),
-            causal_links: Vec::new(),
-            id: golutra_core::EventId::new(),
-            sequence_no: 0,
-            session_id,
-            turn_id: None,
-            task_id: None,
-            parent_event_id: None,
-            event_type: RuntimeEventType::CompactionCompleted,
-            timestamp: Utc::now(),
-            source: RuntimeEventSource::Runtime,
-            payload: json!({"mode": "automatic", "content": "latest automatic summary"}),
-            payload_ref: Some(ArtifactId::new()),
-            durable: true,
-        })
+        .append_event_assigning_sequence(append(RuntimeEventType::CompactionCompleted))
         .await
-        .expect("automatic compaction");
+        .expect("non-context compaction observation");
+    store
+        .append_event_assigning_sequence(append(RuntimeEventType::ProviderStreamed))
+        .await
+        .expect("telemetry event");
+    store
+        .append_event_assigning_sequence(append(RuntimeEventType::CommandCompleted))
+        .await
+        .expect("control event");
 
     let latest = store
-        .load_latest_context_compaction(session_id)
+        .load_latest_model_history_event(session_id)
         .await
-        .expect("query")
-        .expect("context compaction");
-    let explicit = store
-        .load_latest_explicit_compaction(session_id)
-        .await
-        .expect("query")
-        .expect("explicit compaction");
-
-    assert_eq!(latest.payload["content"], "latest automatic summary");
-    assert_eq!(explicit.payload["content"], "latest summary");
+        .expect("latest model history")
+        .expect("history row");
+    assert_eq!(latest.id, history.id);
+    assert_eq!(latest.event_type, RuntimeEventType::AssistantMessage);
 }
 
 #[tokio::test]
@@ -1078,6 +1097,76 @@ async fn stores_and_lists_thread_metadata() {
     assert!(!loaded.removed);
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].session_id, thread.session_id);
+}
+
+#[tokio::test]
+async fn workspace_session_states_are_scoped_to_live_threads() {
+    let store = RuntimeStore::in_memory().await.expect("store opens");
+    let now = Utc::now();
+    let active_session_id = SessionId::new();
+    let active_task_id = TaskId::new();
+    let other_session_id = SessionId::new();
+    let removed_session_id = SessionId::new();
+    let thread = |session_id, workspace_root: &str, removed| ThreadRecord {
+        thread_id: ThreadId::new(),
+        session_id,
+        parent_thread_id: None,
+        forked_from_turn_id: None,
+        forked_from_sequence_no: None,
+        workspace_root: Some(workspace_root.to_owned()),
+        rebound_from_workspace_root: None,
+        rollout_path: None,
+        title: "Recovery fixture".to_owned(),
+        preview: "Workspace projection fixture".to_owned(),
+        created_at: now,
+        updated_at: now,
+        recency_at: now,
+        archived: removed,
+        removed,
+    };
+    for record in [
+        thread(active_session_id, "/workspace-a", false),
+        thread(other_session_id, "/workspace-b", false),
+        thread(removed_session_id, "/workspace-a", true),
+    ] {
+        store.upsert_thread(&record).await.expect("thread stored");
+    }
+    for (session_id, task_id) in [
+        (active_session_id, active_task_id),
+        (other_session_id, TaskId::new()),
+        (removed_session_id, TaskId::new()),
+    ] {
+        store
+            .append_event_assigning_sequence(RuntimeEvent {
+                schema_version: RUNTIME_EVENT_SCHEMA_VERSION,
+                causal_context: Default::default(),
+                causal_links: Vec::new(),
+                id: EventId::new(),
+                sequence_no: 0,
+                session_id,
+                turn_id: Some(TurnId::new()),
+                task_id: Some(task_id),
+                parent_event_id: None,
+                event_type: RuntimeEventType::TaskCreated,
+                timestamp: now,
+                source: RuntimeEventSource::Runtime,
+                payload: json!({"summary": "recoverable task"}),
+                payload_ref: None,
+                durable: true,
+            })
+            .await
+            .expect("task event");
+    }
+
+    let states = store
+        .list_workspace_session_states("/workspace-a")
+        .await
+        .expect("workspace states");
+
+    assert_eq!(states.len(), 1);
+    assert_eq!(states[0].session_id, active_session_id);
+    assert_eq!(states[0].active_task_id, Some(active_task_id));
+    assert_eq!(states[0].task_status, TaskStatus::Running);
 }
 
 #[tokio::test]

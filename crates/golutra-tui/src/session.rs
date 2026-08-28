@@ -299,7 +299,7 @@ pub(crate) async fn resume_session(
 }
 
 fn resume_alias_session_id(value: &str, transport: &RuntimeTransport) -> SessionId {
-    const RESUME_ALIAS_NAMESPACE: Uuid = Uuid::from_u128(0x5ae3_10d2_9488_59ed_a50c_b6b7fcaf_ee16);
+    const RESUME_ALIAS_NAMESPACE: Uuid = Uuid::from_u128(0x5ae3_10d2_9488_59ed_a50c_b6b7_fcaf_ee16);
     let workspace = transport.cwd().map_or_else(
         || transport.workspace_id().to_string(),
         |cwd| cwd.display().to_string(),

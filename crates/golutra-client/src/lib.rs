@@ -12,9 +12,9 @@ use std::{
 use async_trait::async_trait;
 use fs2::FileExt;
 use golutra_config::{ProviderConfigPaths, load_provider_runtime_env_from_paths};
-use golutra_context::ContextContributor;
 #[cfg(test)]
 pub(crate) use golutra_context::estimate_tokens;
+use golutra_context::{ContextContributor, structured_compaction_summary};
 use golutra_core::{
     Actor, ApprovalDecision, ApprovalId, ApprovalResolution, ArtifactId, ArtifactRecord,
     BusyPolicy, CommandId, EventId, MemoryId, PolicyBlockDisposition, PolicyDecision,
@@ -150,6 +150,7 @@ mod evolution;
 mod execution;
 mod execution_trace;
 mod external_evaluation;
+mod file_identity;
 mod governance;
 mod governance_commands;
 mod legacy_task;
@@ -182,8 +183,8 @@ pub(crate) use context::history_contributors_with_budget;
 pub(crate) use context::{
     CachedProjectInstructions, ContextResourceCache, MAX_CACHED_HISTORY_EVENTS,
     ProjectInstructionBundle, bound_cached_history, compact_event_summary, compact_history_text,
-    compact_history_with_summary, completion_criteria_from_payload, context_compaction_from_event,
-    conversation_history_line, effective_model_history_events, environment_context_prompt,
+    completion_criteria_from_payload, context_compaction_from_event, conversation_history_line,
+    effective_model_history_events, environment_context_prompt,
     history_contributors_from_cached_facts, is_history_cache_event,
     load_project_instruction_bundle, memory_context_with_budget, model_prompt_from_payload,
     preview_from_payload, project_instruction_fingerprint, prompt_from_payload,
@@ -225,9 +226,11 @@ pub use post_task::PostTaskCoordinator;
 pub(crate) use provider_runtime::configured_provider_plan;
 #[cfg(test)]
 pub(crate) use provider_runtime::mock_provider_plan;
+#[cfg(test)]
+pub(crate) use provider_runtime::pin_provider_turn_settings;
 pub(crate) use provider_runtime::{
     MockProviderPlan, ProviderRouteCache, cached_mock_provider_plan, isolated_mock_provider_plan,
-    pin_provider_turn_settings,
+    pin_provider_turn_settings_cached,
 };
 pub use rollout::{RolloutEnvelope, RolloutExport, ThreadRebindResult, redact_runtime_value};
 pub(crate) use rollout::{
@@ -1689,9 +1692,7 @@ impl RuntimeHost {
             execution_options,
         })
         .await?;
-        host.synchronize_workspace_rollouts().await?;
         host.recover_orphaned_tasks().await?;
-        host.run_storage_maintenance().await?;
         Ok(host)
     }
 
@@ -2015,20 +2016,14 @@ impl RuntimeHost {
         let Some(workspace_root) = self.workspace_root_string() else {
             return Ok(0);
         };
-        let threads = self
+        let states = self
             .storage
             .repositories
-            .threads
-            .list(Some(&workspace_root), u32::MAX)
+            .projections
+            .workspace_states(&workspace_root)
             .await?;
         let mut recovered = 0;
-        for thread in threads {
-            let state = self
-                .storage
-                .repositories
-                .projections
-                .state(thread.session_id, None)
-                .await?;
+        for state in states {
             let orphan_is_active = state.task_status.is_active();
             let may_have_pending_turns = state
                 .runtime_lane
@@ -2466,9 +2461,8 @@ impl RuntimeHost {
 
     async fn publish_committed_event(&self, event: RuntimeEvent) -> Result<(), ClientError> {
         self.publish_live_event(event.clone());
-        // The event has already crossed the durable append boundary. Update a
-        // warm history entry immediately; cross-process writers are picked up
-        // by the bounded cursor refresh in `cached_history_events`.
+        // durable append 完成后立即推进热历史；其他进程写入由活动叶节点的
+        // 有界刷新发现，不再扫描 session sequence。
         self.execution
             .context_resources
             .lock()
@@ -2536,6 +2530,9 @@ impl RuntimeHost {
     }
 
     async fn run_storage_maintenance(&self) -> Result<StorageMaintenanceReport, ClientError> {
+        // rollout 是 SQLite 的可重建投影，与 artifact/checkpoint 清理共用显式
+        // maintenance 边界，避免每次 host 启动都扫描并重写整个 workspace。
+        self.synchronize_workspace_rollouts().await?;
         let now = chrono::Utc::now();
         let artifact_report = self.storage.store.run_artifact_maintenance(now).await?;
         let checkpoint_directories_removed = if let (Some(workspace_root), Some(paths)) =

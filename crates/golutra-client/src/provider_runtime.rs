@@ -1,9 +1,13 @@
 //! Provider 解析与 runtime 执行计划构造。
 
-use std::{collections::HashMap, fs, path::Path, time::Duration};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use golutra_config::{
-    ProviderConfigPaths, ProviderRuntimeEnv, load_merged_provider_settings,
+    ProviderConfigPaths, ProviderRuntimeEnv, ProviderSettings, load_merged_provider_settings,
     load_provider_runtime_env_for_profile_from_paths, load_provider_runtime_env_from_paths,
 };
 use golutra_context::{ContextBudgetPolicy, ContextBuilder};
@@ -14,7 +18,7 @@ use golutra_runtime::ProviderSessionPolicy;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::LegacyTaskAdapter;
+use crate::{LegacyTaskAdapter, file_identity::path_metadata_fingerprint};
 
 #[derive(Debug, Clone)]
 pub(crate) struct MockProviderPlan {
@@ -35,6 +39,7 @@ pub(crate) struct MockProviderPlan {
 #[derive(Debug, Default)]
 pub(crate) struct ProviderRouteCache {
     entries: HashMap<String, CachedProviderRoute>,
+    settings_snapshot: Option<CachedProviderSettings>,
     clock: u64,
     hits: u64,
     misses: u64,
@@ -47,6 +52,13 @@ struct CachedProviderRoute {
     provider_session_policy: ProviderSessionPolicy,
     fallback_to_mock: bool,
     last_used: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CachedProviderSettings {
+    path: PathBuf,
+    fingerprint: String,
+    settings: ProviderSettings,
 }
 
 #[cfg(test)]
@@ -104,19 +116,51 @@ impl ProviderRouteCache {
 
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
+        self.settings_snapshot = None;
+    }
+
+    fn settings(&mut self, paths: &ProviderConfigPaths) -> Result<ProviderSettings, ProviderError> {
+        let fingerprint = provider_settings_fingerprint(&paths.user_config);
+        if let Some(snapshot) = self.settings_snapshot.as_ref()
+            && snapshot.path == paths.user_config
+            && snapshot.fingerprint == fingerprint
+        {
+            return Ok(snapshot.settings.clone());
+        }
+        let settings =
+            load_merged_provider_settings(paths).map_err(|error| ProviderError::NotConfigured {
+                message: format!("provider configuration could not be loaded: {error}"),
+            })?;
+        self.settings_snapshot = Some(CachedProviderSettings {
+            path: paths.user_config.clone(),
+            fingerprint,
+            settings: settings.clone(),
+        });
+        Ok(settings)
     }
 }
 
+#[cfg(test)]
 pub(crate) fn pin_provider_turn_settings(
+    provider_config_paths: Option<&ProviderConfigPaths>,
+    payload: &mut Value,
+) {
+    let mut cache = ProviderRouteCache::default();
+    pin_provider_turn_settings_cached(&mut cache, provider_config_paths, payload);
+}
+
+/// 从 host 本地配置快照固定入队时的 provider 绑定。配置文件身份变化会精确
+/// 失效快照，连续回合无需重复加锁和解析，同时仍能观察外部编辑。
+pub(crate) fn pin_provider_turn_settings_cached(
+    cache: &mut ProviderRouteCache,
     provider_config_paths: Option<&ProviderConfigPaths>,
     payload: &mut Value,
 ) {
     let Some(paths) = provider_config_paths else {
         return;
     };
-    // Invalid or incomplete provider configuration is handled by the runtime's
-    // authentication flow. Only pin a binding when it can be resolved now.
-    let Ok(settings) = load_merged_provider_settings(paths) else {
+    // 无效或不完整配置由 runtime 的认证流程处理；这里只固定当前可解析的绑定。
+    let Ok(settings) = cache.settings(paths) else {
         return;
     };
     let requested_profile = match payload.get("provider_profile") {
@@ -363,45 +407,7 @@ fn digest_field(hasher: &mut Sha256, name: &str, value: Option<&str>) {
 }
 
 fn provider_settings_fingerprint(path: &Path) -> String {
-    match fs::metadata(path) {
-        Ok(metadata) => metadata_fingerprint(&metadata),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "missing".to_owned(),
-        Err(error) => format!("error:{}", error.kind()),
-    }
-}
-
-fn metadata_fingerprint(metadata: &fs::Metadata) -> String {
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |value| value.as_nanos());
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        format!(
-            "{}:{}:{}:{}:{}:{}",
-            metadata.len(),
-            modified,
-            metadata.dev(),
-            metadata.ino(),
-            metadata.ctime(),
-            metadata.ctime_nsec()
-        )
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        format!(
-            "{}:{}:{}:{}",
-            metadata.len(),
-            modified,
-            metadata.volume_serial_number().unwrap_or(0),
-            metadata.file_index().unwrap_or(0)
-        )
-    }
-    #[cfg(not(any(unix, windows)))]
-    format!("{}:{}", metadata.len(), modified)
+    path_metadata_fingerprint(path)
 }
 
 fn provider_runtime_env_for_payload(
@@ -790,6 +796,29 @@ mod tests {
         let mut without_paths = json!({"prompt": "hello"});
         pin_provider_turn_settings(None, &mut without_paths);
         assert_eq!(without_paths, json!({"prompt": "hello"}));
+    }
+
+    #[test]
+    fn provider_turn_binding_cache_invalidates_after_settings_replacement() {
+        let home = tempdir().expect("home");
+        let paths = ProviderConfigPaths::from_home(home.path()).expect("paths");
+        let mut profile = ProviderProfile::mock();
+        profile.name = "primary".to_owned();
+        profile.model_id = Some("model-one".to_owned());
+        let mut settings = ProviderSettings::default();
+        settings.upsert_profile(profile, true);
+        settings.save(&paths.user_config).expect("initial settings");
+
+        let mut cache = ProviderRouteCache::default();
+        let mut first = json!({"prompt": "first"});
+        pin_provider_turn_settings_cached(&mut cache, Some(&paths), &mut first);
+        assert_eq!(first["provider_model"], "model-one");
+
+        settings.profiles[0].model_id = Some("model-two".to_owned());
+        settings.save(&paths.user_config).expect("updated settings");
+        let mut second = json!({"prompt": "second"});
+        pin_provider_turn_settings_cached(&mut cache, Some(&paths), &mut second);
+        assert_eq!(second["provider_model"], "model-two");
     }
 
     #[test]

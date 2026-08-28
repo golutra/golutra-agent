@@ -85,11 +85,6 @@ impl EventRepository {
         self.store.max_sequence_no().await
     }
 
-    /// 只查询单个 session 的最新游标，避免扫描无关 workspace 或 session。
-    pub async fn max_sequence_for_session(&self, session_id: SessionId) -> StoreResult<u64> {
-        self.store.max_sequence_no_for_session(session_id).await
-    }
-
     pub async fn load(
         &self,
         session_id: SessionId,
@@ -99,6 +94,13 @@ impl EventRepository {
         self.store
             .load_events(session_id, task_id, after_sequence_no)
             .await
+    }
+
+    pub async fn latest_model_history(
+        &self,
+        session_id: SessionId,
+    ) -> StoreResult<Option<RuntimeEvent>> {
+        self.store.load_latest_model_history_event(session_id).await
     }
 
     pub async fn session_for_task(&self, task_id: TaskId) -> StoreResult<Option<SessionId>> {
@@ -170,43 +172,16 @@ impl EventRepository {
             .await
     }
 
-    /// 只读取会进入模型上下文的历史事实，避免 telemetry 挤占缓存窗口。
-    pub async fn load_model_history_page(
+    pub async fn active_context_window(
         &self,
         session_id: SessionId,
-        after_sequence_no: Option<u64>,
-        through_sequence_no: u64,
-        limit: u32,
+        leaf_event_id: golutra_core::EventId,
+        recent_limit: u32,
+        max_depth: u32,
     ) -> StoreResult<Vec<RuntimeEvent>> {
         self.store
-            .load_model_history_page(session_id, after_sequence_no, through_sequence_no, limit)
+            .load_active_context_window(session_id, leaf_event_id, recent_limit, max_depth)
             .await
-    }
-
-    /// 读取快照游标之前的最新模型历史事实，结果按时间升序返回。
-    pub async fn load_recent_model_history(
-        &self,
-        session_id: SessionId,
-        through_sequence_no: u64,
-        limit: u32,
-    ) -> StoreResult<Vec<RuntimeEvent>> {
-        self.store
-            .load_recent_model_history(session_id, through_sequence_no, limit)
-            .await
-    }
-
-    pub async fn latest_explicit_compaction(
-        &self,
-        session_id: SessionId,
-    ) -> StoreResult<Option<RuntimeEvent>> {
-        self.store.load_latest_explicit_compaction(session_id).await
-    }
-
-    pub async fn latest_context_compaction(
-        &self,
-        session_id: SessionId,
-    ) -> StoreResult<Option<RuntimeEvent>> {
-        self.store.load_latest_context_compaction(session_id).await
     }
 
     pub async fn claim_command(
@@ -266,6 +241,15 @@ impl ProjectionRepository {
 
     pub async fn all_states(&self) -> StoreResult<Vec<StateProjection>> {
         self.store.list_session_states().await
+    }
+
+    pub async fn workspace_states(
+        &self,
+        workspace_root: &str,
+    ) -> StoreResult<Vec<StateProjection>> {
+        self.store
+            .list_workspace_session_states(workspace_root)
+            .await
     }
 }
 

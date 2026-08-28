@@ -26,11 +26,11 @@ use super::{
     MAX_PROVIDER_TOOL_NAME_BYTES, ProviderError, ProviderErrorMetadata, ProviderFinishReason,
     ProviderGenerationConfig, ProviderHttpHeaders, ProviderMessage, ProviderMessageMetadata,
     ProviderProbeResult, ProviderProtocol, ProviderRequest, ProviderResponse, ProviderRole,
-    ProviderStreamEvent, configured_or_first_env, custom_headers_from_reader, env_mapping,
-    first_env, generation_config_from_reader, missing_env_error, protocol_capabilities,
-    provider_credential_error, provider_http_client, provider_http_error_with_headers,
-    provider_transport_error, response_json_or_error, sanitize_provider_error,
-    validate_native_base_url,
+    ProviderStreamEvent, SESSION_AFFINITY_HEADER, configured_or_first_env,
+    custom_headers_from_reader, env_mapping, first_env, generation_config_from_reader,
+    missing_env_error, protocol_capabilities, provider_credential_error, provider_http_client,
+    provider_http_error_with_headers, provider_transport_error, response_json_or_error,
+    sanitize_provider_error, validate_native_base_url,
 };
 
 const CHATGPT_ACCOUNT_ID_HEADER: &str = "ChatGPT-Account-Id";
@@ -301,19 +301,15 @@ impl OpenAiResponsesProvider {
                 .unwrap_or_else(|_| HeaderValue::from_static("golutra")),
         );
         headers.insert("originator", HeaderValue::from_static("golutra"));
-        let session_affinity = request.session_id.map_or_else(
-            || request.task_id.to_string(),
-            |session_id| session_id.to_string(),
-        );
-        if let Ok(value) = HeaderValue::from_str(&session_affinity) {
-            headers.insert("session-id", value);
+        headers.extend(self.config.custom_headers.to_header_map());
+        if let Ok(value) = HeaderValue::from_str(&request.affinity_id()) {
+            headers.insert(SESSION_AFFINITY_HEADER, value);
         }
         if let Some(account_id) = account_id
             && let Ok(value) = HeaderValue::from_str(account_id)
         {
             headers.insert(CHATGPT_ACCOUNT_ID_HEADER, value);
         }
-        headers.extend(self.config.custom_headers.to_header_map());
         Headers::from(
             headers
                 .iter()

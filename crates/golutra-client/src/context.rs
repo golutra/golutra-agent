@@ -2,14 +2,13 @@
 
 use std::{
     collections::HashMap,
-    fs,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use golutra_context::{ContextContributor, estimate_tokens};
-use golutra_core::{SessionId, TaskContract, TaskId, TurnId, VerificationRequirement};
+use golutra_core::{EventId, SessionId, TaskContract, TaskId, TurnId, VerificationRequirement};
 use golutra_evolution::SkillManifest;
 use golutra_llm::ProviderRole;
 use golutra_memory::RetrievedMemory;
@@ -19,7 +18,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 
-use super::ClientError;
+use super::{ClientError, file_identity::metadata_fingerprint};
 
 const MIN_MEMORY_RELEVANCE_SCORE: u32 = 50;
 /// 历史工具结果只用于恢复模型的工作状态；完整输出已经在 artifact 中持久化。
@@ -50,21 +49,20 @@ pub(crate) struct CachedSkillIndex {
 
 #[derive(Debug, Clone)]
 pub(crate) struct CachedHistoryEvents {
-    /// Only events that can affect model history are retained. High-volume
-    /// progress, governance, and observation events stay in the durable store.
+    /// 只保留会改变模型历史的事件；高频进度、治理和观测事实仍完整落库。
     pub(crate) events: Arc<Vec<RuntimeEvent>>,
-    /// Highest sequence observed for this session, including events filtered
-    /// out of `events`; this is the cursor for incremental SQLite reads.
-    pub(crate) last_session_sequence: u64,
-    /// Monotonic local recency used for deterministic LRU eviction.
+    /// 选择当前事件集的 durable 叶节点。叶节点变化会使缓存失效；单纯的
+    /// sequence 无法区分线性追加与显式分支。
+    pub(crate) active_leaf_event_id: Option<EventId>,
+    /// 本地单调访问序号，用于确定性 LRU 淘汰。
     pub(crate) last_used: u64,
-    /// Last point at which the durable session cursor was checked. Events
-    /// committed by this host advance the cursor without a second SQLite read.
+    /// 最近一次核对 durable 叶节点的时间；本 host 提交的事件会直接推进叶节点。
     pub(crate) last_checked_at: Instant,
-    /// Parsed model facts are invalidated only when a relevant durable event
-    /// arrives. This avoids rebuilding turn/update state for every new task.
+    /// 仅在相关 durable 事实变化时丢弃解析结果，避免每轮重建历史状态。
     pub(crate) facts: Option<Arc<Vec<CachedHistoryFact>>>,
     pub(crate) latest_compaction: Option<(u64, String)>,
+    /// parent 跨过未投影事件或切换分支时，缓存快照不完整，必须重新读取路径。
+    pub(crate) reload_required: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -168,11 +166,6 @@ impl ContextResourceCache {
         Some(entry.clone())
     }
 
-    /// Mark a cursor check complete and return the current shared history.
-    ///
-    /// The caller may have yielded to SQLite after taking an earlier cache
-    /// snapshot. Re-reading the entry under the lock prevents that stale
-    /// snapshot from hiding a locally committed event.
     pub(crate) fn mark_history_checked(
         &mut self,
         session_id: SessionId,
@@ -188,7 +181,7 @@ impl ContextResourceCache {
         &mut self,
         session_id: SessionId,
         events: Arc<Vec<RuntimeEvent>>,
-        last_session_sequence: u64,
+        active_leaf_event_id: Option<EventId>,
     ) {
         let tick = self.tick();
         let latest_compaction = events.iter().rev().find_map(context_compaction_from_event);
@@ -196,11 +189,12 @@ impl ContextResourceCache {
             session_id,
             CachedHistoryEvents {
                 events,
-                last_session_sequence,
+                active_leaf_event_id,
                 last_used: tick,
                 last_checked_at: Instant::now(),
                 facts: None,
                 latest_compaction,
+                reload_required: false,
             },
         );
         if self.history.len() > MAX_CACHED_HISTORY_SESSIONS
@@ -251,11 +245,14 @@ impl ContextResourceCache {
         entry.latest_compaction.clone()
     }
 
-    /// Advance an existing cache entry after a durable event is committed by
-    /// this host. We intentionally do not create entries here: sessions that
-    /// have never requested context should not consume heap just because they
-    /// emitted telemetry.
+    /// 本 host 提交 durable 事件后推进已有缓存。这里不为冷 session 创建
+    /// 条目，避免从未组装过上下文的 session 因事件写入占用堆内存。
     pub(crate) fn observe_committed_event(&mut self, event: &RuntimeEvent) {
+        // 普通命令、流式遥测和治理事件不改变模型上下文；忽略它们还能让
+        // 缓存的外部刷新窗口保持稳定。
+        if !is_history_cache_event(event) {
+            return;
+        }
         if !self.history.contains_key(&event.session_id) {
             return;
         }
@@ -263,12 +260,30 @@ impl ContextResourceCache {
         let Some(entry) = self.history.get_mut(&event.session_id) else {
             return;
         };
-        entry.last_session_sequence = entry.last_session_sequence.max(event.sequence_no);
-        entry.last_checked_at = Instant::now();
-        entry.last_used = tick;
-        if !is_history_cache_event(event) {
+        if entry.reload_required {
             return;
         }
+        entry.last_checked_at = Instant::now();
+        entry.last_used = tick;
+
+        // parent 等于缓存叶节点表示线性追加；其他 parent 表示切换了分支，
+        // 或接入了缓存之外的执行事实，下一次请求必须重载 durable 路径。
+        let linear_append = entry.active_leaf_event_id.is_none()
+            || event.parent_event_id == entry.active_leaf_event_id;
+        if entry.active_leaf_event_id == Some(event.id) {
+            return;
+        }
+        if !linear_append {
+            // None 是明确的 dirty 标记；若保留新 id，快速路径会在重载前
+            // 错误返回已经清空的缓存。
+            entry.active_leaf_event_id = None;
+            entry.events = Arc::new(Vec::new());
+            entry.facts = None;
+            entry.latest_compaction = None;
+            entry.reload_required = true;
+            return;
+        }
+        entry.active_leaf_event_id = Some(event.id);
         let history = Arc::make_mut(&mut entry.events);
         if history
             .iter()
@@ -336,43 +351,6 @@ pub(crate) fn skill_manifest_fingerprint(path: Option<&Path>) -> String {
         material.push_str("\0missing");
     }
     format!("sha256:{:x}", Sha256::digest(material.as_bytes()))
-}
-
-/// Metadata identity is intentionally cheap: the content is read only after
-/// this fingerprint changes. Unix ctime/inode catches same-size rewrites that
-/// preserve mtime; other platforms retain the strongest portable identity.
-fn metadata_fingerprint(metadata: &fs::Metadata) -> String {
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |value| value.as_nanos());
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        format!(
-            "{}:{}:{}:{}:{}:{}",
-            metadata.len(),
-            modified,
-            metadata.dev(),
-            metadata.ino(),
-            metadata.ctime(),
-            metadata.ctime_nsec()
-        )
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        format!(
-            "{}:{}:{}:{}",
-            metadata.len(),
-            modified,
-            metadata.volume_serial_number().unwrap_or(0),
-            metadata.file_index().unwrap_or(0)
-        )
-    }
-    #[cfg(not(any(unix, windows)))]
-    format!("{}:{}", metadata.len(), modified)
 }
 
 pub(crate) fn skill_context_fingerprint(path: Option<&Path>, objective: &str) -> String {
@@ -636,10 +614,9 @@ pub(crate) fn context_compaction_from_event(event: &RuntimeEvent) -> Option<(u64
 /// the existing provider projection boundary rather than caching all runtime
 /// telemetry and then filtering it on every turn.
 pub(crate) fn is_history_cache_event(event: &RuntimeEvent) -> bool {
-    matches!(
-        event.event_type,
-        RuntimeEventType::TurnCancelled | RuntimeEventType::CompactionCompleted
-    ) || event.event_type.is_model_history_fact()
+    event.event_type == RuntimeEventType::TurnCancelled
+        || event.event_type.is_model_history_fact()
+        || context_compaction_from_event(event).is_some()
 }
 
 /// 将 durable 工具事件转成与当前回合相同的模型可见表示。
@@ -786,7 +763,7 @@ pub(crate) fn bound_cached_history(events: &mut Vec<RuntimeEvent>) {
     }
     let latest_compaction = events
         .iter()
-        .rposition(|event| event.event_type == RuntimeEventType::CompactionCompleted);
+        .rposition(|event| context_compaction_from_event(event).is_some());
     let recent_start = events.len().saturating_sub(MAX_CACHED_HISTORY_EVENTS);
     let tail_start = events
         .len()
@@ -887,20 +864,6 @@ pub(crate) fn truncate_to_token_budget(value: &str, token_budget: u64) -> String
         .collect::<String>()
         .trim()
         .to_owned()
-}
-
-pub(crate) fn compact_history_lines(lines: Vec<String>) -> String {
-    lines.join("\n")
-}
-
-pub(crate) fn compact_history_with_summary(summary: Option<String>, lines: Vec<String>) -> String {
-    match summary {
-        Some(summary) => std::iter::once(summary)
-            .chain(lines)
-            .collect::<Vec<_>>()
-            .join("\n"),
-        None => compact_history_lines(lines),
-    }
 }
 
 pub(crate) fn compact_history_text(value: &str, max_chars: usize) -> String {

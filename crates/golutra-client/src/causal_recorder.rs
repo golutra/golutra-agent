@@ -8,11 +8,13 @@ use golutra_core::{
 use golutra_protocol::{RuntimeEvent, RuntimeEventType};
 use serde_json::Value;
 
-use super::{ClientError, RuntimeHost};
+use super::{ClientError, RuntimeHost, context::is_history_cache_event};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CausalLedger {
     session_heads: HashMap<SessionId, EventId>,
+    /// 只记录会改变模型上下文的事件，避免命令/遥测事件遮蔽对话分支。
+    context_heads: HashMap<SessionId, EventId>,
     task_heads: HashMap<TaskId, EventId>,
     task_contexts: HashMap<TaskId, CausalContext>,
     provider_starts: HashMap<(TaskId, ProviderRequestId), EventId>,
@@ -21,8 +23,16 @@ pub(crate) struct CausalLedger {
 }
 
 impl CausalLedger {
+    pub(crate) fn context_head(&self, session_id: SessionId) -> Option<EventId> {
+        self.context_heads.get(&session_id).copied()
+    }
+
     fn has_session(&self, session_id: SessionId) -> bool {
         self.session_heads.contains_key(&session_id)
+    }
+
+    fn has_context(&self, session_id: SessionId) -> bool {
+        self.context_heads.contains_key(&session_id)
     }
 
     fn has_task(&self, task_id: TaskId) -> bool {
@@ -31,6 +41,7 @@ impl CausalLedger {
 
     fn seed(&mut self, event: &RuntimeEvent) {
         self.session_heads.insert(event.session_id, event.id);
+        self.seed_context_head(event);
         if let Some(task_id) = event.task_id {
             self.task_heads.insert(task_id, event.id);
             let mut context = event.causal_context.clone();
@@ -40,15 +51,25 @@ impl CausalLedger {
         }
     }
 
+    pub(crate) fn seed_context_head(&mut self, event: &RuntimeEvent) {
+        if is_history_cache_event(event) {
+            self.context_heads.insert(event.session_id, event.id);
+        }
+    }
+
     fn enrich(&mut self, workspace_id: WorkspaceId, event: &mut RuntimeEvent) {
         event.schema_version = RUNTIME_EVENT_SCHEMA_VERSION;
-        let previous = event.task_id.and_then(|task_id| {
-            self.task_heads
-                .get(&task_id)
-                .copied()
-                .or_else(|| self.session_heads.get(&event.session_id).copied())
-        });
-        let previous = previous.or_else(|| self.session_heads.get(&event.session_id).copied());
+        // 模型历史事件直接接到活动上下文叶节点，避免 provider/tool 遥测
+        // 拉长历史路径并把正常追加误判成分支；非历史事件继续沿 task 链。
+        let context_parent = is_history_cache_event(event)
+            .then(|| self.context_heads.get(&event.session_id).copied())
+            .flatten();
+        let task_parent = event
+            .task_id
+            .and_then(|task_id| self.task_heads.get(&task_id).copied());
+        let previous = context_parent
+            .or(task_parent)
+            .or_else(|| self.session_heads.get(&event.session_id).copied());
         if event.parent_event_id.is_none() {
             event.parent_event_id = previous;
         }
@@ -74,6 +95,7 @@ impl CausalLedger {
             event.causal_context = context;
         }
         self.session_heads.insert(event.session_id, event.id);
+        self.seed_context_head(event);
         self.index_lifecycle(event);
     }
 
@@ -136,13 +158,14 @@ impl RuntimeHost {
         &self,
         mut event: RuntimeEvent,
     ) -> Result<RuntimeEvent, ClientError> {
-        let (has_session, has_task) = {
+        let (has_session, has_task, has_context) = {
             let ledger = self.execution.causal_ledger.lock().await;
             (
                 ledger.has_session(event.session_id),
                 event
                     .task_id
                     .is_some_and(|task_id| ledger.has_task(task_id)),
+                ledger.has_context(event.session_id),
             )
         };
         if !has_task
@@ -167,6 +190,20 @@ impl RuntimeHost {
                 .pop()
         {
             self.execution.causal_ledger.lock().await.seed(&previous);
+        }
+        if !has_context
+            && let Some(previous) = self
+                .storage
+                .repositories
+                .events
+                .latest_model_history(event.session_id)
+                .await?
+        {
+            self.execution
+                .causal_ledger
+                .lock()
+                .await
+                .seed_context_head(&previous);
         }
         self.execution
             .causal_ledger

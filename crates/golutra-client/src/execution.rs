@@ -1,6 +1,7 @@
 //! Context construction, task supervision, AgentLoop, and provider auth lifecycles.
 
 use super::*;
+use golutra_context::{estimate_tokens, structured_compaction_summary};
 use golutra_llm::ProviderGenerationConfig;
 use tokio::{runtime::Handle, task::JoinHandle};
 
@@ -9,16 +10,15 @@ const HOST_SHUTDOWN_GRACE_TIMEOUT: Duration = Duration::from_millis(250);
 const BACKGROUND_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const MEMORY_CANDIDATE_MIN: usize = 8;
 const MEMORY_CANDIDATE_MAX: usize = 64;
-const HISTORY_CACHE_PAGE_SIZE: u32 = 512;
-
-fn context_budget_share(budget: u64, numerator: u64, denominator: u64) -> u64 {
-    if budget == u64::MAX {
-        return u64::MAX;
-    }
-    budget
-        .saturating_mul(numerator)
-        .saturating_div(denominator.max(1))
-}
+// memory 与 skill 是按需证据，使用绝对上限防止它们挤占持续增长的会话历史；
+// 上限不是预留配额，未命中或未用完的 token 会全部回流给活动历史。
+const MAX_MEMORY_CONTEXT_TOKENS: u64 = 1_024;
+const MAX_SKILL_CONTEXT_TOKENS: u64 = 1_024;
+// compaction 保存旧事实，最近尾部保存当前工作状态；绝对边界避免随大窗口膨胀，
+// 同时让 summary 未用额度继续留给最近历史。
+const MIN_RECENT_HISTORY_TOKENS: u64 = 1_024;
+const MAX_WORKING_SUMMARY_TOKENS: u64 = 2_048;
+const ACTIVE_PATH_COMPACTION_MAX_DEPTH: u32 = 65_536;
 
 fn memory_candidate_limit(context_budget: u64) -> usize {
     if context_budget == 0 {
@@ -375,12 +375,25 @@ impl RuntimeHost {
             source_refs: vec![format!("workspace:{}", workspace_root.display())],
         });
         let project_instructions = self.cached_project_instruction_bundle(&workspace_root);
-        let skill_context = self.active_skill_context_with_budget(
-            &objective,
-            context_budget_share(context_budget, 1, 8),
-        );
-        let (project_instructions, skill_context) =
-            tokio::join!(project_instructions, skill_context);
+        let skill_context =
+            self.active_skill_context_with_budget(&objective, MAX_SKILL_CONTEXT_TOKENS);
+
+        // 四路来源互不依赖且只读取已有状态，并行加载可把首次 provider 请求
+        // 的准备时间收敛到最慢一路；MemoryRetrieved 仍在选择完成后有序落库。
+        let memory_store = self.storage.memory_store.clone();
+        let memory_query = objective.clone();
+        let memory_limit = memory_candidate_limit(context_budget.min(MAX_MEMORY_CONTEXT_TOKENS));
+        let memories = async move {
+            run_blocking(move || {
+                memory_store.retrieve(&memory_query, MemoryScope::Project, memory_limit)
+            })
+            .await?
+            .map_err(ClientError::from)
+        };
+        let history = self.cached_history_events(session_id);
+        let (project_instructions, skill_context, memories, history) =
+            tokio::join!(project_instructions, skill_context, memories, history);
+        let history = history?;
         if let Some(project_instructions) = project_instructions? {
             contributors.push(ContextContributor {
                 name: "project_instructions".to_owned(),
@@ -391,30 +404,86 @@ impl RuntimeHost {
             });
         }
 
-        // 两路查询都只读已有 durable 状态，可以并发执行；MemoryRetrieved 事件仍在
-        // 检索完成后按原顺序写入，避免把有副作用的计数更新移到错误边界之外。
-        let memory_store = self.storage.memory_store.clone();
-        let memory_query = objective.clone();
-        let memory_limit = memory_candidate_limit(context_budget_share(context_budget, 1, 8));
-        let memories = async move {
-            run_blocking(move || {
-                memory_store.retrieve(&memory_query, MemoryScope::Project, memory_limit)
-            })
-            .await?
-            .map_err(ClientError::from)
+        let objective_contributor = ContextContributor {
+            name: "objective".to_owned(),
+            role: ProviderRole::User,
+            content: objective,
+            token_budget_hint: 0,
+            source_refs: vec![format!("task:{current_task_id}:objective")],
         };
+        let output_schema_contributor = output_schema
+            .filter(|value| !value.is_null())
+            .map(|output_schema| {
+                let schema = serde_json::to_string(output_schema)?;
+                Ok::<_, ClientError>(ContextContributor {
+                    name: "output_schema".to_owned(),
+                    role: ProviderRole::User,
+                    content: format!(
+                        "The final assistant response must contain only JSON that validates against this JSON Schema. Do not wrap it in Markdown:\n{schema}"
+                    ),
+                    token_budget_hint: 0,
+                    source_refs: vec![format!("task:{current_task_id}:output_schema")],
+                })
+            })
+            .transpose()?;
+        let mandatory_tokens = contributors
+            .iter()
+            .chain(std::iter::once(&objective_contributor))
+            .chain(output_schema_contributor.iter())
+            .fold(0_u64, |total, contributor| {
+                total.saturating_add(estimate_tokens(&contributor.content))
+            });
+        let mut remaining_budget = context_budget.saturating_sub(mandatory_tokens);
+        let recent_history_reserve = self.conversation_history_recent_reserve(
+            session_id,
+            current_task_id,
+            history.as_ref(),
+            remaining_budget,
+        );
+        let mut optional_budget = remaining_budget.saturating_sub(recent_history_reserve);
+
+        let memories = select_memories_for_context_with_budget(
+            memories?,
+            optional_budget.min(MAX_MEMORY_CONTEXT_TOKENS),
+        );
+        let memory_contributor = (!memories.is_empty()).then(|| ContextContributor {
+            name: "memory".to_owned(),
+            // memory 是每个任务变化的证据，把它放在 user context，避免
+            // rust-genai 将动态内容拼进静态 system prompt，破坏前缀缓存。
+            role: ProviderRole::User,
+            content: memory_context_with_budget(
+                &memories,
+                optional_budget.min(MAX_MEMORY_CONTEXT_TOKENS),
+            ),
+            token_budget_hint: 0,
+            source_refs: memories
+                .iter()
+                .map(|memory| format!("memory:{}", memory.record.memory_id))
+                .collect(),
+        });
+        if let Some(memory) = memory_contributor.as_ref() {
+            let memory_tokens = estimate_tokens(&memory.content);
+            optional_budget = optional_budget.saturating_sub(memory_tokens);
+            remaining_budget = remaining_budget.saturating_sub(memory_tokens);
+        }
+
+        let skill_context = skill_context?
+            .map(|content| {
+                truncate_to_token_budget(&content, optional_budget.min(MAX_SKILL_CONTEXT_TOKENS))
+            })
+            .filter(|content| !content.is_empty());
+        if let Some(skill_context) = skill_context.as_ref() {
+            let skill_tokens = estimate_tokens(skill_context);
+            remaining_budget = remaining_budget.saturating_sub(skill_tokens);
+        }
+
         let history = self.conversation_history_projection(
             session_id,
             current_task_id,
-            context_budget_share(context_budget, 2, 5),
+            history.as_ref(),
+            remaining_budget,
+            recent_history_reserve,
         );
-        let (memories, history) = tokio::join!(memories, history);
-        let memories = memories?;
-        let memories = select_memories_for_context_with_budget(
-            memories,
-            context_budget_share(context_budget, 1, 8),
-        );
-        let history = history?;
         // 没有命中时不写空的 durable 事件。空检索是正常路径，绕过 SQLite、
         // rollout 和通知写入可以把首个 provider 请求留在纯读取热路径上。
         if !memories.is_empty() {
@@ -444,36 +513,15 @@ impl RuntimeHost {
         // 历史是会话中唯一持续增长的前缀；放在每任务变化的 memory 之前，
         // 让 provider 可以复用从 system/project 到历史的连续 cache prefix。
         contributors.extend(history);
-        if !memories.is_empty() {
-            contributors.push(ContextContributor {
-                name: "memory".to_owned(),
-                // memory 是每个任务变化的证据，把它放在 user context，避免
-                // rust-genai 将动态内容拼进静态 system prompt，破坏前缀缓存。
-                role: ProviderRole::User,
-                content: memory_context_with_budget(
-                    &memories,
-                    context_budget_share(context_budget, 1, 8),
-                ),
-                token_budget_hint: 0,
-                source_refs: memories
-                    .iter()
-                    .map(|memory| format!("memory:{}", memory.record.memory_id))
-                    .collect(),
-            });
+        if let Some(memory) = memory_contributor {
+            contributors.push(memory);
         }
 
-        contributors.push(ContextContributor {
-            name: "objective".to_owned(),
-            role: ProviderRole::User,
-            content: objective,
-            token_budget_hint: 0,
-            source_refs: vec![format!("task:{current_task_id}:objective")],
-        });
+        contributors.push(objective_contributor);
 
-        // Skill selection depends on the objective. Keep it in the dynamic
-        // user segment so the stable system/project prefix remains reusable
-        // across unrelated tasks.
-        if let Some(skill_context) = skill_context? {
+        // skill 选择依赖当前目标，因此保留在动态 user 段，避免无关任务变化
+        // 破坏 system/project 稳定前缀。
+        if let Some(skill_context) = skill_context {
             contributors.push(ContextContributor {
                 name: "project_skills".to_owned(),
                 role: ProviderRole::User,
@@ -483,23 +531,67 @@ impl RuntimeHost {
             });
         }
 
-        // The schema is task-local. Keep it beside the objective in the
-        // dynamic user segment so a schema change does not invalidate the
-        // reusable system/project prefix for subsequent turns.
-        if let Some(output_schema) = output_schema.filter(|value| !value.is_null()) {
-            let schema = serde_json::to_string(output_schema)?;
-            contributors.push(ContextContributor {
-                name: "output_schema".to_owned(),
-                role: ProviderRole::User,
-                content: format!(
-                    "The final assistant response must contain only JSON that validates against this JSON Schema. Do not wrap it in Markdown:\n{schema}"
-                ),
-                token_budget_hint: 0,
-                source_refs: vec![format!("task:{current_task_id}:output_schema")],
-            });
+        // schema 也是任务局部内容，放在动态段末尾以保护可复用前缀。
+        if let Some(output_schema) = output_schema_contributor {
+            contributors.push(output_schema);
         }
 
         Ok(contributors)
+    }
+
+    /// 最近历史保存当前工作状态，必须先于 memory/skill 获得有限预算。
+    /// 这里只投影最多一个 reserve 的尾部，避免为预算决策扫描或复制整段历史。
+    fn conversation_history_recent_reserve(
+        &self,
+        session_id: SessionId,
+        current_task_id: TaskId,
+        cached_events: &[RuntimeEvent],
+        available_budget: u64,
+    ) -> u64 {
+        let reserve_cap = available_budget.min(MIN_RECENT_HISTORY_TOKENS);
+        if reserve_cap == 0 {
+            return 0;
+        }
+        let compacted_after = self
+            .execution
+            .context_resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .history_compaction(session_id)
+            .map(|(sequence_no, _)| sequence_no)
+            .unwrap_or_default();
+        let cached_facts = self
+            .execution
+            .context_resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .history_facts(session_id);
+        if let Some(facts) = cached_facts.as_ref() {
+            let mut reserved = 0_u64;
+            for fact in facts.iter().rev().filter(|fact| {
+                fact.sequence_no > compacted_after && fact.task_id != Some(current_task_id)
+            }) {
+                reserved = reserved
+                    .saturating_add(estimate_tokens(&fact.contributor.content))
+                    .min(reserve_cap);
+                if reserved == reserve_cap {
+                    break;
+                }
+            }
+            return reserved;
+        }
+
+        history_contributors_with_budget(
+            cached_events.iter().filter(|event| {
+                event.sequence_no > compacted_after && event.task_id != Some(current_task_id)
+            }),
+            reserve_cap,
+        )
+        .iter()
+        .fold(0_u64, |total, contributor| {
+            total.saturating_add(estimate_tokens(&contributor.content))
+        })
+        .min(reserve_cap)
     }
 
     async fn cached_project_instruction_bundle(
@@ -526,17 +618,20 @@ impl RuntimeHost {
             return Ok(bundle);
         }
         let (_, fingerprint) = project_instruction_fingerprint(&canonical_root).await?;
-        if let Some(cached) = self
-            .execution
-            .context_resources
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .project_instructions
-            .as_ref()
-            .filter(|cached| cached.root == canonical_root && cached.fingerprint == fingerprint)
-            .cloned()
         {
-            return Ok(cached.bundle);
+            let mut resources = self
+                .execution
+                .context_resources
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cached) = resources
+                .project_instructions
+                .as_mut()
+                .filter(|cached| cached.root == canonical_root && cached.fingerprint == fingerprint)
+            {
+                cached.checked_at = Instant::now();
+                return Ok(cached.bundle.clone());
+            }
         }
         let bundle = load_project_instruction_bundle(&canonical_root).await?;
         self.execution
@@ -552,17 +647,16 @@ impl RuntimeHost {
         Ok(bundle)
     }
 
-    /// Read the session tree from newest to oldest until the token budget is
-    /// covered. Durable history facts are incrementally cached per session;
-    /// retention is still decided by message tokens and the latest compaction
-    /// boundary, so the cache never changes the provider-visible policy.
-    async fn conversation_history_projection(
+    /// 只从活动因果路径读取 token 预算内的历史。兄弟分支不会进入模型；
+    /// 叶节点作为缓存键，parent 不匹配时重新读取完整活动路径。
+    fn conversation_history_projection(
         &self,
         session_id: SessionId,
         current_task_id: TaskId,
+        cached_events: &[RuntimeEvent],
         token_budget: u64,
-    ) -> Result<Vec<ContextContributor>, ClientError> {
-        let cached_events = self.cached_history_events(session_id).await?;
+        recent_history_reserve: u64,
+    ) -> Vec<ContextContributor> {
         let compaction = self
             .execution
             .context_resources
@@ -579,20 +673,40 @@ impl RuntimeHost {
             .as_ref()
             .map(|(sequence_no, _)| *sequence_no)
             .unwrap_or_default();
+        let cached_facts = self
+            .execution
+            .context_resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .history_facts(session_id);
+        let history_facts = cached_facts.as_ref().map(|facts| {
+            facts
+                .iter()
+                .filter(|fact| {
+                    fact.sequence_no > compacted_after && fact.task_id != Some(current_task_id)
+                })
+                .collect::<Vec<_>>()
+        });
+        let history_events = history_facts.is_none().then(|| {
+            cached_events
+                .iter()
+                .filter(|event| {
+                    event.sequence_no > compacted_after && event.task_id != Some(current_task_id)
+                })
+                .collect::<Vec<_>>()
+        });
+        let recent_reserve = recent_history_reserve.min(token_budget);
+        let summary_budget = token_budget
+            .saturating_sub(recent_reserve)
+            .min(MAX_WORKING_SUMMARY_TOKENS);
         let mut contributors = Vec::new();
-        let summary_budget = if token_budget == u64::MAX {
-            u64::MAX
-        } else {
-            token_budget.saturating_div(4)
-        };
-        let history_budget = if token_budget == u64::MAX {
-            u64::MAX
-        } else {
-            token_budget.saturating_sub(summary_budget)
-        };
+        let mut summary_tokens = 0;
         if let Some((sequence_no, summary)) = compaction {
-            let summary = truncate_to_token_budget(&summary, summary_budget);
+            // 当前摘要是 canonical 结构，重新按预算编码可保持 JSON 完整；
+            // 不对结构化内容做字符级截断，也不解释旧的非结构化格式。
+            let summary = structured_compaction_summary(Some(&summary), &[], summary_budget);
             if !summary.is_empty() {
+                summary_tokens = estimate_tokens(&summary);
                 contributors.push(ContextContributor {
                     name: "working_summary".to_owned(),
                     role: ProviderRole::User,
@@ -602,174 +716,123 @@ impl RuntimeHost {
                 });
             }
         }
-        let history = {
-            let facts = self
-                .execution
-                .context_resources
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .history_facts(session_id);
-            if let Some(facts) = facts {
-                let history_facts = facts.iter().filter(|fact| {
-                    fact.sequence_no > compacted_after && fact.task_id != Some(current_task_id)
-                });
-                history_contributors_from_cached_facts(history_facts, history_budget)
-            } else {
-                // Cache eviction is unusual, but falling back to the durable
-                // event projector keeps context assembly correct under pressure.
-                let history_events = cached_events.iter().filter(|event| {
-                    event.sequence_no > compacted_after && event.task_id != Some(current_task_id)
-                });
-                history_contributors_with_budget(history_events, history_budget)
-            }
+        let history_budget = token_budget.saturating_sub(summary_tokens);
+        let history = if let Some(facts) = history_facts {
+            history_contributors_from_cached_facts(facts, history_budget)
+        } else {
+            // 缓存被淘汰时直接从同一 durable 快照投影，保持压力下语义一致。
+            history_contributors_with_budget(history_events.into_iter().flatten(), history_budget)
         };
         contributors.extend(history);
-        Ok(contributors)
+        contributors
     }
 
-    /// Load model-history facts once and append only newly committed session
-    /// events on later turns. A global sequence check also catches updates
-    /// written by another runtime process without rescanning every page.
+    /// 每个叶节点只读取一次活动因果路径。短周期刷新用于发现其他 runtime
+    /// 的写入；叶节点未变化时不扫描整段 session，也不重建已解析事实。
     pub(super) async fn cached_history_events(
         &self,
         session_id: SessionId,
     ) -> Result<Arc<Vec<RuntimeEvent>>, ClientError> {
         let events_repository = self.storage.repositories.events.clone();
-        let cached = self
-            .execution
-            .context_resources
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .history(session_id);
-
-        if let Some(entry) = cached.as_ref()
-            && !ContextResourceCache::history_refresh_due(entry)
-        {
-            return Ok(Arc::clone(&entry.events));
-            // The cursor is checked below only after the short refresh window.
-        }
-
-        let session_sequence = events_repository
-            .max_sequence_for_session(session_id)
-            .await?;
-        if let Some(entry) = cached.as_ref()
-            && session_sequence == entry.last_session_sequence
-        {
-            let mut resources = self
-                .execution
-                .context_resources
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(events) = resources.mark_history_checked(session_id) {
-                return Ok(events);
+        loop {
+            // event writer 只作为短暂的 durable 屏障，不覆盖 SQLite 路径查询，
+            // 避免长会话首次读取阻塞流式事件落库。
+            let (local_leaf, cached) = {
+                let _snapshot = self.execution.event_writer.lock().await;
+                let local_leaf = self
+                    .execution
+                    .causal_ledger
+                    .lock()
+                    .await
+                    .context_head(session_id);
+                let cached = self
+                    .execution
+                    .context_resources
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .history(session_id);
+                (local_leaf, cached)
+            };
+            let cached_leaf = cached.as_ref().and_then(|entry| entry.active_leaf_event_id);
+            let cache_dirty = cached.as_ref().is_some_and(|entry| entry.reload_required);
+            let refresh_due = cached
+                .as_ref()
+                .is_none_or(ContextResourceCache::history_refresh_due);
+            if let Some(entry) = cached.as_ref()
+                && !cache_dirty
+                && !refresh_due
+                && local_leaf == cached_leaf
+            {
+                return Ok(Arc::clone(&entry.events));
             }
-            // The entry was evicted while SQLite was being queried. Continue
-            // through the reload path instead of returning the stale clone.
-        }
 
-        let mut cache_sequence = session_sequence;
-        let mut history = if let Some(entry) = cached {
-            if session_sequence < entry.last_session_sequence {
+            // 本地 ledger 已指向 durable 事实时直接使用；只有 ledger 未推进或
+            // 到达外部刷新窗口时才查询 SQLite 的最新模型历史事件。
+            let latest_event = if local_leaf == cached_leaf || local_leaf.is_none() {
+                events_repository.latest_model_history(session_id).await?
+            } else {
+                None
+            };
+            let leaf_event_id = latest_event.as_ref().map(|event| event.id).or(local_leaf);
+
+            if cached.is_some()
+                && !cache_dirty
+                && cached_leaf == leaf_event_id
+                && local_leaf == leaf_event_id
+            {
+                let mut resources = self
+                    .execution
+                    .context_resources
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(events) = resources.mark_history_checked(session_id) {
+                    return Ok(events);
+                }
+                continue;
+            }
+
+            let mut history = if let Some(leaf_event_id) = leaf_event_id {
                 events_repository
-                    .load_recent_model_history(
+                    .active_context_window(
                         session_id,
-                        session_sequence,
+                        leaf_event_id,
                         u32::try_from(MAX_CACHED_HISTORY_EVENTS).unwrap_or(u32::MAX),
+                        ACTIVE_PATH_COMPACTION_MAX_DEPTH,
                     )
                     .await?
                     .into_iter()
                     .filter(is_history_cache_event)
                     .collect::<Vec<_>>()
             } else {
-                let mut history = entry.events.as_ref().clone();
-                let mut cursor = entry.last_session_sequence;
-                let mut reached_snapshot = false;
-                loop {
-                    let additions = events_repository
-                        .load_model_history_page(
-                            session_id,
-                            Some(cursor),
-                            session_sequence,
-                            HISTORY_CACHE_PAGE_SIZE,
-                        )
-                        .await?;
-                    let Some(last_event) = additions.last() else {
-                        reached_snapshot = true;
-                        break;
-                    };
-                    let next_cursor = last_event.sequence_no;
-                    history.extend(additions.into_iter().filter(is_history_cache_event));
-                    // SQL 按严格递增游标返回；异常数据不能让缓存刷新陷入死循环。
-                    if next_cursor <= cursor {
-                        break;
-                    }
-                    cursor = next_cursor;
-                    if cursor >= session_sequence {
-                        reached_snapshot = true;
-                        break;
-                    }
-                }
-                if !reached_snapshot {
-                    // 仅把已确认读取到的游标写入缓存；下一轮会继续补齐剩余页。
-                    cache_sequence = cursor;
-                }
-                history
+                Vec::new()
+            };
+
+            history.sort_by_key(|event| event.sequence_no);
+            history.dedup_by(|left, right| left.sequence_no == right.sequence_no);
+            bound_cached_history(&mut history);
+            let history = Arc::new(history);
+
+            // 发布前再次经过 writer 屏障。查询期间若有本地历史事件落库，
+            // 重新读取新路径；若只发现外部写入，则同步推进本地上下文叶节点。
+            let _publish = self.execution.event_writer.lock().await;
+            let mut ledger = self.execution.causal_ledger.lock().await;
+            if ledger.context_head(session_id) != local_leaf {
+                continue;
             }
-        } else {
-            events_repository
-                .load_recent_model_history(
-                    session_id,
-                    session_sequence,
-                    u32::try_from(MAX_CACHED_HISTORY_EVENTS).unwrap_or(u32::MAX),
-                )
-                .await?
-                .into_iter()
-                .filter(is_history_cache_event)
-                .collect::<Vec<_>>()
-        };
-
-        // 最近窗口可能已经越过最早的压缩边界；单独补回最新 summary，避免
-        // 只为保留一条边界而重新读取整个 session。
-        if !history
-            .iter()
-            .any(|event| event.event_type == RuntimeEventType::CompactionCompleted)
-            && let Some(compaction) = events_repository
-                .latest_context_compaction(session_id)
-                .await?
-                .filter(|event| event.sequence_no <= session_sequence)
-        {
-            history.push(compaction);
+            if let Some(event) = latest_event.as_ref() {
+                ledger.seed_context_head(event);
+            }
+            if ledger.context_head(session_id) != leaf_event_id {
+                continue;
+            }
+            drop(ledger);
+            self.execution
+                .context_resources
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert_history(session_id, Arc::clone(&history), leaf_event_id);
+            return Ok(history);
         }
-
-        history.sort_by_key(|event| event.sequence_no);
-        history.dedup_by(|left, right| left.sequence_no == right.sequence_no);
-        bound_cached_history(&mut history);
-        let last_session_sequence = cache_sequence;
-        let mut history = Arc::new(history);
-        let mut resources = self
-            .execution
-            .context_resources
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // A local commit can arrive while SQLite pages are being read. Merge
-        // the current cache entry before replacing it so a stale page cannot
-        // erase an event that was observed in the meantime.
-        if let Some(current) = resources.history.get(&session_id) {
-            let mut merged = history.as_ref().clone();
-            merged.extend(current.events.iter().cloned());
-            merged.sort_by_key(|event| event.sequence_no);
-            merged.dedup_by(|left, right| left.sequence_no == right.sequence_no);
-            bound_cached_history(&mut merged);
-            history = Arc::new(merged);
-        }
-        let merged_sequence = resources
-            .history
-            .get(&session_id)
-            .map_or(last_session_sequence, |current| {
-                current.last_session_sequence.max(last_session_sequence)
-            });
-        resources.insert_history(session_id, Arc::clone(&history), merged_sequence);
-        Ok(history)
     }
 
     pub(super) fn next_sequence_no(&self) -> u64 {

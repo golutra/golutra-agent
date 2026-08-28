@@ -221,8 +221,12 @@ async fn openai_compatible_provider_matches_goldens() {
     )
     .await;
     let provider = OpenAiCompatibleProvider::new(TEST_API_KEY, base_url, "gpt-golden");
+    let session_id = SessionId::new();
+    let session_header = session_id.to_string();
+    let mut request = comprehensive_request("gpt-golden");
+    request.session_id = Some(session_id);
     let response = provider
-        .complete(comprehensive_request("gpt-golden"))
+        .complete(request)
         .await
         .expect("OpenAI-compatible text response");
     let captured = captured.await.expect("OpenAI-compatible request");
@@ -240,6 +244,10 @@ async fn openai_compatible_provider_matches_goldens() {
     assert_eq!(
         captured.headers.get("authorization"),
         Some(&format!("Bearer {TEST_API_KEY}"))
+    );
+    assert_eq!(
+        captured.headers.get("session-id").map(String::as_str),
+        Some(session_header.as_str())
     );
     assert_eq!(response.finish_reason, ProviderFinishReason::Stop);
     assert_eq!(response.usage.total_tokens, Some(15));
@@ -404,6 +412,7 @@ async fn openai_compatible_custom_headers_are_applied_without_debug_values() {
             json!({
                 "X-Api-Key": "fake-supplemental-key",
                 "X-Client-Name": "golutra-golden",
+                "Session-Id": "external-affinity-must-not-win",
             })
             .to_string(),
         ),
@@ -412,8 +421,12 @@ async fn openai_compatible_custom_headers_are_applied_without_debug_values() {
     .expect("custom header config");
     let debug = format!("{config:?}");
     let provider = OpenAiCompatibleProvider::from_config(config);
+    let session_id = SessionId::new();
+    let session_header = session_id.to_string();
+    let mut request = simple_request("gpt-golden");
+    request.session_id = Some(session_id);
     provider
-        .complete(simple_request("gpt-golden"))
+        .complete(request)
         .await
         .expect("custom header request");
     let captured = captured.await.expect("custom header capture");
@@ -426,7 +439,46 @@ async fn openai_compatible_custom_headers_are_applied_without_debug_values() {
         captured.headers.get("x-client-name").map(String::as_str),
         Some("golutra-golden")
     );
+    assert_eq!(
+        captured.headers.get("session-id").map(String::as_str),
+        Some(session_header.as_str())
+    );
     assert!(!debug.contains("fake-supplemental-key"));
+}
+
+#[tokio::test]
+async fn openai_responses_internal_affinity_overrides_the_custom_session_header() {
+    let (base_url, captured) = spawn_provider_sequence(vec![TestProviderResponse::sse(
+        200,
+        include_str!("fixtures/openai-responses/text-response.sse"),
+    )])
+    .await;
+    let config = OpenAiResponsesProvider::config_from_env_reader(|key| match key {
+        "GOLUTRA_PROVIDER_PROTOCOL" => Some("openai-responses".to_owned()),
+        "GOLUTRA_PROVIDER_API_KEY" => Some(TEST_API_KEY.to_owned()),
+        "GOLUTRA_PROVIDER_MODEL" => Some("gpt-golden".to_owned()),
+        "GOLUTRA_PROVIDER_BASE_URL" => Some(base_url.clone()),
+        "GOLUTRA_PROVIDER_CUSTOM_HEADERS" => {
+            Some(json!({"Session-Id": "external-affinity-must-not-win"}).to_string())
+        }
+        _ => None,
+    })
+    .expect("Responses custom header config");
+    let provider = OpenAiResponsesProvider::from_config(config);
+    let session_id = SessionId::new();
+    let session_header = session_id.to_string();
+    let mut request = simple_request("gpt-golden");
+    request.session_id = Some(session_id);
+
+    provider
+        .complete(request)
+        .await
+        .expect("Responses custom header request");
+    let captured = captured.await.expect("Responses custom header capture");
+    assert_eq!(
+        captured[0].headers.get("session-id").map(String::as_str),
+        Some(session_header.as_str())
+    );
 }
 
 #[tokio::test]

@@ -75,6 +75,7 @@ const MAX_PROVIDER_TOOL_CALL_ID_BYTES: usize = 256;
 const MAX_PROVIDER_TOOL_NAME_BYTES: usize = 128;
 const MAX_PROVIDER_CUSTOM_HEADERS: usize = 32;
 const MAX_PROVIDER_HEADER_VALUE_BYTES: usize = 8 * 1024;
+const SESSION_AFFINITY_HEADER: &str = "session-id";
 
 /// 脱敏后的 provider 诊断元数据，只用于重试决策和可行动的观测。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -176,6 +177,13 @@ pub struct ProviderRequest {
 }
 
 impl ProviderRequest {
+    fn affinity_id(&self) -> String {
+        self.session_id.map_or_else(
+            || self.task_id.to_string(),
+            |session_id| session_id.to_string(),
+        )
+    }
+
     #[must_use]
     pub fn cache_identity(&self) -> Option<CacheIdentity> {
         self.cache_identity_with_namespace("default")
@@ -200,10 +208,8 @@ impl ProviderRequest {
             namespace.trim(),
         );
         use sha2::{Digest, Sha256};
-        // OpenAI-compatible gateways (and Pi) cap prompt cache keys at 64
-        // characters.  Keep a 256-bit-derived key while reserving the limit
-        // for the wire protocol; truncating the hex digest still leaves more
-        // than enough collision resistance for a session-affinity key.
+        // OpenAI-compatible 网关通常把 prompt cache key 限制为 64 字符；
+        // 截断十六进制摘要仍保留足够的 session affinity 碰撞安全余量。
         let digest = format!("{:x}", Sha256::digest(prefix.as_bytes()));
         Some(CacheIdentity {
             session_id,
@@ -795,6 +801,7 @@ impl OpenAiCompatibleProvider {
         builder: reqwest::RequestBuilder,
         token: &str,
         initiator: &str,
+        affinity_id: Option<&str>,
     ) -> reqwest::RequestBuilder {
         let builder = builder.bearer_auth(token);
         let builder = if self.provider_id == "github-copilot" {
@@ -809,7 +816,12 @@ impl OpenAiCompatibleProvider {
         } else {
             builder
         };
-        builder.headers(self.custom_headers.to_header_map())
+        let builder = builder.headers(self.custom_headers.to_header_map());
+        if let Some(affinity_id) = affinity_id {
+            builder.header(SESSION_AFFINITY_HEADER, affinity_id)
+        } else {
+            builder
+        }
     }
 
     #[must_use]
@@ -937,7 +949,7 @@ impl OpenAiCompatibleProvider {
             .await
             .map_err(provider_credential_error)?;
         let response = self
-            .authenticated_request(self.client.get(url), token.expose_secret(), "user")
+            .authenticated_request(self.client.get(url), token.expose_secret(), "user", None)
             .send()
             .await
             .map_err(provider_transport_error)?;
@@ -949,7 +961,7 @@ impl OpenAiCompatibleProvider {
             .credential(true)
             .await
             .map_err(provider_credential_error)?;
-        self.authenticated_request(self.client.get(url), token.expose_secret(), "user")
+        self.authenticated_request(self.client.get(url), token.expose_secret(), "user", None)
             .send()
             .await
             .map_err(provider_transport_error)
@@ -959,6 +971,7 @@ impl OpenAiCompatibleProvider {
         &self,
         url: &str,
         body: &Value,
+        affinity_id: &str,
     ) -> Result<reqwest::Response, ProviderError> {
         let token = self
             .credential
@@ -971,6 +984,7 @@ impl OpenAiCompatibleProvider {
                 self.client.post(url).json(body),
                 token.expose_secret(),
                 initiator,
+                Some(affinity_id),
             )
             .send()
             .await
@@ -987,6 +1001,7 @@ impl OpenAiCompatibleProvider {
             self.client.post(url).json(body),
             token.expose_secret(),
             initiator,
+            Some(affinity_id),
         )
         .send()
         .await
@@ -1051,8 +1066,9 @@ impl LlmProvider for OpenAiCompatibleProvider {
             openai_prompt_cache_supported(&self.base_url),
             cache_identity.as_ref(),
         );
+        let affinity_id = request.affinity_id();
 
-        let response = self.post_with_auth_retry(&url, &body).await?;
+        let response = self.post_with_auth_retry(&url, &body, &affinity_id).await?;
         let status = response.status();
         let headers = response.headers().clone();
         let value = response_json_or_error(response).await?;
@@ -1085,7 +1101,8 @@ impl LlmProvider for OpenAiCompatibleProvider {
             openai_prompt_cache_supported(&self.base_url),
             cache_identity.as_ref(),
         );
-        let response = self.post_with_auth_retry(&url, &body).await?;
+        let affinity_id = request.affinity_id();
+        let response = self.post_with_auth_retry(&url, &body, &affinity_id).await?;
         let status = response.status();
         if status.as_u16() == 429 {
             let headers = response.headers().clone();
